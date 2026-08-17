@@ -489,8 +489,8 @@ fn test_injcomp_size18_structural_cert_proves_optimum() {
 }
 
 /// Locates the PB25 BNN-verification instance the earlier wrong-UNSAT regression
-/// came from. Overridable via `AY_PB_BNN_OPB`; otherwise resolved under
-/// `$AY_PBCOMP_BENCH_ROOT` (default: the checkout-relative `benchmarks/pb-comp`).
+/// came from. Overridable via `AY_PB_BNN_OPB`; otherwise resolved under the
+/// checkout-relative `benchmarks/pb-comp`.
 /// Returns `None` (test skips) when the multi-megabyte instance
 /// is not present, so CI without the benchmark tree stays green.
 fn find_bnn_back_image_73_norm1() -> Option<std::path::PathBuf> {
@@ -499,11 +499,9 @@ fn find_bnn_back_image_73_norm1() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let root = std::env::var_os("AY_PBCOMP_BENCH_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp")
-        });
+    // B14: the AY_PBCOMP_BENCH_ROOT override nothing set is deleted; a
+    // relocated corpus is a symlink at the checkout-relative path.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp");
     let fallback = root.join(
         "PB25/normalized-PB25/OPT-LIN/sakai/\
          PB25-bnn-verification-20250419/instances/\

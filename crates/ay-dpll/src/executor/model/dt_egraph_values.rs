@@ -814,7 +814,7 @@ impl Executor {
                     "dt-egraph assignment: some classes could not be coherently \
                  valued; their consumers fail closed (#mv-dt-single-source)"
                 );
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     let mut reps: Vec<u32> = builder.poisoned.iter().map(|t| t.0).collect();
                     reps.sort_unstable();
                     eprintln!("c phase-trace dt-egraph-poisoned reps={reps:?}");
@@ -850,7 +850,7 @@ impl Executor {
                 "dt-egraph assignment failed the structural self-check; total \
                  selector definitions withheld (#mv-dt-single-source)"
             );
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-egraph-self-check failed");
             }
             // The totalizations are withheld (see the totalization scan), but
@@ -914,7 +914,7 @@ impl Executor {
         let _guard = super::dt_model::OverrideGuard::install(overrides);
         for &assertion in &assertions {
             if !matches!(self.evaluate_term(model, assertion), EvalValue::Bool(true)) {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace dt-egraph-self-check-fail assertion={}",
                         assertion.0
@@ -993,7 +993,7 @@ impl Executor {
                             let rep = asg.dtm.rep(term);
                             let got = asg.class_value.get(&rep)?;
                             if *got != expected {
-                                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                                if ay_core::misc_cli_flags().phase_trace {
                                     eprintln!(
                                         "c phase-trace dt-egraph-owner-stale app={} sel={} \
                                          arg_rep={} expected={expected} got={got}",
@@ -1212,7 +1212,7 @@ impl AsgBuilder<'_> {
         if depth == 0 || !self.in_progress.insert(rep) {
             // Depth exhaustion or a structural cycle through the e-graph:
             // no finite value exists — fail closed.
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-egraph-poison site=cycle rep={}", rep.0);
             }
             self.poisoned.insert(rep);
@@ -1645,7 +1645,7 @@ impl AsgBuilder<'_> {
                         if pin_only_from(self, app_rep, &app_point)
                             && repin_ok(self, app_rep, &canon)
                         {
-                            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().phase_trace {
                                 eprintln!(
                                     "c phase-trace dt-egraph-stale-repin sel={sel} rep={} \
                                      new={canon}",
@@ -1660,7 +1660,7 @@ impl AsgBuilder<'_> {
                         if pin_only_from(self, canon_app_rep, &canon_point)
                             && repin_ok(self, canon_app_rep, &app_val)
                         {
-                            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().phase_trace {
                                 eprintln!(
                                     "c phase-trace dt-egraph-stale-repin sel={sel} rep={} \
                                      new={app_val}",
@@ -1673,7 +1673,7 @@ impl AsgBuilder<'_> {
                             continue;
                         }
                         {
-                            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().phase_trace {
                                 let describe = |b: &Self, rep: TermId| match b.commits.get(&rep) {
                                     Some(CtorCommit::App(c, _)) => format!("App({c})"),
                                     Some(CtorCommit::Tester(c)) => format!("Tester({c})"),
@@ -1766,7 +1766,7 @@ impl AsgBuilder<'_> {
             }
         }
         {
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace dt-egraph-poison site=pin rep={} value={value} \
                      final={final_round} free={} extra={:?}",
@@ -1824,7 +1824,7 @@ impl AsgBuilder<'_> {
             // poisoning — the disequality atom may be don't-care noise, and
             // the structural self-check arbitrates (fail-closed when it was
             // load-bearing).
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace dt-egraph-diseq-unseparated lhs={} rhs={} rl={} rr={} val={vl}",
                     lhs.0, rhs.0, rl.0, rr.0

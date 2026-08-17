@@ -226,6 +226,8 @@ impl CompiledExprEval {
     #[inline]
     pub unsafe fn evaluate_bool(&self, vars: &[i64]) -> Option<bool> {
         debug_assert!(self.is_boolean, "not a boolean expression");
+        // SAFETY: This method has the same caller contract as `evaluate_raw`:
+        // `vars` contains at least `var_mapping.total_vars()` elements.
         let result = unsafe { self.evaluate_raw(vars) };
         match result {
             0 => Some(false),

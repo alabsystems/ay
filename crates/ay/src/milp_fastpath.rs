@@ -30,7 +30,7 @@
 //!   efficiently and exactly — routing those would change competition
 //!   behavior for no need.
 //!
-//! `AY_MILP_FASTPATH=0` disables the route entirely.
+//! `--no-milp-fastpath` disables the route entirely.
 
 use ay_frontend::{Command, CommandStream, CommandStreamItem, Constant, Term};
 use ay_milp::{BabSession, Model, Outcome, SolveOpts};
@@ -73,11 +73,11 @@ struct Script {
 /// output printed; `false` means "not ours" and the caller must proceed with
 /// the standard lane as if this was never called.
 pub(crate) fn try_milp_fastpath(content: &str) -> bool {
-    let debug = std::env::var_os("AY_MILP_FASTPATH_DEBUG").is_some();
+    let debug = ay_core::misc_cli_flags().milp_fastpath_debug;
     if debug {
         eprintln!("fastpath: entry ({} bytes)", content.len());
     }
-    if std::env::var("AY_MILP_FASTPATH").as_deref() == Ok("0") {
+    if ay_core::misc_cli_flags().no_milp_fastpath {
         return false;
     }
     // Cheap pre-screen before any real parsing.
@@ -157,7 +157,7 @@ fn parse_script(content: &str) -> Option<Script> {
                     return None; // incremental use: not ours
                 }
                 let Some(cls) = classify_assert(&term, &index) else {
-                    if std::env::var_os("AY_MILP_FASTPATH_DEBUG").is_some() {
+                    if ay_core::misc_cli_flags().milp_fastpath_debug {
                         eprintln!("fastpath decline on assert: {term:?}");
                     }
                     return None;
@@ -198,7 +198,7 @@ fn parse_script(content: &str) -> Option<Script> {
             // Anything else (push/pop, define-fun, options, optimization…):
             // not the shape this path serves.
             other => {
-                if std::env::var_os("AY_MILP_FASTPATH_DEBUG").is_some() {
+                if ay_core::misc_cli_flags().milp_fastpath_debug {
                     eprintln!("fastpath decline on command: {other:?}");
                 }
                 return None;

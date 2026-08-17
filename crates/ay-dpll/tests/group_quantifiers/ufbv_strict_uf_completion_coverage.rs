@@ -26,7 +26,7 @@
 //! declines by construction and cannot ever fix this case. The two files pin the
 //! two search shapes; this one pins the bare-conjunction publication boundary.
 //!
-//! The defect, traced with `AY_DEBUG_CERT=1`: the result mapper treated
+//! The defect, traced with `--debug-cert`: the result mapper treated
 //! `quantifiers_supported_by_uf_completion` as a certificate even though it is
 //! only a local shape classifier. Compounding it,
 //! `term_supported_by_uf_completion`'s `and` arm (`mbqi.rs:1339`) accepts each

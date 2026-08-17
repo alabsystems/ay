@@ -28,9 +28,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// fail-closed on non-identity transform stacks (is_identity_grade), so every
 /// Safe/Unsafe answer still validates against the ORIGINAL clauses.
 fn graph_collapse_enabled() -> bool {
-    std::env::var("AY_GRAPH_COLLAPSE")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    // B27: CLI-owned; env retired.
+    crate::ab_switches::get().graph_collapse
 }
 
 pub(crate) fn sort_contains_recursive_bv(sort: &ChcSort) -> bool {
@@ -101,25 +100,22 @@ pub(crate) fn condense_share_hits() -> usize {
 }
 
 fn condense_share_enabled() -> bool {
-    std::env::var("AY_CHC_CONDENSE_SHARE")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    // B24: the kill-switch env is retired; sharing stays on.
+    true
 }
 
 /// Every env flag that changes the pc-split+condense output. Stored in the
 /// entry and compared exactly on lookup.
 fn condense_share_env_key() -> String {
-    let var = |name: &str| std::env::var(name).unwrap_or_default();
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        var("AY_CHC_DISABLE_CONDENSE"),
-        var("AY_CHC_DISABLE_SPLIT_SYM"),
-        var("AY_CHC_DISABLE_PC_SPLIT"),
-        var("AY_CHC_CONDENSE_BUDGET_SECS"),
-        var("AY_CHC_CONDENSE_MAX_MEAN_NODES"),
-        var("AY_CHC_DISABLE_ARRAY_STORE_FORWARDING"),
-        var("AY_CHC_DISABLE_GROUND_TABLE_CONCRETIZATION"),
-    )
+    // B8 dropped the condense budget names; B27 drops SPLIT_SYM / PC_SPLIT /
+    // ARRAY_STORE_FORWARDING / GROUND_TABLE_CONCRETIZATION; B54 moves the
+    // condense kill onto the set-once carrier too. The one residual variance
+    // source is the cfg(test) override, which the key must reflect.
+    if crate::ab_switches::get().condense {
+        String::new()
+    } else {
+        "condense-off".to_string()
+    }
 }
 
 /// Cheap pre-filter fingerprint. Deliberately shallow (counts, names,
@@ -236,7 +232,7 @@ impl BackTranslator for SharedCondenseBackTranslator {
 /// Stage -1 of every `build*` pipeline: the unified fixpoint condense
 /// superpass (item #4 CONDENSE). Runs on the ORIGINAL problem so predicate
 /// chains collapse before BV bit-blasting / int abstraction. Disabled via
-/// `AY_CHC_DISABLE_CONDENSE=1`; no-ops (identity back-translator) on
+/// `--chc-no-condense`; no-ops (identity back-translator) on
 /// problems it cannot shrink.
 ///
 /// FIX #2b: results are shared per original problem (see
@@ -417,7 +413,7 @@ impl PreprocessSummary {
         graph_collapse: bool,
     ) -> Self {
         // Stage -1: fixpoint condense superpass on the ORIGINAL problem
-        // (AY_CHC_DISABLE_CONDENSE=1 disables). Collapses predicate chains
+        // (--chc-no-condense disables). Collapses predicate chains
         // before bit-blasting multiplies argument counts.
         let condense_result = condense_stage(problem.clone(), verbose);
 
@@ -570,7 +566,7 @@ impl PreprocessSummary {
     /// TPA/PDR/PDKIND, while BvToBool works for problems needing bit-level
     /// reasoning (#5877).
     pub(crate) fn build_int_only(problem: ChcProblem, verbose: bool) -> Self {
-        // Stage -1: fixpoint condense superpass (AY_CHC_DISABLE_CONDENSE=1 disables)
+        // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
         let condense_result = condense_stage(problem.clone(), verbose);
 
         // Stage 0: forward array store chains (item 4a), concretize read-only
@@ -636,7 +632,7 @@ impl PreprocessSummary {
     /// accepting them. Invalid invariants (where overflow matters) will fail
     /// validation and fall through to the exact path.
     pub(crate) fn build_int_relaxed(problem: ChcProblem, verbose: bool) -> Self {
-        // Stage -1: fixpoint condense superpass (AY_CHC_DISABLE_CONDENSE=1 disables)
+        // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
         let condense_result = condense_stage(problem.clone(), verbose);
 
         // Stage 0 (+ item 4a array store forwarding, cheap no-op without stores)
@@ -741,7 +737,7 @@ impl PreprocessSummary {
 
         let _t_total = ay_core::time::Instant::now();
 
-        // Stage -1: fixpoint condense superpass (AY_CHC_DISABLE_CONDENSE=1 disables)
+        // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
         let condense_result = condense_stage(problem.clone(), verbose);
 
         // Stage 0.5: Flatten DT-sorted predicate args (#8288)
@@ -938,7 +934,7 @@ impl PreprocessSummary {
         verbose: bool,
         decompose_limit: u32,
     ) -> Self {
-        // Stage -1: fixpoint condense superpass (AY_CHC_DISABLE_CONDENSE=1 disables)
+        // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
         let condense_result = condense_stage(problem.clone(), verbose);
 
         // Stage 0 (+ item 4a array store forwarding, cheap no-op without stores)

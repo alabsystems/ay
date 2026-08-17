@@ -135,7 +135,7 @@ fn qf_lra_smtcomp_subset_matches_z3() -> Result<()> {
     let mut skipped = Vec::new();
     for (name, expected) in SMTCOMP_QF_LRA_CASES {
         let path = workspace_path(format!("benchmarks/smtcomp/QF_LRA/{name}"));
-        if !path.exists() {
+        if !path.exists() && crate::common::corpus_skip_allowed(&path) {
             skipped.push(*name);
             continue;
         }
@@ -253,7 +253,7 @@ fn qf_lra_industrial_cooking12_matches_z3() -> Result<()> {
 
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/constraints-cooking12.smt2");
     // Gitignored smtcomp corpus — skip when not installed.
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "SKIP qf_lra_industrial_cooking12_matches_z3: corpus benchmark not found: {}",
             path.display()

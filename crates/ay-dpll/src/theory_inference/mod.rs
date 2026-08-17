@@ -13,9 +13,16 @@
 //! Split into submodules for code health (#5970):
 //! - `euf`: EUF congruence/transitivity lemma inference
 //! - `decompose`: Combined real-theory lemma decomposition
+//! - `funnel`: strict-checkable classification of materialized lemmas
 
+mod arith_farkas_classification;
 mod decompose;
 mod euf;
+mod funnel;
+#[cfg(test)]
+mod funnel_tests;
+
+use std::borrow::Cow;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -26,8 +33,14 @@ use ay_core::{
 
 use crate::proof_tracker::ProofTracker;
 
+use arith_farkas_classification::{linear_equality_arith_farkas_valid, opaque_arith_farkas_valid};
+
 // Re-export pub(crate) items from submodules.
-pub(crate) use decompose::decompose_generic_combined_real_lemma;
+pub(crate) use decompose::{decompose_generic_combined_real_lemma, CombinedDecompositionBudget};
+pub(crate) use funnel::{
+    dt_funnel_registry_data, infer_theory_lemma_kind_from_clause_terms_and_farkas,
+    record_funnel_classified_lemma, DatatypeRegistries,
+};
 
 /// Record a theory conflict and infer the most specific Alethe rule.
 pub(crate) fn record_theory_conflict_unsat(
@@ -36,12 +49,30 @@ pub(crate) fn record_theory_conflict_unsat(
     negations: &HashMap<TermId, TermId>,
     conflict: &[TheoryLit],
 ) -> Option<ProofId> {
+    record_theory_conflict_unsat_with_annotation(tracker, terms, negations, conflict).0
+}
+
+/// Record a theory conflict and return the exact direct trace annotation, when
+/// the recorded derivation can be represented by [`ay_core::TheoryLemmaProof`].
+///
+/// This is the single authority decision used by lazy split pipelines. A
+/// mixed-theory core recorded as `TheoryLemma + Weakening` deliberately returns
+/// no indexed annotation: that compact annotation type cannot encode the
+/// weakening premise, so the full tracker derivation remains authoritative.
+pub(crate) fn record_theory_conflict_unsat_with_annotation(
+    tracker: &mut ProofTracker,
+    terms: Option<&TermStore>,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+) -> (Option<ProofId>, Option<ay_core::TheoryLemmaProof>) {
     if !tracker.is_enabled() {
-        return None;
+        return (None, None);
     }
 
     let Some(clause) = build_blocking_clause_terms(negations, conflict) else {
-        return tracker.add_theory_lemma(conflict.iter().map(|lit| lit.term).collect::<Vec<_>>());
+        let raw_clause = conflict.iter().map(|lit| lit.term).collect::<Vec<_>>();
+        let id = tracker.add_explicit_trust_lemma(raw_clause);
+        return (id, None);
     };
 
     // When no single classifier recognises the whole conflict, try
@@ -60,7 +91,8 @@ pub(crate) fn record_theory_conflict_unsat(
                 if let Some((core_kind, core_clause, full_clause)) =
                     classifiable_core_decomposition(terms, negations, conflict, &clause)
                 {
-                    return tracker.add_theory_lemma_weakened(core_clause, core_kind, full_clause);
+                    let id = tracker.add_theory_lemma_weakened(core_clause, core_kind, full_clause);
+                    return (id, None);
                 }
                 (TheoryLemmaKind::Generic, clause)
             }
@@ -69,204 +101,28 @@ pub(crate) fn record_theory_conflict_unsat(
         (TheoryLemmaKind::Generic, clause)
     };
 
-    match kind {
-        TheoryLemmaKind::Generic => tracker.add_theory_lemma(ordered_clause),
-        TheoryLemmaKind::LiaGeneric => {
-            let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; ordered_clause.len()]);
-            tracker.add_theory_lemma_with_farkas_and_kind(ordered_clause, unit_farkas, kind)
-        }
-        TheoryLemmaKind::LraFarkas => {
-            let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; ordered_clause.len()]);
-            tracker.add_theory_lemma_with_farkas_and_kind(ordered_clause, unit_farkas, kind)
-        }
-        _ => tracker.add_theory_lemma_with_kind(ordered_clause, kind),
-    }
-}
-
-/// Infer the most specific proof kind available for an already-materialized
-/// theory lemma clause.
-#[must_use]
-pub(crate) fn infer_theory_lemma_kind_from_clause_terms(
-    terms: &TermStore,
-    clause: &[TermId],
-) -> TheoryLemmaKind {
-    infer_theory_lemma_kind_from_clause_terms_and_farkas(terms, clause, None)
-}
-
-/// Infer the most specific proof kind available for an already-materialized
-/// theory lemma clause, using semantic Farkas validation when coefficients are
-/// already available.
-#[must_use]
-pub(crate) fn infer_theory_lemma_kind_from_clause_terms_and_farkas(
-    terms: &TermStore,
-    clause: &[TermId],
-    farkas: Option<&FarkasAnnotation>,
-) -> TheoryLemmaKind {
-    let conflict = blocking_clause_to_conflict_lits(terms, clause);
-
-    if let Some(farkas) = farkas {
-        let kind = classify_arith_conflict_kind(terms, &conflict, Some(farkas));
-        if kind != TheoryLemmaKind::Generic {
-            return kind;
-        }
-    }
-
-    if !conflict.is_empty() && conflict_all_arith_literals(terms, &conflict) {
-        let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; conflict.len()]);
-        let kind = classify_arith_conflict_kind(terms, &conflict, Some(&unit_farkas));
-        if kind == TheoryLemmaKind::LraFarkas {
-            return kind;
-        }
-    }
-
-    // Array axiom instances (read-over-write, n-ary store permutation, chain
-    // read-over-write): classify into the strict-checkable kinds the checker
-    // validates (`ay-proof` `validate_array_*`), so they no longer fall back to
-    // the `Generic`/trust kind. Recognition reuses the checker's own schema
-    // matcher (no drift). Drives `ProofQuality::trust_count` down for QF_AX.
-    if let Some(kind) = ay_proof::recognize_array_theory_lemma(terms, clause) {
-        return kind;
-    }
-
-    // Ground string/regex refutations: the QF_S "sink" family reduces to
-    // "this CONSTANT is not in the language of this ground regex", a closed
-    // form the checker decides outright. Classify into the strict-checkable
-    // `StringGroundEval` kind so it stops exporting as `trust`. Recognition is
-    // the checker's own evaluator (`ay_proof::recognize_string_ground_eval`),
-    // so classifier and validator cannot drift.
-    if ay_proof::recognize_string_ground_eval(terms, clause) {
-        return TheoryLemmaKind::StringGroundEval;
-    }
-
-    // Exact FP evaluation (#fp-ground-cert): the QF_FP / QF_BVFP families whose
-    // refutation is "this CLOSED floating-point formula is false", after the
-    // clause's own `(not (= v ground))` literals are substituted in. The
-    // checker re-decides it with an INDEPENDENT correctly-rounded exact
-    // integer/rational IEEE-754 kernel — which is what `FpClassification`
-    // lacks, since it excludes all FP arithmetic — so `fp.add`/`fp.mul`/
-    // `fp.fma`/`fp.sqrt`/`to_fp` conflicts stop exporting as `trust`.
-    // Recognition is the checker's own decision
-    // (`ay_proof::recognize_fp_ground_eval`), so classifier and validator
-    // cannot drift, and `FpClassification` keeps priority on the identities it
-    // already covers (see `fp_ground_eval_applies`).
-    if fp_ground_eval_applies(terms, clause) {
-        return TheoryLemmaKind::FpGroundEval;
-    }
-
-    // Symbolic regex intersection-emptiness (#regex-cert): the automatark
-    // family refutes `x ∈ R₁ ∧ … ∧ x ∈ Rₖ` on a SYMBOLIC `x`, which the ground
-    // evaluator above cannot touch. Classify into the strict-checkable
-    // `RegexIntersectEmpty` kind so it stops exporting as `trust`. Recognition
-    // is the checker's own independent derivative-product emptiness decision
-    // (`ay_proof::recognize_regex_intersect_empty`), so classifier and
-    // validator cannot drift.
-    if ay_proof::recognize_regex_intersect_empty(terms, clause) {
-        return TheoryLemmaKind::RegexIntersectEmpty;
-    }
-
-    // Pure-NRA refutations (#nra-cert): a genuinely NONLINEAR real-arithmetic
-    // conflict (mbo/hong-class) whose negation the strict checker itself
-    // re-refutes. Recognition is the checker's own exact decision
-    // (`ay_proof::recognize_nra_univariate_unsat` — Sturm-based univariate
-    // cell decomposition — and `ay_proof::recognize_nra_interval_unsat` —
-    // bounded exact-rational interval propagation), so classifier and
-    // validator cannot drift. Univariate runs first: its one-variable gate is
-    // cheap and it is the more precise decision on univariate systems.
-    //
-    // These arms run BEFORE `arith_conflict_is_integer` so a nonlinear,
-    // real-refutable NIA conflict certifies instead of being tagged
-    // `LiaGeneric` and rejected; the checkers' nonlinearity gate guarantees
-    // no LINEAR conflict is touched (no label-stealing from
-    // LraFarkas/LiaGeneric).
-    if ay_proof::recognize_nra_univariate_unsat(terms, clause) {
-        return TheoryLemmaKind::NraUnivariateUnsat;
-    }
-    if ay_proof::recognize_nra_interval_unsat(terms, clause) {
-        return TheoryLemmaKind::NraIntervalUnsat;
-    }
-
-    if arith_conflict_is_integer(terms, &conflict) {
-        return TheoryLemmaKind::LiaGeneric;
-    }
-
-    // Opaque-atom Farkas conflicts (#trust-count→0, class 4): inequalities (and
-    // asserted-true equalities) over uninterpreted Int/Real atoms — `(f x)`,
-    // `(select a i)` — are valid `la_generic` steps (Alethe checkers treat
-    // non-arithmetic subterms as opaque variables), but the pure-LA eligibility
-    // above rejects them. This branch fires ONLY where the classifier would
-    // otherwise fall back to `Generic`/trust, and ONLY when the certificate
-    // passes the FULL semantic Farkas verifier (fail-closed; never a
-    // shape-only promotion).
-    match farkas {
-        Some(farkas) => {
-            if opaque_arith_farkas_valid(terms, &conflict, farkas) {
-                return TheoryLemmaKind::LraFarkas;
-            }
-        }
-        // No annotation on the step yet: classify with the unit certificate.
-        // The caller (`promote_generic_theory_lemma_kinds_after_rewrite`)
-        // attaches the SAME unit certificate it re-verifies, so the exported
-        // `:args` are exactly the coefficients that passed the full check.
-        None if !conflict.is_empty() => {
-            let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; conflict.len()]);
-            if opaque_arith_farkas_valid(terms, &conflict, &unit_farkas) {
-                return TheoryLemmaKind::LraFarkas;
-            }
-        }
-        None => {}
-    }
-
-    // Non-integer, non-LRA, non-array clause with no Farkas classification.
-    // Could be EUF, string, datatype, or combined theory. Needs classifier.
-    TheoryLemmaKind::Generic
-}
-
-/// Whether every conflict literal is an "opaque-atom" linear-arithmetic
-/// literal — a binary `<`/`<=`/`>`/`>=` comparison over Int/Real-sorted terms
-/// (uninterpreted subterms are treated as opaque variables, exactly as the
-/// semantic Farkas verifier and Alethe `la_generic` checkers do), or an
-/// equality over Int/Real-sorted terms that is asserted TRUE (its blocking
-/// literal is the negation, which `la_generic` consumes as an equality; an
-/// equality asserted false would need a disequality case split downstream
-/// checkers do not perform, so it is rejected) — AND the given certificate
-/// passes the full semantic Farkas check in LINEAR-ONLY mode (no #4666
-/// congruence merging, which external `la_generic` checkers cannot replay).
-fn opaque_arith_farkas_valid(
-    terms: &TermStore,
-    conflict: &[TheoryLit],
-    farkas: &FarkasAnnotation,
-) -> bool {
-    if conflict.is_empty() {
-        return false;
-    }
-    let eligible = conflict.iter().all(|lit| {
-        let atom = strip_not(terms, lit.term);
-        // `strip_not` flips into conflict polarity: a `Not` wrapper on the
-        // conflict literal inverts the asserted value.
-        let value = if matches!(terms.get(lit.term), TermData::Not(_)) {
-            !lit.value
-        } else {
-            lit.value
-        };
-        match terms.get(atom) {
-            TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-                let arith_sorts = matches!(terms.sort(args[0]), Sort::Int | Sort::Real)
-                    && matches!(terms.sort(args[1]), Sort::Int | Sort::Real);
-                match name.as_str() {
-                    "<" | "<=" | ">" | ">=" => arith_sorts,
-                    "=" => arith_sorts && value,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+    let farkas = matches!(
+        kind,
+        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas
+    )
+    .then(|| FarkasAnnotation::from_ints(&vec![1i64; ordered_clause.len()]));
+    let id = match (kind, farkas.as_ref()) {
+        (TheoryLemmaKind::Generic, _) => tracker.add_explicit_trust_lemma(ordered_clause.clone()),
+        (TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas, Some(unit_farkas)) => tracker
+            .add_theory_lemma_with_farkas_and_kind(
+                ordered_clause.clone(),
+                unit_farkas.clone(),
+                kind,
+            ),
+        _ => tracker.add_theory_lemma_with_kind(ordered_clause.clone(), kind),
+    };
+    let annotation = id.map(|_| ay_core::TheoryLemmaProof {
+        clause: ordered_clause,
+        kind,
+        farkas,
+        lia: None,
     });
-    if !eligible {
-        return false;
-    }
-    // LINEAR-only verification: no congruence-closure merging of opaque
-    // terms, matching exactly what external `la_generic` checkers can check.
-    ay_core::proof_validation::verify_farkas_conflict_lits_linear(terms, conflict, farkas).is_ok()
+    (id, annotation)
 }
 
 /// Classify a clause as one of the strict-checkable array kinds
@@ -342,56 +198,6 @@ fn fp_ground_eval_applies(terms: &TermStore, clause: &[TermId]) -> bool {
         && !ay_proof::recognize_fp_classification(terms, clause)
 }
 
-/// Infer the proof kind for a theory conflict that will be materialized as an
-/// original SAT clause in the clause trace.
-#[must_use]
-pub(crate) fn infer_theory_conflict_kind(
-    terms: Option<&TermStore>,
-    negations: &HashMap<TermId, TermId>,
-    conflict: &[TheoryLit],
-    farkas: Option<&FarkasAnnotation>,
-) -> TheoryLemmaKind {
-    match terms {
-        Some(terms) => {
-            if let Some(farkas) = farkas {
-                let kind = classify_arith_conflict_kind(terms, conflict, Some(farkas));
-                if kind != TheoryLemmaKind::Generic {
-                    return kind;
-                }
-            }
-
-            if !conflict.is_empty() && conflict_all_arith_literals(terms, conflict) {
-                let unit_farkas = FarkasAnnotation::from_ints(&vec![1i64; conflict.len()]);
-                let kind = classify_arith_conflict_kind(terms, conflict, Some(&unit_farkas));
-                if kind == TheoryLemmaKind::LraFarkas {
-                    return kind;
-                }
-            }
-
-            euf::infer_euf_lemma(terms, negations, conflict).map_or_else(
-                || {
-                    if arith_conflict_is_integer(terms, conflict) {
-                        TheoryLemmaKind::LiaGeneric
-                    } else if farkas.is_some_and(|f| opaque_arith_farkas_valid(terms, conflict, f))
-                    {
-                        // Opaque-atom rescue (class 4): fully verified Farkas
-                        // certificate over uninterpreted Int/Real atoms.
-                        TheoryLemmaKind::LraFarkas
-                    } else {
-                        // Non-EUF, non-arith conflict. Needs classifier
-                        // for string, array, or combined theory conflicts.
-                        TheoryLemmaKind::Generic
-                    }
-                },
-                |(kind, _)| kind,
-            )
-        }
-        // No TermStore available -- cannot classify. This path is
-        // hit when proof generation is disabled or terms are not accessible.
-        None => TheoryLemmaKind::Generic,
-    }
-}
-
 /// Record an already-materialized theory LEMMA clause through the central
 /// classifier funnel (#trust->0 C1.iii).
 ///
@@ -433,11 +239,20 @@ pub(crate) fn record_materialized_lemma_clause(
     }
     let funnel_terms = if polarity_complete { terms } else { None };
     let Some(terms) = funnel_terms else {
-        return tracker.add_theory_lemma(clause);
+        return tracker.add_explicit_trust_lemma(clause);
     };
-    let kind = infer_theory_lemma_kind_from_clause_terms(terms, &clause);
+    // DT registries are executor-context state the C1.iii extension lanes do
+    // not hold, so DT shapes stay `Generic` here (fail-closed residual, same
+    // class as the negation-cache misses above). EUF recognition needs only
+    // the clause and runs in full; adopt its validator-ordered clause.
+    let (kind, ordered) =
+        infer_theory_lemma_kind_from_clause_terms_and_farkas(terms, &clause, None, None);
+    let clause = match ordered {
+        Cow::Owned(reordered) => reordered,
+        Cow::Borrowed(_) => clause,
+    };
     match kind {
-        TheoryLemmaKind::Generic => tracker.add_theory_lemma(clause),
+        TheoryLemmaKind::Generic => tracker.add_explicit_trust_lemma(clause),
         // The funnel classifies these only after the integer gate
         // (`LiaGeneric`) or a FULL semantic verification of the UNIT
         // certificate (opaque-atom `LraFarkas`); attach the same unit
@@ -458,8 +273,21 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas(
     negations: &HashMap<TermId, TermId>,
     conflict: &TheoryConflict,
 ) -> Option<ProofId> {
+    record_theory_conflict_unsat_with_farkas_and_annotation(tracker, terms, negations, conflict).0
+}
+
+/// Farkas-bearing counterpart of
+/// [`record_theory_conflict_unsat_with_annotation`]. The returned annotation
+/// is constructed from the exact kind, clause, and evidence recorded in the
+/// tracker; a Generic fallback deliberately carries no rejected certificate.
+pub(crate) fn record_theory_conflict_unsat_with_farkas_and_annotation(
+    tracker: &mut ProofTracker,
+    terms: Option<&TermStore>,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &TheoryConflict,
+) -> (Option<ProofId>, Option<ay_core::TheoryLemmaProof>) {
     if !tracker.is_enabled() {
-        return None;
+        return (None, None);
     }
 
     let Some(farkas) = conflict.farkas.clone() else {
@@ -475,11 +303,20 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas(
         // accept (the mod.rs `build_blocking_clause_terms` miss class,
         // Wave-3). Keep the stricter no-record behavior on that residual by
         // probing the builder first.
-        build_blocking_clause_terms(negations, &conflict.literals)?;
-        return record_theory_conflict_unsat(tracker, terms, negations, &conflict.literals);
+        if build_blocking_clause_terms(negations, &conflict.literals).is_none() {
+            return (None, None);
+        }
+        return record_theory_conflict_unsat_with_annotation(
+            tracker,
+            terms,
+            negations,
+            &conflict.literals,
+        );
     };
 
-    let clause = build_blocking_clause_terms(negations, &conflict.literals)?;
+    let Some(clause) = build_blocking_clause_terms(negations, &conflict.literals) else {
+        return (None, None);
+    };
 
     let kind = match terms {
         Some(terms) => classify_arith_conflict_kind(terms, &conflict.literals, Some(&farkas)),
@@ -487,13 +324,24 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas(
         None => TheoryLemmaKind::Generic,
     };
 
-    match kind {
-        TheoryLemmaKind::Generic => tracker.add_theory_lemma(clause),
-        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas => {
-            tracker.add_theory_lemma_with_farkas_and_kind(clause, farkas, kind)
-        }
-        _ => tracker.add_theory_lemma_with_kind(clause, kind),
-    }
+    let (id, recorded_farkas) = match kind {
+        TheoryLemmaKind::Generic => (tracker.add_explicit_trust_lemma(clause.clone()), None),
+        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas => (
+            tracker.add_theory_lemma_with_farkas_and_kind(clause.clone(), farkas.clone(), kind),
+            Some(farkas),
+        ),
+        _ => (
+            tracker.add_theory_lemma_with_kind(clause.clone(), kind),
+            None,
+        ),
+    };
+    let annotation = id.map(|_| ay_core::TheoryLemmaProof {
+        clause,
+        kind,
+        farkas: recorded_farkas,
+        lia: None,
+    });
+    (id, annotation)
 }
 
 pub(crate) fn build_blocking_clause_terms(
@@ -574,16 +422,17 @@ fn classify_arith_conflict_kind(
         // linear variant deliberately excludes congruence reasoning unavailable
         // to Alethe checkers.
         //
-        // Additionally, ALL conflict literals must be la_generic-eligible:
-        // pure linear arithmetic inequalities without equalities or UF terms.
-        // Without this check, conflicts containing `(= (f x) 10)` or `(= a b)`
-        // are misclassified as LraFarkas, causing Carcara rejection.
+        // First accept the pure-inequality subset. Equality rows need signed
+        // orientation and therefore pass through the narrower exact gate below.
         if conflict_all_arith_literals(terms, conflict)
             && ay_core::proof_validation::verify_farkas_conflict_lits_linear(
                 terms, conflict, farkas,
             )
             .is_ok()
         {
+            return TheoryLemmaKind::LraFarkas;
+        }
+        if linear_equality_arith_farkas_valid(terms, conflict, farkas) {
             return TheoryLemmaKind::LraFarkas;
         }
     }
@@ -593,7 +442,7 @@ fn classify_arith_conflict_kind(
     }
 
     // Opaque-atom rescue (class 4): the conflict would otherwise fall back to
-    // `Generic`/trust. If the provided certificate passes the FULL semantic
+    // `Generic`/trust. If the provided certificate passes the LINEAR semantic
     // Farkas verifier with uninterpreted Int/Real atoms treated as opaque
     // variables, it is a genuine `la_generic` step. Fail-closed.
     if let Some(farkas) = farkas {
@@ -656,13 +505,10 @@ fn conflict_all_arith_literals(terms: &TermStore, conflict: &[TheoryLit]) -> boo
 
 /// Check if a literal is eligible for the Alethe `la_generic` rule.
 ///
-/// `la_generic` only accepts strict/non-strict inequality comparisons
-/// (`<=`, `<`, `>=`, `>`) whose arguments are pure linear arithmetic
-/// (no uninterpreted functions). Equalities (`=`) are NOT valid for
-/// `la_generic` because Carcara checks that the Farkas combination
-/// produces a contradictory *disequality*, and `(not (= a b))` cannot
-/// participate in a linear combination. Mixed-theory terms like
-/// `(>= (f x) 0)` are also invalid because `f` is uninterpreted.
+/// This pure-inequality gate accepts strict/non-strict comparisons whose
+/// arguments are linear arithmetic. Asserted equalities use the separately
+/// signed and verified equality gate; asserted disequalities remain excluded.
+/// Mixed-theory terms such as `(>= (f x) 0)` use the opaque-atom gate.
 fn is_la_generic_eligible_literal(terms: &TermStore, atom: TermId) -> bool {
     match terms.get(atom) {
         TermData::App(Symbol::Named(name), args)
@@ -1172,6 +1018,198 @@ mod tests {
     use num_bigint::BigInt;
 
     #[test]
+    fn conflict_outcome_keeps_euf_reorder_tracker_and_annotation_identical() {
+        let mut terms = TermStore::new();
+        let u = Sort::Uninterpreted("U".to_string());
+        let a = terms.mk_var("a", u.clone());
+        let b = terms.mk_var("b", u.clone());
+        let c = terms.mk_var("c", u);
+        let eq_ab = terms.mk_eq(a, b);
+        let eq_bc = terms.mk_eq(b, c);
+        let eq_ac = terms.mk_eq(a, c);
+        let not_ab = terms.mk_not(eq_ab);
+        let not_bc = terms.mk_not(eq_bc);
+        let mut negations = HashMap::default();
+        negations.insert(eq_ab, not_ab);
+        negations.insert(eq_bc, not_bc);
+
+        // Conclusion first makes the materialized caller order invalid for
+        // the strict EUF validator. The atomic outcome must expose the exact
+        // validator order recorded in the tracker.
+        let conflict = vec![
+            TheoryLit::new(eq_ac, false),
+            TheoryLit::new(eq_bc, true),
+            TheoryLit::new(eq_ab, true),
+        ];
+        let mut tracker = ProofTracker::new();
+        tracker.enable();
+        let (id, annotation) = record_theory_conflict_unsat_with_annotation(
+            &mut tracker,
+            Some(&terms),
+            &negations,
+            &conflict,
+        );
+        let id = id.expect("EUF conflict recorded");
+        let annotation = annotation.expect("direct EUF annotation");
+        let proof = tracker.take_proof();
+        let Some(ay_core::ProofStep::TheoryLemma {
+            clause,
+            kind,
+            farkas,
+            lia,
+            ..
+        }) = proof.get_step(id)
+        else {
+            panic!("expected direct theory lemma");
+        };
+        assert_eq!(annotation.clause, *clause);
+        assert_eq!(annotation.kind, *kind);
+        assert_eq!(annotation.farkas, *farkas);
+        assert_eq!(annotation.lia, *lia);
+        assert_eq!(*kind, TheoryLemmaKind::EufTransitive);
+        assert!(ay_proof::recognize_euf_transitive(&terms, clause));
+    }
+
+    #[test]
+    fn conflict_outcome_keeps_array_tracker_and_annotation_identical() {
+        let mut terms = TermStore::new();
+        let array_sort = Sort::Array(Box::new(ay_core::ArraySort::new(Sort::Int, Sort::Int)));
+        let array = terms.mk_var("a", array_sort.clone());
+        let index = terms.mk_var("i", Sort::Int);
+        let value = terms.mk_var("v", Sort::Int);
+        let store = terms.mk_app(Symbol::named("store"), [array, index, value], array_sort);
+        let select = terms.mk_app(Symbol::named("select"), [store, index], Sort::Int);
+        let row = terms.mk_eq(select, value);
+        let conflict = [TheoryLit::new(row, false)];
+        let mut tracker = ProofTracker::new();
+        tracker.enable();
+        let (id, annotation) = record_theory_conflict_unsat_with_annotation(
+            &mut tracker,
+            Some(&terms),
+            &HashMap::default(),
+            &conflict,
+        );
+        let id = id.expect("array conflict recorded");
+        let annotation = annotation.expect("direct array annotation");
+        let proof = tracker.take_proof();
+        let Some(ay_core::ProofStep::TheoryLemma {
+            clause,
+            kind,
+            farkas,
+            lia,
+            ..
+        }) = proof.get_step(id)
+        else {
+            panic!("expected direct theory lemma");
+        };
+        assert_eq!(annotation.clause, *clause);
+        assert_eq!(annotation.kind, *kind);
+        assert_eq!(annotation.farkas, *farkas);
+        assert_eq!(annotation.lia, *lia);
+        assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: true });
+    }
+
+    #[test]
+    fn conflict_outcome_with_weakening_has_no_lossy_direct_annotation() {
+        let mut terms = TermStore::new();
+        let foreign = terms.mk_var("foreign", Sort::Bool);
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+        let one = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+        let le_zero = terms.mk_le(x, zero);
+        let ge_one = terms.mk_ge(x, one);
+        let conflict = vec![
+            TheoryLit::new(foreign, true),
+            TheoryLit::new(le_zero, true),
+            TheoryLit::new(ge_one, true),
+        ];
+        let mut negations = HashMap::default();
+        for literal in &conflict {
+            negations.insert(literal.term, terms.mk_not(literal.term));
+        }
+        let mut tracker = ProofTracker::new();
+        tracker.enable();
+        let (id, annotation) = record_theory_conflict_unsat_with_annotation(
+            &mut tracker,
+            Some(&terms),
+            &negations,
+            &conflict,
+        );
+        let id = id.expect("decomposed conflict recorded");
+        assert!(
+            annotation.is_none(),
+            "TheoryLemmaProof cannot encode the weakening premise"
+        );
+        let proof = tracker.take_proof();
+        assert!(matches!(
+            proof.get_step(id),
+            Some(ay_core::ProofStep::Step {
+                rule: ay_core::AletheRule::Weakening,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejected_farkas_outcome_is_generic_without_payload_everywhere() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let zero = terms.mk_rational(num_rational::BigRational::from(BigInt::from(0)));
+        let one = terms.mk_rational(num_rational::BigRational::from(BigInt::from(1)));
+        let ge_one = terms.mk_ge(x, one);
+        let le_zero = terms.mk_le(x, zero);
+        let mut negations = HashMap::default();
+        negations.insert(ge_one, terms.mk_not(ge_one));
+        negations.insert(le_zero, terms.mk_not(le_zero));
+        let conflict = TheoryConflict::with_farkas(
+            vec![TheoryLit::new(ge_one, true), TheoryLit::new(le_zero, true)],
+            FarkasAnnotation::from_ints(&[1, 0]),
+        );
+        let mut tracker = ProofTracker::new();
+        tracker.enable();
+        let (id, annotation) = record_theory_conflict_unsat_with_farkas_and_annotation(
+            &mut tracker,
+            Some(&terms),
+            &negations,
+            &conflict,
+        );
+        let id = id.expect("rejected-certificate conflict recorded");
+        let annotation = annotation.expect("Generic direct annotation");
+        let proof = tracker.take_proof();
+        let Some(ay_core::ProofStep::TheoryLemma { kind, farkas, .. }) = proof.get_step(id) else {
+            panic!("expected theory lemma");
+        };
+        assert_eq!(*kind, TheoryLemmaKind::Generic);
+        assert!(farkas.is_none());
+        assert_eq!(annotation.kind, *kind);
+        assert!(annotation.farkas.is_none());
+    }
+
+    #[test]
+    fn c3_evidence_less_arithmetic_annotation_matches_tracker_demotion() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let x_eq_y = terms.mk_eq(x, y);
+        let clause = vec![terms.mk_not_raw(x_eq_y)];
+        let (raw_kind, _) =
+            infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, None, None);
+        assert_eq!(raw_kind, TheoryLemmaKind::LiaGeneric);
+
+        let mut tracker = ProofTracker::new();
+        tracker.enable();
+        let (effective_kind, recorded) =
+            record_funnel_classified_lemma(&mut tracker, &terms, clause, None);
+        assert_eq!(effective_kind, TheoryLemmaKind::Generic);
+        let proof = tracker.take_proof();
+        let Some(ay_core::ProofStep::TheoryLemma { kind, clause, .. }) = proof.steps.first() else {
+            panic!("expected theory lemma");
+        };
+        assert_eq!(*kind, effective_kind);
+        assert_eq!(clause, &recorded);
+    }
+
+    #[test]
     fn combined_theory_core_search_advances_to_two_dropped_literals() {
         use num_rational::BigRational;
 
@@ -1253,10 +1291,14 @@ mod tests {
         let clause = vec![terms.mk_not(gt), terms.mk_not(lt)];
         let farkas = FarkasAnnotation::from_ints(&[1, 1]);
 
-        assert_eq!(
-            infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, Some(&farkas)),
-            TheoryLemmaKind::LraFarkas
+        let (kind, ordered) = infer_theory_lemma_kind_from_clause_terms_and_farkas(
+            &terms,
+            &clause,
+            Some(&farkas),
+            None,
         );
+        assert_eq!(kind, TheoryLemmaKind::LraFarkas);
+        assert_eq!(ordered.as_ref(), clause.as_slice());
     }
 
     #[test]

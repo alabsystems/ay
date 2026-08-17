@@ -215,18 +215,11 @@ impl Solver {
         actual_level
     }
 
-    /// Deep-dive full-backjump gate (profile lever #1, kissat parity).
-    /// DEFAULT OFF — opt-in measured infrastructure, `AY_AB_DEEP_DIVE_BACKJUMP=1`.
+    /// Deep-dive full-backjump gate (retired profile lever #1, kissat parity).
     ///
-    /// Returns `true` when the current search is *diving* — the EMA of
-    /// decisions-per-conflict has climbed at/above the deep-dive threshold —
-    /// meaning `compute_chrono_backtrack_level` should backjump straight to the
-    /// asserting level (kissat `learn.c::kissat_determine_new_level`) instead of
-    /// reusing trail via `compute_chrono_reuse_level` and staying deep.
-    ///
-    /// The EMA (`bumpreason_decision_rate`) is already maintained every conflict
-    /// by `update_bumpreason_decision_rate` (finalize runs *before* the backjump
-    /// decision), so this is a zero-cost read of live state.
+    /// The historical lever returned `true` when the decisions-per-conflict EMA
+    /// crossed its threshold, forcing an asserting-level backjump instead of
+    /// reusing the trail. Production now always returns `false`.
     ///
     /// MEASURED RESULT (workflow wf_22647919, adversarial verify REJECTED
     /// default-ON): the profile A/B on ebbda8d9 moved telemetry sharply toward
@@ -246,31 +239,10 @@ impl Solver {
     /// only paired with a hard-core branching/phase lever AND a full-corpus
     /// PAR-2 A/B re-solving every currently-solved dpc>64 instance.
     ///
-    /// Env knobs (cached once per process, deterministic):
-    /// - `AY_AB_DEEP_DIVE_BACKJUMP=1` — enable the gate (default: off).
-    /// - `AY_DEEP_DIVE_DECS_PER_CONFLICT=<f>` — override the threshold (64).
+    /// B21 retired the opt-in after that rejected experiment; the gate remains
+    /// permanently off until a paired-lever campaign reintroduces it in code.
     fn deep_dive_full_backjump(&self) -> bool {
-        use std::sync::OnceLock;
-        // Default OFF; "1" opts in (house AY_AB_* convention for unproven levers).
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| {
-            matches!(
-                std::env::var("AY_AB_DEEP_DIVE_BACKJUMP").ok().as_deref(),
-                Some("1")
-            )
-        });
-        if !enabled {
-            return false;
-        }
-        static THRESHOLD: OnceLock<f64> = OnceLock::new();
-        let threshold = *THRESHOLD.get_or_init(|| {
-            std::env::var("AY_DEEP_DIVE_DECS_PER_CONFLICT")
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .filter(|v| *v > 0.0)
-                .unwrap_or(64.0)
-        });
-        self.cold.bumpreason_decision_rate >= threshold
+        false
     }
 
     /// Find the best variable above the jump level and return its level.
@@ -639,6 +611,7 @@ impl Solver {
         self.cold.level0_proof_id.fill(0);
         self.cold.level0_proof_sign.fill(0);
         self.cold.lrat_level0_unit_materialize_cursor = 0;
+        self.cold.lrat_level0_unit_materialize_pinned.clear();
 
         // IC3 state preservation (#8643): in IC3 mode, skip destructive
         // CHB/VSIDS resets. IC3 depends on VSIDS activity accumulating
@@ -709,9 +682,7 @@ impl Solver {
         self.cold.saved_lbd_ema_slow_exp = 1.0;
         self.cold.ema_swapped = false;
 
-        // Trail-length EMA for restart blocking
-        self.cold.trail_ema_slow = 0.0;
-        self.cold.trail_ema_count = 0;
+        // Focused-mode EMA restart throttling.
         self.cold.consecutive_ema_restarts = 0;
 
         // Stabilization state
@@ -1191,10 +1162,6 @@ impl Solver {
         self.cold.saved_lbd_ema_fast_exp = 1.0;
         self.cold.saved_lbd_ema_slow_exp = 1.0;
         self.cold.ema_swapped = false;
-
-        // Trail-length EMA for restart blocking
-        self.cold.trail_ema_slow = 0.0;
-        self.cold.trail_ema_count = 0;
 
         // Stabilization state
         self.stable_mode = matches!(self.cold.mode_lock, cold::ModeLock::Stable);

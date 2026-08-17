@@ -5,6 +5,10 @@
 use super::*;
 use ay_core::Sort;
 
+mod finite_array_sat;
+mod proof_access;
+mod proof_records;
+
 impl Default for Executor {
     fn default() -> Self {
         Self::new()
@@ -25,8 +29,7 @@ impl Executor {
         Ok(())
     }
 
-    /// Allocate and register a native constant under one collision-safe core
-    /// identity, independently of SMT-LIB assertion scoping.
+    /// Register a native constant under one collision-safe core identity, outside assertion scoping.
     pub(crate) fn register_native_global_constant(&mut self, name: String, sort: Sort) -> TermId {
         let term = self.ctx.register_native_global_constant(name, sort);
         self.invalidate_last_check_result();
@@ -132,6 +135,7 @@ impl Executor {
         self.last_finite_enum_pigeonhole = None;
         self.last_sat_certificate = None;
         self.last_unsat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         self.last_command_unsat_admission = None;
         self.unsat_query_epoch = None;
         self.last_assumptions = None;
@@ -143,20 +147,23 @@ impl Executor {
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         self.proof_problem_assertion_provenance = None;
-        self.quant_expansion_records.clear();
-        self.ematching_proof_records.clear();
+        self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
+        self.last_proof_decline = None;
         self.last_proof_quality = None;
         self.last_unknown_reason = None;
         self.last_unknown_origin = None;
         self.last_clause_trace = None;
         self.last_checked_sat_refutation = None;
+        self.last_negations = None;
         self.last_lrat_certificate = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
         self.proof_check_result = None;
+        self.proof_check_ok = false;
+        self.last_bv_drat_self_cert = false;
         self.pending_sat_unknown_reason = None;
         self.last_model_validated = false;
         self.clear_quantified_sat_authority();
@@ -387,6 +394,11 @@ impl Executor {
     /// the previously emitted result/model/certificate are still always cleared.
     pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
         self.advance_query_authority_epoch();
+        // M0(a): these counters describe one public publication attempt.
+        // Internal probes deliberately share their enclosing attempt, while a
+        // new user-visible decision starts a fresh attribution window.
+        self.strict_check_invocations.set(0);
+        self.strict_check_steps_validated.set(0);
         #[cfg(test)]
         {
             self.last_authored_query_authority_seen = false;
@@ -408,8 +420,12 @@ impl Executor {
         // for this and later solves (`competition_shedding_active`). The
         // explicit `disable()` (rather than merely skipping `enable()`) makes
         // re-shedding after `(set-option :produce-proofs false)` deterministic.
-        // Publication is untouched: an UNSAT that cannot mint a certificate
-        // still fail-closes to `unknown`.
+        // Publication under shedding goes through the B3 CompetitionRaw
+        // admission lane (unsat_cert.rs, `certify_unsat_presentation`): the
+        // exact query scope still authenticates and stops still revoke, but no
+        // checked certificate backs the verdict — the documented product
+        // carve-out. A raw UNSAT whose scope fails authentication still
+        // fail-closes to `unknown`.
         if self.competition_shedding_active() {
             self.proof_tracker.disable();
         } else {
@@ -461,6 +477,16 @@ impl Executor {
             "competition-mode executor with no proof demand must have the proof \
              tracker disabled after begin_public_solve"
         );
+    }
+
+    /// Start a caller-visible decision query and replenish resource envelopes
+    /// that must remain cumulative across every nested solve/restart it owns.
+    pub(crate) fn begin_external_decision_query(&mut self, preserve_pareto_enumeration: bool) {
+        self.begin_external_proof_checkpoint_budget();
+        self.finite_array_expansion
+            .prune_to_active_assertions(&self.ctx.terms, &self.ctx.assertions);
+        self.finite_array_expansion.begin_external_query();
+        self.begin_public_solve(preserve_pareto_enumeration);
     }
 
     /// Bind public UNSAT/proof authority to the frontend's final query roots.
@@ -520,24 +546,16 @@ impl Executor {
         )
     }
 
-    /// Body of [`Executor::new`] — only called through the stack guard above
-    /// so the struct-literal frames land on the grown segment.
+    /// Body of [`Executor::new`], called only through the stack guard above.
     fn new_stack_guarded() -> Self {
-        // Process memory policy belongs to the host executable. In particular,
-        // constructing this library type must not mutate ay-sys's process-global
-        // ceiling: an AY dependency is compiled without cfg(test) inside another
-        // crate's libtest, and a constructor-side default then couples thousands
-        // of otherwise independent tests through the harness's retained RSS.
-        // The standalone AY binaries and the direct-bindings host arm their
-        // explicit defaults; compiler/server embedders must do likewise at their
-        // process entry point.
+        // Process memory policy belongs to the host; this type must not mutate ay-sys's
+        // global ceiling, which would couple libtests through retained RSS.
         Self {
             ctx: Context::new(),
             query_authority_epoch: QueryAuthorityEpoch::fresh(),
             #[cfg(test)]
             last_authored_query_authority_seen: false,
-            // No string lemma lowered yet — vacuously all-valid.
-            string_lemma_kinds_all_valid: true,
+            string_lemma_kinds_all_valid: true, // No string lemma lowered yet.
             bool_arg_orphan_index: ay_core::kani_compat::DetHashMap::default(),
             qfax_budget_multiplier: 1,
             qfax_refinement_clause: None,
@@ -573,6 +591,7 @@ impl Executor {
             named_assert_rewrites: Default::default(),
             last_proof: None,
             last_unsat_proof_reconstruction_suppressed: false,
+            proof_source_work: Default::default(),
             quantified_proof_translation_incomplete: false,
             deep_qe_retry_armed: false,
             prepass_reachability: PrepassReachability::default(),
@@ -581,11 +600,19 @@ impl Executor {
             proof_problem_assertion_provenance: None,
             quant_expansion_records: Vec::new(),
             ematching_proof_records: Vec::new(),
+            consequence_replay_attempts: Cell::new(0),
+            skolem_instance_records: Vec::new(),
+            skolem_witness_records: Vec::new(),
+            bv_mbqi_false_instance_records: Vec::new(),
+            qpf_premise_forced_instance_records: Vec::new(),
+            propagated_value_provenance: Default::default(),
             last_proof_rebuild_originals: Vec::new(),
+            last_proof_decline: None,
             last_proof_quality: None,
             strict_check_invocations: Cell::new(0),
             strict_check_steps_validated: Cell::new(0),
             last_unknown_reason: None,
+            unsafe_partial_quantifier_unknown: false,
             last_unknown_origin: None,
             last_statistics: Statistics::default(),
             debug_ufbv: false,
@@ -599,6 +626,7 @@ impl Executor {
             incr_theory_state: None,
             counterexample_style: crate::CounterexampleStyle::default(),
             proof_tracker: crate::proof_tracker::ProofTracker::new(),
+            proof_checkpoint_budget: Default::default(),
             proof_output_requested: false,
             proof_artifact_required: false,
             proof_reconstruction_step_budget: None,
@@ -664,6 +692,7 @@ impl Executor {
             last_model_validated: false,
             last_sat_certificate: None,
             last_unsat_certificate: None,
+            pending_nested_array_bool_bv_unsat: None,
             last_command_unsat_admission: None,
             unsat_query_epoch: None,
             cegar_pending_lemma: None,
@@ -674,7 +703,7 @@ impl Executor {
             dt_solver_added_axiom_terms: HashSet::default(),
             skip_model_eval: false,
             read_pin_repair_done: false,
-            nra_algebraic_model: HashMap::default(),
+            nra_algebraic_model: Default::default(),
             dt_theory_model: None,
             dt_validation_wants_egraph: false,
             dt_egraph_assignment: std::cell::RefCell::new(None),
@@ -740,6 +769,7 @@ impl Executor {
             pareto_state: None,
             array_ext_shadow: ArrayExtShadow::default(),
             array_ext_witness_cache: ArrayExtWitnessCache::default(),
+            finite_array_expansion: FiniteArrayExpansionLedger::default(),
             // M-A2 lazy-persistent-combiner shadow: OFF by default (§5 A2).
             #[cfg(debug_assertions)]
             auflia_persistent_shadow: false,
@@ -887,9 +917,17 @@ impl Executor {
     /// disabled instead of arming it, so clause tracing, LRAT bookkeeping,
     /// theory-lemma recording, and post-UNSAT reconstruction never run. Any
     /// explicit proof demand takes precedence over shedding (see
-    /// [`Self::competition_shedding_active`]); UNSAT publication itself remains
-    /// fail-closed — without a mintable certificate the verdict degrades to
-    /// `unknown`, never to an uncertified `unsat`.
+    /// [`Self::competition_shedding_active`]).
+    ///
+    /// #proof-capability B3 — while shedding is active, UNSAT publishes
+    /// through the `CompetitionRaw` admission lane: the exact public-query
+    /// scope is authenticated (epoch/source/term-entry/assumption checks run
+    /// unweakened) but NO checked refutation backs the verdict. This is the
+    /// documented product carve-out from the certified-by-default invariant,
+    /// authorized by this explicit opt-in and by nothing else: with any proof
+    /// demand in scope the raw lane is dead code and every publication is
+    /// certified exactly as without competition mode. A raw UNSAT whose scope
+    /// fails authentication still degrades to `unknown`.
     pub fn set_competition_mode(&mut self, enabled: bool) {
         self.competition_mode = enabled;
     }
@@ -1318,18 +1356,6 @@ impl Executor {
         self.random_seed
     }
 
-    /// Proof from the last UNSAT result.
-    ///
-    /// Returns None if the last result was not UNSAT or if proof production was disabled.
-    #[must_use]
-    pub fn last_proof(&self) -> Option<&Proof> {
-        if self.is_producing_proofs() && !self.last_unsat_proof_reconstruction_suppressed {
-            self.last_proof.as_ref()
-        } else {
-            None
-        }
-    }
-
     /// Get access to the term store
     #[must_use]
     pub fn terms(&self) -> &TermStore {
@@ -1400,6 +1426,7 @@ impl Executor {
         self.invalidate_last_check_result();
         self.ctx = Context::new();
         self.array_ext_witness_cache.clear();
+        self.finite_array_expansion = FiniteArrayExpansionLedger::default();
         // ctx (and its append-only TermStore) is replaced wholesale: term ids
         // restart, so the prefix-extended select index MUST restart with them.
         *self.select_by_array_index.borrow_mut() = (0, Default::default());

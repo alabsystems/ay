@@ -283,6 +283,8 @@ impl SimdClauseScanner {
                 // 0xFFFFFFFF for equal, 0 for not equal. vmaxvq_u32 reduces
                 // across all 4 lanes. Both are pure register operations.
                 let cmp = unsafe { vceqq_s32(chunk, target) };
+                // SAFETY: `cmp` is an initialized NEON register; the two
+                // reinterpretations and horizontal maximum access no memory.
                 let reduced =
                     unsafe { vmaxvq_u32(vreinterpretq_u32_s32(vreinterpretq_s32_u32(cmp))) };
                 if reduced != 0 {
@@ -300,6 +302,8 @@ impl SimdClauseScanner {
                         // by vceqq_s32). The destination array is stack-local
                         // with correct size and alignment.
                         let mut cmp_arr = [0u32; 4];
+                        // SAFETY: `cmp_arr` provides four writable `u32` lanes,
+                        // exactly the extent written by `vst1q_u32`.
                         unsafe { vst1q_u32(cmp_arr.as_mut_ptr(), cmp) };
                         for (lane, &cmp_val) in cmp_arr.iter().enumerate() {
                             if cmp_val != 0 && j + lane < real_len {
@@ -356,7 +360,11 @@ impl SimdClauseScanner {
                 // multiple of 4 elements. b_ptr is valid for the lifetime
                 // of the b_padded slice reference.
                 let chunk = unsafe { vld1q_s32(b_ptr.add(j)) };
+                // SAFETY: `chunk` and `target` are initialized NEON registers;
+                // the comparison performs no memory access.
                 let cmp = unsafe { vceqq_s32(chunk, target) };
+                // SAFETY: `cmp` is initialized; these reinterpretations and
+                // the horizontal maximum are register-only operations.
                 let reduced =
                     unsafe { vmaxvq_u32(vreinterpretq_u32_s32(vreinterpretq_s32_u32(cmp))) };
                 if reduced != 0 {
@@ -409,6 +417,9 @@ impl SimdClauseScanner {
                 // arena. _mm_loadu_si128 accepts unaligned valid pointers, and
                 // x86_64 guarantees SSE2 support.
                 let chunk_ptr = unsafe { arena_ptr.add(off + j) }.cast::<__m128i>();
+                // SAFETY: `chunk_ptr` addresses four initialized `i32` values
+                // in the padded clause, and the unaligned load needs no
+                // stronger alignment than the source slice provides.
                 let chunk = unsafe { _mm_loadu_si128(chunk_ptr) };
                 // SAFETY: x86_64 guarantees SSE2 support, and both arguments
                 // are initialized vector registers.
@@ -477,6 +488,8 @@ impl SimdClauseScanner {
                 // _mm_loadu_si128 accepts unaligned valid pointers, and x86_64
                 // guarantees SSE2 support.
                 let chunk_ptr = unsafe { b_ptr.add(j) }.cast::<__m128i>();
+                // SAFETY: `chunk_ptr` addresses four initialized `i32` values
+                // within `b_padded`; `_mm_loadu_si128` permits this alignment.
                 let chunk = unsafe { _mm_loadu_si128(chunk_ptr) };
                 // SAFETY: x86_64 guarantees SSE2 support, and both arguments
                 // are initialized vector registers.

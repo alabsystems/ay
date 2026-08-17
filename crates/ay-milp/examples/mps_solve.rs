@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#![allow(unsafe_code)] // Diagnostic allocator/environment boundary.
+
 //! Solve a model from an MPS file, so `ay-milp` can be pointed at MIPLIB and compared with
 //! every other solver on the same bytes.
 //!
@@ -18,10 +20,16 @@ use ay_milp::{BabSession, ColKind, Outcome, SolveOpts};
 /// COUNTING GLOBAL ALLOCATOR — load-invariant evidence for a change that claims to remove work.
 ///
 /// Wall clock on a loaded box is noise; allocation count is not. This wraps the system allocator
-/// with two relaxed counters and is reported under `AY_MILP_ALLOCSTAT`. The counters are bumped
+/// with two relaxed counters and is reported under `--allocstat`. The counters are bumped
 /// unconditionally (a branch on an env flag inside `alloc` would cost more than the `fetch_add`),
 /// and every measurement in the campaign report is taken with this same binary, so the overhead
 /// is common-mode between baseline and candidate.
+///
+/// It feeds TWO consumers, because a binary may install only ONE global allocator: the
+/// `--allocstat` summary below, and the ATTRIBUTION dump in `ay_milp::attrib` (under
+/// `the attrib knob`). The two counter sets are kept separate rather than shared so each keeps
+/// its own semantics — note `realloc` charges `--allocstat` the NEW size and attribution only
+/// the GROWTH, which is what each consumer's existing numbers mean.
 struct Counting;
 
 static ALLOC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -29,22 +37,42 @@ static ALLOC_B: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        ALLOC_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ALLOC_B.fetch_add(l.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        ALLOC_N.fetch_add(1, Relaxed);
+        ALLOC_B.fetch_add(l.size() as u64, Relaxed);
+        ay_milp::attrib::ALLOC_COUNT.fetch_add(1, Relaxed);
+        ay_milp::attrib::ALLOC_BYTES.fetch_add(l.size() as u64, Relaxed);
+        // SAFETY: `GlobalAlloc::alloc` supplies a valid, nonzero layout;
+        // forwarding it unchanged preserves `System`'s allocation contract.
         unsafe { std::alloc::System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        ay_milp::attrib::DEALLOC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `p` is a live allocation returned by this wrapper, hence by
+        // `System`, and `l` is the same layout used to allocate it.
         unsafe { std::alloc::System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
-        ALLOC_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ALLOC_B.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        ALLOC_N.fetch_add(1, Relaxed);
+        ALLOC_B.fetch_add(n as u64, Relaxed);
+        ay_milp::attrib::REALLOC_COUNT.fetch_add(1, Relaxed);
+        ay_milp::attrib::ALLOC_BYTES.fetch_add(n.saturating_sub(l.size()) as u64, Relaxed);
+        // SAFETY: `p` is a live `System` allocation made through this wrapper,
+        // `l` is its original layout, and `n > 0`, per the caller contract.
         unsafe { std::alloc::System.realloc(p, l, n) }
     }
 }
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// `--iter-ledger` (B40; was --iter-ledger). Set once at parse.
+static ITER_LEDGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn iter_ledger_on() -> bool {
+    ITER_LEDGER.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn main() {
     // Dump on EVERY exit path, including the diagnostic early returns (`AY_ROOT_CLOSURE` is the
@@ -54,7 +82,7 @@ fn main() {
     impl Drop for Dump {
         fn drop(&mut self) {
             ay_milp::sepstat::dump();
-            if std::env::var_os("AY_MILP_ALLOCSTAT").is_some() {
+            if std::env::args().any(|a| a == "--allocstat") {
                 eprintln!(
                     "AY_ALLOCSTAT allocs={} bytes={}",
                     ALLOC_N.load(std::sync::atomic::Ordering::Relaxed),
@@ -64,7 +92,18 @@ fn main() {
         }
     }
     let _dump = Dump;
-    let mut args = std::env::args().skip(1);
+    // B38: trailing `--<engine-flag>` args ride the shared engine CLI (the
+    // measurement harnesses pass them instead of the retired AY_MILP_* envs).
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let flags = ay_milp::engine_cli::Flags::parse(&raw, ay_milp::engine_cli::VALUE_FLAGS)
+        .unwrap_or_else(|e| {
+            eprintln!("usage: mps_solve <file.mps> [seconds] [--engine-flags]: {e}");
+            std::process::exit(2);
+        });
+    if flags.has("iter-ledger") {
+        ITER_LEDGER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut args = flags.positional.iter().cloned();
     let Some(path) = args.next() else {
         eprintln!("usage: mps_solve <file.mps> [seconds]");
         std::process::exit(2);
@@ -80,7 +119,7 @@ fn main() {
         std::process::exit(3);
     });
 
-    // `AY_MILP_DUAL_CUTOFF` IS READ IN THE MODEL'S OBJECTIVE FRAME, AND THIS FILE IS NOT IN IT.
+    // `--dual-cutoff` IS READ IN THE MODEL'S OBJECTIVE FRAME, AND THIS FILE IS NOT IN IT.
     //
     // The reader multiplies the objective by `obj_scale` (an integralising LCM times a power-of-two
     // normaliser) so its coefficients are exactly representable; every value the solver holds is in
@@ -94,7 +133,8 @@ fn main() {
     //
     // SAFETY: single-threaded — this runs before `BabSession` exists, so before any solver thread
     // can read the environment, and nothing else in this process writes it.
-    if let Ok(v) = std::env::var("AY_MILP_DUAL_CUTOFF") {
+    let mut dual_cutoff_model_frame: Option<f64> = None;
+    if let Some(v) = flags.get("dual-cutoff").cloned() {
         match v.parse::<f64>().and_then(|f| {
             num_rational::BigRational::from_float(f).ok_or_else(|| "".parse::<f64>().unwrap_err())
         }) {
@@ -114,14 +154,13 @@ fn main() {
                     };
                 }
                 eprintln!(
-                    "AY_MILP_DUAL_CUTOFF: {v} (file frame) -> {scaled} (model frame, obj_scale {})",
+                    "--dual-cutoff: {v} (file frame) -> {scaled} (model frame, obj_scale {})",
                     p.obj_scale
                 );
-                unsafe { std::env::set_var("AY_MILP_DUAL_CUTOFF", format!("{scaled:?}")) };
+                dual_cutoff_model_frame = Some(scaled);
             }
             Err(_) => {
-                eprintln!("AY_MILP_DUAL_CUTOFF: `{v}` is not a finite number, ignoring");
-                unsafe { std::env::remove_var("AY_MILP_DUAL_CUTOFF") };
+                eprintln!("--dual-cutoff: `{v}` is not a finite number, ignoring");
             }
         }
     }
@@ -167,11 +206,11 @@ fn main() {
             .join(" ");
         println!("{rescaled}");
         // INSTRUMENTATION GAP, closed. This early return preceded the ITERLEDGER
-        // dump at the bottom of the file, so `AY_MILP_ITER_LEDGER=1` was silently
+        // dump at the bottom of the file, so `--iter-ledger` was silently
         // a no-op in root-closure mode — the ONE mode whose whole subject is
         // where the root LP's iterations go. Same emission as the `AY_LP_ONLY`
         // arm just below, which already did this correctly.
-        if std::env::var_os("AY_MILP_ITER_LEDGER").is_some() {
+        if iter_ledger_on() {
             let ledger = ay_milp::iter_ledger_line();
             if !ledger.is_empty() {
                 eprintln!("{ledger}");
@@ -181,10 +220,11 @@ fn main() {
     }
 
     // Diagnostic: solve just the float-lane LP relaxation (cold) and report
-    // iteration economics; AY_MILP_LP_STATS=1 adds per-phase LPSTAT lines.
+    // iteration economics; --lp-stats adds per-phase LPSTAT lines.
     if std::env::var_os("AY_LP_ONLY").is_some() {
         eprintln!("{}", ay_milp::diag_float_lp(&p.model, secs));
-        if std::env::var_os("AY_MILP_ITER_PROFILE").is_some() {
+        // B12: caller-enabled profilers return empty lines when inactive.
+        {
             let line = ay_milp::rt_profile_line();
             if !line.is_empty() {
                 eprintln!("{line}");
@@ -198,7 +238,7 @@ fn main() {
                 eprintln!("{pxline}");
             }
         }
-        if std::env::var_os("AY_MILP_ITER_LEDGER").is_some() {
+        if iter_ledger_on() {
             let ledger = ay_milp::iter_ledger_line();
             if !ledger.is_empty() {
                 eprintln!("{ledger}");
@@ -207,12 +247,16 @@ fn main() {
         return;
     }
 
-    // MARGIN REFRAME DEMO. `AY_MILP_MARGIN_ROW=last` (or a 0-based row index)
+    // MARGIN REFRAME DEMO. `--margin-row last` (or a 0-based row index)
     // names a band-violation row in this objective-≡0 feasibility model and
     // reports the reframed dual bound — the number that "comes alive" (nonzero,
     // informative) versus the trivial 0 of the zero objective. This exercises
     // the same `mark_margin_row` + reframe path `BabSession::check` takes.
-    if let Ok(spec) = std::env::var("AY_MILP_MARGIN_ROW") {
+    // B22: --margin-row <spec> example flag (was a retired env var).
+    if let Some(spec) = {
+        let mut args = std::env::args();
+        args.find(|a| a == "--margin-row").and_then(|_| args.next())
+    } {
         let nrows = p.model.num_rows();
         let row_idx = if spec.eq_ignore_ascii_case("last") {
             nrows.checked_sub(1)
@@ -220,7 +264,7 @@ fn main() {
             spec.parse::<usize>().ok()
         };
         let Some(row_idx) = row_idx.filter(|&i| i < nrows) else {
-            eprintln!("AY_MILP_MARGIN_ROW: bad row `{spec}` ({nrows} rows)");
+            eprintln!("--margin-row: bad row `{spec}` ({nrows} rows)");
             std::process::exit(2);
         };
         let mut m = p.model.clone();
@@ -241,7 +285,7 @@ fn main() {
     // Only the integer columns are pinned. The continuous ones are re-derived here, because a
     // rival's float output ("600.0000000000003") is not a rational that satisfies an equality
     // row, and feeding it in as one would manufacture a violation that is not in the model.
-    if let Ok(sol) = std::env::var("AY_CHECK_SOL") {
+    if let Some(sol) = flags.get("check-sol").cloned() {
         let text = std::fs::read_to_string(&sol).expect("read solution");
         let index: std::collections::HashMap<&str, usize> = p
             .col_names
@@ -282,19 +326,24 @@ fn main() {
     }
 
     let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
-    // Measurement lever: `AY_MILP_TREE_CERT_LEAVES=N` sets the tree-certificate
+    if let Some(cutoff) = dual_cutoff_model_frame {
+        let engine = opts.engine().with_dual_cutoff(cutoff);
+        opts = opts.with_engine(engine);
+    }
+    opts = ay_milp::engine_cli::apply(&flags, opts).unwrap_or_else(|e| {
+        eprintln!("bad engine flag: {e}");
+        std::process::exit(2);
+    });
+    // Measurement lever (retired to the CLI): the tree-certificate
     // leaf budget (default 256). Set it to 0 to opt into the certificate-free
     // fast path, which enables duplicate-column merging and makes the separately
-    // gated `AY_MILP_SINGLETON_SUB=1` substitution eligible to run.
-    if let Ok(v) = std::env::var("AY_MILP_TREE_CERT_LEAVES") {
-        if let Ok(n) = v.parse::<usize>() {
-            opts = opts.with_tree_cert_leaves(n);
-        }
-    }
+    // gated singleton-sub-knob substitution eligible to run.
+    // (B22: the env lever is retired; the typed carrier is
+    // SolveOpts::with_tree_cert_leaves via `ay-milp solve --tree-cert-leaves`.)
     // Typed parallelism, for measurement runs: `AY_MILP_THREADS=N` (N > 1)
     // requests N worker threads through the SolveOpts contract and opts out of
     // the determinism default (deterministic solves always take the serial
-    // paths). `AY_MILP_LATTICE_THREADS`/`NBCORE` remain ceilings only.
+    // paths). `NBCORE` remains a ceiling only.
     if let Ok(v) = std::env::var("AY_MILP_THREADS") {
         if let Ok(n) = v.parse::<u32>() {
             if n > 1 {
@@ -314,11 +363,11 @@ fn main() {
             return;
         }
     };
-    // Measurement harness: seed the search with a reference incumbent (name value per line,
-    // e.g. a HiGHS --solution_file). Advice only — `seed_incumbent` candidates are exactly
-    // re-checked before belief, so a wrong file cannot corrupt a verdict. This isolates
-    // "the primal is the blocker" from "the enumeration is the blocker" on an instance.
-    if let Ok(seedf) = std::env::var("AY_MILP_SEED_SOL") {
+    // The 4th positional arg seeds a reference incumbent (`name value` lines).
+    // Advice is exactly re-checked before belief, so a bad file cannot corrupt
+    // a verdict; it isolates primal quality from enumeration cost.
+    // B13 replaced the former AY_MILP_SEED_SOL environment arm.
+    if let Some(seedf) = std::env::args().nth(4) {
         let text = std::fs::read_to_string(&seedf).expect("read seed solution");
         let index: std::collections::HashMap<&str, usize> = p
             .col_names
@@ -361,17 +410,7 @@ fn main() {
     // `ay-milp` binary, which has real flags, certificate emission, and a
     // checker: `ay-milp solve <file> --time-limit <secs>`.
     match out {
-        Ok(Outcome::Optimal {
-            ref value,
-            ref model_values,
-            ..
-        }) => {
-            // THE HOLE THIS FIXES. `AY_DUMP_SOL` used to live only on the
-            // `Feasible` arm, so `AY_DUMP_SOL=/tmp/x mps_solve markshare1.mps 30`
-            // printed `OPTIMAL 1` and created NO FILE — the witness of a PROVEN
-            // optimum was the one thing you could not get out. Same file format,
-            // now on both arms. stdout is untouched.
-            dump_sol(&p.col_names, model_values);
+        Ok(Outcome::Optimal { ref value, .. }) => {
             println!(
                 "OPTIMAL {} {dt:.3} {nodes}",
                 ratio_str(&(value / &p.obj_scale))
@@ -382,9 +421,6 @@ fn main() {
             dual_bound,
             ..
         }) => {
-            // Diagnostic: dump the incumbent point (name value per line) so it can be
-            // compared against a reference solver's optimum.
-            dump_sol(&p.col_names, &model_values);
             let v = s.model().objective_value_at(&model_values);
             // The rigorous dual bound, on stderr so the machine-readable stdout line keeps
             // its shape. Unscaled like the value: it is compared against published optima.
@@ -419,9 +455,8 @@ fn main() {
         Err(e) => println!("ERROR {e:?} {dt:.3} {nodes}"),
         Ok(other) => println!("OTHER {other:?} {dt:.3} {nodes}"),
     }
-    // Fused ratio-test profiler (AY_MILP_ITER_PROFILE): us/pivot split of the dual
-    // ratio test's build vs select phases. Empty line when unsampled.
-    if std::env::var_os("AY_MILP_ITER_PROFILE").is_some() {
+    // B12: caller-enabled profilers return empty lines when inactive.
+    {
         let line = ay_milp::rt_profile_line();
         if !line.is_empty() {
             eprintln!("{line}");
@@ -439,17 +474,18 @@ fn main() {
             eprintln!("{sbline}");
         }
     }
-    // ITERATION LEDGER (AY_MILP_ITER_LEDGER): one parseable ITERLEDGER line
+    // ITERATION LEDGER (--iter-ledger): one parseable ITERLEDGER line
     // attributing every simplex iteration to the solve phase that ran it, with
     // the solve count per phase so iterations-per-solve is readable. Counts
     // only, never time: the line is identical on an idle and a contended box.
-    if std::env::var_os("AY_MILP_ITER_LEDGER").is_some() {
+    if iter_ledger_on() {
         let ledger = ay_milp::iter_ledger_line();
         if !ledger.is_empty() {
             eprintln!("{ledger}");
         }
     }
-    if std::env::var_os("AY_MILP_ALLOCSTAT").is_some() {
+    // B20: --allocstat example flag (was a retired env var).
+    if std::env::args().any(|a| a == "--allocstat") {
         eprintln!("AY_ALLOCSTAT nodes={nodes}");
     }
 }
@@ -474,27 +510,6 @@ fn read_maybe_gz(path: &str) -> std::io::Result<String> {
         )));
     }
     String::from_utf8(out.stdout).map_err(std::io::Error::other)
-}
-
-/// Write the point as `name value` per line, the historical `AY_DUMP_SOL`
-/// format, when that variable is set.
-///
-/// The deprecation note goes to stderr and only on runs that set the variable,
-/// so no existing parser sees a byte it did not see before.
-fn dump_sol(col_names: &[String], model_values: &[num_rational::BigRational]) {
-    let Ok(dump) = std::env::var("AY_DUMP_SOL") else {
-        return;
-    };
-    eprintln!(
-        "note: AY_DUMP_SOL is deprecated, use `ay-milp solve --emit-witness {dump}` \
-         (the env name still works)"
-    );
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::File::create(&dump) {
-        for (j, v) in model_values.iter().enumerate() {
-            let _ = writeln!(f, "{} {}", col_names[j], ratio_str(v));
-        }
-    }
 }
 
 /// A rational objective as a decimal, which is what every other solver prints.

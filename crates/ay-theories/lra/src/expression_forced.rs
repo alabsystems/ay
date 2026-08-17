@@ -11,14 +11,14 @@
 //! Split from `optimization.rs` for code health (#5970).
 
 // #8529: Use deterministic hash maps in all builds.
+use crate::{BoundType, LinearExpr, LraSolver, Rational};
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermId;
 use ay_core::DebugChannel;
 use ay_core::TheoryLit;
 use num_rational::BigRational;
-use num_traits::Zero;
 
-use crate::{BoundType, LinearExpr, LraSolver, Rational};
+mod difference_reasons;
 
 // Cached `--debug lra-forced` channel (checked once per process). #8858
 cached_debug_channel!(debug_lra_forced, DebugChannel::LraForced);
@@ -99,79 +99,65 @@ impl LraSolver {
             return None;
         }
 
-        // Case 3: Multi-variable expression - look for tableau rows that match this expression.
-        // When we assert `A = B`, we create slack variables with rows `s1 = A - B` (s1 <= 0)
-        // and `s2 = A - B` (s2 >= 0). Together these pin the expression to 0.
-        //
-        // We collect all matching rows and combine their bounds to determine if the expression
-        // is forced to the target value.
-        //
-        // SEMANTIC MATCHING (#794): We normalize both expressions before comparison so that
-        // `(A+1) - (B+1)` matches `A - B` even if they have different coefficient orderings.
-        let mut matching_slack_vars: Vec<(u32, BigRational)> = Vec::new();
-        let mut all_reasons: Vec<TheoryLit> = Vec::new();
+        self.multi_var_expression_forced_to_value(expr, target_value)
+    }
 
-        // Normalize the input expression for semantic comparison
+    /// Collect tableau slack variables whose rows are proportional to `expr`.
+    fn matching_slack_vars(
+        &self,
+        expr: &LinearExpr,
+        target_value: &BigRational,
+    ) -> Vec<(u32, BigRational)> {
+        let mut matching = Vec::new();
         let normalized_expr = expr.normalize();
 
         for row in &self.rows {
-            // Check if this row's expression matches our expression.
-            // Row represents: basic_var = Σ(row_coeff * var) + row_constant
-            // Our expression: Σ(expr_coeff * var) + expr_constant
-            //
-            // For a match, we need: normalized expr_coeffs == normalized row_coeffs
-            // (same variables, same coefficients - ignoring constant term)
-
-            // Normalize the row expression
             let row_constant_big = row.constant.to_big();
-            let row_expr = LinearExpr {
+            let normalized_row = LinearExpr {
                 coeffs: row.coeffs.clone(),
                 constant: row.constant.clone(),
-            };
-            let normalized_row = row_expr.normalize();
+            }
+            .normalize();
 
             // Use semantic coefficient comparison: exact match first,
             // then proportional match (e.g., 4294967296*(A-B) vs (A-B)).
-            if normalized_expr.same_coefficients(&normalized_row) {
-                // Exact match: expr = row_expr + (expr_constant - row_constant)
-                // For expr to be forced to target_value:
-                // basic_var must be at target_value - expr_constant + row_constant
-                let required_basic_value =
-                    target_value - expr.constant.to_big() + &row_constant_big;
-                matching_slack_vars.push((row.basic_var, required_basic_value));
+            let required_basic_value = if normalized_expr.same_coefficients(&normalized_row) {
+                // expr = row_expr + (expr_constant - row_constant).
+                target_value - expr.constant.to_big() + &row_constant_big
             } else if let Some(k) = normalized_expr.proportional_coefficient_ratio(&normalized_row)
             {
-                // Proportional match: expr_coeffs = k * row_coeffs.
-                // expr = k * (basic_var - row_constant) + expr_constant
-                //      = k * basic_var + (expr_constant - k * row_constant)
-                // For expr = target_value:
-                // basic_var = (target_value - expr_constant + k * row_constant) / k
-                let required_basic_value =
-                    (target_value - expr.constant.to_big() + &k * &row_constant_big) / &k;
-                matching_slack_vars.push((row.basic_var, required_basic_value));
+                // expr = k * basic_var + (expr_constant - k * row_constant).
+                (target_value - expr.constant.to_big() + &k * &row_constant_big) / &k
             } else {
                 continue;
-            }
+            };
+            matching.push((row.basic_var, required_basic_value));
         }
 
+        matching
+    }
+
+    /// Check whether matching tableau rows jointly pin a multi-var expression.
+    fn multi_var_expression_forced_to_value(
+        &self,
+        expr: &LinearExpr,
+        target_value: &BigRational,
+    ) -> Option<(Vec<TheoryLit>, bool)> {
+        let matching_slack_vars = self.matching_slack_vars(expr, target_value);
         if matching_slack_vars.is_empty() {
             return None;
         }
 
-        // Check if the combined bounds from all matching slack variables pin the expression.
-        // We need: for each matching slack variable, its value must be at the required value
-        // AND collectively there must be both a lower and upper bound constraining to that value.
+        let mut all_reasons: Vec<TheoryLit> = Vec::new();
         let mut has_lower_bound_at_target = false;
         let mut has_upper_bound_at_target = false;
 
         for (slack_var, required_value) in &matching_slack_vars {
             if let Some(info) = self.vars.get(*slack_var as usize) {
-                // Check if this variable's value is at the required value
                 if info.value.rational() != *required_value {
                     continue;
                 }
 
-                // Collect bounds that pin this value
                 if let Some(ref lb) = info.lower {
                     if lb.value == *required_value && !lb.strict {
                         has_lower_bound_at_target = true;
@@ -195,12 +181,7 @@ impl LraSolver {
             }
         }
 
-        // Expression is forced if we have both lower and upper bounds pinning to target
-        if has_lower_bound_at_target && has_upper_bound_at_target {
-            return Some((all_reasons, true));
-        }
-
-        None
+        (has_lower_bound_at_target && has_upper_bound_at_target).then_some((all_reasons, true))
     }
 
     /// Discover interface equalities `a = b` that are ENTAILED because the
@@ -315,138 +296,6 @@ impl LraSolver {
         }
 
         result
-    }
-
-    /// One pass over the asserted arithmetic atoms, resolving for every
-    /// unordered var pair `(a, b)` (keyed `(min, max)`) whether asserted
-    /// literals ENTAIL `a - b == 0`, and with which reasons
-    /// (#certora-diff-one-pass; formerly `entailed_difference_zero_reasons`
-    /// re-scanned all asserted atoms per queried pair).
-    ///
-    /// Method (robust against simplex basis state): each parsed atom is
-    /// `expr OP 0` over internal vars. A "difference atom" for pair `(a, b)`
-    /// has expr == k*(a - b) — exactly the two vars with opposite
-    /// coefficients and zero constant. Two asserted NON-STRICT inequalities
-    /// entailing `a - b <= 0` and `a - b >= 0` pin the difference to a closed
-    /// [0,0]; a single asserted equality atom does so directly.
-    ///
-    /// SOUNDNESS (Lean invariant (ENT)): the returned reasons are asserted
-    /// literals, so the equality `a = b` is a genuine logical consequence of
-    /// the current assertions (every model satisfies it), never a
-    /// model/default artifact, and EUF's conflict clause stays valid under
-    /// backtracking. Reason sets are non-empty by construction.
-    ///
-    /// Resolution rules preserved from the per-pair scan, over the SAME
-    /// deterministic `asserted` iteration order: the first asserted-true
-    /// equality atom resolves the pair immediately; otherwise the first
-    /// literal per direction is kept and the pair is frozen the moment both
-    /// directions are found (the former early `break`), so a later equality
-    /// atom cannot override an already-complete `[le, ge]` pair.
-    fn difference_pair_reasons(&self) -> HashMap<(u32, u32), Vec<TheoryLit>> {
-        // Per-pair in-progress state: first `<=`-direction and
-        // `>=`-direction reasons seen (kept only until the pair resolves).
-        let mut partial: HashMap<(u32, u32), (Option<TheoryLit>, Option<TheoryLit>)> =
-            HashMap::default();
-        let mut resolved: HashMap<(u32, u32), Vec<TheoryLit>> = HashMap::default();
-
-        for (&atom_term, &atom_value) in &self.asserted {
-            let info = match self.atom_cache.get(&atom_term) {
-                Some(Some(i)) => i,
-                _ => continue,
-            };
-
-            // Extract the difference form: exactly two distinct vars with
-            // nonzero coefficients c and -c, zero constant. `k` is the
-            // coefficient of the pair's MIN var (the former helper's `var_a`).
-            if !info.expr.constant.is_zero() {
-                continue;
-            }
-            let mut first: Option<(u32, &Rational)> = None;
-            let mut second: Option<(u32, &Rational)> = None;
-            let mut extra = false;
-            for &(v, ref c) in &info.expr.coeffs {
-                if c.is_zero() {
-                    continue;
-                }
-                match (&first, &second) {
-                    (None, _) => first = Some((v, c)),
-                    (Some(_), None) => second = Some((v, c)),
-                    _ => {
-                        extra = true;
-                        break;
-                    }
-                }
-            }
-            let (Some((v1, c1)), Some((v2, c2)), false) = (first, second, extra) else {
-                continue;
-            };
-            if v1 == v2 || (c1 + c2) != Rational::zero() {
-                continue;
-            }
-            // expr == c1*v1 + c2*v2 == c1*(v1 - v2); normalize to the pair key.
-            let (pair, k) = if v1 < v2 {
-                ((v1, v2), c1)
-            } else {
-                ((v2, v1), c2)
-            };
-            if k.is_zero() {
-                continue;
-            }
-            if resolved.contains_key(&pair) {
-                continue;
-            }
-
-            // Equality atom `expr = 0` asserted true ⟹ k*(a-b) = 0 ⟹ a = b.
-            if info.is_eq && !info.is_distinct {
-                if atom_value {
-                    partial.remove(&pair);
-                    resolved.insert(pair, vec![TheoryLit::new(atom_term, true)]);
-                }
-                continue;
-            }
-            if info.is_distinct {
-                continue;
-            }
-
-            // Inequality atom. The parsed form is `expr OP 0` with `is_le`
-            // selecting `<=` vs `>=`. Only asserted-true NON-STRICT atoms can
-            // pin a closed [0,0] (asserted-false flips to a strict bound).
-            if info.strict || !atom_value {
-                continue;
-            }
-
-            // Direction of `a - b` after dividing by k (sign of k flips
-            // `<=`/`>=`): expr <= 0 (is_le) ⟹ k*(a-b) <= 0 ⟹
-            //   k > 0 ⟹ a - b <= 0 ; k < 0 ⟹ a - b >= 0 (dual for >=).
-            let entails_le = if info.is_le {
-                k.is_positive()
-            } else {
-                k.is_negative()
-            };
-
-            let lit = TheoryLit::new(atom_term, atom_value);
-            let entry = partial.entry(pair).or_default();
-            if entails_le {
-                if entry.0.is_none() {
-                    entry.0 = Some(lit);
-                }
-            } else if entry.1.is_none() {
-                entry.1 = Some(lit);
-            }
-            if let (Some(le), Some(ge)) = *entry {
-                partial.remove(&pair);
-                resolved.insert(
-                    pair,
-                    if le.term == ge.term && le.value == ge.value {
-                        vec![le]
-                    } else {
-                        vec![le, ge]
-                    },
-                );
-            }
-        }
-
-        resolved
     }
 
     /// Assert a linear equality constraint: Σ(coeff * var) = value

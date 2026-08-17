@@ -18,6 +18,7 @@
 //! corrupt elimination decisions. This was the primary cause of #8223
 //! (P0 soundness bug) that forced the revert of incremental occ lists.
 
+#[cfg(debug_assertions)]
 use super::*;
 
 /// OTFS BVE occ list notification (#8363): after OTFS strengthening an

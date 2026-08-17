@@ -190,29 +190,8 @@ impl LpNodeBound {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ViolatingBranchRule {
-    First,
-    ViolDegree,
-    /// MARKED BRANCHING (`TWO_CLUB_BRANCH=marked`): on violating pair (a, b),
-    /// branch `a OUT` | `a COMMITTED` (marked). The include side deletes every
-    /// vertex conflicting with a marked vertex, iterated to a fixed point —
-    /// the O(1.62^n) include/exclude device of the exact 2-club literature
-    /// (Bourjolly 2002 onward; see the development design notes).
-    Marked,
-}
-
-impl ViolatingBranchRule {
-    fn from_selector(value: Option<&std::ffi::OsStr>) -> Self {
-        if value == Some(std::ffi::OsStr::new("viol")) {
-            Self::ViolDegree
-        } else if value == Some(std::ffi::OsStr::new("marked")) {
-            Self::Marked
-        } else {
-            Self::First
-        }
-    }
-}
+mod branching;
+use branching::{unwind_frame, Frame, RightBranch, StackItem, ViolatingBranchRule};
 
 /// Process controls snapshotted once before recognition. Production preserves
 /// the historical environment overrides; mandatory tests and `ay-pb-dev` use
@@ -277,6 +256,21 @@ impl TwoClubRuntime {
         Self {
             max_nodes,
             branch_rule: ViolatingBranchRule::Marked,
+            trace,
+            dump_frontier,
+            sdp_worker: None,
+        }
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub(crate) const fn explicit_marked_min_degree(
+        max_nodes: u64,
+        trace: bool,
+        dump_frontier: bool,
+    ) -> Self {
+        Self {
+            max_nodes,
+            branch_rule: ViolatingBranchRule::MarkedMinDegree,
             trace,
             dump_frontier,
             sdp_worker: None,
@@ -476,75 +470,6 @@ struct SearchState {
     cn_alive: Vec<u32>,
     /// pair is "active" iff both endpoints in C.
     both_in: Vec<bool>,
-}
-
-impl SearchState {
-    fn remove(&mut self, v: usize, tc: &TwoClub, undo: &mut Vec<(u32, u8)>) {
-        debug_assert!(self.in_c[v]);
-        self.in_c[v] = false;
-        self.c_size -= 1;
-        for &pi in &tc.pair_of_vertex[v] {
-            if self.both_in[pi as usize] {
-                self.both_in[pi as usize] = false;
-                undo.push((pi, 0));
-            }
-        }
-        for &pi in &tc.cn_of_vertex[v] {
-            self.cn_alive[pi as usize] -= 1;
-            undo.push((pi, 1));
-        }
-    }
-    fn undo(&mut self, v: usize, log: &[(u32, u8)]) {
-        for &(pi, kind) in log.iter().rev() {
-            match kind {
-                0 => self.both_in[pi as usize] = true,
-                _ => self.cn_alive[pi as usize] += 1,
-            }
-        }
-        self.in_c[v] = true;
-        self.c_size += 1;
-    }
-    /// A violating pair: both endpoints in C and zero surviving common neighbours.
-    fn find_violating(&self, tc: &TwoClub) -> Option<usize> {
-        // BRANCHING RULE: among the active violating pairs, pick the one whose
-        // endpoints carry the maximum total VIOLATING-DEGREE (memberships in
-        // other active violating pairs). Removing a high-viol-degree endpoint
-        // resolves many pairs at once — the classic fail-fast branching
-        // preference; the previous first-by-index scan was arbitrary. Two
-        // passes over the same O(pairs) scan: collect violating pairs +
-        // per-vertex counts, then score. Env A/B: TWO_CLUB_BRANCH=first
-        // restores the old rule.
-        // DEFAULT: first-by-index. The viol-degree rule (TWO_CLUB_BRANCH=viol)
-        // cuts pure tree size ~5x on band-only synthetics but MEASURED NEGATIVE
-        // on the real instance: it concentrates the DFS in matching-rich bottom
-        // territory (frontier 145 -> 112, dives 5 -> 1) — kill HEIGHT beats
-        // kill volume here. Re-evaluate together with marked branching.
-        // MARKED mode keeps the first-by-index pair scan: its device is in HOW
-        // the pair is branched (remove | mark), not which pair is chosen.
-        if tc.branch_rule != ViolatingBranchRule::ViolDegree {
-            return self
-                .both_in
-                .iter()
-                .enumerate()
-                .position(|(idx, &active)| active && self.cn_alive[idx] == 0);
-        }
-        let mut viol: Vec<u32> = Vec::new();
-        let mut deg = [0u32; 512];
-        for (idx, &active) in self.both_in.iter().enumerate() {
-            if active && self.cn_alive[idx] == 0 {
-                viol.push(idx as u32);
-                let (a, b, _) = &tc.pairs[idx];
-                deg[*a as usize] += 1;
-                deg[*b as usize] += 1;
-            }
-        }
-        viol.into_iter()
-            .max_by_key(|&idx| {
-                let (a, b, _) = &tc.pairs[idx as usize];
-                deg[*a as usize] + deg[*b as usize]
-            })
-            .map(|idx| idx as usize)
-    }
 }
 
 /// Greedy CLIQUE COVER over the ACTIVE VIOLATING pairs (both endpoints in
@@ -2200,7 +2125,7 @@ fn solve_exact_cell(
     // the root's sweep then performs the IRR reduction (delete anything
     // conflicting with a committed vertex) before the first branch, and a
     // forced-forced violation kills the cell as dead-by-marked-pair.
-    let marked_mode = tc.branch_rule == ViolatingBranchRule::Marked;
+    let marked_mode = tc.branch_rule.is_marked();
     let mut marked = vec![false; n];
     let mut marked_list: Vec<usize> = Vec::new();
     if marked_mode {
@@ -2307,77 +2232,6 @@ fn solve_exact_cell(
     // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
     let mut dual_support: Option<Vec<u32>> = None;
 
-    // The RIGHT side of a two-sided branch on violating pair (a, b) after the
-    // left (remove-a) subtree unwinds.
-    #[derive(Clone, Copy)]
-    enum RightBranch {
-        /// Default rules: remove the other endpoint b.
-        Remove(usize),
-        /// Marked mode: COMMIT the left-removed endpoint a to every solution
-        /// of the right subtree. No state change at push; the child's Enter
-        /// sweep deletes every conflict of the marked set to a fixed point
-        /// (the violating partner b at minimum, so the right side always
-        /// shrinks C and the tree stays finite).
-        Mark(usize),
-    }
-    // Explicit DFS: each frame is (vertex_removed, undo_log, phase).
-    enum Frame {
-        Enter,
-        AfterLeft { right: Option<RightBranch> },
-        Exit,
-    }
-    // Recursive helper via explicit stack of (frame, removed_vertex, undo).
-    // `snap`: this node adopted a dual snapshot when it branched; pop it
-    // (restoring the previous pricing) when its subtree unwinds — BEFORE undoing
-    // the node's own removal, which was accounted under the previous pricing.
-    struct StackItem {
-        frame: Frame,
-        removed: Option<usize>,
-        undo: Vec<(u32, u8)>,
-        snap: bool,
-        /// `c_size` when this frame was pushed — lets the progress trace report
-        /// the OPEN stack's c-distribution (how much skeleton hangs above the
-        /// kill frontier, the number that decides grind-vs-restructure).
-        c_at: usize,
-        /// Marked mode: vertex committed when this frame was pushed (the
-        /// right-branch child of a mark); unmarked LAST on unwind.
-        mark: Option<usize>,
-        /// Marked mode: sweep deletions performed at this frame's Enter, in
-        /// deletion order; undone in REVERSE, before `removed`, on unwind.
-        extra: Vec<(usize, Vec<(u32, u8)>)>,
-    }
-    /// Unwind one frame in EXACT reverse of its forward effects: sweep
-    /// deletions newest-first, then the frame's own branch removal, then its
-    /// mark. Callers pop any adopted dual snapshot FIRST (pop-before-undo:
-    /// `removed` and `extra` were both accounted under the PRE-adoption
-    /// pricing, which the pop restores).
-    fn unwind_frame(
-        item: &mut StackItem,
-        state: &mut SearchState,
-        lp_enabled: bool,
-        dual_d: &[i128],
-        dual_sum: &mut i128,
-        marked: &mut [bool],
-        marked_list: &mut Vec<usize>,
-    ) {
-        while let Some((v, log)) = item.extra.pop() {
-            if lp_enabled {
-                *dual_sum += dual_d[v].min(0);
-            }
-            state.undo(v, &log);
-        }
-        if let Some(v) = item.removed {
-            if lp_enabled {
-                *dual_sum += dual_d[v].min(0);
-            }
-            state.undo(v, &item.undo);
-        }
-        if let Some(m) = item.mark {
-            marked[m] = false;
-            let popped = marked_list.pop();
-            debug_assert_eq!(popped, Some(m), "mark unwind out of order");
-        }
-    }
     let mut stack = vec![StackItem {
         frame: Frame::Enter,
         removed: None,
@@ -2637,7 +2491,14 @@ fn solve_exact_cell(
                         }
                     }
                 }
-                match state.find_violating(tc) {
+                // Marked mode selects a (pair, branch vertex); the other rules
+                // select a pair and derive the branch vertex from forcing.
+                let selected = if marked_mode {
+                    state.find_violating_marked(tc)
+                } else {
+                    state.find_violating(tc).map(|pi| (pi, usize::MAX))
+                };
+                match selected {
                     None => {
                         // C is a 2-club: the subtree was NOT killed — ancestors
                         // contain it and will not LP-prune; disarm the cascade.
@@ -2660,7 +2521,7 @@ fn solve_exact_cell(
                         );
                         continue;
                     }
-                    Some(pi) => {
+                    Some((pi, commit)) => {
                         let a = tc.pairs[pi].0 as usize;
                         let b = tc.pairs[pi].1 as usize;
                         // Only NON-forced endpoints may be removed. A violating
@@ -2700,14 +2561,20 @@ fn solve_exact_cell(
                             // Sweep invariant: after this node's fixed point no
                             // violating pair touches a marked (⊇ forced)
                             // vertex, so both endpoints are free. Branch
-                            // `a OUT` | `a COMMITTED` — the include side's
-                            // child sweep deletes every conflict of a (b among
-                            // them): the O(1.62^n) device.
+                            // `v OUT` | `v COMMITTED` — the include side's
+                            // child sweep deletes every conflict of v (the
+                            // pair's other endpoint among them): the O(1.62^n)
+                            // device. `commit` is an endpoint of this pair (see
+                            // find_violating_marked), so the invariant covers it.
                             debug_assert!(
                                 ra && rb && !marked[a] && !marked[b],
                                 "marked sweep invariant broken"
                             );
-                            (a, Some(RightBranch::Mark(a)))
+                            debug_assert!(
+                                commit == a || commit == b,
+                                "marked selection returned a vertex outside its own pair"
+                            );
+                            (commit, Some(RightBranch::Mark(commit)))
                         } else {
                             let left = if ra { a } else { b };
                             let right = if ra && rb {
@@ -3856,6 +3723,30 @@ mod tests {
             ViolatingBranchRule::from_selector(Some(OsStr::new("viol"))),
             ViolatingBranchRule::ViolDegree
         );
+        assert_eq!(
+            ViolatingBranchRule::from_selector(Some(OsStr::new("marked"))),
+            ViolatingBranchRule::Marked
+        );
+        assert_eq!(
+            ViolatingBranchRule::from_selector(Some(OsStr::new("marked-min"))),
+            ViolatingBranchRule::MarkedMinDegree
+        );
+        // `marked-min` must be EXACT opt-in too. The archived campaign ledgers
+        // were produced under plain `marked`; a near-miss selector silently
+        // changing the traversal would break comparability with every recorded
+        // cell.
+        for value in ["marked-", "markedmin", "marked min", "MARKED-MIN", "min"] {
+            assert_ne!(
+                ViolatingBranchRule::from_selector(Some(OsStr::new(value))),
+                ViolatingBranchRule::MarkedMinDegree,
+                "only the exact `marked-min` selector may change proof traversal"
+            );
+        }
+        // Both marked variants run the mark/sweep device; the other rules do not.
+        assert!(ViolatingBranchRule::Marked.is_marked());
+        assert!(ViolatingBranchRule::MarkedMinDegree.is_marked());
+        assert!(!ViolatingBranchRule::First.is_marked());
+        assert!(!ViolatingBranchRule::ViolDegree.is_marked());
     }
 
     #[test]
@@ -3909,6 +3800,78 @@ mod tests {
                 "round {round}: n={n} edges={edges:?}"
             );
         }
+    }
+
+    /// BRANCH SELECTION MUST NOT CHANGE THE ANSWER.
+    ///
+    /// `MarkedMinDegree` branches on a different vertex than `Marked` — the free
+    /// vertex of MINIMUM violating degree rather than `pairs[pi].0`. The claim
+    /// that this is safe rests on the include/exclude dichotomy
+    /// `{2-clubs subset C} = {those without v} disjoint-union {those with v}`
+    /// holding at EVERY `v` in `C`, so selection can only reorder the tree, never
+    /// make the enumeration incomplete.
+    ///
+    /// That is exactly the kind of claim that deserves a differential rather than
+    /// a comment: every branch rule must reproduce brute force on the same graphs.
+    /// Track 1 shipped this rule with no tests at all; this is the gate.
+    #[test]
+    fn every_branch_rule_matches_bruteforce() {
+        let mut rng = Rng(0x2c1b_b12a);
+        let rules = [
+            ("marked", ViolatingBranchRule::Marked),
+            ("marked-min", ViolatingBranchRule::MarkedMinDegree),
+            ("first", ViolatingBranchRule::First),
+            ("viol", ViolatingBranchRule::ViolDegree),
+        ];
+        let mut checked = 0usize;
+        for round in 0..30 {
+            let n = 6 + (round % 6);
+            let mut edges = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if rng.next() % 100 < 30 {
+                        edges.push((a, b));
+                    }
+                }
+            }
+            let (instance, objective) = encode(n, &edges);
+            if instance.constraints.is_empty() {
+                continue;
+            }
+            let expect = brute_force(n, &edges);
+            for (name, rule) in rules {
+                let runtime = TwoClubRuntime {
+                    max_nodes: u64::MAX,
+                    branch_rule: rule,
+                    trace: false,
+                    dump_frontier: false,
+                    sdp_worker: None,
+                };
+                let mut _im = |_v: i128, _a: &[bool]| {};
+                let got = try_two_club_exact_with_runtime(
+                    &instance,
+                    &objective,
+                    None,
+                    runtime,
+                    TwoClubLpSelection::Standard,
+                    &|| false,
+                    &mut _im,
+                )
+                .unwrap_or_else(|| panic!("round {round} rule {name}: declined a valid encoding"));
+                assert_eq!(
+                    got.objective,
+                    Some(-(expect as i128)),
+                    "round {round} rule {name}: n={n} edges={edges:?} — a branch \
+                     SELECTION rule changed the proven optimum, so the \
+                     include/exclude dichotomy is not holding at the vertex it picks"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 80,
+            "only {checked} (graph, rule) pairs ran — the differential is too thin"
+        );
     }
 
     /// The PARALLEL PROVER's min-excluded partition must reproduce brute force
@@ -4292,7 +4255,7 @@ mod tests {
         drop(replacement);
 
         // The retirement rule itself: only a RUN of breaks is systemic.
-        assert!(SDP_MAX_BROKEN_STREAK >= 2, "one break must be survivable");
+        const _: () = assert!(SDP_MAX_BROKEN_STREAK >= 2, "one break must be survivable");
     }
 
     /// The INCREMENTAL DUAL-SNAPSHOT machinery under maximum stress: refresh at
@@ -4433,44 +4396,55 @@ mod tests {
             }
             let expect = brute_force(n, &edges);
             let mut tc = recognize(&instance, &objective).expect("recognize");
-            tc.branch_rule = ViolatingBranchRule::Marked;
-            for lp in [LpNodeBound::disabled(), aggressive] {
-                let mut _cb = |_s: usize, _a: &[bool]| {};
-                // Whole space in one cell (seed floor 1: a single vertex).
-                let verdict = solve_exact(&tc, 1, &lp, &|| false, &mut _cb)
-                    .unwrap_or_else(|| panic!("round {round}: marked search unfinished"));
-                let got = match verdict {
-                    SearchVerdict::Better(sz, _) => sz,
-                    SearchVerdict::SeedOptimal => 1,
-                };
-                assert_eq!(got, expect, "round {round}: n={n} edges={edges:?}");
-                // Min-excluded partition: full-set cell + every cell m. Forced
-                // vertices become initial marks in marked mode.
-                let mut agg = 1usize;
-                let mut all_done = true;
-                let forced = vec![true; n];
-                match solve_exact_cell(&tc, &forced, &[], 1, &lp, &|| false, &mut _cb) {
-                    Some(SearchVerdict::Better(sz, _)) => agg = agg.max(sz),
-                    Some(SearchVerdict::SeedOptimal) => {}
-                    None => all_done = false,
-                }
-                for m in 0..n {
-                    let mut forced = vec![false; n];
-                    forced[..m].fill(true);
-                    match solve_exact_cell(&tc, &forced, &[m], 1, &lp, &|| false, &mut _cb) {
+            // BOTH marked variants. `MarkedMinDegree` changes only WHICH free
+            // vertex is committed, and the include/exclude dichotomy is valid at
+            // every vertex of C — so it must reproduce brute force exactly like
+            // `Marked` does, on the whole space and on every partition cell. A
+            // selection rule that made the enumeration incomplete would show up
+            // here as a missed optimum.
+            for rule in [
+                ViolatingBranchRule::Marked,
+                ViolatingBranchRule::MarkedMinDegree,
+            ] {
+                tc.branch_rule = rule;
+                for lp in [LpNodeBound::disabled(), aggressive] {
+                    let mut _cb = |_s: usize, _a: &[bool]| {};
+                    // Whole space in one cell (seed floor 1: a single vertex).
+                    let verdict = solve_exact(&tc, 1, &lp, &|| false, &mut _cb)
+                        .unwrap_or_else(|| panic!("round {round}: marked search unfinished"));
+                    let got = match verdict {
+                        SearchVerdict::Better(sz, _) => sz,
+                        SearchVerdict::SeedOptimal => 1,
+                    };
+                    assert_eq!(got, expect, "round {round}: n={n} edges={edges:?}");
+                    // Min-excluded partition: full-set cell + every cell m. Forced
+                    // vertices become initial marks in marked mode.
+                    let mut agg = 1usize;
+                    let mut all_done = true;
+                    let forced = vec![true; n];
+                    match solve_exact_cell(&tc, &forced, &[], 1, &lp, &|| false, &mut _cb) {
                         Some(SearchVerdict::Better(sz, _)) => agg = agg.max(sz),
                         Some(SearchVerdict::SeedOptimal) => {}
                         None => all_done = false,
                     }
+                    for m in 0..n {
+                        let mut forced = vec![false; n];
+                        forced[..m].fill(true);
+                        match solve_exact_cell(&tc, &forced, &[m], 1, &lp, &|| false, &mut _cb) {
+                            Some(SearchVerdict::Better(sz, _)) => agg = agg.max(sz),
+                            Some(SearchVerdict::SeedOptimal) => {}
+                            None => all_done = false,
+                        }
+                    }
+                    assert!(
+                        all_done,
+                        "round {round}: marked partition left cells unexhausted"
+                    );
+                    assert_eq!(
+                        agg, expect,
+                        "round {round} partition: n={n} edges={edges:?} rule={rule:?}"
+                    );
                 }
-                assert!(
-                    all_done,
-                    "round {round}: marked partition left cells unexhausted"
-                );
-                assert_eq!(
-                    agg, expect,
-                    "round {round} partition: n={n} edges={edges:?}"
-                );
             }
         }
     }

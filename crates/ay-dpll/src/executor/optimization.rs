@@ -11,6 +11,10 @@
 //! Extracted from `executor.rs` as part of the executor.rs decomposition
 //! design (the development design notes, Split 2).
 
+mod exact_probe;
+#[cfg(test)]
+pub(in crate::executor) mod maxsmt_test_hooks;
+
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData, TermEntryStamp};
@@ -32,15 +36,8 @@ use crate::logic_detection::LogicCategory;
 /// Upper bound on the TOTAL soft weight the core-guided OLL engine will accept
 /// before falling back to the binary-search baseline.
 ///
-/// The weighted-at-most-`W` confirmation ([`Executor::maxsmt_assert_weighted_at_most_w`])
-/// encodes `sum_i w_i * relax_i <= W` by replicating each soft's relaxation
-/// indicator `w_i` times and asserting an `at-most-W` cardinality constraint over
-/// the flat list of copies. The number of copies is the total soft weight, so an
-/// unbounded total weight would blow up the cardinality encoding. This cap keeps
-/// the encoding tractable; larger-weight instances fall back to the (always
-/// sound) baseline rather than risk a runaway encoding. The value is generous
-/// relative to typical small `(assert-soft ...)` weights yet bounds the copy
-/// count to a few thousand auxiliary Booleans.
+/// Weighted-at-most-`W` replicates relaxation indicators by weight. This caps
+/// the encoding at a few thousand Booleans; larger instances use the fallback.
 pub(crate) const MAXSMT_EXACT_MAX_TOTAL_WEIGHT: u64 = 4096;
 
 /// Per-probe ceiling for disposable optimization authority checks. The checked
@@ -282,9 +279,9 @@ impl Executor {
     /// Decide one exact optimization obligation without importing a model or a
     /// raw nested-solver verdict.
     ///
-    /// Ground obligations use the checked two-sided decision API. Quantified
-    /// obligations have no checked SAT transport here; they may contribute only
-    /// a strict-proof UNSAT token, otherwise the optimization probe is Unknown.
+    /// Ground obligations use the checked ground decision API. Quantified
+    /// obligations use the exact two-sided API: SAT crosses the disposable
+    /// boundary only as a public-emission certificate, never as a raw model.
     fn checked_optimization_decision(
         &mut self,
         assumptions: &[TermId],
@@ -301,18 +298,7 @@ impl Executor {
             .iter()
             .any(|&root| contains_quantifier(&self.ctx.terms, root))
         {
-            return match self
-                .checked_exact_unsat_solve(roots.to_vec(), OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS)
-            {
-                Some(checked) => {
-                    if checked.consume(self, roots) {
-                        CheckedOptimizationDecision::Unsat
-                    } else {
-                        CheckedOptimizationDecision::Unknown
-                    }
-                }
-                _ => CheckedOptimizationDecision::Unknown,
-            };
+            return self.checked_optimization_quantified_decision(roots);
         }
 
         match self.checked_ground_solve(
@@ -1332,6 +1318,11 @@ impl Executor {
     {
         let snapshot = self.ctx.assertions.len();
         add_clauses(self);
+        #[cfg(test)]
+        if maxsmt_test_hooks::decline_checked_decision() {
+            self.ctx.truncate_assertions(snapshot);
+            return CheckedOptimizationDecision::Unknown;
+        }
         let decision = self.checked_optimization_decision(&[]);
         self.ctx.truncate_assertions(snapshot);
         decision

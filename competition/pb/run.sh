@@ -18,11 +18,7 @@
 set -eu
 
 # ---- Trident entry preset (from entries.toml) ------------------------------
-export AY_PB_BNN_FEAS=1
-export AY_PB_BNN_SCHED=1
 export AY_PB_PARALLEL=auto
-export AY_PB_SLS_NLC=1
-export AY_PB_WBO_SLS=1
 # ----------------------------------------------------------------------------
 
 # Use ALL competition cores when the parallel preset is active. NBCORE falls

@@ -39,7 +39,7 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use std::panic::AssertUnwindSafe;
 
 /// Per-call executor trace (inc-13 per-check cost attribution): active at
-/// `AY_CHECKSAT_TRACE>=2`. Logs construction/execute split plus the
+/// `--chc-checksat-trace>=2`. Logs construction/execute split plus the
 /// executor-internal phase timers so the 0.3-0.7s per-check fallback cost
 /// can be attributed to a concrete sink.
 fn exec_trace_enabled() -> bool {
@@ -47,15 +47,10 @@ fn exec_trace_enabled() -> bool {
 }
 
 /// Inc-18 SAT-direction EqDiffVar retry gate (`AY_EXEC_DV_RETRY`, default
-/// ON; `0`/`false` disables). Forced OFF when the inc-14 master switch
-/// `AY_EQ_DIFFVAR=0` already disables the pass globally — a retry without
-/// the pass would re-run an identical pipeline. Read per call (not cached)
-/// so A/B harnesses can toggle within a process, matching the inc-14 gate.
+/// ON; `0`/`false` disables). Read per call so A/B harnesses can toggle it
+/// within a process.
 pub(super) fn dv_unknown_retry_enabled() -> bool {
-    if std::env::var("AY_EQ_DIFFVAR").is_ok_and(|v| v == "0") {
-        return false;
-    }
-    std::env::var("AY_EXEC_DV_RETRY").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    crate::ab_switches::get().exec_dv_retry // B27: CLI-owned; env retired.
 }
 
 fn execute_commands_via_executor(commands: &[ay_frontend::Command]) -> Result<Vec<String>, ()> {
@@ -639,7 +634,7 @@ impl SmtContext {
             );
             // Slow-check capture (inc-13 attribution): dump the exact SMT-LIB
             // text of timeout-class checks for offline differential analysis.
-            if let Ok(dir) = std::env::var("AY_CHECKSAT_DUMP") {
+            if let Some(dir) = ay_core::misc_cli_flags().chc_checksat_dump.as_deref() {
                 let dt = t_build.elapsed();
                 if result_str == "unknown"
                     || matches!(result, SmtResult::Unknown)

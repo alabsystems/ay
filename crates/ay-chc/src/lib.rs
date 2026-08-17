@@ -16,7 +16,7 @@
 // monomorphised code visible only in test builds.  Fixed on nightly; suppress
 // until stable catches up.
 #![cfg_attr(test, allow(clippy::large_stack_arrays))]
-// TODO(missing_docs): ay-chc is the only primary library crate without
+// Missing-docs debt (#8838 follow-up): ay-chc is the only primary library crate without
 // `#![warn(missing_docs)]` (ay, ay-core, and ay-sat all enforce it). Enabling
 // it today would emit 40+ warnings across the effectively-public surface
 // (e.g. the `ChcExpr` constructor methods in expr/methods/constructors.rs,
@@ -151,6 +151,7 @@ pub(crate) fn debug_algebraic_enabled() -> bool {
     ay_core::debug_channel_active(ay_core::DebugChannel::Algebraic)
 }
 
+pub mod ab_switches;
 pub(crate) mod acyclic_cert_cache;
 mod adaptive;
 mod adaptive_bv_dual_lane;

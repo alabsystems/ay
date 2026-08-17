@@ -289,6 +289,7 @@ fn test_run_with_writer_solves_satisfiable_opb() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -317,6 +318,7 @@ fn test_run_with_writer_testscheduling_t030_preparse_route_reports_incumbent() {
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -354,6 +356,7 @@ fn test_run_with_writer_testscheduling_t050_preparse_route_accepts_fixture() {
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -403,6 +406,7 @@ fn test_run_with_writer_fool_solitaire_table_2_0_preparse_route_accepts_fixture(
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -447,6 +451,7 @@ fn test_run_with_writer_same_queens_knights_b35_preparse_route_accepts_fixture()
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -495,6 +500,7 @@ fn test_run_with_writer_average_avoiding_mini40_preparse_route_accepts_fixture()
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -539,6 +545,7 @@ fn test_run_with_writer_solitaire_pattern_table_3_3_9_preparse_route_accepts_fix
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -585,6 +592,7 @@ fn test_run_with_writer_feature_subscription_preparse_route_accepts_50_250_fixtu
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -657,6 +665,7 @@ fn test_run_with_writer_feature_subscription_50_750_preparse_routes_accept_fixtu
             stats: true,
             stats_json: false,
             native: false,
+            ab_switches: Default::default(),
         };
         let mut output = Vec::new();
         let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -709,6 +718,7 @@ fn test_run_with_writer_haplotype_preparse_route_accepts_fixture() {
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -754,6 +764,7 @@ fn test_run_with_writer_charlotte_routing_preparse_route_accepts_fixture() {
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -799,6 +810,7 @@ fn test_run_with_writer_solves_unsatisfiable_opb() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -833,6 +845,7 @@ fn test_run_with_writer_proof_mode_propagates_proof_io_errors() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let err = run_with_writer(&cmd, &mut output)
@@ -864,6 +877,7 @@ fn test_run_with_writer_emits_stats_comments() {
         stats: true,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     // Pin the SEQUENTIAL portfolio: this test asserts the sequential path's
@@ -873,9 +887,12 @@ fn test_run_with_writer_emits_stats_comments() {
     // (`portfolio_timings: None` — the same pinned contract as the standalone
     // binary's stats-json tests). The lock serializes the mutation against
     // concurrent tests; the guard restores the prior value on EVERY exit path
-    // (a panicking solve cannot leak AY_PB_PARALLEL=0).
-    let _lock = lock_env();
-    let _parallel_guard = ScopedEnvVar::set("AY_PB_PARALLEL", "0");
+    // (the RAII guard restores it on every exit path).
+    let _parallel_guard =
+        ay_pb::ab_switches::consumer_test_override::set(ay_pb::ab_switches::PbAbSwitches {
+            parallel_workers: Some(0),
+            ..Default::default()
+        });
     let run_result = run_with_writer(&cmd, &mut output);
     run_result.expect("command should succeed");
 
@@ -913,10 +930,23 @@ const WCSP_UNIFORM_COST_5_ROWS: &str = concat!(
 );
 
 fn run_wbo_text(text: &str) -> String {
+    run_wbo_text_with_edac(text, false)
+}
+
+fn run_wbo_text_with_edac(text: &str, wcsp_edac: bool) -> String {
     let file = NamedTempFile::new().expect("temp file should exist");
     // `.wbo` extension so format detection takes the WBO path.
     let path = file.path().with_extension("wbo");
     fs::write(&path, text).expect("write should succeed");
+    // B56: the probe opt-in rides the per-command switch surface; the
+    // set-once global is bypassed through the test override installed by
+    // `run_with_writer`'s switch application below.
+    let _edac = wcsp_edac.then(|| {
+        ay_pb::ab_switches::consumer_test_override::set(ay_pb::ab_switches::PbAbSwitches {
+            wcsp_edac: true,
+            ..Default::default()
+        })
+    });
     let cmd = PbCommand::Solve {
         file: path.clone(),
         timeout: Some(10_000),
@@ -924,6 +954,7 @@ fn run_wbo_text(text: &str) -> String {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let run_result = run_with_writer(&cmd, &mut output);
@@ -937,8 +968,7 @@ fn test_run_with_writer_wcsp_edac_probe_proves_unsat_at_top() {
     // c0 = 5 >= top = 5: with the opt-in flag set, the trail-checked floor
     // proves there is no admissible model before any conversion/search.
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set("AY_PB_WCSP_EDAC", "1");
-    let rendered = run_wbo_text(&format!("soft: 5 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
+    let rendered = run_wbo_text_with_edac(&format!("soft: 5 ;\n{WCSP_UNIFORM_COST_5_ROWS}"), true);
     assert!(
         rendered.contains("c wcsp edac root probe: c0=5 top=5"),
         "probe comment missing: {rendered}"
@@ -959,8 +989,8 @@ fn test_run_with_writer_wcsp_edac_probe_defers_below_top_and_defaults_off() {
     // Control 1 (flag ON, c0 = 5 < top = 6): the probe reports its floor but
     // must NOT assert a verdict; the ordinary solve finds a cost-5 model.
     {
-        let _guard = ScopedEnvVar::set("AY_PB_WCSP_EDAC", "1");
-        let rendered = run_wbo_text(&format!("soft: 6 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
+        let rendered =
+            run_wbo_text_with_edac(&format!("soft: 6 ;\n{WCSP_UNIFORM_COST_5_ROWS}"), true);
         assert!(
             rendered.contains("c wcsp edac root probe: c0=5 top=6"),
             "probe comment missing: {rendered}"
@@ -978,7 +1008,6 @@ fn test_run_with_writer_wcsp_edac_probe_defers_below_top_and_defaults_off() {
     // the identical UNSAT verdict comes from the ordinary converted solve,
     // cross-checking the probe verdict of the previous test.
     {
-        let _wcsp_edac = ScopedEnvVar::unset("AY_PB_WCSP_EDAC");
         let rendered = run_wbo_text(&format!("soft: 5 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
         assert!(
             !rendered.contains("wcsp edac"),
@@ -1558,6 +1587,7 @@ fn test_optimization_finds_optimum() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1593,6 +1623,7 @@ fn test_optimization_range_overflow_still_fails_closed_at_cli() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1630,6 +1661,7 @@ fn test_optimization_trivial_zero_cost() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1660,6 +1692,7 @@ fn test_wbo_optimization() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1688,6 +1721,7 @@ fn test_wbo_output_projects_away_relaxation_variables() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1737,6 +1771,7 @@ fn test_wbo_wcsp_output_emits_only_final_projected_objective() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1801,6 +1836,7 @@ fn test_wbo_unsatisfiable_soft_constraint() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1828,6 +1864,7 @@ fn test_native_solver_satisfiable() {
         stats: false,
         stats_json: false,
         native: true,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1859,6 +1896,7 @@ fn test_native_solver_nonlinear_linearizes_before_solving() {
         stats: false,
         stats_json: false,
         native: true,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1891,6 +1929,7 @@ fn test_proof_mode_nonlinear_fails_closed() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -1960,6 +1999,7 @@ fn assert_proof_mode_no_cert_path_fails_closed(file_path: &Path, name: &str) {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2150,6 +2190,7 @@ fn test_proof_mode_testscheduling_t030_certified_optimum() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2205,6 +2246,7 @@ fn assert_proof_mode_koops_identity_complement_certifies_unsat(
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2267,6 +2309,7 @@ fn test_native_solver_unsatisfiable() {
         stats: false,
         stats_json: false,
         native: true,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2297,6 +2340,7 @@ fn test_native_solver_cardinality() {
         stats: false,
         stats_json: false,
         native: true,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2326,6 +2370,7 @@ fn test_native_solver_optimization_falls_back() {
         stats: false,
         stats_json: false,
         native: true,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2355,6 +2400,7 @@ fn test_run_with_writer_proof_mode_respects_zero_timeout() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2387,6 +2433,7 @@ fn test_run_with_writer_proof_mode_clique_writes_conflict_row_map_sidecar() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2420,6 +2467,7 @@ fn test_run_with_writer_timeout_applies_during_parse() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2729,6 +2777,7 @@ fn early_structural_check_decides_pigeonhole_unsat_via_cli() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");
@@ -2768,6 +2817,7 @@ fn early_structural_check_leaves_satisfiable_decision_untouched() {
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut output = Vec::new();
     let status = run_with_writer(&cmd, &mut output).expect("command should succeed");

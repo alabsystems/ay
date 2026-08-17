@@ -17,7 +17,7 @@ pub(crate) enum SymmetrySkipReason {
     /// above, all of which mean the route never executed.
     ///
     /// Without this the two are indistinguishable in `--stats`, which is how
-    /// `AY_SAT_SIGNED_SYMMETRY` stayed inert long enough for a full-400 A/B to
+    /// `--sat-signed-symmetry` stayed inert long enough for a full-400 A/B to
     /// "reject" a technique that was never running. A detector that reports
     /// nothing must say whether it looked.
     NoGenerators,

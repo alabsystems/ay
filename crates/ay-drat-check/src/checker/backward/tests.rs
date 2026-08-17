@@ -28,6 +28,26 @@ fn test_backward_simple_proof() {
 }
 
 #[test]
+fn test_backward_checker_reuse_preserves_lazy_step_indexing() {
+    let clauses = vec![
+        vec![lit(0, true), lit(1, true)],
+        vec![lit(0, false), lit(1, true)],
+        vec![lit(0, true), lit(1, false)],
+        vec![lit(0, false), lit(1, false)],
+    ];
+    let steps = vec![
+        ProofStep::Add(vec![lit(0, true)]),
+        ProofStep::Add(vec![lit(1, true)]),
+        ProofStep::Delete(vec![lit(0, true), lit(1, true)]),
+        ProofStep::Add(vec![]),
+    ];
+    let mut checker = BackwardChecker::new(2, false);
+
+    assert!(checker.verify(&clauses, &steps).is_ok());
+    assert!(checker.verify(&clauses, &steps).is_ok());
+}
+
+#[test]
 fn test_backward_soft_delete_updates_occurrences() {
     let clause = vec![lit(0, false), lit(1, true), lit(0, false)];
     let neg_pivot = lit(0, false);

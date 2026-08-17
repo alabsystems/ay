@@ -17,13 +17,14 @@
 //!   results, they must agree (no soundness flip from transformations)
 
 #![no_main]
+#![forbid(unsafe_code)]
 
-use libfuzzer_sys::fuzz_target;
-use std::time::Duration;
 use ay_chc::{
     engines, testing, BmcConfig, ChcParser, EngineConfig, PdrConfig, PortfolioConfig,
     PortfolioResult,
 };
+use libfuzzer_sys::fuzz_target;
+use std::time::Duration;
 
 fuzz_target!(|data: &[u8]| {
     // Try to interpret bytes as UTF-8 string
@@ -93,9 +94,8 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // --- Cross-check: preprocessing must not flip definitive results ---
-    let is_definitive = |r: &PortfolioResult| {
-        matches!(r, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_))
-    };
+    let is_definitive =
+        |r: &PortfolioResult| matches!(r, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_));
 
     if is_definitive(&result_no_pp) && is_definitive(&result_pp) {
         let same_verdict = matches!(

@@ -937,11 +937,6 @@ impl Solver {
         self.dense_clique_mab_branch_route_exercise_count() != 0
     }
 
-    /// Get the number of restarts blocked by trail-length heuristic (#8449).
-    pub fn trail_blocked_restarts(&self) -> u64 {
-        self.stats.trail_blocked_restarts
-    }
-
     /// Return whether Glucose-style EMA restarts are enabled.
     pub fn glucose_restarts_enabled(&self) -> bool {
         self.cold.glucose_restarts

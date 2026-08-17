@@ -60,6 +60,9 @@ use num_traits::{Signed, Zero};
 
 use super::ProofCheckError;
 
+#[path = "string_length_identity_containment.rs"]
+mod containment;
+
 /// Validate a `TheoryLemmaKind::StringLengthLemma` in strict mode.
 pub(crate) fn validate_string_length_lemma(
     terms: &TermStore,
@@ -131,7 +134,7 @@ fn is_valid_str_len_theorem(terms: &TermStore, t: TermId) -> bool {
         || is_len_nonneg(terms, t)
         || is_const_len(terms, t)
         || is_str_eq_len_eq(terms, t)
-        || is_containment_len_bound(terms, t)
+        || containment::is_containment_len_bound(terms, t)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,56 +453,6 @@ fn eq_len_const_ok(terms: &TermStore, x: TermId, k: &BigInt, s: TermId, t: TermI
         return false;
     };
     string_const_len(terms, other).is_some_and(|len| &len == k)
-}
-
-// ---------------------------------------------------------------------------
-// 6. Containment bound: contains/prefixof/suffixof → len(contained) <= len(container)
-//    Stored as `(or (not PRED) (<= (str.len contained) (str.len container)))`.
-// ---------------------------------------------------------------------------
-
-fn is_containment_len_bound(terms: &TermStore, t: TermId) -> bool {
-    let TermData::App(Symbol::Named(sym), args) = terms.get(t) else {
-        return false;
-    };
-    if sym != "or"
-        || args.len() != 2
-        || !matches!(terms.sort(t), Sort::Bool)
-        || args
-            .iter()
-            .any(|&arg| !matches!(terms.sort(arg), Sort::Bool))
-    {
-        return false;
-    }
-    check_containment(terms, args[0], args[1]) || check_containment(terms, args[1], args[0])
-}
-
-fn check_containment(terms: &TermStore, neg_lit: TermId, le_lit: TermId) -> bool {
-    let TermData::Not(pred) = terms.get(neg_lit) else {
-        return false;
-    };
-    if !matches!(terms.sort(*pred), Sort::Bool) {
-        return false;
-    }
-    let TermData::App(Symbol::Named(psym), pargs) = terms.get(*pred) else {
-        return false;
-    };
-    if pargs.len() != 2
-        || pargs
-            .iter()
-            .any(|&arg| !matches!(terms.sort(arg), Sort::String))
-    {
-        return false;
-    }
-    // (contained, container) per SMT-LIB argument order.
-    let (contained, container) = match psym.as_str() {
-        "str.contains" => (pargs[1], pargs[0]),
-        "str.prefixof" | "str.suffixof" => (pargs[0], pargs[1]),
-        _ => return false,
-    };
-    let Some((lo, hi)) = as_binary(terms, le_lit, "<=") else {
-        return false;
-    };
-    str_len_arg(terms, lo) == Some(contained) && str_len_arg(terms, hi) == Some(container)
 }
 
 #[cfg(test)]

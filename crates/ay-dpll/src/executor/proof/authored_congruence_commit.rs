@@ -22,7 +22,9 @@ impl Executor {
     ) -> bool {
         if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, authored).is_ok()
             && Self::proof_derives_empty_clause(&candidate)
-            && self.check_proof_strict_with_datatypes(&candidate).is_ok()
+            && self
+                .check_proof_strict_with_datatypes(&candidate)
+                .is_ok_and(|quality| quality.is_complete())
         {
             // Prefer the SAME reconstruction respelled over the problem file's
             // own terms, so an `assume` still matches the input syntactically.

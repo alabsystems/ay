@@ -72,12 +72,12 @@ pub(crate) struct FirewallDiagnosticOutcome {
 /// Per-file Lean kernel-check timeout. The total diagnostic budget below is an
 /// additional cap, so many artifacts cannot multiply this into an unbounded
 /// post-solve delay.
-const PER_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+const PER_FILE_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum wall-clock time spent in firewall emission/audit/checking when the
 /// CLI deadline has more time remaining (or no deadline). The actual budget is
 /// the smaller of this and the remaining CLI timeout.
-const TOTAL_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(120);
+const TOTAL_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Diagnostic artifacts are attacker/input-amplifiable through proof size. Cap
 /// both their count and aggregate standalone Lean source before invoking Lean.

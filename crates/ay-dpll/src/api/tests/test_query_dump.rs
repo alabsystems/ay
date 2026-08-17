@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `AY_DUMP_QUERY_DIR` query-dump self-containment (#dump-self-contained).
+//! `--dump-query-dir` query-dump self-containment (#dump-self-contained).
 //!
 //! A dumped script must be usable as a standalone repro/oracle input: every
 //! uninterpreted sort referenced by the query must be declared, and the script
@@ -255,7 +255,7 @@ fn query_dump_datatype_weakening_is_standalone_and_fail_visible() {
     soft_check_z3_parseable(&script, &["sat"]);
 }
 
-/// End-to-end env-gated path: `AY_DUMP_QUERY_DIR` writes the self-contained
+/// End-to-end env-gated path: `--dump-query-dir` writes the self-contained
 /// script from an isolated child test process. The parent never mutates its
 /// process-global environment and validates the child's captured file.
 #[test]
@@ -266,11 +266,13 @@ fn query_dump_env_writes_self_contained_file() {
     // process instead. The parent sets the child environment on `Command`
     // without mutating its own process.
     if let Some(dir) = std::env::var_os(QUERY_DUMP_CHILD_DIR) {
-        assert_eq!(
-            std::env::var_os("AY_DUMP_QUERY_DIR").as_deref(),
-            Some(dir.as_os_str()),
-            "child sentinel and production dump directory diverged"
-        );
+        // B64: the child installs the typed carrier from its sentinel; the
+        // production read no longer consults the environment.
+        ay_core::set_global_misc_cli_flags(ay_core::MiscCliFlags {
+            dump_query_dir: Some(dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("first install in the child test process");
 
         let mut solver = Solver::new(Logic::All);
         let carrier = Sort::Uninterpreted("qdump_env_test::sort".to_string());
@@ -291,7 +293,6 @@ fn query_dump_env_writes_self_contained_file() {
     .arg("--nocapture")
     .arg("--test-threads=1")
     .env(QUERY_DUMP_CHILD_DIR, dir.path())
-    .env("AY_DUMP_QUERY_DIR", dir.path())
     .output()
     .expect("run isolated query-dump child test");
     assert!(

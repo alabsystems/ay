@@ -93,8 +93,9 @@ pub(crate) struct PhaseHintExtension<'a, T: TheorySolver> {
 /// Default OFF, so this is behaviour-identical; setting it restores the
 /// unconditional O(atoms) re-seed byte-for-byte.
 pub(crate) fn phase_epoch_skip_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("AY_DISABLE_PHASE_EPOCH_SKIP").is_some())
+    // B17: CLI-populated global (--disable-phase-epoch-skip) replaced the
+    // never-set env var.
+    ay_core::theory_disable_flags().disable_phase_epoch_skip
 }
 
 impl<'a, T: TheorySolver> PhaseHintExtension<'a, T> {

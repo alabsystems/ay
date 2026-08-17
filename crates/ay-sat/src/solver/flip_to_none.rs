@@ -469,10 +469,10 @@ impl Solver {
         self.no_conflict_until = new_ncu.unwrap_or(write);
         if let Some(fr) = first_removed {
             // Root-prefix positions below the first removal are unshifted;
-            // clamp the LRAT root-unit cursor so shifted entries above it are
-            // revisited rather than skipped.
-            self.cold.lrat_level0_unit_materialize_cursor =
-                self.cold.lrat_level0_unit_materialize_cursor.min(fr);
+            // clamp the LRAT root-unit cursor (and drop now-stale pinned
+            // retry slots) so shifted entries above it are revisited rather
+            // than skipped.
+            self.clamp_lrat_level0_unit_materialize_cursor(fr);
         }
         // Reason marks map clauses to trail state that just moved; force a
         // rebuild before the next consumer reads them.

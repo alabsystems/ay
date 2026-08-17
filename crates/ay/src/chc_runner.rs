@@ -1418,19 +1418,18 @@ fn build_chc_manifest_parts(
 /// Opt-in budget for the post-solve CHECKED replay pass (model-checker-consumer wishlist
 /// item 7: emit checked replay artifacts so native proofs become admissible).
 ///
-/// `AY_CHC_CHECKED_REPLAY=1|true` enables with a 10-second default budget;
-/// `AY_CHC_CHECKED_REPLAY=<seconds>` sets an explicit budget; unset, `0`, or
+/// `--chc-checked-replay|true` enables with a 10-second default budget;
+/// `--chc-checked-replay=<seconds>` sets an explicit budget; unset, `0`, or
 /// `false` disables (the default — the pass re-executes every certificate
 /// obligation on a fresh solver, which costs extra wall-clock). Fail-closed:
 /// any replay failure keeps the metadata-only evidence unchanged.
 fn chc_checked_replay_budget() -> Option<Duration> {
-    let raw = std::env::var("AY_CHC_CHECKED_REPLAY").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("false") {
-        return None;
-    }
-    let secs = trimmed.parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(10);
-    Some(Duration::from_secs(secs))
+    // B41: `--chc-checked-replay <secs>`; unset/0 keeps metadata-only
+    // evidence.
+    ay_core::misc_cli_flags()
+        .chc_checked_replay_secs
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
 }
 
 /// Attempt the opt-in CHECKED replay pass and return the upgraded

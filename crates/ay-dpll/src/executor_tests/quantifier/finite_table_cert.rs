@@ -157,6 +157,17 @@ fn finite_table_cert_grants_free_constant_bound() {
 
 /// Two foralls sharing a symbol: ONE interpretation (shared default vector)
 /// must satisfy both simultaneously.
+///
+/// REPINNED after 161d781cc (fix(proof): certify nested integer decrease
+/// obligations) — verified by running this test at 161d781cc (fails) and its
+/// parent b5a635d06 (passes). The widened authored-linear certification now
+/// discharges the demand search's successor-instance refutation INLINE
+/// (`--debug-cert` shows the instance sub-solves classifying `Unsat` with no
+/// parked residue), so the search completes without parking and the exact
+/// public-root table RESCUE — the previously pinned route — is never needed.
+/// The user-visible contract is unchanged and still pinned: `sat`, and ONE
+/// shared interpretation printed for both foralls. The route pins flip to the
+/// new contract: nothing parks, so no rescue grant and no parked stat.
 #[test]
 fn finite_table_cert_grants_shared_symbol_two_foralls() {
     let commands = parse(
@@ -181,15 +192,17 @@ fn finite_table_cert_grants_shared_symbol_two_foralls() {
         outputs.get(1).map(String::as_str),
         Some("(((f 2) 3) ((f 99) 0) ((g 2) 0) ((g 99) 0))")
     );
-    assert!(
-        exec.finite_table_cert_grant_active,
-        "the shared interpretation must be carried by exact table authority"
-    );
     assert_eq!(
         exec.statistics()
             .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
-        Some(1),
-        "this regression must exercise exact-root certification after demand search parks a successor instance"
+        None,
+        "since 161d781cc the successor instance is refuted inline, so the \
+         demand search completes without parking and the table rescue is \
+         never engaged"
+    );
+    assert!(
+        !exec.finite_table_cert_grant_active,
+        "no parked residue means the exact-table rescue lane must stay idle"
     );
 }
 
@@ -216,6 +229,12 @@ fn finite_table_cert_shared_symbol_ground_conflict_never_sat() {
 /// Direct assumption solving captures the same immutable base snapshot as
 /// plain check-sat and appends the active literal to the exact public root
 /// vector used by the rescue and final postflight.
+///
+/// REPINNED after 161d781cc — same mechanism and evidence as
+/// [`finite_table_cert_grants_shared_symbol_two_foralls`]: the successor
+/// instance now refutes inline, nothing parks, and the rescue is never
+/// engaged. The direct-assumption route's user-visible contract (`sat` with
+/// the active literal honored) is unchanged and stays pinned.
 #[test]
 fn finite_table_cert_assumption_is_in_public_rescue_root_window() {
     let commands = parse(
@@ -239,8 +258,10 @@ fn finite_table_cert_assumption_is_in_public_rescue_root_window() {
     assert_eq!(
         exec.statistics()
             .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
-        Some(1),
-        "the direct-assumption route must reach the exact public-root rescue"
+        None,
+        "since 161d781cc the successor instance is refuted inline on the \
+         direct-assumption route too, so nothing parks and the rescue is \
+         never engaged"
     );
 }
 
@@ -248,6 +269,12 @@ fn finite_table_cert_assumption_is_in_public_rescue_root_window() {
 /// but its affine table model stays Pending until the outer plain SAT funnel
 /// consumes it. A second emission would treat Installed transport as stale and
 /// lose this satisfiable query to Unknown.
+///
+/// REPINNED after 161d781cc — same mechanism and evidence as
+/// [`finite_table_cert_grants_shared_symbol_two_foralls`]: the successor
+/// instance now refutes inline, nothing parks, and no exact-root transport is
+/// left for an outer emission. The user-visible contract (`sat` and the one
+/// shared interpretation) is unchanged and stays pinned.
 #[test]
 fn finite_table_cert_named_core_redirect_emits_pending_model_once() {
     let commands = parse(
@@ -276,8 +303,10 @@ fn finite_table_cert_named_core_redirect_emits_pending_model_once() {
     assert_eq!(
         exec.statistics()
             .get_int("quantifier.demand.exact_root_theorem_superseded_parked"),
-        Some(1),
-        "the named-core redirect must leave exact-root transport for one outer emission"
+        None,
+        "since 161d781cc the successor instance is refuted inline on the \
+         named-core redirect too, so nothing parks and no exact-root \
+         transport is left for an outer emission"
     );
 }
 
@@ -461,7 +490,7 @@ fn finite_table_cert_fail_closed_residual_mentions_x() {
 /// view to `∀x,y. f(x)+g(y) >= 0`; at publication the (#p2-default-row)
 /// certificate peels the exact authored tower read-only and checks that same
 /// multi-binder obligation without changing its root identity. This now
-/// decides `sat` (matching z3; verified with AY_DEBUG_CERT: the grant is
+/// decides `sat` (matching z3; verified with --debug-cert: the grant is
 /// `CERT/default-row`, NOT the finite-table certificate, whose single-binder
 /// gate is unchanged). The model is real: `f = ite(x=0,1,d_f)`,
 /// `g = ite(y=0,1,d_g)` with `d_f = d_g = 0` passes the z3 re-assert gate.
@@ -489,7 +518,7 @@ fn finite_table_cert_fail_closed_nested_quantifier() {
 /// Shifted UF argument `f(x+1)` (adversarial item, argument-shape guard):
 /// semantically equivalent to `f(x) >= 0` but outside the bare-`f(x)` class,
 /// which the finite-table scan still rejects (`finite_table_scan_body`'s
-/// xdep-argument guard; AY_DEBUG_CERT shows no finite-table grant here).
+/// xdep-argument guard; --debug-cert shows no finite-table grant here).
 ///
 /// The `sat` this now reports comes from a DIFFERENT sound lane: the CEGQI
 /// UF-graph model-pin certificate (#cegqi-mdef v2, b517b967) reached through

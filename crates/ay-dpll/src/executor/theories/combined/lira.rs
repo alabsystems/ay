@@ -120,10 +120,16 @@ impl Executor {
         // cannot be derived by the lazy ArraySolver alone.
         // Include assumption terms in the reachable set (#6736).
         {
+            let saved_assertions = std::mem::replace(&mut self.ctx.assertions, final_assertions);
+            let _ = self.add_finite_index_array_closure_with_roots(&assumption_terms);
             let axiom_start = self.ctx.assertions.len();
             self.run_array_axiom_full_fixpoint_at_with_roots(axiom_start, &assumption_terms);
-            final_assertions.extend(self.ctx.assertions.drain(axiom_start..));
+            let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
+            final_assertions = std::mem::replace(&mut self.ctx.assertions, saved_assertions);
+            final_assertions.extend(generated_axioms);
         }
+        final_assertions =
+            self.close_finite_arrays_in_owned_assertion_window(final_assertions, &assumption_terms);
         let proof_provenance = ProofProblemAssertionProvenance::from_sources(
             assertions.to_vec(),
             &final_assertions,
@@ -584,10 +590,17 @@ impl Executor {
 
         // Eager array axioms for soundness (#4304, #5086, #6282)
         {
+            let saved_assertions =
+                std::mem::replace(&mut self.ctx.assertions, preprocessed_assertions);
+            let _ = self.add_finite_index_array_closure();
             let axiom_start = self.ctx.assertions.len();
             self.run_array_axiom_full_fixpoint_at(axiom_start);
-            preprocessed_assertions.extend(self.ctx.assertions.drain(axiom_start..));
+            let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
+            preprocessed_assertions = std::mem::replace(&mut self.ctx.assertions, saved_assertions);
+            preprocessed_assertions.extend(generated_axioms);
         }
+        preprocessed_assertions =
+            self.close_finite_arrays_in_owned_assertion_window(preprocessed_assertions, &[]);
         proof_provenance = ProofProblemAssertionProvenance::from_sources(
             proof_provenance.original_problem_assertions,
             &preprocessed_assertions,

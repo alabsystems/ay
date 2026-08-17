@@ -824,7 +824,8 @@ pub unsafe extern "C" fn Z3_rcf_mk_rational(c: Z3_context, val: Z3_string) -> Z3
 /// `c` must be a valid `Z3_context` pointer (or null).
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_mk_small_int(c: Z3_context, val: c_int) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_mk_rational.
+    // SAFETY: a non-null `c` is a live context by the API contract;
+    // `ffi_guard_ptr` rejects null and contains panics while allocating the result.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let r = RealScalar::Rational(BigRational::from_integer(BigInt::from(val)));
@@ -844,7 +845,8 @@ pub unsafe extern "C" fn Z3_rcf_mk_small_int(c: Z3_context, val: c_int) -> Z3_rc
 /// `c` must be a valid `Z3_context` pointer (or null).
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_mk_pi(c: Z3_context) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_mk_rational.
+    // SAFETY: a non-null `c` is a live context by the API contract;
+    // `ffi_guard_ptr` rejects null and contains panics while allocating the result.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             produce_num(
@@ -870,7 +872,8 @@ pub unsafe extern "C" fn Z3_rcf_mk_pi(c: Z3_context) -> Z3_rcf_num {
 /// `c` must be a valid `Z3_context` pointer (or null).
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_mk_e(c: Z3_context) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_mk_rational.
+    // SAFETY: a non-null `c` is a live context by the API contract;
+    // `ffi_guard_ptr` rejects null and contains panics while allocating the result.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             produce_num(
@@ -917,7 +920,8 @@ fn next_infinitesimal_index(ctx: &Z3Context) -> c_uint {
 /// `c` must be a valid `Z3_context` pointer (or null).
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_mk_infinitesimal(c: Z3_context) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_mk_rational.
+    // SAFETY: a non-null `c` is a live context by the API contract;
+    // `ffi_guard_ptr` rejects null and contains panics while allocating the result.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let index = next_infinitesimal_index(ctx);
@@ -1020,7 +1024,8 @@ pub unsafe extern "C" fn Z3_rcf_mk_roots(
 /// null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a`/`b` live handles.
+/// `c` must be a valid `Z3_context` pointer (or null); `a` and `b`, when
+/// non-null, must be live handles allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_add(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> Z3_rcf_num {
     // SAFETY: see Z3_rcf_mk_rational; `a`/`b` are live handles per contract.
@@ -1039,10 +1044,12 @@ pub unsafe extern "C" fn Z3_rcf_add(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num)
 /// mix or engine cap → `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a`/`b` live handles.
+/// `c` must be a valid `Z3_context` pointer (or null); non-null `a` and `b`
+/// must be live handles allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_sub(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and each non-null operand was
+    // allocated by it; the closure rejects null operands and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let (Some(x), Some(y)) = (rcf_ref(a), rcf_ref(b)) else {
@@ -1060,10 +1067,12 @@ pub unsafe extern "C" fn Z3_rcf_sub(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num)
 /// → `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a`/`b` live handles.
+/// `c` must be a valid `Z3_context` pointer (or null); `a` and `b`, when
+/// non-null, must be live handles allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_mul(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and each non-null operand was
+    // allocated by it; the closure rejects null operands and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let (Some(x), Some(y)) = (rcf_ref(a), rcf_ref(b)) else {
@@ -1080,10 +1089,12 @@ pub unsafe extern "C" fn Z3_rcf_mul(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num)
 /// `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a`/`b` live handles.
+/// `c` must be a valid `Z3_context` pointer (or null); `a` and `b`, when
+/// non-null, must be live handles allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_div(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and each non-null operand was
+    // allocated by it; the closure rejects null operands and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let (Some(x), Some(y)) = (rcf_ref(a), rcf_ref(b)) else {
@@ -1099,10 +1110,12 @@ pub unsafe extern "C" fn Z3_rcf_div(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num)
 /// Return `-a`. REAL exact negation (total over every numeral kind).
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a` a live handle.
+/// `c` must be a valid `Z3_context` pointer (or null); non-null `a` must be a
+/// live handle allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_neg(c: Z3_context, a: Z3_rcf_num) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and non-null `a` was allocated
+    // by it; the closure rejects a null operand and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let Some(x) = rcf_ref(a) else {
@@ -1121,10 +1134,12 @@ pub unsafe extern "C" fn Z3_rcf_neg(c: Z3_context, a: Z3_rcf_num) -> Z3_rcf_num 
 /// `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a` a live handle.
+/// `c` must be a valid `Z3_context` pointer (or null); non-null `a` must be a
+/// live handle allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_inv(c: Z3_context, a: Z3_rcf_num) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and non-null `a` was allocated
+    // by it; the closure rejects a null operand and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let Some(x) = rcf_ref(a) else {
@@ -1142,10 +1157,12 @@ pub unsafe extern "C" fn Z3_rcf_inv(c: Z3_context, a: Z3_rcf_num) -> Z3_rcf_num 
 /// `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` must be a valid `Z3_context` pointer (or null); `a` a live handle.
+/// `c` must be a valid `Z3_context` pointer (or null); non-null `a` must be a
+/// live handle allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_power(c: Z3_context, a: Z3_rcf_num, k: c_uint) -> Z3_rcf_num {
-    // SAFETY: see Z3_rcf_add.
+    // SAFETY: the caller guarantees `c` is valid and non-null `a` was allocated
+    // by it; the closure rejects a null operand and the guard contains panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             if k > MAX_FFI_ALGEBRAIC_EXPONENT {
@@ -1185,7 +1202,8 @@ pub unsafe extern "C" fn Z3_rcf_power(c: Z3_context, a: Z3_rcf_num, k: c_uint) -
 /// default that reads as a real ordering).
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 unsafe fn rcf_cmp(
     c: Z3_context,
     a: Z3_rcf_num,
@@ -1217,40 +1235,48 @@ unsafe fn rcf_cmp(
 /// Return `true` if `a < b`. REAL exact ordering; cap → `Z3_EXCEPTION` + false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_lt(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_lt", |o| o == Ordering::Less) }
 }
 
 /// Return `true` if `a > b`. REAL exact ordering; cap → `Z3_EXCEPTION` + false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_gt(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_gt", |o| o == Ordering::Greater) }
 }
 
 /// Return `true` if `a <= b`. REAL exact ordering; cap → `Z3_EXCEPTION` + false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_le(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_le", |o| o != Ordering::Greater) }
 }
 
 /// Return `true` if `a >= b`. REAL exact ordering; cap → `Z3_EXCEPTION` + false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_ge(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_ge", |o| o != Ordering::Less) }
 }
 
@@ -1258,10 +1284,12 @@ pub unsafe extern "C" fn Z3_rcf_ge(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) 
 /// + false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_eq(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_eq", |o| o == Ordering::Equal) }
 }
 
@@ -1269,10 +1297,12 @@ pub unsafe extern "C" fn Z3_rcf_eq(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) 
 /// false.
 ///
 /// # Safety
-/// `c` valid or null; `a`/`b` live handles.
+/// `c` must be valid or null; non-null `a` and `b` must be live handles
+/// allocated by this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_neq(c: Z3_context, a: Z3_rcf_num, b: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_cmp.
+    // SAFETY: the caller guarantees both non-null operands are live handles
+    // from `c`; `rcf_cmp` rejects null before applying this predicate.
     unsafe { rcf_cmp(c, a, b, "Z3_rcf_neq", |o| o != Ordering::Equal) }
 }
 
@@ -1333,7 +1363,8 @@ fn inf_string(index: c_uint, series: &BTreeMap<i64, BigRational>) -> String {
 /// Cap → `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_num_to_string(
     c: Z3_context,
@@ -1385,7 +1416,8 @@ pub unsafe extern "C" fn Z3_rcf_num_to_string(
 /// exponent (infinite magnitude) or a cap → `Z3_EXCEPTION` + null.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_num_to_decimal_string(
     c: Z3_context,
@@ -1636,7 +1668,8 @@ pub unsafe extern "C" fn Z3_rcf_get_numerator_denominator(
 /// false.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 unsafe fn rcf_classify(
     c: Z3_context,
     a: Z3_rcf_num,
@@ -1669,10 +1702,12 @@ unsafe fn rcf_classify(
 /// Lindemann) and ε-series (not real numbers at all) are exactly `false`.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_is_rational(c: Z3_context, a: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_classify.
+    // SAFETY: the caller guarantees non-null `a` is a live handle from `c`;
+    // `rcf_classify` rejects null before inspecting its numeric variant.
     unsafe {
         rcf_classify(c, a, "Z3_rcf_is_rational", |n| match n {
             RcfNum::Real(s) => rcf_api::is_rational(s),
@@ -1689,10 +1724,12 @@ pub unsafe extern "C" fn Z3_rcf_is_rational(c: Z3_context, a: Z3_rcf_num) -> boo
 /// `false`.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_is_algebraic(c: Z3_context, a: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_classify.
+    // SAFETY: the caller guarantees non-null `a` is a live handle from `c`;
+    // `rcf_classify` rejects null before inspecting its numeric variant.
     unsafe {
         rcf_classify(c, a, "Z3_rcf_is_algebraic", |n| match n {
             RcfNum::Real(s) => rcf_api::is_rational(s).map(|r| !r),
@@ -1710,10 +1747,12 @@ pub unsafe extern "C" fn Z3_rcf_is_algebraic(c: Z3_context, a: Z3_rcf_num) -> bo
 /// are exactly `false`.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_is_infinitesimal(c: Z3_context, a: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_classify.
+    // SAFETY: the caller guarantees non-null `a` is a live handle from `c`;
+    // `rcf_classify` rejects null before inspecting its numeric variant.
     unsafe {
         rcf_classify(c, a, "Z3_rcf_is_infinitesimal", |n| {
             Some(matches!(n, RcfNum::Infinitesimal { .. }))
@@ -1728,10 +1767,12 @@ pub unsafe extern "C" fn Z3_rcf_is_infinitesimal(c: Z3_context, a: Z3_rcf_num) -
 /// and ε-series are exactly `false`.
 ///
 /// # Safety
-/// `c` valid or null; `a` a live handle.
+/// `c` must be valid or null; non-null `a` must be a live handle allocated by
+/// this context.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_rcf_is_transcendental(c: Z3_context, a: Z3_rcf_num) -> bool {
-    // SAFETY: see rcf_classify.
+    // SAFETY: the caller guarantees non-null `a` is a live handle from `c`;
+    // `rcf_classify` rejects null before inspecting its numeric variant.
     unsafe {
         rcf_classify(c, a, "Z3_rcf_is_transcendental", |n| {
             Some(matches!(n, RcfNum::Transcendental { .. }))

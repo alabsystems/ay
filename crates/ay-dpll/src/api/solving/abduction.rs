@@ -100,6 +100,7 @@ impl Solver {
         for v in vocabulary {
             self.expect_bool("abduce", *v)?;
         }
+        self.clear_last_solve_state(true, false);
         self.reject_composite_bv_cnf_export("abduce")?;
 
         // Step 1: Check if goal is already implied by current assertions.
@@ -202,6 +203,7 @@ impl Solver {
         for pp in patch_points {
             self.expect_bool("synthesize_patch", *pp)?;
         }
+        self.clear_last_solve_state(true, false);
         self.reject_composite_bv_cnf_export("synthesize_patch")?;
 
         if patch_points.is_empty() {

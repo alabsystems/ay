@@ -47,7 +47,7 @@ fn standalone_pb_stats_json_uses_shared_metadata_shape() {
         // path's per-phase `pb_portfolio_*_ms` stats schema, which the
         // parallel track (now the multi-core default) deliberately omits
         // (`portfolio_timings: None`, as it always has when enabled).
-        .env("AY_PB_PARALLEL", "0")
+        .args(["--pb-parallel", "0"])
         .output()
         .expect("spawn standalone ay-pb binary");
 
@@ -148,7 +148,7 @@ fn standalone_pb_stats_json_current_mode_reports_candidate_fail_closed() {
         .env("AY_COMPETITION_JIT_MODE", "current")
         // Pin the sequential route so the assertions below are deterministic
         // regardless of the host's parallel default.
-        .env("AY_PB_PARALLEL", "0")
+        .args(["--pb-parallel", "0"])
         .output()
         .expect("spawn standalone ay-pb binary");
 
@@ -209,7 +209,7 @@ fn standalone_pb_stats_json_current_mode_reports_candidate_fail_closed() {
 }
 
 /// Companion to `standalone_pb_stats_json_uses_shared_metadata_shape`: the
-/// PARALLEL route's stats envelope is a pinned contract too. `AY_PB_PARALLEL=4`
+/// PARALLEL route's stats envelope is a pinned contract too. `the --pb-parallel policy=4`
 /// forces the parallel portfolio deterministically (regardless of the host's
 /// default), and the same decision fixture must produce the shared envelope
 /// (`mode`/`result`/`wall_time_ms`/`ay_build`) on exactly one stderr JSON line —
@@ -235,7 +235,7 @@ fn standalone_pb_stats_json_parallel_route_keeps_shared_envelope() {
         .env_remove("AY_COMPETITION_JIT_MODE")
         // Deterministically parallel with a fixed worker count, regardless of
         // the host's default or core count.
-        .env("AY_PB_PARALLEL", "4")
+        .args(["--pb-parallel", "4"])
         .output()
         .expect("spawn standalone ay-pb binary");
 

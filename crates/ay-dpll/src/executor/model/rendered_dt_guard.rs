@@ -25,6 +25,7 @@ use super::rendered_dt_limits::{
 pub(super) struct RenderedDatatypeGuard {
     schemas: Option<HashMap<String, DatatypeSchema>>,
     exact_by_sort: RefCell<HashMap<Sort, bool>>,
+    exact_array_cell_by_sort: RefCell<HashMap<Sort, bool>>,
 }
 
 struct DatatypeSchema {
@@ -103,6 +104,7 @@ impl RenderedDatatypeGuard {
         Self {
             schemas: Some(schemas),
             exact_by_sort: RefCell::new(HashMap::default()),
+            exact_array_cell_by_sort: RefCell::new(HashMap::default()),
         }
     }
 
@@ -110,6 +112,7 @@ impl RenderedDatatypeGuard {
         Self {
             schemas: None,
             exact_by_sort: RefCell::new(HashMap::default()),
+            exact_array_cell_by_sort: RefCell::new(HashMap::default()),
         }
     }
 
@@ -127,6 +130,24 @@ impl RenderedDatatypeGuard {
         }
     }
 
+    /// Whether `sort` names a datatype this guard holds a bounded schema for.
+    ///
+    /// This is the CONSTRUCTION eligibility bar (#dt-opaque-app-model):
+    /// total-DT construction produces typed [`ay_model_check::ModelValue`]s
+    /// that the strict oracles and the independent gate evaluate directly, so
+    /// it needs a bounded registered schema but NOT the exact rendered
+    /// round-trip fragment. Requiring [`Self::is_exact`] here (as the original
+    /// opaque-lane landing did) silently excluded every datatype with a scalar
+    /// payload field (e.g. `Cons(hd: Int, tl: List)`): construction bailed
+    /// entirely, other completion passes still committed structured values for
+    /// sibling cells, and the independent gate — comparing an opaque carrier
+    /// against a structured value — had to fail the whole SAT verdict closed.
+    /// Rendering-dependent consumers (`exact_datatype_cell_completions`, the
+    /// rendered-value parsers) each re-check `is_exact` per value themselves.
+    pub(super) fn is_registered(&self, sort: &Sort) -> bool {
+        self.datatype_name(sort).is_some()
+    }
+
     pub(super) fn is_exact(&self, sort: &Sort) -> bool {
         if self.datatype_name(sort).is_none() {
             return false;
@@ -134,8 +155,28 @@ impl RenderedDatatypeGuard {
         if let Some(exact) = self.exact_by_sort.borrow().get(sort) {
             return *exact;
         }
-        let exact = self.compute_exact(sort);
+        let exact = self.compute_exact(sort, false);
         self.exact_by_sort.borrow_mut().insert(sort.clone(), exact);
+        exact
+    }
+
+    /// Whether one already-rendered, size-bounded array cell can be parsed
+    /// exactly into this datatype. This keeps the ordinary opaque-completion
+    /// fragment unchanged while admitting integer payloads at the array-model
+    /// consumer boundary: unlike schema-driven completion, this path has the
+    /// concrete rendered integer in hand and the global S-expression byte/node
+    /// limits bound its `BigInt` parse.
+    pub(super) fn is_exact_array_cell(&self, sort: &Sort) -> bool {
+        if self.datatype_name(sort).is_none() {
+            return false;
+        }
+        if let Some(exact) = self.exact_array_cell_by_sort.borrow().get(sort) {
+            return *exact;
+        }
+        let exact = self.compute_exact(sort, true);
+        self.exact_array_cell_by_sort
+            .borrow_mut()
+            .insert(sort.clone(), exact);
         exact
     }
 
@@ -159,7 +200,7 @@ impl RenderedDatatypeGuard {
             })
     }
 
-    fn compute_exact(&self, sort: &Sort) -> bool {
+    fn compute_exact(&self, sort: &Sort, allow_bounded_int: bool) -> bool {
         let Some(schemas) = self.schemas.as_ref() else {
             return false;
         };
@@ -193,6 +234,7 @@ impl RenderedDatatypeGuard {
                     schemas,
                     constructor,
                     depth,
+                    allow_bounded_int,
                     &mut stack,
                     &mut nodes,
                     &mut static_render_bytes,
@@ -217,6 +259,7 @@ fn check_constructor(
     schemas: &HashMap<String, DatatypeSchema>,
     constructor: &GuardConstructor,
     depth: usize,
+    allow_bounded_int: bool,
     stack: &mut Vec<(String, usize)>,
     nodes: &mut usize,
     static_render_bytes: &mut usize,
@@ -233,6 +276,12 @@ fn check_constructor(
         }
         match field_sort {
             Sort::Bool => {}
+            // An integer sort has no schema-level width bound, so it stays out
+            // of ordinary opaque completion. At the array-cell consumer the
+            // concrete rendered value is already protected by
+            // `rendered_sexp_within_limits`, making its exact `BigInt` parse
+            // bounded without granting schema-driven synthesis authority.
+            Sort::Int if allow_bounded_int => {}
             Sort::BitVec(bitvec) => {
                 if bitvec.width > 256 {
                     return None;

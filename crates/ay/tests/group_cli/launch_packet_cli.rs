@@ -273,8 +273,13 @@ fn launch_packet_bench_progress_every_is_numeric() {
     let reference_solver = write_fake_reference_solver(&repo, "ref-solver");
 
     let output = Command::new(ay_binary())
-        .env("AY_BENCH_PROGRESS_EVERY", "7")
-        .args(["launch-packet", "--metadata-only", "--repo-root"])
+        .args([
+            "launch-packet",
+            "--progress-every",
+            "7",
+            "--metadata-only",
+            "--repo-root",
+        ])
         .arg(repo.path())
         .arg("--ay")
         .arg(ay_binary())
@@ -300,8 +305,13 @@ fn launch_packet_rejects_invalid_bench_progress_every_like_shell() {
     let reference_solver = write_fake_reference_solver(&repo, "ref-solver");
 
     let output = Command::new(ay_binary())
-        .env("AY_BENCH_PROGRESS_EVERY", "0")
-        .args(["launch-packet", "--metadata-only", "--repo-root"])
+        .args([
+            "launch-packet",
+            "--progress-every",
+            "0",
+            "--metadata-only",
+            "--repo-root",
+        ])
         .arg(repo.path())
         .arg("--ay")
         .arg(ay_binary())
@@ -320,7 +330,7 @@ fn launch_packet_rejects_invalid_bench_progress_every_like_shell() {
     );
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("AY_BENCH_PROGRESS_EVERY must be a positive integer"),
+            .contains("--progress-every must be a positive integer"),
         "stderr should explain the invalid progress interval:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );

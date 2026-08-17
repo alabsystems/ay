@@ -5,7 +5,7 @@
 //! Provenance-authenticated repair of formula-level arithmetic ITE leaves.
 //!
 //! Rebuilds substitution-derived ITE leaves from exact preprocessing sources,
-//! checked ITE rules, and independently replayed Farkas implications.
+//! checked ITE/equality rules, and independently replayed Farkas implications.
 
 use ay_core::term::TermData;
 use ay_core::{FarkasAnnotation, Sort, Symbol, TermId, TheoryLemmaKind};
@@ -13,6 +13,7 @@ use ay_frontend::command::Term as FrontendTerm;
 
 use super::proof_farkas_validation::blocking_clause_to_conflict;
 use super::proof_surface_syntax::strip_frontend_annotations;
+use super::proof_trust_surgery_ite_branch::ProvenanceBranchLemma;
 use super::proof_trust_surgery_provenance::{
     branch_resolution_shape_unambiguous, complement_of, retained_original_rows_are_signable,
     source_set_is_exactly_authored, surface_arithmetic_ite_matches, surface_source_is_bounded,
@@ -21,8 +22,8 @@ use super::proof_trust_surgery_provenance::{
 use super::Executor;
 
 /// A provenance-authenticated formula-level ITE consequence whose branch
-/// implications are independently synthesized and replayed as Farkas proofs.
-pub(super) struct ProvenanceItePlan {
+/// implications are independently synthesized and replayed.
+pub(in crate::executor) struct ProvenanceItePlan {
     pub(super) orig: TermId,
     pub(super) defining_source: Option<TermId>,
     pub(super) cond: TermId,
@@ -33,8 +34,8 @@ pub(super) struct ProvenanceItePlan {
     pub(super) goal: TermId,
     pub(super) supports: Vec<TermId>,
     pub(super) source: ProvenanceIteSource,
-    pub(super) then_lemma: ProvenanceFarkasLemma,
-    pub(super) else_lemma: ProvenanceFarkasLemma,
+    pub(super) then_lemma: ProvenanceBranchLemma,
+    pub(super) else_lemma: ProvenanceBranchLemma,
 }
 
 pub(super) enum ProvenanceIteSource {
@@ -61,7 +62,7 @@ pub(super) struct ProvenanceFarkasLemma {
 impl Executor {
     /// Recognize a formula-level arithmetic ITE consequence using only the
     /// exact, unique preprocessing source set recorded for this goal.
-    pub(super) fn plan_provenance_ite_lift(
+    pub(in crate::executor) fn plan_provenance_ite_lift(
         &mut self,
         clause: &[TermId],
         originals: &[(TermId, FrontendTerm)],
@@ -192,8 +193,8 @@ impl Executor {
                 goal,
                 supports,
                 source: ProvenanceIteSource::Formula,
-                then_lemma,
-                else_lemma,
+                then_lemma: then_lemma.into(),
+                else_lemma: else_lemma.into(),
             });
         }
 
@@ -283,7 +284,7 @@ impl Executor {
                     return None;
                 }
                 let Some(then_lemma) =
-                    self.plan_provenance_farkas_implication(eq_then, &lemma_supports, lifted_then)
+                    self.plan_defined_branch_transfer(eq_then, &lemma_supports, lifted_then)
                 else {
                     continue;
                 };
@@ -294,19 +295,19 @@ impl Executor {
                     return None;
                 }
                 let Some(else_lemma) =
-                    self.plan_provenance_farkas_implication(eq_else, &lemma_supports, lifted_else)
+                    self.plan_defined_branch_transfer(eq_else, &lemma_supports, lifted_else)
                 else {
                     continue;
                 };
                 if !retained_original_rows_are_signable(
                     &mut self.ctx,
-                    &then_lemma.supports,
+                    then_lemma.supports(),
                     originals,
                     source_index,
                     planning,
                 ) || !retained_original_rows_are_signable(
                     &mut self.ctx,
-                    &else_lemma.supports,
+                    else_lemma.supports(),
                     originals,
                     source_index,
                     planning,
@@ -320,14 +321,14 @@ impl Executor {
                     not_cond,
                     eq_then,
                     lifted_then,
-                    &then_lemma.clause,
+                    then_lemma.clause(),
                 ) || !branch_resolution_shape_unambiguous(
                     &mut self.ctx.terms,
                     goal,
                     cond,
                     eq_else,
                     lifted_else,
-                    &else_lemma.clause,
+                    else_lemma.clause(),
                 ) {
                     continue;
                 }
@@ -369,6 +370,28 @@ impl Executor {
         conclusion: TermId,
     ) -> Option<ProvenanceFarkasLemma> {
         self.plan_provenance_farkas(source, supports, Some(conclusion))
+    }
+
+    fn plan_defined_branch_transfer(
+        &mut self,
+        source: TermId,
+        supports: &[TermId],
+        conclusion: TermId,
+    ) -> Option<ProvenanceBranchLemma> {
+        if let Some(lemma) = self.plan_provenance_farkas_implication(source, supports, conclusion) {
+            return Some(lemma.into());
+        }
+        let mut clause: Vec<TermId> = std::iter::once(source)
+            .chain(supports.iter().copied())
+            .map(|term| complement_of(&mut self.ctx.terms, term))
+            .collect();
+        clause.push(conclusion);
+        ay_proof::recognize_euf_transitive(&self.ctx.terms, &clause).then(|| {
+            ProvenanceBranchLemma::Transitive {
+                clause,
+                supports: supports.to_vec(),
+            }
+        })
     }
 
     /// Synthesize and replay `source ∧ supports => false` as a minimal

@@ -14,6 +14,8 @@ use super::super::Executor;
 use crate::executor_types::Result;
 use crate::executor_types::SolveResult;
 
+#[cfg(test)]
+mod scaled_product_tests;
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;

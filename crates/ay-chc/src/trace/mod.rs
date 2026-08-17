@@ -295,6 +295,17 @@ pub(crate) fn build_trace(
         // Also include trace_var itself
         step_model.insert(trace_var_name.to_string(), SmtValue::Int(_transition_id));
 
+        // TRP-learned transitions keep `__trp_n` free and `version_transition`
+        // versions it per step exactly like `trace_id`, so the SMT model
+        // carries `__trp_n@d`. Read it in like `trace_id`; otherwise every
+        // composed model in TRL `compress()` lacks the value the chained
+        // formula needs (debug: the "missing snd model value" assert; release:
+        // an under-specified model feeding `implicant_cube`).
+        let trp_n_at_d = versioned_name(crate::trl::TRP_N_VAR_NAME, d);
+        if let Some(val) = model.get(&trp_n_at_d) {
+            step_model.insert(crate::trl::TRP_N_VAR_NAME.to_string(), val.clone());
+        }
+
         // Get the rule formula for this transition
         let rule = match rule_map.get(&_transition_id) {
             Some(r) => r,

@@ -21,23 +21,21 @@ use super::MAX_SPLITS_LRA;
 mod tests;
 
 /// #warm-theory: whether the persistent-theory reuse lane is enabled
-/// (`AY_LRA_WARM_THEORY`). Cached; default OFF (byte-identical default path).
+/// (`--lra-warm-theory`). Cached; default OFF (byte-identical default path).
 fn lra_warm_theory_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AY_LRA_WARM_THEORY").is_ok_and(|v| v != "0" && !v.is_empty()))
+    *V.get_or_init(|| ay_core::misc_cli_flags().lra_warm_theory)
 }
 
 /// #lra-inc-engine (S1): whether to log the per-check-sat persistence counters
-/// on the incremental QF_LRA engine lane (`AY_LRA_INC_ENGINE_STATS`). Cached;
+/// on the incremental QF_LRA engine lane (`--lra-inc-engine-stats`). Cached;
 /// default OFF.
 fn inc_engine_stats_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_LRA_INC_ENGINE_STATS").is_ok_and(|v| v != "0" && !v.is_empty())
-    })
+    *V.get_or_init(|| ay_core::misc_cli_flags().lra_inc_engine_stats)
 }
 
-/// #lra-inc-engine S4 (`AY_LRA_INC_ENGINE_REVERIFY`): opt-in safety fallback that
+/// #lra-inc-engine S4 (`--lra-inc-engine-reverify`): opt-in safety fallback that
 /// re-enables the from-scratch Unsat re-verify (the S1 double-solve). Default OFF
 /// — the lane trusts its Unsat directly, which is ~1.8-3x faster. This is SOUND
 /// after the between-solve-GC reason guard (reduction_between_solves.rs
@@ -48,25 +46,23 @@ fn inc_engine_stats_enabled() -> bool {
 /// + a 272-check-sat push/pop differential fuzz vs z3.
 fn inc_engine_reverify_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_LRA_INC_ENGINE_REVERIFY").is_ok_and(|v| v != "0" && !v.is_empty())
-    })
+    *V.get_or_init(|| ay_core::misc_cli_flags().lra_inc_engine_reverify)
 }
 
-/// #lra-inc-engine S3 (`AY_LRA_INC_WARM`): persist the LraSolver across check-sats
+/// #lra-inc-engine S3 (`--dpll-no-lra-inc-warm`): persist the LraSolver across check-sats
 /// in the inc-engine lane so the deep-check `compute_implied_bounds` re-derivation
 /// becomes O(delta) (the base bounds + implied cache carry over; re-asserting an
 /// already-set bound is a non-tightening no-op). Default ON; set
-/// `AY_LRA_INC_WARM=0` to opt out. `AY_LRA_INC_ENGINE_REVERIFY=1` additionally
+/// `--dpll-no-lra-inc-warm` to opt out. `--lra-inc-engine-reverify` additionally
 /// checks an incremental UNSAT result against the from-scratch path.
 fn inc_engine_warm_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // DEFAULT-ON (opt out: AY_LRA_INC_WARM=0). Warm theory persists the LraSolver
+    // DEFAULT-ON (opt out: --dpll-no-lra-inc-warm). Warm theory persists the LraSolver
     // across check-sats so the deep-check compute_implied_bounds is O(delta); it
     // is a net win in the isolated (competition) config, sound without any
     // re-verify (0-wrong vs z3), with cascade-cap + adaptive-drop-after-SAT
     // neutralizing the alternating-file warm-start regression.
-    *V.get_or_init(|| !std::env::var("AY_LRA_INC_WARM").is_ok_and(|v| v == "0"))
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_lra_inc_warm)
 }
 
 /// #unguarded-tvalid-lemmas (`AY_LRA_INC_UNGUARDED_LEMMAS`): permanently retain
@@ -90,7 +86,7 @@ fn inc_engine_warm_on() -> bool {
 fn inc_engine_unguarded_lemmas_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("AY_LRA_INC_UNGUARDED_LEMMAS").is_ok_and(|v| v != "0" && !v.is_empty())
+        false // B23: never-set opt-in retired.
     })
 }
 
@@ -159,11 +155,11 @@ impl Executor {
             // (reset_search_state_incremental) instead of a full reset — level-0
             // trail / watches / VSIDS / learned clauses persist across check-sats
             // (the accumulated BMC unrolling is NOT re-solved from scratch). Default
-            // ON (opt out with AY_LRA_INC_ENGINE=0 or lra_inc_engine_override=false);
+            // ON (opt out with --dpll-no-lra-inc-engine or lra_inc_engine_override=false);
             // proof sessions never route here. 0-wrong is structural: Sat is re-validated against the
             // original assertions; Unsat is sound by the scope-selector
             // monotone-strengthening argument + the between-solve-GC reason guard.
-            // DEFAULT-ON for QF_LRA incremental (opt out: AY_LRA_INC_ENGINE=0).
+            // DEFAULT-ON for QF_LRA incremental (opt out: --dpll-no-lra-inc-engine).
             // The lane strictly out-solves the from-scratch standalone lane
             // (1.78x, last->beats-SMTInterpol) and is 0-wrong (10 real files +
             // ~1300 push/pop fuzz check-sats vs z3 + a 5-lens adversarial review);
@@ -174,8 +170,7 @@ impl Executor {
                 Some(v) => v,
                 None => {
                     static INC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    *INC_ENV
-                        .get_or_init(|| !std::env::var("AY_LRA_INC_ENGINE").is_ok_and(|v| v == "0"))
+                    *INC_ENV.get_or_init(|| !ay_core::theory_disable_flags().no_lra_inc_engine)
                 }
             };
             if inc_engine_on && !self.is_producing_proofs() {
@@ -214,7 +209,7 @@ impl Executor {
     ///
     /// SOUNDNESS (0-wrong is mandatory, and here structural):
     ///   * default ON for incremental QF_LRA, with proof sessions excluded
-    ///     (routed above) and `AY_LRA_INC_ENGINE=0` as the kill switch;
+    ///     (routed above) and `--dpll-no-lra-inc-engine` as the kill switch;
     ///   * scoped BVE disabled ⇒ the arena stays append-only ⇒ the incremental
     ///     reset never searches a projected `∃v.(clauses)` formula, and
     ///     `can_use_incremental_reset` still fails closed to a full ledger-rebuild
@@ -227,7 +222,7 @@ impl Executor {
     ///   * Unsat is structural: scope-selector pops only add units, the arena is
     ///     append-only, scoped BVE is disabled, and between-solve GC preserves
     ///     reason clauses, so retained learned clauses remain entailed;
-    ///     `AY_LRA_INC_ENGINE_REVERIFY=1` opts into the from-scratch standalone
+    ///     `--lra-inc-engine-reverify` opts into the from-scratch standalone
     ///     re-verification backstop ([`Self::reverify_unsat_via_standalone`]);
     ///   * any non-definite / error / scope-mismatch falls back to the standalone
     ///     lane, which owns the verdict.
@@ -330,10 +325,10 @@ impl Executor {
         // before the from-scratch fallback so it can resolve the check-sat
         // soundly. Purely a liveness knob — a tighter arm deadline can only turn
         // a would-be engine verdict into an earlier Unknown, which the sound
-        // fallback then resolves; never a wrong verdict. AY_LRA_INC_ENGINE_FULL=1
+        // fallback then resolves; never a wrong verdict. --dpll-no-lra-inc-engine-full=1
         // disables the slice (full budget, no double-solve) for A/B measurement
         // of the persistence win.
-        // #lra-inc-engine: DEFAULT-ON (opt out AY_LRA_INC_ENGINE_FULL=0). Give the
+        // #lra-inc-engine: DEFAULT-ON (opt out --dpll-no-lra-inc-engine-full). Give the
         // engine arm the FULL solve deadline instead of a ~2s slice. The slice was
         // a defensive "try-incremental-cheaply-then-fall-back" cap, but on the
         // scored hybrid_networks corpus it STARVES the incremental arm: it times out
@@ -349,7 +344,7 @@ impl Executor {
         // binary match it instead of running the crippled slice.
         fn inc_engine_full_budget() -> bool {
             static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *V.get_or_init(|| std::env::var("AY_LRA_INC_ENGINE_FULL").map_or(true, |v| v != "0"))
+            *V.get_or_init(|| !ay_core::theory_disable_flags().no_lra_inc_engine_full)
         }
         let inc_full_deadline = self.solve_deadline.get();
         if !inc_engine_full_budget() {
@@ -366,8 +361,8 @@ impl Executor {
         self.lra_persist_sat_active = true;
         // #lra-inc-engine S3 (warm theory): persist the LraSolver across check-sats
         // by default (the eager split-loop macro take/store), so the deep-check
-        // compute_implied_bounds becomes O(delta). AY_LRA_INC_WARM=0 opts out;
-        // AY_LRA_INC_ENGINE_REVERIFY=1 additionally checks incremental UNSAT against
+        // compute_implied_bounds becomes O(delta). --dpll-no-lra-inc-warm opts out;
+        // --lra-inc-engine-reverify additionally checks incremental UNSAT against
         // the from-scratch path.
         let _inc_warm_guard = crate::warm_theory_flag::WarmTheoryGuard::new(inc_engine_warm_on());
         let result = self.solve_lra_inc_engine_arm();
@@ -399,7 +394,7 @@ impl Executor {
             self.incr_theory_state = Some(st);
         }
 
-        // Optional persistence-proof logging (AY_LRA_INC_ENGINE_STATS=1): the
+        // Optional persistence-proof logging (--lra-inc-engine-stats): the
         // per-check-sat reset counters on the persistent solver are the objective
         // proof that SAT state persisted (incremental-reset hits growing while
         // full-reset hits stay ~constant ⇒ the accumulated formula was NOT
@@ -455,7 +450,7 @@ impl Executor {
                 // argument that makes the persist-SAT lane sound without a
                 // re-verify. Verified by a 5-lens adversarial review + 0-wrong on
                 // all 10 real files (331 check-sats) + a 272-check-sat push/pop
-                // fuzz. AY_LRA_INC_ENGINE_REVERIFY=1 re-enables the from-scratch
+                // fuzz. --lra-inc-engine-reverify re-enables the from-scratch
                 // re-verify as a safety fallback. (Sat is still re-validated
                 // against the original assertions via last_model_validated=false.)
                 if inc_engine_reverify_enabled() {
@@ -708,7 +703,7 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
 
-        // #warm-theory: when AY_LRA_WARM_THEORY is set, mark this solve so the
+        // #warm-theory: when --lra-warm-theory is set, mark this solve so the
         // persistent-theory pipeline reuses the LraSolver across check-sats. The
         // RAII guard restores the previous flag on return (incl. the internal
         // reverify's standalone call, which runs on a throwaway temp_state and so

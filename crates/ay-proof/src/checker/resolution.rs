@@ -76,6 +76,150 @@ pub(crate) fn is_valid_binary_resolution(
             .any(|pivot| resolves_to(&clause2_set, &clause1_set, *pivot, &conclusion_set))
 }
 
+/// Argument-free binary resolution, decided in O(total) for the common clean
+/// case and metered for the adversarial one.
+///
+/// EQUIVALENCE to the `None` form of [`is_valid_binary_resolution`] (the tested
+/// reference): the fast path returns `Ok(true)` ONLY when [`resolves_to`] — the
+/// exact predicate the reference search uses — accepts a candidate pivot, so it
+/// never admits a resolution the reference would reject. When no fast candidate
+/// is accepted, control falls through to the SAME exhaustive `resolves_to`
+/// search over both premises (in the same order), so it never rejects one the
+/// reference would accept. The fast path is a pure short-circuit: the verdict is
+/// identical to the reference for EVERY input, whatever the candidate analysis.
+///
+/// The set-difference identity behind the fast path: for any valid pivot `p`,
+/// `(S1 ∪ S2) \ conclusion ⊆ {p, ¬p}` — removing `p` from `S1` and `¬p` from
+/// `S2` is the only way the union can shrink to the conclusion — so at most two
+/// distinct difference literals bound the candidate pivots. More than two means
+/// no clean pivot pair exists and we skip straight to the metered fallback.
+///
+/// SOUNDNESS OF THE LOWERED CHARGE: the exhaustive fallback is the only
+/// super-linear work, and every pivot trial is debited through `progress`, so a
+/// pathological many-complementary-pair clause fails closed (`ResourceLimit`)
+/// instead of running unbounded. The caller's up-front precharge therefore no
+/// longer needs the `input * total` pivot-scan term.
+pub(crate) fn argfree_binary_resolution_metered(
+    terms: &TermStore,
+    clause1: &[TermId],
+    clause2: &[TermId],
+    conclusion: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<bool, ProofCheckError> {
+    let clause1_set = clause_as_set(terms, clause1);
+    let clause2_set = clause_as_set(terms, clause2);
+    let conclusion_set = clause_as_set(terms, conclusion);
+    // One pivot trial merges the two premises against the conclusion in one
+    // linear pass; charge that pass (and the one-time union/difference scan)
+    // before it runs so a refused meter fails closed mid-search.
+    let trial_cost = clause1_set
+        .len()
+        .saturating_add(clause2_set.len())
+        .saturating_add(conclusion_set.len())
+        .saturating_add(1);
+
+    if !progress(trial_cost, 0) {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+    // Fast path: candidate pivots from (S1 ∪ S2) \ conclusion, capped at three
+    // distinct literals (a valid clean pivot pair contributes at most two).
+    // The three sets are sorted+deduped, so the difference is one LINEAR
+    // three-pointer merge — never a per-literal search — bounded by the
+    // `trial_cost` (L + R + C + 1) already debited above.
+    let mut diff: Vec<SignedLiteral> = Vec::new();
+    let mut diff_overflow = false;
+    {
+        let mut i = 0usize;
+        let mut j = 0usize;
+        let mut k = 0usize;
+        while i < clause1_set.len() || j < clause2_set.len() {
+            // Next element of the sorted union `S1 ∪ S2`, consuming a shared
+            // literal from both sides at once.
+            let next = match (clause1_set.get(i), clause2_set.get(j)) {
+                (Some(&x), Some(&y)) if x < y => {
+                    i += 1;
+                    x
+                }
+                (Some(&x), Some(&y)) if y < x => {
+                    j += 1;
+                    y
+                }
+                (Some(&x), Some(_)) => {
+                    i += 1;
+                    j += 1;
+                    x
+                }
+                (Some(&x), None) => {
+                    i += 1;
+                    x
+                }
+                (None, Some(&y)) => {
+                    j += 1;
+                    y
+                }
+                (None, None) => break,
+            };
+            // Membership of `next` in the conclusion: advance the sorted cursor.
+            while k < conclusion_set.len() && conclusion_set[k] < next {
+                k += 1;
+            }
+            let in_conclusion = k < conclusion_set.len() && conclusion_set[k] == next;
+            if !in_conclusion {
+                diff.push(next);
+                if diff.len() > 2 {
+                    diff_overflow = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !diff_overflow {
+        let mut candidates: Vec<SignedLiteral> = Vec::with_capacity(4);
+        for &d in &diff {
+            candidates.push(d);
+            candidates.push(d.negated());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for candidate in candidates {
+            // Each orientation is one full `resolves_to` merge; debit each
+            // before it runs so the meter never trails the work.
+            if !progress(trial_cost, 0) {
+                return Err(ProofCheckError::ResourceLimit);
+            }
+            if resolves_to(&clause1_set, &clause2_set, candidate, &conclusion_set) {
+                return Ok(true);
+            }
+            if !progress(trial_cost, 0) {
+                return Err(ProofCheckError::ResourceLimit);
+            }
+            if resolves_to(&clause2_set, &clause1_set, candidate, &conclusion_set) {
+                return Ok(true);
+            }
+        }
+    }
+
+    // Metered fallback: the exact exhaustive search of the reference form, one
+    // metered pivot trial at a time so it fails closed on a pathological clause.
+    for &pivot in &clause1_set {
+        if !progress(trial_cost, 0) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        if resolves_to(&clause1_set, &clause2_set, pivot, &conclusion_set) {
+            return Ok(true);
+        }
+    }
+    for &pivot in &clause2_set {
+        if !progress(trial_cost, 0) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        if resolves_to(&clause2_set, &clause1_set, pivot, &conclusion_set) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn is_valid_rup_step(
     terms: &TermStore,
     clause: &[TermId],
@@ -182,6 +326,7 @@ pub(crate) fn validate_resolution_rule(
     clause: &[TermId],
     premise_clauses: &[&[TermId]],
     args: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
     if !args.is_empty() {
         return validate_pivot_directed_resolution_rule(
@@ -195,10 +340,23 @@ pub(crate) fn validate_resolution_rule(
     }
 
     if premise_clauses.len() != 2 {
-        return validate_chain_resolution_rule(terms, step_id, rule, clause, premise_clauses);
+        return validate_chain_resolution_rule(
+            terms,
+            step_id,
+            rule,
+            clause,
+            premise_clauses,
+            progress,
+        );
     }
 
-    if !is_valid_binary_resolution(terms, premise_clauses[0], premise_clauses[1], clause, None) {
+    if !argfree_binary_resolution_metered(
+        terms,
+        premise_clauses[0],
+        premise_clauses[1],
+        clause,
+        progress,
+    )? {
         return Err(ProofCheckError::InvalidResolution {
             step: step_id,
             rule: rule.name().to_string(),
@@ -294,6 +452,7 @@ pub(crate) fn validate_chain_resolution_rule(
     rule: &AletheRule,
     clause: &[TermId],
     premise_clauses: &[&[TermId]],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
     // Fewer than two premises is not a chain, it is a malformed step. Keep the
     // original arity error so the fail-closed posture (and its message) stands.
@@ -388,11 +547,51 @@ pub(crate) fn validate_chain_resolution_rule(
         }
         budget -= 1;
         let next = clause_as_set(terms, premise_clauses[idx]);
-        for resolvent in chain_resolve_candidates(&acc, &next, CHAIN_MAX_PAIRS_PER_LINK) {
-            stack.push((idx + 1, resolvent));
-        }
+        push_charged_chain_resolvents(progress, &mut stack, idx, &acc, &next)?;
     }
     Err(invalid())
+}
+
+/// Measure one ambiguity-search link before retaining any of its successors.
+///
+/// One binary-searched pivot scan plus at most
+/// `CHAIN_MAX_PAIRS_PER_LINK` filter-chain-sort resolvent builds costs
+/// `(|acc| + |next|) * log2 * 9`. Charging the actual link avoids the old
+/// two-orders-of-magnitude worst-case precharge while preserving fail-closed
+/// cancellation and allocation accounting.
+fn push_charged_chain_resolvents(
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+    stack: &mut Vec<(usize, Vec<SignedLiteral>)>,
+    idx: usize,
+    acc: &[SignedLiteral],
+    next: &[SignedLiteral],
+) -> Result<(), ProofCheckError> {
+    let link_literals = acc.len().saturating_add(next.len());
+    let work = link_literals
+        .saturating_mul(bit_width(link_literals))
+        .saturating_mul(CHAIN_MAX_PAIRS_PER_LINK + 1);
+    if !progress(work, literal_set_bytes(next.len())) {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+    for resolvent in chain_resolve_candidates(acc, next, CHAIN_MAX_PAIRS_PER_LINK) {
+        if !progress(resolvent.len(), literal_set_bytes(resolvent.len())) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        stack.push((idx + 1, resolvent));
+    }
+    Ok(())
+}
+
+/// Bytes retained by one decoded literal set of `len` literals: the elements
+/// themselves plus the `Vec` slack a `collect` can leave behind.
+fn literal_set_bytes(len: usize) -> usize {
+    len.saturating_mul(2 * size_of::<SignedLiteral>())
+}
+
+/// Comparison depth of a sort/binary search over `len` elements, never zero so
+/// a one-element link is still charged.
+fn bit_width(len: usize) -> usize {
+    usize::BITS as usize - len.leading_zeros() as usize + 1
 }
 
 /// Per-link branching allowance, and a flat base so short chains can still

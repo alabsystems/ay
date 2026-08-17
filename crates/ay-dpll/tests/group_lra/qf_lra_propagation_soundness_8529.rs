@@ -39,7 +39,7 @@ fn test_synched_base_release_unsat_8529() -> Result<()> {
     };
 
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/synched.base.smt2");
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!("SKIP: benchmark file not found: {}", path.display());
         return Ok(());
     }

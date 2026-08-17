@@ -94,7 +94,7 @@ const PROOF_CAPABILITY_REGISTRY: &[ProofCapability] = &[
     // chain dpr-trim (DRAT/DPR -> LPR) + cake_lpr on every UNSAT probe run
     // (14/14 incl. braun7/8/10/12, 5246b7b9, 296fd43e with 4-1353 substituted
     // vars). LRAT stays fail-closed until SCC LRAT IDs are checked (#8197).
-    // Kill-switch: AY_AB_DRAT_SUBST=0 restores the pre-unlock DRAT clamp (see
+    // Kill-switch: --sat-no-drat-subst restores the pre-unlock DRAT clamp (see
     // `transform_allowed`).
     ProofCapability::new(ProofTransform::Decompose, true, false),
     ProofCapability::new(ProofTransform::Factor, true, false),
@@ -124,11 +124,11 @@ const PROOF_CAPABILITY_REGISTRY: &[ProofCapability] = &[
     // DRAT (cong_equivs 54-300) end-to-end dpr-trim -> cake_lpr VERIFIED on
     // 4/4 UNSAT runs (braun8/10, 5246b7b9, 296fd43e), on top of the prior
     // 6/6 escape-hatch verifications (2026-07-09, wf_17e73a0f). SAT side:
-    // finalize_sat_fail audits green under AY_AB_CONGRUENCE=1 +
-    // AY_AB_DRAT_SUBST=1 with debug asserts armed, and congruence-fired SAT
+    // finalize_sat_fail audits green under (retired B36) +
+    // --sat-no-drat-subst=1 with debug asserts armed, and congruence-fired SAT
     // models validated externally against the original CNF (zero violations).
     // LRAT stays fail-closed until congruence LRAT hints are checked.
-    // Kill-switch: AY_AB_DRAT_SUBST=0 restores the DRAT clamp (see
+    // Kill-switch: --sat-no-drat-subst restores the DRAT clamp (see
     // `transform_allowed`). The feature itself remains OPT-IN on the Default
     // DIMACS route (0 measured flips — see variant.rs).
     ProofCapability::new(ProofTransform::Congruence, true, false),
@@ -176,9 +176,9 @@ pub(crate) fn transform_allowed(mode: ProofMode, transform: ProofTransform) -> b
     //
     //   unset (default)     -> registry truth: Decompose AND Congruence open
     //                          on DRAT.
-    //   AY_AB_DRAT_SUBST=0  -> kill-switch: force-clamp BOTH Decompose and
+    //   --sat-no-drat-subst  -> kill-switch: force-clamp BOTH Decompose and
     //                          Congruence on DRAT (pre-2026-07-09 behavior).
-    //   AY_AB_DRAT_SUBST=1  -> now redundant with the registry (kept for
+    //   --sat-no-drat-subst=1  -> now redundant with the registry (kept for
     //                          probe-script compatibility; it was the
     //                          congruence escape hatch before 2026-07-10).
     if matches!(mode, ProofMode::Drat)
@@ -187,10 +187,8 @@ pub(crate) fn transform_allowed(mode: ProofMode, transform: ProofTransform) -> b
             ProofTransform::Decompose | ProofTransform::Congruence
         )
     {
-        match std::env::var("AY_AB_DRAT_SUBST").ok().as_deref() {
-            Some("0") => return false,
-            Some(_) => return true,
-            None => {}
+        if ay_core::sat_ab_switches().no_drat_subst {
+            return false;
         }
     }
     PROOF_CAPABILITY_REGISTRY

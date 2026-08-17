@@ -967,7 +967,7 @@ fn test_nra_zero_divisor_inconsistent_pair_not_sat() {
 }
 
 // ---------------------------------------------------------------------------
-// #nra-const-factor — SCALED products must never be registered as monomials
+// #nra-const-factor — scaled products carry their exact coefficient
 //
 // P0 wrong-`unsat` (QF_NRA meti-tarski). `collect_nonlinear_terms` stripped the
 // constant factors of a flattened `*` node to build the monomial key but
@@ -1099,10 +1099,7 @@ fn test_nra_unscaled_monomial_sign_conflict_still_unsat() {
 }
 
 /// CONTROL for the POSITIVE coefficient: `(<= (* x x 2) 0)` with `x > 0` is
-/// genuinely unsat. It is currently given up on (the scaled product is left
-/// opaque), so this only asserts the answer is never WRONG. Pinning it as a
-/// non-`Unsat` would freeze in the completeness loss; pinning it as `Unsat`
-/// would be false once the coefficient-aware follow-up lands. Assert soundness.
+/// genuinely unsat. The positive coefficient preserves its sign constraint.
 #[test]
 fn test_nra_positive_scaled_monomial_answer_is_sound() {
     let mut terms = TermStore::new();
@@ -1120,14 +1117,13 @@ fn test_nra_positive_scaled_monomial_answer_is_sound() {
         !matches!(solver.check(), TheoryResult::Sat),
         "2*x^2 <= 0 with x > 0 is UNSAT — Sat here would be a wrong-sat"
     );
+    assert!(sign_machinery_reports_conflict(&solver));
 }
 
-/// A scaled product must not appear in `monomials` / `aux_to_monomial` at all:
-/// the guard is at REGISTRATION, so every downstream consumer (McCormick,
-/// tangent, even-power non-negativity, `check_monomial_consistency`) is closed
-/// at once rather than one at a time.
+/// A scaled product is registered with the exact non-zero coefficient that
+/// every downstream consumer must preserve.
 #[test]
-fn test_nra_scaled_product_is_not_registered_as_monomial() {
+fn test_nra_scaled_product_registers_its_coefficient() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Real);
     let y = terms.mk_var("y", Sort::Real);
@@ -1138,13 +1134,12 @@ fn test_nra_scaled_product_is_not_registered_as_monomial() {
 
     let mut solver = NraSolver::new(&terms);
     solver.assert_literal(le, true);
-    assert!(
-        solver.monomials.is_empty(),
-        "#nra-const-factor: 3*x*y must NOT be registered under the key [x, y] — \
-         its value is 3*x*y, not x*y; got {:?}",
-        solver.monomials.keys().collect::<Vec<_>>()
-    );
-    assert!(solver.aux_to_monomial.is_empty());
+    let mut key = vec![x, y];
+    key.sort_by_key(|term| term.0);
+    let monomial = solver.monomials.get(&key).expect("scaled product tracked");
+    assert_eq!(monomial.aux_var, scaled);
+    assert_eq!(monomial.coeff, BigRational::from_integer(BigInt::from(3)));
+    assert!(solver.aux_to_monomial.contains_key(&scaled));
 }
 
 /// Unit-coefficient products are unaffected: `(* 1 x y)` still registers, so the
@@ -1166,4 +1161,8 @@ fn test_nra_unit_coefficient_product_still_registers() {
         1,
         "a unit-coefficient product must still be tracked as x*y"
     );
+    assert!(solver
+        .monomials
+        .values()
+        .all(|monomial| !monomial.is_scaled()));
 }

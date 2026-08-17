@@ -60,10 +60,7 @@ const MAX_PROOF_ITP_CONVERT_NODES: usize = 50_000;
 
 fn proof_itp_stats_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_PROOF_ITP_STATS")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    })
+    *FLAG.get_or_init(|| ay_core::misc_cli_flags().chc_proof_itp_stats)
 }
 
 /// Verified proof-derived interpolants served to a consumer.
@@ -259,10 +256,10 @@ pub(crate) fn try_proof_derived_interpolant(
     // Build the SMT-LIB script for the scoped proof-producing solve.
     let script = build_qf_lia_script(script_a, script_b, &var_sorts);
 
-    // Attribution hook (rank-4 inc-5): AY_PROOF_ITP_DUMP=<dir> writes each
+    // Attribution hook (rank-4 inc-5): --chc-proof-itp-dump=<dir> writes each
     // proof-solve script to <dir>/proof_itp_<n>.smt2 for offline replay.
     // Debug-only side channel; never affects the solve or its result.
-    if let Ok(dir) = std::env::var("AY_PROOF_ITP_DUMP") {
+    if let Some(dir) = ay_core::misc_cli_flags().chc_proof_itp_dump.as_deref() {
         if !dir.is_empty() {
             static DUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);

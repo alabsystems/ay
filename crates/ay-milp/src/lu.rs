@@ -56,7 +56,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-/// Per-solve LU cost census (AY_MILP_TRACE): call counts, summed reach
+/// Per-solve LU cost census (--trace): call counts, summed reach
 /// (touched-slot) sizes, and update wall. Diagnostics only — accumulated
 /// only when `lu_solve_stats()` is set, so the default hot path is untouched.
 /// The reach sums answer "how many of m slots does each solve actually
@@ -67,7 +67,7 @@ pub(crate) static LU_BTRAN_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LU_BTRAN_REACH: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LU_UPDATE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LU_UPDATE_NANOS: AtomicU64 = AtomicU64::new(0);
-// Forrest–Tomlin `update()` sub-phase timers (AY_MILP_TRACE; surfaced on the
+// Forrest–Tomlin `update()` sub-phase timers (--trace; surfaced on the
 // UPDPROFILE line): SPIKE = v = U·(P_c·alpha) build, ELIM = the sparse
 // left-looking row solve of old row t + new diagonal, COMMIT = U row/column
 // splice + cyclic pivot-order shift + eta record. Only accumulated under the
@@ -76,10 +76,10 @@ pub(crate) static FT_SPIKE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FT_ELIM_NANOS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FT_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
 
-/// Whether to accumulate the per-solve LU cost census (`AY_MILP_TRACE`).
+/// Whether to accumulate the per-solve LU cost census (`--trace`).
 fn lu_solve_stats() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *B.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 /// Kill switch for the Forrest–Tomlin update's bounds-check-elided fast loops
@@ -89,13 +89,13 @@ fn lu_solve_stats() -> bool {
 /// provably `< m` (stage ids, and `stage_pos`/`urows` column ids are all stage
 /// ids in `0..m` by construction; `w`/`v` are resized to `m`), so it is
 /// byte-identical, not a numeric change. An A/B toggle in one binary.
-fn ft_fast_update() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_FT_FAST").is_none())
-}
+// B11: the FT/FTRAN/countsort A/B switches moved off never-set env vars onto
+// the typed caller layer (`EngineEconomics`), read once per `LuEngine`
+// construction into struct fields — per-pivot sites must not pay a lookup,
+// and a process-global OnceLock would pin the first solve's caller settings.
 
 /// Spike-build arm selection for the Forrest–Tomlin `update`
-/// (`AY_MILP_FT_SPIKE` = `dense` | `sparse` | anything else / unset = `auto`).
+/// (`--ft-spike` = `dense` | `sparse` | anything else / unset = `auto`).
 /// `dense` is the exact pre-change path, so this is an A/B toggle in one
 /// binary; `sparse` forces the pattern-driven arm regardless of density, which
 /// is what lets the dense-reference guard tests cover the new code at m=48..60
@@ -108,12 +108,12 @@ enum SpikeArm {
 }
 
 fn spike_arm() -> SpikeArm {
-    static B: std::sync::OnceLock<SpikeArm> = std::sync::OnceLock::new();
-    *B.get_or_init(|| match std::env::var("AY_MILP_FT_SPIKE").as_deref() {
-        Ok("dense") => SpikeArm::Dense,
-        Ok("sparse") => SpikeArm::Sparse,
+    // B37: caller-layer force (1 dense | 2 sparse); unset = measured auto.
+    match crate::tune::count_opt(crate::tune::Knob::FtSpikeArm) {
+        Some(1) => SpikeArm::Dense,
+        Some(2) => SpikeArm::Sparse,
         _ => SpikeArm::Auto,
-    })
+    }
 }
 
 /// How much of `U` the sparse spike build is allowed to touch before the dense
@@ -142,7 +142,7 @@ fn spike_arm() -> SpikeArm {
 /// (they pay U fill, which sparsifying cannot touch).
 ///
 /// THE GATE IS LOAD-BEARING, NOT A HEDGE. Forcing each arm on all four
-/// (`AY_MILP_FT_SPIKE`, 400 s cap, `AY_MILP_COLD_LU_MAX_ROWS=400000`, 4
+/// (`--ft-spike`, 400 s cap, `AY_MILP_COLD_LU_MAX_ROWS=400000`, 4
 /// concurrent; `update=N (Ts, X ns/call)` off the LUSOLVE line):
 ///
 /// ```text
@@ -160,7 +160,7 @@ fn spike_arm() -> SpikeArm {
 /// ~54%-dense B^-1 made the sparse solve 2.3x SLOWER.
 ///
 /// AND `Auto` DOES PICK RIGHT, unaided, on all four — a fourth run with no
-/// `AY_MILP_FT_SPIKE` set lands within 1.7% of the better arm every time:
+/// `--ft-spike` set lands within 1.7% of the better arm every time:
 ///
 /// ```text
 ///   model              auto ns/call   best forced   auto/best
@@ -174,7 +174,7 @@ fn spike_arm() -> SpikeArm {
 /// the forced-dense run's (62.120038 and 14.782647) — independent corroboration
 /// that taking the gate's other branch changes nothing but the clock.
 ///
-/// # Corpus A/B (`AY_MILP_FT_SPIKE=dense` vs default), 65 models, 60 s, 4 up
+/// # Corpus A/B (`--ft-spike` vs default), 65 models, 60 s, 4 up
 ///
 /// ```text
 ///                                          models  >10% cheaper  >10% dearer
@@ -216,10 +216,6 @@ const SPIKE_SPARSE_MARGIN: usize = 2;
 /// stage ids in `0..m` by construction, `udiag` has length `m`, and `x`/`w` are
 /// length `m` — so it is byte-identical, not a numeric change. Same discipline
 /// (and the same debug_asserts) as `apply_inverse_parts`.
-fn ftran_fast() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_FTRAN_FAST").is_none())
-}
 
 /// Kill switch for the SPARSE `ftran_nz`'s bounds-check-elided reach + sweep
 /// loops (`AY_MILP_NO_FTRANNZ_FAST`). Off (env set) => take the safe checked
@@ -234,10 +230,6 @@ fn ftran_fast() -> bool {
 /// construction, `udiag`/`visit`/`w` have length `m`, and `x.len() == m`. So it
 /// is byte-identical, not a numeric change. Same discipline (and the same
 /// debug_asserts) as `ftran`'s `ftran_fast` path.
-fn ftrannz_fast() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_FTRANNZ_FAST").is_none())
-}
 
 /// Kill switch for the O(m) counting sort of the sparse-solve reach set
 /// (`AY_MILP_NO_COUNTSORT`). Off (env set) => always take the comparison sort,
@@ -245,10 +237,6 @@ fn ftrannz_fast() -> bool {
 /// The two branches produce the SAME order (the reach holds distinct stage ids
 /// and the key is injective into `[0, m)`, so the sorted order is unique), so
 /// the numeric solve loops that consume `reach` are byte-identical either way.
-fn count_sort_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_COUNTSORT").is_none())
-}
 
 /// Sort `reach` — a set of DISTINCT stage ids, each `< m` — ascending (or
 /// descending) by `key`, an INJECTIVE map into `[0, m)` (`upos`/`stage` are
@@ -268,13 +256,14 @@ fn count_sort_by(
     scratch: &mut Vec<usize>,
     m: usize,
     descending: bool,
+    enabled: bool,
     key: impl Fn(usize) -> usize,
 ) {
     let k = reach.len();
     // Crossover: the counting sort's O(m) scatter+sweep beats ~k·⌈log2 k⌉
     // comparisons only when the reach is dense. `bits` = ⌊log2 k⌋+1.
     let bits = (u64::BITS - (k as u64).leading_zeros()) as usize;
-    if k < 2 || k.saturating_mul(bits) < m || !count_sort_enabled() {
+    if k < 2 || k.saturating_mul(bits) < m || !enabled {
         if descending {
             reach.sort_unstable_by_key(|&x| Reverse(key(x)));
         } else {
@@ -355,6 +344,7 @@ const FT_REL_PIVOT_TOL_ILL: f64 = 1e-16;
 const BIG_SPIKE_NORM: f64 = 1e4;
 
 /// `AY_MILP_FT_GROWTH_TOL` override (measurement lever); `None` = auto.
+#[cfg(test)]
 fn parse_ft_growth_tol_override(value: Option<&str>) -> Option<f64> {
     value
         .and_then(|s| s.parse::<f64>().ok())
@@ -362,13 +352,13 @@ fn parse_ft_growth_tol_override(value: Option<&str>) -> Option<f64> {
 }
 
 fn ft_growth_tol_override() -> Option<f64> {
-    static V: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        parse_ft_growth_tol_override(std::env::var("AY_MILP_FT_GROWTH_TOL").ok().as_deref())
-    })
+    // B11: caller-layer value (`with_ft_growth_tol`); the never-set
+    // AY_MILP_FT_GROWTH_TOL env read is gone. Validity (finite, positive) is
+    // enforced by the builder plus the same filter the env parse applied.
+    crate::tune::real_opt(crate::tune::Knob::FtGrowthTol).filter(|v| v.is_finite() && *v > 0.0)
 }
 
-/// Fill budget for `factor` (`AY_MILP_LU_MAX_FILL_NNZ`). A pure SAFETY CEILING
+/// Fill budget for `factor` (`the lu-max-fill-nnz knob`). A pure SAFETY CEILING
 /// on the produced L+U nonzero count: cross it and `factor` DECLINES
 /// (`FactorFail::OutOfBudget`) instead of letting a pathological Markowitz
 /// blow-up exhaust the box's memory. This is what lets the solver ATTEMPT a
@@ -378,17 +368,12 @@ fn ft_growth_tol_override() -> Option<f64> {
 /// byte-identical unset.
 const LU_MAX_FILL_NNZ_DEFAULT: usize = 200_000_000;
 
-fn parse_lu_max_fill_nnz(value: Option<&str>) -> usize {
-    value
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(LU_MAX_FILL_NNZ_DEFAULT)
-}
-
 fn lu_max_fill_nnz() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        parse_lu_max_fill_nnz(std::env::var("AY_MILP_LU_MAX_FILL_NNZ").ok().as_deref())
+        crate::tune::count_opt(crate::tune::Knob::LuMaxFillNnz)
+            .filter(|&v| v > 0)
+            .unwrap_or(LU_MAX_FILL_NNZ_DEFAULT)
     })
 }
 
@@ -466,6 +451,14 @@ struct RowEta {
 pub(crate) struct LuEngine {
     /// Dimension m (number of rows == number of basis positions).
     m: usize,
+    /// B11 A/B switches, read from the caller layer (`EngineEconomics`) once
+    /// at construction: per-pivot sites must not pay a per-call lookup, and a
+    /// process-global cache would pin the first solve's settings. All default
+    /// on; each pair of arms is byte-identical by construction.
+    ft_fast_update: bool,
+    ftran_fast: bool,
+    ftrannz_fast: bool,
+    count_sort: bool,
     /// stage -> original matrix row pivoted at that stage.
     stage_row: Vec<usize>,
     /// original matrix row -> stage.
@@ -555,7 +548,7 @@ pub(crate) struct LuEngine {
     u_mark: Vec<u32>,
     u_epoch: u32,
     u_pat: Vec<usize>,
-    /// Per-engine spike-arm override, outranking `AY_MILP_FT_SPIKE`. Exists so
+    /// Per-engine spike-arm override, outranking `--ft-spike`. Exists so
     /// the guard tests can drive BOTH arms in one process (the env knob is a
     /// process-global `OnceLock`) and, in particular, so the dense-reference
     /// tests can be re-run with the sparse arm FORCED — at m = 48..60 with a
@@ -565,11 +558,20 @@ pub(crate) struct LuEngine {
 }
 
 impl LuEngine {
+    /// Off-diagonal U fill, for density-based arm selection (B19).
+    pub(crate) fn unnz(&self) -> usize {
+        self.unnz
+    }
+
     /// Engine representing `B = -I` (the crash basis) with no factorization
     /// work; see the struct docs.
     pub(crate) fn new(m: usize) -> Self {
         LuEngine {
             m,
+            ft_fast_update: !crate::tune::on(crate::tune::Knob::NoFtFast),
+            ftran_fast: !crate::tune::on(crate::tune::Knob::NoFtranFast),
+            ftrannz_fast: !crate::tune::on(crate::tune::Knob::NoFtranNzFast),
+            count_sort: !crate::tune::on(crate::tune::Knob::NoCountsort),
             stage_row: (0..m).collect(),
             row_stage: (0..m).collect(),
             stage_pos: (0..m).collect(),
@@ -1278,7 +1280,7 @@ impl LuEngine {
         assert_eq!(x.len(), m, "ftran: rhs length");
         let mut w = std::mem::take(&mut self.scratch);
         w.resize(m, 0.0);
-        if !ftran_fast() {
+        if !self.ftran_fast {
             // Checked reference path (`AY_MILP_NO_FTRAN_FAST`): the exact
             // pre-change arithmetic. The fast path below is byte-identical to it.
             for r in 0..m {
@@ -1318,7 +1320,7 @@ impl LuEngine {
             self.scratch = w;
             return;
         }
-        // Bounds-check-elided fast path. SAFETY / byte-identity: every index is
+        // SAFETY: In this bounds-check-elided fast path, every index is
         // provably `< m` — `row_stage`/`stage_pos`/`uorder` are permutations of
         // `0..m`; `lcols`/`urows`/`etas` entries are stage ids in `0..m`; `udiag`
         // has length `m`; `w` is resized to `m` and `x.len() == m` is asserted.
@@ -1459,7 +1461,7 @@ impl LuEngine {
         let mut sortbuf = std::mem::take(&mut self.sortbuf);
         reach.clear();
 
-        if !ftrannz_fast() {
+        if !self.ftrannz_fast {
             // Checked reference path (`AY_MILP_NO_FTRANNZ_FAST`): the exact
             // pre-change arithmetic. The fast path below is byte-identical to it.
             // Gather to stage space + symbolic DFS through L's column pattern.
@@ -1483,7 +1485,14 @@ impl LuEngine {
                 }
             }
             // L forward, in stage order over the reach set only.
-            count_sort_by(&mut reach, &mut sortbuf, self.m, false, |x| x);
+            count_sort_by(
+                &mut reach,
+                &mut sortbuf,
+                self.m,
+                false,
+                self.count_sort,
+                |x| x,
+            );
             for &k in reach.iter() {
                 let wk = w[k];
                 if wk != 0.0 {
@@ -1523,7 +1532,14 @@ impl LuEngine {
                     }
                 }
             }
-            count_sort_by(&mut reach, &mut sortbuf, self.m, true, |x| self.upos[x]);
+            count_sort_by(
+                &mut reach,
+                &mut sortbuf,
+                self.m,
+                true,
+                self.count_sort,
+                |x| self.upos[x],
+            );
             for &k in reach.iter() {
                 let mut s = w[k];
                 for &(c, v) in &self.urows[k] {
@@ -1542,7 +1558,7 @@ impl LuEngine {
                 }
             }
         } else {
-            // Bounds-check-elided fast path. SAFETY / byte-identity: every index
+            // SAFETY: In this bounds-check-elided fast path, every index
             // is provably `< m` — `nz`/`row_stage` map matrix rows in `0..m`;
             // `reach`, `lcols`/`urows`/`ucols`/`etas` entries and every DFS id are
             // stage ids in `0..m` by construction; `stage_pos` maps stages to
@@ -1577,7 +1593,14 @@ impl LuEngine {
                     }
                 }
                 // L forward, in stage order over the reach set only.
-                count_sort_by(&mut reach, &mut sortbuf, self.m, false, |x| x);
+                count_sort_by(
+                    &mut reach,
+                    &mut sortbuf,
+                    self.m,
+                    false,
+                    self.count_sort,
+                    |x| x,
+                );
                 for &k in reach.iter() {
                     let wk = *wp.add(k);
                     if wk != 0.0 {
@@ -1621,7 +1644,14 @@ impl LuEngine {
                         }
                     }
                 }
-                count_sort_by(&mut reach, &mut sortbuf, self.m, true, |x| self.upos[x]);
+                count_sort_by(
+                    &mut reach,
+                    &mut sortbuf,
+                    self.m,
+                    true,
+                    self.count_sort,
+                    |x| self.upos[x],
+                );
                 for &k in reach.iter() {
                     let mut s = *wp.add(k);
                     for &(c, v) in self.urows.get_unchecked(k) {
@@ -1676,8 +1706,7 @@ impl LuEngine {
                 reach.push(k);
             }
         }
-        // U^T forward: closure over the (exact) row patterns, ascending
-        // pivot order.
+        // U^T forward: close exact row patterns in ascending pivot order.
         let mut i0 = 0;
         while i0 < reach.len() {
             let k = reach[i0];
@@ -1690,7 +1719,14 @@ impl LuEngine {
                 }
             }
         }
-        count_sort_by(&mut reach, &mut sortbuf, self.m, false, |x| self.upos[x]);
+        count_sort_by(
+            &mut reach,
+            &mut sortbuf,
+            self.m,
+            false,
+            self.count_sort,
+            |x| self.upos[x],
+        );
         for &k in reach.iter() {
             let zk = w[k] / self.udiag[k];
             w[k] = zk;
@@ -1727,7 +1763,14 @@ impl LuEngine {
                 }
             }
         }
-        count_sort_by(&mut reach, &mut sortbuf, self.m, true, |x| x);
+        count_sort_by(
+            &mut reach,
+            &mut sortbuf,
+            self.m,
+            true,
+            self.count_sort,
+            |x| x,
+        );
         for &k in reach.iter() {
             let mut s = w[k];
             for &(i, lv) in &self.lcols[k] {
@@ -1744,6 +1787,10 @@ impl LuEngine {
                 nz.push(self.stage_row[k]);
             }
         }
+        self.finish_btran_nz(reach, w, sortbuf);
+    }
+
+    fn finish_btran_nz(&mut self, reach: Vec<usize>, w: Vec<f64>, sortbuf: Vec<usize>) {
         if lu_solve_stats() {
             LU_BTRAN_CALLS.fetch_add(1, Relaxed);
             LU_BTRAN_REACH.fetch_add(reach.len() as u64, Relaxed);
@@ -2087,16 +2134,16 @@ impl LuEngine {
             if !finite {
                 reject_update!();
             }
-        } else if ft_fast_update() {
+        } else if self.ft_fast_update {
+            let stage_pos = &self.stage_pos;
+            let udiag = &self.udiag;
+            let urows = &self.urows;
             // SAFETY: `stage_pos` is a permutation of `0..m`, so `stage_pos[k] < m`
             // and `ftran_result.len() == m` (asserted at entry); `w`/`v` were just
             // resized to `m`; `udiag` has length `m`; `urows[k]`'s column ids are
             // stage ids in `0..m` by the U-triangularity invariant. Every index is
             // thus in range. The arithmetic is unchanged (same muls/adds, same
             // order, no reassociation) — only the proven bounds checks are dropped.
-            let stage_pos = &self.stage_pos;
-            let udiag = &self.udiag;
-            let urows = &self.urows;
             unsafe {
                 for k in 0..m {
                     *w.get_unchecked_mut(k) =
@@ -2250,7 +2297,7 @@ impl LuEngine {
         //    of the pivot order, every off-diagonal spike entry sits above
         //    the diagonal, preserving U's triangularity invariant.
         let mut newpat = Vec::new();
-        let ft_fast = ft_fast_update();
+        let ft_fast = self.ft_fast_update;
         if sparse_spike {
             // `pat` is sorted ascending, so this is the dense scan restricted
             // to M — same stages, same order, and every skipped stage holds
@@ -2266,9 +2313,10 @@ impl LuEngine {
                 v[k] = 0.0; // restore the sparse arm's all-zero invariant
             }
         } else if ft_fast {
-            // SAFETY: `v.len() == m` and `urows.len() == m`, so `k < m` throughout.
             for (k, &vk) in v.iter().enumerate() {
                 if vk != 0.0 && k != t {
+                    // SAFETY: `k` comes from enumerating `v`, whose length is
+                    // `m`, and `self.urows.len() == m`.
                     unsafe { self.urows.get_unchecked_mut(k) }.push((t, vk));
                     newpat.push(k);
                     self.unnz += 1;
@@ -2290,11 +2338,11 @@ impl LuEngine {
         // 4. Cyclic shift: stage t goes to the last pivot position.
         let p0 = self.upos[t];
         if ft_fast {
+            let uorder = &mut self.uorder;
+            let upos = &mut self.upos;
             // SAFETY: `pos` and `pos+1` are `< m` (range ends at `m-1`); `uorder`
             // and `upos` have length `m`; `s = uorder[pos+1]` is a stage id `< m`.
             // `uorder`/`upos` are disjoint fields, so the two mut borrows are sound.
-            let uorder = &mut self.uorder;
-            let upos = &mut self.upos;
             unsafe {
                 for pos in p0..m - 1 {
                     let s = *uorder.get_unchecked(pos + 1);
@@ -3631,20 +3679,6 @@ mod tests {
             .expect("dense basis factors under a generous budget");
     }
 
-    /// The fill-budget env parse: valid positives win, everything else falls
-    /// back to the 200M default (mirrors `parse_ft_growth_tol_override`).
-    #[test]
-    fn lu_max_fill_nnz_parse() {
-        assert_eq!(parse_lu_max_fill_nnz(None), LU_MAX_FILL_NNZ_DEFAULT);
-        assert_eq!(parse_lu_max_fill_nnz(Some("500")), 500);
-        for invalid in ["0", "-1", "1.5", "NaN", "invalid", ""] {
-            assert_eq!(
-                parse_lu_max_fill_nnz(Some(invalid)),
-                LU_MAX_FILL_NNZ_DEFAULT
-            );
-        }
-    }
-
     /// (d) Near-singular and threshold pathology. A 1e-12 singleton pivot is
     /// below the absolute floor (singular at working precision). And a tiny
     /// entry with the *best* Markowitz count must be refused by the u = 0.1
@@ -4091,11 +4125,10 @@ mod tests {
 /// It only moves *when* they are read, from "scattered across the solve" to "once,
 /// at a point the caller controls".
 pub(crate) fn prime_env() {
-    let _ = count_sort_enabled();
-    let _ = ft_fast_update();
+    // (B11: the FT/FTRAN/countsort switches are no longer OnceLock-cached
+    // env reads — they live on the caller layer and in LuEngine fields; the
+    // growth tolerance stays primed below.)
     let _ = ft_growth_tol_override();
-    let _ = ftran_fast();
-    let _ = ftrannz_fast();
     let _ = lu_max_fill_nnz();
     let _ = lu_solve_stats();
     let _ = spike_arm();

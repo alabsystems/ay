@@ -38,9 +38,8 @@ fn debug_transred_trace_enabled() -> bool {
 #[cfg(not(kani))]
 fn debug_transred_clause() -> Option<u32> {
     // TransredClause is a numeric parameter, not a boolean flag. The clause
-    // ID comes from `--debug-transred-clause=N` (preferred) or the
-    // `AY_DEBUG_TRANSRED_CLAUSE` env var (deprecated), both of which are
-    // read once and cached in `SatDebugEnvFlags` (#8506, #8834).
+    // ID comes from `--debug-transred-clause=N` (B72: the env fallback is
+    // retired), read once and cached in `SatDebugEnvFlags` (#8506, #8834).
     ay_core::sat_debug_env_flags().debug_transred_clause
 }
 

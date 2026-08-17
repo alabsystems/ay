@@ -371,11 +371,10 @@ fn recursive_dt_flatten_depth() -> usize {
     // adaptive routes. The scalar-prefix mode is experimental and opt-in until
     // ADT-LIA target evidence plus original-problem validation justifies
     // promotion.
-    match std::env::var("AY_CHC_DT_RECURSIVE_PREFIX") {
-        Ok(value) if matches!(value.as_str(), "1" | "true" | "yes") => {
-            RECURSIVE_DT_PREFIX_EXPERIMENT_DEPTH
-        }
-        _ => RECURSIVE_DT_LEGACY_SAFE_DEPTH,
+    if ay_core::misc_cli_flags().chc_dt_recursive_prefix {
+        RECURSIVE_DT_PREFIX_EXPERIMENT_DEPTH
+    } else {
+        RECURSIVE_DT_LEGACY_SAFE_DEPTH
     }
 }
 

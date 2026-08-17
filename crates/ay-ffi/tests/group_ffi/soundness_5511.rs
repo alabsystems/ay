@@ -1,6 +1,8 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
+
+#![allow(unsafe_code)] // Direct C-ABI regression test.
 //! Regression test for #5511: QF_AUFLRA model soundness.
 //!
 //! Root cause: LRA check() cleared dirty=false at start, but NeedDisequalitySplit

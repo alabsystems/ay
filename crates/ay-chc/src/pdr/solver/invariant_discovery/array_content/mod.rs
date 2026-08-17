@@ -7,10 +7,10 @@
 //! Two layers, each independently gated and sound:
 //!
 //! * **Increment 0 — frontier extraction + telemetry** (flag
-//!   `AY_CHC_ARRAY_FRONTIER_TELEMETRY`, default OFF). Computes the per-predicate
+//!   `--chc-array-frontier-telemetry`, default OFF). Computes the per-predicate
 //!   *index-term frontier* `T(pred)` and counts `>= 2`-array predicates. Emits
 //!   nothing into frames; pure analysis. See spec §6 "Increment 0".
-//! * **Increment 1 — single-array value-fact candidates** (flag `AY_CHC_ARRAY_INV`,
+//! * **Increment 1 — single-array value-fact candidates** (flag `--chc-array-inv`,
 //!   default OFF). Turns the frontier into actual invariant *candidates* of the form
 //!   `select(a, t) >= 0`, `select(a, t) = 0`, and (for `Bool`-element arrays)
 //!   `(= (select a t) true/false)`, and feeds each to the **existing, unchanged**
@@ -31,8 +31,8 @@
 //!
 //! ## Cost / behavior gates
 //!
-//! * Increment-0 telemetry is gated on `AY_CHC_ARRAY_FRONTIER_TELEMETRY`.
-//! * Increment-1 candidate emission is gated on `AY_CHC_ARRAY_INV`. When that flag
+//! * Increment-0 telemetry is gated on `--chc-array-frontier-telemetry`.
+//! * Increment-1 candidate emission is gated on `--chc-array-inv`. When that flag
 //!   is OFF (the default, and the hot path) `discover_array_content_invariants`
 //!   returns immediately after one cheap boolean check, proposing nothing — so the
 //!   default solver verdict is **byte-for-byte unchanged** (still `Unknown` on the
@@ -110,29 +110,16 @@ impl IndexTermFrontier {
 
 /// Whether the array-frontier telemetry pass is enabled.
 ///
-/// Reads `AY_CHC_ARRAY_FRONTIER_TELEMETRY` exactly once. The pass is **OFF** by
+/// Reads `--chc-array-frontier-telemetry` exactly once. The pass is **OFF** by
 /// default; only an explicit truthy value (`1`, `true`, `yes`, `on`,
 /// case-insensitive) enables it. Everything else — unset, empty, `0`, `false` —
 /// keeps it off so the hot path is untouched.
 pub(in crate::pdr::solver) fn array_frontier_telemetry_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        array_frontier_telemetry_enabled_for(
-            std::env::var("AY_CHC_ARRAY_FRONTIER_TELEMETRY")
-                .ok()
-                .as_deref(),
-        )
-    })
+    *ENABLED.get_or_init(|| ay_core::misc_cli_flags().chc_array_frontier_telemetry)
 }
 
 /// Testable core of the flag parse: only explicit truthy values enable.
-fn array_frontier_telemetry_enabled_for(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
 /// Budget for the Increment-1 candidate-emission pass. Mirrors the spec's
 /// `array_content_pass_timeout` (§3.6: "default 750ms"). Each candidate still goes
 /// through the (independently bounded) admission gate; this only caps the pass's
@@ -142,7 +129,7 @@ const ARRAY_CONTENT_PASS_TIMEOUT: Duration = Duration::from_millis(750);
 /// Whether the Increment-1 array-content invariant *candidate emission* pass is
 /// enabled.
 ///
-/// Reads `AY_CHC_ARRAY_INV` exactly once. The pass is **OFF** by default; only an
+/// Reads `--chc-array-inv` exactly once. The pass is **OFF** by default; only an
 /// explicit truthy value (`1`, `true`, `yes`, `on`, case-insensitive) enables it.
 /// Everything else — unset, empty, `0`, `false` — keeps it off so the default path
 /// is byte-for-byte unchanged (still `Unknown` on the multi-array cases it targets).
@@ -152,20 +139,11 @@ const ARRAY_CONTENT_PASS_TIMEOUT: Duration = Duration::from_millis(750);
 /// pure-analysis telemetry can stay enabled without emitting any candidate.
 pub(in crate::pdr::solver) fn array_content_invariants_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        array_content_invariants_enabled_for(std::env::var("AY_CHC_ARRAY_INV").ok().as_deref())
-    })
+    *ENABLED.get_or_init(|| ay_core::misc_cli_flags().chc_array_inv)
 }
 
-/// Testable core of the `AY_CHC_ARRAY_INV` flag parse: only explicit truthy values
+/// Testable core of the `--chc-array-inv` flag parse: only explicit truthy values
 /// enable. Shares the exact acceptance set with the telemetry flag.
-fn array_content_invariants_enabled_for(value: Option<&str>) -> bool {
-    matches!(
-        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
 impl PdrSolver {
     /// Collect the array-sorted canonical parameters of `pred`.
     ///
@@ -278,7 +256,7 @@ impl PdrSolver {
     /// bypasses that gate**; a non-inductive candidate is simply rejected.
     ///
     /// Fully gated:
-    /// * returns immediately when `AY_CHC_ARRAY_INV` is not explicitly truthy
+    /// * returns immediately when `--chc-array-inv` is not explicitly truthy
     ///   (default OFF ⇒ no candidates ⇒ default verdict unchanged),
     /// * skips predicates with `< 2` array params (cost gate, spec §3.2),
     /// * stops on cancellation or once the pass budget is spent.
@@ -297,7 +275,7 @@ impl PdrSolver {
     ///
     /// Split out so unit tests can exercise the candidate-generation + admission
     /// path deterministically without depending on the process-global
-    /// `AY_CHC_ARRAY_INV` `OnceLock`. The production entry point above is the only
+    /// `--chc-array-inv` `OnceLock`. The production entry point above is the only
     /// non-test caller and always guards this behind the flag, so the default path
     /// is byte-for-byte unchanged.
     pub(in crate::pdr::solver) fn discover_array_content_invariants_inner(&mut self) -> usize {
@@ -437,7 +415,7 @@ impl PdrSolver {
     ///
     /// This emits **nothing** into any frame and proposes **no** invariant
     /// candidate — it is strict, no-behavior-change instrumentation. It is fully
-    /// gated: when `AY_CHC_ARRAY_FRONTIER_TELEMETRY` is not explicitly truthy it
+    /// gated: when `--chc-array-frontier-telemetry` is not explicitly truthy it
     /// returns `0` immediately, doing no frontier extraction. Returns the number of
     /// predicates with `>= 2` array params seen.
     pub(in crate::pdr::solver) fn run_array_frontier_telemetry(&self) -> usize {

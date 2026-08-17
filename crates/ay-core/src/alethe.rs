@@ -11,15 +11,17 @@
 //!
 //! Reference: <https://github.com/ufmg-smite/carcara>
 
-/// Rule names the Alethe proof checker actually implements.
+/// Rule names the in-process Alethe document checker accepts.
 ///
-/// This is the *wire* allowlist: a `:rule` name outside this set is not a
-/// proof at all — carcara rejects the whole document with
-/// `CheckerError::UnknownRule` and reports `invalid`, which is strictly worse
-/// than declaring the step unproved. See [`AletheRule::wire_name`].
+/// Production emission is the intersection of this compatibility vocabulary
+/// with AY's built-in rule producers, plus checked aliases and direct printer
+/// lowerings. A `:rule` name the installed external checker does not implement
+/// makes its whole document `invalid`, which is strictly worse than declaring
+/// the step unproved. See [`AletheRule::wire_name`].
 ///
 /// Provenance (do not hand-edit; regenerate against the checker you ship
-/// against). Every entry below was verified against the installed
+/// against). Except for the parser-only compatibility entry documented below,
+/// every entry was verified against the installed
 /// `carcara 1.1.0 [git main 9a352ee]` by probing each candidate name:
 ///
 /// ```text
@@ -32,12 +34,14 @@
 /// which the shipped binary rejects. A table that is too *permissive* emits
 /// `invalid` proofs, so it is derived from the checker's observed behaviour.
 ///
-/// ONE ENTRY IS AHEAD OF UPSTREAM: `dt_clash` (datatype constructor
-/// distinctness) is implemented in the datatype-enabled carcara build
-/// (`carcara/src/checker/rules/datatypes.rs`), not in `carcara 1.1.0
-/// [git main 9a352ee]`. Against a checker without it, a `dt_clash` step is an
-/// unknown rule and the document is `invalid` rather than `holey` — see
-/// [`wire_rule_name`] for why that trade is taken.
+/// PARSER-ONLY COMPATIBILITY ENTRY: `dt_clash` remains in this document-checker
+/// vocabulary, but production AY has no built-in rule with that spelling and
+/// no alias targets it. The installed `carcara 1.1.0 [git master 9a352ee]`
+/// answered `unknown rule` when probed on 2026-08-12, so the former
+/// `dt_distinct` wire alias was reverted. Keeping this parser entry is
+/// intentionally separate from the wire inventory: the standing emission
+/// probe in `ay-proof/tests/wire_rule_coverage.rs` scans the pass-throughs AY
+/// actually selects, alias targets, and direct printer lowerings.
 ///
 /// MUST stay sorted — [`is_checkable_alethe_rule`] binary-searches it.
 pub const CHECKABLE_ALETHE_RULES: [&str; 183] = [
@@ -253,17 +257,15 @@ pub const UNPROVED_STEP_RULE: &str = "hole";
 /// subset of) the clauses AY's kind is allowed to carry, so that a step AY
 /// emits under `internal` is one the checker can independently re-derive.
 ///
-/// * `dt_distinct` → `dt_clash`: datatype constructor distinctness, "two
-///   applications of different constructors of one datatype cannot be equal".
-///   AY's [`crate::proof::TheoryLemmaKind::DatatypeDistinct`] is assigned only
-///   by `ay_proof::recognize_datatype_distinct`, which accepts the unit
-///   disjointness clause `(cl (not (= C1(..) C2(..))))` and the binary
-///   exclusion clause `(cl (not (= t C1(..))) (not (= t C2(..))))` with both
-///   heads registered constructors of the same datatype and different from
-///   each other. carcara's `dt_clash` accepts those two shapes and nothing
-///   else, re-deriving constructor membership from the problem's own
-///   `declare-datatypes` rather than trusting AY's registry. The two
-///   validators are therefore independent and shape-aligned.
+/// There are currently no aliases. `dt_distinct` → `dt_clash` was reverted on
+/// 2026-08-12 after the installed `carcara 1.1.0 [git master 9a352ee]` probe
+/// returned `invalid` and `checking failed on step 't0' with rule 'dt_clash':
+/// unknown rule`. The assumed newer datatype rule was not in the checker AY
+/// actually ships against. Keeping `dt_distinct` as an honest `hole` is
+/// strictly better: `holey` identifies one unproved step, while `invalid`
+/// discredits the entire document. A future alias must pass the installed
+/// checker probe in `ay-proof/tests/wire_rule_coverage.rs` as well as the
+/// inference-shape admissibility argument above.
 ///
 /// MEASURED NON-ALIAS: `bv_bitblast`. The checker DOES implement bit-blasting
 /// — `bitblast_add|and|ashr|comp|concat|const|equal|extract|lshr|mult|neg|not|
@@ -348,7 +350,7 @@ pub const UNPROVED_STEP_RULE: &str = "hole";
 /// `string_ground_factor_conflict`, `regex_length_lower_bound`,
 /// `string_length`, `string_length_lemma` and `string_code_inj` — have no rule
 /// of that inference anywhere in the calculus.
-const WIRE_RULE_ALIASES: [(&str, &str); 1] = [("dt_distinct", "dt_clash")];
+const WIRE_RULE_ALIASES: [(&str, &str); 0] = [];
 
 /// True if the Alethe checker implements `name`, i.e. emitting it produces a
 /// checked step rather than `invalid`.
@@ -482,15 +484,14 @@ pub fn alethe_rule_requires_premises_or_args(name: &str) -> bool {
 /// checker just as loudly, and claiming it for one that happens to pass would
 /// be a false certificate.
 ///
-/// The `dt_distinct` → `dt_clash` alias is the one place where the wire name is
-/// AHEAD of the upstream checker: a carcara build without the datatype rules
-/// answers `unknown rule` and marks the whole document `invalid`, which is
-/// worse than the `hole` this used to print. The trade is taken deliberately —
-/// `hole` can never become `valid`, so a datatype refutation could never be
-/// externally certified at all, and the alias is a one-line revert. It costs
-/// nothing in soundness either way: AY's own gates read the proof IR, where
-/// `TheoryLemmaKind::DatatypeDistinct` is re-validated by
-/// `ay_proof::validate_datatype_distinct` regardless of what is printed.
+/// Wire names may never run ahead of the installed checker. The former
+/// `dt_distinct` → `dt_clash` alias demonstrated why: the installed carcara
+/// answered `unknown rule`, turning every affected document `invalid`, while
+/// the fallback below produces the strictly better `holey` verdict. See
+/// [`WIRE_RULE_ALIASES`] for the measured probe. This changes no native
+/// soundness gate: AY still re-validates datatype distinctness from the proof
+/// IR and constructor registry; only the unsupported external claim is
+/// withdrawn.
 #[must_use]
 pub fn wire_rule_name(name: &str) -> &str {
     if is_checkable_alethe_rule(name) {
@@ -737,6 +738,21 @@ pub enum AletheRule {
     ///
     /// Appended to preserve serialized discriminants of the older variants.
     Evaluate,
+
+    /// Quantifier-negation De Morgan step: `¬∃x⃗.φ ≡ ∀x⃗.¬φ`.
+    ///
+    /// The conclusion is the two-literal clause `(cl (exists (x⃗) φ)
+    /// (forall (x⃗) (not φ)))`, i.e. the tautology `(∃x⃗.φ) ∨ (∀x⃗.¬φ)`. It is
+    /// valid because the second disjunct is exactly the negation of the first:
+    /// `¬(∀x⃗.¬φ) = ∃x⃗.¬¬φ = ∃x⃗.φ`, so the clause is `A ∨ ¬A`. Resolving it
+    /// against an assumed `(not (exists (x⃗) φ))` mints the entailed universal
+    /// `(forall (x⃗) (not φ))`, which the existing `forall_inst` path then
+    /// instantiates. See
+    /// `ay_proof::checker::quantifier::validate_qnt_neg_exists` for the strict
+    /// re-derivation and its soundness argument.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    QntNegExists,
 }
 
 impl AletheRule {
@@ -827,6 +843,7 @@ impl AletheRule {
             Self::Trust => "trust",
             Self::Custom(name) => name,
             Self::Evaluate => "evaluate",
+            Self::QntNegExists => "qnt_neg_exists",
         }
     }
 
@@ -858,279 +875,4 @@ impl std::fmt::Display for AletheRule {
 }
 
 #[cfg(test)]
-mod wire_name_tests {
-    use super::*;
-    use crate::proof::TheoryLemmaKind;
-
-    #[test]
-    fn table_is_sorted_and_deduplicated() {
-        // `is_checkable_alethe_rule` binary-searches, so an unsorted or
-        // duplicated table would silently start answering "not checkable" for
-        // real rules and downgrade valid proofs to holey.
-        let mut sorted = CHECKABLE_ALETHE_RULES;
-        sorted.sort_unstable();
-        assert_eq!(CHECKABLE_ALETHE_RULES, sorted, "table must stay sorted");
-        let mut seen = std::collections::HashSet::new();
-        for name in CHECKABLE_ALETHE_RULES {
-            assert!(seen.insert(name), "duplicate rule name in table: {name}");
-        }
-    }
-
-    #[test]
-    fn every_alias_target_is_checkable_and_no_alias_is_dead() {
-        for (internal, wire) in WIRE_RULE_ALIASES {
-            // An alias whose target the checker does not implement would turn
-            // an honest `hole` into an unknown rule name for nothing.
-            assert!(
-                is_checkable_alethe_rule(wire),
-                "alias target {wire} must be in the checkable table"
-            );
-            // An alias whose source is already checkable never fires (the
-            // pass-through arm wins) and is silently misleading.
-            assert!(
-                !is_checkable_alethe_rule(internal),
-                "alias source {internal} is already checkable; the alias is dead"
-            );
-            assert_eq!(wire_rule_name(internal), wire);
-            assert_ne!(
-                wire_rule_name(internal),
-                UNPROVED_STEP_RULE,
-                "{internal} must reach its checked spelling, not the hole"
-            );
-        }
-    }
-
-    #[test]
-    fn hole_is_itself_checkable() {
-        // The fallback must be a rule the checker implements, or the mapping
-        // would turn one invalid proof into another.
-        assert!(is_checkable_alethe_rule(UNPROVED_STEP_RULE));
-        assert_eq!(wire_rule_name(UNPROVED_STEP_RULE), UNPROVED_STEP_RULE);
-    }
-
-    #[test]
-    fn real_rules_pass_through_unchanged() {
-        for name in [
-            "resolution",
-            "th_resolution",
-            "eq_congruent",
-            "eq_transitive",
-            "la_generic",
-            "lia_generic",
-            "arrays_ext",
-            "arrays_row",
-            "arrays_idx",
-            "distinct_elim",
-            "cong",
-            "subproof",
-            "drup",
-            "string_decompose",
-        ] {
-            assert_eq!(wire_rule_name(name), name, "{name} must not be rewritten");
-        }
-    }
-
-    #[test]
-    fn every_name_the_checker_rejects_becomes_hole() {
-        // Measured against carcara 1.1.0 [git main 9a352ee]: each of these
-        // names produces `unknown rule` and makes the whole document invalid.
-        for name in [
-            "trust",
-            "dt_project",
-            "dt_enum_pigeonhole",
-            "all_simplify",
-            "arith_simplify",
-            "array_ext_diff_intro",
-            "bool_tautology",
-            "bv_bitblast",
-            "equiv",
-            "extensionality",
-            "fp_classification",
-            "fp_rm_domain",
-            "fp_rounding_mode_domain",
-            "fp_to_bv",
-            "ite",
-            "ite_same",
-            "lra_farkas",
-            "nia_positivstellensatz",
-            "not_false",
-            "not_true",
-            "nra_interval_unsat",
-            "nra_positivstellensatz",
-            "nra_univariate_unsat",
-            "read_over_write_chain",
-            "read_over_write_neg",
-            "read_over_write_pos",
-            "regex_intersect_empty",
-            "store_permutation",
-            "string_code_inj",
-            "string_ground_eval",
-            "string_length",
-            "string_length_lemma",
-            "eq_mp",
-        ] {
-            assert!(
-                !is_checkable_alethe_rule(name),
-                "{name} must not be in the checkable table"
-            );
-            assert_eq!(
-                wire_rule_name(name),
-                UNPROVED_STEP_RULE,
-                "{name} must render as an honest hole, never as an unknown rule"
-            );
-        }
-    }
-
-    #[test]
-    fn premise_or_arg_required_table_is_sorted_and_deduped() {
-        // `alethe_rule_requires_premises_or_args` binary-searches it; an
-        // out-of-order entry silently stops matching and the guard goes quiet.
-        for pair in PREMISE_OR_ARG_REQUIRED_ALETHE_RULES.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "{} must sort strictly before {}",
-                pair[0],
-                pair[1]
-            );
-        }
-        for name in PREMISE_OR_ARG_REQUIRED_ALETHE_RULES {
-            assert!(
-                alethe_rule_requires_premises_or_args(name),
-                "{name} is in the table but does not look up"
-            );
-        }
-    }
-
-    /// The trap this guard exists for: a name the checker DOES implement, and
-    /// which `is_checkable_alethe_rule` therefore waves through, that no bare
-    /// step can ever be an instance of.
-    #[test]
-    fn checkable_by_name_is_not_backable_by_a_bare_step() {
-        // Measured on carcara 1.1.0 [git master 9a352ee]. Left column: the
-        // rule. Right: what it demands before it looks at the clause.
-        for (name, demand) in [
-            ("string_decompose", "1 premise + 1 arg"),
-            ("string_length_pos", "1 arg"),
-            ("string_length_non_empty", "1 premise"),
-            ("re_inter", "2 premises"),
-            ("concat_eq", "1 premise + 1 arg"),
-            ("concat_unify", "2 premises + 1 arg"),
-            ("concat_conflict", "1 premise + 1 arg"),
-            ("re_concat_unfold_pos", "1 premise"),
-        ] {
-            assert!(
-                is_checkable_alethe_rule(name),
-                "{name} should still be a rule the checker knows"
-            );
-            assert!(
-                alethe_rule_requires_premises_or_args(name),
-                "{name} needs {demand}; a bare step cannot back it"
-            );
-        }
-    }
-
-    /// The rules a bare theory-lemma step legitimately reaches must NOT be
-    /// demoted — the guard has to stay a scalpel, not a blanket.
-    #[test]
-    fn rules_a_bare_step_can_back_are_left_alone() {
-        for name in [
-            UNPROVED_STEP_RULE,
-            "eq_transitive",
-            "eq_reflexive",
-            "eq_congruent",
-            "eq_congruent_pred",
-            "arrays_idx",
-            "true",
-            "false",
-            // Deliberately absent: their argument count is computed from the
-            // conclusion, and the printer either supplies `:args` or refuses
-            // the step outright. Listing them would mute that fail-loud.
-            "la_generic",
-            "lia_generic",
-        ] {
-            assert!(
-                !alethe_rule_requires_premises_or_args(name),
-                "{name} must not be demoted"
-            );
-        }
-    }
-
-    /// The strings/regex/arithmetic wire-mapping audit, locked down.
-    ///
-    /// Each of these internal names was tested as a candidate
-    /// [`WIRE_RULE_ALIASES`] entry against the pinned checker and failed the
-    /// admissibility bar; every one must stay an honest hole. A future agent
-    /// that maps one of them onto `re_inter`, `mod_simplify`,
-    /// `string_length_pos`, `concat_unify`, … trips this test.
-    #[test]
-    fn audited_string_regex_arithmetic_kinds_stay_honest_holes() {
-        for internal in [
-            "string_length",
-            "string_length_lemma",
-            "string_code_inj",
-            "string_ground_eval",
-            "string_containment_identity",
-            "string_concat_cancellation",
-            "string_ground_factor_conflict",
-            "regex_intersect_empty",
-            "regex_length_lower_bound",
-            "lia_mod_range",
-            "nra_interval_unsat",
-            "nra_univariate_unsat",
-        ] {
-            let wire = wire_rule_name(internal);
-            assert_eq!(
-                wire, UNPROVED_STEP_RULE,
-                "{internal} has no admissible checker counterpart; see the \
-                 WIRE_RULE_ALIASES admissibility bar before mapping it"
-            );
-            assert!(
-                !alethe_rule_requires_premises_or_args(wire),
-                "the hole rendering must itself be backable by a bare step"
-            );
-        }
-    }
-
-    #[test]
-    fn trust_renders_as_hole_but_keeps_its_internal_identity() {
-        // The soundness gates (terminal-trust, quality metrics, dedup keys)
-        // match on the INTERNAL name; only the wire name changes.
-        assert_eq!(AletheRule::Trust.name(), "trust");
-        assert_eq!(AletheRule::Trust.wire_name(), "hole");
-        assert_eq!(TheoryLemmaKind::Generic.alethe_rule(), "trust");
-        assert_eq!(TheoryLemmaKind::Generic.alethe_wire_rule(), "hole");
-        assert!(TheoryLemmaKind::Generic.is_trust());
-
-        // Datatype distinctness keeps its INTERNAL name and now prints the
-        // checker's spelling of the same axiom (`dt_clash`), so the step is
-        // genuinely checked instead of left as a hole.
-        assert_eq!(
-            TheoryLemmaKind::DatatypeDistinct.alethe_rule(),
-            "dt_distinct"
-        );
-        assert_eq!(
-            TheoryLemmaKind::DatatypeDistinct.alethe_wire_rule(),
-            "dt_clash"
-        );
-
-        // Finite-enum exhaustiveness is checked only by AY's native strict
-        // checker. The pinned external Alethe calculus has no equivalent rule,
-        // so the wire format must disclose the gap as a hole.
-        assert_eq!(
-            TheoryLemmaKind::DatatypeEnumPigeonhole.alethe_rule(),
-            "dt_enum_pigeonhole"
-        );
-        assert_eq!(
-            TheoryLemmaKind::DatatypeEnumPigeonhole.alethe_wire_rule(),
-            "hole"
-        );
-        assert!(!is_checkable_alethe_rule("dt_enum_pigeonhole"));
-
-        // A theory lemma that DOES have a real Alethe rule keeps it.
-        assert_eq!(TheoryLemmaKind::LraFarkas.alethe_wire_rule(), "la_generic");
-        assert_eq!(
-            TheoryLemmaKind::LiaGeneric.alethe_wire_rule(),
-            "lia_generic"
-        );
-    }
-}
+mod wire_name_tests;

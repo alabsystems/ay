@@ -69,6 +69,9 @@ const SEQ_INJECTED_AXIOM_UNSAT: &str = "\
 /// Strict proofs on, expressed the only way a library consumer can express it.
 const STRICT: &str = "(set-option :produce-proofs true)\n(set-option :check-proofs-strict true)\n";
 
+/// Strict proofs on without requesting a user-visible proof artifact.
+const STRICT_ONLY: &str = "(set-option :check-proofs-strict true)\n";
+
 /// Proofs on, strict OFF — the baseline the gate must not disturb.
 const PLAIN: &str = "(set-option :produce-proofs true)\n";
 
@@ -106,6 +109,21 @@ fn library_strict_proofs_withholds_terminal_trust_unsat() {
         !executor.last_result_is_unsat(),
         "executor state must agree with the published verdict"
     );
+}
+
+/// Strict-only library mode must inspect the mandatory hidden proof rather
+/// than the public artifact accessor, which intentionally returns `None`.
+#[test]
+#[timeout(120_000)]
+fn library_strict_option_alone_withholds_hidden_terminal_trust_unsat() {
+    let (verdict, executor) = solve(STRICT_ONLY, SEQ_LEN_UNCHECKABLE_UNSAT);
+    assert!(
+        !executor.is_producing_proofs(),
+        "fixture must exercise strict-only hidden proof tracking"
+    );
+    assert!(executor.last_proof().is_none());
+    assert_eq!(verdict, "unknown");
+    assert_eq!(executor.unknown_reason(), Some(UnknownReason::ProofTrusted));
 }
 
 /// CONTROL part (b) — the reason must be DISTINGUISHABLE.

@@ -67,6 +67,39 @@ impl Executor {
             }
             FrontendTerm::IndexedApp(name, indices, arguments) => {
                 let elaborated = self.ctx.elaborate_surface_subterm(stripped)?;
+                // SMT-LIB datatype tester `((_ is C) t)`. Its index is a
+                // CONSTRUCTOR SYMBOL, not a numeral, so the numeric-index path
+                // below fails closed on it and the whole enclosing assertion
+                // loses its raw re-intern — the #raw-intern-head-cliff failure
+                // mode, one level down. That cliff is what denies a QF_DT
+                // fold-to-`false` refutation any recorded argument at all
+                // (`authored_conjunct_eval`): the conjunct that made the
+                // assertion false IS a tester application.
+                //
+                // Rebuild it exactly as the elaborator names it — `is-C` from
+                // the index symbol (`elaborate_indexed_app`) — and re-read the
+                // result so a store that folded it fails closed. This grants
+                // no new authority: the term is rebuilt node-by-node from an
+                // assertion THE AUTHOR WROTE, which is the same grant every
+                // other arm of this function makes.
+                if name == "is" && arguments.len() == 1 {
+                    let [FrontendIndex::Symbol(constructor)] = indices.as_slice() else {
+                        return None;
+                    };
+                    let raw_argument = self.raw_intern_surface_prechecked(&arguments[0])?;
+                    let sort = self.ctx.terms.sort(elaborated).clone();
+                    let tester = Symbol::named(format!("is-{constructor}"));
+                    let rebuilt = self
+                        .ctx
+                        .terms
+                        .mk_app(tester.clone(), vec![raw_argument], sort);
+                    return matches!(
+                        self.ctx.terms.get(rebuilt),
+                        ay_core::term::TermData::App(symbol, args)
+                            if *symbol == tester && args.as_slice() == [raw_argument]
+                    )
+                    .then_some(rebuilt);
+                }
                 if arguments.is_empty() {
                     let [FrontendIndex::Numeral(width)] = indices.as_slice() else {
                         return None;

@@ -2,8 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Model completion: make the final model total over the original free
-//! variables before full model validation runs.
+//! Make the final model total over original free variables before full validation.
 //!
 //! Preprocessing (`VariableSubstitution`) eliminates variables bound by
 //! definitional equalities (e.g. `(= v9 (or v3 (<= v8 20)))` substitutes
@@ -50,12 +49,11 @@ use super::{string_witness, EvalValue, Model};
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
 
-/// Deterministic upper bound on graph, declaration, and commit work performed
-/// by checked-projection output completion.
+/// Bound on graph, declaration, and commit work for checked-projection output completion.
 ///
 /// Resource exhaustion is reported as [`CheckedProjectionOutputCompletion::Stopped`]
 /// and can never mint partial evidence. The semantic/source checker uses the
-/// same ten-million-term envelope, so this does not silently admit a larger
+/// same envelope, so this cannot admit a larger
 /// post-check traversal than the proof-producing phase.
 const MAX_CHECKED_PROJECTION_COMPLETION_WORK: usize = 10_000_000;
 
@@ -454,17 +452,17 @@ impl Executor {
         if relevant.is_empty() {
             return (0, false);
         }
-        // Phase 5 has frozen datatype ground values. Index their exact EUF
-        // carrier -> structured-rendering authority once an array actually
-        // needs completion; every later merge lookup is O(1).
-        let exact_dt_cells = self.exact_datatype_cell_completions(model);
+        // Index frozen datatype EUF carrier/rendering authority once; later lookups are O(1).
+        let exact_dt_cells = self.exact_datatype_cell_completions(model, extra_roots);
+        if self.apply_exact_datatype_cell_completions(model, &exact_dt_cells) {
+            super::eval_memo_clear();
+        }
         relevant.sort_by_key(|term| term.index());
         relevant.dedup();
         let relevant_set: HashSet<TermId> = relevant.iter().copied().collect();
 
-        // Record provenance BEFORE mirroring.  Array extractors commonly put a
-        // zero-like fallback in every interpretation, while an independently
-        // evaluated `(default a)` term is an actual semantic observation.  The
+        // Record provenance BEFORE mirroring. Array extractors commonly use a zero fallback,
+        // while an independently evaluated `(default a)` is an actual observation. The
         // distinction matters for store definitions: the RHS default must
         // replace a stale target fallback, but must agree with an explicit
         // `(default target)` value.
@@ -1197,7 +1195,7 @@ impl Executor {
         for (index, value) in candidate.stores {
             match merged_stores.iter_mut().find(|(key, _)| key == &index) {
                 Some((_, authority)) if authority != &value => {
-                    if std::env::var_os("AY_DEBUG_COMPLETION_MERGE").is_some() {
+                    if ay_core::misc_cli_flags().debug_completion_merge {
                         eprintln!(
                             "[completion-merge] cell conflict idx={index} existing={authority} candidate={value}"
                         );
@@ -2175,7 +2173,7 @@ impl Executor {
             if anchor[ei].is_some_and(|prev| prev != color)
                 || ctor_elem[color].is_some_and(|prev| prev != ei)
             {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace enum-model-repair-abort reason=anchor-conflict");
                 }
                 return;
@@ -2294,7 +2292,7 @@ impl Executor {
             match (0..k).find(|&c| !blocked[c]) {
                 Some(c) => color[ei] = Some(c),
                 None => {
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!(
                             "c phase-trace enum-model-repair-abort reason=coloring elem={}",
                             elements[ei]
@@ -2394,7 +2392,7 @@ impl Executor {
                 let mres = mapped(result);
                 match seen_rows.get(&margs) {
                     Some(prev) if *prev != mres => {
-                        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                        if ay_core::misc_cli_flags().phase_trace {
                             eprintln!(
                                 "c phase-trace enum-model-repair-abort \
                                  reason=fn-consistency fn={fn_name}"
@@ -2480,7 +2478,7 @@ impl Executor {
         super::eval_memo_clear();
         self.last_statistics
             .set_int("model_completion.enum_repair_merged", merged as u64);
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!("c phase-trace enum-model-repair sort={sort_name} merged={merged} k={k}");
         }
         tracing::debug!(
@@ -3401,10 +3399,10 @@ impl Executor {
                 .set_int("model_validation.uf_table_conflict", 1);
             self.last_model_validated = false;
             self.last_unknown_reason = Some(crate::executor_types::UnknownReason::Incomplete);
-            if std::env::var_os("AY_F1_DIAG").is_some() {
+            if ay_core::misc_cli_flags().f1_diag {
                 if let Some(euf) = model.euf_model.as_ref() {
                     eprintln!(
-                        "AY_F1_DIAG: model discarded on function_table_conflicts={:?} \
+                        "--f1-diag: model discarded on function_table_conflicts={:?} \
                          uflia_lane={}",
                         euf.function_table_conflicts, self.uflia_congruence_lane
                     );
@@ -4119,7 +4117,7 @@ impl Executor {
         }
     }
 
-    /// W3 (default ON, `AY_STR_WITNESS=0` kill switch): PER-VARIABLE retracting
+    /// W3 (default ON, `--dpll-no-str-witness` kill switch): PER-VARIABLE retracting
     /// completion, run only after NEITHER all-or-nothing strategy was confirmed.
     ///
     /// The pre-existing pass fills every gap variable, gate-checks ONCE, and on
@@ -4244,7 +4242,7 @@ impl Executor {
         if let Some(s) = self.derive_string_from_sat_true_equalities(model, var) {
             return Some(EvalValue::String(s));
         }
-        // (a2) W1 (default ON, `AY_STR_WITNESS=0` kill switch): CONTENT-POSITIVE
+        // (a2) W1 (default ON, `--dpll-no-str-witness` kill switch): CONTENT-POSITIVE
         //      construction from the variable's `str.in_re` memberships as the
         //      SAT model assigns them. The uniform pad in (b) can only emit the
         //      pad letter, so a length-pinned + language-constrained variable is
@@ -4314,7 +4312,7 @@ impl Executor {
         None
     }
 
-    /// W1 (default ON, `AY_STR_WITNESS=0` kill switch): construct `var`'s witness from the
+    /// W1 (default ON, `--dpll-no-str-witness` kill switch): construct `var`'s witness from the
     /// `str.in_re` memberships the SAT model assigns it, via the exact
     /// derivative search [`ay_strings::we_regex::find_witness`].
     ///

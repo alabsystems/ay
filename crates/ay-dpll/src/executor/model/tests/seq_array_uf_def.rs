@@ -179,11 +179,11 @@ fn array_valued_uf_resolves_with_distinct_index_and_element_sorts() {
 /// `collect_array_completion_graph` classified an array equality as a
 /// definition only when one side was a bare `TermData::Var`, so
 /// `(= (const-array 7) (g v))` — App vs App — was dropped, and `(g v)` fell
-/// back to a reads-derived guess. Measured with `AY_DEBUG_STRICT_ORACLE=1`, the
+/// back to a reads-derived guess. Measured with `--debug-strict-oracle`, the
 /// published interpretation came out
 /// `default: "0", stores: [("#x3", "0")]`, the read evaluated to `0`, and the
 /// strict `arrays` oracle rejected assertion 1 as definitively false. (The
-/// independent gate was clean throughout: `AY_G3_GATE_DUMP` reported
+/// independent gate was clean throughout: `--g3-gate-dump` reported
 /// `n_false=0 n_uneval=0`.)
 ///
 /// FIX (#opaque-array-app-def): an OPAQUE array-valued UF application is a

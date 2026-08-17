@@ -58,6 +58,7 @@ pub(in crate::executor) use independent_gate::QuantifiedModelConfirmation;
 mod ite_fixup;
 mod ite_fixup_limits;
 mod minimize;
+mod nra_refine;
 mod output;
 mod output_format;
 mod output_objectives;
@@ -136,6 +137,7 @@ mod eval_memo;
 
 pub(in crate::executor) use eval_guard::AssertionsFrozen;
 pub(in crate::executor::model) use eval_guard::EvalWorkBudget;
+pub(in crate::executor) use eval_memo::with_isolated_eval_memo;
 pub(crate) use eval_memo::EvalMemoSession;
 pub(in crate::executor) use projection_uf::ProjectionUfModel;
 
@@ -185,18 +187,6 @@ mod eval_guard;
 /// (not `&self`) can call it.
 pub(super) fn eval_memo_clear() {
     eval_memo::clear();
-}
-
-/// Evaluate one exact semantic obligation in a fresh memo universe.
-///
-/// This is intentionally closure-based so the isolation guard cannot be
-/// forgotten by a caller.  The nested session permits local DAG memoization,
-/// while the outer session and all of its entries are restored byte-for-byte
-/// after the closure returns or unwinds.
-pub(in crate::executor) fn with_isolated_eval_memo<R>(f: impl FnOnce() -> R) -> R {
-    let _isolation = eval_memo::IsolatedEvalMemo::new();
-    let _session = EvalMemoSession::new();
-    f()
 }
 
 #[cfg(test)]

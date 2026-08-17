@@ -12,15 +12,15 @@ use num_traits::{One, Zero};
 use thiserror::Error;
 
 use crate::{Constant, FarkasAnnotation, Symbol, TermData, TermId, TermStore, TheoryLit};
-
 mod recovery;
-
 pub use recovery::recover_single_equality_farkas;
-
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 /// Errors returned when a Farkas certificate fails structural or semantic validation.
 pub enum FarkasValidationError {
+    /// A caller-owned validation work, scratch-space, or cancellation envelope refused progress.
+    #[error("Farkas validation resource envelope exhausted")]
+    ResourceLimit,
     /// One or more coefficients were negative, violating the Farkas precondition λ >= 0.
     #[error("Farkas coefficients must be non-negative, but found: {negative:?}")]
     NegativeCoefficients {

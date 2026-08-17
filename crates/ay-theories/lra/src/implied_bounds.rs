@@ -37,7 +37,7 @@ impl LraSolver {
         fn gate_disabled() -> bool {
             static D: OnceLock<bool> = OnceLock::new();
             *D.get_or_init(|| {
-                std::env::var("AY_LRA_NO_IB_GATE").is_ok_and(|v| v != "0" && !v.is_empty())
+                false // B24: kill-switch env retired; the gate stays on.
             })
         }
         gate_disabled()

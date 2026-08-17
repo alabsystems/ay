@@ -55,7 +55,7 @@ fn test_preprocess_has_no_manual_lrat_overrides() {
     let fn_body = &source[env_block_end..test_mod];
 
     // The anti-pattern: an inproc_ctrl technique disabled UNDER AN LRAT GUARD
-    // (per the doc above, non-LRAT disables — e.g. the AY_AB_SUBST_AUTO
+    // (per the doc above, non-LRAT disables — e.g. the --sat-no-subst-auto
     // density-probe bail-out routing — are legitimate; only LRAT-conditional
     // blanket disables must go through with_proof_overrides()). A disable is
     // treated as LRAT-guarded when an `lrat` mention appears within the 25

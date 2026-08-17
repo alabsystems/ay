@@ -56,30 +56,25 @@ use super::*;
 pub(in crate::solver) const FACTOR_DENSE_MIN_DENSITY: f64 = 90.0;
 
 /// The live band edge: [`FACTOR_DENSE_MIN_DENSITY`] unless overridden via
-/// `AY_FACTOR_DENSE_MIN_DENSITY` (A/B tuning knob — the 90.0 default was
+/// (B3: the env override is deleted — the 90.0 default was
 /// calibrated when the factor pass cost 47s; the incremental-PQ rework cut
 /// that to ~3s, so the profitable edge is being re-measured). Cached
 /// OnceLock per the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn factor_dense_min_density() -> f64 {
-    static MIN_DENSITY: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *MIN_DENSITY.get_or_init(|| {
-        std::env::var("AY_FACTOR_DENSE_MIN_DENSITY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(FACTOR_DENSE_MIN_DENSITY)
-    })
+    // B3: the AY_FACTOR_DENSE_MIN_DENSITY env override is deleted; the constant stands.
+    FACTOR_DENSE_MIN_DENSITY
 }
 
 /// Env kill-switch for the factor-dense unlock (see
 /// [`FACTOR_DENSE_MIN_DENSITY`]). Default ON; `AY_AB_FACTOR_DENSE=0`
 /// restores the blanket density skip.
 pub(in crate::solver) fn factor_dense_enabled() -> bool {
-    static FACTOR_DENSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FACTOR_DENSE.get_or_init(|| std::env::var_os("AY_AB_FACTOR_DENSE").is_none_or(|v| v != "0"))
+    // B26: CLI-owned opt-out (--sat-no-factor-dense); env retired.
+    !ay_core::sat_ab_switches().no_factor_dense
 }
 
 /// Env kill-switch for the dense-band factor init-budget raise (see
-/// [`FACTOR_DENSE_INIT_TICKS`]). DEFAULT ON; `AY_AB_FACTOR_DENSE_INIT=0`
+/// [`FACTOR_DENSE_INIT_TICKS`]). DEFAULT ON; `--sat-no-factor-dense-init`
 /// restores the sparse [`FACTOR_INIT_TICKS`] (500M) first-call bonus on ALL
 /// bands. Only the first (`factor_rounds == 0`) factoring call in the dense
 /// band (density >= [`factor_dense_min_density`]) is affected — later
@@ -87,7 +82,7 @@ pub(in crate::solver) fn factor_dense_enabled() -> bool {
 /// Cached OnceLock per the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn factor_dense_init_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_AB_FACTOR_DENSE_INIT").is_none_or(|v| v != "0"))
+    *ENABLED.get_or_init(|| !ay_core::sat_ab_switches().no_factor_dense_init)
 }
 
 /// Dense-band first-call factor init budget: [`FACTOR_DENSE_INIT_TICKS`] (1B)
@@ -95,14 +90,8 @@ pub(in crate::solver) fn factor_dense_init_enabled() -> bool {
 /// zero/unparseable is ignored). Cached OnceLock per the #8506
 /// no-per-call-syscall convention.
 pub(in crate::solver) fn factor_dense_init_ticks() -> u64 {
-    static TICKS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TICKS.get_or_init(|| {
-        std::env::var("AY_FACTOR_DENSE_INIT_TICKS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(FACTOR_DENSE_INIT_TICKS)
-    })
+    // B3: the AY_FACTOR_DENSE_INIT_TICKS env override is deleted; the constant stands.
+    FACTOR_DENSE_INIT_TICKS
 }
 
 /// Per-call factor effort ceiling: [`FACTOR_MAX_EFFORT`] (1B) unless overridden
@@ -146,14 +135,8 @@ pub(in crate::solver) fn factor_dense_init_ticks() -> u64 {
 /// fundamentally stronger BVE on the post-factor binary-dense class, not the
 /// reopen gate. Cached OnceLock per the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn factor_max_effort() -> u64 {
-    static MAX_EFFORT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MAX_EFFORT.get_or_init(|| {
-        std::env::var("AY_FACTOR_MAX_EFFORT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(FACTOR_MAX_EFFORT)
-    })
+    // B3: the AY_FACTOR_MAX_EFFORT env override is deleted; the constant stands.
+    FACTOR_MAX_EFFORT
 }
 
 /// Upper residual-clause bound for the dense-band init raise:
@@ -161,14 +144,8 @@ pub(in crate::solver) fn factor_max_effort() -> u64 {
 /// `AY_FACTOR_DENSE_INIT_MAX_CLAUSES` (A/B tuning knob; zero/unparseable is
 /// ignored). Cached OnceLock per the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn factor_dense_init_max_clauses() -> usize {
-    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| {
-        std::env::var("AY_FACTOR_DENSE_INIT_MAX_CLAUSES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(FACTOR_DENSE_INIT_MAX_CLAUSES)
-    })
+    // B3: the AY_FACTOR_DENSE_INIT_MAX_CLAUSES env override is deleted; the constant stands.
+    FACTOR_DENSE_INIT_MAX_CLAUSES
 }
 
 /// Pure predicate: does the dense-band factor init-budget raise apply at the
@@ -189,7 +166,7 @@ pub(in crate::solver) fn factor_dense_init_applies(
 }
 
 /// Post-collapse BVE eligibility re-derivation knob
-/// (`AY_AB_BVE_POST_COLLAPSE`). DEFAULT ON since 2026-07-10 (collapse+BVE
+/// (`--sat-no-bve-post-collapse`). DEFAULT ON since 2026-07-10 (collapse+BVE
 /// default flip, wf_55735963; measurement wf_2ee873fc/wf_0552d0f0): with the
 /// AUTO collapse + sparse-deep stack on the scoreboard protocol
 /// (`--competition`, 120s, no proof, main2025), re-deriving BVE eligibility
@@ -199,30 +176,19 @@ pub(in crate::solver) fn factor_dense_init_applies(
 /// scoped by `bve_post_collapse_unlock_active()` (LRAT/incremental refusal,
 /// collapse requirement, 400K active-var cap, dense re-check), which is
 /// exactly the band the measurement validated. Kill-switch
-/// `AY_AB_BVE_POST_COLLAPSE=0` restores the pre-flip opt-in behavior. Cached
+/// `--sat-no-bve-post-collapse` restores the pre-flip opt-in behavior. Cached
 /// OnceLock per the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn bve_post_collapse_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("AY_AB_BVE_POST_COLLAPSE").ok().as_deref(),
-            Some("0")
-        )
-    })
+    *ENABLED.get_or_init(|| !ay_core::sat_ab_switches().no_bve_post_collapse)
 }
 
 /// Re-derived active-variable cap for the post-collapse BVE unlock:
 /// [`BVE_POST_COLLAPSE_MAX_VARS`] (600K — see that constant for the measured
-/// rationale) unless overridden via `AY_BVE_POST_COLLAPSE_MAX_VARS`.
+/// rationale). (B3: the env override is deleted.)
 pub(in crate::solver) fn bve_post_collapse_max_vars() -> usize {
-    static MAX_VARS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_VARS.get_or_init(|| {
-        std::env::var("AY_BVE_POST_COLLAPSE_MAX_VARS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(BVE_POST_COLLAPSE_MAX_VARS)
-    })
+    // B3: the AY_BVE_POST_COLLAPSE_MAX_VARS env override is deleted.
+    BVE_POST_COLLAPSE_MAX_VARS
 }
 
 /// Pure post-collapse BVE re-eligibility predicate (unit-testable, env-free).
@@ -261,29 +227,18 @@ pub(in crate::solver) fn bve_post_collapse_reopens(
 /// COLLAPSED counts so BVE fires on the factored residual. Cached OnceLock per
 /// the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn bve_post_factor_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("AY_AB_BVE_POST_FACTOR").ok().as_deref(),
-            Some("1")
-        )
-    })
+    // B21: the AY_AB_BVE_POST_FACTOR opt-in is retired — its own test called
+    // it a measured-negative lever and the HONEST STATUS block records the
+    // reopen firing without a solve. The reopen stays compiled-inert.
+    false
 }
 
 /// Minimum factor-collapse ratio for the post-factor BVE reopen:
-/// [`BVE_POST_FACTOR_MIN_COLLAPSE_RATIO`] (8.0) unless overridden via
-/// `AY_BVE_POST_FACTOR_MIN_RATIO` (A/B ranging knob; zero/negative/unparseable
-/// is ignored → the constant). Cached OnceLock per the #8506
-/// no-per-call-syscall convention.
+/// [`BVE_POST_FACTOR_MIN_COLLAPSE_RATIO`] (8.0). (B3: the env override is
+/// deleted.)
 pub(in crate::solver) fn bve_post_factor_min_collapse_ratio() -> f64 {
-    static RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *RATIO.get_or_init(|| {
-        std::env::var("AY_BVE_POST_FACTOR_MIN_RATIO")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or(BVE_POST_FACTOR_MIN_COLLAPSE_RATIO)
-    })
+    // B3: the AY_BVE_POST_FACTOR_MIN_RATIO env override is deleted.
+    BVE_POST_FACTOR_MIN_COLLAPSE_RATIO
 }
 
 /// Pure post-FACTOR BVE re-eligibility predicate (unit-testable, env-free) —
@@ -375,13 +330,8 @@ pub(in crate::solver) fn bve_post_factor_reopens(
 /// nondeterminism (see INPROCESSING_ROUND_WALL_LIMIT_MS), not this gate.
 /// Do NOT flip this default OFF to chase those instances.
 pub(in crate::solver) fn bve_inst_gate_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("AY_AB_BVE_INST_GATE").ok().as_deref(),
-            Some("0")
-        )
-    })
+    // B26: CLI-owned opt-out (--sat-no-bve-inst-gate); env retired.
+    !ay_core::sat_ab_switches().no_bve_inst_gate
 }
 
 /// Pure qualification predicate for the giant raw-BVE unlock (lever 3 of the
@@ -433,7 +383,7 @@ pub(in crate::solver) fn bve_giant_raw_qualifies(
 /// [`Solver::compute_preprocess_policy`] — AUTO-armed decompose/congruence
 /// off and `cold.subst_auto_collapse` cleared BEFORE the policy consults
 /// them, so the whole pipeline is behaviorally identical to
-/// `AY_AB_SUBST_AUTO=0` (verified byte-identical `--stats` behavioral counters
+/// `--sat-no-subst-auto` (verified byte-identical `--stats` behavioral counters
 /// on 43fbacb2, fix-default vs AUTO=0).
 ///
 /// WHY A FORMULA-density cap: the probe's own 0.05 EQUIVALENCE-density gate
@@ -472,8 +422,8 @@ pub(in crate::solver) fn bve_giant_raw_qualifies(
 /// 8b40f19a — do NOT revert and do NOT add a finer dense-giant guard):
 /// this disarm is the attributed cause of losing 1b880681 (19.6M clauses,
 /// parsed density 351.6, historically SAT@97.6s → UNKNOWN@120s).
-/// Differential: default and AY_AB_SUBST_AUTO=0 both UNKNOWN@120s;
-/// AY_AB_SUBST_AUTO=1 (uncapped, no disarm) recovers SAT@100.4s
+/// Differential: default and --sat-no-subst-auto both UNKNOWN@120s;
+/// --sat-no-subst-auto=1 (uncapped, no disarm) recovers SAT@100.4s
 /// (model-verified over all 19.6M clauses, kissat-agreed). Mechanism: the
 /// pre-disarm armed-flag leak bought 2.9s of inprocessing decompose
 /// (inproc_decompose_ms 2873, decomp_subst 62) whose 62 substitutions
@@ -497,7 +447,7 @@ pub(in crate::solver) fn bve_giant_raw_qualifies(
 /// UNSAT@113.8s). See `auto_probe_dense_cap_must_see_parsed_density_not_active`.
 ///
 /// Applies ONLY when `cold.subst_auto_capped` is set (DEFAULT-ON path);
-/// explicit `AY_AB_SUBST_AUTO=1` keeps the historical uncapped semantics.
+/// explicit `--sat-no-subst-auto=1` keeps the historical uncapped semantics.
 pub(super) fn auto_probe_skip_dense(parsed_formula_density: f64) -> bool {
     parsed_formula_density > PREPROCESS_BVE_SKIP_DENSITY
 }
@@ -531,7 +481,7 @@ pub(super) fn auto_probe_skip_dense(parsed_formula_density: f64) -> bool {
 /// bit-for-bit, leak included.
 ///
 /// Applies ONLY when `subst_auto_capped` (DEFAULT-ON path); explicit
-/// `AY_AB_SUBST_AUTO=1` keeps the historical uncapped semantics, and
+/// `--sat-no-subst-auto=1` keeps the historical uncapped semantics, and
 /// non-Default variants / Custom congruence profiles (capped == false)
 /// are untouched.
 ///
@@ -584,10 +534,10 @@ impl Solver {
         // dense instance's entire pipeline — lightweight L0-GC path,
         // preprocess probe block, want_fixpoint, and every inprocessing
         // decompose/congruence gate — is behaviorally identical to
-        // AY_AB_SUBST_AUTO=0. A later disarm leaves skip_congruence false
+        // --sat-no-subst-auto. A later disarm leaves skip_congruence false
         // and diverges (the rejected first attempt). Scoped to the
         // DEFAULT-ON path (`cold.subst_auto_capped`): explicit
-        // AY_AB_SUBST_AUTO=1 keeps the historical uncapped semantics.
+        // --sat-no-subst-auto=1 keeps the historical uncapped semantics.
         //
         // The predicate is fed the PARSED density (num_clauses / num_vars),
         // NOT `formula_density` (active-vars based): 6f354fbe parses 28,984
@@ -624,18 +574,18 @@ impl Solver {
         // 1.7M) are huge ternary-dominant substitution instances the winner
         // (Kissat, no such cap) cracks in 3-8s but AY skips congruence on. The
         // clause-driven XOR extraction is now cheap (15ms/70da), so the
-        // 200k-var / 3M-clause caps are overly conservative. AY_AB_SUBST_AUTO
+        // 200k-var / 3M-clause caps are overly conservative. --sat-no-subst-auto
         // raises them (probe is affordable, and its density gate bails cheaply
         // if the big instance is NOT substitution-heavy) — but keep an upper
         // bound so truly enormous formulas still skip. Default ON since
         // 2026-07-10 (wf_55735963); the flag is armed per resolved config by
         // VariantConfig::apply_to_solver (Default DIMACS variant only,
-        // kill-switch AY_AB_SUBST_AUTO=0).
+        // kill-switch --sat-no-subst-auto).
         let auto_collapse = self.cold.subst_auto_collapse;
         // Giant-band raise (giant-3M fix, 2026-07 — see
         // AUTO_CONGRUENCE_GIANT_MAX_VARS): NON-PROOF default-path solves get
         // the 4M/10M probe band (5ceb95f5 SAT@62.0s, ac388757 SAT@58.6s,
-        // models validated); proof solves and explicit AY_AB_SUBST_AUTO=1
+        // models validated); proof solves and explicit --sat-no-subst-auto=1
         // keep the historical 2M/8M band bit-for-bit (cold.subst_auto_giant
         // is armed only on the capped non-proof path). Kill-switch
         // AY_AB_SUBST_AUTO_GIANT=0 restores 2M/8M exactly.
@@ -793,13 +743,8 @@ impl PreprocessPolicy {
 /// on all four elimination-side gates byte-for-byte. Cached OnceLock per
 /// the #8506 no-per-call-syscall convention.
 pub(in crate::solver) fn dense_skip_lift_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("AY_AB_DENSE_SKIP_LIFT").ok().as_deref(),
-            Some("0")
-        )
-    })
+    // B26: CLI-owned opt-out (--sat-no-dense-skip-lift); env retired.
+    !ay_core::sat_ab_switches().no_dense_skip_lift
 }
 
 #[cfg(test)]
@@ -1016,7 +961,7 @@ mod tests {
 
     #[test]
     fn auto_giant_rerun_bail_scoped_to_the_default_on_path() {
-        // Explicit AY_AB_SUBST_AUTO=1 (capped == false) keeps the historical
+        // Explicit --sat-no-subst-auto=1 (capped == false) keeps the historical
         // uncapped semantics even on a 21M-clause giant; same for
         // non-Default variants and Custom congruence profiles.
         assert!(!auto_capped_giant_skips_decompose_rerun(false, 21_161_364));
@@ -1194,23 +1139,15 @@ mod tests {
     fn bve_post_collapse_env_default_is_on() {
         // Default flipped ON 2026-07-10 (wf_55735963: +7 UNSAT flips / 0 hard
         // losses on the main2025 scoreboard protocol — see
-        // bve_post_collapse_enabled). Hermetic only when the operator has not
-        // exported the knob into the test environment (same tolerant pattern
-        // as the AY_AB_BVE_SPARSE tests in variant.rs).
-        match std::env::var("AY_AB_BVE_POST_COLLAPSE").ok().as_deref() {
-            None => assert!(
-                bve_post_collapse_enabled(),
-                "AY_AB_BVE_POST_COLLAPSE must default ON (wf_55735963 flip)"
-            ),
-            Some("0") => assert!(
-                !bve_post_collapse_enabled(),
-                "AY_AB_BVE_POST_COLLAPSE=0 kill-switch must disable"
-            ),
-            Some(_) => {}
-        }
-        if std::env::var_os("AY_BVE_POST_COLLAPSE_MAX_VARS").is_none() {
-            assert_eq!(bve_post_collapse_max_vars(), BVE_POST_COLLAPSE_MAX_VARS);
-        }
+        // bve_post_collapse_enabled). B34: the kill is CLI-owned
+        // (--sat-no-bve-post-collapse), so the default assert is
+        // unconditional.
+        assert!(
+            bve_post_collapse_enabled(),
+            "the post-collapse BVE unlock must default ON (wf_55735963 flip)"
+        );
+        // B3: the accessor is env-free; assert the constant directly.
+        assert_eq!(bve_post_collapse_max_vars(), BVE_POST_COLLAPSE_MAX_VARS);
     }
 
     #[test]
@@ -1313,27 +1250,15 @@ mod tests {
     }
 
     #[test]
-    fn bve_post_factor_env_default_is_off() {
-        // Measured-negative lever: ships OPT-IN. Hermetic only when the
-        // operator has not exported the knob (same tolerant pattern as the
-        // AY_AB_BVE_POST_COLLAPSE / AY_AB_BVE_SPARSE tests).
-        match std::env::var("AY_AB_BVE_POST_FACTOR").ok().as_deref() {
-            None => assert!(
-                !bve_post_factor_enabled(),
-                "AY_AB_BVE_POST_FACTOR must default OFF (measured-negative lever)"
-            ),
-            Some("1") => assert!(
-                bve_post_factor_enabled(),
-                "AY_AB_BVE_POST_FACTOR=1 must arm the opt-in lever"
-            ),
-            Some(_) => assert!(!bve_post_factor_enabled()),
-        }
-        if std::env::var_os("AY_BVE_POST_FACTOR_MIN_RATIO").is_none() {
-            assert_eq!(
-                bve_post_factor_min_collapse_ratio(),
-                BVE_POST_FACTOR_MIN_COLLAPSE_RATIO
-            );
-        }
+    fn bve_post_factor_stays_retired() {
+        // B21: the measured-negative lever's env spelling is retired; the
+        // reopen must stay compiled-inert until a measurement revives it.
+        assert!(!bve_post_factor_enabled());
+        // B3: the accessor is env-free; assert the constant directly.
+        assert_eq!(
+            bve_post_factor_min_collapse_ratio(),
+            BVE_POST_FACTOR_MIN_COLLAPSE_RATIO
+        );
     }
 
     #[test]
@@ -1369,26 +1294,18 @@ mod tests {
 
     #[test]
     fn factor_dense_init_env_defaults() {
-        if std::env::var_os("AY_AB_FACTOR_DENSE_INIT").is_none() {
-            assert!(
-                factor_dense_init_enabled(),
-                "AY_AB_FACTOR_DENSE_INIT must default ON"
-            );
-        }
-        if std::env::var_os("AY_FACTOR_DENSE_INIT_TICKS").is_none() {
-            assert_eq!(factor_dense_init_ticks(), FACTOR_DENSE_INIT_TICKS);
-        }
-        if std::env::var_os("AY_FACTOR_DENSE_INIT_MAX_CLAUSES").is_none() {
-            assert_eq!(
-                factor_dense_init_max_clauses(),
-                FACTOR_DENSE_INIT_MAX_CLAUSES
-            );
-        }
-        // Measured-infra knob defaults to the compile-time ceiling: unset ⇒
-        // byte-identical `effort.min(FACTOR_MAX_EFFORT)` clamp (certified board
-        // untouched).
-        if std::env::var_os("AY_FACTOR_MAX_EFFORT").is_none() {
-            assert_eq!(factor_max_effort(), FACTOR_MAX_EFFORT);
-        }
+        assert!(
+            factor_dense_init_enabled(),
+            "the dense-band first-call factor bonus must default ON \
+             (`--sat-no-factor-dense-init` kills it)"
+        );
+        // B3: the accessors are env-free; assert the constants directly.
+        assert_eq!(factor_dense_init_ticks(), FACTOR_DENSE_INIT_TICKS);
+        assert_eq!(
+            factor_dense_init_max_clauses(),
+            FACTOR_DENSE_INIT_MAX_CLAUSES
+        );
+        // B3: the accessor is env-free; the clamp is the compile-time ceiling.
+        assert_eq!(factor_max_effort(), FACTOR_MAX_EFFORT);
     }
 }

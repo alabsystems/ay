@@ -125,9 +125,9 @@ fn window_compatible_respects_pins() {
     assert!(!Executor::window_compatible(&buf, 0, &['x', 'y']));
 }
 
-// ── W2: regex-aware materializer (`AY_STR_WITNESS=1`) ─────────────────
+// ── W2: regex-aware materializer ─────────────────
 //
-// The COLLECTOR is env-gated (so flags-off stays byte-identical), but the
+// The COLLECTOR is gated (so flags-off stays byte-identical), but the
 // constraint checking and witness construction below are pure functions of
 // `StringVarConstraints`, so they are exercised directly here — no env
 // mutation, no test-order coupling.

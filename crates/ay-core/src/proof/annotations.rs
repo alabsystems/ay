@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// The interpolant (from A only): `x ≤ 5`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FarkasAnnotation {
     /// Farkas coefficients for each constraint in the conflict
     /// Indexed by position in the clause (same order as `clause` field)
@@ -148,6 +149,7 @@ pub enum LiaAnnotation {
 /// 3. Round up (ceiling) to obtain tighter integer bounds
 /// 4. The tightened bound contradicts existing constraints
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CuttingPlaneAnnotation {
     /// Farkas coefficients for the linear combination step
     pub farkas: FarkasAnnotation,

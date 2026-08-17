@@ -22,10 +22,10 @@ impl Solver {
     /// per-pass (backbone / sweep) guards: `true` once the work window that
     /// started at (`start`, `start_ticks`) has consumed its budget.
     ///
-    /// Deterministic mode (`AY_AB_DETERMINISTIC_INPROC=1`) gates on the
+    /// Deterministic mode (`--sat-deterministic-inproc`) gates on the
     /// machine-independent `search_ticks` delta since the window opened, so
     /// *which* passes fit no longer depends on host load. Wall-clock mode
-    /// (default; `AY_AB_DETERMINISTIC_INPROC=0`) is byte-identical to `main` by
+    /// (default; `--sat-deterministic-inproc=0`) is byte-identical to `main` by
     /// construction — the `else` branch is the exact original `elapsed()`
     /// comparison. Only inner scheduling is bounded; the outer `-t <ms>` total
     /// timeout stays wall-clock. Soundness surface is zero: the budget schedules
@@ -1203,16 +1203,15 @@ impl Solver {
         // log10(clauses/1M) to reduce round frequency proportionally (#7135).
         self.cold.inprobe_phases += 1;
         let log_factor = ((self.cold.inprobe_phases + 9) as f64).log10();
-        // A/B knob (campaign): AY_INPROBE_MULT scales the inprocessing interval
+        // A/B knob (campaign): --inprobe-mult scales the inprocessing interval
         // (lower = more frequent inprocessing). Default 10.0 (current behavior),
         // cached per process.
         let inprobe_mult = {
             use std::sync::OnceLock;
             static M: OnceLock<f64> = OnceLock::new();
             *M.get_or_init(|| {
-                std::env::var("AY_INPROBE_MULT")
-                    .ok()
-                    .and_then(|s| s.parse::<f64>().ok())
+                ay_core::misc_cli_flags()
+                    .inprobe_mult
                     .filter(|m| *m > 0.0 && m.is_finite())
                     .unwrap_or(10.0)
             })

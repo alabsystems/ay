@@ -299,7 +299,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 }
                 // Relevancy brancher (#relevancy-lazy-routing): Scheme-A
                 // CNF-frontier decision restriction for this round's plain SAT
-                // solve. Two sources, env override always wins (AY_RELEVANCY=0
+                // solve. Two sources, env override always wins (--sat-relevancy
                 // kills, =1/2 forces on):
                 //   - `split_lazy_relevancy_hard`: set by the UFLIA hybrid's
                 //     lazy fallback — relevancy ON in HARD mode (engage every
@@ -413,7 +413,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     #[cfg(debug_assertions)]
                                     { let _ = stringify!($sh_expr); _islp_shadow_lits.push((term, value)); }
                                 )?
-                                if std::env::var_os("AY_DEBUG_LAZY_SYNC").is_some() {
+                                if ay_core::misc_cli_flags().debug_lazy_sync {
                                     let arg_detail =
                                         if let ay_core::term::TermData::App(_, args) =
                                             $self.ctx.terms.get(term)
@@ -468,7 +468,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         }
 
                         // Inc0-0c: round counter + per-round LIA check-call
-                        // delta (AY_LIA_INSTRUMENT-gated, write-only).
+                        // delta (--lia-instrument-gated, write-only).
                         ay_lia::instrument::bump_split_round();
                         let _islp_instr_checks_before =
                             ay_lia::instrument::check_calls_now();
@@ -590,7 +590,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         // Inc0-0d: quantify the G1 discard — how many theory
                         // propagations this round's combiner derived that die
                         // with it (the material Inc1 would harvest). Gated on
-                        // AY_LIA_INSTRUMENT; runs AFTER the snapshot export and
+                        // --lia-instrument; runs AFTER the snapshot export and
                         // only on non-Sat rounds (the Sat path still reads the
                         // check()-time model for extraction, which a propagate()
                         // simplex refresh could perturb). Instrumented runs are
@@ -653,15 +653,31 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             break 'split_loop Ok(SolveResult::Unknown);
                                         }
                                         for _sl_clause in &_islp_new_sl_clauses {
-                                            $crate::executor::theories::split_incremental::apply_string_lemma_incremental(
+                                            let (_islp_lowered_sl_clause, _islp_sl_original_id) = $crate::executor::theories::split_incremental::apply_string_lemma_incremental(
                                                 &$self.ctx.terms, solver,
                                                 &mut local_term_to_var, &mut local_var_to_term,
                                                 &mut local_next_var, &mut _islp_negations, _sl_clause,
                                             );
                                             if proof_enabled {
-                                                let _ = $self.proof_tracker.add_theory_lemma(
-                                                    _sl_clause.to_vec(),
+                                                let _ = $self.proof_tracker.add_theory_lemma_with_kind(
+                                                    _islp_lowered_sl_clause.clone(),
+                                                    ay_core::TheoryLemmaKind::StringContentAxiom,
                                                 );
+                                                if let Some(_islp_sl_original_id) = _islp_sl_original_id {
+                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                        &solver,
+                                                        _islp_sl_original_id,
+                                                        None,
+                                                        Some(ay_core::TheoryLemmaProof {
+                                                            clause: _islp_lowered_sl_clause,
+                                                            kind: ay_core::TheoryLemmaKind::StringContentAxiom,
+                                                            farkas: None,
+                                                            lia: None,
+                                                        }),
+                                                        &mut _islp_local_clausification_proofs,
+                                                        &mut _islp_local_original_clause_theory_proofs,
+                                                    );
+                                                }
                                             }
                                         }
                                         _islp_negations.sync_pending(&mut $self.ctx.terms);

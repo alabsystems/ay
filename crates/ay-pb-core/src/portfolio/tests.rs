@@ -5,7 +5,7 @@ use super::*;
 use crate::cdcl::objective_lower_bound_from_constraints;
 use crate::parse_opb;
 use crate::types::{PbConstraint, PbLit, PbRel, PbTerm};
-use ay_test_support::env::{lock_env, ScopedEnvVar};
+use ay_test_support::env::lock_env;
 use std::path::PathBuf;
 
 // Small synthetic OPB used to exercise the general incumbent/solution
@@ -2489,9 +2489,6 @@ fn test_optimization_worker_specs_route_primal_workers_verdict_incapable() {
 /// (dropped first). Worker kinds keep tiling into complete/primal.
 #[test]
 fn test_optimization_worker_specs_wbo_route_appends_wbo_sls_arm() {
-    // Serialize with the env-flag test so a mid-test AY_PB_WBO_SLS override
-    // cannot flip the default-on worker gate under this test's feet.
-    let _guard = lock_env();
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
     let specs = optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced);
@@ -3598,7 +3595,7 @@ fn test_should_parallelize_decision_routing_core() {
 
     // Default multi-core case: budget resolved, plenty of memory.
     assert!(should_parallelize_decision_with(&linear, Some(8), roomy));
-    // Parallel disabled (AY_PB_PARALLEL=0 -> no budget): sequential.
+    // Parallel disabled (--pb-parallel 0 -> no budget): sequential.
     assert!(!should_parallelize_decision_with(&linear, None, roomy));
     // Single core: the ORIGINAL sequential path (with its probe-then-detect
     // symmetry arm) — never a degenerate one-worker "parallel" run.
@@ -3783,7 +3780,7 @@ fn test_sanitize_optimum_claim_skips_floor_cert_when_strict_gate_off() {
         .expect("instance should include objective");
 
     // OptimumFound, claimed == actual (x1=1, x2=0 -> objective 1), strict
-    // mode off (`AY_PB_STRICT_OPTIMUM` unset in the test environment): the
+    // mode off (`--pb-strict-optimum` unset in the test environment): the
     // verdict is decided without the certificate, so none may be computed.
     let calls_before = crate::proof::FLOOR_CERT_CALLS.with(std::cell::Cell::get);
     let sanitized = sanitize_optimization_solution(
@@ -3984,16 +3981,17 @@ fn test_card_descent_worker_covers_then_declines() {
 }
 
 #[test]
-fn test_parallel_setting_from_env_default_auto_explicit_off_disables() {
-    // Batteries-included default: UNSET means parallel ON (Auto, NBCORE-sized;
-    // a single-core machine still degrades to sequential via spawn <= 1).
-    assert_eq!(parallel_setting_from_env(None), Some(ParallelSetting::Auto));
-    // The explicit opt-out (kept for compat) still forces the sequential path.
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new("0"))), None);
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new("off"))), None);
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new("false"))), None);
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new("no"))), None);
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new(""))), None);
+fn test_parallel_setting_default_auto_explicit_off_disables() {
+    // Batteries-included default: no policy means parallel ON (Auto,
+    // NBCORE-sized; a single-core machine still degrades to sequential via
+    // spawn <= 1).
+    assert_eq!(parallel_setting(), Some(ParallelSetting::Auto));
+    // The explicit `--pb-parallel 0` opt-out forces the sequential path.
+    let _off = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+        parallel_workers: Some(0),
+        ..Default::default()
+    });
+    assert_eq!(parallel_setting(), None);
 }
 
 /// Memory clamp for the parallel worker budget (`clamp_parallel_workers_for_limit`):
@@ -4051,7 +4049,7 @@ fn test_should_parallelize_optimization_routing_core() {
         Some(8),
         roomy
     ));
-    // Parallel disabled (AY_PB_PARALLEL=0 -> no budget): sequential.
+    // Parallel disabled (--pb-parallel 0 -> no budget): sequential.
     assert!(!should_parallelize_optimization_with(&linear, None, roomy));
     // Single core: sequential.
     assert!(!should_parallelize_optimization_with(
@@ -4095,7 +4093,7 @@ fn test_should_parallelize_optimization_routing_core() {
         Some(8),
         roomy
     ));
-    // ... but AY_PB_PARALLEL=0 (no budget) / single core still force
+    // ... but --pb-parallel 0 (no budget) / single core still force
     // sequential everywhere.
     assert!(!should_parallelize_optimization_with(
         &wide_nonlinear,
@@ -4143,25 +4141,12 @@ fn test_should_parallelize_optimization_routing_core() {
 }
 
 #[test]
-fn test_parallel_setting_from_env_enabled_variants() {
-    assert_eq!(
-        parallel_setting_from_env(Some(OsStr::new("1"))),
-        Some(ParallelSetting::Auto)
-    );
-    assert_eq!(
-        parallel_setting_from_env(Some(OsStr::new("on"))),
-        Some(ParallelSetting::Auto)
-    );
-    assert_eq!(
-        parallel_setting_from_env(Some(OsStr::new("auto"))),
-        Some(ParallelSetting::Auto)
-    );
-    assert_eq!(
-        parallel_setting_from_env(Some(OsStr::new("8"))),
-        Some(ParallelSetting::Fixed(8))
-    );
-    // Garbage values are treated as disabled (fail-closed to sequential).
-    assert_eq!(parallel_setting_from_env(Some(OsStr::new("banana"))), None);
+fn test_parallel_setting_fixed_worker_count() {
+    let _fixed = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+        parallel_workers: Some(8),
+        ..Default::default()
+    });
+    assert_eq!(parallel_setting(), Some(ParallelSetting::Fixed(8)));
 }
 
 #[test]
@@ -5482,10 +5467,10 @@ fn nonlinear_objective_optimum_downgraded_to_satisfiable() {
     );
 }
 
-// ---- AY_PB_LNS2 (stronger LNS) soundness gate --------------------------
+// ---- Default-on LNS2 (stronger LNS) soundness gate ------------------------
 //
-// Process-global env-var toggling must be serialized so concurrent tests do
-// not race on `AY_PB_LNS2` (the one workspace env lock, `lock_env`).
+// The test-local carrier override cannot race with concurrent tests and is
+// restored automatically when its guard leaves scope.
 
 /// Exhaustive 0/1 optimum of a tiny linear instance.
 fn brute_force_optimum_small(instance: &PbInstance, objective: &PbObjective) -> Option<i128> {
@@ -5520,15 +5505,17 @@ fn vc_opb(num_vertices: u32, edges: &[(u32, u32)]) -> (PbInstance, PbObjective) 
 }
 
 /// SOUNDNESS GATE for the stronger LNS (local branching + feasibility pump):
-/// with `AY_PB_LNS2=1`, across several tiny instances, (1) every incumbent the
-/// portfolio reports through `on_improve` is feasible vs the original
+/// with default-on LNS2 enabled across several tiny instances, (1) every
+/// incumbent the portfolio reports through `on_improve` is feasible vs the original
 /// constraints and never below the brute-force optimum; (2) a declared OPTIMUM
 /// equals the brute-force optimum exactly — never below it. Mirrors
 /// `bnb_matches_bruteforce_optimum`, but specifically with LNS2 enabled.
 #[test]
 fn lns2_portfolio_matches_bruteforce_optimum_and_reports_only_sound_incumbents() {
-    let _guard = lock_env();
-    let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "1");
+    let _lns2 = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+        lns2: true,
+        ..Default::default()
+    });
 
     let cases: Vec<(PbInstance, PbObjective)> = vec![
         vc_opb(6, &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]),
@@ -5591,7 +5578,7 @@ fn lns2_portfolio_matches_bruteforce_optimum_and_reports_only_sound_incumbents()
             );
         }
     }
-    // `_lns2` restores AY_PB_LNS2 at end of scope, still under `_guard`.
+    // `_lns2` restores the carrier override at end of scope.
 }
 
 /// Control: the SAME instances must declare the SAME OPTIMUM value with LNS2
@@ -5621,16 +5608,16 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
             )
         };
 
-        // LNS2 now defaults ON; model the old default-off path explicitly
-        // with `AY_PB_LNS2=0` so this control still compares OFF vs ON.
+        // LNS2 defaults ON; model the old default-off path explicitly with
+        // the carrier override so this control still compares OFF vs ON.
         let off = {
-            let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "0");
+            let _lns2 = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+                lns2: false,
+                ..Default::default()
+            });
             solve_once()
         };
-        let on = {
-            let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "1");
-            solve_once()
-        };
+        let on = solve_once();
 
         // Whatever OFF proved as OPTIMUM, ON must prove the same value (and it
         // must equal the brute-force optimum); ON must never claim a different
@@ -5657,47 +5644,34 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
     }
 }
 
-// Process-global env-var toggling must be serialized so concurrent tests do
-// not observe a mid-test AY_PB_WBO_SLS value (the one workspace env lock,
-// `lock_env`).
-
 #[test]
-fn wbo_sls_enabled_reads_env_flag() {
-    let _guard = lock_env();
-    // Baseline unset for the whole test; restored on scope exit.
-    let _wbo = ScopedEnvVar::unset("AY_PB_WBO_SLS");
-    // Sequential tail fallback: opt-IN (default OFF). Parallel WBO-route
-    // worker: batteries-included (default ON) — the SAME env var only serves
-    // as an explicit override in either direction.
-    assert!(!wbo_sls_enabled());
+fn wbo_sls_follows_the_switch_carrier() {
+    // B31: BOTH WBO gates (the sequential tail fallback and the parallel
+    // `wbo-sls-opt` worker) default ON and follow the one `wbo_sls` switch
+    // (`--no-pb-wbo-sls`); the env spelling and its value-parsing are gone.
+    assert!(wbo_sls_enabled());
     assert!(wbo_sls_worker_enabled());
-    for v in ["1", "true", "yes", "on", "ON", " On "] {
-        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
-        assert!(wbo_sls_enabled(), "expected enabled for {v:?}");
-        assert!(wbo_sls_worker_enabled(), "worker must stay on for {v:?}");
+    {
+        let _off = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+            wbo_sls: false,
+            ..Default::default()
+        });
+        assert!(!wbo_sls_enabled());
+        assert!(!wbo_sls_worker_enabled());
     }
-    for v in ["0", "false", "no", "off", ""] {
-        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
-        assert!(!wbo_sls_enabled(), "expected disabled for {v:?}");
-    }
-    for v in ["0", "false", "no", "off", " OFF ", ""] {
-        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
-        assert!(
-            !wbo_sls_worker_enabled(),
-            "explicit off must disable the worker for {v:?}"
-        );
-    }
-    // (baseline `_wbo` keeps AY_PB_WBO_SLS unset between the probes above)
     // ... and the WBO-route spec set follows the worker gate.
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
     let disabled = {
-        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", "0");
+        let _off = crate::ab_switches::TestOverride::set(crate::ab_switches::PbAbSwitches {
+            wbo_sls: false,
+            ..Default::default()
+        });
         optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced)
     };
     assert!(
         disabled.iter().all(|spec| spec.label != "wbo-sls-opt"),
-        "AY_PB_WBO_SLS=0 must remove the WBO-route worker"
+        "--no-pb-wbo-sls must remove the WBO-route worker"
     );
 }
 

@@ -180,6 +180,27 @@ pub(crate) fn detect_logic(vars: &[ChcVar], expr: &ChcExpr) -> &'static str {
         }
     }
 
+    // BITVECTORS MIXED WITH INT/REAL MUST NOT TAKE A BV-FAMILY NAME.
+    //
+    // Every QF_*BV label routes the query to the eager bit-blast pipeline, which
+    // carries no integer theory, so Int-sorted variables come back with NO
+    // assignment. Model completion fills them with the sort default (0), and
+    // validation then correctly reports the original Int assertion violated —
+    // the solve degrades to `unknown (:reason-unknown incomplete)` rather than
+    // `sat`. `has_int` was previously a don't-care in both BV arms, which is
+    // exactly how a formula full of Int arithmetic acquired a BV logic name.
+    //
+    // MEASURED: an identical five-line query is `unknown` + MODEL-UNCONFIRMED
+    // under QF_AUFBV and `sat` under ALL. Across one workspace this produced
+    // ~59,896 MODEL-UNCONFIRMED events.
+    //
+    // SOUNDNESS: `ALL` only WIDENS the admissible theory set; it never changes a
+    // formula's models, so it cannot turn a violation into UNSAT. It can only
+    // let a query be decided that was previously abandoned.
+    if has_bv && (has_int || has_real) {
+        return "ALL";
+    }
+
     match (has_array, has_bv, has_int, has_real) {
         (true, true, _, _) => "QF_AUFBV",
         (true, _, true, true) => "QF_AUFLIRA",

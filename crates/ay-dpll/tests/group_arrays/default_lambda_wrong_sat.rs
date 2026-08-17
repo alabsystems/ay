@@ -32,7 +32,7 @@
 //! lambda are both correctly `unsat`, so the lambda itself hash-conses fine.
 //!
 //! WHY THE GATE DID NOT CATCH IT. `--stats` reports
-//! `:model_check_gate.result "confirmed-sat"` and `AY_G3_GATE_DUMP=1` reports
+//! `:model_check_gate.result "confirmed-sat"` and `--g3-gate-dump` reports
 //! `n_false=0 n_uneval=0` — the gate evaluated ZERO assertions, and the
 //! published model is literally `(model )`.
 //!

@@ -17,7 +17,9 @@
 //! 3. The reframe is FAIL-SAFE: the kill switch and every ill-fitting shape
 //!    fall back to the plain feasibility solve with an identical verdict.
 
-use ay_milp::{BabSession, Col, Model, Outcome, SolveOpts, TargetFsbPrefixOpts, TreeNode};
+use ay_milp::{
+    BabSession, Col, EngineEconomics, Model, Outcome, SolveOpts, TargetFsbPrefixOpts, TreeNode,
+};
 use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 fn opts() -> SolveOpts {
@@ -136,16 +138,20 @@ fn solve_marked_prefix(model: &Model, prefix: &[Col], tree_leaves: usize) -> Out
 
 fn solve_marked_prefix_capped(model: &Model, prefix: &[Col], tree_leaves: usize) -> Outcome {
     let _env_lock = lock_env();
-    let _node_cap = ScopedEnvVar::set("AY_MILP_MAX_NODES", "0");
-    let _cuts = ScopedEnvVar::set("AY_MILP_NO_CUTS", "1");
-    solve_marked_prefix_unlocked(model, prefix, tree_leaves)
+    // B38: cuts-off (and B48: the node cap) ride the per-solve engine profile.
+    let opts = opts()
+        .with_tree_cert_leaves(tree_leaves)
+        .with_require_certificates(true)
+        .with_engine(EngineEconomics::new().with_cuts(false).with_max_nodes(0));
+    BabSession::new(model.clone(), &opts)
+        .expect("marked-prefix session")
+        .check_marked_margin_shared_binary_prefix(prefix)
+        .expect("marked-prefix check")
 }
 
 #[test]
 fn target_fsb_prefix_resource_decline_matches_the_fixed_fallback_api() {
     let _env_lock = lock_env();
-    let _node_cap = ScopedEnvVar::set("AY_MILP_MAX_NODES", "0");
-    let _cuts = ScopedEnvVar::set("AY_MILP_NO_CUTS", "1");
     let (mut model, fallback) = fractional_margin(true, 1.0);
     let candidates: [Col; 4] = std::array::from_fn(|_| model.add_binary_col());
     assert!(
@@ -154,7 +160,8 @@ fn target_fsb_prefix_resource_decline_matches_the_fixed_fallback_api() {
     );
     let solve_opts = opts()
         .with_tree_cert_leaves(32)
-        .with_require_certificates(true);
+        .with_require_certificates(true)
+        .with_engine(EngineEconomics::new().with_cuts(false).with_max_nodes(0));
 
     let fixed = BabSession::new(model.clone(), &solve_opts)
         .expect("fixed fallback session")
@@ -190,8 +197,6 @@ fn target_fsb_prefix_resource_decline_matches_the_fixed_fallback_api() {
 #[test]
 fn target_fsb_prefix_selected_path_is_visible_and_verifies_in_caller_frame() {
     let _env_lock = lock_env();
-    let _node_cap = ScopedEnvVar::set("AY_MILP_MAX_NODES", "0");
-    let _cuts = ScopedEnvVar::set("AY_MILP_NO_CUTS", "1");
     let mut model = Model::new();
     let fallback: [Col; 4] = std::array::from_fn(|_| model.add_binary_col());
     let candidates: [Col; 4] = std::array::from_fn(|_| model.add_binary_col());
@@ -208,7 +213,8 @@ fn target_fsb_prefix_selected_path_is_visible_and_verifies_in_caller_frame() {
         .expect("fixture has a one-sided nonempty margin");
     let solve_opts = opts()
         .with_tree_cert_leaves(32)
-        .with_require_certificates(true);
+        .with_require_certificates(true)
+        .with_engine(EngineEconomics::new().with_cuts(false).with_max_nodes(0));
 
     let outcome = BabSession::new(model.clone(), &solve_opts)
         .expect("selected target-FSB session")
@@ -576,9 +582,15 @@ fn multiple_inequality_rows_fold_one_soundly() {
 #[test]
 fn kill_switch_falls_back_to_plain() {
     let (mark, plain) = build(false, 1.5, 2.0, true, 1.0);
-    let _env_lock = lock_env();
-    let _kill_switch = ScopedEnvVar::set("AY_MILP_NO_MARGIN_REFRAME", "1");
-    let (reframed, feas) = (solve_unlocked(&mark), solve_unlocked(&plain));
+    // B39b: the kill rides the per-solve engine profile.
+    let off = opts().with_engine(EngineEconomics::new().with_margin_reframe(false));
+    let solve_off = |m: &Model| {
+        BabSession::new(m.clone(), &off)
+            .expect("session")
+            .check()
+            .expect("solve")
+    };
+    let (reframed, feas) = (solve_off(&mark), solve_off(&plain));
     assert_eq!(
         is_sat(&reframed),
         is_sat(&feas),
@@ -643,7 +655,7 @@ fn nonzero_objective_declines_reframe() {
     }
 }
 
-// ---- AUTO-DETECTED margin (`AY_MILP_AUTO_MARGIN=1`) ----
+// ---- AUTO-DETECTED margin (`with_auto_margin(true)`) ----
 //
 // `mark_margin_row`'s only non-test callers require the CALLER to name the row,
 // so the whole reframe is unreachable from an ordinary `check()` — i.e. from
@@ -675,8 +687,14 @@ fn auto_w1_shape(capped: bool) -> Model {
 
 fn solve_auto(m: &Model) -> Outcome {
     let _env_lock = lock_env();
-    let _on = ScopedEnvVar::set("AY_MILP_AUTO_MARGIN", "1");
-    solve_unlocked(m)
+    // B49: the auto-margin opt-in rides the per-solve engine profile.
+    BabSession::new(
+        m.clone(),
+        &opts().with_engine(EngineEconomics::new().with_auto_margin(true)),
+    )
+    .expect("session")
+    .check()
+    .expect("check")
 }
 
 /// The core soundness property for auto-firing: an UNMARKED model must reach the

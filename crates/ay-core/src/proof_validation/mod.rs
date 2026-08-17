@@ -5,6 +5,8 @@
 //! Shared semantic validation for theory proof certificates.
 
 mod farkas;
+#[path = "farkas/metered.rs"]
+mod farkas_metered;
 mod lia;
 
 pub use farkas::{
@@ -12,9 +14,15 @@ pub use farkas::{
     verify_farkas_annotation_shape, verify_farkas_conflict_lits_full,
     verify_farkas_conflict_lits_linear, verify_farkas_signed_shape, FarkasValidationError,
 };
+pub use farkas_metered::{
+    farkas_conflict_literal_is_single_inequality, farkas_progress_row_kind,
+    verify_affine_equality_farkas_with_progress, verify_pure_inequality_farkas_with_progress,
+    FarkasProgressRowKind,
+};
 pub use lia::{
-    recognize_lia_bounds_gap, recognize_lia_divisibility, recognize_lia_linear_identity,
-    recognize_lia_mod_range, validate_lia_mod_range, validate_lia_theory_lemma, LiaValidationError,
+    recognize_arith_disequality_split, recognize_int_bounds_tautology, recognize_lia_bounds_gap,
+    recognize_lia_divisibility, recognize_lia_linear_identity, recognize_lia_mod_range,
+    validate_lia_mod_range, validate_lia_theory_lemma, LiaValidationError,
 };
 
 #[cfg(test)]

@@ -3219,6 +3219,95 @@ fn test_materialize_level0_unit_proofs_counts_incomplete_hidden_fallback() {
     assert_eq!(stats.materialize_unit_hints, 0);
 }
 
+/// #A5: a pinned slot low in the root trail must not force re-walking the
+/// materialized suffix behind it. Pre-#A5 the scalar cursor restarted at the
+/// oldest pin, so every later call re-scanned (level0_end - pin) entries;
+/// with (cursor, pinned) the retry costs exactly |pinned| entries while the
+/// emitted unit lines (and the LRAT stream) stay identical.
+#[test]
+fn test_materialize_level0_unit_proofs_depinned_retry_skips_materialized_suffix() {
+    let proof = ProofOutput::lrat_text(Vec::new(), 0);
+    let mut solver: Solver = Solver::with_proof_output(5, proof);
+
+    let support = Literal::positive(Variable(0));
+    let target = Literal::positive(Variable(1));
+    let base = Literal::positive(Variable(2));
+    let t1 = Literal::positive(Variable(3));
+    let t2 = Literal::positive(Variable(4));
+
+    // target's reason contains an antecedent (support) with no provenance:
+    // target pins its slot with a hidden TrustedTransform fallback.
+    let target_reason_idx = solver.add_clause_db(&[target, support.negated()], false);
+    let target_reason_ref = ClauseRef(target_reason_idx as u32);
+    assert_ne!(solver.clause_id(target_reason_ref), 0);
+
+    // base -> t1 -> t2 is a fully materializable chain behind the pin.
+    let base_idx = solver.add_clause_db(&[base], false);
+    let base_ref = ClauseRef(base_idx as u32);
+    let base_id = solver.clause_id(base_ref);
+    assert_ne!(base_id, 0);
+    let t1_reason_idx = solver.add_clause_db(&[t1, base.negated()], false);
+    let t1_reason_ref = ClauseRef(t1_reason_idx as u32);
+    assert_ne!(solver.clause_id(t1_reason_ref), 0);
+    let t2_reason_idx = solver.add_clause_db(&[t2, t1.negated()], false);
+    let t2_reason_ref = ClauseRef(t2_reason_idx as u32);
+    assert_ne!(solver.clause_id(t2_reason_ref), 0);
+
+    solver.trail = vec![support, target, base, t1, t2];
+    solver.trail_lim = vec![];
+    for (lit, reason) in [
+        (support, NO_REASON),
+        (target, target_reason_ref.0),
+        (base, base_ref.0),
+        (t1, t1_reason_ref.0),
+        (t2, t2_reason_ref.0),
+    ] {
+        let vi = lit.variable().index();
+        solver.var_data[vi].level = 0;
+        solver.var_data[vi].reason = reason;
+    }
+    for (pos, lit) in [support, target, base, t1, t2].into_iter().enumerate() {
+        solver.var_data[lit.variable().index()].trail_pos = pos as u32;
+        assign_test_lit(&mut solver, lit);
+    }
+    solver.record_unit_proof_id_for_lit(base, base_id);
+
+    solver.materialize_level0_unit_proofs();
+
+    let stats = solver.lrat_materialization_stats();
+    assert_eq!(stats.materialize_calls, 1);
+    assert_eq!(stats.materialize_root_trail_entries, 5);
+    assert_eq!(stats.materialize_emitted_unit_lines, 2, "t1 and t2");
+    assert_eq!(stats.materialize_incomplete_chains, 1, "target pins");
+    assert_eq!(stats.materialize_hidden_trusted_units, 1);
+    assert_eq!(
+        solver.cold.lrat_level0_unit_materialize_pinned,
+        vec![1],
+        "only target's slot stays pinned"
+    );
+    assert_eq!(solver.cold.lrat_level0_unit_materialize_cursor, 5);
+
+    solver.materialize_level0_unit_proofs();
+
+    let stats = solver.lrat_materialization_stats();
+    assert_eq!(stats.materialize_calls, 2);
+    assert_eq!(
+        stats.materialize_root_trail_entries, 6,
+        "retry must cost one pinned slot, not the 4-entry suffix the \
+         pre-#A5 scalar cursor re-walked"
+    );
+    assert_eq!(
+        stats.materialize_emitted_unit_lines, 2,
+        "no duplicate unit lines on retry"
+    );
+    assert_eq!(stats.materialize_incomplete_chains, 2);
+    assert_eq!(
+        stats.materialize_hidden_trusted_units, 1,
+        "fallback emitted once"
+    );
+    assert_eq!(solver.cold.lrat_level0_unit_materialize_pinned, vec![1]);
+}
+
 #[test]
 fn test_materialize_level0_unit_proofs_rejects_hidden_trusted_antecedent() {
     let proof = ProofOutput::lrat_text(Vec::new(), 0);
@@ -3697,7 +3786,7 @@ fn test_record_level0_conflict_chain_sets_resolution_hints() {
         .clause_trace
         .as_ref()
         .expect("clause trace exists");
-    assert_eq!(trace.len(), 4);
+    assert_eq!(trace.len(), 5);
     let empty_entry = trace.entries().last().expect("has entries");
     assert!(
         empty_entry.clause.is_empty(),
@@ -3706,9 +3795,15 @@ fn test_record_level0_conflict_chain_sets_resolution_hints() {
     assert!(!empty_entry.is_original, "level-0 chain clause is learned");
     assert_eq!(
         empty_entry.resolution_hints,
-        vec![3, 2, 1],
-        "resolution chain: conflict + reason IDs in trail-reverse order"
+        vec![1, 2, 3],
+        "positive-RUP chain: root fact, implication, then conflict"
     );
+    crate::validate_clause_trace_resolution(
+        trace,
+        2,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("forward level-0 hints must pass independent positive-RUP replay");
 }
 
 /// Regression test for #4617: ClearLevel0 must preserve LRAT chain provenance.
@@ -3807,6 +3902,63 @@ fn test_level0_conflict_chain_after_clearlevel0_includes_saved_proof_id() {
          but got: {:?}",
         empty_entry.resolution_hints,
     );
+    crate::validate_clause_trace_resolution(
+        trace,
+        3,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("ClearLevel0 provenance must remain a complete positive-RUP trace");
+}
+
+/// Re-entering level-0 materialization must reuse the saved standalone unit
+/// provenance rather than append a duplicate clause-ID row to `ClauseTrace`.
+#[test]
+fn test_materialize_level0_unit_proofs_traces_each_id_once() {
+    let proof = ProofOutput::lrat_text(Vec::new(), 0);
+    let mut solver = Solver::with_proof_output(2, proof);
+    solver.cold.clause_trace = Some(ClauseTrace::new());
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c1 = solver.add_clause_db(&[a], false);
+    let c2 = solver.add_clause_db(&[a.negated(), b], false);
+
+    solver.trail = vec![a, b];
+    solver.var_data[0].reason = c1 as u32;
+    solver.var_data[1].reason = c2 as u32;
+    solver.var_data[0].level = 0;
+    solver.var_data[1].level = 0;
+    solver.var_data[0].trail_pos = 0;
+    solver.var_data[1].trail_pos = 1;
+    assign_test_lit(&mut solver, a);
+    assign_test_lit(&mut solver, b);
+
+    solver.materialize_level0_unit_proofs();
+    let b_unit_id = solver
+        .visible_unit_proof_id_for_lit(b)
+        .expect("b must receive standalone unit provenance");
+    let first_count = solver
+        .cold
+        .clause_trace
+        .as_ref()
+        .expect("clause trace")
+        .entries()
+        .iter()
+        .filter(|entry| entry.id == b_unit_id)
+        .count();
+    assert_eq!(first_count, 1);
+
+    solver.materialize_level0_unit_proofs();
+    let second_count = solver
+        .cold
+        .clause_trace
+        .as_ref()
+        .expect("clause trace")
+        .entries()
+        .iter()
+        .filter(|entry| entry.id == b_unit_id)
+        .count();
+    assert_eq!(second_count, 1, "saved proof IDs must not be traced twice");
 }
 
 #[test]
@@ -3844,9 +3996,15 @@ fn test_record_level0_conflict_chain_uses_unit_proof_id_when_reason_absent() {
     let empty_entry = trace.entries().last().expect("empty clause entry");
     assert_eq!(
         empty_entry.resolution_hints,
-        vec![3, 2, 1],
-        "level-0 chain should include unit provenance when reason is absent"
+        vec![1, 2, 3],
+        "level-0 chain should replay unit provenance before the conflict"
     );
+    crate::validate_clause_trace_resolution(
+        trace,
+        2,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("unit-provenance fallback must pass independent positive-RUP replay");
 }
 
 /// Regression guard: collect_resolution_chain reuses persistent work arrays

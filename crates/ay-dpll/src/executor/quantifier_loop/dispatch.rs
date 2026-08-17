@@ -37,11 +37,11 @@ impl Executor {
         &mut self,
         category: LogicCategory,
     ) -> Result<SolveResult> {
-        if std::env::var_os("AY_F1_DIAG").is_some() {
+        if ay_core::misc_cli_flags().f1_diag {
             let result = self.solve_for_category_inner(category);
             if let Ok(r) = &result {
                 eprintln!(
-                    "AY_F1_DIAG: solve_for_category({category:?}) -> {r:?} model_present={}",
+                    "--f1-diag: solve_for_category({category:?}) -> {r:?} model_present={}",
                     self.last_model.is_some()
                 );
             }
@@ -51,7 +51,16 @@ impl Executor {
     }
 
     fn solve_for_category_inner(&mut self, category: LogicCategory) -> Result<SolveResult> {
-        match category {
+        // Refinement rounds append fresh ground instances after the ordinary
+        // pre-dispatch pass. Non-owning routes must close those roots here;
+        // owning routes run exact closure on their post-preprocessing surface.
+        let features = StaticFeatures::collect(&self.ctx.terms, &self.ctx.assertions);
+        if features.has_arrays && !self.should_defer_finite_array_extensionality_to_route(category)
+        {
+            let _ = self.add_finite_index_array_closure();
+        }
+
+        let result = match category {
             LogicCategory::Propositional => self.solve_propositional(),
             LogicCategory::QfUf | LogicCategory::Uf => self.solve_euf(),
             LogicCategory::QfAx => self.solve_array_euf(),
@@ -111,7 +120,8 @@ impl Executor {
             LogicCategory::DtAufbv => self.solve_dt_aufbv(),
             LogicCategory::DtAx => self.solve_dt_ax(),
             // Quantified DT logics (#7150): route to DT-combined solvers
-            LogicCategory::Ufdt | LogicCategory::Aufdt => self.solve_dt(),
+            LogicCategory::Ufdt => self.solve_dt(),
+            LogicCategory::Aufdt => self.solve_dt_ax(),
             LogicCategory::Ufdtlia | LogicCategory::Aufdtlia => self.solve_dt_auflia(),
             LogicCategory::Ufdtlra => self.solve_dt_auflra(),
             LogicCategory::Ufdtlira | LogicCategory::Aufdtlira => self.solve_dt_auflira(),
@@ -123,7 +133,8 @@ impl Executor {
                 self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
                 Ok(SolveResult::Unknown)
             }
-        }
+        };
+        self.fail_close_incomplete_finite_array_sat(result)
     }
 
     /// Phase B1c (#3325): Run one E-matching refinement round using the fresh EUF model.

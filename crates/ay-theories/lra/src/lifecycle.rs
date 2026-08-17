@@ -20,7 +20,7 @@ impl LraSolver {
     pub fn new(terms: &TermStore) -> Self {
         Self {
             deferred_eq_atoms: Vec::new(),
-            a5_core: std::env::var_os("AY_A5_CORE").is_some(),
+            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
             terms_ptr: std::ptr::from_ref(terms),
             rows: Vec::new(),
             vars: Vec::new(),
@@ -224,7 +224,7 @@ impl LraSolver {
         propagation_dirty_vars.extend(snap.compound_use_index.keys().copied());
         let mut solver = Self {
             deferred_eq_atoms: Vec::new(),
-            a5_core: std::env::var_os("AY_A5_CORE").is_some(),
+            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
             terms_ptr: std::ptr::from_ref(terms),
             // Structural fields from snapshot (moved, not cloned):
             rows: snap.rows,

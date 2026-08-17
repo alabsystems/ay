@@ -203,10 +203,9 @@ macro_rules! pipeline_incremental_setup {
             s
         } else {
             _pis_solver_is_new = true;
-            let mut sat = SatSolver::new(_pis_total_vars as usize);
-            sat.set_random_seed($random_seed);
+            let mut sat = $state.fresh_sat_solver(_pis_total_vars as usize, $random_seed);
             // Mirror DpllT::from_tseitin so SMT incremental pipelines honor
-            // AY_TRACE_FILE JSONL emission as soon as the persistent SAT solver
+            // --trace-file JSONL emission as soon as the persistent SAT solver
             // is created.
             ay_sat::TlaTraceable::maybe_enable_tla_trace_from_env(&mut sat);
             // Part of EXPLAINABILITY_AUDIT.md Finding B: honor the
@@ -285,11 +284,17 @@ macro_rules! pipeline_incremental_setup {
                         .iter()
                         .map(|&lit| _pis_cnf_to_sat(lit))
                         .collect();
+                    let _pis_authority_before =
+                        $solver_out.issued_original_clause_id_max();
                     $solver_out.add_clause_global(lits);
-                    $state
-                        .clausification_proofs
-                        .push(_pis_annotations[_pis_idx].clone());
-                    $state.original_clause_theory_proofs.push(None);
+                    let _ = $crate::pipeline_fns::place_single_original_clause_authority(
+                        &$solver_out,
+                        _pis_authority_before,
+                        _pis_annotations[_pis_idx].clone(),
+                        None,
+                        &mut $state.clausification_proofs,
+                        &mut $state.original_clause_theory_proofs,
+                    );
                 }
             } else {
                 for clause in &_pis_def_clauses {
@@ -316,8 +321,11 @@ macro_rules! pipeline_incremental_setup {
                 $solver_out.add_clause_at_scope_depth(vec![_pis_root], _pis_activation_depth);
             }
             if $proof_enabled {
-                $state.clausification_proofs.push(None);
-                $state.original_clause_theory_proofs.push(None);
+                $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                    &$solver_out,
+                    &mut $state.clausification_proofs,
+                    &mut $state.original_clause_theory_proofs,
+                );
             }
 
             $state.$encoded_field.insert(_pis_term, _pis_root_lit);
@@ -501,17 +509,19 @@ macro_rules! pipeline_build_unsat_proof_with_pop {
         $self.last_model = None;
         if $proof_enabled {
             $negations.sync_pending(&mut $self.ctx.terms);
+            $crate::pipeline_fns::drain_pending_original_clause_authorities(
+                &$solver,
+                &mut $negations,
+                &mut $local_clausification_proofs,
+                &mut $local_theory_proofs,
+            );
             let _bup_clause_trace = $solver.snapshot_clause_trace();
             let (_bup_cp, _bup_tp) = {
-                if let Some(ref _bup_trace) = _bup_clause_trace {
-                    let _bup_oc = _bup_trace.original_clauses().count();
-                    if $local_clausification_proofs.len() < _bup_oc {
-                        $local_clausification_proofs.resize(_bup_oc, None);
-                    }
-                    if $local_theory_proofs.len() < _bup_oc {
-                        $local_theory_proofs.resize(_bup_oc, None);
-                    }
-                }
+                $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                    &$solver,
+                    &mut $local_clausification_proofs,
+                    &mut $local_theory_proofs,
+                );
                 (
                     $local_clausification_proofs.clone(),
                     $local_theory_proofs.clone(),

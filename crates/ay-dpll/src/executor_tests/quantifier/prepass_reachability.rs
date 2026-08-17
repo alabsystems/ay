@@ -158,17 +158,14 @@ fn deep_qe_prepass_stands_down_when_a_proof_artifact_was_requested() {
     );
 }
 
-/// ATTRIBUTION. The one `quantifier::` verdict that changed when the deep-QE
-/// lane went live must actually be the deep-QE lane's doing, not an incidental
-/// second solve: the lane only arms after its probe finds a real rewrite, and
-/// `deep_qe_unknown_retries` records exactly that.
+/// Canonical exact finite expansion now resolves this bounded `exists` query
+/// on the primary quantifier path. A successful primary SAT must not enter the
+/// deep-QE fallback, which is reserved for an initial `Unknown` result.
 ///
-/// `test_exists_midrange_bool_uf_with_definition_sat` in `discharge.rs` covers
-/// the verdict itself (z3: sat). This covers the causal claim, which no verdict
-/// assertion can express — and it fails if the lane later stops being the
-/// reason, so the claim cannot rot into folklore.
+/// `deep_qe_prepass_is_entered_on_the_unknown_fallback_lane` above separately
+/// preserves positive reachability coverage for the fallback itself.
 #[test]
-fn the_verdict_the_deep_qe_lane_changed_is_attributable_to_it() {
+fn exact_finite_exists_sat_preempts_the_deep_qe_unknown_retry() {
     let input = r#"
         (set-logic UFLIA)
         (declare-fun P (Int) Bool)
@@ -187,14 +184,16 @@ fn the_verdict_the_deep_qe_lane_changed_is_attributable_to_it() {
         "z3 5.0.0 answers sat (witness x = 300)"
     );
     assert!(
-        seen.deep_qe_unknown_retries > 0,
-        "the ordinary lanes left this query `Unknown` and the deep-QE fallback \
-         is what re-solved it; if this counter is zero the verdict came from \
-         somewhere else and the attribution in `deep_qe_unknown_retry` is stale"
+        seen.deep_qe_applicable > 0,
+        "the query remains quantified at the deep-QE applicability site"
     );
-    assert!(
-        seen.deep_qe_entered > 0,
-        "arming the lane must actually run the pre-pass"
+    assert_eq!(
+        seen.deep_qe_unknown_retries, 0,
+        "exact finite expansion must resolve SAT before the Unknown-only retry"
+    );
+    assert_eq!(
+        seen.deep_qe_entered, 0,
+        "the deep-QE pre-pass must not run without an Unknown retry"
     );
 }
 

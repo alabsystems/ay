@@ -27,7 +27,7 @@ pub(super) const UNASSIGNED_NIL: u32 = u32::MAX;
 /// Read the `AY_LRA_UNASSIGNED_SKIP` flag once per process (default ON).
 ///
 /// Default-ON with opt-out (`AY_LRA_UNASSIGNED_SKIP=0`), matching the
-/// `AY_LRA_INC_ENGINE` convention. When on, `suggest_decision` scans only the
+/// `--dpll-no-lra-inc-engine` convention. When on, `suggest_decision` scans only the
 /// unassigned theory atoms via the order-preserving free-list (selecting the
 /// same literal as the full scan, just skipping assigned atoms); when off it
 /// takes the byte-identical full-scan path. Measured z3-mode @90s 2-sample:
@@ -35,12 +35,9 @@ pub(super) const UNASSIGNED_NIL: u32 = u32::MAX;
 /// (suggest_decision returns decision HINTS only — soundness is enforced
 /// downstream regardless — and no reproducible per-file regression was found).
 pub(super) fn unassigned_skip_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("AY_LRA_UNASSIGNED_SKIP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    // B23: the never-set env kill-switch is retired; the measured default
+    // (ON, +19 with 0 soundness mismatches) stands.
+    true
 }
 
 /// Build the initial skip-assigned free-list backing storage.
@@ -592,7 +589,7 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// memo — drives the warmup-then-sample policy (#12-restore mirror for
     /// arrays; see the Array arm in `propagate_impl`).
     pub(super) verify_array_sem_counter: u64,
-    /// #verify-memo (`AY_VERIFY_MEMO=1`, default off = byte-identical):
+    /// #verify-memo (`--verify-memo=1`, default off = byte-identical):
     /// memoized ACCEPT verdicts for the remaining sampled semantic
     /// propagation-verification arms — the cached mixed-domain Nelson-Oppen
     /// verifier (Unknown domain) and the fresh-solver dispatch

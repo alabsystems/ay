@@ -19,6 +19,8 @@ use ay_sat::{Literal, Variable};
 
 use super::{HintDerivationError, SatProofManager};
 
+mod entrypoints;
+
 /// One processed clause-trace entry: its raw SAT literals and the proof node
 /// that proves it. Trace clause ids can be reused across entries (proof-writer
 /// ids vs arena-index fallback share one id space), so replay tracks every
@@ -41,7 +43,7 @@ const MAX_RUP_WIDENING_VERSIONS: usize = 100_000;
 /// problem. See the development design notes.
 ///
 /// The replay has three distinct decline paths and no one had measured which
-/// fires, so the fix was never aimed at anything. Set `AY_RUP_FALLBACK_TRACE=1`
+/// fires, so the fix was never aimed at anything. Set `--rup-fallback-trace`
 /// and bucket stderr over one `ay-dpll --lib` run to find out.
 ///
 /// Diagnostic only: no verdict, proof shape, or control flow depends on this.
@@ -83,7 +85,7 @@ const MAX_RUP_WIDENING_VERSIONS: usize = 100_000;
 /// `reason` is a closure so the `Err` arm does not format on the hot fallback
 /// path when tracing is off.
 fn rup_fallback_trace(reason: impl FnOnce() -> String) {
-    if std::env::var("AY_RUP_FALLBACK_TRACE").is_ok_and(|v| v == "1") {
+    if ay_core::misc_cli_flags().rup_fallback_trace {
         eprintln!("[rup-fallback] {}", reason());
     }
 }
@@ -445,10 +447,15 @@ impl SatProofManager<'_> {
                     None,
                 );
             };
+            // Emit the rebound annotation's clause (#trust->0 C3): trace
+            // order for certificate-carrying annotations, the producer's
+            // validator-accepted order otherwise (order-sensitive EUF kinds).
+            // Set-equivalent to the traced clause either way, so the
+            // normalized `existing_clause_map` identity is unaffected.
             let id = if let Some(lia) = theory_annot.lia.clone() {
                 proof.add_theory_lemma_with_lia(
                     "theory",
-                    clause.to_vec(),
+                    theory_annot.clause.clone(),
                     theory_annot.farkas.clone(),
                     theory_annot.kind,
                     lia,
@@ -456,7 +463,7 @@ impl SatProofManager<'_> {
             } else {
                 proof.add_theory_lemma_with_farkas_and_kind_opt(
                     "theory",
-                    clause.to_vec(),
+                    theory_annot.clause.clone(),
                     theory_annot.farkas.clone(),
                     theory_annot.kind,
                 )
@@ -1251,9 +1258,9 @@ impl SatProofManager<'_> {
     /// Fail-closed (soundness bar): the lemma is recorded ONLY when the fresh
     /// solver returns `UnsatWithFarkas` with a present, shape-valid Farkas
     /// certificate over an all-arithmetic core; the emitted `LraFarkas` step is
-    /// then strict-validated end-to-end by `check_proof_strict`
-    /// (`validate_lra_farkas` → `verify_farkas_conflict_lits_full`). If the
-    /// solver returns anything else (Sat, plain Unsat, missing/overflowed
+    /// then strict-validated end-to-end by `check_proof_strict`. Its metered
+    /// Farkas validator handles pure inequalities and retains the full validator
+    /// for other shapes. If the solver returns anything else (Sat, plain Unsat, missing/overflowed
     /// certificate, non-arith literal), NOTHING is recorded and the caller
     /// falls back to Trust — never a false proof.
     ///
@@ -1519,12 +1526,16 @@ impl SatProofManager<'_> {
         }
 
         // Same classification discipline as the residual rescue: the strict
-        // checker (`validate_lra_farkas`) is the final arbiter.
-        let classified =
+        // checker's metered Farkas validator is the final arbiter. Only the
+        // order-insensitive arith kinds are ever adopted here, so the funnel's
+        // reordered-clause component is irrelevant (the certificate is
+        // positional over `clause_terms` as recorded).
+        let (classified, _) =
             crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
                 &*self.terms,
                 &clause_terms,
                 Some(&farkas),
+                None,
             );
         let kind = match classified {
             TheoryLemmaKind::LraFarkas | TheoryLemmaKind::LiaGeneric => classified,
@@ -1582,7 +1593,7 @@ impl SatProofManager<'_> {
         //      the clause on Trust anyway. Fail-closed: reject, never record the
         //      wrong lemma.
         let atom_set: HashSet<TermId> = atoms.iter().copied().collect();
-        let trace = std::env::var("AY_TSEITIN_TRACE").is_ok_and(|v| v == "1");
+        let trace = ay_core::misc_cli_flags().tseitin_trace;
 
         // Phase 1: residual atoms alone.
         let mut conflict = self.residual_farkas_over_atoms(&atoms, &[], &atom_set, trace);
@@ -1622,17 +1633,20 @@ impl SatProofManager<'_> {
         // SHAPE-only pre-check that can under-report (Generic) even for a valid
         // Farkas core (representation mismatch between the fresh solver's core and
         // the classifier). If it does not confirm LraFarkas/LiaGeneric, still
-        // record as LraFarkas and let `check_proof_strict`
-        // (`validate_lra_farkas` -> `verify_farkas_conflict_lits_full`) be the
-        // FINAL arbiter — it independently re-derives the contradiction from the
+        // record as LraFarkas and let `check_proof_strict` be the FINAL arbiter:
+        // its metered or full Farkas path independently re-derives the contradiction from the
         // coefficients. FAIL-CLOSED: if the cert is not actually valid, that
         // strict check rejects the whole proof and the clause stays on Trust; no
         // false proof is possible.
-        let classified =
+        // Only order-insensitive arith kinds are adopted (the certificate is
+        // positional over `clause_terms`), so the funnel's reordered-clause
+        // component is deliberately dropped.
+        let (classified, _) =
             crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
                 &*self.terms,
                 &clause_terms,
                 Some(&farkas),
+                None,
             );
         let kind = match classified {
             TheoryLemmaKind::LraFarkas | TheoryLemmaKind::LiaGeneric => classified,
@@ -1773,7 +1787,7 @@ impl SatProofManager<'_> {
                 _ => None,
             })
             .collect();
-        if std::env::var("AY_TSEITIN_TRACE").is_ok_and(|v| v == "1") {
+        if ay_core::misc_cli_flags().tseitin_trace {
             eprintln!(
                 "[empty-rup] gathered {} theory-lemma steps; var_to_term {} keys",
                 lemma_steps.len(),
@@ -1831,7 +1845,7 @@ impl SatProofManager<'_> {
             }
         }
 
-        if std::env::var("AY_TSEITIN_TRACE").is_ok_and(|v| v == "1") {
+        if ay_core::misc_cli_flags().tseitin_trace {
             eprintln!(
                 "[empty-rup] {} base versions + mapped lemmas = {} total for RUP",
                 clause_versions.len(),
@@ -2009,89 +2023,6 @@ impl SatProofManager<'_> {
                 None
             }
         }
-    }
-
-    /// Derive a learned clause from its resolution hints.
-    ///
-    /// Primary strategy (#rank-4 increment 1): RUP/LRAT-style unit-propagation
-    /// replay over the *SAT-level* hint clauses — order-insensitive and
-    /// complete for any hint set under which the target clause is RUP (this
-    /// is exactly the LRAT-check semantics of `ay-sat::lrat_checker`,
-    /// extended with fixpoint iteration because trace hints are not
-    /// guaranteed to be in propagation order). Falls back to the legacy
-    /// left-to-right pairwise term-level resolution (with original-clause
-    /// closure) when replay fails.
-    ///
-    /// The replay runs over raw SAT literals (not SMT terms): distinct SAT
-    /// variables can map to identical or complementary terms, which makes
-    /// term-level propagation stall on chains that are perfectly valid at
-    /// the SAT level (this was the source of the ~10/87 Trust fallbacks on
-    /// the rank-4 captured solve).
-    ///
-    /// On success returns the proof node id *and* the term/SAT clauses that
-    /// node actually proves. RUP replay can derive a strict subclause of the
-    /// target (a stronger clause); callers must record that subclause so
-    /// downstream replays stay exact.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn derive_clause_from_hints(
-        &mut self,
-        target_clause: &[TermId],
-        target_sat_clause: &[Literal],
-        resolution_hints: &[u64],
-        clause_terms: &HashMap<u64, Vec<TermId>>,
-        clause_versions: &[SatClauseVersion],
-        latest_version_by_id: &HashMap<u64, usize>,
-        clause_proofs: &HashMap<u64, ProofId>,
-        engine: &mut RupEngine,
-        proof: &mut Proof,
-    ) -> Result<(ProofId, Vec<TermId>, Vec<Literal>), HintDerivationError> {
-        let mut hint_ids = Vec::with_capacity(resolution_hints.len());
-        let mut hint_versions = Vec::with_capacity(resolution_hints.len());
-        let mut seen_hint_ids: HashSet<u64> = Default::default();
-        for &hint_id in resolution_hints {
-            if !seen_hint_ids.insert(hint_id) {
-                continue;
-            }
-            if clause_terms.contains_key(&hint_id) && clause_proofs.contains_key(&hint_id) {
-                hint_ids.push(hint_id);
-            }
-            if let Some(&version) = latest_version_by_id.get(&hint_id) {
-                hint_versions.push(version);
-            }
-        }
-        if hint_ids.is_empty() && hint_versions.is_empty() {
-            return Err(HintDerivationError::NoUsableHints);
-        }
-
-        match self.derive_clause_via_rup_replay(
-            target_clause,
-            target_sat_clause,
-            &hint_versions,
-            clause_versions,
-            engine,
-            proof,
-        ) {
-            Ok(derived) => return Ok(derived),
-            Err(rup_error) => {
-                tracing::debug!(
-                    ?rup_error,
-                    ?target_clause,
-                    "RUP hint replay failed; falling back to pairwise resolution"
-                );
-            }
-        }
-
-        if hint_ids.is_empty() {
-            return Err(HintDerivationError::NoUsableHints);
-        }
-        self.derive_clause_via_pairwise_resolution(
-            target_clause,
-            &hint_ids,
-            clause_terms,
-            clause_proofs,
-            proof,
-        )
-        .map(|(id, derived_terms)| (id, derived_terms, target_sat_clause.to_vec()))
     }
 
     /// Unit-propagate over the clause versions named by `candidates` to
@@ -2501,7 +2432,7 @@ impl SatProofManager<'_> {
             }
         }
 
-        // Closure-search introspection (`AY_PROOF_INTROSPECT_PROBE=<path>`).
+        // Closure-search introspection (`--proof-introspect-probe=<path>`).
         //
         // The loop above is GREEDY: every step must strictly reduce the mismatch
         // count. With tens of thousands of candidate clauses that can stall even
@@ -2513,7 +2444,10 @@ impl SatProofManager<'_> {
         let probe_dump = if Self::clauses_equivalent(&current_clause, target_clause) {
             None
         } else {
-            std::env::var_os("AY_PROOF_INTROSPECT_PROBE")
+            ay_core::misc_cli_flags()
+                .proof_introspect_probe
+                .clone()
+                .map(std::ffi::OsString::from)
         };
         if let Some(dump) = probe_dump {
             const PROBE_MAX_STEPS: usize = 4000;

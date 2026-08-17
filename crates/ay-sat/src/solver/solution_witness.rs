@@ -168,14 +168,14 @@ impl Solver {
         Ok(())
     }
 
-    /// Load a solution witness from the `AY_SOLUTION_FILE` environment variable.
+    /// Load a solution witness from the `--solution-file` trace config.
     ///
-    /// No-op if the variable is not set. Panics if the file cannot be read.
+    /// No-op if no path is installed. Panics if the file cannot be read.
     pub fn maybe_load_solution_from_env(&mut self) {
         // Delegates to ay-core's centralized TraceConfig (#8495).
         if let Some(path) = &ay_core::trace_config().solution_file_path {
             self.load_solution_file(path)
-                .unwrap_or_else(|e| panic!("AY_SOLUTION_FILE={path}: {e}"));
+                .unwrap_or_else(|e| panic!("--solution-file {path}: {e}"));
         }
     }
 

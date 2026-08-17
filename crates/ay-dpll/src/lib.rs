@@ -143,10 +143,10 @@ pub(crate) mod minimize;
 pub(crate) mod preprocess;
 pub(crate) mod proof_tracker;
 pub mod qe;
+pub(crate) mod quant_unit_authority;
 pub(crate) mod quantifier_manager;
 // Candidate-REJECTION diagnosis instrumentation (env-gated `AY_REJECT_INSTRUMENT`,
 // verdict-neutral). Observes the depth-4 DT candidate-enumeration loop.
-mod reject_instrument;
 pub(crate) mod sat_proof_manager;
 pub(crate) mod skolemize;
 mod solve_common;

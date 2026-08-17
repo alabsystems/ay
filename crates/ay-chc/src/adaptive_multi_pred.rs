@@ -809,7 +809,7 @@ impl AdaptivePortfolio {
             // Diagnostic: dump the collapsed level problem for offline
             // standalone solving (companion to the scalarized dump in
             // run_direct_acyclic_bmc_probe).
-            if let Some(dir) = std::env::var_os("AY_CHC_DUMP_SCALARIZED") {
+            if let Some(dir) = ay_core::misc_cli_flags().chc_dump_scalarized.as_deref() {
                 let dir = std::path::PathBuf::from(dir);
                 let _ = std::fs::create_dir_all(&dir);
                 let script =
@@ -984,8 +984,8 @@ impl AdaptivePortfolio {
                 // back-translator (SharedBackTranslator) so both lanes
                 // back-translate/validate against the ORIGINAL problem.
                 // Diagnostic: dump the scalarized problem for offline
-                // standalone solving (AY_CHC_DUMP_SCALARIZED=<dir>).
-                if let Some(dir) = std::env::var_os("AY_CHC_DUMP_SCALARIZED") {
+                // standalone solving (--chc-dump-scalarized <dir>).
+                if let Some(dir) = ay_core::misc_cli_flags().chc_dump_scalarized.as_deref() {
                     let dir = std::path::PathBuf::from(dir);
                     let _ = std::fs::create_dir_all(&dir);
                     let script = crate::transform::cata_abstract::dump_abstract_lia_problem(

@@ -80,6 +80,14 @@ fn test_check_sat_assuming() {
 }
 
 #[test]
+fn test_get_value() {
+    let x = Expr::var("x", Sort::int());
+    let y = Expr::var("y", Sort::int());
+    let c = Constraint::get_value(vec![x, y]);
+    assert_eq!(c.to_string(), "(get-value (x y))");
+}
+
+#[test]
 fn test_set_logic() {
     let c = Constraint::set_logic(logic::QF_BV);
     assert_eq!(c.to_string(), "(set-logic QF_BV)");

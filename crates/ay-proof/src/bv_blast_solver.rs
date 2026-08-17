@@ -1594,6 +1594,11 @@ const BOUNDED_MAX_LEAF_NAME_BYTES: usize = 1024 * 1024;
 const BOUNDED_MAX_INTERNAL_WIDTH: u32 = 128;
 const BOUNDED_MAX_ESTIMATED_GATE_WORK: usize = 100_000;
 const BOUNDED_MAX_CONSTRUCTION_BYTES: usize = 128 * 1024 * 1024;
+/// Cumulative literal slots allocated while expanding one bounded RUP proof.
+///
+/// This is allocation-volume accounting, not a retained-memory allowance:
+/// every allocation is independently charged to the 128 MiB byte envelope and
+/// every traversal to the 50M work envelope below.
 const BOUNDED_MAX_EXPANDED_LITERALS: usize = 2_000_000;
 const BOUNDED_MAX_EXPANSION_WORK: usize = 50_000_000;
 const BOUNDED_MAX_EXPANSION_BYTES: usize = 128 * 1024 * 1024;

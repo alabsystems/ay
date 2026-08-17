@@ -5,8 +5,9 @@
 //! SMT-LIB2 formatting for [`Constraint`].
 
 use super::Constraint;
+use crate::expr::Expr;
 use crate::format_symbol;
-use crate::sort::Sort;
+use crate::sort::{DatatypeSort, Sort};
 use std::fmt::{self, Display, Formatter};
 
 /// Write a space-separated list of sorts in parentheses.
@@ -19,6 +20,43 @@ fn write_sort_list(f: &mut Formatter<'_>, sorts: &[Sort]) -> fmt::Result {
         write!(f, "{sort}")?;
     }
     write!(f, ")")
+}
+
+fn write_datatype(f: &mut Formatter<'_>, dt: &DatatypeSort) -> fmt::Result {
+    write!(f, "(declare-datatype {} (", format_symbol(&dt.name))?;
+    for (i, cons) in dt.constructors.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "({}", format_symbol(&cons.name))?;
+        for field in &cons.fields {
+            write!(f, " ({} {})", format_symbol(&field.name), field.sort)?;
+        }
+        write!(f, ")")?;
+    }
+    write!(f, "))")
+}
+
+fn write_check_sat_assuming(f: &mut Formatter<'_>, assumptions: &[Expr]) -> fmt::Result {
+    write!(f, "(check-sat-assuming (")?;
+    for (i, a) in assumptions.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{a}")?;
+    }
+    write!(f, "))")
+}
+
+fn write_get_value(f: &mut Formatter<'_>, exprs: &[Expr]) -> fmt::Result {
+    write!(f, "(get-value (")?;
+    for (i, e) in exprs.iter().enumerate() {
+        if i > 0 {
+            write!(f, " ")?;
+        }
+        write!(f, "{}", e.to_smtlib_shared())?;
+    }
+    write!(f, "))")
 }
 
 /// Format core SMT commands (declarations, assertions, control flow).
@@ -51,20 +89,7 @@ fn fmt_core(constraint: &Constraint, f: &mut Formatter<'_>) -> fmt::Result {
             }
             write!(f, ") {return_sort} {})", body.to_smtlib_shared())
         }
-        Constraint::DeclareDatatype(dt) => {
-            write!(f, "(declare-datatype {} (", format_symbol(&dt.name))?;
-            for (i, cons) in dt.constructors.iter().enumerate() {
-                if i > 0 {
-                    write!(f, " ")?;
-                }
-                write!(f, "({}", format_symbol(&cons.name))?;
-                for field in &cons.fields {
-                    write!(f, " ({} {})", format_symbol(&field.name), field.sort)?;
-                }
-                write!(f, ")")?;
-            }
-            write!(f, "))")
-        }
+        Constraint::DeclareDatatype(dt) => write_datatype(f, dt),
         // `to_smtlib_shared` hoists subterms shared by Arc identity into `let`
         // bindings, so an asserted DAG serializes in size linear in its distinct
         // nodes instead of unfolding to an exponential tree (a state-machine loop
@@ -105,27 +130,9 @@ fn fmt_core(constraint: &Constraint, f: &mut Formatter<'_>) -> fmt::Result {
         Constraint::Push => write!(f, "(push)"),
         Constraint::Pop(levels) => write!(f, "(pop {levels})"),
         Constraint::CheckSat => write!(f, "(check-sat)"),
-        Constraint::CheckSatAssuming(assumptions) => {
-            write!(f, "(check-sat-assuming (")?;
-            for (i, a) in assumptions.iter().enumerate() {
-                if i > 0 {
-                    write!(f, " ")?;
-                }
-                write!(f, "{a}")?;
-            }
-            write!(f, "))")
-        }
+        Constraint::CheckSatAssuming(assumptions) => write_check_sat_assuming(f, assumptions),
         Constraint::GetModel => write!(f, "(get-model)"),
-        Constraint::GetValue(exprs) => {
-            write!(f, "(get-value (")?;
-            for (i, e) in exprs.iter().enumerate() {
-                if i > 0 {
-                    write!(f, " ")?;
-                }
-                write!(f, "{}", e.to_smtlib_shared())?;
-            }
-            write!(f, "))")
-        }
+        Constraint::GetValue(exprs) => write_get_value(f, exprs),
         Constraint::GetUnsatCore => write!(f, "(get-unsat-core)"),
         Constraint::SetOption { name, value } => {
             // The direct Solver API documents option keywords with their

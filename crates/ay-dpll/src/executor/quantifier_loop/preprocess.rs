@@ -9,6 +9,7 @@
 //! These are private `impl Executor` methods called from the orchestrator
 //! in `mod.rs`.
 
+mod finite_expansion_provenance;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol};
@@ -16,7 +17,7 @@ use ay_core::{FarkasAnnotation, Sort, TermData, TermId, TermStore, TheoryLemmaKi
 
 use super::super::model::EvalValue;
 use super::super::Executor;
-use super::collect_and_conjuncts;
+use super::{collect_and_conjuncts, FiniteExpansionRecord};
 use crate::cegqi::{is_cegqi_candidate, CegqiInstantiator};
 use crate::ematching::{
     collect_ground_terms_by_sort, contains_quantifier, enumerative_instantiation, subst_vars,
@@ -531,8 +532,11 @@ impl Executor {
     ) {
         // B2 audit: pure proof bookkeeping (freezes the authored-assertion
         // scope for proof export) — safe to skip when the tracker is off,
-        // including under competition shedding; nothing downstream reads the
-        // provenance unless a proof is being built.
+        // including under competition shedding; no certification lane reads
+        // the provenance unless a proof is being built, and the one shed-mode
+        // reader (the B3 CompetitionRaw scope authentication, unsat_cert.rs)
+        // explicitly tolerates its absence while still rejecting a present
+        // provenance bound to different assertions.
         if !self.produce_proofs_enabled() || self.proof_problem_assertion_provenance.is_some() {
             return;
         }
@@ -690,14 +694,44 @@ impl Executor {
                 }
                 registered
             } else if let Some(&source) = normalized_sources.get(&record.quantifier) {
-                self.proof_tracker
+                let registered = self
+                    .proof_tracker
                     .add_normalized_forall_instantiated_assertion(
                         &mut self.ctx.terms,
                         source,
                         record.quantifier,
                         &record.binding,
                         record.instance,
-                    )
+                    );
+                // #consequence-replay: the replay producer derives instances
+                // by `forall_inst` from the ORIGINAL authored universal, so a
+                // normalized registration also records the exact structural
+                // instance of the SOURCE at the same binding. Recomputed here
+                // from the source itself (never taken from the live rewritten
+                // body) and re-derived again by the strict `forall_inst`
+                // validator on any candidate that uses it; a mismatch can only
+                // cost a declined candidate. Kill-switch gated: other repair
+                // lanes also read `ematching_proof_records`, and
+                // `--no-consequence-replay` must restore baseline behaviour
+                // byte-for-byte everywhere.
+                if registered.is_some() && crate::quant_unit_authority::consequence_replay_enabled()
+                {
+                    if let (Some(&assertion_index), Some(exact)) = (
+                        direct_indices.get(&source),
+                        self.exact_forall_instance(source, &record.binding),
+                    ) {
+                        let proof_record = super::super::EmatchingProofRecord {
+                            assertion_index,
+                            quantifier: source,
+                            binding: record.binding.clone(),
+                            instance: exact,
+                        };
+                        if !self.ematching_proof_records.contains(&proof_record) {
+                            self.ematching_proof_records.push(proof_record);
+                        }
+                    }
+                }
+                registered
             } else {
                 None
             };
@@ -810,7 +844,7 @@ impl Executor {
         }
     }
 
-    pub(super) fn expand_finite_domains(&mut self) {
+    pub(super) fn expand_finite_domains(&mut self) -> Vec<FiniteExpansionRecord> {
         // #bool-ground-inst: Bool binders are finite-domain-expanded at
         // {true, false}, which DESTROYS the quantifier (and with it any
         // trigger), so an opaque Bool term `c` buried in a UF argument
@@ -831,6 +865,7 @@ impl Executor {
         bool_candidates.truncate(MAX_BOOL_GROUND_CANDIDATES);
         let _bool_ground_scope =
             crate::skolemize::scoped_bool_ground_instantiation_candidates(bool_candidates);
+        let mut finite_expansion_records = Vec::new();
         let mut expanded = Vec::new();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
@@ -859,10 +894,21 @@ impl Executor {
             // its current behavior). Purely observational — the replacement
             // itself is byte-identical either way.
             let a = self.ctx.assertions[idx];
+            let recorded_expansion = matches!(
+                self.ctx.terms.get(a),
+                TermData::Forall(..) | TermData::Exists(..)
+            )
+            .then(|| crate::skolemize::finite_domain_expand_with_instances(&mut self.ctx.terms, a))
+            .flatten();
+            let exact_root_record = finite_expansion_provenance::exact_record(
+                &mut self.ctx.terms,
+                a,
+                idx,
+                ground,
+                recorded_expansion.as_ref().map(|(root, _)| *root),
+            );
             if matches!(self.ctx.terms.get(a), TermData::Forall(..)) {
-                if let Some((recorded_ground, instances)) =
-                    crate::skolemize::finite_domain_expand_with_instances(&mut self.ctx.terms, a)
-                {
+                if let Some((recorded_ground, instances)) = recorded_expansion {
                     if recorded_ground == ground {
                         // Normalize each instance with the SIMPLIFYING
                         // constructors (the substitution builds `or`/`and`
@@ -939,9 +985,13 @@ impl Executor {
                 }
             }
             self.ctx.assertions[idx] = ground;
+            if let Some(record) = exact_root_record {
+                finite_expansion_records.push(record);
+            }
         }
         // `_bool_ground_scope` restores the predecessor here (and on unwind),
         // so a nested sub-solve must derive candidates from ITS assertions.
+        finite_expansion_records
     }
 
     /// Skolemize existential quantifiers via polarity-aware deep walk.
@@ -953,7 +1003,10 @@ impl Executor {
     /// Z3's NNF Skolemizer (reference/z3/src/ast/normal_forms/nnf.cpp:407).
     /// Runs after finite domain expansion so only non-finite-domain existentials
     /// are Skolemized. (#5840)
-    pub(super) fn skolemize_existentials(&mut self) {
+    pub(super) fn skolemize_existentials(
+        &mut self,
+        finite_expansion_records: &mut [FiniteExpansionRecord],
+    ) {
         let mut skolemized = Vec::new();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
@@ -965,21 +1018,92 @@ impl Executor {
         }
         for (idx, original, body, provenance) in skolemized {
             let body = self.add_enum_skolem_coverage(body);
+            if let Some(record) = finite_expansion_records
+                .iter_mut()
+                .find(|record| record.assertion_index == idx)
+            {
+                record.expanded = body;
+            }
+            // (#quant-unit-authority kill switch) `off` suppresses only the
+            // NEW provenance recording; the pre-campaign tracker call for the
+            // negated-forall shape stays unconditional.
+            let record_skolem_provenance =
+                crate::quant_unit_authority::quant_unit_authority_enabled();
+            // (#skolem-witness-sat) Node-local witness provenance for EVERY
+            // single-constant-witness Skolemization the deep walk performed,
+            // nested occurrences included. Deliberately NOT gated on
+            // `produce_proofs_enabled`: the consumer is the SAT confirmation
+            // arm, not the proof exporter, and it independently replays each
+            // record at consumption.
+            if crate::quant_unit_authority::skolem_witness_sat_enabled() {
+                if ay_core::misc_cli_flags().debug_cert {
+                    eprintln!(
+                        "CERT/skolem-witness: recording {} provenance entries",
+                        provenance.len()
+                    );
+                }
+                for record in &provenance {
+                    self.skolem_witness_records
+                        .push(crate::executor::SkolemWitnessRecord {
+                            quantified: record.quantified,
+                            witness: record.witness,
+                            instance: record.instance,
+                            positive: record.from_exists,
+                        });
+                }
+            }
             if self.produce_proofs_enabled() {
-                if let TermData::Not(quantified) = self.ctx.terms.get(original) {
-                    if let Some(record) = provenance
-                        .iter()
-                        .find(|record| record.quantified == *quantified)
-                    {
-                        let _ = self.proof_tracker.add_single_forall_skolemized_assertion(
-                            &mut self.ctx.terms,
-                            original,
-                            record.quantified,
-                            record.instance,
-                            record.witness,
-                            body,
-                        );
+                match self.ctx.terms.get(original).clone() {
+                    TermData::Not(quantified) => {
+                        if let Some(record) = provenance
+                            .iter()
+                            .find(|record| !record.from_exists && record.quantified == quantified)
+                        {
+                            let _ = self.proof_tracker.add_single_forall_skolemized_assertion(
+                                &mut self.ctx.terms,
+                                original,
+                                record.quantified,
+                                record.instance,
+                                record.witness,
+                                body,
+                            );
+                            // (#skolem-unit-authority) Retain the exact triple
+                            // so the checked-SAT-refutation sidecar can derive
+                            // the asserted unit from the authored source.
+                            if record_skolem_provenance {
+                                self.skolem_instance_records.push(
+                                    crate::executor::SkolemInstanceRecord {
+                                        source: original,
+                                        quantified: record.quantified,
+                                        witness: record.witness,
+                                        instance: record.instance,
+                                        asserted: body,
+                                        positive: false,
+                                    },
+                                );
+                            }
+                        }
                     }
+                    TermData::Exists(..) => {
+                        if let Some(record) = provenance
+                            .iter()
+                            .find(|record| record.from_exists && record.quantified == original)
+                        {
+                            if record_skolem_provenance {
+                                self.skolem_instance_records.push(
+                                    crate::executor::SkolemInstanceRecord {
+                                        source: original,
+                                        quantified: original,
+                                        witness: record.witness,
+                                        instance: record.instance,
+                                        asserted: body,
+                                        positive: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             self.ctx.assertions[idx] = body;
@@ -1372,7 +1496,7 @@ impl Executor {
     /// problems ([`Self::assertions_contain_bridge_term`]) — zero blast radius
     /// elsewhere.
     pub(super) fn propagate_bridge_ground_values(&mut self) {
-        let dbg = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_cert;
         if !self.assertions_contain_bridge_term() {
             if dbg {
                 eprintln!("F6/bridge-fold: no bridge term, skip");
@@ -1844,7 +1968,7 @@ impl Executor {
         // final-solve, so a timed-out run still shows whether the lane armed +
         // parked. Fires only when the lane actually armed (a classified family was
         // present). Pure observation.
-        if gated_debug_len > 0 && std::env::var_os("AY_DEMAND_DEBUG").is_some() {
+        if gated_debug_len > 0 && ay_core::misc_cli_flags().demand_debug {
             if let Some(qm) = self.quantifier_manager.as_ref() {
                 eprintln!(
                     "c demand-lane batch_instances={} gated_families={} frontier={} has_parked={}",
@@ -2822,6 +2946,46 @@ mod tests {
         let mut substitution = HashMap::default();
         substitution.insert(binder_name.to_string(), value);
         subst_vars(terms, body, &substitution)
+    }
+
+    #[test]
+    fn finite_expansion_sat_lineage_includes_exists_without_forall_proof_payload() {
+        let commands = parse(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun P (Int) Bool)
+                (assert (exists ((x Int))
+                    (and (<= 0 x) (<= x 10) (P x))))
+            "#,
+        )
+        .expect("valid bounded existential");
+        let mut exec = Executor::new();
+        assert!(exec
+            .execute_all(&commands)
+            .expect("setup commands execute")
+            .is_empty());
+        let original = exec.ctx.assertions[0];
+
+        let processed = exec.process_quantifiers();
+        let evidence = processed
+            .exact_finite_expansion
+            .expect("top-level exists must retain exact SAT lineage");
+
+        assert_eq!(evidence.records.len(), 1);
+        assert_eq!(evidence.records[0].original, original);
+        assert_eq!(evidence.records[0].assertion_index, 0);
+        assert_eq!(
+            evidence.expanded_assertions[0], evidence.records[0].expanded,
+            "lineage must name the exact root passed to the ground solver"
+        );
+        assert!(!contains_quantifier(
+            &exec.ctx.terms,
+            evidence.records[0].expanded
+        ));
+        assert!(
+            exec.quant_expansion_records.is_empty(),
+            "existential SAT lineage must not masquerade as forall proof provenance"
+        );
     }
 
     #[test]

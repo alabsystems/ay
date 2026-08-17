@@ -46,7 +46,7 @@ pub(in crate::executor) use super::proof_trust_surgery_surface_audit::{
 /// This rejects surface rewrites such as nested/flattened `or` and
 /// `(ite (not c) a b)`, whose canonical terms may be equivalent but whose
 /// printed Alethe rule has a different positional shape.
-pub(super) fn immediate_surface_parts_match(
+pub(in crate::executor) fn immediate_surface_parts_match(
     ctx: &mut ay_frontend::Context,
     parsed: &FrontendTerm,
     expected_head: &str,
@@ -240,7 +240,7 @@ pub(super) fn surface_arithmetic_or_matches(
         }
 }
 
-pub(super) fn surface_or_decomposition_matches(
+pub(in crate::executor) fn surface_or_decomposition_matches(
     ctx: &mut ay_frontend::Context,
     parsed: &FrontendTerm,
     canonical_disjuncts: &[TermId],
@@ -289,7 +289,7 @@ pub(super) fn surface_or_decomposition_matches(
     }
 }
 
-pub(super) fn surface_arithmetic_ite_matches(
+pub(in crate::executor) fn surface_arithmetic_ite_matches(
     ctx: &mut ay_frontend::Context,
     parsed: &FrontendTerm,
     canonical_parts: &[TermId; 3],

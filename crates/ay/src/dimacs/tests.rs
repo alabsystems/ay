@@ -3446,7 +3446,7 @@ fn test_large_formula_disables_xor_extension() {
     // distribution keeps the binary/gate-structure guards from firing first,
     // isolating the absolute-size guard.
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
+    let _g = ScopedEnvVar::unset("--xor-allow-large");
 
     let n = XOR_EXTENSION_MAX_CLAUSES + 1;
     let bin = n / 10; // 10% binary
@@ -3459,11 +3459,15 @@ fn test_large_formula_disables_xor_extension() {
         !should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
         "large formulas must skip the XOR extension regardless of density"
     );
-    // The escape hatch restores GE for experimentation.
-    let _g = ScopedEnvVar::set("AY_XOR_ALLOW_LARGE", "1");
+    // The escape hatch restores GE for experimentation (B41: the carrier
+    // override rides the cross-crate test seam).
+    let _g = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        xor_allow_large: true,
+        ..ay_core::misc_cli_flags().clone()
+    });
     assert!(
         should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
-        "AY_XOR_ALLOW_LARGE must re-enable the XOR extension on large formulas"
+        "--xor-allow-large must re-enable the XOR extension on large formulas"
     );
 }
 
@@ -3472,7 +3476,7 @@ fn test_small_dense_xor_still_enabled_under_size_cap() {
     // inc6: a small, dense, mixed-size XOR-heavy formula (well under the cap)
     // must still route to the XOR extension -- this is the case GE helps.
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
+    let _g = ScopedEnvVar::unset("--xor-allow-large");
 
     let clauses = make_clauses_mixed(0, 80, 20); // 100 clauses, 80% ternary
     assert!(clauses.len() <= XOR_EXTENSION_MAX_CLAUSES);
@@ -3484,11 +3488,11 @@ fn test_small_dense_xor_still_enabled_under_size_cap() {
 
 #[test]
 fn test_should_enable_xor_extension_crypto_benchmarks() {
-    // The residual-dominance asserts below read AY_XOR_ALLOW_RESIDUAL, which the
+    // The residual-dominance asserts below read --xor-allow-residual, which the
     // kill-switch test mutates globally under the shared environment lock;
     // hold that lock and clear the var so the two tests cannot race.
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_RESIDUAL");
+    let _guard = ScopedEnvVar::unset("--xor-allow-residual");
 
     // Crypto benchmarks: low binary fraction, high XOR density, mixed sizes.
     // Real crypto formulas have clauses of sizes 2-8+, not just binary+ternary.
@@ -3505,7 +3509,7 @@ fn test_should_enable_xor_extension_crypto_benchmarks() {
     // forfeits ALL preprocessing (congruence/sweep/BVE/factor) on the huge CNF
     // residual — measured catastrophic on the 31e843c5 class (wf_ff0f9700).
     // The residual-dominance guard (residual > 85%) now keeps these on the
-    // pure-SAT + full-preprocessing path. AY_XOR_ALLOW_RESIDUAL=1 restores the
+    // pure-SAT + full-preprocessing path. --xor-allow-residual restores the
     // old unconditional enable.
     assert!(!should_enable_xor_extension(&clauses, 10_000, 90_000, 500));
     assert!(!should_enable_xor_extension(&clauses, 500, 9_500, 50));
@@ -3522,7 +3526,7 @@ fn test_residual_dominance_disables_xor_extension() {
     // (kissat-agreed, dpr-trim -> cake_lpr verified). The residual-dominance
     // guard disables XOR when residual > 85% of the clause count.
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_RESIDUAL");
+    let _guard = ScopedEnvVar::unset("--xor-allow-residual");
 
     // Mirror 31e843c5's clause-size distribution (32.5% binary, 46% ternary,
     // 21.5% wide) so the binary%, gate%, and sparse-wide guards all pass and
@@ -3556,10 +3560,13 @@ fn test_residual_dominance_disables_xor_extension() {
     );
 
     // Kill switch restores the old unconditional enable byte-for-byte.
-    let _kill_switch = ScopedEnvVar::set("AY_XOR_ALLOW_RESIDUAL", "1");
+    let _kill_switch = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        xor_allow_residual: true,
+        ..ay_core::misc_cli_flags().clone()
+    });
     assert!(
         should_enable_xor_extension(&clauses, 848, 12_560, 207),
-        "AY_XOR_ALLOW_RESIDUAL=1 must restore the pre-fix XOR enable"
+        "--xor-allow-residual must restore the pre-fix XOR enable"
     );
 }
 

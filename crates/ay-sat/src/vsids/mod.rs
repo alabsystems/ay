@@ -31,7 +31,7 @@ const CHB_ALPHA_INIT: f64 = 0.4;
 const CHB_ALPHA_MIN: f64 = 0.06;
 const CHB_ALPHA_DECAY: f64 = 0.999_995;
 
-/// A/B knob (campaign branching research): `AY_VSIDS_DECAY` overrides the default
+/// A/B knob (campaign branching research): `--vsids-decay` overrides the default
 /// EVSIDS decay (0.95 = CaDiCaL scorefactor=950). Decay controls how fast variable
 /// activity is forgotten — the core "which variables accrue activity" lever the
 /// audit identified as the residual Kissat gap. Must be in (0,1); invalid/unset
@@ -41,9 +41,8 @@ fn default_vsids_decay() -> f64 {
     use std::sync::OnceLock;
     static DECAY: OnceLock<f64> = OnceLock::new();
     *DECAY.get_or_init(|| {
-        std::env::var("AY_VSIDS_DECAY")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
+        ay_core::misc_cli_flags()
+            .vsids_decay
             .filter(|d| *d > 0.0 && *d < 1.0 && d.is_finite())
             .unwrap_or(0.95)
     })

@@ -1,7 +1,7 @@
 //! SEPARATION-WORK CENSUS — measurement scaffolding for the cut-separation front.
 //!
 //! Every counter here is load-invariant (counts, not wall) except the two `*_NS` timers, which
-//! are reported only as a secondary signal. The census proper is behind `AY_MILP_SEPSTAT`; with
+//! are reported only as a secondary signal. The census proper is behind `--sepstat`; with
 //! the env var unset the only cost is one relaxed load of a `OnceLock<bool>` per bump site, and
 //! the bump sites sit outside the exact-rational inner loops that matter.
 //!
@@ -52,7 +52,7 @@ counters! {
     LATE_EMPTY, LATE_NONFINITE, LATE_ABSURD,
     // Screen accounting (see `ScreenRow`).
     SCREEN_TRIED, SCREEN_SKIP, SCREEN_BUILD_FAIL, SCREEN_ROW_KILL, SCREEN_UNKNOWN,
-    // Audit mode (`AY_MILP_SEP_SCREEN_AUDIT`): screen claims checked against the exact kernel.
+    // Audit mode (`--sep-screen-audit`): screen claims checked against the exact kernel.
     AUDIT_OK, AUDIT_FAIL,
 }
 
@@ -60,7 +60,7 @@ pub static SEP_NS: AtomicU64 = AtomicU64::new(0);
 
 // ------------------------------------------------------- FORGONE COST
 //
-// Everything above is gated on `AY_MILP_SEPSTAT` and answers "how far did the
+// Everything above is gated on `--sepstat` and answers "how far did the
 // derivation get". The two counters below are ALWAYS ON and answer a different
 // question, about the branch a gate did NOT take.
 //
@@ -132,7 +132,7 @@ pub static GMI_DIGEST: AtomicU64 = AtomicU64::new(0);
 /// The `f64` BITS go in, not the value: `-0.0` and `0.0` are different stores and
 /// a digest that cannot tell them apart cannot police a rounding change either.
 ///
-/// Under `AY_MILP_GMI_CUT_TRACE` (or the general `AY_MILP_TRACE`) each cut also
+/// Under `the gmi-cut-trace knob` (or the general `--trace`) each cut also
 /// prints its OWN hash. The run digest is a chain, so it answers "did these two
 /// runs separate the same cuts" and nothing else — and two arms that stop at
 /// different points disagree for a reason that is not a disagreement about any
@@ -141,7 +141,7 @@ pub static GMI_DIGEST: AtomicU64 = AtomicU64::new(0);
 /// round budget paying for the `m²` assembly the sparse path does not build. The
 /// per-cut line makes the honest comparison possible: PREFIX-compare, and name
 /// the first index that actually differs. It gets its own switch rather than
-/// riding on `AY_MILP_TRACE` because the general trace's VOLUME is itself a cost
+/// riding on `--trace` because the general trace's VOLUME is itself a cost
 /// that perturbs which arm runs out of budget first, which is the exact
 /// confounder this line exists to remove.
 pub fn gmi_cut(lb: f64, coeffs: impl Iterator<Item = (u32, f64)>) {
@@ -167,8 +167,8 @@ pub fn gmi_cut(lb: f64, coeffs: impl Iterator<Item = (u32, f64)>) {
     let i = GMI_CUTS.fetch_add(1, Ordering::Relaxed);
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *TRACE.get_or_init(|| {
-        std::env::var_os("AY_MILP_GMI_CUT_TRACE").is_some()
-            || std::env::var_os("AY_MILP_TRACE").is_some()
+        crate::tune::caller_flag(crate::tune::Knob::GmiCutTrace) == Some(true)
+            || crate::debug_flags::milp_debug_flags().trace
     }) {
         eprintln!("GMICUT i={i} h={one:016x} nz={nz} lb={lb:.17e}");
     }
@@ -306,7 +306,7 @@ pub fn forgone() -> (u64, u64) {
 
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_MILP_SEPSTAT").is_some())
+    *ON.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::Sepstat) == Some(true))
 }
 
 #[inline]
@@ -618,7 +618,7 @@ pub fn dump() {
     if adopt > 0 {
         eprintln!(
             "FORGONE ft-adoption       excluded_solves={adopt} first_excluded_rows={adopt_rows}  \
-             (above AY_MILP_ADOPT_FT_MAX_ROWS)",
+             (above the adopt-ft-max-rows knob)",
         );
     }
     // THE GATE CENSUS. Also outside the `on()` guard, for the reason above: these
@@ -747,7 +747,7 @@ mod forgone_tests {
         );
     }
 
-    /// Always-on: the counters do not consult `AY_MILP_SEPSTAT`. A number that
+    /// Always-on: the counters do not consult `--sepstat`. A number that
     /// appears only when someone already suspects a problem cannot report one
     /// nobody suspects.
     #[test]

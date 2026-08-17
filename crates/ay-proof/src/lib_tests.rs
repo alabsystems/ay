@@ -3,10 +3,12 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use ay_core::{string_literal, AletheRule, Sort};
+use ay_core::{string_literal, AletheRule, Sort, Symbol};
 
 #[path = "alethe_printer_bare_step_rule_tests.rs"]
 mod alethe_printer_bare_step_rule_tests;
+#[path = "alethe_printer_linear_identity_tests.rs"]
+mod alethe_printer_linear_identity_tests;
 #[path = "alethe_printer_resolution_args_tests.rs"]
 mod alethe_printer_resolution_args_tests;
 #[path = "alethe_printer_surface_and_pos_tests.rs"]
@@ -186,6 +188,53 @@ fn test_theory_lemma_with_kind() {
         output.contains(":rule eq_transitive"),
         "Expected eq_transitive rule, got: {output}"
     );
+}
+
+/// An `eq_transitive` hypothesis whose active surface override re-spells the
+/// canonical `(not (= a b))` as the boolean-equality alias `(= (= a b) false)`
+/// is NOT a legal negated-equality hypothesis. Carcara refuses that literal
+/// (`term is of the wrong form, expected (not (= t u))`), taking the whole
+/// document to `invalid`. The printer must fall back to an honest `hole` for
+/// the step rather than emit the native-only rendering.
+#[test]
+fn eq_transitive_boolean_equality_alias_hypothesis_stays_a_hole() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::TheoryLemmaKind;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+
+    let eq_ab = terms.mk_eq(a, b);
+    let eq_bc = terms.mk_eq(b, c);
+    let eq_ac = terms.mk_eq(a, c);
+    let not_eq_ab = terms.mk_not(eq_ab);
+    let not_eq_bc = terms.mk_not(eq_bc);
+
+    let step = ProofStep::TheoryLemma {
+        theory: "EUF".to_string(),
+        clause: vec![not_eq_ab, not_eq_bc, eq_ac],
+        farkas: None,
+        kind: TheoryLemmaKind::EufTransitive,
+        lia: None,
+    };
+
+    // Without the adversarial override the step is a spec-valid eq_transitive.
+    let printer = AlethePrinter::new(&terms);
+    let clean = printer.format_step(&step, ProofId(0)).unwrap();
+    assert!(clean.contains(":rule eq_transitive"), "{clean}");
+    assert!(!clean.contains(":rule hole"), "{clean}");
+
+    // With the boolean-equality alias installed on the first hypothesis, the
+    // only wire rendering the override permits is the shape Carcara rejects, so
+    // the step must decline to an honest hole.
+    let mut overrides = DetHashMap::default();
+    overrides.insert(not_eq_ab, "(= (= a b) false)".to_string());
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+    let aliased = printer.format_step(&step, ProofId(0)).unwrap();
+    assert!(aliased.contains(":rule hole"), "{aliased}");
+    assert!(!aliased.contains(":rule eq_transitive"), "{aliased}");
 }
 
 #[test]
@@ -610,6 +659,40 @@ fn test_format_string_constant_uses_canonical_smtlib_literal() {
         !output.contains("\\\""),
         "Alethe string output must use doubled quotes, not backslash quotes: {output}"
     );
+}
+
+#[test]
+fn bool_constant_clausification_prints_fixed_axioms_without_internal_args() {
+    let mut terms = TermStore::new();
+    let true_term = terms.mk_bool(true);
+    let false_term = terms.mk_bool(false);
+    let not_false = terms.mk_not_raw(false_term);
+    let printer = AlethePrinter::new(&terms);
+
+    for (id, rule, clause, source, expected) in [
+        (
+            ProofId(3),
+            AletheRule::True,
+            true_term,
+            true_term,
+            "(step t3 (cl true) :rule true)",
+        ),
+        (
+            ProofId(4),
+            AletheRule::False,
+            not_false,
+            false_term,
+            "(step t4 (cl (not false)) :rule false)",
+        ),
+    ] {
+        let step = ProofStep::Step {
+            rule,
+            clause: vec![clause],
+            premises: Vec::new(),
+            args: vec![source],
+        };
+        assert_eq!(printer.format_step(&step, id).unwrap(), expected);
+    }
 }
 
 /// S2: a proof free in symbols the problem does not declare is UNRENDERABLE.
@@ -3936,33 +4019,4 @@ fn test_array_store_permutation_mentioning_the_witness_binder_stays_a_hole() {
     }
 }
 
-/// REGRESSION: the collision can also arrive as an application HEAD — a
-/// user FUNCTION named `x` applied to arguments. The printed `(x 0)` is a
-/// parse error inside `(choice ((x S)) …)`, so an unguarded lowering would
-/// regress the document from `holey` to `invalid`. Measured on carcara
-/// 1.1.0: `(x 0)` parses at the top level but not under the binder.
-#[test]
-fn test_array_store_permutation_with_a_function_named_x_stays_a_hole() {
-    use ay_core::{ArraySort, Symbol};
-
-    let mut terms = TermStore::new();
-    let sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
-    let array = terms.mk_var("a", sort);
-    let zero = terms.mk_int(0.into());
-    // Index i = (x 0): an application whose HEAD wears the binder's name.
-    let i = terms.mk_app(Symbol::named("x"), [zero], Sort::Int);
-    let j = terms.mk_var("j", Sort::Int);
-    let v = terms.mk_var("v", Sort::Int);
-    let w = terms.mk_var("w", Sort::Int);
-    let left_inner = terms.mk_store(array, i, v);
-    let left = terms.mk_store(left_inner, j, w);
-    let right_inner = terms.mk_store(array, j, w);
-    let right = terms.mk_store(right_inner, i, v);
-    let index_equality = terms.mk_app(Symbol::named("="), [i, j], Sort::Bool);
-    let array_equality = terms.mk_app(Symbol::named("="), [left, right], Sort::Bool);
-
-    let output = export_store_permutation(vec![index_equality, array_equality], &terms);
-    assert!(output.contains(":rule hole"), "{output}");
-    assert!(!output.contains(":rule arrays_ext"), "{output}");
-    assert!(!output.contains("(choice ((x "), "{output}");
-}
+include!("lib_tests/array_surface_tail.rs");

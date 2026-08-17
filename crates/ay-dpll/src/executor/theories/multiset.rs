@@ -95,6 +95,10 @@ impl Executor {
                 .extend(count_axioms.into_iter().filter(|axiom| seen.insert(*axiom)));
         }
 
+        // Multiset count carriers are arrays; enumerate finite-index
+        // equalities only after all route-local count/subset ties are present.
+        let _ = self.add_finite_index_array_closure();
+
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
         solve_incremental_split_loop_pipeline!(self,

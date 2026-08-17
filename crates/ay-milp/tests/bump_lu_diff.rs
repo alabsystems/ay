@@ -6,7 +6,7 @@
 //! including the opt-in block-triangular-factor (BTF) lane.
 //!
 //! A basis is factored through `refactorize` on BOTH existing trusted lanes:
-//! lane 0 = PFI slot-order (`AY_MILP_NO_BUMP_LU`'s lane) and lane 1 = Markowitz
+//! lane 0 = PFI slot-order (`--no-bump-lu`'s lane) and lane 1 = Markowitz
 //! bump-LU (the default lane above the bump floor). The two lanes invert the
 //! SAME basis by two independent algorithms, so their FTRAN (`B⁻¹·M_j`) and
 //! BTRAN (rows of `B⁻¹`) images MUST agree to floating-point noise, and they
@@ -15,7 +15,7 @@
 //!
 //! The lanes are forced per-solve via the inert `bump_lu_override` seam, so no
 //! env toggles the lane; the env here only ACTIVATES the peel on a tiny LP
-//! (`AY_MILP_TRI_CRASH`) and drops the bump floor to 1 (`AY_MILP_BUMP_LU_MIN`)
+//! (`AY_MILP_TRI_CRASH`) and drops the bump floor to 1 (`the bump-lu-min knob`)
 //! so lane 1 genuinely takes the bump-LU path. Env forcing is per-process and
 //! serialized through the one workspace choke point; this file is its own test
 //! binary, so nothing leaks into other suites.
@@ -27,14 +27,8 @@ use ay_milp::{
 /// Activate the peel + bump-LU on tiny LPs for the duration of `f`, serialized +
 /// restored on exit through the workspace env choke point.
 fn with_peel_env<T>(f: impl FnOnce() -> T) -> T {
-    ay_test_support::env::with_serialized_env_vars(
-        &[
-            ("AY_MILP_TRI_CRASH", "1"),
-            ("AY_MILP_BUMP_LU_MIN", "1"),
-            ("AY_MILP_REFACTOR_EVERY", "1"),
-        ],
-        f,
-    )
+    let _levers = ay_milp::debug_flags::force_bump_lu_for_test();
+    f()
 }
 
 /// An odd cycle `x_i + x_{i+1 mod n} = 2` (n odd) has the unique solution x == 1,

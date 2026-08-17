@@ -1415,7 +1415,7 @@ fn test_conditioning_drat_proof_verified() {
 }
 
 /// Congruence is DRAT-open since 2026-07-10 (registry `Congruence { drat:
-/// true }`, wf_ff5991a1; kill-switch AY_AB_DRAT_SUBST=0). The request must
+/// true }`, wf_ff5991a1; kill-switch --sat-no-drat-subst). The request must
 /// be honored under a DRAT proof and the emitted proof must still verify —
 /// urquhart_3 is the XOR-parity family that motivated the #3378 guard, so a
 /// wrong congruence merge would flip the UNSAT verdict here.
@@ -1434,7 +1434,7 @@ fn test_congruence_drat_request_is_honored() {
     assert!(
         solver.inprocessing_feature_profile().congruence,
         "DRAT proof mode must honor congruence requests (registry drat=true \
-         since 2026-07-10; kill-switch AY_AB_DRAT_SUBST=0)"
+         since 2026-07-10; kill-switch --sat-no-drat-subst)"
     );
 
     for clause in formula.clauses {
@@ -1512,7 +1512,7 @@ fn test_congruence_drat_honored_proof_validated_by_drat_trim() {
     assert!(
         solver.inprocessing_feature_profile().congruence,
         "DRAT proof mode must honor congruence requests (registry drat=true \
-         since 2026-07-10; kill-switch AY_AB_DRAT_SUBST=0)"
+         since 2026-07-10; kill-switch --sat-no-drat-subst)"
     );
 
     for clause in formula.clauses {

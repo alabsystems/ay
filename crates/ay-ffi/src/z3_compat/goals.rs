@@ -215,15 +215,15 @@ unsafe fn apply_tactic_to_goal_impl(
     g: Z3_goal,
     label: &'static str,
 ) -> Z3_apply_result {
-    // Pre-extract the tactic and the goal's formulas outside the guard
-    // (raw-pointer derefs). SAFETY: both handles, when non-null, are arena-owned
-    // by the context and single-threaded per context; `as_ref` null-checks.
-    let (tactic, formulas): (Option<_>, Option<Vec<Z3_ast>>) = unsafe {
-        (
-            t.as_ref().map(|h| h.tactic.clone()),
-            g.as_ref().map(|h| h.formulas.clone()),
-        )
-    };
+    // Pre-extract the tactic and the goal's formulas outside the guard.
+    // SAFETY: the caller guarantees a non-null `t` is a live `TacticHandle`;
+    // `as_ref` checks null before cloning, and the API's single-thread rule
+    // prevents mutation from racing this shared read.
+    let tactic = unsafe { t.as_ref() }.map(|h| h.tactic.clone());
+    // SAFETY: the caller guarantees a non-null `g` is a live `GoalHandle`;
+    // `as_ref` checks null before cloning, and the API's single-thread rule
+    // prevents mutation from racing this shared read.
+    let formulas: Option<Vec<Z3_ast>> = unsafe { g.as_ref() }.map(|h| h.formulas.clone());
 
     // SAFETY: `c` is the caller-supplied context pointer; `ffi_guard_ptr` handles
     // the null case and catches panics.
@@ -528,11 +528,14 @@ pub unsafe extern "C" fn Z3_goal_translate(
     g: Z3_goal,
     target: Z3_context,
 ) -> Z3_goal {
-    // Pre-extract the source goal's formulas + depth (raw deref; the goal lives
-    // in `source`'s arena). SAFETY: `g`, when non-null, is a live `GoalHandle`.
+    // SAFETY: `g`, when non-null, is a live `GoalHandle` in `source`'s arena;
+    // `as_ref` null-checks before the formula/depth snapshot is copied.
     let goal_data = unsafe { g.as_ref() }.map(|h| (h.formulas.clone(), h.depth));
-    // SAFETY: `target` is the destination context; `ffi_guard_ptr` handles a null
-    // context and catches panics.
+    // SAFETY: the caller guarantees that a non-null `target` is a live context;
+    // `ffi_guard_ptr` handles null and contains panics. The only other raw
+    // context dereference below is `source`, whose validity is also part of the
+    // caller contract and whose inequality with `target` prevents aliasing the
+    // guard's exclusive target borrow.
     unsafe {
         ffi_guard_ptr(target, |tgt| {
             let Some((formulas, depth)) = goal_data else {
@@ -615,8 +618,8 @@ pub unsafe extern "C" fn Z3_goal_convert_model(
     _g: Z3_goal,
     m: Z3_model,
 ) -> Z3_model {
-    // Pre-extract a snapshot of the input model (raw deref). SAFETY: `m`, when
-    // non-null, is a live `ModelHandle`; `as_ref` null-checks.
+    // Pre-extract a snapshot of the input model (raw deref).
+    // SAFETY: `m`, when non-null, is a live `ModelHandle`; `as_ref` null-checks.
     let snapshot = unsafe { m.as_ref() }.map(|h| (h.model.clone(), h.func_interps.clone()));
     // SAFETY: `ffi_guard_ptr` handles a null context and catches panics.
     unsafe {

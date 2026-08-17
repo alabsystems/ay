@@ -1004,7 +1004,8 @@ pub unsafe extern "C" fn Z3_optimize_translate(
             h.terminal_error.clone(),
         )
     });
-    // SAFETY: `ffi_guard_ptr` validates/guards `target`.
+    // SAFETY: `target` is live by caller contract; `ffi_guard_ptr` handles a
+    // null pointer defensively before granting mutable context access.
     unsafe {
         ffi_guard_ptr(target, |tgt| {
             let Some((hard, softs, tracked, terminal_error)) = handle_data else {

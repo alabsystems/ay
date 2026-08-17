@@ -25,14 +25,11 @@ impl Sweeper {
         occ: &OccList,
         vals: &[i8],
     ) -> usize {
-        let coi_var_limit = std::env::var("AY_AB_COI_VARS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(COI_VAR_LIMIT);
-        let coi_depth_limit: u32 = std::env::var("AY_AB_COI_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(COI_DEPTH_LIMIT);
+        // B4: the AY_AB_COI_{VARS,DEPTH} env overrides are deleted. They were
+        // also uncached getenv + parse PER VARIABLE on the sweep hot path,
+        // violating the module's own #8506 no-per-call-syscall convention.
+        let coi_var_limit = COI_VAR_LIMIT;
+        let coi_depth_limit: u32 = COI_DEPTH_LIMIT;
         self.kitten.clear();
         self.coi_vars.clear();
         self.coi_clauses.clear();

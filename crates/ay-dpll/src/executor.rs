@@ -29,6 +29,9 @@ use crate::VerificationLevel;
 
 // Combined theory solvers
 pub use crate::combined_solvers::TheoryCombiner;
+// Attributed reason for a refutation that carries no derivation. Public
+// because `Executor::last_proof_decline` returns it; diagnostic only.
+pub use proof::ProofDeclineMechanism;
 // Format helpers - format_sort, format_symbol now used in executor/commands.rs
 
 // Incremental state types
@@ -79,6 +82,8 @@ const MAX_INTERLEAVED_EMATCHING_ROUNDS: usize = 4;
 pub(crate) const NATIVE_API_ASSERTION_PLACEHOLDER: &str = "__ay_api_assertion__";
 
 mod accessors;
+mod array_ext_shadow;
+pub(crate) use array_ext_shadow::ArrayExtShadow;
 mod assumption_solving;
 mod bv_mbqi;
 mod check_sat;
@@ -98,6 +103,7 @@ mod logic_detect;
 mod mbqi;
 mod mod_div_elim;
 mod model;
+mod nra_model_state;
 pub(crate) mod optimization;
 mod partition_rescue;
 mod proof;
@@ -106,6 +112,7 @@ mod proof_euf_lemma;
 mod proof_original_rebuild;
 mod proof_repair;
 use proof_repair::*;
+pub(crate) mod proof_propagated_rewrite;
 mod proof_resolution;
 mod proof_rewrite;
 mod proof_rewrite_division;
@@ -117,6 +124,7 @@ mod qe_prepass;
 mod quantified_sat;
 mod quantifier_loop;
 mod query_authority;
+mod query_state;
 mod rewrite_const_array_reads;
 mod rm_domain;
 mod solve_deadline;
@@ -132,6 +140,12 @@ pub(crate) use model::sat_emit::SatCertificate;
 pub(in crate::executor) use query_authority::AuthoredPlainHardQueryPermit;
 pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
 pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
+pub(crate) use query_state::{
+    BvMbqiFalseInstanceRecord, EmatchingProofRecord, FiniteArrayCachedAxiom,
+    FiniteArrayExpansionLedger, FiniteEnumPigeonholeWitness, PrepassReachability,
+    QpfPremiseForcedInstanceRecord, QuantExpansionRecord, SkolemInstanceRecord,
+    SkolemWitnessRecord,
+};
 pub(crate) use solve_deadline::SolveDeadlineCell;
 pub(crate) use unsat_cert::UnsatCertificate;
 
@@ -179,159 +193,6 @@ pub(crate) use theories::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET};
 // This approach avoids the complexity of tracking global vs scoped assertions
 // and syncing SMT push/pop with SAT push/pop. Instead, we let the SAT solver's
 // assumption-based solving handle the scoping naturally.
-
-/// D1 shadow instrumentation for the on-assert lazy-extensionality campaign.
-///
-/// The eager path (`add_array_extensionality_axioms_up_to`) emits one
-/// `__ay_ext_diff(a,b)` witness clause per SYNTACTIC array-equality atom whose
-/// negation appears anywhere in the term store — an over-approximation that
-/// balloons on qlock-style AUFLIA (many witnesses vs z3's few demand-driven).
-/// This struct records, per solve, the EAGER set of pairs actually emitted so
-/// the finalizer can correlate it against the DEMANDED set (pairs whose
-/// equality atom the search forced false) and surface the dead mass on `-st`.
-///
-/// Measurement only: the eager path stays authoritative and is never gated on
-/// this data. Kept always-on (not `cfg(debug_assertions)`) so the counters are
-/// visible on release `-st` runs; the sets are tiny (bounded by the number of
-/// array-equality atoms) so the overhead is negligible.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ArrayExtShadow {
-    /// Per emitted witness: `(eq_term, lhs, rhs, not_sel_eq_atom)`.
-    ///
-    /// `eq_term` is the `(= a b)` atom the extensionality clause guards;
-    /// `not_sel_eq` is the `¬((select a k) = (select b k))` witness literal.
-    /// Deduplicated by the ordered `(lhs, rhs)` pair at record time.
-    pub(crate) emitted: Vec<(TermId, TermId, TermId, TermId)>,
-    /// Ordered `(lhs, rhs)` pairs already recorded, to dedup emissions.
-    pub(crate) seen_pairs: HashSet<(TermId, TermId)>,
-}
-
-impl ArrayExtShadow {
-    pub(crate) fn clear(&mut self) {
-        self.emitted.clear();
-        self.seen_pairs.clear();
-    }
-
-    /// Record one emitted extensionality witness. Returns false if the ordered
-    /// pair was already recorded this solve (caller may ignore).
-    pub(crate) fn record(
-        &mut self,
-        eq_term: TermId,
-        lhs: TermId,
-        rhs: TermId,
-        not_sel_eq: TermId,
-    ) -> bool {
-        let pair = if lhs.0 <= rhs.0 {
-            (lhs, rhs)
-        } else {
-            (rhs, lhs)
-        };
-        if !self.seen_pairs.insert(pair) {
-            return false;
-        }
-        self.emitted.push((eq_term, lhs, rhs, not_sel_eq));
-        true
-    }
-}
-
-/// Lifetime entry counters for check-sat pre-passes that sit behind a mode
-/// guard (#prepass-reachability).
-///
-/// A pre-pass guarded on a predicate that is unconditionally FALSE on the
-/// public path is DEAD, not opted out — and it is dead SILENTLY: every test
-/// still passes the moment the pass has a fail-closed degradation, because the
-/// degradation is exactly what a never-run pass produces. That failure mode has
-/// already cost this codebase twelve passes (see the doc comment on
-/// [`Executor::produce_proofs_enabled`] and the eleventh/twelfth sites in
-/// `check_sat.rs`), and no verdict-level assertion can catch it: the verdict is
-/// identical either way.
-///
-/// The counters below make reachability itself observable, so a regression test
-/// can assert that a pre-pass really executed on the lane that owns it. They are
-/// incremented only at the pre-pass entry point, are never read by solver logic,
-/// and never influence a verdict.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PrepassReachability {
-    /// Times the deep-QE pre-pass site was reached with its APPLICABILITY
-    /// condition (quantified assertions present) satisfied. Everything that can
-    /// keep `deep_qe_entered` below this is a mode guard.
-    pub(crate) deep_qe_applicable: u64,
-    /// Times the deep-QE pre-pass actually ran
-    /// (`crate::executor::qe_prepass::deep_qe`).
-    pub(crate) deep_qe_entered: u64,
-    /// Times the INTERNAL proof tracker was recording at the deep-QE site, i.e.
-    /// `produce_proofs_enabled()` was true there. Sampled in situ so the
-    /// regression test can pin the trap as a measured fact rather than as a
-    /// claim about `begin_public_solve` made from somewhere else.
-    pub(crate) deep_qe_internal_tracker_on: u64,
-    /// Times `deep_qe_unknown_retry` cleared every guard AND its probe found a
-    /// real rewrite, so an `Unknown` was re-solved with the pre-pass armed. This
-    /// is the attribution counter: a behaviour change on a query with this at
-    /// zero did not come from the deep-QE lane.
-    pub(crate) deep_qe_unknown_retries: u64,
-}
-
-/// Provenance of one finite-domain quantifier expansion that replaced a
-/// top-level `forall` assertion with its ground instance conjunction
-/// (#quant-expansion-proof).
-///
-/// Recorded by `expand_finite_domains` and kept in sync by the later
-/// in-place assertion rewrites of the quantifier lane (strict-int
-/// tightening), so at proof-export time `expanded` still equals the
-/// solver-visible assertion the exported `assume` carries. The trust
-/// surgery matches an unmatched `assume` against `expanded`, then derives
-/// each consumed conjunct from `original` (the genuine problem premise)
-/// with `forall_inst` + guard-discharge steps, using `instances` to look
-/// up the binder-value tuple that produced the conjunct.
-#[derive(Debug, Clone)]
-pub(crate) struct QuantExpansionRecord {
-    /// The original assertion — the `forall` term itself.
-    pub(crate) original: TermId,
-    /// Position of the replaced assertion on the assertion stack at
-    /// expansion time (aligned with `assertions_parsed()` for the
-    /// non-flattened prefix; the surgery re-verifies the surface shape).
-    pub(crate) assertion_index: usize,
-    /// The current ground replacement conjunction (tracks in-place rewrites).
-    pub(crate) expanded: TermId,
-    /// Per enumerated instantiation: binder values (in binder order) and the
-    /// folded instance term as merged into `expanded` (kept in sync with the
-    /// same rewrites).
-    pub(crate) instances: Vec<(Vec<TermId>, TermId)>,
-}
-
-/// Authenticated proof provenance for one direct E-matching instance.
-///
-/// Unlike [`QuantExpansionRecord`], E-matching does not replace the authored
-/// `forall` on the assertion stack.  The record is retained only after the
-/// proof tracker has independently replayed the exact substitution from a
-/// direct problem assertion.  Trust-leaf surgery may then use the same
-/// source/binding/instance triple to reconstruct a checked `forall_inst`
-/// consequence instead of exporting a `Generic` lemma.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EmatchingProofRecord {
-    /// Position of the direct authored `forall` in the immutable assertion
-    /// stack (and therefore in `assertions_parsed()`).
-    pub(crate) assertion_index: usize,
-    /// Canonical source term seen by the E-matcher.  Retained so repair can
-    /// match a folded `not(forall)` leaf before rebuilding the source term.
-    pub(crate) quantifier: TermId,
-    /// Positional binder values independently checked by the proof tracker.
-    pub(crate) binding: Vec<TermId>,
-    /// Exact ground body produced by simultaneous substitution.
-    pub(crate) instance: TermId,
-}
-
-/// The clique behind a finite-enum pigeonhole refutation, with per-pair source
-/// provenance so the proof layer can emit real `Assume` steps.
-#[derive(Debug, Clone)]
-pub(crate) struct FiniteEnumPigeonholeWitness {
-    /// Constructor count of the sort (its exact carrier size).
-    pub(crate) k: usize,
-    /// `k + 1` pairwise-distinct terms of that sort.
-    pub(crate) members: Vec<TermId>,
-    /// Ordered member pair -> the authored assertion that supplied it.
-    pub(crate) edge_sources: HashMap<(TermId, TermId), TermId>,
-}
 
 /// SMT executor that coordinates frontend parsing with theory solving.
 pub struct Executor {
@@ -409,18 +270,18 @@ pub struct Executor {
     /// "relevancy-hard + eager theory propagation" regime
     /// (the development design notes §2 Inc5). Set
     /// ONLY around the UFLIA hybrid's fused detour arm
-    /// (`AY_UFLIA_FUSED_DETOUR=1`, combined/mod.rs #fused-detour slot);
+    /// (`--uflia-fused-detour=1`, combined/mod.rs #fused-detour slot);
     /// always reset immediately after (plus the unconditional post-attempt
     /// and entry-defensive resets in `solve_uf_lia`). Default `false` keeps
     /// every eager expansion (eager1, the hybrid resume, AUFLIA/UF+LRA
-    /// lanes) byte-identical. `AY_RELEVANCY=0` still kills it (env override
+    /// lanes) byte-identical. `--sat-relevancy` still kills it (env override
     /// wins, mirroring the lazy seam).
     pub(crate) split_eager_relevancy_hard: bool,
     /// #relevancy-lazy-routing: when `true`, the lazy split-loop arm runs its
     /// per-round SAT solves with the relevancy brancher in HARD mode (engage
     /// on every decision — the design prototype's regime). Set only around the
     /// UFLIA hybrid's lazy fallback / forced-lazy attempt; always reset
-    /// immediately after. `AY_RELEVANCY=0` still kills it (env override wins).
+    /// immediately after. `--sat-relevancy` still kills it (env override wins).
     pub(crate) split_lazy_relevancy_hard: bool,
     /// #relevancy-lazy-routing: bounded lazy-DETOUR conflict budget. When
     /// `Some(n)`, the lazy split-loop arm caps the WHOLE attempt's SAT work at
@@ -579,7 +440,7 @@ pub struct Executor {
     /// re-admits a conflict already proven jointly-UNSAT (sound to learn); a
     /// memoized Err keeps the fail-closed bail (conservative, never learns).
     pub(crate) conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
-    /// #verify-memo (`AY_VERIFY_MEMO=1`): sampled semantic PROPAGATION
+    /// #verify-memo (`--verify-memo=1`): sampled semantic PROPAGATION
     /// verification memo — see [`crate::verification::PropSemanticVerifyMemo`]
     /// for the key/trust-true-only/lifecycle contract. Populated only while
     /// the env flag is armed (the extension never probes or inserts
@@ -632,6 +493,14 @@ pub struct Executor {
     /// re-solve could otherwise attach a CE-contaminated proof to a sound
     /// verdict established from different premises.
     last_unsat_proof_reconstruction_suppressed: bool,
+    /// One aggregate parsed-source work envelope shared by every proof pass of
+    /// the query in flight. Each pass charges the traversal/clone/format work
+    /// it is about to perform; the ceiling is the same
+    /// `MAX_AGGREGATE_SOURCE_WORK` that used to be pre-charged sixteen times
+    /// over at the build preflight, so oversized sources still fail closed on
+    /// their first pass while bounded ones stop being vetoed for work no pass
+    /// ever performs.
+    proof_source_work: proof_trust_surgery_surface_audit::ProofSourceWorkEnvelope,
     /// This solve asserted at least one quantified consequence whose exact
     /// authored-scope `forall_inst` derivation was not registered.  A raw UNSAT
     /// may still be mathematically sound, but its trace is not publication
@@ -680,6 +549,51 @@ pub struct Executor {
     /// current check-sat.  Cleared and nested-solve scoped alongside
     /// `quant_expansion_records`; no record outlives its authored authority.
     pub(crate) ematching_proof_records: Vec<EmatchingProofRecord>,
+    /// Consequence-replay probe attempts consumed by the CURRENT check-sat
+    /// (#consequence-replay). Each attempt is one bounded same-context probe
+    /// solve; the cap keeps repeated cascade/certification retries from
+    /// re-solving an already-declined consequence set. Cleared per check-sat
+    /// alongside `ematching_proof_records`.
+    pub(crate) consequence_replay_attempts: Cell<u8>,
+    /// Single-binder Skolemization provenance for assertions REPLACED in place
+    /// by `skolemize_existentials` (#skolem-unit-authority). Each record binds
+    /// the authored source (`exists x. B` or `not (forall x. B)`), the exact
+    /// raw substituted instance, the fresh witness, and the final asserted
+    /// term. Cleared per check-sat alongside `ematching_proof_records`.
+    pub(crate) skolem_instance_records: Vec<SkolemInstanceRecord>,
+    /// Node-local single-binder Skolemization provenance for EVERY positive
+    /// `exists` / negative `forall` the deep Skolemizer eliminated, nested
+    /// occurrences included (#skolem-witness-sat). Consumed ONLY by the
+    /// skolem-witness SAT confirmation arm, which replays each record
+    /// independently at consumption. Cleared per check-sat alongside
+    /// `skolem_instance_records`.
+    pub(crate) skolem_witness_records: Vec<SkolemWitnessRecord>,
+    /// BV-MBQI eval-folded-`false` instance provenance
+    /// (#bv-mbqi-false-instance-authority, P3b). Recorded at the exact
+    /// `try_bv_mbqi_refinement` push site when a boundary instance
+    /// constant-folds to the literal `false` term. Lifecycle mirrors
+    /// `skolem_instance_records` exactly: cleared per check-sat /
+    /// check-sat-assuming / reset, and saved+restored across both nested-solve
+    /// rollbacks so no record outlives a rolled-back speculative window.
+    pub(crate) bv_mbqi_false_instance_records: Vec<BvMbqiFalseInstanceRecord>,
+    /// qpf premise-forced instance provenance (#ppp-c7, L2). Recorded at the
+    /// exact re-solve push site in `premise_forced_binder_refutation`.
+    /// Lifecycle mirrors `bv_mbqi_false_instance_records` exactly: cleared
+    /// per check-sat / check-sat-assuming / reset, and saved+restored across
+    /// both nested-solve rollbacks so no record outlives a rolled-back
+    /// speculative window.
+    pub(crate) qpf_premise_forced_instance_records: Vec<QpfPremiseForcedInstanceRecord>,
+    /// `PropagateValues` producer provenance for the current check-sat
+    /// (#ppp-provenance): in-place rewrite records plus the asserted defining
+    /// equalities that licensed each `value_map` entry, drained from the
+    /// fixed-point Preprocessor loop. Consumed by
+    /// `derive_propagated_value_assumptions`, which independently REPLAYS
+    /// each record into strict-checker-validated steps; the records grant no
+    /// authority by themselves. Lifecycle mirrors
+    /// `bv_mbqi_false_instance_records` exactly: cleared per check-sat /
+    /// check-sat-assuming / reset, saved+restored across both nested-solve
+    /// rollbacks so no record outlives a rolled-back speculative window.
+    pub(crate) propagated_value_provenance: crate::preprocess::PropagationRecords,
     /// Re-elaborated or raw-reconstructed ORIGINAL problem-assertion terms
     /// captured by the last proof rebuild.
     ///
@@ -693,6 +607,14 @@ pub struct Executor {
     /// once during the rebuild (stable within the solve — no re-elaboration
     /// between capture and the gate) and cleared per check-sat.
     pub(crate) last_proof_rebuild_originals: Vec<TermId>,
+    /// Why the last refutation carries no derivation, when it carries none.
+    ///
+    /// Diagnostic only: nothing consults this to decide a verdict, mint a
+    /// certificate, or authorize an export. It exists so that the one-line
+    /// `(step t0 (cl) :rule hole)` artifact — which three unrelated conditions
+    /// can produce — is attributable in a corpus census instead of collapsing
+    /// every cause into one label. See `executor::proof::decline`.
+    pub(crate) last_proof_decline: Option<ProofDeclineMechanism>,
     /// Quality metrics from last proof validation (#4420)
     last_proof_quality: Option<ay_proof::ProofQuality>,
     /// M0(a) attribution counter (the development design notes):
@@ -710,6 +632,22 @@ pub struct Executor {
     pub(in crate::executor) strict_check_steps_validated: Cell<u64>,
     /// Reason for last Unknown result (for get-info :reason-unknown)
     last_unknown_reason: Option<UnknownReason>,
+    /// The quantifier classification ended `Unknown` at the MBQI-UNSAFE PARTIAL
+    /// QUANTIFIER guard (`record_unsafe_partial_unknown`) and nowhere else.
+    ///
+    /// #cert-consult-determinism, second half. That guard fails closed for a
+    /// binder sort MBQI cannot synthesize (Array / FP / Seq / RegLan), which is
+    /// a QUANTIFIER incompleteness — exactly the class the self-contained SAT
+    /// certificates exist to discharge. It records two DIFFERENT reason labels
+    /// for the same situation, though: `QuantifierUnhandled` when no
+    /// UF-completion candidate was attempted, and the generic
+    /// `UnknownReason::Incomplete` when one was attempted and failed. The
+    /// certificate consult keys on the label, so merely ATTEMPTING a candidate
+    /// silently removed the certificates' chance to decide the query. This flag
+    /// carries the structural fact instead of the label, so both branches are
+    /// admitted identically. Set by `record_unsafe_partial_unknown`, cleared at
+    /// the top of every `classify_quantifier_result`.
+    pub(in crate::executor) unsafe_partial_quantifier_unknown: bool,
     /// Exact production boundary that published the last Unknown result.
     ///
     /// Internal solver lanes may tentatively classify an Unknown by reason;
@@ -742,9 +680,9 @@ pub struct Executor {
     /// yet validated, mirroring the QF_LIA convention).
     pub(crate) lra_incremental_eager_override: Option<bool>,
     /// Programmatic override for the incremental QF_LRA engine lane
-    /// (#lra-inc-engine, S1). `None` (default) follows the `AY_LRA_INC_ENGINE`
-    /// env flag (default ON); `Some(true)` forces the lane on and `Some(false)`
-    /// forces it off, both independent of the environment. Exists so regression
+    /// (#lra-inc-engine, S1). `None` (default) follows the CLI default
+    /// (ON unless `--dpll-no-lra-inc-engine`); `Some(true)` forces the lane on and
+    /// `Some(false)` forces it off, both independent of the CLI. Exists so regression
     /// tests can exercise the lane deterministically without mutating
     /// process-global env state. The proof-session gate applies regardless.
     pub(crate) lra_inc_engine_override: Option<bool>,
@@ -795,6 +733,10 @@ pub struct Executor {
     counterexample_style: crate::CounterexampleStyle,
     /// Proof tracker for collecting proof steps during solving
     proof_tracker: crate::proof_tracker::ProofTracker,
+    /// Query-wide allocation envelope for proof-ledger rollback snapshots.
+    /// Executor ownership is load-bearing: nested proof-tracker swaps must not
+    /// re-arm the cumulative budget.
+    proof_checkpoint_budget: theories::ProofCheckpointBudget,
     /// Explicit proof-output request, separate from source-selected internal
     /// tracking for strict quantified-BV/self-check UNSAT certification.
     proof_output_requested: bool,
@@ -1207,6 +1149,15 @@ pub struct Executor {
     /// proof acceptance, independently checked refutation/trust discharge, and
     /// the narrow exact semantic theorem as distinct claims.
     last_unsat_certificate: Option<UnsatCertificate>,
+    /// Move-only source authentication produced by the final nested-array
+    /// quarantine and consumed by the mandatory UNSAT mint.
+    ///
+    /// The proof checker binds its evidence to the complete term-store
+    /// snapshot, so this slot is populated only after proof/sidecar building,
+    /// named-core rescue, and core minimization have finished all term
+    /// interning.  It is never a certificate on its own: final publication
+    /// must bind it to a freshly authenticated public-query scope.
+    pending_nested_array_bool_bv_unsat: Option<unsat_cert::PendingNestedArrayBoolBvUnsat>,
     /// Certification class consumed by the most recent SMT-LIB command
     /// boundary. This is separate from the one-shot token so later diagnostics
     /// cannot relabel an exact semantic certificate as a strict proof merely
@@ -1267,15 +1218,8 @@ pub struct Executor {
     /// re-pinned var values), which the independent gate then correctly
     /// rejects. Single-shot per check-sat keeps the repaired model coherent.
     pub(crate) read_pin_repair_done: bool,
-    /// Exact NRA ALGEBRAIC model witnesses for the current SAT (e.g.
-    /// `x*x = 2` ⇒ `x = √2` as a `root-obj`), produced by the NRA theory's
-    /// exact Sturm/IVT irrational-root certificate. Variable lookup
-    /// (`evaluate_var`), polynomial evaluation (`eval_arith`), get-value/
-    /// get-model printing and FULL model validation all consult these
-    /// witnesses and compute with them exactly, so the certificate path needs
-    /// NO validation suppression: validation runs and confirms the model.
-    /// Reset at the start of each `check_sat`/`check_sat_assuming`.
-    nra_algebraic_model: HashMap<TermId, ay_nra::RealAlgebraicValue>,
+    /// Exact NRA witnesses and the one-shot model-print refinement guard.
+    nra_algebraic_model: nra_model_state::NraAlgebraicModel,
     /// DT theory e-graph model exported at `Sat` by the interactive
     /// `DtSolver` lane (#mv-dt-single-source): union-find classes,
     /// constructor/tester commitments, asserted disequalities. The SINGLE
@@ -1423,7 +1367,7 @@ pub struct Executor {
     /// deferred validation in `solve_strings_lia_preprocessed` to decide
     /// whether model validation is needed.
     pub(crate) slia_accepted_unknown: bool,
-    /// W7 (`AY_STR_W7=1`, default OFF): the DEFINING equations
+    /// W7 (default ON, `--dpll-no-str-w7` kills it): the DEFINING equations
     /// (`(= v rhs)`, entailed, `v` a bare string variable) that the W7 witness
     /// pass is currently searching under.
     ///
@@ -1694,6 +1638,8 @@ pub struct Executor {
     /// boundaries retire them, preventing a native raw Term handle from
     /// capturing the next query's fresh Skolem.
     pub(crate) array_ext_witness_cache: ArrayExtWitnessCache,
+    /// Aggregate finite-array closure budget for the current external query.
+    pub(crate) finite_array_expansion: FiniteArrayExpansionLedger,
     /// M-A2 lazy-persistent-combiner SHADOW arm flag
     /// (ARRAY-PROCEDURE-CLOSER-BLUEPRINT §5 A2 / LAZY-M3 §M3.2).
     ///
@@ -1822,45 +1768,14 @@ macro_rules! for_each_incremental_subsystem {
     }};
 }
 
+mod command_boundary;
 mod lifecycle;
 
-#[cfg(test)]
-#[path = "executor/maxsmt_tests.rs"]
-mod maxsmt_tests;
+use command_boundary::CommandExecutionBoundary;
 
 #[cfg(test)]
-#[path = "executor/diff_logic_tests.rs"]
-mod diff_logic_tests;
-
-#[cfg(test)]
-#[path = "executor/competition_mode_tests.rs"]
-mod competition_mode_tests;
-
-#[cfg(test)]
-#[path = "executor/proof_gate_census_tests.rs"]
-mod proof_gate_census_tests;
-
-#[cfg(test)]
-#[path = "executor/dl_theory_tests.rs"]
-mod dl_theory_tests;
-
-#[cfg(test)]
-#[path = "executor/dl_theory_rollback_tests.rs"]
-mod dl_theory_rollback_tests;
-
-/// Complete authority/publication contract for one command execution.
-///
-/// Text commands must certify UNSAT and consume SAT authority before formatting
-/// a definite result. The native optimization adapter instead transfers the
-/// still-linear SAT or UNSAT capability to `VerifiedSolveResult`, which consumes
-/// it at that boundary. Combining origin and publication in one closed enum
-/// makes the forbidden authored-but-unpublished pairing unrepresentable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandExecutionBoundary {
-    GenericText,
-    AuthoredText,
-    NativeOptimization,
-}
+#[path = "executor/root_tests.rs"]
+mod root_tests;
 
 /// Whether a quantified solve may relax its nominal deadline into AY's later
 /// deterministic-work backstop.
@@ -1917,25 +1832,6 @@ impl Executor {
         })
     }
 
-    /// Run the generic `(check-sat)` dispatch for native optimization without
-    /// publishing a text verdict.
-    ///
-    /// The dispatch still owns all objective/parsed-soft routing and canonical
-    /// result installation, but deliberately leaves the exact SAT or UNSAT
-    /// capability for the native `VerifiedSolveResult` boundary to consume
-    /// exactly once. This is narrower than a general unpublished-command escape:
-    /// native callers cannot use it for authored hard-query authority or
-    /// arbitrary commands.
-    pub(crate) fn execute_native_optimization_check_sat(&mut self) -> Result<SolveResult> {
-        stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
-            self.execute_stack_guarded(
-                &Command::CheckSat,
-                CommandExecutionBoundary::NativeOptimization,
-            )?;
-            Ok(self.last_result.clone().unwrap_or(SolveResult::Unknown))
-        })
-    }
-
     /// Body of [`Executor::execute`] — only called through the stack guard
     /// above so its (large, low-opt) frame lands on the grown segment.
     fn execute_stack_guarded(
@@ -1978,7 +1874,13 @@ impl Executor {
             // A new public decision query supersedes the preceding result even
             // when export preflight or command elaboration fails. Preserve only
             // Pareto's intentional cross-query enumeration state.
-            self.begin_public_solve(true);
+            match boundary {
+                CommandExecutionBoundary::GenericText | CommandExecutionBoundary::AuthoredText => {
+                    self.begin_external_decision_query(true);
+                }
+                CommandExecutionBoundary::NativeMaxSmtTextContinuation
+                | CommandExecutionBoundary::NativeOptimization => self.begin_public_solve(true),
+            }
         }
         // Query-local SMT-LIB 2.7 schematic instances are rebuilt by the
         // frontend at each check.  Remove them before incremental subsystems
@@ -2235,7 +2137,8 @@ impl Executor {
                 let sat_result = self.certify_unsat_for_publication(sat_result, &[]);
                 let sat_result = match boundary {
                     CommandExecutionBoundary::GenericText
-                    | CommandExecutionBoundary::AuthoredText => {
+                    | CommandExecutionBoundary::AuthoredText
+                    | CommandExecutionBoundary::NativeMaxSmtTextContinuation => {
                         self.admit_command_solve_result(sat_result)
                     }
                     CommandExecutionBoundary::NativeOptimization => sat_result,
@@ -2245,7 +2148,7 @@ impl Executor {
                 Ok(Some(display))
             }
             Some(CommandResult::CheckSatAssuming(assumptions)) => {
-                self.bind_unsat_query_assumptions(&assumptions);
+                self.bind_authored_unsat_query_assumptions(&assumptions, cmd);
                 if !self.ctx.polymorphic_instantiation_complete() {
                     self.replace_last_result_with_unknown(UnknownReason::Unsupported);
                     return Ok(Some(SolveResult::Unknown.to_string()));
@@ -2276,7 +2179,8 @@ impl Executor {
                 let sat_result = self.certify_unsat_for_publication(sat_result, &assumptions);
                 let sat_result = match boundary {
                     CommandExecutionBoundary::GenericText
-                    | CommandExecutionBoundary::AuthoredText => {
+                    | CommandExecutionBoundary::AuthoredText
+                    | CommandExecutionBoundary::NativeMaxSmtTextContinuation => {
                         self.admit_command_solve_result(sat_result)
                     }
                     CommandExecutionBoundary::NativeOptimization => {
@@ -2287,7 +2191,7 @@ impl Executor {
                 self.last_result = Some(sat_result);
                 Ok(Some(display))
             }
-            Some(CommandResult::GetModel) => Ok(Some(self.model())),
+            Some(CommandResult::GetModel) => Ok(Some(self.model_after_nra_refinement())),
             Some(CommandResult::GetObjectives) => Ok(Some(self.get_objectives())),
             Some(CommandResult::GetObjectiveCertificates) => {
                 Ok(Some(self.get_objective_certificates()))
@@ -2490,6 +2394,3 @@ impl Executor {
         self.last_diff_logic_decided.get()
     }
 }
-
-#[cfg(test)]
-mod pop_underflow_tests;

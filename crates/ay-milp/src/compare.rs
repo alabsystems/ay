@@ -223,7 +223,7 @@ pub fn compare(
 /// large fraction of the 64 kill switches.
 ///
 /// This is cheap because AY keeps a byte-identical arm for every shipped
-/// optimisation. `AY_MILP_FT_SPIKE` is the live example — `knobs.rs` records that
+/// optimisation. `--ft-spike` is the live example — `knobs.rs` records that
 /// *"Both arms leave BYTE-IDENTICAL engine state"* — so the classifier has a known
 /// positive to validate against. No configurator can do this, because none of them
 /// has an arm that restores prior behaviour exactly.

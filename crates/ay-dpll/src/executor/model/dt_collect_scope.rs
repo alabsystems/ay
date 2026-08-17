@@ -366,10 +366,16 @@ impl CollectionPreflight<'_> {
             None
         } else {
             let guard = self.guard.as_ref()?;
+            // Registered bounded schemas are the construction bar; the exact
+            // rendered fragment is only required by the rendering-dependent
+            // consumers, which re-check `is_exact` per value themselves (see
+            // `RenderedDatatypeGuard::is_registered`). This also keeps the
+            // `Sort::Datatype` inline-schema representation fail-closed: the
+            // guard recognizes only registry-backed carrier names.
             if self
                 .datatype_terms
                 .iter()
-                .any(|&term| !guard.is_exact(self.exec.ctx.terms.sort(term)))
+                .any(|&term| !guard.is_registered(self.exec.ctx.terms.sort(term)))
             {
                 return None;
             }

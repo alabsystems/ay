@@ -2044,7 +2044,7 @@ impl TacticSolver {
         // the exact source/declaration capability minted there. This begins the
         // final solve epoch after detached validation; the earlier epoch exists
         // solely to revoke stale artefacts before fallible tactic execution.
-        self.inner.check_sat()
+        self.inner.check_sat_authored_continuation()
     }
 
     /// Execute the tactic, then check satisfiability under temporary assumptions.
@@ -2071,7 +2071,7 @@ impl TacticSolver {
         let source_assertions = self.inner.executor.context().assertions.clone();
         self.inner
             .executor
-            .bind_unsat_query_assumptions(&assumption_ids);
+            .bind_native_query_assumptions(&assumption_ids);
         let source_requires_strict = self
             .inner
             .executor
@@ -2100,7 +2100,7 @@ impl TacticSolver {
             );
             return self.inner.finish_verified_result(SolveResult::Unknown);
         }
-        self.inner.check_sat_assuming(assumptions)
+        self.inner.check_sat_assuming_continuation(assumptions)
     }
 }
 

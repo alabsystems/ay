@@ -2,17 +2,23 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+// Dedicated operating-system/allocator boundary; unsafe sites are audited.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! Low-level system interfaces for AY.
 //!
 //! This crate provides safe wrappers around OS-specific system calls used for
 //! memory measurement, process supervision, and a small number of filesystem
-//! operations. It is the only crate in the ay workspace that permits `unsafe`
-//! code, keeping FFI boundaries minimal and auditable.
+//! operations. It is one of the small set of boundary crates in the AY
+//! workspace that permits `unsafe` code, keeping OS calls centralized and
+//! auditable.
 //!
 //! ## Why this crate exists
 //!
-//! All other ay crates use `#![forbid(unsafe_code)]`. The required operating
-//! system interfaces are isolated here behind safe public APIs.
+//! The required operating-system interfaces are isolated here behind safe
+//! public APIs; consumers do not need to duplicate platform-specific unsafe
+//! code.
 
 use std::alloc::{GlobalAlloc, Layout};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -28,6 +34,10 @@ pub mod time;
 pub mod windows_fs;
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+mod hard_ceiling_writer;
+
+use hard_ceiling_writer::{write_fd, STDERR_FD, STDOUT_FD};
 
 /// Process-wide memory limit in bytes. 0 = no limit.
 static PROCESS_MEMORY_LIMIT: AtomicUsize = AtomicUsize::new(0);
@@ -313,34 +323,13 @@ fn breach_hard_memory_ceiling() -> ! {
     // Only the first thread to breach writes; a loser leaves with the same
     // status so the two verdicts cannot interleave.
     if !HARD_MEMORY_CEILING_FIRED.swap(true, Ordering::SeqCst) {
-        write_fd(libc::STDOUT_FILENO, stdout_line);
-        write_fd(libc::STDERR_FILENO, stderr_line);
+        write_fd(STDOUT_FD, stdout_line);
+        write_fd(STDERR_FD, stderr_line);
     }
     // SAFETY: `_exit` performs no allocation and runs no atexit handler or
     // destructor, which is required here — this runs inside the global
     // allocator, where re-entering it would deadlock or recurse.
     unsafe { libc::_exit(exit_code) }
-}
-
-/// Allocation-free, retry-on-partial write to a raw descriptor.
-fn write_fd(fd: libc::c_int, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        // SAFETY: `bytes` is a valid readable slice of `bytes.len()` bytes and
-        // `write` neither allocates nor retains the pointer.
-        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        let Ok(written) = usize::try_from(written) else {
-            // Negative: EINTR is worth retrying, anything else is unrecoverable
-            // and must not spin.
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return;
-        };
-        if written == 0 {
-            return;
-        }
-        bytes = &bytes[written..];
-    }
 }
 
 /// A `#[global_allocator]` wrapper that maintains [`LIVE_BYTES`], the exact

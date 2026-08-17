@@ -44,7 +44,7 @@ pub(in crate::executor) fn apply_theory_lemma_incremental(
     local_next_var: &mut u32,
     negations: &mut crate::incremental_proof_cache::IncrementalNegationCache,
     clause: &[ay_core::TheoryLit],
-) {
+) -> Option<u64> {
     use ay_sat::Literal as SatLiteral;
     let lits: Vec<SatLiteral> = clause
         .iter()
@@ -65,22 +65,25 @@ pub(in crate::executor) fn apply_theory_lemma_incremental(
             }
         })
         .collect();
+    let before = solver.issued_original_clause_id_max();
     solver.add_clause(lits);
+    single_issued_original_id_since(solver, before)
 }
 
 /// Apply a theory lemma clause to the persistent no-split incremental SAT solver.
 ///
 /// No-split incremental lemmas must survive repeated `check-sat` calls while
 /// the current SAT scope is active, but they must still disappear on `pop()`.
-/// Returns `true` when SAT normalization kept the clause in the original-clause
-/// ledger rather than discarding it as tautological.
+/// Returns whether SAT normalization retained the clause in the trace and the
+/// exact original-clause ID consumed by the add. A skipped tautology still has
+/// an ID so later indexed proof authorities cannot slide into its slot.
 pub(in crate::executor) fn apply_theory_lemma_incremental_persistent(
     solver: &mut ay_sat::Solver,
     term_to_var: &mut super::HashMap<ay_core::TermId, u32>,
     var_to_term: &mut super::HashMap<u32, ay_core::TermId>,
     negations: &mut crate::incremental_proof_cache::IncrementalNegationCache,
     clause: &[ay_core::TheoryLit],
-) -> bool {
+) -> (bool, Option<u64>) {
     use ay_sat::{Literal as SatLiteral, Variable as SatVariable};
 
     let mut lits: Vec<SatLiteral> = clause
@@ -102,8 +105,9 @@ pub(in crate::executor) fn apply_theory_lemma_incremental_persistent(
         .collect();
 
     if lits.is_empty() {
+        let before = solver.issued_original_clause_id_max();
         solver.add_clause(lits);
-        return false;
+        return (false, single_issued_original_id_since(solver, before));
     }
 
     lits.sort_by_key(|lit| lit.raw());
@@ -111,8 +115,9 @@ pub(in crate::executor) fn apply_theory_lemma_incremental_persistent(
     let recorded = !lits
         .windows(2)
         .any(|pair| pair[0].variable() == pair[1].variable());
+    let before = solver.issued_original_clause_id_max();
     solver.add_clause(lits);
-    recorded
+    (recorded, single_issued_original_id_since(solver, before))
 }
 
 /// Apply a string lemma clause to the incremental SAT solver.
@@ -128,7 +133,7 @@ pub(in crate::executor) fn apply_string_lemma_incremental(
     local_next_var: &mut u32,
     negations: &mut crate::incremental_proof_cache::IncrementalNegationCache,
     atoms: &[ay_core::TermId],
-) {
+) -> (Vec<ay_core::TermId>, Option<u64>) {
     use ay_sat::Literal as SatLiteral;
     let mut lowered_atoms = Vec::with_capacity(atoms.len());
     let mut pending: Vec<ay_core::TermId> = atoms.iter().rev().copied().collect();
@@ -250,5 +255,20 @@ pub(in crate::executor) fn apply_string_lemma_incremental(
         }
     }
 
+    let before = solver.issued_original_clause_id_max();
     solver.add_clause(lits);
+    (
+        lowered_atoms,
+        single_issued_original_id_since(solver, before),
+    )
+}
+
+fn single_issued_original_id_since(solver: &ay_sat::Solver, before: u64) -> Option<u64> {
+    let after = solver.issued_original_clause_id_max();
+    if after <= before {
+        return None;
+    }
+    let mut issued = (before + 1..=after).filter(|&id| solver.is_issued_original_clause_id(id));
+    let id = issued.next()?;
+    issued.next().is_none().then_some(id)
 }

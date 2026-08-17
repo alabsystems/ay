@@ -4,7 +4,7 @@
 
 //! OBBT soundness on the PURE EXACT RIM (P3 twin of `tests/obbt.rs`).
 //!
-//! `AY_MILP_NO_FLOAT` forces every solve off the float advice lane and down
+//! `the no-float knob` forces every solve off the float advice lane and down
 //! the exact rim; `float_lane_enabled()` reads it once into a process-global
 //! `OnceLock`, so this switch cannot be toggled per-test. Hence a dedicated
 //! test binary that sets it before any solve runs. The twin's claim: OBBT
@@ -19,7 +19,7 @@ fn obbt_kill_switch_still_tightens_soundly() {
     // Must run before the first solve so the `OnceLock` initialises to "off".
     // Serialized + restore-on-exit via the workspace env choke point; the
     // switch stays set for the whole solve body below.
-    with_serialized_env_vars(&[("AY_MILP_NO_FLOAT", "1")], || {
+    with_serialized_env_vars(&[("the no-float knob", "1")], || {
         // A coupled box: x = y and 1 <= y <= 3, both nominally [-10, 10].
         let mut m = Model::new();
         let x = m.add_col(-10.0, 10.0);

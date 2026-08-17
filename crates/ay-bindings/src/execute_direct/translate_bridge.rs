@@ -23,11 +23,47 @@ use crate::sort::Sort;
 
 type Session<'a> = TranslationSession<'a, String>;
 
+/// Reject a reserved symbol name BEFORE it reaches the declaration APIs.
+///
+/// `Solver::declare_const`/`declare_fun`/`fresh_var` refuse a reserved name (an
+/// `__ay_`-namespaced or builtin theory-operator spelling) by PANICKING — their
+/// fallible `try_*` twins return `SolverError::InvalidArgument`, but the
+/// `ay-translate` session methods this bridge calls are infallible and take the
+/// panicking path. A panic here unwinds into whatever process embeds ay: in the
+/// Trust compiler it printed a full ICE report for every Rust program with a
+/// local named `fp`. A rejected declaration is a RECOVERABLE input error, so
+/// surface it as `ExecuteError` — every caller of `execute_direct` already has
+/// to handle one — instead of aborting the host.
+fn reject_reserved_symbol(name: &str, operation: &str) -> Result<(), ExecuteError> {
+    if ay_frontend::is_reserved_symbol(name) {
+        return Err(ExecuteError::ConstraintExecution(format!(
+            "{operation}: symbol name '{name}' is reserved (an ay builtin \
+             theory-operator name or the internal `__ay_` namespace) and cannot be declared"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject only ay's INTERNAL symbol namespace.
+///
+/// Used where the surrounding API legitimately accepts some reserved spellings
+/// (see [`declare_fun`]) but never an `__ay_` identity — minting one would let a
+/// caller forge a solver-internal symbol.
+fn reject_internal_namespace(name: &str, operation: &str) -> Result<(), ExecuteError> {
+    if name.starts_with("__ay_") {
+        return Err(ExecuteError::ConstraintExecution(format!(
+            "{operation}: symbol name '{name}' enters ay's internal `__ay_` namespace"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn declare_const(
     ctx: &mut ExecutionContext,
     name: &str,
     sort: &Sort,
 ) -> Result<(), ExecuteError> {
+    reject_reserved_symbol(name, "declare_const")?;
     let api_sort = translate_sort(sort)?;
     {
         let mut session = ctx.session();
@@ -47,6 +83,22 @@ pub(super) fn declare_fun(
     arg_sorts: &[Sort],
     return_sort: &Sort,
 ) -> Result<(), ExecuteError> {
+    // NOT the full `is_reserved_symbol` here: the declaration-activated
+    // collection predicates (`set.subset`, `map.dom`, …) are `declare-fun`-able
+    // BY DESIGN — declaring one at its native collection signature is the
+    // documented route that activates ay's native set/map/multiset solvers, and
+    // `Context::declare_fun` special-cases them ahead of its reserved check.
+    // Rejecting them here would break every default `Set::subset_of`/`Map::dom`
+    // encoding. What stays rejected is what `Context::declare_fun` really
+    // refuses: the internal namespace and the structurally-matched builtin
+    // theory-operator names.
+    if ay_frontend::is_reserved_op_name(name) {
+        return Err(ExecuteError::ConstraintExecution(format!(
+            "declare_fun: symbol name '{name}' is a reserved ay builtin \
+             theory-operator name and cannot be declared as an uninterpreted function"
+        )));
+    }
+    reject_internal_namespace(name, "declare_fun")?;
     let domain = arg_sorts
         .iter()
         .map(translate_sort)
@@ -70,6 +122,7 @@ pub(super) fn define_fun(
     let mut param_terms = Vec::with_capacity(params.len());
     let mut bound_scope = BTreeMap::new();
 
+    reject_reserved_symbol(name, "define_fun")?;
     for (param_name, param_sort) in params {
         let api_sort = translate_sort(param_sort)?;
         // `fresh_var` panics when the prefix would enter a reserved namespace;
@@ -107,6 +160,7 @@ pub(super) fn declare_var(
     name: &str,
     sort: &Sort,
 ) -> Result<(), ExecuteError> {
+    reject_reserved_symbol(name, "declare_var")?;
     let api_sort = translate_sort(sort)?;
     let mut session = ctx.session();
     let _ = session
@@ -444,8 +498,7 @@ pub(super) fn maybe_translate_expr(
                 Some(func) => func,
                 None => {
                     return Some(Err(ExecuteError::ExprTranslation(format!(
-                        "undeclared function '{}' in direct execution",
-                        name
+                        "undeclared function '{name}' in direct execution"
                     ))));
                 }
             };

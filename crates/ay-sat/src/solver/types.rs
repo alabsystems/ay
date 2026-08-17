@@ -6,7 +6,8 @@
 //! watch-order policy, and per-variable flag constants.
 
 // Verified types (VerifiedSatResult, VerifiedAssumeResult) live in this module.
-// Crate-level `#![forbid(unsafe_code)]` prevents transmute-based type forgery.
+// Crate-level `#![deny(unsafe_code)]` prevents unaudited type forgery while
+// permitting only explicitly scoped hot-path exceptions.
 
 use crate::literal::Literal;
 use crate::proof_certificate::ProofCertificate;

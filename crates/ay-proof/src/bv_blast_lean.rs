@@ -595,7 +595,7 @@ mod golden {
     /// One (proof, module, golden-artifact) row. Each artifact is committed,
     /// imported into the `AySoundness` lake library, and kernel-re-verified on
     /// every build, so this golden test ties the emitter's output to a
-    /// machine-checked certificate. Set `AY_DUMP_RENDER=1` to regenerate the
+    /// machine-checked certificate. Set `--dump-render` to regenerate the
     /// artifacts after a renderer change (then re-run `lake build`).
     #[test]
     fn renderer_matches_kernel_checked_artifacts() {
@@ -611,7 +611,7 @@ mod golden {
                 include_str!("../../../verification/lean/AySoundness/CombinedBvBlastChain.lean"),
             ),
         ];
-        let dump = std::env::var("AY_DUMP_RENDER").is_ok();
+        let dump = ay_core::misc_cli_flags().dump_render;
         for (proof, module, golden) in cases {
             proof.validate().unwrap_or_else(|error| {
                 panic!("golden renderer fixture {module} must validate natively: {error}")
@@ -624,7 +624,7 @@ mod golden {
             assert_eq!(
                 &rendered, golden,
                 "renderer output for {module} drifted from the kernel-checked artifact; \
-                 regenerate with AY_DUMP_RENDER=1"
+                 regenerate with --dump-render"
             );
         }
     }

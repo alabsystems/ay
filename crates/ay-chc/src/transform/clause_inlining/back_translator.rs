@@ -47,15 +47,11 @@ const EXISTENTIAL_QE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// ORIGINAL clauses before any Safe is reported.
 const EXISTENTIAL_QE_LOOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
 
-/// Acceptance-pipeline profiling (AY_ACCEPT_PROFILE=1): per-leg timing of
+/// Acceptance-pipeline profiling (--chc-accept-profile): per-leg timing of
 /// back-translation synthesis. Diagnostics only — no behavioral effect.
 pub(crate) fn accept_profile_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_ACCEPT_PROFILE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-    })
+    *FLAG.get_or_init(|| ay_core::misc_cli_flags().chc_accept_profile)
 }
 
 /// Back-translator that synthesizes interpretations for predicates removed by inlining.

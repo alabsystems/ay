@@ -42,15 +42,9 @@ pub(crate) fn float_layer_enabled() -> bool {
 
 /// Minimum tableau row count for the float layer to engage. Below this the f64
 /// search + `O(m^3)` exact solve is pure overhead versus a handful of exact
-/// pivots. Overridable via `AY_LRA_FLOAT_LAYER_MIN_ROWS`.
+/// pivots. (B9: compiled constant; the env override nothing set is retired.)
 fn min_rows() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_LRA_FLOAT_LAYER_MIN_ROWS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64)
-    })
+    64
 }
 
 /// Diagnostic counters for the float layer (accept vs fallback), reported in

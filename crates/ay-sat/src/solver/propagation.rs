@@ -165,15 +165,15 @@ impl Solver {
     pub(super) fn enqueue(&mut self, lit: Literal, reason: Option<ClauseRef>) {
         let var = lit.variable();
         let reason_clause = reason;
-        // Soundness-triage tripwire (AY_AB_TRIAGE_VAR=<dimacs var>): report
+        // Soundness-triage tripwire (--sat-ab-triage-var <dimacs var>): report
         // every assignment of that variable with level + pass attribution.
         {
             use std::sync::OnceLock;
             static TVAR: OnceLock<Option<usize>> = OnceLock::new();
             let t = TVAR.get_or_init(|| {
-                std::env::var("AY_AB_TRIAGE_VAR")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok())
+                ay_core::misc_cli_flags()
+                    .ab_triage_var
+                    .and_then(|n| usize::try_from(n).ok())
             });
             if let Some(tv) = t {
                 if var.index() + 1 == *tv {
@@ -1375,30 +1375,23 @@ impl Solver {
         self.dirty_watch_list.clear();
 
         let start_offset = incremental_boundary.unwrap_or(0);
-        // Giant-mode memory lever (`AY_AB_GIANT_MEM`, default ON — see
-        // `giant_mem_levers_enabled` below): collect the watch-init offsets
-        // as u32, not usize. Arena offsets fit u32 by construction (the loop
-        // body builds `ClauseRef(i as u32)` from the very same value); on the
-        // SC2025 giants (157M/315M clauses) the usize collect was a
-        // 1.26GB/2.5GB transient landing exactly at the peak-RSS moment.
-        // The kill-switch path keeps the original usize collect; iteration
-        // order and the loop body are bit-identical either way.
-        let (narrow_offsets, wide_offsets): (Vec<u32>, Vec<usize>) = if giant_mem_levers_enabled() {
-            (
-                self.arena
-                    .indices_from(start_offset)
-                    .map(|i| i as u32)
-                    .collect(),
-                Vec::new(),
-            )
-        } else {
-            (Vec::new(), self.arena.indices_from(start_offset).collect())
-        };
-        for i in narrow_offsets
-            .into_iter()
-            .map(|i| i as usize)
-            .chain(wide_offsets)
-        {
+        // Watch-init offsets collect as u32, not usize (B1: the
+        // AY_AB_GIANT_MEM kill-switch and its usize path are deleted; this is
+        // now the only path). On the SC2025 giants (157M/315M clauses) the
+        // usize collect was a 1.26GB/2.5GB transient landing exactly at the
+        // peak-RSS moment.
+        //
+        // #9670: the u32 narrowing below is lossless ONLY because
+        // ClauseArena::add fail-stops on (end as u64) <= MAX_ARENA_WORDS and
+        // MAX_ARENA_WORDS == u32::MAX. Widening the arena to 64-bit offsets
+        // without widening this collect silently truncates BCP offsets.
+        const _: () = assert!(crate::arena_limits::MAX_ARENA_WORDS <= u32::MAX as u64);
+        let narrow_offsets: Vec<u32> = self
+            .arena
+            .indices_from(start_offset)
+            .map(|i| i as u32)
+            .collect();
+        for i in narrow_offsets.into_iter().map(|i| i as usize) {
             let off = i;
             let clause_ref = ClauseRef(i as u32);
             // #8496: Skip dead clauses (garbage-bit or pending-garbage).
@@ -1693,22 +1686,4 @@ impl Solver {
             self.propagate_bcp::<{ bcp_mode::VIVIFY }>()
         }
     }
-}
-
-/// Kill-switch `AY_AB_GIANT_MEM` (default ON; unset or `=1` enables, any
-/// other explicit value disables — conservative parse matching
-/// `AY_AB_SUBST_AUTO_GIANT`): giant-instance peak-RSS levers. In this crate
-/// it narrows the `initialize_watches` offset collect to u32 (a 1.26GB/2.5GB
-/// usize transient on the SC2025 giants); the `ay` crate reads the same env
-/// var to drop the DIMACS file buffer after parse. Memory-width/lifetime
-/// only — verdicts, stats, iteration order and certificates are unchanged.
-/// Cached OnceLock per the #8506 no-per-call-syscall convention.
-pub(crate) fn giant_mem_levers_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GIANT_MEM: OnceLock<bool> = OnceLock::new();
-    *GIANT_MEM.get_or_init(|| {
-        std::env::var("AY_AB_GIANT_MEM")
-            .map(|v| v == "1")
-            .unwrap_or(true)
-    })
 }

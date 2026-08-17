@@ -622,7 +622,7 @@ impl Solver {
             // SAT@88s → timeout, same 3 factors). So the raise is scoped to
             // density >= FACTOR_DENSE_MIN_DENSITY AND active_clauses <=
             // FACTOR_DENSE_INIT_MAX_CLAUSES, and kill-switched
-            // (AY_AB_FACTOR_DENSE_INIT=0). Density is computed the same way as
+            // (--sat-no-factor-dense-init). Density is computed the same way as
             // the call-site factor-dense gate (bve_density / formula_density =
             // active clauses / active vars).
             let init = {
@@ -701,17 +701,14 @@ impl Solver {
             // CaDiCaL factor.cpp:118: capture the current BVE elimination
             // bound. Factoring only fires when clause reduction exceeds this
             // bound, ensuring BVE cannot profitably undo the factoring.
-            // `AY_FACTOR_ELIM_BOUND` overrides it, because whether this is the
+            // `--factor-elim-bound` overrides it, because whether this is the
             // right threshold at all is an open question: Kissat's
             // `best_quotient` (factor.c:608-640) accepts ANY strictly
             // decreasing quotient (delta >= 1), while `growth_bound` is 8 in
             // fastelim mode — so AY may be demanding a >= 9-clause reduction
             // where Kissat takes >= 1. On `mexam_17_15_2` AY factors 0
             // variables against Kissat's 545.
-            let elim_bound = match std::env::var("AY_FACTOR_ELIM_BOUND")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-            {
+            let elim_bound = match ay_core::misc_cli_flags().factor_elim_bound {
                 Some(forced) => forced,
                 None => self.inproc.bve.growth_bound() as i64,
             };

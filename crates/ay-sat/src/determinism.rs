@@ -21,7 +21,7 @@
 //! function of the search trajectory rather than of host load, so a given
 //! (formula, seed) yields byte-identical verdicts and counters on every host.
 //!
-//! Enabled via `AY_AB_DETERMINISTIC_INPROC` (see
+//! Enabled via `--sat-deterministic-inproc` (see
 //! [`deterministic_inproc_enabled`]); default [`DEFAULT_ON`]. The outer
 //! `-t <ms>` total-solve timeout is deliberately *not* converted — it is the
 //! user's stated wall-clock budget, not an internal scheduling decision.
@@ -33,11 +33,11 @@
 use std::sync::OnceLock;
 
 /// Compile-time default for the deterministic inprocessing budgets when
-/// `AY_AB_DETERMINISTIC_INPROC` is unset.
+/// `--sat-deterministic-inproc` is unset.
 ///
 /// `false` = opt-in: the wall-clock budgets remain the default so the board's
 /// default config is byte-identical to `main` (zero regression-floor risk),
-/// and determinism is requested explicitly with `AY_AB_DETERMINISTIC_INPROC=1`.
+/// and determinism is requested explicitly with `--sat-deterministic-inproc`.
 /// Flip to `true` once the tick-budget calibration has been validated to hold
 /// the full regression floor with no lost solves.
 pub(crate) const DEFAULT_ON: bool = false;
@@ -68,7 +68,7 @@ pub(crate) const BACKBONE_TICK_BUDGET: u64 = 1_500_000;
 pub(crate) const BACKBONE_BINARY_TICK_BUDGET: u64 = 3_750_000;
 
 /// Whether the deterministic (work-count) inprocessing budgets are active,
-/// resolved once from `AY_AB_DETERMINISTIC_INPROC`:
+/// resolved once from `--sat-deterministic-inproc`:
 /// - unset  => [`DEFAULT_ON`] (compile-time default)
 /// - `"0"`  => forced OFF (wall-clock budgets; the kill switch)
 /// - other  => forced ON (deterministic work-count budgets)
@@ -78,13 +78,10 @@ pub(crate) const BACKBONE_BINARY_TICK_BUDGET: u64 = 3_750_000;
 #[inline]
 pub(crate) fn deterministic_inproc_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("AY_AB_DETERMINISTIC_INPROC").ok().as_deref() {
-            None => DEFAULT_ON,
-            Some("0") => false,
-            Some(_) => true,
-        },
-    )
+    *ON.get_or_init(|| match ay_core::sat_ab_switches().deterministic_inproc {
+        None => DEFAULT_ON,
+        Some(forced) => forced,
+    })
 }
 
 /// Per-round `search_ticks` budget used when [`deterministic_inproc_enabled`]
@@ -92,12 +89,6 @@ pub(crate) fn deterministic_inproc_enabled() -> bool {
 /// [`ROUND_TICK_BUDGET`] default (for recalibration / experiments).
 #[inline]
 pub(crate) fn round_tick_budget() -> u64 {
-    static BUDGET: OnceLock<u64> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("AY_XP_INPROC_TICK_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&b| b > 0)
-            .unwrap_or(ROUND_TICK_BUDGET)
-    })
+    // B25: the recalibration env is retired; the named budget stands.
+    ROUND_TICK_BUDGET
 }

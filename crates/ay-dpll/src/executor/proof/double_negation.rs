@@ -76,8 +76,22 @@ impl Executor {
 
         let mut candidate = proof.clone();
         let mut rewrote = false;
+        // #trust->0 C3: same registries the mint-time check uses, so the
+        // funnel's DT recognition is re-decided identically by the strict
+        // re-check gating the swap below.
+        let c3_dt_data = crate::theory_inference::dt_funnel_registry_data(&self.ctx);
+        let c3_dt = c3_dt_data
+            .as_ref()
+            .map(crate::theory_inference::DatatypeRegistries::from_data);
         for step in &mut candidate.steps {
-            let ProofStep::TheoryLemma { kind, clause, .. } = step else {
+            let ProofStep::TheoryLemma {
+                kind,
+                clause,
+                farkas,
+                lia,
+                ..
+            } = step
+            else {
                 continue;
             };
             if !kind.is_trust() {
@@ -92,15 +106,40 @@ impl Executor {
             }
             // The checker's own classifier decides what the collapsed clause
             // is. No schema logic is duplicated here.
-            let inferred =
+            let (inferred, ordered) =
                 crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
                     &self.ctx.terms,
                     &collapsed,
-                    None,
+                    farkas.as_ref(),
+                    c3_dt.as_ref(),
                 );
             if inferred.is_trust() {
                 continue;
             }
+            if (farkas.is_some() || lia.is_some())
+                && !matches!(
+                    inferred,
+                    TheoryLemmaKind::LraFarkas | TheoryLemmaKind::LiaGeneric
+                )
+            {
+                // Positional arithmetic evidence cannot authorize an EUF/DT
+                // relabel, even if the collapsed clause is already in the
+                // non-arithmetic validator's preferred order.
+                continue;
+            }
+            // #trust->0 C3: adopt the validator-ordered clause (EUF kinds).
+            // Collapse preserves position, so a positional Farkas certificate
+            // survives it — but not a REORDER; decline those promotions when a
+            // certificate is attached (fail-closed).
+            let collapsed = match ordered {
+                std::borrow::Cow::Owned(reordered) => {
+                    if farkas.is_some() || lia.is_some() {
+                        continue;
+                    }
+                    reordered
+                }
+                std::borrow::Cow::Borrowed(_) => collapsed,
+            };
             *clause = collapsed;
             *kind = inferred;
             rewrote = true;

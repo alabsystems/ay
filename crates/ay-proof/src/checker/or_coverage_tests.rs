@@ -100,3 +100,43 @@ fn test_strict_or_clausification_non_unit_premise() {
             .expect_err("non-unit premise must fail");
     assert!(matches!(err, ProofCheckError::InvalidBooleanRule { .. }));
 }
+
+/// (P3b, or-fold forgery) An `or` step over a fold root `(or S false false)`
+/// that MISSTATES the disjuncts by dropping the `false` literals — claiming
+/// `(cl S)` directly instead of `(cl S false false)` — must fail: eliding a
+/// disjunct is resolution work, and skipping it would let a producer shortcut
+/// the strict `false`-tautology discharge. The c6 fold chain in
+/// `SatProofManager` therefore states the full disjunct vector and resolves
+/// the `false` literals away against a strict-validated `false` tautology.
+#[test]
+fn test_strict_or_fold_dropping_false_disjuncts_fails() {
+    let mut terms = TermStore::new();
+    let s = terms.mk_var("s", Sort::Bool);
+    let false_term = terms.false_term();
+    let or_fold = mk_or_raw(&mut terms, vec![s, false_term, false_term]);
+    let prior = vec![Some(vec![or_fold])];
+    let err =
+        validate_strict_with_derived(&terms, AletheRule::Or, vec![s], vec![ProofId(0)], prior)
+            .expect_err("dropping the false disjuncts must fail");
+    assert!(matches!(err, ProofCheckError::InvalidBooleanRule { .. }));
+}
+
+/// Positive control for the fold forgery test: the SAME premise with the
+/// full disjunct vector stated is accepted, so the negative above fails for
+/// exactly the misstated clause.
+#[test]
+fn test_strict_or_fold_full_disjunct_vector_is_accepted() {
+    let mut terms = TermStore::new();
+    let s = terms.mk_var("s", Sort::Bool);
+    let false_term = terms.false_term();
+    let or_fold = mk_or_raw(&mut terms, vec![s, false_term, false_term]);
+    let prior = vec![Some(vec![or_fold])];
+    validate_strict_with_derived(
+        &terms,
+        AletheRule::Or,
+        vec![s, false_term, false_term],
+        vec![ProofId(0)],
+        prior,
+    )
+    .expect("the exact disjunct vector must pass");
+}

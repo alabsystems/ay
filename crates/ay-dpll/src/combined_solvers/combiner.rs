@@ -35,6 +35,10 @@ use ay_lia::LiaSolver;
 use ay_lra::LraSolver;
 
 use super::check_loops::defer_non_local_result;
+use super::euf_array_replay::EufArrayNotifyReplayCache;
+#[cfg(test)]
+pub(crate) use super::euf_array_replay::EufArrayNotifyReplayEdge;
+pub(crate) use super::euf_array_replay::EufArrayNotifyReplayState;
 use super::interface_bridge::InterfaceBridge;
 use crate::term_helpers::{
     arg_involves_select_or_store, involves_array, involves_int_arithmetic,
@@ -42,12 +46,7 @@ use crate::term_helpers::{
     is_uf_real_equality,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct EufArrayNotifyReplayEdge {
-    pub(crate) target: TermId,
-    pub(crate) source: TermId,
-    pub(crate) reason: Vec<TheoryLit>,
-}
+mod notification_replay;
 
 /// Endpoint adjacency + dedup index over a `Vec<EufArrayNotifyReplayEdge>`,
 /// maintained incrementally across the prune/append batch loops so the
@@ -87,18 +86,6 @@ impl EufArrayNotifyEdgeIndex {
             self.by_endpoint.entry(edge.source).or_default().push(idx);
         }
         self.dedup.insert(edge.clone());
-    }
-}
-
-impl EufArrayNotifyReplayEdge {
-    pub(crate) fn new(target: TermId, source: TermId, mut reason: Vec<TheoryLit>) -> Self {
-        reason.sort_by_key(|lit| (lit.term.0, lit.value));
-        reason.dedup_by_key(|lit| (lit.term, lit.value));
-        Self {
-            target,
-            source,
-            reason,
-        }
     }
 }
 
@@ -148,7 +135,7 @@ pub(super) struct CrossReplayCoverScratch {
     stack: Vec<TermId>,
 }
 
-/// INTERFACE-DIET mode (`AY_INTERFACE_DIET`): withhold POSITIVE pure-UF=UF Int
+/// INTERFACE-DIET mode (`--interface-diet`): withhold POSITIVE pure-UF=UF Int
 /// equalities from the LIA Nelson-Oppen interface, then value-certify the
 /// arrangement against RAW LIA values before accepting Sat. Read once per
 /// process at construction; REFUSES to arm if any `AY_A5_*` toggle is set (the
@@ -169,13 +156,11 @@ impl DietMode {
     fn from_env() -> Self {
         static MODE: std::sync::OnceLock<DietMode> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| {
-            // Never arm alongside any A5 lane (mutually-exclusive re-routing).
-            let any_a5 =
-                std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("AY_A5_"));
-            if any_a5 {
+            // Never arm alongside the A5 lane (mutually-exclusive re-routing).
+            if ay_core::misc_cli_flags().a5_uf_eq_defer {
                 return DietMode::Off;
             }
-            match std::env::var("AY_INTERFACE_DIET").ok().as_deref() {
+            match ay_core::misc_cli_flags().interface_diet.as_deref() {
                 Some("on") | Some("1") => DietMode::On,
                 Some("shadow") => DietMode::Shadow,
                 _ => DietMode::Off,
@@ -208,7 +193,7 @@ pub struct TheoryCombiner<'a> {
     /// assertion order; deduped by the final-check replay.
     deferred_arith_eqs: Vec<(TermId, bool)>,
     a5_lazy_arith: bool,
-    /// INTERFACE-DIET mode, read once at construction (`AY_INTERFACE_DIET`).
+    /// INTERFACE-DIET mode, read once at construction (`--interface-diet`).
     pub(super) interface_diet: DietMode,
     /// Per-`check()` bound on certifier materialization re-run rounds — a
     /// runaway certify↔materialize ping-pong fail-closes to `Unknown` (never a
@@ -266,9 +251,9 @@ pub struct TheoryCombiner<'a> {
     /// verdict. Candidate models still pass the arrays final check and the
     /// independent model gate.
     ///
-    /// Kill switch: `AY_QFAX_ARR_BCP_LANES=1` restores the legacy
+    /// Kill switch: `--dpll-force-qfax-arr-bcp-lanes` restores the legacy
     /// always-on lanes (A/B lever + safety valve, mirrors
-    /// `AY_NO_PROP_FEEDBACK`).
+    /// `--dpll-no-prop-feedback`).
     pub(super) arrays_bcp_lanes: bool,
     pub(super) interface: Option<InterfaceBridge>,
     pub(super) scope_depth: usize,
@@ -338,17 +323,15 @@ pub struct TheoryCombiner<'a> {
     /// AUFLIA's lazy split loop creates a fresh combiner after each outer
     /// model-equality refinement, so these edges are exported and replayed in
     /// the next combiner only when all SAT-visible reasons are true again.
-    pub(super) euf_array_notify_replay_edges: Vec<EufArrayNotifyReplayEdge>,
-    /// O(1) membership mirror of `euf_array_notify_replay_edges`
-    /// (#no-replay-quadratic M2): `record_euf_array_notify_replay_edge`
-    /// used `Vec::contains` per recorded edge — quadratic within a round;
-    /// a single giant merged component on QF_ALIA cs_lazy.i_6 records ~87k
-    /// edges in one round (2026-07-12 instrumented count).
-    pub(super) euf_array_notify_replay_edge_set: DetHashSet<EufArrayNotifyReplayEdge>,
+    pub(super) euf_array_notify_replay_edges: EufArrayNotifyReplayState,
     /// Replay edges imported into the fresh AUFLIA combiner before SAT model
     /// assignment import. They are replayed from `check()` after assignment
     /// import validates their reasons.
-    pub(super) imported_euf_array_notify_replay_edges: Vec<EufArrayNotifyReplayEdge>,
+    pub(super) imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState,
+    /// Assignment-derived active-forest and array-scope application cache.
+    /// Structural replay groups above survive soft reset/pop; this cache is
+    /// invalidated on every assignment/relation mutation and array rollback.
+    pub(super) euf_array_notify_replay_cache: EufArrayNotifyReplayCache,
     /// Reason-carrying array-derived equalities emitted by this combiner.
     /// These are exported across fresh AUFLIA combiners to avoid re-emitting
     /// the same large array-to-EUF equality batch every refinement round.
@@ -551,6 +534,7 @@ impl<'a> TheoryCombiner<'a> {
             self.array_replay_pending_set.clear();
         }
         self.euf_array_notify_parent.clear();
+        self.euf_array_notify_replay_cache.invalidate_assignment();
         if let Some(interface) = &mut self.interface {
             interface.reset();
         }
@@ -570,7 +554,7 @@ impl<'a> TheoryCombiner<'a> {
             a5_bounded_vars: DetHashSet::default(),
             a5_deferred_by_var: ay_core::kani_compat::DetHashMap::default(),
             a5_materialized: Vec::new(),
-            a5_lazy_arith: std::env::var_os("AY_A5_LAZY_ARITH").is_some(),
+            a5_lazy_arith: false, // B23: never-set experiment gate retired.
             interface_diet: DietMode::from_env(),
             diet_certify_rounds: 0,
             terms,
@@ -601,9 +585,9 @@ impl<'a> TheoryCombiner<'a> {
             equalities_propagated_to_euf: 0,
             equalities_propagated_to_arith: 0,
             euf_array_notify_parent: HashMap::default(),
-            euf_array_notify_replay_edges: Vec::new(),
-            euf_array_notify_replay_edge_set: Default::default(),
-            imported_euf_array_notify_replay_edges: Vec::new(),
+            euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            euf_array_notify_replay_cache: EufArrayNotifyReplayCache::default(),
             array_equality_replays: Vec::new(),
             array_equality_replays_seen: DetHashSet::default(),
             array_replay_export_cursor: 0,
@@ -645,7 +629,7 @@ impl<'a> TheoryCombiner<'a> {
             a5_bounded_vars: DetHashSet::default(),
             a5_deferred_by_var: ay_core::kani_compat::DetHashMap::default(),
             a5_materialized: Vec::new(),
-            a5_lazy_arith: std::env::var_os("AY_A5_LAZY_ARITH").is_some(),
+            a5_lazy_arith: false, // B23: never-set experiment gate retired.
             interface_diet: DietMode::from_env(),
             diet_certify_rounds: 0,
             terms,
@@ -673,9 +657,9 @@ impl<'a> TheoryCombiner<'a> {
             equalities_propagated_to_euf: 0,
             equalities_propagated_to_arith: 0,
             euf_array_notify_parent: HashMap::default(),
-            euf_array_notify_replay_edges: Vec::new(),
-            euf_array_notify_replay_edge_set: Default::default(),
-            imported_euf_array_notify_replay_edges: Vec::new(),
+            euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            euf_array_notify_replay_cache: EufArrayNotifyReplayCache::default(),
             array_equality_replays: Vec::new(),
             array_equality_replays_seen: DetHashSet::default(),
             array_replay_export_cursor: 0,
@@ -710,7 +694,7 @@ impl<'a> TheoryCombiner<'a> {
             a5_bounded_vars: DetHashSet::default(),
             a5_deferred_by_var: ay_core::kani_compat::DetHashMap::default(),
             a5_materialized: Vec::new(),
-            a5_lazy_arith: std::env::var_os("AY_A5_LAZY_ARITH").is_some(),
+            a5_lazy_arith: false, // B23: never-set experiment gate retired.
             interface_diet: DietMode::from_env(),
             diet_certify_rounds: 0,
             terms,
@@ -738,9 +722,9 @@ impl<'a> TheoryCombiner<'a> {
             equalities_propagated_to_euf: 0,
             equalities_propagated_to_arith: 0,
             euf_array_notify_parent: HashMap::default(),
-            euf_array_notify_replay_edges: Vec::new(),
-            euf_array_notify_replay_edge_set: Default::default(),
-            imported_euf_array_notify_replay_edges: Vec::new(),
+            euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            euf_array_notify_replay_cache: EufArrayNotifyReplayCache::default(),
             array_equality_replays: Vec::new(),
             array_equality_replays_seen: DetHashSet::default(),
             array_replay_export_cursor: 0,
@@ -778,7 +762,7 @@ impl<'a> TheoryCombiner<'a> {
             a5_bounded_vars: DetHashSet::default(),
             a5_deferred_by_var: ay_core::kani_compat::DetHashMap::default(),
             a5_materialized: Vec::new(),
-            a5_lazy_arith: std::env::var_os("AY_A5_LAZY_ARITH").is_some(),
+            a5_lazy_arith: false, // B23: never-set experiment gate retired.
             interface_diet: DietMode::from_env(),
             diet_certify_rounds: 0,
             terms,
@@ -806,9 +790,9 @@ impl<'a> TheoryCombiner<'a> {
             equalities_propagated_to_euf: 0,
             equalities_propagated_to_arith: 0,
             euf_array_notify_parent: HashMap::default(),
-            euf_array_notify_replay_edges: Vec::new(),
-            euf_array_notify_replay_edge_set: Default::default(),
-            imported_euf_array_notify_replay_edges: Vec::new(),
+            euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            euf_array_notify_replay_cache: EufArrayNotifyReplayCache::default(),
             array_equality_replays: Vec::new(),
             array_equality_replays_seen: DetHashSet::default(),
             array_replay_export_cursor: 0,
@@ -846,7 +830,7 @@ impl<'a> TheoryCombiner<'a> {
             a5_bounded_vars: DetHashSet::default(),
             a5_deferred_by_var: ay_core::kani_compat::DetHashMap::default(),
             a5_materialized: Vec::new(),
-            a5_lazy_arith: std::env::var_os("AY_A5_LAZY_ARITH").is_some(),
+            a5_lazy_arith: false, // B23: never-set experiment gate retired.
             interface_diet: DietMode::from_env(),
             diet_certify_rounds: 0,
             terms,
@@ -874,9 +858,9 @@ impl<'a> TheoryCombiner<'a> {
             equalities_propagated_to_euf: 0,
             equalities_propagated_to_arith: 0,
             euf_array_notify_parent: HashMap::default(),
-            euf_array_notify_replay_edges: Vec::new(),
-            euf_array_notify_replay_edge_set: Default::default(),
-            imported_euf_array_notify_replay_edges: Vec::new(),
+            euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            imported_euf_array_notify_replay_edges: EufArrayNotifyReplayState::default(),
+            euf_array_notify_replay_cache: EufArrayNotifyReplayCache::default(),
             array_equality_replays: Vec::new(),
             array_equality_replays_seen: DetHashSet::default(),
             array_replay_export_cursor: 0,
@@ -1029,13 +1013,13 @@ impl<'a> TheoryCombiner<'a> {
     /// have empty lists). Callers opt IN per lane: today only the
     /// `array_euf`/DtAx route (blocksworld's actual routing) calls this, so
     /// every other combined lane keeps its exact pre-D1 behavior. The
-    /// `AY_DT_D1=0` environment kill-switch disables the pass entirely.
+    /// `--dpll-no-dt-d1` kill switch disables the pass entirely.
     pub fn register_datatype_selectors(
         &mut self,
         datatypes: &[(String, Vec<String>)],
         selectors: &[(String, Vec<String>)],
     ) {
-        if datatypes.is_empty() || std::env::var_os("AY_DT_D1").is_some_and(|v| v == "0") {
+        if datatypes.is_empty() || ay_core::theory_disable_flags().no_dt_d1 {
             return;
         }
         let d1 = self.dt_d1.get_or_insert_with(ay_dt::DtLazyPropagator::new);
@@ -1080,7 +1064,7 @@ impl<'a> TheoryCombiner<'a> {
         // reach candidate models.
         let fixpoint_assignments = force.then_some(&self.current_assignments);
         let lemmas = d1.propagate_lemmas(self.terms, &mut self.euf, verifier, fixpoint_assignments);
-        if !lemmas.is_empty() && std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if !lemmas.is_empty() && ay_core::misc_cli_flags().phase_trace {
             let (total, failures) = d1.stats();
             // Doubling threshold keeps the trace to ~log2(total) lines.
             if before == 0 || total.leading_zeros() != before.leading_zeros() {
@@ -1115,9 +1099,9 @@ impl<'a> TheoryCombiner<'a> {
         datatypes: &[(String, Vec<String>, bool)],
         bases: &[(TermId, Vec<TermId>)],
     ) {
-        if datatypes.is_empty()
-            || bases.is_empty()
-            || std::env::var_os("AY_DT_D2").is_some_and(|v| v == "0")
+        if datatypes.is_empty() || bases.is_empty()
+        // B23: the D2 kill-switch env spelling is retired (pass re-validates
+        // fail-closed).
         {
             return;
         }
@@ -1145,7 +1129,7 @@ impl<'a> TheoryCombiner<'a> {
             return Vec::new();
         }
         let lemmas = d2.fixpoint_splits(self.terms, &mut self.euf, &self.current_assignments);
-        if !lemmas.is_empty() && std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if !lemmas.is_empty() && ay_core::misc_cli_flags().phase_trace {
             let (bases, total, rejected) = d2.stats();
             eprintln!(
                 "c phase-trace dt-d2-split round_lemmas={} bases={} total={} rejected_bases={}",
@@ -1589,7 +1573,7 @@ impl TheoryCombiner<'_> {
 
     pub(crate) fn prune_current_euf_array_notify_replay_edges(
         &self,
-        edges: &mut Vec<EufArrayNotifyReplayEdge>,
+        edges: &mut EufArrayNotifyReplayState,
     ) {
         // #no-replay-quadratic M2 (superset retention): validity filter +
         // exact-duplicate dedup only — NO covered-by transitive-reduction
@@ -1603,46 +1587,33 @@ impl TheoryCombiner<'_> {
         // anyway — so no needed replay is ever dropped and no wrong verdict
         // is possible; the cost is memory plus O(alpha) no-op union-find
         // merges at replay.
-        let mut retained = std::mem::take(edges);
-        retained.sort_by_key(|edge| (edge.reason.len(), edge.target.0, edge.source.0));
-        let mut seen: DetHashSet<EufArrayNotifyReplayEdge> = Default::default();
-        for edge in retained {
-            if edge.target != edge.source
-                && self.euf_array_notify_replay_edge_reasons_hold(&edge)
-                && seen.insert(edge.clone())
-            {
-                edges.push(edge);
-            }
-        }
+        edges.retain_reason_groups(|reason| self.current_reasons_hold(reason));
     }
 
     pub(crate) fn append_current_euf_array_notify_replay_edges(
         &self,
-        edges: &mut Vec<EufArrayNotifyReplayEdge>,
+        edges: &mut EufArrayNotifyReplayState,
     ) -> usize {
-        let mut exported_edges = self.export_euf_array_notify_replay_edges();
-        let exported_count = exported_edges.len();
-        exported_edges.sort_by_key(|edge| (edge.reason.len(), edge.target.0, edge.source.0));
+        let exported_count = self.euf_array_notify_replay_edges.len();
         // #no-replay-quadratic M2 (superset retention): exact-duplicate
         // hash dedup against the persistent set instead of a covered-by BFS
         // per candidate — see `prune_current_euf_array_notify_replay_edges`
         // for the measurements and the superset soundness argument.
-        let mut seen: DetHashSet<EufArrayNotifyReplayEdge> = edges.iter().cloned().collect();
-        for edge in exported_edges {
-            if edge.target != edge.source
-                && self.euf_array_notify_replay_edge_reasons_hold(&edge)
-                && seen.insert(edge.clone())
-            {
-                edges.push(edge);
-            }
-        }
+        edges.extend_valid_from(&self.euf_array_notify_replay_edges, |reason| {
+            self.current_reasons_hold(reason)
+        });
         exported_count
     }
 
-    pub(super) fn record_current_assignment(&mut self, literal: TermId, value: bool) {
+    pub(super) fn record_current_assignment(
+        &mut self,
+        literal: TermId,
+        value: bool,
+    ) -> (TheoryLit, Option<bool>) {
         let (term, value) = ay_core::unwrap_not(self.terms, literal, value);
         let previous = self.current_assignments.insert(term, value);
         self.current_assignment_trail.push((term, previous));
+        (TheoryLit::new(term, value), previous)
     }
 
     pub(super) fn restore_current_assignments_to_mark(&mut self, mark: usize) {
@@ -1666,6 +1637,7 @@ impl TheoryCombiner<'_> {
         self.current_assignments.clear();
         self.current_assignment_trail.clear();
         self.current_assignment_scope_marks.clear();
+        self.euf_array_notify_replay_cache.invalidate_assignment();
     }
 
     /// Deterministic digest of the combiner's ASSIGNMENT-DERIVED state
@@ -1701,6 +1673,10 @@ impl TheoryCombiner<'_> {
                 (self.current_assignment_scope_marks.len() as u64).wrapping_mul(0x3C6EF372),
             )
             .wrapping_add((self.euf_array_notify_parent.len() as u64).wrapping_mul(0xA54FF53A))
+            .wrapping_add(
+                u64::from(!self.euf_array_notify_replay_cache.is_logically_empty())
+                    .wrapping_mul(0x6A09E667),
+            )
             .wrapping_add((self.scope_depth as u64).wrapping_mul(0x510E527F))
     }
 
@@ -1727,13 +1703,8 @@ impl TheoryCombiner<'_> {
         if reason.is_empty() {
             return;
         }
-        let edge = EufArrayNotifyReplayEdge::new(target, source, reason);
-        // O(1) hash-set dedup (#no-replay-quadratic M2); the former
-        // `Vec::contains` was quadratic within a round (~87k edges recorded
-        // by one giant merged component on cs_lazy.i_6, 2026-07-12 count).
-        if self.euf_array_notify_replay_edge_set.insert(edge.clone()) {
-            self.euf_array_notify_replay_edges.push(edge);
-        }
+        self.euf_array_notify_replay_edges
+            .insert(target, source, reason);
     }
 
     fn direct_array_equality_assignment(
@@ -1862,10 +1833,12 @@ impl TheoryCombiner<'_> {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn export_euf_array_notify_replay_edges(&self) -> Vec<EufArrayNotifyReplayEdge> {
-        self.euf_array_notify_replay_edges.clone()
+        self.euf_array_notify_replay_edges.to_edges()
     }
 
+    #[cfg(test)]
     pub(crate) fn euf_array_notify_replay_edge_reasons_hold(
         &self,
         edge: &EufArrayNotifyReplayEdge,
@@ -1873,11 +1846,21 @@ impl TheoryCombiner<'_> {
         self.current_reasons_hold(&edge.reason)
     }
 
+    #[cfg(test)]
     pub(crate) fn import_euf_array_notify_replay_edges(
         &mut self,
         edges: &[EufArrayNotifyReplayEdge],
     ) {
-        self.imported_euf_array_notify_replay_edges = edges.to_vec();
+        self.imported_euf_array_notify_replay_edges = EufArrayNotifyReplayState::from_edges(edges);
+        self.euf_array_notify_replay_cache.invalidate_assignment();
+    }
+
+    pub(crate) fn import_euf_array_notify_replay_state(
+        &mut self,
+        state: &EufArrayNotifyReplayState,
+    ) {
+        self.imported_euf_array_notify_replay_edges = state.clone();
+        self.euf_array_notify_replay_cache.invalidate_assignment();
     }
 
     pub(crate) fn export_array_equality_replays(&self) -> Vec<ArrayPropagatedEqualityReplay> {
@@ -2407,53 +2390,6 @@ impl TheoryCombiner<'_> {
         replayed
     }
 
-    pub(crate) fn replay_valid_euf_array_notifications(&mut self) -> usize {
-        if self.arrays.is_none()
-            || (self.imported_euf_array_notify_replay_edges.is_empty()
-                && self.euf_array_notify_replay_edges.is_empty())
-        {
-            return 0;
-        }
-
-        let mut edges = self.imported_euf_array_notify_replay_edges.clone();
-        for edge in &self.euf_array_notify_replay_edges {
-            if !edges.contains(edge) {
-                edges.push(edge.clone());
-            }
-        }
-        let mut notifications = Vec::new();
-        for edge in &edges {
-            if !self.current_reasons_hold(&edge.reason) {
-                continue;
-            }
-
-            let target_root =
-                Self::array_notify_find(&mut self.euf_array_notify_parent, edge.target);
-            let source_root =
-                Self::array_notify_find(&mut self.euf_array_notify_parent, edge.source);
-            if target_root == source_root {
-                continue;
-            }
-            let (target, source) = if target_root.0 <= source_root.0 {
-                (target_root, source_root)
-            } else {
-                (source_root, target_root)
-            };
-            self.euf_array_notify_parent.insert(source, target);
-            notifications.push((target, source));
-        }
-
-        if let Some(arrays) = &mut self.arrays {
-            for &(target, source) in &notifications {
-                arrays.notify_equality(target, source);
-            }
-        }
-        if !notifications.is_empty() {
-            self.mark_arrays_dirty();
-        }
-        notifications.len()
-    }
-
     /// Export the array solver's `requested_interface_eqs` dedup set (#8594).
     pub fn export_array_requested_interface_eqs(&self) -> DetHashSet<(TermId, TermId)> {
         self.arrays
@@ -2547,7 +2483,7 @@ impl TheorySolver for TheoryCombiner<'_> {
     }
 
     fn assert_literal(&mut self, literal: TermId, value: bool) {
-        self.record_current_assignment(literal, value);
+        let (normalized_lit, previous_assignment) = self.record_current_assignment(literal, value);
         let direct_array_equality = self.direct_array_equality_assignment(literal, value);
         self.euf.assert_literal(literal, value);
         if let Some(arrays) = &mut self.arrays {
@@ -2562,9 +2498,7 @@ impl TheorySolver for TheoryCombiner<'_> {
                 self.mark_arrays_dirty();
             }
         }
-        if let Some((lhs, rhs, reason)) = direct_array_equality {
-            self.record_euf_array_notify_parent_edge(lhs, rhs, vec![reason]);
-        }
+        self.record_array_assignment(direct_array_equality, normalized_lit, previous_assignment);
         if let Some(lia) = &mut self.lia {
             let is_int_equality_atom = {
                 let inner = match self.terms.get(literal) {
@@ -2621,7 +2555,7 @@ impl TheorySolver for TheoryCombiner<'_> {
                     }
                 }
             } else if !self.a5_replaying
-                && std::env::var_os("AY_A5_UF_EQ_DEFER").is_some()
+                && ay_core::misc_cli_flags().a5_uf_eq_defer
                 && is_uf_int_equality(self.terms, literal).is_some()
             {
                 // A5 v6 (z3's actual split, #qfuflia-a5): UF-containing Int
@@ -2732,7 +2666,7 @@ impl TheorySolver for TheoryCombiner<'_> {
         // TEMP-DIAG (#certora-w8): env-gated combiner-check telemetry.
         {
             static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *TRACE.get_or_init(|| std::env::var_os("AY_CERTORA_TRACE").is_some()) {
+            if *TRACE.get_or_init(|| ay_core::misc_cli_flags().certora_trace) {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static CALLS: AtomicU64 = AtomicU64::new(0);
                 let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2747,10 +2681,17 @@ impl TheorySolver for TheoryCombiner<'_> {
                 }
             }
         }
+        if self.euf_array_replay_capacity_exhausted()
+            || self
+                .euf_array_notify_replay_cache
+                .has_contradictory_overwrite()
+        {
+            return TheoryResult::Unknown;
+        }
         // A5 lazy adapter: materialize the deferred Int equality atoms into
         // LIA before the full check (idempotent per atom set — LIA dedups
         // re-asserted atoms via bound_atoms/asserted maps).
-        if (self.a5_lazy_arith || std::env::var_os("AY_A5_UF_EQ_DEFER").is_some())
+        if (self.a5_lazy_arith || ay_core::misc_cli_flags().a5_uf_eq_defer)
             && !self.deferred_arith_eqs.is_empty()
         {
             let deferred = self.deferred_arith_eqs.clone();
@@ -2775,11 +2716,10 @@ impl TheorySolver for TheoryCombiner<'_> {
         let __no_result = self.nelson_oppen_check();
         // Candidate-REJECTION diagnosis (env-gated `AY_REJECT_INSTRUMENT`,
         // verdict-neutral): categorise what the N-O combiner returns for each
-        // candidate model — the rejector that demands another round. Also sample
-        // the LIA shared-equality interface size at result time (INTERFACE-DIET
-        // C5/R4 flood metric).
-        let __shared_eq_len = self.lia.as_ref().map_or(0, |l| l.shared_equalities_len());
-        crate::reject_instrument::record_combiner_result(&__no_result, self.terms, __shared_eq_len);
+        // candidate model — the rejector that demands another round. (B20:
+        // the AY_REJECT_INSTRUMENT rejection-table module is deleted with
+        // its env gate — nothing set it, so the tables were never written;
+        // git history keeps the recorder if a diagnosis needs it back.)
         __no_result
     }
 
@@ -2944,6 +2884,7 @@ impl TheorySolver for TheoryCombiner<'_> {
             arrays.pop();
         }
         self.euf_array_notify_parent.clear();
+        self.euf_array_notify_replay_cache.invalidate_assignment();
         if self.arrays.is_some() {
             self.mark_arrays_dirty();
         }
@@ -2972,8 +2913,8 @@ impl TheorySolver for TheoryCombiner<'_> {
         }
         self.euf_array_notify_parent.clear();
         self.euf_array_notify_replay_edges.clear();
-        self.euf_array_notify_replay_edge_set.clear();
         self.imported_euf_array_notify_replay_edges.clear();
+        self.euf_array_notify_replay_cache.reset();
         self.array_equality_replays.clear();
         self.imported_array_equality_replays.clear();
         self.cross_theory_equality_replays.clear();
@@ -3141,8 +3082,8 @@ impl TheorySolver for TheoryCombiner<'_> {
         // the arrays arm: ArraySolver has no decision-atom suggestion (trait
         // default `None`), so there is nothing to override.
         //
-        // Env-gated DEFAULT OFF (`AY_UFLIA_ARITH_DECISIONS=1`, single cached
-        // env read): unset keeps the historical `None` and the byte-identical
+        // DEFAULT OFF (`--uflia-arith-decisions`, B72): the default keeps
+        // the historical `None` and the byte-identical
         // trajectory. The consumer's wander suppression (extension wander
         // latch + relevancy_should_engage) sits upstream and is unaffected.
         if !ay_core::debug_channel::uflia_arith_decisions_enabled() {

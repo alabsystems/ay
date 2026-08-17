@@ -6,25 +6,44 @@
 //!
 //! Provides [`ProofQuality`] metrics counting each step type, plus
 //! [`check_proof_with_quality`] and [`check_proof_strict`] for diagnosing
-//! proof completeness and rejecting unverified fallbacks.
+//! native proof completeness and rejecting unverified fallbacks. A native
+//! semantic acceptance can still retain a diagnostic `Generic` producer tag
+//! that renders as an honest Alethe `hole`; quality and wire completeness are
+//! deliberately distinct.
 
 use std::mem::size_of;
 
-use ay_core::kani_compat::{DetHashMap, DetHashSet};
+use ay_core::kani_compat::DetHashSet;
 use ay_core::{
     AletheRule, Constant, DatatypeConstructor, DatatypeField, LiaAnnotation, Proof, ProofId,
     ProofStep, Sort, Symbol, TermData, TermId, TermStore, TheoryLemmaKind,
 };
 
 use crate::checker::{
-    ensure_terminal_empty_clause, quantifier, validate_step, validate_step_with_datatypes,
-    ExtDiffRegistry, ProofCheckError,
+    ensure_terminal_empty_clause, quantifier, validate_datatype_signature_context, validate_step,
+    validate_step_with_datatypes_and_progress, DatatypeMemberSignature, ExtDiffRegistry,
+    ProofCheckError,
 };
 use crate::partial::PartialProofCheck;
 
 type DerivedClauses = Vec<Option<Vec<TermId>>>;
 type DeferredGenericClauses = Vec<(ProofId, Vec<TermId>)>;
 type StrictValidationArtifacts = (ProofQuality, DerivedClauses, DeferredGenericClauses);
+
+#[path = "quality/authentication_payload.rs"]
+mod authentication_payload;
+mod farkas_meter;
+mod semantic_payload;
+use authentication_payload::meter_authentication_payload;
+#[path = "quality/term_cost_memo.rs"]
+mod term_cost_memo;
+#[cfg(test)]
+use term_cost_memo::TERM_COST_MEMO_POLL_INTERVAL;
+use term_cost_memo::{unfolded_work_memoized, TermCostMemo};
+
+#[path = "quality/semantic_charge.rs"]
+mod semantic_charge;
+use semantic_charge::semantic_validator_charge;
 
 /// Proof quality metrics for diagnostic reporting.
 ///
@@ -163,9 +182,12 @@ impl PremiseClausesWithDeferredGeneric {
 impl ProofQuality {
     /// True if the proof has no trust or hole fallbacks.
     ///
-    /// Note: this metric does not imply full semantic verification of every
-    /// proof step. `theory_lemma` and generic rule steps are still accepted as
-    /// axiomatic in the checker.
+    /// This is a diagnostic tag metric, neither the native strict checker's
+    /// acceptance bit nor a guarantee that every native step has a hole-free
+    /// wire lowering. In particular, the exact equality-span subset of a
+    /// `Generic` theory lemma is independently re-derived and may pass strict
+    /// checking while its producer tag still contributes `trust_count == 1`
+    /// (and prints as an honest Alethe `hole`).
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.trust_count == 0 && self.hole_count == 0
@@ -390,8 +412,11 @@ pub fn check_proof_partial_with_quality(
 /// strict semantic boundary, and fails closed on theory-lemma families that do
 /// not yet have a semantic checker. Returns quality metrics on success.
 ///
-/// Limitation: `Generic` theory lemma kind and generic Alethe rules still
-/// lack semantic validation and are rejected in strict mode.
+/// Most `Generic` theory-lemma shapes and generic Alethe rules still lack a
+/// semantic validator and are rejected. The deliberately narrow arithmetic
+/// equality-span subset is accepted only after the checker re-derives the
+/// exact rational combination itself; its `Generic` quality tag remains
+/// diagnostic and does not claim a hole-free external presentation.
 pub fn check_proof_strict(
     proof: &Proof,
     terms: &TermStore,
@@ -399,15 +424,13 @@ pub fn check_proof_strict(
     check_proof_strict_with_datatypes(proof, terms, None)
 }
 
-/// As [`check_proof_strict`], but with the datatype constructor registry so
-/// strict mode can semantically validate `TheoryLemmaKind::DatatypeDistinct`
-/// lemmas instead of failing closed.
+/// Compatibility wrapper carrying a name-only datatype constructor registry.
 ///
-/// `dt_decls` is the list of `(datatype_name, [constructor_name, ..])`
-/// declarations from the executor. Runtime datatype terms carry
-/// `Sort::Uninterpreted`, so the checker cannot recover constructor membership
-/// from the `TermStore` alone — the registry is supplied explicitly. Passing
-/// `None` is equivalent to [`check_proof_strict`].
+/// Name-only registries confer no datatype proof authority, so datatype kinds
+/// and enum-backed finite-array kinds fail closed through this API. Use
+/// [`check_proof_strict_with_typed_context`] with the exact member-signature
+/// table to validate either family. Passing `None` remains equivalent to
+/// [`check_proof_strict`].
 pub fn check_proof_strict_with_datatypes(
     proof: &Proof,
     terms: &TermStore,
@@ -416,15 +439,12 @@ pub fn check_proof_strict_with_datatypes(
     check_proof_strict_with_datatypes_and_selectors(proof, terms, dt_decls, None)
 }
 
-/// As [`check_proof_strict_with_datatypes`], but additionally threading the
-/// constructor→selector registry so strict mode can semantically validate
-/// `TheoryLemmaKind::DatatypeSelectorProject` lemmas (`fst (mk x y) = x`)
-/// instead of failing closed.
+/// Compatibility wrapper additionally carrying a name-only
+/// constructor-to-selector registry.
 ///
-/// `ctor_selectors` is the list of `(constructor_name, [selector_name in field
-/// order])` declarations from the executor. As with `dt_decls`, runtime
-/// datatype terms carry `Sort::Uninterpreted`, so the field-position registry is
-/// supplied explicitly. Passing `None` is equivalent to
+/// These registries likewise confer no datatype proof authority without exact
+/// member signatures. Use [`check_proof_strict_with_typed_context`] for
+/// datatype and enum-backed finite-array validation. Passing `None` is equivalent to
 /// [`check_proof_strict_with_datatypes`].
 pub fn check_proof_strict_with_datatypes_and_selectors(
     proof: &Proof,
@@ -439,10 +459,13 @@ pub fn check_proof_strict_with_datatypes_and_selectors(
 ///
 /// Every step is checked by the same implementation used by
 /// [`check_proof_strict_with_context`]: unverified `trust`/`hole` and generic
-/// rules are rejected, supported theory lemmas are checked semantically,
-/// datatype and selector declarations are honored, expensive BV budgets are
+/// rules are rejected, while the exact semantically revalidated `Generic`
+/// theory-lemma subset and other supported lemmas are checked independently,
+/// name-only datatype contexts remain fail-closed, expensive BV budgets are
 /// enforced, and every `assume` must belong to `problem_assertions` (or a
-/// nested conjunct of one).
+/// nested conjunct of one). Use
+/// [`authenticate_premise_clauses_strict_with_typed_context`] for datatype
+/// authority.
 ///
 /// Unlike [`check_proof_strict_with_context`], this function deliberately does
 /// **not** require the final clause to be empty. An `Ok` result therefore does
@@ -497,6 +520,52 @@ pub fn authenticate_premise_clauses_strict_with_context_and_progress(
         terms,
         dt_decls,
         ctor_selectors,
+        None,
+        Some(problem_assertions),
+        GenericTheoryDeferral::Reject,
+        progress,
+    )?;
+    debug_assert!(deferred_generic.is_empty());
+    Ok(AuthenticatedPremiseClauses { derived_clauses })
+}
+
+/// Typed-context form of [`authenticate_premise_clauses_strict_with_context`].
+pub fn authenticate_premise_clauses_strict_with_typed_context(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: &[TermId],
+) -> Result<AuthenticatedPremiseClauses, ProofCheckError> {
+    let mut unbounded = |_: usize, _: usize| true;
+    authenticate_premise_clauses_strict_with_typed_context_and_progress(
+        proof,
+        terms,
+        dt_decls,
+        ctor_selectors,
+        datatype_member_signatures,
+        problem_assertions,
+        &mut unbounded,
+    )
+}
+
+/// Metered typed-context premise authentication.
+pub fn authenticate_premise_clauses_strict_with_typed_context_and_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<AuthenticatedPremiseClauses, ProofCheckError> {
+    let (_, derived_clauses, deferred_generic) = validate_strict_steps_with_context(
+        proof,
+        terms,
+        dt_decls,
+        ctor_selectors,
+        Some(datatype_member_signatures),
         Some(problem_assertions),
         GenericTheoryDeferral::Reject,
         progress,
@@ -510,10 +579,11 @@ pub fn authenticate_premise_clauses_strict_with_context_and_progress(
 ///
 /// Explicit `trust` and `hole` steps remain hard errors. Supported theory
 /// lemmas and every structural proof step pass the ordinary strict checker.
-/// Each `Generic` theory lemma is retained by exact [`ProofId`] and clause, but
-/// is inaccessible through the strict-clause accessor on the returned type.
-/// The caller must independently establish every deferred clause before using
-/// it as a premise in a composed certificate.
+/// Each `Generic` theory lemma not already accepted by the exact equality-span
+/// validator is retained by exact [`ProofId`] and clause, but is inaccessible
+/// through the strict-clause accessor on the returned type. The caller must
+/// independently establish every deferred clause before using it as a premise
+/// in a composed certificate.
 ///
 /// `progress` covers the same full proof/checker envelope as strict premise
 /// authentication, plus the retained deferred-clause storage.
@@ -530,6 +600,34 @@ pub fn authenticate_premise_clauses_with_deferred_generic_theory_and_progress(
         terms,
         dt_decls,
         ctor_selectors,
+        None,
+        Some(problem_assertions),
+        GenericTheoryDeferral::Collect,
+        progress,
+    )?;
+    Ok(PremiseClausesWithDeferredGeneric {
+        derived_clauses,
+        deferred_generic,
+    })
+}
+
+/// Typed-context form of
+/// [`authenticate_premise_clauses_with_deferred_generic_theory_and_progress`].
+pub fn authenticate_premise_clauses_with_deferred_generic_theory_and_typed_context_and_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<PremiseClausesWithDeferredGeneric, ProofCheckError> {
+    let (_, derived_clauses, deferred_generic) = validate_strict_steps_with_context(
+        proof,
+        terms,
+        dt_decls,
+        ctor_selectors,
+        Some(datatype_member_signatures),
         Some(problem_assertions),
         GenericTheoryDeferral::Collect,
         progress,
@@ -583,6 +681,32 @@ pub fn check_proof_strict_with_context(
     )
 }
 
+/// Strict proof validation with the exact typed datatype member context.
+///
+/// Unlike the compatibility API, this form can authorize concrete datatype
+/// constructor, selector, and tester rules.  The signature table is validated
+/// globally and every occurrence of a registered member in `terms` must match
+/// its exact argument and result sorts.
+pub fn check_proof_strict_with_typed_context(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: Option<&[TermId]>,
+) -> Result<ProofQuality, ProofCheckError> {
+    let mut unbounded = |_: usize, _: usize| true;
+    check_proof_strict_with_typed_context_and_progress(
+        proof,
+        terms,
+        dt_decls,
+        ctor_selectors,
+        datatype_member_signatures,
+        problem_assertions,
+        &mut unbounded,
+    )
+}
+
 /// Metered form of [`check_proof_strict_with_context`].
 ///
 /// `progress` receives `(work_delta, byte_delta)` before each whole-proof
@@ -608,6 +732,32 @@ pub fn check_proof_strict_with_context_and_progress(
         terms,
         dt_decls,
         ctor_selectors,
+        None,
+        problem_assertions,
+        GenericTheoryDeferral::Reject,
+        progress,
+    )?;
+    debug_assert!(deferred_generic.is_empty());
+    ensure_terminal_empty_clause(&derived_clauses)?;
+    Ok(quality)
+}
+
+/// Metered form of [`check_proof_strict_with_typed_context`].
+pub fn check_proof_strict_with_typed_context_and_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: Option<&[TermId]>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<ProofQuality, ProofCheckError> {
+    let (quality, derived_clauses, deferred_generic) = validate_strict_steps_with_context(
+        proof,
+        terms,
+        dt_decls,
+        ctor_selectors,
+        Some(datatype_member_signatures),
         problem_assertions,
         GenericTheoryDeferral::Reject,
         progress,
@@ -686,59 +836,12 @@ fn push_term(
     Ok(())
 }
 
-/// Account the complete dynamic proof/context payload and every reachable
-/// term-DAG edge before semantic validation starts. This replaces scalar
-/// `terms.len() * constant` guesses with data-dependent charges and provides
-/// frequent caller-owned cancellation/deadline polls while walking the input.
-fn meter_authentication_payload(
-    proof: &Proof,
-    terms: &TermStore,
-    dt_decls: Option<&[(String, Vec<String>)]>,
-    ctor_selectors: Option<&[(String, Vec<String>)]>,
-    problem_assertions: Option<&[TermId]>,
-    progress: &mut dyn FnMut(usize, usize) -> bool,
-) -> Result<AuthenticationPayloadStats, ProofCheckError> {
-    let mut stats = PayloadStats::default();
-    let mut overflow = false;
-    let registry = {
-        let mut counting_progress = |work: usize, bytes: usize| {
-            let Some(next_work) = stats.work.checked_add(work) else {
-                overflow = true;
-                return false;
-            };
-            let Some(next_bytes) = stats.bytes.checked_add(bytes) else {
-                overflow = true;
-                return false;
-            };
-            stats.work = next_work;
-            stats.bytes = next_bytes;
-            progress(work, bytes)
-        };
-        meter_authentication_payload_inner(
-            proof,
-            terms,
-            dt_decls,
-            ctor_selectors,
-            problem_assertions,
-            &mut counting_progress,
-        )?
-    };
-    if overflow {
-        Err(ProofCheckError::ResourceLimit)
-    } else {
-        Ok(AuthenticationPayloadStats {
-            aggregate: stats,
-            datatype_registry: registry.datatype,
-            selector_registry: registry.selectors,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct PayloadStats {
     work: usize,
     bytes: usize,
     unfolded_work: usize,
+    order_assignments: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -760,125 +863,6 @@ struct AuthenticationPayloadStats {
     selector_registry: RegistryPayloadStats,
 }
 
-fn meter_authentication_payload_inner(
-    proof: &Proof,
-    terms: &TermStore,
-    dt_decls: Option<&[(String, Vec<String>)]>,
-    ctor_selectors: Option<&[(String, Vec<String>)]>,
-    problem_assertions: Option<&[TermId]>,
-    progress: &mut dyn FnMut(usize, usize) -> bool,
-) -> Result<RegistryContextStats, ProofCheckError> {
-    charge_progress(
-        progress,
-        proof.steps.len(),
-        checked_mul_usize(proof.steps.capacity(), size_of::<ProofStep>())?,
-    )?;
-    let datatype = match dt_decls {
-        Some(declarations) => charge_name_lists(declarations, progress)?,
-        None => RegistryPayloadStats::default(),
-    };
-    let selectors = match ctor_selectors {
-        Some(selectors) => charge_name_lists(selectors, progress)?,
-        None => RegistryPayloadStats::default(),
-    };
-
-    let mut pending = Vec::new();
-    if let Some(assertions) = problem_assertions {
-        push_term_slice(&mut pending, assertions, progress)?;
-    }
-
-    for step in &proof.steps {
-        charge_progress(progress, 1, 0)?;
-        match step {
-            ProofStep::Assume(term) => push_term(&mut pending, *term, progress)?,
-            ProofStep::Resolution { clause, pivot, .. } => {
-                charge_progress(
-                    progress,
-                    1,
-                    checked_mul_usize(clause.capacity(), size_of::<TermId>())?,
-                )?;
-                push_term_slice(&mut pending, clause, progress)?;
-                push_term(&mut pending, *pivot, progress)?;
-            }
-            ProofStep::TheoryLemma {
-                theory,
-                clause,
-                farkas,
-                lia,
-                ..
-            } => {
-                let clause_bytes = checked_mul_usize(clause.capacity(), size_of::<TermId>())?;
-                charge_progress(
-                    progress,
-                    checked_add_usize(theory.len(), 1)?,
-                    checked_add_usize(theory.capacity(), clause_bytes)?,
-                )?;
-                push_term_slice(&mut pending, clause, progress)?;
-                if let Some(annotation) = farkas {
-                    charge_progress(
-                        progress,
-                        annotation.coefficients.len(),
-                        checked_mul_usize(
-                            annotation.coefficients.capacity(),
-                            size_of::<num_rational::Rational64>(),
-                        )?,
-                    )?;
-                }
-                if let Some(LiaAnnotation::CuttingPlane(annotation)) = lia {
-                    charge_progress(
-                        progress,
-                        annotation.farkas.coefficients.len(),
-                        checked_mul_usize(
-                            annotation.farkas.coefficients.capacity(),
-                            size_of::<num_rational::Rational64>(),
-                        )?,
-                    )?;
-                }
-            }
-            ProofStep::Step {
-                rule,
-                clause,
-                premises,
-                args,
-            } => {
-                let clause_bytes = checked_mul_usize(clause.capacity(), size_of::<TermId>())?;
-                let premise_bytes = checked_mul_usize(premises.capacity(), size_of::<ProofId>())?;
-                let arg_bytes = checked_mul_usize(args.capacity(), size_of::<TermId>())?;
-                let mut bytes = checked_add_usize(clause_bytes, premise_bytes)?;
-                bytes = checked_add_usize(bytes, arg_bytes)?;
-                if let AletheRule::Custom(name) = rule {
-                    bytes = checked_add_usize(bytes, name.capacity())?;
-                }
-                let rule_name_work = match rule {
-                    AletheRule::Custom(name) => checked_add_usize(name.len(), 1)?,
-                    _ => 1,
-                };
-                charge_progress(progress, rule_name_work, bytes)?;
-                push_term_slice(&mut pending, clause, progress)?;
-                push_term_slice(&mut pending, args, progress)?;
-            }
-            ProofStep::Anchor { variables, .. } => {
-                charge_progress(
-                    progress,
-                    variables.len(),
-                    checked_mul_usize(variables.capacity(), size_of::<(String, Sort)>())?,
-                )?;
-                for (name, sort) in variables {
-                    charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?;
-                    meter_sort(sort, progress)?;
-                }
-            }
-            _ => charge_progress(progress, 1, 0)?,
-        }
-    }
-
-    meter_reachable_terms(terms, pending, progress)?;
-    Ok(RegistryContextStats {
-        datatype,
-        selectors,
-    })
-}
-
 fn push_sort<'a>(
     pending: &mut Vec<&'a Sort>,
     sort: &'a Sort,
@@ -889,7 +873,7 @@ fn push_sort<'a>(
     Ok(())
 }
 
-fn meter_sort(
+pub(crate) fn meter_sort(
     root: &Sort,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
@@ -1014,72 +998,86 @@ fn meter_reachable_terms(
         }
         charge_progress(progress, 1, checked_add_usize(size_of::<TermId>(), 32)?)?;
         visited.insert(term);
+        meter_reachable_node(terms, term, &mut pending, progress)?;
+    }
+    Ok(())
+}
 
-        charge_progress(
-            progress,
-            1,
-            checked_add_usize(size_of::<TermData>(), size_of::<Sort>())?,
-        )?;
-        meter_sort(terms.sort(term), progress)?;
-        match terms.get(term) {
-            TermData::Const(constant) => meter_constant(constant, progress)?,
-            TermData::Var(name, _) => {
-                charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?
+/// The per-unique-node payload charges of [`meter_reachable_terms`]: term
+/// header and sort, the node's own content (names, constants, argument
+/// slots), and the push charges for its children, which are appended to
+/// `pending`. Factored out so [`charge_step_payload_walks`] emits EXACTLY the
+/// same per-node content charges as the reachability walk itself — one code
+/// path, no drift.
+fn meter_reachable_node(
+    terms: &TermStore,
+    term: TermId,
+    pending: &mut Vec<TermId>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    charge_progress(
+        progress,
+        1,
+        checked_add_usize(size_of::<TermData>(), size_of::<Sort>())?,
+    )?;
+    meter_sort(terms.sort(term), progress)?;
+    match terms.get(term) {
+        TermData::Const(constant) => meter_constant(constant, progress)?,
+        TermData::Var(name, _) => {
+            charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?
+        }
+        TermData::App(symbol, args) => {
+            meter_symbol(symbol, progress)?;
+            charge_progress(
+                progress,
+                1,
+                checked_mul_usize(args.capacity(), size_of::<TermId>())?,
+            )?;
+            push_term_slice(pending, args, progress)?;
+        }
+        TermData::Let(bindings, body) => {
+            charge_progress(
+                progress,
+                bindings.len(),
+                checked_mul_usize(bindings.capacity(), size_of::<(String, TermId)>())?,
+            )?;
+            for (name, value) in bindings {
+                charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?;
+                push_term(pending, *value, progress)?;
             }
-            TermData::App(symbol, args) => {
-                meter_symbol(symbol, progress)?;
+            push_term(pending, *body, progress)?;
+        }
+        TermData::Not(inner) => push_term(pending, *inner, progress)?,
+        TermData::Ite(condition, then_branch, else_branch) => {
+            push_term(pending, *condition, progress)?;
+            push_term(pending, *then_branch, progress)?;
+            push_term(pending, *else_branch, progress)?;
+        }
+        TermData::Forall(variables, body, triggers)
+        | TermData::Exists(variables, body, triggers) => {
+            let variable_bytes =
+                checked_mul_usize(variables.capacity(), size_of::<(String, Sort)>())?;
+            let trigger_bytes = checked_mul_usize(triggers.capacity(), size_of::<Vec<TermId>>())?;
+            charge_progress(
+                progress,
+                variables.len(),
+                checked_add_usize(variable_bytes, trigger_bytes)?,
+            )?;
+            for (name, sort) in variables {
+                charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?;
+                meter_sort(sort, progress)?;
+            }
+            push_term(pending, *body, progress)?;
+            for trigger in triggers {
                 charge_progress(
                     progress,
                     1,
-                    checked_mul_usize(args.capacity(), size_of::<TermId>())?,
+                    checked_mul_usize(trigger.capacity(), size_of::<TermId>())?,
                 )?;
-                push_term_slice(&mut pending, args, progress)?;
+                push_term_slice(pending, trigger, progress)?;
             }
-            TermData::Let(bindings, body) => {
-                charge_progress(
-                    progress,
-                    bindings.len(),
-                    checked_mul_usize(bindings.capacity(), size_of::<(String, TermId)>())?,
-                )?;
-                for (name, value) in bindings {
-                    charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?;
-                    push_term(&mut pending, *value, progress)?;
-                }
-                push_term(&mut pending, *body, progress)?;
-            }
-            TermData::Not(inner) => push_term(&mut pending, *inner, progress)?,
-            TermData::Ite(condition, then_branch, else_branch) => {
-                push_term(&mut pending, *condition, progress)?;
-                push_term(&mut pending, *then_branch, progress)?;
-                push_term(&mut pending, *else_branch, progress)?;
-            }
-            TermData::Forall(variables, body, triggers)
-            | TermData::Exists(variables, body, triggers) => {
-                let variable_bytes =
-                    checked_mul_usize(variables.capacity(), size_of::<(String, Sort)>())?;
-                let trigger_bytes =
-                    checked_mul_usize(triggers.capacity(), size_of::<Vec<TermId>>())?;
-                charge_progress(
-                    progress,
-                    variables.len(),
-                    checked_add_usize(variable_bytes, trigger_bytes)?,
-                )?;
-                for (name, sort) in variables {
-                    charge_progress(progress, checked_add_usize(name.len(), 1)?, name.capacity())?;
-                    meter_sort(sort, progress)?;
-                }
-                push_term(&mut pending, *body, progress)?;
-                for trigger in triggers {
-                    charge_progress(
-                        progress,
-                        1,
-                        checked_mul_usize(trigger.capacity(), size_of::<TermId>())?,
-                    )?;
-                    push_term_slice(&mut pending, trigger, progress)?;
-                }
-            }
-            _ => charge_progress(progress, 1, 0)?,
         }
+        _ => charge_progress(progress, 1, 0)?,
     }
     Ok(())
 }
@@ -1115,48 +1113,60 @@ fn append_term_children(
     Ok(())
 }
 
-/// Exact tree-unfolding upper bound for recursive validators over a hash-consed
-/// term DAG. A memoized postorder computes `cost(t) = 1 + sum(cost(child))`;
-/// the arithmetic is checked, so an exponentially shared DAG that cannot fit
-/// the caller's finite counter is refused before any unmetered recursion.
-fn unfolded_term_work(
+/// Per-step payload charge walk. Emits, for one step's `roots`, a charge
+/// stream whose per-step totals are byte-identical to the two walks it
+/// replaces (pinned by the
+/// `a2_per_step_payload_stats_are_byte_identical_to_the_unmemoized_metering`
+/// test):
+///
+/// * Phase 1 replicates the former `unfolded_term_work` traversal charge for
+///   charge — same stack discipline, same charge sites — with a per-step
+///   `completed` set standing in for the per-call cost-map membership that
+///   steered the original traversal. The cost arithmetic itself is gone
+///   (it moved, memoized, into [`unfolded_work_memoized`]).
+/// * Phase 2 emits [`meter_reachable_terms`]'s charges over the SAME
+///   per-step unique-node set without a second hash traversal: that walk pops
+///   one pending entry per root and per child edge (a `(1, 0)` membership
+///   probe each) and charges node content once per unique node via
+///   [`meter_reachable_node`] — re-emitted here per node in phase-1 discovery
+///   order, so the per-step charge totals are identical and one full
+///   traversal (hash set, pending vector, probe loop) is saved.
+///
+/// Both phases use fresh per-step state on purpose; see [`TermCostMemo`] for
+/// why per-step content charges are load-bearing and must not be memoized.
+fn charge_step_payload_walks(
     terms: &TermStore,
     roots: &[TermId],
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<usize, ProofCheckError> {
-    let mut costs: DetHashMap<TermId, usize> = DetHashMap::default();
-    let mut active = DetHashSet::default();
+    let mut completed: DetHashSet<TermId> = DetHashSet::default();
+    let mut active: DetHashSet<TermId> = DetHashSet::default();
     let mut stack: Vec<(TermId, bool)> = Vec::new();
+    let mut discovered: Vec<TermId> = Vec::new();
+    let mut children: Vec<TermId> = Vec::new();
+    let mut order_variables = 0usize;
 
     for &root in roots {
-        if costs.contains_key(&root) {
+        if completed.contains(&root) {
             continue;
         }
         charge_progress(progress, 1, size_of::<(TermId, bool)>())?;
         stack.push((root, false));
         while let Some((term, expanded)) = stack.pop() {
             charge_progress(progress, 1, 0)?;
-            if costs.contains_key(&term) {
+            if completed.contains(&term) {
                 continue;
             }
             if expanded {
                 active.remove(&term);
-                let mut children = Vec::new();
+                children.clear();
                 append_term_children(terms, term, &mut children, progress)?;
-                let mut cost = 1_usize;
-                for child in children {
-                    let child_cost = costs
-                        .get(&child)
-                        .copied()
-                        .ok_or(ProofCheckError::ResourceLimit)?;
-                    cost = checked_add_usize(cost, child_cost)?;
-                }
                 charge_progress(
                     progress,
                     1,
                     checked_add_usize(size_of::<(TermId, usize)>(), 32)?,
                 )?;
-                costs.insert(term, cost);
+                completed.insert(term);
                 continue;
             }
 
@@ -1166,13 +1176,20 @@ fn unfolded_term_work(
             }
             charge_progress(progress, 1, size_of::<(TermId, bool)>())?;
             stack.push((term, true));
-            let mut children = Vec::new();
+            discovered.push(term);
+            if matches!(terms.sort(term), Sort::Int | Sort::Real)
+                && matches!(terms.get(term), TermData::Var(_, _))
+            {
+                order_variables = checked_add_usize(order_variables, 1)?;
+            }
+            children.clear();
             append_term_children(terms, term, &mut children, progress)?;
-            for child in children.into_iter().rev() {
+            for index in (0..children.len()).rev() {
+                let child = children[index];
                 if active.contains(&child) {
                     return Err(ProofCheckError::ResourceLimit);
                 }
-                if !costs.contains_key(&child) {
+                if !completed.contains(&child) {
                     charge_progress(progress, 1, size_of::<(TermId, bool)>())?;
                     stack.push((child, false));
                 }
@@ -1180,17 +1197,19 @@ fn unfolded_term_work(
         }
     }
 
-    let mut total = 0_usize;
-    for root in roots {
-        total = checked_add_usize(
-            total,
-            costs
-                .get(root)
-                .copied()
-                .ok_or(ProofCheckError::ResourceLimit)?,
-        )?;
+    // Phase 2: `meter_reachable_terms` charges one `(1, 0)` pop probe per
+    // initial root and per pushed child edge, then per unique node the
+    // visited-set insert plus the node content. Same totals, one node at a
+    // time, no second traversal.
+    charge_progress(progress, roots.len(), 0)?;
+    let mut pushed: Vec<TermId> = Vec::new();
+    for &term in &discovered {
+        charge_progress(progress, 1, checked_add_usize(size_of::<TermId>(), 32)?)?;
+        pushed.clear();
+        meter_reachable_node(terms, term, &mut pushed, progress)?;
+        charge_progress(progress, pushed.len(), 0)?;
     }
-    Ok(total)
+    Ok(order_variables)
 }
 
 fn validate_problem_assumptions_metered(
@@ -1328,6 +1347,7 @@ fn meter_step_term_payload(
     step: &ProofStep,
     terms: &TermStore,
     derived_clauses: &[Option<Vec<TermId>>],
+    memo: &mut TermCostMemo,
     progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<PayloadStats, ProofCheckError> {
     let mut stats = PayloadStats::default();
@@ -1382,9 +1402,10 @@ fn meter_step_term_payload(
             }
             _ => {}
         }
-        let unfolded_work = unfolded_term_work(terms, &roots, &mut counting_progress)?;
-        meter_reachable_terms(terms, roots, &mut counting_progress)?;
-        unfolded_work
+        stats.order_assignments = crate::checker::order_ite_assignment_count(
+            charge_step_payload_walks(terms, &roots, &mut counting_progress)?,
+        );
+        unfolded_work_memoized(memo, terms, &roots, &mut counting_progress)?
     };
     if overflow {
         Err(ProofCheckError::ResourceLimit)
@@ -1397,183 +1418,113 @@ fn meter_step_term_payload(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SemanticChargeClass {
     General,
-    ArgumentFreeUnitTail,
+    ResolutionRoute,
     DatatypeEnumPigeonhole,
+    ArrayClauseSchema,
+    ProgressFarkas,
+    /// The EUF identity/congruence family — `refl`, `symm`, `trans`, `cong`,
+    /// `eq_transitive`, `eq_congruent`, `eq_congruent_pred` (as Alethe steps AND
+    /// as the corresponding `Euf*` theory lemmas). Their strict validators
+    /// compare argument and endpoint terms by `TermId` identity and BFS a
+    /// `TermId`-keyed equality graph; NONE descends into an argument's subterms
+    /// (verified: crates/ay-proof/src/checker/euf.rs,
+    /// crates/ay-proof/src/checker/euf_step_rules.rs). Their worst-case work is
+    /// therefore a constant number of passes over the step's reachable DAG,
+    /// already metered by the base payload walk — NOT the tree-unfolded payload.
+    /// Charging the `General` `unfolded_work^2` product here over-charges by the
+    /// square of a store-chain's internal sharing and withheld correctly decided
+    /// `storecomm` UNSAT results as `unknown`. See [`EUF_IDENTITY_WORK_FACTOR`].
+    EufIdentityRoute,
+    /// `TheoryLemmaKind::BoolTautology`, whose validator is the exhaustive
+    /// bounded Bool/BV evaluator in [`crate::checker::bv_bitblast`].
+    ///
+    /// That evaluator enumerates at most `2^MAX_BOUNDED_ASSIGNMENT_BITS`
+    /// assignments and, per assignment, walks each literal's TREE once while
+    /// resolving every variable through an environment of at most
+    /// `MAX_BOUNDED_ASSIGNMENT_BITS` entries (a variable needs at least one
+    /// assignment bit). Its worst case is therefore
+    /// `assignments * unfolded_work * min(unfolded_work, vars + 1)`, NOT
+    /// `assignments * unfolded_work^2`: the second factor saturates at the
+    /// environment width. The `General` product ignores that saturation, so any
+    /// packed unit with `unfolded_work` above ~1,169 was refused BEFORE the
+    /// evaluator ran — including single-literal Tseitin units the recognizer
+    /// discharges structurally without evaluating anything at all.
+    ///
+    /// That threshold is `sqrt(350_000_000 / 256)`, NOT `sqrt(350_000_000)`:
+    /// this family carried a private `1 << 8` scale, and dropping it inflates
+    /// the figure 16x. (~18,708 IS correct — for the unscaled
+    /// `UnorderedClauseMatch` class, not this one.) Measured: at
+    /// `unfolded = 2,003` the legacy charge is already 1,027,074,304, i.e. 2.9x
+    /// the whole envelope.
+    /// See [`BOUNDED_EVAL_ENV_WIDTH`].
+    BoundedAssignmentEval,
+    /// `AletheRule::Or` (premise-based clause decomposition), whose validator is
+    /// [`crate::checker::validate_or_clausification`]: O(1) shape checks and
+    /// then `clause_matches_unordered`, which compares `TermId`s PAIRWISE and
+    /// never descends into a literal. Its worst case is quadratic in the CLAUSE
+    /// LENGTH — tens — while the `General` product bills it the square of the
+    /// tree-unfolded term payload, which on heavily-shared BV formulas exceeds
+    /// the whole envelope for a step that performs a few hundred integer
+    /// comparisons.
+    UnorderedClauseMatch,
 }
 
-fn semantic_validator_charge(
-    step: &ProofStep,
-    payload: PayloadStats,
-    class: SemanticChargeClass,
-) -> Result<(usize, usize), ProofCheckError> {
-    match class {
-        SemanticChargeClass::ArgumentFreeUnitTail => {
-            // `chain_resolution_charge` accounts the exact deterministic-set
-            // route, including leading-not decoding and both live hash sets.
-            // Do not also apply the generic recursive-product estimate: this
-            // validator never enters the ambiguity search for an all-unit
-            // tail.
-            return Ok((0, 0));
-        }
-        SemanticChargeClass::DatatypeEnumPigeonhole => {
-            // The enum validator performs a constant number of hash probes per
-            // literal/member. Member sorts are checked only on first insertion;
-            // declaration scans and set scratch are charged separately by
-            // `datatype_registry_charge`.
-            let linear = payload.work.max(payload.unfolded_work);
-            return Ok((checked_mul_usize(linear, 8)?, payload.bytes));
-        }
-        SemanticChargeClass::General => {}
-    }
+/// Constant factor over the array clause schemas' quadratic term.
+///
+/// [`crate::checker::array_axiom`]'s row-chain entry point tries eight
+/// sub-schemas, the widest of which pairs every literal with every array-
+/// equality premise at up to two witness indices and two orientations. Eight
+/// covers that cross product, the two chain parses per candidate, the
+/// `sort_unstable` log factor over one chain's entries, and per-node sort
+/// comparisons.
+const ARRAY_SCHEMA_WORK_FACTOR: usize = 8;
 
-    // Unordered component matching and several exact schema validators have a
-    // product worst case over their recursive term-tree walks, even when the
-    // authored clause/`:args` vectors are tiny. `unfolded_work` counts shared
-    // sub-DAGs once per recursive occurrence, so it also covers exponential
-    // re-walks that a unique-node census misses.
-    let named_recursive_work = checked_mul_usize(payload.work, payload.unfolded_work)?;
-    let recursive_pair_work = checked_mul_usize(payload.unfolded_work, payload.unfolded_work)?;
-    let base_work = named_recursive_work.max(recursive_pair_work);
-    let mut work = base_work;
-    let mut bytes = payload.bytes;
+/// Per-unfolded-node allowance for the array schemas' live scratch.
+///
+/// A store-chain entry is `(TermId, TermId)`, an index/pair set entry is at
+/// most that plus hash control bytes and growth slack, and every such entry
+/// needs at least one unfolded node to exist. 128 bytes covers the widest
+/// entry in any of the sub-schemas' live containers.
+const ARRAY_SCHEMA_ENTRY_BYTES: usize = 128;
 
-    let (private_work, private_bytes) = match step {
-        ProofStep::Step {
-            rule: AletheRule::Skolem,
-            ..
-        } => (100_000, 8 * 1024 * 1024),
-        ProofStep::Step {
-            rule: AletheRule::Evaluate,
-            ..
-        } => (100_000, 1024 * 1024),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::StringGroundEval,
-            ..
-        } => {
-            // Ground string values are decoded from UTF-8 to four-byte chars
-            // and cloned through the value memo. The three evaluator maps can
-            // retain one hash-table entry per unit of their shared 4M budget;
-            // 96 bytes covers the largest loop-memo key, value, bucket slack,
-            // and control bytes. Its separate aggregate `Vec<char>` allocation
-            // cap is shared with the evaluator, so the precharge and internal
-            // fail-closed check cannot drift.
-            let decoded_and_cloned = checked_mul_usize(payload.bytes, 16)?;
-            let table_overhead = checked_mul_usize(crate::checker::STRING_EVAL_WORK_LIMIT, 96)?;
-            let char_allocation = checked_mul_usize(
-                crate::checker::STRING_CHAR_ALLOCATION_LIMIT,
-                size_of::<char>(),
-            )?;
-            let numeric_allocation =
-                checked_add_usize(crate::checker::STRING_NUMERIC_BIT_ALLOCATION_LIMIT, 7)? / 8;
-            let private_work = checked_add_usize(
-                checked_add_usize(
-                    crate::checker::STRING_EVAL_WORK_LIMIT,
-                    crate::checker::STRING_CHAR_ALLOCATION_LIMIT,
-                )?,
-                crate::checker::STRING_NUMERIC_WORK_LIMIT,
-            )?;
-            (
-                private_work,
-                checked_add_usize(
-                    checked_add_usize(
-                        checked_add_usize(table_overhead, char_allocation)?,
-                        numeric_allocation,
-                    )?,
-                    decoded_and_cloned,
-                )?,
-            )
-        }
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::RegexIntersectEmpty,
-            ..
-        } => (10_600_000, 256 * 1024 * 1024),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::NraIntervalUnsat | TheoryLemmaKind::NraUnivariateUnsat,
-            ..
-        } => (8_300_000, 128 * 1024 * 1024),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::FpForwardError,
-            ..
-        } => (1_000_000, 16 * 1024 * 1024),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::FpGroundEval,
-            ..
-        } => {
-            // The exact IEEE-754 evaluator enumerates at most
-            // `2^MAX_ENUMERATION_BITS` assignments and spends one unit per
-            // evaluated node, capped by its own work budget; its rationals are
-            // bounded by the same constant, so the byte charge scales with the
-            // clause payload at the same factor as the enumeration.
-            (
-                crate::checker::FP_GROUND_WORK_LIMIT,
-                checked_mul_usize(payload.bytes, 1 << 16)?,
-            )
-        }
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::FpClassification { .. },
-            ..
-        } => (
-            checked_mul_usize(base_work, 1 << 16)?,
-            checked_mul_usize(payload.bytes, 1 << 16)?,
-        ),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::OrderIteTautology,
-            ..
-        } => (
-            checked_mul_usize(base_work, 46_656)?,
-            checked_mul_usize(payload.bytes, 46_656)?,
-        ),
-        ProofStep::TheoryLemma {
-            kind:
-                TheoryLemmaKind::BoolTautology
-                | TheoryLemmaKind::BvBitBlast
-                | TheoryLemmaKind::BvBitBlastGate { .. },
-            ..
-        } => (
-            checked_mul_usize(base_work, 1 << 8)?,
-            checked_mul_usize(payload.bytes, 1 << 8)?,
-        ),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::ArrayDefaultConst | TheoryLemmaKind::ArrayExtensionality,
-            ..
-        } => (100_000, checked_mul_usize(payload.bytes, 2)?),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::SetCardMemberCount,
-            ..
-        } => (
-            checked_mul_usize(payload.work, payload.unfolded_work)?,
-            checked_mul_usize(payload.bytes, 512)?,
-        ),
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::ArrayRowChain | TheoryLemmaKind::ArrayStorePermutation,
-            ..
-        } => {
-            let square = checked_mul_usize(payload.unfolded_work, payload.unfolded_work)?;
-            let cube = checked_mul_usize(square, payload.unfolded_work)?;
-            let named_cube = checked_mul_usize(square, payload.work)?;
-            (
-                cube.max(named_cube),
-                checked_mul_usize(payload.bytes, square)?,
-            )
-        }
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::LraFarkas | TheoryLemmaKind::LiaGeneric,
-            ..
-        } => {
-            let square = checked_mul_usize(payload.unfolded_work, payload.unfolded_work)?;
-            let cube = checked_mul_usize(square, payload.unfolded_work)?;
-            let coefficient_work = checked_mul_usize(square, payload.work)?;
-            (
-                cube.max(coefficient_work),
-                checked_mul_usize(payload.bytes, square)?,
-            )
-        }
-        _ => (0, 0),
-    };
-    work = work.max(private_work);
-    bytes = bytes.max(private_bytes);
-    Ok((work, bytes))
-}
+/// Work factor for [`SemanticChargeClass::EufIdentityRoute`], applied to the
+/// step's DAG payload `work` (NOT the tree-unfolded payload).
+///
+/// The base per-step payload walk already debits `work` once. On top of that a
+/// reclassified validator performs at most a small constant number of extra
+/// linear passes over the same reachable DAG: decode each literal's leading-not
+/// chain, clone the top-level argument lists, build a `TermId`-keyed adjacency
+/// map, BFS it, and reconstruct one path — each `O(clause + premises)` and thus
+/// `<= work`. Eight covers every such pass with room to spare while staying
+/// LINEAR in `work`, so a genuinely wide EUF step still grows its charge and is
+/// refused once its real DAG payload is large enough.
+const EUF_IDENTITY_WORK_FACTOR: usize = 8;
+
+/// Byte factor for [`SemanticChargeClass::EufIdentityRoute`]. The validators'
+/// scratch (edge vector, two `TermId`-keyed hash maps, a BFS queue) is
+/// `O(premises)` entries of a `TermId` plus small control words; four times the
+/// step's DAG payload bytes dominates it.
+const EUF_IDENTITY_BYTE_FACTOR: usize = 4;
+
+/// Saturating second factor for [`SemanticChargeClass::BoundedAssignmentEval`].
+///
+/// `validate_bounded_clause_semantics` refuses any clause whose bounded
+/// variables need more than `MAX_BOUNDED_ASSIGNMENT_BITS` assignment bits, and
+/// every bounded variable consumes at least one bit, so the evaluation
+/// environment holds at most that many entries. `eval_term` resolves a variable
+/// by a LINEAR scan of that environment, and every other node kind is constant
+/// work, so one assignment's pass over a literal tree costs at most
+/// `unfolded_work * (MAX_BOUNDED_ASSIGNMENT_BITS + 1)`. The `+ 1` covers the
+/// per-node dispatch itself, so the bound also holds for a tree with no
+/// variables at all.
+///
+/// This is the ONLY difference from the `General` product, and it is a pure
+/// TIGHTENING: `min(unfolded_work, BOUNDED_EVAL_ENV_WIDTH) <= unfolded_work`,
+/// so this class never charges more than `General` did for the same step.
+const BOUNDED_EVAL_ENV_WIDTH: usize = crate::checker::MAX_BOUNDED_ASSIGNMENT_BITS as usize + 1;
+
+/// Assignment count enumerated by the bounded Bool/BV evaluator.
+const BOUNDED_EVAL_ASSIGNMENTS: usize = 1 << crate::checker::MAX_BOUNDED_ASSIGNMENT_BITS;
 
 fn datatype_registry_charge(
     step: &ProofStep,
@@ -1617,14 +1568,18 @@ fn datatype_registry_charge(
         ProofStep::TheoryLemma {
             kind: TheoryLemmaKind::DatatypeDistinct
                 | TheoryLemmaKind::DatatypeSelectorProject
-                | TheoryLemmaKind::DatatypeTesterEval,
+                | TheoryLemmaKind::DatatypeTesterEval
+                | TheoryLemmaKind::DatatypeExhaustive
+                | TheoryLemmaKind::DatatypeConstructorReconstruct
+                | TheoryLemmaKind::ArrayFiniteExtensionality
+                | TheoryLemmaKind::ArrayFiniteSelectExpansion,
             ..
         }
     ) {
         return Ok((0, 0));
     }
 
-    // All three declaration-backed validators can rescan a registry for each
+    // Each declaration-backed validator can rescan a registry for each
     // decoded literal/constructor. Tester evaluation also has an exhaustive
     // lane with repeated constructor membership checks and may consult the
     // selector registry for a nullary sibling. The retained census charges
@@ -1673,24 +1628,55 @@ fn binary_resolution_charge(
     left: usize,
     right: usize,
     conclusion: usize,
+    literal_decode_work: usize,
 ) -> Result<(usize, usize), ProofCheckError> {
     let input = checked_add_usize(left, right)?;
     let total = checked_add_usize(input, conclusion)?;
-    let pairs = checked_mul_usize(left, right)?;
 
     let mut work = checked_add_usize(sort_comparison_bound(left)?, sort_comparison_bound(right)?)?;
     work = checked_add_usize(work, sort_comparison_bound(conclusion)?)?;
-    work = checked_add_usize(
-        work,
-        checked_mul_usize(pairs, checked_add_usize(total, 1)?)?,
-    )?;
+    // The argument-DIRECTED validator (`resolution_exact`) additionally
+    // constructs and sorts the resolvent, which has at most `total` literals and
+    // receives no progress callback of its own; charge that fourth sort here so
+    // the directed path stays covered without the dropped width term.
+    work = checked_add_usize(work, sort_comparison_bound(total)?)?;
+    // The pivot search itself is no longer precharged here. The argument-free
+    // form is decided by `checker::resolution::argfree_binary_resolution_metered`,
+    // which finds the pivot in O(total) on the common clean case (one LINEAR
+    // difference merge, bounded by the `total`-sized trial charge it debits) and
+    // debits any exhaustive fallback trial-by-trial through the strict-check
+    // meter (failing closed). Precharging the former `input * (total + 1)` scan
+    // worst case here over-charged every ordinary two-premise step by the clause
+    // WIDTH — on `QF_AUFLIA/storecomm` 309 ~1000-literal `th_resolution` steps
+    // consumed 259M of the 350M envelope and withheld a correctly decided UNSAT.
+    // Literal decoding walks each literal's COMPLETE leading-not chain, then
+    // treats the atom below it as an opaque `TermId` — it never descends into
+    // the atom's arguments. `literal_decode_work` is the step's reachable-DAG
+    // payload `work`, which counts every `Not` node once and therefore upper-
+    // bounds the total leading-not length across the step's clauses; it is NOT
+    // the tree-unfolded payload (that squared a store-chain's internal sharing
+    // and withheld correct `storecomm` UNSAT results). Both routes make one
+    // decoding pass per clause (`clause_as_set` for the argument-free form,
+    // `clause_as_unique_set` plus one pivot per link for the argument-directed
+    // one); four passes cover either with room to spare. Without this the
+    // exemption in `SemanticChargeClass::ResolutionRoute` would leave deep
+    // negation chains unpaid.
+    work = checked_add_usize(work, checked_mul_usize(literal_decode_work, 4)?)?;
 
-    let decoded_bytes = checked_mul_usize(total, size_of::<(TermId, bool)>())?;
-    let semantic_bytes = checked_mul_usize(
-        checked_mul_usize(pairs, total)?,
-        checked_add_usize(size_of::<TermId>(), 32)?,
-    )?;
-    Ok((work, checked_add_usize(decoded_bytes, semantic_bytes)?))
+    // Exactly three decoded sets are built — both premises and the conclusion,
+    // `total` literals in all — and `resolves_to` is documented and written to
+    // merge them WITHOUT allocating a resolvent, which is why the byte term is
+    // linear. Four copies cover the sets, the argument-directed form's one
+    // resolvent per link, and `Vec` growth slack.
+    //
+    // The superseded `pairs * total * 36` term modelled one full resolvent
+    // allocation per candidate pivot, which this path does not perform: on
+    // `QF_AX/storecomm/storecomm_t1_np_nf_ai_00030_005.cvc` it demanded 6.7 MB
+    // for one 23+23 -> 304 step, and such steps exhausted the 1.34 GB byte
+    // envelope 568 steps into the proof.
+    let decoded_bytes =
+        checked_mul_usize(checked_mul_usize(total, 4)?, size_of::<(TermId, bool)>())?;
+    Ok((work, decoded_bytes))
 }
 
 fn chain_resolution_charge(
@@ -1698,7 +1684,7 @@ fn chain_resolution_charge(
     derived_clauses: &[Option<Vec<TermId>>],
     conclusion: usize,
     argument_free_unit_tail: bool,
-    unfolded_literal_work: usize,
+    literal_decode_work: usize,
 ) -> Result<(usize, usize), ProofCheckError> {
     if premises.len() < 2 {
         return Ok((0, 0));
@@ -1727,7 +1713,7 @@ fn chain_resolution_charge(
         let hash_operations = checked_add_usize(total, set_entries)?;
         let shape_scans = checked_mul_usize(premises.len(), 3)?;
         let work = checked_add_usize(
-            unfolded_literal_work,
+            literal_decode_work,
             checked_add_usize(hash_operations, shape_scans)?,
         )?;
         let hash_entry_bytes = checked_add_usize(size_of::<(TermId, bool)>(), 32)?;
@@ -1735,27 +1721,28 @@ fn chain_resolution_charge(
         return Ok((work, bytes));
     }
 
+    // ENTRY COST ONLY. The bounded ambiguity search now charges each link as it
+    // is explored (`checker::resolution::validate_chain_resolution_rule`), so
+    // pre-charging its worst case here would double-charge the ordinary
+    // unambiguous chain — and did so at two orders of magnitude, exhausting the
+    // byte envelope on proofs whose steps each allocate tens of kilobytes.
+    //
+    // What still must be paid up front is everything that happens WITHOUT a
+    // per-link charge: the two entry sets, and — on the argument-DIRECTED path,
+    // which folds the chain linearly and never enters the search — one decoded
+    // set per link. `branch_budget + 1` decoding passes over the step's
+    // reachable-DAG literal payload (`literal_decode_work`) covers both,
+    // including complete leading-not chains — the DAG payload counts every `Not`
+    // node once and so bounds the total not-chain length — and the sort inside
+    // each set construction (its `log2(total)` factor is far below
+    // `branch_budget`).
     let branch_budget = checked_add_usize(checked_mul_usize(premises.len(), 4)?, 256)?;
-    let pair_checks = checked_mul_usize(checked_mul_usize(branch_budget, total)?, max_premise)?;
-    let candidates_per_branch = max_premise.min(8);
-    let candidate_literals = checked_mul_usize(
-        checked_mul_usize(branch_budget, candidates_per_branch)?,
-        total,
-    )?;
-    let candidate_work = checked_mul_usize(
-        candidate_literals,
-        checked_add_usize(
-            if total <= 1 {
-                1
-            } else {
-                usize::BITS as usize - (total - 1).leading_zeros() as usize
-            },
-            1,
-        )?,
-    )?;
+    let decode_passes =
+        checked_mul_usize(checked_add_usize(branch_budget, 1)?, literal_decode_work)?;
+    let entry_literals = checked_mul_usize(total, 2)?;
     Ok((
-        checked_add_usize(pair_checks, candidate_work)?,
-        checked_mul_usize(candidate_literals, size_of::<TermId>())?,
+        checked_add_usize(decode_passes, entry_literals)?,
+        checked_mul_usize(entry_literals, size_of::<(TermId, bool)>())?,
     ))
 }
 
@@ -1791,7 +1778,128 @@ fn drup_charge(
     ))
 }
 
+/// Pick the charge model for `step`. Every non-`General` class either
+/// replaces the general recursive-tree estimate with a route-specific meter or
+/// identifies a private allocation path charged dynamically by the checker.
+fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> SemanticChargeClass {
+    if matches!(
+        step,
+        ProofStep::Resolution { .. }
+            | ProofStep::Step {
+                rule: AletheRule::Resolution | AletheRule::ThResolution,
+                ..
+            }
+    ) {
+        return SemanticChargeClass::ResolutionRoute;
+    }
+    if matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::DatatypeEnumPigeonhole,
+            ..
+        }
+    ) {
+        return SemanticChargeClass::DatatypeEnumPigeonhole;
+    }
+    if matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArrayRowChain | TheoryLemmaKind::ArrayStorePermutation,
+            ..
+        }
+    ) {
+        return SemanticChargeClass::ArrayClauseSchema;
+    }
+    if farkas_meter::uses_progress_meter(step, terms) {
+        return SemanticChargeClass::ProgressFarkas;
+    }
+    if is_euf_identity_route(step) {
+        return SemanticChargeClass::EufIdentityRoute;
+    }
+    if matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::BoolTautology,
+            ..
+        }
+    ) {
+        return SemanticChargeClass::BoundedAssignmentEval;
+    }
+    if matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::Or,
+            ..
+        }
+    ) {
+        return SemanticChargeClass::UnorderedClauseMatch;
+    }
+    SemanticChargeClass::General
+}
+
+/// Recognize the EUF identity/congruence family whose strict validators are
+/// bounded by the step's reachable DAG (no descent into argument subterms), in
+/// BOTH its Alethe-step and theory-lemma spellings. Kept as a conservative
+/// allowlist: any rule NOT proven `TermId`-identity bounded stays `General` and
+/// keeps the conservative tree-unfolded charge.
+fn is_euf_identity_route(step: &ProofStep) -> bool {
+    match step {
+        ProofStep::Step {
+            rule:
+                AletheRule::Refl
+                | AletheRule::Symm
+                | AletheRule::Trans
+                | AletheRule::Cong
+                | AletheRule::EqTransitive
+                | AletheRule::EqCongruent
+                | AletheRule::EqCongruentPred,
+            ..
+        } => true,
+        ProofStep::TheoryLemma {
+            kind:
+                TheoryLemmaKind::EufReflexive
+                | TheoryLemmaKind::EufTransitive
+                | TheoryLemmaKind::EufCongruent
+                | TheoryLemmaKind::EufCongruentPred,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+fn strict_semantic_charge(
+    step: &ProofStep,
+    semantic_payload: PayloadStats,
+    semantic_class: SemanticChargeClass,
+) -> Result<(usize, usize), ProofCheckError> {
+    // `ArrayRowChain` AND `ArrayStorePermutation` meter their ACTUAL validation
+    // work through the strict-check progress callback inside their validators
+    // ([`crate::checker::validate_array_row_chain`] /
+    // [`crate::checker::validate_array_store_permutation`]) — the same
+    // (0,0)-precharge-then-debit-actual pattern `ResolutionRoute`/`Generic`
+    // lemmas use — so they take NO up-front semantic precharge here. The former
+    // `ArrayClauseSchema` precharge (`~8 * unfolded_work^2`) is quadratic in the
+    // step's unfolded payload, hence QUARTIC in the store-chain length for the
+    // store-commutativity clause shape (whose `O(P^2)` index-pair literal count
+    // makes `unfolded_work` itself `Θ(P^2)`); it over-charged the common
+    // genuinely-`O(L + P^2)` shape and withheld a correctly decided `storecomm`
+    // UNSAT. Both validators now debit a tight `O(L + P^2)` bound per node/pair
+    // and fail closed on an adversarial clause.
+    if matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArrayRowChain | TheoryLemmaKind::ArrayStorePermutation,
+            ..
+        }
+    ) {
+        Ok((0, 0))
+    } else {
+        semantic_validator_charge(step, semantic_payload, semantic_class)
+    }
+}
+
 fn strict_step_charge(
+    terms: &TermStore,
     step: &ProofStep,
     derived_clauses: &[Option<Vec<TermId>>],
     derived_literal_count: usize,
@@ -1831,7 +1939,9 @@ fn strict_step_charge(
             prior_clause_len(derived_clauses, *clause1),
             prior_clause_len(derived_clauses, *clause2),
         ) {
-            (Some(left), Some(right)) => binary_resolution_charge(left, right, clause_len)?,
+            (Some(left), Some(right)) => {
+                binary_resolution_charge(left, right, clause_len, semantic_payload.unfolded_work)?
+            }
             _ => (0, 0),
         },
         ProofStep::Step {
@@ -1842,7 +1952,9 @@ fn strict_step_charge(
             prior_clause_len(derived_clauses, premises[0]),
             prior_clause_len(derived_clauses, premises[1]),
         ) {
-            (Some(left), Some(right)) => binary_resolution_charge(left, right, clause_len)?,
+            (Some(left), Some(right)) => {
+                binary_resolution_charge(left, right, clause_len, semantic_payload.unfolded_work)?
+            }
             _ => (0, 0),
         },
         ProofStep::Step {
@@ -1864,20 +1976,8 @@ fn strict_step_charge(
     };
     work = checked_add_usize(work, expensive.0)?;
     bytes = checked_add_usize(bytes, expensive.1)?;
-    let semantic_class = if argument_free_unit_tail {
-        SemanticChargeClass::ArgumentFreeUnitTail
-    } else if matches!(
-        step,
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::DatatypeEnumPigeonhole,
-            ..
-        }
-    ) {
-        SemanticChargeClass::DatatypeEnumPigeonhole
-    } else {
-        SemanticChargeClass::General
-    };
-    let semantic = semantic_validator_charge(step, semantic_payload, semantic_class)?;
+    let semantic_class = select_semantic_charge_class(step, terms);
+    let semantic = strict_semantic_charge(step, semantic_payload, semantic_class)?;
     work = checked_add_usize(work, semantic.0)?;
     bytes = checked_add_usize(bytes, semantic.1)?;
     Ok((work, bytes))
@@ -1889,11 +1989,16 @@ enum GenericTheoryDeferral {
     Collect,
 }
 
+// This is the single boundary that threads the complete proof-validation
+// context into the strict pass; bundling these borrowed registries would only
+// obscure their distinct provenance and lifetime contracts.
+#[allow(clippy::too_many_arguments)]
 fn validate_strict_steps_with_context(
     proof: &Proof,
     terms: &TermStore,
     dt_decls: Option<&[(String, Vec<String>)]>,
     ctor_selectors: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: Option<&[DatatypeMemberSignature]>,
     problem_assertions: Option<&[TermId]>,
     generic_theory_deferral: GenericTheoryDeferral,
     progress: &mut dyn FnMut(usize, usize) -> bool,
@@ -1908,10 +2013,15 @@ fn validate_strict_steps_with_context(
         terms,
         dt_decls,
         ctor_selectors,
+        datatype_member_signatures,
         problem_assertions,
         progress,
     )?;
     let payload_stats = authentication_stats.aggregate;
+
+    if let Some(signatures) = datatype_member_signatures {
+        validate_datatype_signature_context(terms, dt_decls, ctor_selectors, signatures)?;
+    }
 
     // Cover the proof scan that counts tagged lemmas, then debit both complete
     // memoized classifier passes before either one can execute.
@@ -2001,16 +2111,18 @@ fn validate_strict_steps_with_context(
         deferred_generic = Vec::with_capacity(deferred_count);
     }
 
+    // A2: pure `cost()` values are memoized once per validation; every
+    // payload work/byte charge stays per-step (see `TermCostMemo`). The memo
+    // never outlives this validation, and the `check_bounded_finite_enum_proof`
+    // route inherits it by construction — this loop is the only production
+    // caller of `meter_step_term_payload`.
+    let mut term_cost_memo = TermCostMemo::default();
+
     for (idx, step) in proof.steps.iter().enumerate() {
-        let semantic_payload = match step {
-            ProofStep::Resolution { .. }
-            | ProofStep::TheoryLemma { .. }
-            | ProofStep::Step { .. } => {
-                meter_step_term_payload(step, terms, &derived_clauses, progress)?
-            }
-            _ => PayloadStats::default(),
-        };
+        let semantic_payload =
+            semantic_payload::meter(step, terms, &derived_clauses, &mut term_cost_memo, progress)?;
         let (mut step_work, mut step_bytes) = strict_step_charge(
+            terms,
             step,
             &derived_clauses,
             derived_literal_count,
@@ -2034,7 +2146,7 @@ fn validate_strict_steps_with_context(
                     ..
                 }
             );
-        validate_step_with_datatypes(
+        validate_step_with_datatypes_and_progress(
             terms,
             &mut derived_clauses,
             ProofId(idx as u32),
@@ -2042,9 +2154,11 @@ fn validate_strict_steps_with_context(
             true,
             dt_decls,
             ctor_selectors,
+            datatype_member_signatures,
             ext_diff.as_ref(),
             empty_sets.as_ref(),
             collect_this_generic.then_some(&mut deferred_generic),
+            progress,
         )?;
         derived_literal_count = checked_add_usize(derived_literal_count, step_clause_len(step))?;
         // Validators such as BV replay own internal deadlines. This zero-cost
@@ -2158,6 +2272,10 @@ fn classify_step(step: &ProofStep, quality: &mut ProofQuality) {
 #[cfg(test)]
 #[path = "quality_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "quality_a2_poll_tests.rs"]
+mod a2_poll_tests;
 
 #[cfg(test)]
 #[path = "quality_finite_enum_meter_tests.rs"]

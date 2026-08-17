@@ -493,13 +493,13 @@ mod fixed_assignment_tree_warm_mode_tests {
     }
 }
 
-/// Whether the float lane runs. Off via `AY_MILP_NO_FLOAT=1`, which forces every
+/// Whether the float lane runs. Off via `the no-float knob`, which forces every
 /// solve down the exact rim — the A/B switch the float lane's speedup is
 /// measured with, and the escape hatch if it ever misbehaves. Read once: this
 /// sits on the per-solve path.
 fn float_lane_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_NO_FLOAT").is_none())
+    *ENABLED.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::NoFloat) != Some(true))
 }
 
 /// Build the exact-lane iteration/deadline budget for `model` under `opts`.
@@ -538,14 +538,11 @@ fn cert_budget_for(model: &Model, opts: &SolveOpts) -> Budget {
 /// Farkas certificate quickly; when infeasibility required branching, no root
 /// certificate exists and a long exact pass would be wasted. The pass is
 /// therefore capped at `max(5s, 15% of the time limit)`, overridable with
-/// `AY_MILP_CERT_GRACE=<secs>` (`0` selects the uncapped behavior). The verdict
+/// `--cert-grace-secs` (`0` selects the uncapped behavior). The verdict
 /// is never at stake: a budget miss only leaves `cert` as `None`.
 fn cert_budget_native(model: &Model, opts: &SolveOpts) -> Budget {
     let uncapped = cert_budget_for(model, opts);
-    let cap = match std::env::var("AY_MILP_CERT_GRACE")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-    {
+    let cap = match crate::tune::real_opt(crate::tune::Knob::CertGraceSecs) {
         Some(s) if s == 0.0 => return uncapped,
         Some(s) if s > 0.0 => Duration::from_secs_f64(s),
         _ => opts
@@ -1469,7 +1466,7 @@ fn certified_weak_row_from_duals(
         (None, Some(_)) => (&negated_duals[..], row_duals),
         _ => (row_duals, &negated_duals[..]),
     };
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+    let trace = crate::debug_flags::milp_debug_flags().trace;
     for (proposal, duals) in [first, second].into_iter().enumerate() {
         if let Some(row) = certified_weak_dual_row(model, q, duals, deadline) {
             let sufficient = stronger_than.is_none_or(|threshold| &row.lb > threshold);
@@ -1477,12 +1474,12 @@ fn certified_weak_row_from_duals(
                 let lb = &row.lb;
                 match stronger_than {
                     Some(threshold) => eprintln!(
-                        "AY_MILP_TRACE {trace_context} proposal {proposal}: \
+                        "--trace {trace_context} proposal {proposal}: \
                          lb={lb} threshold={threshold} sufficient={sufficient}"
                     ),
-                    None => eprintln!(
-                        "AY_MILP_TRACE {trace_context} proposal {proposal}: lb={lb} accepted"
-                    ),
+                    None => {
+                        eprintln!("--trace {trace_context} proposal {proposal}: lb={lb} accepted")
+                    }
                 }
             }
             if sufficient {
@@ -2170,7 +2167,7 @@ fn adaptive_target_fsb_select_stage(
     probe_calls: &mut usize,
     trace_context: &str,
 ) -> Option<(usize, [f64; 2], f64)> {
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+    let trace = crate::debug_flags::milp_debug_flags().trace;
     let mut selected_index = None;
     let mut selected_bounds = [f64::NEG_INFINITY; 2];
     let mut selected_worst = f64::NEG_INFINITY;
@@ -2207,7 +2204,7 @@ fn adaptive_target_fsb_select_stage(
         let worst = zero.min(one);
         if trace {
             eprintln!(
-                "AY_MILP_TRACE {trace_context}: candidate_col={} zero={zero:.17e} \
+                "--trace {trace_context}: candidate_col={} zero={zero:.17e} \
                  one={one:.17e} worst={worst:.17e}",
                 candidate.index(),
             );
@@ -3959,14 +3956,14 @@ impl LpSession {
                 let row = cert.into_certified_row();
                 row.verify(&self.model).ok()?;
                 let sufficient = stronger_than.is_none_or(|threshold| &row.lb > threshold);
-                if std::env::var_os("AY_MILP_TRACE").is_some() {
+                if crate::debug_flags::milp_debug_flags().trace {
                     match stronger_than {
                         Some(threshold) => eprintln!(
-                            "AY_MILP_TRACE harvest exact fallback: lb={} threshold={threshold} sufficient={sufficient}",
+                            "--trace harvest exact fallback: lb={} threshold={threshold} sufficient={sufficient}",
                             row.lb
                         ),
                         None => eprintln!(
-                            "AY_MILP_TRACE harvest exact fallback: lb={} accepted",
+                            "--trace harvest exact fallback: lb={} accepted",
                             row.lb
                         ),
                     }
@@ -4209,9 +4206,9 @@ impl LpSession {
                 {
                     return None;
                 }
-                if std::env::var_os("AY_MILP_TRACE").is_some() {
+                if crate::debug_flags::milp_debug_flags().trace {
                     eprintln!(
-                        "AY_MILP_TRACE assignment tree prefix bridge: \
+                        "--trace assignment tree prefix bridge: \
                          fixed={prefix_len}/{depth} start={start_assignment:0depth$b} \
                          mode={:?} status={:?} basis_changes={basis_changes}",
                         WarmSolveMode::PrimalAdvice,
@@ -4266,9 +4263,9 @@ impl LpSession {
                     if expired() {
                         return None;
                     }
-                    if std::env::var_os("AY_MILP_TRACE").is_some() {
+                    if crate::debug_flags::milp_debug_flags().trace {
                         eprintln!(
-                            "AY_MILP_TRACE assignment tree first proof leaf: \
+                            "--trace assignment tree first proof leaf: \
                              incoming={incoming_status:?} mode={warm_mode:?} \
                              route=cached-dual-verified"
                         );
@@ -4292,9 +4289,9 @@ impl LpSession {
                 deadline,
             );
             drop(prior);
-            if step == 0 && warm_start.is_some() && std::env::var_os("AY_MILP_TRACE").is_some() {
+            if step == 0 && warm_start.is_some() && crate::debug_flags::milp_debug_flags().trace {
                 eprintln!(
-                    "AY_MILP_TRACE assignment tree first proof leaf: \
+                    "--trace assignment tree first proof leaf: \
                      incoming={incoming_status:?} mode={warm_mode:?} \
                      status={:?}",
                     candidate.status
@@ -4443,9 +4440,9 @@ impl LpSession {
         {
             return None;
         }
-        if warm_start.is_some() && std::env::var_os("AY_MILP_TRACE").is_some() {
+        if warm_start.is_some() && crate::debug_flags::milp_debug_flags().trace {
             eprintln!(
-                "AY_MILP_TRACE assignment tree root start: strategy={warm_start:?} \
+                "--trace assignment tree root start: strategy={warm_start:?} \
                  status={:?}",
                 root.status
             );
@@ -4600,7 +4597,7 @@ impl LpSession {
             return None;
         }
 
-        let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+        let trace = crate::debug_flags::milp_debug_flags().trace;
         let mut lower = lp.lower.clone();
         let mut upper = lp.upper.clone();
         let mut rc_scratch = vec![(0.0, 0.0); lp.n];
@@ -4642,7 +4639,7 @@ impl LpSession {
             let worst = zero.min(one);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE target FSB first candidate: col={} zero={zero:.17e} \
+                    "--trace target FSB first candidate: col={} zero={zero:.17e} \
                      one={one:.17e} worst={worst:.17e}",
                     candidate.index()
                 );
@@ -4677,7 +4674,7 @@ impl LpSession {
             let worst = bounds.into_iter().fold(f64::INFINITY, f64::min);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE target FSB joint candidate: first_col={} \
+                    "--trace target FSB joint candidate: first_col={} \
                      second_col={} b00={:.17e} b01={:.17e} b10={:.17e} \
                      b11={:.17e} worst={worst:.17e}",
                     first.index(),
@@ -4699,7 +4696,7 @@ impl LpSession {
         let selected = [first, candidates[second_index]];
         if trace {
             eprintln!(
-                "AY_MILP_TRACE target FSB selected: first_col={} first_worst={first_worst:.17e} \
+                "--trace target FSB selected: first_col={} first_worst={first_worst:.17e} \
                  second_col={} joint_worst={joint_worst:.17e} probes={probe_calls}/{required_calls}",
                 selected[0].index(),
                 selected[1].index(),
@@ -4890,7 +4887,7 @@ impl LpSession {
             return None;
         }
 
-        let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+        let trace = crate::debug_flags::milp_debug_flags().trace;
         let mut lower = lp.lower.clone();
         let mut upper = lp.upper.clone();
         let hard = f64::from(u8::from(hard_value));
@@ -4939,7 +4936,7 @@ impl LpSession {
             let worst = zero.min(one);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE adaptive three-leaf candidate: root_col={} hard={} \
+                    "--trace adaptive three-leaf candidate: root_col={} hard={} \
                      second_col={} zero={zero:.17e} one={one:.17e} worst={worst:.17e}",
                     root_split.index(),
                     u8::from(hard_value),
@@ -4961,7 +4958,7 @@ impl LpSession {
         let second_split = candidates[second_candidate_index];
         if trace {
             eprintln!(
-                "AY_MILP_TRACE adaptive three-leaf selected: root_col={} hard={} \
+                "--trace adaptive three-leaf selected: root_col={} hard={} \
                  second_col={} zero={:.17e} one={:.17e} worst={selected_worst:.17e} \
                  probes={probe_calls}/{required_calls}",
                 root_split.index(),
@@ -5163,10 +5160,10 @@ impl LpSession {
             return None;
         }
 
-        let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+        let trace = crate::debug_flags::milp_debug_flags().trace;
         if trace {
             eprintln!(
-                "AY_MILP_TRACE adaptive four-leaf anchor: root_col={} root_hard={} status=optimal",
+                "--trace adaptive four-leaf anchor: root_col={} root_hard={} status=optimal",
                 root_split.index(),
                 u8::from(root_hard_value),
             );
@@ -5211,7 +5208,7 @@ impl LpSession {
             let worst = zero.min(one);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE adaptive four-leaf second candidate: root_col={} \
+                    "--trace adaptive four-leaf second candidate: root_col={} \
                      root_hard={} second_col={} zero={zero:.17e} one={one:.17e} \
                      worst={worst:.17e}",
                     root_split.index(),
@@ -5273,7 +5270,7 @@ impl LpSession {
             let worst = zero.min(one);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE adaptive four-leaf third candidate: root_col={} \
+                    "--trace adaptive four-leaf third candidate: root_col={} \
                      root_hard={} second_col={} second_hard={} third_col={} \
                      zero={zero:.17e} one={one:.17e} worst={worst:.17e}",
                     root_split.index(),
@@ -5304,7 +5301,7 @@ impl LpSession {
         let third_split = candidates[third_candidate_index];
         if trace {
             eprintln!(
-                "AY_MILP_TRACE adaptive four-leaf selected: root_col={} root_hard={} \
+                "--trace adaptive four-leaf selected: root_col={} root_hard={} \
                  second_col={} second_hard={} second_zero={:.17e} second_one={:.17e} \
                  second_worst={second_worst:.17e} third_col={} third_zero={:.17e} \
                  third_one={:.17e} third_worst={third_worst:.17e} \
@@ -5544,10 +5541,10 @@ impl LpSession {
             return None;
         }
 
-        let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+        let trace = crate::debug_flags::milp_debug_flags().trace;
         if trace {
             eprintln!(
-                "AY_MILP_TRACE adaptive five-leaf anchor: root_col={} root_hard={} status=optimal",
+                "--trace adaptive five-leaf anchor: root_col={} root_hard={} status=optimal",
                 root_split.index(),
                 u8::from(root_hard_value),
             );
@@ -5640,7 +5637,7 @@ impl LpSession {
         let fourth_split = candidates[fourth_candidate_index];
         if trace {
             eprintln!(
-                "AY_MILP_TRACE adaptive five-leaf selected: root_col={} root_hard={} \
+                "--trace adaptive five-leaf selected: root_col={} root_hard={} \
                  second_col={} second_hard={} second_zero={:.17e} second_one={:.17e} \
                  second_worst={second_worst:.17e} third_col={} third_hard={} \
                  third_zero={:.17e} third_one={:.17e} third_worst={third_worst:.17e} \
@@ -6113,7 +6110,7 @@ struct ScopeFrame {
 enum MilpLane {
     /// Native branch-and-bound over the float LP core.
     Native,
-    /// ay-dpll typed-Solver fallback, forced with `AY_MILP_SMT=1`.
+    /// ay-dpll typed-Solver fallback, forced with `--smt-lane`.
     #[cfg(feature = "smt")]
     Smt(Box<crate::smt::SmtMilp>),
     /// Exact rim (continuous models).
@@ -6141,22 +6138,11 @@ enum NetworkDesignReplayHandoff {
 /// branch-and-bound. The A/B switch the native lane is measured against.
 fn smt_lane_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| std::env::var_os("AY_MILP_SMT").is_some())
-}
-
-/// Whether the exact structure-recognition routes may claim an ordinary native
-/// check. Off process-wide via `AY_MILP_NO_STRUCTURE_ROUTE=1`: the A/B arm the
-/// routed lanes are measured against, and the escape hatch that pins a solve on
-/// native branch-and-bound (the only lane exporting a root Farkas or a
-/// whole-tree case-split certificate). Read once — this sits on the per-solve
-/// path. Per-session control is [`SolveOpts::with_structure_routing`].
-fn structure_routing_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_NO_STRUCTURE_ROUTE").is_none())
+    *FORCED.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::SmtLane) == Some(true))
 }
 
 fn structure_trace_enabled() -> bool {
-    std::env::var_os("AY_MILP_TRACE").is_some()
+    crate::debug_flags::milp_debug_flags().trace
 }
 
 /// The verdict word, for the one message a consumer must be able to read
@@ -6468,7 +6454,7 @@ impl BabSession {
         lane_claims: Vec<crate::cert_io::ReplayClaim>,
         finisher: Finisher,
     ) -> Option<Outcome> {
-        // `AY_MILP_ANCHOR_FIRST_REFUSAL_MS=0` is the DEGENERATE POINT: deferral
+        // `--anchor-first-refusal-ms` is the DEGENERATE POINT: deferral
         // off, every lane closes exactly as it did before the evidence floor
         // existed. Keeping that arm alive is what lets a differential test
         // assert the invariant on one binary instead of arguing about two.
@@ -6503,7 +6489,7 @@ impl BabSession {
                 })
                 .collect();
             eprintln!(
-                "AY_MILP_TRACE portfolio: lane={} DEFERRED ({}) — native gets first refusal",
+                "--trace portfolio: lane={} DEFERRED ({}) — native gets first refusal",
                 lane.lane,
                 below.join("; "),
             );
@@ -7156,12 +7142,11 @@ impl BabSession {
             // where `validate_witnesses` re-checks it — a better carrier than a
             // session side channel. Yield to it.
             && self.model.margin_row().is_none()
-            && self.opts.structure_routing
-            && structure_routing_enabled();
+            && self.opts.structure_routing;
 
         // A NOTE ON THE PRELUDE TAX, AND ON A FIX THAT WAS TRIED AND REJECTED.
         //
-        // The lattice device belongs to the ANCHOR — `AY_MILP_NO_STRUCTURE_ROUTE=1`
+        // The lattice device belongs to the ANCHOR — `SolveOpts::with_structure_routing(false)`
         // runs it at the top of `bab::structural_prologue` — and on the
         // market-split family it is the whole answer. Reaching it only through
         // branch-and-bound means the speculative prelude runs first, and on
@@ -7169,7 +7154,7 @@ impl BabSession {
         //
         // ```text
         //   default                        OPTIMAL 1 @ 1.13 s   3/3
-        //   AY_MILP_NO_STRUCTURE_ROUTE=1   OPTIMAL 1 @ 0.15 s   3/3
+        //   `SolveOpts::with_structure_routing(false)`   OPTIMAL 1 @ 0.15 s   3/3
         // ```
         //
         // (`pb_route::try_solve_production_portfolio` alone held 398 of 730
@@ -7458,7 +7443,7 @@ impl BabSession {
             );
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE network-design-attempt t={:.6}s applicable={}",
+                    "--trace network-design-attempt t={:.6}s applicable={}",
                     network_attempt_started.elapsed().as_secs_f64(),
                     !matches!(
                         network_attempt,
@@ -7646,7 +7631,7 @@ impl BabSession {
             });
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE infeasibility-probe single_row={:.6}s hit={}",
+                    "--trace infeasibility-probe single_row={:.6}s hit={}",
                     infeasibility_probe_started.elapsed().as_secs_f64(),
                     single_row.is_some(),
                 );
@@ -7692,7 +7677,7 @@ impl BabSession {
             });
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE infeasibility-probe multi_row={:.6}s hit={}",
+                    "--trace infeasibility-probe multi_row={:.6}s hit={}",
                     multi_row_started.elapsed().as_secs_f64(),
                     multi_row.is_some(),
                 );
@@ -7729,7 +7714,7 @@ impl BabSession {
             });
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE infeasibility-probe open_domain={:.6}s hit={}",
+                    "--trace infeasibility-probe open_domain={:.6}s hit={}",
                     open_domain_started.elapsed().as_secs_f64(),
                     open_domain.is_some(),
                 );
@@ -7853,7 +7838,7 @@ impl BabSession {
                     });
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE infeasibility-probe hybrid_pb_lp={:.6}s hit={}",
+                    "--trace infeasibility-probe hybrid_pb_lp={:.6}s hit={}",
                     direct_hybrid_started.elapsed().as_secs_f64(),
                     direct_hybrid.is_some(),
                 );
@@ -8623,10 +8608,8 @@ impl BabSession {
             // typed cut-ledger/refutation artifact; an optimality result remains
             // replay evidence because this route does not export a matching dual
             // optimum proof.
-            let hybrid_enabled = matches!(
-                std::env::var("AY_MILP_HYBRID_PB_LP").as_deref(),
-                Ok("1") | Ok("force")
-            );
+            let hybrid_enabled =
+                crate::tune::caller_flag(crate::tune::Knob::HybridPbLp) == Some(true);
             enum HybridCertifiedDecision {
                 Direct(crate::hybrid_pb_lp::CertifiedHybridPbLpDecision),
                 IntegerLift(crate::hybrid_integer_lift::CertifiedHybridIntegerLiftDecision),
@@ -9042,7 +9025,7 @@ impl BabSession {
                         // once the float lane proposes the ray and the rationals
                         // only have to CHECK it (29.0 s / 16.4 s for the exact
                         // rim to derive the same thing from cold, measured with
-                        // `AY_MILP_CERT_GRACE=0`).
+                        // `--cert-grace-secs`).
                         //
                         // Strictly additive: the returned certificate is already
                         // exact-verified against this model, a declining float
@@ -9351,7 +9334,7 @@ impl BabSession {
             // two answers instead of a preference for one.
             if structure_trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE portfolio: native decided inside its first-refusal slice; \
+                    "--trace portfolio: native decided inside its first-refusal slice; \
                      publishing native's verdict, lane `{}` claim filed as corroboration",
                     deferred.lane,
                 );
@@ -9364,7 +9347,7 @@ impl BabSession {
         // Case 2.
         if structure_trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE portfolio: native did not decide inside its first-refusal \
+                "--trace portfolio: native did not decide inside its first-refusal \
                  slice; publishing deferred verdict from lane `{}`",
                 deferred.lane,
             );
@@ -9400,11 +9383,8 @@ impl BabSession {
         if self.opts.deadline.is_none() && self.opts.time_limit.is_none() {
             return true;
         }
-        let floor = std::env::var("AY_MILP_SMT_MIN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|s| s.is_finite() && *s >= 0.0)
-            .unwrap_or(SMT_FALLBACK_MIN_BUDGET_SECS);
+        // B6: the AY_MILP_SMT_MIN_BUDGET env override is deleted.
+        let floor = SMT_FALLBACK_MIN_BUDGET_SECS;
         let now = Instant::now();
         if self
             .opts
@@ -9593,9 +9573,6 @@ mod ft_adoption_frame_tests {
 
     #[test]
     fn actual_margin_reframe_enters_one_owner_and_one_borrower() {
-        let _env_lock = ay_test_support::env::lock_env();
-        let _margin_reframe =
-            ay_test_support::env::ScopedEnvVar::unset("AY_MILP_NO_MARGIN_REFRAME");
         let mut model = Model::new();
         let x = model.add_binary_col();
         let y = model.add_binary_col();
@@ -10370,5 +10347,4 @@ mod tests {
 pub(crate) fn prime_env() {
     let _ = float_lane_enabled();
     let _ = smt_lane_forced();
-    let _ = structure_routing_enabled();
 }

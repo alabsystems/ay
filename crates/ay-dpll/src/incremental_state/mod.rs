@@ -19,6 +19,7 @@
 //! - Only assertion activation (unit clause on root literal) is scoped
 //! - This ensures cached term→var mappings remain valid after pop
 
+mod authority_reset;
 #[cfg(test)]
 mod tests;
 
@@ -470,20 +471,6 @@ impl IncrementalTheoryState {
                 meta.source_sets.push(sources);
             }
         }
-    }
-
-    /// Reset LIA-specific SAT solver and encoding state (#6853).
-    ///
-    /// LIA preprocessing can change the assertion set between check-sats.
-    /// Accumulated global Tseitin definition clauses from prior check-sats
-    /// over-constrain the variable space when combined with new activation
-    /// clauses, causing false UNSAT. Resetting the LIA state before each
-    /// check-sat ensures a clean encoding.
-    pub(crate) fn reset_lia_sat(&mut self) {
-        self.lia_persistent_sat = None;
-        self.lia_encoded_assertions.clear();
-        self.lia_assertion_activation_scope.clear();
-        self.lia_tseitin_state = TseitinState::new();
     }
 
     /// Compute the activation depth for an assertion root clause.

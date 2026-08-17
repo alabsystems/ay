@@ -2,6 +2,11 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+// Native SIMD and bounds-check-elided hot-path boundary; unsafe sites are
+// individually justified beside the operation.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! # ay-milp: a MILP/LP engine with a typed in-process API
 //!
 //! The crate exposes a solver-neutral [`Model`] plus reusable [`LpSession`]
@@ -45,9 +50,14 @@
 //! in-process ay-dpll lowering provides an exact QF_LRA fallback for binary
 //! columns represented as 0/1 disjunctions.
 
+#[doc(hidden)]
+pub mod acensus;
+pub mod attrib;
 mod bab;
 mod block_angular_route;
 mod cardinality_branch;
+pub mod debug_flags;
+pub mod engine_cli;
 #[doc(hidden)]
 pub use bab::{
     bump_lu_diff_on_model,
@@ -164,6 +174,8 @@ pub use pb_route::{
 };
 mod pb_translate;
 mod presolve;
+#[cfg(test)]
+mod presolve_adversarial;
 mod probe;
 mod sat_relu;
 pub use sat_relu::{
@@ -189,8 +201,7 @@ mod tune;
 // This is the seam `tests/env_layer_snapshot.rs` uses to assert about the arm
 // releases actually run. Read-only and knob-name-addressed; it installs nothing.
 #[doc(hidden)]
-pub use tune::{diag_env_layer, EnvLayerProbe};
-
+// B38: diag_env_layer/EnvLayerProbe removed with the env snapshot layer.
 pub use cert::{
     BoundSide, CertificateError, CertifiedRow, FactRef, FarkasCertificate, Multiplier,
     OptimalityCertificate,
@@ -198,7 +209,9 @@ pub use cert::{
 pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
 pub use mps::{read_mps, MpsError, MpsProblem};
-pub use opts::{EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, SolveOpts};
+pub use opts::{
+    EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, FlipSolveMode, SolveOpts,
+};
 pub use outcome::{Outcome, Trust, UnknownReason};
 pub use session::{
     AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,

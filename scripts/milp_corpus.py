@@ -41,7 +41,13 @@ import sys
 import urllib.error
 import urllib.request
 
-ROOT = pathlib.Path(os.environ.get("AY_MILP_CORPUS", pathlib.Path.home() / "ay-bench" / "milp"))
+# B20: the env locator is retired; pass --corpus <dir> or symlink at the
+# default path.
+ROOT = (
+    pathlib.Path(sys.argv[sys.argv.index("--corpus") + 1])
+    if "--corpus" in sys.argv
+    else pathlib.Path.home() / "ay-bench" / "milp"
+)
 INSTANCES = ROOT / "instances"
 META = ROOT / "meta"
 MANIFEST = ROOT / "manifest.json"

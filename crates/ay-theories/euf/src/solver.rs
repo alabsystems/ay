@@ -89,56 +89,41 @@ fn euf_debug_flags() -> &'static EufDebugFlags {
     })
 }
 
-/// Parse the `AY_EUF_CONG_NEG` kill switch / depth knob (#cong-neg-prop):
-/// `0` = lookahead off, `1` = one-step (the default), `2..=8` = cascade
-/// depth (hypothesis merge counts as depth 1), unset/invalid = default.
-/// Cached process-wide (read on every solver construction otherwise —
-/// EufSolver::new sits on the DPLL(T) restart path).
+/// Negative-congruence lookahead depth (#cong-neg-prop): one-step.
 ///
-/// The default is 1: cascade depths were measured on SMT-LIB QF_UF
-/// (2026-07) and made things WORSE — PEQ012_size4 depth 2 cut theory
+/// The value 1 is MEASURED, not provisional: cascade depths on SMT-LIB QF_UF
+/// (2026-07) made things WORSE — PEQ012_size4 depth 2 cut theory
 /// conflicts 18% (2,895 -> 2,367) but left total conflicts flat (29.5k) at
 /// 2.2x wall (0.84s -> 1.85s), and NEQ033_size5 blew up 5,486 -> 24,360
 /// conflicts / 14s -> 239s (the long multi-level reasons produce weak
 /// learned clauses that derail the search, on top of the per-scan
-/// simulation cost). Depths 2-3 remain available for A/B.
+/// simulation cost). B9: the `AY_EUF_CONG_NEG` depth knob nothing set is
+/// retired; re-measuring depths 2..=8 means editing this constant.
+const CONG_NEG_DEPTH: u32 = 1;
+
 fn cong_neg_depth_from_env() -> u32 {
-    static DEPTH: OnceLock<u32> = OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        const DEFAULT_DEPTH: u32 = 1;
-        match std::env::var("AY_EUF_CONG_NEG") {
-            Ok(s) => s.trim().parse::<u32>().map_or(DEFAULT_DEPTH, |d| d.min(8)),
-            Err(_) => DEFAULT_DEPTH,
-        }
-    })
+    CONG_NEG_DEPTH
 }
 
 /// #cong-neg-backoff: whether the adaptive-suspend for the cascade
 /// negative-congruence lookahead is enabled. Default true; `AY_EUF_CONG_NEG_ADAPTIVE=0`
 /// restores the legacy always-on lookahead (kill switch).
 fn cong_neg_adaptive_from_env() -> bool {
-    static ADAPTIVE: OnceLock<bool> = OnceLock::new();
-    *ADAPTIVE.get_or_init(|| {
-        !matches!(
-            std::env::var("AY_EUF_CONG_NEG_ADAPTIVE").as_deref(),
-            Ok("0")
-        )
-    })
+    // B24: the kill-switch env is retired; adaptive-suspend stays on.
+    true
 }
 
-/// #euf-atom-filter: whether to restrict the negative-congruence
+/// #euf-atom-filter: production policy for restricting the negative-congruence
 /// propagation-candidate list (`eq_terms`) to equalities that are SAT atoms
-/// (have a Boolean variable in the DPLL solver). Default ON; `AY_EUF_ATOM_FILTER=0`
-/// restores the legacy unfiltered behavior (every same-sorted equality in the
-/// TermStore is a propagation candidate, even ones the SAT layer can never
-/// receive). The filter only ever REMOVES provably-inert candidates: a
+/// (have a Boolean variable in the DPLL solver). B24 retired the legacy
+/// unfiltered A/B path, so the filter is always enabled. It only ever removes
+/// provably-inert candidates: a
 /// propagation on an equality with no SAT variable is dropped at the DPLL
 /// boundary, so dropping it up front changes no verdict. `check()` (the
 /// conflict authority) ignores `eq_terms`. Installed only on SAT-boundary solvers (see
 /// `TheorySolver::set_sat_atom_terms`).
-pub(crate) fn atom_filter_from_env() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("AY_EUF_ATOM_FILTER").as_deref(), Ok("0")))
+pub(crate) fn atom_filter_enabled() -> bool {
+    true
 }
 
 use crate::types::{
@@ -445,7 +430,7 @@ pub struct EufSolver<'a> {
     /// In standalone QF_UF nothing ever drains `pending_propagations`, so the
     /// explain is never computed at all — a big win on congruence-heavy pure
     /// QF_UF; in combined N-O it is computed at drain (same total work, later).
-    /// Default ON; `AY_EUF_LAZY_NOPROP=0` disables. Sound: `explain(lhs,rhs)` walks the same
+    /// Default ON; `--no-euf-lazy-noprop` disables. Sound: `explain(lhs,rhs)` walks the same
     /// congruence proof-forest edge the eager arg-pair loop did, so the reason
     /// SET is identical; and any valid reason justifies the propagation.
     pub(crate) lazy_noprop_reasons: bool,
@@ -678,7 +663,7 @@ pub struct EufSolver<'a> {
     /// `CongSet`/`CongRemove` undo entries for every `cong_table` mutation and
     /// pop() replays them instead of running the full O(func_apps) rebuild.
     /// This is the dominant per-pop cost on the giant Certora QF_UFLIA files
-    /// (one pop rebuilds 10^5+ signatures). Kill-switch: `AY_EUF_INC_CONG_UNDO=0`
+    /// (one pop rebuilds 10^5+ signatures). Kill-switch: `--no-euf-inc-cong-undo`
     /// falls back to the from-scratch rebuild.
     pub(crate) inc_cong_undo_enabled: bool,
     /// Minimum `func_apps` count for the incremental pop-restore to activate
@@ -700,7 +685,7 @@ pub struct EufSolver<'a> {
     pub(crate) undo_work: u64,
     /// Incremental (trail-based) disequality-pair-index restore on pop
     /// (#euf-inc-diseq-undo). When active (default; kill-switch
-    /// `AY_EUF_INC_DISEQ_UNDO=0`), `incremental_merge` (rekey) and
+    /// `--no-euf-inc-diseq-undo`), `incremental_merge` (rekey) and
     /// `sync_diseq_index` record `DiseqSet`/`DiseqRemove` undo entries for every
     /// `diseq_pair_index` mutation, and pop() replays them instead of running
     /// the from-scratch O(|assigns|) rebuild (the confirmed #1 Certora
@@ -778,7 +763,7 @@ pub struct EufSolver<'a> {
     ///
     /// MUST remain `None` on the real solve-path solver.
     pub(crate) func_app_scope: Option<HashSet<u32>>,
-    /// #euf-prop-gap: env-gated (`AY_EUF_GAP_STATS=1`) profiling counters for
+    /// #euf-prop-gap: CLI-gated (`--euf-gap-stats`) profiling counters for
     /// the eager-propagation gap. Zero-cost when disabled (one bool test on
     /// the assert path). Flushed to process-wide statics on Drop.
     pub(crate) gap_stats_enabled: bool,
@@ -790,7 +775,7 @@ pub struct EufSolver<'a> {
     /// protocol (`reason_data` + `explain_propagation`). Set to `true` by the
     /// eager SAT extension via `set_lazy_propagation_supported`; stays `false`
     /// for consumers that turn `reason` directly into clauses (legacy DpllT
-    /// loop, verification instances). Kill switch: `AY_EUF_LAZY_EXPLAIN=0`
+    /// loop, verification instances). Kill switch: `--no-euf-lazy-explain`
     /// forces eager reasons even when the consumer supports lazy.
     pub(crate) lazy_explain_enabled: bool,
     /// Emission counter driving the warmup-then-sample EAGER carve-out (see
@@ -963,7 +948,7 @@ pub(crate) const DISEQ_UNDO_MIN_FUNC_APPS: usize = 0;
 
 impl<'a> EufSolver<'a> {
     /// Whether the incremental (trail-based) cong_table pop-restore is active
-    /// for THIS solve: opted in (`AY_EUF_INC_CONG_UNDO` != 0) AND the func_apps
+    /// for THIS solve: opted in (no `--no-euf-inc-cong-undo`) AND the func_apps
     /// set is large enough that skipping the O(func_apps) rebuild pays for the
     /// per-merge undo overhead (see `CONG_UNDO_MIN_FUNC_APPS`).
     #[inline]
@@ -1023,7 +1008,7 @@ impl<'a> EufSolver<'a> {
     }
 
     /// Whether the incremental (trail-based) `diseq_pair_index` pop-restore is
-    /// active for THIS solve: opted in (`AY_EUF_INC_DISEQ_UNDO` != 0) AND the
+    /// active for THIS solve: opted in (`--no-euf-inc-diseq-undo` != 0) AND the
     /// func_apps set is large enough that skipping the O(|assigns|) rebuild pays
     /// for the per-merge/per-sync undo overhead (see the size-gate rationale on
     /// `CONG_UNDO_MIN_FUNC_APPS`). `func_apps` is frozen after `init_func_apps`,
@@ -1296,8 +1281,8 @@ impl<'a> EufSolver<'a> {
             // memoization (758e1bb2) + lazy N-O propagation reasons (d5eeecc9),
             // both default-on with their original env kill-switches.
             explain_memo: crate::explain::ExplainMemo::default(),
-            explain_memo_enabled: std::env::var_os("AY_EUF_EXPLAIN_MEMO").is_none_or(|v| v != "0"),
-            lazy_noprop_reasons: std::env::var_os("AY_EUF_LAZY_NOPROP").is_none_or(|v| v != "0"),
+            explain_memo_enabled: true, // B24: kill-switch env retired.
+            lazy_noprop_reasons: !ay_core::theory_disable_flags().no_euf_lazy_noprop,
             // Pre-indexed ITE terms (#5575)
             ite_terms: Vec::new(),
             ite_terms_init: false,
@@ -1360,21 +1345,13 @@ impl<'a> EufSolver<'a> {
             uf_dirty_nodes: HashSet::default(),
             uf_full_sync_needed: true,
             inc_sync_enabled: true,
-            inc_cong_undo_enabled: std::env::var_os("AY_EUF_INC_CONG_UNDO")
-                .is_none_or(|v| v != "0"),
+            inc_cong_undo_enabled: !ay_core::theory_disable_flags().no_euf_inc_cong_undo,
             undo_latched: false,
             rebuild_work: 0,
             undo_work: 0,
-            cong_undo_min_func_apps: std::env::var("AY_EUF_CONG_UNDO_MIN")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(CONG_UNDO_MIN_FUNC_APPS),
-            inc_diseq_undo_enabled: std::env::var_os("AY_EUF_INC_DISEQ_UNDO")
-                .is_none_or(|v| v != "0"),
-            diseq_undo_min_func_apps: std::env::var("AY_EUF_DISEQ_UNDO_MIN")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(DISEQ_UNDO_MIN_FUNC_APPS),
+            cong_undo_min_func_apps: CONG_UNDO_MIN_FUNC_APPS, // B25: env retired.
+            inc_diseq_undo_enabled: !ay_core::theory_disable_flags().no_euf_inc_diseq_undo,
+            diseq_undo_min_func_apps: DISEQ_UNDO_MIN_FUNC_APPS, // B25: env retired.
             neg_index_prebuilt: false,
             diseq_index_base_depth: 0,
             diseq_keys_dirty: false,
@@ -1382,8 +1359,8 @@ impl<'a> EufSolver<'a> {
             // verification constructors flip this on via verify_only().
             verify_only: false,
             func_app_scope: None,
-            // #euf-prop-gap profiling (env-gated, off by default)
-            gap_stats_enabled: std::env::var_os("AY_EUF_GAP_STATS").is_some(),
+            // #euf-prop-gap profiling (--euf-gap-stats, off by default)
+            gap_stats_enabled: ay_core::misc_cli_flags().euf_gap_stats,
             gap_stats: PropGapStats::default(),
             // Lazy propagation justifications (#8467, #euf-lazy-explain):
             // OFF until the consumer opts in via

@@ -1,9 +1,9 @@
 # In-tree git hooks
 
-GitHub Actions checks the complete public workspace and runs focused SAT-core
-and LRAT-checker tests on pushes and pull requests. These opt-in hooks provide
-earlier feedback and additional local soundness coverage; they supplement,
-rather than replace, the hosted CI checks.
+AY deliberately has no hosted GitHub Actions workflow. These opt-in hooks
+provide early local soundness feedback; they supplement, rather than replace,
+the checked-in `ay gate solver` and `publish/publish.sh check ay --check`
+commands that maintainers run before staging a release.
 
 ## `pre-push` — zero-skip and SMT soundness gates
 

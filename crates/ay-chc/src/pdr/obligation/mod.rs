@@ -37,15 +37,13 @@ pub(crate) enum PobKind {
 
 /// `AY_CHC_MAY_POB` kill-switch (default ON; only the literal "0" disables).
 pub(crate) fn may_pob_env_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        may_pob_enabled_from_env_value(std::env::var("AY_CHC_MAY_POB").ok().as_deref())
-    })
+    // B27: CLI-owned (--chc-no-may-pob); env retired.
+    crate::ab_switches::get().may_pob
 }
 
 /// Pure parser for the `AY_CHC_MAY_POB` kill-switch value (unit-testable
 /// without process-global env mutation).
+#[cfg(test)]
 pub(crate) fn may_pob_enabled_from_env_value(value: Option<&str>) -> bool {
     value != Some("0")
 }

@@ -2,9 +2,11 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! A theory lemma prints as a BARE step — `(step id (cl …) :rule R)` with no
-//! `:premises` and no `:args`. These pin that `R` is never a rule the pinned
-//! Alethe checker refuses on the premise/argument count.
+//! A theory lemma's generic fallback prints as a BARE step —
+//! `(step id (cl …) :rule R)` with no `:premises` and no `:args`. These pin
+//! that `R` is never a rule the pinned Alethe checker refuses on the
+//! premise/argument count. Dedicated checked lowerings may instead publish
+//! their precisely audited premises or arguments.
 //!
 //! `is_checkable_alethe_rule` answers only "does the checker know this NAME".
 //! For a bare step that is the wrong question: `string_decompose` (1 premise,
@@ -93,6 +95,27 @@ fn string_content_axiom_keeps_its_internal_rule_identity() {
     );
 }
 
+/// `IntBoundsTautology` has a dedicated, non-bare lowering: its unit fixture
+/// carries the one Farkas coefficient required by `la_generic`. Keep this
+/// exact exception pinned instead of exempting every step that happens to grow
+/// an argument list.
+#[test]
+fn int_bounds_tautology_publishes_exact_unit_farkas_surface() {
+    let mut terms = TermStore::new();
+    let clause = string_content_clause(&mut terms);
+    let step = theory_lemma(vec![clause], TheoryLemmaKind::IntBoundsTautology);
+    let printer = AlethePrinter::new(&terms);
+
+    let text = printer
+        .format_step(&step, ProofId(1))
+        .expect("the dedicated integer-bounds surface must render");
+
+    assert_eq!(
+        text,
+        "(step t1 (cl (str.contains bare_x (str.++ bare_y \"a\"))) :rule la_generic :args (1))"
+    );
+}
+
 /// The general invariant, over EVERY kind rather than the one that regressed:
 /// whatever a theory lemma publishes, it is never a rule the bare step cannot
 /// back. A kind that refuses to print at all (missing Farkas annotation, an
@@ -110,6 +133,14 @@ fn no_theory_lemma_kind_publishes_a_rule_its_bare_step_cannot_back() {
         let Ok(text) = printer.format_step(&step, ProofId(1)) else {
             continue;
         };
+        if matches!(kind, TheoryLemmaKind::IntBoundsTautology) {
+            assert_eq!(
+                text,
+                "(step t1 (cl (str.contains bare_x (str.++ bare_y \"a\"))) :rule la_generic :args (1))",
+                "the sole argument-bearing kind in this sweep must retain its exact audited surface"
+            );
+            continue;
+        }
         checked += 1;
         let rule = text
             .rsplit_once(":rule ")
@@ -134,8 +165,9 @@ fn no_theory_lemma_kind_publishes_a_rule_its_bare_step_cannot_back() {
 
 /// Every `TheoryLemmaKind` a bare theory-lemma step can carry.
 ///
-/// Spelled out rather than derived so that a newly added kind fails to compile
-/// here and its author has to state what the wire name is.
+/// Spelled out because payload-bearing variants need concrete representatives.
+/// Keep this synchronized with the exhaustive `TheoryLemmaKind::alethe_rule`
+/// match in `ay-core`; each new kind needs an explicit wire-behaviour audit.
 fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
     use ay_core::{BvGateType, FpOp};
     let all = vec![
@@ -147,6 +179,7 @@ fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
         TheoryLemmaKind::LiaGeneric,
         TheoryLemmaKind::LiaModRange,
         TheoryLemmaKind::BvLiaTautology,
+        TheoryLemmaKind::SeqExtensionalCompanionContradiction,
         TheoryLemmaKind::BvBitBlast,
         TheoryLemmaKind::BvBitBlastGate {
             gate_type: BvGateType::And,
@@ -185,8 +218,17 @@ fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
         TheoryLemmaKind::DatatypeEnumPigeonhole,
         TheoryLemmaKind::DatatypeSelectorProject,
         TheoryLemmaKind::DatatypeTesterEval,
+        TheoryLemmaKind::DatatypeExhaustive,
+        TheoryLemmaKind::DatatypeConstructorReconstruct,
+        TheoryLemmaKind::DatatypeInjective,
+        TheoryLemmaKind::DatatypeAcyclicDirect,
+        TheoryLemmaKind::DatatypeValueEqCongruence,
         TheoryLemmaKind::OrderIteTautology,
         TheoryLemmaKind::BoolTautology,
+        TheoryLemmaKind::ArithEqTriangle,
+        TheoryLemmaKind::ArithEqImpliesBound,
+        TheoryLemmaKind::IntBoundsTautology,
+        TheoryLemmaKind::ArithDisequalitySplit,
         TheoryLemmaKind::IteSame,
         TheoryLemmaKind::FpClassification {
             operation: FpOp::Abs,
@@ -198,6 +240,9 @@ fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
         TheoryLemmaKind::Generic,
         TheoryLemmaKind::RoundingModeDomain,
         TheoryLemmaKind::FpGroundEval,
+        TheoryLemmaKind::ArrayFiniteExtensionality,
+        TheoryLemmaKind::ArrayFiniteSelectExpansion,
+        TheoryLemmaKind::QuantifierNegatedExistsDual,
     ];
     // Non-vacuity: the enumeration must actually reach the kind that regressed
     // and the near-miss string/regex family the wire-mapping audit covered.
@@ -206,7 +251,11 @@ fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
         TheoryLemmaKind::StringLengthLemma,
         TheoryLemmaKind::RegexIntersectEmpty,
         TheoryLemmaKind::LiaModRange,
+        TheoryLemmaKind::SeqExtensionalCompanionContradiction,
         TheoryLemmaKind::NraIntervalUnsat,
+        TheoryLemmaKind::ArrayFiniteExtensionality,
+        TheoryLemmaKind::ArrayFiniteSelectExpansion,
+        TheoryLemmaKind::QuantifierNegatedExistsDual,
     ] {
         assert!(
             all.contains(&required),

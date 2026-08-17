@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! #warm-simplex (`AY_LRA_WARM_SIMPLEX_STATE`, default OFF): delta-only simplex
+//! #warm-simplex (`--no-lra-warm-simplex` opts out): delta-only simplex
 //! bookkeeping across push/pop, adopted (clean-room) from OpenSMT, the 2025
 //! SMT-COMP incremental QF_LRA winner.
 //!
@@ -50,9 +50,8 @@
 //! Flag OFF: every gated site takes the exact code path it takes today.
 
 use super::*;
-use std::sync::OnceLock;
 
-/// `AY_LRA_WARM_SIMPLEX_STATE` — parse-once process-wide default (same pattern
+/// Process-wide default (same pattern
 /// as the other `AY_LRA_*` flags). DEFAULT ON (`=0` opts out) since 2026-07-25:
 /// 2-sample full-division @1200s measurement (official SMT-COMP 2025 Inc QF_LRA
 /// 10-file corpus, isolated per file) = 769/763 warm vs 743/751 off — non-
@@ -65,8 +64,9 @@ use std::sync::OnceLock;
 /// code paths read, so tests can drive flag-on and flag-off solvers in one
 /// process.
 pub(crate) fn warm_simplex_state_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| !std::env::var("AY_LRA_WARM_SIMPLEX_STATE").is_ok_and(|v| v == "0"))
+    // B16: the CLI-populated global replaced the never-set env var; default
+    // is enabled.
+    !ay_core::theory_disable_flags().no_lra_warm_simplex
 }
 
 /// All #warm-simplex state, grouped so constructors add a single field.

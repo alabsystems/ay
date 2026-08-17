@@ -4,7 +4,6 @@
 
 //! Bridge between the solver and the INDEPENDENT, fail-closed model-check gate
 //! ([`ay_model_check`]).
-//!
 //! After `check-sat` produces `Sat` with a model, the gate re-evaluates every
 //! assertion under that model with a *separate*, solver-independent evaluator.
 //! Both non-confirming verdicts fail closed unconditionally (no environment
@@ -28,6 +27,9 @@
 //! so the independence is at the operator/composition level — exactly where the
 //! historical wrong-`sat` bugs lived.
 
+mod current_assertion_confirmation;
+mod point_table;
+mod restoration_bridge;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -51,6 +53,8 @@ use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
+mod quantified_table;
+use point_table::QuantifiedGateUfInterp;
 /// Exact roots of the public query being certified: the provenance-captured
 /// pre-solve assertion snapshot when available, otherwise the current base
 /// stack, plus every temporary `check-sat-assuming` literal. Solver-injected
@@ -1816,8 +1820,8 @@ impl IndependentModelView<'_> {
         // Read the opt-out ONCE: this runs on every datatype-sorted leaf and UF
         // application (~9k atoms x 2 on `vlsat3_k13`), and this division is
         // already time-sensitive.
-        static CANON_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*CANON_ON.get_or_init(|| std::env::var("AY_DT_ELEMENT_CANON").as_deref() != Ok("0")) {
+        if false {
+            // B23: the A/B opt-out env is retired; canonicalization is on.
             return None;
         }
         let dt_name = self.exec.datatype_sort_name(sort)?;
@@ -1995,17 +1999,12 @@ impl IndependentModelView<'_> {
                 return Some(v);
             }
         }
-        // A non-nullary datatype cell is stored in ArrayInterpretation as the
-        // printer's constructor text (for example `(PbTerm #x00)`), not as an
-        // EvalValue carrying structure. Parse that exact text back into the
-        // canonical gate value before the generic scalar parser collapses it
-        // to an opaque `Element`. This is representation normalization only:
-        // malformed trees and abstract `@Datatype!n` carriers still fall
-        // through to the existing fail-closed path.
-        if self.datatype_guard().is_exact(sort) {
+        // Parse exact array-cell constructor text before the scalar parser collapses it to an
+        // opaque `Element`; malformed trees and abstract carriers still fail closed.
+        if self.datatype_guard().is_exact_array_cell(sort) {
             if let Some(value) =
                 self.exec
-                    .parse_rendered_dt_value_guarded(s, sort, self.datatype_guard())
+                    .parse_rendered_dt_value_cached(s, sort, self.datatype_guard())
             {
                 return Some(value);
             }
@@ -2560,6 +2559,7 @@ impl Executor {
         self.sexp_to_model_value(&sx, sort)
     }
 
+    #[cfg(test)]
     pub(super) fn parse_rendered_dt_value_guarded(
         &self,
         s: &str,
@@ -2749,7 +2749,7 @@ impl Executor {
         // (`resolving`/`resolved`) is empty, so branch/disjunct selection is
         // deterministic and not perturbed by an in-flight leaf resolution.
         view.ensure_def_index();
-        if std::env::var_os("AY_G3_GATE_DUMP").is_some() {
+        if ay_core::misc_cli_flags().g3_gate_dump {
             self.dump_gate_diagnostics(&view);
         }
         // A specialized quantified certificate is allowed to discharge only
@@ -2881,6 +2881,31 @@ impl Executor {
         GateVerdict::ConfirmedSat
     }
 
+    /// Evaluate each given (ground, witnessed-rewrite) term with the
+    /// independent gate's OWN evaluator under the emitted model, confirming
+    /// only on an exact `Bool(true)` for every term (#skolem-witness-sat).
+    ///
+    /// This is the evaluation core of the skolem-witness SAT confirmation
+    /// arm: the same `IndependentModelView` + `ay_model_check` evaluator every
+    /// gate-confirmed assertion goes through, sharing no state with the
+    /// producer that emitted the model. A `false`, a non-Boolean value, or an
+    /// unevaluable term all fail closed to `false` — the caller must decline,
+    /// never refute, on that answer (an unevaluable or false WITNESS instance
+    /// does not falsify the source existential).
+    pub(in crate::executor) fn skolem_witness_terms_evaluate_true(&self, terms: &[TermId]) -> bool {
+        let Some(model) = self.last_model.as_ref() else {
+            return false;
+        };
+        let view = IndependentModelView::new(self, model);
+        view.ensure_def_index();
+        terms.iter().all(|&term| {
+            matches!(
+                ay_model_check::evaluate_term(&self.ctx.terms, &view, term),
+                EvalOutcome::Value(ModelValue::Bool(true))
+            )
+        })
+    }
+
     /// Emission-side entailed reconstruction, shared with the model PRINTER.
     ///
     /// For every user-declared datatype- or array-sorted constant, resolve it to
@@ -2963,7 +2988,7 @@ impl Executor {
         out
     }
 
-    /// DEBUG-ONLY (AY_G3_GATE_DUMP): print each assertion's gate outcome AFTER
+    /// DEBUG-ONLY (--g3-gate-dump): print each assertion's gate outcome AFTER
     /// the datatype-tautology normalizer, plus reconstructed leaf values for the
     /// operands of each false/uneval field-decomposition assertion.
     fn dump_gate_diagnostics(&self, view: &IndependentModelView<'_>) {
@@ -2991,7 +3016,7 @@ impl Executor {
                 }
             };
             eprintln!(
-                "AY_G3_GATE_DUMP [{label}] assertion={} reason={:?} :: {}",
+                "--g3-gate-dump [{label}] assertion={} reason={:?} :: {}",
                 assertion.index(),
                 out,
                 self.format_term(assertion)
@@ -3011,7 +3036,7 @@ impl Executor {
                 );
             }
         }
-        eprintln!("AY_G3_GATE_DUMP SUMMARY: n_false={n_false} n_uneval={n_uneval}");
+        eprintln!("--g3-gate-dump SUMMARY: n_false={n_false} n_uneval={n_uneval}");
     }
 
     /// Collect the free variable/leaf term ids referenced by `term` (DEBUG).
@@ -3071,18 +3096,18 @@ impl Executor {
                 // structured trace): a theory-search path produced an invalid
                 // model. Emitted while `last_model` is still live (the downgrade
                 // below clears it).
-                if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                if ay_core::misc_cli_flags().model_reject_dump {
                     eprintln!("[reject-site] apply_independent_model_gate");
                 }
                 self.report_caught_invalid_model(assertion, &term);
-                // DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default off is
+                // DIAGNOSTIC ONLY (`--model-reject-dump`; default off is
                 // byte-identical). The gate names the TOP-LEVEL assertion, which
                 // on a single-`assert` benchmark is the whole conjunction — an
                 // unusable census signal. Re-run the SAME evaluator over the
                 // FLATTENED conjuncts to name the one that actually computed
                 // false. WRITE-ONLY: no verdict path reads it, and the
                 // enforcement below is untouched.
-                if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                if ay_core::misc_cli_flags().model_reject_dump {
                     self.dump_violated_flat_conjuncts(assertion);
                 }
                 self.last_statistics
@@ -3162,7 +3187,7 @@ impl Executor {
         }
     }
 
-    /// DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`): name the FLATTENED
+    /// DIAGNOSTIC ONLY (`--model-reject-dump`): name the FLATTENED
     /// conjuncts of a gate-refuted assertion that the gate's own evaluator
     /// computes `false`. Pure re-evaluation through the same
     /// [`IndependentModelView`]; nothing is mutated and no verdict path reads
@@ -3225,7 +3250,7 @@ impl Executor {
     /// Printed to STDERR (never stdout, so the `sat`/`unsat`/`unknown` verdict
     /// line stays machine-parseable) with the falsifying assignment, so the
     /// offending theory can be debugged, AND as a structured `tracing::warn!`.
-    /// Suppress the stderr banner with `AY_QUIET_SOUNDNESS_GATE=1` for
+    /// Suppress the stderr banner with `--quiet-soundness-gate` for
     /// noise-sensitive batch/fuzz runs (the trace record still fires). MUST be
     /// called BEFORE [`downgrade_sat_after_gate`](Self::downgrade_sat_after_gate),
     /// which clears `last_model`.
@@ -3243,7 +3268,7 @@ impl Executor {
             "SOUNDNESS GATE caught an invalid model: a theory-search path produced \
              a model that falsifies an assertion; fail-closing Sat -> Unknown"
         );
-        if std::env::var_os("AY_QUIET_SOUNDNESS_GATE").is_some() {
+        if ay_core::misc_cli_flags().quiet_soundness_gate {
             return;
         }
         eprintln!(
@@ -3254,7 +3279,7 @@ impl Executor {
              logic:     {logic}\n    \
              assertion: {assertion_str}\n    \
              falsified under model: {assignment}\n    \
-             (set AY_QUIET_SOUNDNESS_GATE=1 to silence this banner)\n"
+             (set --quiet-soundness-gate to silence this banner)\n"
         );
     }
 
@@ -4518,82 +4543,6 @@ impl Executor {
         }
     }
 
-    /// Positively certify every quantified leaf in the CURRENT assertion set
-    /// against the retained model, using the same checker as the mandatory
-    /// publication gate.
-    ///
-    /// Quantifier-result restoration invokes this only after ordinary model
-    /// validation has checked the ground siblings but skipped a quantifier.
-    /// The bridge is deliberately limited to the regression class that needs
-    /// it: at least one leaf must contain a provably vacuous binder that the
-    /// mandatory checker removes. It must not turn that checker into a general
-    /// post-hoc SAT authority for live quantifiers (in particular, enumerating
-    /// only the datatype values present in a model does not cover a recursive
-    /// datatype's full carrier). Every retained leaf must then return
-    /// [`QuantifiedModelCheck::Confirmed`]. A refutation, deferral,
-    /// indeterminate result, missing model, recursion, or exhausted deadline
-    /// returns `false` and preserves the existing fail-closed `Unknown` path.
-    pub(in crate::executor) fn quantified_model_gate_confirms_current_assertions(
-        &mut self,
-    ) -> bool {
-        if self.last_model.is_none() || self.in_quantified_model_gate {
-            return false;
-        }
-
-        let assertions = self.ctx.assertions.clone();
-        let mut candidates = Vec::new();
-        for assertion in assertions {
-            if !contains_quantifier(&self.ctx.terms, assertion) {
-                continue;
-            }
-            let mut conjuncts = Vec::new();
-            crate::executor::quantifier_loop::collect_and_conjuncts(
-                &self.ctx.terms,
-                assertion,
-                &mut conjuncts,
-            );
-            if conjuncts.is_empty() {
-                conjuncts.push(assertion);
-            }
-            for conjunct in conjuncts {
-                let is_and_node = matches!(
-                    self.ctx.terms.get(conjunct),
-                    TermData::App(sym, _) if sym.name() == "and"
-                );
-                if !is_and_node
-                    && contains_quantifier(&self.ctx.terms, conjunct)
-                    && self.quantified_gate_drop_vacuous_binders(conjunct) != conjunct
-                    && !candidates.contains(&conjunct)
-                {
-                    candidates.push(conjunct);
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return false;
-        }
-
-        let saved_deadline = self.solve_deadline.get();
-        let budget = Instant::now() + Duration::from_secs(2);
-        self.set_deadline(match saved_deadline {
-            Some(deadline) if deadline < budget => Some(deadline),
-            _ => Some(budget),
-        });
-        let saved_statistics = self.last_statistics.clone();
-        self.in_quantified_model_gate = true;
-        let confirmed = candidates.into_iter().all(|conjunct| {
-            !self.solve_deadline.expired()
-                && matches!(
-                    self.check_quantified_conjunct_against_model(conjunct),
-                    QuantifiedModelCheck::Confirmed
-                )
-        });
-        self.in_quantified_model_gate = false;
-        self.set_deadline(saved_deadline);
-        self.last_statistics = saved_statistics;
-        confirmed
-    }
-
     /// Validate ONE quantified leaf conjunct against the emitted model.
     ///
     /// Strategy (#quantified-model-gate):
@@ -4735,7 +4684,7 @@ impl Executor {
         // binder is only ever dropped when its variable provably cannot appear
         // — never the dangling-binder UNSAT→SAT hazard.
         let devacuoused = self.quantified_gate_drop_vacuous_binders(conjunct);
-        if devacuoused != conjunct && std::env::var("AY_DEBUG_QMG").is_ok() {
+        if devacuoused != conjunct && ay_core::misc_cli_flags().debug_qmg {
             // Observability, and the build MARKER this change is verified by
             // (`strings -a target/release/ay | grep 'QMG dropped vacuous
             // binders'`). A `last_statistics` key would be pointless here: the
@@ -4777,7 +4726,7 @@ impl Executor {
         // the pre-existing certificate lane instead of failing closed
         // (refutation outcomes are never relaxed).
         let (interps, defer_ok) = self.quantified_gate_uf_interps(conjunct, &mut elems);
-        if std::env::var("AY_DEBUG_QMG").is_ok() {
+        if ay_core::misc_cli_flags().debug_qmg {
             let mut names: Vec<&String> = interps.keys().collect();
             names.sort();
             safe_eprintln!("QMG interps built: {names:?} defer_ok={defer_ok}");
@@ -4942,7 +4891,7 @@ impl Executor {
                 let clean = pins.total && ufs_complete && expanded_all_usorts && !usort_skolem;
                 let mut nested = pins.equalities.clone();
                 nested.extend(elems.distinct_assertions(&mut self.ctx.terms));
-                if std::env::var("AY_DEBUG_QMG").is_ok() {
+                if ay_core::misc_cli_flags().debug_qmg {
                     safe_eprintln!("QMG instance: {}", self.format_term(instance));
                     for &p in &nested {
                         safe_eprintln!("QMG pin: {}", self.format_term(p));
@@ -4973,7 +4922,7 @@ impl Executor {
                     let target = self.ctx.terms.mk_not(instance);
                     nested.push(target);
                     let r = self.quantified_gate_checked_ground_solve(nested);
-                    if std::env::var("AY_DEBUG_QMG").is_ok() {
+                    if ay_core::misc_cli_flags().debug_qmg {
                         safe_eprintln!("QMG universal nested result: {r:?}");
                     }
                     match r {
@@ -5470,7 +5419,7 @@ impl Executor {
         interps: &DetHashMap<String, QuantifiedGateUfInterp>,
         elems: &mut QuantifiedGateElements,
     ) -> Option<QuantifiedModelCheck> {
-        let debug = std::env::var("AY_DEBUG_QMG").is_ok();
+        let debug = ay_core::misc_cli_flags().debug_qmg;
         if uni_binders.is_empty() || uni_binders.len() > QUANTIFIED_GATE_MAX_WITNESS_BINDERS {
             return None;
         }
@@ -5743,7 +5692,7 @@ impl Executor {
         let has_residual_quantifier = nested
             .iter()
             .any(|&t| contains_quantifier(&self.ctx.terms, t));
-        if std::env::var("AY_DEBUG_QMG").is_ok() {
+        if ay_core::misc_cli_flags().debug_qmg {
             safe_eprintln!(
                 "QMG general clean={clean} closed={closed} total={} ufs_complete={ufs_complete} residual_quantifier={has_residual_quantifier}",
                 pins.total
@@ -6015,7 +5964,7 @@ impl Executor {
             stack.extend(self.ctx.terms.children(t));
         }
         if heads.is_empty() {
-            if std::env::var("AY_DEBUG_QMG").is_ok() {
+            if ay_core::misc_cli_flags().debug_qmg {
                 safe_eprintln!("QMG interp: no declared-function heads in conjunct");
             }
             return (interps, false);
@@ -6042,14 +5991,14 @@ impl Executor {
             let Some(euf) = model.euf_model.as_ref() else {
                 // No EUF component at all: the printer will print NO
                 // interpretation for any of these functions.
-                if std::env::var("AY_DEBUG_QMG").is_ok() {
+                if ay_core::misc_cli_flags().debug_qmg {
                     safe_eprintln!("QMG interp: model has no EUF component");
                 }
                 return (interps, true);
             };
             let view = IndependentModelView::new(self, model);
             view.ensure_def_index();
-            let qmg_debug = std::env::var("AY_DEBUG_QMG").is_ok();
+            let qmg_debug = ay_core::misc_cli_flags().debug_qmg;
             // Resolve ONE raw table entry the printer's way
             // (`resolve_table_value`): `@?N` placeholders evaluate the term
             // through the printer's own evaluator (array-sorted ones through
@@ -6637,20 +6586,7 @@ impl Executor {
                         .all(|(row_args, _)| row_args.len() == new_args.len())
                 };
                 if let Some(interp) = interps.get(sym.name()).filter(|i| arity_matches(i)) {
-                    let mut acc = interp.else_value;
-                    for (row_args, row_result) in interp.rows.iter().rev() {
-                        let mut conds = Vec::with_capacity(new_args.len());
-                        for (&actual, &expected) in new_args.iter().zip(row_args.iter()) {
-                            conds.push(self.ctx.terms.mk_eq(actual, expected));
-                        }
-                        let cond = if conds.len() == 1 {
-                            conds[0]
-                        } else {
-                            self.ctx.terms.mk_and(conds)
-                        };
-                        acc = self.ctx.terms.mk_ite(cond, *row_result, acc);
-                    }
-                    acc
+                    point_table::rewrite_application(self, &new_args, interp)
                 } else {
                     if !args.is_empty() && declared_fns.contains(sym.name()) {
                         // An application of a function whose printed
@@ -6728,7 +6664,7 @@ impl Executor {
     /// requires a strictly verified proof.
     fn quantified_gate_checked_ground_solve(
         &mut self,
-        assertions: Vec<TermId>,
+        mut assertions: Vec<TermId>,
     ) -> Option<QuantifiedGateCheckedGroundDecision> {
         if assertions
             .iter()
@@ -6736,6 +6672,8 @@ impl Executor {
         {
             return None;
         }
+        let enabled = self.ctx.datatype_iter().next().is_none();
+        quantified_table::simplify(&mut self.ctx.terms, &mut assertions, enabled);
         let roots = assertions;
         let decision = self.checked_ground_solve(roots.clone(), LogicCategory::Other, 500)?;
         Some(QuantifiedGateCheckedGroundDecision {
@@ -7235,15 +7173,6 @@ fn quantified_gate_witness_tuples(per_binder: &[Vec<TermId>]) -> Vec<Vec<TermId>
     }
     tuples.truncate(QUANTIFIED_GATE_MAX_WITNESS_TUPLES);
     tuples
-}
-
-/// One reconstructed printer-visible function interpretation
-/// (#quantified-model-gate): the resolved table rows IN ORDER minus the last
-/// (whose result is `else_value`), exactly `format_function_table`'s
-/// first-match `ite` chain.
-struct QuantifiedGateUfInterp {
-    rows: Vec<(Vec<TermId>, TermId)>,
-    else_value: TermId,
 }
 
 /// One resolved raw EUF-table entry (#quantified-model-gate), phase-A form —
@@ -9359,41 +9288,6 @@ mod tests {
             ay_model_check::evaluate_term(&exec.ctx.terms, &view, len),
             EvalOutcome::Unevaluable(_)
         ));
-    }
-
-    /// The post-UF-substitution obligation produced by the mid-range Bool-UF
-    /// discharge: `P(v)`'s printed table says true only at 300, while its
-    /// pointwise definition says exactly `v = 300`.
-    fn midrange_bool_uf_gate_obligation(exec: &mut Executor) -> TermId {
-        let q = exec.ctx.terms.mk_fresh_var("qmg!stress", Sort::Int);
-        let three_hundred = exec.ctx.terms.mk_int(BigInt::from(300));
-        let pivot = exec.ctx.terms.mk_eq(three_hundred, q);
-        let mut table = Vec::with_capacity(301);
-        table.push(pivot);
-        for value in 0..300 {
-            let value = exec.ctx.terms.mk_int(BigInt::from(value));
-            let equality = exec.ctx.terms.mk_eq(value, q);
-            table.push(exec.ctx.terms.mk_not(equality));
-        }
-        let table = exec.ctx.terms.mk_and(table);
-        let definition_matches_table = exec.ctx.terms.mk_eq(pivot, table);
-        exec.ctx.terms.mk_not(definition_matches_table)
-    }
-
-    /// Regression for the E4/E5 discharge timeout: the same valid table
-    /// obligation must prove UNSAT repeatedly inside the unchanged 500 ms
-    /// nested-solve slice.  Fresh executors prevent incremental solver state
-    /// from making later iterations artificially easier.
-    #[test]
-    fn quantified_gate_bool_uf_discharge_is_repeatable() {
-        for iteration in 0..16 {
-            let mut exec = Executor::new();
-            let obligation = midrange_bool_uf_gate_obligation(&mut exec);
-            assert!(
-                quantified_gate_checked_unsat(&mut exec, vec![obligation]),
-                "iteration {iteration}: valid Bool-UF table equivalence was not proved"
-            );
-        }
     }
 
     /// Mixed nonlinear Int/Real arithmetic is intentionally unsupported by

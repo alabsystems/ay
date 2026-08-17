@@ -127,7 +127,7 @@ pub(crate) fn fingerprint_query_text(smt_text: &str) -> u64 {
 /// Kill switch: `AY_EXEC_UNKNOWN_MEMO=0` disables the memo.
 pub(crate) fn executor_unknown_memo_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("AY_EXEC_UNKNOWN_MEMO").map_or(true, |v| v != "0"))
+    *ENABLED.get_or_init(|| crate::ab_switches::get().exec_unknown_memo)
 }
 
 // The memo is thread-local rather than `SmtContext`-owned: PDKIND and several

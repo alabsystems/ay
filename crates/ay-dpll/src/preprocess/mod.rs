@@ -58,7 +58,9 @@ pub(crate) use normalize_eq_bv_concat::NormalizeEqBvConcat;
 // Apply-surface only (z3's `propagate-ineqs` tactic): NOT a
 // `PreprocessingPass`, deliberately never enrolled in the solve pipeline.
 pub(crate) use propagate_ineqs::PropagateIneqs;
-pub(crate) use propagate_values::PropagateValues;
+pub(crate) use propagate_values::{
+    PropagateValues, PropagatedEntrySource, PropagatedRewriteRecord, PropagationRecords,
+};
 pub(crate) use qe_light::QeLight;
 pub(crate) use reduce_args::ReduceArgs;
 pub(crate) use tseitin_cnf::TseitinCnf;
@@ -67,10 +69,11 @@ pub(crate) use variable_subst::{VariableSubstitution, VAR_SUBST_SCALAR_REPLACEME
 use ay_core::{TermId, TermStore};
 use std::sync::{Arc, Mutex};
 
-/// Wrapper to allow sharing VariableSubstitution pass with external code.
-struct VariableSubstitutionWrapper(Arc<Mutex<VariableSubstitution>>);
+/// Shared-handle wrapper for preprocessing passes whose state is inspected
+/// after the fixed-point loop.
+struct SharedPass<P>(Arc<Mutex<P>>);
 
-impl PreprocessingPass for VariableSubstitutionWrapper {
+impl<P: PreprocessingPass> PreprocessingPass for SharedPass<P> {
     fn apply(&mut self, terms: &mut TermStore, assertions: &mut Vec<TermId>) -> bool {
         self.0.lock().unwrap().apply(terms, assertions)
     }
@@ -164,22 +167,28 @@ impl Preprocessor {
     /// 5. [`VariableSubstitution`] - Substitute equivalent variables
     /// 6. [`NormalizeBvArith`] - Canonicalize BV arithmetic (bvadd/bvmul)
     ///
-    /// Returns (preprocessor, variable_substitution_pass) where the pass can be
-    /// queried for substitutions after preprocessing.
-    pub(crate) fn new_with_subst() -> (Self, Arc<Mutex<VariableSubstitution>>) {
+    /// Returns the variable-substitution and `PropagateValues` pass handles so
+    /// callers can inspect substitutions and drain producer provenance after
+    /// the loop (#ppp-provenance).
+    pub(crate) fn new_with_subst_and_propagation() -> (
+        Self,
+        Arc<Mutex<VariableSubstitution>>,
+        Arc<Mutex<PropagateValues>>,
+    ) {
         let var_subst = Arc::new(Mutex::new(VariableSubstitution::new()));
+        let propagate_values = Arc::new(Mutex::new(PropagateValues::new()));
         let preprocessor = Self {
             passes: vec![
                 Box::new(NormalizeEqBvConcat::new()),
                 Box::new(FlattenAnd::new()),
-                Box::new(PropagateValues::new()),
+                Box::new(SharedPass(propagate_values.clone())),
                 Box::new(IteEquality::new()),
-                Box::new(VariableSubstitutionWrapper(var_subst.clone())),
+                Box::new(SharedPass(var_subst.clone())),
                 Box::new(NormalizeBvArith::new()),
             ],
             max_iterations: 100,
         };
-        (preprocessor, var_subst)
+        (preprocessor, var_subst, propagate_values)
     }
 
     /// Create a new preprocessor with default passes.
@@ -243,11 +252,11 @@ impl Preprocessor {
     ) -> usize {
         debug_assert_eq!(assertions.len(), source_sets.len());
         let mut iterations = 0;
-        // Env-gated per-pass timing (`AY_PHASE_TRACE=1`): pass index follows the
+        // Env-gated per-pass timing (`--phase-trace`): pass index follows the
         // `new_with_subst` order (0 NormalizeEqBvConcat, 1 FlattenAnd,
         // 2 PropagateValues, 3 IteEquality, 4 VariableSubstitution,
         // 5 NormalizeBvArith). Diagnostic-only stderr comment lines.
-        let trace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let trace = ay_core::misc_cli_flags().phase_trace;
 
         loop {
             iterations += 1;

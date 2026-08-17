@@ -78,7 +78,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     );
 
                 let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                    &$self.ctx.terms, $solver,
+                    &mut $self.ctx.terms, $solver,
                     &mut $local_term_to_var, &mut $local_var_to_term,
                     &mut $local_next_var, &mut $negations,
                     le_atom, ge_atom, None,
@@ -102,7 +102,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     DisequalitySplitAtoms::Skip => { continue; }
                     DisequalitySplitAtoms::IntFractional { le, ge } => {
                         let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $local_term_to_var, &mut $local_var_to_term,
                             &mut $local_next_var, &mut $negations, le, ge, None,
                             &mut $islp_added_split_clauses,
@@ -114,7 +114,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     DisequalitySplitAtoms::IntExact { le, ge, disequality_term, is_distinct } => {
                         let guard = disequality_term.map(|dt| (dt, is_distinct));
                         let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $local_term_to_var, &mut $local_var_to_term,
                             &mut $local_next_var, &mut $negations, le, ge, guard,
                             &mut $islp_added_split_clauses,
@@ -126,7 +126,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     DisequalitySplitAtoms::Real { lt, gt, disequality_term, is_distinct } => {
                         let guard = disequality_term.map(|dt| (dt, is_distinct));
                         let (lt_var, gt_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $local_term_to_var, &mut $local_var_to_term,
                             &mut $local_next_var, &mut $negations, lt, gt, guard,
                             &mut $islp_added_split_clauses,
@@ -165,7 +165,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
 
                 let guard = Some((split.disequality_term, is_distinct));
                 let (lt_var, gt_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                    &$self.ctx.terms, $solver,
+                    &mut $self.ctx.terms, $solver,
                     &mut $local_term_to_var, &mut $local_var_to_term,
                     &mut $local_next_var, &mut $negations,
                     lt_atom, gt_atom, guard,
@@ -185,7 +185,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     )
                 {
                     let _ = $crate::executor::theories::split_incremental::encode_and_add_negated_atom_lemma(
-                        &$self.ctx.terms, $solver,
+                        &mut $self.ctx.terms, $solver,
                         &mut $local_term_to_var, &mut $local_var_to_term,
                         &mut $local_next_var, &mut $negations,
                         idx_eq, (split.disequality_term, is_distinct),
@@ -218,7 +218,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
 
                     let guard = Some((split.disequality_term, is_distinct));
                     let (lt_var, gt_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                        &$self.ctx.terms, $solver,
+                        &mut $self.ctx.terms, $solver,
                         &mut $local_term_to_var, &mut $local_var_to_term,
                         &mut $local_next_var, &mut $negations,
                         lt_atom, gt_atom, guard,
@@ -238,7 +238,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                         )
                     {
                         let _ = $crate::executor::theories::split_incremental::encode_and_add_negated_atom_lemma(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $local_term_to_var, &mut $local_var_to_term,
                             &mut $local_next_var, &mut $negations,
                             idx_eq, (split.disequality_term, is_distinct),
@@ -268,6 +268,14 @@ macro_rules! pipeline_incremental_split_eager_build_unsat_proof {
      $local_clausification_proofs:ident, $local_theory_proofs:ident
     ) => {
         $self.last_model = None;
+        if $proof_enabled {
+            $crate::pipeline_fns::drain_pending_original_clause_authorities(
+                $solver,
+                &mut $islp_negations,
+                &mut $local_clausification_proofs,
+                &mut $local_theory_proofs,
+            );
+        }
         if let Some(__islp_cap) = $crate::pipeline_fns::capture_split_unsat_proof(
             $solver,
             $proof_enabled,

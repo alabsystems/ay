@@ -167,10 +167,10 @@ impl Executor {
     ) -> Option<Vec<TermId>> {
         // AY convention: default ON, `=0` opts out (a flag-gated-off fast
         // path is not a fix; the escape hatch is for A/B measurement).
-        if std::env::var_os("AY_INT_PIGEONHOLE").is_some_and(|v| v == "0") {
+        if ay_core::theory_disable_flags().no_int_pigeonhole {
             return None;
         }
-        let debug = std::env::var_os("AY_DEBUG_PIGEONHOLE").is_some();
+        let debug = ay_core::misc_cli_flags().debug_pigeonhole;
         if named.is_some_and(|n| n.is_empty()) {
             return None;
         }
@@ -500,9 +500,8 @@ impl Executor {
     /// of the enrichment-selected outside vertices, or those vertices reach the
     /// reduced benchmark as unbounded Ints.
     fn int_pigeonhole_enrich_k_threshold() -> usize {
-        std::env::var("AY_INT_PIGEONHOLE_ENRICH_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        ay_core::misc_cli_flags()
+            .int_pigeonhole_enrich_k
             .unwrap_or(usize::MAX)
     }
 
@@ -995,13 +994,13 @@ mod tests {
     }
 
     /// DEFAULT-ON: the pass fires with no env var set at all (the
-    /// `AY_INT_PIGEONHOLE=0` opt-out is exercised end-to-end through the
+    /// `--dpll-no-int-pigeonhole` opt-out is exercised end-to-end through the
     /// binary — `std::env::set_var` is unavailable here, the crate is
     /// `#![forbid(unsafe_code)]`).
     #[test]
     fn test_int_pigeonhole_is_default_on() {
         assert!(
-            std::env::var_os("AY_INT_PIGEONHOLE").is_none(),
+            !ay_core::theory_disable_flags().no_int_pigeonhole,
             "test env must not pin the knob"
         );
         let exec = exec_setup(K4_INT);

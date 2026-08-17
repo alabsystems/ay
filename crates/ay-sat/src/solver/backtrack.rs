@@ -255,11 +255,14 @@ impl Solver {
         self.trail_lim.truncate(target_level as usize);
         self.decision_level = target_level;
         if target_level == 0 {
-            self.cold.lrat_level0_unit_materialize_cursor = if lrat_root_prefix_unchanged {
-                old_lrat_level0_unit_materialize_cursor.min(old_root_prefix_end)
+            if lrat_root_prefix_unchanged {
+                self.cold.lrat_level0_unit_materialize_cursor =
+                    old_lrat_level0_unit_materialize_cursor;
+                self.clamp_lrat_level0_unit_materialize_cursor(old_root_prefix_end);
             } else {
-                0
-            };
+                self.cold.lrat_level0_unit_materialize_cursor = 0;
+                self.cold.lrat_level0_unit_materialize_pinned.clear();
+            }
         }
 
         // Re-propagate out-of-order literals from chrono BT compaction.

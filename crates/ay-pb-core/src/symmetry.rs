@@ -2356,7 +2356,7 @@ fn build_scalable_index(instance: &PbInstance) -> Option<ScalableIndex> {
         &cons_incidence,
     );
 
-    if std::env::var_os("AY_PB_SYM_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().pb_sym_debug {
         let nv = distinct_count(&base_var_color);
         let nc = distinct_count(&base_cons_color);
         let mut sizes: BTreeMap<u64, usize> = BTreeMap::new();
@@ -3316,7 +3316,7 @@ fn detect_scalable_generators(
     let Some(index) = build_scalable_index(instance) else {
         return Vec::new();
     };
-    let dbg = std::env::var_os("AY_PB_SYM_DEBUG").is_some();
+    let dbg = ay_core::misc_cli_flags().pb_sym_debug;
 
     // Candidate orbit classes: variables sharing a base colour, size >= 2.
     let mut classes: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
@@ -3525,7 +3525,7 @@ mod tests {
         let partition = detect_verified_block_partition_with_deadline(&instance, None)
             .expect("bounded exact detection")
             .expect("complete block family");
-        assert!(std::ptr::eq(partition.source(), &instance));
+        assert!(std::ptr::eq(partition.source(), &raw const instance));
         assert_eq!(partition.block_count(), 3);
         assert_eq!(partition.block_width(), 2);
         assert_eq!(partition.transpositions().len(), 2);

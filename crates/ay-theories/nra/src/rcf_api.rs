@@ -49,7 +49,10 @@ pub fn sign(s: &RealScalar) -> Option<i32> {
 pub fn canonicalize(s: &RealScalar) -> Option<RealScalar> {
     match s {
         RealScalar::Rational(r) => Some(RealScalar::Rational(r.clone())),
-        RealScalar::Algebraic(v) => v.to_number(),
+        // Canonicalization is an explicit introspection boundary, so it may
+        // spend the bounded rational-root certificate that arithmetic inner
+        // loops intentionally avoid.
+        RealScalar::Algebraic(v) => v.to_number_for_output(),
     }
 }
 

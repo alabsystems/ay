@@ -1053,11 +1053,9 @@ impl TheorySolver for EufSolver<'_> {
     fn set_lazy_propagation_supported(&mut self, supported: bool) {
         // #euf-lazy-explain: capability handshake (#8467). Only flips lazy
         // emission ON when the consumer declared support AND the kill switch
-        // is not set. `AY_EUF_LAZY_EXPLAIN=0` restores eager reasons
-        // everywhere (A/B lever + safety valve).
-        static KILL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let killed =
-            *KILL.get_or_init(|| std::env::var_os("AY_EUF_LAZY_EXPLAIN").is_some_and(|v| v == "0"));
+        // (`--no-euf-lazy-explain`) is not set — the A/B lever + safety
+        // valve restoring eager reasons everywhere.
+        let killed = ay_core::theory_disable_flags().no_euf_lazy_explain;
         self.lazy_explain_enabled = supported && !killed;
     }
 

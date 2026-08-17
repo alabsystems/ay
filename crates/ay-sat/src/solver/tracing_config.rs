@@ -119,6 +119,7 @@ impl Solver {
         );
         self.cold.lrat_enabled = true;
         self.cold.lrat_level0_unit_materialize_cursor = 0;
+        self.cold.lrat_level0_unit_materialize_pinned.clear();
         self.enforce_inprocessing_proof_overrides();
         // unit_proof_id, level0_proof_id, and clause_ids are now allocated
         // unconditionally at construction (#8069: Phase 2a). No resizing needed.
@@ -196,14 +197,35 @@ impl Solver {
         self.cold.clause_trace.is_some()
     }
 
+    /// Highest clause ID ever issued to an original (non-derived) clause.
+    ///
+    /// This is an ID high-water mark, not a count: derived IDs may occupy
+    /// holes below it, and tautological originals may consume IDs without a
+    /// retained trace row. Proof-annotation ledgers use this value to preserve
+    /// their `clause_id - 1` indexing across both kinds of hole.
+    #[must_use]
+    pub fn issued_original_clause_id_max(&self) -> u64 {
+        self.cold.issued_original_clause_id_max
+    }
+
+    /// Whether `id` was actually issued to an original (non-derived) clause.
+    ///
+    /// Range membership alone is insufficient because late original clauses
+    /// share the monotonic namespace with derived clauses.
+    #[must_use]
+    pub fn is_issued_original_clause_id(&self, id: u64) -> bool {
+        self.is_original_clause_id(id)
+    }
+
     /// Take the clause trace, consuming it from the solver
     ///
     /// Returns `None` if clause trace was not enabled.
     pub fn take_clause_trace(&mut self) -> Option<ClauseTrace> {
         let solver_num_vars = self.total_num_vars();
+        let scope_assumptions = self.active_scope_assumptions();
         let mut trace = self.cold.clause_trace.take();
         if let Some(t) = trace.as_mut() {
-            t.stamp_solver_num_vars(solver_num_vars);
+            t.stamp_solver_provenance(solver_num_vars, &scope_assumptions);
             // #A2b observability: the two search-time proof bookkeeping
             // meters (trace bytes recorded, root-trail entries rescanned by
             // level-0 LRAT materialization) that calibrate the construction
@@ -229,7 +251,7 @@ impl Solver {
     /// through a public [`ClauseTrace`] mutator clears that provenance.
     pub fn snapshot_clause_trace(&self) -> Option<ClauseTrace> {
         let mut trace = self.cold.clause_trace.clone()?;
-        trace.stamp_solver_num_vars(self.total_num_vars());
+        trace.stamp_solver_provenance(self.total_num_vars(), &self.active_scope_assumptions());
         Some(trace)
     }
 

@@ -4,7 +4,7 @@
 
 use super::ArrayAxiomMode;
 use crate::Executor;
-use ay_core::TermData;
+use ay_core::{Sort, TermData};
 use ay_frontend::parse;
 
 fn run_script(input: &str) -> Vec<String> {
@@ -25,6 +25,229 @@ fn prepare_executor(input: &str) -> Executor {
         "setup scripts should not emit check-sat results"
     );
     exec
+}
+
+#[test]
+fn finite_array_extensionality_budget_emits_only_complete_equality_atoms() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_ABV)
+        (declare-const a (Array (_ BitVec 4) (_ BitVec 8)))
+        (declare-const b (Array (_ BitVec 4) (_ BitVec 8)))
+        (assert (= (store a #x0 #x01) (store a #x1 #x02)))
+        (assert (= (store b #x2 #x03) (store b #x3 #x04)))
+    "#,
+    );
+    let assertion_count = exec.ctx.assertions.len();
+
+    let report = exec.add_finite_index_array_extensionality_with_budget(16);
+
+    assert_eq!(report.candidate_equalities, 2);
+    assert_eq!(report.candidate_index_points, 32);
+    assert_eq!(report.emitted_equalities, 1);
+    assert_eq!(report.emitted_index_points, 16);
+    assert_eq!(report.budget_deferred_equalities, 1);
+    assert_eq!(report.budget_deferred_index_points, 16);
+    assert!(!report.is_complete());
+    assert_eq!(
+        exec.ctx.assertions.len(),
+        assertion_count + 1,
+        "the budget may emit one whole biconditional, never a partial second one"
+    );
+}
+
+#[test]
+fn finite_array_closure_reaches_nested_array_fixed_point() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_AX)
+        (declare-const a (Array Bool (Array Bool Bool)))
+        (declare-const b (Array Bool (Array Bool Bool)))
+        (assert (= a b))
+    "#,
+    );
+
+    let report = exec.add_finite_index_array_closure();
+
+    assert!(report.is_complete(), "nested closure deferred: {report:?}");
+    assert_eq!(report.emitted_equalities, 3);
+    assert_eq!(report.emitted_index_points, 6);
+    assert_eq!(report.budget_deferred_equalities, 0);
+}
+
+#[test]
+fn incremental_const_store_extensionality_exposes_finite_cell_equality() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_AX)
+        (declare-const constant_cell (Array Bool Int))
+        (declare-const base_cell (Array Bool Int))
+        (declare-const stored_cell (Array Bool Int))
+        (assert
+          (= ((as const (Array Int (Array Bool Int))) constant_cell)
+             (store ((as const (Array Int (Array Bool Int))) base_cell)
+                    0
+                    stored_cell)))
+    "#,
+    );
+
+    let initial = exec.add_finite_index_array_closure();
+    assert_eq!(initial.candidate_equalities, 0);
+    assert_eq!(initial.emitted_equalities, 0);
+
+    // The infinite outer Int carrier is outside exact closure. Its restricted
+    // const/store axiom nevertheless exposes `constant_cell = stored_cell`,
+    // whose nested Bool carrier must be closed by the incremental route's
+    // second, final pass.
+    exec.add_const_store_array_extensionality();
+    let final_report = exec.add_finite_index_array_closure();
+
+    assert!(final_report.is_complete());
+    assert_eq!(final_report.candidate_equalities, 1);
+    assert_eq!(final_report.emitted_equalities, 1);
+    assert_eq!(final_report.emitted_index_points, 2);
+}
+
+#[test]
+fn finite_array_closure_reuses_axiom_without_recharge_and_reinstalls_after_swap() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_ABV)
+        (declare-const a (Array (_ BitVec 4) (_ BitVec 8)))
+        (declare-const b (Array (_ BitVec 4) (_ BitVec 8)))
+        (assert (= a b))
+    "#,
+    );
+    let base_len = exec.ctx.assertions.len();
+    let first = exec.add_finite_index_array_closure();
+    let remaining = exec.finite_array_expansion.remaining_index_points;
+    assert_eq!(first.emitted_equalities, 1);
+    assert_eq!(exec.ctx.assertions.len(), base_len + 1);
+
+    let second = exec.add_finite_index_array_closure();
+    assert_eq!(second.emitted_equalities, 0);
+    assert_eq!(second.already_covered_equalities, 1);
+    assert_eq!(exec.ctx.assertions.len(), base_len + 1);
+    assert_eq!(
+        exec.finite_array_expansion.remaining_index_points,
+        remaining
+    );
+
+    // Simulate an internal route assertion swap while the query ledger and
+    // proof session remain alive. A cache hit must reinstall the axiom without
+    // charging it again.
+    exec.ctx.assertions.truncate(base_len);
+    let reinstalled = exec.add_finite_index_array_closure();
+    assert_eq!(reinstalled.emitted_equalities, 0);
+    assert_eq!(reinstalled.already_covered_equalities, 1);
+    assert_eq!(exec.ctx.assertions.len(), base_len + 1);
+    assert_eq!(
+        exec.finite_array_expansion.remaining_index_points,
+        remaining
+    );
+}
+
+#[test]
+fn finite_array_closure_shares_budget_between_symbolic_selects_and_equalities() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_AX)
+        (declare-const a (Array Bool Bool))
+        (declare-const b (Array Bool Bool))
+        (declare-const p Bool)
+        (assert (= (select a p) true))
+        (assert (= a b))
+    "#,
+    );
+
+    let report = exec.add_finite_index_array_extensionality_with_budget(2);
+
+    assert_eq!(report.emitted_selects, 1);
+    assert_eq!(report.emitted_select_index_points, 2);
+    assert_eq!(report.emitted_equalities, 0);
+    assert_eq!(report.budget_deferred_equalities, 1);
+    assert!(!report.is_complete());
+}
+
+#[test]
+fn finite_array_value_cell_cap_defers_before_domain_allocation() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_ABV)
+        (declare-const a (Array (_ BitVec 8) (_ BitVec 1024)))
+        (declare-const b (Array (_ BitVec 8) (_ BitVec 1024)))
+        (assert (= a b))
+    "#,
+    );
+    let term_count = exec.ctx.terms.len();
+
+    let report = exec.add_finite_index_array_closure();
+
+    assert_eq!(report.emitted_equalities, 0);
+    assert_eq!(report.budget_deferred_equalities, 1);
+    assert_eq!(report.budget_deferred_value_cells, 256 * 1024);
+    assert_eq!(
+        exec.ctx.terms.len(),
+        term_count,
+        "a rejected whole candidate must not allocate its 256 domain terms"
+    );
+}
+
+#[test]
+fn finite_array_budget_rearms_only_at_external_query_boundary() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_AX)
+        (declare-const a (Array Bool Bool))
+        (declare-const b (Array Bool Bool))
+        (assert (= a b))
+    "#,
+    );
+
+    let exhausted = exec.add_finite_index_array_extensionality_with_budget(0);
+    assert!(!exhausted.is_complete());
+    assert!(!exec.finite_array_expansion.is_complete());
+    assert_eq!(exec.finite_array_expansion.remaining_index_points, 0);
+
+    exec.begin_public_solve(false);
+    assert!(!exec.finite_array_expansion.is_complete());
+    assert_eq!(
+        exec.finite_array_expansion.remaining_index_points, 0,
+        "an internal continuation must not replenish the query budget"
+    );
+
+    exec.begin_external_decision_query(false);
+    let replenished = exec.add_finite_index_array_closure();
+    assert!(replenished.is_complete());
+    assert_eq!(replenished.emitted_equalities, 1);
+}
+
+#[test]
+fn finite_array_candidate_scan_is_bounded_and_fail_closed() {
+    let mut exec = Executor::new();
+    let array_sort = Sort::array(Sort::Bool, Sort::Bool);
+    for index in 0..=Executor::FINITE_ARRAY_CANDIDATE_SCAN_CAP {
+        let lhs = exec
+            .ctx
+            .terms
+            .mk_var(format!("scan_lhs_{index}"), array_sort.clone());
+        let rhs = exec
+            .ctx
+            .terms
+            .mk_var(format!("scan_rhs_{index}"), array_sort.clone());
+        let equality = exec.ctx.terms.mk_eq(lhs, rhs);
+        exec.ctx.assertions.push(equality);
+    }
+
+    let report = exec.add_finite_index_array_closure();
+
+    assert_eq!(report.candidate_scan_truncated, 1);
+    assert_eq!(
+        report.candidate_equalities,
+        Executor::FINITE_ARRAY_CANDIDATE_SCAN_CAP
+    );
+    assert!(!report.is_complete());
+    assert!(exec.finite_array_expansion.candidate_scan_truncated);
 }
 
 // --- Core check-sat path tests ---
@@ -376,25 +599,7 @@ fn array_extensionality_sat_different_at_other_index() {
     assert_eq!(run_script(input), vec!["sat"]);
 }
 
-#[test]
-fn negated_pointwise_forall_array_eq_is_sat_not_unsat() {
-    // SOUNDNESS (quant_more): `(not (forall i. b[i]=cc[i]))` says the two arrays
-    // are NOT pointwise equal, i.e. `b != cc`, which is SAT (pick them to differ
-    // at index 0; z3 agrees). The pointwise-forall extensionality pass formerly
-    // descended through the `not` and added `(= b cc)` as a "consequence" — but a
-    // forall under a negation is NOT an asserted premise, so adding `(= b cc)`
-    // manufactured a contradiction and returned a WRONG `unsat`. The pass is now
-    // polarity-aware: it only treats a positively-occurring pointwise forall as a
-    // premise.
-    let input = r#"
-        (set-logic ALIA)
-        (declare-const b (Array Int Int))
-        (declare-const cc (Array Int Int))
-        (assert (not (forall ((X0 Int)) (= (select b X0) (select cc X0)))))
-        (check-sat)
-    "#;
-    assert_eq!(run_script(input), vec!["sat"]);
-}
+mod negated_pointwise_array;
 
 #[test]
 fn negated_pointwise_forall_array_eq_with_eq_premise_is_unsat() {
@@ -847,7 +1052,7 @@ fn array_extensionality_user_legacy_name_collision_stays_sat() {
         .pair_witness(&exec.ctx.terms, a, b)
         .expect("solver created a disjoint internal witness");
     assert_ne!(user_term, internal_term);
-    assert_eq!(exec.ctx.terms.sort(internal_term), &ay_core::Sort::Int);
+    assert_eq!(exec.ctx.terms.sort(internal_term), &Sort::Int);
 }
 
 #[test]

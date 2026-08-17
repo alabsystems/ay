@@ -28,15 +28,21 @@ struct PatchPlan {
 }
 
 impl NraSolver<'_> {
-    /// Collect monomials whose aux_var value disagrees with the factor product.
+    /// Collect monomials whose auxiliary is absent or disagrees with the factor
+    /// product. An absent auxiliary can occur when a nonlinear term appears
+    /// only beneath an uninterpreted-function application: its factors still
+    /// have arithmetic model values, but LRA never needed a row for the term
+    /// itself. Treat that as an exact extension to materialize, not as a reason
+    /// to weaken the final consistency check.
     fn collect_inconsistent_monomials(&self) -> Vec<(Monomial, BigRational)> {
         let mut patches = Vec::new();
-        for mon in self.monomials.values() {
+        for mon in self.products() {
             if let Some(product) = self.compute_monomial_product(mon) {
-                if let Some(m_val) = self.var_value(mon.aux_var) {
-                    if m_val != product {
-                        patches.push((mon.clone(), product));
-                    }
+                if self
+                    .var_value(mon.aux_var)
+                    .is_none_or(|value| value != product)
+                {
+                    patches.push((mon.clone(), product));
                 }
             }
         }
@@ -49,7 +55,7 @@ impl NraSolver<'_> {
         for &var in &mon.vars {
             product *= self.var_value(var)?;
         }
-        Some(product)
+        Some(mon.aux_from_product(&product))
     }
 
     /// Decide how to patch each inconsistent monomial. Returns `None` if any
@@ -90,7 +96,7 @@ impl NraSolver<'_> {
             if patched_vars.contains(&var) {
                 continue;
             }
-            let other_product = self.product_excluding_factor(mon, idx)?;
+            let other_product = &mon.coeff * self.product_excluding_factor(mon, idx)?;
             if other_product.is_zero() {
                 continue;
             }
@@ -130,7 +136,11 @@ impl NraSolver<'_> {
     /// Check whether a variable can be set to a given value without violating bounds.
     fn can_patch_to(&self, var: TermId, value: &BigRational) -> bool {
         let Some((lower, upper)) = self.lra.get_bounds(var) else {
-            return false;
+            // No LRA variable means no row or bound constrains this term. The
+            // caller will register it and install exact equal lower/upper cuts
+            // in the tentative scope. This is the model extension needed for
+            // products occurring only below opaque applications.
+            return true;
         };
         if let Some(ref lb) = lower {
             let lb_val = lb.value_big();
@@ -160,7 +170,7 @@ impl NraSolver<'_> {
         new_value: &BigRational,
         already_patched: &[TermId],
     ) -> bool {
-        for mon in self.monomials.values() {
+        for mon in self.products() {
             if !mon.vars.contains(&var) || already_patched.contains(&mon.aux_var) {
                 continue;
             }
@@ -187,8 +197,8 @@ impl NraSolver<'_> {
         let Some(m_val) = self.var_value(mon.aux_var) else {
             return false;
         };
-        let was_consistent = m_val == old_product;
-        let is_consistent = m_val == new_product;
+        let was_consistent = m_val == mon.aux_from_product(&old_product);
+        let is_consistent = m_val == mon.aux_from_product(&new_product);
         was_consistent && !is_consistent
     }
 
@@ -266,7 +276,7 @@ impl NraSolver<'_> {
         let mon_patches = self.collect_inconsistent_monomials();
         let div_patches = self.collect_inconsistent_division_patches();
         if mon_patches.is_empty() && div_patches.is_empty() {
-            return true;
+            return !self.has_inconsistent_monomials();
         }
 
         let mut all_plans = match self.plan_patches(&mon_patches) {
@@ -309,5 +319,77 @@ impl NraSolver<'_> {
         // Patch failed — undo the cuts
         self.lra.pop();
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ay_core::term::{Symbol, TermStore};
+    use ay_core::{Sort, TheoryResult};
+    use num_bigint::BigInt;
+
+    fn integer(value: i64) -> BigRational {
+        BigRational::from_integer(BigInt::from(value))
+    }
+
+    fn opaque_positive(terms: &mut TermStore, argument: TermId) -> TermId {
+        let application = terms.mk_app(Symbol::named("f"), vec![argument], Sort::Real);
+        let zero = terms.mk_rational(BigRational::zero());
+        terms.mk_gt(application, zero)
+    }
+
+    #[test]
+    fn missing_scaled_product_aux_is_materialized_exactly() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let two = terms.mk_rational(integer(2));
+        let three = terms.mk_rational(integer(3));
+        let product = terms.mk_mul(vec![three, x, x]);
+        let x_is_two = terms.mk_eq(x, two);
+        let uf_atom = opaque_positive(&mut terms, product);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(x_is_two, true);
+        solver.assert_literal(uf_atom, true);
+
+        assert!(matches!(solver.check(), TheoryResult::Sat));
+        assert_eq!(solver.var_value(product), Some(integer(12)));
+        assert!(!solver.has_inconsistent_monomials());
+    }
+
+    #[test]
+    fn missing_product_factor_remains_fail_closed() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let y = terms.mk_var("y", Sort::Real);
+        let two = terms.mk_rational(integer(2));
+        let product = terms.mk_mul(vec![x, y]);
+        let x_is_two = terms.mk_eq(x, two);
+        let uf_atom = opaque_positive(&mut terms, product);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(x_is_two, true);
+        solver.assert_literal(uf_atom, true);
+
+        assert!(matches!(solver.check(), TheoryResult::Unknown));
+        assert!(solver.var_value(y).is_none());
+        assert!(solver.has_inconsistent_monomials());
+    }
+
+    #[test]
+    fn missing_symbolic_division_beneath_uf_remains_extendable() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let one = terms.mk_rational(integer(1));
+        let two = terms.mk_rational(integer(2));
+        let division = terms.mk_div(one, x);
+        let x_is_two = terms.mk_eq(x, two);
+        let uf_atom = opaque_positive(&mut terms, division);
+        let mut solver = NraSolver::new(&terms);
+        solver.assert_literal(x_is_two, true);
+        solver.assert_literal(uf_atom, true);
+
+        assert!(matches!(solver.check(), TheoryResult::Sat));
+        assert!(!solver.has_inconsistent_divisions());
+        assert!(!solver.zero_divisor_model_is_unsound());
     }
 }

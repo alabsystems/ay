@@ -184,3 +184,233 @@ fn test_gate_qf_ax_flat_array_store_ext_still_sat() {
         &["sat"],
     );
 }
+
+// --- Exact finite-array closure architecture ---
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_ax_finite_ext_defers_aliases_until_after_substitution() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic QF_AX)
+        (declare-const a0 (Array Bool Bool))
+        (declare-const a1 (Array Bool Bool))
+        (declare-const a2 (Array Bool Bool))
+        (declare-const a3 (Array Bool Bool))
+        (assert (= a1 (store a0 false true)))
+        (assert (= a2 (store a1 true false)))
+        (assert (= a3 (store a2 false false)))
+        (declare-const p (Array Bool Bool))
+        (declare-const q (Array Bool Bool))
+        (assert (not (= p q)))
+        (assert (= (select p false) (select q false)))
+        (assert (= (select p true) (select q true)))
+        (check-sat)
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1)
+    );
+    assert!(
+        stats
+            .get_int("smt.array.finite_ext.emitted_equalities")
+            .is_some_and(|emitted| emitted > 0),
+        "the route must emit exact coverage for its live post-substitution surface"
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.budget_deferred_equalities"),
+        Some(0)
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.candidate_scan_truncated"),
+        Some(0)
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_dt_ax_finite_ext_defers_aliases_until_after_substitution() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D ((d0) (d1)))
+        (declare-const a0 (Array Bool D))
+        (declare-const a1 (Array Bool D))
+        (declare-const a2 (Array Bool D))
+        (assert (= a1 (store a0 false d0)))
+        (assert (= a2 (store a1 true d1)))
+        (declare-const p (Array Bool D))
+        (declare-const q (Array Bool D))
+        (assert (not (= p q)))
+        (assert (= (select p false) (select q false)))
+        (assert (= (select p true) (select q true)))
+        (check-sat)
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1),
+        "DtAx must defer without traversing the raw store-flat aliases"
+    );
+    assert!(
+        stats
+            .get_int("smt.array.finite_ext.emitted_equalities")
+            .is_some_and(|emitted| emitted > 0),
+        "the DT+array route must emit exact coverage after DT preprocessing"
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.budget_deferred_equalities"),
+        Some(0)
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.candidate_scan_truncated"),
+        Some(0)
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_aufdt_routes_array_aware_and_closes_finite_arrays() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic AUFDT)
+        (declare-datatype D ((d0) (d1)))
+        (declare-const a (Array Bool D))
+        (declare-const b (Array Bool D))
+        (assert (= (select a false) (select b false)))
+        (assert (= (select a true) (select b true)))
+        (assert (not (= a b)))
+        (check-sat)
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(stats.get_string("solver.logic_category"), Some("Aufdt"));
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1),
+        "AUFDT must defer exact closure until after DT axiom preprocessing"
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.emitted_equalities"),
+        Some(1),
+        "the finite Bool-indexed equality must close after DT preprocessing"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_aufdt_assuming_routes_array_aware_and_closes_finite_arrays() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic AUFDT)
+        (declare-datatype D ((d0) (d1)))
+        (declare-const a (Array Bool D))
+        (declare-const b (Array Bool D))
+        (assert (= (select a false) (select b false)))
+        (assert (= (select a true) (select b true)))
+        (check-sat-assuming ((not (= a b))))
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(stats.get_string("solver.logic_category"), Some("Aufdt"));
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1),
+        "AUFDT assumptions must share the array-aware DT query boundary"
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.emitted_equalities"),
+        Some(1),
+        "assumption-only disequality must seed exact finite closure"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_aufdtlra_alias_defers_to_array_aware_dt_lra_route() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic AUFDTLRA)
+        (declare-datatype D ((d0) (d1)))
+        (declare-const a (Array Bool D))
+        (declare-const b (Array Bool D))
+        (declare-const x Real)
+        (assert (= x 0.0))
+        (assert (= (select a false) (select b false)))
+        (assert (= (select a true) (select b true)))
+        (assert (not (= a b)))
+        (check-sat)
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(stats.get_string("solver.logic_category"), Some("Ufdtlra"));
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1),
+        "AUFDTLRA's shared category must defer to its DT+AUFLRA pipeline"
+    );
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.emitted_equalities"),
+        Some(1)
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_ax_nested_finite_extensionality_closes_before_current_quarantine() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic QF_AX)
+        (declare-const a (Array Bool (Array Bool Bool)))
+        (declare-const b (Array Bool (Array Bool Bool)))
+        (assert (not (= a b)))
+        (assert (= (select (select a false) false) (select (select b false) false)))
+        (assert (= (select (select a false) true) (select (select b false) true)))
+        (assert (= (select (select a true) false) (select (select b true) false)))
+        (assert (= (select (select a true) true) (select (select b true) true)))
+        (check-sat)
+    "#,
+    );
+
+    assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    assert_eq!(
+        stats.get_int("smt.array.finite_ext.emitted_equalities"),
+        Some(3),
+        "the outer equality and both array-valued cells must close before exact source authentication"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_ax_array_valued_symbolic_select_has_strict_proof() {
+    assert_unsat_with_proof(
+        r#"
+        (set-logic QF_AX)
+        (set-option :produce-proofs true)
+        (set-option :check-proofs-strict true)
+        (declare-const outer (Array Bool (Array Bool Bool)))
+        (declare-const cell (Array Bool Bool))
+        (declare-const p Bool)
+        (assert (= (select outer false) cell))
+        (assert (= (select outer true) cell))
+        (assert (not (= (select outer p) cell)))
+        (check-sat)
+        (get-proof)
+    "#,
+        ProofExpectation::InternalChecked,
+    );
+}

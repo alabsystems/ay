@@ -404,10 +404,6 @@ pub(crate) struct ColdState {
     /// Luby values that make `THEORY_LUBY_BASE * Luby(luby_idx)` enormous
     /// and effectively disable restarts for theory-dominated problems.
     pub(super) theory_luby_idx: u32,
-    /// Trail-length EMA (slow) for restart blocking (Audemard & Simon SAT 2012).
-    pub(super) trail_ema_slow: f64,
-    /// Number of trail EMA updates (for warmup gating).
-    pub(super) trail_ema_count: u64,
     /// Count of consecutive focused-mode EMA restarts (#8360).
     /// When the Glucose EMA fires on every restart for many consecutive
     /// restarts, it is not providing useful quality information (the formula
@@ -473,7 +469,7 @@ pub(crate) struct ColdState {
     /// tick delta. CaDiCaL restart.cpp:53-54.
     pub(super) stabilize_tick_inc: u64,
     /// Focused-mode search ticks at the moment the current/most recent focused
-    /// phase was entered (`AY_AB_MODE_EQUITICKS=1`, opt-in; 2026-07
+    /// phase was entered (`--sat-mode-equiticks true`, opt-in; 2026-07
     /// wf_0370e641 batch-3). Lets the stable-phase budget mirror Kissat
     /// mode.c `update_mode_limit`: each stable phase receives exactly the
     /// ticks the just-ended focused phase consumed, instead of the
@@ -490,7 +486,7 @@ pub(crate) struct ColdState {
     /// Tick limit for the current stabilization phase (absolute tick count for the
     /// current mode). CaDiCaL restart.cpp:64.
     pub(super) stabilize_tick_limit: u64,
-    /// Equiticks progress-gate (`AY_AB_EQT_PROGRESS`): conflict count at the most
+    /// Equiticks progress-gate (`--sat-eqt-progress`): conflict count at the most
     /// recent stable-mode `target_trail_len` improvement. Used to decide whether
     /// the stable frontier is still deepening when the equal-effort tick budget
     /// (`stabilize_tick_limit`) is reached, so a converging stable phase can be
@@ -504,11 +500,11 @@ pub(crate) struct ColdState {
     /// budget UP TO the default schedule — never further (bounds unbounded run).
     /// Only written when equiticks is active; 0 otherwise (inert).
     pub(super) stable_tick_hardcap: u64,
-    /// Cached `AY_AB_EQT_PROGRESS` env decision (None = not yet read; inner 0 =
+    /// Cached `--sat-eqt-progress` env decision (None = not yet read; inner 0 =
     /// disabled, >0 = the progress WINDOW in conflicts). Off by default: the
     /// progress-gated stable-phase extension is opt-in and only has any effect
-    /// when `AY_AB_MODE_EQUITICKS` is also active. `AY_AB_EQT_PROGRESS=1` enables
-    /// with the default window; `AY_AB_EQT_PROGRESS=<N>` (N>1) sets the window.
+    /// when `--sat-mode-equiticks` is also active. `--sat-eqt-progress 1` enables
+    /// with the default window; `--sat-eqt-progress <N>` (N>1) sets the window.
     pub(super) eqt_progress_cached: Option<u64>,
     /// Knuth reluctant doubling state u (see reference/cadical/src/reluctant.hpp)
     pub(super) reluctant_u: u64,
@@ -893,8 +889,19 @@ pub(crate) struct ColdState {
     pub(super) level0_proof_id: Vec<u64>,
     /// Signed literal proven by `level0_proof_id`; 0 means no signed provenance.
     pub(super) level0_proof_sign: Vec<i8>,
-    /// First root-trail position that still needs level-0 LRAT unit materialization.
+    /// High-water mark for level-0 LRAT unit materialization: every root-trail
+    /// position below it has been attempted at least once. Positions below the
+    /// cursor that remain unmaterializable are tracked individually in
+    /// `lrat_level0_unit_materialize_pinned` (#A5), so already-materialized
+    /// prefixes are never re-walked.
     pub(super) lrat_level0_unit_materialize_cursor: usize,
+    /// Root-trail positions below `lrat_level0_unit_materialize_cursor` that
+    /// still need a level-0 LRAT unit materialization retry (hidden hint IDs,
+    /// stale reasons, failed emits). Sorted ascending, deduplicated; every
+    /// entry is below the cursor. Replaces the pre-#A5 scalar cursor pinning
+    /// (`next_cursor.min(i)`) that re-walked the whole suffix after the oldest
+    /// unresolved entry on every call.
+    pub(super) lrat_level0_unit_materialize_pinned: Vec<usize>,
     /// Remaining deterministic work budget for search-time proof bookkeeping
     /// (level-0 LRAT unit materialization rescans; #A2b construction budget).
     /// `None` = unbudgeted (explicit `--proof`/`--strict-proofs`/
@@ -1254,6 +1261,14 @@ pub(crate) struct ColdState {
     pub(super) incremental_watch_boundary: Option<usize>,
     pub(super) symmetry_enabled: bool,
     pub(super) symmetry_stats: crate::symmetry::SymmetryStats,
+    /// CLI opt-outs for the symmetry routes (B2): `--disable symmetry-signed`
+    /// etc. Replace the retired env gates; false = route follows its default.
+    pub(super) symmetry_signed_disabled: bool,
+    pub(super) symmetry_auxfree_disabled: bool,
+    pub(super) symmetry_orbitope_disabled: bool,
+    /// Capability decisions from the resolved variant plan (batch B0):
+    /// what engaged and which layer decided, printed under `--stats`.
+    pub(super) capability_ledger: crate::auto::CapabilityLedger,
     pub(super) tla_trace: Option<TlaTraceWriter>,
     pub(super) diagnostic_trace: Option<SatDiagnosticWriter>,
     pub(super) decision_trace: Option<DecisionTraceWriter>,
@@ -1303,12 +1318,12 @@ pub(crate) struct ColdState {
     /// transient decays within the window (see
     /// `process_memory_interrupt_pending`).
     pub(super) process_memory_armed_at: Option<ay_core::time::Instant>,
-    /// Cached check: `AY_TRACE_EXT_CONFLICT` env var was set at solver creation.
-    /// Avoids repeated `std::env::var()` syscalls in the CDCL hot loop (#perf).
+    /// Cached check: `--trace-ext-conflict` was set at solver creation.
+    /// Read once, not per-conflict, to keep the CDCL hot loop clean (#perf).
     pub(super) trace_ext_conflict: bool,
-    /// Cached `AY_BVE_LIMIT` env var. Avoids per-candidate syscalls in BVE loop.
+    /// Cached `--bve-limit`. Read once, not per-candidate, in the BVE loop.
     pub(super) bve_limit: Option<usize>,
-    /// Cached `AY_BVE_TRACE` env var. Avoids per-elimination syscalls in BVE loop.
+    /// Cached `--bve-trace`. Read once, not per-elimination, in the BVE loop.
     pub(super) bve_trace: bool,
     /// When true, the quick elimination pre-pass (CaDiCaL elimfast pattern) is
     /// disabled. Set by `--disable elimfast` CLI flag (#8331).
@@ -1321,9 +1336,9 @@ pub(crate) struct ColdState {
     /// num_clauses>3M) — but ONLY on genuinely sparse formulas. The dense-skip
     /// guard is re-checked at BVE entry so this can never run expensive BVE on a
     /// dense formula. Bounded by the existing preprocess deadline and the
-    /// fastelim wall-clock guard. Default-driven by AY_AB_BVE_SPARSE +
-    /// AY_BVE_SPARSE_MAX_VARS/MAX_DENSITY; large formulas require the operator
-    /// to raise AY_BVE_SPARSE_MAX_VARS above the 150K default.
+    /// fastelim wall-clock guard. Default-driven by --sat-no-bve-sparse +
+    /// --sat-bve-sparse-max-vars/MAX_DENSITY; large formulas require the operator
+    /// to raise --sat-bve-sparse-max-vars above the 150K default.
     pub(super) sparse_band_bve_preprocess_unlock: bool,
     /// Giant raw-BVE unlock ROUTE flag (lever 3, 2026-07-11 sparse-prize
     /// completion round; OPT-IN via AY_AB_BVE_GIANT_RAW=1, band + measured
@@ -1376,7 +1391,7 @@ pub(crate) struct ColdState {
     /// losses on main2025, see `VariantConfig::subst_auto_collapse_enabled`).
     ///
     /// Set from the resolved variant config (Default DIMACS variant only;
-    /// kill-switch AY_AB_SUBST_AUTO=0). When true, the FIRST preprocess
+    /// kill-switch --sat-no-subst-auto). When true, the FIRST preprocess
     /// congruence round doubles as an equivalence-density probe that gates
     /// the expensive decompose+fixpoint collapse (config_preprocess.rs), and
     /// compute_preprocess_policy raises the congruence size caps to the AUTO
@@ -1388,14 +1403,14 @@ pub(crate) struct ColdState {
     /// (2026-07-11 dense-band regression fix; certified remeasure2 dense
     /// 23→19 attribution at main 0bb876d9). True only when
     /// `subst_auto_collapse` came from the DEFAULT-ON path
-    /// (`AY_AB_SUBST_AUTO` unset). Arms two NARROW, instance-scoped guards:
+    /// (`--sat-no-subst-auto` unset). Arms two NARROW, instance-scoped guards:
     ///
     ///   1. EARLY formula-density disarm of the whole AUTO arming
     ///      (`compute_preprocess_policy`, predicate `auto_probe_skip_dense`,
     ///      density > PREPROCESS_BVE_SKIP_DENSITY = 20): fires BEFORE the
     ///      policy reads `congruence.enabled` / the AUTO caps, so a dense
     ///      instance's whole pipeline (lightweight L0-GC path included) is
-    ///      behaviorally identical to AY_AB_SUBST_AUTO=0. Recovers 43fbacb2
+    ///      behaviorally identical to --sat-no-subst-auto. Recovers 43fbacb2
     ///      (48K clauses, formula density 60.3: the probe's 0.05
     ///      EQUIVALENCE-density gate measured 0.50 there — it does not
     ///      correlate with formula density — arming the collapse machinery
@@ -1418,7 +1433,7 @@ pub(crate) struct ColdState {
     ///      depends on (a GLOBAL fail-closed disarm was measured to LOSE
     ///      that flip; do not widen these guards without re-running it).
     ///
-    /// Explicit `AY_AB_SUBST_AUTO=1` keeps the historical uncapped
+    /// Explicit `--sat-no-subst-auto=1` keeps the historical uncapped
     /// measurement semantics (this stays false).
     pub(super) subst_auto_capped: bool,
     /// Giant-band AUTO probe raise (giant-3M loss fix, 2026-07; target
@@ -1430,7 +1445,7 @@ pub(crate) struct ColdState {
     /// compute_preprocess_policy uses the raised 4M/10M probe caps instead
     /// of 2M/8M, and preprocess() grants the 12s giant-band budget to
     /// in-band non-dense instances. Proof solves, explicit
-    /// `AY_AB_SUBST_AUTO=1`, and non-Default variants stay false — their
+    /// `--sat-no-subst-auto=1`, and non-Default variants stay false — their
     /// pipelines are bit-for-bit unchanged.
     pub(super) subst_auto_giant: bool,
     /// Collect BCP attribution counters in optimized builds.
@@ -1820,19 +1835,11 @@ pub(crate) struct ColdState {
     pub(super) debug_interp_output: ay_jit::conflict_jit::ConflictProcessorOutput,
 }
 
-/// A/B knob (campaign): `AY_AB_STABLE_EMA_GATE` overrides the INITIAL stable-mode
-/// Glucose-EMA restart gate (default `STABLE_EMA_MIN_CONFLICTS`). Post-init
-/// overrides in solve/mod.rs (small-dense / >1M-clause => u64::MAX) still apply.
-/// Cached per process (each solver run is a fresh process).
+/// The INITIAL stable-mode Glucose-EMA restart gate. Post-init overrides in
+/// solve/mod.rs (small-dense / >1M-clause => u64::MAX) still apply. (B21:
+/// the campaign env override is retired; the named constant is the value.)
 fn ab_stable_ema_gate() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_AB_STABLE_EMA_GATE")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(STABLE_EMA_MIN_CONFLICTS)
-    })
+    STABLE_EMA_MIN_CONFLICTS
 }
 
 impl ColdState {
@@ -1857,8 +1864,6 @@ impl ColdState {
             theory_conflict_ratio: 0.0,
             ext_conflict_count: 0,
             theory_luby_idx: 1,
-            trail_ema_slow: 0.0,
-            trail_ema_count: 0,
             consecutive_ema_restarts: 0,
             geometric_restarts: false,
             geometric_initial: 100.0,
@@ -2000,6 +2005,7 @@ impl ColdState {
             level0_proof_id: vec![0; num_vars],
             level0_proof_sign: vec![0; num_vars],
             lrat_level0_unit_materialize_cursor: 0,
+            lrat_level0_unit_materialize_pinned: Vec::new(),
             proof_bookkeeping_budget: None,
             next_clause_id: 1,
             next_original_clause_id: 1,
@@ -2080,6 +2086,10 @@ impl ColdState {
             incremental_watch_boundary: None,
             symmetry_enabled: false, // #8190: CaDiCaL has no symmetry detection; adaptive re-enables for small structured formulas
             symmetry_stats: crate::symmetry::SymmetryStats::default(),
+            capability_ledger: crate::auto::CapabilityLedger::default(),
+            symmetry_signed_disabled: false,
+            symmetry_auxfree_disabled: false,
+            symmetry_orbitope_disabled: false,
             tla_trace: None,
             diagnostic_trace: None,
             decision_trace: None,

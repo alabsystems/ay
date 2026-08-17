@@ -4,26 +4,15 @@
 
 //! CEGAR-style array functional consistency refinement for QF_ABV (#8510).
 //!
-//! After the SAT solver finds a satisfying assignment for the bit-blasted
-//! formula, this module checks whether the assignment respects array
-//! functional consistency (FC): if two select terms on the same array
-//! have equal concrete index values, their result values must also be equal.
+//! Audits bit-blasted SAT assignments for functional consistency (FC): selects
+//! on the same array and concrete index must have equal result values.
 //!
 //! When FC violations are found, the corresponding FC axiom clauses are
 //! generated and returned for injection into the SAT solver. The caller
 //! re-solves until no violations remain or a max iteration count is reached.
 //!
-//! This is necessary because the upfront FC axiom budget
-//! (`FC_CROSS_BASE_BUDGET_PER_ARRAY = 200`) can be insufficient for
-//! formulas with many constant-indexed selects and few symbolic-indexed
-//! selects. The CEGAR loop adds only the FC axioms that are actually
-//! needed, keeping the clause count manageable.
-//!
-//! Strategy: when a select term is found in an FC violation, generate FC
-//! axioms between that select and ALL other selects on the same array.
-//! This prevents the SAT solver from simply shifting the symbolic index
-//! to a different value that wasn't covered. One batch of axioms per
-//! violating select covers all possible aliasing scenarios.
+//! Refinement covers only direct-array, equal-index, unequal-value pairs. Hard
+//! traversal, bit, pair, variable, and clause budgets fail closed to `unknown`.
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_bv::BvBits;
@@ -36,6 +25,11 @@ use num_bigint::BigInt;
 use super::super::Executor;
 use super::bv_encoding;
 
+#[path = "bv_cegar_array_budget.rs"]
+mod budget;
+#[path = "bv_cegar_array_refine.rs"]
+mod refine;
+
 /// Result of CEGAR array FC check: new clauses to add to the SAT solver.
 pub(in crate::executor) struct CegarArrayResult {
     /// SAT-level clauses encoding violated FC axioms.
@@ -44,60 +38,44 @@ pub(in crate::executor) struct CegarArrayResult {
     pub(in crate::executor) num_new_vars: usize,
 }
 
+/// A complete FC audit, a refinement batch, or a fail-closed incomplete audit.
+pub(in crate::executor) enum CegarArrayCheck {
+    Consistent,
+    Refinement(CegarArrayResult),
+    Incomplete,
+}
+
+struct CegarArrayBuild {
+    clauses: Vec<Vec<SatLiteral>>,
+    next_var: u32,
+    new_vars: usize,
+    inspected_bits: usize,
+    pair_attempts: usize,
+    newly_covered: HashSet<(TermId, TermId)>,
+}
+
 impl Executor {
     /// Check array functional consistency against a concrete SAT model.
     ///
-    /// For each pair of select terms on the same root array where the
+    /// For each pair of select terms on the same direct array operand where the
     /// concrete index values are equal but the concrete result values
-    /// differ, identify the "violating" select terms and generate FC
-    /// axiom clauses between each violating select and ALL other selects
-    /// on the same array.
-    ///
-    /// Returns `None` if no violations found (model is FC-consistent).
-    /// Returns `Some(result)` with the FC axiom clauses if violations found.
+    /// differ, generate the corresponding FC axiom clauses.
     ///
     /// `already_covered` tracks pairs that have had FC axioms generated
     /// in previous CEGAR iterations to avoid duplicate work.
     pub(in crate::executor) fn check_array_fc_violations(
-        &self,
+        &mut self,
         sat_model: &[bool],
         term_bits: &HashMap<TermId, BvBits>,
         var_offset: i32,
         next_var_offset: usize,
         already_covered: &mut HashSet<(TermId, TermId)>,
-    ) -> Option<CegarArrayResult> {
-        // Collect select terms from assertions.
-        let mut select_terms: Vec<(TermId, TermId, TermId)> = Vec::new();
-        let mut store_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
-        let mut visited = HashSet::default();
-
-        for &assertion in &self.ctx.assertions {
-            self.collect_array_terms(assertion, &mut select_terms, &mut store_terms, &mut visited);
-        }
-
-        // Assertion traversal misses select terms that were materialized by the
-        // bit-blaster or array axiom generator. Those terms still have concrete
-        // SAT bits and must obey FC. If they conflict with assertion selects,
-        // model extraction can only fail closed after SAT, instead of giving
-        // CEGAR a chance to add the missing pair.
-        let mut seen_select_terms: HashSet<TermId> =
-            select_terms.iter().map(|(select, _, _)| *select).collect();
-        for &term_id in term_bits.keys() {
-            if !seen_select_terms.insert(term_id) {
-                continue;
-            }
-            if let TermData::App(sym, args) = self.ctx.terms.get(term_id) {
-                if sym.name() == "select"
-                    && args.len() == 2
-                    && matches!(self.ctx.terms.get(args[0]), TermData::Var(_, _))
-                {
-                    select_terms.push((term_id, args[0], args[1]));
-                }
-            }
-        }
-
+    ) -> CegarArrayCheck {
+        let Some(select_terms) = self.collect_fc_select_terms(term_bits) else {
+            return CegarArrayCheck::Incomplete;
+        };
         if select_terms.is_empty() {
-            return None;
+            return CegarArrayCheck::Consistent;
         }
 
         // Group selects by their DIRECT array operand, not root.
@@ -125,8 +103,20 @@ impl Executor {
                 .push((select_term, index));
         }
 
-        let mut all_new_clauses: Vec<Vec<SatLiteral>> = Vec::new();
-        let mut next_var = next_var_offset as u32 + 1; // 1-based DIMACS
+        let Some(initial_next_var) = next_var_offset.checked_add(1) else {
+            return CegarArrayCheck::Incomplete;
+        };
+        let Ok(next_var) = u32::try_from(initial_next_var) else {
+            return CegarArrayCheck::Incomplete;
+        };
+        let mut build = CegarArrayBuild {
+            clauses: Vec::new(),
+            next_var,
+            new_vars: 0,
+            inspected_bits: 0,
+            pair_attempts: 0,
+            newly_covered: HashSet::default(),
+        };
 
         for (_array_root, selects) in &selects_by_array {
             if selects.len() < 2 {
@@ -134,118 +124,274 @@ impl Executor {
             }
 
             // Compute concrete index values for each select.
-            let mut concrete_selects: Vec<(usize, BigInt, BigInt)> = Vec::new();
+            let mut concrete_selects: Vec<(TermId, TermId, BigInt, BigInt)> = Vec::new();
 
-            for (i, &(select_term, index_term)) in selects.iter().enumerate() {
+            for &(select_term, index_term) in selects {
                 let Some(idx_bits) = term_bits.get(&index_term) else {
-                    continue;
+                    return CegarArrayCheck::Incomplete;
                 };
                 let Some(sel_bits) = term_bits.get(&select_term) else {
-                    continue;
+                    return CegarArrayCheck::Incomplete;
                 };
 
-                let idx_val = self.concrete_bv_value(sat_model, idx_bits, var_offset);
-                let sel_val = self.concrete_bv_value(sat_model, sel_bits, var_offset);
+                let Some(idx_val) = self.concrete_bv_value_bounded(
+                    sat_model,
+                    idx_bits,
+                    var_offset,
+                    &mut build.inspected_bits,
+                ) else {
+                    return CegarArrayCheck::Incomplete;
+                };
+                let Some(sel_val) = self.concrete_bv_value_bounded(
+                    sat_model,
+                    sel_bits,
+                    var_offset,
+                    &mut build.inspected_bits,
+                ) else {
+                    return CegarArrayCheck::Incomplete;
+                };
 
-                concrete_selects.push((i, idx_val, sel_val));
+                concrete_selects.push((select_term, index_term, idx_val, sel_val));
             }
 
             // Group by concrete index value, find violations.
-            let mut by_index: HashMap<BigInt, Vec<(usize, BigInt)>> = HashMap::default();
-            for (i, idx_val, sel_val) in &concrete_selects {
+            let mut by_index: HashMap<BigInt, Vec<(TermId, TermId, BigInt)>> = HashMap::default();
+            for (select, index, idx_val, sel_val) in concrete_selects {
                 by_index
-                    .entry(idx_val.clone())
+                    .entry(idx_val)
                     .or_default()
-                    .push((*i, sel_val.clone()));
+                    .push((select, index, sel_val));
             }
 
             for group in by_index.values() {
                 if group.len() < 2 {
                     continue;
                 }
-                let first_val = &group[0].1;
-                let has_violation = group.iter().skip(1).any(|e| e.1 != *first_val);
+                let first_val = &group[0].2;
+                let has_violation = group.iter().skip(1).any(|entry| entry.2 != *first_val);
                 if !has_violation {
                     continue;
                 }
 
-                // Add the concrete violated FC pairs first. Earlier versions
-                // expanded each violating select against every other select on
-                // the same array, which is too broad once generated/select
-                // materialization terms are included in this scan.
-                for a in 0..group.len() {
-                    for b in (a + 1)..group.len() {
-                        let (select_a_idx, value_a) = &group[a];
-                        let (select_b_idx, value_b) = &group[b];
-                        if value_a == value_b {
-                            continue;
-                        }
-                        let (sel_a_term, idx_a_term) = selects[*select_a_idx];
-                        let (sel_b_term, idx_b_term) = selects[*select_b_idx];
-                        if sel_a_term == sel_b_term {
-                            continue;
-                        }
-                        let pair_key = if sel_a_term < sel_b_term {
-                            (sel_a_term, sel_b_term)
-                        } else {
-                            (sel_b_term, sel_a_term)
-                        };
-                        if already_covered.contains(&pair_key) {
-                            continue;
-                        }
-                        already_covered.insert(pair_key);
-
-                        let new_clauses = self.generate_fc_axiom_clauses(
-                            term_bits,
-                            var_offset,
-                            idx_a_term,
-                            idx_b_term,
-                            sel_a_term,
-                            sel_b_term,
-                            &mut next_var,
-                        );
-                        all_new_clauses.extend(new_clauses);
-                    }
+                if !self.append_fc_group_refinement(
+                    group,
+                    term_bits,
+                    var_offset,
+                    already_covered,
+                    &mut build,
+                ) {
+                    return CegarArrayCheck::Incomplete;
                 }
             }
         }
 
-        if all_new_clauses.is_empty() {
-            return None;
+        if build.clauses.is_empty() {
+            return CegarArrayCheck::Consistent;
         }
 
-        let num_new_vars = (next_var as usize).saturating_sub(next_var_offset + 1);
-        Some(CegarArrayResult {
-            clauses: all_new_clauses,
-            num_new_vars,
+        already_covered.extend(build.newly_covered);
+        CegarArrayCheck::Refinement(CegarArrayResult {
+            clauses: build.clauses,
+            num_new_vars: build.new_vars,
         })
     }
 
-    /// Compute the concrete BV value of a term given its SAT-level bit assignments.
-    fn concrete_bv_value(&self, sat_model: &[bool], bits: &BvBits, var_offset: i32) -> BigInt {
+    fn append_fc_group_refinement(
+        &mut self,
+        group: &[(TermId, TermId, BigInt)],
+        term_bits: &HashMap<TermId, BvBits>,
+        var_offset: i32,
+        already_covered: &HashSet<(TermId, TermId)>,
+        build: &mut CegarArrayBuild,
+    ) -> bool {
+        for a in 0..group.len() {
+            for b in (a + 1)..group.len() {
+                build.pair_attempts = build.pair_attempts.saturating_add(1);
+                if build.pair_attempts > budget::MAX_PAIR_ATTEMPTS
+                    || (build.pair_attempts & 0xff == 0 && self.should_abort_theory_loop())
+                {
+                    return false;
+                }
+                let (sel_a, idx_a, value_a) = &group[a];
+                let (sel_b, idx_b, value_b) = &group[b];
+                if value_a == value_b || sel_a == sel_b {
+                    continue;
+                }
+                let pair = if sel_a < sel_b {
+                    (*sel_a, *sel_b)
+                } else {
+                    (*sel_b, *sel_a)
+                };
+                if already_covered.contains(&pair) {
+                    return false;
+                }
+                if !build.newly_covered.insert(pair) {
+                    continue;
+                }
+                let Some((pair_vars, pair_clauses)) =
+                    self.fc_pair_cost_for_terms(term_bits, *idx_a, *idx_b, *sel_a, *sel_b)
+                else {
+                    return false;
+                };
+                let Some(next_vars) = build.new_vars.checked_add(pair_vars) else {
+                    return false;
+                };
+                let Some(next_clauses) = build.clauses.len().checked_add(pair_clauses) else {
+                    return false;
+                };
+                let last_var = (build.next_var as usize)
+                    .checked_add(pair_vars.saturating_sub(1))
+                    .unwrap_or(usize::MAX);
+                if pair_clauses == 0
+                    || next_vars > budget::MAX_NEW_VARS
+                    || next_clauses > budget::MAX_NEW_CLAUSES
+                    || (pair_vars > 0 && last_var > i32::MAX as usize)
+                {
+                    return false;
+                }
+                let clauses = self.generate_fc_axiom_clauses(
+                    term_bits,
+                    var_offset,
+                    *idx_a,
+                    *idx_b,
+                    *sel_a,
+                    *sel_b,
+                    &mut build.next_var,
+                );
+                if clauses.len() != pair_clauses {
+                    return false;
+                }
+                build.new_vars = next_vars;
+                build.clauses.extend(clauses);
+            }
+        }
+        true
+    }
+
+    fn collect_fc_select_terms(
+        &mut self,
+        term_bits: &HashMap<TermId, BvBits>,
+    ) -> Option<Vec<(TermId, TermId, TermId)>> {
+        if self.ctx.assertions.len() > budget::MAX_TERMS || term_bits.len() > budget::MAX_TERM_BITS
+        {
+            return None;
+        }
+        let mut pending = self.ctx.assertions.clone();
+        let mut visited = HashSet::default();
+        let mut selects = Vec::new();
+        let mut seen_selects = HashSet::default();
+        while let Some(term) = pending.pop() {
+            if !visited.insert(term) {
+                continue;
+            }
+            if visited.len() > budget::MAX_TERMS
+                || (visited.len() & 0xff == 0 && self.should_abort_theory_loop())
+            {
+                return None;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::App(sym, args) => {
+                    if pending.len().saturating_add(args.len()) > budget::MAX_TERMS {
+                        return None;
+                    }
+                    if sym.name() == "select" && args.len() == 2 && seen_selects.insert(term) {
+                        if selects.len() >= budget::MAX_SELECTS {
+                            return None;
+                        }
+                        selects.push((term, args[0], args[1]));
+                    }
+                    pending.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => pending.push(*inner),
+                TermData::Ite(cond, then_term, else_term) => {
+                    if pending.len() > budget::MAX_TERMS.saturating_sub(3) {
+                        return None;
+                    }
+                    pending.extend([*cond, *then_term, *else_term]);
+                }
+                _ => {}
+            }
+        }
+
+        // Include base-array selects materialized by bit-blasting/axiomatization.
+        for (position, &term) in term_bits.keys().enumerate() {
+            if position & 0xff == 0 && self.should_abort_theory_loop() {
+                return None;
+            }
+            if seen_selects.contains(&term) {
+                continue;
+            }
+            let generated = match self.ctx.terms.get(term) {
+                TermData::App(sym, args)
+                    if sym.name() == "select"
+                        && args.len() == 2
+                        && matches!(self.ctx.terms.get(args[0]), TermData::Var(_, _)) =>
+                {
+                    Some((term, args[0], args[1]))
+                }
+                _ => None,
+            };
+            if let Some(select) = generated {
+                if selects.len() >= budget::MAX_SELECTS {
+                    return None;
+                }
+                seen_selects.insert(term);
+                selects.push(select);
+            }
+        }
+        Some(selects)
+    }
+
+    fn concrete_bv_value_bounded(
+        &mut self,
+        sat_model: &[bool],
+        bits: &BvBits,
+        var_offset: i32,
+        inspected_bits: &mut usize,
+    ) -> Option<BigInt> {
+        if bits.len() > budget::MAX_SINGLE_WIDTH {
+            return None;
+        }
+        *inspected_bits = inspected_bits.checked_add(bits.len())?;
+        if *inspected_bits > budget::MAX_TOTAL_BITS {
+            return None;
+        }
         let mut value = BigInt::from(0u64);
         for (i, &bit_lit) in bits.iter().enumerate() {
-            let offset_lit = bv_encoding::offset_cnf_lit(bit_lit, var_offset);
-            let sat_var_idx = if offset_lit > 0 {
-                (offset_lit - 1) as usize
+            if i & 0xff == 0 && self.should_abort_theory_loop() {
+                return None;
+            }
+            let offset_lit = if bit_lit > 0 {
+                bit_lit.checked_add(var_offset)?
             } else {
-                (-offset_lit - 1) as usize
+                bit_lit.checked_sub(var_offset)?
             };
-            let bit_value = if sat_var_idx < sat_model.len() {
-                let sat_val = sat_model[sat_var_idx];
-                if offset_lit > 0 {
-                    sat_val
-                } else {
-                    !sat_val
-                }
-            } else {
-                false
-            };
+            let sat_var_idx = usize::try_from(offset_lit.unsigned_abs())
+                .ok()?
+                .checked_sub(1)?;
+            let sat_val = *sat_model.get(sat_var_idx)?;
+            let bit_value = if offset_lit > 0 { sat_val } else { !sat_val };
             if bit_value {
                 value |= BigInt::from(1) << i;
             }
         }
-        value
+        Some(value)
+    }
+
+    fn fc_pair_cost_for_terms(
+        &self,
+        term_bits: &HashMap<TermId, BvBits>,
+        idx_a: TermId,
+        idx_b: TermId,
+        sel_a: TermId,
+        sel_b: TermId,
+    ) -> Option<(usize, usize)> {
+        budget::pair_cost(
+            term_bits.get(&idx_a)?,
+            term_bits.get(&idx_b)?,
+            term_bits.get(&sel_a)?,
+            term_bits.get(&sel_b)?,
+        )
     }
 
     /// Generate FC axiom clauses for a single pair of selects.

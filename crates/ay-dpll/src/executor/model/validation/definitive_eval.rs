@@ -1308,7 +1308,7 @@ impl DefinitiveEval for ArrayOracle {
         // concrete theory values. Re-evaluate the predicate term itself to
         // determine true/false; the evaluator compares the concrete values
         // directly.
-        if std::env::var_os("AY_DEBUG_STRICT_ORACLE").is_some() {
+        if ay_core::misc_cli_flags().debug_strict_oracle {
             if let TermData::App(sym, args) = executor.ctx.terms.get(inner) {
                 let vals: Vec<String> = args
                     .iter()
@@ -1440,7 +1440,7 @@ impl DefinitiveEval for ArithmeticOracle {
     fn definitive_false(&self, executor: &Executor, model: &Model, term: TermId) -> bool {
         let rejected = self.is_applicable(executor, model, term)
             && matches!(executor.evaluate_term(model, term), EvalValue::Bool(false));
-        if rejected && std::env::var_os("AY_DEBUG_ARITH_ORACLE").is_some() {
+        if rejected && ay_core::misc_cli_flags().debug_arith_oracle {
             let inner = Self::strip_top_not(executor, term);
             if let TermData::App(_, args) = executor.ctx.terms.get(inner) {
                 for &a in args.iter() {
@@ -1517,7 +1517,7 @@ impl DefinitiveEval for IteDefinitionOracle {
         // `Unknown` (not `Bool(false)`) and is likewise never demoted.
         let rejected = self.is_applicable(executor, model, term)
             && matches!(executor.evaluate_term(model, term), EvalValue::Bool(false));
-        if rejected && std::env::var_os("AY_DEBUG_STRICT_ORACLE").is_some() {
+        if rejected && ay_core::misc_cli_flags().debug_strict_oracle {
             let (inner, negated) = match executor.ctx.terms.get(term) {
                 TermData::Not(i) => (*i, true),
                 _ => (term, false),

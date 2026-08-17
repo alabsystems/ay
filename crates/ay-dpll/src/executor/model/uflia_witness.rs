@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! #uflia-witness-complete — model-EXTRACTION completion for the QF_UFLIA
-//! model-rejection tail (`AY_UFLIA_WITNESS_COMPLETE=1`, default OFF and
+//! model-rejection tail (`--uflia-witness-complete=1`, default OFF and
 //! byte-identical: every entry point is a single `OnceLock`-cached `var`
 //! probe taken before any state is read or written).
 //!
@@ -86,26 +86,22 @@ use crate::executor_types::SolveResult;
 /// byte-identical (no scan, no clone, no model mutation).
 pub(crate) fn uflia_witness_complete_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_UFLIA_WITNESS_COMPLETE").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().uflia_witness_complete)
 }
 
 fn debug_enabled() -> bool {
-    std::env::var_os("AY_UFLIA_WITNESS_DEBUG").is_some()
+    ay_core::misc_cli_flags().uflia_witness_debug
 }
 
 /// Per-half A/B selector, so the orchestrator (and a bisect) can attribute a
 /// conversion or a regression to the SENTINEL half (1a) or the FREE-POINT half
-/// (1b) without a rebuild. `AY_UFLIA_WITNESS_PARTS=fill` / `=chain`; unset (or
+/// (1b) without a rebuild. `--uflia-witness-parts=fill` / `=chain`; unset (or
 /// any other value) means BOTH, which is what the main gate enables.
 fn part_enabled(part: &str) -> bool {
     if !uflia_witness_complete_enabled() {
         return false;
     }
-    static PARTS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    match PARTS
-        .get_or_init(|| std::env::var("AY_UFLIA_WITNESS_PARTS").ok())
-        .as_deref()
-    {
+    match ay_core::misc_cli_flags().uflia_witness_parts.as_deref() {
         Some("fill") => part == "fill",
         Some("chain") => part == "chain",
         _ => true,
@@ -451,7 +447,7 @@ impl Executor {
         // A/B; anything else (including unset) refuses.
         static IN_RANGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let in_range = *IN_RANGE.get_or_init(|| {
-            std::env::var("AY_UFLIA_WITNESS_SHIFT").ok().as_deref() == Some("inrange")
+            false // B23: retired; REFUSE is the measured winner.
         });
         if in_range {
             let mut candidate = range.lo.clone();

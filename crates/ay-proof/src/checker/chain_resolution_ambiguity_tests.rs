@@ -366,3 +366,70 @@ fn demorgan_equivalence_is_not_a_resolution_pivot() {
         "Alethe requires an explicit Boolean derivation between De Morgan equivalents"
     );
 }
+
+/// CHARGE PARITY for the bounded search.
+///
+/// The search charges each link as it explores it, so its cost is MEASURED
+/// rather than pre-charged at the worst case. Two things must stay true: the
+/// charges are actually levied (nothing became free), and a caller that refuses
+/// stops the search with `ResourceLimit` instead of completing it unpaid.
+#[test]
+fn the_bounded_search_charges_every_link_and_stops_when_refused() {
+    let mut terms = TermStore::new();
+    let (mut proof, via_a, _) = ambiguous_chain(&mut terms);
+    let premises: Vec<ProofId> = (0..proof.steps.len())
+        .map(|index| ProofId(index as u32))
+        .collect();
+    proof.add_rule_step(AletheRule::ThResolution, via_a, premises, Vec::new());
+    let premise_clauses: Vec<Vec<TermId>> = proof.steps[..proof.steps.len() - 1]
+        .iter()
+        .map(|premise| match premise {
+            ProofStep::Step { clause, .. } => clause.clone(),
+            other => panic!("unexpected premise shape: {other:?}"),
+        })
+        .collect();
+    let views: Vec<&[TermId]> = premise_clauses.iter().map(Vec::as_slice).collect();
+    let step = proof.steps.last().expect("the chain step");
+    let ProofStep::Step { clause, rule, .. } = step else {
+        panic!("unexpected step shape: {step:?}");
+    };
+
+    let mut charges: Vec<(usize, usize)> = Vec::new();
+    resolution::validate_chain_resolution_rule(
+        &terms,
+        ProofId(3),
+        rule,
+        clause,
+        &views,
+        &mut |work, bytes| {
+            charges.push((work, bytes));
+            true
+        },
+    )
+    .expect("the ambiguous chain reaches its declared clause");
+    assert!(
+        charges.len() >= 2,
+        "every explored link must be charged: {charges:?}"
+    );
+    assert!(
+        charges.iter().all(|&(work, bytes)| work > 0 && bytes > 0),
+        "a link that materializes literal sets must charge work AND bytes: {charges:?}"
+    );
+
+    // Refusing the FIRST link aborts the search with the resource verdict, so a
+    // budget that is genuinely spent still fails closed.
+    let mut seen = 0_usize;
+    let refused = resolution::validate_chain_resolution_rule(
+        &terms,
+        ProofId(3),
+        rule,
+        clause,
+        &views,
+        &mut |_, _| {
+            seen += 1;
+            false
+        },
+    );
+    assert_eq!(refused, Err(ProofCheckError::ResourceLimit));
+    assert_eq!(seen, 1, "the search must stop on the first refusal");
+}

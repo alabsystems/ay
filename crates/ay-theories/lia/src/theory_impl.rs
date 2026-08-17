@@ -935,7 +935,7 @@ impl TheorySolver for LiaSolver<'_> {
         // never-wired), so arithmetic decision hints never reached the
         // theory-suggested-decision rank in LIA-backed extension lanes.
         //
-        // Env-gated DEFAULT OFF (`AY_UFLIA_ARITH_DECISIONS=1`): unset keeps
+        // DEFAULT OFF (`--uflia-arith-decisions`, B72): the default keeps
         // the historical `None` and the byte-identical trajectory. The
         // consumer's wander suppression (extension wander latch +
         // relevancy_should_engage) sits upstream and is unaffected.

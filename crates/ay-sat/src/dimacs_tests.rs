@@ -415,7 +415,7 @@ fn test_into_solver_dimacs_policy_defaults() {
     let solver = formula.into_solver();
     // Default flipped 2026-07-08 (post ef818369): the sparse-band BVE
     // unlock is ON by default; this tiny formula is in-band, so BVE is
-    // enabled. AY_AB_BVE_SPARSE=0 is the kill-switch (asserted hermetically
+    // enabled. --sat-no-bve-sparse is the kill-switch (asserted hermetically
     // when set).
     if crate::variant::ab_bve_sparse_knob_set() {
         assert!(
@@ -426,39 +426,25 @@ fn test_into_solver_dimacs_policy_defaults() {
     } else {
         assert!(
             !solver.is_bve_enabled(),
-            "kill-switch (AY_AB_BVE_SPARSE=0) restores BVE-off"
+            "kill-switch (--sat-no-bve-sparse) restores BVE-off"
         );
     }
     // Default flipped 2026-07-10 (wf_55735963): the route-aware
     // substitution-collapse AUTO is ON by default on the non-proof Default
     // route (+7 measured UNSAT flips / 0 hard losses, main2025 scoreboard
     // protocol); the expensive fixpoint stays gated behind the one-round
-    // equivalence-density probe at preprocess time. AY_AB_SUBST_AUTO=0 is
-    // the kill-switch (asserted hermetically when set).
-    match std::env::var("AY_AB_SUBST_AUTO").ok().as_deref() {
-        None | Some("1") => {
-            assert!(
-                solver.is_congruence_enabled(),
-                "DIMACS default enables congruence eligibility (AUTO \
-                 default-ON, probe-gated; wf_55735963)"
-            );
-            assert!(
-                solver.is_decompose_enabled(),
-                "DIMACS default enables decompose eligibility (AUTO \
-                 default-ON, probe-gated; wf_55735963)"
-            );
-        }
-        Some(_) => {
-            assert!(
-                !solver.is_congruence_enabled(),
-                "kill-switch (AY_AB_SUBST_AUTO=0) restores congruence-off"
-            );
-            assert!(
-                !solver.is_decompose_enabled(),
-                "kill-switch (AY_AB_SUBST_AUTO=0) restores decompose-off"
-            );
-        }
-    }
+    // equivalence-density probe at preprocess time. B34: the kill is
+    // CLI-owned (--sat-no-subst-auto), so the default arm is unconditional.
+    assert!(
+        solver.is_congruence_enabled(),
+        "DIMACS default enables congruence eligibility (AUTO \
+         default-ON, probe-gated; wf_55735963)"
+    );
+    assert!(
+        solver.is_decompose_enabled(),
+        "DIMACS default enables decompose eligibility (AUTO \
+         default-ON, probe-gated; wf_55735963)"
+    );
     assert!(
         solver.is_subsume_enabled(),
         "DIMACS solver should enable subsumption (#4872 one-watch forward)"

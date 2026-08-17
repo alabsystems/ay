@@ -26,7 +26,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Strings increment P2 master switch (default ON, `AY_STR_P2=0` kill switch).
+/// Strings increment P2 master switch (default ON, `--dpll-no-str-p2` kill switch).
 ///
 /// Gates the eager NON-GROUND extended-function reduction package
 /// (Reynolds CAV'17 / CVC-style):
@@ -46,8 +46,8 @@ pub(in crate::executor) fn str_p2_enabled() -> bool {
     // DEFAULT-ON: 7 conversions on its own target families plus the reduction
     // substrate P3/W4 build on; 0 disagreements, 0 regressions across the
     // solved-file sweeps, fuzz clean. Escalation passes only run AFTER the
-    // default passes return Unknown. AY_STR_P2=0 kills it.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_P2").ok().as_deref(), Some("0")))
+    // default passes return Unknown. --dpll-no-str-p2 kills it.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_p2)
 }
 
 impl Executor {
@@ -75,7 +75,7 @@ impl Executor {
     /// Reference: CVC5 `theory_strings_preprocess.cpp:62-121` (substr),
     ///            CVC5 `theory_strings_preprocess.cpp:572-631` (replace),
     ///            CVC5 `theory_strings_preprocess.cpp:527-571` (str.at)
-    /// `p2_symbolic_only` (strings increment P2, `AY_STR_P2=1` escalation
+    /// `p2_symbolic_only` (strings increment P2, enabled escalation
     /// pass): when true, the pass collects ONLY the P2 reduction classes —
     /// `str.substr` with NON-constant bounds and `str.indexof` — and ignores
     /// `enable_substr_and_at`/`enable_replace` (those classes are owned by
@@ -152,7 +152,7 @@ impl Executor {
                         // still reduce the deferred cases later once values
                         // become concrete.
                         //
-                        // P2 (`AY_STR_P2=1`, escalation pass only): lift the
+                        // P2 (escalation pass only): lift the
                         // constant-bounds restriction. The reduction lemma
                         // itself never inspects the bound values — it is the
                         // SAME exact characterization of SMT-LIB `str.substr`

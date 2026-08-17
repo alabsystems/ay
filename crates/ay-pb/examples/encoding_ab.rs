@@ -131,7 +131,7 @@ fn describe_row(coeffs: &[i128], rhs: i128) -> String {
     distinct.dedup();
     let (gte_aux, gte_clause_ub, gte_work, gte_fit) =
         gte_estimate(coeffs, rhs, 50_000_000, 4_000_000);
-    let (bdd_nodes, bdd_fit) = bdd_estimate(coeffs, rhs, 8_000_000);
+    let (bdd_nodes, bdd_fit) = bdd::bdd_estimate(coeffs, rhs, 8_000_000);
     format!(
         "n={n} rhs={rhs} max_c={max_c} distinct_c={} gte_aux={gte_aux} gte_clause_ub={gte_clause_ub} \
          gte_work={gte_work} gte_fit={gte_fit} bdd_nodes={bdd_nodes} bdd_fit={bdd_fit}",
@@ -300,45 +300,6 @@ fn gte_estimate(coeffs: &[i128], rhs: i128, max_work: u64, max_aux: u64) -> (u64
     (aux, clause_ub, work, true)
 }
 
-/// BDD dry run: count reachable memoized `(i, slack)` states of `encode_bdd`
-/// (coefficient-descending order, suffix-sum pruning). Clauses <= 2*nodes + 1.
-fn bdd_estimate(coeffs: &[i128], rhs: i128, max_nodes: u64) -> (u64, bool) {
-    use std::collections::BTreeSet;
-    let mut sorted: Vec<i128> = coeffs.to_vec();
-    sorted.sort_unstable_by(|a, b| b.cmp(a));
-    let n = sorted.len();
-    let mut suffix = vec![0i128; n + 1];
-    for i in (0..n).rev() {
-        suffix[i] = suffix[i + 1].saturating_add(sorted[i]);
-    }
-    // Level-by-level reachable slack values (deduped), pruned like build_bdd:
-    // terminal when s <= 0 (true) or suffix[i] < s (false).
-    let mut level: BTreeSet<i128> = BTreeSet::new();
-    if rhs > 0 && suffix[0] >= rhs {
-        level.insert(rhs);
-    }
-    let mut nodes: u64 = 0;
-    for i in 0..n {
-        if level.is_empty() {
-            break;
-        }
-        nodes += level.len() as u64;
-        if nodes > max_nodes {
-            return (nodes, false);
-        }
-        let mut next: BTreeSet<i128> = BTreeSet::new();
-        for &s in &level {
-            for s2 in [s - sorted[i], s] {
-                if s2 > 0 && i + 1 < n && suffix[i + 1] >= s2 {
-                    next.insert(s2);
-                }
-            }
-        }
-        level = next;
-    }
-    (nodes, true)
-}
-
 fn profile(args: &[String]) {
     let path = args.first().expect("profile: missing <file.opb>");
     let text = std::fs::read_to_string(path).expect("failed to read instance");
@@ -505,3 +466,6 @@ fn solve(args: &[String]) {
         start.elapsed().as_secs_f64(),
     );
 }
+
+#[path = "encoding_ab/bdd.rs"]
+mod bdd;

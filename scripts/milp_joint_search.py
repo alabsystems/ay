@@ -128,67 +128,36 @@ class JointConfig:
 # propagation happened to fit under current load.  These switches alter which
 # established pass runs, while the three-repeat/trace gate below still refuses
 # any root pipeline whose own deadline visibly truncates work.
+# B38: the GMI_ROUNDS / ROOT_CUTS_PER_ROUND / NO_DUALFIX env spellings are
+# retired (the knobs are CLI-only: --gmi-rounds / --root-cuts-per-round /
+# --no-dualfix on the shared engine CLI). The coordinates that depended on
+# them are REMOVED rather than left to silently no-op — this harness's audit
+# identity is the environment hash, so a future campaign wanting those axes
+# must extend CoordinateValue with a CLI-args field and fold the args into
+# the configured-environment hash. RETIRED_ENV_NAMES below fails fast if a
+# retired spelling reappears in a coordinate.
+RETIRED_ENV_NAMES: frozenset[str] = frozenset({
+    "AY_MILP_GMI_ROUNDS",
+    "AY_MILP_ROOT_CUTS_PER_ROUND",
+    "AY_MILP_NO_DUALFIX",
+    "AY_MILP_SB_REL",
+    "AY_MILP_SB_CANDS",
+    "AY_MILP_SB_TOTAL",
+    "AY_MILP_NO_PRESOLVE",
+    "AY_MILP_NO_PRESOLVE_SCOUT",
+})
+
 COORDINATES: tuple[tuple[str, tuple[CoordinateValue, ...]], ...] = (
-    (
-        "cuts",
-        (
-            CoordinateValue("default", ()),
-            CoordinateValue("gmi-1", (("AY_MILP_GMI_ROUNDS", "1"),)),
-            CoordinateValue("gmi-5", (("AY_MILP_GMI_ROUNDS", "5"),)),
-            CoordinateValue("gmi-10", (("AY_MILP_GMI_ROUNDS", "10"),)),
-        ),
-    ),
-    (
-        "cut-selection-budget",
-        (
-            CoordinateValue("default", ()),
-            CoordinateValue(
-                "top8-budget16",
-                (
-                    ("AY_MILP_ROOT_CUTS_PER_ROUND", "16"),
-                    ("AY_MILP_CUT_TOPK", "8"),
-                ),
-            ),
-            CoordinateValue(
-                "top24-budget40",
-                (
-                    ("AY_MILP_ROOT_CUTS_PER_ROUND", "40"),
-                    ("AY_MILP_CUT_TOPK", "24"),
-                ),
-            ),
-        ),
-    ),
     (
         "branching",
         (
             CoordinateValue("default", ()),
-            CoordinateValue(
-                "economy",
-                (
-                    ("AY_MILP_SB_REL", "2"),
-                    ("AY_MILP_SB_CANDS", "8"),
-                    ("AY_MILP_SB_TOTAL", "600"),
-                ),
-            ),
-            CoordinateValue(
-                "thorough",
-                (
-                    ("AY_MILP_SB_REL", "8"),
-                    ("AY_MILP_SB_CANDS", "24"),
-                    ("AY_MILP_SB_TOTAL", "6000"),
-                ),
-            ),
         ),
     ),
     (
         "structural-presolve",
         (
             CoordinateValue("default", ()),
-            CoordinateValue(
-                "exact-no-scout", (("AY_MILP_NO_PRESOLVE_SCOUT", "1"),)
-            ),
-            CoordinateValue("no-dualfix", (("AY_MILP_NO_DUALFIX", "1"),)),
-            CoordinateValue("off", (("AY_MILP_NO_PRESOLVE", "1"),)),
         ),
     ),
 )
@@ -630,7 +599,14 @@ def config_environment(config_id: str) -> dict[str, str]:
     config = GRID_BY_ID.get(config_id)
     if config is None:
         raise ValueError(f"unknown configuration {config_id!r}")
-    return config.env_dict()
+    env = config.env_dict()
+    stale = sorted(RETIRED_ENV_NAMES.intersection(env))
+    if stale:
+        raise ValueError(
+            f"configuration {config_id!r} names retired env spellings {stale}; "
+            "pass the CLI flags instead (see the B38 note above COORDINATES)"
+        )
+    return env
 
 
 def validate_artifact_identity(

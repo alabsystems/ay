@@ -13,7 +13,7 @@ use ay_core::term::{Symbol, TermId, TermStore};
 use ay_core::Sort;
 use ay_core::TheorySolver;
 use ay_euf::EufSolver;
-use ay_test_support::env::{lock_env, ScopedEnvVar};
+use ay_test_support::env::lock_env;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 struct EufBenchProblem {
@@ -62,19 +62,8 @@ fn bench_congruence_closure(c: &mut Criterion) {
         let problem = build_chain_problem(num_vars);
         let label = format!("{num_vars}_vars");
 
-        // Legacy rebuild path (AY_LEGACY_EUF=1).
+        // Incremental rebuild path (the only path; the legacy env arm is dead).
         {
-            let _legacy = ScopedEnvVar::set("AY_LEGACY_EUF", "1");
-            group.bench_with_input(
-                BenchmarkId::new("legacy_check", &label),
-                &problem,
-                |b, p| b.iter(|| run_check(black_box(p))),
-            );
-        }
-
-        // Incremental rebuild path (default).
-        {
-            let _incremental = ScopedEnvVar::unset("AY_LEGACY_EUF");
             group.bench_with_input(
                 BenchmarkId::new("incremental_check", &label),
                 &problem,

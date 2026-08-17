@@ -19,10 +19,8 @@ fn assert_no_trust(proof: &Proof) {
 
 #[test]
 fn scalar_aliased_select_witness_has_a_strict_native_proof() {
-    let commands = parse(
-        r#"
+    let input = r#"
         (set-option :produce-proofs true)
-        (set-option :check-proofs-strict true)
         (set-logic QF_AUFLIA)
         (declare-fun a () (Array Int Int))
         (declare-fun v1 () Int)
@@ -39,9 +37,8 @@ fn scalar_aliased_select_witness_has_a_strict_native_proof() {
         (assert (= e2 (select rhs k)))
         (assert (not (= e1 e2)))
         (check-sat)
-        "#,
-    )
-    .expect("fixture parses");
+        "#;
+    let commands = parse(input).expect("fixture parses");
     let mut exec = Executor::new();
     assert_eq!(
         exec.execute_all(&commands).expect("fixture executes"),
@@ -79,6 +76,24 @@ fn scalar_aliased_select_witness_has_a_strict_native_proof() {
         }
     )));
     assert_no_trust(proof);
+
+    let strict_input = input.replacen(
+        "(set-option :produce-proofs true)",
+        "(set-option :produce-proofs true)\n        (set-option :check-proofs-strict true)",
+        1,
+    );
+    let strict_commands = parse(&strict_input).expect("strict fixture parses");
+    let mut strict_exec = Executor::new();
+    assert_eq!(
+        strict_exec
+            .execute_all(&strict_commands)
+            .expect("strict fixture executes"),
+        vec!["unknown"]
+    );
+    assert_eq!(
+        strict_exec.unknown_reason(),
+        Some(crate::UnknownReason::ProofTrusted)
+    );
 }
 
 #[test]

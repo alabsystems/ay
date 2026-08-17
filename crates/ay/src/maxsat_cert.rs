@@ -273,8 +273,7 @@ fn reported_version(checker: &Path) -> Option<String> {
     let text = output.stdout + &output.stderr;
     let field = text
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .next_back()?
+        .rfind(|line| !line.trim().is_empty())?
         .split_whitespace()
         .next_back()?;
     Some(excerpt(field, DETAIL_EXCERPT_MAX))

@@ -90,6 +90,15 @@ impl Solver {
             }
             crate::SatTechnique::Walk => self.set_walk_enabled(false),
             crate::SatTechnique::Warmup => self.set_warmup_enabled(false),
+            crate::SatTechnique::SymmetrySigned => {
+                self.cold.symmetry_signed_disabled = true;
+            }
+            crate::SatTechnique::SymmetryAuxfree => {
+                self.cold.symmetry_auxfree_disabled = true;
+            }
+            crate::SatTechnique::SymmetryOrbitope => {
+                self.cold.symmetry_orbitope_disabled = true;
+            }
         }
     }
 }

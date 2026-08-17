@@ -4,11 +4,11 @@
 
 use super::*;
 use crate::Executor;
-use ay_core::{Sort, TermStore};
 use ay_frontend::parse;
-use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::FromPrimitive;
+
+mod split_atoms;
 
 fn rat(n: i64) -> BigRational {
     BigRational::from_i64(n).unwrap()
@@ -120,162 +120,6 @@ fn test_check_split_oscillation_independent_variables() {
     assert_eq!(tracking[&var_b].1, 1);
     // var_a's 20th triggers
     assert!(check_split_oscillation(&mut tracking, var_a, &rat(20)));
-}
-
-#[test]
-fn test_create_disequality_split_atoms_skips_non_numeric_variables() {
-    let mut terms = TermStore::new();
-    let b = terms.mk_var("b", Sort::Bool);
-    let split = ay_core::DisequalitySplitRequest {
-        variable: b,
-        excluded_value: rat(1),
-        disequality_term: None,
-        is_distinct: false,
-    };
-
-    assert!(matches!(
-        create_disequality_split_atoms(&mut terms, &split),
-        DisequalitySplitAtoms::Skip
-    ));
-}
-
-#[test]
-fn test_create_disequality_split_atoms_int_fractional_uses_floor_ceil_bounds() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let split = ay_core::DisequalitySplitRequest {
-        variable: x,
-        excluded_value: BigRational::new(BigInt::from(7), BigInt::from(2)),
-        disequality_term: None,
-        is_distinct: false,
-    };
-
-    let three = terms.mk_int(BigInt::from(3));
-    let four = terms.mk_int(BigInt::from(4));
-    let expected_le = terms.mk_le(x, three);
-    let expected_ge = terms.mk_ge(x, four);
-
-    match create_disequality_split_atoms(&mut terms, &split) {
-        DisequalitySplitAtoms::IntFractional { le, ge } => {
-            assert_eq!(le, expected_le);
-            assert_eq!(ge, expected_ge);
-        }
-        _ => panic!("expected IntFractional split atoms"),
-    }
-}
-
-#[test]
-fn test_create_disequality_split_atoms_int_exact_preserves_context() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let five = terms.mk_int(BigInt::from(5));
-    let eq = terms.mk_eq(x, five);
-    let diseq = terms.mk_not(eq);
-    let split = ay_core::DisequalitySplitRequest {
-        variable: x,
-        excluded_value: rat(5),
-        disequality_term: Some(diseq),
-        is_distinct: true,
-    };
-
-    let four = terms.mk_int(BigInt::from(4));
-    let six = terms.mk_int(BigInt::from(6));
-    let expected_le = terms.mk_le(x, four);
-    let expected_ge = terms.mk_ge(x, six);
-
-    match create_disequality_split_atoms(&mut terms, &split) {
-        DisequalitySplitAtoms::IntExact {
-            le,
-            ge,
-            disequality_term,
-            is_distinct,
-        } => {
-            assert_eq!(le, expected_le);
-            assert_eq!(ge, expected_ge);
-            assert_eq!(disequality_term, Some(diseq));
-            assert!(is_distinct);
-        }
-        _ => panic!("expected IntExact split atoms"),
-    }
-}
-
-#[test]
-fn test_create_disequality_split_atoms_real_uses_strict_inequalities() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Real);
-    let excluded_term_for_eq =
-        terms.mk_rational(BigRational::new(BigInt::from(9), BigInt::from(4)));
-    let eq = terms.mk_eq(x, excluded_term_for_eq);
-    let excluded = BigRational::new(BigInt::from(9), BigInt::from(4));
-    let split = ay_core::DisequalitySplitRequest {
-        variable: x,
-        excluded_value: excluded.clone(),
-        disequality_term: Some(eq),
-        is_distinct: false,
-    };
-
-    let excluded_term = terms.mk_rational(excluded);
-    let expected_lt = terms.mk_lt(x, excluded_term);
-    let expected_gt = terms.mk_gt(x, excluded_term);
-
-    match create_disequality_split_atoms(&mut terms, &split) {
-        DisequalitySplitAtoms::Real {
-            lt,
-            gt,
-            disequality_term,
-            is_distinct,
-        } => {
-            assert_eq!(lt, expected_lt);
-            assert_eq!(gt, expected_gt);
-            assert_eq!(disequality_term, Some(eq));
-            assert!(!is_distinct);
-        }
-        _ => panic!("expected Real split atoms"),
-    }
-}
-
-#[test]
-fn test_create_int_split_atoms_real_sort_uses_rational_constants_and_prefer_ceil() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Real);
-    let split = ay_core::SplitRequest {
-        variable: x,
-        value: BigRational::new(BigInt::from(7), BigInt::from(4)),
-        floor: BigInt::from(1),
-        ceil: BigInt::from(2),
-    };
-
-    let one = terms.mk_rational(BigRational::from(BigInt::from(1)));
-    let two = terms.mk_rational(BigRational::from(BigInt::from(2)));
-    let expected_le = terms.mk_le(x, one);
-    let expected_ge = terms.mk_ge(x, two);
-
-    let (le, ge, prefer_ceil) = create_int_split_atoms(&mut terms, &split);
-    assert_eq!(le, expected_le);
-    assert_eq!(ge, expected_ge);
-    assert_eq!(prefer_ceil, Some(true));
-}
-
-#[test]
-fn test_create_int_split_atoms_exact_half_prefers_floor_first() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let split = ay_core::SplitRequest {
-        variable: x,
-        value: BigRational::new(BigInt::from(3), BigInt::from(2)),
-        floor: BigInt::from(1),
-        ceil: BigInt::from(2),
-    };
-
-    let one = terms.mk_int(BigInt::from(1));
-    let two = terms.mk_int(BigInt::from(2));
-    let expected_le = terms.mk_le(x, one);
-    let expected_ge = terms.mk_ge(x, two);
-
-    let (le, ge, prefer_ceil) = create_int_split_atoms(&mut terms, &split);
-    assert_eq!(le, expected_le);
-    assert_eq!(ge, expected_ge);
-    assert_eq!(prefer_ceil, Some(false));
 }
 
 #[test]
@@ -497,5 +341,131 @@ fn eq_diffvar_must_not_break_mandatory_unsat_certification() {
         None,
         "the verdict must come from the plain pipeline, not from a run that \
          happened to certify despite the reduction"
+    );
+}
+
+// ---- #ppp-l3 licensing-source augmentation (template + helpers) ----
+
+/// A rewritten assertion keeps its provenance, augmented with the licensing
+/// definition's own sources, instead of the pre-L3 blanket `None`.
+#[test]
+fn int_const_substitution_augments_provenance_with_licensing_definition() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("l3_subst_x", Sort::Int);
+    let y = terms.mk_var("l3_subst_y", Sort::Int);
+    let five = terms.mk_int(num_bigint::BigInt::from(5));
+    let definition = terms.mk_eq(x, five);
+    let dependent = terms.mk_gt(x, y);
+    // Original-root ids the window slots cite (stand-ins for authored roots).
+    let def_root = definition;
+    let dependent_root = dependent;
+    let mut assertions = vec![definition, dependent];
+    let mut source_sets = vec![Some(vec![vec![def_root]]), Some(vec![vec![dependent_root]])];
+
+    let changed = substitute_int_constants_preserving_definitions(
+        &mut terms,
+        &mut assertions,
+        &mut source_sets,
+    );
+
+    assert!(changed, "the dependent assertion must be rewritten");
+    assert_eq!(assertions[0], definition, "definitions are preserved");
+    let rewritten = assertions[1];
+    assert_ne!(rewritten, dependent, "x must be replaced by 5");
+    let mut expected = vec![def_root, dependent_root];
+    expected.sort_by_key(|term| term.index());
+    assert_eq!(
+        source_sets[1],
+        Some(vec![expected]),
+        "the rewritten slot must cite its original AND the licensing definition"
+    );
+    assert_eq!(
+        source_sets[0],
+        Some(vec![vec![def_root]]),
+        "the definition's own provenance is untouched"
+    );
+}
+
+/// Fail-closed: a licensing definition whose own slot carries no provenance
+/// must decline augmentation (the rewritten slot falls back to `None`).
+#[test]
+fn int_const_substitution_declines_augmentation_without_definition_provenance() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("l3_noprov_x", Sort::Int);
+    let y = terms.mk_var("l3_noprov_y", Sort::Int);
+    let five = terms.mk_int(num_bigint::BigInt::from(5));
+    let definition = terms.mk_eq(x, five);
+    let dependent = terms.mk_gt(x, y);
+    let mut assertions = vec![definition, dependent];
+    let mut source_sets = vec![None, Some(vec![vec![dependent]])];
+
+    let changed = substitute_int_constants_preserving_definitions(
+        &mut terms,
+        &mut assertions,
+        &mut source_sets,
+    );
+
+    assert!(changed);
+    assert_eq!(
+        source_sets[1], None,
+        "an unprovenanced licensing definition must decline the augmentation"
+    );
+}
+
+/// Guard-removal-proven cap: an augmented group above
+/// `MAX_AUGMENTED_SOURCE_GROUP` members declines whole (fail-closed).
+#[test]
+fn augmented_source_groups_declines_over_cap() {
+    let base = vec![vec![TermId(1)]];
+    let extra_ok: Vec<TermId> = (2..=16).map(TermId).collect();
+    assert!(
+        augmented_source_groups(&base, &extra_ok).is_some(),
+        "16 members total is within the cap"
+    );
+    let extra_over: Vec<TermId> = (2..=17).map(TermId).collect();
+    assert!(
+        augmented_source_groups(&base, &extra_over).is_none(),
+        "17 members must decline the whole slot"
+    );
+}
+
+/// The licensing walk maps every used replacement key through its recorded
+/// definition and fails closed on a missing one.
+#[test]
+fn collect_used_int_const_definitions_is_exact_and_fail_closed() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("l3_walk_x", Sort::Int);
+    let y = terms.mk_var("l3_walk_y", Sort::Int);
+    let z = terms.mk_var("l3_walk_z", Sort::Int);
+    let five = terms.mk_int(num_bigint::BigInt::from(5));
+    let six = terms.mk_int(num_bigint::BigInt::from(6));
+    let def_x = terms.mk_eq(x, five);
+    let def_y = terms.mk_eq(y, six);
+    let sum = terms.mk_add(vec![x, y]);
+    let uses_both = terms.mk_gt(sum, z);
+    let uses_none = terms.mk_gt(z, five);
+
+    let mut replacements: HashMap<TermId, TermId> = HashMap::default();
+    replacements.insert(x, five);
+    replacements.insert(y, six);
+    let mut definition_of: HashMap<TermId, TermId> = HashMap::default();
+    definition_of.insert(x, def_x);
+    definition_of.insert(y, def_y);
+
+    let both = collect_used_int_const_definitions(&terms, &replacements, &definition_of, uses_both)
+        .expect("both keys occur");
+    assert_eq!(both.len(), 2);
+    assert!(both.contains(&def_x) && both.contains(&def_y));
+    assert!(
+        collect_used_int_const_definitions(&terms, &replacements, &definition_of, uses_none)
+            .is_none(),
+        "no used key means no licensing claim"
+    );
+
+    definition_of.remove(&y);
+    assert!(
+        collect_used_int_const_definitions(&terms, &replacements, &definition_of, uses_both)
+            .is_none(),
+        "a used key without a recorded definition must fail closed"
     );
 }

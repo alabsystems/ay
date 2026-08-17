@@ -244,7 +244,7 @@ impl Executor {
         }
 
         let mut recovered_vars = HashSet::default();
-        let ptrace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let ptrace = ay_core::misc_cli_flags().phase_trace;
         // Shared evaluation memo for the WHOLE recovery pass: bv_model's maps only
         // GAIN entries during recovery (the removals happen above, before any
         // evaluation), so cached Some results stay correct - see `BvEvalMemo`.

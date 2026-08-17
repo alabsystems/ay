@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-use super::*;
-
 use super::{BufferBinding, GpuContext, GpuError, StorageBinding};
 
 const VECTOR_ADD_SHADER: &str = r#"

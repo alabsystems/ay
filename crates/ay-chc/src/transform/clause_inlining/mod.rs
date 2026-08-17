@@ -57,12 +57,8 @@ fn fresh_var_name(prefix: &str) -> String {
 /// entries left for content re-resolution → Unknown). Matches the
 /// `AY_CHC_DISABLE_*` convention used by condense/pc_split/split_sym.
 pub(super) fn deriv_expansion_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_CHC_DISABLE_DERIV_EXPANSION")
-            .map(|v| v == "0")
-            .unwrap_or(true)
-    })
+    // B15: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().deriv_expansion
 }
 
 /// One inlined-predicate application composed into a surviving clause.

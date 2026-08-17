@@ -176,7 +176,7 @@ fn eval_monomial(
     mono: &Monomial,
     coeff: &BigRational,
     dom: &BTreeMap<TermId, Ival>,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<Ival, String> {
     let mut acc = Ival::point(BigRational::one());
     for &(v, k) in mono {
@@ -193,7 +193,7 @@ fn eval_monomial(
 fn revise_constraint(
     c: &Constraint,
     dom: &mut BTreeMap<TermId, Ival>,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<bool, String> {
     // Monomials in BTreeMap order — deterministic.
     let monos: Vec<(&Monomial, &BigRational)> = c.poly.terms.iter().collect();
@@ -285,7 +285,7 @@ fn revise_constraint(
 fn narrow_var_from_pow(
     powiv: &Ival,
     k: u32,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<Option<Ival>, String> {
     if k == 1 {
         return Ok(Some(powiv.clone()));
@@ -338,7 +338,7 @@ fn narrow_var_from_pow(
 }
 
 /// Outward rational LOWER bound for `x` given `x^k >= bound` (odd `k`).
-fn odd_root_lower(b: &Bnd, k: u32, meter: &mut WorkMeter) -> Result<Bnd, String> {
+fn odd_root_lower(b: &Bnd, k: u32, meter: &mut WorkMeter<'_>) -> Result<Bnd, String> {
     Ok(match b {
         Bnd::NegInf => Bnd::NegInf,
         Bnd::PosInf => Bnd::PosInf,
@@ -356,7 +356,7 @@ fn odd_root_lower(b: &Bnd, k: u32, meter: &mut WorkMeter) -> Result<Bnd, String>
 }
 
 /// Outward rational UPPER bound for `x` given `x^k <= bound` (odd `k`).
-fn odd_root_upper(b: &Bnd, k: u32, meter: &mut WorkMeter) -> Result<Bnd, String> {
+fn odd_root_upper(b: &Bnd, k: u32, meter: &mut WorkMeter<'_>) -> Result<Bnd, String> {
     Ok(match b {
         Bnd::PosInf => Bnd::PosInf,
         Bnd::NegInf => Bnd::NegInf,

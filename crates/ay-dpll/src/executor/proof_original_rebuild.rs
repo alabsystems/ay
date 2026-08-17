@@ -258,7 +258,7 @@ fn parsed_head(parsed: &FrontendTerm) -> Option<&str> {
 /// surface-fidelity concern: there is no problem file to print-match, so the
 /// canonical rendering IS the surface, and no overrides may be registered
 /// (an override would print the sentinel string).
-fn is_api_placeholder(parsed: &FrontendTerm) -> bool {
+pub(in crate::executor) fn is_api_placeholder(parsed: &FrontendTerm) -> bool {
     matches!(
         strip_frontend_annotations(parsed),
         FrontendTerm::Symbol(name) if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
@@ -285,10 +285,10 @@ impl Executor {
         // substituted forms). Fail-closed on any assertion that does not
         // re-elaborate.
         let parsed_stack = self.ctx.assertions_parsed();
-        if !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
-            parsed_stack
-                .iter()
-                .flat_map(|parsed| [parsed, parsed, parsed]),
+        // Three passes: this audit, the deep clone below, and re-elaboration.
+        if !self.proof_source_work.spend(
+            super::proof_trust_surgery_surface_audit::ProofSourcePass::OriginalAssertionRebuild,
+            parsed_stack,
         ) {
             return;
         }
@@ -397,7 +397,7 @@ impl Executor {
         // collapse shape carries no trust step, only the misused `false`
         // rule. Fail-closed (whole-proof shape gated); see
         // `try_rebuild_false_collapse`.
-        if self.try_rebuild_false_collapse(proof, &originals, &authored_originals) {
+        if self.try_rebuild_false_collapse(proof, &originals, &authored_originals, false) {
             return;
         }
 
@@ -692,13 +692,45 @@ impl Executor {
         // AUTHORED assertion plus the defining equalities. Fail-closed.
         self.try_rebuild_with_substitution_bridge(proof, &originals);
 
-        // Final internal-certificate fallback for exact mixed Bool/Int/BV
-        // source queries.  Run only after every ordinary Alethe reconstruction
-        // above has had first refusal: the pinned external checker cannot parse
-        // `bv2nat`, while AY's bounded source interpreter can independently
-        // re-decide a narrow finite query.  The candidate is still an ordinary
-        // assume + tautology + resolution proof, and both its premise scope and
-        // every step are replayed before replacement.
+        // A premise-bound trust step is useful only when every checkable
+        // reconstruction in this pass has declined. In particular, committing
+        // that fallback before the arithmetic planners masks the externally
+        // checkable `la_disequality` proof for a conjoined-equalities collapse.
+        // The later authored cascade may still replace this honest fallback;
+        // the internal BV/LIA fallback runs after that cascade.
+        let _ = self.try_rebuild_false_collapse(proof, &originals, &authored_originals, true);
+
+        // NOTE: the internal-certificate BV/LIA fallback deliberately does NOT
+        // run here. This function executes EARLY in proof publication (from
+        // `apply_input_syntax_rewrites_to_proof`), before the authored
+        // replacement cascade — which includes
+        // `replace_with_exact_authored_bv_refutation`, the pass that emits a
+        // REAL, externally surfaceable `bv_bitblast` certificate. Running the
+        // internal fallback here once silently downgraded a pure QF_BV
+        // commutativity refutation from a strict `BvBitBlast` lemma to a
+        // `BvLiaTautology` step that renders as an honest `hole` on the Alethe
+        // wire (the cascade's strict gate then saw a valid proof and declined
+        // to touch it). The fallback is invoked as the TRUE last resort in
+        // `build_unsat_proof`, after `run_authored_replacement_cascade`; see
+        // `rebuild_authenticated_bv_lia_internal_certificate_last_resort`.
+    }
+
+    /// Final internal-certificate fallback for exact mixed Bool/Int/BV source
+    /// queries — the TRUE last resort of proof publication.
+    ///
+    /// Runs only after every ordinary Alethe reconstruction (including the
+    /// authored replacement cascade) has had first refusal: the pinned
+    /// external checker cannot parse `bv2nat`, while AY's bounded source
+    /// interpreter can independently re-decide a narrow finite query. The
+    /// candidate is still an ordinary assume + tautology + resolution proof,
+    /// and both its premise scope and every step are replayed before
+    /// replacement; a proof that is already strict-complete over the authored
+    /// scope is preserved byte-identically.
+    pub(super) fn rebuild_authenticated_bv_lia_internal_certificate_last_resort(
+        &mut self,
+        proof: &mut Proof,
+    ) {
+        let authenticated_terms = self.authenticated_authored_roots_for_internal_certificate();
         if !authenticated_terms.is_empty() {
             self.try_rebuild_authenticated_bv_lia_refutation(proof, &authenticated_terms);
         }
@@ -712,14 +744,25 @@ impl Executor {
         authenticated_authored_roots: &[TermId],
     ) -> bool {
         // Preserve a proof that an earlier, externally surfaceable rebuild has
-        // already completed.  Scope validation is separate from rule replay:
-        // a syntactically valid proof with a foreign assume is not authoritative.
-        if ay_proof::validate_reachable_assumes_in_problem_scope(
-            proof,
-            authenticated_authored_roots,
-        )
-        .is_ok()
-            && ay_proof::check_proof_strict(proof, &self.ctx.terms)
+        // already completed. Scope validation is separate from rule replay:
+        // a syntactically valid proof with a foreign assume is not
+        // authoritative — but "not foreign" is exactly what the leak-2
+        // provenance authority `proof_legit_assume_set` decides (canonical
+        // originals, and-conjuncts, the re-elaborated/raw-re-interned grants in
+        // `last_proof_rebuild_originals`, quantifier-expansion premises), and
+        // the strict authority for the existing proof is the datatype-aware
+        // checker the publication gates themselves consult. Checking a
+        // NARROWER scope or the datatype-blind checker here once replaced
+        // strict `BvBitBlast` certificates from `promote_bv_identity_collapse`
+        // and `DatatypeSelectorProject` lemmas with internal `BvLiaTautology`
+        // steps that render as holes on the Alethe wire. The wider scope can
+        // only ever DECLINE a replacement, never authorize one: the candidate
+        // built below remains authorized against the narrow
+        // `authenticated_authored_roots` slice alone.
+        let preservation_scope: Vec<TermId> = self.proof_legit_assume_set().into_iter().collect();
+        if ay_proof::validate_reachable_assumes_in_problem_scope(proof, &preservation_scope).is_ok()
+            && self
+                .check_proof_strict_with_datatypes(proof)
                 .is_ok_and(|quality| quality.is_complete())
             && Self::proof_derives_empty_clause(proof)
         {
@@ -730,17 +773,55 @@ impl Executor {
         // constant pivot. Deduplicate exact TermIds in linear time and stop as
         // soon as the independent checker's root bound is exceeded. No
         // rewritten/generated root is admitted.
-        let Some(roots) =
+        let Some(mut roots) =
             collect_bounded_bv_lia_roots(&self.ctx.terms, authenticated_authored_roots)
         else {
             return false;
         };
-        if roots.is_empty()
-            || ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &roots, None).is_err()
-        {
+        if roots.is_empty() {
             return false;
         }
+        let kind = match ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &roots, None) {
+            Ok(_) => TheoryLemmaKind::BvLiaTautology,
+            Err(error) if error.is_capability_decline() => {
+                let Some(subset) = ay_proof::recognize_seq_extensional_companion_contradiction(
+                    &self.ctx.terms,
+                    &roots,
+                ) else {
+                    return false;
+                };
+                roots = subset.into();
+                TheoryLemmaKind::SeqExtensionalCompanionContradiction
+            }
+            Err(_) => return false,
+        };
 
+        let Some(candidate) =
+            self.build_authenticated_bv_lia_refutation(&roots, kind, authenticated_authored_roots)
+        else {
+            return false;
+        };
+
+        *proof = candidate;
+        true
+    }
+
+    /// Build and independently replay the exact internal certificate used by
+    /// the last-resort BV/LIA and sequence-extensionality lanes.
+    ///
+    /// `authenticated_scope` is the complete immutable public query, while
+    /// `roots` is the independently recognized, load-bearing theorem subset.
+    /// Requiring every selected root to remain reachable prevents a recognizer
+    /// bug from silently authorizing a proof over a weaker subset.
+    fn build_authenticated_bv_lia_refutation(
+        &mut self,
+        roots: &[TermId],
+        kind: TheoryLemmaKind,
+        authenticated_scope: &[TermId],
+    ) -> Option<Proof> {
+        if roots.is_empty() {
+            return None;
+        }
         let mut candidate = Proof::new();
         let assumes: Vec<ProofId> = roots
             .iter()
@@ -754,7 +835,7 @@ impl Executor {
             theory: "BV_LIA".to_string(),
             clause: residual.clone(),
             farkas: None,
-            kind: TheoryLemmaKind::BvLiaTautology,
+            kind,
             lia: None,
         });
         for (&root, &assume) in roots.iter().zip(assumes.iter()) {
@@ -762,31 +843,40 @@ impl Executor {
             let before = residual.len();
             residual.retain(|&literal| literal != complement);
             if residual.len() + 1 != before {
-                return false;
+                return None;
             }
             current = candidate.add_resolution(residual.clone(), root, current, assume);
         }
         if !residual.is_empty() {
-            return false;
+            return None;
         }
 
-        if ay_proof::validate_reachable_assumes_in_problem_scope(
-            &candidate,
-            authenticated_authored_roots,
-        )
-        .is_err()
+        if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, authenticated_scope)
+            .is_err()
         {
-            return false;
+            return None;
+        }
+        // Scope validation above rejects foreign leaves. Removing each
+        // selected root in turn proves the converse: every selected theorem
+        // premise is reachable from the empty clause and therefore
+        // load-bearing in this exact candidate.
+        for omitted in 0..roots.len() {
+            let reduced: Vec<TermId> = roots
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &root)| (index != omitted).then_some(root))
+                .collect();
+            if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &reduced).is_ok() {
+                return None;
+            }
         }
         let Ok(quality) = ay_proof::check_proof_strict(&candidate, &self.ctx.terms) else {
-            return false;
+            return None;
         };
         if !quality.is_complete() || !Self::proof_derives_empty_clause(&candidate) {
-            return false;
+            return None;
         }
-
-        *proof = candidate;
-        true
+        Some(candidate)
     }
 
     /// Replace a trust-bearing sequence push-back proof with the exact
@@ -4333,6 +4423,8 @@ enum SurfaceCanonicalization {
 #[path = "proof_original_rebuild_tests.rs"]
 mod proof_original_rebuild_tests;
 
+#[path = "proof_original_rebuild_bv_lia_scope.rs"]
+mod proof_original_rebuild_bv_lia_scope;
 #[cfg(test)]
 #[path = "proof_original_rebuild_bv_lia_tests.rs"]
 mod proof_original_rebuild_bv_lia_tests;

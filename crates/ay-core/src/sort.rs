@@ -17,6 +17,7 @@ use std::fmt;
 ///
 /// This wrapper type provides explicit documentation and helper methods.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BitVecSort {
     /// Bitvector width in bits
     pub width: u32,
@@ -34,6 +35,7 @@ impl BitVecSort {
 ///
 /// This wrapper type provides explicit documentation and helper methods.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArraySort {
     /// Index (domain) sort
     pub index_sort: Sort,
@@ -54,6 +56,7 @@ impl ArraySort {
 
 /// A field in a datatype constructor (selector).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatatypeField {
     /// Field (selector) name
     pub name: String,
@@ -74,6 +77,7 @@ impl DatatypeField {
 
 /// A constructor in a datatype definition.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatatypeConstructor {
     /// Constructor name
     pub name: String,
@@ -105,6 +109,7 @@ impl DatatypeConstructor {
 ///
 /// This type holds the full datatype definition including constructors and fields.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatatypeSort {
     /// Datatype name
     pub name: String,

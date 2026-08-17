@@ -275,8 +275,13 @@ impl OpaqueDtConstructionBudget {
     }
 
     /// Charge a scalar pin before cloning it into the completed model. The
-    /// active opaque fragment admits only Bool and bounded canonical BV
-    /// fields; any other payload fails closed here.
+    /// active opaque fragment admits Bool, bounded canonical BV, numeric
+    /// (Int/Real via `Rational`), element-token, and string payloads — the
+    /// same scalar fields ordinary (non-opaque) total-DT construction has
+    /// always produced (#dt-opaque-app-model). Every admitted payload is
+    /// charged by its actual size against the shared work budget, so an
+    /// oversized pin still fails closed; structured payloads (Seq/FP/
+    /// algebraic) remain outside the lane.
     pub(super) fn charge_scalar_pin(&mut self, value: &EvalValue) -> bool {
         if !self.active {
             return true;
@@ -292,6 +297,17 @@ impl OpaqueDtConstructionBudget {
                     .ok()
                     .map(|bits| bits.div_ceil(8) + 1)
             }
+            EvalValue::Rational(value) => usize::try_from(value.numer().bits())
+                .ok()
+                .zip(usize::try_from(value.denom().bits()).ok())
+                .and_then(|(numer, denom)| {
+                    numer
+                        .div_ceil(8)
+                        .checked_add(denom.div_ceil(8))?
+                        .checked_add(1)
+                }),
+            EvalValue::Element(token) => token.len().checked_add(1),
+            EvalValue::String(text) => text.len().checked_add(1),
             _ => None,
         };
         let Some(work) = work else {
@@ -443,6 +459,22 @@ fn canonical_render_bytes(value: &ModelValue, limit: usize) -> Option<usize> {
                     width.max(1)
                 })?
             }
+            // Numeric, element-token, and string payloads render as their
+            // digit/byte length plus small fixed syntax (`(- n)`, `(/ a b)`,
+            // quotes). These are the scalar fields ordinary total-DT
+            // construction has always emitted (#dt-opaque-app-model); each is
+            // charged by actual size so an oversized payload fails closed.
+            ModelValue::Int(value) => usize::try_from(value.bits())
+                .ok()?
+                .div_ceil(3)
+                .checked_add(5)?,
+            ModelValue::Real(value) => usize::try_from(value.numer().bits())
+                .ok()?
+                .div_ceil(3)
+                .checked_add(usize::try_from(value.denom().bits()).ok()?.div_ceil(3))?
+                .checked_add(9)?,
+            ModelValue::Str(text) => text.len().checked_add(2)?,
+            ModelValue::Uninterpreted(token) => token.len().checked_add(1)?,
             ModelValue::Datatype { ctor, args } => {
                 if args.len() > limit.saturating_sub(bytes) {
                     return None;

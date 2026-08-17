@@ -216,26 +216,18 @@ impl std::fmt::Display for GroundDerivationError {
 /// behavior exactly (search-replay only), matching the `AY_CHC_DISABLE_*`
 /// convention used by the other transform-side features.
 pub(crate) fn ground_backtranslation_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        !std::env::var("AY_CHC_DISABLE_GROUND_BACKTRANSLATION")
-            .map(|value| value != "0")
-            .unwrap_or(false)
-    })
+    // B27: CLI-owned (--chc-no-ground-backtranslation); env retired.
+    crate::ab_switches::get().ground_backtranslation
 }
 
 /// Whether ground back-translation diagnostics should be printed.
 ///
-/// Enabled by `AY_CHC_GROUND_BT_DEBUG=1`. The landing sites print their own
+/// Enabled by `--chc-ground-bt-debug`. The landing sites print their own
 /// one-line outcome under `--verbose`; this switch adds the per-pass detail
 /// used to find which transform in a chain is the blocker.
 pub(crate) fn ground_backtranslation_debug() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_CHC_GROUND_BT_DEBUG")
-            .map(|value| value != "0")
-            .unwrap_or(false)
-    })
+    *FLAG.get_or_init(|| ay_core::misc_cli_flags().chc_ground_bt_debug)
 }
 
 /// Record that `pass` could not ground-back-translate a derivation.
@@ -468,7 +460,7 @@ pub(crate) fn validate_ground_derivation(
 /// Report the first conjunct of an indeterminate constraint that does not
 /// evaluate, together with the variables it needs that the environment lacks.
 ///
-/// Diagnostics only (`AY_CHC_GROUND_BT_DEBUG`); this is how a chain-level
+/// Diagnostics only (`--chc-ground-bt-debug`); this is how a chain-level
 /// fail-closed is traced back to the specific pass whose reconstruction was
 /// incomplete.
 fn diagnose_indeterminate_constraint(

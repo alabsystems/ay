@@ -199,6 +199,22 @@ const SUBMISSION_EXECUTABLE_NAMES: &[&str] = &[
 ];
 
 /// Generate competition submission artifacts.
+#[derive(clap::Args)]
+pub(crate) struct SubmissionArgs {
+    /// Path to the gzip binary used for archives (B41; was --gzip).
+    #[arg(long, global = true)]
+    gzip: Option<PathBuf>,
+    #[command(subcommand)]
+    command: SubmissionCommand,
+}
+
+pub(crate) fn run_args(args: SubmissionArgs) -> Result<()> {
+    if let Some(gzip) = args.gzip {
+        set_gzip_override(gzip);
+    }
+    run(args.command)
+}
+
 #[derive(Subcommand)]
 pub(crate) enum SubmissionCommand {
     /// Generate submission skeletons for one or more competitions.
@@ -3433,12 +3449,9 @@ fn default_submission_git_program() -> String {
 }
 
 fn submission_git_program() -> String {
-    if let Ok(program) = env::var("AY_SUBMISSION_GIT") {
-        let program = program.trim();
-        if !program.is_empty() {
-            return program.to_string();
-        }
-    }
+    // B5: the AY_SUBMISSION_GIT env override is deleted. The platform default
+    // below already picks the right git; a typed --git-program option can be
+    // added to the submission subcommand if a non-default git is ever needed.
     default_submission_git_program()
 }
 
@@ -4517,7 +4530,7 @@ fn verify_zenodo_download(
         .with_context(|| format!("failed to download {}", redact_submit_url(archive_url)))?;
     let mut reader = response.into_reader();
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = reader
             .read(&mut buffer)
@@ -7758,9 +7771,6 @@ fn resolve_ay_bin(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return canonical_file(path, "ay binary");
     }
-    if let Ok(path) = env::var("AY_SUBMISSION_BIN") {
-        return canonical_file(Path::new(&path), "AY_SUBMISSION_BIN");
-    }
     let root = workspace_root();
     for (target, label) in [
         (
@@ -8009,12 +8019,19 @@ fn write_ustar_octal(field: &mut [u8], value: u64, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// `--gzip <path>` override for the archive compressor (B41; was --gzip).
+/// Process-constant, stored at dispatch: `create_tar_gz` sits several
+/// packaging layers down.
+static GZIP_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub(crate) fn set_gzip_override(path: PathBuf) {
+    let _ = GZIP_OVERRIDE.set(path);
+}
+
 fn select_submission_gzip() -> Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = env::var("AY_GZIP") {
-        if !path.trim().is_empty() {
-            candidates.push(PathBuf::from(path));
-        }
+    if let Some(path) = GZIP_OVERRIDE.get() {
+        candidates.push(path.clone());
     }
     #[cfg(windows)]
     {
@@ -8040,7 +8057,7 @@ fn select_submission_gzip() -> Result<PathBuf> {
     }
 
     bail!(
-        "submission archive creation requires gzip with -n/--no-name support; set AY_GZIP to a compatible gzip. tried: {}",
+        "submission archive creation requires gzip with -n/--no-name support; set --gzip to a compatible gzip. tried: {}",
         tried.join(", ")
     )
 }

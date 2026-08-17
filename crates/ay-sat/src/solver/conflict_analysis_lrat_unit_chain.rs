@@ -39,7 +39,7 @@ impl Solver {
         if var_index < self.unit_proof_id.len() {
             self.unit_proof_id[var_index] = proof_id;
             self.unit_proof_sign[var_index] = if proof_id == 0 { 0 } else { lit.sign_i8() };
-            self.lower_lrat_level0_unit_materialize_cursor_for_var(var_index);
+            self.pin_lrat_level0_unit_materialize_for_var(var_index);
         }
     }
 
@@ -49,12 +49,16 @@ impl Solver {
         if var_index < self.cold.level0_proof_id.len() {
             self.cold.level0_proof_id[var_index] = proof_id;
             self.cold.level0_proof_sign[var_index] = if proof_id == 0 { 0 } else { lit.sign_i8() };
-            self.lower_lrat_level0_unit_materialize_cursor_for_var(var_index);
+            self.pin_lrat_level0_unit_materialize_for_var(var_index);
         }
     }
 
+    /// Mark a level-0 variable's trail slot as needing a (re-)materialization
+    /// attempt. Pre-#A5 this lowered the scalar materialize cursor, forcing a
+    /// re-walk of every slot after it; now the slot is pinned individually and
+    /// the high-water cursor never moves backward for a single variable.
     #[inline]
-    pub(super) fn lower_lrat_level0_unit_materialize_cursor_for_var(&mut self, var_index: usize) {
+    pub(super) fn pin_lrat_level0_unit_materialize_for_var(&mut self, var_index: usize) {
         if !self.cold.lrat_enabled
             || var_index >= self.num_vars
             || self.var_data[var_index].level != 0
@@ -64,10 +68,28 @@ impl Solver {
         }
         let trail_pos = self.var_data[var_index].trail_pos as usize;
         let level0_end = self.trail_lim.first().copied().unwrap_or(self.trail.len());
-        if trail_pos < level0_end {
-            self.cold.lrat_level0_unit_materialize_cursor =
-                self.cold.lrat_level0_unit_materialize_cursor.min(trail_pos);
+        if trail_pos >= level0_end || trail_pos >= self.cold.lrat_level0_unit_materialize_cursor {
+            // Never attempted yet: the next scan's fresh range covers it.
+            return;
         }
+        let pinned = &mut self.cold.lrat_level0_unit_materialize_pinned;
+        let idx = pinned.partition_point(|&p| p < trail_pos);
+        if pinned.get(idx) != Some(&trail_pos) {
+            pinned.insert(idx, trail_pos);
+        }
+    }
+
+    /// Clamp the level-0 materialization high-water cursor to `pos` and drop
+    /// pinned retry slots at or above the new cursor: after a trail shrink or
+    /// compaction those positions no longer describe the same literals, and
+    /// the fresh range of the next scan covers them (#A5).
+    #[inline]
+    pub(super) fn clamp_lrat_level0_unit_materialize_cursor(&mut self, pos: usize) {
+        let cursor = self.cold.lrat_level0_unit_materialize_cursor.min(pos);
+        self.cold.lrat_level0_unit_materialize_cursor = cursor;
+        let pinned = &mut self.cold.lrat_level0_unit_materialize_pinned;
+        let keep = pinned.partition_point(|&p| p < cursor);
+        pinned.truncate(keep);
     }
 
     #[inline]

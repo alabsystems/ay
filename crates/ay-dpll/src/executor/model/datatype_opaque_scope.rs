@@ -76,12 +76,18 @@ impl Executor {
         result: TermId,
     ) -> bool {
         let result_sort = self.ctx.terms.sort(result);
+        // `is_registered`, NOT `is_exact`: construction commits typed model
+        // values, so the exact rendered round-trip fragment is not required
+        // here — see the rationale on [`RenderedDatatypeGuard::is_registered`].
+        // Demanding exactness made construction bail for every datatype with a
+        // scalar payload field and degraded genuinely-SAT DT queries to
+        // `unknown` (#dt-uf-bridge-congruence and the dt_model_cert lanes).
         if !matches!(symbol, Symbol::Named(_))
             || args.is_empty()
             || args.len() > MAX_OPAQUE_DT_APP_ARGS
             || ay_frontend::is_canonical_theory_operator_identity(symbol.name())
             || !self.opaque_uf_signature_within_limits(symbol, args, result_sort)
-            || !guard.is_exact(result_sort)
+            || !guard.is_registered(result_sort)
         {
             return false;
         }
@@ -142,6 +148,31 @@ impl Executor {
         args: &[TermId],
         result: TermId,
     ) -> bool {
+        self.dt_completion_array_select_application_with_guard(guard, symbol, args, result, false)
+    }
+
+    /// The same exact canonical `select` identity/signature check, but for an
+    /// already-rendered array cell.  That consumer may admit an `Int` field
+    /// because the concrete value is bounded by the rendered-value parser; it
+    /// does not widen schema-driven datatype synthesis.
+    pub(super) fn dt_completion_array_cell_select_application_guarded(
+        &self,
+        guard: &RenderedDatatypeGuard,
+        symbol: &Symbol,
+        args: &[TermId],
+        result: TermId,
+    ) -> bool {
+        self.dt_completion_array_select_application_with_guard(guard, symbol, args, result, true)
+    }
+
+    fn dt_completion_array_select_application_with_guard(
+        &self,
+        guard: &RenderedDatatypeGuard,
+        symbol: &Symbol,
+        args: &[TermId],
+        result: TermId,
+        rendered_array_cell: bool,
+    ) -> bool {
         if symbol.name() != "select"
             || !matches!(symbol, Symbol::Named(_))
             || args.len() != 2
@@ -156,8 +187,13 @@ impl Executor {
                     self.ctx.effective_declaration_kind(info.declaration_id())
                         == Some(ay_frontend::DeclarationKind::Theory)
                 });
+        let exact_result = if rendered_array_cell {
+            guard.is_exact_array_cell(self.ctx.terms.sort(result))
+        } else {
+            guard.is_exact(self.ctx.terms.sort(result))
+        };
         canonical_binding_is_coherent
-            && guard.is_exact(self.ctx.terms.sort(result))
+            && exact_result
             && matches!(self.ctx.terms.sort(args[0]), Sort::Array(array_sort)
                 if &array_sort.index_sort == self.ctx.terms.sort(args[1])
                     && &array_sort.element_sort == self.ctx.terms.sort(result))

@@ -18,6 +18,11 @@ default = ["smt"]
 # The L0 lowering lane through ay-dpll's typed Solver API. Carries the full
 # ay-dpll dependency; native Track E paths do not need it.
 smt = ["dep:ay-dpll"]
+# ALLOCATION CENSUS. Compiles the per-region / per-segment allocation probes into the
+# branch-and-bound node loop. OFF by default and the probes are `#[cfg]`-erased, not merely
+# branch-predicted, so a default build has bit-identical codegen in the hot loop. Only the
+# `alloc_census` measurement binary asks for it.
+acensus = []
 
 [dependencies]
 ay-dpll = { workspace = true, optional = true }
@@ -41,3 +46,9 @@ proptest.workspace = true
 
 [lints]
 workspace = true
+
+# The census binary is the only consumer of the `acensus` probes; `required-features` keeps a
+# plain `cargo build --examples` from silently producing a binary whose probes are erased.
+[[example]]
+name = "alloc_census"
+required-features = ["acensus"]

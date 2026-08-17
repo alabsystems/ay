@@ -51,13 +51,13 @@ fn arith_rank(s: &Sort) -> u8 {
     }
 }
 
-/// Kill switch (AY_ELAB_LET_CHAIN=0 restores the legacy per-level clone) for the
-/// flattened let-chain elaboration that avoids O(N^2) env cloning on deeply
-/// nested let-chains. Cached after first read.
+/// Production policy for the flattened let-chain elaboration that avoids
+/// O(N^2) environment cloning on deeply nested let-chains.
+///
+/// B24 retired the legacy per-level-clone A/B path, so the optimized,
+/// semantics-equivalent chain elaboration is always enabled.
 fn elab_let_chain_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_ELAB_LET_CHAIN").is_none_or(|v| v != "0"))
+    true
 }
 
 /// Collect every symbol/function name referenced anywhere in `root` into `out`.
@@ -297,8 +297,8 @@ impl Context {
                 //      is still walked LEVEL BY LEVEL; only the clone is hoisted.
                 //      Collapsing the levels into one ordered list is what made the
                 //      flatten unsound, and is exactly what is no longer done.
-                // Kill switch AY_ELAB_LET_CHAIN=0 falls back to the per-level clone
-                // (identical semantics, one clone per level).
+                // The legacy per-level clone remains below as a local reference
+                // implementation; B24 retired its runtime A/B switch.
                 if elab_let_chain_enabled() {
                     // Collect the body-position chain as LEVELS. Level boundaries
                     // are semantically load-bearing and must not be merged.

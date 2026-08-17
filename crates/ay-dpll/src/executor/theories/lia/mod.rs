@@ -399,7 +399,7 @@ impl Executor {
     ///    truncated one — a capped-out probe would have returned Unknown and
     ///    taken the earlier `!matches!(r1, Unsat)` exit.
     ///
-    /// `AY_NO_UC_LIA_PROBE_FALLTHROUGH=1` restores the previous behaviour.
+    /// `--dpll-no-uc-lia-probe-fallthrough` restores the previous behaviour.
     fn uc_probe_should_decline(
         &self,
         r1_elapsed: std::time::Duration,
@@ -408,7 +408,7 @@ impl Executor {
         if !self.produce_unsat_cores_enabled() {
             return false;
         }
-        if std::env::var_os("AY_NO_UC_LIA_PROBE_FALLTHROUGH").is_some() {
+        if ay_core::theory_disable_flags().no_uc_lia_probe_fallthrough {
             return false;
         }
         deadline.is_none_or(|dl| Instant::now() + r1_elapsed.saturating_mul(4) < dl)
@@ -439,12 +439,12 @@ impl Executor {
     /// itself — which earns no points here, and un-answering is not an error.
     ///
     /// Gated on `produce_unsat_cores_enabled()` so non-UC solving is untouched,
-    /// and on the same `AY_NO_UC_LIA_PROBE_FALLTHROUGH` escape hatch.
+    /// and on the same `--dpll-no-uc-lia-probe-fallthrough` escape hatch.
     fn uc_probe_should_decline_padded_core(&self, core_len: usize, n_assumptions: usize) -> bool {
         if !self.produce_unsat_cores_enabled() {
             return false;
         }
-        if std::env::var_os("AY_NO_UC_LIA_PROBE_FALLTHROUGH").is_some() {
+        if ay_core::theory_disable_flags().no_uc_lia_probe_fallthrough {
             return false;
         }
         // Only when NO minimization happened at all: the core is every

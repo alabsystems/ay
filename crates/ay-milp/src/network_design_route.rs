@@ -212,7 +212,7 @@ fn try_solve_direct(
         Ok(projection) => projection,
         Err(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE network-pb: lazy-projection-declined={reason}");
+                eprintln!("--trace network-pb: lazy-projection-declined={reason}");
             }
             return None;
         }
@@ -235,7 +235,7 @@ fn try_solve_direct(
             Ok(projection) => Some(projection),
             Err(reason) => {
                 if trace_enabled() {
-                    eprintln!("AY_MILP_TRACE network-pb: eager-projection-declined={reason}");
+                    eprintln!("--trace network-pb: eager-projection-declined={reason}");
                 }
                 None
             }
@@ -515,21 +515,21 @@ fn try_solve_pattern_count_master(
         Ok(plan) => plan,
         Err(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE network-pattern-count: translate-declined={reason:?}");
+                eprintln!("--trace network-pattern-count: translate-declined={reason:?}");
             }
             return PatternCountMasterAttempt::Declined;
         }
     };
     let Some(objective) = plan.objective.as_ref() else {
         if trace_enabled() {
-            eprintln!("AY_MILP_TRACE network-pattern-count: no-objective");
+            eprintln!("--trace network-pattern-count: no-objective");
         }
         return PatternCountMasterAttempt::Declined;
     };
     let families = projection.ordered_interchangeable_block_families(Some(deadline));
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE network-pattern-count: families={} pb-vars={} rows={}",
+            "--trace network-pattern-count: families={} pb-vars={} rows={}",
             families.len(),
             plan.num_vars,
             plan.num_constraints
@@ -541,7 +541,7 @@ fn try_solve_pattern_count_master(
         }
         let Some(blocks) = plan.lift_model_column_blocks_to_pb(&family) else {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE network-pattern-count: block-lift-declined");
+                eprintln!("--trace network-pattern-count: block-lift-declined");
             }
             continue;
         };
@@ -553,13 +553,13 @@ fn try_solve_pattern_count_master(
         let result = match attempt {
             crate::pattern_count_route::PatternCountSolveAttempt::Declined(reason) => {
                 if trace_enabled() {
-                    eprintln!("AY_MILP_TRACE network-pattern-count: partition-declined={reason:?}");
+                    eprintln!("--trace network-pattern-count: partition-declined={reason:?}");
                 }
                 continue;
             }
             crate::pattern_count_route::PatternCountSolveAttempt::VerifiedDeclined(reason) => {
                 if trace_enabled() {
-                    eprintln!("AY_MILP_TRACE network-pattern-count: quotient-declined={reason:?}");
+                    eprintln!("--trace network-pattern-count: quotient-declined={reason:?}");
                 }
                 return PatternCountMasterAttempt::Admitted(None);
             }
@@ -569,13 +569,13 @@ fn try_solve_pattern_count_master(
             Ok(Some(solution)) => solution,
             Ok(None) => {
                 if trace_enabled() {
-                    eprintln!("AY_MILP_TRACE network-pattern-count: exact-infeasible");
+                    eprintln!("--trace network-pattern-count: exact-infeasible");
                 }
                 return PatternCountMasterAttempt::Admitted(None);
             }
             Err(reason) => {
                 if trace_enabled() {
-                    eprintln!("AY_MILP_TRACE network-pattern-count: solve-declined={reason:?}");
+                    eprintln!("--trace network-pattern-count: solve-declined={reason:?}");
                 }
                 return PatternCountMasterAttempt::Admitted(None);
             }
@@ -619,7 +619,7 @@ fn trace_result(
             PbRouteDecision::Optimal { .. } => "OPTIMAL",
         };
         eprintln!(
-            "AY_MILP_TRACE network-pb: engine={} master-cols={} master-rows={} components={} \
+            "--trace network-pb: engine={} master-cols={} master-rows={} components={} \
              hoffman-rows={} verdict={} wall={:.6}s",
             engine,
             projection.master.num_cols(),
@@ -1510,7 +1510,7 @@ fn trace_enabled() -> bool {
     // `set_var` can race, which priming cannot help. `OnceLock` is the shape
     // that ratchet asks for and `simplex.rs` already uses.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 #[cfg(test)]

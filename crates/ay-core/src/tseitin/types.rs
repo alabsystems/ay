@@ -103,6 +103,22 @@ impl TseitinResult {
         }
     }
 
+    /// Attach a proof ledger only when it is exactly parallel to the clauses.
+    ///
+    /// A positional clausification annotation is authority for one original
+    /// SAT-clause ID.  A short or long ledger therefore cannot be partially
+    /// accepted: discard it wholesale and leave reconstruction proofless so
+    /// the strict publication boundary fails closed.
+    #[must_use]
+    pub fn with_parallel_proof_annotations(
+        mut self,
+        proof_annotations: Option<Vec<Option<ClausificationProof>>>,
+    ) -> Self {
+        self.proof_annotations =
+            proof_annotations.filter(|annotations| annotations.len() == self.clauses.len());
+        self
+    }
+
     /// Convert a CNF variable to a TermId if it exists
     pub fn term_for_var(&self, var: u32) -> Option<TermId> {
         self.var_to_term.get(&var).copied()

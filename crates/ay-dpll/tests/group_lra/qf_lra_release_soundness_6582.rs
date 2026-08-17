@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Regression test for #6582: release-only false-UNSAT on QF_LRA benchmarks.
+//! Regression test for #6582: release-only false-UNSAT from erased strict
+//! interval endpoints.
 //!
 //! Root cause: `compute_expr_interval()` collapsed strict/non-strict endpoints
 //! into plain `BigRational`, so open-zero boundaries were indistinguishable
@@ -11,12 +12,9 @@
 //! The fix (Packet 2) introduces `IntervalEndpoint` with a `strict` flag and
 //! replaces raw sign checks with endpoint-aware helpers.
 //!
-//! `constraints-tempo-width-10` is fixed by Packet 1 (propagation guard) +
-//! Packet 2 (endpoint strictness). The remaining 2 benchmarks
-//! (`constraints-tempo-width-60`, `simple_startup_6nodes`) no longer return
-//! false `unsat`, but they still time out in the current release solver. Keep
-//! those as release soundness canaries until the deeper simplex/performance
-//! work lands.
+//! The original failures were exposed by externally licensed SMT-LIB corpus
+//! benchmarks. These release tests use hand-authored Apache-2.0 reductions of
+//! both open-zero endpoint directions, so the mandatory gate is hermetic.
 //!
 //! Part of #6582
 
@@ -28,114 +26,55 @@ use anyhow::Result;
 const BENCHMARK_TIMEOUT_SECS: u64 = 10;
 
 #[cfg(not(debug_assertions))]
-const FALSE_UNSAT_CANARY_TIMEOUT_SECS: u64 = 10;
-
-#[cfg(not(debug_assertions))]
-const FALSE_UNSAT_CANARY_Z3_TIMEOUT_SECS: u64 = 20;
-
-#[cfg(not(debug_assertions))]
 const FALSE_UNSAT_CANARY_RUNS: usize = 3;
 
-/// Release-only regression: constraints-tempo-width-10 must return SAT.
+/// Release-only regression: an open-zero lower endpoint must remain SAT.
 ///
-/// Before the #6582 fix, release mode returned false-UNSAT because the interval
-/// propagation path erased endpoint strictness, causing unsound compound-atom
-/// implications.
+/// `x > 0` and `y >= 0` imply `x + y > 0`; the first disjunct is false,
+/// while `x = 1, y = 0` is an explicit satisfying witness.
 #[cfg(not(debug_assertions))]
 #[test]
 #[ntest::timeout(120_000)]
-fn test_constraints_tempo_width_10_release_sat_6582() -> Result<()> {
-    use crate::common::{
-        check_z3_or_skip, run_executor_file_with_timeout, run_z3_file, workspace_path,
-        SolverOutcome,
-    };
+fn test_open_zero_lower_endpoint_release_sat_6582() -> Result<()> {
+    use crate::common::{run_executor_file_with_timeout, workspace_path, SolverOutcome};
 
-    let path = workspace_path("benchmarks/smtcomp/QF_LRA/constraints-tempo-width-10.smt2");
+    let path = workspace_path(
+        "benchmarks/smt/regression/qf_lra_release_soundness/open_zero_lower_sat.smt2",
+    );
     assert!(path.exists(), "Benchmark not found: {}", path.display());
-
-    if check_z3_or_skip() {
-        assert_eq!(
-            run_z3_file(&path, BENCHMARK_TIMEOUT_SECS)?,
-            SolverOutcome::Sat,
-            "Z3 disagrees on expected SAT for constraints-tempo-width-10"
-        );
-    }
 
     for run in 0..5 {
         let got = run_executor_file_with_timeout(&path, BENCHMARK_TIMEOUT_SECS)?;
         assert_eq!(
             got,
             SolverOutcome::Sat,
-            "release run {run} returned {got:?} for constraints-tempo-width-10 (#6582)"
+            "release run {run} returned {got:?} on the #6582 open-zero lower reduction"
         );
     }
     Ok(())
 }
 
-/// Release soundness canary: width-60 is known SAT in Z3 and must never
-/// regress back to false-UNSAT in AY release, even though current HEAD still
-/// times out within the canary budget.
+/// Release-only regression: an open-zero upper endpoint must remain SAT.
+///
+/// `x < 0` and `y <= 0` imply `x + y < 0`; the first disjunct is false,
+/// while `x = -1, y = 0` is an explicit satisfying witness.
 #[cfg(not(debug_assertions))]
 #[test]
 #[ntest::timeout(120_000)]
-fn test_constraints_tempo_width_60_release_no_false_unsat_6582() -> Result<()> {
-    use crate::common::{
-        assert_z3_sat_or_known_status, run_executor_file_with_timeout, workspace_path,
-        SolverOutcome,
-    };
+fn test_open_zero_upper_endpoint_release_sat_6582() -> Result<()> {
+    use crate::common::{run_executor_file_with_timeout, workspace_path, SolverOutcome};
 
-    let path = workspace_path("benchmarks/smtcomp/QF_LRA/constraints-tempo-width-60.smt2");
+    let path = workspace_path(
+        "benchmarks/smt/regression/qf_lra_release_soundness/open_zero_upper_sat.smt2",
+    );
     assert!(path.exists(), "Benchmark not found: {}", path.display());
 
-    assert_z3_sat_or_known_status(
-        &path,
-        FALSE_UNSAT_CANARY_Z3_TIMEOUT_SECS,
-        "constraints-tempo-width-60",
-    )?;
-
     for run in 0..FALSE_UNSAT_CANARY_RUNS {
-        let got = run_executor_file_with_timeout(&path, FALSE_UNSAT_CANARY_TIMEOUT_SECS)?;
-        assert!(
-            matches!(
-                got,
-                SolverOutcome::Sat | SolverOutcome::Unknown | SolverOutcome::Timeout
-            ),
-            "release run {run} returned false-UNSAT for constraints-tempo-width-60 (#6582): {got:?}"
-        );
-    }
-    Ok(())
-}
-
-/// Release soundness canary: the 6-node startup case is SAT in Z3 and must not
-/// regress back to false-UNSAT in AY release while the remaining performance
-/// work is still open.
-#[cfg(not(debug_assertions))]
-#[test]
-#[ntest::timeout(120_000)]
-fn test_simple_startup_6nodes_release_no_false_unsat_6582() -> Result<()> {
-    use crate::common::{
-        assert_z3_sat_or_known_status, run_executor_file_with_timeout, workspace_path,
-        SolverOutcome,
-    };
-
-    let path =
-        workspace_path("benchmarks/smtcomp/QF_LRA/simple_startup_6nodes.missing.induct.smt2");
-    assert!(path.exists(), "Benchmark not found: {}", path.display());
-
-    assert_z3_sat_or_known_status(
-        &path,
-        FALSE_UNSAT_CANARY_Z3_TIMEOUT_SECS,
-        "simple_startup_6nodes.missing.induct",
-    )?;
-
-    for run in 0..FALSE_UNSAT_CANARY_RUNS {
-        let got = run_executor_file_with_timeout(&path, FALSE_UNSAT_CANARY_TIMEOUT_SECS)?;
-        assert!(
-            matches!(
-                got,
-                SolverOutcome::Sat | SolverOutcome::Unknown | SolverOutcome::Timeout
-            ),
-            "release run {run} returned false-UNSAT for simple_startup_6nodes.missing.induct (#6582): {got:?}"
+        let got = run_executor_file_with_timeout(&path, BENCHMARK_TIMEOUT_SECS)?;
+        assert_eq!(
+            got,
+            SolverOutcome::Sat,
+            "release run {run} returned {got:?} on the #6582 open-zero upper reduction"
         );
     }
     Ok(())

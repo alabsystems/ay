@@ -492,7 +492,7 @@ pub(crate) fn lp_lower_bound_with_target(
     )
 }
 
-/// Whether the Farkas-certificate emit/check path is enabled (`AY_PB_FARKAS_CERT`).
+/// Whether the Farkas-certificate emit/check path is enabled (`--pb-farkas-cert`).
 /// Re-exported here so consumers do not depend on the `farkas_cert` module
 /// directly. Default OFF, so the certificate machinery never perturbs the existing
 /// (already-sound) bound path unless explicitly enabled.
@@ -503,7 +503,7 @@ pub(crate) fn cert_path_enabled() -> bool {
 /// Outcome of validating a base-LP Farkas certificate against its claimed bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CertOutcome {
-    /// `AY_PB_FARKAS_CERT` was unset; no certificate was built.
+    /// `--pb-farkas-cert` was unset; no certificate was built.
     Disabled,
     /// The certificate `check_slack` accepted and its `claimed_bound == bound`.
     /// The bound is trusted via the checked certificate (no re-derivation needed).
@@ -4087,9 +4087,8 @@ mod tests {
     /// gitignored, so fresh checkouts only carry the tiny `test-instances/`
     /// subset and these sweeps skip).
     fn measurement_corpus_root() -> std::path::PathBuf {
-        if let Some(root) = std::env::var_os("AY_PBCOMP_BENCH_ROOT") {
-            return std::path::PathBuf::from(root);
-        }
+        // B14: the AY_PBCOMP_BENCH_ROOT override nothing set is deleted; a
+        // relocated corpus is a symlink at the checkout-relative path.
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp")
     }
 
@@ -4497,10 +4496,10 @@ mod tests {
     #[test]
     fn farkas_cert_validates_real_opb_instance_via_gated_path() {
         // End-to-end on a REAL OPT-LIN .opb instance through the gated emit path:
-        // enable AY_PB_FARKAS_CERT, parse the instance, run lp_lower_bound_with_cert,
+        // enable --pb-farkas-cert, parse the instance, run lp_lower_bound_with_cert,
         // and confirm the checker VERIFIED the certificate for the real LP bound.
-        // (Env vars are process-global; this is the only test that sets this flag,
-        // and it restores the prior value.)
+        // (B63: the gate rides MiscCliFlags; the thread-scoped override
+        // restores the prior value on drop.)
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../ay-pb/tests/instances/weighted_opt.opb"
@@ -4509,15 +4508,16 @@ mod tests {
         let instance = crate::parser::parse_opb(&text).expect("parse OPB");
         let objective = instance.objective.clone().expect("instance has objective");
 
-        // Serialized + restored via the one workspace env choke point.
-        let result = with_serialized_env_vars(&[("AY_PB_FARKAS_CERT", "1")], || {
-            lp_lower_bound_with_cert(
-                &objective,
-                &instance.constraints,
-                instance.num_vars,
-                &never_stop,
-            )
+        let _cert_gate = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+            pb_farkas_cert: true,
+            ..Default::default()
         });
+        let result = lp_lower_bound_with_cert(
+            &objective,
+            &instance.constraints,
+            instance.num_vars,
+            &never_stop,
+        );
 
         let (bound, cert, outcome) = result.expect("certified bound");
         assert_eq!(

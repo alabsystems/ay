@@ -16,9 +16,7 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 /// var=term folding pass; the transform is equivalence-preserving (bindings
 /// re-conjoined), so enabling it is sound for every consumer by construction.
 fn fold_frames_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_FOLD_FRAMES").is_ok_and(|v| v == "1"))
+    false // B24: never-set opt-in retired.
 }
 
 impl TransitionSystem {

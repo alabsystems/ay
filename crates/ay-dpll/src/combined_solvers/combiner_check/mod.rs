@@ -110,7 +110,7 @@ impl TheoryCombiner<'_> {
     pub(super) fn nelson_oppen_check(&mut self) -> TheoryResult {
         let debug = debug_nelson_oppen();
         // Inc0-0c: combiner-check vs fixpoint-iteration attribution
-        // (AY_LIA_INSTRUMENT-gated, write-only).
+        // (--lia-instrument-gated, write-only).
         ay_lia::instrument::bump_no_check();
         const MAX_ITERATIONS: usize = 100;
         let mut deferred_arith_result: Option<TheoryResult> = None;
@@ -1154,11 +1154,10 @@ impl TheoryCombiner<'_> {
                 return Some(result);
             }
         }
-        // Diagnostic-only: AY_DEBUG_NO_TERMS="242,30,..." dumps the EUF/LIA
+        // Diagnostic-only: --debug-no-terms="242,30,..." dumps the EUF/LIA
         // view of the listed term ids at every Sat-accepting fixpoint.
-        if let Some(list) = std::env::var_os("AY_DEBUG_NO_TERMS") {
+        if let Some(list) = ay_core::misc_cli_flags().debug_no_terms.as_deref() {
             let ids: Vec<u32> = list
-                .to_string_lossy()
                 .split(',')
                 .filter_map(|tok| tok.trim().parse::<u32>().ok())
                 .collect();
@@ -1371,7 +1370,7 @@ impl TheoryCombiner<'_> {
         }
 
         if to_materialize.is_empty() {
-            if debug || std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if debug || ay_core::misc_cli_flags().phase_trace {
                 safe_eprintln!(
                     "c phase-trace diet-certify CERTIFIED-SAT resident={} euf_classes={} label={}",
                     resident_valued.len(),
@@ -1406,7 +1405,7 @@ impl TheoryCombiner<'_> {
                 materialized += 1;
             }
         }
-        if debug || std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if debug || ay_core::misc_cli_flags().phase_trace {
             safe_eprintln!(
                 "c phase-trace diet-certify MATERIALIZED n={} round={} label={}",
                 materialized,
@@ -1728,10 +1727,10 @@ impl TheoryCombiner<'_> {
             return Some(TheoryResult::Unsat(conflict));
         }
         let get = |t: TermId| get_value_with_euf_fallback(lia, &euf_int_values, t);
-        // Diagnostic-only: AY_DEBUG_NO_TERMS="4,30,..." dumps the LIA/EUF view
+        // Diagnostic-only: --debug-no-terms="4,30,..." dumps the LIA/EUF view
         // of the listed term ids at every fixpoint mismatch scan.
-        if let Some(list) = std::env::var_os("AY_DEBUG_NO_TERMS") {
-            for raw in list.to_string_lossy().split(',') {
+        if let Some(list) = ay_core::misc_cli_flags().debug_no_terms.as_deref() {
+            for raw in list.split(',') {
                 let Ok(id) = raw.trim().parse::<u32>() else {
                     continue;
                 };

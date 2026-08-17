@@ -14,9 +14,10 @@ use super::pigeonhole_core::EnumDiseqEdges;
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, Symbol, TermData, TermId};
-use num_bigint::BigInt;
 
 const SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL: usize = 1024;
+
+pub(in crate::executor) mod finite_array_closure;
 
 /// Whether singleton-sort closure finished emitting its complete spanning set.
 ///
@@ -59,21 +60,6 @@ impl Polarity {
             Polarity::Unknown => Polarity::Unknown,
         }
     }
-}
-
-/// Finite index domain of an array equality, over which exact
-/// extensionality is expanded (`add_finite_index_array_extensionality`).
-#[derive(Clone)]
-enum FiniteArrayIndexDomain {
-    /// BitVec index of the given width: the `2^width` concrete bit-vectors.
-    BitVec(u32),
-    /// Bool index: the two values `false` / `true`.
-    Bool,
-    /// All-nullary (enum) datatype index: the constructor constants, built
-    /// with the given index sort. The inhabitants of an all-nullary datatype
-    /// are exactly its constructor constants, so this enumerates the full
-    /// (finite) index domain.
-    EnumDatatype(Vec<String>, Sort),
 }
 
 impl Executor {
@@ -1108,7 +1094,7 @@ impl Executor {
     /// Match `(= (select X i) (select Y i))` where the index of BOTH selects is
     /// exactly the bound variable `binder` and the arrays `X`, `Y` are
     /// binder-independent terms of the same array sort. Returns `(X, Y)`.
-    fn select_eq_at_binder(
+    pub(in crate::executor) fn select_eq_at_binder(
         &self,
         term: TermId,
         binder: &str,
@@ -1297,7 +1283,7 @@ impl Executor {
     /// When `sort` is an ALL-NULLARY (enum) datatype with `1..=CAP`
     /// constructors, return its constructor names — the complete (finite) set
     /// of inhabitants. Otherwise `None`. Used as an array index domain for exact
-    /// finite-index extensionality (`add_finite_index_array_extensionality`).
+    /// finite-index extensionality (`add_finite_index_array_closure`).
     /// Resolves both the inline `Sort::Datatype` form and a bare
     /// `Sort::Uninterpreted(name)` against the declared-datatype registry.
     fn finite_enum_datatype_ctors(&self, sort: &Sort) -> Option<Vec<String>> {
@@ -1442,7 +1428,7 @@ impl Executor {
             self.collect_guarded_ite_diseq_edges(assertion, assertion, &mut by_sort);
         }
 
-        let debug_pigeonhole = std::env::var_os("AY_DEBUG_PIGEONHOLE").is_some();
+        let debug_pigeonhole = ay_core::misc_cli_flags().debug_pigeonhole;
         for (_sort, info) in by_sort {
             let k = info.k;
             let edges: HashSet<(TermId, TermId)> = info.edges.keys().copied().collect();
@@ -2163,76 +2149,9 @@ impl Executor {
         None
     }
 
-    /// Maximum BitVec index width for which finite-domain array extensionality
-    /// is expanded eagerly. Width `w` enumerates `2^w` indices; `w <= 8` keeps
-    /// this at <= 256 select pairs per array equality, which the bit-blaster
-    /// handles cheaply while making such equalities EXACTLY decided.
-    const FINITE_BV_ARRAY_EXT_MAX_INDEX_WIDTH: u32 = 8;
-
-    /// Eager, sound + COMPLETE finite-domain extensionality for array equalities
-    /// over a small BitVec index domain.
-    ///
-    /// For an array sort `(Array (_ BitVec w) E)` with `w` small, the index
-    /// domain is finite (`2^w` values), so two arrays are equal iff they agree
-    /// at every index. The lazy single-Skolem extensionality axiom used
-    /// elsewhere can only *witness* a difference; it cannot *refute* an
-    /// equality that secretly fails (or holds) at a specific concrete index,
-    /// which left QF_ABV array equalities involving `(as const ...)` /
-    /// store-chains under-constrained and produced wrong-SAT.
-    ///
-    /// This pass asserts the exact biconditional for each such equality atom
-    /// `(= a b)` reachable from the assertions:
-    ///   `(= a b)  <=>  AND_{i in domain} (= (select a i) (select b i))`
-    /// which the underlying solver then decides completely. Fires for BitVec
-    /// index widths `<= FINITE_BV_ARRAY_EXT_MAX_INDEX_WIDTH` and for Bool
-    /// indices (2 values, `false`/`true`); larger / infinite index domains are
-    /// left to the lazy machinery (no soundness impact — it just stays as-is).
-    /// (Soundness fix: finite-index / as-const array (dis)equality wrong-SAT.)
-    pub(in crate::executor) fn add_finite_index_array_extensionality(&mut self) {
-        let mut eq_atoms: Vec<(TermId, TermId, TermId, FiniteArrayIndexDomain)> = Vec::new();
-        let mut seen: HashSet<TermId> = HashSet::default();
-        let assertions = self.ctx.assertions.clone();
-        for &assertion in &assertions {
-            self.collect_finite_index_array_eq_atoms(assertion, &mut eq_atoms, &mut seen);
-        }
-
-        for (eq_atom, lhs, rhs, domain) in eq_atoms {
-            // Enumerate the full (finite) index domain.
-            let indices: Vec<TermId> = match domain {
-                FiniteArrayIndexDomain::BitVec(width) => (0..(1u64 << width))
-                    .map(|i| self.ctx.terms.mk_bitvec(BigInt::from(i), width))
-                    .collect(),
-                FiniteArrayIndexDomain::Bool => {
-                    vec![self.ctx.terms.mk_bool(false), self.ctx.terms.mk_bool(true)]
-                }
-                // A nullary datatype constructor reference elaborates to
-                // `mk_var(name, sort)` (frontend elaborate/term.rs), so build the
-                // index constants the SAME way — otherwise they would be fresh
-                // `App` terms that do not match the existing constructor terms in
-                // the store and the select/store rewrites would not fold.
-                FiniteArrayIndexDomain::EnumDatatype(ctor_names, index_sort) => ctor_names
-                    .iter()
-                    .map(|name| self.ctx.terms.mk_var(name.clone(), index_sort.clone()))
-                    .collect(),
-            };
-            // Build AND over all indices of (= (select lhs i) (select rhs i)).
-            let mut conjuncts = Vec::with_capacity(indices.len());
-            for idx in indices {
-                let sel_lhs = self.ctx.terms.mk_select(lhs, idx);
-                let sel_rhs = self.ctx.terms.mk_select(rhs, idx);
-                let sel_eq = self.ctx.terms.mk_eq(sel_lhs, sel_rhs);
-                conjuncts.push(sel_eq);
-            }
-            let conjunction = self.ctx.terms.mk_and(conjuncts);
-            // (= eq_atom conjunction) over Bool is the biconditional.
-            let biconditional = self.ctx.terms.mk_eq(eq_atom, conjunction);
-            self.push_array_axiom_assertion_site(biconditional, "finite_index_array_ext");
-        }
-    }
-
     /// (#array-const-store-ext) Restricted extensionality for `const-array = store
     /// chain` over an INFINITE index domain, where
-    /// [`add_finite_index_array_extensionality`](Self::add_finite_index_array_extensionality)
+    /// [`add_finite_index_array_closure`](Self::add_finite_index_array_closure)
     /// does not apply and the lazy ArraySolver applies the const=store congruence at
     /// only ONE written index — so `((as const) ed) = (store (store c i0 e3) i1 e0)`
     /// with `i0 != i1`, `e3 != e0` was wrongly SAT (round-3 rank2: it should force
@@ -2259,7 +2178,7 @@ impl Executor {
                 let sel_s = self.ctx.terms.mk_select(chain_side, e);
                 let sel_eq = self.ctx.terms.mk_eq(sel_c, sel_s);
                 let imp = self.ctx.terms.mk_implies(eq_atom, sel_eq);
-                self.push_array_axiom_assertion_site(imp, "const_store_array_ext");
+                self.ensure_array_axiom_assertion_site(imp, "const_store_array_ext");
             }
         }
     }
@@ -2324,201 +2243,6 @@ impl Executor {
                 }
                 _ => return,
             }
-        }
-    }
-
-    /// Back-compat alias for the BV-array route (#bv array ext). Now also covers
-    /// Bool-indexed arrays; the name is kept for the existing call site.
-    pub(in crate::executor) fn add_finite_bv_array_extensionality(&mut self) {
-        self.add_finite_index_array_extensionality()
-    }
-
-    /// Soundness pass (#arr-finite-symbolic-index): a `(select arr i)` over an
-    /// array with a FINITE index domain (Bool / small BitVec / enum datatype) and
-    /// a SYMBOLIC (non-constant) index `i` must equal the array's value at
-    /// whichever domain element `i` is. Without this, `(select a p) = 0` with
-    /// `a[true] = 2 ∧ a[false] = 7` over `(Array Bool Int)` was wrongly SAT — the
-    /// solver never case-split `p` over `{true,false}` nor linked `(select a p)`
-    /// to `(select a true)`/`(select a false)`. Emit
-    /// `(= (select arr i) (ite (= i d0) (select arr d0) (ite (= i d1) … )))` over
-    /// the finite index domain.
-    ///
-    /// Sound: `i` provably equals one of the domain elements, so the ITE chain is
-    /// a tautology — it removes no models and just makes the value reachable to
-    /// the ground array/EUF solver.
-    pub(in crate::executor) fn add_finite_index_select_expansion(&mut self) {
-        let assertions = self.ctx.assertions.clone();
-        let mut selects: Vec<(TermId, TermId, FiniteArrayIndexDomain)> = Vec::new();
-        let mut seen: HashSet<TermId> = HashSet::default();
-        for &assertion in &assertions {
-            self.collect_finite_symbolic_selects(assertion, &mut selects, &mut seen);
-        }
-        for (arr, idx, domain) in selects {
-            let domain_vals: Vec<TermId> = self.finite_index_domain_values(&domain);
-            let Some((&last, rest)) = domain_vals.split_last() else {
-                continue;
-            };
-            // Fold from the last domain element to build the ITE chain.
-            let mut acc = self.ctx.terms.mk_select(arr, last);
-            for &d in rest.iter().rev() {
-                let d_eq = self.ctx.terms.mk_eq(idx, d);
-                let sel_d = self.ctx.terms.mk_select(arr, d);
-                acc = self.ctx.terms.mk_ite(d_eq, sel_d, acc);
-            }
-            let sel_orig = self.ctx.terms.mk_select(arr, idx);
-            if sel_orig == acc {
-                continue; // already folded (e.g. literal index)
-            }
-            let axiom = self.ctx.terms.mk_eq(sel_orig, acc);
-            if !self.ctx.assertions.contains(&axiom) {
-                self.push_array_axiom_assertion_site(axiom, "finite_index_select_expansion");
-            }
-        }
-    }
-
-    /// Enumerate the index constants of a finite array index domain (shared by
-    /// the extensionality and select-expansion passes).
-    fn finite_index_domain_values(&mut self, domain: &FiniteArrayIndexDomain) -> Vec<TermId> {
-        match domain {
-            FiniteArrayIndexDomain::BitVec(width) => (0..(1u64 << width))
-                .map(|i| self.ctx.terms.mk_bitvec(BigInt::from(i), *width))
-                .collect(),
-            FiniteArrayIndexDomain::Bool => {
-                vec![self.ctx.terms.mk_bool(false), self.ctx.terms.mk_bool(true)]
-            }
-            FiniteArrayIndexDomain::EnumDatatype(ctor_names, index_sort) => ctor_names
-                .iter()
-                .map(|name| self.ctx.terms.mk_var(name.clone(), index_sort.clone()))
-                .collect(),
-        }
-    }
-
-    /// Collect `(select arr i)` sub-terms whose index `i` has a finite domain
-    /// (Bool / small BitVec / enum) and is NOT a constant/literal index. Records
-    /// the index domain for enumeration.
-    fn collect_finite_symbolic_selects(
-        &self,
-        term: TermId,
-        out: &mut Vec<(TermId, TermId, FiniteArrayIndexDomain)>,
-        seen: &mut HashSet<TermId>,
-    ) {
-        if !seen.insert(term) {
-            return;
-        }
-        if let TermData::App(sym, args) = self.ctx.terms.get(term).clone() {
-            if sym.name() == "select" && args.len() == 2 {
-                let (arr, idx) = (args[0], args[1]);
-                if !matches!(self.ctx.terms.get(idx), TermData::Const(_)) {
-                    // Restrict to SMALL domains (Bool, enum datatype). A symbolic
-                    // BitVec index is decided by EUF/bit-blasting and a 2^w ITE
-                    // chain per select would blow up, so it is intentionally left
-                    // to the BV machinery.
-                    match self.finite_index_domain_of(idx) {
-                        Some(domain @ FiniteArrayIndexDomain::Bool)
-                        | Some(domain @ FiniteArrayIndexDomain::EnumDatatype(..)) => {
-                            out.push((arr, idx, domain));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            for arg in args {
-                self.collect_finite_symbolic_selects(arg, out, seen);
-            }
-            return;
-        }
-        match self.ctx.terms.get(term).clone() {
-            TermData::Not(inner) => self.collect_finite_symbolic_selects(inner, out, seen),
-            TermData::Ite(c, t, e) => {
-                self.collect_finite_symbolic_selects(c, out, seen);
-                self.collect_finite_symbolic_selects(t, out, seen);
-                self.collect_finite_symbolic_selects(e, out, seen);
-            }
-            _ => {}
-        }
-    }
-
-    /// The finite index domain of a term `idx` based on its SORT (Bool, small
-    /// BitVec, or enum datatype), or `None` for infinite/large domains.
-    fn finite_index_domain_of(&self, idx: TermId) -> Option<FiniteArrayIndexDomain> {
-        match self.ctx.terms.sort(idx).clone() {
-            Sort::Bool => Some(FiniteArrayIndexDomain::Bool),
-            Sort::BitVec(bv)
-                if bv.width >= 1 && bv.width <= Self::FINITE_BV_ARRAY_EXT_MAX_INDEX_WIDTH =>
-            {
-                Some(FiniteArrayIndexDomain::BitVec(bv.width))
-            }
-            ref s => self
-                .finite_enum_datatype_ctors(s)
-                .map(|ctors| FiniteArrayIndexDomain::EnumDatatype(ctors, s.clone())),
-        }
-    }
-
-    /// Collect distinct array-equality atoms `(= a b)` whose index sort is a
-    /// small finite domain (`(_ BitVec w)` with `w <= cap`, or `Bool`),
-    /// reachable from `term`, recursing through boolean structure. Records the
-    /// index domain for enumeration.
-    fn collect_finite_index_array_eq_atoms(
-        &self,
-        term: TermId,
-        out: &mut Vec<(TermId, TermId, TermId, FiniteArrayIndexDomain)>,
-        seen: &mut HashSet<TermId>,
-    ) {
-        if !seen.insert(term) {
-            return;
-        }
-        match self.ctx.terms.get(term).clone() {
-            TermData::App(sym, args) => {
-                if sym.name() == "=" && args.len() == 2 {
-                    let (lhs, rhs) = (args[0], args[1]);
-                    if let Sort::Array(arr) = self.ctx.terms.sort(lhs).clone() {
-                        if lhs != rhs {
-                            match &arr.index_sort {
-                                Sort::BitVec(bv)
-                                    if bv.width >= 1
-                                        && bv.width
-                                            <= Self::FINITE_BV_ARRAY_EXT_MAX_INDEX_WIDTH =>
-                                {
-                                    out.push((
-                                        term,
-                                        lhs,
-                                        rhs,
-                                        FiniteArrayIndexDomain::BitVec(bv.width),
-                                    ));
-                                }
-                                Sort::Bool => {
-                                    out.push((term, lhs, rhs, FiniteArrayIndexDomain::Bool));
-                                }
-                                idx_sort => {
-                                    if let Some(ctors) = self.finite_enum_datatype_ctors(idx_sort) {
-                                        out.push((
-                                            term,
-                                            lhs,
-                                            rhs,
-                                            FiniteArrayIndexDomain::EnumDatatype(
-                                                ctors,
-                                                idx_sort.clone(),
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                for arg in args {
-                    self.collect_finite_index_array_eq_atoms(arg, out, seen);
-                }
-            }
-            TermData::Not(inner) => {
-                self.collect_finite_index_array_eq_atoms(inner, out, seen);
-            }
-            TermData::Ite(c, t, e) => {
-                self.collect_finite_index_array_eq_atoms(c, out, seen);
-                self.collect_finite_index_array_eq_atoms(t, out, seen);
-                self.collect_finite_index_array_eq_atoms(e, out, seen);
-            }
-            _ => {}
         }
     }
 
@@ -2798,14 +2522,14 @@ impl Executor {
         // equality) kept a lazy ArraySolver that misses upward select
         // propagation, certifying a witness-less model: false SAT (4 residual
         // conflicts in the 2026-07-02 QF_AX sweep after the same-base fix).
-        // OPT-IN research gate (AY_QFAX_NEG_EQ_WITNESS=1). Same latent
+        // OPT-IN research gate (--qfax-neg-eq-witness). Same latent
         // eager-axiom unsoundness as the negated-chain gate above:
         // storeinv_invalid_t3_np_nf_ai_00002_001 (`:status sat`) flips to
         // FALSE UNSAT when this fires. Default OFF until the eager fixpoint
         // derivation is fixed; the storeinv `_np_` wrong-SAT models this was
         // added for are instead degraded fail-closed by the unwitnessed
         // array-disequality guard in model validation.
-        if std::env::var_os("AY_QFAX_NEG_EQ_WITNESS").is_none_or(|v| v != "1") {
+        if !ay_core::misc_cli_flags().qfax_neg_eq_witness {
             return false;
         }
         for &assertion in &self.ctx.assertions {
@@ -2890,7 +2614,7 @@ impl Executor {
     /// closes the gap; the ROW2b budget bounds the cost. Depth >= 2 on at least
     /// one side: single stores are handled exactly by the lazy solver.
     pub(in crate::executor) fn has_negated_deep_store_chain_array_equality(&self) -> bool {
-        // OPT-IN research gate (AY_QFAX_NEG_CHAIN_GATE=1). Firing eager
+        // OPT-IN research gate (--qfax-neg-chain-gate). Firing eager
         // ROW2b on every negated deep-chain equality exposed a LATENT
         // eager-axiom unsoundness: `:status sat` siblings of the swap `_np_`
         // family (e.g. swap_invalid_t1_np_sf_ai_00002_008) flip to FALSE
@@ -2899,7 +2623,7 @@ impl Executor {
         // is proven sound on these shapes, the sound default is OFF: wrong
         // lazy models are caught fail-closed by the strict-gate array oracle
         // (`store_chain_equality_violated`) and degrade to unknown instead.
-        if std::env::var_os("AY_QFAX_NEG_CHAIN_GATE").is_none_or(|v| v != "1") {
+        if !ay_core::misc_cli_flags().qfax_neg_chain_gate {
             return false;
         }
         for &assertion in &self.ctx.assertions {
@@ -3551,6 +3275,17 @@ impl Executor {
             if top_level_positive_array_equalities.contains(&eq_term) {
                 continue;
             }
+            // An active exact finite-array axiom already supplies the full
+            // pointwise biconditional for this equality, recursively through
+            // every nested array layer. A fresh generic difference Skolem is
+            // therefore redundant and can itself expose another symbolic
+            // array-cell equality (the historical fourth obligation for a
+            // two-level Bool array). Do not infer coverage merely from the
+            // sort: a route may not have run exact closure yet, or the query's
+            // cumulative budget may have deferred this particular candidate.
+            if self.finite_array_equality_has_active_exact_coverage(eq_term) {
+                continue;
+            }
             let pair = if lhs.0 <= rhs.0 {
                 (lhs, rhs)
             } else {
@@ -3714,7 +3449,7 @@ impl Executor {
             // still degrade via the strict oracle; the transitive select-value
             // chain the seed creates needs e-graph closure the checker-based
             // route lacks. Kept OPT-IN for the follow-up interplay work.
-            if std::env::var_os("AY_EXT_ROW_SEED").is_some() {
+            if ay_core::misc_cli_flags().ext_row_seed {
                 for side in [lhs, rhs] {
                     let mut t = side;
                     let mut depth = 0usize;
@@ -3740,7 +3475,7 @@ impl Executor {
                         };
                         self.push_array_axiom_assertion_site(row1, "ext_row_seed");
                         self.push_array_axiom_assertion_site(row2, "ext_row_seed");
-                        if std::env::var_os("AY_DEBUG_ROW_SEED").is_some() {
+                        if ay_core::misc_cli_flags().debug_row_seed {
                             eprintln!(
                                 "[row-seed] level depth={depth} side={} store={}",
                                 side.0, t.0
@@ -4437,7 +4172,7 @@ impl Executor {
                 clauses += 2;
             }
         }
-        if std::env::var_os("AY_DEBUG_WGR").is_some() {
+        if ay_core::misc_cli_flags().debug_wgr {
             eprintln!(
                 "[wgr-dbg] fired: nodes={} witnesses={} relevant={} clauses={} truncated={} pos_chain_eqs={} neg_array_eqs={}",
                 nodes.len(),

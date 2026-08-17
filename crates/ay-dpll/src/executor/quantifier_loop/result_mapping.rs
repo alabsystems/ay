@@ -4,13 +4,22 @@
 
 //! Quantifier result mapping: interprets SAT/UNSAT through CEGQI and E-matching semantics.
 //!
-//! `map_quantifier_result` translates the raw theory-solve result into the correct
-//! quantified-formula answer by accounting for CEGQI forall/exists inversion,
+//! `map_quantifier_result` maps raw solves through CEGQI forall/exists inversion,
 //! E-matching incompleteness, interleaved refinement, and assertion restoration.
 
+mod cert_consult;
+mod checked_isolated_solve;
+mod checked_model_rewrite;
+mod closed_universal;
+mod exact_array_negation;
+mod finite_expansion_replay;
+mod qpf_premise_forced;
+mod quantified_unsat;
+mod unsafe_partial_unknown;
 use ay_core::term::{TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::{TermData, TermId};
 use ay_frontend::SourceContextStamp;
+pub(in crate::executor) use exact_array_negation::CheckedExactArrayNegationSatAuthority;
 
 use super::super::Executor;
 use super::collect_and_conjuncts;
@@ -94,6 +103,7 @@ use super::super::MAX_INTERLEAVED_EMATCHING_ROUNDS;
 /// translated outer proof/certificate and therefore retains its existing
 /// fail-closed publication behavior.
 enum ClosedUniversalRefutation {
+    TranslatedProof,
     CheckedLiteral(CheckedExactClosedForallUnsat),
     UntranslatedSkolemModel,
 }
@@ -228,7 +238,7 @@ impl CheckedModelInstallSnapshot {
     fn take(executor: &mut Executor) -> Self {
         Self {
             model: executor.last_model.take(),
-            nra_algebraic_model: std::mem::take(&mut executor.nra_algebraic_model),
+            nra_algebraic_model: executor.nra_algebraic_model.take_values(),
             dt_theory_model: executor.dt_theory_model.take(),
             dt_validation_wants_egraph: executor.dt_validation_wants_egraph,
             dt_egraph_assignment: executor.dt_egraph_assignment.replace(None),
@@ -252,7 +262,7 @@ impl CheckedModelInstallSnapshot {
 
     fn restore(self, executor: &mut Executor) {
         executor.last_model = self.model;
-        executor.nra_algebraic_model = self.nra_algebraic_model;
+        executor.restore_nra_values(self.nra_algebraic_model);
         executor.dt_theory_model = self.dt_theory_model;
         executor.dt_validation_wants_egraph = self.dt_validation_wants_egraph;
         executor
@@ -401,8 +411,7 @@ impl CheckedExactUnsat {
 #[must_use = "checked finite-expansion SAT authority must be consumed or discarded"]
 #[derive(Debug)]
 pub(in crate::executor) struct CheckedFiniteExpansionSatAuthority {
-    scope: CheckedGroundScope,
-    model_epoch: crate::executor::model::QuantifiedGrantModelEpoch,
+    checked: checked_model_rewrite::CheckedModelRewriteSatAuthority,
 }
 
 impl CheckedFiniteExpansionSatAuthority {
@@ -411,80 +420,13 @@ impl CheckedFiniteExpansionSatAuthority {
         roots: &[TermId],
         expanded_model_roots: &[TermId],
     ) -> Option<Self> {
-        if roots.is_empty()
-            || expanded_model_roots.is_empty()
-            || executor.should_abort_theory_loop()
-            || crate::executor::model::scoped_term_evaluation_override_active()
-        {
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
-                eprintln!("CERT/exact-finite-expansion: empty roots or external stop");
-            }
-            return None;
-        }
-
-        // Work on a semantic clone and retain the exact predecessor for an
-        // affine rollback on every decline. Output-only completion is allowed
-        // solely for ordinary declarations absent from the authored roots.
-        // The completed candidate is then revalidated against every expanded
-        // root before it receives a replacement-sensitive seal.
-        let Some(predecessor) = executor.last_model.take() else {
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
-                eprintln!("CERT/exact-finite-expansion: no retained ground model");
-            }
-            return None;
-        };
-        let mut candidate = predecessor.clone();
-        let completed = crate::executor::model::with_isolated_eval_memo(|| {
-            executor.complete_quantified_output_model_before_seal(&mut candidate, roots)
-        });
-        if !completed
-            || executor.should_abort_theory_loop()
-            || crate::executor::model::scoped_term_evaluation_override_active()
-        {
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
-                eprintln!("CERT/exact-finite-expansion: output-safe completion declined");
-            }
-            executor.last_model = Some(predecessor);
-            crate::executor::model::eval_memo_clear();
-            return None;
-        }
-        executor.last_model = Some(candidate);
-        crate::executor::model::eval_memo_clear();
-        let accepted = crate::executor::model::with_isolated_eval_memo(|| {
-            !executor.should_abort_theory_loop()
-                && !crate::executor::model::scoped_term_evaluation_override_active()
-                && installed_model_satisfies_roots(executor, expanded_model_roots)
-        });
-        if !accepted {
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
-                eprintln!(
-                    "CERT/exact-finite-expansion: retained model failed {} expanded roots",
-                    expanded_model_roots.len()
-                );
-            }
-            executor.last_model = Some(predecessor);
-            crate::executor::model::eval_memo_clear();
-            return None;
-        }
-
-        let scope = CheckedGroundScope::capture(executor, roots);
-        if executor.should_abort_theory_loop()
-            || crate::executor::model::scoped_term_evaluation_override_active()
-        {
-            executor.last_model = Some(predecessor);
-            crate::executor::model::eval_memo_clear();
-            return None;
-        }
-        let Some(model) = executor.last_model.as_mut() else {
-            executor.last_model = Some(predecessor);
-            crate::executor::model::eval_memo_clear();
-            return None;
-        };
-        let model_epoch = model.seal_quantified_grant_model();
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
-            eprintln!("CERT/exact-finite-expansion: sealed exact retained model");
-        }
-        Some(Self { scope, model_epoch })
+        checked_model_rewrite::CheckedModelRewriteSatAuthority::for_current(
+            executor,
+            roots,
+            expanded_model_roots,
+            "exact-finite-expansion",
+        )
+        .map(|checked| Self { checked })
     }
 
     pub(in crate::executor) fn into_current_roots(
@@ -494,16 +436,7 @@ impl CheckedFiniteExpansionSatAuthority {
         Box<[TermId]>,
         crate::executor::model::QuantifiedGrantModelEpoch,
     )> {
-        let current = !executor.should_abort_theory_loop()
-            && !crate::executor::model::scoped_term_evaluation_override_active()
-            && self
-                .scope
-                .is_current_for(executor, self.scope.roots.as_ref())
-            && executor
-                .last_model
-                .as_ref()
-                .is_some_and(|model| model.carries_quantified_grant_model(&self.model_epoch));
-        current.then_some((self.scope.roots, self.model_epoch))
+        self.checked.into_current_roots(executor)
     }
 }
 
@@ -832,6 +765,13 @@ mod cegqi_unsat_authority {
     #[must_use = "a checked CEGQI UNSAT certificate must be consumed to publish UNSAT"]
     pub(super) struct Checked {
         source_context_stamp: SourceContextStamp,
+        /// `true` when a translated authored-scope strict proof was installed
+        /// as `last_proof` by the consequence-replay producer
+        /// (#consequence-replay). Publication then keeps the proof and takes
+        /// the ordinary strict-certification mint, which independently
+        /// re-validates it; the artifact firewall below is only for the
+        /// proof-less verdict-only certificate.
+        translated_strict_proof: bool,
     }
 
     impl Checked {
@@ -850,6 +790,14 @@ mod cegqi_unsat_authority {
                     Some(super::UnknownReason::QuantifierCegqiIncomplete);
                 return SolveResult::Unknown;
             }
+            if self.translated_strict_proof {
+                // Mirror the live strict-proof leg of
+                // `disambiguate_cegqi_unsat`: the installed authored-scope
+                // proof IS the publication artifact, and mandatory
+                // certification re-checks it from scratch at mint time.
+                executor.last_unknown_reason = None;
+                return SolveResult::unsat();
+            }
             executor.publish_quantified_verdict_only_unsat()
         }
     }
@@ -859,9 +807,21 @@ mod cegqi_unsat_authority {
         snapshot: Option<&[TermId]>,
         category: LogicCategory,
     ) -> Option<Checked> {
+        // Producer first (#consequence-replay): a translated authored-scope
+        // strict proof is strictly stronger than the proof-suppressed
+        // verdict-only certificate, in every mode. The translation is
+        // fail-closed and installs `last_proof` only after the outer strict
+        // checker accepted the complete stitched derivation.
+        if executor.try_translate_authored_consequence_replay_unsat() {
+            return Some(Checked {
+                source_context_stamp: executor.ctx.source_context_stamp(),
+                translated_strict_proof: true,
+            });
+        }
         if executor.cegqi_consequence_set_is_unsat(snapshot, category) {
             Some(Checked {
                 source_context_stamp: executor.ctx.source_context_stamp(),
+                translated_strict_proof: false,
             })
         } else {
             None
@@ -1004,7 +964,7 @@ mod cegqi_sat_authority {
         category: LogicCategory,
     ) -> Option<GroundWitness> {
         let installed = executor.install_authenticated_snapshot_ground_model(snapshot, category);
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!(
                 "[cegqi-attr] SAT ground witness: installed={} snapshot_roots={} model_present={} model_validated={}",
                 installed.is_some(),
@@ -1038,7 +998,7 @@ mod cegqi_sat_authority {
         let current = ground_witness.is_current(executor, snapshot);
         let nonconjunctive = executor.snapshot_has_nonconjunctive_forall(snapshot);
         if !current || nonconjunctive {
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT model-group DECLINE: current={current} nonconjunctive={nonconjunctive}"
                 );
@@ -1050,7 +1010,7 @@ mod cegqi_sat_authority {
         // producer omitted (and duplicate groups must not hide that omission).
         use ay_core::kani_compat::DetHashSet;
         if cegqi_state.is_empty() {
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!("[cegqi-attr] SAT model-group DECLINE: empty CEGQI state");
             }
             return Err(ground_witness);
@@ -1064,7 +1024,7 @@ mod cegqi_sat_authority {
                 )
                 || !state_quants.insert(*quant)
             {
-                if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
                     eprintln!(
                         "[cegqi-attr] SAT model-group DECLINE: invalid/duplicate state quantifier {quant:?}"
                     );
@@ -1085,7 +1045,7 @@ mod cegqi_sat_authority {
             if !matches!(executor.ctx.terms.get(quant), ay_core::TermData::Forall(..))
                 || !state_quants.contains(&quant)
             {
-                if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
                     eprintln!(
                         "[cegqi-attr] SAT model-group DECLINE: uncovered snapshot quantifier {quant:?}"
                     );
@@ -1095,7 +1055,7 @@ mod cegqi_sat_authority {
             snapshot_foralls.insert(quant);
         }
         if snapshot_foralls != state_quants {
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT model-group DECLINE: snapshot/state coverage mismatch snapshot={} state={}",
                     snapshot_foralls.len(),
@@ -1107,7 +1067,7 @@ mod cegqi_sat_authority {
         let mut grouped_quants = DetHashSet::default();
         for (quant, _) in ce_lemma_groups {
             if !state_quants.contains(quant) || !grouped_quants.insert(*quant) {
-                if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
                     eprintln!(
                         "[cegqi-attr] SAT model-group DECLINE: invalid/duplicate lemma group for {quant:?}"
                     );
@@ -1116,7 +1076,7 @@ mod cegqi_sat_authority {
             }
         }
         if grouped_quants != state_quants {
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT model-group DECLINE: group/state coverage mismatch groups={} state={}",
                     grouped_quants.len(),
@@ -1131,7 +1091,7 @@ mod cegqi_sat_authority {
             .collect();
         let certified =
             executor.cegqi_model_refutes_all_groups(snapshot, &ce_vars, ce_lemma_groups, category);
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             let outcome = match &certified {
                 Some(CegqiGroupRefutation::RetainedGroundModel) => "retained-model",
                 Some(CegqiGroupRefutation::UfRecompletion(_)) => "uf-recompletion",
@@ -1179,7 +1139,7 @@ mod cegqi_sat_authority {
         let current = ground_witness.is_current(executor, snapshot);
         let nonconjunctive = executor.snapshot_has_nonconjunctive_forall(snapshot);
         if !current || nonconjunctive {
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT quantified-CE DECLINE: current={current} nonconjunctive={nonconjunctive}"
                 );
@@ -1187,7 +1147,7 @@ mod cegqi_sat_authority {
             return Err(ground_witness);
         }
         let certified = executor.refuted_all_quantified_ce_lemmas(cegqi_state, snapshot, category);
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!("[cegqi-attr] SAT quantified-CE theorem: certified={certified}");
         }
         if certified && ground_witness.is_current(executor, snapshot) {
@@ -1292,6 +1252,10 @@ impl Executor {
         self.has_current_model_free_mbqi_sat_authority(roots)
     }
 
+    fn replay_exact_finite_quantifier_root(&mut self, root: TermId) -> Option<TermId> {
+        finite_expansion_replay::replay(&mut self.ctx.terms, root)
+    }
+
     /// Re-authenticate a fully-ground finite expansion and return the complete
     /// root vector the retained model must satisfy.
     ///
@@ -1314,7 +1278,7 @@ impl Executor {
         let _standalone_replay = crate::skolemize::scoped_standalone_finite_domain_replay();
         macro_rules! decline {
             ($reason:expr) => {{
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!("CERT/exact-finite-expansion: decline ({})", $reason);
                 }
                 return None;
@@ -1337,20 +1301,6 @@ impl Executor {
                 continue;
             }
             quantified_roots += 1;
-            let TermData::Forall(vars, body, _) = self.ctx.terms.get(assertion).clone() else {
-                decline!("quantified authored root is not a top-level forall");
-            };
-            if vars.is_empty() || contains_quantifier(&self.ctx.terms, body) {
-                decline!("empty binder list or nested quantifier");
-            }
-            let all_bv = vars
-                .iter()
-                .all(|(_, sort)| matches!(sort, ay_core::Sort::BitVec(_)));
-            let guarded_single_int = vars.len() == 1 && vars[0].1 == ay_core::Sort::Int;
-            if !all_bv && !guarded_single_int {
-                decline!("binder class is outside exact BV/single-Int routes");
-            }
-
             let record_index =
                 evidence
                     .records
@@ -1377,14 +1327,11 @@ impl Executor {
             // not mere recognizer success, is load-bearing: strict-int or
             // bridge rewrites that changed the solved root without synchronised
             // provenance must fail closed.
-            let Some((canonical, _)) = crate::skolemize::finite_domain_expand_with_instances(
-                &mut self.ctx.terms,
-                assertion,
-            ) else {
+            let Some(canonical) = self.replay_exact_finite_quantifier_root(assertion) else {
                 decline!("canonical independent replay declined");
             };
             if canonical != recorded_expansion {
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!(
                         "CERT/exact-finite-expansion: canonical={canonical:?} recorded={recorded_expansion:?}"
                     );
@@ -1435,24 +1382,7 @@ impl Executor {
                 continue;
             }
             quantified_roots += 1;
-            let TermData::Forall(vars, body, _) = self.ctx.terms.get(root).clone() else {
-                return None;
-            };
-            if vars.is_empty() || contains_quantifier(&self.ctx.terms, body) {
-                return None;
-            }
-            let all_bv = vars
-                .iter()
-                .all(|(_, sort)| matches!(sort, ay_core::Sort::BitVec(_)));
-            let guarded_single_int = vars.len() == 1 && vars[0].1 == ay_core::Sort::Int;
-            if !all_bv && !guarded_single_int {
-                return None;
-            }
-            let (expanded, _) =
-                crate::skolemize::finite_domain_expand_with_instances(&mut self.ctx.terms, root)?;
-            if contains_quantifier(&self.ctx.terms, expanded) {
-                return None;
-            }
+            let expanded = self.replay_exact_finite_quantifier_root(root)?;
             model_roots.push(expanded);
         }
         (quantified_roots > 0).then_some(model_roots)
@@ -1525,11 +1455,34 @@ impl Executor {
             ematching_instances_created,
             original_assertions,
             exact_finite_expansion,
+            exact_array_negation,
             cegqi_state,
             has_unsafe_partial_quantifiers,
             quantifiers_supported_by_uf_completion,
         } = qr;
         let cegqi_source_context_stamp = cegqi_has_forall.then(|| self.ctx.source_context_stamp());
+
+        // Exact finite-array exhaustion is cumulative for this external query.
+        // Demand, E-matching, MBQI, and CEGQI re-solves cannot replenish it, so
+        // do not let an initial Unknown/SAT demotion enter a refinement loop or
+        // a certificate path that could manufacture a later SAT proposal.
+        // Restore the pre-quantifier assertion surface exactly as the ordinary
+        // tail would, then return the canonical resource Unknown.
+        if !self.finite_array_expansion.is_complete()
+            && !matches!(&result, Ok(SolveResult::Unsat(_)))
+        {
+            self.publish_unknown_from_origin(UnknownOrigin::DeterministicResourceBudget);
+            let mut final_result = Ok(SolveResult::Unknown);
+            self.restore_assertions(
+                original_assertions,
+                &mut final_result,
+                category,
+                has_uninstantiated_quantifiers,
+                false,
+                false,
+            );
+            return final_result;
+        }
 
         // Phase 0 (M5 demand lane, PRODUCTION for classified families): on-demand
         // frontier flush + fence drain. When the demand lane parked over-frontier
@@ -1575,7 +1528,7 @@ impl Executor {
                 .as_ref()
                 .is_some_and(|proof| self.check_proof_strict_with_datatypes(proof).is_ok());
             if strict_refutation {
-                if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
                     eprintln!(
                         "[quant-proof] strict producer refutation superseded non-UNSAT search result"
                     );
@@ -1636,7 +1589,7 @@ impl Executor {
                 match self.check_proof_strict_with_datatypes(proof) {
                     Ok(_) => true,
                     Err(error) => {
-                        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                        if ay_core::misc_cli_flags().trace_cegqi_attr {
                             eprintln!(
                                 "[quant-proof] incomplete translation proof declined: {error}"
                             );
@@ -1651,7 +1604,7 @@ impl Executor {
             if !live_proof_is_strict {
                 final_result =
                     self.quantified_semantic_unsat_or_unknown(UnknownReason::QuantifierUnhandled);
-            } else if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            } else if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[quant-proof] strict authored-scope proof discharged incomplete translation"
                 );
@@ -1664,15 +1617,7 @@ impl Executor {
         // preserves the certificate's exact interpretation as the published
         // witness for formulas such as `forall x. P(x)`.
         if matches!(final_result, Ok(SolveResult::Unknown))
-            && matches!(
-                self.last_unknown_reason,
-                Some(
-                    UnknownReason::QuantifierCegqiIncomplete
-                        | UnknownReason::QuantifierUnhandled
-                        | UnknownReason::QuantifierRoundLimit
-                        | UnknownReason::QuantifierEmatchingExistsIncomplete
-                )
-            )
+            && self.quantifier_sat_cert_consult_admitted()
             && !self.demand_parked_blocks_sat()
         {
             if let Some(snapshot) = original_assertions
@@ -1704,24 +1649,17 @@ impl Executor {
         // non-quantifier Unknown reason, e.g. Timeout/Incomplete) is never
         // touched.
         let mut finite_table_sat_certificate = false;
+        // Admits the quantifier-incompleteness labels, plus a load-derived
+        // `Timeout` label while the enclosing solve is genuinely live (see
+        // `quantifier_sat_cert_consult_admitted`). CCMC M1: a
+        // patterned/curried forall whose trigger never e-matched a ground app
+        // lands in `QuantifierEmatchingExistsIncomplete`; it is SAFE to consult
+        // the finite-table certificate there — the cert partition
+        // (`try_finite_table_sat_certificate`) rejects any snapshot whose top
+        // level contains an exists / nested quantifier (grant-only,
+        // fail-closed), so a genuine existential is never wrongly discharged.
         if matches!(final_result, Ok(SolveResult::Unknown))
-            && matches!(
-                self.last_unknown_reason,
-                Some(
-                    UnknownReason::QuantifierCegqiIncomplete
-                        | UnknownReason::QuantifierUnhandled
-                        | UnknownReason::QuantifierRoundLimit
-                        // CCMC M1: a patterned/curried forall whose trigger never
-                        // e-matched a ground app lands here (ematching-exists
-                        // incompleteness). It is SAFE to consult the finite-table
-                        // certificate: the cert partition
-                        // (`try_finite_table_sat_certificate`) rejects any
-                        // snapshot whose top level contains an exists / nested
-                        // quantifier (grant-only, fail-closed), so a genuine
-                        // existential is never wrongly discharged here.
-                        | UnknownReason::QuantifierEmatchingExistsIncomplete
-                )
-            )
+            && self.quantifier_sat_cert_consult_admitted()
             // M4 (item 4, CERTIFICATE DISCIPLINE): consult the finite-table SAT
             // certificate ONLY after a full grant-only flush — a parked-nonempty
             // state (the fence hit the deadline/ceiling and left instances withheld)
@@ -1784,15 +1722,7 @@ impl Executor {
         // by the dedicated installer before the shared MBQI-compatible handoff
         // becomes active.
         if matches!(final_result, Ok(SolveResult::Unknown))
-            && matches!(
-                self.last_unknown_reason,
-                Some(
-                    UnknownReason::QuantifierCegqiIncomplete
-                        | UnknownReason::QuantifierUnhandled
-                        | UnknownReason::QuantifierRoundLimit
-                        | UnknownReason::QuantifierEmatchingExistsIncomplete
-                )
-            )
+            && self.quantifier_sat_cert_consult_admitted()
             && !self.demand_parked_blocks_sat()
         {
             if let Some(snapshot) = original_assertions
@@ -1969,33 +1899,18 @@ impl Executor {
             }
         }
 
-        // Phase 2.7 (exact finite-expansion SAT authority): the early
-        // preprocessing exit can solve a genuinely quantifier-free equivalent
-        // before E-matching exists. Re-authenticate that exact transformation
-        // only after all pre-restoration nested probes have finished, validate
-        // the final retained model against the complete expanded vector, and
-        // seal the grant to that model. Installing earlier would let a later
-        // certificate probe replace the model while leaving syntactic
-        // expansion evidence behind.
-        if matches!(final_result, Ok(SolveResult::Sat)) && full_ematching_coverage {
-            if let (Some(original), Some(expansion)) = (
-                original_assertions.as_deref(),
-                exact_finite_expansion.as_ref(),
-            ) {
-                let installed =
-                    self.install_exact_finite_expansion_sat_authority(original, expansion);
-                if installed {
-                    // Canonical equivalence plus exact-model validation over
-                    // every expanded root and every authored ground sibling is
-                    // the complete validation for this route. Running the
-                    // generic post-restore validator would skip the authored
-                    // forall, mutate/replace the sealed model in fallback
-                    // probes, and discard the stronger typed authority.
-                    self.defer_model_validation = false;
-                    self.last_model_validated = true;
-                }
-            }
-        }
+        self.route_exact_array_negation_result(
+            &mut final_result,
+            original_assertions.as_deref(),
+            exact_array_negation.as_ref(),
+        );
+
+        self.install_finite_expansion_if_sat(
+            &final_result,
+            full_ematching_coverage,
+            original_assertions.as_deref(),
+            exact_finite_expansion.as_ref(),
+        );
 
         // Preserve only a routing fact here: before restoration, authenticate
         // that the ground UNSAT was obtained after the exact recorded
@@ -2041,7 +1956,7 @@ impl Executor {
             let prior_roots = std::mem::replace(&mut self.ctx.assertions, public_roots);
             if let Some(evidence) = self.try_authorize_current_query_exact_finite_expansion_unsat()
             {
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!("CERT/exact-finite-expansion-unsat: public theorem accepted");
                 }
                 let emitted = self.emit_checked_exact_finite_expansion_unsat(evidence);
@@ -2053,7 +1968,7 @@ impl Executor {
                     self.ctx.assertions = prior_roots;
                 }
                 final_result = Ok(emitted);
-            } else if std::env::var_os("AY_DEBUG_CERT").is_some() {
+            } else if ay_core::misc_cli_flags().debug_cert {
                 self.ctx.assertions = prior_roots;
                 eprintln!("CERT/exact-finite-expansion-unsat: public theorem declined");
             } else {
@@ -2348,7 +2263,7 @@ impl Executor {
                     exact_public_authority,
                 );
                 if rescue_needed {
-                    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                    if ay_core::misc_cli_flags().debug_cert {
                         eprintln!(
                             "CERT/public-root-table-rescue: begin ({} public roots, prior={:?}, authority={exact_public_authority:?}, reuse={exact_public_transport})",
                             public_roots.len(),
@@ -2421,7 +2336,7 @@ impl Executor {
                                 1,
                             );
                         }
-                        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                        if ay_core::misc_cli_flags().debug_cert {
                             eprintln!("CERT/public-root-table-rescue: granted");
                         }
                     } else {
@@ -2429,7 +2344,7 @@ impl Executor {
                         // immediate exact-current check cannot leave transport
                         // state for a later path to activate accidentally.
                         self.clear_quantified_sat_authority();
-                        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                        if ay_core::misc_cli_flags().debug_cert {
                             eprintln!("CERT/public-root-table-rescue: declined");
                         }
                     }
@@ -2758,8 +2673,12 @@ impl Executor {
         has_unsafe_partial_quantifiers: bool,
         quantifiers_supported_by_uf_completion: bool,
     ) -> Result<SolveResult> {
+        // One classification, one verdict: the structural marker describes THIS
+        // classification only, so a stale `true` from an earlier solve can never
+        // widen a later certificate consult.
+        self.unsafe_partial_quantifier_unknown = false;
         let cegqi_mixed = cegqi_has_forall && cegqi_has_exists;
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if ay_core::misc_cli_flags().debug_cert {
             let kind = match &result {
                 Ok(SolveResult::Sat) => "Sat",
                 Ok(SolveResult::Unsat(_)) => "Unsat",
@@ -2856,14 +2775,14 @@ impl Executor {
                     // degrade below, byte-identical to before.
                     let snapshot_owned = snapshot.to_vec();
                     if self.instance_closure_ground_unsat(&snapshot_owned, category) {
-                        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                        if ay_core::misc_cli_flags().debug_cert {
                             eprintln!("CERT/rescue@277: instance-closure UNSAT");
                         }
                         return self.quantified_semantic_unsat_or_unknown(
                             UnknownReason::QuantifierUnhandled,
                         );
                     }
-                    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                    if ay_core::misc_cli_flags().debug_cert {
                         eprintln!("CERT/degrade@277");
                     }
                     self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
@@ -2916,7 +2835,7 @@ impl Executor {
                         if let Some(snapshot) = refinement_assertions {
                             let snapshot = snapshot.to_vec();
                             if self.instance_closure_ground_unsat(&snapshot, category) {
-                                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                                if ay_core::misc_cli_flags().debug_cert {
                                     eprintln!("CERT/rescue@298: instance-closure UNSAT");
                                 }
                                 if cegqi_has_forall {
@@ -2937,10 +2856,10 @@ impl Executor {
                             }
                         }
                     }
-                    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                    if ay_core::misc_cli_flags().debug_cert {
                         eprintln!("CERT/degrade@298");
                     }
-                    self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
+                    self.record_unsafe_partial_unknown(quantifiers_supported_by_uf_completion);
                     return Ok(SolveResult::Unknown);
                 }
             }
@@ -2990,7 +2909,7 @@ impl Executor {
                         self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
                         return self.cegqi_fail_closed_unknown();
                     }
-                    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                    if ay_core::misc_cli_flags().debug_cert {
                         eprintln!("CERT/degrade@343");
                     }
                     self.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
@@ -3506,9 +3425,7 @@ impl Executor {
                                                 })
                                             {
                                                 if matches!(decided, SolveResult::Unsat(_)) {
-                                                    self.quantified_semantic_unsat_or_unknown(
-                                                        UnknownReason::QuantifierUnhandled,
-                                                    )
+                                                    self.empty_universe_semantic_unsat_or_unknown()
                                                 } else {
                                                     Ok(decided)
                                                 }
@@ -3521,7 +3438,7 @@ impl Executor {
                                         _ => result,
                                     }
                                 } else {
-                                    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                                    if ay_core::misc_cli_flags().debug_cert {
                                         eprintln!("CERT/degrade@802");
                                     }
                                     self.last_unknown_reason =
@@ -3554,9 +3471,7 @@ impl Executor {
                                             )
                                         {
                                             return if matches!(decided, SolveResult::Unsat(_)) {
-                                                self.quantified_semantic_unsat_or_unknown(
-                                                    UnknownReason::QuantifierUnhandled,
-                                                )
+                                                self.empty_universe_semantic_unsat_or_unknown()
                                             } else {
                                                 Ok(decided)
                                             };
@@ -3599,9 +3514,7 @@ impl Executor {
                             category,
                         ) {
                             return if matches!(decided, SolveResult::Unsat(_)) {
-                                self.quantified_semantic_unsat_or_unknown(
-                                    UnknownReason::QuantifierUnhandled,
-                                )
+                                self.empty_universe_semantic_unsat_or_unknown()
                             } else {
                                 Ok(decided)
                             };
@@ -3651,7 +3564,7 @@ impl Executor {
             // excluded whatever CEGQI did. (Mixed forall/exists Unknowns are
             // already returned by the `cegqi_mixed` arm above.)
             Ok(SolveResult::Unknown) if ematching_added_instantiations => {
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!("CERT/instance-closure: unknown-arm reached");
                 }
                 if let Some(snapshot) = refinement_assertions {
@@ -4014,7 +3927,7 @@ impl Executor {
                 added_support = true;
             }
         }
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if ay_core::misc_cli_flags().debug_cert {
             eprintln!(
                 "CERT/instance-closure: ground={} support_added={added_support}",
                 ground.len()
@@ -4039,7 +3952,7 @@ impl Executor {
             Some(CheckedGroundDecision::Unsat(checked)) => checked.consume(self, &obligation),
             _ => false,
         };
-        if decided && std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if decided && ay_core::misc_cli_flags().debug_cert {
             eprintln!("CERT/instance-closure: UNSAT via fresh consequence-set re-solve");
         }
         decided
@@ -4112,6 +4025,7 @@ impl Executor {
         let result = self.closed_universal_validity_precheck_inner(&candidates, fallback_category);
         self.in_closed_universal_precheck = false;
         match result {
+            Some(ClosedUniversalRefutation::TranslatedProof) => Some(Ok(SolveResult::unsat())),
             Some(ClosedUniversalRefutation::CheckedLiteral(evidence)) => {
                 Some(Ok(self.emit_checked_exact_closed_forall_unsat(evidence)))
             }
@@ -4187,148 +4101,6 @@ impl Executor {
                 })
             {
                 return Some(ClosedUniversalRefutation::UntranslatedSkolemModel);
-            }
-        }
-        None
-    }
-
-    /// Find a concrete numeral tuple whose closed instance is false.
-    ///
-    /// Candidate enumeration is completeness-only: every accepted tuple is
-    /// independently checked after exact substitution, so a poor candidate can
-    /// only make this helper decline.  The bounded Cartesian product covers the
-    /// small arithmetic witnesses used by fixed interpreted operations while
-    /// avoiding an unbounded quantifier search.
-    fn closed_universal_false_at_literal_witness(
-        &mut self,
-        vars: &[(String, ay_core::Sort)],
-        body: TermId,
-        forall_id: TermId,
-        fallback_category: LogicCategory,
-    ) -> Option<ClosedUniversalRefutation> {
-        const MAX_BINDERS: usize = 3;
-        const MAX_VALUES_PER_BINDER: usize = 7;
-        const MAX_TUPLES: usize = 64;
-        const MAX_FALLBACK_SOLVES: usize = 8;
-
-        if vars.is_empty() || vars.len() > MAX_BINDERS || self.should_abort_theory_loop() {
-            return None;
-        }
-
-        let mut int_values = crate::executor::mbqi::synthesize_int_refutation_candidates(
-            &self.ctx.terms,
-            body,
-            &[forall_id],
-        );
-        int_values.truncate(MAX_VALUES_PER_BINDER);
-
-        let real_values = [
-            num_rational::BigRational::from_integer(num_bigint::BigInt::from(0)),
-            num_rational::BigRational::from_integer(num_bigint::BigInt::from(1)),
-            num_rational::BigRational::from_integer(num_bigint::BigInt::from(-1)),
-            num_rational::BigRational::new(
-                num_bigint::BigInt::from(1),
-                num_bigint::BigInt::from(2),
-            ),
-            num_rational::BigRational::new(
-                num_bigint::BigInt::from(-1),
-                num_bigint::BigInt::from(2),
-            ),
-            num_rational::BigRational::new(
-                num_bigint::BigInt::from(3),
-                num_bigint::BigInt::from(2),
-            ),
-            num_rational::BigRational::new(
-                num_bigint::BigInt::from(-3),
-                num_bigint::BigInt::from(2),
-            ),
-        ];
-        let mut literal_sets: Vec<Vec<TermId>> = Vec::with_capacity(vars.len());
-        for (_, sort) in vars {
-            let literals = match sort {
-                ay_core::Sort::Int => int_values
-                    .iter()
-                    .cloned()
-                    .map(|value| self.ctx.terms.mk_int(value))
-                    .collect(),
-                ay_core::Sort::Real => real_values
-                    .iter()
-                    .cloned()
-                    .map(|value| self.ctx.terms.mk_rational(value))
-                    .collect(),
-                ay_core::Sort::BitVec(bv_sort) => {
-                    let width = bv_sort.width;
-                    let mut values = crate::executor::bv_mbqi::synthesize_bv_refutation_candidates(
-                        &self.ctx.terms,
-                        body,
-                        width,
-                    );
-                    values.truncate(MAX_VALUES_PER_BINDER);
-                    values
-                        .into_iter()
-                        .map(|value| self.ctx.terms.mk_bitvec(value, width))
-                        .collect()
-                }
-                _ => return None,
-            };
-            literal_sets.push(literals);
-        }
-        if literal_sets.iter().any(Vec::is_empty) {
-            return None;
-        }
-
-        let mut tuples: Vec<Vec<TermId>> = vec![Vec::new()];
-        for values in literal_sets {
-            let mut next = Vec::new();
-            'prefixes: for prefix in &tuples {
-                for value in &values {
-                    let mut tuple = prefix.clone();
-                    tuple.push(*value);
-                    next.push(tuple);
-                    if next.len() >= MAX_TUPLES {
-                        break 'prefixes;
-                    }
-                }
-            }
-            tuples = next;
-        }
-
-        let empty_model = Model::empty();
-        let mut fallback_solves = 0usize;
-        for tuple in tuples {
-            if self.should_abort_theory_loop() {
-                return None;
-            }
-            let mut subst: HashMap<String, TermId> = HashMap::default();
-            for ((name, _), &literal) in vars.iter().zip(&tuple) {
-                subst.insert(name.clone(), literal);
-            }
-            let instance = crate::ematching::subst_vars(&mut self.ctx.terms, body, &subst);
-            match self.evaluate_term(&empty_model, instance) {
-                EvalValue::Bool(false) => {
-                    if let Some(evidence) = self
-                        .try_authorize_current_query_exact_closed_forall_unsat(forall_id, &tuple)
-                    {
-                        return Some(ClosedUniversalRefutation::CheckedLiteral(evidence));
-                    }
-                }
-                EvalValue::Bool(true) => continue,
-                _ if fallback_solves < MAX_FALLBACK_SOLVES => {
-                    fallback_solves += 1;
-                    let obligation = vec![instance];
-                    if self
-                        .checked_ground_solve(obligation.clone(), fallback_category, 2_000)
-                        .is_some_and(|decision| match decision {
-                            CheckedGroundDecision::Unsat(checked) => {
-                                checked.consume(self, &obligation)
-                            }
-                            CheckedGroundDecision::Sat(_) => false,
-                        })
-                    {
-                        return Some(ClosedUniversalRefutation::UntranslatedSkolemModel);
-                    }
-                }
-                _ => {}
             }
         }
         None
@@ -4477,6 +4249,22 @@ impl Executor {
                                         *final_result = Ok(SolveResult::Sat);
                                         return;
                                     }
+                                    // (#skolem-witness-sat) LAST, so the arm
+                                    // only decides what previously fell
+                                    // through to the fail-closed demote: a
+                                    // restored positive `exists` whose
+                                    // recorded witness instance evaluates
+                                    // TRUE under the emitted model — with the
+                                    // independent gate's own evaluator,
+                                    // through the polarity-sound witnessed
+                                    // rewrite of EVERY public query root — is
+                                    // checked evidence for this exact Sat.
+                                    // Keep it; the unchanged emission gates
+                                    // still adjudicate the publication.
+                                    if self.try_skolem_witness_sat_confirmation() {
+                                        *final_result = Ok(result);
+                                        return;
+                                    }
                                     self.last_unknown_reason =
                                         Some(UnknownReason::QuantifierEmatchingExistsIncomplete);
                                     self.last_result = Some(SolveResult::Unknown);
@@ -4499,6 +4287,16 @@ impl Executor {
                                             }
                                             Ok(SolveResult::Sat | SolveResult::Unknown) => {}
                                         }
+                                    }
+                                    // (#skolem-witness-sat) Same arm as the
+                                    // no-evidence branch. Placed AFTER the
+                                    // MBQI refinement so every pre-existing
+                                    // refutation path is untouched; the arm
+                                    // only decides what previously fell
+                                    // through to the fail-closed demote.
+                                    if self.try_skolem_witness_sat_confirmation() {
+                                        *final_result = Ok(result);
+                                        return;
                                     }
                                     // SOUND COMPLETENESS (#mbqi-completeness Q2):
                                     // the refinement found no counterexample. If the
@@ -4686,6 +4484,14 @@ impl Executor {
                         )
                         .is_some()
                     {
+                        return;
+                    }
+                    // (#skolem-witness-sat) LAST, exactly as in the deferred
+                    // branch: the arm only decides what previously fell
+                    // through to this fail-closed demote. A confirm keeps the
+                    // ground solve's `Sat`; the unchanged emission gates
+                    // still adjudicate the publication.
+                    if self.try_skolem_witness_sat_confirmation() {
                         return;
                     }
                     self.last_unknown_reason =
@@ -4988,7 +4794,7 @@ impl Executor {
         snapshot: Option<&[TermId]>,
         category: LogicCategory,
     ) -> bool {
-        let trace = std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some();
+        let trace = ay_core::misc_cli_flags().trace_cegqi_attr;
         // The disposable verifier below intentionally does not export a proof.
         // Mandatory proof modes therefore decline until the consequence
         // certificate carries a translated proof object for the authored
@@ -5168,11 +4974,124 @@ impl Executor {
             scope,
             _certificate: certificate,
             model: probe.last_model.take()?,
-            nra_algebraic_model: std::mem::take(&mut probe.nra_algebraic_model),
+            nra_algebraic_model: probe.nra_algebraic_model.take_values(),
             dt_theory_model: probe.dt_theory_model.take(),
             recorded_var_substitutions: std::mem::take(&mut probe.recorded_var_substitutions),
             delegated_assertions: std::mem::take(&mut probe.model_validation_delegated_assertions),
         })
+    }
+
+    /// Solve an exact quantifier-free assertion vector on a same-context
+    /// disposable Executor and return its STRICT-CHECKED UNSAT proof object
+    /// (#consequence-replay).
+    ///
+    /// The [`Self::checked_same_context_ground_model`] pattern is mirrored
+    /// exactly — internal query window, Context swap, sidecar map swaps,
+    /// panic-safe restoration — because the returned proof's steps reference
+    /// `TermId`s that must stay coherent in the OUTER term store. A cloned
+    /// context (the `checked_isolated_solve` route) cannot provide that: terms
+    /// minted during the probe's own solving would dangle or diverge outside.
+    ///
+    /// The probe runs the ordinary public `check_sat` pipeline, so the proof
+    /// tracker is armed and `build_unsat_proof` runs the full authored
+    /// replacement cascade over the probe's window. The proof is returned only
+    /// when the probe's OWN strict checker accepts it complete over the probe
+    /// window; the caller must still re-validate the stitched result against
+    /// the enclosing authored scope, which is where publication authority
+    /// lives. Every other outcome — SAT, unknown, missing or trust-carrying
+    /// proof, stale window, external stop — returns `None`.
+    pub(in crate::executor) fn checked_same_context_unsat_proof(
+        &mut self,
+        assertions: &[TermId],
+        budget_ms: u64,
+    ) -> Option<ay_core::Proof> {
+        if assertions
+            .iter()
+            .any(|&root| contains_quantifier(&self.ctx.terms, root))
+            || self.should_abort_theory_loop()
+            || !self.qpf_probe_preflight()
+        {
+            return None;
+        }
+
+        let mut probe = self.qpf_probe_executor(ay_frontend::Context::new(), budget_ms);
+        let window = self
+            .ctx
+            .begin_internal_query_window(assertions.to_vec())
+            .ok()?;
+        std::mem::swap(&mut self.ctx, &mut probe.ctx);
+        std::mem::swap(
+            &mut self.array_default_epsilon_by_sort,
+            &mut probe.array_default_epsilon_by_sort,
+        );
+        std::mem::swap(
+            &mut self.array_default_diag_by_sort,
+            &mut probe.array_default_diag_by_sort,
+        );
+        probe.original_problem_had_quantifiers = false;
+        probe.incremental_mode = false;
+
+        // Keep `probe` outside the closure: a solver panic is resumed only
+        // after the exact outer query window, Context, and sidecars have been
+        // restored.
+        let trace = ay_core::misc_cli_flags().trace_cegqi_attr;
+        let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe.begin_public_solve(false);
+            probe.bind_unsat_query_assumptions(&[]);
+            let raw = probe.check_sat();
+            if trace {
+                eprintln!("[consequence-replay] probe raw result: {raw:?}");
+            }
+            match raw.ok()? {
+                SolveResult::Unsat(_) => {
+                    if probe.last_proof.is_none() {
+                        probe.build_unsat_proof();
+                    }
+                    let proof = probe.last_proof.take()?;
+                    // The probe's own strict gate over the probe window; the
+                    // caller re-checks the stitched proof over the authored
+                    // scope before anything publishes.
+                    match probe.check_proof_strict_with_datatypes(&proof) {
+                        Ok(quality) if quality.is_complete() => Some(proof),
+                        Ok(_) => {
+                            if trace {
+                                eprintln!("[consequence-replay] probe strict check incomplete");
+                            }
+                            None
+                        }
+                        Err(error) => {
+                            if trace {
+                                eprintln!(
+                                    "[consequence-replay] probe strict check refused: {error}"
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                SolveResult::Sat | SolveResult::Unknown => None,
+            }
+        }));
+
+        let window_is_current = probe.ctx.restore_internal_query_window(window);
+        std::mem::swap(&mut self.ctx, &mut probe.ctx);
+        std::mem::swap(
+            &mut self.array_default_epsilon_by_sort,
+            &mut probe.array_default_epsilon_by_sort,
+        );
+        std::mem::swap(
+            &mut self.array_default_diag_by_sort,
+            &mut probe.array_default_diag_by_sort,
+        );
+
+        let proof = match nested {
+            Ok(proof) => proof?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        if !window_is_current || self.should_abort_theory_loop() || !self.qpf_probe_preflight() {
+            return None;
+        }
+        Some(proof)
     }
 
     /// Atomically install, optionally postprocess, and consume a checked model.
@@ -5221,7 +5140,7 @@ impl Executor {
         let result = {
             let executor = transaction.executor();
             executor.last_model = Some(model);
-            executor.nra_algebraic_model = nra_algebraic_model;
+            executor.restore_nra_values(nra_algebraic_model);
             executor.dt_theory_model = dt_theory_model;
             executor.dt_validation_wants_egraph = false;
             executor.dt_egraph_assignment.replace(None);
@@ -5332,7 +5251,7 @@ impl Executor {
         if installed.is_none() {
             self.clear_cegqi_inner_unsat_artifacts();
         }
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!(
                 "[cegqi-attr] authenticated G0 model: ground_roots={} accepted={}",
                 ground.len(),
@@ -5420,23 +5339,26 @@ impl Executor {
         SolveResult::unsat()
     }
 
-    /// Publish a sound quantified-instance refutation only when no proof
-    /// artifact is mandatory. These bounded inner solves currently prove the
-    /// mathematical verdict but do not translate their standalone assumptions
-    /// back to authored `forall_inst` steps. Mandatory proof modes fail closed;
-    /// best-effort/no-proof modes use the same proof-suppressed publisher as the
-    /// sealed consequence certificate.
-    fn quantified_semantic_unsat_or_unknown(
-        &mut self,
-        missing_proof_reason: UnknownReason,
-    ) -> Result<SolveResult> {
-        if self.translated_unsat_proof_required() {
-            self.clear_cegqi_inner_unsat_artifacts();
-            self.last_unknown_reason = Some(missing_proof_reason);
-            Ok(SolveResult::Unknown)
-        } else {
-            Ok(self.publish_quantified_verdict_only_unsat())
+    /// Empty-universe EPR UNSAT publisher.
+    ///
+    /// The EPR singleton path has already CHECKED the singleton-instance UNSAT,
+    /// but its raw proof names the synthesized witness assertions, not the
+    /// authored `forall`s, so the ordinary
+    /// [`Self::quantified_semantic_unsat_or_unknown`] artifact firewall
+    /// downgrades the correct `unsat` to `unknown` under mandatory
+    /// certification. First TRY to translate the semantic verdict into an
+    /// authored-scope `forall_inst` certificate
+    /// ([`Self::try_translate_witnessed_forall_conflict_unsat`]); on success the
+    /// ordinary publication funnel mints a genuine `StrictProof` token and the
+    /// verdict publishes as `unsat`. On failure fall back to the unchanged
+    /// fail-closed firewall — so this can only ever turn a firewalled `unknown`
+    /// into a strictly-certified `unsat`, never widen what publishes.
+    fn empty_universe_semantic_unsat_or_unknown(&mut self) -> Result<SolveResult> {
+        if self.try_translate_witnessed_forall_conflict_unsat() {
+            self.last_unknown_reason = None;
+            return Ok(SolveResult::unsat());
         }
+        self.quantified_semantic_unsat_or_unknown(UnknownReason::QuantifierUnhandled)
     }
 
     fn cegqi_inner_unsat_or_unknown(&mut self) -> Result<SolveResult> {
@@ -5526,7 +5448,7 @@ impl Executor {
                     self.last_unknown_reason = None;
                     return Ok(SolveResult::unsat());
                 }
-                Err(error) if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() => {
+                Err(error) if ay_core::misc_cli_flags().trace_cegqi_attr => {
                     eprintln!("[cegqi-attr] live strict proof declined: {error}");
                     for (index, step) in proof.steps.iter().take(64).enumerate() {
                         eprintln!("[cegqi-attr] proof[{index}] = {step:?}");
@@ -5664,7 +5586,7 @@ impl Executor {
         // regressed group_quantifiers tests, 2026-07-10 bisect).
         let ground_core = self.snapshot_ground_core(snapshot);
         let model = self.last_model.clone()?;
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!(
                 "[cegqi-attr] SAT model-group verifier: ground_roots={} groups={} ce_vars={}",
                 ground_core.len(),
@@ -6148,7 +6070,7 @@ impl Executor {
                 break;
             }
             if group.is_empty() || ay_core::time::Instant::now() >= tight {
-                if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
                     eprintln!(
                         "[cegqi-attr] SAT model-group verifier DECLINE: quant={quant:?} group_terms={} deadline_expired={}",
                         group.len(),
@@ -6175,7 +6097,7 @@ impl Executor {
                     .then_some(CheckedGroundKind::Sat),
                 _ => None,
             };
-            if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!(
                     "[cegqi-attr] SAT model-group refutation: quant={quant:?} group_terms={} pins={} uf_pins={} result={lemma_result:?}",
                     group.len(),
@@ -6189,7 +6111,7 @@ impl Executor {
             }
         }
         self.set_deadline(saved_deadline);
-        if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() {
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
             eprintln!(
                 "[cegqi-attr] SAT model-group verifier result: all_refuted={all_ce_lemmas_refuted} uf_pins_usable={uf_pins_usable} stopped={}",
                 self.should_abort_theory_loop(),
@@ -6621,10 +6543,12 @@ impl Executor {
     /// `check_sat` pipeline. SAT must therefore carry the private
     /// `SatCertificate` minted by `emit_sat_verdict`; UNSAT is routed through
     /// `certify_unsat_for_publication` and accepted only when its one-shot
-    /// certificate is the strict authored-scope proof variant. The cloned
-    /// Context and every proof/model artifact die with the probe. Only the
-    /// non-cloneable decision crosses back, bound to the enclosing query epoch,
-    /// source stamp, exact ordered roots, and term-store snapshot.
+    /// certificate is a checked exact-query authority. This includes strict
+    /// proof, independently verified, and exact-semantic certificates, while
+    /// excluding the competition raw admission. The cloned Context and every
+    /// proof/model artifact die with the probe. Only the non-cloneable decision
+    /// crosses back, bound to the enclosing query epoch, source stamp, exact
+    /// ordered roots, and term-store snapshot.
     pub(in crate::executor) fn checked_ground_solve(
         &mut self,
         assertions: Vec<TermId>,
@@ -6644,14 +6568,15 @@ impl Executor {
         }
     }
 
-    /// Strictly certify one exact assertion vector as UNSAT on a disposable
-    /// public-query transaction.
+    /// Certify one exact assertion vector as UNSAT on a disposable public-query
+    /// transaction.
     ///
     /// Ground and quantified obligations share this UNSAT-only path.  A raw
-    /// nested result is never returned: success requires a strict authored-root
-    /// proof certificate, and the resulting linear token must still match the
-    /// enclosing query epoch, source context, ordered roots, and exact term
-    /// snapshot when consumed.
+    /// nested result is never returned: success requires a checked exact-query
+    /// certificate (strict proof, independent verification, or exact semantic
+    /// theorem), and the resulting linear token must still match the enclosing
+    /// query epoch, source context, ordered roots, and exact term snapshot when
+    /// consumed.
     pub(in crate::executor) fn checked_exact_unsat_solve(
         &mut self,
         assertions: Vec<TermId>,
@@ -6660,82 +6585,6 @@ impl Executor {
         let (scope, outcome) =
             self.checked_isolated_solve(assertions, CheckedIsolatedMode::ExactUnsat, budget_ms)?;
         matches!(outcome, CheckedGroundKind::Unsat).then_some(CheckedExactUnsat { scope })
-    }
-
-    /// Shared isolation/certification transaction for the public ground probe
-    /// and this module's quantified-UNSAT theorem probes.
-    fn checked_isolated_solve(
-        &mut self,
-        assertions: Vec<TermId>,
-        mode: CheckedIsolatedMode,
-        budget_ms: u64,
-    ) -> Option<(CheckedGroundScope, CheckedGroundKind)> {
-        let has_quantifier = assertions
-            .iter()
-            .any(|&term| contains_quantifier(&self.ctx.terms, term));
-        let fragment_mismatch =
-            matches!(mode, CheckedIsolatedMode::GroundDecision) && has_quantifier;
-        if fragment_mismatch || self.should_abort_theory_loop() || !self.qpf_probe_preflight() {
-            return None;
-        }
-        let scope = CheckedGroundScope::capture(self, &assertions);
-        let mut probe_ctx = self.ctx.clone();
-        // Strip the outer query transaction before installing the exact
-        // obligation. In particular, objectives, soft constraints, named-core
-        // provenance, and assertion scopes must not silently strengthen the
-        // checked subproblem. `begin_public_solve` below runs only after these
-        // exact roots are in place, so its proof/source epoch authenticates the
-        // obligation rather than the enclosing query's baggage.
-        if probe_ctx
-            .process_command(&ay_frontend::Command::ResetAssertions)
-            .is_err()
-        {
-            return None;
-        }
-        // Keep the exact unpurified obligation as the probe's authored root
-        // window. The ordinary check-sat pipeline performs any purification and
-        // proof-producing rewrites, so strict UNSAT certification is about this
-        // exact vector rather than an unchecked transformed surrogate.
-        probe_ctx.assertions = assertions.clone();
-        let mut probe = self.qpf_probe_executor(probe_ctx, budget_ms);
-        probe.original_problem_had_quantifiers = has_quantifier;
-        probe.incremental_mode = false;
-        // Exact-UNSAT obligations may originate in the alternation validator or
-        // the nested-array quarantine. Prevent either optional rescue from
-        // recursively trying to validate itself. The ordinary quantified
-        // preprocessing/refinement and proof pipeline remains active, and only
-        // its strict proof certificate can cross this boundary.
-        if matches!(mode, CheckedIsolatedMode::ExactUnsat) {
-            probe.in_alternation_validation = true;
-            probe.in_nested_array_residue_probe = true;
-        }
-        probe.begin_public_solve(false);
-        probe.bind_unsat_query_assumptions(&[]);
-
-        let outcome = match probe.check_sat().ok()? {
-            SolveResult::Sat if matches!(mode, CheckedIsolatedMode::GroundDecision) => probe
-                .take_sat_certificate()
-                .is_some_and(|certificate| certificate.confirms_sat_emission())
-                .then_some(CheckedGroundKind::Sat),
-            SolveResult::Sat => None,
-            result @ SolveResult::Unsat(_) => {
-                let certified = probe.certify_unsat_for_publication(result, &[]);
-                (certified.is_unsat()
-                    && probe
-                        .take_unsat_certificate()
-                        .is_some_and(|certificate| certificate.strict_proof_verified()))
-                .then_some(CheckedGroundKind::Unsat)
-            }
-            SolveResult::Unknown => None,
-        };
-        drop(probe);
-        if self.should_abort_theory_loop()
-            || !self.qpf_probe_preflight()
-            || !scope.is_current_for(self, &assertions)
-        {
-            return None;
-        }
-        Some((scope, outcome?))
     }
 
     /// SOUND UNSAT independence check (#mbqi-completeness Q1).
@@ -7401,14 +7250,9 @@ impl Executor {
         foralls: &[TermId],
         snapshot: &[TermId],
     ) -> Option<Result<SolveResult>> {
-        // Industrial UFBV routinely exceeds 100k terms: of the 12 wintersteiger
-        // `fixpoint` wrong-SATs found by the 2026-07-25 corpus scoreboard, four
-        // tripped this cap alone (ethernet-1 101,710; cache-coherence-3-1
-        // 102,105; cache-coherence-3-2 252,741; pi-bus-2 310,022) — barely, in
-        // two cases. The cap bounds sub-solve WORK, not soundness: the probe
-        // returns UNSAT only after independently ground-solving the whole
-        // substituted body at concrete literals, so a wider admission can add
-        // decided UNSATs or waste time, never a wrong answer.
+        // Industrial UFBV routinely exceeds 100k terms; four known `fixpoint`
+        // wrong-SATs exceeded the old cap. This cap bounds sub-solve work, not
+        // soundness: UNSAT still requires an independent concrete ground solve.
         const MAX_QPF_CONTEXT_TERMS: usize = 500_000;
         if self.ctx.terms.len() > MAX_QPF_CONTEXT_TERMS || !self.qpf_probe_preflight() {
             return None;
@@ -7425,14 +7269,8 @@ impl Executor {
             if vars.is_empty()
                 || vars
                     .iter()
-                    // Bool is admitted alongside fixed-width BitVec: the
-                    // soundness argument in this function's doc comment is
-                    // "every candidate value is exactly materializable as a
-                    // model-independent literal", and `pin_eval_const_for_sort`
-                    // already materializes `Sort::Bool` exactly (two values).
-                    // Excluding it was stricter than its own justification and
-                    // lost 9 of the 12 UFBV wrong-SATs before premise recovery
-                    // was even attempted.
+                    // Bool is exactly materializable alongside fixed-width BV;
+                    // excluding it lost most known UFBV premise recoveries.
                     .any(|(_, sort)| {
                         !matches!(sort, ay_core::Sort::BitVec(_) | ay_core::Sort::Bool)
                     })
@@ -7475,13 +7313,8 @@ impl Executor {
             // answer. `qpf_probe_preflight` and the per-attempt sub-budgets bound
             // the cost, and the loop stops early as soon as the premise solver
             // stops producing new valuations.
-            // COST DISCIPLINE. The FIRST attempt is byte-identical in cost to the
-            // single-point probe this replaced, so nothing that passed before can
-            // newly time out because of attempt 1; attempts 2..N are the only new
-            // work and they SHARE one small wall budget, checked before an attempt
-            // starts rather than inside one. Without that budget the worst case
-            // would be `MAX_QPF_POINTS` × (premise solve + ground verify), i.e.
-            // seconds per quantifier on an axiom-heavy input.
+            // Attempt one retains the old single-point cost. Extra points share
+            // one wall budget checked between complete solve/verify attempts.
             const MAX_QPF_POINTS: usize = 8;
             const EXTRA_POINTS_BUDGET_MS: u64 = 1200;
             let extra_points_deadline = ay_core::time::Instant::now()
@@ -7610,6 +7443,14 @@ impl Executor {
                         CheckedGroundDecision::Sat(_) => false,
                     })
                 {
+                    // Preserve this independently checked instance as a c7 fragment hint.
+                    self.qpf_register_premise_forced_instance(
+                        q,
+                        &vars,
+                        body,
+                        &literal_subst,
+                        body_k,
+                    );
                     return Some(Ok(SolveResult::unsat()));
                 }
                 tried_values.push(witness_values);
@@ -8969,6 +8810,52 @@ impl Executor {
             let a = self.ctx.assertions[i];
             if contains_quantifier(&self.ctx.terms, a) {
                 let mut simplified = self.drop_unused_bound_vars(a);
+                if proof_authority_active && simplified != a {
+                    // (#vacuous-quantifier-authority) Certify the collapse from
+                    // the authored root (the tracker independently replays the
+                    // vacuousness check), retaining the exact triple for the
+                    // checked-SAT-refutation sidecar. The conservative
+                    // `quantified_proof_translation_incomplete` marker is
+                    // still set for EVERY rewrite unless the DEFAULT-OFF
+                    // narrowing stage is armed: the landing audit found the
+                    // marker's read site can route through
+                    // `Unknown(QuantifierUnhandled)` into the phase-2.4/2.5
+                    // SAT certificates, so un-setting it is a staged SAT-side
+                    // behaviour change (#sat-grants-are-staged). With the
+                    // stage off, a certified collapse is discharged instead by
+                    // the pre-existing strict-proof gate at the marker's read
+                    // site. `--no-quant-unit-authority` restores baseline
+                    // exactly (marker always set, no certification attempt).
+                    let certified = crate::quant_unit_authority::quant_unit_authority_enabled()
+                        .then(|| {
+                            self.proof_tracker.add_vacuous_quantifier_collapse(
+                                &mut self.ctx.terms,
+                                a,
+                                simplified,
+                            )
+                        })
+                        .flatten();
+                    match certified {
+                        Some(record) => {
+                            self.skolem_instance_records.push(
+                                crate::executor::SkolemInstanceRecord {
+                                    source: a,
+                                    quantified: record.quantified,
+                                    witness: record.witness,
+                                    instance: record.instance,
+                                    asserted: simplified,
+                                    positive: record.positive,
+                                },
+                            );
+                            if !crate::quant_unit_authority::vacuous_marker_narrowing_enabled() {
+                                self.quantified_proof_translation_incomplete = true;
+                            }
+                        }
+                        None => {
+                            self.quantified_proof_translation_incomplete = true;
+                        }
+                    }
+                }
                 if !proof_authority_active {
                     // Hoist conjuncts out of quantifiers they don't mention BEFORE
                     // the infeasibility check, so a deep binder-independent conjunct
@@ -11043,20 +10930,38 @@ mod rebuild_tests {
             .expect("check-sat produces a verdict")
     }
 
-    fn assert_semantic_proof_firewall_unknown(exec: &mut Executor, policy: &str) {
-        assert_eq!(execute_authored_check_sat(exec), "unknown", "{policy}");
-        assert!(exec.last_result_is_unknown(), "{policy}");
-        assert_eq!(
-            exec.get_reason_unknown(),
-            Some(UnknownReason::QuantifierUnhandled),
-            "{policy}"
+    fn assert_internal_strict_certified_unsat(
+        exec: &mut Executor,
+        policy: &str,
+        retain_artifact: bool,
+    ) {
+        assert_eq!(execute_authored_check_sat(exec), "unsat", "{policy}");
+        assert!(exec.last_result_is_unsat(), "{policy}");
+        assert!(
+            exec.last_command_unsat_was_strictly_verified(),
+            "the public verdict must carry the internal StrictProof token: {policy}"
         );
-        assert!(exec.last_proof().is_none(), "{policy}");
-        assert!(exec.last_lrat_certificate().is_none(), "{policy}");
         assert!(
             !exec.last_unsat_proof_reconstruction_suppressed,
-            "an Unknown result is not verdict-only UNSAT authority: {policy}"
+            "a strict witnessed-forall certificate must remain publishable: {policy}"
         );
+        if retain_artifact {
+            let proof = exec
+                .last_proof()
+                .unwrap_or_else(|| panic!("strict witnessed-forall proof missing: {policy}"))
+                .clone();
+            assert!(
+                exec.check_proof_strict_with_datatypes(&proof)
+                    .is_ok_and(|quality| quality.is_complete()),
+                "retained witnessed-forall proof must independently replay strictly: {policy}"
+            );
+        } else {
+            assert!(
+                exec.last_proof().is_none(),
+                "an internal check-only policy need not retain an artifact: {policy}"
+            );
+        }
+        assert!(exec.last_lrat_certificate().is_none(), "{policy}");
     }
 
     fn run_premise_probe(exec: &mut Executor) -> Option<Result<SolveResult>> {
@@ -11139,6 +11044,22 @@ mod rebuild_tests {
             None,
             "the grant is scoped to one exact ordered authored root window"
         );
+    }
+
+    #[test]
+    fn finite_expansion_authority_builds_a_model_for_closed_ground_truth() {
+        let (mut exec, roots, expansion) = exact_single_int_expansion_fixture();
+        exec.last_model = None;
+        let model_roots = exec
+            .exact_finite_expansion_model_roots(&roots, &expansion)
+            .expect("fixture expansion replays canonically");
+
+        let token =
+            CheckedFiniteExpansionSatAuthority::for_current(&mut exec, &roots, &model_roots)
+                .expect("closed true expansion needs no pre-existing ground model");
+
+        assert!(exec.last_model.is_some());
+        assert!(token.into_current_roots(&mut exec).is_some());
     }
 
     #[test]
@@ -11966,10 +11887,8 @@ mod rebuild_tests {
             .symbol_iter()
             .find_map(|(name, info)| (name == "p").then_some(info.term).flatten())
             .expect("declared Bool constant");
-        // Extend the real production grant with one explicit scalar premise.
-        // The authored quantifier does not constrain p, so this setup probes
-        // only model-definition revision and leaves the grant's query, source,
-        // binding, root, and sealed-model identities untouched.
+        // Extend the real grant with unconstrained p, probing model-definition
+        // revision while leaving query, source, binding, root, and model identities untouched.
         let p_var = {
             let model = exec.last_model.as_mut().expect("checked model");
             let var = model.sat_model.len() as u32;
@@ -11978,6 +11897,7 @@ mod rebuild_tests {
             var
         };
         grant.model_definition = vec![p].into_boxed_slice();
+        grant.model_definition_entries = [exec.ctx.terms.entry_stamp(p)].into();
         assert_eq!(
             grant.model_definition.as_ref(),
             [p],
@@ -12039,24 +11959,15 @@ mod rebuild_tests {
     }
 
     #[test]
-    fn semantic_only_quantified_unsat_best_effort_is_verdict_only() {
+    fn witnessed_forall_unsat_best_effort_retains_strict_certificate() {
         let mut exec = empty_ground_universe_refutation("");
         exec.set_best_effort_produce_proofs(100);
 
-        assert_eq!(execute_authored_check_sat(&mut exec), "unsat");
-        assert!(exec.last_result_is_unsat());
-        assert!(exec.last_unsat_proof_reconstruction_suppressed);
-        assert!(exec.last_proof().is_none());
-        assert!(exec.last_lrat_certificate().is_none());
-        exec.build_unsat_proof();
-        assert!(
-            exec.last_proof().is_none(),
-            "the authored outer trace cannot be rebuilt as authority for a semantic-only verdict"
-        );
+        assert_internal_strict_certified_unsat(&mut exec, "best-effort proof request", true);
     }
 
     #[test]
-    fn semantic_only_quantified_unsat_mandatory_proof_policies_fail_closed() {
+    fn witnessed_forall_unsat_all_internal_proof_policies_certify() {
         let mut explicit = empty_ground_universe_refutation("");
         explicit.set_produce_proofs(true);
         explicit.set_proof_reconstruction_step_budget(Some(100));
@@ -12064,20 +11975,20 @@ mod rebuild_tests {
             explicit.proof_reconstruction_step_budget.is_none(),
             "a later budget call must not downgrade an explicit API proof request"
         );
-        assert_semantic_proof_firewall_unknown(&mut explicit, "explicit API proof request");
+        assert_internal_strict_certified_unsat(&mut explicit, "explicit API proof request", true);
 
         let mut script = empty_ground_universe_refutation("(set-option :produce-proofs true)");
         script.set_proof_reconstruction_step_budget(Some(100));
-        assert_semantic_proof_firewall_unknown(&mut script, "SMT-LIB proof request");
+        assert_internal_strict_certified_unsat(&mut script, "SMT-LIB proof request", true);
 
         let mut strict = empty_ground_universe_refutation("(set-option :check-proofs-strict true)");
         strict.set_proof_reconstruction_step_budget(Some(100));
-        assert_semantic_proof_firewall_unknown(&mut strict, "strict proof checking");
+        assert_internal_strict_certified_unsat(&mut strict, "strict proof checking", false);
 
         let mut self_check = empty_ground_universe_refutation("");
         self_check.set_best_effort_produce_proofs(100);
         self_check.set_self_check(true);
-        assert_semantic_proof_firewall_unknown(&mut self_check, "self-check");
+        assert_internal_strict_certified_unsat(&mut self_check, "self-check", true);
     }
 
     #[test]
@@ -12649,6 +12560,177 @@ mod rebuild_tests {
         );
     }
 
+    /// An isolated probe whose exact roots contain the Boolean constant `false`
+    /// must not install a working set it cannot publish.
+    ///
+    /// The probe used to receive its roots by a raw `probe_ctx.assertions = ...`
+    /// write performed after `ResetAssertions`. That left `authored_assertions`
+    /// and `assertions_parsed` EMPTY against N live roots, so inside the probe
+    /// `boolean_constant_premises_authored()` answered "nothing authored here",
+    /// `proof_export_scope_assertions` stripped `false` out of the strict-proof
+    /// problem (`#rewritten-constant-premise`), and
+    /// `authored_corroboration_scope` — which reads `ctx.assertions` — still
+    /// carried it. Its `debug_assert!` then fired on a scope that is not a
+    /// subset of the problem, surfacing to deductive-checks as a `SolverPanic`.
+    ///
+    /// Here the enclosing query really does author `false`, so the probe
+    /// inherits publication rights over it and the two views agree.
+    ///
+    /// This asserts the PRODUCER postcondition directly rather than waiting for
+    /// the downstream panic: reaching `authored_corroboration_scope` needs the
+    /// full `minimize_assumption_core` -> `checked_exact_unsat_solve` descent,
+    /// but the state it trips over is created right here, and a probe whose
+    /// working set is not a subset of its own publishable problem is already
+    /// broken whether or not a later stage looks.
+    #[test]
+    fn isolated_probe_roots_stay_inside_the_publishable_problem() {
+        let exec = load_assertions(
+            r#"
+                (set-logic QF_LIA)
+                (declare-const x Int)
+                (assert (= x 1))
+                (assert false)
+            "#,
+        );
+        assert!(
+            exec.boolean_constant_premises_authored().1,
+            "fixture precondition: the enclosing query must author literal false"
+        );
+        let roots = exec.ctx.assertions.clone();
+        assert!(
+            roots.contains(&exec.ctx.terms.false_term()),
+            "fixture precondition: the probe roots must carry the constant"
+        );
+
+        let mut probe_ctx = exec.ctx.clone();
+        probe_ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .expect("reset the probe context");
+        exec.install_isolated_probe_roots(&mut probe_ctx, &roots);
+        let probe = exec.qpf_probe_executor(probe_ctx, 2_000);
+
+        assert_eq!(
+            probe.ctx.assertions, roots,
+            "the probe must decide exactly the roots it was handed"
+        );
+        // THE primary invariant — the one `authored_corroboration_scope`'s
+        // `debug_assert!` polices — checked where the state is built.
+        let problem = probe.complete_problem_assertions_for_strict_proof();
+        for root in &probe.ctx.assertions {
+            assert!(
+                problem.contains(root),
+                "probe root {root:?} is outside the strict-proof problem it would \
+                 publish; the corroboration re-solve would answer a question the \
+                 publication never claimed"
+            );
+        }
+        // Second, independent stack the raw field write corrupted.
+        assert_eq!(
+            probe.ctx.assertions.len(),
+            probe.ctx.assertion_finite_set_metadata().len(),
+            "finite-set metadata must stay aligned with the assertion stack"
+        );
+    }
+
+    /// Same invariant where the enclosing query authors NO literal `false` and
+    /// the constant reaches the probe only as one of its exact roots — the shape
+    /// the alternation and independent-gate lanes raise, sometimes as the single
+    /// root of the whole probe.
+    ///
+    /// The probe still has to hold together: `#rewritten-constant-premise`
+    /// withholds publication rights for `false` at the OUTER export boundary,
+    /// but a probe that stripped its own live root would go on to decide a
+    /// strictly smaller problem than the one it was handed. With a lone `false`
+    /// root that means deciding the EMPTY problem, which is trivially SAT.
+    #[test]
+    fn isolated_probe_roots_survive_without_outer_false_authority() {
+        let exec = load_assertions(
+            r#"
+                (set-logic QF_LIA)
+                (declare-const x Int)
+                (assert (= x 1))
+            "#,
+        );
+        assert!(
+            !exec.boolean_constant_premises_authored().1,
+            "fixture precondition: the enclosing query must NOT author literal false"
+        );
+        let roots = vec![exec.ctx.terms.false_term()];
+
+        let mut probe_ctx = exec.ctx.clone();
+        probe_ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .expect("reset the probe context");
+        exec.install_isolated_probe_roots(&mut probe_ctx, &roots);
+        let probe = exec.qpf_probe_executor(probe_ctx, 2_000);
+
+        assert_eq!(
+            probe.ctx.assertions, roots,
+            "the probe must decide exactly the roots it was handed"
+        );
+        let problem = probe.complete_problem_assertions_for_strict_proof();
+        for root in &probe.ctx.assertions {
+            assert!(
+                problem.contains(root),
+                "probe root {root:?} is outside the strict-proof problem it would \
+                 publish; a probe that drops its only root decides the empty \
+                 problem instead of the question it was asked"
+            );
+        }
+    }
+
+    /// The narrowness pin for the two tests above: the probe's private
+    /// literal-false authority must NOT leak outward.
+    ///
+    /// Installing roots through the native-API route marks each one
+    /// literal-false-sourced (the `__ay_api_assertion__` placeholder). That is
+    /// safe only because the probe's context is a clone whose artifacts die with
+    /// it, so the enclosing query must re-derive publication rights from its own
+    /// authored record and still be refused them.
+    #[test]
+    fn isolated_probe_false_authority_does_not_leak_to_the_enclosing_query() {
+        let mut exec = load_assertions(
+            r#"
+                (set-logic QF_LIA)
+                (declare-const x Int)
+                (assert (= x 1))
+            "#,
+        );
+        let assertions_before = exec.ctx.assertions.clone();
+        let mut roots = assertions_before.clone();
+        roots.push(exec.ctx.terms.false_term());
+
+        let _ = exec.checked_exact_unsat_solve(roots, 2_000);
+
+        assert!(
+            !exec.boolean_constant_premises_authored().1,
+            "the probe must not hand the enclosing query authority over `false`"
+        );
+        assert_eq!(
+            exec.ctx.assertions, assertions_before,
+            "the disposable probe must not disturb the enclosing query"
+        );
+    }
+
+    #[test]
+    fn checked_exact_unsat_probe_accepts_exact_semantic_authority() {
+        let mut exec = load_assertions(
+            r#"
+                (set-logic UFLIA)
+                (assert (forall ((y Int)) (= (rem 2 y) 0)))
+            "#,
+        );
+        let roots = exec.ctx.assertions.clone();
+
+        let checked = exec
+            .checked_exact_unsat_solve(roots.clone(), 2_000)
+            .expect("the exact false instance must cross the disposable boundary");
+        assert!(
+            checked.consume(&mut exec, &roots),
+            "exact semantic authority must remain bound to its outer query and roots"
+        );
+    }
+
     /// Build `forall x. B` where `B = psi0[y := sk_y(x)]` the way the
     /// Skolemizer does (registered internal symbol), plus its instantiator.
     fn skolemized_alternation(
@@ -12685,7 +12767,7 @@ mod rebuild_tests {
     }
 
     #[test]
-    fn proof_fold_preserves_certified_negative_forall_source_only() {
+    fn proof_fold_preserves_sources_without_strict_rewrite_provenance() {
         let mut proof_exec = Executor::new();
         proof_exec.set_produce_proofs(true);
         let (negative, positive) = negative_single_forall_with_foldable_comparison(&mut proof_exec);
@@ -12722,9 +12804,9 @@ mod rebuild_tests {
 
         proof_exec.fold_quantified_linear_eqs();
 
-        assert_ne!(
+        assert_eq!(
             proof_exec.ctx.assertions[0], nested_negative,
-            "nested quantifiers are outside the certified Skolem lane and must still fold"
+            "nested quantified rewrites have no strict provenance translation and must retain the authored source"
         );
 
         let mut ordinary_exec = Executor::new();

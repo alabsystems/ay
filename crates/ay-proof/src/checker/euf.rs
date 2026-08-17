@@ -298,6 +298,41 @@ pub fn recognize_euf_congruent(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_euf_congruent(terms, ProofId(0), clause).is_ok()
 }
 
+/// Recognize the exact EUF transitive-chain clause shape
+/// `validate_euf_transitive` accepts (#trust->0 C3): `(not (= a b))
+/// (not (= b c)) .. (= lhs rhs)` — premises forming a chain from `lhs` to
+/// `rhs` with no redundant premise, conclusion LAST. Like
+/// [`recognize_euf_congruent`], recognition IS the strict validator run on the
+/// clause, so classifier and checker cannot drift and the ORDER-SENSITIVE
+/// placement of the conclusion is verified on exactly the clause the caller
+/// intends to record (fail-closed).
+#[must_use]
+pub fn recognize_euf_transitive(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_euf_transitive(terms, ProofId(0), clause).is_ok()
+}
+
+/// Recognize the exact EUF congruent-predicate clause shape
+/// `validate_euf_congruent_pred` accepts (#trust->0 C3): `(not (= a1 b1)) ..
+/// (not (= an bn)) (not (p a1..an)) (p b1..bn)` — per-position premise
+/// equalities in argument order (identical-argument positions may omit
+/// theirs), negated predicate second-to-last, positive predicate LAST.
+/// Recognition IS the strict validator (fail-closed, order verified).
+#[must_use]
+pub fn recognize_euf_congruent_pred(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_euf_congruent_pred(terms, ProofId(0), clause).is_ok()
+}
+
+/// Recognize the exact reflexivity clause shape the strict checker's
+/// `EufReflexive` arm accepts (#trust->0 C3): a single positive binary
+/// equality relating a term to ITSELF. Recognition IS
+/// `validate_eq_reflexive` — the same routine backing the `eq_reflexive`
+/// Alethe rule and the `TheoryLemmaKind::EufReflexive` dispatch — so
+/// classifier and checker cannot drift (fail-closed).
+#[must_use]
+pub fn recognize_euf_reflexive(terms: &TermStore, clause: &[TermId]) -> bool {
+    super::boolean_derived::validate_eq_reflexive(terms, ProofId(0), clause).is_ok()
+}
+
 /// Validate an EUF congruent predicate lemma.
 ///
 /// Clause structure: `(not (= a1 b1)) ... (not (= an bn)) (not (p a1..an)) (p b1..bn)`
@@ -505,4 +540,68 @@ pub(crate) fn validate_distinct_elim(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod euf_recognizer_tests {
+    use ay_core::{Sort, Symbol, TermStore};
+
+    /// The C3 recognizers ARE the validators: the canonical order is accepted
+    /// and — because the EUF validators are ORDER-SENSITIVE — the same literal
+    /// set with the conclusion moved off its mandated position is rejected.
+    #[test]
+    fn euf_recognizers_are_order_sensitive_validators() {
+        let mut terms = TermStore::new();
+        let u = Sort::Uninterpreted("U".to_string());
+        let a = terms.mk_var("a", u.clone());
+        let b = terms.mk_var("b", u.clone());
+        let c = terms.mk_var("c", u.clone());
+        let eq_ab = terms.mk_eq(a, b);
+        let eq_bc = terms.mk_eq(b, c);
+        let eq_ac = terms.mk_eq(a, c);
+        let not_ab = terms.mk_not(eq_ab);
+        let not_bc = terms.mk_not(eq_bc);
+
+        // eq_transitive: premises-then-conclusion accepted, conclusion-first
+        // rejected.
+        assert!(super::recognize_euf_transitive(
+            &terms,
+            &[not_ab, not_bc, eq_ac]
+        ));
+        assert!(!super::recognize_euf_transitive(
+            &terms,
+            &[eq_ac, not_ab, not_bc]
+        ));
+
+        // eq_congruent: (not (= a b)) (= (f a) (f b)) accepted; swapped order
+        // rejected.
+        let f_a = terms.mk_app(Symbol::named("f"), [a], u.clone());
+        let f_b = terms.mk_app(Symbol::named("f"), [b], u.clone());
+        let eq_fafb = terms.mk_eq(f_a, f_b);
+        assert!(super::recognize_euf_congruent(&terms, &[not_ab, eq_fafb]));
+        assert!(!super::recognize_euf_congruent(&terms, &[eq_fafb, not_ab]));
+
+        // eq_congruent_pred: (not (= a b)) (not (p a)) (p b) accepted;
+        // predicate literals swapped rejected.
+        let p_a = terms.mk_app(Symbol::named("p"), [a], Sort::Bool);
+        let p_b = terms.mk_app(Symbol::named("p"), [b], Sort::Bool);
+        let not_p_a = terms.mk_not(p_a);
+        assert!(super::recognize_euf_congruent_pred(
+            &terms,
+            &[not_ab, not_p_a, p_b]
+        ));
+        assert!(!super::recognize_euf_congruent_pred(
+            &terms,
+            &[not_ab, p_b, not_p_a]
+        ));
+
+        // eq_reflexive: unit `(= a a)` (built raw — `mk_eq` folds it to
+        // `true`) accepted; a two-literal clause rejected.
+        let raw_eq_aa = terms.mk_app(Symbol::named("="), [a, a], Sort::Bool);
+        assert!(super::recognize_euf_reflexive(&terms, &[raw_eq_aa]));
+        assert!(!super::recognize_euf_reflexive(
+            &terms,
+            &[not_ab, raw_eq_aa]
+        ));
+    }
 }

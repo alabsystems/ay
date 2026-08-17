@@ -397,7 +397,7 @@ fn solve_marker_dag_tree(
         // Model concretely REFUTES the derivation. This is always spurious —
         // decline whether it came from seed fabrication or a false-SAT.
         Some(SmtValue::Bool(false)) => {
-            if std::env::var_os("AY_DEBUG_MARKER_DAG_VERIFY").is_some() {
+            if ay_core::misc_cli_flags().chc_debug_marker_dag_verify {
                 safe_eprintln!(
                     "adt_array_nullary: marker-DAG model concretely REFUTES derivation \
                      (smt_confirmed={smt_confirmed}); declining candidate (fail-closed to Unknown)"
@@ -410,7 +410,7 @@ fn solve_marker_dag_tree(
         // cannot confirm must be declined.
         _ => {
             if !smt_confirmed {
-                if std::env::var_os("AY_DEBUG_MARKER_DAG_VERIFY").is_some() {
+                if ay_core::misc_cli_flags().chc_debug_marker_dag_verify {
                     safe_eprintln!(
                         "adt_array_nullary: fabricated marker-DAG model could not be confirmed \
                          (evaluate_expr indeterminate); declining candidate (fail-closed to Unknown)"
@@ -424,7 +424,7 @@ fn solve_marker_dag_tree(
     let Some(cex) = marker_dag_counterexample(problem, query_clause, &nodes, root, &model) else {
         return MarkerDagSolve::Unknown;
     };
-    let verbose_validation = std::env::var_os("AY_DEBUG_MARKER_DAG_VERIFY").is_some();
+    let verbose_validation = ay_core::misc_cli_flags().chc_debug_marker_dag_verify;
     if !validate_counterexample(problem, &cex, budget, verbose_validation) {
         return MarkerDagSolve::Unknown;
     }

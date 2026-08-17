@@ -300,17 +300,26 @@ pub(crate) fn try_lra_farkas_reconstruction(
         return false;
     }
 
-    let inferred_kind =
+    let (inferred_kind, _) =
         crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
             terms,
             clause,
             Some(&rebound),
+            None,
         );
+    // This routine reconstructs and independently validates positional Farkas
+    // evidence. It may therefore publish only an evidence-compatible
+    // arithmetic kind; an EUF/DT recognition in either caller or reordered
+    // form cannot inherit this certificate.
+    let caller_order_kind = match inferred_kind {
+        TheoryLemmaKind::LraFarkas | TheoryLemmaKind::LiaGeneric => inferred_kind,
+        _ => TheoryLemmaKind::LraFarkas,
+    };
     *farkas = Some(rebound);
-    *kind = if inferred_kind.is_trust() {
+    *kind = if caller_order_kind.is_trust() {
         TheoryLemmaKind::LraFarkas
     } else {
-        inferred_kind
+        caller_order_kind
     };
     true
 }

@@ -16,7 +16,7 @@
 //! matched owned the whole solve. Three failures followed, all measured on the
 //! release binary, all reproduced before this file existed:
 //!
-//! | model | routed (default) | fallback (`AY_MILP_NO_STRUCTURE_ROUTE=1`) |
+//! | model | routed (default) | fallback (`SolveOpts::with_structure_routing(false)`) |
 //! |---|---|---|
 //! | `markshare_5_0` | `FEASIBLE 5` @ 20.000 s, 3/3 | `OPTIMAL 1` @ 0.150 s, 3/3 |
 //! | `W1_unsat_v9_c14_000008` | REPLAY, 758 B, `verify` exit 10 | SUCCINCT, 19,664 B, exit 0 |

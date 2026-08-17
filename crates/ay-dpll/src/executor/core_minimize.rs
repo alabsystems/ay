@@ -71,13 +71,18 @@
 
 use std::time::Duration;
 
-use ay_core::kani_compat::{DetHashMap, DetHashSet as HashSet};
+use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::time::Instant;
-use ay_core::{TermData, TermId, TermStore};
+use ay_core::TermId;
 
 use super::Executor;
 use crate::executor_types::{Result, SolveResult};
 use crate::logic_detection::LogicCategory;
+
+mod term_order;
+
+#[cfg(test)]
+mod tests;
 
 /// Below this much remaining wall budget the pass does not start: the risk of
 /// blowing the output window outweighs any shrink.
@@ -240,6 +245,10 @@ impl Executor {
         let saved_result = self.last_result.clone();
         let saved_unknown_reason = self.last_unknown_reason;
         let saved_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
+        debug_assert!(
+            self.pending_nested_array_bool_bv_unsat.is_none(),
+            "finite-array authority must be sealed only after core minimization"
+        );
         // #uc-minimize-proof-gate: park the entry UNSAT certificate across the
         // subset solves. Each subset solve is a full public decision that mints
         // its own one-shot certificate for a REDUCED problem; leaving that in
@@ -281,6 +290,19 @@ impl Executor {
         let saved_proof = self.last_proof.take();
         let saved_finite_enum_witness = self.last_finite_enum_pigeonhole.take();
         let saved_checked_finite_enum = self.last_checked_finite_enum_pigeonhole.take();
+        // Preserve the already completed SAT-resolution theorem, not its
+        // producer scratch records. c674's fragment builder can seal forall /
+        // Skolem chains and intern terms while doing so; rebuilding after the
+        // subset attempts would both lose those per-solve records and violate
+        // the final finite-array snapshot ordering.
+        let saved_checked_sat_refutation = self.last_checked_sat_refutation.take();
+        // Both trusted array reductions are affine markers for the OUTER raw
+        // verdict. Subset solves reset and may re-arm their own instances; park
+        // the outer values and discard every inner marker unconditionally.
+        let saved_nested_array_row_reduction_unsat =
+            std::mem::take(&mut self.nested_array_row_reduction_unsat);
+        let saved_ho_seq_unfold_array_free_unsat =
+            std::mem::take(&mut self.ho_seq_unfold_array_free_unsat);
         let out = self.minimize_assumption_core_inner(combined, result, rescue_elapsed);
         // Unconditional: the take()s above must never be observable, whether or
         // not the inner pass did any work.
@@ -290,6 +312,10 @@ impl Executor {
         self.last_proof = saved_proof;
         self.last_finite_enum_pigeonhole = saved_finite_enum_witness;
         self.last_checked_finite_enum_pigeonhole = saved_checked_finite_enum;
+        self.last_checked_sat_refutation = saved_checked_sat_refutation;
+        self.nested_array_row_reduction_unsat = saved_nested_array_row_reduction_unsat;
+        self.ho_seq_unfold_array_free_unsat = saved_ho_seq_unfold_array_free_unsat;
+        self.pending_nested_array_bool_bv_unsat = None;
         // Only restore the verdict when the pass was entered on an UNSAT (the
         // inner function is a no-op otherwise, so nothing was clobbered).
         if matches!(saved_result, Some(SolveResult::Unsat(_))) {
@@ -312,7 +338,7 @@ impl Executor {
         // them, so "no `uc-minimize` output" was indistinguishable between
         // "never called" and "declined at gate N". That ambiguity cost a wrong
         // root cause on 2026-08-08. Name the declining gate instead.
-        let gate_trace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let gate_trace = ay_core::misc_cli_flags().phase_trace;
         macro_rules! decline {
             ($why:expr) => {{
                 if gate_trace {
@@ -351,9 +377,10 @@ impl Executor {
             decline!("proofs");
         }
         // A/B knob (NOT a soundness guard — the pass only shrinks a valid
-        // core; disabling it restores the padded-superset behavior).
-        if std::env::var_os("AY_NO_UC_MINIMIZE").is_some() {
-            decline!("env-kill");
+        // core; disabling it restores the padded-superset behavior). B17:
+        // CLI-populated global (--no-uc-minimize) replaced the never-set env.
+        if ay_core::theory_disable_flags().no_uc_minimize {
+            decline!("cli-kill");
         }
 
         // Category gate: EUF / ArrayEuf content only for now
@@ -422,10 +449,10 @@ impl Executor {
         // with `core must be available: NotUnsat`. That defect is fixed at its
         // source — see `minimize_assumption_core`'s verdict save/restore — and it
         // was latent in the EUF path too, so the kill switch is now an escape
-        // hatch (`AY_NO_UC_MINIMIZE_GENERAL=1`) rather than an opt-in.
+        // hatch (`--dpll-no-uc-minimize-general`) rather than an opt-in.
         let general_ok = !euf_like
             && !dt_owned
-            && std::env::var_os("AY_NO_UC_MINIMIZE_GENERAL").is_none()
+            && !ay_core::theory_disable_flags().no_uc_minimize_general
             && combined.len() <= GENERAL_MINIMIZE_CAP;
         if !euf_like && !general_ok {
             decline!(format!("category={category:?} len={}", combined.len()));
@@ -477,9 +504,7 @@ impl Executor {
         // harvest-jump re-canonicalization (`verified.iter().filter(...)`)
         // — so the sorted order propagates to every attempt.
         if !features.has_arrays {
-            let mut memo: DetHashMap<TermId, u64> = DetHashMap::default();
-            let terms = &self.ctx.terms;
-            full.sort_by_key(|t| term_node_count(terms, &mut memo, *t));
+            term_order::sort_by_node_count(&self.ctx.terms, &mut full);
         }
 
         // Starting point: the certified harvest when it is a genuine smaller
@@ -525,7 +550,7 @@ impl Executor {
         // The stripped base, captured once for the scoped engine.
         let base_assertions = self.ctx.assertions.clone();
 
-        let trace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let trace = ay_core::misc_cli_flags().phase_trace;
         let initial_len = start.len();
         let mut verified = start;
         let mut attempts: u64 = 0;
@@ -705,6 +730,50 @@ impl Executor {
                 .checked_add(attempt_budget)
                 .map_or(shrink_deadline, |d| d.min(shrink_deadline));
             self.solve_deadline.set(Some(per_solve_deadline));
+            // #uc-minimize-gate-window: RE-SCOPE the mandatory SAT gate's
+            // authored root window to the problem THIS attempt actually solves,
+            // `base_assertions AND candidate`.
+            //
+            // `candidate` is a PROPER SUBSET of the entry assumptions. Without
+            // this, the attempt inherits the enclosing public query's authored
+            // snapshot — `check_sat_internal` installs the FULL
+            // named-plus-unnamed assertion set, and
+            // `check_sat_assuming_with_publication` deliberately REUSES whatever
+            // is already installed rather than recapturing the stripped base.
+            // The gate then evaluates the attempt's model against assertions the
+            // attempt never asserted, and a perfectly correct subset model reads
+            // as a refutation:
+            //
+            //   (assert (! p :named a1)) (assert (! (not p) :named a2)) ...
+            //   drop a1 -> model p=false, window still holds `p`       -> "violates"
+            //   drop a2 -> model p=true,  window still holds `(not p)` -> "violates"
+            //
+            // Both fired the LOUD `report_caught_invalid_model` soundness alarm
+            // on a model that is not invalid, and downgraded the attempt's `Sat`
+            // to `Unknown`. The over-wide window is fail-CLOSED (a superset of
+            // roots can only turn `Sat` into `Unknown`, never the reverse), so
+            // no wrong verdict shipped — but it slanders the producing lane and
+            // blunts an alarm whose whole value is being rare and true.
+            //
+            // Installed EXACTLY, not left to `independent_gate_query_roots`'s
+            // `last_assumptions` append: an empty window would let the gate
+            // confirm any model vacuously, which is the failure mode
+            // `check_sat_internal`'s own snapshot comment records. Narrowing to
+            // the true problem cannot license a verdict either way — a subset
+            // attempt never publishes, the pass adopts only on `Unsat`, and
+            // adoption still requires the strict re-check below.
+            let attempt_gate_roots = {
+                let mut roots = base_assertions.clone();
+                for &member in &candidate {
+                    if !roots.contains(&member) {
+                        roots.push(member);
+                    }
+                }
+                roots
+            };
+            let saved_gate_authored = self
+                .independent_gate_authored_assertions
+                .replace(attempt_gate_roots);
             // Engine choice, array containment policy
             // (#array-deadline-forward): ARRAY content always takes the
             // scoped plain engine, even for direct-lane verdicts. The
@@ -770,6 +839,9 @@ impl Executor {
                     self.last_assumption_core = None;
                 }
             }
+            // End of this attempt's problem: hand the enclosing public query
+            // its own authored window back (#uc-minimize-gate-window).
+            self.independent_gate_authored_assertions = saved_gate_authored;
             // Adapt the headroom to the costliest attempt observed; the fuse
             // trips (after result processing — a late unsat is still a valid
             // verification) when the engine grossly ignored its per-solve
@@ -922,57 +994,4 @@ impl Executor {
         }
         result
     }
-}
-
-/// Memoized term node-count for the tail-first candidate order
-/// (#uc-minimize-policy P3): tree size computed over the hash-consed DAG —
-/// each distinct subterm's size is computed once (memo), shared subterms
-/// COUNT at every occurrence (saturating add, so deeply shared DAGs
-/// saturate instead of overflowing). Deterministic: a pure function of the
-/// parsed term structure. Iterative post-order — assert bodies on the axiom
-/// classes nest deeply enough that recursion would risk the stack.
-fn term_node_count(terms: &TermStore, memo: &mut DetHashMap<TermId, u64>, root: TermId) -> u64 {
-    fn children(data: &TermData, out: &mut Vec<TermId>) {
-        match data {
-            TermData::Const(_) | TermData::Var(..) => {}
-            TermData::App(_, args) => out.extend_from_slice(args),
-            TermData::Let(bindings, body) => {
-                out.extend(bindings.iter().map(|(_, t)| *t));
-                out.push(*body);
-            }
-            TermData::Not(t) => out.push(*t),
-            TermData::Ite(c, t, e) => out.extend([*c, *t, *e]),
-            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-                out.push(*body);
-                out.extend(triggers.iter().flatten().copied());
-            }
-            // `TermData` is #[non_exhaustive]; future leaf-or-unknown
-            // variants count as size 1 (still deterministic).
-            _ => {}
-        }
-    }
-    let mut stack: Vec<(TermId, bool)> = vec![(root, false)];
-    let mut kids: Vec<TermId> = Vec::new();
-    while let Some((id, expanded)) = stack.pop() {
-        if memo.contains_key(&id) {
-            continue;
-        }
-        kids.clear();
-        children(terms.get(id), &mut kids);
-        if expanded {
-            let mut n: u64 = 1;
-            for k in &kids {
-                n = n.saturating_add(memo.get(k).copied().unwrap_or(1));
-            }
-            memo.insert(id, n);
-        } else {
-            stack.push((id, true));
-            for k in &kids {
-                if !memo.contains_key(k) {
-                    stack.push((*k, false));
-                }
-            }
-        }
-    }
-    memo.get(&root).copied().unwrap_or(1)
 }

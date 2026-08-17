@@ -1,6 +1,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
+
+#![allow(unsafe_code)] // Direct C-ABI conformance tests.
+
 //! Integration test for ay_z3_compat.h header coverage (#4990).
 //!
 //! Exercises all 19 functions that were added to the header in the

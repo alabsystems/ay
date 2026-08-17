@@ -4,7 +4,8 @@
 
 // Verified result wrappers (VerifiedSatResult, VerifiedAssumeResult) are
 // defined in `types.rs` and re-exported from this module.
-// Crate-level `#![forbid(unsafe_code)]` prevents transmute-based type forgery.
+// Crate-level `#![deny(unsafe_code)]` blocks unaudited type forgery; narrow
+// hot-path exceptions opt in beside their safety invariants.
 
 //! Main CDCL SAT solver
 //!
@@ -160,6 +161,7 @@ mod cold;
 mod cold_restart;
 pub(crate) mod compact;
 mod config;
+mod config_capability;
 mod config_preprocess;
 mod config_preprocess_bve;
 mod config_preprocess_cleanup;
@@ -220,6 +222,7 @@ pub(crate) mod reap;
 mod reduction;
 mod reduction_between_solves;
 mod reduction_execute;
+mod reduction_triggers;
 mod relevancy;
 mod rephase;
 mod restart;

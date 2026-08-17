@@ -20,6 +20,8 @@
 //
 // Part of #7914: TLA2 codegen pipeline for ay specs.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -275,12 +277,8 @@ impl KindCodegen {
 
     /// SafeFromInductionRequiresBaseCheck:
     ///   (result = "Safe" /\ phase in {"forward","backward"}) => baseCaseChecked
-    fn check_safe_from_induction_requires_base_check(
-        &self,
-        state: &KindCodegenState,
-    ) -> bool {
-        !(state.result == "Safe"
-            && ["forward", "backward"].contains(&state.phase.as_str()))
+    fn check_safe_from_induction_requires_base_check(&self, state: &KindCodegenState) -> bool {
+        !(state.result == "Safe" && ["forward", "backward"].contains(&state.phase.as_str()))
             || state.base_case_checked
     }
 }
@@ -372,10 +370,7 @@ mod tests {
             "Expected >10 reachable states, got {}",
             seen.len()
         );
-        assert!(
-            transitions_checked > 0,
-            "No transitions checked"
-        );
+        assert!(transitions_checked > 0, "No transitions checked");
         eprintln!(
             "Exhaustive exploration: {} states, {} transitions",
             seen.len(),

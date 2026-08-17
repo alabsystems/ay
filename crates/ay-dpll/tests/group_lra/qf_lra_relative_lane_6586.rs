@@ -100,7 +100,7 @@ fn test_constraints_tempo_width_10_reports_bound_refinement_handoffs_issue_6586(
     // `benchmarks/smtcomp/` is gitignored, so a clean checkout has no corpus.
     // Skip when the fixture is absent instead of hard-failing; the Sat assertion
     // below is unchanged and still runs wherever the corpus is installed.
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "SKIP test_constraints_tempo_width_10_reports_bound_refinement_handoffs_issue_6586: \
              corpus benchmark not found: {}",

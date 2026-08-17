@@ -319,11 +319,13 @@ impl Solver {
                 let _ = self.charge_proof_bookkeeping(units);
             }
             if let Some(ref mut trace) = self.cold.clause_trace {
-                trace.add_clause_with_hints(
+                // #A3: slice API — literals/hints are copied straight into the
+                // trace's shared pools without per-entry Vec allocations.
+                trace.add_clause_with_hint_slices(
                     clause_id,
-                    literals.to_vec(),
+                    literals,
                     !forward_check_derived,
-                    resolution_hints.to_vec(),
+                    resolution_hints,
                 );
             }
         }

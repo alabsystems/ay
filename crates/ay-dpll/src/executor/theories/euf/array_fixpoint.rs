@@ -7,7 +7,7 @@
 use super::super::super::Executor;
 use super::{reachable_term_set, ArrayAxiomMode};
 use crate::combined_solvers::combiner::{
-    CrossTheoryEqualityReplay, EufArrayNotifyReplayEdge, TheoryCombiner,
+    CrossTheoryEqualityReplay, EufArrayNotifyReplayState, TheoryCombiner,
 };
 use crate::executor::theories::solve_harness::TheoryModels;
 use crate::executor::theories::MAX_SPLITS_ARRAY_EUF;
@@ -75,6 +75,25 @@ impl ArrayAxiomPlan {
 }
 
 impl Executor {
+    /// Run exact finite-array closure over an owned, preprocessed assertion
+    /// window, returning that window with every generated axiom appended.
+    ///
+    /// Combined routes build their final solver input in a local `Vec` and only
+    /// install it immediately before dispatch. A route-independent eager pass
+    /// cannot see equalities created by their legacy ROW/fixpoint preprocessing,
+    /// while running before store-flat substitution retains dead aliases. This
+    /// scoped swap makes the exact pass a post-preprocessing operation without
+    /// leaking the temporary assertion view into the public scope.
+    pub(in crate::executor) fn close_finite_arrays_in_owned_assertion_window(
+        &mut self,
+        assertions: Vec<TermId>,
+        extra_roots: &[TermId],
+    ) -> Vec<TermId> {
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, assertions);
+        let _ = self.add_finite_index_array_closure_with_roots(extra_roots);
+        std::mem::replace(&mut self.ctx.assertions, saved_assertions)
+    }
+
     /// Whether the active assertion/assumption roots contain an explicit
     /// symbolic array-default term.  Such terms require the carrier-sensitive
     /// default fixpoint even when the BV path's select-count throttle would
@@ -106,7 +125,15 @@ impl Executor {
         // pipeline that only processes scoped assertions, avoiding phantom
         // axioms from dead terms in the append-only TermStore (#6726).
         if self.incremental_mode {
-            return self.solve_array_euf_incremental();
+            let _ = self.add_finite_index_array_closure();
+            self.add_const_store_array_extensionality();
+            // Const/store extensionality over an infinite outer carrier can
+            // synthesize an equality between array-valued cells whose nested
+            // carrier is finite. Close that newly exposed final surface before
+            // the persistent encoder snapshots it.
+            let _ = self.add_finite_index_array_closure();
+            let result = self.solve_array_euf_incremental();
+            return self.fail_close_incomplete_finite_array_sat(result);
         }
 
         // Snapshot the user-facing assertions before destructive in-place
@@ -130,24 +157,6 @@ impl Executor {
         // forms (#6885).
         let mut flatten_pass = crate::preprocess::FlattenAnd::new();
         flatten_pass.apply(&mut self.ctx.terms, &mut self.ctx.assertions);
-
-        // Exact finite-index extensionality for array equalities over a small
-        // finite index domain (Bool, or BitVec width <= cap). The lazy
-        // single-Skolem extensionality axiom can only WITNESS a difference; it
-        // cannot REFUTE an equality that secretly fails at a concrete index, so
-        // `(= (store ((as const ...) true) false false) ((as const ...) false))`
-        // over `(Array Bool Bool)` was left under-constrained and returned
-        // wrong-SAT. Asserting `(= a b) <=> AND_i (= (select a i) (select b i))`
-        // over the 2 Bool indices decides it exactly. (#bug13 wrong-sat)
-        self.add_finite_index_array_extensionality();
-
-        // Restricted extensionality for `const-array = store-chain` over an INFINITE
-        // index domain (#array-const-store-ext): the lazy ArraySolver applies the
-        // const=store congruence at only ONE written index of a multi-store chain, so
-        // `((as const) ed) = (store (store c i0 e3) i1 e0)` (i0!=i1, e3!=e0) was wrongly
-        // SAT. Posts `(= a b) => (= (select a e)(select b e))` over the chain's store
-        // indices — sound implications that the ROW axioms then resolve.
-        self.add_const_store_array_extensionality();
 
         // #6820: Inline store-flat array equalities before axiom generation.
         // Store-flat benchmarks (storecomm_*_sf_*, storeinv_*_sf_*, swap_*_sf_*)
@@ -219,6 +228,20 @@ impl Executor {
         } else {
             array_alias_var_subst = crate::preprocess::VariableSubstitution::new_skip_arrays();
         }
+
+        // Exact finite-index array coverage must run on the POST-substitution
+        // surface. Expanding first embeds every store-flat definition inside a
+        // generated biconditional, making the subsequent substitution retain
+        // the alias and multiplying a cheap SSA chain by its whole finite
+        // domain. The route-independent pre-dispatch pass defers QF_AX/DtAx to
+        // this site for the same reason.
+        let _ = self.add_finite_index_array_closure();
+
+        // Restricted extensionality for `const-array = store-chain` over an
+        // infinite index domain (#array-const-store-ext). This also belongs
+        // after substitution so dead store-flat aliases do not seed axioms.
+        self.add_const_store_array_extensionality();
+
         // Enable reachability scoping when store-flat substitution removed
         // defining equalities (dead array vars) OR when finite-domain
         // expansion / skolemization left ghost quantifier `Var` terms in the
@@ -261,14 +284,14 @@ impl Executor {
         // search, and the lanes were measured as ~60% of on-CPU time with
         // zero conflicts contributed (t3 reds: 17.9s->2.9s;
         // unknown@T:60->unsat ~30s; 0 verdict changes + 1 unknown->unsat
-        // across the 300-file corpus sweep). `AY_QFAX_ARR_BCP_LANES=1`
+        // across the 300-file corpus sweep). `--dpll-force-qfax-arr-bcp-lanes`
         // restores the legacy lanes unconditionally (safety valve, mirrors
-        // AY_NO_PROP_FEEDBACK). Completeness/soundness are owned by the full
+        // --dpll-no-prop-feedback). Completeness/soundness are owned by the full
         // `check()` + final_check ladder either way (see the
         // `arrays_bcp_lanes` field docs in combiner.rs).
         let arrays_bcp_lanes = self.has_top_level_positive_store_store_equality()
-            || std::env::var_os("AY_QFAX_ARR_BCP_LANES").is_some();
-        if std::env::var_os("AY_QFAX_LANES_DEBUG").is_some() {
+            || ay_core::theory_disable_flags().force_qfax_arr_bcp_lanes;
+        if ay_core::misc_cli_flags().qfax_lanes_debug {
             eprintln!("[qfax_lanes] arrays_bcp_lanes={arrays_bcp_lanes}");
         }
 
@@ -284,6 +307,12 @@ impl Executor {
         // on size7 — the bottleneck is the DPLL(T) refinement loop overhead,
         // not the eager clause surface.
         self.run_array_axiom_fixpoint_at(0, ArrayAxiomMode::LazyRow2FinalCheck);
+
+        // The legacy ROW pass can itself expose array-valued cell equalities.
+        // Re-enter the idempotent exact closure on that final assertion surface
+        // so nested finite arrays are closed before either the trivial-SAT exit
+        // or DPLL(T) sees the window.
+        let _ = self.add_finite_index_array_closure();
 
         // #8635: If the caller interrupted or the deadline expired during the
         // fixpoint loop, return Unknown immediately instead of proceeding to
@@ -311,6 +340,11 @@ impl Executor {
             let true_term = self.ctx.terms.true_term();
             if self.ctx.assertions.is_empty() || self.ctx.assertions.iter().all(|&a| a == true_term)
             {
+                if !self.finite_array_expansion.is_complete() {
+                    self.ctx.assertions = pre_solve_assertions;
+                    let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
+                    return Ok(SolveResult::Unknown);
+                }
                 // Restore the user-facing assertions so the model-output layer
                 // can resolve get-value/get-model from the committed equalities
                 // (store-flat/alias substitution rewrote them in place) (#5450).
@@ -421,7 +455,7 @@ impl Executor {
             let mut _persistent_array_exact_select_model_eqs: ay_core::kani_compat::DetHashSet<
                 ExactSelectModelEqKey,
             > = ay_core::kani_compat::DetHashSet::default();
-            let mut _persistent_euf_array_notify_edges: Vec<EufArrayNotifyReplayEdge> = Vec::new();
+            let mut _persistent_euf_array_notify_edges = EufArrayNotifyReplayState::default();
             let mut _persistent_array_equality_replays: Vec<ArrayPropagatedEqualityReplay> =
                 Vec::new();
             let mut _persistent_cross_theory_equality_replays: Vec<CrossTheoryEqualityReplay> =
@@ -465,7 +499,7 @@ impl Executor {
                     theory.import_cross_theory_equality_replays(
                         &_persistent_cross_theory_equality_replays,
                     );
-                    theory.import_euf_array_notify_replay_edges(
+                    theory.import_euf_array_notify_replay_state(
                         &_persistent_euf_array_notify_edges,
                     );
                 },
@@ -517,6 +551,8 @@ impl Executor {
                 skip_arith_triangle: true
             )
         });
+
+        let result = self.fail_close_incomplete_finite_array_sat(result);
 
         if matches!(result, Ok(SolveResult::Sat))
             && !array_alias_var_subst.substitutions().is_empty()
@@ -835,7 +871,7 @@ impl Executor {
         // chains while capping worst-case growth if the gate misfires. No env
         // override (no-env-vars law) — this is the former unset default.
         let row2b_gate_budget: usize = 256 * self.qfax_budget_multiplier;
-        if self.qfax_budget_multiplier > 1 && std::env::var_os("AY_DEBUG_LADDER").is_some() {
+        if self.qfax_budget_multiplier > 1 && ay_core::misc_cli_flags().debug_ladder {
             eprintln!("[ladder] tier-2 fixpoint active, row2b_budget={row2b_gate_budget}");
         }
         // #6820: Budget controls to prevent exponential growth in the eager

@@ -38,6 +38,8 @@ use crate::ematching::subst_vars;
 use crate::executor_types::{Result, SolveResult};
 use crate::logic_detection::LogicCategory;
 
+mod false_instance;
+
 /// Maximum BV-MBQI refinement rounds.
 const MAX_BV_MBQI_ROUNDS: usize = 5;
 
@@ -706,30 +708,16 @@ impl Executor {
                         .collect();
                     let ground_body = subst_vars(&mut self.ctx.terms, body, &subst_map);
 
-                    // Evaluate under the model; model-less rounds constant-fold
-                    // against the empty model instead (fully-interpreted closed
-                    // instances get a definite verdict, anything that would
-                    // need a model value fails closed to `Unknown`).
-                    let eval = match self.last_model {
-                        Some(ref model) => self.evaluate_term(model, ground_body),
-                        None => self.evaluate_term(&empty_model, ground_body),
-                    };
-
-                    match eval {
-                        EvalValue::Bool(true) => {
-                            // Satisfies — continue
-                        }
-                        EvalValue::Bool(false) => {
-                            // Counterexample found
-                            if seen_instantiations.insert(ground_body) {
-                                new_instantiations.push(ground_body);
-                            }
-                            all_satisfied = false;
-                        }
-                        _ => {
-                            // Unknown
-                            all_satisfied = false;
-                        }
+                    if !self.observe_bv_mbqi_instance(
+                        quant,
+                        body,
+                        &subst_map,
+                        &binding,
+                        ground_body,
+                        &empty_model,
+                        (&mut seen_instantiations, &mut new_instantiations),
+                    ) {
+                        all_satisfied = false;
                     }
 
                     checked += 1;

@@ -62,12 +62,7 @@ use std::time::Duration;
 /// headroom, not an expectation.
 fn witness_budget() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("AY_CHC_GROUND_WITNESS_BUDGET_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2_000)
-    }))
+    Duration::from_millis(*MS.get_or_init(|| 2_000))
 }
 
 /// Total wall-clock budget for ALL witness solves in one back-translation.
@@ -77,22 +72,13 @@ fn witness_budget() -> Duration {
 /// skipped and completion reverts to sort defaults.
 fn witness_chain_budget() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("AY_CHC_GROUND_WITNESS_TOTAL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30_000)
-    }))
+    Duration::from_millis(*MS.get_or_init(|| 30_000))
 }
 
 /// Whether the witness solve is enabled at all (kill switch).
 fn witness_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        !std::env::var("AY_CHC_DISABLE_GROUND_WITNESS")
-            .map(|value| value != "0")
-            .unwrap_or(false)
-    })
+    // B15: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().ground_witness
 }
 
 thread_local! {

@@ -47,7 +47,7 @@ pub(super) fn value_unavailable_marker(detail: &str) -> String {
 fn eval_value_real_string(value: &EvalValue) -> Option<String> {
     match value {
         EvalValue::Rational(r) => Some(format_real(r)),
-        EvalValue::Algebraic(v) => match v.to_number() {
+        EvalValue::Algebraic(v) => match v.to_number_for_output() {
             Some(ay_nra::RealScalar::Rational(r)) => Some(format_real(&r)),
             _ => None,
         },
@@ -1621,7 +1621,7 @@ impl Executor {
             // Exact real algebraic value: rational-valued expressions print as
             // plain rationals; irrational ones in z3 `root-obj` syntax, e.g.
             // `(root-obj (+ (^ x 2) (- 2)) 2)` for `√2`.
-            EvalValue::Algebraic(v) => match v.to_number() {
+            EvalValue::Algebraic(v) => match v.to_number_for_output() {
                 Some(ay_nra::RealScalar::Rational(r)) => {
                     if r.is_integer() {
                         Ok(r.numer().to_string())
@@ -1738,7 +1738,7 @@ impl Executor {
             // ROOT INDEX, which this representation stores as an isolating
             // interval instead. Declining to print is fail-closed: a caller
             // gets no value rather than a wrong one. Converting the interval
-            // to an index is part of the ordering work (see the A1 TODO in
+            // to an index is part of the ordering work documented in
             // `ay-model-check::algebraic`).
             MV::Algebraic(_) => None,
             MV::Int(i) => Some(format_bigint(i)),

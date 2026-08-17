@@ -1140,13 +1140,184 @@ impl<'a> Evaluator<'a> {
         if (1..args.len()).all(|k| self.congruent_equal(args[0], args[k], depth)) {
             return Ok(ModelValue::Bool(true));
         }
+        let operand_sort = self.terms.sort(args[0]);
+        if args[1..]
+            .iter()
+            .any(|&arg| self.terms.sort(arg) != operand_sort)
+        {
+            return Err("= operands have different sorts".to_string());
+        }
         let vals = self.eval_all(args, depth)?;
         for v in &vals[1..] {
-            if !value_eq(&vals[0], v)? {
+            if !self.value_eq_at_sort(&vals[0], v, operand_sort)? {
                 return Ok(ModelValue::Bool(false));
             }
         }
         Ok(ModelValue::Bool(true))
+    }
+
+    /// Equality with the operand sort still attached.
+    ///
+    /// Most model values carry enough type information for [`value_eq`]. An
+    /// [`ArrayValue`] intentionally does not: it stores only a default and a
+    /// finite override list. For arrays, the index sort is necessary to decide
+    /// whether differing defaults are reachable. A finite override list can
+    /// never cover `Int`, for example, while it can cover all of `Bool`.
+    fn value_eq_at_sort(
+        &self,
+        left: &ModelValue,
+        right: &ModelValue,
+        sort: &Sort,
+    ) -> Result<bool, String> {
+        match (sort, left, right) {
+            (Sort::Array(array_sort), ModelValue::Array(left), ModelValue::Array(right)) => {
+                self.array_eq_at_sort(left, right, array_sort)
+            }
+            _ => value_eq(left, right),
+        }
+    }
+
+    /// Extensional equality for typed array values.
+    ///
+    /// The untyped comparator in `lib.rs` must fail closed when defaults differ,
+    /// because it cannot know whether finite stores cover the index domain. This
+    /// evaluator owns the original operand sort, so it can make the exact
+    /// distinction:
+    ///
+    /// * on a provably infinite index sort, finitely many stores always leave an
+    ///   index where both defaults are read;
+    /// * on a known finite carrier, equal reads at every distinct stored key
+    ///   decide equality iff those keys cover the complete carrier;
+    /// * on an unknown carrier (notably an uninterpreted sort), it retains the
+    ///   fail-closed result.
+    fn array_eq_at_sort(
+        &self,
+        left: &ArrayValue,
+        right: &ArrayValue,
+        sort: &ay_core::ArraySort,
+    ) -> Result<bool, String> {
+        let defaults_equal =
+            self.value_eq_at_sort(&left.default, &right.default, &sort.element_sort)?;
+
+        // A finite override set cannot hide different defaults over an infinite
+        // carrier. This proof needs no comparison between the stored keys.
+        if !defaults_equal && Self::index_sort_is_definitely_infinite(&sort.index_sort) {
+            return Ok(false);
+        }
+
+        for (key, _) in left.store.iter().chain(&right.store) {
+            let left_value = self.array_select_at_sort(left, key, &sort.index_sort)?;
+            let right_value = self.array_select_at_sort(right, key, &sort.index_sort)?;
+            if !self.value_eq_at_sort(&left_value, &right_value, &sort.element_sort)? {
+                return Ok(false);
+            }
+        }
+        if defaults_equal {
+            return Ok(true);
+        }
+
+        let keys = self.distinct_array_keys(left, right, &sort.index_sort)?;
+        match Self::known_finite_index_cardinality(&sort.index_sort) {
+            Some(cardinality) if BigInt::from(keys.len()) >= cardinality => Ok(true),
+            Some(_) => Ok(false),
+            None => Err(
+                "array equality with differing defaults needs index-domain coverage evidence"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn array_select_at_sort(
+        &self,
+        array: &ArrayValue,
+        index: &ModelValue,
+        index_sort: &Sort,
+    ) -> Result<ModelValue, String> {
+        for (stored_index, value) in array.store.iter().rev() {
+            if self.value_eq_at_sort(stored_index, index, index_sort)? {
+                return Ok(value.clone());
+            }
+        }
+        Ok(array.default.clone())
+    }
+
+    fn distinct_array_keys<'b>(
+        &self,
+        left: &'b ArrayValue,
+        right: &'b ArrayValue,
+        index_sort: &Sort,
+    ) -> Result<Vec<&'b ModelValue>, String> {
+        let mut distinct: Vec<&'b ModelValue> = Vec::new();
+        for (key, _) in left.store.iter().chain(&right.store) {
+            if !Self::model_value_can_index_sort(key, index_sort) {
+                return Err("array store key does not inhabit the index sort".to_string());
+            }
+            let mut duplicate = false;
+            for &seen in &distinct {
+                if self.value_eq_at_sort(key, seen, index_sort)? {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if !duplicate {
+                distinct.push(key);
+            }
+        }
+        Ok(distinct)
+    }
+
+    fn index_sort_is_definitely_infinite(sort: &Sort) -> bool {
+        matches!(sort, Sort::Int | Sort::Real | Sort::String | Sort::Seq(_))
+    }
+
+    /// Exact cardinality for the finite scalar carriers whose model values the
+    /// independent checker can validate without consulting solver state.
+    /// `None` means unknown here, not infinite; infinite carriers are handled
+    /// separately above.
+    fn known_finite_index_cardinality(sort: &Sort) -> Option<BigInt> {
+        match sort {
+            Sort::Bool => Some(BigInt::from(2u8)),
+            Sort::BitVec(bitvec) => Some(BigInt::from(1u8) << bitvec.width as usize),
+            Sort::Char => Some(BigInt::from(0x3_0000u32)),
+            Sort::FiniteDomain(_, size) => Some(BigInt::from(*size)),
+            Sort::Datatype(datatype)
+                if datatype
+                    .constructors
+                    .iter()
+                    .all(|constructor| constructor.fields.is_empty()) =>
+            {
+                Some(BigInt::from(datatype.constructors.len()))
+            }
+            _ => None,
+        }
+    }
+
+    fn model_value_can_index_sort(value: &ModelValue, sort: &Sort) -> bool {
+        match (value, sort) {
+            (ModelValue::Bool(_), Sort::Bool) => true,
+            (ModelValue::Int(_), Sort::Int) => true,
+            (ModelValue::Real(_) | ModelValue::Algebraic(_), Sort::Real) => true,
+            (ModelValue::BitVec { width, value }, Sort::BitVec(bitvec)) => {
+                *width == bitvec.width
+                    && !value.is_negative()
+                    && value < &(BigInt::from(1u8) << bitvec.width as usize)
+            }
+            (ModelValue::Str(_), Sort::String) => true,
+            (ModelValue::Seq(_), Sort::Seq(_)) => true,
+            (ModelValue::Int(value), Sort::Char) => {
+                !value.is_negative() && value < &BigInt::from(0x3_0000u32)
+            }
+            (ModelValue::Int(value), Sort::FiniteDomain(_, size)) => {
+                !value.is_negative() && value < &BigInt::from(*size)
+            }
+            (ModelValue::Datatype { ctor, args }, Sort::Datatype(datatype)) => {
+                datatype.constructors.iter().any(|constructor| {
+                    constructor.name == *ctor && constructor.fields.len() == args.len()
+                })
+            }
+            (ModelValue::Uninterpreted(_), Sort::Uninterpreted(_) | Sort::TypeVar(_)) => true,
+            _ => false,
+        }
     }
 
     /// Sound congruence test: are `lhs` and `rhs` provably equal because they are
@@ -1171,7 +1342,11 @@ impl<'a> Evaluator<'a> {
                 al.iter().zip(ar.iter()).all(|(&x, &y)| {
                     matches!(
                         (self.eval(x, depth + 1), self.eval(y, depth + 1)),
-                        (Ok(vx), Ok(vy)) if value_eq(&vx, &vy).unwrap_or(false)
+                        (Ok(vx), Ok(vy))
+                            if self.terms.sort(x) == self.terms.sort(y)
+                                && self
+                                    .value_eq_at_sort(&vx, &vy, self.terms.sort(x))
+                                    .unwrap_or(false)
                     )
                 })
             }
@@ -1180,10 +1355,20 @@ impl<'a> Evaluator<'a> {
     }
 
     fn eval_distinct(&self, args: &[TermId], depth: usize) -> Result<ModelValue, String> {
+        let Some(&first) = args.first() else {
+            return Ok(ModelValue::Bool(true));
+        };
+        let operand_sort = self.terms.sort(first);
+        if args[1..]
+            .iter()
+            .any(|&arg| self.terms.sort(arg) != operand_sort)
+        {
+            return Err("distinct operands have different sorts".to_string());
+        }
         let vals = self.eval_all(args, depth)?;
         for i in 0..vals.len() {
             for j in (i + 1)..vals.len() {
-                if value_eq(&vals[i], &vals[j])? {
+                if self.value_eq_at_sort(&vals[i], &vals[j], operand_sort)? {
                     return Ok(ModelValue::Bool(false));
                 }
             }

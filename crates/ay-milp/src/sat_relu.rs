@@ -371,7 +371,7 @@ impl SatReluPlan {
                 Err(error) => {
                     if trace_enabled() {
                         eprintln!(
-                            "AY_MILP_TRACE sat-relu-proof: vars={} clauses={} outcome=DECLINE \
+                            "--trace sat-relu-proof: vars={} clauses={} outcome=DECLINE \
                          reason={error} wall={:.6}s",
                             self.num_vars(),
                             self.clauses().len(),
@@ -451,7 +451,7 @@ impl SatReluPlan {
                     SatReluDecision::Unsat => "UNSAT",
                 };
                 eprintln!(
-                    "AY_MILP_TRACE sat-relu: vars={} clauses={} verdict={verdict} wall={:.6}s",
+                    "--trace sat-relu: vars={} clauses={} verdict={verdict} wall={:.6}s",
                     self.gadget.n,
                     self.gadget.clauses.len(),
                     started.elapsed().as_secs_f64(),
@@ -465,7 +465,7 @@ impl SatReluPlan {
 fn trace_proof_attempt(plan: &SatReluPlan, started: Instant, outcome: &str, reason: &str) {
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE sat-relu-proof: vars={} clauses={} outcome={outcome} reason={reason} \
+            "--trace sat-relu-proof: vars={} clauses={} outcome={outcome} reason={reason} \
              wall={:.6}s",
             plan.num_vars(),
             plan.clauses().len(),
@@ -476,7 +476,7 @@ fn trace_proof_attempt(plan: &SatReluPlan, started: Instant, outcome: &str, reas
 
 pub(crate) fn trace_ordinary_fallback() {
     if trace_enabled() {
-        eprintln!("AY_MILP_TRACE sat-relu-proof: fallback=ordinary-cdcl");
+        eprintln!("--trace sat-relu-proof: fallback=ordinary-cdcl");
     }
 }
 
@@ -2072,7 +2072,7 @@ fn trace_enabled() -> bool {
     // `set_var` can race, which priming cannot help. `OnceLock` is the shape
     // that ratchet asks for and `simplex.rs` already uses.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 #[cfg(test)]

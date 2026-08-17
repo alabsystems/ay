@@ -209,7 +209,7 @@ fn integral_f64(v: &Rational) -> Option<f64> {
 /// Its verdict, its optimal value and its witnesses transfer; its evidence does
 /// not.
 pub(crate) fn dual_fix(model: &Model, deadline: Option<Instant>) -> Option<(Model, DualFixLog)> {
-    // KILL SWITCH. `AY_MILP_NO_DUALFIX=1` restores the prior behaviour
+    // KILL SWITCH. `--no-dualfix` restores the prior behaviour
     // byte-identically: this is the only entry point and it returns `None`.
     if crate::tune::on(crate::tune::Knob::NoDualfix) {
         return None;
@@ -959,10 +959,14 @@ mod tests {
         let z = m.add_binary_col();
         m.add_row(f64::NEG_INFINITY, 0.0, &[(y, 1.0), (z, -5.0)]);
         assert!(dual_fix(&m, None).is_some());
-        // SAFETY: single-threaded within the env lock held above.
-        unsafe { std::env::set_var("AY_MILP_NO_DUALFIX", "1") };
-        let off = dual_fix(&m, None);
-        unsafe { std::env::remove_var("AY_MILP_NO_DUALFIX") };
+        // B38: the kill rides the caller layer (`with_dual_fixing(false)`).
+        let off = {
+            let _tuned = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+                crate::tune::Knob::NoDualfix,
+                crate::tune::Setting::Flag(true),
+            ));
+            dual_fix(&m, None)
+        };
         assert!(off.is_none());
     }
 
@@ -1141,9 +1145,11 @@ mod tests {
             };
             fired += 1;
             let with = crate::bab::solve_milp(&m, &opts);
-            // SAFETY: single-threaded within the env lock held above.
-            unsafe { std::env::set_var("AY_MILP_NO_DUALFIX", "1") };
-            let without = crate::bab::solve_milp(&m, &opts);
+            // B38: the kill rides the per-solve engine profile.
+            let off_opts = opts
+                .clone()
+                .with_engine(crate::EngineEconomics::new().with_dual_fixing(false));
+            let without = crate::bab::solve_milp(&m, &off_opts);
             // IS THE HARVEST LOAD-BEARING ON THIS MODEL? Solve the reduced frame
             // directly and ask the seal's own question of its tree: does it
             // verify against the CALLER's model? A `false` here is the exact
@@ -1152,8 +1158,7 @@ mod tests {
             // artifact and none. Counted so the assertions above cannot go
             // quietly vacuous. (The kill switch stays set across this solve so it
             // does not re-enter the reduction on an already-reduced model.)
-            let reduced_outcome = crate::bab::solve_milp(&reduced, &opts);
-            unsafe { std::env::remove_var("AY_MILP_NO_DUALFIX") };
+            let reduced_outcome = crate::bab::solve_milp(&reduced, &off_opts);
             if let crate::Outcome::Infeasible {
                 tree_cert: Some(t), ..
             } = &reduced_outcome

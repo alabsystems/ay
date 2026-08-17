@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! cargo run --release -p ay-milp --example milp_sparse_speed -- 2000 1500 6
-//! AY_MILP_LU=1 TIME_LIMIT=30 ... -- 2000 1500 6
+//! --lu TIME_LIMIT=30 ... -- 2000 1500 6
 //! ```
 
 use std::time::Instant;

@@ -1139,7 +1139,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
     }
 
     /// Wire the Executor-owned sampled propagation-verification memo
-    /// (#verify-memo, `AY_VERIFY_MEMO=1`) into this eager extension.
+    /// (#verify-memo, `--verify-memo=1`) into this eager extension.
     ///
     /// See the `verify_prop_memo` field doc for the trust-true-only policy.
     /// The memo is inert unless the env flag is armed; `None` (the default)

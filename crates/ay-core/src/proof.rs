@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 mod accessors;
 mod annotations;
+mod builders;
 mod fp;
 mod theory_lemma_kind;
 
@@ -40,6 +41,7 @@ pub use fp::FpOp;
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum TheoryLemmaKind {
     /// EUF transitivity chain: `(cl (not (= a b)) (not (= b c)) ... (= a z))`
@@ -89,18 +91,18 @@ pub enum TheoryLemmaKind {
     LiaModRange,
 
     /// Bounded mixed Bool/Int/BV semantic tautology.
-    ///
     /// Every clause literal must be the explicit negation of one source-level
     /// root.  The strict checker reconstructs that conjunction and independently
     /// proves it UNSAT with the bounded BV/LIA interpreter; the producer's tag
     /// carries no authority.  This closes proof-presentation gaps for exact
     /// `bv2nat` obligations while remaining fail-closed outside the checker's
     /// finite fragment.
-    ///
     /// The pinned external Alethe checker does not parse SMT-LIB `bv2nat`, so
     /// this internal certificate renders as an honest `hole` on that wire.
     BvLiaTautology,
 
+    /// Exact five-root guarded sequence contradiction, replayed strictly; unsupported mixed quantified-array Alethe renders as `hole`.
+    SeqExtensionalCompanionContradiction,
     /// Bitvector bit-blasting (legacy, no gate info).
     /// Uses Alethe rule `bv_bitblast`.
     BvBitBlast,
@@ -644,6 +646,58 @@ pub enum TheoryLemmaKind {
     /// constructor registry; without that registry strict mode fails closed.
     DatatypeTesterEval,
 
+    /// Datatype constructor-coverage (exhaustiveness) over ONE scrutinee:
+    /// `(cl (is-C1 t) (is-C2 t) ... (is-Ck t))` where `C1 .. Ck` are ALL the
+    /// declared constructors of `t`'s datatype — every datatype value is built
+    /// by SOME declared constructor, so the disjunction holds in every model.
+    /// This is the DT axiom family the eager selector pass injects for every
+    /// datatype-sorted scrutinee (`dt_selector_axioms` family (D)); with a
+    /// single-constructor datatype the disjunction is the bare unit tester.
+    ///
+    /// Uses AY's `dt_exhaustive` rule (the pinned external Alethe calculus has
+    /// no datatype rules, so on that wire it renders as an honest `hole`).
+    /// Validated by `ay-proof` against the datatype constructor registry — the
+    /// coverage list is re-derived from the declarations, never taken from the
+    /// clause; without the registry this kind fails closed in strict mode.
+    DatatypeExhaustive,
+
+    /// Guarded datatype constructor reconstruction:
+    /// `(cl (not (is-C t)) (= t (C (sel_1 t) .. (sel_k t))))` — if `t` is
+    /// built by constructor `C`, then `t` equals `C` re-applied to `t`'s own
+    /// selector projections, `sel_1 .. sel_k` being ALL of `C`'s declared
+    /// selectors in declared field order (for a nullary `C` the conclusion is
+    /// `(= t C)`). This is the guarded-disjunct form of the constructor axiom
+    /// `is-C(t) => t = C(sel_1(t), ..)` the eager DT pass injects for every
+    /// datatype-sorted scrutinee (`dt_selector_axioms` family (C); `=>` is
+    /// desugared to the disjunction at `mk_implies`).
+    ///
+    /// Uses AY's `dt_ctor_reconstruct` rule (honest `hole` on the external
+    /// Alethe wire). Validated by `ay-proof` against BOTH the datatype
+    /// constructor registry and the constructor→selector registry — the
+    /// selector list and its field order are re-derived from the declarations,
+    /// so a permuted, truncated, or foreign selector chain is rejected;
+    /// without either registry this kind fails closed in strict mode.
+    DatatypeConstructorReconstruct,
+
+    /// Reserved C5b constructor-injectivity vocabulary. Exact typed datatype
+    /// member signatures are available, but the former validator was removed
+    /// pending an iterative, progress-polled resource and stack-safety review.
+    /// Strict checking rejects this kind and the solver does not mint it. It
+    /// renders as an honest `hole` on the external Alethe wire.
+    DatatypeInjective,
+
+    /// Reserved C5b direct-acyclicity vocabulary. Exact typed datatype member
+    /// signatures are available, but strict checking rejects this kind until
+    /// its containment walk is reintroduced iteratively with progress polling
+    /// and conservative work accounting. It renders as an honest Alethe `hole`.
+    DatatypeAcyclicDirect,
+
+    /// Reserved C5b datatype value-equality vocabulary. Exact constructor and
+    /// selector signatures are authenticated, but this kind remains disabled
+    /// with the rest of C5b pending a fresh resource and stack-safety review. It
+    /// renders as an honest Alethe `hole`.
+    DatatypeValueEqCongruence,
+
     /// Bounded exact tautology over a pure total-order / term-ITE fragment.
     /// Numeric leaves are at most six Int or Real variables; numeric terms may
     /// only select such leaves through `ite`, and Boolean structure may only
@@ -659,6 +713,30 @@ pub enum TheoryLemmaKind {
     /// `ay-proof` via exhaustive bounded evaluation over the Bool/small-BV
     /// variables.
     BoolTautology,
+
+    /// Arithmetic equality-adapter triangle:
+    /// `(cl (not (<= a b)) (not (<= b a)) (= a b))` over Int or Real.
+    ///
+    /// The strict checker validates the complete flat three-literal schema;
+    /// this is the flattened conclusion of Alethe's `la_disequality` theorem,
+    /// not a producer-trusted generic arithmetic lemma.
+    ArithEqTriangle,
+
+    /// One direction of the arithmetic equality adapter:
+    /// `(cl (not (= a b)) (<= a b))` or
+    /// `(cl (not (= a b)) (<= b a))`, over equal Int/Real sorts.
+    /// The strict checker independently validates the exact two-literal shape.
+    ArithEqImpliesBound,
+
+    /// Two-literal integer arithmetic clause whose negated literals are exact
+    /// contradictory bounds on the same integral linear form.  Covers both
+    /// branch-and-bound cover clauses and mutually-exclusive split branches.
+    IntBoundsTautology,
+
+    /// Exact guarded arithmetic disequality split.  The final literal is the
+    /// equality guard and the first two literals are precisely the two Int or
+    /// Real branches whose falsity forces that equality.
+    ArithDisequalitySplit,
 
     /// If-then-else with identical branches: `(= (ite c x x) x)` — a conditional
     /// whose two branches are the same term equals that branch, for ANY condition
@@ -804,6 +882,68 @@ pub enum TheoryLemmaKind {
     /// Alethe has no rule for exact FP evaluation, so this internal
     /// certificate renders as an honest `hole` on that wire.
     FpGroundEval,
+
+    /// Exact extensionality over a small, completely enumerated array index
+    /// carrier.
+    ///
+    /// ```text
+    /// (= (= a b)
+    ///    (and (= (select a d0) (select b d0))
+    ///         ...
+    ///         (= (select a dn) (select b dn))))
+    /// ```
+    ///
+    /// The index carrier is exactly `Bool`, a bit-vector of width `1..=8`, or
+    /// an all-nullary datatype with a complete authenticated constructor list.
+    /// AY's strict checker independently verifies both array sorts and every
+    /// carrier point: no duplicate, omitted, foreign, or ill-sorted index is
+    /// accepted. This is a theory tautology because equality of functions on
+    /// every element of a finite domain is equivalent to array equality.
+    ///
+    /// The pinned external Alethe checker has no rule for this finite-domain
+    /// biconditional, so it renders as an honest `hole` on that wire.
+    ///
+    /// Appended after the older variants so their serialized enum ordinals do
+    /// not move.
+    ArrayFiniteExtensionality,
+
+    /// Exact expansion of a symbolic select over a completely enumerated
+    /// finite index carrier.
+    ///
+    /// ```text
+    /// (= (select a i)
+    ///    (ite (= i d0) (select a d0)
+    ///      ...
+    ///      (select a dn)))
+    /// ```
+    ///
+    /// The carrier is exactly `Bool` or an all-nullary datatype with a
+    /// complete authenticated constructor list. The strict checker verifies
+    /// the full ITE chain (including the term store's exact equality-over-ITE
+    /// normal form), the common array and symbolic index, every branch sort,
+    /// and complete duplicate-free carrier coverage. The final unguarded
+    /// branch is sound precisely because the preceding tests plus the final
+    /// point exhaust the carrier.
+    ///
+    /// The pinned external Alethe checker has no corresponding rule, so this
+    /// internal certificate renders as an honest `hole` on that wire.
+    ///
+    /// Appended after the older variants so their serialized enum ordinals do
+    /// not move.
+    ArrayFiniteSelectExpansion,
+
+    /// Exact NNF dual implication for a negated existential:
+    /// `(cl (not (not (exists (x..) body))) (forall (x..) (not body)))`.
+    ///
+    /// AY's strict checker validates binder, trigger, polarity, and body shape
+    /// directly. This internal bridge carries no payload and fails closed on
+    /// any normalization beyond raw negation/double-negation elimination.
+    /// The pinned external Alethe checker has no quantifier-duality rule, so
+    /// the bridge renders as an honest `hole` on that wire.
+    ///
+    /// Appended after the older variants so their serialized enum ordinals do
+    /// not move.
+    QuantifierNegatedExistsDual,
 }
 
 /// Proof annotation for a theory lemma clause in the SAT clause trace (#6031 Phase 4).
@@ -829,11 +969,11 @@ pub struct TheoryLemmaProof {
 
 /// A proof step (Alethe-compatible)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ProofStep {
     /// Input assertion from the problem
     Assume(TermId),
-
     /// Resolution inference (SAT solver)
     Resolution {
         /// The resolvent clause (result of resolution)
@@ -881,7 +1021,6 @@ pub enum ProofStep {
         variables: Vec<(String, crate::sort::Sort)>,
     },
 }
-
 pub use crate::alethe::{
     alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
     CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
@@ -905,210 +1044,6 @@ pub struct Proof {
     pub steps: Vec<ProofStep>,
     /// Named step IDs (for assume commands)
     pub named_steps: crate::kani_compat::KaniHashMap<String, ProofId>,
-}
-
-impl Proof {
-    /// Create a new empty proof
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Rebuild a proof from an ordered list of steps, leaving `named_steps`
-    /// empty. `ProofId(i)` resolves to `steps[i]` (the same positional invariant
-    /// [`add_step`](Self::add_step) maintains), so the step DAG is preserved.
-    /// `named_steps` only resolves `assume` *names* for the Alethe printer and is
-    /// never consulted by [`check_proof`](crate) / `check_proof_strict`, so a
-    /// proof rebuilt this way re-checks identically. This is the deserialization
-    /// counterpart used to reconstruct a [`Proof`] from a serialized step list.
-    #[must_use]
-    pub fn from_steps(steps: Vec<ProofStep>) -> Self {
-        Self {
-            steps,
-            named_steps: crate::kani_compat::KaniHashMap::default(),
-        }
-    }
-
-    /// Add a proof step
-    #[allow(clippy::cast_possible_truncation)] // Proof step count is bounded well under u32::MAX
-    pub fn add_step(&mut self, step: ProofStep) -> ProofId {
-        debug_assert!(
-            self.steps.len() < u32::MAX as usize,
-            "BUG: proof exceeds u32::MAX steps ({})",
-            self.steps.len()
-        );
-        let id = ProofId(self.steps.len() as u32);
-        self.steps.push(step);
-        id
-    }
-
-    /// Add an assumption and optionally name it
-    pub fn add_assume(&mut self, term: TermId, name: Option<String>) -> ProofId {
-        let id = self.add_step(ProofStep::Assume(term));
-        if let Some(n) = name {
-            self.named_steps.insert(n, id);
-        }
-        id
-    }
-
-    /// Add a generic step with a rule
-    pub fn add_rule_step(
-        &mut self,
-        rule: AletheRule,
-        clause: Vec<TermId>,
-        premises: Vec<ProofId>,
-        args: Vec<TermId>,
-    ) -> ProofId {
-        self.add_step(ProofStep::Step {
-            rule,
-            clause,
-            premises,
-            args,
-        })
-    }
-
-    /// Add a resolution step
-    pub fn add_resolution(
-        &mut self,
-        clause: Vec<TermId>,
-        pivot: TermId,
-        clause1: ProofId,
-        clause2: ProofId,
-    ) -> ProofId {
-        self.add_step(ProofStep::Resolution {
-            clause,
-            pivot,
-            clause1,
-            clause2,
-        })
-    }
-
-    /// Add a theory lemma with default kind
-    pub fn add_theory_lemma(&mut self, theory: impl Into<String>, clause: Vec<TermId>) -> ProofId {
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas: None,
-            kind: TheoryLemmaKind::Generic,
-            lia: None,
-        })
-    }
-
-    /// Add a theory lemma with specified kind
-    pub fn add_theory_lemma_with_kind(
-        &mut self,
-        theory: impl Into<String>,
-        clause: Vec<TermId>,
-        kind: TheoryLemmaKind,
-    ) -> ProofId {
-        debug_assert!(
-            !matches!(kind, TheoryLemmaKind::LraFarkas),
-            "BUG: LraFarkas requires Farkas :args; use add_theory_lemma_with_farkas_and_kind"
-        );
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas: None,
-            kind,
-            lia: None,
-        })
-    }
-
-    /// Add a theory lemma with Farkas annotation (for arithmetic theories)
-    pub fn add_theory_lemma_with_farkas(
-        &mut self,
-        theory: impl Into<String>,
-        clause: Vec<TermId>,
-        farkas: FarkasAnnotation,
-    ) -> ProofId {
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas: Some(farkas),
-            kind: TheoryLemmaKind::LraFarkas,
-            lia: None,
-        })
-    }
-
-    /// Add a theory lemma with Farkas annotation and explicit kind
-    pub fn add_theory_lemma_with_farkas_and_kind(
-        &mut self,
-        theory: impl Into<String>,
-        clause: Vec<TermId>,
-        farkas: FarkasAnnotation,
-        kind: TheoryLemmaKind,
-    ) -> ProofId {
-        // Farkas certificates must have non-negative coefficients.
-        // A negative coefficient indicates a bug in the arithmetic solver's
-        // conflict explanation. Catch early before emitting into the proof.
-        debug_assert!(
-            farkas.is_valid(),
-            "BUG: Farkas certificate has negative coefficient(s): {:?}",
-            farkas.coefficients,
-        );
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas: Some(farkas),
-            kind,
-            lia: None,
-        })
-    }
-
-    /// Add a theory lemma with optional Farkas annotation and explicit kind (#6031 Phase 4).
-    ///
-    /// Like `add_theory_lemma_with_farkas_and_kind` but accepts `Option<FarkasAnnotation>`,
-    /// used by `SatProofManager` when wiring theory lemma annotations from the clause trace.
-    pub fn add_theory_lemma_with_farkas_and_kind_opt(
-        &mut self,
-        theory: impl Into<String>,
-        clause: Vec<TermId>,
-        farkas: Option<FarkasAnnotation>,
-        kind: TheoryLemmaKind,
-    ) -> ProofId {
-        if let Some(ref f) = farkas {
-            debug_assert!(
-                f.is_valid(),
-                "BUG: Farkas certificate has negative coefficient(s): {:?}",
-                f.coefficients,
-            );
-        }
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas,
-            kind,
-            lia: None,
-        })
-    }
-
-    /// Add a theory lemma with LIA annotation and explicit kind.
-    ///
-    /// Used by the LIA solver when it can provide a specific proof shape
-    /// (bounds gap, divisibility, or cutting plane).
-    pub fn add_theory_lemma_with_lia(
-        &mut self,
-        theory: impl Into<String>,
-        clause: Vec<TermId>,
-        farkas: Option<FarkasAnnotation>,
-        kind: TheoryLemmaKind,
-        lia: LiaAnnotation,
-    ) -> ProofId {
-        if let Some(ref f) = farkas {
-            debug_assert!(
-                f.is_valid(),
-                "BUG: Farkas certificate has negative coefficient(s): {:?}",
-                f.coefficients,
-            );
-        }
-        self.add_step(ProofStep::TheoryLemma {
-            theory: theory.into(),
-            clause,
-            farkas,
-            kind,
-            lia: Some(lia),
-        })
-    }
 }
 
 #[allow(clippy::panic)]

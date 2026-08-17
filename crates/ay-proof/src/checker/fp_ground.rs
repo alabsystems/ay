@@ -1700,3 +1700,7 @@ fn values_equal(left: &Val, right: &Val) -> Option<bool> {
 #[cfg(test)]
 #[path = "fp_ground_tests.rs"]
 mod fp_ground_tests;
+
+#[cfg(test)]
+#[path = "fp_ground_adversarial_audit_tests.rs"]
+mod fp_ground_adversarial_audit_tests;

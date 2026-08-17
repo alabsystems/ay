@@ -4,6 +4,8 @@
 
 //! Native reducer/replay export for downstream consumers.
 
+mod identity_validation;
+
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -175,15 +177,12 @@ impl Solver {
             }
         }
         let datatype_declarations = datatype_declarations_from_events(&self.native_replay_events);
-        let mut function_declarations =
-            function_declarations_from_events(self, &self.native_replay_events, &mut replay_gaps);
-        function_declarations.retain(|declaration| {
-            needed_functions.contains(&declaration.name)
-                || self
-                    .native_fun_signatures
-                    .get(&declaration.name)
-                    .is_some_and(|registration| needed_functions.contains(&registration.core_name))
-        });
+        let function_declarations = function_declarations_from_events(
+            self,
+            &self.native_replay_events,
+            &needed_functions,
+            &mut replay_gaps,
+        );
         let symbol_identities = export_native_replay_symbol_identities(
             self,
             &declarations,
@@ -1260,6 +1259,7 @@ fn native_replay_manifest_rejection_reasons(
 fn function_declarations_from_events(
     solver: &Solver,
     events: &[NativeReplayEvent],
+    needed_functions: &HashSet<String>,
     replay_gaps: &mut Vec<String>,
 ) -> Vec<NativeReplayFunctionDeclaration> {
     let mut declarations = Vec::new();
@@ -1270,6 +1270,19 @@ fn function_declarations_from_events(
             range,
         } = &event.kind
         {
+            // Native applications carry the frontend-assigned core identity,
+            // not the caller-visible spelling. In particular, a declaration
+            // named `=` owns a private core while a builtin equality retains
+            // the raw canonical `=` head. Matching both against the surface
+            // spelling would retain an unused declaration and let replay put a
+            // shadowing symbol into scope unnecessarily.
+            let is_needed = solver.native_fun_signatures.get(name).map_or_else(
+                || needed_functions.contains(name),
+                |registration| needed_functions.contains(&registration.core_name),
+            );
+            if !is_needed {
+                continue;
+            }
             if declarations
                 .iter()
                 .any(|decl: &NativeReplayFunctionDeclaration| {
@@ -1973,67 +1986,7 @@ fn validate_native_replay_identity_tables(
 
     validate_native_replay_symbol_identity_table(artifact, &nodes)?;
 
-    let mut declaration_terms = HashSet::default();
-    let mut declaration_names = HashSet::default();
-    let mut declaration_core_names = HashSet::default();
-    for declaration in &artifact.declarations {
-        if !declaration_terms.insert(declaration.term) {
-            return Err(native_replay_artifact_error(format!(
-                "duplicate declaration for term {}",
-                declaration.term.0
-            )));
-        }
-        if !declaration_names.insert(declaration.name.as_str()) {
-            return Err(native_replay_artifact_error(format!(
-                "duplicate native constant declaration name `{}`",
-                declaration.name
-            )));
-        }
-        if ay_frontend::is_reserved_symbol(&declaration.name) {
-            return Err(native_replay_artifact_error(format!(
-                "native constant declaration name `{}` is reserved",
-                declaration.name
-            )));
-        }
-        if !declaration_core_names.insert(declaration.core_name.as_str()) {
-            return Err(native_replay_artifact_error(format!(
-                "duplicate native constant core identity `{}`",
-                declaration.core_name
-            )));
-        }
-        if declaration.core_name != declaration.name
-            && !is_allocator_private_declaration_identity(&declaration.core_name)
-        {
-            return Err(native_replay_artifact_error(format!(
-                "declaration `{}` claims an unauthorized private core identity `{}`",
-                declaration.name, declaration.core_name
-            )));
-        }
-        let Some(node) = nodes.get(&declaration.term) else {
-            return Err(native_replay_artifact_error(format!(
-                "declaration `{}` references missing term {}",
-                declaration.name, declaration.term.0
-            )));
-        };
-        let TermData::Var(node_name, _) = &node.data else {
-            return Err(native_replay_artifact_error(format!(
-                "declaration `{}` targets non-variable term {}",
-                declaration.name, declaration.term.0
-            )));
-        };
-        if node_name != &declaration.core_name {
-            return Err(native_replay_artifact_error(format!(
-                "declaration `{}` records core identity `{}`, but term {} uses `{node_name}`",
-                declaration.name, declaration.core_name, declaration.term.0
-            )));
-        }
-        if node.is_datatype_constructor {
-            return Err(native_replay_artifact_error(format!(
-                "term {} cannot be both a native constant and a datatype constructor",
-                declaration.term.0
-            )));
-        }
-    }
+    let declaration_names = identity_validation::validate_constant_identities(artifact, &nodes)?;
 
     let mut function_names = HashSet::default();
     for declaration in &artifact.function_declarations {
@@ -4016,6 +3969,29 @@ fn rebuild_builtin_application(
     symbol: &Symbol,
     args: &[TermId],
 ) -> Result<TermId, SolverError> {
+    // A serialized named head is a core identity, not surface syntax. Reusing
+    // surface elaboration for a raw canonical operator after replaying a
+    // same-spelled private declaration changes its meaning: e.g. builtin `=`
+    // becomes the user UF named `=`. Bypass declaration lookup for canonical
+    // heads and invoke the frontend's shared builtin dispatcher directly.
+    if let Symbol::Named(name) = symbol {
+        if ay_frontend::is_canonical_theory_operator_identity(name) {
+            let rebuilt = solver
+                .executor
+                .context_mut_internal()
+                .elaborate_canonical_theory_application(name, args)
+                .map_err(|error| {
+                    native_replay_term_error(
+                        node.id,
+                        format!(
+                            "unrecognized or ill-sorted canonical application `{symbol}`: {error}"
+                        ),
+                    )
+                })?;
+            return validate_rebuilt_builtin_sort(solver, node, symbol, rebuilt);
+        }
+    }
+
     let bindings: Vec<(String, TermId)> = args
         .iter()
         .enumerate()
@@ -4047,6 +4023,15 @@ fn rebuild_builtin_application(
                 format!("unrecognized or ill-sorted builtin application `{symbol}`"),
             )
         })?;
+    validate_rebuilt_builtin_sort(solver, node, symbol, rebuilt)
+}
+
+fn validate_rebuilt_builtin_sort(
+    solver: &Solver,
+    node: &NativeReplayTermNode,
+    symbol: &Symbol,
+    rebuilt: TermId,
+) -> Result<TermId, SolverError> {
     let actual_sort = solver.terms().sort(rebuilt);
     if actual_sort != &node.sort {
         return Err(native_replay_term_error(

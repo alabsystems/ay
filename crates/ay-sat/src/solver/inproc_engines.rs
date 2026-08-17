@@ -101,10 +101,10 @@ pub(crate) struct InprocessingEngines {
 impl InprocessingEngines {
     /// Create all inprocessing engines for `num_vars` variables.
     pub(crate) fn new(num_vars: usize) -> Self {
-        // `AY_SAT_MEM_PROBE=1`: per-engine construction footprint. This
+        // `--sat-mem-probe`: per-engine construction footprint. This
         // constructor is 685 of the ~849 resident bytes per variable AY commits
         // before reading a clause, so the breakdown decides what to make lazy.
-        if std::env::var_os("AY_SAT_MEM_PROBE").is_some() {
+        if ay_core::misc_cli_flags().sat_mem_probe {
             let mut last = ay_sys::current_footprint_bytes();
             macro_rules! probe {
                 ($label:literal, $e:expr) => {{

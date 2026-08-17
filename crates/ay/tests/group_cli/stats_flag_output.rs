@@ -607,6 +607,10 @@ fn test_cli_dimacs_stats_flag_prints_statistics_to_stderr() {
             && !stderr.contains("sat.propagation_native_"),
         "Retired SAT propagation compiler stats must not appear in active stats output: {stderr}"
     );
+    assert!(
+        !stderr.contains("trail_blocked"),
+        "Retired trail-blocking stats must not appear in active stats output: {stderr}"
+    );
 }
 
 #[test]
@@ -647,6 +651,10 @@ fn test_cli_dimacs_stats_json_exposes_sat_attribution_keys() {
     let parsed = parse_stats_json_line(&stderr);
 
     assert_eq!(parsed["mode"], "dimacs-sat");
+    assert!(
+        parsed.get("sat.trail_blocked_restarts").is_none(),
+        "retired trail-blocking counter must not reappear in stats JSON: {parsed}"
+    );
     assert!(
         stats_json_bool(&parsed, "sat.bcp_trail_lookahead_prefetch_enabled"),
         "outer-loop BCP trail-lookahead prefetch should default on: {parsed}"

@@ -5,8 +5,8 @@
 // ay-dpll panicking convenience methods are deprecated in favor of try_* variants.
 // This FFI layer uses catch_unwind guards; migration to try_* tracked in ay#6183.
 #![allow(deprecated)]
+#![allow(unsafe_code)] // Dedicated C-ABI boundary; sites carry local invariants.
 #![deny(clippy::unwrap_used)]
-
 //! ay-ffi: C FFI bindings for AY SMT solver
 //!
 //! This crate provides C-compatible FFI bindings for AY, enabling integration
@@ -1145,6 +1145,13 @@ pub extern "C" fn ay_malloc(n: usize) -> *mut u8 {
 }
 
 #[cfg(target_arch = "wasm32")]
+/// Free an allocation returned by [`ay_malloc`].
+///
+/// # Safety
+///
+/// `ptr` must be null or the exact live pointer returned by a successful
+/// [`ay_malloc`] call. A non-null allocation must be freed at most once and
+/// must not be accessed after this call.
 #[no_mangle]
 pub unsafe extern "C" fn ay_free(ptr: *mut u8) {
     use std::alloc::{dealloc, Layout};
@@ -1154,6 +1161,8 @@ pub unsafe extern "C" fn ay_free(ptr: *mut u8) {
     // SAFETY: `ptr` was produced by `ay_malloc`, so the 8-byte header directly
     // precedes it and records the total allocation size.
     let base = unsafe { ptr.sub(8) };
+    // SAFETY: `base` is the original 8-byte-aligned allocation address, and
+    // `ay_malloc` initialized its leading `usize` header before returning.
     let total = unsafe { (base as *const usize).read() };
     if let Ok(layout) = Layout::from_size_align(total, 8) {
         // SAFETY: `base`/`layout` match the original `ay_malloc` allocation.

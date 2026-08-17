@@ -4,7 +4,9 @@
 
 //! Terminal proof-trust and premise-provenance gates.
 
-use ay_core::{ProofStep, Sort, TermData, TermId, TermStore};
+mod constant_premise;
+
+use ay_core::{Constant, Proof, ProofStep, Sort, TermData, TermId, TermStore};
 
 use super::super::Executor;
 
@@ -36,6 +38,132 @@ fn add_term_with_and_conjuncts(
 }
 
 impl Executor {
+    /// Whether one internally checked bit-blast theorem is also in the exact
+    /// ground-constant subset the Alethe printer expands into
+    /// `evaluate`/`equiv_pos2`/`false`/`resolution`.
+    ///
+    /// Keep this deliberately narrower than the printer: a surface override
+    /// can change the bytes the external checker sees, so any override on the
+    /// accepted shape remains a known gap. Certified authored replacements
+    /// purge those overrides before publication. All other `BvBitBlast`
+    /// clauses retain the honest `hole` classification.
+    fn bv_constant_disequality_is_fixed_wire_evaluate(&self, clause: &[TermId]) -> bool {
+        let [literal] = clause else {
+            return false;
+        };
+        let TermData::Not(equality) = self.ctx.terms.get(*literal) else {
+            return false;
+        };
+        let TermData::App(symbol, operands) = self.ctx.terms.get(*equality) else {
+            return false;
+        };
+        if symbol.name() != "=" || operands.len() != 2 {
+            return false;
+        }
+        let (left, right) = (operands[0], operands[1]);
+        let (
+            TermData::Const(Constant::BitVec {
+                value: left_value,
+                width: left_width,
+            }),
+            TermData::Const(Constant::BitVec {
+                value: right_value,
+                width: right_width,
+            }),
+        ) = (self.ctx.terms.get(left), self.ctx.terms.get(right))
+        else {
+            return false;
+        };
+        if left_width == &0
+            || left_width != right_width
+            || left_value == right_value
+            || left_value.bits() > u64::from(*left_width)
+            || right_value.bits() > u64::from(*right_width)
+            || self.ctx.terms.sort(left) != &Sort::bitvec(*left_width)
+            || self.ctx.terms.sort(right) != &Sort::bitvec(*right_width)
+            || self.ctx.terms.sort(*equality) != &Sort::Bool
+            || self.ctx.terms.sort(*literal) != &Sort::Bool
+        {
+            return false;
+        }
+        !self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| {
+                [*literal, *equality, left, right]
+                    .iter()
+                    .any(|term| overrides.contains_key(term))
+            })
+    }
+
+    /// Whether a native Boolean-constant clausification step prints as one of
+    /// Alethe's two fixed, premise-free axioms.
+    ///
+    /// The internal source term in `args` is positional reconstruction
+    /// metadata; the printer deliberately omits it.  Any different shape or
+    /// surface override stays a known wire gap rather than being inferred safe.
+    fn bool_constant_step_is_fixed_wire_axiom(
+        &self,
+        rule: &ay_core::AletheRule,
+        clause: &[TermId],
+        premises: &[ay_core::ProofId],
+        args: &[TermId],
+    ) -> bool {
+        if !premises.is_empty() || clause.len() != 1 {
+            return false;
+        }
+
+        let literal = clause[0];
+        let source = match rule {
+            ay_core::AletheRule::True
+                if matches!(
+                    self.ctx.terms.get(literal),
+                    TermData::Const(Constant::Bool(true))
+                ) =>
+            {
+                literal
+            }
+            ay_core::AletheRule::False => {
+                let TermData::Not(source) = self.ctx.terms.get(literal) else {
+                    return false;
+                };
+                if !matches!(
+                    self.ctx.terms.get(*source),
+                    TermData::Const(Constant::Bool(false))
+                ) {
+                    return false;
+                }
+                *source
+            }
+            _ => return false,
+        };
+
+        if !args.is_empty() && args != [source] {
+            return false;
+        }
+        !self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| {
+                overrides.contains_key(&literal) || overrides.contains_key(&source)
+            })
+    }
+
+    /// Internal proof retained for terminal publication policy.
+    ///
+    /// Unlike [`Self::last_proof`], this deliberately does not require a
+    /// user-facing artifact request: mandatory proof tracking also serves
+    /// `:check-proofs-strict` when that option is enabled by itself. Explicit
+    /// reconstruction suppression still hides the proof, and ordinary query
+    /// invalidation clears the underlying slot before a later policy check.
+    fn retained_unsat_proof_for_policy(&self) -> Option<&Proof> {
+        if self.last_unsat_proof_reconstruction_suppressed {
+            None
+        } else {
+            self.last_proof.as_ref()
+        }
+    }
+
     /// Build the set of `assume` terms an external checker may legitimately
     /// accept as free hypotheses for the last UNSAT proof (leak-2 provenance
     /// gate).
@@ -57,7 +185,9 @@ impl Executor {
     /// identity) and rode it to a "certified" empty clause. The strict-proofs
     /// and `--self-check` gates treat such an `assume` exactly like a `trust`
     /// fallback and downgrade the verdict to `unknown`.
-    pub(super) fn proof_legit_assume_set(&self) -> ay_core::kani_compat::DetHashSet<TermId> {
+    pub(in crate::executor) fn proof_legit_assume_set(
+        &self,
+    ) -> ay_core::kani_compat::DetHashSet<TermId> {
         let mut set: ay_core::kani_compat::DetHashSet<TermId> =
             ay_core::kani_compat::DetHashSet::default();
 
@@ -115,6 +245,17 @@ impl Executor {
             }
         }
 
+        // #rewritten-constant-premise: authenticate constants only after every
+        // provenance source has contributed to the finished set. See the
+        // `constant_premise` module for rationale and incident evidence.
+        let (authored_true, authored_false) = self.boolean_constant_premises_authored();
+        if !authored_true {
+            set.remove(&self.ctx.terms.true_term());
+        }
+        if !authored_false {
+            set.remove(&self.ctx.terms.false_term());
+        }
+
         set
     }
 
@@ -124,7 +265,7 @@ impl Executor {
     /// gate; a `true` result downgrades the UNSAT to a sound `unknown`.
     #[must_use]
     pub fn unsat_proof_terminal_foreign_assume(&self) -> bool {
-        let Some(proof) = self.last_proof() else {
+        let Some(proof) = self.retained_unsat_proof_for_policy() else {
             return false;
         };
         let legit: ay_core::kani_compat::DetHashSet<TermId> =
@@ -157,7 +298,7 @@ impl Executor {
     /// gate alongside [`Self::unsat_proof_terminal_foreign_assume`].
     #[must_use]
     pub fn unsat_proof_references_uncheckable_seq_theory(&self) -> bool {
-        let Some(proof) = self.last_proof() else {
+        let Some(proof) = self.retained_unsat_proof_for_policy() else {
             return false;
         };
         let mut stack: Vec<TermId> = Vec::new();
@@ -215,9 +356,70 @@ impl Executor {
     /// boundaries answer identically.
     #[must_use]
     pub fn unsat_proof_terminal_trust_detected(&self) -> bool {
-        self.last_proof()
+        self.retained_unsat_proof_for_policy()
             .is_some_and(|proof| ay_proof::terminal_trust_report(proof).has_terminal_trust())
             || self.unsat_proof_terminal_foreign_assume()
             || self.unsat_proof_references_uncheckable_seq_theory()
+    }
+
+    /// Conservative, allocation-free screen for native steps whose default
+    /// Alethe spelling is known to require an honest unproved fallback.
+    ///
+    /// This is deliberately deny-only. It scans every stored step because the
+    /// exporter emits the whole proof, not just the terminal cone, but it does
+    /// not attempt to predict every clause-sensitive printer rewrite. A known
+    /// wire gap is sufficient to refuse `:check-proofs-strict`; absence of one
+    /// is not advertised as external semantic validation.
+    #[must_use]
+    pub fn unsat_proof_has_known_wire_gap(&self) -> bool {
+        let Some(proof) = self.retained_unsat_proof_for_policy() else {
+            return false;
+        };
+        self.proof_has_known_wire_gap(proof)
+    }
+
+    /// Apply the wire-gap screen to a proof that has not yet been published
+    /// into `last_proof`. Proof construction uses this so it never has to
+    /// overwrite retained query state merely to inspect a candidate.
+    pub(super) fn proof_has_known_wire_gap(&self, proof: &Proof) -> bool {
+        proof.steps.iter().any(|step| match step {
+            ProofStep::Assume(term) => {
+                matches!(self.ctx.terms.get(*term), TermData::Let(..))
+                    || self
+                        .last_proof_term_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.get(term))
+                        // Keep this predicate identical to the printer's let
+                        // bridge trigger. `(` is a valid SMT-LIB token
+                        // delimiter, so compact `(let((x true))x)` syntax must
+                        // be screened as well as whitespace-separated syntax.
+                        .is_some_and(|surface| surface.starts_with("(let"))
+            }
+            ProofStep::TheoryLemma { clause, kind, .. } => {
+                if matches!(
+                    kind,
+                    ay_core::TheoryLemmaKind::BvBitBlast
+                        | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
+                ) && self.bv_constant_disequality_is_fixed_wire_evaluate(clause)
+                {
+                    return false;
+                }
+                let wire = kind.alethe_wire_rule();
+                wire == ay_core::UNPROVED_STEP_RULE
+                    || ay_core::alethe_rule_requires_premises_or_args(wire)
+            }
+            ProofStep::Step {
+                rule,
+                clause,
+                premises,
+                args,
+            } => {
+                (matches!(rule, ay_core::AletheRule::True | ay_core::AletheRule::False)
+                    && !self.bool_constant_step_is_fixed_wire_axiom(rule, clause, premises, args))
+                    || rule.wire_name() == ay_core::UNPROVED_STEP_RULE
+            }
+            ProofStep::Resolution { .. } | ProofStep::Anchor { .. } => false,
+            _ => true,
+        })
     }
 }

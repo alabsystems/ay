@@ -25,9 +25,15 @@
 //! Runtime selection via `AY_SAT_VARIANT` environment variable or
 //! per-variant StarExec run scripts in `competition/bin/`.
 
-use crate::features::{InstanceClass, SatFeatures};
+use crate::auto::DecisionSource;
+#[cfg(test)]
+use crate::features::InstanceClass;
+use crate::features::SatFeatures;
 use crate::proof_capability::{self, ProofMode};
 use crate::{BranchHeuristic, InprocessingFeatureProfile, Solver};
+
+mod capability_plan;
+pub use capability_plan::VariantProfilePlan;
 
 /// Named SAT-COMP preset selector.
 ///
@@ -122,12 +128,16 @@ impl SolverVariant {
     /// the probe-route band (see [`SatFeatures::matches_probe_route_band`]).
     ///
     /// Non-Default variants are returned unchanged (an explicit `--sat-variant`
-    /// choice is always honored). Kill-switch: `AY_AB_PROBE_ROUTE=0` disables
+    /// choice is always honored). Kill-switch: `--sat-no-probe-route` disables
     /// the re-route entirely. The caller must only apply this when no explicit
     /// `--sat-variant` was requested.
     #[must_use]
     pub fn auto_probe_route(self, features: &SatFeatures) -> Self {
-        self.auto_probe_route_if(features.matches_probe_route_band())
+        self.auto_probe_route_if_with_source(
+            features.matches_probe_route_band(),
+            DecisionSource::Default,
+        )
+        .0
     }
 
     /// Raw-count variant of [`Self::auto_probe_route`] for the streaming parse
@@ -141,27 +151,29 @@ impl SolverVariant {
         num_clauses: usize,
         num_binary: usize,
     ) -> Self {
-        self.auto_probe_route_if(crate::features::probe_route_band_from_counts(
-            num_vars,
-            num_clauses,
-            num_binary,
-        ))
+        self.auto_probe_route_if_with_source(
+            crate::features::probe_route_band_from_counts(num_vars, num_clauses, num_binary),
+            DecisionSource::Default,
+        )
+        .0
     }
 
     /// Shared core: re-route Default -> Probe when `in_band`, honoring the
-    /// `AY_AB_PROBE_ROUTE=0` kill-switch and leaving non-Default variants intact.
+    /// `--sat-no-probe-route` kill-switch and leaving non-Default variants intact.
     #[must_use]
-    fn auto_probe_route_if(self, in_band: bool) -> Self {
-        if !matches!(self, Self::Default) {
-            return self;
+    fn auto_probe_route_if_with_source(
+        self,
+        in_band: bool,
+        source: DecisionSource,
+    ) -> (Self, DecisionSource) {
+        if !matches!(self, Self::Default) || !in_band {
+            return (self, source);
         }
-        if std::env::var("AY_AB_PROBE_ROUTE").as_deref() == Ok("0") {
-            return self;
-        }
-        if in_band {
-            Self::Probe
+        if ay_core::sat_ab_switches().no_probe_route {
+            // B34: the operator vetoed the in-band route (--sat-no-probe-route).
+            (self, DecisionSource::Cli)
         } else {
-            self
+            (Self::Probe, DecisionSource::Auto)
         }
     }
 
@@ -173,13 +185,28 @@ impl SolverVariant {
     /// `ratio <= 4.0`, aggressive owns `4.0 < ratio <= 6.5`), so the order is
     /// not load-bearing for correctness; probe is evaluated first to match the
     /// landed precedence. Each band has its own kill-switch
-    /// (`AY_AB_PROBE_ROUTE=0` / `AY_AB_AGGRESSIVE_ROUTE=0`); disabling one
+    /// (`--sat-no-probe-route` / `--sat-no-aggressive-route`); disabling one
     /// leaves the other active. The caller must only apply this when no explicit
     /// `--sat-variant` was requested.
     #[must_use]
     pub fn auto_route(self, features: &SatFeatures) -> Self {
-        self.auto_probe_route(features)
-            .auto_aggressive_route(features)
+        self.auto_route_with_source(features, DecisionSource::Default)
+            .0
+    }
+
+    /// Resolve the combined auto-route while preserving the last decisive
+    /// source, including a compatibility kill-switch that vetoes an otherwise
+    /// in-band route.
+    #[must_use]
+    pub fn auto_route_with_source(
+        self,
+        features: &SatFeatures,
+        source: DecisionSource,
+    ) -> (Self, DecisionSource) {
+        let (variant, source) =
+            self.auto_probe_route_if_with_source(features.matches_probe_route_band(), source);
+        variant
+            .auto_aggressive_route_if_with_source(features.matches_aggressive_route_band(), source)
     }
 
     /// Raw-count variant of [`Self::auto_route`] for the streaming parse path,
@@ -193,8 +220,32 @@ impl SolverVariant {
         num_clauses: usize,
         num_binary: usize,
     ) -> Self {
-        self.auto_probe_route_from_counts(num_vars, num_clauses, num_binary)
-            .auto_aggressive_route_from_counts(num_vars, num_clauses, num_binary)
+        self.auto_route_from_counts_with_source(
+            num_vars,
+            num_clauses,
+            num_binary,
+            DecisionSource::Default,
+        )
+        .0
+    }
+
+    /// Raw-count counterpart of [`Self::auto_route_with_source`].
+    #[must_use]
+    pub fn auto_route_from_counts_with_source(
+        self,
+        num_vars: usize,
+        num_clauses: usize,
+        num_binary: usize,
+        source: DecisionSource,
+    ) -> (Self, DecisionSource) {
+        let (variant, source) = self.auto_probe_route_if_with_source(
+            crate::features::probe_route_band_from_counts(num_vars, num_clauses, num_binary),
+            source,
+        );
+        variant.auto_aggressive_route_if_with_source(
+            crate::features::aggressive_route_band_from_counts(num_vars, num_clauses, num_binary),
+            source,
+        )
     }
 
     /// Auto-route the Default preset to Aggressive when load-time `features`
@@ -203,10 +254,14 @@ impl SolverVariant {
     ///
     /// Non-Default variants are returned unchanged (an explicit `--sat-variant`
     /// choice — and any prior probe re-route — is always honored). Kill-switch:
-    /// `AY_AB_AGGRESSIVE_ROUTE=0` disables the re-route entirely.
+    /// `--sat-no-aggressive-route` disables the re-route entirely.
     #[must_use]
     pub fn auto_aggressive_route(self, features: &SatFeatures) -> Self {
-        self.auto_aggressive_route_if(features.matches_aggressive_route_band())
+        self.auto_aggressive_route_if_with_source(
+            features.matches_aggressive_route_band(),
+            DecisionSource::Default,
+        )
+        .0
     }
 
     /// Raw-count variant of [`Self::auto_aggressive_route`] for the streaming
@@ -218,28 +273,31 @@ impl SolverVariant {
         num_clauses: usize,
         num_binary: usize,
     ) -> Self {
-        self.auto_aggressive_route_if(crate::features::aggressive_route_band_from_counts(
-            num_vars,
-            num_clauses,
-            num_binary,
-        ))
+        self.auto_aggressive_route_if_with_source(
+            crate::features::aggressive_route_band_from_counts(num_vars, num_clauses, num_binary),
+            DecisionSource::Default,
+        )
+        .0
     }
 
     /// Shared core: re-route Default -> Aggressive when `in_band`, honoring the
-    /// `AY_AB_AGGRESSIVE_ROUTE=0` kill-switch and leaving non-Default variants
+    /// `--sat-no-aggressive-route` kill-switch and leaving non-Default variants
     /// intact (so a prior probe re-route to Probe is preserved).
     #[must_use]
-    fn auto_aggressive_route_if(self, in_band: bool) -> Self {
-        if !matches!(self, Self::Default) {
-            return self;
+    fn auto_aggressive_route_if_with_source(
+        self,
+        in_band: bool,
+        source: DecisionSource,
+    ) -> (Self, DecisionSource) {
+        if !matches!(self, Self::Default) || !in_band {
+            return (self, source);
         }
-        if std::env::var("AY_AB_AGGRESSIVE_ROUTE").as_deref() == Ok("0") {
-            return self;
-        }
-        if in_band {
-            Self::Aggressive
+        if ay_core::sat_ab_switches().no_aggressive_route {
+            // B34: the operator vetoed the in-band route
+            // (--sat-no-aggressive-route).
+            (self, DecisionSource::Cli)
         } else {
-            self
+            (Self::Aggressive, DecisionSource::Auto)
         }
     }
 }
@@ -492,74 +550,6 @@ fn is_official_main_lrat_default_route(variant: SolverVariant, input: VariantInp
         )
 }
 
-/// Fully resolved SAT profile plan for one formula.
-///
-/// This adds a single startup formula classification step on top of
-/// [`VariantConfig`]. Callers that have already extracted [`SatFeatures`] use
-/// this plan to apply adaptive feature gates once before CDCL starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VariantProfilePlan {
-    /// Variant config after formula-class adaptive adjustment.
-    pub config: VariantConfig,
-    /// Formula class computed from the supplied feature snapshot.
-    pub instance_class: InstanceClass,
-    /// Whether adaptive profile adjustment changed any feature gate.
-    pub adjusted_features: bool,
-}
-
-impl VariantProfilePlan {
-    /// Build a profile plan from a variant, input metadata, and formula features.
-    #[must_use]
-    pub fn for_features(
-        variant: SolverVariant,
-        input: VariantInput,
-        features: &SatFeatures,
-    ) -> Self {
-        Self::from_config_features(variant.config(input), features)
-    }
-
-    /// Add formula-class adaptive adjustment to an already resolved config.
-    #[must_use]
-    pub fn from_config_features(mut config: VariantConfig, features: &SatFeatures) -> Self {
-        let instance_class = InstanceClass::classify(features);
-        let adaptive_adjusted = crate::adaptive::adjust_features_for_instance(
-            features,
-            &instance_class,
-            &mut config.features,
-        );
-        let route_adjusted = config.apply_route_profile_clamps();
-        let branch_adjusted = config.apply_feature_adaptive_branch_policy(features);
-        let dense_clique_mab_adjusted = config.apply_dense_clique_mab_branch_experiment(features);
-        let dense_mutex_restart_adjusted =
-            config.apply_dense_mutex_focused_restart_gate_experiment(features);
-        let midband_restart_adjusted = config.apply_midband_deep_restart_gate(features);
-        let before_proof_clamp = config.features;
-        if config.input.proof_mode {
-            proof_capability::apply_profile_permissions(
-                &mut config.features,
-                ProofMode::from_lrat_enabled(config.input.lrat_mode),
-            );
-        }
-        let proof_adjusted = before_proof_clamp != config.features;
-        Self {
-            config,
-            instance_class,
-            adjusted_features: adaptive_adjusted
-                || route_adjusted
-                || branch_adjusted
-                || dense_clique_mab_adjusted
-                || dense_mutex_restart_adjusted
-                || midband_restart_adjusted
-                || proof_adjusted,
-        }
-    }
-
-    /// Apply this frozen profile plan to a fresh solver.
-    pub fn apply_to_solver(&self, solver: &mut Solver) {
-        self.config.apply_to_solver(solver);
-    }
-}
-
 /// Clause threshold for full preprocessing in Default variant.
 /// Raised from 3M to 5M: shuffling-2 (4.7M clauses, 138K vars) benefits from
 /// full preprocessing (probing, subsumption, HTR) but was previously stuck in
@@ -588,7 +578,7 @@ const DIMACS_REDUCED_EFFORT_SUBSUME: u64 = 200;
 /// pattern as FACTOR_DENSE_MIN_DENSITY banding the factor-dense unlock.
 /// The prior net-neutral BVE A/B (variant.rs bve comment below) was over an
 /// UNSCOPED sample; this band is the response. Tunable via
-/// AY_BVE_SPARSE_MAX_DENSITY; DEFAULT ON (AY_AB_BVE_SPARSE=0 disables).
+/// --sat-bve-sparse-max-density; DEFAULT ON (--sat-no-bve-sparse disables).
 /// Default flipped 2026-07-08 after the braun.11 blocker was fixed at root
 /// cause (preprocess subsume learned-subsumer promotion, ef818369) and the
 /// fixer + an independent adversarial verifier both re-measured the band:
@@ -612,7 +602,7 @@ const BVE_SPARSE_MAX_DENSITY: f64 = 12.0;
 /// fixpoint reaches 0.2-1.7% elimination on the huge Cluster-C instances
 /// (vs kissat's 49-93%) — all perturbation, no payoff. 150K keeps a
 /// margin below both the 200K preprocess gate and the first measured
-/// loss (184K). Tunable via AY_BVE_SPARSE_MAX_VARS.
+/// loss (184K). Tunable via --sat-bve-sparse-max-vars.
 const BVE_SPARSE_MAX_VARS: usize = 150_000;
 /// Giant raw-BVE band (lever 3, 2026-07-11 sparse-prize completion round;
 /// `AY_AB_BVE_GIANT_RAW`, see `bve_giant_raw_route_active`).
@@ -665,7 +655,7 @@ const DENSE_MUTEX_FOCUSED_RESTART_MAX_VARS: usize = 1000;
 const DENSE_MUTEX_FOCUSED_RESTART_MIN_RATIO: f64 = 10.0;
 const DENSE_MUTEX_FOCUSED_RESTART_MIN_BINARY_FRAC: f64 = 0.95;
 /// Mid-band deep-restart gate (xor-heavy batch-3 root cause, 2026-07;
-/// kill-switch `AY_AB_MIDBAND_DEEP_RESTART=0`, see
+/// kill-switch `--sat-no-midband-deep-restart`, see
 /// [`VariantConfig::apply_midband_deep_restart_gate`]).
 ///
 /// The 100K–1M-clause gate-dense (bin+ternary >= 85%) class keeps the hot
@@ -792,9 +782,9 @@ impl VariantConfig {
     /// changes restart/branching). Applied LAST so the EXPLICIT knobs win over
     /// the dense/proof clamps for a clean isolated measurement.
     ///
-    ///   AY_AB_DECOMPOSE=1   -> features.decompose = true
-    ///   AY_AB_CONGRUENCE=1  -> features.congruence = true (implies decompose)
-    ///   AY_AB_SUBST_AUTO    -> route-aware AUTO, see
+    ///   (retired B36)   -> features.decompose = true
+    ///   (retired B36)  -> features.congruence = true (implies decompose)
+    ///   --sat-no-subst-auto    -> route-aware AUTO, see
     ///                          [`Self::subst_auto_collapse_enabled`]:
     ///                          DEFAULT ON (unset) with kill-switch =0;
     ///                          explicit =1 keeps the historical measurement
@@ -803,7 +793,7 @@ impl VariantConfig {
     /// Proof-capability note (2026-07-10): BOTH Decompose (2026-07-09) and
     /// Congruence (2026-07-10, wf_ff5991a1 — complementary-edge and
     /// vivify-husk fixes, externally verified) are DRAT-open in the registry;
-    /// no AY_AB_DRAT_SUBST needed, kill-switch AY_AB_DRAT_SUBST=0. LRAT
+    /// no --sat-no-drat-subst needed, kill-switch --sat-no-drat-subst. LRAT
     /// stays fail-closed for both (see proof_capability.rs). The AUTO DEFAULT
     /// now matches registry truth (ON under DRAT, OFF under LRAT) since
     /// wf_0c7d84e9 fixed and externally re-verified the f0bafebd emission —
@@ -812,18 +802,12 @@ impl VariantConfig {
         if !matches!(self.variant, SolverVariant::Default) {
             return;
         }
-        use std::sync::OnceLock;
-        static DECOMPOSE: OnceLock<bool> = OnceLock::new();
-        static CONGRUENCE: OnceLock<bool> = OnceLock::new();
-        let want_congruence = *CONGRUENCE
-            .get_or_init(|| matches!(std::env::var("AY_AB_CONGRUENCE").ok().as_deref(), Some("1")));
-        let want_decompose = *DECOMPOSE
-            .get_or_init(|| matches!(std::env::var("AY_AB_DECOMPOSE").ok().as_deref(), Some("1")));
-        let want_auto = self.subst_auto_collapse_enabled();
-        if want_decompose || want_congruence || want_auto {
+        // B36: the (retired B36)/(retired B36) force-enables are gone —
+        // they were redundant measurement shims over this default-ON AUTO
+        // path (and the proof registry still clamps either feature under a
+        // proof surface regardless).
+        if self.subst_auto_collapse_enabled() {
             self.features.decompose = true;
-        }
-        if want_congruence || want_auto {
             self.features.congruence = true;
         }
     }
@@ -856,7 +840,7 @@ impl VariantConfig {
     /// found a congruence/decompose-active DRAT emission on main2025
     /// f0bafebd that dpr-trim REJECTED ("RAT check on proof pivot failed:
     /// [51477] 1163 -2820", proof line 26774) while the identical solve with
-    /// AY_AB_SUBST_AUTO=0 verified end-to-end. wf_0c7d84e9 root-caused it to
+    /// --sat-no-subst-auto verified end-to-end. wf_0c7d84e9 root-caused it to
     /// congruence XOR-ladder rungs watched as BINARY clauses (proof_ladder.rs
     /// insert_ladder_rung: a deleted rung husk kept its binary watch and
     /// vivify propagated a proof-less level-0 unit that
@@ -895,23 +879,31 @@ impl VariantConfig {
         }
     }
 
-    /// Cached explicit `AY_AB_SUBST_AUTO` parse: `Some(true)` for `=1`,
+    /// Cached explicit `--sat-no-subst-auto` parse: `Some(true)` for `=1`,
     /// `Some(false)` for any other explicit value (kill-switch semantics),
     /// `None` when unset (the DEFAULT-ON path). Cached OnceLock per the
     /// #8506 no-per-call-syscall convention.
     fn subst_auto_env_explicit() -> Option<bool> {
-        use std::sync::OnceLock;
-        static AUTO: OnceLock<Option<bool>> = OnceLock::new();
-        *AUTO.get_or_init(|| std::env::var("AY_AB_SUBST_AUTO").ok().map(|v| v == "1"))
+        // B34: CLI-owned. `--sat-no-subst-auto` is the kill (Some(false));
+        // `--sat-subst-auto-uncapped` keeps the historical explicit-on
+        // UNCAPPED measurement semantics (Some(true)); default None.
+        let s = ay_core::sat_ab_switches();
+        if s.no_subst_auto {
+            Some(false)
+        } else if s.subst_auto_uncapped {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     /// Dense-band guard rails for the AUTO collapse path (2026-07-11
     /// dense-band regression fix): true iff AUTO is on via the DEFAULT path
-    /// (`AY_AB_SUBST_AUTO` unset). Arms the EARLY formula-density disarm in
+    /// (`--sat-no-subst-auto` unset). Arms the EARLY formula-density disarm in
     /// compute_preprocess_policy and the giant decompose re-run bail in
     /// inprocessing_schedule (see `cold.subst_auto_capped` for the
     /// certified remeasure2 measurement: dense 23→19, casualties 43fbacb2 +
-    /// 0ec8c5e9 recovered by the guards). Explicit `AY_AB_SUBST_AUTO=1`
+    /// 0ec8c5e9 recovered by the guards). Explicit `--sat-no-subst-auto=1`
     /// keeps the historical UNCAPPED measurement semantics — this returns
     /// false there so A/B probe scripts see today's behavior unchanged.
     pub(crate) fn subst_auto_collapse_capped(&self) -> bool {
@@ -927,8 +919,8 @@ impl VariantConfig {
     ///
     /// Scope (each arm load-bearing):
     ///   - DEFAULT-ON capped path only (`subst_auto_collapse_capped`):
-    ///     explicit `AY_AB_SUBST_AUTO=1` keeps the historical 2M/8M
-    ///     measurement semantics, and `AY_AB_SUBST_AUTO=0` kills the whole
+    ///     explicit `--sat-no-subst-auto=1` keeps the historical 2M/8M
+    ///     measurement semantics, and `--sat-no-subst-auto` kills the whole
     ///     AUTO stack including this band.
     ///   - NON-PROOF only (`!input.proof_mode`): under DRAT the congruence
     ///     proof ladder RUP-probes per edge (~10.4K edges/s measured); the
@@ -946,16 +938,13 @@ impl VariantConfig {
 
     /// Cached `AY_AB_SUBST_AUTO_GIANT` parse: ON when unset or `=1`, OFF for
     /// any other explicit value (kill-switch semantics, conservative parse
-    /// matching `AY_AB_SUBST_AUTO`). Cached OnceLock per the #8506
+    /// matching `--sat-no-subst-auto`). Cached OnceLock per the #8506
     /// no-per-call-syscall convention.
     fn subst_auto_giant_env_enabled() -> bool {
-        use std::sync::OnceLock;
-        static GIANT: OnceLock<bool> = OnceLock::new();
-        *GIANT.get_or_init(|| {
-            std::env::var("AY_AB_SUBST_AUTO_GIANT")
-                .map(|v| v == "1")
-                .unwrap_or(true)
-        })
+        // B21: the AY_AB_SUBST_AUTO_GIANT kill-switch is retired (never set;
+        // the giant band stays independently guarded by its own registry
+        // clamps). Always on.
+        true
     }
 
     /// Sparse-band BVE unlock (#sparse-gap Cluster C, default ON since
@@ -1003,10 +992,10 @@ impl VariantConfig {
     /// guarded by the independent model-validation gate and DRAT
     /// verification — this changes scheduling/completeness only.
     ///
-    ///   unset / AY_AB_BVE_SPARSE=1    -> scoped unlock ACTIVE (default)
-    ///   AY_AB_BVE_SPARSE=0            -> kill-switch (pre-unlock behavior)
-    ///   AY_BVE_SPARSE_MAX_DENSITY=<f> -> tune the band edge (default 12.0)
-    ///   AY_BVE_SPARSE_MAX_VARS=<n>    -> tune the size cap (default 150000)
+    ///   unset / --sat-no-bve-sparse=1    -> scoped unlock ACTIVE (default)
+    ///   --sat-no-bve-sparse            -> kill-switch (pre-unlock behavior)
+    ///   --sat-bve-sparse-max-density=<f> -> tune the band edge (default 12.0)
+    ///   --sat-bve-sparse-max-vars=<n>    -> tune the size cap (default 150000)
     ///
     /// Cached per-process like the other AY_AB_* knobs.
     fn apply_ab_bve_knob(&mut self) {
@@ -1033,10 +1022,9 @@ impl VariantConfig {
         }
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        static MAX_DENSITY: OnceLock<f64> = OnceLock::new();
         let enabled = *ENABLED.get_or_init(|| {
-            // Default ON; "0" is the kill-switch (house AY_AB_* convention).
-            !matches!(std::env::var("AY_AB_BVE_SPARSE").ok().as_deref(), Some("0"))
+            // Default ON; `--sat-no-bve-sparse` is the kill switch (B34).
+            !ay_core::sat_ab_switches().no_bve_sparse
         });
         if !enabled {
             return false;
@@ -1044,24 +1032,17 @@ impl VariantConfig {
         if self.input.num_vars == 0 {
             return false;
         }
-        static MAX_VARS: OnceLock<usize> = OnceLock::new();
-        let max_vars = *MAX_VARS.get_or_init(|| {
-            std::env::var("AY_BVE_SPARSE_MAX_VARS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(BVE_SPARSE_MAX_VARS)
-        });
+        let max_vars = ay_core::sat_ab_switches()
+            .bve_sparse_max_vars
+            .filter(|value| *value > 0)
+            .unwrap_or(BVE_SPARSE_MAX_VARS);
         if self.input.num_vars > max_vars {
             return false;
         }
-        let max_density = *MAX_DENSITY.get_or_init(|| {
-            std::env::var("AY_BVE_SPARSE_MAX_DENSITY")
-                .ok()
-                .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .unwrap_or(BVE_SPARSE_MAX_DENSITY)
-        });
+        let max_density = ay_core::sat_ab_switches()
+            .bve_sparse_max_density
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(BVE_SPARSE_MAX_DENSITY);
         let density = self.input.num_clauses as f64 / self.input.num_vars as f64;
         density <= max_density
     }
@@ -1126,45 +1107,18 @@ impl VariantConfig {
         if self.input.lrat_mode {
             return false;
         }
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = *ENABLED.get_or_init(|| {
-            matches!(
-                std::env::var("AY_AB_BVE_GIANT_RAW").ok().as_deref(),
-                Some("1")
-            )
-        });
-        if !enabled {
+        // B21: the AY_AB_BVE_GIANT_RAW opt-in is retired — measured
+        // default-OFF, never armed anywhere. The route stays compiled for a
+        // future measured revival; this gate keeps it inert.
+        if true {
             return false;
         }
-        // Env-tunable band ceilings (mirrors AY_BVE_SPARSE_MAX_VARS/DENSITY).
-        // Default 2M/8M keeps the AUTO-probe-reachable band and the
-        // floor-control exclusions (4d6e18e5 7.3M / 00fd8ac9 23.4M SAT held
-        // out-of-band by construction) intact. Raising them (e.g. 4M/10M)
-        // admits the ac388757-class sparse giant (3.42M vars / 9.2M clauses)
-        // for operators running the giant-raw A/B: the cap lift is unambiguous
-        // formula reduction there (net −2.9..4.3M clauses, elimination is pure
-        // profit), still density- and no-collapse-gated by
-        // try_qualify_bve_giant_raw + the deep-sparse walls, and still verdict-
-        // guarded. Measured NO flip in 120s on ac388757 (search-bound after a
-        // 17-21s preprocess), so the default ceilings are unchanged and the
-        // raise is opt-in via env — inert unless AY_AB_BVE_GIANT_RAW=1 too.
-        static MAX_VARS: OnceLock<usize> = OnceLock::new();
-        static MAX_CLAUSES: OnceLock<usize> = OnceLock::new();
-        let max_vars = *MAX_VARS.get_or_init(|| {
-            std::env::var("AY_BVE_GIANT_RAW_MAX_VARS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(BVE_GIANT_RAW_MAX_VARS)
-        });
-        let max_clauses = *MAX_CLAUSES.get_or_init(|| {
-            std::env::var("AY_BVE_GIANT_RAW_MAX_CLAUSES")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(BVE_GIANT_RAW_MAX_CLAUSES)
-        });
+        // Band ceilings: named constants (B21 — the ceiling env raises were
+        // inert without the route gate above; ac388757's measured NO-flip in
+        // 120s means the defaults stand, and re-probing means editing the
+        // constants).
+        let max_vars = BVE_GIANT_RAW_MAX_VARS;
+        let max_clauses = BVE_GIANT_RAW_MAX_CLAUSES;
         if self.input.num_vars <= BVE_SPARSE_MAX_VARS
             || self.input.num_vars > max_vars
             || self.input.num_clauses > max_clauses
@@ -1239,7 +1193,7 @@ impl VariantConfig {
         // The same predicate that flips `features.bve` on the sparse band also
         // arms the preprocess-BVE expensive-pass bypass, so preprocess
         // BVE/fastelim can run on LARGE sparse formulas (num_vars beyond the 200K
-        // expensive-pass cap) when the operator raises AY_BVE_SPARSE_MAX_VARS.
+        // expensive-pass cap) when the operator raises --sat-bve-sparse-max-vars.
         // BVE-specific only: it does NOT relax skip_expensive for other passes.
         solver.set_sparse_band_bve_preprocess_unlock(self.sparse_band_bve_unlock_active());
         // Giant raw-BVE unlock ROUTE flag (lever 3, 2026-07-11 sparse-prize
@@ -1255,12 +1209,12 @@ impl VariantConfig {
         // wf_55735963 — see subst_auto_collapse_enabled for the measurement):
         // arm the solver-side flag so the preprocess density-probe gate and
         // the raised congruence caps engage exactly for this resolved config
-        // (Default DIMACS variant; kill-switch AY_AB_SUBST_AUTO=0), instead of
+        // (Default DIMACS variant; kill-switch --sat-no-subst-auto), instead of
         // variant-blind env reads in solver code.
         solver.set_subst_auto_collapse(self.subst_auto_collapse_enabled());
         // Dense-band guard rails for the DEFAULT-ON AUTO path (2026-07-11
         // dense-band regression fix): early formula-density disarm + giant
-        // decompose re-run bail, scoped so explicit AY_AB_SUBST_AUTO=1
+        // decompose re-run bail, scoped so explicit --sat-no-subst-auto=1
         // keeps the historical uncapped A/B semantics. See
         // cold.subst_auto_capped for the measurement.
         solver.set_subst_auto_collapse_capped(self.subst_auto_collapse_capped());
@@ -1269,7 +1223,7 @@ impl VariantConfig {
         // NON-PROOF default-path solves only (proof runs keep 2M/8M
         // bit-for-bit — the per-edge RUP proof ladder cannot afford 1.31M-
         // edge closures). Kill-switch AY_AB_SUBST_AUTO_GIANT=0; also rides
-        // AY_AB_SUBST_AUTO=0. See subst_auto_giant_band_active.
+        // --sat-no-subst-auto. See subst_auto_giant_band_active.
         solver.set_subst_auto_giant_band(self.subst_auto_giant_band_active());
 
         if official_main_lrat_default && self.input.bve_lrat_scout_route {
@@ -1367,17 +1321,9 @@ impl VariantConfig {
         // route differences. Unset => current behavior. Mirrors inc7's AY_AB_*
         // knobs; cached per-process (each solver run is a fresh process).
         if matches!(self.variant, SolverVariant::Default) {
-            use std::sync::OnceLock;
-            static FORCED: OnceLock<Option<VariantBranchPolicy>> = OnceLock::new();
-            let forced = *FORCED.get_or_init(|| {
-                match std::env::var("AY_SAT_BRANCH_POLICY").ok().as_deref() {
-                    Some("mab") => Some(VariantBranchPolicy::MabUcb1 {
-                        epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
-                    }),
-                    Some("legacy") => Some(VariantBranchPolicy::LegacyCoupled),
-                    _ => None,
-                }
-            });
+            // B21: the AY_SAT_BRANCH_POLICY campaign force is retired; the
+            // auto decision below is the shipped rule.
+            let forced: Option<VariantBranchPolicy> = None;
             if let Some(forced) = forced {
                 if self.branch_policy == forced {
                     return false;
@@ -1421,7 +1367,7 @@ impl VariantConfig {
     /// gate applies on proof routes too — an in-band UNSAT flip found on
     /// the plain route reproduces under `--proof` for its DRAT certificate.
     ///
-    /// Kill-switch `AY_AB_MIDBAND_DEEP_RESTART`: ON when unset or `=1`, OFF
+    /// Kill-switch `--sat-no-midband-deep-restart` (B26: env retired): ON
     /// for any other explicit value (conservative parse matching
     /// `AY_AB_SUBST_AUTO_GIANT`).
     fn apply_midband_deep_restart_gate(&mut self, features: &SatFeatures) -> bool {
@@ -1442,17 +1388,13 @@ impl VariantConfig {
         }
     }
 
-    /// Cached `AY_AB_MIDBAND_DEEP_RESTART` parse: ON when unset or `=1`, OFF
+    /// The midband deep-restart gate (B26: CLI-owned): ON
     /// for any other explicit value (kill-switch semantics). Cached OnceLock
     /// per the #8506 no-per-call-syscall convention.
     fn midband_deep_restart_env_enabled() -> bool {
-        use std::sync::OnceLock;
-        static MIDBAND: OnceLock<bool> = OnceLock::new();
-        *MIDBAND.get_or_init(|| {
-            std::env::var("AY_AB_MIDBAND_DEEP_RESTART")
-                .map(|v| v == "1")
-                .unwrap_or(true)
-        })
+        // B26: CLI-owned opt-out (--sat-no-midband-deep-restart); env
+        // retired.
+        !ay_core::sat_ab_switches().no_midband_deep_restart
     }
 
     fn apply_dense_mutex_focused_restart_gate_experiment(
@@ -1560,7 +1502,7 @@ fn dimacs_baseline_features() -> InprocessingFeatureProfile {
         // this opt-in was root-caused by ef818369 to preprocess-subsume
         // constraint loss (fixed in config_preprocess_cleanup.rs), so the
         // scoped unlock is now DEFAULT-ON via `apply_ab_bve_knob`
-        // (3c9b980b; kill-switch AY_AB_BVE_SPARSE=0). This baseline flag
+        // (3c9b980b; kill-switch --sat-no-bve-sparse). This baseline flag
         // stays false: the band predicate, not the profile, decides.
         bve: false,
         // CaDiCaL defaults block=0 (DISABLED). BCE removes blocked clauses but
@@ -1574,10 +1516,10 @@ fn dimacs_baseline_features() -> InprocessingFeatureProfile {
         condition: false,
         // Decompose: SCC-based equivalent-literal substitution over the binary
         // implication graph (Kissat's "substitute"). Kept opt-in. A/B knob:
-        // AY_AB_DECOMPOSE=1 (decompose) / AY_AB_CONGRUENCE=1 (decompose+congruence)
+        // (retired B36) (decompose) / (retired B36) (decompose+congruence)
         // on the Default variant.
         //
-        // Measured 2026-06-27 (AY_AB_CONGRUENCE, 60s, satcomp2025): net-negative
+        // Measured 2026-06-27 ((retired B36), 60s, satcomp2025): net-negative
         // on solved count. The lost SAT (b5431f41) is NOT a reconstruction
         // degrade as previously believed — it is a SLOWDOWN: decompose takes the
         // 22s default solve to ~87s, so it times out at 60s but still returns a
@@ -1601,16 +1543,16 @@ fn dimacs_baseline_features() -> InprocessingFeatureProfile {
         // UPDATE 2026-07-09 (decompose DRAT unclamp): the proof-capability
         // registry now ships Decompose { drat: true } (externally verified,
         // dpr-trim + cake_lpr — see proof_capability.rs), so an opt-in
-        // decompose run no longer needs AY_AB_DRAT_SUBST.
+        // decompose run no longer needs --sat-no-drat-subst.
         //
         // UPDATE 2026-07-10 (wf_55735963 collapse+BVE default flip): the
         // earlier "zero flips" finding was the collapse WITHOUT bounded
         // elimination behind it. With the post-collapse BVE re-derivation
-        // (AY_AB_BVE_POST_COLLAPSE) + deep sparse budgets
+        // (--sat-no-bve-post-collapse) + deep sparse budgets
         // (AY_AB_BVE_SPARSE_DEEP) composed, the scoreboard protocol measured
         // +7 kissat-agreeing UNSAT flips / 0 hard losses, so the route-aware
         // probe-gated AUTO is now DEFAULT-ON — via `apply_ab_substitution_knob`
-        // (kill-switch AY_AB_SUBST_AUTO=0), NOT via this profile flag. This
+        // (kill-switch --sat-no-subst-auto), NOT via this profile flag. This
         // baseline flag stays false: the knob predicate (Default variant,
         // proof-clamp-respecting), not the profile, decides — same pattern
         // as the sparse-band `bve` flag above.
@@ -1721,13 +1663,112 @@ fn probe_features() -> InprocessingFeatureProfile {
 #[cfg(test)]
 pub(crate) fn ab_bve_sparse_knob_set() -> bool {
     // Default flipped ON 2026-07-08 (post reconstruction fix ef818369):
-    // the unlock is active unless explicitly killed with =0.
-    !matches!(std::env::var("AY_AB_BVE_SPARSE").ok().as_deref(), Some("0"))
+    // the unlock is active unless explicitly killed (B34: --sat-no-bve-sparse).
+    !ay_core::sat_ab_switches().no_bve_sparse
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decision<'a>(
+        plan: &'a VariantProfilePlan,
+        capability: &str,
+    ) -> &'a crate::auto::CapabilityDecision {
+        plan.ledger
+            .entries()
+            .iter()
+            .find(|decision| decision.capability == capability)
+            .unwrap_or_else(|| panic!("missing capability decision for {capability}"))
+    }
+
+    /// B0 records every final feature gate and its deciding layer.
+    #[test]
+    fn capability_ledger_records_every_decision() {
+        let features = SatFeatures::extract(
+            4,
+            &[
+                vec![
+                    crate::Literal::positive(crate::Variable::new(0)),
+                    crate::Literal::positive(crate::Variable::new(1)),
+                ],
+                vec![
+                    crate::Literal::negative(crate::Variable::new(2)),
+                    crate::Literal::positive(crate::Variable::new(3)),
+                ],
+            ],
+        );
+        let input = VariantInput::new(4, 2, false, false);
+        let config = SolverVariant::Default.config(input);
+        let plan = VariantProfilePlan::from_config_features(config, &features);
+        assert_eq!(plan.ledger.entries().len(), 23);
+        assert_eq!(
+            decision(&plan, "preprocess").source,
+            DecisionSource::Default
+        );
+        assert_eq!(
+            decision(&plan, "symmetry").source,
+            DecisionSource::Auto,
+            "small-formula symmetry re-enable is an automatic decision"
+        );
+    }
+
+    #[test]
+    fn capability_ledger_attributes_cli_and_adaptive_decisions_truthfully() {
+        let features = SatFeatures::from_streaming_counters(1_000, 101_000, 0, 101_000);
+        let profile = InprocessingFeatureProfile {
+            condition: true,
+            ..Default::default()
+        };
+        let plan = VariantProfilePlan::for_features_with_source(
+            SolverVariant::Custom(profile),
+            VariantInput::new(1_000, 101_000, false, false),
+            &features,
+            DecisionSource::Cli,
+        );
+        let preprocess = decision(&plan, "preprocess");
+        assert_eq!(preprocess.source, DecisionSource::Cli);
+        let condition = decision(&plan, "condition");
+        assert_eq!(condition.state, crate::auto::CapabilityState::Off);
+        assert_eq!(condition.source, DecisionSource::Auto);
+        assert!(condition.because.contains("clause_var_ratio="));
+    }
+
+    #[test]
+    fn capability_ledger_attributes_proof_clamps_to_policy() {
+        let features = SatFeatures::from_streaming_counters(10_000, 20_000, 0, 20_000);
+        let plan = VariantProfilePlan::for_features_with_source(
+            SolverVariant::Probe,
+            VariantInput::new(10_000, 20_000, true, true),
+            &features,
+            DecisionSource::Cli,
+        );
+        let decompose = decision(&plan, "decompose");
+        assert_eq!(decompose.state, crate::auto::CapabilityState::Off);
+        assert_eq!(decompose.source, DecisionSource::Auto);
+        assert!(decompose.because.contains("proof capability policy"));
+    }
+
+    #[test]
+    fn capability_ledger_attributes_route_clamps_to_policy() {
+        let features = SatFeatures::from_streaming_counters(10_000, 20_000, 0, 20_000);
+        let profile = InprocessingFeatureProfile {
+            sweep: true,
+            ..Default::default()
+        };
+        let input = VariantInput::new(10_000, 20_000, false, false)
+            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
+        let plan = VariantProfilePlan::for_features_with_source(
+            SolverVariant::Custom(profile),
+            input,
+            &features,
+            DecisionSource::Cli,
+        );
+        let sweep = decision(&plan, "sweep");
+        assert_eq!(sweep.state, crate::auto::CapabilityState::Off);
+        assert_eq!(sweep.source, DecisionSource::Auto);
+        assert!(sweep.because.contains("route=official-satcomp-main-lrat"));
+    }
 
     /// The combined `auto_route` never overrides a non-Default variant. This is
     /// env-independent (the non-Default early-return precedes any kill-switch
@@ -1761,7 +1802,7 @@ mod tests {
         assert!(!config.full_preprocessing);
         assert!(config.features.preprocess);
         // Default flipped 2026-07-08: the sparse-band BVE unlock is ON by
-        // default for in-band inputs (32v/96c is in-band); AY_AB_BVE_SPARSE=0
+        // default for in-band inputs (32v/96c is in-band); --sat-no-bve-sparse
         // is the kill-switch restoring the old profile.
         if ab_bve_sparse_knob_set() {
             assert!(
@@ -1771,39 +1812,24 @@ mod tests {
         } else {
             assert!(
                 !config.features.bve,
-                "kill-switch (AY_AB_BVE_SPARSE=0) restores BVE-off"
+                "kill-switch (--sat-no-bve-sparse) restores BVE-off"
             );
         }
         // Default flipped 2026-07-10 (wf_55735963): the route-aware
         // substitution-collapse AUTO is ON by default on the non-proof
         // Default route (+7 measured UNSAT flips / 0 hard losses on the
-        // main2025 scoreboard protocol); AY_AB_SUBST_AUTO=0 is the
-        // kill-switch restoring the old opt-in profile. Tolerant of an
-        // operator-exported knob (same pattern as AY_AB_BVE_SPARSE above).
-        match std::env::var("AY_AB_SUBST_AUTO").ok().as_deref() {
-            None | Some("1") => {
-                assert!(
-                    config.features.congruence,
-                    "substitution-collapse AUTO is default-ON: congruence \
-                     eligible (probe-gated) on the non-proof Default route"
-                );
-                assert!(
-                    config.features.decompose,
-                    "substitution-collapse AUTO is default-ON: decompose \
-                     eligible (probe-gated) on the non-proof Default route"
-                );
-            }
-            Some(_) => {
-                assert!(
-                    !config.features.congruence,
-                    "kill-switch (AY_AB_SUBST_AUTO=0) restores congruence-off"
-                );
-                assert!(
-                    !config.features.decompose,
-                    "kill-switch (AY_AB_SUBST_AUTO=0) restores decompose-off"
-                );
-            }
-        }
+        // main2025 scoreboard protocol). B34: the kill is CLI-owned
+        // (--sat-no-subst-auto), so the default arm is unconditional.
+        assert!(
+            config.features.congruence,
+            "substitution-collapse AUTO is default-ON: congruence \
+             eligible (probe-gated) on the non-proof Default route"
+        );
+        assert!(
+            config.features.decompose,
+            "substitution-collapse AUTO is default-ON: decompose \
+             eligible (probe-gated) on the non-proof Default route"
+        );
         assert!(config.features.subsume);
         // Non-competitive features OFF to match CaDiCaL defaults (#8084)
         assert!(!config.features.bce, "BCE should be OFF (CaDiCaL block=0)");
@@ -1822,16 +1848,8 @@ mod tests {
     fn test_subst_auto_default_respects_proof_clamps() {
         // The DEFAULT-ON substitution-collapse path (wf_55735963) must never
         // override a proof refusal: LRAT is fail-closed for both Congruence
-        // and Decompose in PROOF_CAPABILITY_REGISTRY. Hermetic only when the
-        // operator has not exported the substitution knobs into the test
-        // environment.
-        if std::env::var_os("AY_AB_SUBST_AUTO").is_some()
-            || std::env::var_os("AY_AB_CONGRUENCE").is_some()
-            || std::env::var_os("AY_AB_DECOMPOSE").is_some()
-            || std::env::var_os("AY_AB_DRAT_SUBST").is_some()
-        {
-            return;
-        }
+        // and Decompose in PROOF_CAPABILITY_REGISTRY. B36: every
+        // substitution control is CLI-owned, so no hermeticity guard.
 
         let lrat = VariantConfig::for_variant(
             SolverVariant::Default,
@@ -1883,7 +1901,7 @@ mod tests {
         // Default flipped ON 2026-07-08 (post ef818369): with the knob
         // unset (or =1) the unlock is ACTIVE — BVE enabled exactly for the
         // in-band shape (density<=12, vars<=150K) and untouched elsewhere.
-        // AY_AB_BVE_SPARSE=0 is the kill-switch (asserted hermetically only
+        // --sat-no-bve-sparse is the kill-switch (asserted hermetically only
         // when set). The LRAT clamp below is unconditional.
         if ab_bve_sparse_knob_set() {
             for (vars, clauses, expect_bve) in [
@@ -2502,9 +2520,11 @@ mod tests {
 
     /// True when the process env has the mid-band kill-switch thrown
     /// (any explicit value other than `1`); the gate tests branch on this so
-    /// they stay hermetic under `AY_AB_MIDBAND_DEEP_RESTART=0` runs.
+    /// they stay hermetic under CLI-disabled runs.
     fn midband_kill_switch_thrown() -> bool {
-        std::env::var("AY_AB_MIDBAND_DEEP_RESTART").is_ok_and(|v| v != "1")
+        // B26: env retired; the only remaining disable is the CLI switch,
+        // which tests do not throw.
+        ay_core::sat_ab_switches().no_midband_deep_restart
     }
 
     #[test]
@@ -2516,7 +2536,7 @@ mod tests {
             assert_eq!(
                 plan.config.restart_policy,
                 VariantRestartPolicy::Glucose,
-                "kill-switch AY_AB_MIDBAND_DEEP_RESTART must restore the Glucose regime"
+                "the midband kill-switch must restore the Glucose regime"
             );
             return;
         }
@@ -3223,8 +3243,8 @@ mod tests {
         let dimacs = SolverVariant::Default;
         let input = VariantInput::new(32, 96, false, false);
         let mut dimacs_features = dimacs.config(input).features;
-        // The sparse-band BVE unlock (AY_AB_BVE_SPARSE, default ON) and the
-        // substitution-collapse AUTO (AY_AB_SUBST_AUTO, default ON since
+        // The sparse-band BVE unlock (--sat-no-bve-sparse, default ON) and the
+        // substitution-collapse AUTO (--sat-no-subst-auto, default ON since
         // wf_55735963) apply to the Default variant only; Custom profiles are
         // explicit user choices and stay untouched. Normalize so this
         // comparison holds whether or not the A/B knobs are set in the

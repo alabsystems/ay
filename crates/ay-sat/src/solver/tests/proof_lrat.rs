@@ -843,6 +843,82 @@ fn test_lrat_level0_conflict_has_hints() {
     );
 }
 
+/// A level-0 conflict with two false literals must be recorded in forward BCP
+/// order for ClauseTrace's strict positive-RUP replay.  The historical raw
+/// resolution walk started with the conflict clause; because neither of its
+/// literals was assigned yet in replay, the validator correctly rejected it.
+#[test]
+fn clause_trace_level0_multiliteral_conflict_is_positive_rup() {
+    let mut solver = Solver::new(3);
+    solver.enable_clause_trace();
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+    let clauses = [
+        vec![a],
+        vec![a.negated(), b],
+        vec![a.negated(), c],
+        vec![b.negated(), c.negated()],
+    ];
+    for clause in clauses {
+        assert!(solver.add_clause(clause));
+    }
+
+    assert!(solver.solve().into_inner().is_unsat());
+    let trace = solver.take_clause_trace().expect("clause trace enabled");
+    let empty = trace.entries().last().expect("terminal empty-clause entry");
+    assert!(empty.clause.is_empty());
+    assert_eq!(
+        empty.resolution_hints.last(),
+        Some(&4),
+        "the multi-literal conflict clause must be the final positive-RUP hint"
+    );
+
+    let validated = crate::validate_clause_trace_resolution(
+        &trace,
+        3,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("forward level-0 BCP hints must pass independent positive-RUP replay");
+    assert_eq!(validated.dag().empty_clause_id, 5);
+}
+
+#[test]
+fn clause_trace_level0_conflict_missing_id_fails_closed() {
+    let mut solver = Solver::new(3);
+    solver.enable_clause_trace();
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+    assert!(solver.add_clause(vec![a]));
+    assert!(solver.add_clause(vec![a.negated(), b]));
+    assert!(solver.add_clause(vec![a.negated(), c]));
+
+    let conflict_offset = solver.arena.len();
+    assert!(solver.add_clause(vec![b.negated(), c.negated()]));
+    assert_ne!(solver.cold.clause_ids[conflict_offset], 0);
+    solver.cold.clause_ids[conflict_offset] = 0;
+
+    assert!(solver.solve().into_inner().is_unsat());
+    let trace = solver.take_clause_trace().expect("clause trace enabled");
+    assert!(
+        trace.proof_work_exhausted(),
+        "a missing required ID must poison reconstruction explicitly"
+    );
+    assert!(
+        trace.entries().iter().all(|entry| !entry.clause.is_empty()),
+        "an incomplete terminal hint chain must not be published"
+    );
+    assert!(crate::validate_clause_trace_resolution(
+        &trace,
+        3,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .is_err());
+}
+
 /// Regression test for #4434: LRAT `add` returns sentinel `Ok(0)` after I/O
 /// failure, but `replace_clause_checked` must NOT propagate that sentinel into
 /// `clause_ids` or `next_clause_id`.

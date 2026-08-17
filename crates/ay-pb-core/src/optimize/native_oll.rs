@@ -1712,7 +1712,7 @@ where
     let lp_should_stop =
         || std::time::Instant::now() >= deadline || (should_stop_cell.borrow_mut())();
 
-    // When the Farkas-certificate emit path is enabled (`AY_PB_FARKAS_CERT`), build
+    // When the Farkas-certificate emit path is enabled (`--pb-farkas-cert`), build
     // and self-validate a checked certificate for the base LP bound. This is purely
     // an ADDED, fail-closed trust layer: the floor returned is the SAME value the
     // exact simplex computed regardless of the certificate outcome. On `Verified`
@@ -1722,7 +1722,7 @@ where
     // The certified base bound, when the Farkas emit path is on. This used to
     // RETURN here, which meant the subgradient floor below was never computed on
     // the certificate path at all — measured on `..._mw19_19`, the dual dropped
-    // from 139 to 130 the moment `AY_PB_FARKAS_CERT` was set, putting proof
+    // from 139 to 130 the moment `--pb-farkas-cert` was set, putting proof
     // coverage and floor quality in direct conflict. Now it feeds the same
     // single exit as every other floor.
     //
@@ -3098,17 +3098,16 @@ mod tests {
 
     // ---- Real instance optima vs Exact (gated by file availability) ----
 
-    /// Resolves a PB-competition corpus file: `$AY_PBCOMP_BENCH_ROOT/<rel>`
-    /// when the env var is set, else the checkout-relative
-    /// `benchmarks/pb-comp/<rel>`. The corpus is not tracked in git; tests
-    /// skip when the file is absent.
+    /// Resolves a PB-competition corpus file under the checkout-relative
+    /// `benchmarks/pb-comp/<rel>` (B14: the env override nothing set is
+    /// deleted; a relocated corpus is a symlink). The corpus is not tracked
+    /// in git; tests skip when the file is absent.
     fn pbcomp_path(rel: &str) -> String {
-        let root = std::env::var_os("AY_PBCOMP_BENCH_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp")
-            });
-        root.join(rel).display().to_string()
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/pb-comp")
+            .join(rel)
+            .display()
+            .to_string()
     }
 
     fn opb_path_optimum(rel: &str, expected: i128) {

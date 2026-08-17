@@ -14,6 +14,8 @@ mod common;
 
 #[path = "group_proofs/array_collapse_promotion.rs"]
 mod array_collapse_promotion;
+#[path = "group_proofs/authored_fold_to_false_refutation.rs"]
+mod authored_fold_to_false_refutation;
 #[path = "group_proofs/carcara_external_check.rs"]
 mod carcara_external_check;
 #[path = "group_proofs/check_sat_assuming_proof_net.rs"]
@@ -36,6 +38,8 @@ mod ematching_forall_farkas_rebuild;
 mod incremental_clausification_proofs;
 #[path = "group_proofs/incremental_proof_quality_8154.rs"]
 mod incremental_proof_quality_8154;
+#[path = "group_proofs/ite_lift_substituted_bound_rebuild.rs"]
+mod ite_lift_substituted_bound_rebuild;
 #[path = "group_proofs/linear_and_collapse_rebuild.rs"]
 mod linear_and_collapse_rebuild;
 #[path = "group_proofs/multi_equality_farkas_rebuild.rs"]

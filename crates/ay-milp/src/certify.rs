@@ -413,10 +413,7 @@ pub(crate) fn certified_weak_dual_row_big_reference_proposal(
 
 /// Overridable for measurement.
 pub(crate) fn max_exact_basis_rows() -> usize {
-    std::env::var("AY_MILP_MAX_BASIS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_EXACT_BASIS_ROWS)
+    MAX_EXACT_BASIS_ROWS
 }
 
 /// Solve `A z = b` exactly by Gaussian elimination with partial pivoting on the
@@ -481,7 +478,7 @@ pub(crate) fn solve_sparse(
     let mut pivot_row = vec![usize::MAX; n];
     let mut pivot_col = vec![0usize; n];
 
-    let dbg = std::env::var_os("AY_MILP_SOLVE_DBG").is_some();
+    let dbg = false;
     let t0 = std::time::Instant::now();
 
     for k in 0..n {
@@ -506,7 +503,7 @@ pub(crate) fn solve_sparse(
                 .max()
                 .unwrap_or(0);
             eprintln!(
-                "AY_MILP_TRACE solve_sparse pivot {k}/{n} @ {:.1}s: live_nnz={live_nnz} max_bits={max_bits}",
+                "--trace solve_sparse pivot {k}/{n} @ {:.1}s: live_nnz={live_nnz} max_bits={max_bits}",
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -591,7 +588,7 @@ pub(crate) fn solve_sparse(
     // pivoted LATER, whose z is already known by the time we reach this step.
     if dbg {
         eprintln!(
-            "AY_MILP_TRACE solve_sparse forward done @ {:.2}s; back-substituting",
+            "--trace solve_sparse forward done @ {:.2}s; back-substituting",
             t0.elapsed().as_secs_f64()
         );
     }
@@ -655,7 +652,7 @@ pub(crate) fn solve_sparse(
                 .max()
                 .unwrap_or(0);
             eprintln!(
-                "AY_MILP_TRACE solve_sparse back-sub {done}/{n} @ {:.1}s: max_z_bits={zbits}",
+                "--trace solve_sparse back-sub {done}/{n} @ {:.1}s: max_z_bits={zbits}",
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -689,7 +686,7 @@ pub(crate) fn solve_dense(
 ///
 /// ```text
 ///   default routing               UNKNOWN Timeout @ 15.9 s   ZERO nodes searched
-///   AY_MILP_NO_STRUCTURE_ROUTE=1  FEASIBLE 5.9594  @  2.8 s   141 nodes
+///   `SolveOpts::with_structure_routing(false)`  FEASIBLE 5.9594  @  2.8 s   141 nodes
 /// ```
 ///
 /// A 5.3x overrun of the caller's own deadline, with branch-and-bound never
@@ -805,14 +802,14 @@ fn exact_point_inner(
     // Reject the vertex if any BASIC variable lands outside its bound: the float
     // basis's exact vertex is then infeasible and the caller must fall back.
     // Nonbasics sit exactly on a bound by construction, so only basics can violate.
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+    let trace = crate::debug_flags::milp_debug_flags().trace;
     for &j in &cand.basis {
         if let Some(lo) = exact(lower[j]) {
             if z[j] < lo {
                 if trace {
                     let d = (&lo - &z[j]).to_f64().unwrap_or(f64::NAN);
                     eprintln!(
-                        "AY_MILP_TRACE !! exact_point: basic col {j} below its lower bound by {d:.3e}"
+                        "--trace !! exact_point: basic col {j} below its lower bound by {d:.3e}"
                     );
                 }
                 return None;
@@ -823,7 +820,7 @@ fn exact_point_inner(
                 if trace {
                     let d = (&z[j] - &hi).to_f64().unwrap_or(f64::NAN);
                     eprintln!(
-                        "AY_MILP_TRACE !! exact_point: basic col {j} above its upper bound by {d:.3e}"
+                        "--trace !! exact_point: basic col {j} above its upper bound by {d:.3e}"
                     );
                 }
                 return None;
@@ -906,9 +903,9 @@ pub(crate) fn exact_vertex_with_rest(
     if rest.len() != structural.len() {
         return None; // not a basis: the shapes must match
     }
-    if std::env::var_os("AY_MILP_TRACE").is_some() {
+    if crate::debug_flags::milp_debug_flags().trace {
         eprintln!(
-            "AY_MILP_TRACE exact_point: structural basis {} (cap {}), {} rows",
+            "--trace exact_point: structural basis {} (cap {}), {} rows",
             structural.len(),
             max_rows.unwrap_or_else(max_exact_basis_rows),
             m
@@ -935,7 +932,8 @@ pub(crate) fn exact_vertex_with_rest(
             },
         };
     }
-    let dbg = std::env::var_os("AY_MILP_SOLVE_DBG").is_some();
+    // B7: the AY_MILP_SOLVE_DBG env switch is deleted; enable by editing.
+    let dbg = false;
     let t0 = std::time::Instant::now();
     if m > 0 {
         let mut rhs = vec![BigRational::zero(); m];
@@ -997,7 +995,7 @@ pub(crate) fn exact_vertex_with_rest(
             }
             if dbg {
                 eprintln!(
-                    "AY_MILP_TRACE exact_point brows built @ {:.2}s (d={d}); solve_sparse begins",
+                    "--trace exact_point brows built @ {:.2}s (d={d}); solve_sparse begins",
                     t0.elapsed().as_secs_f64()
                 );
             }
@@ -1008,7 +1006,7 @@ pub(crate) fn exact_vertex_with_rest(
         }
         if dbg {
             eprintln!(
-                "AY_MILP_TRACE exact_point solve done @ {:.2}s; logical back-sub begins ({} logical rows x {} structurals)",
+                "--trace exact_point solve done @ {:.2}s; logical back-sub begins ({} logical rows x {} structurals)",
                 t0.elapsed().as_secs_f64(),
                 logical_of_row.iter().filter(|l| l.is_some()).count(),
                 structural.len()
@@ -1059,7 +1057,7 @@ pub(crate) fn exact_vertex_with_rest(
 
         if dbg {
             eprintln!(
-                "AY_MILP_TRACE exact_point logical back-sub done @ {:.2}s; bound check begins",
+                "--trace exact_point logical back-sub done @ {:.2}s; bound check begins",
                 t0.elapsed().as_secs_f64()
             );
         }
@@ -1699,7 +1697,7 @@ pub(crate) fn certify_bounded_by(
         }
         // Primal feasibility of the basics. (Non-basics sit on their bounds by
         // construction.)
-        let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+        let trace = crate::debug_flags::milp_debug_flags().trace;
         for (index, &j) in cand.basis.iter().enumerate() {
             if index & 0x3f == 0 && expired() {
                 return None;
@@ -1709,7 +1707,7 @@ pub(crate) fn certify_bounded_by(
                     if trace {
                         let d = (&lo - &z[j]).to_f64().unwrap_or(f64::NAN);
                         eprintln!(
-                            "AY_MILP_TRACE !! exact_point: basic col {j} below its lower bound by {d:.3e}"
+                            "--trace !! exact_point: basic col {j} below its lower bound by {d:.3e}"
                         );
                     }
                     return None;
@@ -1720,7 +1718,7 @@ pub(crate) fn certify_bounded_by(
                     if trace {
                         let d = (&z[j] - &hi).to_f64().unwrap_or(f64::NAN);
                         eprintln!(
-                            "AY_MILP_TRACE !! exact_point: basic col {j} above its upper bound by {d:.3e}"
+                            "--trace !! exact_point: basic col {j} above its upper bound by {d:.3e}"
                         );
                     }
                     return None;
@@ -1903,15 +1901,15 @@ pub(crate) struct ExactLu {
 }
 
 /// Kill switch (shared with the GMI separator's fused arithmetic) for the
-/// clone-elided form of the exact triangular solve. When `AY_MILP_NO_CUT_FMA`
+/// clone-elided form of the exact triangular solve. When `--no-cut-fma`
 /// is set the solve falls back to the literal `acc -= lu.clone() * &y` form for
 /// an A/B byte-identity check. Cached once per process: the O(n²) solve must not
 /// pay a syscall per term. `&lu * &y` runs the identical `Mul for &Rational` the
 /// clone form did — same canonical value, minus a heap clone of a wide rational.
 #[inline]
 fn exact_lu_fma_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_MILP_NO_CUT_FMA").is_none())
+    // B29: this typed thread-local read needs no process cache, unlike the retired env read.
+    crate::tune::caller_flag(crate::tune::Knob::NoCutFma).map_or(true, |no| !no)
 }
 
 impl ExactLu {
@@ -2060,7 +2058,7 @@ impl ExactLu {
 /// about, so any non-zero pivot sequence reaches that same `u`. The pivot order is
 /// therefore free: it buys sparsity and cannot buy a different answer. A singular
 /// basis declines either way (no admissible pivot here, no non-zero in the column
-/// there). None of this is left as an argument: `AY_MILP_DENSE_GMI_LU=1` restores
+/// there). None of this is left as an argument: `--dense-gmi-lu` restores
 /// the dense path, the tests below require byte-equal solutions from both over
 /// random, near-triangular and deliberately fill-prone systems, and the corpus A/B
 /// was run with the switch as the only difference.
@@ -2418,7 +2416,7 @@ impl SparseExactLu {
     }
 
     /// Stored non-zeros across both factors — what the dense path spent `m²` on.
-    /// Diagnostic (`AY_MILP_TRACE`), and the number the row cap's replacement
+    /// Diagnostic (`--trace`), and the number the row cap's replacement
     /// argument rests on.
     pub(crate) fn factor_nnz(&self) -> usize {
         self.l.iter().map(Vec::len).sum::<usize>()

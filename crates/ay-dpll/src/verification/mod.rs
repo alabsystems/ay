@@ -156,7 +156,7 @@ impl VerificationError {
     }
 }
 
-/// #verify-memo (`AY_VERIFY_MEMO=1`, default off = byte-identical): arms the
+/// #verify-memo (`--verify-memo=1`, default off = byte-identical): arms the
 /// verify-lane obligation memo in the extension's sampled propagation
 /// verification (see `extension/propagate.rs`). The verification TAX is never
 /// weakened — same obligations selected for verification (sampling policy
@@ -167,12 +167,12 @@ impl VerificationError {
 /// `verify_array_memo` discipline), so every rejection re-runs the complete
 /// verification with its exact error kind.
 ///
-/// Read once per process (same pattern as `AY_PROP_DEBUG` /
-/// `AY_LIA_INSTRUMENT`): when unset, every call is a single load and the
+/// Read once per process (same pattern as `--prop-debug` /
+/// `--lia-instrument`): when unset, every call is a single load and the
 /// solver's control flow is byte-for-byte the unflagged build.
 pub(crate) fn verify_memo_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| std::env::var_os("AY_VERIFY_MEMO").is_some_and(|v| v != "0"))
+    *ARMED.get_or_init(|| ay_core::misc_cli_flags().verify_memo)
 }
 
 /// #verify-memo: Executor-owned memo for sampled semantic PROPAGATION

@@ -168,6 +168,28 @@ impl ProvenanceSurfaceAudit {
         self.require_original_as(ctx, originals, canonical, canonical)
     }
 
+    /// Require one spelling that an exact source registration already
+    /// authenticated. Deep arithmetic spellings are compatibility-only by
+    /// default because most certified rules must stay canonical. An ITE-lift
+    /// plan promotes its guard and any authenticated term-ITE spellings that
+    /// generated ITE rules print independently, so the authored premise and
+    /// those rules use one opaque-atom spelling. Final copied-step, rule-role,
+    /// and printed-certificate replay still decide whether a promotion is safe.
+    pub(in crate::executor) fn promote_registered_requirement(&mut self, term: TermId) -> bool {
+        if !self.requirements.contains_key(&term) {
+            return false;
+        }
+        if !self.promoted_requirements.contains(&term)
+            && self.promoted_requirements.len() >= MAX_AUDITED_TERMS
+        {
+            self.overflowed = true;
+            return false;
+        }
+        self.compatibility_requirements.remove(&term);
+        self.promoted_requirements.insert(term);
+        true
+    }
+
     pub(in crate::executor) fn require_original_as(
         &mut self,
         ctx: &mut ay_frontend::Context,
@@ -416,7 +438,7 @@ impl ProvenanceSurfaceAudit {
                 actual == expected
             } else if self.compatibility_requirements.contains(&term) {
                 true
-            } else if self.aliases.contains(&term) {
+            } else if self.aliases.contains(&term) || self.promoted_requirements.contains(&term) {
                 active.insert(term, expected.clone());
                 true
             } else {

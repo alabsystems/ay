@@ -20,7 +20,40 @@
 //!   T(x₁,...,xₙ) = Σᵢ (∏_{j≠i} vⱼ) * xᵢ - (n-1) * ∏ᵢ vᵢ
 //!
 //! Based on Z3's `nla_tangent_lemmas.cpp`.
+//!
+//! ## Fixed-factor linearization (exact, no bounds required)
+//!
+//! Both relaxations above need a finite box: McCormick returns NOTHING when
+//! either factor is unbounded, and the tangent plane is only an approximation
+//! at the model point, so any UNSAT reached through it must be rechecked and
+//! any SAT near an irrational witness is unreachable.
+//!
+//! But a product needs no box at all when the ASSERTED constraints already pin
+//! all of its factors but one. If `x = c` follows from the assertions, then
+//!
+//!   `m = x*y  ∧  x = c   ⊨   m = c*y`
+//!
+//! for EVERY real `y` — a linear identity, not a relaxation. Likewise `m = 0`
+//! whenever any pinned factor is zero, whatever the remaining factors are, and
+//! `m = c₁·…·cₙ` when every factor is pinned.
+//!
+//! This is the shape of the template-synthesis families (LassoRanker,
+//! UltimateAutomizer): the products are `motzkin · templateVar` where the
+//! Motzkin multiplier is confined to `{0, 1}` by a case-split clause and the
+//! template coefficient is a completely unbounded real. Once DPLL(T) picks a
+//! side of the split, every one of those products becomes linear — the whole
+//! query collapses into LRA. Before this, the linearization saturated in
+//! milliseconds with `McCormick envelope: 0 constraints` on every monomial and
+//! the check loop returned `unknown`.
+//!
+//! Soundness: the pins come from [`NraSolver::fixed_factor_values`], which is
+//! computed from the LRA bound state BEFORE any tentative scope is pushed, so
+//! it never picks up a model-point patch, sign cut or feasible-set pin. The
+//! emitted equalities are therefore implied by the asserted atoms, exactly like
+//! McCormick over asserted bounds — they do NOT set the tangent-approximation
+//! flag, and an UNSAT reached with them alone stays genuine.
 
+use ay_core::term::TermId;
 use ay_lra::GomoryCut;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
@@ -28,21 +61,24 @@ use num_traits::{One, Zero};
 use crate::monomial::Monomial;
 use crate::NraSolver;
 
+#[path = "tangent/fixed_factor.rs"]
+mod fixed_factor;
 impl NraSolver<'_> {
     /// Add a single McCormick bound: m - a*y - b*x [cmp] -a*b
     ///
     /// `vars`: (m_var, x_var, y_var) — LRA variable indices for the monomial.
     fn add_mccormick_bound(
         &mut self,
-        m: ay_core::term::TermId,
+        m: TermId,
         vars: (u32, u32, u32),
+        aux_reciprocal: &BigRational,
         a_val: &BigRational,
         b_val: &BigRational,
         is_lower: bool,
     ) {
         let (m_var, x_var, y_var) = vars;
         let coeffs = vec![
-            (m_var, BigRational::one()),
+            (m_var, aux_reciprocal.clone()),
             (y_var, -a_val.clone()),
             (x_var, -b_val.clone()),
         ];
@@ -86,27 +122,56 @@ impl NraSolver<'_> {
             self.lra.ensure_var_registered(x),
             self.lra.ensure_var_registered(y),
         );
+        let aux_reciprocal = BigRational::one() / &mon.coeff;
 
         let mut count = 0;
 
         // Lower bound 1: m ≥ xL*y + yL*x - xL*yL
         if let (Some(ref xl), Some(ref yl)) = (&x_lb, &y_lb) {
-            self.add_mccormick_bound(m, vars, &xl.value_big(), &yl.value_big(), true);
+            self.add_mccormick_bound(
+                m,
+                vars,
+                &aux_reciprocal,
+                &xl.value_big(),
+                &yl.value_big(),
+                true,
+            );
             count += 1;
         }
         // Lower bound 2: m ≥ xU*y + yU*x - xU*yU
         if let (Some(ref xu), Some(ref yu)) = (&x_ub, &y_ub) {
-            self.add_mccormick_bound(m, vars, &xu.value_big(), &yu.value_big(), true);
+            self.add_mccormick_bound(
+                m,
+                vars,
+                &aux_reciprocal,
+                &xu.value_big(),
+                &yu.value_big(),
+                true,
+            );
             count += 1;
         }
         // Upper bound 1: m ≤ xU*y + yL*x - xU*yL
         if let (Some(ref xu), Some(ref yl)) = (&x_ub, &y_lb) {
-            self.add_mccormick_bound(m, vars, &xu.value_big(), &yl.value_big(), false);
+            self.add_mccormick_bound(
+                m,
+                vars,
+                &aux_reciprocal,
+                &xu.value_big(),
+                &yl.value_big(),
+                false,
+            );
             count += 1;
         }
         // Upper bound 2: m ≤ xL*y + yU*x - xL*yU
         if let (Some(ref xl), Some(ref yu)) = (&x_lb, &y_ub) {
-            self.add_mccormick_bound(m, vars, &xl.value_big(), &yu.value_big(), false);
+            self.add_mccormick_bound(
+                m,
+                vars,
+                &aux_reciprocal,
+                &xl.value_big(),
+                &yu.value_big(),
+                false,
+            );
             count += 1;
         }
 
@@ -147,9 +212,10 @@ impl NraSolver<'_> {
             full_product *= v;
         }
 
-        // Build coefficients: m has coefficient 1, each xᵢ has coefficient -(∏_{j≠i} vⱼ)
+        // Build coefficients: m has coefficient 1/coeff, each xᵢ has
+        // coefficient -(∏_{j≠i} vⱼ).
         let mut coeffs = Vec::with_capacity(n + 1);
-        coeffs.push((m_var, BigRational::one()));
+        coeffs.push((m_var, BigRational::one() / &mon.coeff));
 
         for (i, &var) in mon.vars.iter().enumerate() {
             let var_id = self.lra.ensure_var_registered(var);
@@ -195,6 +261,15 @@ impl NraSolver<'_> {
     /// assigns m < 0, this constraint forces the model to respect the
     /// algebraic identity.
     pub(crate) fn add_even_power_nonneg(&mut self, mon: &Monomial) -> bool {
+        self.add_even_power_nonneg_with_reasons(mon, &[])
+    }
+
+    /// Add even-power non-negativity with asserted reasons for global replay.
+    pub(crate) fn add_even_power_nonneg_with_reasons(
+        &mut self,
+        mon: &Monomial,
+        reasons: &[(TermId, bool)],
+    ) -> bool {
         // Check if the monomial is an even power: all factors are the same variable.
         if mon.vars.is_empty() {
             return false;
@@ -206,22 +281,22 @@ impl NraSolver<'_> {
             return false;
         }
 
-        // Check if aux value is already non-negative — no lemma needed.
+        // The lemma concerns the bare even power, i.e. `aux / coeff >= 0`.
         if let Some(v) = self.var_value(mon.aux_var) {
-            if v >= BigRational::zero() {
+            if mon.product_from_aux(&v) >= BigRational::zero() {
                 return false;
             }
         }
 
         let m_var = self.lra.ensure_var_registered(mon.aux_var);
-        let coeffs = vec![(m_var, BigRational::one())];
+        let coeffs = vec![(m_var, BigRational::one() / &mon.coeff)];
         let bound = BigRational::zero();
         self.lra.add_gomory_cut(
             &GomoryCut {
                 coeffs,
                 bound,
                 is_lower: true, // m >= 0
-                reasons: Vec::new(),
+                reasons: reasons.to_vec(),
                 source_term: None,
             },
             mon.aux_var,
@@ -241,8 +316,8 @@ impl NraSolver<'_> {
         let mut binary_mons: Vec<(Monomial, Vec<BigRational>, bool)> = Vec::new();
         let mut general_constrain: Vec<(Monomial, Vec<BigRational>, bool)> = Vec::new();
 
-        let mut sorted_mons: Vec<_> = self.monomials.values().collect();
-        sorted_mons.sort_unstable_by(|a, b| a.vars.cmp(&b.vars));
+        let mut sorted_mons: Vec<_> = self.products().collect();
+        sorted_mons.sort_unstable_by(|a, b| (&a.vars, a.aux_var.0).cmp(&(&b.vars, b.aux_var.0)));
 
         for mon in sorted_mons {
             // Collect factor values for all monomials
@@ -264,27 +339,36 @@ impl NraSolver<'_> {
                 continue;
             };
 
-            let mut c = BigRational::one();
+            let mut true_product = BigRational::one();
             for fv in &factor_values {
-                c *= fv;
+                true_product *= fv;
             }
 
-            if v == c {
+            let model_product = mon.product_from_aux(&v);
+            if model_product == true_product {
                 continue;
             }
+            let is_below = model_product < true_product;
 
             if mon.is_binary() {
-                binary_mons.push((mon.clone(), factor_values, v < c));
+                binary_mons.push((mon.clone(), factor_values, is_below));
             } else {
-                general_constrain.push((mon.clone(), factor_values, v < c));
+                general_constrain.push((mon.clone(), factor_values, is_below));
             }
         }
 
         let mut count = 0;
         let mut used_tangent = false;
 
-        // Binary monomials: try McCormick first, fall back to tangent hyperplane
+        // Binary monomials: exact fixed-factor identity, then McCormick, then
+        // the tangent hyperplane. The identity is tried first because it is
+        // strictly stronger than both (an equality, and available with no
+        // bound at all on the free factor).
         for (mon, factor_values, is_below) in binary_mons {
+            if self.add_fixed_factor_linearization(&mon) > 0 {
+                count += 2;
+                continue;
+            }
             let mc = self.add_mccormick_constraints(&mon);
             if mc > 0 {
                 count += mc;
@@ -301,8 +385,13 @@ impl NraSolver<'_> {
             }
         }
 
-        // Higher-degree monomials: tangent hyperplane at model point
+        // Higher-degree monomials: exact fixed-factor identity when the pins
+        // reduce them to linear, else the tangent hyperplane at the model point.
         for (mon, factor_values, is_below) in general_constrain {
+            if self.add_fixed_factor_linearization(&mon) > 0 {
+                count += 2;
+                continue;
+            }
             self.add_even_power_nonneg(&mon);
             if self.add_tangent_constraint_general(&mon, &factor_values, is_below) {
                 count += 1;
@@ -310,7 +399,60 @@ impl NraSolver<'_> {
             }
         }
 
+        // Scaled aliases are independent LRA atoms until this exact identity
+        // ties each one to the representative over the same factor multiset.
+        let representatives = std::mem::take(&mut self.monomials);
+        let aliases = std::mem::take(&mut self.scaled_aliases);
+        count += self.add_alias_tie_constraints(&representatives, &aliases);
+        self.monomials = representatives;
+        self.scaled_aliases = aliases;
+
         (count, used_tangent)
+    }
+
+    /// Emit `alias == (alias.coeff / representative.coeff) * representative`
+    /// as an exact two-sided linear identity whenever the current model violates it.
+    pub(crate) fn add_alias_tie_constraints(
+        &mut self,
+        representatives: &crate::HashMap<Vec<TermId>, Monomial>,
+        aliases: &[Monomial],
+    ) -> usize {
+        let mut added = 0;
+        for alias in aliases {
+            let Some(representative) = representatives.get(&alias.vars) else {
+                continue;
+            };
+            let ratio = &alias.coeff / &representative.coeff;
+            let (Some(alias_value), Some(representative_value)) = (
+                self.var_value(alias.aux_var),
+                self.var_value(representative.aux_var),
+            ) else {
+                continue;
+            };
+            if alias_value == &ratio * representative_value {
+                continue;
+            }
+            let alias_var = self.lra.ensure_var_registered(alias.aux_var);
+            let representative_var = self.lra.ensure_var_registered(representative.aux_var);
+            let coefficients = vec![
+                (alias_var, BigRational::one()),
+                (representative_var, -ratio),
+            ];
+            for is_lower in [true, false] {
+                self.lra.add_gomory_cut(
+                    &GomoryCut {
+                        coeffs: coefficients.clone(),
+                        bound: BigRational::zero(),
+                        is_lower,
+                        reasons: Vec::new(),
+                        source_term: None,
+                    },
+                    alias.aux_var,
+                );
+            }
+            added += 2;
+        }
+        added
     }
 }
 

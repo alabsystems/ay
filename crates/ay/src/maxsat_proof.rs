@@ -571,7 +571,7 @@ impl HardUp {
             .hard_lits
             .saturating_add(2u64.saturating_mul(shape.max_var as u64 + 1))
             <= budget
-            && shape.hard_lits <= u32::MAX as u64
+            && u32::try_from(shape.hard_lits).is_ok()
     }
 
     /// One extra streaming pass over the WCNF. The hard clauses are held ONCE:

@@ -4,7 +4,7 @@
 
 //! Shared bridge between the string MODEL-CONSTRUCTION paths and the
 //! content-positive regex witness search `ay_strings::we_regex::find_witness`
-//! (strings increments W1-W3, default ON, `AY_STR_WITNESS=0` kill switch).
+//! (strings increments W1-W3, default ON, `--dpll-no-str-witness` kill switch).
 //!
 //! ## Why this module exists
 //!
@@ -58,7 +58,7 @@ pub(in crate::executor) const MAX_WITNESS_CONSTRUCT_LEN: usize = 4096;
 /// exists is never reached. Bounding work, not soundness.
 pub(in crate::executor) const WITNESS_SEARCH_MAX_LEN: usize = 512;
 
-/// Strings witness-construction master switch (`AY_STR_WITNESS=1`, default
+/// Strings witness-construction master switch (default
 /// OFF).
 ///
 /// Default OFF keeps every model-construction path byte-identical to
@@ -67,8 +67,8 @@ pub(in crate::executor) fn str_witness_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: W1b converts 4 automatark files (z3-verified), 0 losses,
     // 0 disagreements, fuzz clean; W1/W2/W3 are inert on this corpus but
-    // correct and gated. AY_STR_WITNESS=0 kills it.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_WITNESS").ok().as_deref(), Some("0")))
+    // correct and gated. --dpll-no-str-witness kills it.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_witness)
 }
 
 /// Per-increment kill switch: `AY_STR_WITNESS_W<n>=0` disables increment `n`
@@ -234,16 +234,15 @@ impl Executor {
 mod tests {
     use super::*;
 
-    /// Witness construction went DEFAULT-ON (`AY_STR_WITNESS=0` kills it); the
+    /// Witness construction went DEFAULT-ON (`--dpll-no-str-witness` kills it); the
     /// pin is that the master switch and every sub-increment agree, so a
     /// sub-increment can never be live while the master switch is off. (This
     /// test previously asserted the pre-default-on contract and had gone stale.)
     #[test]
     fn witness_flags_track_the_master_switch() {
         let master = str_witness_enabled();
-        if std::env::var("AY_STR_WITNESS").is_err() {
-            assert!(master, "AY_STR_WITNESS is DEFAULT-ON (=0 kills it)");
-        }
+        // B28: CLI-owned; nothing ambient can kill the master switch.
+        assert!(master, "the witness master switch is DEFAULT-ON");
         for (name, live) in [
             ("W1", str_witness_w1()),
             ("W2", str_witness_w2()),

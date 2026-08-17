@@ -23,7 +23,7 @@ const SYMMETRY_MAX_VARS: usize = 4_096;
 /// Soundness is unaffected by widening it, for the same reason the clause cap
 /// could be widened: a mis-detected matrix only yields a proof the native SR
 /// checker REJECTS, never a false VERIFIED. The clause cap remains the real
-/// cost bound. Override for calibration with `AY_SAT_SYMMETRY_DETECTOR_MAX_VARS`.
+/// cost bound. (B2: the env override is deleted; edit the constant.)
 const SYMMETRY_DETECTOR_MAX_VARS: usize = 1_000_000;
 /// Clause cap for routes that may invoke the EXPENSIVE backtracking automorphism
 /// finder (`find_composite_generators` / `ir::find_automorphisms`): the composite,
@@ -46,7 +46,7 @@ const SYMMETRY_IR_MAX_CLAUSES: usize = 20_000;
 /// clauses, `chnl-030x091` at 245_882) and were dropped to plain CDCL, where
 /// they time out, while the four below the cap solve in 67-1337 ms. Since the
 /// route is one linear scan and the proof is the gate, the cap buys nothing at
-/// this size. Override with `AY_SAT_SYMMETRY_DETECTOR_MAX_CLAUSES`.
+/// this size. (B2: the env override is deleted; edit the constant.)
 const SYMMETRY_DETECTOR_MAX_CLAUSES: usize = 1_000_000;
 /// Size guard for the SIGNED IR search. The search itself is node-budgeted, but
 /// building the colored graph and the clause multiset is linear in the formula,
@@ -83,7 +83,7 @@ impl Solver {
         if self.preprocessing_should_stop(should_stop) {
             return (false, false);
         }
-        if std::env::var_os("AY_SAT_SYMMETRY_TRACE").is_some() {
+        if ay_core::misc_cli_flags().sat_symmetry_trace {
             safe_eprintln!(
                 "c symmetry-trace: entered: enabled={} oneshot={} incremental={} proof_manager={} lrat={} clause_trace={} vars={} clauses={}",
                 self.cold.symmetry_enabled,
@@ -97,15 +97,11 @@ impl Solver {
             );
         }
 
-        // #17: AY_SAT_COMPOSITE_SYMMETRY enables the (default-off, no-proof-only)
+        // #17: --sat-composite-symmetry enables the (default-off, no-proof-only)
         // composite-permutation symmetry path even when the profile leaves
         // symmetry off — for the clique/coloring/PHP family that the single-swap
-        // detector cannot break. Cached per process (each run is a fresh process).
-        let composite_symmetry = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_COMPOSITE_SYMMETRY").is_some())
-        };
+        // detector cannot break.
+        let composite_symmetry = ay_core::sat_ab_switches().composite_symmetry;
         if self.cold.has_been_incremental {
             self.cold
                 .symmetry_stats
@@ -137,11 +133,8 @@ impl Solver {
         // opt-in via a variable nothing set, so the route never ran outside a
         // hand-written command line.
         let orbitope_route = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| {
-                std::env::var("AY_SAT_ORBITOPE").map_or(true, |v| v != "0" && v != "false")
-            })
+            // B26: CLI-owned opt-out (--sat-no-orbitope); env retired.
+            !ay_core::sat_ab_switches().no_orbitope
         };
         // Structural routes remove models, so they are valid only for a
         // one-shot solve. `has_been_incremental` is NOT sufficient: it is false
@@ -158,6 +151,7 @@ impl Solver {
         let orbitope_fits = self.arena.active_clause_count() <= ORBITOPE_MAX_CLAUSES
             && self.num_vars <= ORBITOPE_MAX_VARS;
         if orbitope_route
+            && !self.cold.symmetry_orbitope_disabled
             && self.cold.symmetry_oneshot
             && self.cold.symmetry_stats.runs == 1
             && orbitope_fits
@@ -191,17 +185,11 @@ impl Solver {
         // structural scan), so like the orbitope route it must not be denied by
         // `symmetry_enabled` — a flag that defaults false and only re-enables
         // below 4096 vars, while the PHP family it targets is far larger.
-        let sr_auxfree_enabled = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| {
-                std::env::var("AY_SAT_SYMMETRY_SR_AUXFREE")
-                    .map_or(true, |v| v != "0" && v != "false")
-            })
-        };
+        // B26: CLI-owned opt-out (--sat-no-symmetry-sr-auxfree); env retired.
+        let sr_auxfree_enabled = !ay_core::sat_ab_switches().no_symmetry_sr_auxfree;
         let sr_auxfree_enabled = sr_auxfree_enabled && self.cold.symmetry_oneshot;
         // The signed route's flag is read further down, AFTER this gate, so
-        // `AY_SAT_SIGNED_SYMMETRY=1` alone never reached it: `symmetry_enabled`
+        // `--sat-signed-symmetry` alone never reached it: `symmetry_enabled`
         // defaults false and its only re-enable (`adaptive.rs`) is guarded by
         // `num_vars < 4096`. Verified 2026-08-10 on a 139 160-variable instance:
         // with the flag set, the trace still reports `enabled=false` and
@@ -211,15 +199,12 @@ impl Solver {
         // The full-400 A/B that REJECTED signed symmetry (-3 solved) measured a
         // technique that was inert on every instance above 4096 variables, i.e.
         // on most of the corpus. Re-judge that decision now the route can run.
-        let signed_enabled = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some())
-        };
+        let signed_enabled = ay_core::sat_ab_switches().signed_symmetry;
         // Signed lex leaders remove models just like every other structural
         // symmetry route. An environment flag must not silently opt an
         // embedder or assumption solver into that one-shot-only transform.
-        let signed_route = signed_enabled && self.cold.symmetry_oneshot;
+        let signed_route =
+            signed_enabled && self.cold.symmetry_oneshot && !self.cold.symmetry_signed_disabled;
         if !self.cold.symmetry_enabled
             && !composite_symmetry
             && !sr_auxfree_enabled
@@ -236,17 +221,14 @@ impl Solver {
         // survives competition polarity shuffling. Like the orbitope units, the
         // emitted lex-leader clauses are satisfiability-preserving rather than
         // RUP, so they stay off any proof surface for now.
-        // `AY_SAT_SIGNED_SYMMETRY_SR` promotes the route to a certificate-bearing
+        // `--sat-signed-symmetry-sr` promotes the route to a certificate-bearing
         // one: each lex-leader clause is written as a DSR `a`-line witnessed by
         // the signed automorphism σ, verified externally by
         // `dsr-trim → drat/lsr → cake_lpr` (a 2026-legal Main Track checker
         // pipeline). Same proof-surface preconditions as the existing DPR/SR
         // symmetry routes: a DRAT proof manager, no LRAT, no clause trace.
-        let signed_sr = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_SIGNED_SYMMETRY_SR").is_some())
-        } && self.proof_manager.is_some()
+        let signed_sr = ay_core::sat_ab_switches().signed_symmetry_sr
+            && self.proof_manager.is_some()
             && !self.cold.lrat_enabled
             && self.cold.clause_trace.is_none()
             && crate::proof_capability::symmetry_pr_proof_allowed(
@@ -307,7 +289,7 @@ impl Solver {
         // DRAT proof manager attached, and NEITHER LRAT nor a clause-trace surface
         // active (PR is not wired for those). When this holds we skip the blanket
         // proof-surface clamp below and take the PR-emitting branch later.
-        // #8011 SR route: AY_SAT_SYMMETRY_SR promotes the DPR PR route to a FULL
+        // #8011 SR route: --sat-symmetry-sr promotes the DPR PR route to a FULL
         // SR (substitution-redundancy) route. Instead of emitting only the aux-free
         // `j=0` binary as DPR and dropping the tower, it emits the WHOLE lex tower
         // (every `j>0` clause + Tseitin defs) as DSR `a`-lines, each with the full
@@ -315,23 +297,19 @@ impl Solver {
         // (including prior SBP) onto itself, so the per-generator towers compose.
         // External verification: emitted .sr → dsr-trim → .drat/.lsr → drat-trim →
         // .lrat → cake_lpr. Same proof-surface preconditions as the DPR route.
-        let sr_route = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_SYMMETRY_SR").is_some())
-        };
-        // #8011 AUX-FREE SR route: AY_SAT_SYMMETRY_SR_AUXFREE replaces the
+        let sr_route = ay_core::sat_ab_switches().symmetry_sr;
+        // #8011 AUX-FREE SR route: --sat-symmetry-sr_AUXFREE replaces the
         // lex-leader SR tower (which carries equal-prefix aux `e_j` whose Tseitin
         // clauses dsr-trim rejects under a σ-only witness) with a COMPLETE aux-free
         // SR refutation over the original variables only, for the pigeonhole family
         // — a faithful port of `third_party/dsr-trim/php/php-sr.c`. It out-solves:
         // the emitted units make root propagation derive the empty clause.
         //
-        // Default ON with an `AY_SAT_SYMMETRY_SR_AUXFREE=0` opt-out. Unlike the
+        // Default ON with an `--sat-symmetry-sr_AUXFREE=0` opt-out. Unlike the
         // lex-leader routes this one is externally checkable, so there is no
         // reason to keep it behind a variable nothing sets.
-        let sr_auxfree_route = sr_auxfree_enabled;
-        // HHW route (T2): AY_SAT_SYMMETRY_HHW emits, per gate-verified generator,
+        let sr_auxfree_route = sr_auxfree_enabled && !self.cold.symmetry_auxfree_disabled;
+        // HHW route (T2): --sat-symmetry-hhw emits, per gate-verified generator,
         // a Heule-Hunt-Wetzler (CADE 2015 §5) image-and-chain DRAT fragment + the
         // leading lex-leader symmetry clause as PLAIN DRAT (RUP/RAT additions +
         // deletions). Unlike the DPR/SR routes (witnessed `a`-lines checked
@@ -339,11 +317,7 @@ impl Solver {
         // RUP/RAT DRAT checker (`ay check drat` / `--verify-proof`) — zero
         // external dependencies. Same proof-surface preconditions as the DPR
         // route (DRAT proof manager attached, no LRAT/clause-trace surface).
-        let hhw_route_enabled = {
-            use std::sync::OnceLock;
-            static F: OnceLock<bool> = OnceLock::new();
-            *F.get_or_init(|| std::env::var_os("AY_SAT_SYMMETRY_HHW").is_some())
-        };
+        let hhw_route_enabled = ay_core::sat_ab_switches().symmetry_hhw;
         // A DRAT proof surface that can carry witnessed `a`-lines.
         let witnessed_drat_ok = self.proof_manager.is_some()
             && !self.cold.lrat_enabled
@@ -362,7 +336,7 @@ impl Solver {
         // (they are a complete refutation over the original variables), so the
         // route runs and the emission calls are no-ops.
         let sr_auxfree_supported = !self.symmetry_proof_surface_active() || witnessed_drat_ok;
-        // AY_SAT_COMPOSITE_SYMMETRY is documented no-proof-only: the lex-leader
+        // --sat-composite-symmetry is documented no-proof-only: the lex-leader
         // clauses it adds are NOT accompanied by checkable proof steps. Combining
         // it with proof emission therefore yields an UNSAT whose certificate a
         // real checker rejects. Measured on SAT-COMP 2026 cb2e8b7f and 965ca988:
@@ -389,11 +363,11 @@ impl Solver {
             static WARNED: Once = Once::new();
             WARNED.call_once(|| {
                 safe_eprintln!(
-                    "c Warning: AY_SAT_COMPOSITE_SYMMETRY is active WITH proof emission. \
+                    "c Warning: --sat-composite-symmetry is active WITH proof emission. \
                      Composite symmetry breaking is no-proof-only, so any UNSAT it produces \
                      may carry a certificate that an external checker REJECTS. Re-run without \
                      --competition to let the internal proof re-check gate the result, or \
-                     unset AY_SAT_COMPOSITE_SYMMETRY for a certifiable run."
+                     unset --sat-composite-symmetry for a certifiable run."
                 );
             });
         }
@@ -431,27 +405,15 @@ impl Solver {
         // reach the expensive backtracking IR finder and keeps the tight IR cap.
         // ALWAYS emit a diagnostic on a size skip — never drop to plain CDCL
         // silently (master-plan G7: php_50 used to vanish into CDCL with no trace).
+        // B2: the AY_SAT_SYMMETRY_DETECTOR_MAX_* env overrides are deleted;
+        // the named constants are the single source of truth.
         let clause_cap = if sr_auxfree_route {
-            use std::sync::OnceLock;
-            static C: OnceLock<usize> = OnceLock::new();
-            *C.get_or_init(|| {
-                std::env::var("AY_SAT_SYMMETRY_DETECTOR_MAX_CLAUSES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(SYMMETRY_DETECTOR_MAX_CLAUSES)
-            })
+            SYMMETRY_DETECTOR_MAX_CLAUSES
         } else {
             SYMMETRY_IR_MAX_CLAUSES
         };
         let var_cap = if sr_auxfree_route {
-            use std::sync::OnceLock;
-            static V: OnceLock<usize> = OnceLock::new();
-            *V.get_or_init(|| {
-                std::env::var("AY_SAT_SYMMETRY_DETECTOR_MAX_VARS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(SYMMETRY_DETECTOR_MAX_VARS)
-            })
+            SYMMETRY_DETECTOR_MAX_VARS
         } else {
             SYMMETRY_MAX_VARS
         };
@@ -803,20 +765,14 @@ impl Solver {
         if clauses.len() < 2 {
             return (false, false);
         }
-        let node_budget: u64 = std::env::var("AY_SAT_IR_NODE_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8_000);
-        let max_gens: usize = std::env::var("AY_SAT_IR_MAX_GENERATORS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(96);
         let formula_counts = crate::symmetry::build_formula_counts(&clauses);
+        // B2: budgets are the shared constants in `symmetry/mod.rs`, the same
+        // ones the composite route reads.
         let generators = crate::symmetry::ir::find_signed_automorphisms(
             &clauses,
             &formula_counts,
-            node_budget,
-            max_gens,
+            crate::symmetry::IR_NODE_BUDGET,
+            crate::symmetry::IR_MAX_GENERATORS,
         );
         if generators.is_empty() {
             // Record that the search RAN and found nothing. Returning silently
@@ -835,14 +791,8 @@ impl Solver {
         // `homer11.shuffled` (96 generators over 220 variables) went from 44.8 s
         // to 1.85 s. Breaking is worth it when the symmetry is global, so
         // require several generators covering a real share of the formula.
-        let min_generators: usize = std::env::var("AY_SAT_SIGNED_MIN_GENERATORS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
-        let min_support_pct: usize = std::env::var("AY_SAT_SIGNED_MIN_SUPPORT_PCT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10);
+        let min_generators: usize = crate::symmetry::SIGNED_MIN_GENERATORS;
+        let min_support_pct: usize = crate::symmetry::SIGNED_MIN_SUPPORT_PCT;
         let moved: BTreeSet<Variable> = generators
             .iter()
             .flat_map(|perm| perm.keys().map(|l| l.variable()))

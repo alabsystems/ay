@@ -2526,28 +2526,7 @@ pub(crate) fn wait_for_guarded_child_with_file_limit(
     wait_for_guarded_child_with_limits(child, watchdog, timeout, label, file_limit, None)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnreapedChildState {
-    Running,
-    Stopped(nix::sys::signal::Signal),
-    Exited,
-}
-
-// On platforms without `waitid(..., WNOWAIT)`, observation fails closed before
-// producing a state. Keep an exhaustive compile-time witness so all variants
-// remain type-checked on those targets as well as on the supported targets.
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "macos",
-    all(target_os = "linux", not(target_env = "uclibc")),
-)))]
-const UNREAPED_CHILD_STATE_TYPE_WITNESS: [UnreapedChildState; 3] = [
-    UnreapedChildState::Running,
-    UnreapedChildState::Stopped(nix::sys::signal::Signal::SIGSTOP),
-    UnreapedChildState::Exited,
-];
+include!("resource/unreaped_child_state.rs");
 
 #[cfg(any(
     target_os = "android",
@@ -2624,6 +2603,8 @@ fn observe_child_unreaped(
     _include_stopped: bool,
     label: &str,
 ) -> Result<UnreapedChildState> {
+    // Unix-only: off Unix the witness does not exist (see its definition).
+    #[cfg(unix)]
     let _ = UNREAPED_CHILD_STATE_TYPE_WITNESS;
     Err(BenchError::msg(format!(
         "{label}: safe unreaped child observation is unavailable on this platform"

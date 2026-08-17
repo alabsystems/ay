@@ -28,7 +28,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 #[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
-        use ay_sat::{AssumeResult, Literal as SatLiteral, Solver as SatSolver, Variable as SatVariable};
+        use ay_sat::{AssumeResult, Literal as SatLiteral, Variable as SatVariable};
         use $crate::executor_types::{SolveResult, UnknownReason};
         use $crate::incremental_state::{
             collect_active_theory_atoms_cached, collect_reachable_theory_atoms,
@@ -117,10 +117,17 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         .iter()
                         .map(|&lit| _iaslp_cnf_to_sat(lit))
                         .collect();
+                    let _iaslp_authority_before =
+                        _iaslp_solver.issued_original_clause_id_max();
                     _iaslp_solver.add_clause_global(lits);
-                    state.clausification_proofs.push(_iaslp_ann[_iaslp_didx].clone());
-                    // Keep theory-proof ledger in lockstep with clausification (#6725)
-                    state.original_clause_theory_proofs.push(None);
+                    let _ = $crate::pipeline_fns::place_single_original_clause_authority(
+                        &_iaslp_solver,
+                        _iaslp_authority_before,
+                        _iaslp_ann[_iaslp_didx].clone(),
+                        None,
+                        &mut state.clausification_proofs,
+                        &mut state.original_clause_theory_proofs,
+                    );
                 }
             } else {
                 for clause in &enc.def_clauses {

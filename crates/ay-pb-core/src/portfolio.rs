@@ -1071,7 +1071,7 @@ fn solve_optimization_portfolio_with_timings_impl(
     // its current simple simplex gives bounds too loose at competition scale to
     // close the 100v+ LP-gap families, so it is dormant by default (zero default-
     // path impact) until a stronger simplex + LP-guided branching land. Enable with
-    // AY_PB_BNB for experimentation.
+    // --pb-bnb for experimentation.
     let bnb_eligible = bnb_upgrade_enabled()
         && instance.num_vars > 0
         && instance.num_vars <= BNB_MAX_VARS
@@ -1145,7 +1145,7 @@ fn solve_optimization_portfolio_with_timings_impl(
                 pre_slice,
                 on_improve,
             );
-            if std::env::var_os("AY_MILP_LANE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().milp_lane_trace {
                 eprintln!(
                     "c [milp-lane] pre-solve slice={pre_slice:?} won={} elapsed={:?}",
                     res.is_some(),
@@ -1324,7 +1324,7 @@ fn solve_optimization_portfolio_with_timings_impl(
     // Post-solve external-engine optimality upgrade. The original PB incumbent
     // seeds the leaf engine, while `run_linear_optimum_upgrade` independently
     // verifies both a returned optimum and any anytime improvements.
-    if std::env::var_os("AY_MILP_LANE_TRACE").is_some() {
+    if ay_core::misc_cli_flags().milp_lane_trace {
         eprintln!(
             "c [milp-lane] eligible={external_upgrade_eligible} status={:?} assign_len={} elapsed={:?}",
             outcome.solution.status,
@@ -1502,17 +1502,12 @@ fn try_small_nlc_exhaustive_optimum(
 }
 
 /// Whether the opt-in NS-safe-LP branch-and-bound optimality upgrade is enabled
-/// (`AY_PB_BNB` ∈ {1,true,yes,on}). Default OFF: the B&B is a sound, validated
+/// (`--pb-bnb` ∈ {1,true,yes,on}). Default OFF: the B&B is a sound, validated
 /// foundation but its simple simplex is not yet strong enough to close the
 /// competition-scale LP-gap families, so it stays dormant (no reserve, no
 /// default-path change) until that work lands.
 fn bnb_upgrade_enabled() -> bool {
-    std::env::var_os("AY_PB_BNB").is_some_and(|v| {
-        matches!(
-            v.to_str().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    ay_core::misc_cli_flags().pb_bnb
 }
 
 /// Whether the clique-coloring certified-optimum shortcut is enabled (default
@@ -1520,12 +1515,8 @@ fn bnb_upgrade_enabled() -> bool {
 /// `AY_PB_NO_CLIQUE_COLORING` escape hatch disables it purely for A/B measurement
 /// (baseline vs head) without a rebuild.
 fn clique_coloring_enabled() -> bool {
-    !std::env::var_os("AY_PB_NO_CLIQUE_COLORING").is_some_and(|v| {
-        matches!(
-            v.to_str().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    // B14: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().clique_coloring
 }
 
 /// Whether the injcomp certified-optimum shortcut is enabled (default ON). It is
@@ -1533,18 +1524,14 @@ fn clique_coloring_enabled() -> bool {
 /// `AY_PB_NO_INJCOMP` escape hatch disables it purely for A/B measurement
 /// (baseline vs head) without a rebuild.
 fn injcomp_enabled() -> bool {
-    !std::env::var_os("AY_PB_NO_INJCOMP").is_some_and(|v| {
-        matches!(
-            v.to_str().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    // B14: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().injcomp
 }
 
-/// Whether the BNN-first SEQUENTIAL routing is enabled (`AY_PB_BNN_SCHED` ∈
-/// {1,true,yes,on}). Default OFF: when unset the sequential path is byte-identical
-/// to before (the complete engine runs first, the standalone SLS only as a
-/// no-incumbent fallback). When set AND the instance is a recognized BNN OPT-LIN
+/// Whether the default-on BNN-first SEQUENTIAL routing is enabled.
+/// `--no-pb-bnn-sched` restores the prior complete-engine-first path (with
+/// standalone SLS only as a no-incumbent fallback). When enabled AND the
+/// instance is a recognized BNN OPT-LIN
 /// instance (`bnn_feas::is_recognized`), the BNN-seeded standalone SLS runs FIRST
 /// for the whole budget — because the complete native engine returns UNKNOWN (no
 /// incumbent) on these, so deferring it loses nothing while the SLS gets the full
@@ -1552,12 +1539,7 @@ fn injcomp_enabled() -> bool {
 /// the same `sanitize_optimization_incumbent` gate, so this flag only reroutes
 /// TIME, never which incumbents may be reported.
 fn bnn_sched_enabled() -> bool {
-    std::env::var_os("AY_PB_BNN_SCHED").is_some_and(|v| {
-        matches!(
-            v.to_str().map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    crate::ab_switches::get().bnn_sched
 }
 
 /// Whether the instance + objective are purely linear (every term a single
@@ -1585,10 +1567,10 @@ fn solve_optimization_portfolio_inner(
         return portfolio_outcome(unsupported_solution(), timings, portfolio_start);
     }
 
-    // Opt-in (AY_PB_BNN_SCHED): BNN-first sequential routing. On recognized
-    // binarized-neural-net OPT-LIN instances (the `bnn_mnist_*` family) the
+    // Default-on (`--no-pb-bnn-sched` opts out): BNN-first sequential routing.
+    // On binarized-neural-net OPT-LIN instances (the `bnn_mnist_*` family) the
     // complete native engine returns UNKNOWN (no incumbent) within budget, so it is
-    // useless there; meanwhile the now-instant-feasible (AY_PB_BNN_FEAS) standalone
+    // useless there; meanwhile the structure-seeded (default-on) standalone
     // SLS only gets the leftover ~15 s as a fallback. Detect the structure EARLY
     // (one O(occurrences) recognizer pass that bails to `false` on any non-BNN
     // instance — so non-BNN routing is unchanged) and, when recognized, run the
@@ -1710,7 +1692,7 @@ fn solve_optimization_portfolio_inner(
         }
     }
 
-    // Opt-in (AY_PB_SLS_NLC): NLC-first sequential routing for NON-LINEAR
+    // Default-on (`--no-pb-sls-nlc` opts out): NLC-first routing for NON-LINEAR
     // (OPT-NLC) optimization. On the local QPLIB family the complete native engine
     // returns UNKNOWN (no incumbent) within budget — exactly the no-incumbent gap
     // — while the linear SLS DECLINES on product terms, so AY emits nothing. Run
@@ -2277,7 +2259,7 @@ fn solve_optimization_portfolio_inner(
         on_improve,
     );
 
-    // Opt-in (AY_PB_SLS_NLC): if the whole pipeline produced NO incumbent (still
+    // Default-on (`--no-pb-sls-nlc` opts out): if there is NO incumbent (still
     // UNKNOWN) and the instance is NON-linear (product terms in constraints
     // and/or objective), run the product-native primal SLS to FIND a first
     // feasible incumbent from scratch — the no-incumbent OPT-NLC gap that the
@@ -2294,7 +2276,7 @@ fn solve_optimization_portfolio_inner(
         on_improve,
     );
 
-    // Opt-in (AY_PB_LNS2): if the whole pipeline produced NO incumbent (still
+    // Default-on (`--no-pb-lns2` opts out): if there is NO incumbent (still
     // UNKNOWN), try the feasibility pump to manufacture a first feasible point.
     // Its output is a CANDIDATE only; it is re-verified against ALL original
     // constraints before being reported (UNKNOWN -> SATISFIABLE, never a verdict).
@@ -2319,10 +2301,10 @@ fn solve_optimization_portfolio_inner(
     portfolio_outcome(solution, timings, portfolio_start)
 }
 
-/// BNN-first standalone SLS for the sequential path (`AY_PB_BNN_SCHED`).
+/// Default-on BNN-first standalone SLS for the sequential path.
 ///
 /// Runs the standalone SLS primal ([`solve_optimization_sls`], which honors the
-/// `AY_PB_BNN_FEAS` structure-aware seed) FIRST with the FULL deadline, so that on
+/// default-on structure-aware seed) FIRST with the FULL deadline, so that on
 /// recognized BNN OPT-LIN instances — where the complete native engine returns
 /// UNKNOWN within budget — the productive objective descent gets the whole time
 /// rather than only the post-engine fallback slice. Returns the best feasible
@@ -2453,22 +2435,12 @@ fn sls_first_incumbent_if_unknown(
     }
 }
 
-/// Whether the product-native (OPT-NLC) primal SLS first-incumbent path is
-/// enabled, per the `AY_PB_SLS_NLC` environment variable (∈ {`1`, `true`, `yes`,
-/// `on`}). Default OFF: the non-linear path is byte-identical to before unless
-/// this is set, so it can be A/B compared cleanly and the linear path is never
-/// touched. ADVISORY-ONLY: every incumbent is still re-verified by
+/// Whether the default-on product-native (OPT-NLC) primal SLS path is enabled.
+/// `--no-pb-sls-nlc` restores the prior path for a clean A/B comparison; the
+/// linear path is never touched. ADVISORY-ONLY: every incumbent is still
 /// `sanitize_optimization_incumbent`, so this flag can never affect soundness.
 fn sls_nlc_enabled() -> bool {
-    std::env::var_os("AY_PB_SLS_NLC").is_some_and(|v| {
-        matches!(
-            v.to_str()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    crate::ab_switches::get().sls_nlc
 }
 
 /// Product-native (OPT-NLC) standalone SLS, returning the best re-verified
@@ -2505,7 +2477,7 @@ fn nlc_first_sls(
     )
 }
 
-/// Shared body of [`nlc_first_sls`] (sequential `AY_PB_SLS_NLC` routing,
+/// Shared body of [`nlc_first_sls`] (default-on sequential OPT-NLC routing,
 /// `seed_xor == 0`) and the parallel `nlc-sls-opt` primal worker
 /// ([`SLS_NLC_SEED_XOR`]): the product-native standalone SLS with the doubly
 /// independent sanitize gate in front of every forwarded incumbent. Runs the
@@ -2604,16 +2576,16 @@ fn nlc_sls_with_options(
     }
 }
 
-/// Opt-in product-native SLS first-incumbent fallback for the NON-LINEAR
+/// Default-on product-native SLS first-incumbent fallback for the NON-LINEAR
 /// (OPT-NLC) sequential path (TAIL safety net).
 ///
-/// Only fires when (1) `AY_PB_SLS_NLC` is enabled, (2) the solution is still
+/// Only fires when (1) `--no-pb-sls-nlc` is absent, (2) the solution is still
 /// `Unknown` (no incumbent, no verdict), (3) the instance is NON-linear (the
 /// linear path is handled by `sls_first_incumbent_if_unknown` and is unaffected),
-/// and (4) budget remains. In the normal flagged path the NLC-first routing at
+/// and (4) budget remains. In the normal default-on path the NLC-first routing at
 /// the top of the inner pipeline already ran the product SLS with the full
-/// budget, so this tail step is a cheap no-op (budget exhausted); it exists so the
-/// flag still rescues an UNKNOWN if the early routing was skipped for any reason.
+/// budget, so this tail step is a cheap no-op (budget exhausted); the fallback
+/// still rescues an UNKNOWN if the early routing was skipped for any reason.
 /// Soundness identical to [`nlc_first_sls`].
 fn sls_nlc_first_incumbent_if_unknown(
     solution: PbSolution,
@@ -2650,9 +2622,9 @@ fn sls_nlc_first_incumbent_if_unknown(
     }
 }
 
-/// Opt-in feasibility-pump first-incumbent fallback for the sequential path.
+/// Default-on feasibility-pump first-incumbent fallback for the sequential path.
 ///
-/// Only fires when (1) `AY_PB_LNS2` is enabled, (2) the solution is still
+/// Only fires when (1) `--no-pb-lns2` is absent, (2) the solution is still
 /// `Unknown` (no incumbent, no verdict), (3) the instance is linear, and (4)
 /// budget remains. Runs the feasibility pump; on a verified-feasible result it
 /// upgrades `Unknown` -> `Satisfiable` with the recomputed objective. A proven
@@ -2838,7 +2810,7 @@ fn lns_polish_incumbent(
         );
     }
 
-    // Opt-in (AY_PB_LNS2): a local-branching pass on the best incumbent found so
+    // Default-on (`--no-pb-lns2` opts out): local branching on the best incumbent
     // far, using whatever time the RINS/RENS pass left idle. Strictly richer than
     // RINS hard-fixing (any <= k variables may flip), soundness-gated identically
     // (every adopted incumbent re-verified + strictly better). Added only to the
@@ -2992,16 +2964,8 @@ fn sls_polish_incumbent(
 /// `available_parallelism` (a single-core machine degrades to the sequential
 /// path via the `spawn <= 1` fallback). The knob is kept as the OPT-OUT
 /// (flags disable, not enable).
-///
-/// Accepted values:
-/// - unset                                -> parallel enabled, auto worker count
-/// - `""` / `0` / `off` / `false` / `no`  -> parallel disabled (sequential path)
-/// - `1` / `on` / `true` / `yes` / `auto` -> parallel enabled, auto worker count
-/// - any positive integer `N`             -> parallel enabled with `N` workers
-const AY_PB_PARALLEL_ENV: &str = "AY_PB_PARALLEL";
-
 /// Fallback "number of cores" knob, mirroring the competition `NBCORE` convention.
-/// Only consulted to size the worker pool when `AY_PB_PARALLEL` requested `auto`.
+/// Only consulted to size the worker pool when the parallel policy is `auto`.
 const NBCORE_ENV: &str = "NBCORE";
 
 /// Hard cap on spawned workers so an absurd knob value cannot exhaust the system.
@@ -3011,12 +2975,12 @@ const PARALLEL_MAX_WORKERS: usize = 64;
 /// a usable value.
 const PARALLEL_DEFAULT_WORKERS: usize = 8;
 
-/// Returns whether the parallel portfolio is enabled, per the `AY_PB_PARALLEL`
-/// environment knob. Defaults to `true` (batteries-included; set
-/// `AY_PB_PARALLEL=0` to force the sequential path).
+/// Returns whether the parallel portfolio is enabled, per the typed
+/// `--pb-parallel` policy. Defaults to `true` (batteries-included;
+/// `--pb-parallel 0` forces the sequential path).
 #[must_use]
 pub fn parallel_portfolio_enabled() -> bool {
-    parallel_setting_from_env(std::env::var_os(AY_PB_PARALLEL_ENV).as_deref()).is_some()
+    parallel_setting().is_some()
 }
 
 /// The CORE BUDGET `B` for the parallel portfolio: the maximum number of worker
@@ -3024,7 +2988,7 @@ pub fn parallel_portfolio_enabled() -> bool {
 /// is disabled (the sequential default path).
 ///
 /// `B` is resolved, in order:
-/// 1. the explicit `AY_PB_PARALLEL=<N>` value, else
+/// 1. the explicit `the --pb-parallel policy=<N>` value, else
 /// 2. `NBCORE` (the competition core-count convention), else
 /// 3. `std::thread::available_parallelism()` (the machine's core count), else
 /// 4. a sensible default.
@@ -3034,7 +2998,7 @@ pub fn parallel_portfolio_enabled() -> bool {
 /// `min(candidate_workers, B)` threads, so the core pool is never oversubscribed.
 #[must_use]
 pub fn parallel_portfolio_worker_count() -> Option<usize> {
-    let setting = parallel_setting_from_env(std::env::var_os(AY_PB_PARALLEL_ENV).as_deref())?;
+    let setting = parallel_setting()?;
     let count = match setting {
         ParallelSetting::Auto => auto_worker_count(),
         ParallelSetting::Fixed(n) => n,
@@ -3050,23 +3014,15 @@ enum ParallelSetting {
     Fixed(usize),
 }
 
-/// Parses the `AY_PB_PARALLEL` value. UNSET defaults to [`ParallelSetting::Auto`]
-/// (the batteries-included default: parallel ON, `NBCORE`-sized). Returns `None`
-/// — the sequential path — only on an EXPLICIT opt-out (`0`/`off`/`false`/`no`,
-/// empty, or an unparseable value, which fails closed to sequential).
-fn parallel_setting_from_env(value: Option<&OsStr>) -> Option<ParallelSetting> {
-    let Some(value) = value else {
-        return Some(ParallelSetting::Auto);
-    };
-    let text = value.to_str()?.trim();
-    match text.to_ascii_lowercase().as_str() {
-        "" | "0" | "off" | "false" | "no" => None,
-        "1" | "on" | "true" | "yes" | "auto" => Some(ParallelSetting::Auto),
-        other => other
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n >= 1)
-            .map(ParallelSetting::Fixed),
+/// Resolves the typed `--pb-parallel` policy. Unset defaults to
+/// [`ParallelSetting::Auto`] (the batteries-included default: parallel ON,
+/// `NBCORE`-sized). Returns `None` — the sequential path — only on the
+/// explicit `--pb-parallel 0` opt-out.
+fn parallel_setting() -> Option<ParallelSetting> {
+    match crate::ab_switches::get().parallel_workers {
+        None => Some(ParallelSetting::Auto),
+        Some(0) => None,
+        Some(n) => Some(ParallelSetting::Fixed(n as usize)),
     }
 }
 
@@ -3365,17 +3321,11 @@ const SYM_DETECT_MAX_MS: u64 = 600_000;
 const SYM_DETECT_NUM: u64 = 3;
 const SYM_DETECT_DEN: u64 = 5;
 
-/// Whether the shape-gated symmetry arm is enabled (`AY_PB_SYMMETRY_ARM`, on by
-/// default). Mirrors `symmetry_arm_enabled` in the binary so the parallel
+/// Whether the default-on shape-gated symmetry arm is enabled; the
+/// `--no-pb-symmetry-arm` opt-out mirrors the binary so the parallel
 /// portfolio's symmetry worker stays in lockstep with the sequential path.
 fn symmetry_arm_enabled() -> bool {
-    !matches!(
-        std::env::var_os("AY_PB_SYMMETRY_ARM")
-            .and_then(|v| v.into_string().ok())
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+    crate::ab_switches::get().symmetry_arm
 }
 
 /// Cheap structural gate: is this a linear instance worth running the symmetry
@@ -3988,10 +3938,10 @@ fn optimization_worker_specs_with_upgrade(
 
     // [WBO] High-cap two-phase SLS primal worker for the WBO route ONLY: the
     // `solve_wbo_reduced_sls` arm (previously reachable only behind the
-    // opt-in `AY_PB_WBO_SLS` sequential fallback) as a proper spec, ON BY
-    // DEFAULT on this route (batteries-included; `AY_PB_WBO_SLS=0` disables —
-    // the env gate stays as an override, and the sequential fallback keeps
-    // its unchanged opt-in semantics). The soft-relaxation blow-up on
+    // formerly env-gated sequential fallback) as a proper spec, ON BY
+    // DEFAULT on this route (batteries-included; `--no-pb-wbo-sls` disables
+    // both this worker and the sequential fallback). The soft-relaxation
+    // blow-up on
     // WCSP/MaxSAT-style WBO (celar / uclid: ~250k relaxation vars) pushes the
     // reduced PBO past the default `MAX_SLS_VARS` cap, so every standard SLS
     // arm DECLINES there; this arm runs the same two-phase search with the
@@ -4189,7 +4139,7 @@ fn optimization_worker_specs_with_upgrade(
         });
         // [P10] Unified adaptive-λ arm (λ locked at 0 until feasible): the
         // direct from-scratch retry of the NuPBO-style single loop, in worker
-        // form — the `AY_PB_SLS_UNIFIED` sequential gate is NOT consulted.
+        // form — the `--pb-sls-unified` sequential gate is NOT consulted.
         specs.push(OptimizationWorkerSpec {
             label: "sls-unified-opt",
             run: OptimizationWorkerKind::Primal(Box::new(
@@ -4241,7 +4191,7 @@ fn optimization_worker_specs_with_upgrade(
     // baselines so it is safe-additive by position and dropped first under a
     // tight budget. Same structural spawn path as every primal arm
     // (`OptimizationWorkerKind::Primal` — verdict-incapable by construction);
-    // the sequential path's `AY_PB_SLS_NLC` opt-in routing is untouched and
+    // the sequential path's default-on NLC routing is untouched and
     // now serves as an override for the sequential trajectory only.
     if !profile.is_linear && profile.has_objective {
         specs.push(OptimizationWorkerSpec {
@@ -4541,7 +4491,7 @@ pub fn solve_optimization_portfolio_parallel(
 ///
 /// This is the typed, in-process counterpart of
 /// [`solve_optimization_portfolio_parallel`].  It deliberately does not read
-/// `AY_PB_PARALLEL` or `NBCORE`: an embedding solver has already resolved its
+/// `--pb-parallel` policy or `NBCORE`: an embedding solver has already resolved its
 /// own thread policy and must not let a process-global environment setting
 /// silently override that contract.  The ordinary per-instance memory clamp,
 /// worker-priority ordering, hard collection deadline, and fail-closed result
@@ -5825,7 +5775,7 @@ fn collect_optimization_result(
 ///    sequential upgrades), and finally the full
 ///    [`sanitize_optimization_solution`] claim gate (which also applies the
 ///    non-linear-objective OPTIMUM stopgap and the opt-in
-///    `AY_PB_STRICT_OPTIMUM` certificate gate).
+///    `--pb-strict-optimum` certificate gate).
 ///
 /// Every doubt — empty/poisoned slot, absent floor, infeasible or
 /// objective-mismatched model, floor not met, downgraded claim — returns
@@ -5881,7 +5831,7 @@ fn shared_bounds_optimum_upgrade(
 ///   incumbent as SATISFIABLE.
 /// * `OptimumFound` is first routed through [`sanitize_optimization_solution`]
 ///   (model re-verification + exact objective recompute + the
-///   `AY_PB_STRICT_OPTIMUM` gate), exactly like the sequential consumers wrap
+///   `--pb-strict-optimum` gate), exactly like the sequential consumers wrap
 ///   the SAT engines. A claim that fails the sanitizer (infeasible model,
 ///   claimed/actual objective mismatch, absent objective) or whose objective
 ///   is STRICTLY WORSE than the verified best incumbent is refused likewise —
@@ -6844,7 +6794,7 @@ fn solve_optimization_lns(
         }
     }
 
-    // Opt-in (AY_PB_LNS2): if the seed phase produced NO feasible incumbent, run
+    // Default-on (`--no-pb-lns2` opts out): with NO feasible incumbent, run
     // the feasibility pump to manufacture a first one (UNKNOWN -> SATISFIABLE).
     // The pump's output is a CANDIDATE only; `sanitize_optimization_incumbent`
     // re-verifies it against ALL original constraints before it is forwarded, so
@@ -6908,7 +6858,7 @@ fn solve_optimization_lns(
         );
     }
 
-    // Opt-in (AY_PB_LNS2): local-branching pass on the best incumbent so far,
+    // Default-on (`--no-pb-lns2` opts out): local branching on the best incumbent,
     // using whatever time the RINS/RENS pass left idle. Soundness-gated
     // identically to the RINS/RENS loop; sub-problem-only rows.
     if lns2_on && !should_stop() {
@@ -7004,7 +6954,7 @@ fn solve_optimization_sls(
         };
         // NuPBO-class unified primal (default): a single objective-as-soft loop
         // that can move through mildly-infeasible regions toward a better optimum.
-        // `AY_PB_SLS_UNIFIED=0` falls back to the historical two-phase PAWS search,
+        // `--pb-sls-unified=0` falls back to the historical two-phase PAWS search,
         // kept live for A/B measurement.
         if crate::optimize::sls::unified_enabled() {
             // Feasibility-wall lever (Task V4): equality-heavy 0/1 systems (any
@@ -7021,7 +6971,7 @@ fn solve_optimization_sls(
             // unified path — zero regression risk there. Sweep (V4): +3 feasible
             // incumbents recovered (market_split, subset_sum), 0 objective
             // regression on the unified-win families, 0 wrong (VIG). Disable with
-            // `AY_PB_SLS_FEASFIRST=0`.
+            // `--no-pb-sls-feasfirst`.
             let feasibility_first = sls_feasibility_first_enabled()
                 && instance.constraints.iter().any(|c| c.rel == PbRel::Eq);
             if feasibility_first {
@@ -7161,13 +7111,13 @@ const SLS_DDFW_SEED_XOR: u64 = 0xB4D2_7A93_5EED_000C;
 
 /// Seed-XOR diversifier for the WBO-route `wbo-sls-opt` worker. See
 /// [`SLS_RESTARTS_SEED_XOR`]; also keeps this arm's trajectory distinct from
-/// the sequential `AY_PB_WBO_SLS` fallback (`solve_wbo_reduced_sls`, unXORed
+/// the default-on sequential WBO fallback (`solve_wbo_reduced_sls`, unXORed
 /// structural seed) and from P7 on small reduced instances.
 const SLS_WBO_SEED_XOR: u64 = 0xE85C_16B4_5EED_000D;
 
 /// Seed-XOR diversifier for the product-native `nlc-sls-opt` worker. See
 /// [`SLS_RESTARTS_SEED_XOR`]; keeps the worker's trajectory distinct from the
-/// sequential `AY_PB_SLS_NLC` routing (`nlc_first_sls`, unXORed structural
+/// default-on sequential OPT-NLC routing (`nlc_first_sls`, unXORed structural
 /// seed) when that override runs concurrently inside the P1 worker.
 const SLS_NLC_SEED_XOR: u64 = 0x27A9_F1D8_5EED_000E;
 
@@ -7325,7 +7275,7 @@ fn solve_optimization_sls_alt(
 /// loop (`sls::search_unified`, λ HARD-LOCKED at 0 until the first feasible
 /// point — design §2.1), called DIRECTLY: this worker IS the retry of the
 /// unified-from-scratch idea in diversified-worker form, so it does NOT
-/// consult the `AY_PB_SLS_UNIFIED` env gate (which stays untouched for the
+/// consult the `--pb-sls-unified` env gate (which stays untouched for the
 /// sequential default). Starts from the sound unit-propagation seed when the
 /// instance forces units (advisory only), else all-false — exactly the
 /// sequential unified path's start.
@@ -7581,17 +7531,9 @@ fn solve_optimization_nlc_sls_focused(
 }
 
 /// Whether the SLS feasibility-first pre-pass (Task V4 equality-wall lever) is
-/// enabled. Default ON; `AY_PB_SLS_FEASFIRST=0` disables it (for A/B measurement).
+/// enabled. Default ON; `--no-pb-sls-feasfirst` disables it (for A/B measurement).
 fn sls_feasibility_first_enabled() -> bool {
-    match std::env::var_os("AY_PB_SLS_FEASFIRST").as_deref() {
-        None => true,
-        Some(v) => v.to_str().map_or(true, |v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        }),
-    }
+    !ay_core::misc_cli_flags().no_pb_sls_feasfirst
 }
 
 /// Fraction of the remaining SLS budget given to the feasibility-first pre-pass
@@ -7631,43 +7573,27 @@ fn sls_feasibility_deadline(deadline: Option<Instant>) -> Option<Instant> {
 /// occurrence cap still applies, and every reported incumbent is re-verified.
 const MAX_WBO_SLS_VARS: usize = 4_000_000;
 
-/// Whether the WBO-reduction primal SLS path is enabled, per the
-/// `AY_PB_WBO_SLS` environment variable (∈ {`1`, `true`, `yes`, `on`}). Default
-/// OFF: the WBO solve path is byte-identical to before unless this is set, so it
-/// can be A/B compared cleanly. ADVISORY-ONLY: every incumbent is still
-/// re-verified by `sanitize_optimization_incumbent` and (in the CLI) re-projected
-/// and re-scored against the ORIGINAL WBO, so this flag can never affect
+/// Whether the default-on WBO-reduction primal SLS path is enabled.
+/// `--no-pb-wbo-sls` restores the prior path for clean A/B comparison.
+/// ADVISORY-ONLY: every incumbent is still re-verified by
+/// `sanitize_optimization_incumbent` and (in the CLI) re-projected and
+/// re-scored against the ORIGINAL WBO, so this switch can never affect
 /// soundness.
 pub fn wbo_sls_enabled() -> bool {
-    std::env::var_os("AY_PB_WBO_SLS").is_some_and(|v| {
-        matches!(
-            v.to_str()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    // B31: default ON (the official wrapper always exported it on); the one
+    // `--no-pb-wbo-sls` opt-out governs this sequential tail fallback AND the
+    // parallel worker below.
+    crate::ab_switches::get().wbo_sls
 }
 
 /// Whether the WBO-route PARALLEL primal SLS worker (`wbo-sls-opt`) is
 /// enabled. ON BY DEFAULT (batteries-included — the default moved to code
-/// when the arm became a proper worker spec); `AY_PB_WBO_SLS=0|off|false|no`
-/// or empty disables it as an override (an EXPLICITLY SET empty value is an
-/// opt-out, matching [`parallel_setting_from_env`]'s convention). Distinct
-/// from [`wbo_sls_enabled`], the SEQUENTIAL tail fallback's opt-IN gate,
-/// whose default-OFF semantics are unchanged (`AY_PB_WBO_SLS=1` still
-/// additionally enables that fallback).
+/// when the arm became a proper worker spec); `--no-pb-wbo-sls` disables
+/// both this worker and the sequential tail fallback. The shared typed
+/// carrier keeps the two routes in lockstep without an environment-value
+/// parser or a separate fallback default.
 fn wbo_sls_worker_enabled() -> bool {
-    !matches!(
-        std::env::var_os("AY_PB_WBO_SLS")
-            .as_deref()
-            .and_then(OsStr::to_str)
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("" | "0" | "off" | "false" | "no")
-    )
+    crate::ab_switches::get().wbo_sls
 }
 
 /// Standalone primal SLS over a WBO-reduced PBO instance, with the higher
@@ -9530,14 +9456,12 @@ fn sanitize_optimization_incumbent(
 }
 
 /// Environment switch for the fail-closed OPTIMUM gate. When
-/// `AY_PB_STRICT_OPTIMUM` is set to a non-empty, non-`0` value, an OPTIMUM
+/// `--pb-strict-optimum` is set to a non-empty, non-`0` value, an OPTIMUM
 /// verdict is only emitted if a self-checking cutting-planes lower-bound
 /// certificate confirms its floor meets the incumbent (see
 /// [`sanitize_optimization_solution`]). Default OFF.
 fn strict_optimum_gate_enabled() -> bool {
-    std::env::var_os("AY_PB_STRICT_OPTIMUM")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    ay_core::misc_cli_flags().pb_strict_optimum
 }
 
 /// TOP-LEVEL OPTIMUM verdict finalization (TASK O1): the single chokepoint that
@@ -9558,7 +9482,7 @@ fn strict_optimum_gate_enabled() -> bool {
 /// 3. ADDITIVE upgrade: a certificate-backed `SATISFIABLE` becomes `OPTIMUM`
 ///    (sound by construction — a forged/overcounted floor fails the checker and
 ///    is ignored, so a wrong OPTIMUM is impossible).
-/// 4. FAIL-CLOSED downgrade (opt-in via `AY_PB_STRICT_OPTIMUM`): an `OPTIMUM`
+/// 4. FAIL-CLOSED downgrade (opt-in via `--pb-strict-optimum`): an `OPTIMUM`
 ///    with no checked floor is downgraded to `SATISFIABLE`. Used to MEASURE the
 ///    certificate-backed (sound-by-construction) subset; default OFF so the
 ///    separately-sound exhaustion-proof OPTIMUMs are preserved.
@@ -9635,7 +9559,7 @@ fn sanitize_optimization_solution(
 /// addition to `FLOOR_CERT_SELF_BUDGET`: the parallel coordinator threads its
 /// HARD COLLECTION DEADLINE through here (via
 /// [`shared_bounds_optimum_upgrade`]) so that no certificate — not even the
-/// opt-in `AY_PB_STRICT_OPTIMUM` gate's — can stall verdict collection past
+/// opt-in `--pb-strict-optimum` gate's — can stall verdict collection past
 /// the wall clock, where overshooting forfeits the answer.
 fn sanitize_optimization_solution_with_deadline(
     solution: PbSolution,
@@ -9710,7 +9634,7 @@ fn sanitize_optimization_solution_with_deadline(
             // LAZY: the certificate is computed ONLY when its result can
             // affect the status — (a) the SATISFIABLE -> OPTIMUM additive
             // upgrade below (claimed AND current status both SATISFIABLE) or
-            // (b) the opt-in `AY_PB_STRICT_OPTIMUM` fail-closed gate. In
+            // (b) the opt-in `--pb-strict-optimum` fail-closed gate. In
             // particular, an `OptimumFound` claim with `claimed == actual` and
             // strict mode OFF performs NO floor-cert work: the parallel
             // coordinator calls this sanitizer under its hard collection
@@ -9768,7 +9692,7 @@ fn sanitize_optimization_solution_with_deadline(
                 status = PbStatus::Satisfiable;
             }
 
-            // FAIL-CLOSED OPTIMUM GATE (opt-in via `AY_PB_STRICT_OPTIMUM=1`):
+            // FAIL-CLOSED OPTIMUM GATE (opt-in via `--pb-strict-optimum=1`):
             // never emit an OPTIMUM whose floor is not backed by a self-checking
             // cutting-planes certificate. DEFAULT OFF — the OPTIMUMs produced by
             // the B&B / OLL exhaustion paths are separately sound (VIG incumbent +

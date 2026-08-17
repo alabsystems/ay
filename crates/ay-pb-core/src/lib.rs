@@ -30,6 +30,176 @@
 // enforced invariant (matches the workspace's theory crates).
 #![forbid(unsafe_code)]
 
+/// Engine A/B switches, set ONCE by the frontend before any solve.
+///
+/// B14 of the env-flag retirement: these were `AY_PB_*` env vars nothing set
+/// (`AY_PB_NO_CLIQUE_COLORING`, `AY_PB_NO_INJCOMP`, `AY_PB_NO_COMPACT_CERT`,
+/// `AY_PB_NO_RESTART_FLOOR`, `AY_PB_DISABLE_COUNTING`). Every switch guards a
+/// SOUND alternative path — disabling is for A/B measurement, never for
+/// correctness. The carrier is a typed set-once bridge (the same shape as
+/// ay's `DISABLED_SAT_TECHNIQUES`): the portfolio entry fns have seven
+/// downstream consumers and threading a config through every signature is
+/// churn without benefit for process-constant switches.
+pub mod ab_switches {
+    use std::sync::OnceLock;
+
+    /// The switch set. Every field defaults to the SHIPPED engine — all ON.
+    /// (B31 flipped the four lanes the official PB-COMP wrapper used to
+    /// enable by env export into in-engine defaults; the exports are gone.)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PbAbSwitches {
+        /// Clique-coloring certified-optimum shortcut (sound, 0-wrong).
+        pub clique_coloring: bool,
+        /// Injcomp certified-optimum shortcut (sound, 0-wrong).
+        pub injcomp: bool,
+        /// Compact certificate path (strictly additive; VeriPB re-checks).
+        pub compact_cert: bool,
+        /// Dense-PB restart floor (without it dense search may never restart).
+        pub restart_floor: bool,
+        /// Counting propagation (both counting and non-counting are sound).
+        pub counting: bool,
+        /// Structure-aware BNN feasibility seed (advisory-only starting
+        /// point; B31 default-on — the official wrapper always enabled it).
+        pub bnn_feas: bool,
+        /// BNN-first sequential routing on recognized BNN OPT-LIN instances
+        /// (reroutes TIME only; B31 default-on).
+        pub bnn_sched: bool,
+        /// Product-native (OPT-NLC) primal SLS first-incumbent path
+        /// (advisory-only, sanitize-verified; B31 default-on).
+        pub sls_nlc: bool,
+        /// WBO SLS: the parallel `wbo-sls-opt` worker AND the sequential tail
+        /// fallback follow this one switch (B31; the wrapper set both on).
+        pub wbo_sls: bool,
+        /// Stronger LNS2 neighborhoods (local branching + feasibility pump).
+        pub lns2: bool,
+        /// Shape-gated symmetry arm (probe-then-augment).
+        pub symmetry_arm: bool,
+        /// Root EDAC/VAC-lite WCSP probe (B56; opt-in — ships OFF, the one
+        /// non-kill switch in the set).
+        pub wcsp_edac: bool,
+        /// Parallel-portfolio worker policy (B57; was `the --pb-parallel policy`):
+        /// `None` = the shipped default (parallel ON, auto/NBCORE-sized),
+        /// `Some(0)` = force the sequential path, `Some(n)` = n workers.
+        pub parallel_workers: Option<u16>,
+    }
+
+    impl Default for PbAbSwitches {
+        fn default() -> Self {
+            Self {
+                clique_coloring: true,
+                injcomp: true,
+                compact_cert: true,
+                restart_floor: true,
+                counting: true,
+                bnn_feas: true,
+                bnn_sched: true,
+                sls_nlc: true,
+                wbo_sls: true,
+                lns2: true,
+                symmetry_arm: true,
+                wcsp_edac: false,
+                parallel_workers: None,
+            }
+        }
+    }
+
+    static SWITCHES: OnceLock<PbAbSwitches> = OnceLock::new();
+
+    /// Install the switch set. First caller wins; a second call returns the
+    /// rejected value so a misconfigured double-install is loud at the caller.
+    ///
+    /// # Errors
+    ///
+    /// The rejected `switches` when a set was already installed.
+    pub fn set(switches: PbAbSwitches) -> Result<(), PbAbSwitches> {
+        SWITCHES.set(switches).map_err(|_| switches)
+    }
+
+    /// The installed switch set, or the all-on default.
+    #[must_use]
+    pub fn get() -> PbAbSwitches {
+        #[cfg(test)]
+        if let Some(overridden) = TEST_OVERRIDE.with(std::cell::Cell::get) {
+            return overridden;
+        }
+        if let Some(overridden) =
+            consumer_test_override::CONSUMER_OVERRIDE.with(std::cell::Cell::get)
+        {
+            return overridden;
+        }
+        SWITCHES.get().copied().unwrap_or_default()
+    }
+
+    /// Consumer-crate test seam (B56; same shape as
+    /// `ay_core::misc_test_override`): `cfg(test)` seams cannot serve a
+    /// consumer crate's own tests, so this doc-hidden thread-local override
+    /// is always compiled. Production code must never touch it.
+    #[doc(hidden)]
+    pub mod consumer_test_override {
+        use super::PbAbSwitches;
+
+        thread_local! {
+            pub(super) static CONSUMER_OVERRIDE: std::cell::Cell<Option<PbAbSwitches>> =
+                const { std::cell::Cell::new(None) };
+        }
+
+        /// RAII guard restoring the previous override on drop.
+        pub struct Guard(Option<PbAbSwitches>);
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let prev = self.0;
+                CONSUMER_OVERRIDE.with(|c| c.set(prev));
+            }
+        }
+
+        /// Install a thread-scoped override for the current test.
+        #[must_use]
+        pub fn set(switches: PbAbSwitches) -> Guard {
+            let prev = CONSUMER_OVERRIDE.with(|c| c.replace(Some(switches)));
+            Guard(prev)
+        }
+
+        /// Whether an override is active on this thread. Frontends use it to
+        /// skip the set-once global install (the override IS the resolution).
+        #[must_use]
+        pub fn active() -> bool {
+            CONSUMER_OVERRIDE.with(std::cell::Cell::get).is_some()
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// In-process per-test override. The set-once global cannot be
+        /// flipped inside one test binary; A/B tests scope an override
+        /// through [`TestOverride`] instead (the seam the retired
+        /// `ScopedEnvVar` steering used to provide).
+        static TEST_OVERRIDE: std::cell::Cell<Option<PbAbSwitches>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// RAII scope for a test's switch override; restores the previous value
+    /// (usually `None`) on drop.
+    #[cfg(test)]
+    pub(crate) struct TestOverride(Option<PbAbSwitches>);
+
+    #[cfg(test)]
+    impl TestOverride {
+        pub(crate) fn set(switches: PbAbSwitches) -> Self {
+            let prev = TEST_OVERRIDE.with(|c| c.replace(Some(switches)));
+            TestOverride(prev)
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for TestOverride {
+        fn drop(&mut self) {
+            let prev = self.0;
+            TEST_OVERRIDE.with(|c| c.set(prev));
+        }
+    }
+}
+
 pub mod cdcl;
 pub mod clique_witness;
 mod cp_dense;

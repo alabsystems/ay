@@ -505,7 +505,7 @@ impl Solver {
     ///
     /// Normally driven by the route profile: only the official SAT-COMP
     /// Main/default/LRAT route prunes the per-conflict experiments (DIP-ERCL,
-    /// IBCL, and friends). `AY_SAT_PRUNE_CONFLICT_EXPERIMENTS=1|0` overrides it
+    /// IBCL, and friends). `--sat-prune-conflict-experiments=1|0` overrides it
     /// so the experiments can be A/B'd on any route.
     ///
     /// This exists because of a measurement, not a preference: profiling AY on
@@ -517,12 +517,7 @@ impl Solver {
     #[inline(always)]
     pub(super) fn should_prune_conflict_analysis_experiments(&self) -> bool {
         use std::sync::OnceLock;
-        static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
-        match *OVERRIDE.get_or_init(|| {
-            std::env::var("AY_SAT_PRUNE_CONFLICT_EXPERIMENTS")
-                .ok()
-                .map(|v| v != "0")
-        }) {
+        match ay_core::misc_cli_flags().sat_prune_conflict_experiments {
             Some(forced) => forced,
             None => self.cold.sat_comp_main_conflict_pruning,
         }
@@ -1097,7 +1092,7 @@ impl Solver {
     }
 
     /// Force equal-effort stable-mode budgeting (the `equiticks` config),
-    /// overriding the `AY_AB_MODE_EQUITICKS` env resolution. Used by the
+    /// overriding the `--sat-mode-equiticks` env resolution. Used by the
     /// portfolio's Equiticks strategy arm to give the target-phase machinery
     /// more stable airtime on model-finding instances.
     pub fn set_mode_equiticks(&mut self, enabled: bool) {
@@ -1105,7 +1100,7 @@ impl Solver {
     }
 
     /// Enable the equiticks stable-phase progress gate at the default window,
-    /// overriding the `AY_AB_EQT_PROGRESS` env resolution. Only has effect when
+    /// overriding the `--sat-eqt-progress` env resolution. Only has effect when
     /// equiticks is also active (the gate requires `stable_tick_hardcap > 0`).
     /// Used by the portfolio's Equiticks arm so a still-converging stable phase
     /// is not starved by the halved equal-effort budget (captures 3ef7fa06 /
@@ -1336,16 +1331,18 @@ impl Solver {
     }
 
     /// Estimate memory usage of the solver (in bytes)
-    ///
     /// Returns a breakdown of live heap-backed buffers plus the inline solver
     /// shell. Tracks the current hot/cold split layout so `#5090` regressions
     /// show up in tests.
+    /// Clause storage is arena allocated, with header and literal buffers.
+    /// Clauses have no individual heap allocations.
+    /// Reusable scratch and proof buffers are charged by retained capacity, even
+    /// when their logical length is zero.
     #[cfg(test)]
     pub(crate) fn memory_stats(&self) -> MemoryStats {
         fn packed_bool_vec_bytes(capacity: usize) -> usize {
             capacity.div_ceil(8)
         }
-
         let solver_shell = size_of::<Self>();
 
         let var_data = self.vals.capacity() * size_of::<i8>()
@@ -1371,9 +1368,6 @@ impl Solver {
             + self.shrink_stamp.capacity() * size_of::<u32>()
             + minimize_bytes;
 
-        // Clause database with arena allocation:
-        // - ClauseArena contains headers Vec and literals Vec (arena)
-        // - No per-clause heap allocation
         let arena = self.arena.memory_bytes();
         let total_literals = self.arena.active_literals();
 
@@ -1389,12 +1383,12 @@ impl Solver {
             + self.cold.i2e.capacity() * size_of::<u32>()
             + self.var_lifecycle.heap_bytes()
             + packed_bool_vec_bytes(self.phase_init.walk_prev_phase.capacity())
+            + self.cold.capability_ledger.heap_bytes()
             + self
                 .cold
                 .solution_witness
                 .as_ref()
                 .map_or(0, |witness| witness.capacity() * size_of::<Option<bool>>());
-
         let clause_ids = self.cold.clause_ids.capacity() * size_of::<u64>()
             + self.cold.bcp_learned_clause_birth_conflicts.capacity() * size_of::<u64>()
             + self.unit_proof_id.capacity() * size_of::<u64>()
@@ -1402,6 +1396,7 @@ impl Solver {
             + self.pending_theory_unit_proof_ids.capacity() * size_of::<(ClauseRef, u64)>()
             + self.cold.level0_proof_id.capacity() * size_of::<u64>()
             + self.cold.level0_proof_sign.capacity() * size_of::<i8>()
+            + self.cold.lrat_level0_unit_materialize_pinned.capacity() * size_of::<usize>()
             + self.cold.scope_selectors.capacity() * size_of::<Variable>()
             + self.cold.root_satisfied_saved.capacity() * size_of::<Vec<Literal>>()
             + self
@@ -1522,7 +1517,7 @@ mod tests {
             solver.is_congruence_enabled(),
             "congruence is DRAT-open since 2026-07-10 (wf_ff5991a1: registry \
              Congruence drat=true; externally verified via dpr-trim + cake_lpr; \
-             kill-switch AY_AB_DRAT_SUBST=0)"
+             kill-switch --sat-no-drat-subst)"
         );
         assert!(
             solver.is_factor_enabled(),

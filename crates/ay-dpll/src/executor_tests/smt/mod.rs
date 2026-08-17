@@ -14,6 +14,7 @@ mod array_declared_witness;
 mod array_persistent_combiner_shadow;
 mod bv_lia_indep_model_graft;
 mod qf_auflia;
+mod qf_auflia_l3_propagation;
 mod qf_auflra_and_regression;
 mod qf_ax;
 mod qf_eia;

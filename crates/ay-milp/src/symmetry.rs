@@ -220,7 +220,7 @@ pub(crate) struct Symmetry {
     /// generator-walk. See `enumerate_group` and `down_orbit_stab`.
     support: Vec<u32>,
     group: Vec<Vec<u32>>,
-    /// When true (`AY_MILP_STAB_ORBIT`) and `group` is enumerated, `down_orbit`
+    /// When true (`the stab-orbit knob`) and `group` is enumerated, `down_orbit`
     /// returns the EXACT orbit under the box-stabilizer subgroup instead of the
     /// generator-walk under-approximation.
     stab: bool,
@@ -240,7 +240,7 @@ pub(crate) struct Symmetry {
     /// extension (`cell`, bab.rs `SymSeq`).
     cells: Vec<(u32, u32)>,
     /// DYNAMIC ORBITOPAL LANE toggle (set by the solver from
-    /// `AY_MILP_ORBITOPE_DYN`): when true, nodes propagate the lex order
+    /// `the orbitope-dyn knob`): when true, nodes propagate the lex order
     /// relative to the BRANCHING ORDER TAKEN (`propagate_orbitopes_dyn`)
     /// instead of the static root order. The two orders are NOT composable
     /// (journal at `propagate_orbitopes_dyn`), so a solve uses exactly one.
@@ -284,7 +284,7 @@ const MAX_GROUP_PERMUTATION_CELLS: usize = 1 << 20;
 const MAX_GROUP_COMPOSITION_WORK: usize = 1 << 24;
 
 impl Symmetry {
-    /// Debug probe (`AY_MILP_SYM_DEBUG`): why is each generator that moves
+    /// Debug probe (`--sym-debug`): why is each generator that moves
     /// `j` inapplicable at this box? Prints the first failing pair/guard.
     pub(crate) fn debug_applicability(&self, j: usize, lower: &[f64], upper: &[f64]) {
         for &gid in &self.col_gens[j] {
@@ -315,7 +315,7 @@ impl Symmetry {
     }
 
     /// Enumerated box-stabilizer group size (0 when exact stabilization is off
-    /// or declined) — a trace probe for the `AY_MILP_STAB_ORBIT` A/B.
+    /// or declined) — a trace probe for the `the stab-orbit knob` A/B.
     pub(crate) fn stab_group_size(&self) -> usize {
         self.group.len()
     }
@@ -331,7 +331,7 @@ impl Symmetry {
         upper: &[f64],
         out: &mut Vec<usize>,
     ) {
-        // EXACT box-stabilizer orbit when enumerated (`AY_MILP_STAB_ORBIT`);
+        // EXACT box-stabilizer orbit when enumerated (`the stab-orbit knob`);
         // otherwise the generator-walk under-approximation below.
         if self.stab && !self.group.is_empty() {
             self.down_orbit_stab(j, lower, upper, out);
@@ -1312,10 +1312,10 @@ pub(crate) fn detect(model: &Model) -> Option<Symmetry> {
     if gens.is_empty() {
         return None;
     }
-    // `AY_MILP_NO_ORBITOPE` keeps every generator on the per-branch orbit
+    // `with_orbitope(false)` keeps every generator on the per-branch orbit
     // walk instead of assembling components — the A/B lane for the static
-    // orbitope machinery.
-    let (orbitopes, in_component) = if std::env::var_os("AY_MILP_NO_ORBITOPE").is_some() {
+    // orbitope machinery. (B11: was the never-set AY_MILP_NO_ORBITOPE env.)
+    let (orbitopes, in_component) = if crate::tune::on(crate::tune::Knob::NoOrbitope) {
         (Vec::new(), vec![false; gens.len()])
     } else {
         assemble_orbitopes(model, &view, &classes, &gens, n)
@@ -1348,8 +1348,8 @@ pub(crate) fn detect(model: &Model) -> Option<Symmetry> {
     // lane). Declined (empty) unless every such generator has NO slack guards
     // (so the lifted map is the plain column permutation — the orbital-fixing
     // soundness journal's part (b) with no slack recomputation) and the closure
-    // fits `MAX_GROUP`. Only enumerated when `AY_MILP_STAB_ORBIT` is set.
-    let stab = std::env::var_os("AY_MILP_STAB_ORBIT").is_some();
+    // fits `MAX_GROUP`. Only enumerated when `the stab-orbit knob` is set.
+    let stab = crate::tune::caller_flag(crate::tune::Knob::StabOrbit) == Some(true);
     let (support, group) = if stab {
         let walk_gens: Vec<&SymGen> = (0..gens.len())
             .filter(|&gi| !in_component[gi])
@@ -1426,15 +1426,14 @@ fn assemble_orbitopes(
     // that is w-integers/y-binaries before the barely-branched link binaries,
     // which is the difference between the frontier moving and not
     // (`AY_MILP_ORBITOPE_ORDER`: `deg` default, `index`, `revindex` A/B).
-    let order = std::env::var("AY_MILP_ORBITOPE_ORDER").unwrap_or_default();
+    // B6: the AY_MILP_ORBITOPE_ORDER env selector is deleted; "deg" (the
+    // default arm below) is the shipped ordering, `index`/`revindex` were A/B.
+    let order = String::new();
     // General-integer DENSITY floor for the static-lex lane (percent of the
     // block; see the lane choice below). Default 12: assemble only when
     // general integers are >= ~1/8 of the block. `0` restores the pre-2026-07-18
     // behaviour (assemble every non-all-binary component); `100` is ~NO_ORBITOPE.
-    let min_int_pct: usize = std::env::var("AY_MILP_ORBITOPE_MIN_INT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(12);
+    let min_int_pct: usize = 12;
     let pos_key = |c: u32| -> (u8, i64, i64) {
         let col = model.col_at(c as usize).expect("in range");
         let cont = u8::from(model.col_kind(col) == ColKind::Continuous);

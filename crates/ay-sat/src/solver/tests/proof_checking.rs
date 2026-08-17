@@ -321,13 +321,16 @@ fn test_derived_irredundant_clause_trace_shows_derived_not_original() {
     let entries = trace.entries();
 
     // First 2 entries are original clauses.
-    assert!(entries[0].is_original, "first clause should be original");
-    assert!(entries[1].is_original, "second clause should be original");
+    assert!(entries.at(0).is_original, "first clause should be original");
+    assert!(
+        entries.at(1).is_original,
+        "second clause should be original"
+    );
 
     // Third entry is the derived-irredundant clause — must NOT be marked original.
     assert_eq!(entries.len(), 3, "expected 3 trace entries");
     assert!(
-        !entries[2].is_original,
+        !entries.at(2).is_original,
         "derived-irredundant clause must be marked as derived in trace, not original (#4648)"
     );
 }

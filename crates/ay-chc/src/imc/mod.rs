@@ -27,14 +27,12 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Attribution-only per-iteration loop stats (rank-4 inc-7), gated on
-/// `AY_IMC_STATS=1`. Prints one line per IMC phase (k-check / interpolation /
+/// `--chc-imc-stats`. Prints one line per IMC phase (k-check / interpolation /
 /// fixpoint) to stderr so wall-time attribution per phase is possible without
 /// a profiler. Never on by default; zero effect on the solve itself.
 fn imc_stats_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_IMC_STATS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    })
+    *FLAG.get_or_init(|| ay_core::misc_cli_flags().chc_imc_stats)
 }
 
 /// Proof-derived interpolation default for the IMC ROUTE (inc-16 S2).
@@ -54,14 +52,9 @@ fn imc_stats_enabled() -> bool {
 /// existing Craig validation inside the proof path, and IMC's fixpoint +
 /// inductive-invariant validation remain mandatory.
 fn imc_route_proof_interpolants_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| match std::env::var("AY_IMC_PROOF_ITP") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => match std::env::var("AY_PROOF_INTERPOLANTS") {
-            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
-            Err(_) => true,
-        },
-    })
+    // B9 deleted the legacy alias; B27 retires the kill-switch env too —
+    // the CLI carrier (--chc-no-imc-proof-itp) is the sole opt-out.
+    crate::ab_switches::get().imc_proof_itp
 }
 
 /// Render an expression for stats lines, truncated to keep logs bounded.
@@ -206,12 +199,9 @@ impl ImcSolver {
             .config
             .proof_interpolants
             .unwrap_or_else(imc_route_proof_interpolants_enabled);
-        let mut proof_budget = proof_mode.then(|| {
-            std::env::var("AY_PROOF_ITP_BUDGET_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map_or(self.config.query_timeout, Duration::from_millis)
-        });
+        // B8: the AY_PROOF_ITP_BUDGET_MS env override is deleted; the typed
+        // config.query_timeout rules.
+        let mut proof_budget = proof_mode.then(|| self.config.query_timeout);
         // Inc-16 S2 strike rule: when the proof-producing solve exhausts its
         // budget without UNSAT (lustre guarded-eq networks: EqDiffVar is
         // disabled under proof production, so the proof-mode solver hits the

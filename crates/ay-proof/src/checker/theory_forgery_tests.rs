@@ -7,8 +7,7 @@
 //!
 //! Prior to #8820 every BV/Array/FP/String lemma was accepted if the clause
 //! was non-empty. An attacker-controlled proof could therefore forge any
-//! Boolean clause (including single `false` literals that collapse to the
-//! empty clause via resolution) and drive the checker to UNSAT.
+//! Boolean clause, including a single `false`, and drive the checker to UNSAT.
 //!
 //! This module asserts that each theory lemma kind now rejects clauses that
 //! the strict checker cannot independently prove.
@@ -19,6 +18,7 @@ use ay_core::{
     ProofStep, Sort, TermId, TermStore, TheoryLemmaKind,
 };
 use num_bigint::BigInt;
+mod mixed_polarity;
 
 /// Validate a `TheoryLemma` step in strict mode, returning the error (if any).
 fn validate_theory_lemma_strict(
@@ -50,6 +50,102 @@ fn validate_rule_strict(
     };
     let mut derived = Vec::new();
     validate_step(terms, &mut derived, ProofId(0), &step, true, None)
+}
+
+#[test]
+fn arithmetic_equality_adapter_exact_schemas_accept_only_matching_operands() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let eq = terms.mk_eq(a, b);
+    let not_eq = terms.mk_not(eq);
+    let forward = terms.mk_le(a, b);
+    let reverse = terms.mk_le(b, a);
+    let unrelated = terms.mk_le(a, c);
+    let not_forward = terms.mk_not(forward);
+    let not_reverse = terms.mk_not(reverse);
+
+    validate_theory_lemma_strict(
+        &terms,
+        vec![not_eq, forward],
+        TheoryLemmaKind::ArithEqImpliesBound,
+    )
+    .expect("matching equality implication must validate");
+    validate_theory_lemma_strict(
+        &terms,
+        vec![not_eq, reverse],
+        TheoryLemmaKind::ArithEqImpliesBound,
+    )
+    .expect("reverse equality implication must validate");
+    validate_theory_lemma_strict(
+        &terms,
+        vec![not_forward, not_reverse, eq],
+        TheoryLemmaKind::ArithEqTriangle,
+    )
+    .expect("exact equality triangle must validate");
+
+    for forged in [vec![not_eq, unrelated], vec![forward, not_eq], vec![not_eq]] {
+        validate_theory_lemma_strict(&terms, forged, TheoryLemmaKind::ArithEqImpliesBound)
+            .expect_err("mismatched implication schema must fail closed");
+    }
+    validate_theory_lemma_strict(
+        &terms,
+        vec![not_reverse, not_forward, eq],
+        TheoryLemmaKind::ArithEqTriangle,
+    )
+    .expect_err("triangle literal order is part of the checked schema");
+
+    // Mixed-sort equalities cannot be represented through TermStore's safe
+    // constructors; malformed terms fail before reaching this proof schema.
+}
+
+#[test]
+fn arithmetic_split_exact_schemas_reject_reordered_or_mismatched_clauses() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let y_minus_one = terms.mk_sub(vec![y, one]);
+    let y_plus_one = terms.mk_add(vec![y, one]);
+    let upper = terms.mk_le(x, y_minus_one);
+    let lower = terms.mk_le(y_plus_one, x);
+    let equality = terms.mk_eq(x, y);
+    let wrong_equality = terms.mk_eq(x, z);
+
+    validate_theory_lemma_strict(
+        &terms,
+        vec![upper, lower],
+        TheoryLemmaKind::IntBoundsTautology,
+    )
+    .expect_err("unguarded exact-value branches leave the equality case open");
+    let not_upper = terms.mk_not(upper);
+    let not_lower = terms.mk_not(lower);
+    validate_theory_lemma_strict(
+        &terms,
+        vec![not_upper, not_lower],
+        TheoryLemmaKind::IntBoundsTautology,
+    )
+    .expect("exact integer branch mutex must validate");
+    validate_theory_lemma_strict(
+        &terms,
+        vec![upper, lower, equality],
+        TheoryLemmaKind::ArithDisequalitySplit,
+    )
+    .expect("exact guarded integer split must validate");
+    validate_theory_lemma_strict(
+        &terms,
+        vec![lower, upper, equality],
+        TheoryLemmaKind::ArithDisequalitySplit,
+    )
+    .expect_err("reordered guarded split must fail closed");
+    validate_theory_lemma_strict(
+        &terms,
+        vec![upper, lower, wrong_equality],
+        TheoryLemmaKind::ArithDisequalitySplit,
+    )
+    .expect_err("split guard must bind the exact branch operands");
 }
 
 // ============================================================================
@@ -3081,4 +3177,65 @@ fn test_nra_valid_instances_accept_under_their_kind() {
     let hong_clause = vec![terms.mk_not_raw(lt), terms.mk_not_raw(gt1)];
     validate_theory_lemma_strict(&terms, hong_clause, TheoryLemmaKind::NraUnivariateUnsat)
         .expect("hong_1-shaped univariate refutation must validate");
+}
+
+// ---------------------------------------------------------------------------
+// #quant-unit-authority c3b channel: the producer emits
+// `evaluate (cl (= <closed comparison> true|false))` for a closed ground
+// comparison unit. The producer's screen is purely syntactic — THESE checks
+// are the authority, so a false claim must fail strict authentication
+// exactly like the pre-campaign refusal. Proven load-bearing by neutering
+// the strict Evaluate validator and watching the negative test fail (see
+// P3A_DERIVATION_AUTHORITY_REVIEW.md).
+
+#[test]
+fn test_evaluate_accepts_true_closed_int_comparison_unit() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let comparison = terms.mk_app(ay_core::Symbol::named("<"), vec![zero, one], Sort::Bool);
+    let true_term = terms.mk_bool(true);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![comparison, true_term],
+        Sort::Bool,
+    );
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect("a true closed comparison unit must be checked exactly");
+}
+
+#[test]
+fn test_evaluate_rejects_non_tautology_closed_comparison_unit() {
+    // `(< 1 0)` is false; claiming it evaluates to `true` is the exact
+    // forgery a compromised c3b producer could attempt.
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let comparison = terms.mk_app(ay_core::Symbol::named("<"), vec![one, zero], Sort::Bool);
+    let true_term = terms.mk_bool(true);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![comparison, true_term],
+        Sort::Bool,
+    );
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect_err("a false closed comparison claimed true must be rejected");
+}
+
+#[test]
+fn test_evaluate_rejects_false_negated_comparison_unit() {
+    // The negated-unit leg of the same chain: claiming `(< 0 1)` evaluates
+    // to `false` must also fail.
+    let mut terms = TermStore::new();
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let comparison = terms.mk_app(ay_core::Symbol::named("<"), vec![zero, one], Sort::Bool);
+    let false_term = terms.mk_bool(false);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![comparison, false_term],
+        Sort::Bool,
+    );
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect_err("a true closed comparison claimed false must be rejected");
 }

@@ -571,6 +571,32 @@ fn validate_theory_lemma_strict(
 }
 
 #[test]
+fn strict_euf_rejects_unconsumed_arithmetic_evidence() {
+    use ay_core::FarkasAnnotation;
+
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let eq_bc = mk_eq_raw(&mut terms, b, c);
+    let not_bc = terms.mk_not_raw(eq_bc);
+    let eq_ac = mk_eq_raw(&mut terms, a, c);
+    let step = ProofStep::TheoryLemma {
+        theory: "euf".to_string(),
+        clause: vec![not_ab, not_bc, eq_ac],
+        farkas: Some(FarkasAnnotation::from_ints(&[1, 1, 1])),
+        kind: TheoryLemmaKind::EufTransitive,
+        lia: None,
+    };
+    let mut derived = Vec::new();
+    let error = validate_step(&terms, &mut derived, ProofId(0), &step, true, None)
+        .expect_err("EUF must not silently ignore positional arithmetic evidence");
+    assert!(matches!(error, ProofCheckError::InvalidTheoryLemma { .. }));
+}
+
+#[test]
 fn or_wrapped_eq_transitive_accepts_valid_chain() {
     // (cl (or (not (= a b)) (not (= b c)) (= a c))) — the packed form of a
     // valid 2-edge transitivity chain a — b — c.

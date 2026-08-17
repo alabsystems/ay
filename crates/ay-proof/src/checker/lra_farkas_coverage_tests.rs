@@ -8,9 +8,11 @@
 //! lemmas in strict mode. Tests construct TheoryLemma proof steps with Farkas
 //! annotations and verify the checker accepts valid lemmas and rejects invalid ones.
 //!
-//! Validation is wired: `validate_lra_farkas` converts blocking-clause polarity
-//! to conflict-literal polarity, then delegates to
-//! `ay_core::proof_validation::verify_farkas_conflict_lits_full`.
+//! Validation is wired through `validate_metered`, which converts blocking-clause
+//! polarity to conflict-literal polarity. Pure-inequality clauses use the
+//! progress-metered validator; the exact affine equality-span/disequality
+//! fragment is metered as well, while every other shape retains the full
+//! validator.
 
 use num_bigint::BigInt;
 

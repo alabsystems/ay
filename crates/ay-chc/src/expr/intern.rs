@@ -104,16 +104,11 @@ pub(crate) fn intern(node: ChcExpr) -> Arc<ChcExpr> {
 }
 
 /// Whether interning is active. Off by default while the fast core is rolled
-/// out and measured; set `AY_CHC_INTERN=1` to enable (kill switch =0). Read
+/// out and measured; set `--chc-intern` to enable (kill switch =0). Read
 /// once and cached so the per-construction check is a single atomic load.
 fn intern_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("AY_CHC_INTERN")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| ay_core::misc_cli_flags().chc_intern)
 }
 
 /// Wrap an about-to-be-child expression in an `Arc`, interning it when it is a

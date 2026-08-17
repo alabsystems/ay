@@ -5,7 +5,7 @@
 //! Planning and finalization of retained proof-surface requirements.
 
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::{FarkasAnnotation, Proof, TermId};
+use ay_core::{Proof, TermId};
 use ay_frontend::command::Term as FrontendTerm;
 
 use super::{IteLiftPlan, OrTautologyPlan, OrUnitPlan, SubstEqPlan};
@@ -39,20 +39,15 @@ impl Executor {
     ) -> Option<ProvenanceSurfaceAudit> {
         let mut audit = ProvenanceSurfaceAudit::default();
         for plan in ite_lifts.values() {
-            let source_ok = if let Some(source) = plan.defining_source {
-                audit.require_original_arithmetic_alias_only(
-                    &mut self.ctx,
-                    originals,
-                    source,
-                    plan.orig,
-                )
-            } else {
-                audit.require_original(&mut self.ctx, originals, plan.orig)
-            };
-            if !source_ok
-                || plan
-                    .bound
-                    .is_some_and(|bound| !audit.require_original(&mut self.ctx, originals, bound))
+            if !self.authenticate_ite_surface_source(
+                &mut audit,
+                originals,
+                plan.defining_source,
+                plan.orig,
+                plan.cond,
+            ) || plan
+                .bound
+                .is_some_and(|bound| !audit.require_original(&mut self.ctx, originals, bound))
             {
                 return None;
             }
@@ -69,9 +64,9 @@ impl Executor {
             {
                 audit.protect_farkas_operand(&mut self.ctx.terms, operand);
             }
-            for (branch_eq, lifted) in [
-                (plan.eq_then, plan.lifted_then),
-                (plan.eq_else, plan.lifted_else),
+            for (branch_eq, lifted, farkas) in [
+                (plan.eq_then, plan.lifted_then, &plan.then_coeffs),
+                (plan.eq_else, plan.lifted_else, &plan.else_coeffs),
             ] {
                 let not_eq = complement_of(&mut self.ctx.terms, branch_eq);
                 let not_orig = complement_of(&mut self.ctx.terms, plan.orig);
@@ -80,35 +75,26 @@ impl Executor {
                     clause.push(complement_of(&mut self.ctx.terms, bound));
                 }
                 clause.push(lifted);
-                let farkas = FarkasAnnotation::from_ints(&vec![1; clause.len()]);
-                audit.protect_farkas_lemma(&mut self.ctx.terms, &clause, &farkas);
+                audit.protect_farkas_lemma(&mut self.ctx.terms, &clause, farkas);
             }
             for operand in [plan.goal, plan.ite_def, plan.and_term, plan.intro_eq] {
                 audit.protect_rigid_root(&mut self.ctx.terms, operand);
             }
-            audit.protect_ite_intro_role(
-                &mut self.ctx.terms,
-                plan.ite_term,
-                plan.eq_then,
-                plan.eq_else,
-            );
+            if !self.protect_ite_lift_rendering(&mut audit, plan) {
+                return None;
+            }
         }
         for plan in provenance_ite_lifts.values() {
-            let source_ok = if let Some(source) = plan.defining_source {
-                audit.require_original_arithmetic_alias_only(
-                    &mut self.ctx,
-                    originals,
-                    source,
-                    plan.orig,
-                )
-            } else {
-                audit.require_original(&mut self.ctx, originals, plan.orig)
-            };
-            if !source_ok
-                || plan
-                    .supports
-                    .iter()
-                    .any(|&support| !audit.require_original(&mut self.ctx, originals, support))
+            if !self.authenticate_ite_surface_source(
+                &mut audit,
+                originals,
+                plan.defining_source,
+                plan.orig,
+                plan.cond,
+            ) || plan
+                .supports
+                .iter()
+                .any(|&support| !audit.require_original(&mut self.ctx, originals, support))
             {
                 return None;
             }
@@ -165,6 +151,47 @@ impl Executor {
                 .protect_surface_operands(&mut audit, &mut self.ctx.terms);
         }
         Some(audit)
+    }
+
+    /// Keep the retained authored ITE and the generated `ite1`/`ite2`
+    /// equalities on one authenticated spelling. Otherwise canonicalization
+    /// can make a Farkas row contain two spellings of the same opaque atom.
+    fn protect_ite_lift_rendering(
+        &mut self,
+        audit: &mut ProvenanceSurfaceAudit,
+        plan: &IteLiftPlan,
+    ) -> bool {
+        audit.protect_ite_intro_role(
+            &mut self.ctx.terms,
+            plan.ite_term,
+            plan.eq_then,
+            plan.eq_else,
+        );
+        let ay_core::term::TermData::Ite(cond, then_term, else_term) =
+            *self.ctx.terms.get(plan.ite_term)
+        else {
+            return false;
+        };
+        for operand in [plan.ite_term, cond, then_term, else_term] {
+            audit.require_installed_surface(&mut self.ctx.terms, operand);
+        }
+        true
+    }
+
+    fn authenticate_ite_surface_source(
+        &mut self,
+        audit: &mut ProvenanceSurfaceAudit,
+        originals: &[(TermId, FrontendTerm)],
+        defining_source: Option<TermId>,
+        original: TermId,
+        condition: TermId,
+    ) -> bool {
+        let source_ok = if let Some(source) = defining_source {
+            audit.require_original_arithmetic_alias_only(&mut self.ctx, originals, source, original)
+        } else {
+            audit.require_original(&mut self.ctx, originals, original)
+        };
+        source_ok && audit.promote_registered_requirement(condition)
     }
 
     /// Add plans discovered during Assume classification, then validate the

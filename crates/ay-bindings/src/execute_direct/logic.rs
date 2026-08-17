@@ -57,8 +57,7 @@ pub(super) fn parse_logic(program: &AYProgram) -> Result<Logic, ExecuteError> {
         _ if logic_str.contains("DT") => Ok(Logic::All),
         // HORN requires CHC solving infrastructure
         "HORN" => Err(ExecuteError::UnsupportedLogic(format!(
-            "logic '{}' requires fallback path",
-            logic_str
+            "logic '{logic_str}' requires fallback path"
         ))),
         other => match other.parse::<Logic>() {
             Ok(logic) => Ok(logic),

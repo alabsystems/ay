@@ -25,8 +25,11 @@
 //!   (d) the per-clone memory cost for air05's ~7195-col matrix.
 //!
 //! The always-on guard includes an in-repository MPS fixture. Larger models are
-//! located via `AY_MILP_CORPUS` (a dir of `*.mps`) or known developer corpus dirs;
+//! located in known developer corpus dirs (/private/tmp);
 //! absent optional models skip with a diagnostic.
+
+#[path = "parallel_ready/process_memory.rs"]
+mod process_memory;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -90,11 +93,9 @@ fn find_model(name: &str) -> Option<Model> {
                 .model,
         );
     }
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = std::env::var("AY_MILP_CORPUS") {
-        dirs.push(PathBuf::from(d));
-    }
-    dirs.push(PathBuf::from("/private/tmp"));
+    // B20: the AY_MILP_CORPUS env locator is deleted; a corpus elsewhere is
+    // a symlink into the known directory.
+    let dirs: Vec<PathBuf> = vec![PathBuf::from("/private/tmp")];
     for d in dirs {
         let p = d.join(format!("{name}.mps"));
         if let Ok(text) = std::fs::read_to_string(&p) {
@@ -107,7 +108,7 @@ fn find_model(name: &str) -> Option<Model> {
             }
         }
     }
-    eprintln!("[corpus] SKIP: {name}.mps not found (set AY_MILP_CORPUS to a dir of .mps)");
+    eprintln!("[corpus] SKIP: {name}.mps not found (drop .mps files in /private/tmp)");
     None
 }
 
@@ -232,18 +233,6 @@ fn parallel_replay(
         }
     }
     (out.into_iter().map(Option::unwrap).collect(), wall)
-}
-
-/// Best-effort resident-set size (KiB) of THIS process via `ps`; `None` if unusable.
-fn rss_kib() -> Option<u64> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
 }
 
 // ===========================================================================
@@ -387,9 +376,9 @@ fn bounded_parallel_throughput_and_memory_characterization() {
         } else {
             8usize
         };
-        let rss_before = rss_kib();
+        let rss_before = process_memory::rss_kib();
         let held: Vec<NodeLpProbe> = (0..n_hold).map(|_| root.clone()).collect();
-        let rss_after = rss_kib();
+        let rss_after = process_memory::rss_kib();
         let clone_t0 = Instant::now();
         let _timed: Vec<NodeLpProbe> = (0..n_hold).map(|_| root.clone()).collect();
         let per_clone_wall = clone_t0.elapsed() / n_hold as u32;

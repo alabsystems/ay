@@ -54,6 +54,9 @@ pub(crate) struct ForallSkolemProvenance {
     pub(crate) quantified: TermId,
     pub(crate) instance: TermId,
     pub(crate) witness: TermId,
+    /// `true` when the source is a POSITIVE `exists` (the witness realizes the
+    /// existential directly); `false` for the negated single-binder `forall`.
+    pub(crate) from_exists: bool,
 }
 
 /// Red zone size for `stacker::maybe_grow` in skolemization recursion (#8414).
@@ -97,13 +100,26 @@ fn skolemize_with_env(
                         quantified: quantifier_id,
                         instance,
                         witness: *witness,
+                        from_exists: false,
                     });
                 }
             }
             terms.mk_not(instance)
         }
         TermData::Exists(_, _, _) if !negated => {
-            skolemize_quantifier_body(terms, quantifier_id, universal_env)?.0
+            let (instance, witnesses) =
+                skolemize_quantifier_body(terms, quantifier_id, universal_env)?;
+            if let [witness] = witnesses.as_slice() {
+                if matches!(terms.get(*witness), TermData::Var(..)) {
+                    provenance.push(ForallSkolemProvenance {
+                        quantified: quantifier_id,
+                        instance,
+                        witness: *witness,
+                        from_exists: true,
+                    });
+                }
+            }
+            instance
         }
         _ => return None, // Not a Skolemization target
     };

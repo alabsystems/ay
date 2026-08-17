@@ -39,7 +39,7 @@ impl Executor {
             EvalValue::Seq(_) => None, // Seq values have no atomic representation
             // Exact NRA algebraic value: rational-valued expressions render as
             // rationals, irrational ones in z3 `root-obj` syntax.
-            EvalValue::Algebraic(a) => match a.to_number() {
+            EvalValue::Algebraic(a) => match a.to_number_for_output() {
                 Some(ay_nra::RealScalar::Rational(r)) => {
                     if r.is_integer() {
                         Some(r.numer().to_string())

@@ -23,7 +23,7 @@ use super::super::Executor;
 use super::ArrayAxiomResult;
 
 fn debug_abv_packed_lookup() -> bool {
-    std::env::var_os("AY_DEBUG_ABV_PACKED_LOOKUP").is_some()
+    ay_core::misc_cli_flags().debug_abv_packed_lookup
 }
 
 /// Read an eager array functional-consistency (FC) pair budget from `name`,
@@ -3349,9 +3349,9 @@ impl Executor {
             clauses: Vec::new(),
             num_vars: 0,
         };
-        // Env-gated per-section clause accounting (`AY_PHASE_TRACE=1`), matching
+        // Env-gated per-section clause accounting (`--phase-trace`), matching
         // the solve_bv_core_inner phase trace. Diagnostic-only stderr comments.
-        let ptrace = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let ptrace = ay_core::misc_cli_flags().phase_trace;
         macro_rules! section_trace {
             ($name:expr) => {
                 if ptrace {
@@ -4550,9 +4550,10 @@ impl Executor {
         // still emitted ~250K pairs x ~344 clauses/pair = 86M clauses (43% of a
         // 200M-clause CNF; memout). Pairs beyond this global cap are left to
         // the CEGAR refinement — same soundness argument as the per-array caps.
-        // Lower it (e.g. AY_FC_GLOBAL_BUDGET=2000) to make a huge-array instance
+        // Lower it (`--fc-global-budget 2000`) to make a huge-array instance
         // solve its base CNF first and lazily refine FC on demand.
-        let mut fc_global_pair_budget: usize = fc_budget_env("AY_FC_GLOBAL_BUDGET", 30_000);
+        let fc_budget_cli = ay_core::misc_cli_flags().fc_global_budget;
+        let mut fc_global_pair_budget: usize = fc_budget_cli.unwrap_or(30_000);
         // AUTO-SCALE for the many-array BMC class (#dt-array-fc-autoscale). A BMC
         // instance that mints thousands of SSA array versions generates a
         // candidate FC set whose clause mass drowns the CDCL even at the global
@@ -4565,14 +4566,14 @@ impl Executor {
         // csplit-style array with thousands of constant selects, which needs its
         // eager FC) is NOT affected. Sound: identical lazy-refinement +
         // fail-closed-to-Unknown safety net as any FC truncation.
-        if std::env::var_os("AY_FC_GLOBAL_BUDGET").is_none() {
+        if fc_budget_cli.is_none() {
             const FC_AUTOSCALE_ARRAY_THRESHOLD: usize = 500;
             const FC_AUTOSCALE_BUDGET: usize = 2_000;
             let arrays_with_reads = selects_by_array.values().filter(|s| s.len() >= 2).count();
             if arrays_with_reads > FC_AUTOSCALE_ARRAY_THRESHOLD
                 && fc_global_pair_budget > FC_AUTOSCALE_BUDGET
             {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace fc-autoscale arrays={arrays_with_reads} budget {fc_global_pair_budget}->{FC_AUTOSCALE_BUDGET}"
                     );

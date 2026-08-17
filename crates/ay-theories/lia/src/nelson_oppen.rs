@@ -9,22 +9,20 @@
 
 use super::*;
 
-/// Kill switch for the `detect_algebraic_equalities` memo: set
-/// `AY_NO_ALGEBRAIC_DETECT_CACHE=1` to force a full re-derivation on every
-/// call (semantic A/B testing and paranoid CI — the disabled run must produce
-/// identical verdicts, only slower). Read once per process (#6359 pattern).
-fn algebraic_detect_cache_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("AY_NO_ALGEBRAIC_DETECT_CACHE").is_some())
+/// Production policy for the `detect_algebraic_equalities` memo.
+///
+/// B24 retired the semantic A/B kill switch after establishing that disabling
+/// the memo changes only performance, so production always uses the cache.
+fn algebraic_detect_cache_enabled() -> bool {
+    true
 }
 
-/// Kill switch for the #probe-rref-memo incremental probe conflict predictor:
-/// set `AY_NO_PROBE_INCREMENTAL=1` to route every probe `detect_algebraic`
-/// call through the full recompute (A/B verification — the disabled run must
-/// produce identical verdicts, only slower). Read once per process.
-fn algebraic_probe_incremental_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("AY_NO_PROBE_INCREMENTAL").is_some())
+/// Production policy for the #probe-rref-memo conflict predictor.
+///
+/// B24 retired its semantic A/B kill switch after verification, so eligible
+/// conflict probes always use the incremental predictor.
+fn algebraic_probe_incremental_enabled() -> bool {
+    true
 }
 
 /// #probe-rref-memo observability: process-global self-time + call/fallback
@@ -157,7 +155,7 @@ impl LiaSolver<'_> {
         if self.conflict_probe
             && !self.shared_equalities.is_empty()
             && !self.skip_shared_algebraic
-            && !algebraic_probe_incremental_disabled()
+            && algebraic_probe_incremental_enabled()
         {
             return self.detect_algebraic_probe(debug);
         }
@@ -172,7 +170,7 @@ impl LiaSolver<'_> {
         // so returning the cached conflict-free result is behaviour-identical.
         // Conflict runs are never cached (see the exit sites below).
         let stamp = self.algebraic_detect_stamp();
-        if !algebraic_detect_cache_disabled() {
+        if algebraic_detect_cache_enabled() {
             if let Some((cached_stamp, cached)) = &self.detect_algebraic_cache {
                 if *cached_stamp == stamp {
                     self.detect_algebraic_cache_hits += 1;
@@ -282,7 +280,7 @@ impl LiaSolver<'_> {
         if equations.is_empty() {
             // Conflict-free exit: cache the (empty) result. The stamp taken
             // at entry is still current — nothing above mutates stamped state.
-            if !algebraic_detect_cache_disabled() {
+            if algebraic_detect_cache_enabled() {
                 self.detect_algebraic_cache = Some((stamp, Vec::new()));
             }
             return vec![];
@@ -641,7 +639,7 @@ impl LiaSolver<'_> {
         // match the POST-run pair set (a hit means the Case-2 gate would
         // suppress every emission, making the skipped side effects empty).
         // The Case 0 conflict return above is deliberately NOT cached.
-        if !algebraic_detect_cache_disabled() {
+        if algebraic_detect_cache_enabled() {
             self.detect_algebraic_cache =
                 Some((self.algebraic_detect_stamp(), derived_tight_bounds.clone()));
         }

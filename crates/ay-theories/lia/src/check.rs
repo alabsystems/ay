@@ -194,17 +194,12 @@ impl LiaSolver<'_> {
             return None;
         }
         // Lever-P ceiling experiment (eager-theory-prop design §5.5):
-        // AY_LIA_PROBE_SCAN=0 skips the minimization scan entirely, taking the
+        // --no-lia-probe-scan skips the minimization scan entirely, taking the
         // sound full-closure augmentation fallback. Diagnostic-only knob to
         // measure how much of the spin-cell budget the probe storm costs vs
         // how load-bearing minimized clauses are. Default (unset) unchanged.
-        {
-            static SCAN_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let enabled = *SCAN_ENABLED
-                .get_or_init(|| std::env::var("AY_LIA_PROBE_SCAN").ok().as_deref() != Some("0"));
-            if !enabled {
-                return None;
-            }
+        if ay_core::theory_disable_flags().no_lia_probe_scan {
+            return None;
         }
 
         // Only equalities whose reasons will ACTUALLY REACH the clause may be
@@ -863,15 +858,9 @@ impl LiaSolver<'_> {
     /// (kill/force, process-cached); otherwise the per-solver opt-in set by
     /// `set_probe_subset_cache` decides (default OFF — see `types.rs`).
     fn probe_subset_cache_active(&self) -> bool {
-        static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-        (*OVERRIDE.get_or_init(
-            || match std::env::var("AY_PROBE_SUBSET_CACHE").ok().as_deref() {
-                Some("0") => Some(false),
-                Some("1") => Some(true),
-                _ => None,
-            },
-        ))
-        .unwrap_or(self.probe_subset_cache)
+        // B24: the typed field IS the carrier; the env override shim over it
+        // is retired.
+        self.probe_subset_cache
     }
 
     pub(super) fn augment_farkas_with_shared_reasons(
@@ -892,7 +881,7 @@ impl LiaSolver<'_> {
         // TEMP-DIAG (#certora-w8): env-gated augmentation telemetry.
         {
             static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if *TRACE.get_or_init(|| std::env::var_os("AY_CERTORA_TRACE").is_some()) {
+            if *TRACE.get_or_init(|| ay_core::misc_cli_flags().certora_trace) {
                 use std::sync::atomic::{AtomicU64, Ordering};
                 static CALLS: AtomicU64 = AtomicU64::new(0);
                 let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1279,13 +1268,8 @@ const PROBE_RESCUE_BUDGET_DEFAULT: usize = 24;
 /// (`AY_PRESCREEN_RESCUE` override, else [`PROBE_RESCUE_BUDGET_DEFAULT`]).
 /// Process-cached (one env read).
 fn probe_rescue_budget() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("AY_PRESCREEN_RESCUE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(PROBE_RESCUE_BUDGET_DEFAULT)
-    })
+    // B25: env override retired; the named constant is the value.
+    PROBE_RESCUE_BUDGET_DEFAULT
 }
 
 /// #probe-batch-prescreen observability: per-process histogram of the full-set
@@ -1391,12 +1375,11 @@ fn probe_stats_record(checks: u64, success: bool, subset_len: usize) {
         SUBSET_LEN.fetch_add(subset_len as u64, Ordering::Relaxed);
     }
     // Report interval override for short runs (measurement-only):
-    // AY_PROBE_STATS_EVERY=<n> (default 1000).
+    // --probe-stats-every <n> (default 1000).
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| {
-        std::env::var("AY_PROBE_STATS_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        ay_core::misc_cli_flags()
+            .probe_stats_every
             .filter(|&v| v > 0)
             .unwrap_or(1000)
     });

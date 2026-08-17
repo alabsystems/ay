@@ -205,7 +205,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // ONCE at attempt entry. Non-fused attempts (the default: eager1, the
         // hybrid's isolated resume, the AUFLIA/UF+LRA lanes) carry `false` and
         // keep their byte-identical relevancy configuration below. The FUSED
-        // detour arm (`AY_UFLIA_FUSED_DETOUR=1`, combined/mod.rs #fused-detour
+        // detour arm (`--uflia-fused-detour=1`, combined/mod.rs #fused-detour
         // slot) sets the flag around this expansion so relevancy-hard rides
         // the live TheoryExtension on the SHARED persistent solver
         // (the development design notes §2 Inc5).
@@ -376,14 +376,6 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 state.round_trips += 1;
                 _islp_timing.dpll.round_trips += 1;
 
-                // Candidate-REJECTION diagnosis (env-gated `AY_REJECT_INSTRUMENT`,
-                // verdict-neutral): record this candidate-loop iteration + the
-                // current term-store length so the growth curve of the depth-4
-                // DT candidate enumeration is observable. No-op when unset.
-                $crate::reject_instrument::record_candidate_iteration(
-                    _iteration, $self.ctx.terms.len(),
-                );
-
                 // #6846: non-convergence guard for non-persistent eager arm.
                 // #ssl-residue D1: reset the counter when the previous
                 // iteration added ANYTHING new (split clause, bound
@@ -480,8 +472,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 // the development design notes
                 //
                 // Inc5 #fused-detour seam (flag-respecting; mirrors the lazy
-                // arm's seam verbatim): `AY_RELEVANCY=0` still kills the
-                // brancher (env override wins); `AY_RELEVANCY=1|2` forces it
+                // arm's seam verbatim): `--sat-relevancy` still kills the
+                // brancher (env override wins); `--sat-relevancy|2` forces it
                 // on. With the fused flag unset this computes exactly the
                 // historical values (branching = env default-off, hard =
                 // false — eager solves never ran relevancy HARD, and the
@@ -572,7 +564,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 break 'split_loop Ok(SolveResult::Unknown);
                             }
                             for _sl_clause in &_islp_new_sl_clauses {
-                                $crate::executor::theories::split_incremental::apply_string_lemma_incremental(
+                                let (_islp_lowered_sl_clause, _islp_sl_original_id) = $crate::executor::theories::split_incremental::apply_string_lemma_incremental(
                                     &$self.ctx.terms,
                                     solver,
                                     &mut local_term_to_var,
@@ -586,17 +578,24 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     // are content axioms (decomposition, contains, substr).
                                     // Use StringContentAxiom instead of Generic/trust.
                                     let _ = $self.proof_tracker.add_theory_lemma_with_kind(
-                                        _sl_clause.to_vec(),
+                                        _islp_lowered_sl_clause.clone(),
                                         ay_core::TheoryLemmaKind::StringContentAxiom,
                                     );
-                                    // #6725: append indexed proof entries in lockstep with SAT clause creation.
-                                    _islp_local_clausification_proofs.push(None);
-                                    _islp_local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
-                                        clause: _sl_clause.to_vec(),
-                                        kind: ay_core::TheoryLemmaKind::StringContentAxiom,
-                                        farkas: None,
-                                        lia: None,
-                                    }));
+                                    if let Some(_islp_sl_original_id) = _islp_sl_original_id {
+                                        $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                            &solver,
+                                            _islp_sl_original_id,
+                                            None,
+                                            Some(ay_core::TheoryLemmaProof {
+                                                clause: _islp_lowered_sl_clause,
+                                                kind: ay_core::TheoryLemmaKind::StringContentAxiom,
+                                                farkas: None,
+                                                lia: None,
+                                            }),
+                                            &mut _islp_local_clausification_proofs,
+                                            &mut _islp_local_original_clause_theory_proofs,
+                                        );
+                                    }
                                 }
                             }
                             _islp_negations.sync_pending(&mut $self.ctx.terms);
@@ -638,8 +637,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                             );
                             drop(theory);
+                            let mut _islp_lemma_original_ids = Vec::with_capacity(lemmas.len());
                             for lemma in &lemmas {
-                                $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                _islp_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                     &$self.ctx.terms,
                                     solver,
                                     &mut local_term_to_var,
@@ -647,11 +647,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     &mut local_next_var,
                                     &mut _islp_negations,
                                     &lemma.clause,
-                                );
+                                ));
                             }
                             if proof_enabled {
                                 _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                for lemma in &lemmas {
+                                // #trust->0 C3: DT registries, once per batch.
+                                let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                for (lemma, _islp_original_id) in
+                                    lemmas.iter().zip(_islp_lemma_original_ids)
+                                {
                                     let terms: Vec<ay_core::TermId> = lemma
                                         .clause
                                         .iter()
@@ -666,29 +670,30 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             }
                                         })
                                         .collect();
-                                    let kind =
-                                        $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                                    // #trust->0 C3: funnel classifies + records;
+                                    // adopt its validator-ordered clause.
+                                    let (kind, terms) =
+                                        $crate::theory_inference::record_funnel_classified_lemma(
+                                            &mut $self.proof_tracker,
                                             &$self.ctx.terms,
-                                            &terms,
+                                            terms,
+                                            _c3_dt.as_ref(),
                                         );
-                                    match kind {
-                                        ay_core::TheoryLemmaKind::Generic => {
-                                            let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                                        }
-                                        _ => {
-                                            let _ = $self
-                                                .proof_tracker
-                                                .add_theory_lemma_with_kind(terms.clone(), kind);
-                                        }
+                                    if let Some(_islp_original_id) = _islp_original_id {
+                                        $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                            &solver,
+                                            _islp_original_id,
+                                            None,
+                                            Some(ay_core::TheoryLemmaProof {
+                                                clause: terms,
+                                                kind,
+                                                farkas: None,
+                                                lia: None,
+                                            }),
+                                            &mut _islp_local_clausification_proofs,
+                                            &mut _islp_local_original_clause_theory_proofs,
+                                        );
                                     }
-                                    // #6725: append indexed proof entries in lockstep with SAT clause creation.
-                                    _islp_local_clausification_proofs.push(None);
-                                    _islp_local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
-                                        clause: terms,
-                                        kind,
-                                        farkas: None,
-                                        lia: None,
-                                    }));
                                 }
                             }
                             continue;
@@ -808,11 +813,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
                 match sat_result {
                     SatResult::Sat(model) => {
-                        // Diagnostic-only (AY_DEBUG_NO_TERMS): dump the SAT view of
+                        // Diagnostic-only (--debug-no-terms): dump the SAT view of
                         // listed atoms at every SAT-accept: var mapping + model value
                         // + whether the var was ASSIGNED on the trail (vs defaulted).
-                        if let Some(list) = std::env::var_os("AY_DEBUG_NO_TERMS") {
-                            for raw in list.to_string_lossy().split(',') {
+                        if let Some(list) = ay_core::misc_cli_flags().debug_no_terms.as_deref() {
+                            for raw in list.split(',') {
                                 let Ok(id) = raw.trim().parse::<u32>() else { continue };
                                 let t = ay_core::TermId(id);
                                 let var = local_term_to_var.get(&t).copied();
@@ -1026,8 +1031,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         drop(theory);
+                                        let mut _fc_lemma_original_ids = Vec::with_capacity(lemmas.len());
                                         for lemma in &lemmas {
-                                            $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            _fc_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                                 &$self.ctx.terms,
                                                 solver,
                                                 &mut local_term_to_var,
@@ -1035,11 +1041,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                 &mut local_next_var,
                                                 &mut _islp_negations,
                                                 &lemma.clause,
-                                            );
+                                            ));
                                         }
                                         if proof_enabled {
                                             _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                            for lemma in &lemmas {
+                                            // #trust->0 C3: DT registries, once per batch.
+                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                            for (lemma, _fc_original_id) in
+                                                lemmas.iter().zip(_fc_lemma_original_ids)
+                                            {
                                                 let terms: Vec<ay_core::TermId> = lemma
                                                     .clause
                                                     .iter()
@@ -1054,28 +1064,31 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                         }
                                                     })
                                                     .collect();
-                                                let kind =
-                                                    $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                                                // #trust->0 C3: funnel classifies +
+                                                // records; adopt its validator-ordered
+                                                // clause.
+                                                let (kind, terms) =
+                                                    $crate::theory_inference::record_funnel_classified_lemma(
+                                                        &mut $self.proof_tracker,
                                                         &$self.ctx.terms,
-                                                        &terms,
+                                                        terms,
+                                                        _c3_dt.as_ref(),
                                                     );
-                                                match kind {
-                                                    ay_core::TheoryLemmaKind::Generic => {
-                                                        let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                                                    }
-                                                    _ => {
-                                                        let _ = $self
-                                                            .proof_tracker
-                                                            .add_theory_lemma_with_kind(terms.clone(), kind);
-                                                    }
+                                                if let Some(_fc_original_id) = _fc_original_id {
+                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                        &solver,
+                                                        _fc_original_id,
+                                                        None,
+                                                        Some(ay_core::TheoryLemmaProof {
+                                                            clause: terms,
+                                                            kind,
+                                                            farkas: None,
+                                                            lia: None,
+                                                        }),
+                                                        &mut _islp_local_clausification_proofs,
+                                                        &mut _islp_local_original_clause_theory_proofs,
+                                                    );
                                                 }
-                                                _islp_local_clausification_proofs.push(None);
-                                                _islp_local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
-                                                    clause: terms,
-                                                    kind,
-                                                    farkas: None,
-                                                    lia: None,
-                                                }));
                                             }
                                         }
                                         continue;
@@ -1205,8 +1218,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         drop(theory);
+                                        let mut _ps_lemma_original_ids = Vec::with_capacity(lemmas.len());
                                         for lemma in &lemmas {
-                                            $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            _ps_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                                 &$self.ctx.terms,
                                                 solver,
                                                 &mut local_term_to_var,
@@ -1214,11 +1228,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                 &mut local_next_var,
                                                 &mut _islp_negations,
                                                 &lemma.clause,
-                                            );
+                                            ));
                                         }
                                         if proof_enabled {
                                             _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                            for lemma in &lemmas {
+                                            // #trust->0 C3: DT registries, once per batch.
+                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                            for (lemma, _ps_original_id) in
+                                                lemmas.iter().zip(_ps_lemma_original_ids)
+                                            {
                                                 let terms: Vec<ay_core::TermId> = lemma
                                                     .clause
                                                     .iter()
@@ -1233,28 +1251,31 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                         }
                                                     })
                                                     .collect();
-                                                let kind =
-                                                    $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                                                // #trust->0 C3: funnel classifies +
+                                                // records; adopt its validator-ordered
+                                                // clause.
+                                                let (kind, terms) =
+                                                    $crate::theory_inference::record_funnel_classified_lemma(
+                                                        &mut $self.proof_tracker,
                                                         &$self.ctx.terms,
-                                                        &terms,
+                                                        terms,
+                                                        _c3_dt.as_ref(),
                                                     );
-                                                match kind {
-                                                    ay_core::TheoryLemmaKind::Generic => {
-                                                        let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                                                    }
-                                                    _ => {
-                                                        let _ = $self
-                                                            .proof_tracker
-                                                            .add_theory_lemma_with_kind(terms.clone(), kind);
-                                                    }
+                                                if let Some(_ps_original_id) = _ps_original_id {
+                                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                        &solver,
+                                                        _ps_original_id,
+                                                        None,
+                                                        Some(ay_core::TheoryLemmaProof {
+                                                            clause: terms,
+                                                            kind,
+                                                            farkas: None,
+                                                            lia: None,
+                                                        }),
+                                                        &mut _islp_local_clausification_proofs,
+                                                        &mut _islp_local_original_clause_theory_proofs,
+                                                    );
                                                 }
-                                                _islp_local_clausification_proofs.push(None);
-                                                _islp_local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
-                                                    clause: terms,
-                                                    kind,
-                                                    farkas: None,
-                                                    lia: None,
-                                                }));
                                             }
                                         }
                                         continue;
@@ -1489,7 +1510,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager wander-abort"));
                             break 'split_loop Ok(SolveResult::Unknown);
                         }
-                        if std::env::var_os("AY_DEBUG_SPLIT_EXIT").is_some() {
+                        if ay_core::misc_cli_flags().debug_split_exit {
                             safe_eprintln!(
                                 "[split-exit-probe] sat_unknown_reason={:?}",
                                 solver.last_unknown_reason()
@@ -1613,8 +1634,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                         );
                                         drop(theory);
+                                        let mut _unk_lemma_original_ids = Vec::with_capacity(lemmas.len());
                                         for lemma in &lemmas {
-                                            $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                            _unk_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                                 &$self.ctx.terms,
                                                 solver,
                                                 &mut local_term_to_var,
@@ -1622,7 +1644,53 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                 &mut local_next_var,
                                                 &mut _islp_negations,
                                                 &lemma.clause,
-                                            );
+                                            ));
+                                        }
+                                        if proof_enabled {
+                                            _islp_negations.sync_pending(&mut $self.ctx.terms);
+                                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                            for (lemma, _unk_original_id) in
+                                                lemmas.iter().zip(_unk_lemma_original_ids)
+                                            {
+                                                let terms: Vec<ay_core::TermId> = lemma
+                                                    .clause
+                                                    .iter()
+                                                    .map(|lit| {
+                                                        if lit.value {
+                                                            lit.term
+                                                        } else {
+                                                            *_islp_negations
+                                                                .as_map()
+                                                                .get(&lit.term)
+                                                                .expect("unknown-recovery theory-lemma negation cache should be synced")
+                                                        }
+                                                    })
+                                                    .collect();
+                                                let (kind, terms) =
+                                                    $crate::theory_inference::record_funnel_classified_lemma(
+                                                        &mut $self.proof_tracker,
+                                                        &$self.ctx.terms,
+                                                        terms,
+                                                        _c3_dt.as_ref(),
+                                                    );
+                                                if let Some(_unk_original_id) = _unk_original_id {
+                                                    if !matches!(kind, ay_core::TheoryLemmaKind::Generic) {
+                                                        $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                            &solver,
+                                                            _unk_original_id,
+                                                            None,
+                                                            Some(ay_core::TheoryLemmaProof {
+                                                                clause: terms,
+                                                                kind,
+                                                                farkas: None,
+                                                                lia: None,
+                                                            }),
+                                                            &mut _islp_local_clausification_proofs,
+                                                            &mut _islp_local_original_clause_theory_proofs,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                         continue;
                                     }

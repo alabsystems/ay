@@ -3,9 +3,12 @@
 
 //! Independent, resource-bounded replay for in-memory resolution DAGs.
 
+mod rup_fixpoint;
+
 use crate::literal::Literal;
 use crate::resolution_dag::{ResolutionDag, RupStep};
 use ay_core::time::Instant;
+use rup_fixpoint::replay_hints_to_fixpoint;
 use std::collections::HashMap;
 use std::mem::size_of;
 
@@ -552,15 +555,28 @@ impl ResolutionDag {
             )?,
             ResolutionValidationResource::Bytes,
         )?;
-        estimated_bytes = checked_add(
-            estimated_bytes,
+        let fixed_variable_marker_bytes = if fixed_unit_premises.is_empty() {
+            0
+        } else {
             checked_mul(
                 self.num_vars,
-                checked_add(
-                    size_of::<Option<bool>>(),
-                    size_of::<usize>(),
+                size_of::<u8>(),
+                ResolutionValidationResource::Bytes,
+            )?
+        };
+        estimated_bytes = checked_add(
+            estimated_bytes,
+            checked_add(
+                checked_mul(
+                    self.num_vars,
+                    checked_add(
+                        size_of::<Option<bool>>(),
+                        size_of::<usize>(),
+                        ResolutionValidationResource::Bytes,
+                    )?,
                     ResolutionValidationResource::Bytes,
                 )?,
+                fixed_variable_marker_bytes,
                 ResolutionValidationResource::Bytes,
             )?,
             ResolutionValidationResource::Bytes,
@@ -603,6 +619,32 @@ impl ResolutionDag {
             assign.resize(next_len, None);
             meter.check_controls()?;
         }
+        // Premised replay specializes the clause database under authenticated
+        // fixed units. Keep their variables separate from target-negation and
+        // propagated assignments: a hint clause made true by a fixed premise
+        // is absent from the specialized database and is therefore a sound
+        // no-op even when other literals in its raw form remain open.
+        let mut fixed_variables: Vec<u8> = Vec::new();
+        if !fixed_unit_premises.is_empty() {
+            meter.charge_usize(self.num_vars)?;
+            meter.check_controls()?;
+            fixed_variables
+                .try_reserve_exact(self.num_vars)
+                .map_err(|_| ResolutionValidationError::AllocationFailed {
+                    resource: ResolutionValidationResource::AssignmentScratch,
+                })?;
+            while fixed_variables.len() < self.num_vars {
+                let chunk = (self.num_vars - fixed_variables.len()).min(INITIALIZATION_CHUNK);
+                let next_len = fixed_variables.len().checked_add(chunk).ok_or(
+                    ResolutionValidationError::AccountingOverflow {
+                        resource: ResolutionValidationResource::Work,
+                    },
+                )?;
+                meter.charge_usize(chunk)?;
+                fixed_variables.resize(next_len, 0);
+                meter.check_controls()?;
+            }
+        }
         let mut trail: Vec<usize> = Vec::new();
         meter.charge_usize(self.num_vars)?;
         meter.check_controls()?;
@@ -621,9 +663,17 @@ impl ResolutionDag {
                     size_of::<Option<bool>>(),
                     ResolutionValidationResource::Bytes,
                 )?,
-                checked_mul(
-                    trail.capacity(),
-                    size_of::<usize>(),
+                checked_add(
+                    checked_mul(
+                        trail.capacity(),
+                        size_of::<usize>(),
+                        ResolutionValidationResource::Bytes,
+                    )?,
+                    checked_mul(
+                        fixed_variables.capacity(),
+                        size_of::<u8>(),
+                        ResolutionValidationResource::Bytes,
+                    )?,
                     ResolutionValidationResource::Bytes,
                 )?,
                 ResolutionValidationResource::Bytes,
@@ -682,6 +732,7 @@ impl ResolutionDag {
                 .into());
             }
             let value = literal.is_positive();
+            fixed_variables[var] = 1;
             match assign[var] {
                 None => {
                     assign[var] = Some(value);
@@ -712,7 +763,14 @@ impl ResolutionDag {
             let result = if fixed_premises_conflict {
                 Ok(())
             } else {
-                replay_rup(step, &db, &mut assign, &mut trail, &mut meter)
+                replay_rup(
+                    step,
+                    &db,
+                    &mut assign,
+                    &mut trail,
+                    &fixed_variables,
+                    &mut meter,
+                )
             };
             for &var in &trail[fixed_trail_len..] {
                 meter.charge(1)?;
@@ -844,6 +902,7 @@ enum HintScan {
     Conflict,
     Propagate(Literal),
     SatisfiedUnit,
+    FixedPremiseSatisfied,
     NonUnit,
 }
 
@@ -852,6 +911,7 @@ fn replay_rup(
     db: &HashMap<u64, &[Literal]>,
     assign: &mut [Option<bool>],
     trail: &mut Vec<usize>,
+    fixed_variables: &[u8],
     meter: &mut WorkMeter<'_>,
 ) -> Result<(), ResolutionValidationError> {
     for lit in &step.clause {
@@ -868,53 +928,66 @@ fn replay_rup(
         }
     }
 
-    for &hint in &step.rup_hints {
-        meter.charge(1)?;
-        let Some(hint_clause) = db.get(&hint) else {
-            return Err(ResolutionDagValidateError::UnknownHint {
-                step: step.id,
-                hint,
-            }
-            .into());
-        };
-        match scan_hint(hint_clause, assign, meter)? {
-            HintScan::Conflict => return Ok(()),
-            HintScan::Propagate(lit) => {
-                let var = lit.variable().index();
-                assign[var] = Some(lit.is_positive());
-                trail.push(var);
-            }
-            HintScan::SatisfiedUnit => {}
-            HintScan::NonUnit => {
-                return Err(ResolutionDagValidateError::HintNotUnit {
-                    step: step.id,
-                    hint,
-                }
-                .into());
-            }
-        }
-    }
-    Err(ResolutionDagValidateError::NoConflict { step: step.id }.into())
+    // Propagate to FIXPOINT rather than demanding the hints already sit in
+    // propagation order. The clause trace deliberately carries hints in RAW
+    // conflict-analysis order: its other consumer (`SatProofManager`) resolves
+    // iteratively and finds pivots dynamically. A strict in-order walk rejects
+    // valid traces whenever a wide early hint becomes unit only after a later
+    // hint propagates.
+    // This occurs in real traces: an early three-literal hint can have all
+    // three variables open while later unit hints close it, and terminal
+    // empty-clause chains can similarly place unit hints behind a wide one.
+    // Rejecting at the first open hint turns a valid proof into `unknown`.
+    //
+    // The raw order is a test-pinned producer contract, so the validator must
+    // not reorder the stored hint vector. Instead, each sweep visits hints in
+    // their original order and repeats that order only after making progress.
+    // This preserves which missing ID is reported first and which stalled
+    // non-unit ID is retained for the compatibility error.
+    //
+    //
+    // Sweeping is sound because every propagated clause is unit under the
+    // current assignment, regardless of discovery order. A currently non-unit
+    // hint may become unit on a later sweep. Only a whole sweep without progress
+    // establishes the existing `HintNotUnit` or `NoConflict` error, and every
+    // visit remains charged to the bounded work meter.
+    replay_hints_to_fixpoint(step, db, assign, trail, fixed_variables, meter)
 }
 
 fn scan_hint(
     clause: &[Literal],
     assign: &[Option<bool>],
+    fixed_variables: &[u8],
     meter: &mut WorkMeter<'_>,
 ) -> Result<HintScan, ResolutionValidationError> {
     let mut non_falsified: Option<(Literal, bool)> = None;
+    let mut non_unit = false;
     for &lit in clause {
         meter.charge(1)?;
-        let truth = assign[lit.variable().index()].map(|value| value == lit.is_positive());
+        let variable = lit.variable().index();
+        let truth = assign[variable].map(|value| value == lit.is_positive());
+        if truth == Some(true) && fixed_variables.get(variable) == Some(&1) {
+            return Ok(HintScan::FixedPremiseSatisfied);
+        }
         match truth {
             Some(false) => {}
             Some(true) | None => {
                 if non_falsified.is_some() {
-                    return Ok(HintScan::NonUnit);
+                    if fixed_variables.is_empty() {
+                        return Ok(HintScan::NonUnit);
+                    }
+                    // Continue only in premised replay: a later literal may
+                    // make this whole raw clause true under a fixed premise,
+                    // in which case specialization removes it.
+                    non_unit = true;
+                    continue;
                 }
                 non_falsified = Some((lit, truth == Some(true)));
             }
         }
+    }
+    if non_unit {
+        return Ok(HintScan::NonUnit);
     }
     Ok(match non_falsified {
         None => HintScan::Conflict,
@@ -979,8 +1052,10 @@ mod compatibility_tests {
     #[cfg(feature = "unsat-cert")]
     #[test]
     fn legacy_unsat_cert_module_path_remains_public() {
-        let error: crate::unsat_cert::ResolutionDagValidateError =
-            ResolutionDagValidateError::NoSteps;
-        let _: crate::ResolutionDagValidateError = error;
+        use crate::unsat_cert::ResolutionDagValidateError as LegacyError;
+        use crate::ResolutionDagValidateError as RootError;
+
+        let error: LegacyError = ResolutionDagValidateError::NoSteps;
+        let _: RootError = error;
     }
 }

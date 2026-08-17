@@ -11,10 +11,81 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
-    FarkasAnnotation, Sort, TermData, TermId, TermStore, TheoryConflict, TheoryLemmaKind, TheoryLit,
+    FarkasAnnotation, Sort, Symbol, TermData, TermId, TermStore, TheoryConflict, TheoryLemmaKind,
+    TheoryLit,
 };
 
 use super::decode_eq;
+
+/// Maximum Generic lemmas inspected by this pass in one proof.
+const MAX_DECOMPOSITION_ATTEMPTS_PER_PROOF: usize = 128;
+/// Maximum literals inspected in one candidate clause.
+const MAX_DECOMPOSITION_CLAUSE_LITERALS: usize = 64;
+/// Maximum candidate operand pairs inspected for one Generic lemma.
+const MAX_CANDIDATE_PROBES_PER_CLAUSE: usize = 4096;
+/// Maximum arguments inspected in either candidate application.
+const MAX_CANDIDATE_APPLICATION_ARITY: usize = 64;
+/// Maximum bytes compared in either candidate application's symbol name.
+const MAX_CANDIDATE_SYMBOL_NAME_BYTES: usize = 256;
+/// Maximum indexed-symbol parameters compared per candidate application.
+const MAX_CANDIDATE_SYMBOL_INDICES: usize = 64;
+/// Maximum fresh LRA solvers constructed for one Generic lemma.
+const MAX_LRA_REPLAYS_PER_CLAUSE: usize = 32;
+/// Maximum fresh LRA solvers constructed by the pass in one proof.
+const MAX_LRA_REPLAYS_PER_PROOF: usize = 64;
+
+/// Shared resource envelope for one proof's combined-conflict pass.
+///
+/// Exhaustion declines decomposition, leaving the original Generic lemma for
+/// strict checking. It can therefore cost proof completeness, never soundness.
+pub(crate) struct CombinedDecompositionBudget {
+    remaining_attempts: usize,
+    remaining_replays: usize,
+    candidate_probes_per_clause: usize,
+    replays_per_clause: usize,
+}
+
+struct ClauseDecompositionBudget {
+    remaining_candidate_probes: usize,
+    remaining_replays: usize,
+}
+
+impl CombinedDecompositionBudget {
+    pub(crate) const fn new() -> Self {
+        Self {
+            remaining_attempts: MAX_DECOMPOSITION_ATTEMPTS_PER_PROOF,
+            remaining_replays: MAX_LRA_REPLAYS_PER_PROOF,
+            candidate_probes_per_clause: MAX_CANDIDATE_PROBES_PER_CLAUSE,
+            replays_per_clause: MAX_LRA_REPLAYS_PER_CLAUSE,
+        }
+    }
+
+    fn begin_clause(&mut self) -> Option<ClauseDecompositionBudget> {
+        if self.remaining_replays == 0 {
+            return None;
+        }
+        self.remaining_attempts = self.remaining_attempts.checked_sub(1)?;
+        Some(ClauseDecompositionBudget {
+            remaining_candidate_probes: self.candidate_probes_per_clause,
+            remaining_replays: self.replays_per_clause,
+        })
+    }
+
+    fn charge_replay(&mut self, clause: &mut ClauseDecompositionBudget) -> Option<()> {
+        let clause_remaining = clause.remaining_replays.checked_sub(1)?;
+        let proof_remaining = self.remaining_replays.checked_sub(1)?;
+        clause.remaining_replays = clause_remaining;
+        self.remaining_replays = proof_remaining;
+        Some(())
+    }
+}
+
+impl ClauseDecompositionBudget {
+    fn charge_candidate_probe(&mut self) -> Option<()> {
+        self.remaining_candidate_probes = self.remaining_candidate_probes.checked_sub(1)?;
+        Some(())
+    }
+}
 
 /// Decompose a Generic/trust combined real-theory lemma into an EUF congruence
 /// lemma plus an arithmetic bridge lemma with Farkas coefficients (#6756 Packet 2).
@@ -26,7 +97,12 @@ use super::decode_eq;
 pub(crate) fn decompose_generic_combined_real_lemma(
     terms: &mut TermStore,
     clause: &[TermId],
+    budget: &mut CombinedDecompositionBudget,
 ) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>, FarkasAnnotation)> {
+    let mut clause_budget = budget.begin_clause()?;
+    if clause.len() > MAX_DECOMPOSITION_CLAUSE_LITERALS {
+        return None;
+    }
     // All literals must be negated equalities with non-Int operands.
     let mut eq_atoms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
     for &lit in clause {
@@ -63,12 +139,15 @@ pub(crate) fn decompose_generic_combined_real_lemma(
                 (eq_atoms[i].3, eq_atoms[j].2),
                 (eq_atoms[i].3, eq_atoms[j].3),
             ] {
+                clause_budget.charge_candidate_probe()?;
                 if let Some(result) = try_congruence_decomposition(
                     terms,
                     clause,
                     &eq_by_pair,
                     candidate_lhs,
                     candidate_rhs,
+                    budget,
+                    &mut clause_budget,
                 ) {
                     return Some(result);
                 }
@@ -84,18 +163,14 @@ fn try_congruence_decomposition(
     eq_by_pair: &HashMap<(TermId, TermId), (TermId, TermId)>,
     candidate_lhs: TermId,
     candidate_rhs: TermId,
+    budget: &mut CombinedDecompositionBudget,
+    clause_budget: &mut ClauseDecompositionBudget,
 ) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>, FarkasAnnotation)> {
     if candidate_lhs == candidate_rhs {
         return None;
     }
-    let (lhs_sym, lhs_args) = match terms.get(candidate_lhs) {
-        TermData::App(sym, args) if !args.is_empty() => (sym.clone(), args.clone()),
-        _ => return None,
-    };
-    let (rhs_sym, rhs_args) = match terms.get(candidate_rhs) {
-        TermData::App(sym, args) if !args.is_empty() => (sym.clone(), args.clone()),
-        _ => return None,
-    };
+    let (lhs_sym, lhs_args) = bounded_candidate_application(terms, candidate_lhs)?;
+    let (rhs_sym, rhs_args) = bounded_candidate_application(terms, candidate_rhs)?;
     if lhs_sym != rhs_sym || lhs_args.len() != rhs_args.len() {
         return None;
     }
@@ -114,6 +189,10 @@ fn try_congruence_decomposition(
     if arg_eq_not_lits.is_empty() {
         return None;
     }
+
+    // Reserve both replay envelopes before synthesizing terms or constructing
+    // the temporary solver. A declined reservation leaves the proof untouched.
+    budget.charge_replay(clause_budget)?;
 
     // Synthesize the conclusion equality and its negation.
     let conclusion_eq = terms.mk_eq_coerce(candidate_lhs, candidate_rhs);
@@ -145,6 +224,20 @@ fn try_congruence_decomposition(
         bridge_clause,
         farkas,
     ))
+}
+
+fn bounded_candidate_application(terms: &TermStore, term: TermId) -> Option<(&Symbol, &[TermId])> {
+    let TermData::App(symbol, arguments) = terms.get(term) else {
+        return None;
+    };
+    if arguments.is_empty()
+        || arguments.len() > MAX_CANDIDATE_APPLICATION_ARITY
+        || symbol.name().len() > MAX_CANDIDATE_SYMBOL_NAME_BYTES
+        || matches!(symbol, Symbol::Indexed(_, indices) if indices.len() > MAX_CANDIDATE_SYMBOL_INDICES)
+    {
+        return None;
+    }
+    Some((symbol, arguments))
 }
 
 /// Replay a clause through a temporary LRA solver to obtain Farkas coefficients.
@@ -231,54 +324,5 @@ fn rebind_replayed_farkas(
 }
 
 #[cfg(test)]
-mod tests {
-    use num_bigint::BigInt;
-    use num_rational::BigRational;
-
-    use super::*;
-
-    #[test]
-    fn replayed_farkas_is_rebound_from_permuted_nonuniform_conflict() {
-        let mut terms = TermStore::new();
-        let x = terms.mk_var("x", Sort::Real);
-        let zero = terms.mk_rational(BigRational::from_integer(BigInt::from(0)));
-        let one = terms.mk_rational(BigRational::from_integer(BigInt::from(1)));
-        let three = terms.mk_rational(BigRational::from_integer(BigInt::from(3)));
-        let three_x = terms.mk_mul(vec![three, x]);
-        let three_x_le_zero = terms.mk_le(three_x, zero);
-        let x_ge_one = terms.mk_ge(x, one);
-        let not_three_x_le_zero = terms.mk_not(three_x_le_zero);
-        let not_x_ge_one = terms.mk_not(x_ge_one);
-
-        let target_clause = vec![not_three_x_le_zero, not_x_ge_one];
-        let target_conflict = vec![
-            TheoryLit::new(three_x_le_zero, true),
-            TheoryLit::new(x_ge_one, true),
-        ];
-        let source_farkas = FarkasAnnotation::from_ints(&[3, 1]);
-        assert!(ay_core::proof_validation::verify_farkas_conflict_lits_full(
-            &terms,
-            &target_conflict,
-            &source_farkas,
-        )
-        .is_err());
-
-        let solver_conflict = TheoryConflict::with_farkas(
-            vec![
-                TheoryLit::new(x_ge_one, true),
-                TheoryLit::new(three_x_le_zero, true),
-            ],
-            source_farkas,
-        );
-        let rebound = rebind_replayed_farkas(&terms, &target_clause, &solver_conflict)
-            .expect("permuted replay certificate should rebind by literal identity");
-
-        assert_eq!(rebound, FarkasAnnotation::from_ints(&[1, 3]));
-        ay_core::proof_validation::verify_farkas_conflict_lits_full(
-            &terms,
-            &target_conflict,
-            &rebound,
-        )
-        .expect("rebound certificate must validate against the exact bridge clause");
-    }
-}
+#[path = "decompose/tests.rs"]
+mod tests;

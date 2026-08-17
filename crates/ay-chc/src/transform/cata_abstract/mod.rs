@@ -476,7 +476,7 @@ impl DtRegistry {
 /// When `include_element_catas` is set, the CATA v3 element/ordering levels
 /// (`Min`/`Max` projections, the ascending-sortedness fold) are appended after
 /// the exact v2 size-family ladder (default on at the route; opt-out via
-/// `AY_CHC_DISABLE_CATA_ELEMENTS=1`). They are fully certified by the same
+/// `--chc-no-cata-elements`). They are fully certified by the same
 /// fail-closed gate (per-clause obligations + abstract re-verification + query
 /// gate), so they are 0-wrong by construction. NOTE: on the sampled
 /// element/ordering ADT-LIA family the affine-Houdini/PDR abstract-solve
@@ -2190,7 +2190,7 @@ fn sum_exprs(mut terms: Vec<ChcExpr>) -> ChcExpr {
 // ============================================================================
 
 /// Serialize a datatype-free LIA CHC problem to a standalone `(set-logic HORN)`
-/// SMT-LIB script (diagnostic only; see `AY_CHC_CATA_DUMP_ABSTRACT`).
+/// SMT-LIB script (diagnostic only; see `--chc-cata-dump-abstract`).
 pub(crate) fn dump_abstract_lia_problem(problem: &ChcProblem) -> String {
     let preds = problem.predicates();
     let pred_name = |id: PredicateId| -> String { quote_symbol(&preds[id.index()].name) };
@@ -2265,12 +2265,15 @@ pub(crate) fn dump_abstract_lia_problem(problem: &ChcProblem) -> String {
 /// ONLY for a definitive `unsat`; every other outcome (sat, unknown, parse
 /// error, executor error, ay-internal panic) fails closed.
 ///
-/// Diagnostics: set `AY_CHC_CATA_DUMP_OBLIGATIONS=<dir>` to write every
+/// Diagnostics: set `--chc-cata-dump-obligations <dir>` to write every
 /// non-discharging script to `<dir>` for offline replay.
 pub(crate) fn run_obligation_expect_unsat(script: &str, budget: Duration) -> bool {
     let discharged = run_obligation_expect_unsat_impl(script, budget);
     if !discharged {
-        if let Some(dir) = std::env::var_os("AY_CHC_CATA_DUMP_OBLIGATIONS") {
+        if let Some(dir) = ay_core::misc_cli_flags()
+            .chc_cata_dump_obligations
+            .as_deref()
+        {
             let dir = std::path::PathBuf::from(dir);
             let _ = std::fs::create_dir_all(&dir);
             let stamp = std::time::SystemTime::now()

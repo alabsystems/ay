@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! E2E tests for the root EDAC/VAC-lite WCSP probe wiring in the `ay-pb`
-//! binary (campaign soft-1, opt-in via `AY_PB_WCSP_EDAC=1`, default OFF).
+//! binary (campaign soft-1, opt-in via `--pb-wcsp-edac`, default OFF).
 //!
 //! The probe may assert `s UNSATISFIABLE` ONLY when its trail-checked floor
 //! `c0` reaches the WBO top cost. These tests pin: the firing case, the
@@ -35,13 +35,9 @@ fn write_instance(case: &str, text: &str) -> std::path::PathBuf {
 
 fn solve(path: &std::path::Path, edac: bool) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ay-pb"));
-    cmd.args(["pb", "solve", "--timeout", "10000"])
-        .arg(path)
-        // Never inherit the flag from the caller's environment: each case
-        // states its own gate explicitly.
-        .env_remove("AY_PB_WCSP_EDAC");
+    cmd.args(["pb", "solve", "--timeout", "10000"]).arg(path);
     if edac {
-        cmd.env("AY_PB_WCSP_EDAC", "1");
+        cmd.arg("--pb-wcsp-edac");
     }
     let output = cmd.output().expect("run ay-pb");
     String::from_utf8_lossy(&output.stdout).into_owned()

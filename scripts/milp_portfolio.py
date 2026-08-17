@@ -50,8 +50,15 @@ import sys
 import threading
 import time
 
-CORPUS = pathlib.Path(os.environ.get("AY_MILP_CORPUS",
-                                     pathlib.Path.home() / "ay-bench" / "milp"))
+# B20: the env locator is retired; pass --corpus <dir> or symlink the corpus
+# at the default path.
+def _corpus_dir() -> pathlib.Path:
+    argv = sys.argv
+    if "--corpus" in argv:
+        return pathlib.Path(argv[argv.index("--corpus") + 1])
+    return pathlib.Path.home() / "ay-bench" / "milp"
+
+CORPUS = _corpus_dir()
 MANIFEST = CORPUS / "manifest.json"
 AY_BIN = os.path.abspath(os.environ.get("AY_BIN", "./target/release/examples/mps_solve"))
 REL_TOL = 1e-6
@@ -62,29 +69,32 @@ PROVED = ("OPTIMAL", "INFEASIBLE")
 # They are deliberately coarse: the point is to find WHICH DECISIONS MATTER and on
 # which shapes, not to land a final constant. A no-op arm costs one run and shows
 # up as a duplicate of default, which is itself a useful (negative) result.
-ARMS: dict[str, dict[str, str]] = {
-    "default":     {},
+# B38: each arm is (env_extra, cli_args) — the retired knob env spellings ride
+# the shared engine CLI now; names with surviving env verdicts stay env.
+ARMS: dict[str, tuple[dict[str, str], list[str]]] = {
+    "default":     ({}, []),
     # Root cut volume. The campaign measured 40x10 as +9.25pp closure but -7
     # verdicts GLOBALLY; that is exactly the shape of a setting that should be
     # selected per-instance rather than switched on or off for everyone.
-    "cuts-big":    {"AY_MILP_ROOT_CUTS_PER_ROUND": "40", "AY_MILP_GMI_ROUNDS": "10"},
-    "cuts-mid":    {"AY_MILP_ROOT_CUTS_PER_ROUND": "16", "AY_MILP_GMI_ROUNDS": "5"},
-    "cuts-off":    {"AY_MILP_NO_CUTS": "1"},
+    "cuts-big":    ({}, ["--root-cuts-per-round", "40", "--gmi-rounds", "10"]),
+    "cuts-mid":    ({}, ["--root-cuts-per-round", "16", "--gmi-rounds", "5"]),
+    "cuts-off":    ({}, ["--no-cuts"]),
     # Presolve / probing.
-    "probe":       {"AY_MILP_ROOT_PROBE": "1", "AY_MILP_ROOT_PROBE_ALL": "1"},
-    "singleton":   {"AY_MILP_SINGLETON_SUB": "1"},
+    "probe":       ({}, ["--root-probe", "--root-probe-all"]),
+    "singleton":   ({"AY_MILP_SINGLETON_SUB": "1"}, []),
     # Tree.
-    "dfs":         {"AY_MILP_DFS": "1"},
-    "noplunge":    {"AY_MILP_PLUNGE": "0"},
-    "vsids":       {"AY_MILP_VSIDS": "1"},
-    "nodecuts":    {"AY_MILP_NODE_CUTS": "1"},
+    "dfs":         ({}, ["--dfs"]),
+    "noplunge":    ({}, ["--no-plunge"]),
+    "vsids":       ({}, ["--vsids"]),
+    "nodecuts":    ({}, ["--node-cuts"]),
     # LP.
-    "devex":       {"AY_MILP_DEVEX": "1"},
+    "devex":       ({"AY_MILP_DEVEX": "1"}, []),
     # One combination, because the terminal finding of the previous campaign was
     # that single-component transplants each regress; a saddle is crossed by
     # moving more than one coordinate.
-    "cuts-probe":  {"AY_MILP_ROOT_CUTS_PER_ROUND": "40", "AY_MILP_GMI_ROUNDS": "10",
-                    "AY_MILP_ROOT_PROBE": "1", "AY_MILP_ROOT_PROBE_ALL": "1"},
+    "cuts-probe":  ({},
+                    ["--root-cuts-per-round", "40", "--gmi-rounds", "10",
+                     "--root-probe", "--root-probe-all"]),
 }
 
 
@@ -111,13 +121,15 @@ def close_enough(a, b, tol: float = REL_TOL) -> bool:
     return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
 
 
-def run_ay(inst: dict, secs: float, env_extra: dict[str, str]) -> dict:
+def run_ay(inst: dict, secs: float, arm: tuple[dict[str, str], list[str]]) -> dict:
+    env_extra, cli_args = arm
     env = dict(os.environ)
     env.pop("AY_ROOT_CLOSURE", None)
     env.update(env_extra)
     t0 = time.monotonic()
     try:
-        r = subprocess.run([AY_BIN, inst["file"], str(secs)], capture_output=True,
+        r = subprocess.run([AY_BIN, inst["file"], str(secs), *cli_args],
+                           capture_output=True,
                            text=True, timeout=secs + 120, env=env)
     except subprocess.TimeoutExpired:
         return {"status": "HARDTIMEOUT", "t": secs + 120}

@@ -94,7 +94,7 @@ struct StringVarConstraints {
     /// A fully pinned value (from `(= v const)`), if present.
     pinned: Option<String>,
     /// HARD regex memberships the witness must satisfy (W2,
-    /// default ON, `AY_STR_WITNESS=0` kill switch — the vector stays EMPTY when the flag
+    /// default ON, `--dpll-no-str-witness` kill switch — the vector stays EMPTY when the flag
     /// is off, so every check below is a no-op and the flags-off materializer
     /// is byte-identical). A negative membership `x ∉ R` is carried EXACTLY as
     /// `Comp(R)`, so both polarities constrain the witness.

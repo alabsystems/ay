@@ -103,7 +103,7 @@ impl TheoryCombiner<'_> {
         merge_lia_values(&mut euf_model, lia_model.as_ref());
         let reunify_protected =
             crate::pipeline_fns::collect_top_level_arith_diseq_vars(self.terms, assertions);
-        if std::env::var_os("AY_DEBUG_CLASS_MERGE").is_some() {
+        if ay_core::misc_cli_flags().debug_class_merge {
             eprintln!(
                 "[class-merge-dbg] protected={:?}",
                 reunify_protected.iter().map(|t| t.0).collect::<Vec<_>>()
@@ -289,7 +289,7 @@ impl TheoryCombiner<'_> {
             } else {
                 continue;
             };
-            if std::env::var_os("AY_DEBUG_CLASS_MERGE").is_some()
+            if ay_core::misc_cli_flags().debug_class_merge
                 && members.iter().any(|m| protected.contains(m))
             {
                 eprintln!(
@@ -482,7 +482,7 @@ impl TheoryCombiner<'_> {
                     *rep,
                 )
             });
-            if std::env::var_os("AY_DEBUG_CLASS_MERGE").is_some() {
+            if ay_core::misc_cli_flags().debug_class_merge {
                 let mut pairs: Vec<String> = Vec::new();
                 for i in 0..group.len() {
                     for j in (i + 1)..group.len() {
@@ -764,7 +764,7 @@ impl TheoryCombiner<'_> {
                 // faithfully in the scalar EUF table.  Record the conflict;
                 // outer witness completion consumes this marker by discarding
                 // the candidate model, so the public SAT funnel fails closed.
-                if std::env::var_os("AY_F1_DIAG").is_some() {
+                if ay_core::misc_cli_flags().f1_diag {
                     fn fmt_term(terms: &ay_core::TermStore, t: TermId, depth: usize) -> String {
                         if depth == 0 {
                             return format!("#{}", t.0);
@@ -784,18 +784,18 @@ impl TheoryCombiner<'_> {
                         }
                     }
                     eprintln!(
-                        "AY_F1_DIAG: table {table_name:?} conflict-marked: hard_values={hard_values:?} \
+                        "--f1-diag: table {table_name:?} conflict-marked: hard_values={hard_values:?} \
                          known_disequal={known_disequal_results} repairable={directly_repairable}"
                     );
                     for row in rows.iter() {
                         eprintln!(
-                            "AY_F1_DIAG:   deep src={}",
+                            "--f1-diag:   deep src={}",
                             fmt_term(self.terms, row.source, 6)
                         );
                     }
                     for row in rows.iter() {
                         eprintln!(
-                            "AY_F1_DIAG:   row src={:?} ({:?}) value={:?} hard_const={:?} hard_bool={:?}",
+                            "--f1-diag:   row src={:?} ({:?}) value={:?} hard_const={:?} hard_bool={:?}",
                             row.source,
                             self.terms.get(row.source),
                             row.value,

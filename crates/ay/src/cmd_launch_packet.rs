@@ -41,6 +41,15 @@ struct LaunchPacketArgs {
     #[arg(long)]
     repo_root: Option<PathBuf>,
 
+    /// Eval registry directory (B5: was the AY_LAUNCH_REGISTRY_DIR env var,
+    /// whose default string was duplicated at two read sites and could drift).
+    #[arg(long, default_value = "evals/registry")]
+    registry_dir: String,
+
+    /// Results root directory (B5: was the AY_LAUNCH_RESULTS_DIR env var).
+    #[arg(long, default_value = "evals/results")]
+    results_root: String,
+
     /// ay binary to benchmark or describe.
     #[arg(long, default_value = "./target/release/ay")]
     ay: PathBuf,
@@ -48,6 +57,11 @@ struct LaunchPacketArgs {
     /// Per-benchmark timeout in seconds.
     #[arg(long, default_value = "30")]
     timeout: String,
+
+    /// Bench progress cadence, in instances (B41; was
+    /// --progress-every — also echoed into the generated packet).
+    #[arg(long, default_value_t = 1)]
+    progress_every: u64,
 
     /// Runs per benchmark.
     #[arg(long, default_value_t = 1)]
@@ -142,6 +156,8 @@ pub(crate) struct FastPacketConfig {
     pub(crate) requested_evals: Vec<String>,
     pub(crate) excluded_evals: Vec<String>,
     pub(crate) mode: FastPacketMode,
+    /// Bench progress cadence (B41; echoed into the packet verbatim).
+    pub(crate) progress_every: u64,
 }
 
 #[derive(Clone)]
@@ -184,8 +200,27 @@ const LAUNCH_EVALS: &[EvalSpec] = &[
         uses_reference: true,
     },
 ];
+/// Launch directories, resolved ONCE from clap (B5). `set` is called at the
+/// subcommand entry; the free functions below read the accessor instead of the
+/// environment, so the default strings cannot drift between sites.
+struct LaunchDirs {
+    registry_dir: String,
+    results_root: String,
+}
+static LAUNCH_DIRS: std::sync::OnceLock<LaunchDirs> = std::sync::OnceLock::new();
+fn launch_dirs() -> &'static LaunchDirs {
+    LAUNCH_DIRS.get_or_init(|| LaunchDirs {
+        registry_dir: "evals/registry".to_string(),
+        results_root: "evals/results".to_string(),
+    })
+}
 
 pub(crate) fn run(command: &LaunchPacketCommand) -> Result<i32> {
+    // B5: resolve the launch directories once from clap, before any reader.
+    let _ = LAUNCH_DIRS.set(LaunchDirs {
+        registry_dir: command.run_args.registry_dir.clone(),
+        results_root: command.run_args.results_root.clone(),
+    });
     match &command.command {
         Some(LaunchPacketSubcommand::Index(args)) => run_index(args),
         None => run_packet(&command.run_args),
@@ -217,6 +252,7 @@ fn run_packet(args: &LaunchPacketArgs) -> Result<i32> {
         requested_evals: args.evals.clone(),
         excluded_evals: args.exclude_eval.clone(),
         mode,
+        progress_every: args.progress_every,
     })?;
     eprintln!(
         "launch packet: {} complete; commands in {}/commands.log",
@@ -729,7 +765,7 @@ pub(crate) fn write_fast_packet(config: FastPacketConfig) -> Result<PathBuf> {
         Path::new(&reference_solver_path),
         &["--version"],
     );
-    let bench_progress_every = bench_progress_every_value()?;
+    let bench_progress_every = bench_progress_every_value(&config)?;
 
     let planned_rows = active_evals
         .iter()
@@ -788,7 +824,7 @@ pub(crate) fn write_fast_packet(config: FastPacketConfig) -> Result<PathBuf> {
         "parameters": {
             "timeout_seconds": config.timeout,
             "runs": config.runs,
-            "results_root": env::var("AY_LAUNCH_RESULTS_DIR").unwrap_or_else(|_| "evals/results".to_string()),
+            "results_root": launch_dirs().results_root.clone(),
             "bench_progress_every": bench_progress_every,
             "parallelism": "ay bench default",
             "seed_policy": "no explicit seed; solver defaults",
@@ -924,9 +960,8 @@ fn registered_eval_ids(repo_root: &Path, ay: &Path) -> Option<HashSet<String>> {
 }
 
 fn registered_eval_ids_from_registry(repo_root: &Path) -> Option<HashSet<String>> {
-    let registry_dir =
-        env::var("AY_LAUNCH_REGISTRY_DIR").unwrap_or_else(|_| "evals/registry".to_string());
-    let registry_path = resolve_path_arg(repo_root, Path::new(&registry_dir));
+    let registry_dir = &launch_dirs().registry_dir;
+    let registry_path = resolve_path_arg(repo_root, Path::new(registry_dir));
     let entries = fs::read_dir(&registry_path).ok()?;
     let mut ids = HashSet::new();
     for entry in entries.flatten() {
@@ -960,14 +995,12 @@ fn registry_eval_id(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn bench_progress_every_value() -> Result<u64> {
-    let raw = env::var("AY_BENCH_PROGRESS_EVERY").unwrap_or_else(|_| "1".to_string());
-    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        bail!("launch packet: AY_BENCH_PROGRESS_EVERY must be a positive integer: {raw}");
+fn bench_progress_every_value(config: &FastPacketConfig) -> Result<u64> {
+    // B41: `--progress-every` (positive; the packet echoes it verbatim).
+    if config.progress_every == 0 {
+        bail!("launch packet: --progress-every must be a positive integer");
     }
-    raw.parse::<u64>().with_context(|| {
-        format!("launch packet: AY_BENCH_PROGRESS_EVERY must be an integer: {raw}")
-    })
+    Ok(config.progress_every)
 }
 
 fn eval_command(
@@ -1217,9 +1250,8 @@ fn write_input_inventory(
     repo_root: &Path,
     rows: &[(EvalSpec, Vec<String>)],
 ) -> Result<()> {
-    let registry_dir =
-        env::var("AY_LAUNCH_REGISTRY_DIR").unwrap_or_else(|_| "evals/registry".to_string());
-    let registry_dir_display = PathBuf::from(&registry_dir);
+    let registry_dir = &launch_dirs().registry_dir;
+    let registry_dir_display = PathBuf::from(registry_dir);
     let mut text = String::new();
     for (eval, _) in rows {
         let registry_display_path = registry_dir_display.join(format!("{}.yaml", eval.id));
@@ -1523,12 +1555,9 @@ fn write_provenance_txt(
     text.push_str(&format!("runs={}\n", config.runs));
     text.push_str(&format!(
         "results_root={}\n",
-        env::var("AY_LAUNCH_RESULTS_DIR").unwrap_or_else(|_| "evals/results".to_string())
+        launch_dirs().results_root.clone()
     ));
-    text.push_str(&format!(
-        "bench_progress_every={}\n",
-        env::var("AY_BENCH_PROGRESS_EVERY").unwrap_or_else(|_| "1".to_string())
-    ));
+    text.push_str(&format!("bench_progress_every={}\n", config.progress_every));
     text.push_str(&format!("launch_scope={launch_scope}\n"));
     if !config.requested_evals.is_empty() {
         text.push_str(&format!(

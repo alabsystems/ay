@@ -1696,7 +1696,51 @@ fn unchanged_quantified_bv_tactic_query_never_downgrades_to_ordinary_unsat() {
         "the contradictory universal must never become SAT"
     );
     if result.is_unsat() {
-        assert!(result.was_unsat_strictly_verified());
+        // CONTRACT REFRESH (#closed-universal-authored-scope). This branch used
+        // to demand `was_unsat_strictly_verified()` specifically. That named ONE
+        // publication authority at a time when the query could only reach one;
+        // the test's actual subject — its name — is that the verdict must never
+        // be an ORDINARY (unauthorized) unsat. AY publishes UNSAT through three
+        // recognized authorities, and `types::results` exposes one accessor per
+        // authority precisely so a caller can tell them apart: the strict proof
+        // checker, an independent refutation check, and the exact SEMANTIC
+        // theorem. The third is a first-class class, not a shortcut — the
+        // sibling pin `tactic_qe_light_validates_detached_rewrite_and_matches_baseline_unsat`
+        // in this same file (line ~1029) asserts it POSITIVELY together with
+        // `!was_unsat_strictly_verified()` and the message "the exact semantic
+        // theorem must not be mislabeled as strict proof-checker acceptance",
+        // and `emit_checked_exact_closed_forall_unsat` documents that it is
+        // deliberately distinct from a translated `forall_inst` proof and that
+        // explicit-proof/strict modes still fail closed on it.
+        //
+        // `(forall ((x (_ BitVec 4))) (not (= (f x) (f x))))` folds to
+        // `(forall x. false)` at construction, so it is a CLOSED universal, and
+        // it is now refuted by the exact closed-forall certificate against the
+        // authored roots. Measured on this exact query: strict=false
+        // independent=false exact_semantic=true witness=true. Pinning
+        // `strictly_verified` here would outlaw a correct, authenticated verdict
+        // and force the fail-closed `unknown` back.
+        //
+        // The assertion below is the EXACTLY-ONE form, copied deliberately from
+        // `unsat_chokepoint_conformance::quantified_ufbv_unsat_is_exactly_certified_or_fails_closed`,
+        // which pins this same query (Logic::All, BV4, `f(x) != f(x)`) with the
+        // same construction. A disjunction would admit a verdict claiming two
+        // classes at once; "exactly one sealed certification class" forbids the
+        // mislabeling that the qe-light pin above also guards against. Keep the
+        // two conformance statements identical.
+        assert!(
+            result.has_unsat_emission_witness(),
+            "an UNSAT must carry its emission witness"
+        );
+        assert_eq!(
+            usize::from(result.was_unsat_strictly_verified())
+                + usize::from(result.was_unsat_independently_verified())
+                + usize::from(result.was_unsat_exact_semantically_verified()),
+            1,
+            "public UNSAT must retain exactly one sealed certification class — \
+             strict proof, independent verification, or the exact semantic \
+             theorem — never an ordinary unauthorized one and never two at once"
+        );
     } else {
         assert!(result.is_unknown(), "strict proof gaps must fail closed");
     }

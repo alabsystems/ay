@@ -18,7 +18,7 @@
 //! routing is strictly additive. This is the exact reduced shape of the
 //! `tip2015_sort_ISortSorts` size obligation that previously timed out.
 //!
-//! Kill switch: `AY_DPLL_NO_DT_UFLIA=1` restores the old array-only routing.
+//! Kill switch: `--dpll-no-dt-uflia` restores the old array-only routing.
 
 use ntest::timeout;
 

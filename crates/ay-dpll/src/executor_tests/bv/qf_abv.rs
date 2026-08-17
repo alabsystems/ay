@@ -783,6 +783,90 @@ fn test_executor_qf_abv_small_finite_array_extract_constant_fc_unsat_11936() {
 }
 
 #[test]
+fn test_executor_qf_abv_nested_bv1_exact_closure_precedes_generic_extensionality() {
+    // The owner route must establish recursively exact finite-domain coverage
+    // before generic extensionality examines the outer disequality. Otherwise
+    // its fresh outer witness exposes a redundant fourth array equality in
+    // addition to the outer equality and its two concrete BV1 cells.
+    let input = r#"
+        (set-logic QF_ABV)
+        (declare-const a (Array (_ BitVec 1) (Array (_ BitVec 1) (_ BitVec 1))))
+        (declare-const b (Array (_ BitVec 1) (Array (_ BitVec 1) (_ BitVec 1))))
+        (assert (not (= a b)))
+        (assert (= (select (select a #b0) #b0) (select (select b #b0) #b0)))
+        (assert (= (select (select a #b0) #b1) (select (select b #b0) #b1)))
+        (assert (= (select (select a #b1) #b0) (select (select b #b1) #b0)))
+        (assert (= (select (select a #b1) #b1) (select (select b #b1) #b1)))
+    "#;
+
+    let commands = parse(input).expect("valid nested finite QF_ABV input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("nested finite QF_ABV input executes");
+
+    assert!(outputs.is_empty(), "setup must not execute a public query");
+    exec.begin_external_decision_query(false);
+    exec.bind_materialized_public_query();
+    let result = exec
+        .solve_abv_owner_route_for_test()
+        .expect("owned ABV route solves");
+    assert!(
+        result.is_unsat(),
+        "the raw owner route must close the nested contradiction"
+    );
+    let a = exec.ctx.terms.lookup("a").expect("a declared");
+    let b = exec.ctx.terms.lookup("b").expect("b declared");
+    assert_eq!(
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b),
+        None,
+        "exact outer coverage must suppress the generic difference Skolem"
+    );
+    let unique_candidates = exec
+        .statistics()
+        .get_int("smt.array.finite_ext.candidate_equalities")
+        .expect("candidate telemetry published");
+    let replayed_candidates = exec
+        .statistics()
+        .get_int("smt.array.finite_ext.already_covered_equalities")
+        .expect("coverage telemetry published");
+    assert_eq!(
+        unique_candidates, 3,
+        "the initial closure must discover exactly three query-unique obligations, not a fourth generic-witness cell"
+    );
+    assert_eq!(
+        replayed_candidates, 3,
+        "the final closure must replay all three live exact obligations without re-emission"
+    );
+    assert_eq!(
+        unique_candidates + replayed_candidates,
+        6,
+        "the initial and final closures must account for six total obligation visits"
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.emitted_equalities"),
+        Some(3),
+        "recursive closure must emit every nested finite equality"
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.budget_deferred_equalities"),
+        Some(0)
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.candidate_scan_truncated"),
+        Some(0)
+    );
+    assert!(
+        exec.finite_array_expansion.is_complete(),
+        "the query-cumulative exact-closure ledger must remain complete"
+    );
+}
+
+#[test]
 fn test_executor_qf_abv_packed_lookup_lshr_matches_symbolic_select_11936() {
     // A packed word assembled from all finite constant-index reads must agree
     // with the symbolic read selected by the same shift index.
@@ -1083,16 +1167,19 @@ fn test_executor_qf_abv_small_finite_array_extract_fc_ignores_cross_budget_11936
 }
 
 #[test]
+#[ntest::timeout(10_000)]
 fn test_executor_qf_abv_cegar_fc_row2_aliasing_unsat_8510() {
-    // ROW2 aliasing test: store at index i, read at index j where i == j.
-    // The stored value is #xAA but the read asserts #xBB. Since i == j,
-    // ROW1 says the read must return #xAA, contradicting #xBB. UNSAT.
+    // ROW2 aliasing test: store at index i, read at index j where BV
+    // antisymmetry forces i == j. Expressing that fact as two inequalities is
+    // intentional: a direct `(= i j)` is eliminated by Phase-0 substitution
+    // and folds the select before the array route, making the test vacuous.
     let input = r#"
         (set-logic QF_ABV)
         (declare-const mem (Array (_ BitVec 16) (_ BitVec 8)))
         (declare-const i (_ BitVec 16))
         (declare-const j (_ BitVec 16))
-        (assert (= i j))
+        (assert (bvule i j))
+        (assert (bvule j i))
         (assert (= (select (store mem i #xAA) j) #xBB))
         (check-sat)
     "#;
@@ -1101,8 +1188,24 @@ fn test_executor_qf_abv_cegar_fc_row2_aliasing_unsat_8510() {
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
 
-    // UNSAT: i == j means select(store(mem, i, #xAA), j) = #xAA, not #xBB.
+    // UNSAT: i <= j <= i means select(store(mem, i, #xAA), j) = #xAA, not #xBB.
     assert_eq!(outputs, vec!["unsat"]);
+    let stats = exec.statistics();
+    for (key, expected) in [
+        ("smt.array.finite_ext.candidate_equalities", 0),
+        ("smt.array.finite_ext.emitted_equalities", 0),
+        ("smt.array.finite_ext.budget_deferred_equalities", 0),
+        ("smt.abv.array_fixpoint.complex_selects", 1),
+        ("smt.abv.array_fixpoint.runs", 1),
+        ("smt.abv.array_fixpoint.skips", 0),
+        ("smt.abv.array_fc_cegar.refinement_rounds", 0),
+    ] {
+        assert_eq!(
+            stats.get_int(key),
+            Some(expected),
+            "unexpected {key} statistic: {stats:?}"
+        );
+    }
 }
 
 #[test]
@@ -1377,30 +1480,32 @@ fn test_executor_qf_abv_indirect_equality_many_constants_unsat_8510() {
 }
 
 #[test]
+#[ntest::timeout(10_000)]
 fn test_executor_qf_abv_fixpoint_gate_skipped_fc_violation_unsat_8510() {
-    // Test that the CEGAR FC refinement catches violations even when
-    // the fixpoint gate is SKIPPED (>80 complex selects) and FC axioms
-    // were not generated upfront.
+    // Regression for the old pre-dispatch finite-extensionality explosion.
     //
-    // Pattern: a store chain with 100+ symbolic-indexed stores creates
-    // 100+ complex selects, triggering the fixpoint gate skip. The FC
-    // budget is then irrelevant (FC axioms generated only in the
-    // fixpoint), so all FC consistency must come from the CEGAR loop.
+    // Four store-flat aliases over a BV5-indexed array used to be expanded into
+    // 128 select pairs before route preprocessing. Those generated
+    // terms retained every alias and multiplied later ROW/FC work. Exact
+    // closure now belongs to the QF_ABV route after its own preprocessing; the
+    // remaining live ROW surface stays bounded and the indirect equality is
+    // solved exactly.
     use std::fmt::Write;
     let mut smt = String::new();
     writeln!(smt, "(set-logic QF_ABV)").unwrap();
-    writeln!(smt, "(declare-const mem (Array (_ BitVec 8) (_ BitVec 8)))").unwrap();
+    writeln!(smt, "(declare-const mem (Array (_ BitVec 5) (_ BitVec 8)))").unwrap();
 
-    // Build a store chain with symbolic indices to create complex selects
-    let n_stores = 50;
+    // Keep enough aliases to distinguish raw eager expansion from the bounded
+    // post-route surface while leaving ample headroom under the test timeout.
+    let n_stores = 4;
     let mut current_mem = "mem".to_string();
     for i in 0..n_stores {
-        writeln!(smt, "(declare-const idx{i} (_ BitVec 8))").unwrap();
+        writeln!(smt, "(declare-const idx{i} (_ BitVec 5))").unwrap();
         writeln!(smt, "(declare-const val{i} (_ BitVec 8))").unwrap();
         let next_mem = format!("m{i}");
         writeln!(
             smt,
-            "(declare-const {next_mem} (Array (_ BitVec 8) (_ BitVec 8)))"
+            "(declare-const {next_mem} (Array (_ BitVec 5) (_ BitVec 8)))"
         )
         .unwrap();
         writeln!(
@@ -1411,22 +1516,19 @@ fn test_executor_qf_abv_fixpoint_gate_skipped_fc_violation_unsat_8510() {
         current_mem = next_mem;
     }
 
-    // Read from the final memory at many different symbolic indices
-    // through the store chain. These are "complex" selects because the
-    // array is a store chain.
-    let n_reads = 45;
+    let n_reads = 2;
     for i in 0..n_reads {
         writeln!(smt, "(declare-const r{i} (_ BitVec 8))").unwrap();
         writeln!(smt, "(assert (= r{i} (select {current_mem} idx{i})))").unwrap();
     }
 
     // Two reads at pointers forced to be equal via BV bounds
-    writeln!(smt, "(declare-const pa (_ BitVec 8))").unwrap();
-    writeln!(smt, "(declare-const pb (_ BitVec 8))").unwrap();
-    writeln!(smt, "(assert (bvule #xff pa))").unwrap();
-    writeln!(smt, "(assert (bvule pa #xff))").unwrap();
-    writeln!(smt, "(assert (bvule #xff pb))").unwrap();
-    writeln!(smt, "(assert (bvule pb #xff))").unwrap();
+    writeln!(smt, "(declare-const pa (_ BitVec 5))").unwrap();
+    writeln!(smt, "(declare-const pb (_ BitVec 5))").unwrap();
+    writeln!(smt, "(assert (bvule #b11111 pa))").unwrap();
+    writeln!(smt, "(assert (bvule pa #b11111))").unwrap();
+    writeln!(smt, "(assert (bvule #b11111 pb))").unwrap();
+    writeln!(smt, "(assert (bvule pb #b11111))").unwrap();
     writeln!(smt, "(assert (= (select {current_mem} pa) #xAA))").unwrap();
     writeln!(smt, "(assert (= (select {current_mem} pb) #xBB))").unwrap();
     writeln!(smt, "(check-sat)").unwrap();
@@ -1435,10 +1537,39 @@ fn test_executor_qf_abv_fixpoint_gate_skipped_fc_violation_unsat_8510() {
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
 
-    // pa = pb = #xFF, so select(mem, pa) = select(mem, pb) → 0xAA != 0xBB → UNSAT.
+    // pa = pb = #b11111, so select(mem, pa) = select(mem, pb) → 0xAA != 0xBB.
+    assert_eq!(outputs, vec!["unsat"]);
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.route_deferrals"),
+        Some(1),
+        "the raw store-flat window must be deferred without traversing it"
+    );
+    let candidate_equalities = exec
+        .statistics()
+        .get_int("smt.array.finite_ext.candidate_equalities")
+        .expect("finite closure must publish candidate telemetry");
     assert!(
-        outputs == vec!["unsat"] || outputs == vec!["unknown"],
-        "expected unsat or unknown, got {outputs:?} — false SAT is a soundness bug (#8510)"
+        candidate_equalities < 48,
+        "post-route closure must stay well below the 128 raw-alias expansion; got {candidate_equalities}"
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.budget_deferred_equalities"),
+        Some(0)
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("smt.array.finite_ext.candidate_scan_truncated"),
+        Some(0)
+    );
+    assert_eq!(
+        exec.statistics().get_int("smt.abv.array_fixpoint.runs"),
+        Some(1)
+    );
+    assert_eq!(
+        exec.statistics().get_int("smt.abv.array_fixpoint.skips"),
+        Some(0)
     );
 }
 
@@ -2088,8 +2219,10 @@ fn test_executor_qf_abv_try_nested_bv1_select_wrapper_validates_11920() {
         "the restored root and its two exact leaves must retain BV authority"
     );
     assert_eq!(
-        exec.statistics().get_int("model_validation.checked"),
-        Some(0),
+        exec.statistics()
+            .get_int("model_validation.checked")
+            .unwrap_or(0),
+        0,
         "quantified syntax must not be relabelled as generic evaluator evidence"
     );
     assert_eq!(

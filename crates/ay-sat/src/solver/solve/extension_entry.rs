@@ -321,6 +321,7 @@ impl Solver {
         self.cold.level0_proof_id.fill(0);
         self.cold.level0_proof_sign.fill(0);
         self.cold.lrat_level0_unit_materialize_cursor = 0;
+        self.cold.lrat_level0_unit_materialize_pinned.clear();
         // Reset fixed variable tracking
         self.var_lifecycle.reset_fixed();
         self.fixed_count = 0;

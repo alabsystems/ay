@@ -35,7 +35,8 @@
 //! ORDER comparisons are different: `α > 0` is true for one root of `x^2 - 2`
 //! and false for the other, so they need the isolating interval and sign
 //! refinement. Those are deliberately NOT implemented here yet, and no API in
-//! this module lets a caller conclude an ordering. See the module TODO.
+//! this module lets a caller conclude an ordering; that API remains deliberately
+//! absent until exact interval refinement and root selection are implemented.
 //!
 //! Construction still validates the interval (`lo < hi` with a strict sign
 //! change), so a stored root object is well-formed when ordering support

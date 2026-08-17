@@ -224,6 +224,20 @@ impl Executor {
                     return None;
                 }
             };
+            if !self.finite_array_expansion.is_complete() {
+                // Every component shares the external query's deterministic
+                // finite-array budget. A later component/retry cannot repair an
+                // exhausted exact closure, and restoring the primary guard here
+                // would resurrect provisional SAT artifacts that the canonical
+                // revocation just retired.
+                self.publish_unknown_from_origin(
+                    crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
+                );
+                self.skip_model_eval = guard.skip_model_eval;
+                self.defer_model_validation = guard.defer_model_validation;
+                self.qfax_refinement_clause = guard.qfax_refinement_clause.clone();
+                return Some(Ok(SolveResult::Unknown));
+            }
             if matches!(
                 self.last_unknown_reason,
                 Some(UnknownReason::Interrupted)
@@ -328,8 +342,11 @@ impl Executor {
         let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict();
         if features.has_arrays {
             self.add_distinct_const_array_disequalities();
-            self.add_finite_index_array_extensionality();
-            self.add_finite_index_select_expansion();
+            if self.should_defer_finite_array_extensionality_to_route(category) {
+                self.record_finite_array_extensionality_route_deferral();
+            } else {
+                let _ = self.add_finite_index_array_closure();
+            }
         }
 
         let result = if pigeonhole_unsat {
@@ -337,6 +354,7 @@ impl Executor {
         } else {
             self.route_to_solver(category, &features)
         };
+        let result = self.fail_close_incomplete_finite_array_sat(result);
 
         self.ctx.assertions = saved_assertions;
         self.incr_theory_state = saved_incr;

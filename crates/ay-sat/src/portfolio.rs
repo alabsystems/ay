@@ -45,6 +45,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+mod strategy_configs;
+
+use strategy_configs::{bve_focused_config, conservative_config, probe_focused_config};
+
 const PORTFOLIO_SHARE_MAX_LBD: u32 = 3;
 const PORTFOLIO_SHARE_MAX_CLAUSE_LEN: usize = 32;
 const PORTFOLIO_SHARE_MAX_STORED: usize = 4096;
@@ -328,99 +332,11 @@ impl Strategy {
                 ..Default::default()
             },
             // Minimal: all inprocessing disabled
-            Self::Conservative => SolverConfig {
-                features: crate::InprocessingFeatureProfile {
-                    preprocess: true,
-                    walk: true,
-                    warmup: true,
-                    shrink: true,
-                    hbr: false,
-                    vivify: false,
-                    subsume: false,
-                    probe: false,
-                    bve: false,
-                    bce: false,
-                    condition: false,
-                    decompose: false,
-                    factor: false,
-                    sbva: false,
-                    transred: false,
-                    htr: false,
-                    gate: false,
-                    congruence: false,
-                    sweep: false,
-                    backbone: false,
-                    symmetry: false,
-                    reorder: false,
-                    cce: false,
-                },
-                glucose_restarts: false,
-                chrono_enabled: false,
-                seed: 3,
-                ..Default::default()
-            },
+            Self::Conservative => conservative_config(),
             // Probing emphasis: subsumption + probing + HBR only
-            Self::ProbeFocused => SolverConfig {
-                features: crate::InprocessingFeatureProfile {
-                    preprocess: true,
-                    walk: true,
-                    warmup: true,
-                    shrink: true,
-                    hbr: true,
-                    vivify: false,
-                    subsume: true,
-                    probe: true,
-                    bve: false,
-                    bce: false,
-                    condition: false,
-                    decompose: false,
-                    factor: false,
-                    sbva: false,
-                    transred: false,
-                    htr: false,
-                    gate: false,
-                    congruence: false,
-                    sweep: false,
-                    backbone: true,
-                    symmetry: false,
-                    reorder: true,
-                    cce: false,
-                },
-                initial_phase: Some(false),
-                seed: 4,
-                ..Default::default()
-            },
+            Self::ProbeFocused => probe_focused_config(),
             // BVE emphasis: elimination + gate + conditioning
-            Self::BveFocused => SolverConfig {
-                features: crate::InprocessingFeatureProfile {
-                    preprocess: true,
-                    walk: true,
-                    warmup: true,
-                    shrink: true,
-                    hbr: false,
-                    vivify: false,
-                    subsume: true,
-                    probe: false,
-                    bve: true,
-                    bce: true,
-                    condition: true,
-                    decompose: false,
-                    factor: true,
-                    sbva: true,
-                    transred: false,
-                    htr: false,
-                    gate: true,
-                    congruence: false,
-                    sweep: false,
-                    backbone: false,
-                    symmetry: false,
-                    reorder: true,
-                    cce: true,
-                },
-                initial_phase: Some(true),
-                seed: 5,
-                ..Default::default()
-            },
+            Self::BveFocused => bve_focused_config(),
             // Equiticks: full default inprocessing + equal-effort stable-mode
             // budgeting (more stable airtime feeds the target-phase machinery).
             // Captures the model-finding SAT losses the default variant misses;

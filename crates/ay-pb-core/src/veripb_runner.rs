@@ -8,6 +8,11 @@
 //! callers use it solely to turn generated proof text into an externally
 //! checked verification receipt.
 
+// The public typed error intentionally retains the bounded checker transcript
+// inline. Boxing it would break the existing pattern-matching API; both output
+// strings are already capped by `VeriPbEnvelope`.
+#![allow(clippy::result_large_err)]
+
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -25,7 +30,7 @@ use nix::unistd::Pid;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(1);
 const DEFAULT_STREAM_LIMIT_BYTES: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -362,9 +367,7 @@ pub fn verify_unsat(
         Some(stdout) => stdout,
         None => {
             let source = io::Error::other("checker stdout was not piped");
-            if let Err(error) = terminate_and_reap(&mut child, checker) {
-                return Err(error);
-            }
+            terminate_and_reap(&mut child, checker)?;
             return Err(VeriPbRunError::Io {
                 action: "capture VeriPB stdout for",
                 path: checker.to_path_buf(),
@@ -376,9 +379,7 @@ pub fn verify_unsat(
         Some(stderr) => stderr,
         None => {
             let source = io::Error::other("checker stderr was not piped");
-            if let Err(error) = terminate_and_reap(&mut child, checker) {
-                return Err(error);
-            }
+            terminate_and_reap(&mut child, checker)?;
             return Err(VeriPbRunError::Io {
                 action: "capture VeriPB stderr for",
                 path: checker.to_path_buf(),
@@ -391,9 +392,7 @@ pub fn verify_unsat(
     let stdout_capture = match spawn_capture("ay-veripb-stdout", stdout_pipe, stdout_limit) {
         Ok(capture) => capture,
         Err(source) => {
-            if let Err(error) = terminate_and_reap(&mut child, checker) {
-                return Err(error);
-            }
+            terminate_and_reap(&mut child, checker)?;
             return Err(VeriPbRunError::Io {
                 action: "start VeriPB stdout capture for",
                 path: checker.to_path_buf(),
@@ -405,9 +404,7 @@ pub fn verify_unsat(
     let stderr_capture = match spawn_capture("ay-veripb-stderr", stderr_pipe, stderr_limit) {
         Ok(capture) => capture,
         Err(source) => {
-            if let Err(error) = terminate_and_reap(&mut child, checker) {
-                return Err(error);
-            }
+            terminate_and_reap(&mut child, checker)?;
             let _ = finish_capture("stdout", stdout_capture);
             return Err(VeriPbRunError::Io {
                 action: "start VeriPB stderr capture for",
@@ -420,10 +417,7 @@ pub fn verify_unsat(
     let process_result = loop {
         match child.try_wait() {
             Ok(Some(observed_status)) => {
-                let status = match finish_terminal_child(&child, observed_status) {
-                    Ok(status) => status,
-                    Err(error) => return Err(error),
-                };
+                let status = finish_terminal_child(&child, observed_status)?;
                 break Ok((status, false));
             }
             Ok(None) if started.elapsed() < envelope.timeout => {
@@ -431,16 +425,11 @@ pub fn verify_unsat(
                 thread::sleep(POLL_INTERVAL.min(remaining));
             }
             Ok(None) => {
-                let status = match terminate_and_reap(&mut child, checker) {
-                    Ok(status) => status,
-                    Err(error) => return Err(error),
-                };
+                let status = terminate_and_reap(&mut child, checker)?;
                 break Ok((status, true));
             }
             Err(source) => {
-                if let Err(error) = terminate_and_reap(&mut child, checker) {
-                    return Err(error);
-                }
+                terminate_and_reap(&mut child, checker)?;
                 break Err(VeriPbRunError::Io {
                     action: "poll VeriPB checker",
                     path: checker.to_path_buf(),

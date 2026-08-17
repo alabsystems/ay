@@ -473,7 +473,7 @@ impl NraSolver<'_> {
     /// Evaluate an arithmetic term to an exact rational under the model.
     /// Variables in the model take their witness value; variables NOT in the
     /// model are treated as fully unknown and make evaluation fail (None).
-    fn eval_term_under_model(
+    pub(crate) fn eval_term_under_model(
         &self,
         term: TermId,
         model: &[(TermId, BigRational)],
@@ -2641,7 +2641,7 @@ fn isolate_quadratic(p: &UniPoly) -> Option<Vec<RootMarker>> {
 /// Exact rational square root of a non-negative rational, or `None` if it is
 /// not a perfect square. Works by taking integer square roots of numerator and
 /// denominator after reducing to lowest terms.
-pub(crate) fn exact_rational_sqrt(r: &BigRational) -> Option<BigRational> {
+pub fn exact_rational_sqrt(r: &BigRational) -> Option<BigRational> {
     if r.is_zero() {
         return Some(BigRational::zero());
     }

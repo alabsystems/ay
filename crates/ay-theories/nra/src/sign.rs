@@ -10,7 +10,7 @@ pub(crate) use ay_core::nonlinear::SignConstraint;
 #[allow(unused_imports)]
 pub(crate) use ay_core::nonlinear::{
     check_sign_consistency, extract_sign_constraint, product_sign, propagate_monomial_signs,
-    record_sign_constraint, sign_contradicts, vars_needing_model_sign,
+    propagate_product_signs, record_sign_constraint, sign_contradicts, vars_needing_model_sign,
 };
 
 #[cfg(test)]

@@ -80,7 +80,8 @@ pub(crate) unsafe fn ffi_guard_int(
     default_val: c_int,
     f: impl FnOnce(&mut Z3Context) -> c_int,
 ) -> c_int {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return default_val;
     };
@@ -110,7 +111,8 @@ pub(crate) unsafe fn ffi_guard_ptr<T>(
     c: Z3_context,
     f: impl FnOnce(&mut Z3Context) -> *mut T,
 ) -> *mut T {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return ptr::null_mut();
     };
@@ -158,7 +160,8 @@ pub(crate) unsafe fn ffi_guard_const_ptr_keep_error(
     c: Z3_context,
     f: impl FnOnce(&mut Z3Context) -> *const c_char,
 ) -> *const c_char {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return ptr::null();
     };
@@ -187,7 +190,8 @@ pub(crate) unsafe fn ffi_guard_ast(
     c: Z3_context,
     f: impl FnOnce(&mut Z3Context) -> Z3_ast,
 ) -> Z3_ast {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return 0;
     };
@@ -218,7 +222,8 @@ pub(crate) unsafe fn ffi_guard_double(
     default_val: f64,
     f: impl FnOnce(&mut Z3Context) -> f64,
 ) -> f64 {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return default_val;
     };
@@ -268,7 +273,8 @@ pub(crate) unsafe fn ffi_guard_uint_keep_error(
     default_val: c_uint,
     f: impl FnOnce(&mut Z3Context) -> c_uint,
 ) -> c_uint {
-    // SAFETY: see ffi_guard_void.
+    // SAFETY: the caller guarantees `c` is null or a live, non-aliased context;
+    // `as_mut` checks for null before creating the unique reference.
     let Some(ctx) = (unsafe { c.as_mut() }) else {
         return default_val;
     };

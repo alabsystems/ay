@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::path::Path;
 

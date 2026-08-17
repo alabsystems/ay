@@ -43,6 +43,8 @@
 
 use crate::model::{Col, Model, Sense};
 
+mod bounded_setup;
+
 /// A column's resting place when non-basic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NbBound {
@@ -67,7 +69,7 @@ pub(crate) enum SimplexStatus {
     /// Iteration cap or deadline. No claim either way.
     Stopped,
     /// The LU factorization DECLINED: its fill would have crossed the memory
-    /// budget (`AY_MILP_LU_MAX_FILL_NNZ`). No claim either way — the caller maps
+    /// budget (`the lu-max-fill-nnz knob`). No claim either way — the caller maps
     /// this to `Outcome::Unknown{MemoryLimit}` at the root and treats it like
     /// `Stopped` (undisproved, unbounded) at an interior node. Distinct from
     /// `Stopped` so the top-level lanes can name the reason honestly.
@@ -141,7 +143,7 @@ pub(crate) struct Candidate {
 /// warm node re-solves (basis distance) or in cold heuristic/root solves.
 pub(crate) static DUAL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DUAL_ITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// LU-factor diagnostics (AY_MILP_TRACE): count, summed factor nnz, summed factor nanos.
+/// LU-factor diagnostics (--trace): count, summed factor nnz, summed factor nanos.
 pub(crate) static LU_FACT_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static LU_FACT_NNZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -155,8 +157,8 @@ pub(crate) static LU_FACT_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) static LU_LATE_PROMOTE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Eta rebuilds across the process, and the largest number any ONE solve paid
-/// (`AY_MILP_TRACE`). Process-global and so NOT decision inputs — they exist to
-/// calibrate `AY_MILP_COLD_LU_ETA_REBUILDS` against a corpus without a rebuild,
+/// (`--trace`). Process-global and so NOT decision inputs — they exist to
+/// calibrate `the cold-lu-eta-rebuilds knob` against a corpus without a rebuild,
 /// and the per-solve maximum is the one that matters because the budget is a
 /// per-solve threshold.
 pub(crate) static ETA_REBUILD_TOTAL: std::sync::atomic::AtomicU64 =
@@ -547,7 +549,7 @@ pub(crate) static BASIS_DIFF_HIST: [std::sync::atomic::AtomicU64; 8] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// LANE + CALLER ATTRIBUTION of eta rebuilds (`AY_MILP_TRACE`; diagnostics only,
+/// LANE + CALLER ATTRIBUTION of eta rebuilds (`--trace`; diagnostics only,
 /// the delta read is skipped entirely unless trace is enabled). Answers the
 /// question the LU-lane-extension arm must answer FIRST: of the O(m·nnz) eta
 /// rebuilds (`REFAC_COUNT`), which LANE and which CALLER provoked them —
@@ -674,7 +676,7 @@ fn record_lane(lane: usize, eta_delta: u64) {
 
 // ============================ THE ITERATION LEDGER ============================
 //
-// `AY_MILP_ITER_LEDGER`. Attributes every simplex ITERATION this process runs to
+// `--iter-ledger`. Attributes every simplex ITERATION this process runs to
 // the SOLVE PHASE that asked for it, and splits each phase's iterations by KIND
 // (dual pivot / primal phase-I / primal phase-II).
 //
@@ -805,7 +807,7 @@ fn ledger_phase_is_heuristic(p: usize) -> bool {
 /// included.
 ///
 /// ZERO COST WHEN OFF. Both constructors return `None` unless
-/// `AY_MILP_ITER_LEDGER` is set, so the default path pays one `OnceLock` bool
+/// `--iter-ledger` is set, so the default path pays one `OnceLock` bool
 /// load per scope entry (NOT per iteration) and never writes the thread-local.
 pub(crate) struct PhaseScope(usize);
 impl PhaseScope {
@@ -961,8 +963,8 @@ pub(crate) const DUAL_ANAT_LABELS: [&str; 3] = ["noenter", "opt", "other"];
 /// `AY_MILP_DUAL_ANATOMY` gate — the per-walk anatomy accounting is skipped
 /// entirely unless this is set (the hot loop pays one bool load per walk).
 fn dual_anatomy_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_DUAL_ANATOMY").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_DUAL_ANATOMY env read is gone.
+    crate::tune::on(crate::tune::Knob::DualAnatomy)
 }
 /// Threshold below which a whole-walk dual-objective rise counts as "flat"
 /// (see `DUAL_ANAT_ZFLAT`).
@@ -1055,7 +1057,6 @@ pub(crate) struct FloatLp {
     /// Dual steepest-edge weights from the previous solve on this LP — reference
     /// weights for the next warm solve (a unit restart burns the first pivots of
     /// every child re-learning the same row norms). Cold solves reset to units.
-    dse_cache: LuCacheCellDse,
     /// Cross-probe LU reuse for a bounded strong-branch sweep (see
     /// `ProbeReuse`). Armed explicitly around one probe loop; otherwise inert.
     probe_reuse: ProbeReuseCell,
@@ -1074,11 +1075,11 @@ pub(crate) struct FloatLp {
     /// (0 = undecided, 1 = chain, 2 = not). A tall, nearly singleton-peelable
     /// matrix enables the triangular equality crash, peel preorder, and Devex
     /// from iteration zero. The broad size class keeps its existing path;
-    /// `AY_MILP_CHAIN_SHAPE=0` disables this structural gate.
+    /// `--no-chain-shape` disables this structural gate.
     chain_shape: std::cell::Cell<u8>,
     /// Typed per-instance override for the cold affine-chain distress-probe
     /// iteration budget. `None` preserves the historical
-    /// `AY_MILP_CHAIN_PROBE`/20,000-iteration policy.
+    /// `the chain-probe knob`/20,000-iteration policy.
     chain_distress_probe_iters: Option<u64>,
     /// Per-instance advice to try the triangular equality crash immediately on
     /// a cold solve, without changing the global size/shape policy.  The LP
@@ -1167,7 +1168,7 @@ pub(crate) struct FloatLp {
     scost_scale: f64,
 }
 
-/// Equilibration mode from `AY_MILP_SCALE`: unset/`0` off, `1` force-on, `auto` =
+/// Equilibration mode from `the scale knob`: unset/`0` off, `1` force-on, `auto` =
 /// scale when the matrix exponent span exceeds `AUTO_SPAN_BITS`.
 ///
 /// DEFAULT OFF — a measured negative, not caution: on today's engine the scaled
@@ -1179,9 +1180,9 @@ pub(crate) struct FloatLp {
 /// transfers. The frame plumbing here is verified (full suite green with scaling
 /// FORCED on) and stays as the substrate for a future phase-1-robust scaling.
 fn equil_mode() -> u8 {
-    match std::env::var("AY_MILP_SCALE").as_deref() {
-        Ok("1") => 1,
-        Ok("auto") => 2,
+    match crate::tune::count_opt(crate::tune::Knob::Scale) {
+        Some(1) => 1,
+        Some(2) => 2,
         _ => 0,
     }
 }
@@ -1231,22 +1232,30 @@ const MAX_ITERS: usize = 200_000;
 /// Eta updates that must have accumulated before a declared optimum is worth re-checking against a
 /// freshly factorised basis -- see the note where it is used.
 fn verify_after() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_VERIFY_AFTER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(VERIFY_AFTER)
-    })
+    // B12: caller-layer value; the never-set AY_MILP_VERIFY_AFTER env read is
+    // gone.
+    crate::tune::count(crate::tune::Knob::VerifyAfter, VERIFY_AFTER)
 }
 const VERIFY_AFTER: usize = 20;
 
 /// Env toggles consulted on EVERY solve (~70k times a proof) — `getenv` walks
 /// the environment block each call, so the answer is cached. None of these
 /// change mid-process (no test or caller sets them at runtime).
+/// Attribution-only RAII stamp charging one `solve_bounded` to its tree level
+/// (see `crate::attrib`). Measurement only.
+struct AttribLpStamp(std::time::Instant, usize);
+impl Drop for AttribLpStamp {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::attrib::LP_NANOS_BY_LEVEL[self.1]
+            .fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+        crate::attrib::LP_CALLS_BY_LEVEL[self.1].fetch_add(1, Relaxed);
+    }
+}
+
 fn trace_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *B.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 /// EAGER anti-degeneracy: perturb the box BEFORE the phase-II cleanup, not only after a `Stopped`.
 /// Set-partitioning LPs (air05: 426 equality rows) reach a primal-feasible-but-not-dual-optimal
@@ -1254,11 +1263,11 @@ fn trace_enabled() -> bool {
 /// makes those steps non-degenerate. Sound by construction — it restores the true box before
 /// optimality is judged, so it can change the PATH but never the admitted verdict.
 ///
-/// THREE MODES, because "path only" is not the same as "free". `AY_MILP_EAGER_PERTURB`:
+/// THREE MODES, because "path only" is not the same as "free". `--eager-perturb-mode`:
 /// * `0`   — never (the `wide_tall` gate and a caller's own `lp.eager_perturb` still apply).
-/// * unset — ARMED (the default): a COLD solve of an LP whose cold, unperturbed walk has
+/// * unset / `1` — ARMED (the default): a COLD solve of an LP whose cold, unperturbed walk has
 ///   ALREADY come back `Stopped` at least once. See `eager_perturb_applies`.
-/// * `1` / `all` — every solve. This is the blanket default that shipped 2026-07-20
+/// * `2` — every solve. This is the blanket default that shipped 2026-07-20
 ///   (`d82673540`) and it is the downstream optimization consumer's documented lever for the 540-binary diff-net root
 ///   LP (the development design notes).
 ///
@@ -1266,9 +1275,9 @@ fn trace_enabled() -> bool {
 /// "Large MIPLIB-scale general instances are not checked into the repo; recommend a confirming
 /// pass on the local MIPLIB tuning set before considering the gate fully retired." The pass was
 /// run and the blanket gate is a NET LOSS on the tuning set. Measured 60 s serial, same binary,
-/// `AY_MILP_SYM_BRANCH_BAND=0`:
+/// `--sym-branch-band`:
 ///
-/// | model  | `=all` (the 2026-07-20 default) | armed (this default) |
+/// | model  | mode 2 (the 2026-07-20 default) | armed (this default) |
 /// |--------|---------------------------------|----------------------|
 /// | rout   | FEASIBLE 1109.61, 64,138 nodes  | **OPTIMAL 1077.56, 30/30 @14.45-15.22 s**, 17,616 nodes |
 /// | noswot | FEASIBLE -41 (bound -43)        | **OPTIMAL -41 @51.2 s** |
@@ -1283,16 +1292,10 @@ fn trace_enabled() -> bool {
 /// needs it (a crash-basis phase I that cycles once cycles again) and leaves every model whose
 /// cold walk never stalls bit-for-bit as it was before 2026-07-20.
 fn eager_perturb_mode() -> u8 {
-    static B: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *B.get_or_init(|| eager_perturb_mode_of(std::env::var("AY_MILP_EAGER_PERTURB").ok().as_deref()))
-}
-
-/// The knob's spelling-to-mode map, split out so it is testable without the
-/// process-wide `OnceLock` (which latches on the first solve of the run).
-fn eager_perturb_mode_of(raw: Option<&str>) -> u8 {
-    match raw {
-        Some("0") => 0,
-        Some("1" | "all") => 2,
+    // B29: caller-layer value (0 off | 1 armed-on-stall | 2 all walks,
+    // builder-validated); out-of-domain reads as the default.
+    match crate::tune::count_opt(crate::tune::Knob::EagerPerturbMode) {
+        Some(m @ (0 | 2)) => m as u8,
         _ => 1,
     }
 }
@@ -1322,10 +1325,6 @@ fn eager_perturb_applies_to(mode: u8, warm_started: bool, cold_stalled: bool) ->
 fn eager_perturb_applies(warm_started: bool, lp: &FloatLp) -> bool {
     eager_perturb_applies_to(eager_perturb_mode(), warm_started, lp.cold_stalled.get())
 }
-fn dse_persist_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_DSE_PERSIST").is_some())
-}
 /// FUSED SINGLE-PASS BFRT RATIO TEST (`AY_MILP_FUSED_RT`). The dual ratio test
 /// does two O(cols) passes: a BUILD loop that materialises the breakpoint Vec
 /// `self.bp`, then a separate min-scan over it. Stage A folds that min-scan INTO
@@ -1340,8 +1339,9 @@ fn fused_rt_enabled() -> bool {
     // Stage A is PROVEN walk-invariant (byte-identical pivot stream / node counts /
     // verdict off-vs-on across the whole corpus + k124 cert), and a uniform speedup,
     // so it ships DEFAULT-ON. `AY_MILP_NO_FUSED_RT` restores the two-pass A/B baseline.
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_FUSED_RT").is_none())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_FUSED_RT env read
+    // is gone.
+    !crate::tune::on(crate::tune::Knob::NoFusedRt)
 }
 /// MASKED / BRANCHLESS BUILD experiment (`AY_MILP_RT_MASKED`, requires fused_rt).
 /// Splits the fused BUILD into (1) a branch-free `rt_ratio[j] = |d[j]/arow[j]|`
@@ -1359,7 +1359,7 @@ fn fused_rt_enabled() -> bool {
 /// count. The fused single-pass build (Stage A) stays the default.
 fn rt_masked_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_RT_MASKED").is_some())
+    *B.get_or_init(|| false)
 }
 /// INCREMENTAL ELIGIBILITY BITMASK for the dual ratio-test build (`rt_kind`; kill
 /// switch `AY_MILP_NO_RT_KIND`). Default-ON: the bitmask scan reads one `u8` per
@@ -1367,29 +1367,30 @@ fn rt_masked_enabled() -> bool {
 /// 5-arm eligibility match, and is byte-identical to the 4-stream build (same
 /// breakpoints, same first-minimal argmin, same pivot stream). See `rt_kind`.
 fn rt_kind_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_RT_KIND").is_none())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_RT_KIND env read is gone.
+    !crate::tune::on(crate::tune::Knob::NoRtKind)
 }
 /// Correctness harness for `rt_kind` (`AY_MILP_RT_KIND_VERIFY`): recompute the
 /// eligibility bitmask from scratch before every ratio-test scan and assert it
 /// matches the incrementally-maintained one. O(cols) per pivot — testing only;
 /// proves the incremental maintenance never drifts from the ground truth.
 fn rt_kind_verify_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_RT_KIND_VERIFY").is_some())
+    // B6: the AY_MILP_RT_KIND_VERIFY env switch is deleted. The O(cols)
+    // ground-truth verifier is testing-only; enable by editing this constant.
+    false
 }
 /// Per-iteration ratio-test profiler (`AY_MILP_ITER_PROFILE`). See `rt_profile_line`.
 fn iter_profile_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_ITER_PROFILE").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_ITER_PROFILE env read is gone.
+    crate::tune::on(crate::tune::Knob::IterProfile)
 }
-/// Per-phase ITERATION LEDGER (`AY_MILP_ITER_LEDGER`). See `iter_ledger_line`.
+/// Per-phase ITERATION LEDGER (`--iter-ledger`). See `iter_ledger_line`.
 /// Read once per SCOPE ENTRY and once per dual/primal WALK — never inside a
 /// pivot loop, so the default path pays a `OnceLock` load a few times per solve
 /// and nothing per iteration.
 fn iter_ledger_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_ITER_LEDGER").is_some())
+    *B.get_or_init(|| std::env::var_os("--iter-ledger").is_some())
 }
 /// BREAKPOINT-SORT INTEGER-KEY comparator (`AY_MILP_NO_RT_BITS_KEY` kills it).
 /// The dual long-step (BFRT) select phase sorts `self.bp: Vec<(f64,u32)>` by the
@@ -1407,8 +1408,8 @@ fn iter_ledger_enabled() -> bool {
 /// stream. The only difference is the comparator drops `total_cmp`'s two conditional
 /// sign-flip XORs (dead for our non-negative keys) for a bare `u64` compare.
 fn rt_bits_key_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_RT_BITS_KEY").is_none())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_RT_BITS_KEY env read is gone.
+    !crate::tune::on(crate::tune::Knob::NoRtBitsKey)
 }
 /// Sparse DSE τ = B⁻¹ρ solve (OPT-IN, `AY_MILP_TAU_NZ`; default dense). The
 /// steepest-edge weight update needs τ = B⁻¹ρ, where ρ = B⁻ᵀe_r is the pivot row
@@ -1422,27 +1423,30 @@ fn rt_bits_key_enabled() -> bool {
 /// re-derivation; the default stays dense.
 fn tau_nz_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_TAU_NZ").is_some())
+    *B.get_or_init(|| false)
 }
-/// Sparse flip-aggregate solve wflip = B⁻¹·Σδ (OPT-IN, `AY_MILP_FLIP_NZ`; default
-/// dense). The dual long-step commits a flip SET whose aggregate column movement
-/// is solved against the OLD basis. `ftran_nz` (Gilbert–Peierls) is BYTE-IDENTICAL
-/// to the dense `ftran` (same L/eta/U ops in the same order, structural zeros
-/// skipped; the input support may carry duplicates harmlessly, as `ftran_nz`
-/// zeroes each input row after reading it, so a repeat gathers `+= 0.0`) — the
-/// dual bound is bit-for-bit unchanged (air05 25941 either way).
+/// Sparse flip-aggregate solve wflip = B⁻¹·Σδ. The dual long-step commits a
+/// flip SET whose aggregate column movement is solved against the OLD basis.
+/// `ftran_nz` (Gilbert–Peierls) is BYTE-IDENTICAL to the dense `ftran` (same
+/// L/eta/U ops in the same order, structural zeros skipped; the input support
+/// may carry duplicates harmlessly, as `ftran_nz` zeroes each input row after
+/// reading it, so a repeat gathers `+= 0.0`) — the dual bound is bit-for-bit
+/// unchanged (air05 25941 either way).
 ///
-/// MEASURED A DEAD-END on the near-dense network/set-partition bases this program
-/// targets — exactly like the DSE τ solve (see `tau_nz_enabled`). Although the
-/// flip RHS is far sparser than ρ (air05: ~3 flipped columns, a dozen-odd matrix
-/// rows, vs ρ's ~260 nonzeros), on air05's ~54%-dense B⁻¹ even that tiny RHS
-/// closes near-dense through Gilbert–Peierls, so the symbolic DFS + two O(m)
-/// count-sorts cost MORE than the flat dense sweep they replace: air05 flip
-/// 5.0→11.4us (2.3× slower). Kept behind the flag (byte-identical, harmless) to
-/// spare a future arm the re-derivation; the default stays dense.
-fn flip_nz_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_FLIP_NZ").is_some())
+/// On the near-dense network/set-partition bases this program targets the
+/// sparse arm LOSES — exactly like the DSE τ solve (see `tau_nz_enabled`):
+/// on air05's ~54%-dense B⁻¹ even a tiny RHS closes near-dense through
+/// Gilbert–Peierls, so the symbolic DFS + two O(m) count-sorts cost MORE than
+/// the flat dense sweep they replace (air05 flip 5.0→11.4us, 2.3× slower).
+/// B19: the opt-in env lever is retired; the arm is AUTO-DECIDED per commit
+/// by the same predicted-marked-set test the FT spike build proved out
+/// (`est·(m+unnz)·2 < m·m`, dense on ties so air05-class bases are
+/// unchanged), with `--flip-solve=<auto|sparse|dense>` as the typed override.
+/// The uccase12/physiciansched6-2 sparse-basis A/B is still QUEUED — the
+/// auto arm has not yet been measured at this fork.
+fn flip_solve_mode() -> usize {
+    // 0 = auto, 1 = sparse, 2 = dense.
+    crate::tune::count_opt(crate::tune::Knob::FlipSolve).unwrap_or(0)
 }
 /// STAGE B opt-in (`AY_MILP_FUSED_RT_DEFER`, requires `AY_MILP_FUSED_RT`). Deferring
 /// `self.bp` on the no-flip step turned out to be a WASH-to-LOSS: a Vec push is cheap
@@ -1453,15 +1457,15 @@ fn flip_nz_enabled() -> bool {
 /// alone; this flag keeps the deferral available for A/B. Byte-identical either way.
 fn fused_defer_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_FUSED_RT_DEFER").is_some())
+    *B.get_or_init(|| false)
 }
 /// Kill switch for the WIDE-AND-TALL warm-dual divergence-guard relaxation (see the
 /// `bloom_cap` note in `dual_simplex`): restores the `(4·entry_viol).max(64)` cap so
 /// a wide set-partitioning node re-solve bloom-aborts and falls back to the cold
 /// re-crash byte-for-byte.
 fn no_wide_bloom() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_WIDE_BLOOM").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_WIDE_BLOOM env read is gone.
+    crate::tune::on(crate::tune::Knob::NoWideBloom)
 }
 
 /// Kill switch for the TALL-DEGENERATE bloom-cap relaxation (the tall_lu arm of
@@ -1470,7 +1474,7 @@ fn no_wide_bloom() -> bool {
 /// TALL-degenerate class (`tall_lu`, m ≥ 1,000 — qiu's capacity==demand network,
 /// whose warm dual is 83–88% degenerate-θ≈0 and CONVERGES, but blooms a few
 /// hundred violated rows on the way and gets aborted at `(4·entry_viol).max(64)`
-/// into a wasteful cold primal re-solve). Setting `AY_MILP_NO_BLOOM_RELAX`
+/// into a wasteful cold primal re-solve). Setting `--no-bloom-relax`
 /// restores the `wide_tall`-only uncap, so a tall_lu warm-dual walk bloom-aborts
 /// byte-for-byte. Verdict-neutral either way (only the float pivot SEQUENCE and
 /// thus the walk length change; every exit is re-checked, every leaf re-derived
@@ -1522,19 +1526,14 @@ fn no_bloom_relax() -> bool {
 /// behind the opt-in flag (sound, gated) to spare a future arm the re-derivation.
 fn dual_perturb_mag() -> f64 {
     static M: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    // DEFAULT 0.0 = OFF. Opt in with `AY_MILP_DUAL_PERTURB=<mag>` (e.g. 1e-8).
-    *M.get_or_init(|| {
-        std::env::var("AY_MILP_DUAL_PERTURB")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    })
+    // DEFAULT 0.0 = OFF. Opt in with `--dual-perturb` (e.g. 1e-8).
+    *M.get_or_init(|| crate::tune::real_opt(crate::tune::Knob::DualPerturb).unwrap_or(0.0))
 }
 /// Kill switch for the dual cost perturbation (`AY_MILP_NO_DUAL_PERTURB`);
 /// restores the un-perturbed warm/cold dual walk byte-for-byte for A/B.
 fn no_dual_perturb() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_DUAL_PERTURB").is_some())
+    *B.get_or_init(|| false)
 }
 /// Width factor of the dual anti-churn Harris band, in units of `cost_tol`
 /// (`AY_MILP_CHURN_BAND`, default 0.5 — the shipped value). A WIDER band lets the
@@ -1545,64 +1544,60 @@ fn no_dual_perturb() -> bool {
 /// acceptance tolerance (`DUAL_ACCEPT_TOL`, 1e-7). Only fires on `dual_churn_band`
 /// shapes (qiu / air05). WALK-CHANGING — re-cert on any non-default value.
 fn churn_band_factor() -> f64 {
-    static F: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("AY_MILP_CHURN_BAND")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.5)
-    })
+    // B6: the AY_MILP_CHURN_BAND env override is deleted; 0.5 is the shipped,
+    // WALK-CHANGING-if-touched value (re-cert on any change).
+    0.5
 }
 fn lu_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_LU").is_some())
+    *B.get_or_init(|| std::env::var_os("--lu").is_some())
 }
 
 /// Kill switch for CROSS-SOLVE ETA REUSE (see `warm_start`): `AY_MILP_NO_ETA_REUSE`
 /// restores the unconditional per-warm-solve rebuild for A/B.
 fn no_eta_reuse() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_ETA_REUSE").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_ETA_REUSE env read is gone.
+    crate::tune::on(crate::tune::Knob::NoEtaReuse)
 }
 
 /// Warm solves whose eta rebuild the cross-solve reuse skipped (trace).
 pub(crate) static ETA_REUSE_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 fn no_devex() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_DEVEX").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_DEVEX env read is gone.
+    crate::tune::on(crate::tune::Knob::NoDevex)
 }
 /// Per-phase iteration-economics lines (`LPSTAT phase...`) on stderr. Diagnostic only.
 fn lp_stats_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_LP_STATS").is_some())
+    *B.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::LpStats) == Some(true))
 }
 /// Kill switch for the COLD dual-simplex start on wide-and-tall LPs (A/B lever).
 fn no_cold_dual() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_COLD_DUAL").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_COLD_DUAL env read is gone.
+    crate::tune::on(crate::tune::Knob::NoColdDual)
 }
 
 /// Measurement arm: try the cold dual start on EVERY shape, not just `wide_tall`.
 /// Default off, so the shipped path is byte-identical. See the call site for why.
 fn cold_dual_all() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_COLD_DUAL_ALL").is_some())
+    *B.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::ColdDualAll) == Some(true))
 }
 /// Kill switch for the triangular equality crash on big cold LPs (A/B lever).
 fn no_tri_crash() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_TRI_CRASH").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_TRI_CRASH env read is gone.
+    crate::tune::on(crate::tune::Knob::NoTriCrash)
 }
 /// Force the triangular crash regardless of size (tests / small-LP A/B).
 fn force_tri_crash() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("AY_MILP_TRI_CRASH").as_deref() == Ok("1"))
+    *B.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::TriCrashAll) == Some(true))
 }
 /// Parse the historical range-logical crash environment opt-in.
 ///
 /// Exact `"1"` only: malformed or merely truthy-looking values remain off.
+#[cfg(test)]
 fn range_logical_crash_env_value(value: Option<&str>) -> bool {
     value == Some("1")
 }
@@ -1613,25 +1608,23 @@ fn range_logical_crash_env_value(value: Option<&str>) -> bool {
 /// Exact `"1"` only: this is a default-off measurement lever, not a new
 /// production policy.
 fn range_logical_crash_env_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| {
-        let value = std::env::var("AY_MILP_RANGE_LOGICAL_CRASH");
-        range_logical_crash_env_value(value.as_deref().ok())
-    })
+    // B22: the env spelling is retired; the typed per-session carrier
+    // (SolveOpts::with_range_logical_triangular_crash) is the override.
+    false
 }
 
 /// Kill switch for the CHAIN-SHAPE class gate (`FloatLp::chain_shape`):
-/// `AY_MILP_CHAIN_SHAPE=0` restores the pure size gate byte-for-byte.
+/// `--no-chain-shape` restores the pure size gate byte-for-byte.
 fn chain_shape_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("AY_MILP_CHAIN_SHAPE").as_deref() != Ok("0"))
+    // B29: typed carrier; per-solve, so the process-wide latch is gone too.
+    crate::tune::caller_flag(crate::tune::Knob::NoChainShape).map_or(true, |no| !no)
 }
-/// `AY_MILP_SHAPE_CENSUS` + trace: print the peel census for every LP that
+/// `--shape-census` + trace: print the peel census for every LP that
 /// reaches a cold eta-path solve, even when the candidate pre-filter fails
 /// (diagnostic only; never changes the verdict).
 fn shape_census_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_SHAPE_CENSUS").is_some())
+    *B.get_or_init(|| crate::debug_flags::milp_debug_flags().shape_census)
 }
 /// Chain-shape Devex reach (`AY_MILP_CHAIN_DEVEX`): `0` = chain never drives
 /// Devex, `1` = every primal walk on a chain LP, unset = COLD walks only
@@ -1641,18 +1634,18 @@ fn shape_census_enabled() -> bool {
 /// (dual postchk fails 114 -> 410, rim 0 -> 77.7s, unknown @592s vs unsat
 /// 222s off — the drifted walks fall into the exact rim).
 fn chain_devex_mode() -> u8 {
-    static N: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("AY_MILP_CHAIN_DEVEX").as_deref() {
-        Ok("0") => 0,
-        Ok("1") => 1,
+    // B12: caller-layer value (0 | 1 | 2, builder-validated); the never-set
+    // AY_MILP_CHAIN_DEVEX env read is gone. Out-of-domain reads as the
+    // default, exactly as the env parse did.
+    match crate::tune::count_opt(crate::tune::Knob::ChainDevex) {
+        Some(m @ (0 | 1)) => m as u8,
         _ => 2,
-    })
+    }
 }
-/// `AY_MILP_CHAIN_PREORDER=0`: the chain verdict stops driving the
+/// `--no-chain-preorder`: the chain verdict stops driving the
 /// `refactorize` peel preorder (A/B lever; default on).
 fn chain_preorder() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var("AY_MILP_CHAIN_PREORDER").as_deref() != Ok("0"))
+    crate::tune::caller_flag(crate::tune::Knob::NoChainPreorder).map_or(true, |no| !no)
 }
 /// The DISTRESS PROBE budget (primal iterations) for cold eta-path walks on a
 /// chain-ARMED LP (`chain_shape == 3`): a walk that has not settled inside the
@@ -1662,13 +1655,12 @@ fn chain_preorder() -> bool {
 /// k=63: 3,400), while the k=546 grind runs >100,000 iterations into its
 /// Stopped deadline slice without converging — the order-of-magnitude gap
 /// makes the threshold safe. `0` disables the probe (armed LPs never promote:
-/// measurement / kill lever `AY_MILP_CHAIN_PROBE`).
+/// measurement / kill lever `the chain-probe knob`).
 fn chain_probe_iters() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("AY_MILP_CHAIN_PROBE")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        crate::tune::count_opt(crate::tune::Knob::ChainProbe)
+            .map(|n| n as u64)
             .unwrap_or(20_000)
     })
 }
@@ -1681,8 +1673,7 @@ fn resolve_chain_distress_probe_iters(typed: Option<u64>, historical: impl FnOnc
 }
 /// Kill switch for the BUMP LU base factor inside `refactorize` (A/B lever).
 fn no_bump_lu() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_BUMP_LU").is_some())
+    crate::tune::caller_flag(crate::tune::Knob::NoBumpLu) == Some(true)
 }
 /// `AY_MILP_NO_FILL_TRIP=1`: restore the pure column floor, byte-for-byte.
 ///
@@ -1690,18 +1681,18 @@ fn no_bump_lu() -> bool {
 /// optimisation keeps a switch that restores prior behaviour exactly; with this
 /// set the latch never arms, so `bump_active` reduces to
 /// `!forced.is_empty() && peel_nb >= bump_lu_min()` — the historical expression.
-/// `AY_MILP_BUMP_FILL_TRIP=1`: opt into the (biased, provisional) fill-rate trip.
+/// The (biased, provisional) fill-rate trip opt-in — B22: env spelling retired.
 /// Unset, `maybe_trip_bump_fill` returns immediately and the lane is the historical
 /// column floor byte-for-byte. See that function for why this is not on by default.
 fn fill_trip_optin() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_FILL_TRIP").is_some())
+    // B22: retired env spelling (never set); the fill-trip lane stays off.
+    false
 }
 fn no_fill_trip() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_FILL_TRIP").is_some())
+    // B22: retired with its opt-in lane.
+    false
 }
-/// `AY_MILP_BUMP_BTF=1`: route the bump base factor through the BLOCK-TRIANGULAR
+/// `the bump-btf knob`: route the bump base factor through the BLOCK-TRIANGULAR
 /// lane (lane 2) instead of the monolithic Markowitz LU (lane 1). Opt-in until
 /// proven: unset, `refactorize` is byte-identical to before. The bump decomposes
 /// near-triangularly (a few small SCC blocks + ~20k singletons), so factoring
@@ -1709,45 +1700,40 @@ fn no_fill_trip() -> bool {
 /// from the monolithic ~47M toward O(bump nnz), the full-depth FTRAN-cost lever.
 fn bump_btf_env() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_BTF").is_some())
+    *B.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::BumpBtf) == Some(true))
 }
 /// Bump-size floor for the LU base factor in `refactorize`: below it the PFI
 /// segment stays (small bumps rebuild near-zero-fill anyway — the crash-walk
 /// bases run 130-160 bump columns; the mid-walk SCC runs ~10.2k). Measurement
-/// lever `AY_MILP_BUMP_LU_MIN`.
+/// lever `the bump-lu-min knob`.
 fn bump_lu_min() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_BUMP_LU_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(512)
-    })
+    *N.get_or_init(|| crate::tune::count_opt(crate::tune::Knob::BumpLuMin).unwrap_or(512))
 }
-/// `AY_MILP_BUMP_DIAG=1`: per-rebuild peel-segment anatomy lines (entry and
+/// `--bump-diag`: per-rebuild peel-segment anatomy lines (entry and
 /// time split across fronts / bump / backs). Diagnostic only.
 fn bump_diag_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_DIAG").is_some())
+    *B.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::BumpDiag) == Some(true))
 }
 /// Kill switch for the objective-cutoff early stop in the warm dual walk (A/B lever).
 fn no_cutoff() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_CUTOFF").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_CUTOFF env read is gone.
+    crate::tune::on(crate::tune::Knob::NoCutoff)
 }
 /// Kill switch for the WARM-solve LU engine on wide-tall `plain_cold` instances
 /// (A/B lever). See the gate in `solve_bounded`: node re-solves on a set-partition
 /// LP grind on the eta inverse's drift; the LU engine's accuracy repays itself in
 /// far fewer pivots (the same reason `try_cold_dual` installs one at the root).
 fn no_node_lu() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_NODE_LU").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_NODE_LU env read is gone.
+    crate::tune::on(crate::tune::Knob::NoNodeLu)
 }
 
 /// Kill switch for the TALL LU gate (`FloatLp::tall_lu`; A/B lever).
 fn no_tall_lu() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_TALL_LU").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_TALL_LU env read is gone.
+    crate::tune::on(crate::tune::Knob::NoTallLu)
 }
 
 /// Kill switch for the COLD-ROOT LU band (`FloatLp::cold_root_lu`): restores the
@@ -1756,14 +1742,14 @@ fn no_tall_lu() -> bool {
 ///
 /// Resolved through `tune`, so it is a PER-SOLVE decision reached from
 /// [`EngineEconomics::with_cold_root_lu`]. It was a process-global `OnceLock`
-/// over `AY_MILP_NO_COLD_LU`, which is precisely why it could not be one: the
+/// over `--no-cold-lu`, which is precisely why it could not be one: the
 /// first solve in a process latched the lane for every later solve, and a
 /// consumer forbidden from exporting `AY_MILP_*` could not reach it at all.
 fn no_cold_lu() -> bool {
     crate::tune::on(crate::tune::Knob::NoColdLu)
 }
 
-/// Row FLOOR of the cold-root LU band (`AY_MILP_COLD_LU_ROWS`).
+/// Row floor of the cold-root LU band (formerly `AY_MILP_COLD_LU_ROWS`).
 ///
 /// 3 000, not `TALL_LU_ROWS` (1 000): the measured crossover is between
 /// binkar10_1 (m = 2 298, mixed: better incumbent, fewer nodes, no clear win)
@@ -1775,27 +1761,19 @@ fn no_cold_lu() -> bool {
 /// deadline-truncated instances between 1 000 and 3 000 rows swing more from
 /// machine load than from the lane (air05, same arm, four runs: 374/374/374 vs
 /// 2 340 eta rebuilds). See `FloatLp::cold_root_lu` for the table.
-/// ⚠ A FLOOR OF ZERO IS REJECTED, not honoured. `AY_MILP_COLD_LU_ROWS=0` reads
-/// as "no floor" and silently opens the band to EVERY in-band `plain_cold`
-/// solve — which is sound but measurably costs verdicts (gt2 and qiu both fall
+/// A floor of zero would silently open the band to every in-band `plain_cold`
+/// solve. That is sound but measurably costs verdicts (gt2 and qiu both fall
 /// OPTIMAL -> FEASIBLE, timtab1 loses its incumbent), because under the floor
-/// the FT engine's per-pivot cost is pure loss and it moves the vertex. A knob
-/// whose zero value quietly degrades the solver is a footgun, so zero falls
-/// back to the compiled floor, matching `parse_lu_max_fill_nnz`'s own
-/// `.filter(|&v| v > 0)` (`lu.rs`). Use `AY_MILP_NO_COLD_LU=1` to turn the band
-/// off; that is what the kill switch is for.
+/// the FT engine's per-pivot cost is pure loss and it moves the vertex. B25
+/// retired the value override, leaving the compiled floor as the sole value;
+/// edit `COLD_LU_MIN_ROWS` to repeat the measurement. Use the separate
+/// `--no-cold-lu` kill switch to turn the band off.
 fn cold_lu_min_rows() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_COLD_LU_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(COLD_LU_MIN_ROWS)
-    })
+    // B25: env override retired; the named constant is the value.
+    COLD_LU_MIN_ROWS
 }
 
-/// Row CEILING of the cold-root LU band (`AY_MILP_COLD_LU_MAX_ROWS`), default
+/// Row ceiling of the cold-root LU band (formerly `AY_MILP_COLD_LU_MAX_ROWS`), default
 /// `REFACTOR_TALL_ROWS`. Above it `LuEngine::update`'s O(m) dense sweeps replace
 /// the refactorisation wall rather than removing it (measured 1.85 ms/update at
 /// m = 40 962, 3.57 ms at m = 69 608 — 23–34 % of LP time); raise it to re-run
@@ -1829,13 +1807,8 @@ fn cold_lu_min_rows() -> usize {
 /// `btran` is untouched by the spike work. That — not the ceiling — is the
 /// next lever for this class.
 fn cold_lu_max_rows() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_COLD_LU_MAX_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(REFACTOR_TALL_ROWS)
-    })
+    // B25: env override retired; the named constant is the value.
+    REFACTOR_TALL_ROWS
 }
 
 /// LATE LU PROMOTION BUDGET: how many eta rebuilds ONE SOLVE may pay before
@@ -1847,7 +1820,7 @@ fn cold_lu_max_rows() -> usize {
 ///
 /// The shipped band `[COLD_LU_MIN_ROWS, REFACTOR_TALL_ROWS)` is keyed on `m`,
 /// and `m` does not predict what the FT engine costs. Measured over 39 corpus
-/// models (`AY_MILP_LU=1`, 60 s, deterministic `LU_FTRAN_REACH`/`LUFACT`
+/// models (`--lu`, 60 s, deterministic `LU_FTRAN_REACH`/`LUFACT`
 /// counters), Spearman against ns per FT update per row:
 ///
 /// ```text
@@ -2012,9 +1985,8 @@ fn cold_lu_max_rows() -> usize {
 fn cold_lu_eta_rebuilds() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("AY_MILP_COLD_LU_ETA_REBUILDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        crate::tune::count_opt(crate::tune::Knob::ColdLuEtaRebuilds)
+            .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(LATE_LU_ETA_REBUILDS)
     })
 }
@@ -2022,7 +1994,7 @@ fn cold_lu_eta_rebuilds() -> u32 {
 /// Default late-promotion budget. `0` = OFF; see `cold_lu_eta_rebuilds`.
 const LATE_LU_ETA_REBUILDS: u32 = 0;
 
-/// LU-LANE EXTENSION for `WarmSolver` (`AY_MILP_WARM_LU=1`; A/B lever, DEFAULT
+/// LU-LANE EXTENSION for `WarmSolver` (`--warm-lu`; A/B lever, DEFAULT
 /// OFF). The pooled bound-change re-solver (the dive/flip-LNS loop) keeps its
 /// `Simplex` — and, with this on, its LU operator — ALIVE across solves. On the
 /// tall-LU class that is the largest single eta consumer on qiu: the census
@@ -2049,8 +2021,8 @@ pub(crate) fn warm_lu_enabled() -> bool {
 /// Kill switch for the tall-LP extension of the dual anti-churn band (restores
 /// the historical `wide_tall`-only gate). See `FloatLp::dual_churn_band`.
 fn no_dual_churn_band() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_DUAL_CHURN_BAND").is_some())
+    // B12: caller-layer switch; the never-set AY_MILP_NO_DUAL_CHURN_BAND env read is gone.
+    crate::tune::on(crate::tune::Knob::NoDualChurnBand)
 }
 
 /// Kill switch for the EQUILIBRATION-SAFE `noenter` Farkas shortcut (`run`'s
@@ -2060,7 +2032,7 @@ fn no_dual_churn_band() -> bool {
 /// the unscaled-frame shortcut is unaffected either way.
 fn no_noenter_unscale() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_NOENTER_UNSCALE").is_some())
+    *B.get_or_init(|| false)
 }
 
 /// Verify/skip staleness trigger when the FT LU ENGINE backs a TALL-class LP
@@ -2080,13 +2052,8 @@ fn no_noenter_unscale() -> bool {
 /// `REFACTOR_TALL_ROWS` band so the w5/cifar wide-tall regime and every
 /// corpus/ladder instance keep their historical trajectory bit-identically.
 fn lu_verify_after() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_LU_VERIFY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64)
-    })
+    // B25: env override retired; the named cadence stands.
+    64
 }
 
 /// Refactor CADENCE when the FT LU engine backs a tall-not-wide LP
@@ -2131,7 +2098,7 @@ fn lu_verify_after() -> usize {
 /// ```
 ///
 /// That inertness is what distinguishes this from the walk-changing knobs this file
-/// has rejected. `AY_MILP_CUT_WARM` also showed a headline gain and was refused because
+/// has rejected. `the cut-warm knob` also showed a headline gain and was refused because
 /// it moved REAL trees (blend2 3882 -> 5940 nodes, p0201 110 -> 798); Devex was 1.95x
 /// on its target instance and +91.6s over fourteen. This one leaves fifteen trees
 /// bit-for-bit alone.
@@ -2142,12 +2109,7 @@ fn lu_verify_after() -> usize {
 /// (qiu/qnet1/gen/khb05250 are 73.6% of the corpus gap by wall), are both open.
 fn lu_refactor_every() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_LU_REFACTOR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20)
-    })
+    *N.get_or_init(|| 20)
 }
 
 /// FT-ADOPTION distance cap (Lever A2; `AY_MILP_ADOPT_FT` overrides, `=0`
@@ -2155,7 +2117,7 @@ fn lu_refactor_every() -> usize {
 /// `d <= cap` positions is absorbed as `d` Forrest–Tomlin updates (one sparse
 /// FTRAN + `LuEngine::update` each) instead of a full base factor. Same
 /// class gate as `lu_verify_after`.
-/// Row CEILING for FT ADOPTION (`AY_MILP_ADOPT_FT_MAX_ROWS`), default
+/// Row CEILING for FT ADOPTION (`the adopt-ft-max-rows knob`), default
 /// `REFACTOR_TALL_ROWS`.
 ///
 /// # Why this override exists
@@ -2178,21 +2140,13 @@ fn lu_refactor_every() -> usize {
 fn adopt_ft_max_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("AY_MILP_ADOPT_FT_MAX_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(REFACTOR_TALL_ROWS)
+        crate::tune::count_opt(crate::tune::Knob::AdoptFtMaxRows).unwrap_or(REFACTOR_TALL_ROWS)
     })
 }
 
 fn adopt_ft_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_ADOPT_FT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(31)
-    })
+    *N.get_or_init(|| 31)
 }
 
 /// Warm-dual bypass policy constants — see `FloatLp::warm_dual_should_attempt`.
@@ -2201,16 +2155,15 @@ const DUAL_BYPASS_WIN_DEN: u32 = 8;
 const DUAL_BYPASS_PROBE_EVERY: u32 = 64;
 const DUAL_BYPASS_FORGET_AT: u32 = 512;
 
-/// `AY_MILP_DUAL_BYPASS`: `off`/`0` = 0 (never bypass — the old behavior),
-/// `force` = 2 (always bypass warm duals; measurement lever), unset/other = 1
-/// (adaptive, the default).
+/// `--dual-bypass-mode`: `0` = never bypass (the old behavior), `2` = always
+/// bypass warm duals (measurement lever), unset = 1 (adaptive, the default).
 fn dual_bypass_mode() -> u8 {
-    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *M.get_or_init(|| match std::env::var("AY_MILP_DUAL_BYPASS").as_deref() {
-        Ok("off") | Ok("0") => 0,
-        Ok("force") => 2,
+    // B29: caller-layer value (0 never | 1 adaptive | 2 force,
+    // builder-validated); out-of-domain reads as the default.
+    match crate::tune::count_opt(crate::tune::Knob::DualBypassMode) {
+        Some(m @ (0 | 2)) => m as u8,
         _ => 1,
-    })
+    }
 }
 
 /// A/B override for the dual divergence guard's bloom cap
@@ -2218,12 +2171,9 @@ fn dual_bypass_mode() -> u8 {
 /// `max(4·entry, 64)` policy; `0` disables the guard entirely. Unset keeps the
 /// default policy byte-identically.
 fn dual_bloom_cap_override() -> Option<usize> {
-    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_DUAL_BLOOM_CAP")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
+    // B12: caller-layer value; the never-set AY_MILP_DUAL_BLOOM_CAP env read
+    // is gone.
+    crate::tune::count_opt(crate::tune::Knob::DualBloomCap)
 }
 
 /// Rebuild the product-form inverse every this many basis changes.
@@ -2234,9 +2184,9 @@ fn dual_bloom_cap_override() -> Option<usize> {
 /// rebuild is O(m·nnz), and at that height it was 78% of the run. The cadence
 /// is trajectory-dependent (100 measured WORSE than either on w5), so the bump
 /// is confined to the measured regime, m >= REFACTOR_TALL_ROWS; smaller models
-/// keep 50 byte-identically. `AY_MILP_REFACTOR_EVERY` overrides both. A caller
+/// keep 50 byte-identically. `the refactor-every knob` overrides both. A caller
 /// with no LP in scope passes m = 0 for the conservative small-m policy.
-/// The operator's `AY_MILP_REFACTOR_EVERY` override, or `None`.
+/// The operator's `the refactor-every knob` override, or `None`.
 ///
 /// Split out of [`refactor_every`] so it is NULLARY and therefore primeable. The
 /// combined form cached its environment read behind a size argument, which meant
@@ -2246,11 +2196,7 @@ fn dual_bloom_cap_override() -> Option<usize> {
 /// no caching, so separating the two costs nothing and closes the hole.
 fn refactor_every_override() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_REFACTOR_EVERY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
+    *N.get_or_init(|| crate::tune::count_opt(crate::tune::Knob::RefactorEvery))
 }
 
 fn refactor_every(m: usize) -> usize {
@@ -2274,13 +2220,13 @@ const BIG_LP_COLS: usize = 8192;
 const BIG_LP_ROWS: usize = 8192;
 /// Recompute basic values from scratch this often, to damp drift.
 const REFRESH_EVERY: usize = 200;
-/// Diagnostic counters -- what the search actually spends its simplex on. `AY_MILP_TRACE` prints
+/// Diagnostic counters -- what the search actually spends its simplex on. `--trace` prints
 /// them; nothing else reads them.
 pub(crate) mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub(crate) static DUAL_ITERS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static PRIMAL_ITERS: AtomicU64 = AtomicU64::new(0);
-    /// Iteration ECONOMICS (diagnostic, `AY_MILP_LP_STATS`): degenerate primal
+    /// Iteration ECONOMICS (diagnostic, `--lp-stats`): degenerate primal
     /// steps (ratio test blocked at zero), bound flips, and iterations that
     /// actually MOVED this phase's objective. Together with `PRIMAL_ITERS`
     /// they answer "is the walk moving or shuffling" — the air05 question.
@@ -2441,7 +2387,7 @@ impl<'a> WarmSolver<'a> {
     ) -> Self {
         let mut sx = Simplex::new(lp, lower, upper);
         let seeded = warm.is_some();
-        // LU-LANE EXTENSION (`AY_MILP_WARM_LU`, default off; gated `tall_lu`).
+        // LU-LANE EXTENSION (`--warm-lu`, default off; gated `tall_lu`).
         // Install an LU engine so this pooled re-solver's bound-change solves run
         // the FT lane: the engine survives across `solve` calls with the basis,
         // so a re-solve on an unchanged basis takes the `rep_basis` match-skip
@@ -2643,9 +2589,21 @@ const EAGER_PERTURB_MIN_ROWS: usize = 200;
 /// near-identical (the LU lane changes SPEED, never the LP verdict). The floor
 /// still clears every OTHER ladder/corpus instance — the next-tallest is gen at
 /// 780 rows, a 220-row margin — so only qiu changes lanes, and the ACAS class
-/// (≥1,425 rows) is untouched. `AY_MILP_TALL_LU_ROWS` overrides (=1200 restores
-/// the historical behavior byte-for-byte; the `no_tall_lu` kill switch still
-/// disables the lane entirely). See the journal at `tall_lu`.
+/// (≥1,425 rows) is untouched. See the journal at `tall_lu`.
+///
+/// NOT RUNTIME-SETTABLE, and deliberately so. The 1,200→1,000 commit shipped an
+/// `AY_MILP_TALL_LU_ROWS` override "(=1200 restores byte-for-byte)"; B6 deleted
+/// the read (`46e5eae53`) on the decision table's explicit verdict — a threshold
+/// that DEFINES a class must not be settable per process, because the gate that
+/// mirrors the same number (the node-propagation cap raise in `bab.rs`) cannot
+/// follow it and would drift apart silently. It drifted anyway, from a plain edit
+/// — that gate still reads 1_200; the note there says why re-tracking it is a
+/// behaviour change, not a tidy-up. Recover the pre-qiu boundary by editing this
+/// constant to 1_200 and rebuilding, not by exporting anything. The `no_tall_lu`
+/// kill switch still disables the lane entirely, and it IS reachable per solve —
+/// as the caller-layer `Knob::NoTallLu` (`EngineEconomics::with_tall_lu`, wired to
+/// the `ay-milp` engine flag `no-tall-lu`), not as an env var. That is the shape a
+/// lever is supposed to have here; the row floor simply is not a lever.
 const TALL_LU_ROWS: usize = 1_000;
 
 /// The cold-root LU band membership test, extracted from `FloatLp::cold_root_lu`
@@ -2666,16 +2624,16 @@ fn cold_root_lu_band(m: usize, min_rows: usize, max_rows: usize) -> bool {
 /// measurement table on `FloatLp::cold_root_lu`.
 const COLD_LU_MIN_ROWS: usize = 3_000;
 
-/// Row floor for `FloatLp::tall_lu`, with an env override (`AY_MILP_TALL_LU_ROWS`)
-/// so the LU-engine boundary can be A/B'd (=1200 restores the pre-qiu default).
+/// Row floor for `FloatLp::tall_lu`: `TALL_LU_ROWS`, unconditionally.
+///
+/// B6: make-constant; the never-set AY_MILP_TALL_LU_ROWS env read is gone, and
+/// the `OnceLock` that cached its parse went with it — a process-global latch
+/// over a `const` buys nothing and reads as a runtime knob to the next person.
+/// A/B the LU-engine boundary by editing `TALL_LU_ROWS` (see the retirement note
+/// there); there is no runtime override to reach for.
+#[inline]
 fn tall_lu_rows() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_TALL_LU_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(TALL_LU_ROWS)
-    })
+    TALL_LU_ROWS
 }
 
 /// Pivot allowance per row for the COLD dual-simplex start (`try_cold_dual`).
@@ -2891,7 +2849,6 @@ impl FloatLp {
             scale,
             lu_cache: LuCacheCell(std::cell::RefCell::new(None)),
             sx_cache: SxCell(std::cell::RefCell::new(None)),
-            dse_cache: LuCacheCellDse(std::cell::RefCell::new(None)),
             probe_reuse: ProbeReuseCell(std::cell::RefCell::new(ProbeReuse {
                 armed: false,
                 pristine: None,
@@ -3127,7 +3084,7 @@ impl FloatLp {
             scost = scost.max(c.abs());
             sscale = sscale.max(c.abs());
         }
-        if std::env::var_os("AY_MILP_TRACE").is_some() {
+        if crate::debug_flags::milp_debug_flags().trace {
             let (rmin, rmax) = (
                 rexp.iter().min().unwrap_or(&0),
                 rexp.iter().max().unwrap_or(&0),
@@ -3137,7 +3094,7 @@ impl FloatLp {
                 cexp.iter().max().unwrap_or(&0),
             );
             eprintln!(
-                "AY_MILP_TRACE equilibrate: span 2^{emin}..2^{emax} rexp [{rmin},{rmax}] cexp [{cmin},{cmax}] smat={smat:.2e} srhs={srhs:.2e} scost={scost:.2e} sscale={sscale:.2e}"
+                "--trace equilibrate: span 2^{emin}..2^{emax} rexp [{rmin},{rmax}] cexp [{cmin},{cmax}] smat={smat:.2e} srhs={srhs:.2e} scost={scost:.2e} sscale={sscale:.2e}"
             );
         }
         self.rexp = rexp.iter().map(|&e| e as i16).collect();
@@ -3276,7 +3233,7 @@ impl FloatLp {
     /// `plain_cold` (see the field's note) pins COLD solves to the eta file
     /// because the root vertex seeds the pump/dive/RINS chain. That pin is
     /// correct policy and wrong at one size class. Measured, 2026-07-27/28,
-    /// 60–120 s caps, `AY_MILP_LU=1` as the force-lever (deterministic counters
+    /// 60–120 s caps, `--lu` as the force-lever (deterministic counters
     /// first, wall indicative — the box was contended):
     ///
     /// | m | instance | eta lane | LU lane |
@@ -3297,7 +3254,7 @@ impl FloatLp {
     /// takes its place, so the lane change is not yet a win to bank — that is a
     /// `lu.rs::update` sparsification job, not a dispatch job.
     ///
-    /// # What the band bought, A/B'd against `AY_MILP_NO_COLD_LU` at 60 s
+    /// # What the band bought, A/B'd against `--no-cold-lu` at 60 s
     ///
     /// 61 instance pairs (40 in band, 21 outside), one binary, both arms.
     /// In-band totals: 89,220 → 21,264 eta rebuilds, 861.2 s → 99.3 s of REFAC,
@@ -3335,7 +3292,7 @@ impl FloatLp {
     ///   (m = 40,962) 242 vs 243 eta rebuilds with the identical root LP bound
     ///   9.028183 and `LUFACT count=0` in both arms, and neos-827175
     ///   (m = 14,187) 371 vs 373 with its triangular crash intact in both —
-    ///   which is the confound the `AY_MILP_LU=1` force-lever could not avoid.
+    ///   which is the confound the `--lu` force-lever could not avoid.
     /// * `AY_MILP_LU_VERIFY=1` — refactorize-from-scratch and re-ask after EVERY
     ///   single Forrest–Tomlin update, the strictest cross-check the crate has,
     ///   and in class here because the band sits inside `verify_after_for`'s
@@ -3360,7 +3317,7 @@ impl FloatLp {
     ///
     /// WARM solves are untouched here: they already take the LU lane through
     /// `node_lu` (`warm.is_some() && tall_lu()`), which is why the only measured
-    /// gap was the cold root. `AY_MILP_NO_COLD_LU` restores the historical
+    /// gap was the cold root. `--no-cold-lu` restores the historical
     /// eta-file cold root byte-for-byte.
     pub(crate) fn cold_root_lu(&self) -> bool {
         !no_cold_lu() && cold_root_lu_band(self.m, cold_lu_min_rows(), cold_lu_max_rows())
@@ -3571,8 +3528,8 @@ impl FloatLp {
     /// cleanup; a rolled-back walk is a LOSS. Deterministic (counters, no
     /// clocks), self-gating (a class that keeps winning never bypasses), and
     /// fail-closed as ever: this chooses which float walk runs, never what is
-    /// believed. `AY_MILP_DUAL_BYPASS=off` kills it (always attempt);
-    /// `=force` always bypasses (measurement lever).
+    /// believed. `--dual-bypass-mode 0` kills it (always attempt);
+    /// `--dual-bypass-mode 2` always bypasses (measurement lever).
     pub(crate) fn warm_dual_should_attempt(&self) -> bool {
         match dual_bypass_mode() {
             0 => true,
@@ -3633,6 +3590,8 @@ impl FloatLp {
         if j < self.n {
             let (s, e) = (self.col_ptr[j], self.col_ptr[j + 1]);
             debug_assert!(e <= self.col_idx.len() && s <= e);
+            // SAFETY: `s..e` bounds the aligned CSC index/value arrays, and
+            // every stored row is less than `out.len()` by construction.
             unsafe {
                 let ci = self.col_idx.as_ptr();
                 let cv = self.p_col_val().as_ptr();
@@ -3826,6 +3785,7 @@ impl FloatLp {
         })
     }
 
+    #[track_caller]
     pub(crate) fn solve_bounded(
         &self,
         lower: &[f64],
@@ -3842,6 +3802,7 @@ impl FloatLp {
     /// [`WarmSolveMode::PrimalProofContinuation`] takes the same direct-primal
     /// path but returns a verdict candidate that its caller must exactify just
     /// like a [`WarmSolveMode::Normal`] result.
+    #[track_caller]
     pub(crate) fn solve_bounded_with_mode(
         &self,
         lower: &[f64],
@@ -3854,6 +3815,17 @@ impl FloatLp {
             warm.is_some() || warm_mode == WarmSolveMode::Normal,
             "direct-primal warm modes require an adopted warm basis"
         );
+        // ATTRIBUTION (measurement only, gated): charge this solve to the exact
+        // `file:line` that asked for it. `#[track_caller]` chains through the
+        // `solve_bounded` shim, so the location is the real search call site.
+        // NOTE: `Location::caller()` must be called DIRECTLY in this
+        // `#[track_caller]` body — inside a closure it resolves to the closure,
+        // not to the propagated caller, and the whole site census collapses.
+        if crate::attrib::on() {
+            crate::attrib::record_solve_site(std::panic::Location::caller());
+        }
+        let _attrib = crate::attrib::on()
+            .then(|| AttribLpStamp(std::time::Instant::now(), crate::attrib::level()));
         stats::bump(&stats::SOLVES);
         // ITERATION LEDGER: charge this solve to the phase live ON ENTRY. The
         // iterations it goes on to run are charged where they RUN, so a solve
@@ -3889,17 +3861,11 @@ impl FloatLp {
         // than fresh units (22.1 vs 16.1 it/solve; wall 9.5s vs 7.3s on 70x52 s2026,
         // 10.3s vs 8.1s on 60x45 s7, 68.3s vs 54.2s on 70x52 s99) — a weight belongs
         // to a row SLOT, and the slot's meaning does not survive the basis changing
-        // under it across solves. Off by default; `AY_MILP_DSE_PERSIST` keeps the
-        // measurement lever alive.
-        if warm.is_some() && dse_persist_enabled() {
-            sx.dse = self
-                .dse_cache
-                .0
-                .borrow_mut()
-                .take()
-                .filter(|v| v.len() == self.m)
-                .unwrap_or_else(|| vec![1.0; self.m]);
-        } else {
+        // under it across solves. (B18: the persist arm and its env lever are
+        // RETIRED — measured slower on the seeds it was tried on; the
+        // overflow pathology was pre-cap and produced no wrong answers. The
+        // numbers above are the surviving record of the reversal.)
+        {
             // In place: identical to `vec![1.0; m]`, minus the allocation.
             sx.dse.resize(self.m, 1.0);
             sx.dse.fill(1.0);
@@ -3919,7 +3885,7 @@ impl FloatLp {
         // the identity crash, so the two cannot compose); models whose peel
         // declines — set-partition (air05: the singleton queue never seeds),
         // square-ish, everything else — fall through to exactly the historical
-        // path, and the decline traces say why. The explicit `AY_MILP_LU=1`
+        // path, and the decline traces say why. The explicit `--lu`
         // force-lever keeps its meaning (LU path, no crash), as does
         // `plain_cold`'s cache-drop on success below.
         let crash_installed = warm.is_none()
@@ -3976,7 +3942,7 @@ impl FloatLp {
         //
         // Ordered AFTER the triangular crash on purpose. The crash and the LU
         // operator "cannot compose" (the note above), and the blunt
-        // `AY_MILP_LU=1` force-lever suppresses the crash outright via
+        // `--lu` force-lever suppresses the crash outright via
         // `!lu_enabled()` — which is what made neos-827175 (m=14,187, 10,512/
         // 10,512 equality rows peeled) look like an LU-lane loss when it was a
         // crash loss. This gate never fires when `crash_installed`, so a
@@ -3997,30 +3963,7 @@ impl FloatLp {
                 rep_basis: (self.n..self.n + self.m).collect(),
             });
         }
-        if let Some(cache) = sx.lu.as_mut() {
-            // A fresh Simplex is born on the crash basis with the invariant
-            // "operator == current basis". A COLD solve never refactorizes
-            // before its first pricing, so a cached operator representing any
-            // other basis must be reset to the crash identity here (a stale
-            // operator against the wrong basis prices garbage — caught by the
-            // differential harness as an Unknown, never as a wrong answer).
-            // A WARM solve keeps the operator: `warm_start` adopts a basis and
-            // unconditionally refactorizes, where a basis MATCH makes the
-            // cached operator free — the whole point of carrying it across
-            // solves.
-            if warm.is_none()
-                && cache
-                    .rep_basis
-                    .iter()
-                    .enumerate()
-                    .any(|(r, &j)| j != self.n + r)
-            {
-                cache.eng.reset_to_identity();
-                cache.rep_basis.clear();
-                cache.rep_basis.extend(self.n..self.n + self.m);
-            }
-            sx.sync_lu_counters();
-        }
+        bounded_setup::reset_cached_lu_basis(self, &mut sx, warm.is_none());
         let warm_started = warm.is_some();
         // LANE/CALLER ATTRIBUTION (trace only): the lane is fixed now (an LU
         // engine is installed or it is not); snapshot the eta-rebuild count so
@@ -4050,37 +3993,20 @@ impl FloatLp {
         // anything). The BIG size class is never classified: its whole bundle
         // is already on and its path must stay byte-identical. See the
         // `chain_shape` field for the regime and the measurements.
-        if warm.is_none()
-            && sx.lu.is_none()
-            && !no_tri_crash()
-            && self.chain_shape.get() == 0
-            && !(self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS)
-        {
-            let candidate =
-                chain_shape_enabled() && self.m >= TALL_LU_ROWS && self.n < DEVEX_WIDTH * self.m;
-            let census = shape_census_enabled() && trace_enabled();
-            let mut is_chain = false;
-            if candidate || census {
-                let (neq, peeled) = self.chain_peel_census(&sx.lo, &sx.up);
-                // CHAIN: equality rows carry real mass (>= m/4) and peel
-                // near-completely (>= 15/16) — the layered-affine-chain
-                // signature (k=546: 1,235/1,235 peel on 2,874 rows; see the
-                // census table in the report). The bar is deliberately high:
-                // the bundle exists for near-triangular chains, not merely
-                // for LPs that happen to have some equalities.
-                is_chain = candidate && neq * 4 >= self.m && peeled * 16 >= neq * 15;
-                if trace_enabled() {
-                    eprintln!(
-                        "AY_MILP_TRACE shape census: m={} n={} neq={neq} peeled={peeled} \
-                         candidate={candidate} chain={is_chain}",
-                        self.m, self.n
-                    );
-                }
+        if let Some(census) = bounded_setup::classify_chain_shape(self, &sx, warm.is_none()) {
+            if census.trace {
+                eprintln!(
+                    "--trace shape census: m={} n={} neq={} peeled={} \
+                     candidate={} chain={}",
+                    self.m,
+                    self.n,
+                    census.equalities,
+                    census.peeled,
+                    census.candidate,
+                    census.is_chain
+                );
             }
-            // A chain verdict ARMS the rescue (state 3) — it does not fire it.
-            // The default path stays bit-for-bit until a cold walk dies; see
-            // the escalation below the `run` call.
-            self.chain_shape.set(if is_chain { 3 } else { 2 });
+            self.chain_shape.set(if census.is_chain { 3 } else { 2 });
         }
         // (The triangular-crash attempt for cold big-LP / chain-shape solves
         // happens ABOVE, before the LU-install decision — see `crash_installed`.
@@ -4140,7 +4066,7 @@ impl FloatLp {
             sx.probe_iters_left = u64::MAX;
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE chain probe: cold walk {:?} after {} primal iters",
+                    "--trace chain probe: cold walk {:?} after {} primal iters",
                     status,
                     stats::get(&stats::PRIMAL_ITERS) - primal_before
                 );
@@ -4162,7 +4088,7 @@ impl FloatLp {
                     status = sx.run(self, false, WarmSolveMode::Normal, deadline);
                     if trace_enabled() {
                         eprintln!(
-                            "AY_MILP_TRACE chain probe: bundle retry {:?} ({} primal iters total)",
+                            "--trace chain probe: bundle retry {:?} ({} primal iters total)",
                             status,
                             stats::get(&stats::PRIMAL_ITERS) - primal_before
                         );
@@ -4201,12 +4127,9 @@ impl FloatLp {
         );
         // The factorization survives to the next solve on this LP.
         *self.lu_cache.0.borrow_mut() = sx.lu.take();
-        // The DSE cache is only ever READ under AY_MILP_DSE_PERSIST, so it is
-        // only written there too — the default path keeps the weights inside
-        // the pooled solver instead of round-tripping an allocation per solve.
-        if dse_persist_enabled() {
-            *self.dse_cache.0.borrow_mut() = Some(std::mem::take(&mut sx.dse));
-        }
+        // (B18: the DSE persist cache write went with its arm; the default
+        // path keeps the weights inside the pooled solver instead of
+        // round-tripping an allocation per solve.)
         let out = Candidate {
             basis: sx.basis.clone(),
             at: sx.at.clone(),
@@ -4454,14 +4377,6 @@ impl Clone for SxCell {
     }
 }
 
-/// Same take/put + Clone-to-None protocol as `LuCacheCell`, for the DSE weights.
-struct LuCacheCellDse(std::cell::RefCell<Option<Vec<f64>>>);
-impl Clone for LuCacheCellDse {
-    fn clone(&self) -> Self {
-        LuCacheCellDse(std::cell::RefCell::new(None))
-    }
-}
-
 impl Clone for LuCacheCell {
     fn clone(&self) -> Self {
         LuCacheCell(std::cell::RefCell::new(None))
@@ -4510,8 +4425,8 @@ impl Clone for ProbeReuseCell {
 /// Kill switch for cross-probe LU reuse (`AY_MILP_NO_PROBE_LU_REUSE=1`). Default
 /// on: the reuse is bit-identical, so the only reason to disable it is A/B timing.
 fn probe_lu_reuse_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_PROBE_LU_REUSE").is_none())
+    // B22: retired; the reuse is bit-identical and stays on.
+    true
 }
 
 /// RAII arm/disarm guard for cross-probe LU reuse, so an early return or panic
@@ -4618,8 +4533,8 @@ struct BumpFactor {
 /// each rebuild. Diagnostic-only; gates the BTF block-factor program (many
 /// medium SCCs ⇒ block substitution wins, one giant SCC ⇒ it does not).
 fn bump_scc_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_SCC").is_some())
+    // B22: retired (diagnostic served its BTF-gating purpose).
+    false
 }
 
 /// The block-triangular structure of the bump `acols` (transformed bump
@@ -5153,7 +5068,7 @@ struct Simplex {
     /// bounds inside `run` — exported on the Candidate so the tree does not pay
     /// for the same verification twice.
     farkas_verified: bool,
-    /// The sparse LU / Forrest–Tomlin basis engine (`AY_MILP_LU=1`), replacing
+    /// The sparse LU / Forrest–Tomlin basis engine (`--lu`), replacing
     /// the eta file as the representation of `B^{-1}`. Installed by
     /// `solve_bounded` from the LP's cross-solve cache; advice-lane only, like
     /// everything here: a defect costs speed or tightness, never soundness.
@@ -5163,7 +5078,7 @@ struct Simplex {
     /// cost estimate, because no deterministic cost unit survived measurement.
     ///
     /// Reset on every `reset`, INCLUDING `keep_factor=true`. A pooled warm
-    /// solver's rebuild bill is a different lane's problem (`AY_MILP_WARM_LU`,
+    /// solver's rebuild bill is a different lane's problem (`--warm-lu`,
     /// default off, and a documented incumbent-moving landmine); charging its
     /// cross-solve total to one solve's budget would promote the flip-LNS eval
     /// loop, which is not what any of this was measured on.
@@ -5320,7 +5235,7 @@ struct Simplex {
     /// byte-identical.
     oom: bool,
     /// DIFFERENTIAL-HARNESS SEAM (`factor_probe`): forces the `refactorize`
-    /// bump-LU base-factor lane for this solve, bypassing the `AY_MILP_NO_BUMP_LU`
+    /// bump-LU base-factor lane for this solve, bypassing the `--no-bump-lu`
     /// env read. `None` = production (the env expression decides — BYTE-IDENTICAL
     /// to the pre-seam gate); `Some(1)` = force the Markowitz bump-LU lane on
     /// (still subject to the peel being active AND the bump above `bump_lu_min`);
@@ -5355,7 +5270,7 @@ struct Simplex {
     refactor_bump_lu_used: bool,
 }
 
-/// Eta-file fill-cap multiplier (`AY_MILP_ETA_CAP_MULT`, default 4 = the
+/// Eta-file fill-cap multiplier (`the eta-cap-mult knob`, default 4 = the
 /// shipped `4 * nnz` cap, byte-identical unset). MEASUREMENT LEVER for the
 /// w5/full-depth root-LP refactorization wall: measured w5 fill is ≈365k
 /// nnz/pivot, so `4 × nnz` on a 7.5M-nnz model forces a rebuild every ~85
@@ -5368,23 +5283,13 @@ struct Simplex {
 /// `verify_after`.
 fn eta_cap_mult() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_ETA_CAP_MULT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
-    })
+    *N.get_or_init(|| crate::tune::count_opt(crate::tune::Knob::EtaCapMult).unwrap_or(4))
 }
 
 /// Generation cap for the cross-solve skip (`AY_MILP_ETA_GEN`, default in code).
 fn eta_gen_cap() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("AY_MILP_ETA_GEN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(u32::MAX)
-    })
+    *N.get_or_init(|| u32::MAX)
 }
 
 /// Age cap (absorbed pivots) for the cross-solve skip (`AY_MILP_ETA_AGE`). NOT
@@ -5398,10 +5303,7 @@ fn eta_gen_cap() -> u32 {
 fn eta_reuse_age() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("AY_MILP_ETA_AGE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(48)
+        48
             // m = 0: this cache is process-wide with no LP in scope, so the cap
             // is the conservative small-m drift policy, as before the size gate.
             .min(refactor_every(0))
@@ -5436,7 +5338,7 @@ impl Simplex {
             y_is_duals: false,
             // Refactor early once the eta-file's fill rivals the matrix itself:
             // that is when a single FTRAN stops being cheap. The multiplier is
-            // env-tunable (`AY_MILP_ETA_CAP_MULT`, default 4 — see
+            // env-tunable (`the eta-cap-mult knob`, default 4 — see
             // `eta_cap_mult` for the measured w5 economics this lever probes).
             eta_nnz_cap: (eta_cap_mult() * nnz).max(16 * lp.m).max(1024),
             alpha: vec![0.0; lp.m],
@@ -5502,7 +5404,7 @@ impl Simplex {
     fn reset(&mut self, lp: &FloatLp, lower: &[f64], upper: &[f64], keep_factor: bool) {
         debug_assert!(self.m == lp.m && self.cols == lp.cols);
         // The big-LP rebuild-floor raise in `refactorize` is per-solve state…
-        // `eta_cap_mult()` (not a literal 4) so `AY_MILP_ETA_CAP_MULT` is a
+        // `eta_cap_mult()` (not a literal 4) so `the eta-cap-mult knob` is a
         // LIVE lever: `new` seeds the cap through it but immediately calls
         // this, and every per-solve entry lands here — a hardcoded 4 made the
         // env ladder a silent no-op (the queued prop885 REFAC-wall ladder
@@ -5673,6 +5575,8 @@ impl Simplex {
         }
         debug_assert_eq!(etas.start.len(), etas.len() + 1);
         let n = etas.len();
+        // SAFETY: `EtaFile` keeps `p`/`diag` at `n`, `start` at `n + 1`, and
+        // its ranges within aligned `idx`/`val`; all stored rows index `w`.
         unsafe {
             let ps = etas.p.as_ptr();
             let ds = etas.diag.as_ptr();
@@ -5769,6 +5673,8 @@ impl Simplex {
         let etas = &self.etas;
         debug_assert_eq!(etas.start.len(), etas.len() + 1);
         let n = etas.len();
+        // SAFETY: `EtaFile` keeps `p`/`diag` at `n`, `start` at `n + 1`, and
+        // its ranges within aligned `idx`/`val`; all stored rows index `alpha`.
         unsafe {
             let ps = etas.p.as_ptr();
             let ds = etas.diag.as_ptr();
@@ -5859,6 +5765,8 @@ impl Simplex {
         let etas = &self.etas;
         let y = &mut self.y[..];
         debug_assert_eq!(etas.start.len(), etas.len() + 1);
+        // SAFETY: `EtaFile` keeps `p`/`diag` aligned, `start` at `len + 1`, and
+        // its ranges within aligned `idx`/`val`; all stored rows index `y`.
         unsafe {
             let ps = etas.p.as_ptr();
             let ds = etas.diag.as_ptr();
@@ -6177,7 +6085,7 @@ impl Simplex {
         // (margin -> infinity is today's behaviour exactly).
         //
         // Shipping that needs a probe schedule so the discarded factorisations are
-        // bounded. Until then this stays behind `AY_MILP_BUMP_FILL_TRIP=1`.
+        // bounded. Until then the lane stays off (B22: env spelling retired).
         if self.bump_fill_latched || no_fill_trip() || !fill_trip_optin() {
             return;
         }
@@ -6348,7 +6256,7 @@ impl Simplex {
             // that a trigger provoked now leaves `since_refactor` strictly
             // below that trigger, so every re-ask happens at most once per
             // clean basis. (The `min` guards an env override setting
-            // AY_MILP_VERIFY_AFTER above AY_MILP_REFACTOR_EVERY.)
+            // AY_MILP_VERIFY_AFTER above the refactor-every knob.)
             let basis_match = cache.rep_basis == self.basis;
             if basis_match && cache.eng.updates() < verify_cap && cache.eng.nnz() < self.eta_nnz_cap
             {
@@ -6834,7 +6742,7 @@ impl Simplex {
             }
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE refactorize peel: {} fronts + {} bump + {} backs of {}",
+                    "--trace refactorize peel: {} fronts + {} bump + {} backs of {}",
                     fronts.len(),
                     ordered.len() - fronts.len() - backs.len(),
                     backs.len(),
@@ -6874,14 +6782,14 @@ impl Simplex {
             // operator, `nnz(L)+nnz(U)` entries. Gated on the peel being
             // active AND the bump above `bump_lu_min` so the crash-walk bases
             // (~160-column bumps, already near-zero-fill) keep the measured
-            // PFI path; `AY_MILP_NO_BUMP_LU=1` kills it for A/B. Warm updates
+            // PFI path; `--no-bump-lu` kills it for A/B. Warm updates
             // stay PFI on top, exactly as before.
             // The `bump_lu_override` seam (default `None`) reproduces the env
             // expression BYTE-FOR-BYTE in production; `factor_probe` sets it to
             // force a specific lane for the differential harness. `bump_lane`:
             // 0 = PFI product-form (no bump segment), 1 = monolithic Markowitz
             // bump-LU (`bump_lu_segment`), 2 = block-triangular (`bump_btf_segment`).
-            // The default (override `None`, `AY_MILP_BUMP_BTF` unset) is lane 1
+            // The default (override `None`, `the bump-btf knob` unset) is lane 1
             // exactly as before — BTF is opt-in until proven.
             // THE FILL-RATE TRIP joins the column floor by OR: the lane arms on the
             // floor exactly as before, or once this solve has MEASURED a bump whose
@@ -6896,7 +6804,7 @@ impl Simplex {
             // produced. Self-limiting against the slot-order retry: that path clears
             // `forced` before looping, so a re-entry cannot charge twice.
             // ⚠ ATTRIBUTION. The charge must land on THE FLOOR, not on an operator who
-            // turned the lane off. `AY_MILP_NO_BUMP_LU=1` and an explicit
+            // turned the lane off. `--no-bump-lu` and an explicit
             // `bump_lu_override` both force the product-form path regardless of
             // `peel_nb`, so charging them books an A/B arm's own kill switch as
             // forgone cost of the floor. Both are inert at the default, so this does
@@ -6999,9 +6907,13 @@ impl Simplex {
                 // pivot loops.
                 if best.is_none() {
                     for &i in &self.nz {
+                        // SAFETY: `ftran` guarantees each support row is less
+                        // than `m`, which is the length of `rf_row_used`.
                         if unsafe { *self.rf_row_used.get_unchecked(i) } {
                             continue;
                         }
+                        // SAFETY: `ftran` guarantees each support row is less
+                        // than `m`, which is the length of `alpha`.
                         let a = unsafe { self.alpha.get_unchecked(i) }.abs();
                         if a > best_mag {
                             best_mag = a;
@@ -7043,6 +6955,8 @@ impl Simplex {
                 let piv = self.alpha[p];
                 let inv = 1.0 / piv;
                 for &i in &self.nz {
+                    // SAFETY: `ftran` guarantees every `i` in `nz` is less
+                    // than `m`, which is the length of `alpha`.
                     let ai = unsafe { *self.alpha.get_unchecked(i) };
                     if i != p && ai != 0.0 {
                         self.etas.push_entry(i, -ai * inv);
@@ -7052,6 +6966,8 @@ impl Simplex {
                 self.rf_new_basis[p] = j;
                 self.rf_row_used[p] = true;
                 for &i in &self.nz {
+                    // SAFETY: `ftran` guarantees every `i` in `nz` is less
+                    // than `m`, which is the length of `alpha`.
                     unsafe { *self.alpha.get_unchecked_mut(i) = 0.0 };
                 }
                 if self.etas.entries() > fill_cap {
@@ -7082,7 +6998,7 @@ impl Simplex {
                     (seg_eb, seg_tb)
                 };
                 eprintln!(
-                    "AY_MILP_BUMP_DIAG rebuild: nf={peel_nf} nb={peel_nb} nk={} | entries F={ef} B={} K={} | t F={tf:.2}s B={:.2}s K={:.2}s | lu={} kicked={kicked} blew={blew}",
+                    "--bump-diag rebuild: nf={peel_nf} nb={peel_nb} nk={} | entries F={ef} B={} K={} | t F={tf:.2}s B={:.2}s K={:.2}s | lu={} kicked={kicked} blew={blew}",
                     deferred.len().saturating_sub(peel_nf + peel_nb),
                     eb.saturating_sub(ef),
                     e_end.saturating_sub(eb),
@@ -7098,7 +7014,7 @@ impl Simplex {
             // go again in the historical slot order, unguarded.
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE refactorize: peel-order fill blew {} > {fill_cap}; slot-order retry",
+                    "--trace refactorize: peel-order fill blew {} > {fill_cap}; slot-order retry",
                     self.etas.entries()
                 );
             }
@@ -7144,9 +7060,13 @@ impl Simplex {
                 let mut best: Option<usize> = None;
                 let mut best_mag = tol;
                 for &i in &self.nz {
+                    // SAFETY: `ftran` guarantees each support row is less
+                    // than `m`, which is the length of `rf_row_used`.
                     if unsafe { *self.rf_row_used.get_unchecked(i) } {
                         continue;
                     }
+                    // SAFETY: `ftran` guarantees each support row is less
+                    // than `m`, which is the length of `alpha`.
                     let a = unsafe { self.alpha.get_unchecked(i) }.abs();
                     if a > best_mag {
                         best_mag = a;
@@ -7157,6 +7077,8 @@ impl Simplex {
                     let piv = self.alpha[p];
                     let inv = 1.0 / piv;
                     for &i in &self.nz {
+                        // SAFETY: `ftran` guarantees every `i` in `nz` is less
+                        // than `m`, which is the length of `alpha`.
                         let ai = unsafe { *self.alpha.get_unchecked(i) };
                         if i != p && ai != 0.0 {
                             self.etas.push_entry(i, -ai * inv);
@@ -7173,7 +7095,7 @@ impl Simplex {
             REFAC_REPAIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if trace_enabled() && REFAC_REPAIRS.load(std::sync::atomic::Ordering::Relaxed) <= 5 {
                 eprintln!(
-                    "AY_MILP_TRACE refactorize: singular basis repaired ({kicked} dependent column(s) kicked to their bounds)"
+                    "--trace refactorize: singular basis repaired ({kicked} dependent column(s) kicked to their bounds)"
                 );
             }
         }
@@ -7225,7 +7147,7 @@ impl Simplex {
         self.chain_gen = 0;
         if self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS && trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE refactorize: rebuilt {} etas / {} entries in {:.2}s",
+                "--trace refactorize: rebuilt {} etas / {} entries in {:.2}s",
                 self.etas.len(),
                 self.etas.entries(),
                 _t.elapsed().as_secs_f64()
@@ -7299,10 +7221,7 @@ impl Simplex {
         }
         let open: Vec<bool> = self.rf_row_used.iter().map(|&u| !u).collect();
         if bump_scc_enabled() {
-            eprintln!(
-                "AY_MILP_TRACE {}",
-                bump_scc_histogram(self.m, &acols, &open)
-            );
+            eprintln!("--trace {}", bump_scc_histogram(self.m, &acols, &open));
         }
         let Some(f) = bump_eliminate(self.m, acols, &open, tol, entry_cap) else {
             return false;
@@ -7334,7 +7253,7 @@ impl Simplex {
         *kicked += f.kicked.len();
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE refactorize bump LU: {nb} cols ({gathered} gathered nnz) -> {} pivots, L {lnnz} + U {unnz} entries, {} kicked, {:.2}s",
+                "--trace refactorize bump LU: {nb} cols ({gathered} gathered nnz) -> {} pivots, L {lnnz} + U {unnz} entries, {} kicked, {:.2}s",
                 f.stages.len(),
                 f.kicked.len(),
                 _t.elapsed().as_secs_f64()
@@ -7389,10 +7308,7 @@ impl Simplex {
         // `rf_row_used`), the exact pivot set — matched here and per block below.
         let open: Vec<bool> = self.rf_row_used.iter().map(|&u| !u).collect();
         if bump_scc_enabled() {
-            eprintln!(
-                "AY_MILP_TRACE {}",
-                bump_scc_histogram(self.m, &acols, &open)
-            );
+            eprintln!("--trace {}", bump_scc_histogram(self.m, &acols, &open));
         }
         // Block-triangular decomposition + topological (sources-first) order.
         let (col_block, block_order, col_row) = bump_scc_blocks(self.m, &acols, &open);
@@ -7470,7 +7386,7 @@ impl Simplex {
         }
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE refactorize bump BTF: {nb} cols ({gathered} gathered nnz) -> {nblocks} blocks (largest {largest_block}), L {total_l} + U {total_u} = {} fill, {nk} kicked, {:.2}s",
+                "--trace refactorize bump BTF: {nb} cols ({gathered} gathered nnz) -> {nblocks} blocks (largest {largest_block}), L {total_l} + U {total_u} = {} fill, {nk} kicked, {:.2}s",
                 total_l + total_u,
                 _t.elapsed().as_secs_f64()
             );
@@ -7491,6 +7407,8 @@ impl Simplex {
             let (s, e) = (lp.col_ptr[j], lp.col_ptr[j + 1]);
             debug_assert!(e <= lp.col_idx.len() && s <= e);
             let mut dot = 0.0f64;
+            // SAFETY: `s..e` bounds the aligned CSC index/value arrays, and
+            // every stored row is less than `self.y.len()` by construction.
             unsafe {
                 let ci = lp.col_idx.as_ptr();
                 let cv = lp.p_col_val().as_ptr();
@@ -7537,6 +7455,8 @@ impl Simplex {
         } else {
             // Unchecked under the CSR invariants (`row_idx` entries `< n`,
             // `row_ptr` monotone within bounds), asserted in debug builds.
+            // SAFETY: Every `row_ptr` range bounds the aligned CSR index/value
+            // arrays, and each stored column is less than `n <= arow.len()`.
             unsafe {
                 let ri = lp.row_idx.as_ptr();
                 let rv = lp.p_row_val().as_ptr();
@@ -7731,7 +7651,7 @@ impl Simplex {
     /// forced pivot or eta-entry growth (a non-triangular assignment on some
     /// future model) abandons the build and falls back to the all-logical
     /// crash. Gated to `cols >= BIG_LP_COLS && m >= BIG_LP_ROWS` cold solves on the eta path
-    /// (`AY_MILP_TRI_CRASH=1` forces it on small LPs for tests;
+    /// (`the tri-crash-all knob` forces it on small LPs for tests;
     /// `AY_MILP_NO_TRI_CRASH` kills it). The typed
     /// `SolveOpts::with_range_logical_triangular_crash()` request, or the
     /// historical exact `AY_MILP_RANGE_LOGICAL_CRASH=1` compatibility opt-in,
@@ -7762,7 +7682,7 @@ impl Simplex {
         // basis to change the phase-1 regime; keep the all-logical start.
         if neq * 2 < m && !retain_range_logicals {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE triangular crash declined: {neq}/{m} equality rows");
+                eprintln!("--trace triangular crash declined: {neq}/{m} equality rows");
             }
             return false;
         }
@@ -7831,7 +7751,7 @@ impl Simplex {
             // bump-capable crash or nothing.
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE triangular crash declined: peel {}/{neq} eq rows (m={m})",
+                    "--trace triangular crash declined: peel {}/{neq} eq rows (m={m})",
                     peel.len()
                 );
             }
@@ -7877,7 +7797,7 @@ impl Simplex {
                 // for fixed logicals, so nothing else needs undoing.
                 if trace_enabled() {
                     eprintln!(
-                        "AY_MILP_TRACE triangular crash declined: {} at row {}/{} ({} eta entries, cap {entries_cap})",
+                        "--trace triangular crash declined: {} at row {}/{} ({} eta entries, cap {entries_cap})",
                         if ok { "eta blow-up" } else { "tiny pivot" },
                         peel.len() - k,
                         peel.len(),
@@ -7897,7 +7817,7 @@ impl Simplex {
         self.chain_gen = 0;
         if trace_enabled() && retain_range_logicals {
             eprintln!(
-                "AY_MILP_TRACE range-logical triangular crash: equality_rows={neq} \
+                "--trace range-logical triangular crash: equality_rows={neq} \
                  range_rows={} peeled={} retained_range_logicals={} eta_entries={}",
                 m - neq,
                 peel.len(),
@@ -7906,7 +7826,7 @@ impl Simplex {
             );
         } else if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE triangular crash: peeled {}/{neq} equality rows ({} eta entries)",
+                "--trace triangular crash: peeled {}/{neq} equality rows ({} eta entries)",
                 peel.len(),
                 self.etas.entries()
             );
@@ -8080,6 +8000,34 @@ impl Simplex {
             && caller_tag() != CALLER_FLIP_LNS
     }
 
+    /// B19 flip-arm choice: forced sparse needs live LU; auto applies the
+    /// FT-spike predicted-marked-set test and selects dense on ties.
+    fn prepare_sparse_flip_solve(&mut self, lp: &FloatLp, mode: usize) -> bool {
+        let sparse = match mode {
+            2 => false,
+            1 => self.lu.is_some(),
+            _ => self.lu.as_ref().is_some_and(|cache| {
+                let m = self.m;
+                let unnz = cache.eng.unnz();
+                let est: usize = self
+                    .flips
+                    .iter()
+                    .map(|&ju| {
+                        let j = ju as usize;
+                        if j < lp.n {
+                            lp.col_ptr[j + 1] - lp.col_ptr[j]
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
+                est.saturating_mul(m.saturating_add(unnz)).saturating_mul(2) < m.saturating_mul(m)
+            }),
+        };
+        self.wflip.fill(0.0);
+        sparse
+    }
+
     fn dual_simplex_inner(
         &mut self,
         lp: &FloatLp,
@@ -8115,7 +8063,7 @@ impl Simplex {
         let rt_profile = iter_profile_enabled();
         let rt_bits_key = rt_bits_key_enabled();
         let tau_nz = tau_nz_enabled();
-        let flip_nz = flip_nz_enabled();
+        let flip_solve = flip_solve_mode();
         let bland_after = budget / 4;
         let mut stall = 0usize;
         // No stale Farkas candidate may survive into this walk (see `noenter_ray`).
@@ -8500,7 +8448,10 @@ impl Simplex {
             // cols` bounds `lo`/`up` (a basis invariant), debug-asserted.
             for i in 0..self.m {
                 debug_assert!(i < self.basis.len() && self.basis[i] < self.lo.len());
+                // SAFETY: `i < m` bounds the row arrays `basis` and `xb`.
                 let (b, v) = unsafe { (*self.basis.get_unchecked(i), *self.xb.get_unchecked(i)) };
+                // SAFETY: The basis invariant keeps `b` within the aligned
+                // column-bound arrays `lo` and `up`, as asserted above.
                 let (lo_b, up_b) =
                     unsafe { (*self.lo.get_unchecked(b), *self.up.get_unchecked(b)) };
                 let ft = feas_tol * lp.bmul(b);
@@ -8517,6 +8468,7 @@ impl Simplex {
                     }
                 } else {
                     // Steepest-edge score: violation normalised by the row's norm.
+                    // SAFETY: `i < m`, and `dse` has one entry per row.
                     let score = viol * viol / unsafe { *self.dse.get_unchecked(i) };
                     if score > worst {
                         worst = score;
@@ -8614,6 +8566,8 @@ impl Simplex {
                     self.arow[n + r] = -y_r; // the logical column is -e_r
                 }
             } else {
+                // SAFETY: CSR ranges bound the aligned index/value arrays;
+                // `r < m` bounds `rho` and `n + r`, while every index is < `n`.
                 unsafe {
                     let ri = lp.row_idx.as_ptr();
                     let rv = lp.p_row_val().as_ptr();
@@ -9182,7 +9136,7 @@ impl Simplex {
                 DUAL_VANISH_IT.fetch_add(iter as u64, Relaxed);
                 if trace_enabled() && DUAL_VANISH.load(Relaxed) <= 5 {
                     eprintln!(
-                        "AY_MILP_TRACE dual vanish: iter={iter} piv={piv:.3e} arow={:.3e} since_refac={}",
+                        "--trace dual vanish: iter={iter} piv={piv:.3e} arow={:.3e} since_refac={}",
                         self.arow[col], self.since_refactor
                     );
                 }
@@ -9211,7 +9165,7 @@ impl Simplex {
                 None
             };
             if !self.flips.is_empty() {
-                self.wflip.fill(0.0);
+                let flip_nz = self.prepare_sparse_flip_solve(lp, flip_solve);
                 // Track wflip's matrix-row support during the scatter ONLY when
                 // the sparse solve is armed (opt-in, a measured dead-end here):
                 // the pushes are dead on the default dense/eta paths, so those
@@ -9306,7 +9260,7 @@ impl Simplex {
                     DUAL_LUREJ_IT.fetch_add(iter as u64, Relaxed);
                     if trace_enabled() && DUAL_LUREJ.load(Relaxed) <= 5 {
                         eprintln!(
-                            "AY_MILP_TRACE dual lurej: iter={iter} piv={piv:.3e} since_refac={}",
+                            "--trace dual lurej: iter={iter} piv={piv:.3e} since_refac={}",
                             self.since_refactor
                         );
                     }
@@ -9399,8 +9353,10 @@ impl Simplex {
             // `nz` entries are `< m`, bounding alpha/xb/tau/dse (debug-asserted
             // in `ftran`), so these support walks run unchecked.
             for &i in &self.nz {
+                // SAFETY: `ftran` guarantees `i < m`, which bounds `alpha`.
                 let ai = unsafe { *self.alpha.get_unchecked(i) };
                 if i != row && ai != 0.0 {
+                    // SAFETY: `ftran` guarantees `i < m`, which bounds `xb`.
                     unsafe { *self.xb.get_unchecked_mut(i) -= ai * step };
                 }
             }
@@ -9410,6 +9366,7 @@ impl Simplex {
                 let inv = 1.0 / piv;
                 let before = self.etas.entries();
                 for &i in &self.nz {
+                    // SAFETY: `ftran` guarantees `i < m`, which bounds `alpha`.
                     let ai = unsafe { *self.alpha.get_unchecked(i) };
                     if i != row && ai != 0.0 {
                         self.etas.push_entry(i, -ai * inv);
@@ -9512,9 +9469,12 @@ impl Simplex {
             };
             let wr = self.dse[row].max(1e-10);
             for &i in &self.nz {
+                // SAFETY: `ftran` guarantees `i < m`, which bounds `alpha`.
                 let ai = unsafe { *self.alpha.get_unchecked(i) };
                 if i != row && ai != 0.0 {
                     let ar = ai / piv;
+                    // SAFETY: `ftran` guarantees `i < m`, which bounds the
+                    // per-row arrays `tau` and `dse`.
                     let (ti, wi) =
                         unsafe { (*self.tau.get_unchecked(i), *self.dse.get_unchecked(i)) };
                     // NOT `clamp`: max/min maps a NaN (overflowed update) to the 1e-4
@@ -9523,6 +9483,7 @@ impl Simplex {
                     let nw = (wi - 2.0 * ar * ti + ar * ar * wr)
                         .max(1e-4)
                         .min(DSE_WEIGHT_CAP);
+                    // SAFETY: `ftran` guarantees `i < m`, which bounds `dse`.
                     unsafe { *self.dse.get_unchecked_mut(i) = nw };
                 }
             }
@@ -9540,6 +9501,7 @@ impl Simplex {
             }
 
             for &i in &self.nz {
+                // SAFETY: `ftran` guarantees `i < m`, which bounds `alpha`.
                 unsafe { *self.alpha.get_unchecked_mut(i) = 0.0 };
             }
             if let Some(t) = upd_t0 {
@@ -9945,7 +9907,7 @@ impl Simplex {
                     if trace_enabled() && DUAL_POSTCHK.load(Relaxed) <= 3 {
                         let out = self.dual_violations(lp);
                         eprintln!(
-                            "AY_MILP_TRACE !! dual: violations IN={_dv_in} OUT={out} (of {} cols)",
+                            "--trace !! dual: violations IN={_dv_in} OUT={out} (of {} cols)",
                             self.cols
                         );
                     }
@@ -10110,7 +10072,7 @@ impl Simplex {
                 // ledger read `cold-retry=397 solves / 0 iterations` — a phase
                 // that had not run once. Same short-circuit order, so the
                 // default path is unchanged.
-                // MEASUREMENT ARM (`AY_MILP_COLD_DUAL_ALL=1`, default off, byte-identical
+                // MEASUREMENT ARM (`the cold-dual-all knob`, default off, byte-identical
                 // when unset): drop the `wide_tall()` shape gate so the cold dual start is
                 // tried on SQUARE-ISH models too.
                 //
@@ -10200,7 +10162,7 @@ impl Simplex {
             let v = self.dual_violations(lp);
             if v > 0 {
                 eprintln!(
-                    "AY_MILP_TRACE !! a basis just declared OPTIMAL has {v} dual violations (warm={warm_started})"
+                    "--trace !! a basis just declared OPTIMAL has {v} dual violations (warm={warm_started})"
                 );
             }
         }
@@ -10274,7 +10236,7 @@ impl Simplex {
         self.recompute_xb(lp);
         let polished = self.rounds(lp, deadline);
         if trace_enabled() {
-            eprintln!("AY_MILP_TRACE perturbed retry -> {polished:?}");
+            eprintln!("--trace perturbed retry -> {polished:?}");
         }
         polished
     }
@@ -10339,10 +10301,7 @@ impl Simplex {
     /// the one it recorded. They are outward only, so the perturbed box CONTAINS the true one and
     /// a feasible LP stays feasible.
     fn perturb_box(&mut self, lp: &FloatLp) {
-        let pert = std::env::var("AY_MILP_PERTURB")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(PERTURB);
+        let pert = PERTURB;
         for j in 0..self.cols {
             // A hashed unit in [0.5, 1.5), so no two columns move by the same amount.
             let h = (j as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -10364,13 +10323,13 @@ impl Simplex {
 
     /// Stats shim over the pivot loop, and the ITERATION LEDGER's primal hook.
     ///
-    /// When `AY_MILP_LP_STATS` is set it prints one `LPSTAT` line per phase —
+    /// When `--lp-stats` is set it prints one `LPSTAT` line per phase —
     /// iteration count, degenerate-step and bound-flip counts, objective-moving
     /// iterations, wall. Counters are relaxed atomics bumped inside the loop
     /// either way (same cost class as `PRIMAL_ITERS`, which the loop already
     /// bumps); the prints never touch the float path.
     ///
-    /// When `AY_MILP_ITER_LEDGER` is set it also charges this phase's primal
+    /// When `--iter-ledger` is set it also charges this phase's primal
     /// iterations to the (solve-phase, phase-I/II) ledger cell. Both hooks are
     /// per-CALL, never per-iteration.
     fn loop_phase(
@@ -10394,7 +10353,7 @@ impl Simplex {
         status
     }
 
-    /// The `AY_MILP_LP_STATS` half of [`Self::loop_phase`]; see its note.
+    /// The `--lp-stats` half of [`Self::loop_phase`]; see its note.
     fn loop_phase_stats(
         &mut self,
         lp: &FloatLp,
@@ -10456,9 +10415,11 @@ impl Simplex {
         // columns), air03 (124 / 10,757), mod010 (146 / 2,655), air05 (426 / 7,195) -- against
         // every dense instance here, which sits near 1:1.
         let wide = lp.n >= DEVEX_WIDTH * lp.m.max(1);
-        // `AY_MILP_DEVEX=1` forces Devex from iteration 0 regardless of shape
+        // `the devex knob` forces Devex from iteration 0 regardless of shape
         // (measurement lever: square-ish NN LPs grind Dantzig phase 1).
-        let force_devex = std::env::var("AY_MILP_DEVEX").as_deref() == Ok("1");
+        // (B22 briefly retired this as "never set" — WRONG: the
+        // milp_portfolio.py "devex" arm sets it through a dict literal.)
+        let force_devex = crate::tune::caller_flag(crate::tune::Knob::Devex) == Some(true);
         // CHAIN-shape LPs (see `FloatLp::chain_shape`) need Devex from
         // iteration 0 exactly like wide ones — on their COLD walks: the k=546
         // diff-net root walks a massively degenerate phase 1 that Dantzig
@@ -10608,9 +10569,8 @@ impl Simplex {
             // column, and the drift re-ask after it re-checks on a fresh
             // inverse. Bland mode always runs the full smallest-index scan
             // (termination argument). Small LPs keep the exact full sweep.
-            //
             // Two economies, chosen by env:
-            // - CANDIDATE-LIST (default for big LPs; AY_MILP_FULL_PRICING=1
+            // - CANDIDATE-LIST (default for big LPs; --full-pricing
             //   restores full): a MAJOR full pass harvests the top candidates
             //   into a pool; MINOR iterations re-price only the pool (~400×
             //   cheaper) until nothing in it improves, forcing the next major
@@ -10623,22 +10583,16 @@ impl Simplex {
             const MIN_SECTIONS_WITH_CANDIDATE: usize = 2;
             const PRICE_POOL_MAX: usize = 64;
             let big = self.cols >= PARTIAL_PRICE_MIN_COLS;
-            let full_forced = std::env::var("AY_MILP_FULL_PRICING").as_deref() == Ok("1");
-            let sectional = !bland
-                && big
-                && !full_forced
-                && std::env::var("AY_MILP_PARTIAL_PRICING").as_deref() == Ok("1");
-            // Pool mode is ALSO measured-out as a default (w2 walk 5,831 →
-            // 9,978 iterations; w5 walk collapses — phase-1's cb depends on the
-            // violated SET, which shifts globally each pivot, so any cached
-            // candidate list goes stale immediately). The shipping default for
-            // big LPs is the SWEPT full pass below: byte-identical walk, one
-            // sequential O(nnz) sweep instead of scattered per-column dots.
-            let pool_mode = !bland
-                && big
-                && !full_forced
-                && !sectional
-                && std::env::var("AY_MILP_POOL_PRICING").as_deref() == Ok("1");
+            let full_forced =
+                crate::tune::caller_flag(crate::tune::Knob::FullPricing) == Some(true);
+            let sectional = !bland && big && !full_forced && false; // B22: sectional pricing retired (measured-out).
+                                                                    // Pool mode is ALSO measured-out as a default (w2 walk 5,831 →
+                                                                    // 9,978 iterations; w5 walk collapses — phase-1's cb depends on the
+                                                                    // violated SET, which shifts globally each pivot, so any cached
+                                                                    // candidate list goes stale immediately). The shipping default for
+                                                                    // big LPs is the SWEPT full pass below: byte-identical walk, one
+                                                                    // sequential O(nnz) sweep instead of scattered per-column dots.
+            let pool_mode = !bland && big && !full_forced && !sectional && false; // B7: the AY_MILP_POOL_PRICING opt-in is deleted (never shipped on)
 
             // MINOR iteration: re-price the pool only. A pool column that went
             // basic/fixed or stopped improving simply doesn't enter; if none
@@ -10977,7 +10931,7 @@ impl Simplex {
 
             if !min_t.is_finite() {
                 if phase1 && trace_enabled() {
-                    eprintln!("AY_MILP_TRACE !! simplex Stopped: phase-I ratio test unbounded on col {col} (iter {iter})");
+                    eprintln!("--trace !! simplex Stopped: phase-I ratio test unbounded on col {col} (iter {iter})");
                 }
                 return if phase1 {
                     SimplexStatus::Stopped
@@ -10995,16 +10949,15 @@ impl Simplex {
                 stats::bump(&stats::PRIMAL_FLIPS);
             }
             let step = dir * min_t;
-            // STEP TRACE (diagnostic): AY_MILP_STEP_TRACE=N prints the first N
+            // STEP TRACE (diagnostic): --step-trace=N prints the first N
             // pivots' economics — entering column and its frame, the step in both
             // frames, and who blocked — the instrument for scaled-frame stalls.
             {
                 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
                 static STEP_TRACE_LEFT: AtomicU64 = AtomicU64::new(u64::MAX);
                 if STEP_TRACE_LEFT.load(Relaxed) == u64::MAX {
-                    let n = std::env::var("AY_MILP_STEP_TRACE")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
+                    let n = crate::tune::count_opt(crate::tune::Knob::StepTraceN)
+                        .map(|v| v as u64)
                         .unwrap_or(0);
                     STEP_TRACE_LEFT.store(n, Relaxed);
                 }
@@ -11110,7 +11063,7 @@ impl Simplex {
         }
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE !! MAX_ITERS phase{} stall={stall} bland={bland} devex={devex} \
+                "--trace !! MAX_ITERS phase{} stall={stall} bland={bland} devex={devex} \
                  obj={last_obj:.4e} degenerate={_degen} boundflips={_flips} fixed_basics={}",
                 u8::from(!phase1) + 1,
                 (0..self.m)
@@ -12138,22 +12091,14 @@ mod solve_work_frame_tests {
 
 #[cfg(test)]
 mod eager_perturb_gate_tests {
-    use super::{eager_perturb_applies_to, eager_perturb_mode_of};
+    use super::{eager_perturb_applies_to, eager_perturb_mode};
 
-    /// The default spelling must be ARMED, and `1`/`all` must still mean the
-    /// blanket 2026-07-20 behaviour — that is the downstream optimization consumer's documented lever for the
-    /// diff-net root LP, and retiring the blanket DEFAULT must not retire the
-    /// blanket MODE.
+    /// With no caller opinion the mode must be ARMED (1) — the shipped
+    /// default; the blanket arm (2) stays reachable only by explicit request
+    /// (`with_eager_perturb(2)`, builder-validated).
     #[test]
-    fn the_knob_spellings_map_to_the_three_modes() {
-        assert_eq!(eager_perturb_mode_of(None), 1, "unset must be ARMED");
-        assert_eq!(eager_perturb_mode_of(Some("0")), 0);
-        assert_eq!(eager_perturb_mode_of(Some("1")), 2);
-        assert_eq!(eager_perturb_mode_of(Some("all")), 2);
-        // Anything unrecognised falls back to the shipped default rather than
-        // to the blanket arm: a typo must not re-enable what was measured off.
-        assert_eq!(eager_perturb_mode_of(Some("yes")), 1);
-        assert_eq!(eager_perturb_mode_of(Some("")), 1);
+    fn the_default_mode_is_armed() {
+        assert_eq!(eager_perturb_mode(), 1, "unset must be ARMED");
     }
 
     /// The gate that carries rout's and noswot's proofs. Under the DEFAULT mode
@@ -12220,7 +12165,6 @@ pub(crate) fn prime_env() {
     let _ = cold_lu_eta_rebuilds();
     let _ = cold_lu_max_rows();
     let _ = cold_lu_min_rows();
-    let _ = dse_persist_enabled();
     let _ = dual_anatomy_enabled();
     let _ = dual_bloom_cap_override();
     let _ = dual_bypass_mode();
@@ -12229,7 +12173,6 @@ pub(crate) fn prime_env() {
     let _ = eta_cap_mult();
     let _ = eta_gen_cap();
     let _ = eta_reuse_age();
-    let _ = flip_nz_enabled();
     let _ = force_tri_crash();
     let _ = fused_defer_enabled();
     let _ = fused_rt_enabled();
@@ -12305,7 +12248,7 @@ mod refactor_cadence_tests {
 mod fill_trip_tests {
     /// THE TRIP CANNOT ARM UNLESS EXPLICITLY OPTED IN.
     ///
-    /// `maybe_trip_bump_fill` ships behind `AY_MILP_BUMP_FILL_TRIP` because its
+    /// `maybe_trip_bump_fill` ships off-by-default (B22: env retired) because its
     /// predicate is known biased — it compares the bump against the singleton peel,
     /// which is fill-free BY SELECTION rather than by measurement, so a strict `>`
     /// with no margin would arm on the ~160-column crash-walk bumps the floor exists
@@ -12316,11 +12259,12 @@ mod fill_trip_tests {
     /// predicate is provisional — it is a test that the predicate CANNOT RUN.
     #[test]
     fn the_default_lane_is_the_column_floor_alone() {
-        // Absent the opt-in, no environment state and no fill ratio can arm it.
+        // B22: the opt-in is a compiled constant now — nothing ambient can
+        // arm it.
         assert!(
             !super::fill_trip_optin(),
-            "AY_MILP_BUMP_FILL_TRIP must be unset in the test environment; with it set \
-             the shipped default is not what this test claims to pin"
+            "the fill-trip opt-in must be retired-off; the shipped default is \
+             not what this test claims to pin otherwise"
         );
         // And the kill switch is independent of the opt-in: either one off is enough.
         // `no_fill_trip()` is the arm that restores prior behaviour when someone HAS

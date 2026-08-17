@@ -481,11 +481,13 @@ fn trusted_var(
 fn native_code_helpers_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let explicit = env::var("AY_CHC_NATIVE_CODE_HELPERS").ok();
+        // B15: the never-set AY_CHC_NATIVE_CODE_HELPERS explicit override is
+        // deleted; the competition-mode names (set by the submission harness)
+        // remain the only runtime inputs.
         let competition_mode = env::var("AY_COMPETITION_JIT_CANDIDATE_MODE")
             .ok()
             .or_else(|| env::var("AY_COMPETITION_JIT_MODE").ok());
-        native_code_helpers_enabled_for_modes(explicit.as_deref(), competition_mode.as_deref())
+        native_code_helpers_enabled_for_modes(None, competition_mode.as_deref())
     })
 }
 

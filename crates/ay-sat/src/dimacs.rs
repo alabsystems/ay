@@ -354,6 +354,22 @@ impl DimacsFormula {
         variant: SolverVariant,
         allow_auto_route: bool,
     ) -> Solver {
+        self.into_solver_with_variant_routed_source(
+            variant,
+            allow_auto_route,
+            crate::auto::DecisionSource::Default,
+        )
+    }
+
+    /// Like [`Self::into_solver_with_variant_routed`], with truthful provenance
+    /// for the frontend's requested variant. An actual formula-driven reroute
+    /// supersedes this source with `Auto`.
+    pub fn into_solver_with_variant_routed_source(
+        self,
+        variant: SolverVariant,
+        allow_auto_route: bool,
+        requested_source: crate::auto::DecisionSource,
+    ) -> Solver {
         // Content-driven sizing: allocate the solver for the variables that
         // ACTUALLY appear, not the (untrusted) declared header count, so an
         // over-declared `p cnf 4000000000 1` with three real variables is solved
@@ -373,10 +389,10 @@ impl DimacsFormula {
         // to Probe or Aggressive before the config is resolved (the same
         // features then drive the adaptive adjustments below).
         let features = crate::features::SatFeatures::extract(solver_vars, &self.clauses);
-        let variant = if allow_auto_route {
-            variant.auto_route(&features)
+        let (variant, variant_source) = if allow_auto_route {
+            variant.auto_route_with_source(&features, requested_source)
         } else {
-            variant
+            (variant, requested_source)
         };
         let config = variant.config(VariantInput::new(
             solver_vars,
@@ -390,9 +406,13 @@ impl DimacsFormula {
         // initial variant application. Reorder is now part of
         // InprocessingFeatureProfile (#8149), so adjust_features_for_instance
         // handles it without a separate call.
-        let plan = VariantProfilePlan::from_config_features(config, &features);
-        let config = plan.config;
-        config.apply_to_solver(&mut solver);
+        let plan =
+            VariantProfilePlan::from_config_features_with_source(config, &features, variant_source);
+        // Apply via the PLAN, not plan.config alone: the plan also carries the
+        // capability ledger (B0), and applying the bare config would silently
+        // drop it -- the same partial-application slip that kept
+        // set_symmetry_oneshot off this path in §28.4.
+        plan.apply_to_solver(&mut solver);
 
         for clause in self.clauses {
             solver.add_clause(clause);

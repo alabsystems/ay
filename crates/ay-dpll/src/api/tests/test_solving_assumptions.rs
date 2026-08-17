@@ -7,6 +7,19 @@
 use crate::api::*;
 
 #[test]
+fn test_native_literal_false_assumption_retains_exact_unsat_authority() {
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    let false_assumption = solver.bool_const(false);
+
+    assert!(solver.check_sat_assuming(&[false_assumption]).is_unsat());
+    let proof = solver
+        .last_proof()
+        .expect("native literal false must retain its strict proof");
+    assert!(ay_proof::terminal_trust_report(proof).is_trust_free());
+}
+
+#[test]
 fn test_check_sat_assuming_basic() {
     // Basic check_sat_assuming: assumptions are temporary
     let mut solver = Solver::new(Logic::QfLia);
@@ -30,6 +43,70 @@ fn test_check_sat_assuming_basic() {
     let x_eq_1 = solver.eq(x, one);
     solver.assert_term(x_eq_1);
     assert_eq!(solver.check_sat(), SolveResult::Sat);
+}
+
+#[test]
+fn test_invalid_assumption_handle_starts_clean_external_query_boundary() {
+    let mut solver = Solver::new(Logic::QfLia);
+
+    let x = solver.declare_const("x", Sort::Int);
+    let zero = solver.int_const(0);
+    let x_eq_zero = solver.eq(x, zero);
+    solver.assert_term(x_eq_zero);
+
+    assert_eq!(solver.check_sat_assuming(&[x_eq_zero]), SolveResult::Sat);
+    assert!(
+        solver.model().is_some(),
+        "baseline SAT must publish a model"
+    );
+    assert!(solver.last_assumptions.is_some());
+
+    // Model a prior query that consumed the exact finite-array work envelope.
+    // The invalid handle fails before Executor::check_sat_assuming is entered,
+    // so only the native API boundary can retire the stale result and replenish
+    // this ledger.
+    let ledger = &mut solver.executor.finite_array_expansion;
+    ledger.remaining_index_points = 0;
+    ledger.remaining_value_cells = 0;
+    ledger.remaining_scan_nodes = 0;
+    ledger.remaining_scan_edges = 0;
+    ledger.remaining_candidates = 0;
+    ledger.candidate_scan_truncated = true;
+
+    let result = solver.check_sat_assuming(&[Term::from_raw(u32::MAX)]);
+    assert_eq!(result, SolveResult::Unknown);
+    assert_eq!(solver.unknown_reason(), Some(UnknownReason::Incomplete));
+    assert!(
+        solver.model().is_none(),
+        "the prior SAT model must be revoked"
+    );
+    assert!(
+        solver.last_assumptions.is_none(),
+        "invalid assumption resolution must not expose stale assumptions"
+    );
+
+    let ledger = &solver.executor.finite_array_expansion;
+    assert_eq!(
+        ledger.remaining_index_points,
+        crate::executor::FiniteArrayExpansionLedger::MAX_INDEX_POINTS
+    );
+    assert_eq!(
+        ledger.remaining_value_cells,
+        crate::executor::FiniteArrayExpansionLedger::MAX_VALUE_CELLS
+    );
+    assert_eq!(
+        ledger.remaining_scan_nodes,
+        crate::executor::FiniteArrayExpansionLedger::MAX_SCAN_NODES
+    );
+    assert_eq!(
+        ledger.remaining_scan_edges,
+        crate::executor::FiniteArrayExpansionLedger::MAX_SCAN_EDGES
+    );
+    assert_eq!(
+        ledger.remaining_candidates,
+        crate::executor::FiniteArrayExpansionLedger::MAX_CANDIDATES
+    );
+    assert!(ledger.is_complete());
 }
 
 #[test]

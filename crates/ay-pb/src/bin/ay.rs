@@ -2,6 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+// Dedicated process-watchdog/syscall boundary; unsafe sites are locally audited.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
@@ -452,6 +456,20 @@ fn main() {
     std::process::exit(pb_exit_code(status));
 }
 
+/// `--proof-tap-legacy` (B31; was `AY_PB_PROOF_TAP=legacy`). Process-constant,
+/// stored at arg parse: the consumer sits under the N1 proof phase several
+/// call layers down, and the choice is per-process exactly like the retired
+/// env var was.
+static PROOF_TAP_LEGACY: AtomicBool = AtomicBool::new(false);
+
+/// The dense async proof tap is the default; `--proof-tap-legacy` selects the
+/// legacy synchronous CpConstraint proof path. Fail-closed is identical on
+/// both paths: any tap failure surfaces via conclude_proof and no proof
+/// commits.
+fn proof_tap_enabled() -> bool {
+    !PROOF_TAP_LEGACY.load(Ordering::Relaxed)
+}
+
 fn run_main() -> Result<PbStatus, String> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
@@ -608,69 +626,7 @@ fn run_verify(args: Vec<String>) -> Result<PbStatus, String> {
     std::process::exit(if report.ok { 0 } else { 1 });
 }
 
-#[derive(Debug)]
-struct SolveArgs {
-    file: PathBuf,
-    timeout: Option<u64>,
-    proof: Option<PathBuf>,
-    stats: bool,
-    stats_json: bool,
-    native: bool,
-}
-
-fn parse_solve_args(args: Vec<String>) -> Result<SolveArgs, String> {
-    let mut file = None;
-    let mut timeout = None;
-    let mut proof = None;
-    let mut stats = false;
-    let mut stats_json = false;
-    let mut native = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--timeout" | "-t" => {
-                i += 1;
-                let value = args
-                    .get(i)
-                    .ok_or_else(|| "--timeout requires a millisecond value".to_string())?;
-                timeout = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| format!("invalid timeout value: {value}"))?,
-                );
-            }
-            "--proof" => {
-                i += 1;
-                proof = Some(PathBuf::from(
-                    args.get(i)
-                        .ok_or_else(|| "--proof requires a path".to_string())?,
-                ));
-            }
-            "--stats" => stats = true,
-            "--stats-json" => stats_json = true,
-            "--native" => native = true,
-            "--help" | "-h" => return Err(usage()),
-            arg if arg.starts_with('-') => return Err(format!("unknown argument: {arg}")),
-            path => {
-                if file.is_some() {
-                    return Err(format!("unexpected extra input path: {path}"));
-                }
-                file = Some(PathBuf::from(path));
-            }
-        }
-        i += 1;
-    }
-
-    Ok(SolveArgs {
-        file: file.ok_or_else(usage)?,
-        timeout,
-        proof,
-        stats,
-        stats_json,
-        native,
-    })
-}
+include!("ay/solve_args.rs");
 
 fn run_solve(cmd: &SolveArgs) -> Result<PbStatus, String> {
     run_solve_with_writer(cmd, io::stdout().lock())
@@ -1271,7 +1227,7 @@ fn solve_opb<W: Write>(
     // matching the in-place checks' guard and keeping the certified-proof path on
     // its own dedicated emission route.
     if instance.objective.is_none() && proof.is_none() && structural_unsat_self_checked(instance) {
-        if std::env::var_os("AY_CERT_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().cert_debug {
             eprintln!(
                 "c refutation self-checked EARLY: structural 0>=1 (kernel-algebra), \
                  emitting s UNSATISFIABLE"
@@ -1372,8 +1328,8 @@ fn solve_opb<W: Write>(
 
         // PARALLEL track (batteries-included default): with a memory-clamped
         // core budget of at least two workers, run the diverse-strategy
-        // parallel portfolio and take the first proven verdict. `AY_PB_PARALLEL`
-        // defaults to AUTO (`NBCORE`-sized, memory-clamped); `AY_PB_PARALLEL=0`
+        // parallel portfolio and take the first proven verdict. the `--pb-parallel` policy
+        // defaults to AUTO (`NBCORE`-sized, memory-clamped); `--pb-parallel 0`
         // opts out. BELOW two workers (NBCORE=1 / tiny MEMLIMIT) this gate
         // keeps the ORIGINAL sequential path below — including its
         // probe-then-detect `try_symmetry_decision` arm — instead of a
@@ -1466,7 +1422,7 @@ fn solve_opb<W: Write>(
     // (P1 = this full sequential routing on a dedicated core, the internally
     // linearizing SAT-encoded arms, and the product-native `nlc-sls-opt` primal) and
     // enforces the wall clock itself via the coordinator's hard collection deadline.
-    // With parallelism unavailable (`AY_PB_PARALLEL=0` / single core / memory clamp)
+    // With parallelism unavailable (`--pb-parallel 0` / single core / memory clamp)
     // this sequential wrapper path is byte-identical to before.
     if wbo_projection.is_none()
         && !is_linear(instance)
@@ -1514,7 +1470,7 @@ fn solve_opb<W: Write>(
         cache_exact_solution(best_solution, exact_solution);
     };
     // PARALLEL OPTIMIZATION TRACK (batteries-included default; design §2.3):
-    // when the memory-clamped core budget is >= 2 (`AY_PB_PARALLEL` unset
+    // when the memory-clamped core budget is >= 2 (`the --pb-parallel policy` unset
     // defaults to AUTO, `NBCORE`-sized; `=0` disables) and the instance is
     // eligible (`should_parallelize_optimization` — linear, the NLC-safe
     // non-linear subset, and WBO reductions, which are linear by
@@ -1547,7 +1503,7 @@ fn solve_opb<W: Write>(
     // sequential o=6009 under whole-core contention) predates the
     // priority-ordered core budgeting with the P1 sequential worker first and
     // the diversified primal arms dropped first; the parallel track is now
-    // the default, with `AY_PB_PARALLEL=0` as the sequential opt-out.
+    // the default, with `the --pb-parallel policy=0` as the sequential opt-out.
     // `search_instance` carries any sound lex-leader symmetry rows (objective
     // identical to the original, so the optimum is preserved).
     let (portfolio_solution_raw, portfolio_timings) =
@@ -1583,7 +1539,7 @@ fn solve_opb<W: Write>(
             );
             (portfolio_result.solution, Some(portfolio_result.timings))
         };
-    // WBO primal-SLS fallback (opt-in, AY_PB_WBO_SLS, default OFF): when the
+    // WBO primal-SLS fallback (default ON; --no-pb-wbo-sls opts out): when the
     // complete portfolio finished the reduced-PBO solve with NO incumbent (still
     // Unknown — the celar / uclid soft-heavy WBO families, where the standalone
     // SLS would otherwise DECLINE because the relaxation blow-up pushes the var
@@ -2017,17 +1973,27 @@ fn best_known_legacy_solution(best_solution: &Mutex<Option<PbExactSolution>>) ->
 
 #[allow(clippy::too_many_arguments)]
 /// Whether the clique conflict-row/import-map CSV sidecar may be written.
-/// OPT-IN via `AY_PB_CLIQUE_ROW_MAP_SIDECAR=1` and OFF by default: the sidecar
+/// OPT-IN via `--clique-row-map-sidecar` and OFF by default: the sidecar
 /// is a write-only diagnostic for offline tooling, and the competition
 /// confines solver writes to stdout/stderr/TMPDIR plus the organizer-provided
 /// PROOFFILE (requirements §4.3) — an extra PROOFFILE-adjacent CSV is a
 /// compliance violation the organizer can see on every clique-shaped
 /// OPT-LIN-CERT instance. No competition entry sets this variable.
+static CLIQUE_ROW_MAP_SIDECAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test override (RAII via `tests::set_clique_row_map_sidecar`).
+    static CLIQUE_ROW_MAP_SIDECAR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn clique_row_map_sidecar_enabled() -> bool {
-    matches!(
-        trimmed_env_value("AY_PB_CLIQUE_ROW_MAP_SIDECAR").as_deref(),
-        Some("1")
-    )
+    #[cfg(test)]
+    if let Some(v) = CLIQUE_ROW_MAP_SIDECAR_TEST.with(std::cell::Cell::get) {
+        return v;
+    }
+    CLIQUE_ROW_MAP_SIDECAR.get().copied().unwrap_or(false)
 }
 
 fn maybe_write_clique_conflict_row_import_map_sidecar<W: Write>(
@@ -2153,23 +2119,6 @@ fn dec_cert_portfolio_enabled() -> bool {
     )
 }
 
-/// Selects the asynchronous proof tap on the decision N1 phase
-/// (the development design notes, PHASE 4 default flip): the DENSE
-/// conflict path with micro-op capture is now the DEFAULT for proof-on. The
-/// legacy synchronous CpConstraint proof path is the escape hatch, selected by
-/// `AY_PB_PROOF_TAP=legacy` (or `=0`, kept for symmetry with the old opt-in).
-/// `AY_PB_PROOF_TAP=1` and any other value (including unset) stay on the tap.
-/// Fail-closed is identical on both paths: any tap failure surfaces via
-/// conclude_proof and no proof commits.
-fn proof_tap_enabled() -> bool {
-    !matches!(
-        trimmed_env_value("AY_PB_PROOF_TAP")
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("legacy" | "0")
-    )
-}
-
 /// Writes and atomically commits a SOLUTION-ONLY VeriPB 3 proof for a decision
 /// SAT verdict: `conclusion SAT : <literals>` — the checker itself validates
 /// the model against the ORIGINAL problem, so no derivation is needed. The
@@ -2240,7 +2189,7 @@ fn solve_decision_with_proof(
         // PHASE N1: native proof-logging CDCL (capped when the pipeline is
         // eligible; today's full-budget behavior otherwise). By default
         // (proof-tap spec PHASE 4) N1 runs the DENSE conflict-analysis fast
-        // path with async micro-op capture; AY_PB_PROOF_TAP=legacy|0 falls
+        // path with async micro-op capture; --proof-tap-legacy falls
         // back to the legacy synchronous CpConstraint proof path. Either way
         // any tap failure fails closed to UNKNOWN via conclude_proof, never an
         // uncheckable-but-claimed proof.
@@ -3547,8 +3496,8 @@ fn cache_exact_solution(best_solution: &Mutex<Option<PbExactSolution>>, solution
         // set; used by the proof-to-score verification harness.
         #[cfg(debug_assertions)]
         assert!(
-            std::env::var_os("AY_PB_DEBUG_PANIC_ON_INCUMBENT").is_none(),
-            "AY_PB_DEBUG_PANIC_ON_INCUMBENT: injected panic after recording incumbent"
+            !ay_core::misc_cli_flags().pb_debug_panic_on_incumbent,
+            "--pb-debug-panic-on-incumbent: injected panic after recording incumbent"
         );
     }
     let mut guard = best_solution
@@ -4145,17 +4094,12 @@ fn symmetry_breaking_enabled() -> bool {
 }
 
 /// Returns whether the shape-gated symmetry *arm* (probe-then-augment for large
-/// highly-symmetric decision instances) is enabled. **On by default**; set
-/// `AY_PB_SYMMETRY_ARM=0|off|false|no` to disable. It never touches an instance
+/// highly-symmetric decision instances) is enabled. **On by default**;
+/// `--no-pb-symmetry-arm` disables. It never touches an instance
 /// that fails the cheap structural gate, and never adds overhead to an instance
 /// the normal probe already decides, so it is no-regression on the broad corpus.
 fn symmetry_arm_enabled() -> bool {
-    !matches!(
-        trimmed_env_value("AY_PB_SYMMETRY_ARM")
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+    ay_pb::ab_switches::get().symmetry_arm
 }
 
 /// Returns whether the shape-gated clique witness *arm* (parallel clique local search
@@ -4175,22 +4119,47 @@ fn clique_arm_enabled() -> bool {
 /// Returns whether the certified-optimization portfolio fallback (budget-split
 /// native slice -> portfolio -> out-of-band certification -> native tail) is
 /// enabled in proof mode. **On by default**; set
-/// `AY_PB_OPT_CERT_PORTFOLIO=0|off|false|no` to restore the native-only
+/// `--no-opt-cert-portfolio` to restore the native-only
 /// full-budget behavior.
+static OPT_CERT_PORTFOLIO_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test override consulted before the CLI value (RAII via
+    /// `tests::set_opt_cert_portfolio`).
+    static OPT_CERT_PORTFOLIO_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn opt_cert_portfolio_enabled() -> bool {
-    !matches!(
-        trimmed_env_value("AY_PB_OPT_CERT_PORTFOLIO")
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
+    #[cfg(test)]
+    if let Some(v) = OPT_CERT_PORTFOLIO_TEST.with(std::cell::Cell::get) {
+        return v;
+    }
+    !OPT_CERT_PORTFOLIO_OFF.get().copied().unwrap_or(false)
+}
+
+/// CLI-installed override for the certified-optimization native slice
+/// (`--cert-native-cap-ms`).
+static CERT_NATIVE_CAP_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test override consulted before the CLI value (RAII via
+    /// `tests::set_cert_native_cap_ms`).
+    static CERT_NATIVE_CAP_MS_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Test/tuning override for the certified-optimization native slice: pins the
 /// initial slice AND the hard ceiling to this many milliseconds with no
 /// improvement grace. Soundness-free — it only moves the interrupt point.
 fn cert_native_cap_ms_override() -> Option<u64> {
-    trimmed_env_value("AY_PB_CERT_NATIVE_CAP_MS")?.parse().ok()
+    #[cfg(test)]
+    if let Some(v) = CERT_NATIVE_CAP_MS_TEST.with(std::cell::Cell::get) {
+        return Some(v);
+    }
+    CERT_NATIVE_CAP_MS.get().copied()
 }
 
 /// Probe budget (fraction of the total decision timeout) given to the NORMAL
@@ -5175,7 +5144,7 @@ mod tests {
         // competition runs; this test opts in explicitly. Serialized with the
         // off-by-default test below via the shared process-environment lock.
         let _serial = lock_env();
-        let _sidecar_env = ScopedEnvVar::set("AY_PB_CLIQUE_ROW_MAP_SIDECAR", "1");
+        let _sidecar_env = set_clique_row_map_sidecar(true);
         let file_path = write_temp_pb(
             "proof-mode-clique-row-map",
             "opb",
@@ -5218,7 +5187,7 @@ mod tests {
         // PROOFFILE except the proof itself. Serialized with the opt-in test
         // above via the shared process-environment lock.
         let _serial = lock_env();
-        let _sidecar_env = ScopedEnvVar::unset("AY_PB_CLIQUE_ROW_MAP_SIDECAR");
+        let _sidecar_env = set_clique_row_map_sidecar(false);
         let file_path = write_temp_pb(
             "proof-mode-clique-row-map-off",
             "opb",
@@ -5248,7 +5217,7 @@ mod tests {
         assert!(proof_path.exists(), "completed proof should be committed");
         assert!(
             !sidecar_exists,
-            "sidecar must not be written without AY_PB_CLIQUE_ROW_MAP_SIDECAR=1"
+            "sidecar must not be written without the opt-in"
         );
 
         remove_temp_files(&[&file_path, &proof_path, &sidecar_path]);
@@ -5650,7 +5619,7 @@ mod tests {
         let _cert = clear_cert_env();
         // Kill N1: the plain-speed phase must produce the model and the
         // solution-only proof must be committed.
-        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = set_cert_native_cap_ms(0);
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n",
@@ -5690,7 +5659,7 @@ mod tests {
     fn test_dec_cert_pipeline_unsat_via_native_tail() {
         let _serial = lock_env();
         let _cert = clear_cert_env();
-        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = set_cert_native_cap_ms(0);
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n",
@@ -5887,17 +5856,55 @@ mod tests {
         assert_eq!(solution.objective, Some(2));
     }
 
-    /// Clears the AY_PB_OPT_CERT_PORTFOLIO / AY_PB_CERT_NATIVE_CAP_MS
+    /// Pins the portfolio ON (the shipped default)
     /// process-global env vars for the lifetime of the returned guards
     /// (restored on scope exit, also on panic). Bind at the start of each cert
     /// test — held under the `lock_env()` serialization guard. Tests serialize
     /// on the one workspace env lock (`lock_env`).
     #[must_use]
-    fn clear_cert_env() -> [ScopedEnvVar; 2] {
-        [
-            ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO"),
-            ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS"),
-        ]
+    fn clear_cert_env() -> [OptCertPortfolioGuard; 1] {
+        [set_opt_cert_portfolio(true)]
+    }
+
+    /// RAII per-test native-slice cap (replaces the retired
+    /// retired env override).
+    struct CertCapGuard;
+    impl Drop for CertCapGuard {
+        fn drop(&mut self) {
+            CERT_NATIVE_CAP_MS_TEST.with(|c| c.set(None));
+        }
+    }
+    #[must_use]
+    fn set_cert_native_cap_ms(ms: u64) -> CertCapGuard {
+        CERT_NATIVE_CAP_MS_TEST.with(|c| c.set(Some(ms)));
+        CertCapGuard
+    }
+
+    /// RAII per-test opt-cert-portfolio pin (replaces the retired env
+    /// override).
+    struct OptCertPortfolioGuard;
+    impl Drop for OptCertPortfolioGuard {
+        fn drop(&mut self) {
+            OPT_CERT_PORTFOLIO_TEST.with(|c| c.set(None));
+        }
+    }
+    #[must_use]
+    fn set_opt_cert_portfolio(enabled: bool) -> OptCertPortfolioGuard {
+        OPT_CERT_PORTFOLIO_TEST.with(|c| c.set(Some(enabled)));
+        OptCertPortfolioGuard
+    }
+
+    /// RAII per-test sidecar pin (replaces the retired env override).
+    struct SidecarGuard;
+    impl Drop for SidecarGuard {
+        fn drop(&mut self) {
+            CLIQUE_ROW_MAP_SIDECAR_TEST.with(|c| c.set(None));
+        }
+    }
+    #[must_use]
+    fn set_clique_row_map_sidecar(enabled: bool) -> SidecarGuard {
+        CLIQUE_ROW_MAP_SIDECAR_TEST.with(|c| c.set(Some(enabled)));
+        SidecarGuard
     }
 
     fn solve_opb_text_with_proof(input: &str, proof_path: &Path) -> (PbSolution, String) {
@@ -6039,7 +6046,7 @@ mod tests {
         let _cert = clear_cert_env();
         // Kill N1 outright: the portfolio must prove the optimum and the
         // out-of-band helpers must certify it.
-        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = set_cert_native_cap_ms(0);
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-fallback-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6073,8 +6080,8 @@ mod tests {
         let _cert = clear_cert_env();
         // Kill switch off => the CAP override must be ignored and the native
         // full-budget path must still prove + commit.
-        let _portfolio = ScopedEnvVar::set("AY_PB_OPT_CERT_PORTFOLIO", "0");
-        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _portfolio = set_opt_cert_portfolio(false);
+        let _cap = set_cert_native_cap_ms(0);
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-killswitch-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6096,7 +6103,7 @@ mod tests {
         let _cert = clear_cert_env();
         // N1 disabled; the portfolio's UNSAT is uncertified and must NOT be
         // emitted — the native tail is the only compliant INF INF source.
-        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = set_cert_native_cap_ms(0);
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-tail-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");

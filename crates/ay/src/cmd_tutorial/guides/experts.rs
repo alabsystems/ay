@@ -5,6 +5,10 @@ use anyhow::Result;
 
 use super::ExpertChapter;
 
+fn print_block(text: &str) {
+    println!("{text}");
+}
+
 pub(super) fn run(selected: Option<ExpertChapter>, interactive: bool) -> Result<()> {
     println!();
     println!("=== AY for Experts ===");
@@ -37,8 +41,7 @@ pub(super) fn run(selected: Option<ExpertChapter>, interactive: bool) -> Result<
 }
 
 fn proofs() {
-    println!(
-        "{}",
+    print_block(
         r#"Worked example A: theory UNSAT -> Alethe -> independent replay
 
   (set-logic QF_LIA)
@@ -93,8 +96,7 @@ certificate format. Keep proof-carrying claims format- and path-specific.
 }
 
 fn incremental() {
-    println!(
-        "{}",
+    print_block(
         r#"Worked example: named cores, scopes, and assumptions in one warm process
 
 Run `ay --z3-mode -in`, then send:
@@ -141,8 +143,7 @@ proved the scoped formula satisfiable or unsatisfiable.
 }
 
 fn optimization() {
-    println!(
-        "{}",
+    print_block(
         r#"Worked example: exact LRA optimality evidence
 
   (set-logic QF_LRA)
@@ -189,8 +190,7 @@ Unbounded, Infeasible, and Unknown as distinct results.
 }
 
 fn theories() {
-    println!(
-        "{}",
+    print_block(
         r#"AY's DPLL(T) surface spans UF, LIA/LRA/LIRA, bit-vector, arrays,
 floating point, strings/sequences, datatypes, nonlinear fragments, quantifiers,
 and combinations. `ay --features` reports routes and proof renderers; it is not
@@ -242,8 +242,7 @@ correct default is the complete configured solver.
 }
 
 fn research() {
-    println!(
-        "{}",
+    print_block(
         r#"Worked workflow: turn a surprising answer into a reproducible experiment
 
   cargo build -p ay --features bench

@@ -498,6 +498,7 @@ fn run_native_launch_packet_fast(args: &ResolvedArgs, state: &mut GateState) -> 
         requested_evals: Vec::new(),
         excluded_evals: vec!["sat-par2-dev".to_string()],
         mode,
+        progress_every: 1,
     };
     match crate::cmd_launch_packet::write_fast_packet(config) {
         Ok(out_dir) => {

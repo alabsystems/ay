@@ -166,13 +166,32 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                         // Polarity is already exact here: both literals were
                         // resolved through the negation cache above (a miss
                         // `continue`s without recording anything).
-                        let kind = self.terms.map_or(TheoryLemmaKind::Generic, |terms| {
-                            crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
-                                terms,
-                                &clause,
-                                farkas.as_ref(),
-                            )
-                        });
+                        let (kind, clause) = match self.terms {
+                            None => (TheoryLemmaKind::Generic, clause),
+                            Some(terms) => {
+                                let (kind, ordered) = crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+                                    terms,
+                                    &clause,
+                                    farkas.as_ref(),
+                                    None,
+                                );
+                                // #trust->0 C3: adopt the funnel's
+                                // validator-ordered clause; with a positional
+                                // Farkas certificate present a REORDER must
+                                // not detach it — keep the pre-C3
+                                // Generic-with-certificate recording instead
+                                // (fail-closed).
+                                match ordered {
+                                    std::borrow::Cow::Borrowed(_) => (kind, clause),
+                                    std::borrow::Cow::Owned(reordered) if farkas.is_none() => {
+                                        (kind, reordered)
+                                    }
+                                    std::borrow::Cow::Owned(_) => {
+                                        (TheoryLemmaKind::Generic, clause)
+                                    }
+                                }
+                            }
+                        };
                         match kind {
                             // Attach the certificate the funnel validated (or
                             // the unit coefficients it verified when the
@@ -1351,7 +1370,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                                 // #euf-prop-gap (lazy twin): same ITE-deferral
                                 // blind-spot churn as the eager site — feed the
                                 // SAT value back, scoped to guarded vars, same
-                                // kill switch (AY_NO_PROP_FEEDBACK=1).
+                                // kill switch (--dpll-no-prop-feedback).
                                 self.eager_stats.props_already_assigned += 1;
                                 if Self::prop_feedback_enabled()
                                     && self.is_ite_guarded_term(prop.literal.term)
@@ -1424,7 +1443,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             // dropped here after full verification.
             if self.term_to_var.get(&prop.literal.term).is_none() {
                 self.eager_stats.props_unmapped += 1;
-                if *PROP_DEBUG.get_or_init(|| std::env::var_os("AY_PROP_DEBUG").is_some()) {
+                if *PROP_DEBUG.get_or_init(|| ay_core::misc_cli_flags().prop_debug) {
                     if let Some(terms) = self.terms {
                         safe_eprintln!(
                             "PROPDBG UNMAPPED {} := {}",
@@ -1509,7 +1528,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                         // path.
                         let prop_domain =
                             crate::verification::classify_propagation_domain(terms, &prop);
-                        // #verify-memo (AY_VERIFY_MEMO=1, default off =
+                        // #verify-memo (--verify-memo=1, default off =
                         // byte-identical): obligation memo for the two arms
                         // WITHOUT one — the cached mixed-domain N-O verifier
                         // (each check still pays the full N-O fixpoint, ~20k
@@ -1874,11 +1893,11 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                     // to guarded vars: unguarded atoms reach the theory via
                     // the normal trail feed next round, no loop is possible.
                     self.eager_stats.props_already_assigned += 1;
-                    // Kill switch: AY_NO_PROP_FEEDBACK=1 restores the old
+                    // Kill switch: --dpll-no-prop-feedback restores the old
                     // drop-only behavior (A/B lever + safety valve).
                     static NO_FEEDBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     let feedback_enabled = !*NO_FEEDBACK
-                        .get_or_init(|| std::env::var_os("AY_NO_PROP_FEEDBACK").is_some());
+                        .get_or_init(|| ay_core::theory_disable_flags().no_prop_feedback);
                     let ite_guarded = self.term_to_var.get(&prop.literal.term).is_some_and(|&v| {
                         let idx = v as usize;
                         let w = idx / 64;
@@ -1985,7 +2004,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 // trail). Establish why the gate is at level 0 before widening it.
                 //
                 // See the development design notes.
-                if std::env::var("AY_RUP_FALLBACK_TRACE").is_ok_and(|v| v == "1") {
+                if ay_core::misc_cli_flags().rup_fallback_trace {
                     safe_eprintln!(
                         "[level0-recorder] level={} lazy={} reason_len={}",
                         ctx.decision_level(),
@@ -2127,7 +2146,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 // VSIDS bump, sort/dedup. Clause is stored only as reason.
                 self.eager_stats.props_clause_added += 1;
                 // Temporary campaign instrumentation (#qfax-t3-atom-space).
-                if *PROP_DEBUG.get_or_init(|| std::env::var_os("AY_PROP_DEBUG").is_some()) {
+                if *PROP_DEBUG.get_or_init(|| ay_core::misc_cli_flags().prop_debug) {
                     if let Some(terms) = self.terms {
                         let mut rkey: Vec<(u32, bool)> =
                             prop.reason.iter().map(|l| (l.term.0, l.value)).collect();
@@ -2224,7 +2243,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     /// that value in the SAT trail; un-deferring is a relevancy no-op.
     fn prop_feedback_enabled() -> bool {
         static NO_FEEDBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*NO_FEEDBACK.get_or_init(|| std::env::var_os("AY_NO_PROP_FEEDBACK").is_some())
+        !*NO_FEEDBACK.get_or_init(|| ay_core::theory_disable_flags().no_prop_feedback)
     }
 
     /// Whether the atom's SAT variable is ITE-guarded (deferred from the
@@ -2279,7 +2298,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                                 // #euf-prop-gap (lazy twin): same ITE-deferral
                                 // blind-spot churn as the eager site — feed the
                                 // SAT value back, scoped to guarded vars, same
-                                // kill switch (AY_NO_PROP_FEEDBACK=1).
+                                // kill switch (--dpll-no-prop-feedback).
                                 self.eager_stats.props_already_assigned += 1;
                                 if Self::prop_feedback_enabled()
                                     && self.is_ite_guarded_term(prop.literal.term)
@@ -2370,7 +2389,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                     // #euf-prop-gap (early-drain eager twin): same ITE-deferral
                     // blind-spot churn as the propagate_impl eager site — feed
                     // the SAT value back, scoped to guarded vars, same kill
-                    // switch (AY_NO_PROP_FEEDBACK=1).
+                    // switch (--dpll-no-prop-feedback).
                     self.eager_stats.props_already_assigned += 1;
                     if Self::prop_feedback_enabled() && self.is_ite_guarded_term(prop.literal.term)
                     {

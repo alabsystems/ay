@@ -26,7 +26,7 @@
 //! - `unvetted_no_proof_lane_allowed()` sites (any polarity) — the two
 //!   audited dormant UNSAT-originating lanes, kept dead under shedding.
 //!
-//! The scan strips `//` line comments, skips `*_tests.rs` files and
+//! The scan strips `//` line comments, skips `tests.rs`/`*_tests.rs` files and
 //! `tests`/`*_tests` directories (cfg(test)-only modules), and matches the exact
 //! zero-argument call token, so definitions (`fn ...(&self)`) and prose
 //! references do not count. Known limitation: a call inside a `/* */` block
@@ -67,12 +67,30 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
          the competition_shedding_active predicate itself",
     ),
     (
-        "executor/proof.rs",
-        1,
+        "executor/lifecycle/proof_access.rs",
+        0,
         1,
         0,
+        "proof-access accessors (last_proof / install_unsat_proof) relocated \
+         from the lifecycle split; the sole !is_producing_proofs site is a \
+         test assertion (proof_checking_solve_does_not_expose_proof_without_\
+         output_request), not a live UNSAT-routing lane — bookkeeping only",
+    ),
+    (
+        "executor/proof.rs",
+        0,
+        1,
+        0,
+        "an explicit-demand artifact gate (the unvetted_no_proof_lane_allowed \
+         definition moved to executor/proof/lane_policy.rs upstream)",
+    ),
+    (
+        "executor/proof/lane_policy.rs",
+        1,
+        0,
+        0,
         "the unvetted_no_proof_lane_allowed definition (the vetted \
-         chokepoint) + an explicit-demand artifact gate",
+         chokepoint), relocated here by the upstream lane-policy refactor",
     ),
     (
         "executor/quantifier_loop/preprocess.rs",
@@ -195,7 +213,12 @@ fn production_sources(dir: &Path, out: &mut Vec<PathBuf>) {
             && !path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with("_tests.rs"))
+                // `foo/tests.rs` is the `#[cfg(test)] mod tests;` convention
+                // (e.g. `executor/proof/tests.rs`), exactly as cfg(test)-only
+                // as a `*_tests.rs` file; counting its asserts as production
+                // gates broke the census when c141d3b80 added
+                // `assert!(!exec.is_producing_proofs())` there.
+                .is_some_and(|n| n.ends_with("_tests.rs") || n == "tests.rs")
         {
             out.push(path);
         }

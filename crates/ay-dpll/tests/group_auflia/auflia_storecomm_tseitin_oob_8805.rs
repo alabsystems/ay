@@ -47,7 +47,7 @@ const TIMEOUT_SECS: u64 = 20;
 /// correctness of that outcome is covered by #8785, not by this test.
 fn assert_no_panic_on_release(relative_path: &str) -> Result<()> {
     let path = workspace_path(relative_path);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storecomm_invalid benchmark not checked into repo: {}",
             path.display()

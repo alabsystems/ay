@@ -108,7 +108,8 @@ pub unsafe extern "C" fn Z3_mk_empty_set(c: Z3_context, domain: Z3_sort) -> Z3_a
     if domain.is_null() {
         return 0;
     }
-    // SAFETY: see `Z3_mk_set_sort`.
+    // SAFETY: `domain` was null-checked above and the caller guarantees each
+    // non-null domain pointer names a live sort handle for this call.
     let domain_sort = unsafe { (*domain).sort.clone() };
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
@@ -136,7 +137,8 @@ pub unsafe extern "C" fn Z3_mk_full_set(c: Z3_context, domain: Z3_sort) -> Z3_as
     if domain.is_null() {
         return 0;
     }
-    // SAFETY: see `Z3_mk_set_sort`.
+    // SAFETY: `domain` was null-checked above and the caller guarantees each
+    // non-null domain pointer names a live sort handle for this call.
     let domain_sort = unsafe { (*domain).sort.clone() };
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
@@ -532,7 +534,8 @@ pub unsafe extern "C" fn Z3_mk_re_concat(c: Z3_context, n: c_uint, args: *const 
         return 0;
     }
     if n == 0 || args.is_null() {
-        // SAFETY: ffi_guard_ast null-checks `c`.
+        // SAFETY: `c` is live by caller contract; `ffi_guard_ast` checks for
+        // null before the closure mutates its error state.
         unsafe {
             return ffi_guard_ast(c, |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -646,7 +649,8 @@ pub unsafe extern "C" fn Z3_mk_re_intersect(
         return 0;
     }
     if n == 0 || args.is_null() {
-        // SAFETY: ffi_guard_ast null-checks `c`.
+        // SAFETY: `c` is live by caller contract; `ffi_guard_ast` checks for
+        // null before the closure mutates its error state.
         unsafe {
             return ffi_guard_ast(c, |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -807,7 +811,8 @@ pub unsafe extern "C" fn Z3_mk_re_empty(c: Z3_context, re_sort: Z3_sort) -> Z3_a
     if re_sort.is_null() {
         return 0;
     }
-    // SAFETY: see `Z3_mk_re_full`.
+    // SAFETY: `re_sort` was null-checked above and the caller guarantees a live
+    // sort handle; the guarded closure separately rejects a non-RegLan sort.
     let s = unsafe { (*re_sort).sort.clone() };
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
@@ -837,7 +842,8 @@ pub unsafe extern "C" fn Z3_mk_re_allchar(c: Z3_context, re_sort: Z3_sort) -> Z3
     if re_sort.is_null() {
         return 0;
     }
-    // SAFETY: see `Z3_mk_re_full`.
+    // SAFETY: `re_sort` was null-checked above and the caller guarantees a live
+    // sort handle; the guarded closure separately rejects a non-RegLan sort.
     let s = unsafe { (*re_sort).sort.clone() };
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {

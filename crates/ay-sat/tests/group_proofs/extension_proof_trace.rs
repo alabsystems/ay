@@ -3,8 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 use ay_sat::{
-    ClauseTraceEntry, ExtCheckResult, ExtPropagateResult, Extension, Literal, Solver,
-    SolverContext, Variable,
+    validate_clause_trace_resolution, ClauseTraceEntryRef, ExtCheckResult, ExtPropagateResult,
+    Extension, Literal, ResolutionValidationLimits, Solver, SolverContext, Variable,
 };
 
 struct NoopExtension;
@@ -49,7 +49,7 @@ fn test_solve_with_extension_level0_bcp_conflict_records_clause_trace_hints() {
     );
     assert_eq!(trace.len(), 4, "3 original clauses + derived empty clause");
 
-    let empty_entry: &ClauseTraceEntry = trace.entries().last().expect("empty clause entry");
+    let empty_entry: ClauseTraceEntryRef<'_> = trace.entries().last().expect("empty clause entry");
     assert!(
         empty_entry.clause.is_empty(),
         "final clause-trace entry must be the empty clause"
@@ -60,7 +60,9 @@ fn test_solve_with_extension_level0_bcp_conflict_records_clause_trace_hints() {
     );
     assert_eq!(
         empty_entry.resolution_hints,
-        vec![3, 2, 1],
-        "extension init loop must record conflict + reason clause IDs in trail-reverse order"
+        vec![1, 2, 3],
+        "extension init loop must record root fact, implication, then conflict in positive-RUP order"
     );
+    validate_clause_trace_resolution(&trace, 2, &ResolutionValidationLimits::unbounded())
+        .expect("extension level-0 hints must pass independent positive-RUP replay");
 }

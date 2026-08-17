@@ -119,7 +119,7 @@ fn count_with_phases<W: value::CountValue>(
     // spawning FlowCutter there is a pure ~1s tax (and phase-1 expiry still
     // routes them to TD if they turn out hard).
     let td_first = num_vars <= 20_000 && (1_000..=50_000).contains(&approx_edges);
-    if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().count_debug {
         eprintln!("c o [debug] scheduling: approx_edges={approx_edges} td_first={td_first}");
     }
     let phase1_deadline = phase1_budget
@@ -144,7 +144,7 @@ fn count_with_phases<W: value::CountValue>(
                     "phase 1 ({}s, no TD) expired; computing tree decomposition",
                     options.phase1_secs
                 ));
-                if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+                if ay_core::misc_cli_flags().count_debug {
                     eprintln!(
                         "c o [debug] phase1 expired after {}s (decisions={} conflicts={} cache_stores={})",
                         options.phase1_secs,
@@ -165,7 +165,7 @@ fn count_with_phases<W: value::CountValue>(
                 match &scores {
                     Some(s) => {
                         warnings.push("TD scores active".to_string());
-                        if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+                        if ay_core::misc_cli_flags().count_debug {
                             let max = s.iter().copied().fold(0.0f64, f64::max);
                             eprintln!("c o [debug] TD scores active, max_score={max:.1}");
                         }
@@ -173,7 +173,7 @@ fn count_with_phases<W: value::CountValue>(
                     None => {
                         warnings
                             .push("TD skipped (graph guard or decomposition failure)".to_string());
-                        if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+                        if ay_core::misc_cli_flags().count_debug {
                             eprintln!("c o [debug] TD skipped");
                         }
                     }
@@ -256,7 +256,7 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
             stats: None,
         };
     }
-    if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().count_debug {
         eprintln!(
             "c o [debug] prep: fixed={} vivified={} merged={} pinned={} clauses={} model_preserving={}",
             prepped.fixed_count,
@@ -303,7 +303,7 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
                     std::time::Duration::from_secs(5),
                     100,
                 );
-                if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+                if ay_core::misc_cli_flags().count_debug {
                     eprintln!(
                         "c o [debug] indep support: {:?} vars in {:.2}s",
                         s.as_ref().map(Vec::len),

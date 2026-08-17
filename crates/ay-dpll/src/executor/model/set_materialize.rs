@@ -1087,6 +1087,10 @@ impl Executor {
             return SetCardPlan::FailClosed;
         };
 
+        // Exact sets an asserted DISEQUALITY forbids the witness from being.
+        // Checked at every `Fix` exit below (#set-card-diseq-witness).
+        let forbidden = self.set_class_forbidden_witnesses(model, class);
+
         if constraints.opaque_definition {
             // The definition is not readable here, so the committed cells are
             // the only witness available: accept it when it already has the
@@ -1103,6 +1107,9 @@ impl Executor {
                 }
             }
             if pinned.iter().filter(|(_, v)| v == "true").count() != target {
+                return SetCardPlan::FailClosed;
+            }
+            if Self::witness_is_forbidden(&forbidden, &pinned) {
                 return SetCardPlan::FailClosed;
             }
             return SetCardPlan::Fix {
@@ -1189,6 +1196,18 @@ impl Executor {
                 cells.push((key, "false".to_string()));
             }
         }
+        // A candidate that IS one of the forbidden sets falsifies its own
+        // assertion. Under `honor_preferences` this is the common case and it is
+        // repairable: the offending member came from a NON-entailed `(select s
+        // e)` probe (a don't-care the theory happened to assign), so the caller's
+        // retry drops those preferences and pads with an element the assertions
+        // never mention. Reporting `FailClosed` here is what routes it there.
+        // If the preference-free attempt still lands on a forbidden set the
+        // members are entailed, there is no witness to print, and `FailClosed`
+        // is the honest answer (#set-card-diseq-witness).
+        if Self::witness_is_forbidden(&forbidden, &cells) {
+            return SetCardPlan::FailClosed;
+        }
         SetCardPlan::Fix { cells, index_sort }
     }
 
@@ -1223,6 +1242,74 @@ impl Executor {
             }
         }
         out
+    }
+
+    /// The exact member-key sets the printed witness may NOT equal, read off the
+    /// top-level NEGATED set equalities `(not (= class_var expr))`.
+    ///
+    /// This is the WITNESS-CONTENT twin of the two `#set-card-equality-polarity`
+    /// holes already fixed in this module (the defining-equality read in
+    /// [`Self::set_class_witness_constraints`] and the class merge in
+    /// [`Self::set_carrier_equality_classes`]). Both of those stopped a
+    /// disequality from being MISREAD as an equality; neither made the witness
+    /// actually RESPECT it. A disequality is a real constraint on the printed
+    /// set: `|s| = 1 ∧ s ≠ {2}` is satisfiable, but only by a witness that is
+    /// not `{2}`.
+    ///
+    /// Only a `expr` with a readable FINITE reading (`default = false`)
+    /// constrains anything: a committed witness always has the `false` default,
+    /// so it can never equal a co-finite set, and an unreadable `expr` yields no
+    /// key set to compare against. Set-carrier VARIABLES are excluded on the
+    /// same ground as the positive case — their own interpretation may not have
+    /// been materialized yet, so reading one here would be order-dependent.
+    /// Those stay covered by the (fail-closed) model gate.
+    fn set_class_forbidden_witnesses(&self, model: &Model, class: &[TermId]) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for (atom, polarity) in self.top_level_literals() {
+            if polarity {
+                continue;
+            }
+            let TermData::App(sym, args) = self.ctx.terms.get(atom) else {
+                continue;
+            };
+            if sym.name() != "=" || args.len() != 2 || !self.ctx.terms.sort(args[0]).is_array() {
+                continue;
+            }
+            for (var, expr) in [(args[0], args[1]), (args[1], args[0])] {
+                if !class.contains(&var) || self.is_set_carrier_var(expr) {
+                    continue;
+                }
+                if let Some((false, cells)) = self.set_model_reading(model, expr) {
+                    let mut members: Vec<String> = cells
+                        .into_iter()
+                        .filter(|(_, m)| *m)
+                        .map(|(k, _)| k)
+                        .collect();
+                    members.sort();
+                    members.dedup();
+                    if !out.contains(&members) {
+                        out.push(members);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the witness `cells` denote exactly one of the `forbidden` sets,
+    /// i.e. the plan would print a set an asserted disequality rules out.
+    fn witness_is_forbidden(forbidden: &[Vec<String>], cells: &[(String, String)]) -> bool {
+        if forbidden.is_empty() {
+            return false;
+        }
+        let mut members: Vec<String> = cells
+            .iter()
+            .filter(|(_, v)| v == "true")
+            .map(|(k, _)| k.clone())
+            .collect();
+        members.sort();
+        members.dedup();
+        forbidden.iter().any(|f| *f == members)
     }
 
     /// Gather what the query entails about the membership of one set-carrier

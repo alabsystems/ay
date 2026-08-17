@@ -4,22 +4,26 @@
 
 //! In-memory clause trace for SMT proof reconstruction
 //!
-//! This module records SAT clause additions for use by the SMT layer when
-//! reconstructing explicit Alethe `resolution` proof steps. Unlike DRAT/LRAT
-//! file output, this keeps the trace in memory for direct consumption by
-//! `SatProofManager`.
+//! ## Arena storage (#A3)
 //!
-//! The trace records clause additions (both original and learned) with stable
-//! IDs, and tracks when the empty clause is derived.
+//! Entries are stored as `(offset, len)` spans into two shared pools (one for
+//! literals, one for resolution hints) instead of one heap allocation pair per
+//! entry. The hot add path has only amortized pool growth, and replay walks
+//! two contiguous arrays. [`ClauseTraceEntryRef`] exposes the owned entry's
+//! field shape without copying; [`ClauseTrace::entries_snapshot`] is the
+//! explicit owned-snapshot compatibility path.
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
 use std::cell::Cell;
-use std::mem::size_of;
+use std::sync::OnceLock;
 
 use crate::literal::Literal;
 
-/// A single clause addition entry in the trace
+/// An owned clause addition entry.
+///
+/// Borrowing consumers use [`ClauseTraceEntryRef`]; this type is the retained
+/// snapshot compatibility path.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ClauseTraceEntry {
@@ -55,20 +59,54 @@ impl ClauseTraceEntry {
     }
 }
 
-/// Default memory budget for clause trace: 256 MB.
-///
-/// Typical entry is ~224 bytes (64 byte overhead + 80 bytes literals +
-/// 80 bytes hints for a 20-literal clause with 10 hints). At 256 MB,
-/// this allows ~1.1M entries before truncation.
+/// Borrowed view of one trace entry, resolving its spans into shared pools.
+#[derive(Debug, Clone, Copy)]
+pub struct ClauseTraceEntryRef<'a> {
+    /// Stable clause ID (matches `clause_ids` in solver)
+    pub id: u64,
+    /// The clause literals
+    pub clause: &'a [Literal],
+    /// True if this is an original (input) clause, false if learned
+    pub is_original: bool,
+    /// Resolution hints (clause IDs) used to derive this clause.
+    pub resolution_hints: &'a [u64],
+}
+
+impl ClauseTraceEntryRef<'_> {
+    /// Owned snapshot of this entry.
+    #[must_use]
+    pub fn to_entry(&self) -> ClauseTraceEntry {
+        ClauseTraceEntry::new(
+            self.id,
+            self.clause.to_vec(),
+            self.is_original,
+            self.resolution_hints.to_vec(),
+        )
+    }
+}
+
+/// Internal per-entry `u32` spans; insertion fails closed on overflow.
+#[derive(Debug, Clone, Copy)]
+struct EntryMeta {
+    id: u64,
+    clause_off: u32,
+    clause_len: u32,
+    hints_off: u32,
+    hints_len: u32,
+    is_original: bool,
+}
+
+/// Default 256 MB budget, accounting exact retained arena capacities.
 const DEFAULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Cached `--sat-probe-trace-dup` probe (#A3): the environment is scanned once
+/// per process instead of once per clause addition in the conflict hot loop.
+fn probe_trace_dup_enabled() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| ay_core::misc_cli_flags().probe_trace_dup)
+}
+
 /// Why a level-0 minimize-chain hint could not be recorded.
-///
-/// A conflict-analysis literal whose reason cannot be named by a stable clause
-/// ID contributes NO resolution hint, so downstream proof reconstruction cannot
-/// resolve that literal away. The derived clause then keeps extra literals and
-/// `SatProofManager` falls back to an unverifiable `trust` step. These counters
-/// make that loss observable instead of silent.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct HintOmissionStats {
@@ -129,6 +167,9 @@ impl Clone for HintOmissionCounters {
     }
 }
 
+/// Solver-minted `(variable count, active scope premises)` authority.
+type SolverProvenance = (usize, Vec<Literal>);
+
 /// In-memory clause trace for proof reconstruction
 ///
 /// Records all clause additions in order, enabling the SMT layer to emit
@@ -137,19 +178,24 @@ impl Clone for HintOmissionCounters {
 /// ## Memory budget (#6553)
 ///
 /// The trace enforces a memory budget (default 256 MB). When the budget
-/// is exceeded, new non-empty clause entries are silently dropped and
-/// `is_truncated` is set. Empty clauses (UNSAT signal) are always recorded.
+/// is exceeded, new clause entries are dropped and `is_truncated` is set.
+/// Admission reserves and checks all backing-vector capacities before any
+/// live arena contents are changed.
+/// An empty clause always sets the allocation-free UNSAT marker, even when its
+/// entry/payload cannot be admitted.
 /// The consumer (`SatProofManager::process_trace`) handles incomplete traces
 /// via trust-lemma fallback, so truncation degrades proof quality without
 /// affecting solver correctness.
 #[derive(Debug, Clone)]
 pub struct ClauseTrace {
-    /// All clause additions in order
-    entries: Vec<ClauseTraceEntry>,
+    /// Per-entry metadata (id, flags, pool spans) in addition order.
+    meta: Vec<EntryMeta>,
+    /// Shared literal pool; every entry's clause is a contiguous span here.
+    lit_pool: Vec<Literal>,
+    /// Shared hint pool; every entry's hints are a contiguous span here.
+    hint_pool: Vec<u64>,
     /// True if the empty clause was derived (UNSAT proven)
     has_empty: bool,
-    /// Estimated memory usage in bytes
-    used_bytes: usize,
     /// Maximum allowed memory usage in bytes
     budget_bytes: usize,
     /// True if entries were dropped due to budget exhaustion
@@ -158,13 +204,8 @@ pub struct ClauseTrace {
     proof_work_exhausted: bool,
     /// Why level-0 minimize-chain hints were dropped (introspection).
     hint_omissions: HintOmissionCounters,
-    /// Authoritative SAT variable namespace captured by the owning solver at
-    /// the exact extraction boundary.
-    ///
-    /// Live/manual traces carry `None`. The field is private and every public
-    /// proof-content mutator clears it, so downstream proof composition cannot
-    /// pair a mutated trace with stale namespace authority.
-    solver_num_vars: Option<usize>,
+    /// Namespace and active-scope authority; mutators clear the whole value.
+    solver_num_vars: Option<SolverProvenance>,
 }
 
 impl Default for ClauseTrace {
@@ -173,51 +214,132 @@ impl Default for ClauseTrace {
     }
 }
 
+#[path = "clause_trace_arena.rs"]
+mod arena;
+#[path = "clause_trace_capacity.rs"]
+mod capacity;
+
+/// Borrowed, indexable view of all trace entries.
+///
+/// Obtained from [`ClauseTrace::entries`]. Supports `len`/`is_empty`/`get`/
+/// `first`/`last` and iteration (`iter()`, or `for entry in trace.entries()`),
+/// yielding [`ClauseTraceEntryRef`] items.
+#[derive(Debug, Clone, Copy)]
+pub struct TraceEntries<'a> {
+    meta: &'a [EntryMeta],
+    lit_pool: &'a [Literal],
+    hint_pool: &'a [u64],
+}
+
+impl<'a> TraceEntries<'a> {
+    fn view(&self, meta: &EntryMeta) -> ClauseTraceEntryRef<'a> {
+        let clause_start = meta.clause_off as usize;
+        let clause_end = clause_start + meta.clause_len as usize;
+        let hints_start = meta.hints_off as usize;
+        let hints_end = hints_start + meta.hints_len as usize;
+        ClauseTraceEntryRef {
+            id: meta.id,
+            clause: &self.lit_pool[clause_start..clause_end],
+            is_original: meta.is_original,
+            resolution_hints: &self.hint_pool[hints_start..hints_end],
+        }
+    }
+
+    /// Number of entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.meta.len()
+    }
+
+    /// True when there are no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.meta.is_empty()
+    }
+
+    /// Entry at `index`, if present.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<ClauseTraceEntryRef<'a>> {
+        self.meta.get(index).map(|meta| self.view(meta))
+    }
+
+    /// Entry at `index`; panics when out of bounds (slice-indexing analog).
+    #[must_use]
+    pub fn at(&self, index: usize) -> ClauseTraceEntryRef<'a> {
+        self.get(index)
+            .unwrap_or_else(|| panic!("trace entry index {index} out of bounds"))
+    }
+
+    /// First entry, if any.
+    #[must_use]
+    pub fn first(&self) -> Option<ClauseTraceEntryRef<'a>> {
+        self.get(0)
+    }
+
+    /// Last entry, if any.
+    #[must_use]
+    pub fn last(&self) -> Option<ClauseTraceEntryRef<'a>> {
+        self.meta.last().map(|meta| self.view(meta))
+    }
+
+    /// Iterator over all entries in addition order.
+    #[must_use]
+    pub fn iter(&self) -> TraceEntriesIter<'a> {
+        TraceEntriesIter {
+            entries: *self,
+            index: 0,
+        }
+    }
+}
+
+impl<'a> IntoIterator for TraceEntries<'a> {
+    type Item = ClauseTraceEntryRef<'a>;
+    type IntoIter = TraceEntriesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &TraceEntries<'a> {
+    type Item = ClauseTraceEntryRef<'a>;
+    type IntoIter = TraceEntriesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over [`TraceEntries`].
+#[derive(Debug, Clone)]
+pub struct TraceEntriesIter<'a> {
+    entries: TraceEntries<'a>,
+    index: usize,
+}
+
+impl<'a> Iterator for TraceEntriesIter<'a> {
+    type Item = ClauseTraceEntryRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.entries.get(self.index)?;
+        self.index += 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.entries.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for TraceEntriesIter<'_> {}
+
 impl ClauseTrace {
-    /// Create a new empty clause trace with the default memory budget.
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            has_empty: false,
-            used_bytes: 0,
-            budget_bytes: DEFAULT_BUDGET_BYTES,
-            is_truncated: false,
-            proof_work_exhausted: false,
-            hint_omissions: HintOmissionCounters::default(),
-            solver_num_vars: None,
-        }
-    }
-
-    /// Create a new trace with pre-allocated capacity and the default budget.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(capacity),
-            has_empty: false,
-            used_bytes: 0,
-            budget_bytes: DEFAULT_BUDGET_BYTES,
-            is_truncated: false,
-            proof_work_exhausted: false,
-            hint_omissions: HintOmissionCounters::default(),
-            solver_num_vars: None,
-        }
-    }
-
-    /// Estimate the heap allocation size of a clause trace entry.
-    fn estimate_entry_bytes(clause_len: usize, hints_len: usize) -> usize {
-        // ClauseTraceEntry struct overhead (id + is_original + Vec headers)
-        // plus heap allocations for clause and hints vectors.
-        const ENTRY_OVERHEAD: usize = 64;
-        ENTRY_OVERHEAD + clause_len * size_of::<Literal>() + hints_len * size_of::<u64>()
-    }
-
-    /// Allocated slots in the outer entry vector.
-    ///
-    /// The bounded independent-replay path combines this with every entry's
-    /// public clause/hint capacity.  `used_bytes()` is intentionally only the
-    /// trace writer's len-based admission estimate, so it cannot serve as an
-    /// exact retained-capacity census for certificate validation.
-    pub(crate) fn entries_capacity(&self) -> usize {
-        self.entries.capacity()
+    /// Allocated capacity of the solver-minted scope-premise snapshot.
+    pub(crate) fn scope_assumptions_capacity(&self) -> usize {
+        self.solver_num_vars
+            .as_ref()
+            .map_or(0, |provenance| provenance.1.capacity())
     }
 
     /// Record the outcome of a level-0 minimize-chain hint lookup.
@@ -253,109 +375,6 @@ impl ClauseTrace {
         }
     }
 
-    /// Record a clause addition.
-    pub fn add_clause(&mut self, id: u64, clause: Vec<Literal>, is_original: bool) {
-        self.add_clause_with_hints(id, clause, is_original, Vec::new());
-    }
-
-    /// Whether any entry already carries this stable id.
-    ///
-    /// The trace's id space must be injective — `clause_trace_resolution`
-    /// rejects the WHOLE trace on a duplicate, which discards an otherwise
-    /// valid refutation. Callers that mint an id from a different space (the
-    /// LRAT proof manager, say) must check before pushing.
-    pub fn contains_id(&self, id: u64) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
-    }
-
-    /// Record a clause addition with explicit resolution hints.
-    ///
-    /// Empty clauses are always recorded because they signal UNSAT. Non-empty
-    /// clauses are silently dropped when the memory budget is exceeded.
-    pub fn add_clause_with_hints(
-        &mut self,
-        id: u64,
-        clause: Vec<Literal>,
-        is_original: bool,
-        resolution_hints: Vec<u64>,
-    ) {
-        self.solver_num_vars = None;
-        let entry_bytes = Self::estimate_entry_bytes(clause.len(), resolution_hints.len());
-
-        if clause.is_empty() {
-            self.has_empty = true;
-        } else if self.used_bytes + entry_bytes > self.budget_bytes {
-            // Budget exceeded: drop this entry silently.
-            // Empty clauses bypass this check (UNSAT signal must not be lost).
-            if !self.is_truncated {
-                self.is_truncated = true;
-                tracing::warn!(
-                    used_bytes = self.used_bytes,
-                    budget_bytes = self.budget_bytes,
-                    entries = self.entries.len(),
-                    "clause trace memory budget exceeded — further entries will be dropped"
-                );
-            }
-            return;
-        }
-
-        if std::env::var_os("AY_PROBE_TRACE_DUP").is_some() && self.contains_id(id) {
-            let prev = self
-                .entries
-                .iter()
-                .position(|e| e.id == id)
-                .unwrap_or(usize::MAX);
-            eprintln!(
-                "AY_PROBE_TRACE_DUP: id={id} pushed at entry {} already at entry {prev};                  new_is_original={is_original} new_len={} prev_is_original={} prev_len={}",
-                self.entries.len(),
-                clause.len(),
-                self.entries.get(prev).map(|e| e.is_original).unwrap_or(false),
-                self.entries.get(prev).map(|e| e.clause.len()).unwrap_or(0),
-            );
-        }
-        self.used_bytes += entry_bytes;
-        self.entries.push(ClauseTraceEntry {
-            id,
-            clause,
-            is_original,
-            resolution_hints,
-        });
-    }
-
-    /// Update the resolution hints for an existing clause entry.
-    ///
-    /// Prefer `add_clause_with_hints` for new code — it attaches hints
-    /// atomically at insertion time, preventing hint-loss regressions (#4435).
-    /// This method is retained for LRAT ID resync edge cases and tests.
-    ///
-    /// Returns `true` if the clause ID was found and updated. Logs a warning
-    /// in release builds when the ID is missing, so proof-DAG edge drops are
-    /// never completely silent.
-    pub fn set_resolution_hints(&mut self, id: u64, resolution_hints: Vec<u64>) -> bool {
-        self.solver_num_vars = None;
-        // Search from the end: the target clause was almost always just appended,
-        // making the common case O(1) instead of O(n). Over C total conflicts,
-        // this turns the aggregate cost from O(C^2) to O(C).
-        if let Some(entry) = self.entries.iter_mut().rfind(|entry| entry.id == id) {
-            // Adjust used_bytes for the hint size change.
-            let old_bytes = entry.resolution_hints.len() * size_of::<u64>();
-            let new_bytes = resolution_hints.len() * size_of::<u64>();
-            self.used_bytes = self
-                .used_bytes
-                .wrapping_sub(old_bytes)
-                .wrapping_add(new_bytes);
-            entry.resolution_hints = resolution_hints;
-            true
-        } else {
-            tracing::warn!(
-                clause_id = id,
-                hint_count = resolution_hints.len(),
-                "set_resolution_hints: clause ID not found — resolution DAG edge dropped"
-            );
-            false
-        }
-    }
-
     /// Record that the empty clause was derived.
     pub fn mark_empty(&mut self) {
         self.solver_num_vars = None;
@@ -386,43 +405,46 @@ impl ClauseTrace {
         self.proof_work_exhausted
     }
 
-    /// Drop all recorded entries (reclaims memory after #A2b budget
-    /// exhaustion). The `proof_work_exhausted` / `has_empty` markers are
-    /// kept so consumers still see the honest degrade signal.
-    pub fn clear_entries(&mut self) {
-        self.solver_num_vars = None;
-        self.entries = Vec::new();
-        self.used_bytes = 0;
+    /// Get all trace entries as a borrowed, iterable view.
+    pub fn entries(&self) -> TraceEntries<'_> {
+        TraceEntries {
+            meta: &self.meta,
+            lit_pool: &self.lit_pool,
+            hint_pool: &self.hint_pool,
+        }
     }
 
-    /// Estimated memory usage in bytes.
-    pub fn used_bytes(&self) -> usize {
-        self.used_bytes
-    }
-
-    /// Get all trace entries.
-    pub fn entries(&self) -> &[ClauseTraceEntry] {
-        &self.entries
+    /// Materialize all trace entries as owned snapshots.
+    ///
+    /// This is the allocation-explicit compatibility path for pre-A3 callers
+    /// that consumed the owned `&[ClauseTraceEntry]` returned by `entries()`.
+    /// Borrowing consumers should prefer [`Self::entries`].
+    #[must_use]
+    pub fn entries_snapshot(&self) -> Vec<ClauseTraceEntry> {
+        self.entries()
+            .iter()
+            .map(|entry| entry.to_entry())
+            .collect()
     }
 
     /// Number of entries in the trace.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.meta.len()
     }
 
     /// Check if trace is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.meta.is_empty()
     }
 
     /// Get original clauses only.
-    pub fn original_clauses(&self) -> impl Iterator<Item = &ClauseTraceEntry> {
-        self.entries.iter().filter(|e| e.is_original)
+    pub fn original_clauses(&self) -> impl Iterator<Item = ClauseTraceEntryRef<'_>> {
+        self.entries().iter().filter(|e| e.is_original)
     }
 
     /// Get learned clauses only.
-    pub fn learned_clauses(&self) -> impl Iterator<Item = &ClauseTraceEntry> {
-        self.entries.iter().filter(|e| !e.is_original)
+    pub fn learned_clauses(&self) -> impl Iterator<Item = ClauseTraceEntryRef<'_>> {
+        self.entries().iter().filter(|e| !e.is_original)
     }
 
     /// Exact SAT variable namespace captured by the solver that produced this
@@ -432,14 +454,36 @@ impl ClauseTrace {
     /// after extraction and therefore cannot authorize proof publication.
     #[must_use]
     pub fn solver_num_vars(&self) -> Option<usize> {
+        self.solver_num_vars.as_ref().map(|provenance| provenance.0)
+    }
+
+    /// Solver-minted unit premises that activate the live incremental scopes
+    /// represented by this immutable trace snapshot.
+    ///
+    /// `None` means the trace is live, manually constructed, or was mutated
+    /// after extraction. `Some(&[])` is an authoritative base-scope snapshot.
+    #[must_use]
+    pub fn scope_assumptions(&self) -> Option<&[Literal]> {
         self.solver_num_vars
+            .as_ref()
+            .map(|provenance| provenance.1.as_slice())
     }
 
     /// Bind a freshly extracted immutable snapshot to its owning solver's
     /// exact variable namespace. Only solver extraction code may mint this
     /// provenance.
+    #[cfg(test)]
     pub(crate) fn stamp_solver_num_vars(&mut self, solver_num_vars: usize) {
-        self.solver_num_vars = Some(solver_num_vars);
+        self.solver_num_vars = Some((solver_num_vars, Vec::new()));
+    }
+
+    /// Atomically seal namespace and active-scope authority at extraction.
+    pub(crate) fn stamp_solver_provenance(
+        &mut self,
+        solver_num_vars: usize,
+        scope_assumptions: &[Literal],
+    ) {
+        self.solver_num_vars = Some((solver_num_vars, scope_assumptions.to_vec()));
     }
 }
 

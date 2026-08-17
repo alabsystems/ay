@@ -3420,7 +3420,6 @@ mod tests {
     use super::*;
     use crate::{parse_dimacs, Literal, Variable};
     use std::env;
-    use std::fs;
     use std::path::Path;
 
     fn pos(var: usize) -> Literal {
@@ -4342,11 +4341,10 @@ mod tests {
         let packet =
             build_dense_clique_php_replay_packet_from_clauses(formula.num_vars, &formula.clauses)
                 .unwrap();
-        let compact_drat_path = env::var("AY_DENSE_CLIQUE_COMPACT_DRAT_PROOF").ok();
-        let compact_drat = compact_drat_path
-            .as_ref()
-            .map(|path| fs::read_to_string(path).expect("read compact dense-clique DRAT proof"))
-            .unwrap_or_else(|| "0\n".to_string());
+        // B1: the AY_DENSE_CLIQUE_* file-substitution hooks are deleted; the
+        // built-in fixtures are the only inputs, so every assertion below is
+        // unconditional (previously guarded by `.is_none()`).
+        let compact_drat = "0\n".to_string();
 
         let materialization = materialize_dense_clique_php_original_drat_from_compact_proof(
             DenseCliquePhpOriginalDratMaterializerConfig { enabled: true },
@@ -4372,26 +4370,11 @@ mod tests {
             .drat
             .starts_with("-1 181 0\n-2 181 0\n1 2 -181 0\n-3 182 0\n"));
 
-        if compact_drat_path.is_none() {
-            assert_eq!(materialization.stats.compact_proof_lines_seen, 1);
-            assert_eq!(materialization.stats.compact_proof_additions_remapped, 1);
-            assert_eq!(materialization.stats.compact_proof_deletions_remapped, 0);
-            assert_eq!(materialization.stats.compact_proof_max_var, 0);
-            assert_eq!(materialization.stats.original_proof_max_var, 270);
-        }
-
-        if let Ok(out_path) = env::var("AY_DENSE_CLIQUE_ORIGINAL_DRAT_OUT") {
-            let out_path = Path::new(&out_path);
-            assert!(
-                out_path.starts_with("/tmp"),
-                "proof sidecar output must stay under /tmp: {}",
-                out_path.display()
-            );
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).expect("create dense-clique proof sidecar parent");
-            }
-            fs::write(out_path, materialization.drat).expect("write dense-clique proof sidecar");
-        }
+        assert_eq!(materialization.stats.compact_proof_lines_seen, 1);
+        assert_eq!(materialization.stats.compact_proof_additions_remapped, 1);
+        assert_eq!(materialization.stats.compact_proof_deletions_remapped, 0);
+        assert_eq!(materialization.stats.compact_proof_max_var, 0);
+        assert_eq!(materialization.stats.original_proof_max_var, 270);
     }
 
     #[test]
@@ -4405,11 +4388,8 @@ mod tests {
         let packet =
             build_dense_clique_php_replay_packet_from_clauses(formula.num_vars, &formula.clauses)
                 .unwrap();
-        let compact_lrat_path = env::var("AY_DENSE_CLIQUE_COMPACT_LRAT_PROOF").ok();
-        let compact_lrat = compact_lrat_path
-            .as_ref()
-            .map(|path| fs::read_to_string(path).expect("read compact dense-clique LRAT proof"))
-            .unwrap_or_else(|| "416 0 0\n".to_string());
+        // B1: file-substitution hook deleted; built-in fixture only.
+        let compact_lrat = "416 0 0\n".to_string();
 
         let materialization = materialize_dense_clique_php_original_lrat_from_compact_proof(
             DenseCliquePhpOriginalLratMaterializerConfig { enabled: true },
@@ -4435,29 +4415,14 @@ mod tests {
             .lrat
             .starts_with("3161 181 -1 0 0\n3162 181 -2 0 0\n3163 -181 1 2 0 -3161 -3162 0\n"));
 
-        if compact_lrat_path.is_none() {
-            assert_eq!(materialization.stats.compact_lrat_lines_seen, 1);
-            assert_eq!(materialization.stats.compact_lrat_additions_remapped, 1);
-            assert_eq!(materialization.stats.compact_lrat_deletions_remapped, 0);
-            assert_eq!(materialization.stats.compact_lrat_max_var, 0);
-            assert_eq!(materialization.stats.compact_lrat_max_id, 416);
-            assert_eq!(materialization.stats.compact_lrat_derived_id_offset, 4_240);
-            assert_eq!(materialization.stats.original_lrat_max_var, 270);
-            assert_eq!(materialization.stats.original_lrat_max_id, 4_656);
-        }
-
-        if let Ok(out_path) = env::var("AY_DENSE_CLIQUE_ORIGINAL_LRAT_OUT") {
-            let out_path = Path::new(&out_path);
-            assert!(
-                out_path.starts_with("/tmp"),
-                "proof sidecar output must stay under /tmp: {}",
-                out_path.display()
-            );
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).expect("create dense-clique proof sidecar parent");
-            }
-            fs::write(out_path, materialization.lrat).expect("write dense-clique proof sidecar");
-        }
+        assert_eq!(materialization.stats.compact_lrat_lines_seen, 1);
+        assert_eq!(materialization.stats.compact_lrat_additions_remapped, 1);
+        assert_eq!(materialization.stats.compact_lrat_deletions_remapped, 0);
+        assert_eq!(materialization.stats.compact_lrat_max_var, 0);
+        assert_eq!(materialization.stats.compact_lrat_max_id, 416);
+        assert_eq!(materialization.stats.compact_lrat_derived_id_offset, 4_240);
+        assert_eq!(materialization.stats.original_lrat_max_var, 270);
+        assert_eq!(materialization.stats.original_lrat_max_id, 4_656);
     }
 
     #[test]

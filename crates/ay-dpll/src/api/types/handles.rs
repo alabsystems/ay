@@ -21,6 +21,8 @@ pub(crate) struct TermArenaStamp(u64);
 impl TermArenaStamp {
     #[allow(clippy::panic)]
     pub(crate) fn fresh() -> Self {
+        // `fetch_update`, not `try_update`: same closure-CAS loop, stable
+        // since 1.45 — see the twin note in ay-core/src/term/mod.rs.
         let stamp = NEXT_TERM_ARENA_STAMP
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)

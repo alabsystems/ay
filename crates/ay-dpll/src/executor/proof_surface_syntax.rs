@@ -14,8 +14,12 @@ use ay_frontend::command::{
 };
 use ay_frontend::{Context, SExpr};
 
+#[path = "proof_surface_syntax/atom_override.rs"]
+mod atom_override;
 #[path = "proof_surface_syntax_realify.rs"]
 mod realify;
+pub(super) use atom_override::collect_root_surface_term_override;
+use atom_override::override_would_hijack_atom;
 use realify::realify_real_context_numerals;
 
 pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
@@ -153,27 +157,6 @@ fn collect_surface_term_overrides_prechecked(
     }
 
     collect_subterm_surface_overrides(ctx, parsed, overrides);
-}
-
-/// Record only the authored spelling of a whole assertion, without attaching
-/// surface spellings to any of its canonical subterms.
-///
-/// Certified theory rules must print their arrays, indices, and other
-/// load-bearing operands from the exact terms the checker validated.  A
-/// reintroduced authored premise still needs its top-level input spelling to
-/// match the problem, but recursively applying that spelling to a ROW lemma
-/// can change a checked canonical index such as `(+ x (- 1))` back into the
-/// source's `(+ (- x 1) 0)`.  Root-only collection preserves premise identity
-/// without contaminating independently certified theory steps.
-pub(super) fn collect_root_surface_term_override(
-    ctx: &mut Context,
-    canonical: TermId,
-    parsed: &FrontendTerm,
-    overrides: &mut HashMap<TermId, String>,
-) {
-    let parsed = strip_frontend_annotations(parsed);
-    let echo = realify_real_context_numerals(ctx, parsed, false, &mut Vec::new());
-    overrides.insert(canonical, format_frontend_term(&echo));
 }
 
 /// Recover the exact fresh variable identity used by an elaborated binder.
@@ -443,7 +426,12 @@ fn collect_subterm_surface_overrides(
         let Some(child) = ctx.elaborate_surface_subterm(arg) else {
             continue;
         };
-        if !overrides.contains_key(&child) {
+        // A subterm that FOLDED to a plain variable/constant must not
+        // register its spelling: keyed by the atom's TermId, it would
+        // re-spell every unrelated occurrence of that atom (see
+        // `override_would_hijack_atom`). Still descend — deeper subterms
+        // that survived elaboration keep their own faithful spellings.
+        if !override_would_hijack_atom(&ctx.terms, child, arg) && !overrides.contains_key(&child) {
             let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
             overrides.insert(child, format_frontend_term(&echo));
         }
@@ -479,7 +467,11 @@ pub(super) fn collect_deep_arith_surface_overrides(
             continue;
         }
         if let Some(child) = ctx.elaborate_surface_subterm(arg) {
-            if !overrides.contains_key(&child) {
+            // Same fold guard as the connective collector: an override on a
+            // folded-to-atom subterm re-spells the atom everywhere.
+            if !override_would_hijack_atom(&ctx.terms, child, arg)
+                && !overrides.contains_key(&child)
+            {
                 let echo = realify_real_context_numerals(ctx, arg, false, &mut Vec::new());
                 overrides.insert(child, format_frontend_term(&echo));
             }

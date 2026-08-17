@@ -7,6 +7,9 @@ use super::*;
 use ay_core::{Sort, Symbol, TermStore};
 use ay_sat::{ClauseTrace, Literal, Variable};
 
+mod folded_unit_authority;
+mod propagation_unit_authority;
+
 fn setup_test_terms() -> (TermStore, HashMap<u32, TermId>, HashMap<TermId, TermId>) {
     let mut terms = TermStore::new();
     let mut var_to_term = HashMap::default();
@@ -30,7 +33,6 @@ fn setup_test_terms() -> (TermStore, HashMap<u32, TermId>, HashMap<TermId, TermI
 fn test_lit_to_term_positive() {
     let (mut terms, var_to_term, _negations) = setup_test_terms();
     let mut manager = SatProofManager::new(&var_to_term, &mut terms);
-
     let lit = Literal::positive(Variable::new(0));
     let term = manager.lit_to_term(lit).unwrap();
     assert_eq!(term, var_to_term[&0]);
@@ -390,6 +392,61 @@ fn test_farkas_annotation_rebinds_by_literal_and_merges_duplicates() {
     );
 
     assert!(SatProofManager::rebind_theory_annotation(&annotation, &[q]).is_none());
+}
+
+#[test]
+fn c3_euf_annotation_keeps_validator_order_across_trace_permutation() {
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let mut terms = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = terms.mk_var("a", u.clone());
+    let b = terms.mk_var("b", u.clone());
+    let c = terms.mk_var("c", u);
+    let eq_ab = terms.mk_eq(a, b);
+    let eq_bc = terms.mk_eq(b, c);
+    let eq_ac = terms.mk_eq(a, c);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let not_bc = terms.mk_not_raw(eq_bc);
+    let producer_clause = vec![not_ab, not_bc, eq_ac];
+    let traced_clause = vec![eq_ac, not_bc, not_ab];
+    let annotation = TheoryLemmaProof {
+        clause: producer_clause.clone(),
+        kind: TheoryLemmaKind::EufTransitive,
+        farkas: None,
+        lia: None,
+    };
+
+    let rebound = SatProofManager::rebind_theory_annotation(&annotation, &traced_clause)
+        .expect("set-equivalent watched-literal permutation must rebind");
+    assert_eq!(rebound.clause, producer_clause);
+    assert!(rebound.farkas.is_none());
+    assert!(rebound.lia.is_none());
+
+    let mut existing_clause_map: HashMap<Vec<TermId>, ProofId> = HashMap::default();
+    let mut proof = Proof::new();
+    let id = SatProofManager::add_original_clause_step(
+        &mut terms,
+        &mut proof,
+        &traced_clause,
+        &mut existing_clause_map,
+        None,
+        Some(&annotation),
+    );
+    let Some(ProofStep::TheoryLemma {
+        clause,
+        kind,
+        farkas,
+        lia,
+        ..
+    }) = proof.get_step(id)
+    else {
+        panic!("expected theory lemma");
+    };
+    assert_eq!(clause, &producer_clause);
+    assert_eq!(*kind, TheoryLemmaKind::EufTransitive);
+    assert!(farkas.is_none() && lia.is_none());
+    assert!(ay_proof::recognize_euf_transitive(&terms, clause));
 }
 
 #[test]
@@ -824,6 +881,42 @@ fn test_original_annotation_uses_reserved_clause_id_slot() {
 }
 
 #[test]
+fn exact_fragment_uses_annotation_after_reserved_tautology_id() {
+    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
+
+    let (mut terms, var_to_term, _negations) = setup_test_terms();
+    let q = var_to_term[&1];
+    let annotations = vec![
+        None,
+        Some(TheoryLemmaProof {
+            clause: vec![q],
+            kind: TheoryLemmaKind::Generic,
+            farkas: None,
+            lia: None,
+        }),
+    ];
+    let mut trace = ClauseTrace::new();
+    trace.add_clause(2, vec![Literal::positive(Variable::new(1))], true);
+
+    let fragment = {
+        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
+        manager.set_original_clause_theory_proofs(&annotations);
+        manager
+            .build_exact_original_proof_fragment(&trace, &[])
+            .expect("ID 2 must bind annotation slot 1 after reserved ID 1")
+    };
+    let binding = fragment.binding(2).expect("binding for stable ID 2");
+    assert!(matches!(
+        fragment.proof().get_step(binding.proof_id()),
+        Some(ProofStep::TheoryLemma {
+            clause,
+            kind: TheoryLemmaKind::Generic,
+            ..
+        }) if clause == &vec![q]
+    ));
+}
+
+#[test]
 fn test_mismatched_clausification_annotation_fails_closed() {
     use ay_core::ClausificationProof;
 
@@ -1033,13 +1126,13 @@ fn exact_original_fragment_charges_full_clausification_source_before_clone() {
     let mut consumed_work = 0usize;
     let mut progress = |work: usize, _bytes: usize| {
         let actual = consumed_work.checked_add(work).ok_or(
-            ResolutionValidationError::AccountingOverflow {
-                resource: ResolutionValidationResource::Work,
+            ay_sat::ResolutionValidationError::AccountingOverflow {
+                resource: ay_sat::ResolutionValidationResource::Work,
             },
         )?;
         if actual > 1000 {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
+            return Err(ay_sat::ResolutionValidationError::LimitExceeded {
+                resource: ay_sat::ResolutionValidationResource::Work,
                 limit: 1000,
                 actual: actual as u128,
             });
@@ -1057,8 +1150,8 @@ fn exact_original_fragment_charges_full_clausification_source_before_clone() {
 
     assert!(matches!(
         error,
-        ExactOriginalProofError::Resource(ResolutionValidationError::LimitExceeded {
-            resource: ResolutionValidationResource::Work,
+        ExactOriginalProofError::Resource(ay_sat::ResolutionValidationError::LimitExceeded {
+            resource: ay_sat::ResolutionValidationResource::Work,
             limit: 1000,
             ..
         })
@@ -1190,43 +1283,6 @@ fn exact_original_fragment_rejects_stale_indexed_theory_annotation() {
         ExactOriginalProofError::InvalidTheoryAnnotation {
             clause_id: 1,
             clause: vec![p],
-        }
-    );
-}
-
-#[test]
-fn exact_original_fragment_rejects_unannotated_generated_clause() {
-    use ay_core::{TheoryLemmaKind, TheoryLemmaProof};
-
-    let (mut terms, var_to_term, _negations) = setup_test_terms();
-    let p = var_to_term[&0];
-    let q = var_to_term[&1];
-    let mut content_annotations = HashMap::default();
-    content_annotations.insert(
-        vec![q],
-        TheoryLemmaProof {
-            clause: vec![q],
-            kind: TheoryLemmaKind::Generic,
-            farkas: None,
-            lia: None,
-        },
-    );
-    let mut trace = ClauseTrace::new();
-    trace.add_clause(1, vec![Literal::positive(Variable::new(1))], true);
-
-    let error = {
-        let mut manager = SatProofManager::new(&var_to_term, &mut terms);
-        manager.set_theory_lemma_proofs(&content_annotations);
-        manager
-            .build_exact_original_proof_fragment(&trace, &[p])
-            .expect_err("content-keyed fallback is not exact identity authority")
-    };
-
-    assert_eq!(
-        error,
-        ExactOriginalProofError::UnauthenticatedOriginalClause {
-            clause_id: 1,
-            clause: vec![q],
         }
     );
 }

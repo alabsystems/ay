@@ -42,7 +42,7 @@ use crate::univariate::{
     cauchy_bound, isolate_roots, poly_gcd, rational_sign, square_free_part, sturm_count,
     sturm_sequence, RootMarker, UniPoly,
 };
-
+mod rational_root;
 /// Hard cap on interval-refinement bisection steps. Each step halves the
 /// isolating interval, so 4096 steps shrink it by 2^4096 — unreachable for any
 /// genuine computation on these polynomial degrees; hitting the cap means a
@@ -676,9 +676,9 @@ impl RealAlgebraicValue {
     /// z3 `root-obj` rendering of the value, or `None` when no derived
     /// defining polynomial could be computed (callers fail closed) or when the
     /// value is exactly rational (`Some(Err(rational))`-style is avoided —
-    /// use [`Self::to_number`] when the rational case must be handled).
+    /// use [`Self::to_number_for_output`] for the rational case).
     pub fn to_smtlib(&self) -> Option<String> {
-        match self.to_number()? {
+        match self.to_number_for_output()? {
             RealScalar::Rational(_) => None,
             RealScalar::Algebraic(v) => Some(v.alpha.to_smtlib()),
         }

@@ -175,7 +175,7 @@ impl Solver {
     /// default ON since 2026-07-10, wf_55735963).
     ///
     /// Set from the resolved variant config (Default DIMACS variant only;
-    /// kill-switch AY_AB_SUBST_AUTO=0). Gates the expensive
+    /// kill-switch --sat-no-subst-auto). Gates the expensive
     /// congruence+decompose fixpoint on the one-round equivalence-density
     /// probe and raises the congruence size caps to the AUTO bounds — see
     /// `cold.subst_auto_collapse`.
@@ -188,7 +188,7 @@ impl Solver {
     /// density disarm in compute_preprocess_policy + the giant decompose
     /// re-run bail in inprocessing_schedule. Set from the resolved variant
     /// config ONLY when AUTO is on via the default path
-    /// (`AY_AB_SUBST_AUTO` unset); explicit `=1` keeps the historical
+    /// (`--sat-no-subst-auto` unset); explicit `=1` keeps the historical
     /// uncapped A/B semantics — see `cold.subst_auto_capped`.
     pub(crate) fn set_subst_auto_collapse_capped(&mut self, capped: bool) {
         self.cold.subst_auto_capped = capped;
@@ -198,7 +198,7 @@ impl Solver {
     /// raised 4M/10M probe caps + 12s in-band preprocess budget. Set from
     /// the resolved variant config ONLY on the DEFAULT-ON capped path for
     /// NON-PROOF solves (kill-switch `AY_AB_SUBST_AUTO_GIANT=0`; also rides
-    /// `AY_AB_SUBST_AUTO=0`) — see `cold.subst_auto_giant`.
+    /// `--sat-no-subst-auto`) — see `cold.subst_auto_giant`.
     pub(crate) fn set_subst_auto_giant_band(&mut self, enabled: bool) {
         self.cold.subst_auto_giant = enabled;
     }

@@ -14,107 +14,23 @@ mod axioms_indexof;
 mod axioms_replace;
 mod axioms_search;
 mod bv_transitivity;
+mod classify;
 mod ground;
 mod ho_unfold;
 mod scan;
+mod solve_seq;
 #[cfg(test)]
 mod tests;
-
-use scan::SUPPORTED_SEQ_OPS;
 
 use super::super::Executor;
 use super::solve_harness::TheoryModels;
 use super::MAX_SPLITS_LIA;
-use crate::combined_solvers::{UfSeqLiaSolver, UfSeqSolver};
+use crate::combined_solvers::UfSeqLiaSolver;
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
-use ay_core::term::{Symbol, TermData, TermId};
+use ay_core::term::TermId;
 
 impl Executor {
-    /// Solve using the combined EUF+Seq theory (QF_SEQ).
-    ///
-    /// If `seq.len` terms or axiom-generating operations (contains, extract, etc.)
-    /// are detected, automatically routes to `solve_seq_lia()` for LIA reasoning.
-    pub(in crate::executor) fn solve_seq(&mut self) -> Result<SolveResult> {
-        if self.should_abort_theory_loop() {
-            return Ok(SolveResult::Unknown);
-        }
-        // GROUND + BOUNDED-UNFOLDING of seq.map/mapi/foldl/foldli (#ho-seq):
-        // finitely-unfoldable combinators are eliminated BEFORE the allowlist
-        // guard below, so goals over them are actually decided; anything not
-        // unfoldable stays and fails closed to Unknown as before.
-        self.unfold_ho_seq_ops();
-        // Guard: return Unknown for unsupported Seq operations (#5985).
-        // Without axioms, these become uninterpreted functions → false SAT.
-        if self.assertions_contain_unsupported_seq_ops() {
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            return Ok(SolveResult::Unknown);
-        }
-
-        // Route to SeqLIA if length terms or axiom-generating ops are present.
-        // Operations like seq.contains, seq.extract, seq.prefixof, etc.
-        // generate length constraints that require LIA reasoning (#5841).
-        if self.assertions_contain_seq_len()
-            || self.assertions_contain_axiom_ops()
-            || self.assertions_contain_seq_concat_equality()
-            || self.assertions_contain_seq_ite_equality()
-        {
-            return self.solve_seq_lia();
-        }
-
-        // Inject structural axioms (e.g., seq.nth) even without seq.len (#5841).
-        let nth_axioms = self.collect_seq_nth_axioms();
-        if !nth_axioms.is_empty() {
-            let mut seen: HashSet<_> = self.ctx.assertions.iter().copied().collect();
-            self.ctx
-                .assertions
-                .extend(nth_axioms.into_iter().filter(|axiom| seen.insert(*axiom)));
-        }
-
-        // Inject seq.++ associativity/identity normalization (#seq-assoc). The EUF
-        // core treats seq.++ as uninterpreted, so associativity-variant concats are
-        // distinct terms and a negated equality between them is wrongly SAT. These
-        // axioms equate concats sharing a flattened leaf form.
-        let concat_axioms = self.collect_seq_concat_normalization_axioms();
-        if !concat_axioms.is_empty() {
-            let mut seen: HashSet<_> = self.ctx.assertions.iter().copied().collect();
-            self.ctx.assertions.extend(
-                concat_axioms
-                    .into_iter()
-                    .filter(|axiom| seen.insert(*axiom)),
-            );
-        }
-
-        // Inject BV comparison transitivity axioms for Seq<BitVec> formulas (#7587, #7579).
-        // When BV predicates (bvsle, bvule, etc.) appear in Seq formulas, EUF treats
-        // them as uninterpreted — losing ordering transitivity. Explicit axioms restore it.
-        let bv_trans_axioms = self.collect_bv_transitivity_axioms();
-        if !bv_trans_axioms.is_empty() {
-            let mut seen: HashSet<_> = self.ctx.assertions.iter().copied().collect();
-            self.ctx.assertions.extend(
-                bv_trans_axioms
-                    .into_iter()
-                    .filter(|axiom| seen.insert(*axiom)),
-            );
-        }
-
-        // #8456: Model validation now runs for Seq theories.
-        solve_incremental_theory_pipeline!(self,
-            tag: "Seq",
-            create_theory: UfSeqSolver::new(&self.ctx.terms),
-            extract_models: |theory| {
-                let (euf_model, seq_model) = theory.extract_models();
-                TheoryModels {
-                    euf: Some(euf_model),
-                    seq: Some(seq_model),
-                    ..TheoryModels::default()
-                }
-            },
-            track_theory_stats: true,
-            set_unknown_on_error: false
-        )
-    }
-
     /// Solve using the combined EUF+Seq+LIA theory (QF_SEQLIA).
     ///
     /// Injects `seq.len` axioms then solves with `UfSeqLiaSolver` (#5958).
@@ -407,7 +323,7 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
 
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
 
         let seq_len_axioms = self.collect_seq_len_axioms();
         if !seq_len_axioms.is_empty() {
@@ -429,6 +345,11 @@ impl Executor {
             );
         }
 
+        // This wrapper can add sequence/array bridge terms before delegating
+        // to AUFLIA (or its mod/div rescue). Close the final wrapper surface so
+        // an early rescue SAT cannot skip finite-index array equalities.
+        let _ = self.add_finite_index_array_closure();
+
         let features = StaticFeatures::collect(&self.ctx.terms, &self.ctx.assertions);
         let result = if features.has_int_div_mod {
             if let Some(result) = self.try_sat_via_mod_free_or_branch()? {
@@ -439,7 +360,7 @@ impl Executor {
         } else {
             self.solve_auf_lia()
         };
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
         result
     }
 
@@ -526,209 +447,5 @@ impl Executor {
                 Err(err)
             }
         }
-    }
-
-    /// Check whether any assertion contains a `seq.len` application.
-    fn assertions_contain_seq_len(&self) -> bool {
-        let mut stack: Vec<TermId> = self.ctx.assertions.clone();
-        let mut visited = HashSet::default();
-        while let Some(term) = stack.pop() {
-            if !visited.insert(term) {
-                continue;
-            }
-            match self.ctx.terms.get(term) {
-                TermData::App(Symbol::Named(name), args) => {
-                    if name == "seq.len" {
-                        return true;
-                    }
-                    for &arg in args {
-                        stack.push(arg);
-                    }
-                }
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(c, t, e) => {
-                    stack.push(*c);
-                    stack.push(*t);
-                    stack.push(*e);
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    fn assertions_contain_native_seq_ops(&self) -> bool {
-        let mut stack: Vec<TermId> = self.ctx.assertions.clone();
-        let mut visited = HashSet::default();
-        while let Some(term) = stack.pop() {
-            if !visited.insert(term) {
-                continue;
-            }
-            match self.ctx.terms.get(term) {
-                TermData::App(Symbol::Named(name), args) => {
-                    if name.starts_with("seq.") {
-                        return true;
-                    }
-                    for &arg in args {
-                        stack.push(arg);
-                    }
-                }
-                TermData::App(_, args) => {
-                    for &arg in args {
-                        stack.push(arg);
-                    }
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, binding) in bindings {
-                        stack.push(*binding);
-                    }
-                    stack.push(*body);
-                }
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(c, t, e) => {
-                    stack.push(*c);
-                    stack.push(*t);
-                    stack.push(*e);
-                }
-                TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-                    stack.push(*body);
-                    for trigger in triggers {
-                        for &pattern in trigger {
-                            stack.push(pattern);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    /// Check whether live assertions contain active datatype operations.
-    ///
-    /// Datatype-sorted opaque UFs are satisfiability-equivalent to EUF over a
-    /// nonempty sort unless constructors, testers, or selectors are used. Do
-    /// not reject Seq formulas merely because a QuantifierConsumer bridge function returns a
-    /// datatype sort.
-    pub(in crate::executor) fn assertions_contain_datatype_terms(&self) -> bool {
-        self.terms_contain_datatype_terms(&self.ctx.assertions)
-    }
-
-    pub(in crate::executor) fn terms_contain_datatype_terms(&self, roots: &[TermId]) -> bool {
-        let mut stack: Vec<TermId> = roots.to_vec();
-        let mut visited = HashSet::default();
-        while let Some(term) = stack.pop() {
-            if !visited.insert(term) {
-                continue;
-            }
-            match self.ctx.terms.get(term) {
-                TermData::App(sym, args) => {
-                    if self.is_datatype_symbol_name(sym.name()) {
-                        return true;
-                    }
-                    for &arg in args {
-                        stack.push(arg);
-                    }
-                }
-                // Nullary constructors are elaborated as `Var(ctor_name, _)` rather
-                // than `App`, so a formula whose only datatype content is a bare
-                // nullary constructor (e.g. `(= A B)` for `((A) (B))`) would
-                // otherwise be misclassified as QF_UF. The EUF solver then treats
-                // distinct nullary constructors as ordinary uninterpreted constants
-                // and may unify them, producing false `sat` for a constructor clash
-                // that SMT-LIB datatype disjointness makes UNSAT (#dt-nullary-clash).
-                TermData::Var(name, _) => {
-                    if self.ctx.is_constructor(name).is_some() {
-                        return true;
-                    }
-                }
-                TermData::Let(bindings, body) => {
-                    for (_, binding) in bindings {
-                        stack.push(*binding);
-                    }
-                    stack.push(*body);
-                }
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(c, t, e) => {
-                    stack.push(*c);
-                    stack.push(*t);
-                    stack.push(*e);
-                }
-                TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-                    stack.push(*body);
-                    for trigger in triggers {
-                        for &pattern in trigger {
-                            stack.push(pattern);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
-    fn is_datatype_symbol_name(&self, name: &str) -> bool {
-        if self.ctx.is_constructor(name).is_some() {
-            return true;
-        }
-        if name
-            .strip_prefix("is-")
-            .is_some_and(|ctor| self.ctx.is_constructor(ctor).is_some())
-        {
-            return true;
-        }
-        self.ctx
-            .ctor_selectors_iter()
-            .any(|(_, selectors)| selectors.iter().any(|selector| selector == name))
-    }
-
-    /// Check whether assertions contain any unsupported Seq operations (#5985, #6026).
-    ///
-    /// Uses a positive allowlist (`SUPPORTED_SEQ_OPS`) instead of a negative blocklist.
-    /// Any `seq.*` application not in the allowlist triggers Unknown, preventing
-    /// unrecognized operations from silently becoming uninterpreted functions (false SAT).
-    pub(in crate::executor) fn assertions_contain_unsupported_seq_ops(&self) -> bool {
-        let mut stack: Vec<TermId> = self.ctx.assertions.clone();
-        let mut visited = HashSet::default();
-        while let Some(term) = stack.pop() {
-            if !visited.insert(term) {
-                continue;
-            }
-            match self.ctx.terms.get(term) {
-                TermData::App(Symbol::Named(name), args) => {
-                    if name.starts_with("seq.") && !SUPPORTED_SEQ_OPS.contains(&name.as_str()) {
-                        return true;
-                    }
-                    // (#seq-ite-of-seq-arg) The structural seq axioms cannot model a
-                    // seq operation applied to an ite-of-SEQUENCES: the length /
-                    // emptiness reasoning can't pin which branch the opaque ite is, so
-                    // `(seq.len (ite c a b))` leaked to EUF as a free Int and was
-                    // wrongly SAT (fuzzer rank3 — also the seq.suffixof-of-ite variant).
-                    // Fail closed to a sound `unknown`. An ite of Int seq.len RESULTS
-                    // — `(ite c (seq.len a) (seq.len b))` — is NOT a Seq-sorted ite, so
-                    // it is unaffected and still decided exactly.
-                    if name.starts_with("seq.")
-                        && args.iter().any(|&a| {
-                            matches!(self.ctx.terms.get(a), TermData::Ite(..))
-                                && self.ctx.terms.sort(a).is_seq()
-                        })
-                    {
-                        return true;
-                    }
-                    for &arg in args {
-                        stack.push(arg);
-                    }
-                }
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(c, t, e) => {
-                    stack.push(*c);
-                    stack.push(*t);
-                    stack.push(*e);
-                }
-                _ => {}
-            }
-        }
-        false
     }
 }

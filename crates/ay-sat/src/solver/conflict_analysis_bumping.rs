@@ -16,13 +16,9 @@ use crate::literal::{Literal, Variable};
 /// (2 stable / 1 focused); `Some(0)` = disable reason-side bumping entirely
 /// (Kissat-like analyzed-only bump); `Some(d)` = cap depth at `d`.
 fn bumpreason_depth_override() -> Option<u32> {
-    use std::sync::OnceLock;
-    static OVERRIDE: OnceLock<Option<u32>> = OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        std::env::var("AY_BUMPREASON_DEPTH")
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-    })
+    // B21: the AY_BUMPREASON_DEPTH A/B override is retired; the shipped
+    // CaDiCaL default (2 stable / 1 focused) stands.
+    None
 }
 
 impl Solver {

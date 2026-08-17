@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -28,7 +30,7 @@ ay-pb-dev: explicit, bounded developer campaigns
 USAGE:
   ay-pb-dev two-club INSTANCE [--seed FILE] [--seconds N] [--max-nodes N]
       [--worker W --workers N [--pivot-k K | --d2-base N --d2-classes C,...]]
-      [--branch first|viol|marked] [--trace] [--dump-frontier] [--no-lp]
+      [--branch first|viol|marked|marked-min] [--trace] [--dump-frontier] [--no-lp]
       [--lp-warmup N] [--lp-cadence N] [--lp-window N] [--lp-max-rows N]
       [--lp-low-margin N] [--lp-exact-margin N] [--no-lp-ceiling]
       [--nbhd-rows] [--sdp-worker FILE]
@@ -114,8 +116,9 @@ fn parse_two_club_branch(raw: Option<&str>) -> Result<TwoClubBranchRule, String>
         "first" => Ok(TwoClubBranchRule::First),
         "viol" => Ok(TwoClubBranchRule::ViolatingDegree),
         "marked" => Ok(TwoClubBranchRule::Marked),
+        "marked-min" => Ok(TwoClubBranchRule::MarkedMinDegree),
         other => Err(format!(
-            "--branch must be first, viol, or marked, got {other:?}"
+            "--branch must be first, viol, marked, or marked-min, got {other:?}"
         )),
     }
 }
@@ -494,7 +497,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let count = file
             .read(&mut buffer)
@@ -542,6 +545,9 @@ fn temporary_proof(artifact_name: &str, proof: &str) -> Result<PathBuf, String> 
     ))
 }
 
+// Debug formatting deliberately escapes paths so an embedded newline cannot
+// forge an extra field in this line-oriented verification receipt.
+#[allow(clippy::unnecessary_debug_formatting)]
 fn verification_sidecar(
     config: &CertifyConfig,
     formula: &Path,

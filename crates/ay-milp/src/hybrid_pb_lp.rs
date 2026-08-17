@@ -2674,13 +2674,13 @@ fn deadline_reached(deadline: Option<Instant>) -> bool {
 /// race — and that ratchet may only move DOWN.
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 fn trace_result(decomposition: &Decomposition, cuts: usize, verdict: &str, elapsed: Duration) {
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE hybrid-pb-lp: master={} coupling_rows={} cuts={} \
+            "--trace hybrid-pb-lp: master={} coupling_rows={} cuts={} \
              verdict={} wall={:.6}s",
             decomposition.master_to_original.len(),
             decomposition.coupling_rows,

@@ -476,7 +476,7 @@ impl SmtFileSource {
             // Preserve the physical parent selected for this invocation even if
             // an ancestor symlink is retargeted after the input descriptor opens.
             path: resolve_artifact_target(path)?,
-            identity: SmtFileIdentity::resolve(SmtFileRef::Handle(&file)),
+            identity: SmtFileIdentity::resolve(SmtFileRef::Handle(file)),
         })
     }
 }
@@ -3577,6 +3577,18 @@ fn disclose_alethe_certificate(executor: &Executor, path: &str) {
     if foreign_assume {
         safe_eprintln!(
             "c warning: {path} contains an `assume` that is not verbatim an assertion of the input; an external checker rejects it at that step"
+        );
+    }
+    // A refutation with NO derivation at all is a different failure from one
+    // whose last mile is unproved, and until this line the two were
+    // indistinguishable in the emitted artifact and in every corpus census
+    // built from it. Name the mechanism so the census says which machinery is
+    // missing instead of bucketing every cause under one label.
+    if let Some(mechanism) = executor.last_proof_decline() {
+        safe_eprintln!(
+            "c ay.proof.decline path={path} mechanism={} — {}",
+            mechanism.tag(),
+            mechanism.explanation(),
         );
     }
     if !self_checkable {
@@ -6837,13 +6849,14 @@ enum ProofSelfCheckMode {
 /// Why off: this check is new and its false-reject rate is measured over a
 /// benchmark corpus, not proved. Turning it on by default would put an
 /// unproven gate in front of a verdict AY has already printed, and it costs a
-/// per-byte parse over documents that reach 687 MB. `AY_PROOF_SELF_CHECK=1`
+/// per-byte parse over documents that reach 687 MB. `--proof-self-check`
 /// enables the warning form, `=strict` the refusing form. Both are opt-in, so
 /// the competition path is byte-for-byte unchanged.
 fn proof_self_check_mode() -> ProofSelfCheckMode {
-    match std::env::var("AY_PROOF_SELF_CHECK").ok().as_deref() {
-        Some("1" | "warn" | "on") => ProofSelfCheckMode::Warn,
-        Some("strict" | "2") => ProofSelfCheckMode::Strict,
+    // B41: `--proof-self-check 1|2` (warn | strict); unset = off.
+    match ay_core::misc_cli_flags().proof_self_check {
+        Some(1) => ProofSelfCheckMode::Warn,
+        Some(2) => ProofSelfCheckMode::Strict,
         _ => ProofSelfCheckMode::Off,
     }
 }
@@ -7726,9 +7739,8 @@ fn reject_bv_cnf_export_for_non_smt_route(route: &str) {
 /// Soundness: this only decides *when* to attempt a parse — never the parse
 /// result. When the depth reaches `<= 0` the existing `parse` + naive-paren
 /// recovery runs exactly as before, so a mis-tracked depth can at worst trigger
-/// a parse that then self-heals through the unchanged error path. Gated by
-/// `AY_INC_LINEAR_PARSE` (default on; set to `0`/`off` to restore the
-/// parse-every-line behavior).
+/// a parse that then self-heals through the unchanged error path.
+/// `--no-inc-linear-parse` restores parse-every-line behavior.
 #[derive(Default)]
 struct IncrementalDepth {
     depth: i64,
@@ -7962,10 +7974,8 @@ fn run_interactive_smt_stream(
     // time the buffer is parsed and cleared.
     let mut line_base = 1usize;
     // Linear-time completeness gate for the accumulation buffer (#inc-lra-parse).
-    // Default on; `AY_INC_LINEAR_PARSE=0`/`off` restores parse-every-line.
-    let linear_parse = std::env::var_os("AY_INC_LINEAR_PARSE")
-        .map(|v| v != "0" && v != "off" && v != "false")
-        .unwrap_or(true);
+    // Default on; `--no-inc-linear-parse` restores parse-every-line.
+    let linear_parse = !ay_core::misc_cli_flags().no_inc_linear_parse;
     let mut depth_scan = IncrementalDepth::default();
     let mut artifact_input = String::new();
     let mut executor = new_executor();

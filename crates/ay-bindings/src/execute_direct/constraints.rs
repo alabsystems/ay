@@ -84,7 +84,7 @@ pub(super) fn execute_constraint(
             for expr in exprs {
                 let term = translate_expr(ctx, expr)?;
                 // Store the expression string for output formatting
-                ctx.get_value_terms.push((format!("{}", expr), term));
+                ctx.get_value_terms.push((format!("{expr}"), term));
             }
             Ok(())
         }

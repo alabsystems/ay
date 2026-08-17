@@ -635,7 +635,7 @@ impl Executor {
                     if let Some(alg) = self.nra_algebraic_model.get(&term_id) {
                         // A residue value can reduce to an exact rational (a
                         // triangular-assignment variable): print it as such.
-                        let value_str = match alg.to_number() {
+                        let value_str = match alg.to_number_for_output() {
                             Some(ay_nra::RealScalar::Rational(r)) => format_real(&r),
                             Some(ay_nra::RealScalar::Algebraic(n)) => n.alpha().to_smtlib(),
                             None => alg
@@ -1174,7 +1174,7 @@ impl Executor {
             }
         }
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace TIMING get-value n={} {:.1}s",
                 requested.len(),

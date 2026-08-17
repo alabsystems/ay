@@ -32,6 +32,12 @@ fn proof_enabled_unsat_exposes_proof() {
         solver.last_proof().is_some(),
         "proof must be available after UNSAT with produce-proofs enabled"
     );
+    solver.set_produce_proofs(false);
+    assert!(
+        solver.last_proof().is_some(),
+        "solve-time request must persist"
+    );
+    assert!(solver.export_last_proof_alethe().is_some());
 }
 
 /// Keep proofs disabled, assert a contradiction, verify proof is None.
@@ -51,6 +57,24 @@ fn proof_disabled_unsat_returns_none() {
         solver.last_proof().is_none(),
         "proof must be None when produce-proofs is disabled"
     );
+}
+
+#[test]
+fn later_proof_requests_do_not_expose_unrequested_solve() {
+    let mut solver = Solver::new(Logic::QfUf);
+    let p = solver.declare_const("p", Sort::Bool);
+    let not_p = solver.not(p);
+    solver.assert_term(p);
+    solver.assert_term(not_p);
+
+    assert!(solver.check_sat().is_unsat());
+    assert!(solver.last_proof().is_none());
+    assert!(solver.export_last_proof_alethe().is_none());
+
+    solver.set_verification_level(VerificationLevel::ProofChecked);
+    solver.set_produce_proofs(true);
+    assert!(solver.last_proof().is_none());
+    assert!(solver.export_last_proof_alethe().is_none());
 }
 
 /// First UNSAT with proof, then SAT — proof must be cleared.

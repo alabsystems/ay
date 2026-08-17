@@ -760,7 +760,9 @@ pub unsafe extern "C" fn Z3_mk_set_intersect(
     num_args: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
-    // SAFETY: see `Z3_mk_set_union`.
+    // SAFETY: the caller guarantees `c` is live and that non-null `args` points
+    // to `num_args` readable slots; `mk_set_nary` bounds the count, checks null,
+    // and authenticates every copied AST in the guarded context.
     unsafe { mk_set_nary(c, "and", num_args, args) }
 }
 

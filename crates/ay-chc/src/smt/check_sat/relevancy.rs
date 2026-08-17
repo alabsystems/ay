@@ -30,7 +30,7 @@
 //! blocking clauses (still valid theory lemmas). SAT models are re-verified
 //! against the original expression by `sat_or_unknown` before SAT is
 //! reported, so a wrong don't-care choice can only degrade to Unknown, never
-//! to a wrong answer. Kill switch: `AY_CHC_DONT_CARE_FILTER=0`.
+//! to a wrong answer. Kill switch: `--chc-dont-care-filter=0`.
 
 use std::collections::BTreeMap;
 
@@ -47,11 +47,11 @@ use super::super::model_verify::is_theory_atom;
 /// a wrong UNSAT inside PDR's own model VALIDATORS — which also run through
 /// the filtered check_sat — lets a bad invariant validate, and/or
 /// Indeterminate model verification accepting under-evaluated models).
-/// Re-enable with `AY_CHC_DONT_CARE_FILTER=1` only for experiments until
+/// Re-enable with `--chc-dont-care-filter` only for experiments until
 /// the z3 differential corpus passes and the root cause is fixed.
 pub(crate) fn dont_care_filter_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("AY_CHC_DONT_CARE_FILTER").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| ay_core::misc_cli_flags().chc_dont_care_filter)
 }
 
 /// Model value of a term under the current SAT model, if it has a CNF var.

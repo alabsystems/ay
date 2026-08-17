@@ -19,16 +19,19 @@ cargo test -p <crate>          # e.g. -p ay-sat, -p ay-dpll
 cargo check -p ay --features cli
 ```
 
-Public CI checks the complete workspace under every public feature; exercises
-SAT, SMT, CHC, LRAT, proof replay, PB model admission, and approximate BCP; and
-smoke-tests the README's CLI and Alethe path. Please still run the narrowest
-relevant checks locally before sending a change. Solver changes should also be
-checked against a reference solver and, where possible, a proof or model
-checker.
+AY deliberately has no hosted GitHub Actions workflow. Maintainers run the
+checked-in local solver gate and the full public-export check instead:
 
-CI downloads a checksum-pinned Carcara release and independently replays the
-quick-start Alethe certificate. Solver or proof changes should still use the
-narrowest relevant checker tests locally before the full CI gate.
+```bash
+cargo run --locked -p ay --features cli -- gate solver
+publish/publish.sh check ay --check
+```
+
+The publication command builds an allowlisted export, runs fail-closed content
+guards, and checks the pinned, locked public workspace in an isolated Cargo
+environment. Run the narrowest relevant checks first; solver changes should
+also be checked against a reference solver and, where possible, a proof or
+model checker.
 
 ## Licensing
 

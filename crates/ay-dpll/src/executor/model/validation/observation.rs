@@ -795,12 +795,12 @@ impl Executor {
                         term_str(),
                     ));
                 }
-                if std::env::var_os("AY_F1_DIAG").is_some() {
+                if ay_core::misc_cli_flags().f1_diag {
                     if let TermData::App(sym, args) = self.ctx.terms.get(term) {
                         if sym.name() == "=" {
                             for &arg in args {
                                 eprintln!(
-                                    "AY_F1_DIAG: violated-eq side {:?} ({}) -> {:?}",
+                                    "--f1-diag: violated-eq side {:?} ({}) -> {:?}",
                                     arg,
                                     self.format_term(arg),
                                     self.evaluate_term(model, arg)

@@ -66,14 +66,21 @@ fn test_array_euf_solver_soft_reset_clears_conflict_state() {
     solver.assert_literal(eq, true);
     solver.assert_literal(eq, false);
     assert!(
-        matches!(
-            solver.check(),
-            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
-        ),
-        "expected contradiction before soft_reset"
+        solver
+            .euf_array_notify_replay_cache
+            .has_contradictory_overwrite(),
+        "an opposite assignment without pop must poison replay authority"
+    );
+    assert!(
+        matches!(solver.check(), TheoryResult::Unknown),
+        "a contradictory overwrite must fail closed before soft_reset"
     );
 
     solver.soft_reset();
+    assert!(
+        solver.euf_array_notify_replay_cache.is_logically_empty(),
+        "soft_reset must clear contradictory assignment-derived replay state"
+    );
     assert!(
         matches!(solver.check(), TheoryResult::Sat),
         "soft_reset should clear ArrayEUF conflict state"

@@ -317,7 +317,7 @@ fn scores_from_td(td: &TreeDecomp, num_vars: usize, decow: f64) -> Vec<f64> {
     scores
 }
 
-/// Resolve the FlowCutter binary: explicit path, else `AY_FLOWCUTTER` env,
+/// Resolve the FlowCutter binary: explicit path,
 /// else `flow_cutter_pace17` beside the current executable, else PATH.
 pub fn find_flow_cutter(explicit: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     if let Some(p) = explicit {
@@ -326,13 +326,8 @@ pub fn find_flow_cutter(explicit: Option<&std::path::Path>) -> Option<std::path:
         }
         return None;
     }
-    if let Ok(env) = std::env::var("AY_FLOWCUTTER") {
-        let p = std::path::PathBuf::from(env);
-        if p.exists() {
-            return Some(p);
-        }
-        return None;
-    }
+    // (B17: the AY_FLOWCUTTER env arm is deleted; explicit path,
+    // beside-the-executable, and PATH remain the resolution chain.)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let p = dir.join("flow_cutter_pace17");

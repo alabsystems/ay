@@ -54,7 +54,7 @@
 //! ## How the margin row is found
 //!
 //! A caller may NAME it ([`Model::mark_margin_row`]), which is the only route
-//! that is on by default. Under `AY_MILP_AUTO_MARGIN=1` an ordinary
+//! that is on by default. Under `with_auto_margin(true)` an ordinary
 //! [`crate::BabSession::check`] that was given no name AUTO-DETECTS one instead
 //! (see [`auto_margin_row`]) — the arm that makes this module reachable from a
 //! model that arrives as a FILE, which is every ny W1 model and so the whole
@@ -69,7 +69,7 @@
 //! `finish` re-adjudicates every mapped verdict against the ORIGINAL model. That
 //! held on all 46 measured models: zero disagreements with the plain solve.
 //!
-//! Kill switch: `AY_MILP_NO_MARGIN_REFRAME=1` disables the reframe entirely (the
+//! Kill switch: `--no-margin-reframe` disables the reframe entirely (the
 //! plain feasibility solve decides), marked or detected. Detection additionally
 //! requires an objective identically zero, so a model with a real objective is
 //! byte-identical however the arm is set.
@@ -197,7 +197,7 @@ pub(crate) fn prepare(model: &Model) -> Option<PreparedMargin> {
 /// The whole-module kill switch, read at ONE literal site so the ledger's
 /// derived read-site count stays a fact about the source rather than a guess.
 fn reframe_disabled() -> bool {
-    std::env::var_os("AY_MILP_NO_MARGIN_REFRAME").is_some()
+    crate::tune::caller_flag(crate::tune::Knob::NoMarginReframe) == Some(true)
 }
 
 /// [`prepare`], falling back to [`auto_margin_row`] when no margin is marked.
@@ -261,7 +261,7 @@ pub(crate) fn prepare_auto(model: &Model) -> Option<PreparedMargin> {
 ///
 /// # ⛔ DEFAULT OFF: MEASURED, AND IT LOSES THE VERDICT ny WANTS
 ///
-/// `AY_MILP_AUTO_MARGIN=1` opts in. The name exists because the negative result
+/// `with_auto_margin(true)` opts in. The name exists because the negative result
 /// is worth keeping re-checkable, not because the arm is dormant scaffolding —
 /// it fires, it works, and the trade is the wrong way round for this consumer.
 ///
@@ -299,11 +299,7 @@ fn auto_margin_row(model: &Model) -> Option<Row> {
     // Default OFF (see above). `=0`/`off` is spelled out rather than left to
     // `is_ok()` so that setting the name to zero cannot mean "on" — the ledger's
     // own `ZERO_IGNORED` trap in reverse.
-    let opted_in = match std::env::var("AY_MILP_AUTO_MARGIN").as_deref() {
-        Ok("0") | Ok("off") => false,
-        Ok(_) => true,
-        Err(_) => false,
-    };
+    let opted_in = crate::tune::caller_flag(crate::tune::Knob::AutoMargin) == Some(true);
     if !opted_in {
         return None;
     }
@@ -559,7 +555,7 @@ fn margin_farkas(
 /// Diagnostic: build the margin reframe for `model` and report the reframed
 /// dual bound next to the trivial-0 zero-objective bound, plus the mapped
 /// verdict. Mirrors [`crate::diag_float_lp`]; used by the `mps_solve` example
-/// under `AY_MILP_MARGIN_ROW`.
+/// under the margin-row demo flag.
 #[must_use]
 pub fn diag_margin_reframe(model: &Model, secs: f64) -> String {
     use num_traits::ToPrimitive;
@@ -641,13 +637,16 @@ fn verdict_tag(o: &Outcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use ay_test_support::env::lock_env;
 
     /// Every detection test runs with the arm ON, because the arm is default-OFF
     /// (measured losing; see [`auto_margin_row`]). `default_is_off` below is the
     /// one test that asserts the default itself.
-    fn armed() -> ScopedEnvVar {
-        ScopedEnvVar::set("AY_MILP_AUTO_MARGIN", "1")
+    fn armed() -> crate::tune::Active {
+        crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+            crate::tune::Knob::AutoMargin,
+            crate::tune::Setting::Flag(true),
+        ))
     }
 
     /// The ny W1 shape in miniature: an objective-≡0 model whose network rows
@@ -680,8 +679,11 @@ mod tests {
             prepare_auto(&m).is_none(),
             "with the arm unset an unmarked model runs plain feasibility"
         );
-        // `=0` must mean off, not "the name is set, therefore on".
-        let _zero = ScopedEnvVar::set("AY_MILP_AUTO_MARGIN", "0");
+        // An explicit `false` must mean off, not "the knob is set, therefore on".
+        let _zero = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+            crate::tune::Knob::AutoMargin,
+            crate::tune::Setting::Flag(false),
+        ));
         assert_eq!(auto_margin_row(&m), None);
     }
 
@@ -783,9 +785,11 @@ mod tests {
     /// The wider kill switch turns off the reframe however the row was found.
     #[test]
     fn the_reframe_kill_switch_outranks_the_arm() {
-        let _env_lock = lock_env();
         let _on = armed();
-        let _off = ScopedEnvVar::set("AY_MILP_NO_MARGIN_REFRAME", "1");
+        let _off = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+            crate::tune::Knob::NoMarginReframe,
+            crate::tune::Setting::Flag(true),
+        ));
         let (m, _lo, _hi) = w1_shape();
         assert!(prepare_auto(&m).is_none());
     }

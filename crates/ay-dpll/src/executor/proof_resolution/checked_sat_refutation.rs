@@ -21,6 +21,9 @@
 //! No producer verdict, `is_original` bit, content-only lookup, or later proof
 //! surgery participates in this authority.
 
+mod builder;
+mod derivation_evidence;
+
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Proof, ProofId, ProofStep, TermData, TermId, TermStore, TheoryLit};
 use ay_frontend::SourceContextStamp;
@@ -42,6 +45,12 @@ use crate::sat_proof_manager::{
     ExactOriginalProofError, ExactOriginalProofFragment, SatProofManager,
 };
 use crate::verification::ConflictSemanticVerifyMemo;
+use derivation_evidence::{
+    sealed_fragment_derivation_maps, sealed_instance_root_derivations,
+    sealed_propagation_environment,
+};
+#[cfg(test)]
+use derivation_evidence::{CheckedInstanceDerivation, CheckedSkolemDerivation};
 
 /// Hard resource envelope for the independent positive-RUP replay.
 ///
@@ -332,6 +341,77 @@ fn metered_term_id_concat(
     Ok(combined)
 }
 
+fn metered_literal_concat(
+    left: &[Literal],
+    right: &[Literal],
+    meter: &mut CheckedRefutationMeter,
+) -> Result<Vec<Literal>, ResolutionValidationError> {
+    let len = checked_resource_add(left.len(), right.len(), ResolutionValidationResource::Work)?;
+    let bytes = checked_resource_mul(
+        len,
+        size_of::<Literal>(),
+        ResolutionValidationResource::Bytes,
+    )?;
+    meter.charge(len, bytes)?;
+    let mut combined = Vec::new();
+    combined
+        .try_reserve_exact(len)
+        .map_err(|_| ResolutionValidationError::AllocationFailed {
+            resource: ResolutionValidationResource::Bytes,
+        })?;
+    charge_capacity_excess::<Literal>(combined.capacity(), len, meter)?;
+    combined.extend_from_slice(left);
+    combined.extend_from_slice(right);
+    meter.charge(0, 0)?;
+    Ok(combined)
+}
+
+fn validate_scope_assumptions(
+    assumptions: &[Literal],
+    var_to_term: &HashMap<u32, TermId>,
+    sat_num_vars: usize,
+    meter: &mut CheckedRefutationMeter,
+) -> Result<(), CheckedSatRefutationError> {
+    meter.charge(assumptions.len(), 0)?;
+    let mut previous = None;
+    for (premise_index, &premise) in assumptions.iter().enumerate() {
+        let variable = premise.variable().index() as u32;
+        if premise.is_positive() {
+            return Err(CheckedSatRefutationError::PositiveScopePremise {
+                premise_index,
+                variable,
+            });
+        }
+        if variable as usize >= sat_num_vars {
+            return Err(CheckedSatRefutationError::StructuralTrace(
+                ClauseTraceResolutionError::UnitPremiseVariableOutOfRange {
+                    premise_index,
+                    variable: variable as usize,
+                    num_vars: sat_num_vars,
+                },
+            ));
+        }
+        if var_to_term.contains_key(&variable) {
+            return Err(CheckedSatRefutationError::MappedScopePremise { variable });
+        }
+        if let Some(prior) = previous {
+            if variable == prior {
+                return Err(CheckedSatRefutationError::DuplicateScopePremise { variable });
+            }
+            if variable < prior {
+                return Err(CheckedSatRefutationError::UnorderedScopePremise {
+                    premise_index,
+                    previous: prior,
+                    variable,
+                });
+            }
+        }
+        previous = Some(variable);
+    }
+    meter.charge(0, 0)?;
+    Ok(())
+}
+
 /// Reconstruct the exact SAT literal used for each authored assumption.
 ///
 /// The producing path intentionally retains no term-to-variable map, so this
@@ -610,6 +690,7 @@ fn authenticate_assumption_unit_premises(
     terms: &mut TermStore,
     datatype_decls: &[(String, Vec<String>)],
     selector_decls: &[(String, Vec<String>)],
+    member_signatures: &[ay_proof::DatatypeMemberSignature],
     meter: &mut CheckedRefutationMeter,
 ) -> Result<(), CheckedSatRefutationError> {
     if assumptions.len() != sat_literals.len() {
@@ -642,6 +723,7 @@ fn authenticate_assumption_unit_premises(
             0,
             std::slice::from_ref(&sat_literal),
             var_to_term,
+            &[],
             terms,
             meter,
         )?;
@@ -661,20 +743,22 @@ fn authenticate_assumption_unit_premises(
     let authentication_bytes = strict_authentication_bytes(&proof, meter)?;
     meter.charge(proof.steps.len(), authentication_bytes)?;
     let mut authentication_resource_error = None;
-    let authenticated = ay_proof::authenticate_premise_clauses_strict_with_context_and_progress(
-        &proof,
-        terms,
-        (!datatype_decls.is_empty()).then_some(datatype_decls),
-        (!selector_decls.is_empty()).then_some(selector_decls),
-        authored_query_terms,
-        &mut |work, bytes| match meter.charge(work, bytes) {
-            Ok(()) => true,
-            Err(error) => {
-                authentication_resource_error = Some(error);
-                false
-            }
-        },
-    );
+    let authenticated =
+        ay_proof::authenticate_premise_clauses_strict_with_typed_context_and_progress(
+            &proof,
+            terms,
+            (!datatype_decls.is_empty()).then_some(datatype_decls),
+            (!selector_decls.is_empty()).then_some(selector_decls),
+            member_signatures,
+            authored_query_terms,
+            &mut |work, bytes| match meter.charge(work, bytes) {
+                Ok(()) => true,
+                Err(error) => {
+                    authentication_resource_error = Some(error);
+                    false
+                }
+            },
+        );
     if let Some(error) = authentication_resource_error {
         return Err(error.into());
     }
@@ -826,211 +910,7 @@ impl CheckedSatRefutation {
     }
 
     fn build(executor: &mut Executor) -> Result<Self, CheckedSatRefutationError> {
-        let (query_epoch, source_context_stamp) = executor
-            .checked_sat_refutation_query_scope()
-            .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
-        let bound_assumptions = executor
-            .checked_sat_refutation_query_assumptions()
-            .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
-        let solver_assumptions_match = executor.last_assumptions.as_deref()
-            == Some(bound_assumptions)
-            || (bound_assumptions.is_empty() && executor.last_assumptions.is_none());
-        if !solver_assumptions_match {
-            return Err(CheckedSatRefutationError::UnsupportedQueryScope);
-        }
-
-        // Snapshot caller-owned controls before borrowing the retained trace.
-        // The deadline remains the exact absolute solve deadline; interrupt
-        // and both RSS ceilings are polled cooperatively throughout conversion
-        // and independent replay.
-        let limits = validation_limits(executor);
-        let interrupt = executor.solve_interrupt.clone();
-        let memory_limit = executor.memory_limit();
-        let conversion_interrupt = interrupt.clone();
-        let mut should_stop = move || {
-            conversion_interrupt
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-                || crate::memory::memory_exceeded(memory_limit)
-                || ay_sys::process_memory_exceeded()
-        };
-
-        let trace = executor
-            .last_clause_trace
-            .as_ref()
-            .ok_or(CheckedSatRefutationError::MissingClauseTrace)?;
-        let sat_num_vars = trace
-            .solver_num_vars()
-            .ok_or(CheckedSatRefutationError::MissingSatVariableNamespace)?;
-        let var_to_term = executor
-            .last_var_to_term
-            .as_ref()
-            .ok_or(CheckedSatRefutationError::MissingVariableMap)?;
-
-        // Mapping the authored assumptions into the solver-stamped Boolean
-        // namespace is part of the same finite certification allowance as trace
-        // conversion and replay. Give the validator only the remainder, then
-        // absorb its exact usage back into this meter.
-        let mut meter = CheckedRefutationMeter::new(limits, interrupt, memory_limit)?;
-        let assumption_sat_literals = exact_assumption_sat_literals(
-            bound_assumptions,
-            var_to_term,
-            &executor.ctx.terms,
-            sat_num_vars,
-            &mut meter,
-        )?;
-        let remaining_limits = meter.remaining_validation_limits()?;
-        let validated = validate_clause_trace_resolution_with_unit_premises_interruptible(
-            trace,
-            sat_num_vars,
-            assumption_sat_literals.as_slice(),
-            &remaining_limits,
-            &mut should_stop,
-        )?;
-        meter.absorb_validation(&validated)?;
-        meter.charge(validated.unit_premises().len(), 0)?;
-        if validated.unit_premises() != assumption_sat_literals {
-            return Err(CheckedSatRefutationError::ValidatedAssumptionPremiseMismatch);
-        }
-
-        // The query epoch previously cloned this potentially large vector
-        // before the aggregate meter existed. Copy it only after replay has
-        // resumed that meter, with fallible allocation and periodic control
-        // polling, because the boxed copy survives in the minted capability.
-        let ordered_authored_roots = {
-            let roots = executor
-                .checked_sat_refutation_query_roots()
-                .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
-            metered_term_id_copy(roots, &mut meter)?
-        };
-        let ordered_assumptions = {
-            let assumptions = executor
-                .checked_sat_refutation_query_assumptions()
-                .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
-            metered_term_id_copy(assumptions, &mut meter)?
-        };
-        let authored_query_terms = metered_term_id_concat(
-            ordered_authored_roots.as_slice(),
-            ordered_assumptions.as_slice(),
-            &mut meter,
-        )?;
-        let provenance = executor
-            .proof_problem_assertion_provenance
-            .as_ref()
-            .ok_or(CheckedSatRefutationError::MissingAuthoredProvenance)?;
-        meter.charge(ordered_authored_roots.len(), 0)?;
-        if provenance.original_problem_assertions != ordered_authored_roots {
-            return Err(CheckedSatRefutationError::AuthoredRootMismatch);
-        }
-
-        let datatype_decls = metered_datatype_decls(executor, &mut meter)?;
-        let selector_decls = metered_selector_decls(executor, &mut meter)?;
-        let clausification_proofs = executor.last_clausification_proofs.as_deref();
-        let theory_proofs = executor.last_original_clause_theory_proofs.as_deref();
-
-        let fragment = {
-            let mut manager = SatProofManager::new(var_to_term, &mut executor.ctx.terms);
-            if let Some(proofs) = clausification_proofs {
-                manager.set_clausification_proofs(proofs);
-            }
-            if let Some(proofs) = theory_proofs {
-                manager.set_original_clause_theory_proofs(proofs);
-            }
-            manager.build_exact_original_proof_fragment_metered(
-                trace,
-                authored_query_terms.as_slice(),
-                &mut |work, bytes| meter.charge(work, bytes),
-            )?
-        };
-
-        // Keep this opaque result function-local and tied to the exact fragment,
-        // TermStore, and trace bundle used above. It is not a free-standing
-        // theorem and must never be cached or paired with another fragment.
-        let authentication_bytes = strict_authentication_bytes(fragment.proof(), &mut meter)?;
-        // Precharge the proof-container scratch before entering the checker.
-        // Its callback adds the reachable term/sort payload and rule-specific
-        // work to this same meter before those phases run.
-        let authentication_input_work = fragment.proof().steps.len();
-        meter.charge(authentication_input_work, authentication_bytes)?;
-        let mut authentication_resource_error = None;
-        let authenticated =
-            ay_proof::authenticate_premise_clauses_with_deferred_generic_theory_and_progress(
-                fragment.proof(),
-                &executor.ctx.terms,
-                (!datatype_decls.is_empty()).then_some(datatype_decls.as_slice()),
-                (!selector_decls.is_empty()).then_some(selector_decls.as_slice()),
-                authored_query_terms.as_slice(),
-                &mut |work, bytes| match meter.charge(work, bytes) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        authentication_resource_error = Some(error);
-                        false
-                    }
-                },
-            );
-        if let Some(error) = authentication_resource_error {
-            return Err(error.into());
-        }
-        let authenticated = SemanticallyCompletedPremiseClauses::complete(
-            authenticated?,
-            &executor.conflict_semantic_verify_memo,
-            &executor.ctx.terms,
-            &mut meter,
-        )?;
-        meter.charge(0, 0)?;
-
-        verify_exact_composition(
-            &validated,
-            &fragment,
-            &authenticated,
-            var_to_term,
-            &mut executor.ctx.terms,
-            &mut meter,
-        )?;
-        authenticate_assumption_unit_premises(
-            ordered_assumptions.as_slice(),
-            assumption_sat_literals.as_slice(),
-            authored_query_terms.as_slice(),
-            var_to_term,
-            &mut executor.ctx.terms,
-            datatype_decls.as_slice(),
-            selector_decls.as_slice(),
-            &mut meter,
-        )?;
-
-        // `Vec::into_boxed_slice` is allowed to shrink/reallocate when spare
-        // capacity exists. Charge a simultaneous destination envelope before
-        // conversion even though this path currently reserves exactly.
-        let boxed_root_bytes = checked_resource_mul(
-            ordered_authored_roots.len(),
-            size_of::<TermId>(),
-            ResolutionValidationResource::Bytes,
-        )?;
-        meter.charge(ordered_authored_roots.len(), boxed_root_bytes)?;
-        let ordered_authored_roots = ordered_authored_roots.into_boxed_slice();
-        let boxed_assumption_bytes = checked_resource_mul(
-            ordered_assumptions.len(),
-            size_of::<TermId>(),
-            ResolutionValidationResource::Bytes,
-        )?;
-        meter.charge(ordered_assumptions.len(), boxed_assumption_bytes)?;
-        let ordered_assumptions = ordered_assumptions.into_boxed_slice();
-        meter.charge(0, 0)?;
-
-        let original_clause_count = checked_resource_add(
-            validated.original_mappings().len(),
-            ordered_assumptions.len(),
-            ResolutionValidationResource::OriginalClauses,
-        )?;
-
-        Ok(Self {
-            query_epoch,
-            source_context_stamp,
-            ordered_authored_roots,
-            ordered_assumptions,
-            original_clause_count,
-            derived_step_count: validated.dag().derived.len(),
-        })
+        builder::build(executor)
     }
 }
 
@@ -1048,6 +928,8 @@ enum CheckedSatRefutationError {
     MissingClauseTrace,
     #[error("the SAT trace has no authoritative solver variable-namespace size")]
     MissingSatVariableNamespace,
+    #[error("the SAT trace has no solver-minted active-scope authority")]
+    MissingScopeAuthority,
     #[error("the SAT trace has no exact SAT-variable to SMT-term map")]
     MissingVariableMap,
     #[error("authored assumption {assumption_index} references stale term {assumption:?}")]
@@ -1077,6 +959,20 @@ enum CheckedSatRefutationError {
     },
     #[error("validated unit premises differ from the exact mapped assumption slice")]
     ValidatedAssumptionPremiseMismatch,
+    #[error("scope premise {premise_index} for SAT variable {variable} must be negative")]
+    PositiveScopePremise { premise_index: usize, variable: u32 },
+    #[error("scope premise SAT variable {variable} appears more than once")]
+    DuplicateScopePremise { variable: u32 },
+    #[error(
+        "scope premise {premise_index} SAT variable {variable} is not greater than prior variable {previous}"
+    )]
+    UnorderedScopePremise {
+        premise_index: usize,
+        previous: u32,
+        variable: u32,
+    },
+    #[error("scope premise SAT variable {variable} overlaps the SMT-term map")]
+    MappedScopePremise { variable: u32 },
     #[error(
         "authored assumption count {assumptions} differs from validated unit-premise count {premises}"
     )]
@@ -1129,6 +1025,8 @@ enum CheckedSatRefutationError {
     BindingSourceMismatch { trace_id: u64 },
     #[error("trace original {trace_id} references unmapped SAT variable {variable}")]
     UnmappedVariable { trace_id: u64, variable: u32 },
+    #[error("trace original {trace_id} contains satisfied negative scope selector {variable}")]
+    SatisfiedScopeGuard { trace_id: u64, variable: u32 },
     #[error("trace original {trace_id} maps SAT variable {variable} to stale term {term:?}")]
     StaleMappedTerm {
         trace_id: u64,
@@ -1192,6 +1090,7 @@ fn translate_sat_clause(
     trace_id: u64,
     literals: &[Literal],
     var_to_term: &HashMap<u32, TermId>,
+    scope_assumptions: &[Literal],
     terms: &mut TermStore,
     meter: &mut CheckedRefutationMeter,
 ) -> Result<Vec<TermId>, CheckedSatRefutationError> {
@@ -1225,6 +1124,15 @@ fn translate_sat_clause(
             meter.charge(0, 0)?;
         }
         let variable = literal.variable().index() as u32;
+        if scope_assumptions
+            .iter()
+            .any(|premise| !premise.is_positive() && premise.variable().index() as u32 == variable)
+        {
+            if literal.is_positive() {
+                continue;
+            }
+            return Err(CheckedSatRefutationError::SatisfiedScopeGuard { trace_id, variable });
+        }
         let &positive = var_to_term
             .get(&variable)
             .ok_or(CheckedSatRefutationError::UnmappedVariable { trace_id, variable })?;
@@ -1258,6 +1166,7 @@ fn verify_exact_composition<E: CheckedResolutionEvidence>(
     fragment: &ExactOriginalProofFragment,
     authenticated: &SemanticallyCompletedPremiseClauses,
     var_to_term: &HashMap<u32, TermId>,
+    scope_assumptions: &[Literal],
     terms: &mut TermStore,
     meter: &mut CheckedRefutationMeter,
 ) -> Result<(), CheckedSatRefutationError> {
@@ -1327,6 +1236,7 @@ fn verify_exact_composition<E: CheckedResolutionEvidence>(
             trace_id,
             &mapping.trace_entry().clause,
             var_to_term,
+            scope_assumptions,
             terms,
             meter,
         )?;
@@ -1352,6 +1262,26 @@ fn verify_exact_composition<E: CheckedResolutionEvidence>(
 }
 
 impl Executor {
+    /// Whether the retained checked SAT-refutation sidecar proves the current
+    /// public query: same epoch, source stamp, ordered roots, and assumptions.
+    pub(in crate::executor) fn checked_sat_refutation_authorizes_current_query(&self) -> bool {
+        let Some((query_epoch, source_context_stamp)) = self.checked_sat_refutation_query_scope()
+        else {
+            return false;
+        };
+        let Some(roots) = self.checked_sat_refutation_query_roots() else {
+            return false;
+        };
+        let Some(assumptions) = self.checked_sat_refutation_query_assumptions() else {
+            return false;
+        };
+        self.last_checked_sat_refutation
+            .as_ref()
+            .is_some_and(|checked| {
+                checked.is_current_for(&query_epoch, &source_context_stamp, roots, assumptions)
+            })
+    }
+
     /// Rebuild the checked SAT-refutation sidecar from the current immutable
     /// proof bundle. Any missing or rejected evidence clears the prior token.
     pub(in crate::executor) fn refresh_checked_sat_refutation(&mut self) {
@@ -1382,8 +1312,9 @@ mod tests {
     use ay_sat::{ClauseTrace, Literal, Variable};
 
     use super::*;
+    use crate::executor::SkolemInstanceRecord;
     use crate::executor_types::SolveResult;
-
+    include!("checked_sat_refutation/incremental_id_tests.rs");
     fn contradictory_unit_executor() -> (Executor, TermId, TermId) {
         let mut executor = Executor::new();
         let proposition = executor.ctx.terms.mk_var("p", Sort::Bool);
@@ -1436,6 +1367,44 @@ mod tests {
         (executor, proposition)
     }
 
+    fn scoped_contradictory_unit_executor() -> (Executor, TermId) {
+        let mut executor = Executor::new();
+        let proposition = executor.ctx.terms.mk_var("scoped_p", Sort::Bool);
+        let not_proposition = executor.ctx.terms.mk_not_raw(proposition);
+        executor.ctx.assertions = vec![proposition, not_proposition];
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        executor.proof_problem_assertion_provenance = Some(
+            crate::executor::theories::solve_harness::ProofProblemAssertionProvenance {
+                original_problem_assertions: vec![proposition, not_proposition],
+                problem_assertions: vec![proposition, not_proposition],
+                assertion_sources: Default::default(),
+            },
+        );
+
+        let mut sat = ay_sat::Solver::new(1);
+        sat.enable_clause_trace();
+        sat.push();
+        sat.add_clause(vec![Literal::positive(Variable::new(0))]);
+        sat.add_clause(vec![Literal::negative(Variable::new(0))]);
+        assert!(sat.solve().into_inner().is_unsat());
+        let trace = sat
+            .snapshot_clause_trace()
+            .expect("proof-enabled scoped solver retains a trace");
+        assert_eq!(
+            trace.scope_assumptions(),
+            Some([Literal::negative(Variable::new(1))].as_slice())
+        );
+
+        let mut var_to_term = HashMap::default();
+        var_to_term.insert(0, proposition);
+        executor.last_clause_trace = Some(trace);
+        executor.last_var_to_term = Some(var_to_term);
+        executor.last_clausification_proofs = None;
+        executor.last_original_clause_theory_proofs = None;
+        (executor, proposition)
+    }
+
     #[test]
     fn exact_composition_mints_epoch_bound_sidecar() {
         let (executor, proposition, not_proposition) = contradictory_unit_executor();
@@ -1473,6 +1442,50 @@ mod tests {
             &[proposition, not_proposition],
             &[proposition],
         ));
+    }
+
+    #[test]
+    fn solver_minted_scope_premise_authorizes_guard_projection() {
+        let (mut executor, _) = scoped_contradictory_unit_executor();
+        executor.refresh_checked_sat_refutation();
+        assert!(
+            executor.last_checked_sat_refutation.is_some(),
+            "the sealed negative selector must support both structural replay and semantic projection"
+        );
+    }
+
+    #[test]
+    fn flipped_or_dropped_scope_authority_fails_closed() {
+        let (mut executor, proposition) = scoped_contradictory_unit_executor();
+        let mut map = HashMap::default();
+        map.insert(0, proposition);
+        let error = validate_scope_assumptions(
+            &[Literal::positive(Variable::new(1))],
+            &map,
+            2,
+            &mut CheckedRefutationMeter::unbounded(),
+        )
+        .expect_err("flipping the solver-minted negative selector must be rejected");
+        assert!(matches!(
+            error,
+            CheckedSatRefutationError::PositiveScopePremise {
+                premise_index: 0,
+                variable: 1
+            }
+        ));
+
+        let mut trace = executor
+            .last_clause_trace
+            .take()
+            .expect("scoped trace candidate");
+        trace.mark_empty();
+        assert_eq!(trace.scope_assumptions(), None);
+        executor.last_clause_trace = Some(trace);
+        executor.refresh_checked_sat_refutation();
+        assert!(
+            executor.last_checked_sat_refutation.is_none(),
+            "a trace mutation that drops scope authority must retire the capability"
+        );
     }
 
     #[test]
@@ -1805,6 +1818,7 @@ mod tests {
             &fragment_b,
             &authenticated_b,
             &map_b,
+            &[],
             &mut terms,
             &mut CheckedRefutationMeter::unbounded(),
         )
@@ -1816,7 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_sidecar_is_only_an_alternative_for_trust_family_rejection() {
+    fn checked_sidecar_is_independent_of_an_unrequested_alethe_presentation() {
         let (mut accepted, _, _) = contradictory_unit_executor();
         let mut trust_proof = Proof::new();
         trust_proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
@@ -1828,11 +1842,24 @@ mod tests {
         assert!(accepted.last_command_unsat_was_independently_verified());
         assert!(!accepted.last_command_unsat_was_exact_semantically_verified());
 
-        let (mut rejected, _, _) = contradictory_unit_executor();
-        rejected.last_proof = Some(Proof::new());
-        let result = rejected.certify_unsat_for_publication(SolveResult::unsat(), &[]);
+        let (mut malformed, _, _) = contradictory_unit_executor();
+        malformed.last_proof = Some(Proof::new());
+        let result = malformed.certify_unsat_for_publication(SolveResult::unsat(), &[]);
+        assert!(result.is_unsat());
+        assert!(malformed.admit_command_solve_result(result).is_unsat());
+        assert!(!malformed.last_command_unsat_was_strictly_verified());
+        assert!(malformed.last_command_unsat_was_independently_verified());
+        assert!(!malformed.last_command_unsat_was_exact_semantically_verified());
+
+        // An explicit proof request promises that the Alethe presentation
+        // itself checks. The same independent theorem cannot satisfy that
+        // stronger artifact contract when the presentation is malformed.
+        let (mut required, _, _) = contradictory_unit_executor();
+        required.set_produce_proofs(true);
+        required.last_proof = Some(Proof::new());
+        let result = required.certify_unsat_for_publication(SolveResult::unsat(), &[]);
         assert!(result.is_unknown());
-        assert!(rejected.take_unsat_certificate().is_none());
+        assert!(required.take_unsat_certificate().is_none());
     }
 
     #[test]
@@ -1872,4 +1899,6 @@ mod tests {
         assert!(limits.max_work < u64::MAX);
         assert!(limits.max_bytes < usize::MAX);
     }
+
+    mod instance_authority_tests;
 }

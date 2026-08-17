@@ -132,7 +132,7 @@ pub mod dev_tools {
         should_stop: &dyn Fn() -> bool,
         on_improve: &mut dyn FnMut(i128, &[bool]),
     ) -> Result<ProbeOutcome, DevToolError> {
-        ay_pb_core::dev_tools::run_probe_with_upgrade(
+        run_probe_with_upgrade(
             instance,
             engine,
             config,

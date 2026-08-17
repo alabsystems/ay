@@ -88,6 +88,45 @@ fn deep_compatibility_requires_an_exact_value_only_when_active() {
 }
 
 #[test]
+fn explicit_promotion_installs_only_an_authenticated_requirement() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("promoted_ite_value", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let guard = terms.mk_app(Symbol::named("="), [value, zero], Sort::Bool);
+    let authored = "(= 0 promoted_ite_value)";
+
+    let mut audit = ProvenanceSurfaceAudit::default();
+    assert!(!audit.promote_registered_requirement(guard));
+    assert!(audit.require_compatibility_spelling(&mut terms, guard, authored));
+    assert!(audit.promote_registered_requirement(guard));
+    assert!(audit.promote_registered_requirement(guard));
+    audit.protect_operand(&mut terms, guard);
+
+    let mut active = HashMap::default();
+    assert!(audit.merge_into(&mut active));
+    assert_eq!(active.get(&guard).map(String::as_str), Some(authored));
+    assert!(audit.validate_effective(&terms, &active));
+}
+
+#[test]
+fn promotion_does_not_resolve_conflicting_authenticated_spellings() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("conflicting_ite_value", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let guard = terms.mk_app(Symbol::named("="), [value, zero], Sort::Bool);
+    let mut audit = ProvenanceSurfaceAudit::default();
+    assert!(audit.require_compatibility_spelling(&mut terms, guard, "(= 0 conflicting_ite_value)",));
+    assert!(!audit.require_compatibility_spelling(
+        &mut terms,
+        guard,
+        "(= conflicting_ite_value 0)",
+    ));
+    assert!(audit.promote_registered_requirement(guard));
+    audit.protect_operand(&mut terms, guard);
+    assert!(audit.merge_into(&mut HashMap::default()));
+}
+
+#[test]
 fn mandatory_requirement_promotes_deep_compatibility_in_either_order() {
     let mut terms = TermStore::new();
     let term = terms.mk_var("promoted_compatibility_term", Sort::Int);

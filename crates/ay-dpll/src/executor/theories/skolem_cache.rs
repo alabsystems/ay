@@ -48,7 +48,7 @@ pub(in crate::executor::theories) enum SkolemKind {
     /// application is built on this skolem.
     ReplaceAllSuffix,
     /// Result skolem bridging a `str.from_int` application to a plain
-    /// string variable (strings increment P3, `AY_STR_P3=1`): keeps the
+    /// string variable (strings increment P3, default ON): keeps the
     /// normal-form machinery from bailing on the opaque extf component,
     /// mirroring `ReplaceResult` for the regex-replace reductions.
     FromIntResult,

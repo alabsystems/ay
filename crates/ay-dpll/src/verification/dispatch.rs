@@ -1659,13 +1659,7 @@ pub(crate) fn verify_lra_conflict_semantic(
 /// verifier; exceeding it degrades to the pre-existing "accept optimistically" path.
 /// Override with `AY_VERIFY_SOLVE_BUDGET_MS`.
 fn verify_solve_budget() -> std::time::Duration {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("AY_VERIFY_SOLVE_BUDGET_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1_000)
-    }))
+    std::time::Duration::from_secs(1)
 }
 
 pub(crate) fn verify_lia_conflict_semantic(
@@ -1787,7 +1781,7 @@ fn conflict_involves_seq_sort(terms: &TermStore, conflict: &[TheoryLit]) -> bool
 /// semantic verification and no trace of the fact. Every path through the gate
 /// — verified, rejected, or skipped — now bumps a counter here, so "a silent
 /// accept" is no longer possible: `mixed_string_verify_counts()` reports the
-/// exact population, and `AY_VERIFY_MIXED_STRINGS_STATS` streams each event to
+/// exact population, and `--verify-mixed-strings-stats` streams each event to
 /// stderr.
 pub(crate) mod mixed_string_verify_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1808,8 +1802,6 @@ pub(crate) mod mixed_string_verify_stats {
     /// Skipped: the conflict mentions `Seq`-sorted terms, which the QF_SLIA
     /// adapter has no theory for.
     pub(crate) static SKIPPED_SEQ: AtomicU64 = AtomicU64::new(0);
-    /// Skipped: the gate was switched off via `AY_VERIFY_MIXED_STRINGS=0`.
-    pub(crate) static SKIPPED_DISABLED: AtomicU64 = AtomicU64::new(0);
     /// Fresh re-solve said `Sat`, but a string->int bridge term (`str.len`,
     /// `str.indexof`, ...) was left unpinned so LIA treated it as an
     /// unconstrained Int — the verdict proves nothing. Accepted (counted).
@@ -1829,7 +1821,6 @@ pub(crate) mod mixed_string_verify_stats {
         pub skipped_int_real: u64,
         pub skipped_unverifiable: u64,
         pub skipped_seq: u64,
-        pub skipped_disabled: u64,
         pub accepted_sat_unfaithful: u64,
         pub accepted_sat_ground_refuted: u64,
     }
@@ -1842,7 +1833,6 @@ pub(crate) mod mixed_string_verify_stats {
             skipped_int_real: SKIPPED_INT_REAL.load(Ordering::Relaxed),
             skipped_unverifiable: SKIPPED_UNVERIFIABLE.load(Ordering::Relaxed),
             skipped_seq: SKIPPED_SEQ.load(Ordering::Relaxed),
-            skipped_disabled: SKIPPED_DISABLED.load(Ordering::Relaxed),
             accepted_sat_unfaithful: ACCEPTED_SAT_UNFAITHFUL.load(Ordering::Relaxed),
             accepted_sat_ground_refuted: ACCEPTED_SAT_GROUND_REFUTED.load(Ordering::Relaxed),
         }
@@ -1854,27 +1844,16 @@ pub(crate) mod mixed_string_verify_stats {
         counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `AY_VERIFY_MIXED_STRINGS_STATS` — stream every gate event to stderr.
+    /// `--verify-mixed-strings-stats` — stream every gate event to stderr.
     pub(super) fn stats_stream_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("AY_VERIFY_MIXED_STRINGS_STATS").is_some())
+        *ON.get_or_init(|| ay_core::misc_cli_flags().verify_mixed_strings_stats)
     }
 }
 
-/// Whether the mixed string+arith semantic gate is enabled.
-///
-/// DEFAULT-ON: soundness gates are not opt-in. `AY_VERIFY_MIXED_STRINGS=0`
-/// (or `off`/`false`/empty) is a measurement kill-switch that restores the
-/// pre-fix behaviour (unconditional accept) for A/B benchmarking only.
+/// Compile-time pin for the non-disableable mixed string soundness gate.
 fn mixed_strings_gate_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("AY_VERIFY_MIXED_STRINGS") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "off" | "false" | "no"
-        ),
-        Err(_) => true,
-    })
+    true
 }
 
 /// Record a gate event: counter bump + tracing (WARN on the first occurrence of
@@ -2231,15 +2210,7 @@ fn verify_strings_mixed_conflict_semantic(
         // Structurally rejected upstream by `verify_theory_conflict`.
         return Ok(());
     }
-
-    if !mixed_strings_gate_enabled() {
-        observe_mixed_string_event(
-            &mixed_string_verify_stats::SKIPPED_DISABLED,
-            "skipped-disabled",
-            conflict.len(),
-        );
-        return Ok(());
-    }
+    debug_assert!(mixed_strings_gate_enabled());
 
     // `Seq`-sorted content (`seq.unit` / `seq.empty` / Seq (dis)equalities)
     // classifies String-domain but is NOT the QF_SLIA fragment: the adapter's
@@ -3443,12 +3414,6 @@ mod mixed_string_conflict_gate_tests {
         (x, terms.mk_eq(x, c))
     }
 
-    /// The gate is default-ON; `AY_VERIFY_MIXED_STRINGS=0` is a
-    /// measurement-only kill-switch. Rejection tests are vacuous under it.
-    fn gate_on() -> bool {
-        mixed_strings_gate_enabled()
-    }
-
     /// `(>= (str.len x) k)` — Arithmetic-domain literal mentioning a string.
     fn str_len_ge(terms: &mut TermStore, x: TermId, k: i64) -> TermId {
         let len = terms.mk_app(Symbol::named("str.len"), vec![x], Sort::Int);
@@ -3492,9 +3457,6 @@ mod mixed_string_conflict_gate_tests {
     /// rejected.
     #[test]
     fn spurious_mixed_string_arith_conflict_is_rejected() {
-        if !gate_on() {
-            return;
-        }
         let mut terms = TermStore::new();
         let (x, eq) = str_eq_const(&mut terms, "x", "ab");
         let ge = str_len_ge(&mut terms, x, 2);
@@ -3580,9 +3542,6 @@ mod mixed_string_conflict_gate_tests {
     /// and the spurious conflict `{(= x "ab"), (>= n 5)}` is rejected.
     #[test]
     fn bridge_free_spurious_mixed_conflict_is_rejected() {
-        if !gate_on() {
-            return;
-        }
         let mut terms = TermStore::new();
         let (_x, eq) = str_eq_const(&mut terms, "x", "ab");
         let n = terms.mk_var("n", Sort::Int);
@@ -3622,9 +3581,6 @@ mod mixed_string_conflict_gate_tests {
     /// trusts precisely the largest, least-verifiable conflicts.
     #[test]
     fn oversized_mixed_string_conflict_fails_closed() {
-        if !gate_on() {
-            return;
-        }
         let mut terms = TermStore::new();
         let (x, eq) = str_eq_const(&mut terms, "x", "ab");
         let mut conflict = vec![TheoryLit::new(eq, true)];

@@ -736,7 +736,7 @@ pub(in crate::executor) fn recover_substituted_lia_values_protecting(
             continue;
         }
         let to = rhs_by_from[&from];
-        if std::env::var_os("AY_DEBUG_SUBST").is_some() {
+        if ay_core::misc_cli_flags().debug_subst {
             eprintln!(
                 "[subst-dbg] from={} protected={} has_val={:?} to={} to_data={:?}",
                 from.0,
@@ -1098,7 +1098,7 @@ pub(in crate::executor) fn backfill_opaque_app_values_from_equalities(
                 continue;
             };
             if model.values.get(&app) != Some(&val) {
-                if std::env::var_os("AY_DEBUG_SUBST").is_some() {
+                if ay_core::misc_cli_flags().debug_subst {
                     eprintln!("[backfill-dbg] var={} -> app={} val={val}", var.0, app.0);
                 }
                 model.values.insert(app, val);
@@ -1106,7 +1106,7 @@ pub(in crate::executor) fn backfill_opaque_app_values_from_equalities(
             }
         }
     }
-    if std::env::var_os("AY_DEBUG_SUBST").is_some() {
+    if ay_core::misc_cli_flags().debug_subst {
         eprintln!(
             "[backfill-dbg] assertions={} rewritten={rewritten}",
             assertions.len()

@@ -34,7 +34,7 @@
 //!   in the rare case it leans on lower bounds. What changed is the response to
 //!   that: a re-solve instead of a forfeited reduction.
 //! * SINGLETON substitution never was gated on `tree_cert_leaves`. Its only gate is
-//!   `if singleton_sub_enabled()` (`AY_MILP_SINGLETON_SUB=1`, default OFF for a
+//!   `if singleton_sub_enabled()` (`the singleton-sub knob`, default OFF for a
 //!   measured search regression that has nothing to do with certificates). It runs
 //!   under ARMED capture and `expand_singleton_outcome` lifts the tree leaf by leaf,
 //!   stripping only on a decline — so it needs no re-solve.
@@ -1949,7 +1949,7 @@ mod tests {
     /// serialises WRITERS, and a solve is a READER of a couple of dozen `AY_*`
     /// names — it samples them once, at `solve_milp_in` entry. Sibling tests in
     /// this binary set knobs around their own solves and hold them for the
-    /// duration (`bab::tests::solve_node_capped` installs `AY_MILP_MAX_NODES`,
+    /// duration (`bab::tests::solve_node_capped` installs `with_max_nodes`,
     /// exactly as its doc says), so a solve that STARTS inside that window
     /// inherits the cap and reports `Feasible { incumbent_only: true }` where the
     /// test demanded `Optimal`. Observed live: seven tests in this module at
@@ -3239,7 +3239,10 @@ mod tests {
         // Already holds the lock in its own right (it MUTATES the environment);
         // `solve_lock` is the same mutex and must not be taken twice.
         let _env_lock = ay_test_support::env::lock_env();
-        let _on = ay_test_support::env::ScopedEnvVar::set("AY_MILP_SINGLETON_SUB", "1");
+        let _on = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+            crate::tune::Knob::SingletonSub,
+            crate::tune::Setting::Flag(true),
+        ));
 
         let original = singleton_case_split_model();
         assert!(

@@ -17,7 +17,7 @@
 
 use crate::Executor;
 use ay_frontend::parse;
-
+mod authority_reset;
 fn solve(smt: &str) -> String {
     let commands = parse(smt).expect("parse failed");
     let mut exec = Executor::new();

@@ -41,6 +41,8 @@ pub enum TwoClubBranchRule {
     First,
     ViolatingDegree,
     Marked,
+    /// Marked branching with MIN-violating-degree vertex selection.
+    MarkedMinDegree,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +250,11 @@ pub fn run_two_club(
             config.trace,
             config.dump_frontier,
         ),
+        TwoClubBranchRule::MarkedMinDegree => TwoClubRuntime::explicit_marked_min_degree(
+            config.max_nodes_per_cell,
+            config.trace,
+            config.dump_frontier,
+        ),
     };
     if let Some(sdp) = &config.sdp {
         if !config.lp.enabled || !config.lp.ceiling {
@@ -316,12 +323,12 @@ impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
             node_budget: 10_000_000,
-            milp_budget: Duration::from_secs(60),
+            milp_budget: Duration::from_mins(1),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProbeOutcome {
     Bnn {
         recognized: bool,

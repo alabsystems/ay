@@ -524,7 +524,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                         conflict_len = conflict_terms.len(),
                         "BUG(#8123): semantic conflict verification failed in check() Unsat path; escalating to Unknown"
                     );
-                    if std::env::var_os("AY_DEBUG_SPLIT_EXIT").is_some() {
+                    if ay_core::misc_cli_flags().debug_split_exit {
                         for lit in &conflict_terms {
                             safe_eprintln!(
                                 "[conflict-probe] {:?}={} :: {}",
@@ -847,5 +847,5 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
 /// opt-in until its ablation is done.
 pub(super) fn mint_theory_vars_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("AY_DPLL_MINT_THEORY_VARS").is_ok_and(|v| v != "0"))
+    *ENABLED.get_or_init(|| ay_core::misc_cli_flags().dpll_mint_theory_vars)
 }

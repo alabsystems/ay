@@ -2636,7 +2636,11 @@ impl Solver {
             // dropped or moved, so no compaction happens here and an
             // immediate conflict return leaves the list untouched.
             while i < binary_count {
-                // SAFETY: i < binary_count <= watch_len.
+                // SAFETY: `entries_ptr` addresses the `watch_len` contiguous
+                // entries returned above. The loop guard gives `i < binary_count`,
+                // and the maintained watch-list invariant gives
+                // `binary_count <= watch_len`,
+                // so this aligned read remains within the allocation.
                 let entry = unsafe { *entries_ptr.add(i) };
                 i += 1;
                 let blocker_raw = watched::entry_blocker_raw(entry);
@@ -2675,6 +2679,8 @@ impl Solver {
                 // unconditionally; drop paths simply do not advance j.
                 // SAFETY: i < end = watch_len and j <= i.
                 let entry = unsafe { *entries_ptr.add(i) };
+                // SAFETY: j <= i < end = watch_len, and entries_ptr spans all
+                // watch_len packed entries, so the compaction write is in bounds.
                 unsafe { *entries_ptr.add(j) = entry };
                 i += 1;
                 debug_assert!(

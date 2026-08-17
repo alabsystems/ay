@@ -7,10 +7,20 @@
 use ay_core::{AletheRule, Proof, ProofStep, TermId, TheoryLemmaKind};
 
 use super::super::Executor;
+use super::decline::ProofDeclineMechanism;
 
 const MAX_PROOF_SOURCE_ROOTS: usize = 100_000;
 
 impl Executor {
+    /// Get the last serialized LRAT certificate, if proof export captured one.
+    pub(crate) fn last_lrat_certificate(&self) -> Option<&[u8]> {
+        if self.last_unsat_proof_reconstruction_suppressed {
+            None
+        } else {
+            self.last_lrat_certificate.as_deref()
+        }
+    }
+
     /// Revoke both the detector candidate and the query-sealed authority.
     ///
     /// These values are meaningful only beside the exact current UNSAT proof;
@@ -30,7 +40,21 @@ impl Executor {
 
     /// Whether generic proof reconstruction would reject the authored surface
     /// before cloning or recursively traversing it.
+    #[cfg(test)]
     pub(super) fn proof_sources_are_oversized(&self) -> bool {
+        self.proof_source_decline().is_some()
+    }
+
+    /// WHY generic proof reconstruction rejects the authored surface, if it
+    /// does.
+    ///
+    /// This used to be a bare `bool`, and the caller turned it into the
+    /// one-line `(step t0 (cl) :rule hole)` poison. Three unrelated
+    /// conditions reach that artifact and a corpus census could not tell them
+    /// apart — see [`super::decline`] for the measured split. Nothing about
+    /// the decision moves here: the same three tests run in the same order and
+    /// a decline is still a decline. Only the answer carries its reason.
+    pub(super) fn proof_source_decline(&self) -> Option<ProofDeclineMechanism> {
         let provenance_is_bounded =
             self.proof_problem_assertion_provenance
                 .as_ref()
@@ -39,25 +63,52 @@ impl Executor {
                         && provenance.original_problem_assertions.len() <= MAX_PROOF_SOURCE_ROOTS
                         && provenance.assertion_sources.len() <= MAX_PROOF_SOURCE_ROOTS
                 });
-        !(provenance_is_bounded
+        if !(provenance_is_bounded
             && self.ctx.assertions.len() <= MAX_PROOF_SOURCE_ROOTS
-            && self.ctx.assertions_parsed().len() <= MAX_PROOF_SOURCE_ROOTS
-            && crate::executor::proof_repair::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
-                self.ctx
-                    .assertions_parsed()
-                    .iter()
-                    // Proof assembly/rebuild has several mutually exclusive
-                    // snapshots, plus a handful of shared source collections.
-                    // Charge the worst reachable clone/format count up front so
-                    // each later recursive clone remains inside one aggregate
-                    // source-work envelope.
-                    .flat_map(|parsed| [parsed; 16]),
-            ))
+            && self.ctx.assertions_parsed().len() <= MAX_PROOF_SOURCE_ROOTS)
+        {
+            return Some(ProofDeclineMechanism::AuthoredSourceRootCount);
+        }
+        // This preflight performs exactly ONE traversal of the parsed
+        // stack, so it charges one. It used to charge sixteen — the worst
+        // reachable clone/format count of every LATER pass, billed here
+        // whether or not any of them ran. Those passes now charge
+        // themselves against the same shared envelope, which keeps the
+        // aggregate ceiling identical while ending the pre-charge: a
+        // 25-assertion / 48 KB QF_UF instance whose whole source stack
+        // costs 2.9 MiB was refused a proof outright because 16x2.9 MiB
+        // exceeded a 32 MiB budget nothing was going to spend.
+        if self.proof_source_work.spend(
+            crate::executor::proof_repair::proof_trust_surgery_surface_audit::ProofSourcePass::UnsatProofBuild,
+            self.ctx.assertions_parsed(),
+        ) {
+            return None;
+        }
+        // The spend refused. Separate the two ways it can: a root nothing can
+        // render at any budget, versus roots that are all individually
+        // renderable and simply do not fit in what is left of the envelope.
+        // The remedies are opposite — the first needs a per-root bound that
+        // reflects real rendering work, the second needs a bigger or
+        // better-spent envelope — and only this distinction tells a census
+        // which one a given instance wants.
+        if self
+            .ctx
+            .assertions_parsed()
+            .iter()
+            .any(|root| !crate::executor::proof_repair::proof_trust_surgery_surface_audit::surface_source_is_bounded(root))
+        {
+            Some(ProofDeclineMechanism::AuthoredSourceRootUnbounded)
+        } else {
+            Some(ProofDeclineMechanism::AuthoredSourceAggregateBudget)
+        }
     }
 
     /// Install the canonical fail-closed terminal trust proof and revoke any
     /// narrow proof authority that could otherwise survive beside it.
-    pub(super) fn install_uncertifiable_proof_poison(&mut self) {
+    ///
+    /// `mechanism` is recorded for disclosure only; it changes nothing about
+    /// the artifact, which stays exactly as fail-closed as before.
+    pub(super) fn install_uncertifiable_proof_poison(&mut self, mechanism: ProofDeclineMechanism) {
         // A terminal trust leaf keeps the UNSAT result behind the normal
         // mandatory certificate gate, which will honestly publish `unknown`
         // rather than an externally mismatched proof.
@@ -68,6 +119,12 @@ impl Executor {
         self.last_proof_quality = None;
         self.proof_check_result = None;
         self.last_proof = Some(proof);
+        self.record_proof_decline(mechanism);
+    }
+
+    /// Record WHY this query's refutation carries no derivation.
+    pub(in crate::executor) fn record_proof_decline(&mut self, mechanism: ProofDeclineMechanism) {
+        self.last_proof_decline = Some(mechanism);
     }
 
     /// Reconstruct arithmetic certificates and immediately demote any step

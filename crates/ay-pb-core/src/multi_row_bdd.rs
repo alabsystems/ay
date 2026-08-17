@@ -1500,7 +1500,7 @@ mod tests {
                             term(coefficient, variable)
                         });
                     }
-                    let relation = if next_random(&mut seed) % 4 == 0 {
+                    let relation = if next_random(&mut seed).is_multiple_of(4) {
                         PbRel::Eq
                     } else {
                         PbRel::Ge

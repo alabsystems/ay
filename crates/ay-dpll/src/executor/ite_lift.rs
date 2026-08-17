@@ -33,10 +33,8 @@
 
 use std::sync::OnceLock;
 
-/// True when `AY_DPLL_ITE_LIFT=1` (or `true`, case-insensitive).
+/// True when `--dpll-ite-lift` (or `true`, case-insensitive).
 pub(crate) fn ite_lift_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AY_DPLL_ITE_LIFT").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    })
+    *ENABLED.get_or_init(|| ay_core::misc_cli_flags().dpll_ite_lift)
 }

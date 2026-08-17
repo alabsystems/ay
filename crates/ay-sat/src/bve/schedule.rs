@@ -174,7 +174,7 @@ impl BVE {
     /// - preprocessing fastelim: min(clauses_removed, growth_bound)
     /// - inprocessing elimination: clauses_removed + growth_bound
     ///
-    /// Lever `AY_AB_BVE_ADDITIVE_FASTELIM` (wf_eab7d219, banded wf_e2bdf6e1):
+    /// Lever `--sat-[no-]bve-additive-fastelim` (wf_eab7d219, banded wf_e2bdf6e1):
     /// when armed, the Pass-1 fastelim budget (`fastelim_mode && !quick_elim_mode`)
     /// adopts kissat's ADDITIVE `clauses_removed + growth_bound`
     /// (resolve.c:283-294) instead of CaDiCaL's no-growth `min`. The no-growth

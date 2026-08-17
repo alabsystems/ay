@@ -32,7 +32,7 @@
 //!   silently wrap and could turn a false certificate into an accept. BigInt makes
 //!   that impossible. No `unsafe`, no float.
 //! - The emit path (`lp_bound::lp_lower_bound_with_cert`) is gated behind
-//!   `AY_PB_FARKAS_CERT` and is, by itself, a pure add-on: the certificate is
+//!   `--pb-farkas-cert` and is, by itself, a pure add-on: the certificate is
 //!   built from data already in hand and validated; on a failed check the caller
 //!   keeps today's exact path verbatim.
 //!
@@ -371,12 +371,12 @@ pub(crate) fn check_slack(sc: &SCertZ) -> bool {
     le(&comb_const(&pairs), &add(&concl_const, &sc.slack))
 }
 
-/// Is the emit-cert path enabled? Gated behind `AY_PB_FARKAS_CERT`. Default OFF,
+/// Is the emit-cert path enabled? Gated behind `--pb-farkas-cert`. Default OFF,
 /// so the certificate machinery is a pure opt-in add-on that cannot perturb the
 /// existing (already-sound) bound path until explicitly enabled.
 #[must_use]
 pub(crate) fn cert_emit_enabled() -> bool {
-    std::env::var_os("AY_PB_FARKAS_CERT").is_some()
+    ay_core::misc_cli_flags().pb_farkas_cert
 }
 
 #[cfg(test)]

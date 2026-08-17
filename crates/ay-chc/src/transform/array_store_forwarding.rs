@@ -61,9 +61,8 @@ use super::{
 /// Kill switch: `AY_CHC_DISABLE_ARRAY_STORE_FORWARDING=1` (or any value other
 /// than `0`) disables the pass. Default: enabled.
 pub(crate) fn array_store_forwarding_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_ARRAY_STORE_FORWARDING")
-        .map(|v| v == "0")
-        .unwrap_or(true)
+    // B27: CLI-owned (--chc-no-array-store-forwarding); env retired.
+    crate::ab_switches::get().array_store_forwarding
 }
 
 /// Definitional array equalities considered per clause (linear scan cap).

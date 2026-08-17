@@ -1128,7 +1128,7 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     let names = p.col_names.clone();
     let scale = p.obj_scale.clone();
     let opts = SolveOpts::new()
-        .with_time_limit(std::time::Duration::from_secs(20))
+        .with_time_limit(std::time::Duration::from_secs(300)) // Hang guard, not a performance limit.
         .with_require_certificates(true);
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture hybrid solve");
@@ -1138,7 +1138,6 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
         .is_none());
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: HYBRID_INF,

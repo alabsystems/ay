@@ -5,13 +5,14 @@
 //! Kill-switch coverage for the strings witness/escalation lanes.
 //!
 //! The strings increments (W4/W5/W6/W7 witness search, P2/P3 preregister
-//! escalations, the W1-W3 `AY_STR_WITNESS` family) are all DEFAULT-ON with a
-//! per-lane `=0` env kill switch. When each lane was flipped default-on, the
-//! flags-off pipeline was A/B-measured byte-identical — but that old
-//! defaults-off mode had no executable regression coverage afterwards,
-//! because the gates are `OnceLock`-cached env reads and cannot be toggled
-//! in-process. These tests restore that coverage the only way that works:
-//! spawning the `ay` binary as a subprocess with the kill switches set.
+//! escalations, the W1-W3 witness family) are all DEFAULT-ON with a per-lane
+//! CLI kill switch (`--dpll-no-str-*`). When each lane was flipped
+//! default-on, the flags-off pipeline was A/B-measured byte-identical — but
+//! that old defaults-off mode had no executable regression coverage
+//! afterwards, because the gates are `OnceLock`-cached reads of the set-once
+//! carrier and cannot be toggled in-process. These tests restore that
+//! coverage the only way that works: spawning the `ay` binary as a
+//! subprocess with the kill switches on the command line.
 //!
 //! Every solve runs under `--self-check` (fail-closed: a `sat` is only
 //! printed when AY's own model validation certifies it), so `sat` here pins
@@ -28,13 +29,13 @@ fn ay_binary() -> &'static str {
 /// Every strings-lane kill switch, so the "all off" run exercises the
 /// pre-flip (defaults-off) pipeline end to end.
 const ALL_KILL_SWITCHES: &[&str] = &[
-    "AY_STR_WITNESS",
-    "AY_STR_W4",
-    "AY_STR_W5",
-    "AY_STR_W6",
-    "AY_STR_W7",
-    "AY_STR_P2",
-    "AY_STR_P3",
+    "--dpll-no-str-witness",
+    "--dpll-no-str-w4",
+    "--dpll-no-str-w5",
+    "--dpll-no-str-w6",
+    "--dpll-no-str-w7",
+    "--dpll-no-str-p2",
+    "--dpll-no-str-p3",
 ];
 
 /// Small QF_S problems that were sat BEFORE the default-on flips: their
@@ -63,14 +64,12 @@ const QF_S_SAT_PROBLEMS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Spawn `ay solve --self-check` on `input` (via stdin) with the given env
-/// pairs, and return stdout+stderr.
-fn solve_self_check(input: &str, env: &[(&str, &str)]) -> (String, String) {
+/// Spawn `ay solve --self-check` on `input` (via stdin) with the given extra
+/// CLI flags, and return stdout+stderr.
+fn solve_self_check(input: &str, flags: &[&str]) -> (String, String) {
     let mut cmd = Command::new(ay_binary());
     cmd.args(["solve", "--self-check", "--stdin"]);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
+    cmd.args(flags);
     let output = cmd
         .output_timeout_with_stdin(input.as_bytes(), DEFAULT_CHILD_TIMEOUT)
         .expect("spawn ay solve --self-check --stdin");
@@ -99,33 +98,32 @@ fn assert_certified_sat(name: &str, mode: &str, stdout: &str, stderr: &str) {
     );
 }
 
-/// Pre-flip mode: every strings lane killed via its `=0` switch. This is the
+/// Pre-flip mode: every strings lane killed via its CLI switch. This is the
 /// executable pin of the old defaults-off pipeline that the default-on flips
 /// (W4/P3: 87796d22f9, 360a85b477; and the later W5/W6/W7 flips) previously
 /// left covered only by flip-time A/B measurements.
 #[test]
 fn qf_s_sat_survives_all_string_kill_switches() {
-    let env: Vec<(&str, &str)> = ALL_KILL_SWITCHES.iter().map(|k| (*k, "0")).collect();
     for (name, input) in QF_S_SAT_PROBLEMS {
-        let (stdout, stderr) = solve_self_check(input, &env);
+        let (stdout, stderr) = solve_self_check(input, ALL_KILL_SWITCHES);
         assert_certified_sat(name, "all-lanes-killed", &stdout, &stderr);
     }
 }
 
-/// Each master switch killed individually (the exact `=0` contract each gate
-/// documents), with the remaining lanes at their defaults.
+/// Each master switch killed individually, with the remaining lanes at
+/// their defaults.
 #[test]
 fn qf_s_sat_survives_each_string_kill_switch_alone() {
     for switch in ALL_KILL_SWITCHES {
         for (name, input) in QF_S_SAT_PROBLEMS {
-            let (stdout, stderr) = solve_self_check(input, &[(switch, "0")]);
-            assert_certified_sat(name, &format!("{switch}=0"), &stdout, &stderr);
+            let (stdout, stderr) = solve_self_check(input, &[switch]);
+            assert_certified_sat(name, switch, &stdout, &stderr);
         }
     }
 }
 
-/// Default mode (no env): the flipped default-on pipeline certifies the same
-/// problems, so both sides of every kill switch are pinned by execution.
+/// Default mode (no flags): the flipped default-on pipeline certifies the
+/// same problems, so both sides of every kill switch are pinned by execution.
 #[test]
 fn qf_s_sat_certified_in_default_on_mode() {
     for (name, input) in QF_S_SAT_PROBLEMS {

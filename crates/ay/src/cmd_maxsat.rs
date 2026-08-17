@@ -1356,7 +1356,7 @@ impl MaxSatCapture {
 /// checker answers in ~0.06s. 60s is three orders of magnitude of slack and
 /// still a bound — the point is that a checker which hangs cannot hold the
 /// host-wide MaxSAT lease open forever before the sweep has even started.
-const CERT_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const CERT_PROBE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Capture cap for one startup probe. The expected output is two lines; this
 /// is enough slack for a stack trace and small enough to allocate three times
@@ -1518,100 +1518,19 @@ const GIANT_INSTANCE_BYTES: u64 = 80 * 1024 * 1024;
 /// giant's worth of artifacts on a 24GB host that has kernel-panicked twice.
 const PROOF_MAX_INSTANCE_MIB_DEFAULT: u64 = 40;
 
-/// Arguments for `ay maxsat solve`.
-#[derive(clap::Args)]
-pub(crate) struct MaxSatSolveArgs {
-    /// WCNF/MaxSAT input file.
-    pub file: PathBuf,
-    /// Wall-clock timeout in seconds (0 = none). On timeout, prints the best
-    /// bound found and `s UNKNOWN`.
-    #[arg(long, default_value_t = 0.0)]
-    pub timeout: f64,
-    /// EXPERIMENTAL: solve via the native ay-milp 0/1-ILP encoding instead of
-    /// the OLL core-guided engine. Validation lane for LP-structured weighted
-    /// families (facility-location / MPE / auctions) where OLL stalls.
-    #[arg(long)]
-    pub milp: bool,
-    /// Write a VeriPB certificate of the reported answer to `<STEM>.opb` and
-    /// `<STEM>.opb.pbp`. Emission is write-only: it can refuse to certify (which
-    /// raises an alarm) but never changes the answer AY reports.
-    #[arg(long, value_name = "STEM")]
-    pub proof: Option<PathBuf>,
-}
-
-/// Arguments for `ay maxsat bench`.
-#[derive(clap::Args)]
-pub(crate) struct MaxSatBenchArgs {
-    /// Directory containing .wcnf instances (searched recursively).
-    pub dir: PathBuf,
-    /// Per-instance wall-clock timeout in seconds.
-    #[arg(long, default_value_t = 60.0)]
-    pub timeout: f64,
-    /// Reference field CSV (columns: instance, o_value, then one column of
-    /// per-instance runtimes per competing solver). Enables optimum
-    /// verification and a retroactive leaderboard at the same timeout.
-    #[arg(long)]
-    pub field: Option<PathBuf>,
-    /// Number of instances to run in parallel.
-    #[arg(long)]
-    pub jobs: Option<usize>,
-    /// Run only the first N instances (sorted by name).
-    #[arg(long)]
-    pub limit: Option<usize>,
-    /// Deterministically subsample: keep every Nth instance.
-    #[arg(long)]
-    pub stride: Option<usize>,
-    /// Write detailed per-instance results to a JSON file.
-    #[arg(long)]
-    pub out: Option<PathBuf>,
-    /// Skip re-verifying reported models against the instance.
-    #[arg(long)]
-    pub no_verify: bool,
-    /// Certify every reported optimum: ask the solver child for a VeriPB
-    /// certificate and check it with the pinned checker before the row is
-    /// scored. OFF by default. A certified sweep writes a multi-MB `.opb` per
-    /// instance (36MB for a 1,035,351-constraint one) and pays for that
-    /// emission inside the measured `seconds`, so its PAR2 and solved count are
-    /// DELIBERATELY pessimistic — campaign numbers come from the uncertified
-    /// lane. Certification can only downgrade a row or annotate it; it can
-    /// never turn a non-optimum into an optimum.
-    #[arg(long)]
-    pub proof_check: bool,
-    /// Directory for certificate artifacts. Default: a per-run scratch
-    /// directory under the system temp dir, removed when the sweep ends.
-    /// Point this at a large volume when certifying the full corpus.
-    #[arg(long, value_name = "DIR", requires = "proof_check")]
-    pub proof_dir: Option<PathBuf>,
-    /// Skip certification for instances above this size (MiB; 0 = no cap).
-    /// The artifacts are BIGGER than the `.wcnf`, not "roughly its size":
-    /// measured, a 43,020,161-byte `.wcnf` produced a 71,989,226-byte `.opb`
-    /// plus a 7,059,974-byte `.pbp` — 1.84x the input, on disk, for every armed
-    /// row. The default is therefore 40MiB of `.wcnf`, which is ~74MiB of
-    /// artifacts: just under `GIANT_INSTANCE_BYTES` (80MiB), the size at which
-    /// the OOM guard already special-cases an instance. The checker's RSS is
-    /// also not in the resource plan (`MaxSatResources::plan`) — it borrows the
-    /// solver's slot after the solver exits. Skips are annotated per row and
-    /// counted in the summary; they are never silently recorded as verified.
-    #[arg(
-        long,
-        value_name = "MIB",
-        default_value_t = PROOF_MAX_INSTANCE_MIB_DEFAULT,
-        requires = "proof_check"
-    )]
-    pub proof_max_instance_mib: u64,
-    /// Benchmark an external solver instead of AY: "NAME=CMD" where CMD is
-    /// a program plus arguments; "{file}" in CMD is replaced by the
-    /// instance path (appended if absent). The same wall-clock timeout,
-    /// kill policy, and model/optimum verification apply.
-    #[arg(long)]
-    pub solver: Option<String>,
-}
+include!("cmd_maxsat/command_args.rs");
 
 /// Run a MaxSAT command and return the competition exit code.
 pub(crate) fn run(cmd: &MaxSatCommand) -> Result<i32> {
     match cmd {
-        MaxSatCommand::Solve(args) => solve(args),
-        MaxSatCommand::Bench(args) => bench(args),
+        MaxSatCommand::Solve(args) => {
+            args.engine_flags.install_misc_cli_flags()?;
+            solve(args)
+        }
+        MaxSatCommand::Bench(args) => {
+            args.validate_engine_flags()?;
+            bench(args)
+        }
     }
 }
 
@@ -1660,8 +1579,6 @@ pub(crate) fn run_z3_compat(
         stream_wcnf_file(path, &mut install)
             .with_context(|| format!("failed to parse '{}'", path.display()))?
     };
-    drop(install);
-
     let deadline = timeout_ms
         .filter(|milliseconds| *milliseconds > 0)
         .map(|milliseconds| {
@@ -1774,7 +1691,7 @@ const MILP_RACE_DELAY_SECS: f64 = 3.0;
 /// If no OLL incumbent has appeared by this point, launch unseeded anyway.
 const MILP_RACE_UB_WAIT_SECS: f64 = 6.0;
 
-/// **DEFAULT ON** (`AY_AB_MAXSAT_MILP_RACE=0` disables it).
+/// **DEFAULT ON** (`--maxsat-no-milp-race` disables it).
 ///
 /// This lane used to be opt-in, and the justification was a BENCH-PROTOCOL
 /// measurement: at `bench --jobs 10` on a 14-core box the extra threads
@@ -1795,12 +1712,10 @@ const MILP_RACE_UB_WAIT_SECS: f64 = 6.0;
 /// reach on its own.
 ///
 /// Contention is a property of the HARNESS, not of the solver, so the harness
-/// disables it (`AY_AB_MAXSAT_MILP_RACE=0`) rather than every competition run
+/// disables it (`--maxsat-no-milp-race`) rather than every competition run
 /// having to remember to switch it on. Correct by default; opt OUT for bench.
 fn maxsat_milp_race_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_MILP_RACE").as_deref() != Ok("0"))
+    !ay_core::misc_cli_flags().maxsat_no_milp_race
 }
 
 /// A race-lane verdict, produced by the MILP worker thread.
@@ -1967,13 +1882,9 @@ fn milp_race_worker(
     //
     // The row's purpose was to let the lane prove an OLL incumbent optimal via
     // MilpRaceWin::CutoffProof; measurement says finding the optimum outright is
-    // simply the easier problem here. `AY_AB_MAXSAT_MILP_RACE_CUTOFF=1` restores
-    // the old seeded behavior.
-    let cutoff_row_enabled = {
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_MILP_RACE_CUTOFF").as_deref() == Ok("1"))
-    };
+    // simply the easier problem here. B24 retired the never-set environment
+    // opt-in, so the measured no-cutoff path is now unconditional.
+    let cutoff_row_enabled = false; // B24: never-set opt-in retired.
     let cutoff_applied = cutoff_row_enabled && cutoff != u64::MAX && cutoff > 0;
     if cutoff_applied {
         let rhs = (cutoff as f64) - offset - 1.0;
@@ -2153,7 +2064,7 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     if race_ok && (race_soft.is_empty() || race_soft.iter().all(|(w, _)| *w == race_soft[0].0)) {
         race_ok = false;
     }
-    if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
+    if ay_core::misc_cli_flags().maxsat_debug {
         eprintln!(
             "c milp-race gate: wanted={} ok={} hard={} soft={} vars={} wsum={}",
             race_wanted,
@@ -2613,7 +2524,6 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     if files.is_empty() {
         bail!("no .wcnf files found under '{}'", args.dir.display());
     }
-
     let field = match &args.field {
         Some(path) => Some(parse_field_csv(path)?),
         None => auto_field_for(&files),
@@ -2645,7 +2555,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
             args.proof_max_instance_mib,
             // A checker that needs longer than the solve did is itself a
             // finding; it lands in Unvalidated, never in green.
-            timeout.max(Duration::from_secs(60)),
+            timeout.max(Duration::from_mins(1)),
         )
         .map_err(|why| anyhow::anyhow!("--proof-check: {why}"))?;
         safe_println!(
@@ -2741,6 +2651,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
                     field.as_ref(),
                     &resources,
                     cert.as_ref(),
+                    &args.engine_flags,
                 );
                 if is_giant {
                     giants_running.fetch_sub(1, Ordering::AcqRel);
@@ -2993,6 +2904,7 @@ fn write_json_report(
             .as_deref()
             .map(|s| s.split('=').next().unwrap_or("external"))
             .unwrap_or("AY"),
+        "internal_solver_cli_args": args.effective_internal_solver_cli_args(resource_plan.jobs),
         "summary": {
             "total": results.len(),
             "solved": summary.solved,
@@ -3165,14 +3077,14 @@ fn run_one(
     field: Option<&FieldData>,
     resources: &MaxSatResources,
     cert: Option<&maxsat_cert::CertPlan>,
+    engine_flags: &MaxSatEngineFlags,
 ) -> RunResult {
     let instance = instance_key(file);
-    // #bench-cert: decide the certificate arm before anything is spawned. `Off`
-    // unless `--proof-check` is on and this is the internal solver; `Skipped`
-    // when the size guard declines the instance.
+    // #bench-cert: decide the certificate arm before anything is spawned: `Off`
+    // unless internal proof-checking is on, or `Skipped` when the size gate declines.
     let arm = maxsat_cert::arm_certificate(cert, external.is_some(), file, &instance);
-    // RAII net. Every early return below drops this and takes the artifacts
-    // with it, and so does the anytime path — a `s UNKNOWN` with an incumbent
+    // RAII net: every early return and the anytime path drop their artifacts;
+    // a `s UNKNOWN` with an incumbent
     // emits a full `.opb` too, so a 3600s sweep of timeouts would otherwise
     // accumulate the whole corpus on disk without a single check being run.
     // The fold marks the two outcomes worth keeping.
@@ -3215,6 +3127,7 @@ fn run_one(
                 .arg(file)
                 .arg("--timeout")
                 .arg(format!("{timeout}"));
+            cmd.args(engine_flags.solver_cli_args(resources.plan.jobs > 1));
             // Attach the certificate request HERE, ahead of `wrap_stopped`
             // below: the oom-guard wrapper copies only the target's program and
             // args, so anything set on `cmd` after that call is silently lost.
@@ -3232,7 +3145,6 @@ fn run_one(
     command.stderr(Stdio::null());
     isolate_maxsat_process_group(&mut command);
     let child = command.spawn();
-
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
@@ -5140,6 +5052,7 @@ mod tests {
             None,
             &resources,
             None,
+            &MaxSatEngineFlags::default(),
         );
         assert_eq!(result.status, RunStatus::Timeout, "{}", result.detail);
         assert_eq!(fs::read_to_string(env_file).unwrap().trim(), "3");

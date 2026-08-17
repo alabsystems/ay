@@ -46,10 +46,10 @@ use crate::portfolio::PortfolioResult;
 use crate::transform::cata_abstract::{build_cata_ladder, CataAbstraction};
 
 /// Kill switch: set to any value to disable the catamorphism lane.
-const CATA_DISABLE_ENV: &str = "AY_CHC_DISABLE_CATA";
+
 /// Kill switch for the CATA v2 multi-predicate affine-Houdini abstract solver
 /// (default ON). Setting it forces the v1 nested-portfolio abstract solve only.
-const CATA_V2_DISABLE_ENV: &str = "AY_CHC_DISABLE_CATA_V2";
+
 /// Toggle for the CATA v2 depth-1 GUARDED candidate families (flag-guarded
 /// ordering facts + non-convex min recurrences). Default ON; set
 /// `AY_CHC_CATA_GUARDED=0` (or `off`/`false`/`no`) to suppress them — the
@@ -141,11 +141,11 @@ const CATA_ABSTRACT_VERIFY_CAP: Duration = Duration::from_secs(6);
 const CATA_CEX_DEPTH_SLACK: usize = 2;
 
 fn cata_lane_disabled() -> bool {
-    std::env::var_os(CATA_DISABLE_ENV).is_some()
+    !crate::ab_switches::get().cata_route
 }
 
 fn cata_v2_disabled() -> bool {
-    std::env::var_os(CATA_V2_DISABLE_ENV).is_some()
+    !crate::ab_switches::get().cata_v2
 }
 
 /// CATA v3 disjunctive ICE learner: ON by default, off only when
@@ -254,8 +254,8 @@ impl AdaptivePortfolio {
         // runs (the landed conversions are provably unaffected). Every verdict
         // still passes the same fail-closed certificate gate (obligations +
         // abstract re-verification + query gate), so the lever is 0-wrong by
-        // construction. Opt-out kill switch: `AY_CHC_DISABLE_CATA_ELEMENTS=1`.
-        let element_catas = std::env::var_os("AY_CHC_DISABLE_CATA_ELEMENTS").is_none();
+        // construction. Opt-out: `--chc-no-cata-elements` (B27: env retired).
+        let element_catas = crate::ab_switches::get().cata_elements; // B27: CLI-owned.
         let ladder = build_cata_ladder(&self.problem, element_catas);
         if ladder.is_empty() {
             return None;
@@ -428,9 +428,9 @@ impl AdaptivePortfolio {
         };
 
         // Diagnostic: dump the abstract LIA problem for offline standalone
-        // solving (AY_CHC_CATA_DUMP_ABSTRACT=<dir>). Datatype-free, so it is a
+        // solving (--chc-cata-dump-abstract <dir>). Datatype-free, so it is a
         // plain LIA-CHC script.
-        if let Some(dir) = std::env::var_os("AY_CHC_CATA_DUMP_ABSTRACT") {
+        if let Some(dir) = ay_core::misc_cli_flags().chc_cata_dump_abstract.as_deref() {
             let dir = std::path::PathBuf::from(dir);
             let _ = std::fs::create_dir_all(&dir);
             let script = crate::transform::cata_abstract::dump_abstract_lia_problem(

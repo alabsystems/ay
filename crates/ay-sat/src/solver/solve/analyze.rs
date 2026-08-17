@@ -209,11 +209,6 @@ impl Solver {
             self.notify_observer_learn(result.learned_clause.len() as u32, result.lbd);
         }
 
-        // Update trail-length EMA before backtracking (trail is still at full
-        // length). This feeds the restart-blocking heuristic (Audemard & Simon
-        // SAT 2012). CaDiCaL updates this in analyze.cpp before backtrack.
-        self.update_trail_ema();
-
         before_backtrack(self, actual_backtrack_level);
         self.backtrack(actual_backtrack_level);
 
@@ -342,7 +337,6 @@ impl Solver {
     /// - OTFS Branch B (on-the-fly strengthening)
     /// - DIP-ERCL (dual implication point extension)
     /// - Eager subsumption of learned clauses
-    /// - Trail-length EMA updates (IC3 uses Luby restarts)
     /// - TLA trace events
     /// - Observer notifications
     /// - Diagnostic pass tracking

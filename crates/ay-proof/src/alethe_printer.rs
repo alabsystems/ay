@@ -6,14 +6,20 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+#[path = "alethe_printer_eq_transitive.rs"]
+mod eq_transitive;
+mod folded_assume;
 #[cfg(test)]
 #[path = "alethe_printer_ground_eval_tests.rs"]
 mod ground_eval_tests;
 #[path = "alethe_printer_resolution_args.rs"]
 mod resolution_args;
+#[path = "alethe_printer/store_permutation.rs"]
+mod store_permutation;
 mod surface_and_pos;
 mod surface_symm;
 mod surface_tokens;
+mod term_format;
 use surface_tokens::split_smt_terms;
 pub use surface_tokens::{split_alethe_application_bounded, AletheSurfaceParseError};
 // #8529: Use deterministic hash maps in all builds.
@@ -295,7 +301,27 @@ pub(crate) struct AlethePrinter<'a> {
     /// form once; from that point on the term must print as the eliminated
     /// form everywhere, which is what this map does. Read BEFORE
     /// `term_overrides` so the switch is atomic for the whole document.
+    ///
+    /// The FOLDED-conjunction assume bridge ([`Self::plan_folded_and_assumes`])
+    /// uses the same channel for the same reason, and installs its entries
+    /// EAGERLY in `prepare_proof` rather than at the assume, so no step printed
+    /// before the assume can observe the authored spelling.
     let_bridge_renderings: std::cell::RefCell<HashMap<TermId, String>>,
+    /// Authored spellings that may be printed ONLY at their own `assume`.
+    ///
+    /// Populated by [`Self::plan_folded_and_assumes`] for every assumed term
+    /// whose surface override is an authored conjunction that elaboration
+    /// FOLDED away. The spelling has to reach the `assume` (that is what the
+    /// external checker matches against the problem file) and must reach
+    /// nothing else (it does not denote the folded term the rest of the
+    /// document derives from).
+    folded_assume_surfaces: std::cell::RefCell<HashMap<TermId, String>>,
+    /// Subset of [`Self::folded_assume_surfaces`] whose `assume` is a PREMISE
+    /// of some step, and therefore owes the consumers a derivation of the
+    /// folded clause. An assumption nothing consumes owes nothing and is
+    /// printed unchanged — introducing a bridge (and, in the worst case, a
+    /// `hole`) for it would put an unproved step into a document that had none.
+    folded_assume_bridged: std::cell::RefCell<HashSet<TermId>>,
     /// Internal clauses by proof id, populated eagerly so a resolution step
     /// can repair surface-order complements in its already-printed premises.
     proof_clauses: std::cell::RefCell<HashMap<ProofId, Vec<TermId>>>,
@@ -330,6 +356,8 @@ impl<'a> AlethePrinter<'a> {
             format_cache: std::cell::RefCell::new(HashMap::default()),
             assume_terms: std::cell::RefCell::new(HashMap::default()),
             let_bridge_renderings: std::cell::RefCell::new(HashMap::default()),
+            folded_assume_surfaces: std::cell::RefCell::new(HashMap::default()),
+            folded_assume_bridged: std::cell::RefCell::new(HashSet::default()),
             proof_clauses: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
             work_budget,
@@ -358,6 +386,10 @@ impl<'a> AlethePrinter<'a> {
                 }
             }
         }
+        // Must precede every emission: an authored conjunction that FOLDED may
+        // not be substituted for the folded term in any step, including steps
+        // printed before its own `assume`.
+        self.plan_folded_and_assumes(proof);
         crate::checker::quantifier::validate_sko_forall_uniqueness(proof, self.terms).map_err(
             |err| AlethePrintError::InvalidSkolemStep {
                 id: match err {
@@ -876,88 +908,6 @@ impl<'a> AlethePrinter<'a> {
         self.navigate_and_pos_gate(id, &source_str, &ak_str)
     }
 
-    /// Rebuild an `and_pos` tautology when the authored spelling wraps the
-    /// canonical conjunction in `(or false C)`.
-    ///
-    /// Elaboration simplifies that wrapper to `C`, so the proof IR correctly
-    /// records `and_pos` over `C`; the source override must nevertheless print
-    /// the authored root so its `assume` matches the problem.  Printing the IR
-    /// step directly would claim `and_pos` over an `or`.  Compose the exact
-    /// Boolean rules instead:
-    ///
-    /// `or_pos(ROOT)`, `false`, and `and_pos(C)` resolve to `¬ROOT ∨ Ak`.
-    fn resugar_and_pos_false_or_and(
-        &self,
-        id: ProofId,
-        rule: &ay_core::AletheRule,
-        clause: &[TermId],
-        args: &[TermId],
-    ) -> Option<String> {
-        let ay_core::AletheRule::AndPos(i) = rule else {
-            return None;
-        };
-        let [source] = args else {
-            return None;
-        };
-        let TermData::App(Symbol::Named(name), conjuncts) = self.terms.get(*source) else {
-            return None;
-        };
-        if name != "and" || clause.len() != 2 {
-            return None;
-        }
-        let ak = *conjuncts.get(*i as usize)?;
-        let ak_str = self.format_term(ak);
-        let printed: [String; 2] = [self.format_term(clause[0]), self.format_term(clause[1])];
-        let ak_pos = printed.iter().position(|literal| *literal == ak_str)?;
-        let gate = clause[1 - ak_pos];
-        if matches!(self.terms.get(gate), TermData::Not(inner) if *inner == *source)
-            || !self.is_demorgan_negation(gate, *source)
-        {
-            return None;
-        }
-
-        let root = self.format_term(*source);
-        let root_operands = split_application(&root, "or")?;
-        if root_operands.len() != 2 {
-            return None;
-        }
-        let (false_operand, inner) = if root_operands[0] == "false" {
-            (&root_operands[0], &root_operands[1])
-        } else if root_operands[1] == "false" {
-            (&root_operands[1], &root_operands[0])
-        } else {
-            return None;
-        };
-        let inner_operands = split_application(inner, "and")?;
-        let inner_index = inner_operands
-            .iter()
-            .position(|operand| operand == &ak_str)?;
-        // Require an exact one-to-one printed conjunction. A nested/reordered
-        // spelling needs a navigation proof; declining here is safer than
-        // guessing an `and_pos` index.
-        if inner_operands.len() != conjuncts.len()
-            || inner_operands
-                .iter()
-                .filter(|operand| *operand == &ak_str)
-                .count()
-                != 1
-        {
-            return None;
-        }
-
-        let or_id = format!("{id}.ow0");
-        let false_id = format!("{id}.ow1");
-        let and_id = format!("{id}.ow2");
-        let drop_id = format!("{id}.ow3");
-        Some(format!(
-            "(step {or_id} (cl (not {root}) {false_operand} {inner}) :rule or_pos)\n\
-             (step {false_id} (cl (not {false_operand})) :rule false)\n\
-             (step {and_id} (cl (not {inner}) {ak_str}) :rule and_pos :args ({inner_index}))\n\
-             (step {drop_id} (cl (not {root}) {inner}) :rule resolution :premises ({or_id} {false_id}))\n\
-             (step {id} (cl (not {root}) {ak_str}) :rule resolution :premises ({drop_id} {and_id}))"
-        ))
-    }
-
     /// Derive `(cl (not ROOT) Ak)` by walking the PRINTED `and` nesting.
     ///
     /// The printed root stays byte-identical to `format_term(source)`, so the
@@ -973,7 +923,17 @@ impl<'a> AlethePrinter<'a> {
     /// Returns `None` (fail loud at the caller) when `Ak` is not a printed
     /// operand anywhere in the nesting — emitting `:args (i)` against a shape
     /// that does not hold it is exactly the wrong-index step this guards.
-    fn navigate_and_pos_gate(&self, id: ProofId, root: &str, ak_str: &str) -> Option<String> {
+    /// `id` is the identifier the CONCLUSION is emitted under, and the prefix
+    /// every intermediate hop is named from. It is a `Display` rather than a
+    /// `ProofId` so a caller that is itself already emitting a sub-derivation
+    /// (the folded-conjunction `assume` bridge) can hang the projection off its
+    /// own sub-id without colliding with the step id it is repairing.
+    fn navigate_and_pos_gate(
+        &self,
+        id: impl std::fmt::Display,
+        root: &str,
+        ak_str: &str,
+    ) -> Option<String> {
         let nesting = PrintedNesting::build(root, "and", PRINTED_NESTING_NODE_BUDGET)?;
         if nesting.is_flat() {
             // Flat print with a mismatching index: the internal conjunct
@@ -1745,6 +1705,9 @@ impl<'a> AlethePrinter<'a> {
         match step {
             ProofStep::Assume(term_id) => {
                 self.assume_terms.borrow_mut().insert(id, *term_id);
+                if let Some(bridge) = self.format_folded_and_assume_bridge(id, *term_id) {
+                    return Ok(bridge);
+                }
                 let term_str = self.format_term(*term_id);
                 if let Some(bridge) = self.format_let_assume_bridge(id, *term_id, &term_str) {
                     return Ok(bridge);
@@ -2154,6 +2117,59 @@ impl<'a> AlethePrinter<'a> {
         match_pair
     }
 
+    /// Render an independently evaluated ground LIA unit through the exact
+    /// rules implemented by the pinned external checker.
+    ///
+    /// Carcara treats `lia_generic` as an unchecked hole. A positive
+    /// directional equality can use `evaluate` directly. A true ground
+    /// disequality cannot: `evaluate` only concludes `(= term value)`, so spell
+    /// out the checked `evaluate` / `equiv1` / `false` / `resolution` bridge.
+    ///
+    /// The native ground evaluator is the authority here, independently of
+    /// the LIA annotation. The canonical-surface equality is load-bearing: a
+    /// source override that changes what the external checker sees must not
+    /// inherit authority from the internal term DAG.
+    fn format_lia_ground_evaluate(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        clause_str: &str,
+    ) -> Option<String> {
+        if clause_str != AlethePrinter::new(self.terms).format_clause(clause) {
+            return None;
+        }
+        if crate::checker::validate_ground_evaluate_for_printer(self.terms, id, clause, 0, &[])
+            .is_ok()
+        {
+            return Some(format!("(step {id} {clause_str} :rule evaluate)"));
+        }
+
+        let [literal] = clause else {
+            return None;
+        };
+        let TermData::Not(equality) = self.terms.get(*literal) else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(operator), operands) = self.terms.get(*equality) else {
+            return None;
+        };
+        if operator != "="
+            || operands.len() != 2
+            || !crate::checker::recognize_ground_evaluate(self.terms, *literal)
+        {
+            return None;
+        }
+
+        let equality = self.format_term(*equality);
+        let literal = self.format_term(*literal);
+        Some(format!(
+            "(step {id}.ev (cl (= {equality} false)) :rule evaluate)\n\
+             (step {id}.q (cl {literal} false) :rule equiv1 :premises ({id}.ev))\n\
+             (step {id}.f (cl (not false)) :rule false)\n\
+             (step {id} {clause_str} :rule resolution :premises ({id}.q {id}.f))"
+        ))
+    }
+
     fn format_theory_lemma(
         &self,
         id: ProofId,
@@ -2162,6 +2178,18 @@ impl<'a> AlethePrinter<'a> {
         farkas: Option<&ay_core::FarkasAnnotation>,
         kind: &ay_core::TheoryLemmaKind,
     ) -> Result<String, AlethePrintError> {
+        if matches!(kind, ay_core::TheoryLemmaKind::ArithEqTriangle) {
+            return self.format_arith_eq_triangle(id, clause);
+        }
+        if matches!(kind, ay_core::TheoryLemmaKind::ArithEqImpliesBound) {
+            return self.format_arith_eq_implies_bound(id, clause);
+        }
+        if matches!(kind, ay_core::TheoryLemmaKind::IntBoundsTautology) {
+            return self.format_unit_farkas_clause(id, clause, "integer bounds tautology");
+        }
+        if matches!(kind, ay_core::TheoryLemmaKind::ArithDisequalitySplit) {
+            return self.format_arith_disequality_split(id, clause);
+        }
         // AY's wide BV checker proves binary `bvand` commutativity by building
         // and replaying a bit-blast/LRAT refutation from this exact live term.
         // Alethe has no monolithic `bv_bitblast` rule, but it does have the
@@ -2241,6 +2269,11 @@ impl<'a> AlethePrinter<'a> {
         }
 
         let clause_str = self.format_clause(clause);
+        if matches!(kind, ay_core::TheoryLemmaKind::LiaGeneric) {
+            if let Some(text) = self.format_lia_ground_evaluate(id, clause, &clause_str) {
+                return Ok(text);
+            }
+        }
         if let Some(farkas) = farkas {
             // WIRE name, not the internal one: a kind the checker does not
             // implement must print as `hole`, never as an unknown rule name
@@ -2324,19 +2357,8 @@ impl<'a> AlethePrinter<'a> {
             });
         }
 
-        // An `eq_transitive` clause whose negated-equality hypotheses print
-        // in AY's `(distinct a b)` surface spelling (or which degenerates to
-        // the two-literal symmetry tautology) is not spec-valid Alethe:
-        // Carcara requires every hypothesis to be a literal `(not (= t u))`
-        // and requires at least two of them. Rebuild it from the canonical
-        // `(not (= …))` forms plus reflexive padding, then bridge each
-        // hypothesis back to its printed `(distinct …)` spelling with
-        // `distinct_elim`/`equiv2` so the step's final clause is byte-identical
-        // and every downstream premise reference is unaffected. Emission-only.
-        if kind.alethe_rule() == "eq_transitive" {
-            if let Some(text) = self.resugar_eq_transitive(id, clause) {
-                return Ok(text);
-            }
+        if let Some(text) = self.format_eq_transitive_or_hole(id, clause, kind) {
+            return Ok(text);
         }
 
         // Non-arithmetic kinds fall through to their own rule name, mapped to
@@ -2347,9 +2369,10 @@ impl<'a> AlethePrinter<'a> {
         // array/string/FP kinds with no Alethe counterpart. Those print as
         // `hole`: the checker accepts the document as *holey* and the step is
         // machine-readable as unproved, where an unknown rule name would make
-        // the whole proof `invalid`. The one datatype kind that DOES have a
-        // checker rule, `dt_distinct`, is aliased by `wire_rule_name` to the
-        // checker's spelling `dt_clash` and is genuinely checked.
+        // the whole proof `invalid`. Datatype distinctness belongs in that set:
+        // its former `dt_distinct` -> `dt_clash` alias was reverted after the
+        // installed carcara 1.1.0 answered `unknown rule`, making every such
+        // document invalid where `hole` keeps the unsupported step explicit.
         //
         // The #8759 terminal-trust detector is unaffected — it walks the proof
         // IR and reads `kind.is_trust()` / `AletheRule::Hole`, both of which
@@ -2372,6 +2395,113 @@ impl<'a> AlethePrinter<'a> {
             }
         }
         Ok(format!("(step {id} {clause_str} :rule {wire})"))
+    }
+
+    /// Lower the flat arithmetic equality-adapter triangle through Alethe's
+    /// checked `la_disequality` rule and a single `or` flattening step.
+    fn format_arith_eq_triangle(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        let [not_forward, not_reverse, equality] = clause else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "arithmetic equality triangle must have three literals".to_string(),
+            });
+        };
+        let forward = self.format_term(*not_forward);
+        let reverse = self.format_term(*not_reverse);
+        let equality = self.format_term(*equality);
+        let packed = format!("(or {equality} {forward} {reverse})");
+        Ok(format!(
+            "(step {id}.split (cl {packed}) :rule la_disequality)\n\
+             (step {id} (cl {forward} {reverse} {equality}) :rule or :premises ({id}.split))"
+        ))
+    }
+
+    /// Lower `a=b => a<=b` (or the reverse bound) through the standard
+    /// `la_generic` checker rule.  The native strict checker already fixed the
+    /// exact operands and sorts; the signed coefficients below independently
+    /// combine `a != b`'s equality branch with the negated bound.
+    fn format_arith_eq_implies_bound(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        let [not_equality, bound] = clause else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "arithmetic equality implication must have two literals".to_string(),
+            });
+        };
+        Ok(format!(
+            "(step {id} (cl {} {}) :rule la_generic :args (-1 1))",
+            self.format_term(*not_equality),
+            self.format_term(*bound),
+        ))
+    }
+
+    fn format_unit_farkas_clause(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        label: &str,
+    ) -> Result<String, AlethePrintError> {
+        if clause.is_empty() {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: format!("{label} must be non-empty"),
+            });
+        }
+        let coeffs = std::iter::repeat_n("1", clause.len())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!(
+            "(step {id} {} :rule la_generic :args ({coeffs}))",
+            self.format_clause(clause),
+        ))
+    }
+
+    fn format_arith_disequality_split(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        let [first, second, equality] = clause else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "guarded arithmetic split must have three literals".to_string(),
+            });
+        };
+        let TermData::App(Symbol::Named(eq_name), eq_args) = self.terms.get(*equality) else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "guarded arithmetic split must end in an equality".to_string(),
+            });
+        };
+        if eq_name != "=" || eq_args.len() != 2 {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "guarded arithmetic split must end in a binary equality".to_string(),
+            });
+        }
+        let lhs = self.format_term(eq_args[0]);
+        let rhs = self.format_term(eq_args[1]);
+        let equality = self.format_term(*equality);
+        let first = self.format_term(*first);
+        let second = self.format_term(*second);
+        let le_forward = format!("(<= {lhs} {rhs})");
+        let le_reverse = format!("(<= {rhs} {lhs})");
+        let packed = format!("(or {equality} (not {le_forward}) (not {le_reverse}))");
+        Ok(format!(
+            "(step {id}.split (cl {packed}) :rule la_disequality)\n\
+             (step {id}.flat (cl {equality} (not {le_forward}) (not {le_reverse})) :rule or :premises ({id}.split))\n\
+             (step {id}.b0 (cl {le_forward} {second}) :rule la_generic :args (1 1))\n\
+             (step {id}.b1 (cl {le_reverse} {first}) :rule la_generic :args (1 1))\n\
+             (step {id}.mid (cl {equality} (not {le_reverse}) {second}) :rule resolution :premises ({id}.flat {id}.b0))\n\
+             (step {id} (cl {first} {second} {equality}) :rule resolution :premises ({id}.mid {id}.b1))"
+        ))
     }
 
     /// Decode the printed spelling of a CLOSED SMT-LIB bitvector constant into
@@ -3137,395 +3267,6 @@ impl<'a> AlethePrinter<'a> {
             }
         }
         Ok(out)
-    }
-
-    /// Lower AY's internally checked n-ary STORE-PERMUTATION lemma to the
-    /// array rules the pinned Carcara dialect actually implements.
-    ///
-    /// Carcara has no `store_permutation` rule (probed: `unknown rule`), so
-    /// this is a DERIVATION, not a rename. Two store chains that write the same
-    /// `(index, value)` multiset over one base differ only by a permutation of
-    /// pairwise-distinct indices, and every permutation factors into ADJACENT
-    /// transpositions. Each transposition
-    /// `store(store(X,i,v),j,w) = store(store(X,j,w),i,v)` is proved on its own
-    /// by refutation: assume the two arrays differ, take Carcara's `arrays_ext`
-    /// witness `E`, and case-split on `E`. Both readings agree when `E` misses
-    /// both indices (two `arrays_row` reductions to `select(X,E)`), when `E` is
-    /// the outer index (both sides read `w`), and when `E` is the inner index
-    /// (both sides read `v`); the fourth case makes `i = j`, which the clause's
-    /// own index-disequality literal refutes. `cong` lifts each transposition
-    /// through the untouched outer stores and `trans` composes them.
-    ///
-    /// Returns `None` — an honest `hole` — whenever the printed clause is not
-    /// exactly the schema this derivation proves. Every term used below is
-    /// re-read from the clause and re-checked against its PRINTED spelling, so
-    /// a surface override that moves an index, a value, the base array or an
-    /// equality orientation refuses instead of publishing a derivation of
-    /// something else.
-    fn format_array_store_permutation(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
-        let shape = crate::checker::array_store_permutation_printer_terms(self.terms, clause)?;
-
-        // Capture guard: the derivation inlines the printed chains into the
-        // scope of the `arrays_ext` witness's `choice` binder, which is
-        // literally `x`, so a free `x` of any sort inside either chain would
-        // be captured by it — the document would claim a different term than
-        // the one the checker constructs. Decline, exactly as the witness
-        // installation lane above declines, and keep the honest hole.
-        if term_mentions_symbol(self.terms, shape.left_array, EXT_CHOICE_BINDER)
-            || term_mentions_symbol(self.terms, shape.right_array, EXT_CHOICE_BINDER)
-        {
-            return None;
-        }
-
-        // ---- printed surfaces, re-checked against the clause -------------
-        let literals: Vec<String> = clause.iter().map(|&lit| self.format_term(lit)).collect();
-        // A repeated literal would make the `not_not` discharge chain resolve
-        // two occurrences on one pivot; refuse rather than mis-shape the clause.
-        let unique: HashSet<&String> = literals.iter().collect();
-        if unique.len() != literals.len() {
-            return None;
-        }
-
-        let base = self.format_term(shape.base);
-        let printed_entries = |entries: &[(TermId, TermId)]| -> Vec<(String, String)> {
-            entries
-                .iter()
-                .map(|&(index, value)| (self.format_term(index), self.format_term(value)))
-                .collect()
-        };
-        let left = printed_entries(&shape.left);
-        let right = printed_entries(&shape.right);
-
-        // Distinct index TERMS must stay distinct once printed: the schema's
-        // soundness rests on it, and a surface override could collapse two.
-        let distinct: HashSet<&String> = left.iter().map(|(index, _)| index).collect();
-        if distinct.len() != left.len() {
-            return None;
-        }
-
-        let left_text = store_chain_text(&base, &left);
-        let right_text = store_chain_text(&base, &right);
-        if self.format_term(shape.left_array) != left_text
-            || self.format_term(shape.right_array) != right_text
-            || literals[shape.row_position] != format!("(= {left_text} {right_text})")
-        {
-            return None;
-        }
-
-        // Each index-equality literal must print as the exact pair it carries,
-        // in the orientation the clause spells. `diseq` maps an unordered index
-        // pair to (assumption id, printed lhs, printed rhs).
-        let mut diseq: HashMap<(String, String), (String, String, String)> = HashMap::default();
-        for &(_, position, lhs, rhs) in &shape.index_equalities {
-            let (lhs, rhs) = (self.format_term(lhs), self.format_term(rhs));
-            if literals[position] != format!("(= {lhs} {rhs})") {
-                return None;
-            }
-            let key = if lhs <= rhs {
-                (lhs.clone(), rhs.clone())
-            } else {
-                (rhs.clone(), lhs.clone())
-            };
-            diseq.insert(key, (format!("{id}.a{position}"), lhs, rhs));
-        }
-
-        let index_sort = shape.index_sort.to_string();
-
-        // ---- the adjacent-transposition schedule -------------------------
-        // An IDENTITY "permutation" needs no transposition at all, so there is
-        // nothing for this derivation to compose; it stays an honest hole
-        // rather than falling off the end of an empty schedule.
-        let swaps = adjacent_transposition_schedule(&left, &right)?;
-        if swaps.is_empty() {
-            return None;
-        }
-
-        let mut out = String::new();
-        // `subproof` appends `false` whenever the discharged block ends in the
-        // empty clause; this is the step that strips it back off.
-        out.push_str(&format!("(step {id}.nf (cl (not false)) :rule false)\n"));
-        out.push_str(&format!("(anchor :step {id}.sp0)\n"));
-        for (position, literal) in literals.iter().enumerate() {
-            out.push_str(&format!("(assume {id}.a{position} (not {literal}))\n"));
-        }
-
-        let mut current = left.clone();
-        let mut segments: Vec<(String, String, String)> = Vec::new();
-        for (nth, &at) in swaps.iter().enumerate() {
-            let rest = store_chain_text(&base, &current[at + 2..]);
-            let outer = current[at].clone();
-            let inner = current[at + 1].clone();
-            let key = if outer.0 <= inner.0 {
-                (outer.0.clone(), inner.0.clone())
-            } else {
-                (inner.0.clone(), outer.0.clone())
-            };
-            let (premise, diseq_lhs, diseq_rhs) = diseq.get(&key)?.clone();
-            let tag = format!("{id}.k{nth}");
-            let (mut before, mut after) = self.write_store_transposition(
-                &mut out,
-                &tag,
-                &rest,
-                &outer,
-                &inner,
-                &index_sort,
-                &premise,
-                (&diseq_lhs, &diseq_rhs),
-                id,
-            )?;
-            // Lift the two-store equality back out through the untouched outer
-            // stores, innermost first.
-            let mut lifted = tag.clone();
-            for depth in (0..at).rev() {
-                let (index, value) = &current[depth];
-                let next_before = format!("(store {before} {index} {value})");
-                let next_after = format!("(store {after} {index} {value})");
-                let step = format!("{tag}.l{depth}");
-                out.push_str(&format!(
-                    "(step {step} (cl (= {next_before} {next_after})) \
-                     :rule cong :premises ({lifted}))\n"
-                ));
-                lifted = step;
-                before = next_before;
-                after = next_after;
-            }
-            segments.push((lifted, before, after));
-            current.swap(at, at + 1);
-        }
-        if current != right {
-            return None;
-        }
-
-        // ---- compose the transpositions ----------------------------------
-        let mut chain_step = segments[0].0.clone();
-        let mut chain_end = segments[0].2.clone();
-        for (nth, (step, _, after)) in segments.iter().enumerate().skip(1) {
-            let composed = format!("{id}.tr{nth}");
-            out.push_str(&format!(
-                "(step {composed} (cl (= {left_text} {after})) \
-                 :rule trans :premises ({chain_step} {step}))\n"
-            ));
-            chain_step = composed;
-            chain_end = after.clone();
-        }
-        if chain_end != right_text || segments[0].1 != left_text {
-            return None;
-        }
-
-        // ---- discharge the whole clause ----------------------------------
-        out.push_str(&format!(
-            "(step {id}.bot (cl) :rule resolution :premises ({id}.a{} {chain_step}))\n",
-            shape.row_position
-        ));
-        let doubled: Vec<String> = literals
-            .iter()
-            .map(|literal| format!("(not (not {literal}))"))
-            .collect();
-        let discharge: Vec<String> = (0..literals.len())
-            .map(|position| format!("{id}.a{position}"))
-            .collect();
-        out.push_str(&format!(
-            "(step {id}.sp0 (cl {} false) :rule subproof :discharge ({}))\n",
-            doubled.join(" "),
-            discharge.join(" ")
-        ));
-        out.push_str(&format!(
-            "(step {id}.sp (cl {}) :rule resolution :premises ({id}.sp0 {id}.nf))\n",
-            doubled.join(" ")
-        ));
-        for (position, literal) in literals.iter().enumerate() {
-            out.push_str(&format!(
-                "(step {id}.d{position} (cl (not {}) {literal}) :rule not_not)\n",
-                doubled[position]
-            ));
-        }
-        let mut previous = format!("{id}.sp");
-        for position in 0..literals.len() {
-            let mut resolvent: Vec<&str> =
-                doubled[position + 1..].iter().map(String::as_str).collect();
-            resolvent.extend(literals[..=position].iter().map(String::as_str));
-            let step = if position + 1 == literals.len() {
-                id.to_string()
-            } else {
-                format!("{id}.c{position}")
-            };
-            out.push_str(&format!(
-                "(step {step} (cl {}) :rule resolution :premises ({previous} {id}.d{position}))\n",
-                resolvent.join(" ")
-            ));
-            previous = step;
-        }
-        // The emitted conclusion must be the clause the caller printed, byte
-        // for byte; anything else is a derivation of a different claim.
-        if previous != id.to_string()
-            || self.format_clause(clause) != format!("(cl {})", literals.join(" "))
-        {
-            return None;
-        }
-        out.pop();
-        Some(out)
-    }
-
-    /// Emit one adjacent transposition
-    /// `store(store(X,ii,vi),jo,wo) = store(store(X,jo,wo),ii,vi)` as a
-    /// self-contained subproof concluding `(cl (= before after))` under step
-    /// name `tag`.
-    ///
-    /// `premise` names a unit step whose term is `(not (= dl dr))` with
-    /// `{dl, dr} == {ii, jo}`; that disequality is what rules out the case
-    /// where Carcara's extensionality witness equals both indices at once.
-    /// `id` names the enclosing lemma step, whose `{id}.nf` step strips the
-    /// `false` literal `subproof` appends to every discharged refutation.
-    #[allow(clippy::too_many_arguments)]
-    fn write_store_transposition(
-        &self,
-        out: &mut String,
-        tag: &str,
-        rest: &str,
-        outer: &(String, String),
-        inner: &(String, String),
-        index_sort: &str,
-        premise: &str,
-        diseq: (&str, &str),
-        id: ProofId,
-    ) -> Option<(String, String)> {
-        let (jo, wo) = (&outer.0, &outer.1);
-        let (ii, vi) = (&inner.0, &inner.1);
-        let before = format!("(store (store {rest} {ii} {vi}) {jo} {wo})");
-        let after = format!("(store (store {rest} {jo} {wo}) {ii} {vi})");
-        // `before` minus its outer store (index `jo`), and likewise for `after`.
-        let inner_left = format!("(store {rest} {ii} {vi})");
-        let inner_right = format!("(store {rest} {jo} {wo})");
-        // The exact epsilon term Carcara's `arrays_ext` constructs for this
-        // array pair. It must match byte for byte: the rule compares with
-        // `assert_polyeq`, which does not quotient by alpha-renaming.
-        let binder = EXT_CHOICE_BINDER;
-        let witness = format!(
-            "(choice (({binder} {index_sort})) (or (= {before} {after}) \
-             (not (= (select {before} {binder}) (select {after} {binder})))))"
-        );
-        let selected = format!("(= (select {before} {witness}) (select {after} {witness}))");
-        let eq_outer = format!("(= {jo} {witness})");
-        let eq_inner = format!("(= {ii} {witness})");
-        let not_outer = format!("(not {eq_outer})");
-        let not_inner = format!("(not {eq_inner})");
-        let nf = format!("{id}.nf");
-
-        out.push_str(&format!("(anchor :step {tag}.sp0)\n"));
-        out.push_str(&format!(
-            "(assume {tag}.h (not (= {before} {after})))\n\
-             (step {tag}.ext (cl (not {selected})) :rule arrays_ext :premises ({tag}.h))\n"
-        ));
-
-        // (a) the witness misses both indices: both chains reduce to the base.
-        out.push_str(&format!(
-            "(anchor :step {tag}.nn0)\n\
-             (assume {tag}.nn.j {not_outer})\n\
-             (assume {tag}.nn.i {not_inner})\n\
-             (step {tag}.nn.1 (cl (= (select {before} {witness}) (select {inner_left} {witness}))) :rule arrays_row :premises ({tag}.nn.j))\n\
-             (step {tag}.nn.2 (cl (= (select {inner_left} {witness}) (select {rest} {witness}))) :rule arrays_row :premises ({tag}.nn.i))\n\
-             (step {tag}.nn.3 (cl (= (select {before} {witness}) (select {rest} {witness}))) :rule trans :premises ({tag}.nn.1 {tag}.nn.2))\n\
-             (step {tag}.nn.4 (cl (= (select {after} {witness}) (select {inner_right} {witness}))) :rule arrays_row :premises ({tag}.nn.i))\n\
-             (step {tag}.nn.5 (cl (= (select {inner_right} {witness}) (select {rest} {witness}))) :rule arrays_row :premises ({tag}.nn.j))\n\
-             (step {tag}.nn.6 (cl (= (select {after} {witness}) (select {rest} {witness}))) :rule trans :premises ({tag}.nn.4 {tag}.nn.5))\n\
-             (step {tag}.nn.7 (cl (= (select {rest} {witness}) (select {after} {witness}))) :rule symm :premises ({tag}.nn.6))\n\
-             (step {tag}.nn.8 (cl {selected}) :rule trans :premises ({tag}.nn.3 {tag}.nn.7))\n\
-             (step {tag}.nn.9 (cl) :rule resolution :premises ({tag}.ext {tag}.nn.8))\n\
-             (step {tag}.nn0 (cl (not {not_outer}) (not {not_inner}) false) :rule subproof :discharge ({tag}.nn.j {tag}.nn.i))\n\
-             (step {tag}.nn1 (cl (not {not_outer}) (not {not_inner})) :rule resolution :premises ({tag}.nn0 {nf}))\n\
-             (step {tag}.na (cl (not (not {not_outer})) {eq_outer}) :rule not_not)\n\
-             (step {tag}.nb (cl (not (not {not_inner})) {eq_inner}) :rule not_not)\n\
-             (step {tag}.nn2 (cl (not {not_inner}) {eq_outer}) :rule resolution :premises ({tag}.nn1 {tag}.na))\n\
-             (step {tag}.nnR (cl {eq_outer} {eq_inner}) :rule resolution :premises ({tag}.nn2 {tag}.nb))\n"
-        ));
-
-        // (b) the witness IS the outer index: both chains read the outer value.
-        out.push_str(&format!(
-            "(anchor :step {tag}.pj0)\n\
-             (assume {tag}.pj.j {eq_outer})\n\
-             (assume {tag}.pj.i {not_inner})\n\
-             (step {tag}.pj.1 (cl (= (select {before} {jo}) {wo})) :rule arrays_idx)\n\
-             (step {tag}.pj.2 (cl (= (select {before} {jo}) (select {before} {witness}))) :rule cong :premises ({tag}.pj.j))\n\
-             (step {tag}.pj.3 (cl (= (select {before} {witness}) (select {before} {jo}))) :rule symm :premises ({tag}.pj.2))\n\
-             (step {tag}.pj.4 (cl (= (select {before} {witness}) {wo})) :rule trans :premises ({tag}.pj.3 {tag}.pj.1))\n\
-             (step {tag}.pj.5 (cl (= (select {after} {witness}) (select {inner_right} {witness}))) :rule arrays_row :premises ({tag}.pj.i))\n\
-             (step {tag}.pj.6 (cl (= (select {inner_right} {jo}) {wo})) :rule arrays_idx)\n\
-             (step {tag}.pj.7 (cl (= (select {inner_right} {jo}) (select {inner_right} {witness}))) :rule cong :premises ({tag}.pj.j))\n\
-             (step {tag}.pj.8 (cl (= (select {inner_right} {witness}) (select {inner_right} {jo}))) :rule symm :premises ({tag}.pj.7))\n\
-             (step {tag}.pj.9 (cl (= (select {inner_right} {witness}) {wo})) :rule trans :premises ({tag}.pj.8 {tag}.pj.6))\n\
-             (step {tag}.pj.10 (cl (= (select {after} {witness}) {wo})) :rule trans :premises ({tag}.pj.5 {tag}.pj.9))\n\
-             (step {tag}.pj.11 (cl (= {wo} (select {after} {witness}))) :rule symm :premises ({tag}.pj.10))\n\
-             (step {tag}.pj.12 (cl {selected}) :rule trans :premises ({tag}.pj.4 {tag}.pj.11))\n\
-             (step {tag}.pj.13 (cl) :rule resolution :premises ({tag}.ext {tag}.pj.12))\n\
-             (step {tag}.pj0 (cl (not {eq_outer}) (not {not_inner}) false) :rule subproof :discharge ({tag}.pj.j {tag}.pj.i))\n\
-             (step {tag}.pj1 (cl (not {eq_outer}) (not {not_inner})) :rule resolution :premises ({tag}.pj0 {nf}))\n\
-             (step {tag}.pjR (cl (not {eq_outer}) {eq_inner}) :rule resolution :premises ({tag}.pj1 {tag}.nb))\n"
-        ));
-
-        // (c) the witness IS the inner index: both chains read the inner value.
-        out.push_str(&format!(
-            "(anchor :step {tag}.pi0)\n\
-             (assume {tag}.pi.i {eq_inner})\n\
-             (assume {tag}.pi.j {not_outer})\n\
-             (step {tag}.pi.1 (cl (= (select {before} {witness}) (select {inner_left} {witness}))) :rule arrays_row :premises ({tag}.pi.j))\n\
-             (step {tag}.pi.2 (cl (= (select {inner_left} {ii}) {vi})) :rule arrays_idx)\n\
-             (step {tag}.pi.3 (cl (= (select {inner_left} {ii}) (select {inner_left} {witness}))) :rule cong :premises ({tag}.pi.i))\n\
-             (step {tag}.pi.4 (cl (= (select {inner_left} {witness}) (select {inner_left} {ii}))) :rule symm :premises ({tag}.pi.3))\n\
-             (step {tag}.pi.5 (cl (= (select {inner_left} {witness}) {vi})) :rule trans :premises ({tag}.pi.4 {tag}.pi.2))\n\
-             (step {tag}.pi.6 (cl (= (select {before} {witness}) {vi})) :rule trans :premises ({tag}.pi.1 {tag}.pi.5))\n\
-             (step {tag}.pi.7 (cl (= (select {after} {ii}) {vi})) :rule arrays_idx)\n\
-             (step {tag}.pi.8 (cl (= (select {after} {ii}) (select {after} {witness}))) :rule cong :premises ({tag}.pi.i))\n\
-             (step {tag}.pi.9 (cl (= {vi} (select {after} {ii}))) :rule symm :premises ({tag}.pi.7))\n\
-             (step {tag}.pi.10 (cl (= {vi} (select {after} {witness}))) :rule trans :premises ({tag}.pi.9 {tag}.pi.8))\n\
-             (step {tag}.pi.11 (cl {selected}) :rule trans :premises ({tag}.pi.6 {tag}.pi.10))\n\
-             (step {tag}.pi.12 (cl) :rule resolution :premises ({tag}.ext {tag}.pi.11))\n\
-             (step {tag}.pi0 (cl (not {eq_inner}) (not {not_outer}) false) :rule subproof :discharge ({tag}.pi.i {tag}.pi.j))\n\
-             (step {tag}.pi1 (cl (not {eq_inner}) (not {not_outer})) :rule resolution :premises ({tag}.pi0 {nf}))\n\
-             (step {tag}.piR (cl (not {eq_inner}) {eq_outer}) :rule resolution :premises ({tag}.pi1 {tag}.na))\n"
-        ));
-
-        // (d) the witness is BOTH indices at once: refuted by the clause's own
-        //     index disequality, in the exact orientation that literal spells.
-        // `pp.i` assumes `(= ii witness)` and `pp.j` assumes `(= jo witness)`;
-        // flipping one of them and chaining reproduces either spelling of the
-        // index equality, and the premise refutes exactly the one it carries.
-        let (contradiction, chained, flipped, flipped_conclusion) = match diseq {
-            (lhs, rhs) if (lhs, rhs) == (ii.as_str(), jo.as_str()) => (
-                format!("(= {ii} {jo})"),
-                format!("{tag}.pp.i"),
-                format!("{tag}.pp.j"),
-                format!("(= {witness} {jo})"),
-            ),
-            (lhs, rhs) if (lhs, rhs) == (jo.as_str(), ii.as_str()) => (
-                format!("(= {jo} {ii})"),
-                format!("{tag}.pp.j"),
-                format!("{tag}.pp.i"),
-                format!("(= {witness} {ii})"),
-            ),
-            _ => return None,
-        };
-        out.push_str(&format!(
-            "(anchor :step {tag}.pp0)\n\
-             (assume {tag}.pp.i {eq_inner})\n\
-             (assume {tag}.pp.j {eq_outer})\n\
-             (step {tag}.pp.1 (cl {flipped_conclusion}) :rule symm :premises ({flipped}))\n\
-             (step {tag}.pp.2 (cl {contradiction}) :rule trans :premises ({chained} {tag}.pp.1))\n\
-             (step {tag}.pp.3 (cl) :rule resolution :premises ({premise} {tag}.pp.2))\n\
-             (step {tag}.pp0 (cl (not {eq_inner}) (not {eq_outer}) false) :rule subproof :discharge ({tag}.pp.i {tag}.pp.j))\n\
-             (step {tag}.ppR (cl (not {eq_inner}) (not {eq_outer})) :rule resolution :premises ({tag}.pp0 {nf}))\n"
-        ));
-
-        // The four cases are exhaustive, so the refutation closes.
-        out.push_str(&format!(
-            "(step {tag}.r1 (cl {eq_inner}) :rule resolution :premises ({tag}.nnR {tag}.pjR))\n\
-             (step {tag}.r2 (cl (not {eq_inner})) :rule resolution :premises ({tag}.piR {tag}.ppR))\n\
-             (step {tag}.bot (cl) :rule resolution :premises ({tag}.r1 {tag}.r2))\n\
-             (step {tag}.sp0 (cl (not (not (= {before} {after}))) false) :rule subproof :discharge ({tag}.h))\n\
-             (step {tag}.sp (cl (not (not (= {before} {after})))) :rule resolution :premises ({tag}.sp0 {nf}))\n\
-             (step {tag}.nn3 (cl (not (not (not (= {before} {after})))) (= {before} {after})) :rule not_not)\n\
-             (step {tag} (cl (= {before} {after})) :rule resolution :premises ({tag}.sp {tag}.nn3))\n"
-        ));
-        Some((before, after))
     }
 
     /// Lower AY's internally checked ROW1/ROW2 lemmas to the array rules
@@ -5722,67 +5463,6 @@ impl<'a> AlethePrinter<'a> {
         }
     }
 
-    /// Format a term as an SMT-LIB expression
-    pub(crate) fn format_term(&self, term_id: TermId) -> String {
-        let mut out = String::new();
-        self.write_term_into(&mut out, term_id);
-        out
-    }
-
-    /// Append the rendering of `term_id` to `out`.
-    ///
-    /// Same semantics (including #A2b work-budget charging) as
-    /// [`Self::format_term`], but a cache hit copies the cached bytes
-    /// straight into the caller's buffer instead of allocating an owned
-    /// clone first (#proof-tax).
-    fn write_term_into(&self, out: &mut String, term_id: TermId) {
-        // #A2b: once the emission work budget is exhausted the whole
-        // document is guaranteed to be DISCARDED (the export loop returns
-        // `EmissionBudgetExhausted` at the next step boundary — `work` never
-        // decreases), so cut the recursion short instead of grinding through
-        // gigabytes of string building for output nobody will see. The
-        // placeholder never reaches disk.
-        if self.work_budget_exhausted() {
-            out.push_str("@a2b_emission_budget_exhausted");
-            return;
-        }
-        if let Some(term_str) = self.skolem_overrides.borrow().get(&term_id).cloned() {
-            self.charge(term_str.len() as u64);
-            out.push_str(&term_str);
-            return;
-        }
-        // A `let`-bridged assertion prints as its eliminated form from the
-        // bridge step onwards; the surface `(let ...)` spelling survives only
-        // inside the bridge itself (the `assume` and the equivalence it
-        // discharges), which embeds it literally.
-        if let Some(term_str) = self.let_bridge_renderings.borrow().get(&term_id).cloned() {
-            self.charge(term_str.len() as u64);
-            out.push_str(&term_str);
-            return;
-        }
-        if let Some(term_str) = self
-            .term_overrides
-            .and_then(|overrides| overrides.get(&term_id))
-        {
-            self.charge(term_str.len() as u64);
-            out.push_str(term_str);
-            return;
-        }
-        if let Some(cached) = self.format_cache.borrow().get(&term_id) {
-            // A cache hit still copies the rendered bytes; on proofs whose
-            // steps repeat megabyte literals that copy IS the dominant cost,
-            // so it is charged against the emission work budget (#A2b).
-            self.charge(cached.len() as u64);
-            out.push_str(cached);
-            return;
-        }
-        let term = self.terms.get(term_id);
-        let formatted = self.format_term_data(term);
-        self.charge(formatted.len() as u64);
-        out.push_str(&formatted);
-        self.format_cache.borrow_mut().insert(term_id, formatted);
-    }
-
     /// Format term data recursively
     fn format_term_data(&self, term: &TermData) -> String {
         match term {
@@ -5969,6 +5649,8 @@ impl<'a> AlethePrinter<'a> {
                 rule,
                 ay_core::AletheRule::AndPos(_)
                     | ay_core::AletheRule::AndNeg
+                    | ay_core::AletheRule::True
+                    | ay_core::AletheRule::False
                     | ay_core::AletheRule::OrPos(_)
                     | ay_core::AletheRule::OrNeg
                     | ay_core::AletheRule::ImpliesPos
@@ -6591,41 +6273,6 @@ const PRINTED_NESTING_NODE_BUDGET: usize = 4096;
 /// deliberately unspellable as an SMT-LIB symbol: a body that already mentioned
 /// it could otherwise be made to collide with a different body on purpose.
 const CHOICE_BINDER_NORMAL_FORM: &str = "|ay!choice-binder|";
-
-/// Render the printed `store` chain `entries` (OUTERMOST-FIRST) over `base`.
-fn store_chain_text(base: &str, entries: &[(String, String)]) -> String {
-    let mut text = base.to_string();
-    for (index, value) in entries.iter().rev() {
-        text = format!("(store {text} {index} {value})");
-    }
-    text
-}
-
-/// Positions of the ADJACENT transpositions that turn `left` into `right`.
-///
-/// Returns `None` when the two lists are not permutations of each other, which
-/// keeps the caller fail-closed instead of emitting a partial rearrangement.
-/// Each returned position `p` swaps entries `p` and `p + 1` of the list as it
-/// stands after all earlier swaps, so the caller can replay the schedule and
-/// name the intermediate chains.
-fn adjacent_transposition_schedule(
-    left: &[(String, String)],
-    right: &[(String, String)],
-) -> Option<Vec<usize>> {
-    if left.len() != right.len() {
-        return None;
-    }
-    let mut current: Vec<(String, String)> = left.to_vec();
-    let mut swaps = Vec::new();
-    for (target, wanted) in right.iter().enumerate() {
-        let found = (target..current.len()).find(|&at| &current[at] == wanted)?;
-        for at in (target..found).rev() {
-            swaps.push(at);
-            current.swap(at, at + 1);
-        }
-    }
-    (current == right).then_some(swaps)
-}
 
 /// Whether `needle` occurs anywhere inside `haystack` (inclusive).
 fn term_mentions(terms: &TermStore, haystack: TermId, needle: TermId) -> bool {

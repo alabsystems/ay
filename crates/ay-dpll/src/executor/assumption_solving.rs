@@ -9,6 +9,8 @@
 //! (assertions, assumptions, theory_kind) and returns SolveResult with optional
 //! UNSAT core extraction.
 
+mod array_preprocess;
+
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{TermId, Tseitin};
@@ -71,7 +73,7 @@ impl Executor {
             };
 
             // Add any extra assertions (e.g., DT axioms) not already in ctx.assertions
-            let base_len = self.ctx.assertions.len();
+            let base_assertions_exact = self.ctx.assertions.clone();
             let base_set: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
             for &a in assertions {
                 if !base_set.contains(&a) {
@@ -89,8 +91,9 @@ impl Executor {
                 self.solve_bv_core(config, assumptions)
             };
 
-            // Restore original assertions
-            self.ctx.assertions.truncate(base_len);
+            // Restore the exact prefix: array/BV preprocessing may rewrite
+            // existing assertions without changing their length.
+            self.ctx.assertions = base_assertions_exact;
             return result;
         }
 
@@ -164,44 +167,11 @@ impl Executor {
         );
         let mut preprocessed_assertions = preprocessed_assertions;
         if has_arrays {
-            let axiom_start = self.ctx.assertions.len();
-            // Snapshot the base assertion SET so the array axioms the fixpoint
-            // ADDS can be identified robustly afterward. `run_array_axiom_*` both
-            // deduplicate `self.ctx.assertions` (array_fixpoint.rs, `retain`), which
-            // can drop duplicate BASE assertions and shrink the base below
-            // `axiom_start` (and left-shift appended axioms) — so a raw
-            // `drain(axiom_start..)` both PANICS ("range start out of range") and can
-            // silently MISS a shifted axiom. Seen with datatype-over-uninterpreted-
-            // sort construction assumptions. A set-diff by identity is dedup-robust
-            // and captures every new axiom; sound because `base ∧ axioms` is
-            // independent of assertion order/multiplicity.
-            let mut base_set: HashSet<TermId> =
-                ay_core::kani_compat::det_hash_set_with_capacity(self.ctx.assertions.len());
-            for a in &self.ctx.assertions {
-                base_set.insert(*a);
-            }
-            let assumption_terms: Vec<TermId> =
-                preprocessed_assumptions.iter().map(|(t, _)| *t).collect();
-            if theory_kind == TheoryKind::ArrayEuf {
-                // QF_AX: full eager axiom set including array congruence (#4304).
-                self.run_array_axiom_fixpoint_5_with_roots(&assumption_terms);
-            } else {
-                // Combined theories: eager all without congruence (#4304, #5086).
-                // Congruence handled by N-O equality exchange at runtime.
-                self.run_array_axiom_full_fixpoint_at_with_roots(axiom_start, &assumption_terms);
-            }
-            // The newly-generated array axioms are exactly the assertions absent
-            // from the pre-fixpoint base set; move them into the theory assertion
-            // set and restore `self.ctx.assertions` to the (deduplicated) base.
-            let array_axioms: Vec<TermId> = self
-                .ctx
-                .assertions
-                .iter()
-                .copied()
-                .filter(|a| !base_set.contains(a))
-                .collect();
-            self.ctx.assertions.retain(|a| base_set.contains(a));
-            preprocessed_assertions.extend(array_axioms);
+            preprocessed_assertions = self.prepare_assumption_array_assertions(
+                preprocessed_assertions,
+                &preprocessed_assumptions,
+                theory_kind,
+            );
         }
 
         // Purify compound Boolean arguments to uninterpreted functions: replace
@@ -254,8 +224,20 @@ impl Executor {
             &mut preprocessed_assertions,
         );
 
-        // Create Tseitin transformation and encode assertions
-        let mut tseitin = Tseitin::new(&self.ctx.terms);
+        // Create the Tseitin transformation with the same proof annotations as
+        // the plain check-sat pipelines. Assumption solving still installs the
+        // generated definitional clauses as ORIGINAL SAT clauses; without the
+        // parallel annotations, a conflict against one of those clauses (the
+        // smallest example is an assumed literal `false`, whose `¬false`
+        // clause is justified by Alethe `false`) reaches reconstruction with
+        // no exact authority and the public UNSAT is downgraded to
+        // ProofTrusted.
+        let proof_enabled = self.produce_proofs_enabled();
+        let mut tseitin = if proof_enabled {
+            Tseitin::new_with_proofs(&self.ctx.terms)
+        } else {
+            Tseitin::new(&self.ctx.terms)
+        };
 
         // Encode each assertion and add as unit clause using the incremental API
         for &assertion in &preprocessed_assertions {
@@ -292,6 +274,7 @@ impl Executor {
 
         // Get clauses and mappings from Tseitin context
         let clauses = tseitin.all_clauses().to_vec();
+        let proof_annotations = tseitin.proof_annotations().map(<[_]>::to_vec);
         let num_vars = tseitin.num_vars();
 
         // Build TseitinResult for DpllT
@@ -301,10 +284,8 @@ impl Executor {
             tseitin.var_to_term().clone(),
             0, // Not used when we manually add unit clauses
             num_vars,
-        );
-
-        // Check if proof tracking is enabled
-        let proof_enabled = self.produce_proofs_enabled();
+        )
+        .with_parallel_proof_annotations(proof_annotations);
 
         // Build negations map for proof tracking if needed
         let negations: HashMap<TermId, TermId> = if proof_enabled {
@@ -462,8 +443,12 @@ impl Executor {
                         result.var_to_term.iter().map(|(&v, &t)| (v - 1, t)).collect(),
                     );
                     self.last_negations = Some(negations.clone());
-                    // Assumption solving doesn't use Tseitin proof annotations.
-                    self.last_clausification_proofs = None;
+                    // Exact, index-aligned authority for every Tseitin clause
+                    // loaded into this SAT instance. The strict checker
+                    // independently validates each annotation's rule and
+                    // source shape; missing/forged entries therefore continue
+                    // to fail closed.
+                    self.last_clausification_proofs = result.proof_annotations.clone();
                     self.last_original_clause_theory_proofs = None;
                 }
             };
@@ -685,6 +670,11 @@ impl Executor {
 
         // Process result and extract assumption core
         match solve_result {
+            AssumeResult::Sat(_model)
+                if self.revoke_provisional_sat_if_finite_array_incomplete(true) =>
+            {
+                Ok(SolveResult::Unknown)
+            }
             AssumeResult::Sat(model) => {
                 self.last_assumption_core = None;
                 self.solve_and_store_model_full(

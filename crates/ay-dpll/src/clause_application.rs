@@ -500,7 +500,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
         tracker: &mut proof_tracker::ProofTracker,
     ) {
         self.apply_string_lemma(atoms);
-        let _ = tracker.add_theory_lemma(atoms.to_vec());
+        let _ = tracker.add_explicit_trust_lemma(atoms.to_vec());
     }
 }
 

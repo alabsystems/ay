@@ -90,32 +90,16 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 // Record structured theory proof (#6725) — mirrors no-split
                 // incremental path (pipeline_incremental_macros.rs:248).
                 let _sld_theory_proof = if $pe {
-                    $crate::theory_inference::build_blocking_clause_terms(
-                        $neg.as_map(),
-                        &conflict_terms,
-                    )
-                    .map(|clause| ay_core::TheoryLemmaProof {
-                        clause,
-                        kind: $crate::theory_inference::infer_theory_conflict_kind(
-                            Some(&$self.ctx.terms),
-                            $neg.as_map(),
-                            &conflict_terms,
-                            None,
-                        ),
-                        farkas: None,
-                        lia: None,
-                    })
-                } else {
-                    None
-                };
-                if $pe {
-                    let _ = $crate::theory_inference::record_theory_conflict_unsat(
+                    $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
                         &mut $self.proof_tracker,
                         Some(&$self.ctx.terms),
                         $neg.as_map(),
                         &conflict_terms,
-                    );
-                }
+                    )
+                    .1
+                } else {
+                    None
+                };
                 pipeline_map_incremental_split_conflict_clause!(
                     $self,
                     label: $loop_label,
@@ -129,7 +113,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     local_term_to_var: $ltv,
                     conflict_terms: conflict_terms,
                     proof_enabled: $pe,
-                    negations: $neg.as_map(),
+                    negations: $neg,
                     local_var_to_term: $lvt,
                     local_clausification_proofs: $lcp,
                     local_theory_proofs: $ltp,
@@ -224,55 +208,26 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 // Record structured theory proof with Farkas coefficients (#6725)
                 // — mirrors no-split incremental path (pipeline_incremental_macros.rs:321-327).
                 let _sld_theory_proof = if $pe {
-                    $crate::theory_inference::build_blocking_clause_terms(
-                        $neg.as_map(),
-                        &conflict.literals,
-                    )
-                    .map(|clause| if _sld_farkas_proof_valid {
-                        ay_core::TheoryLemmaProof {
-                            clause,
-                            kind: $crate::theory_inference::infer_theory_conflict_kind(
-                                Some(&$self.ctx.terms),
-                                $neg.as_map(),
-                                &conflict.literals,
-                                conflict.farkas.as_ref(),
-                            ),
-                            farkas: conflict.farkas.clone(),
-                            lia: None,
-                        }
-                    } else {
-                        ay_core::TheoryLemmaProof {
-                            clause,
-                            kind: $crate::theory_inference::infer_theory_conflict_kind(
-                                Some(&$self.ctx.terms),
-                                $neg.as_map(),
-                                &conflict.literals,
-                                None,
-                            ),
-                            farkas: None,
-                            lia: None,
-                        }
-                    })
-                } else {
-                    None
-                };
-                if $pe {
                     if _sld_farkas_proof_valid {
-                        let _ = $crate::theory_inference::record_theory_conflict_unsat_with_farkas(
+                        $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
                             &mut $self.proof_tracker,
                             Some(&$self.ctx.terms),
                             $neg.as_map(),
                             &conflict,
-                        );
+                        )
+                        .1
                     } else {
-                        let _ = $crate::theory_inference::record_theory_conflict_unsat(
+                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
                             &mut $self.proof_tracker,
                             Some(&$self.ctx.terms),
                             $neg.as_map(),
                             &conflict.literals,
-                        );
+                        )
+                        .1
                     }
-                }
+                } else {
+                    None
+                };
                 pipeline_map_incremental_split_conflict_clause!(
                     $self,
                     label: $loop_label,
@@ -286,7 +241,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     local_term_to_var: $ltv,
                     conflict_terms: conflict.literals,
                     proof_enabled: $pe,
-                    negations: $neg.as_map(),
+                    negations: $neg,
                     local_var_to_term: $lvt,
                     local_clausification_proofs: $lcp,
                     local_theory_proofs: $ltp,
@@ -346,7 +301,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     );
 
                 let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                    &$self.ctx.terms, $solver,
+                    &mut $self.ctx.terms, $solver,
                     &mut $ltv, &mut $lvt,
                     &mut $lnv, &mut $neg,
                     le_atom, ge_atom, None,
@@ -375,7 +330,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     DisequalitySplitAtoms::Skip => { continue; }
                     DisequalitySplitAtoms::IntFractional { le, ge } => {
                         let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $ltv, &mut $lvt,
                             &mut $lnv, &mut $neg, le, ge, None,
                             &mut $asc,
@@ -387,7 +342,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     DisequalitySplitAtoms::IntExact { le, ge, disequality_term, is_distinct } => {
                         let guard = disequality_term.map(|dt| (dt, is_distinct));
                         let (le_var, ge_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $ltv, &mut $lvt,
                             &mut $lnv, &mut $neg, le, ge, guard,
                             &mut $asc,
@@ -399,7 +354,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     DisequalitySplitAtoms::Real { lt, gt, disequality_term, is_distinct } => {
                         let guard = disequality_term.map(|dt| (dt, is_distinct));
                         let (lt_var, gt_var, _) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $ltv, &mut $lvt,
                             &mut $lnv, &mut $neg, lt, gt, guard,
                             &mut $asc,
@@ -456,7 +411,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
 
                 let guard = Some((split.disequality_term, is_distinct));
                 let (lt_var, gt_var, _sld_xs_split_added) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                    &$self.ctx.terms, $solver,
+                    &mut $self.ctx.terms, $solver,
                     &mut $ltv, &mut $lvt,
                     &mut $lnv, &mut $neg,
                     lt_atom, gt_atom, guard,
@@ -478,7 +433,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                     )
                 {
                     _sld_xs_lemma_added = $crate::executor::theories::split_incremental::encode_and_add_negated_atom_lemma(
-                        &$self.ctx.terms, $solver,
+                        &mut $self.ctx.terms, $solver,
                         &mut $ltv, &mut $lvt,
                         &mut $lnv, &mut $neg,
                         idx_eq, (split.disequality_term, is_distinct),
@@ -543,7 +498,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
 
                     let guard = Some((split.disequality_term, is_distinct));
                     let (lt_var, gt_var, _sld_xs_split_added) = $crate::executor::theories::split_incremental::encode_and_add_split_clause(
-                        &$self.ctx.terms, $solver,
+                        &mut $self.ctx.terms, $solver,
                         &mut $ltv, &mut $lvt,
                         &mut $lnv, &mut $neg,
                         lt_atom, gt_atom, guard,
@@ -565,7 +520,7 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         )
                     {
                         _sld_xs_lemma_added = $crate::executor::theories::split_incremental::encode_and_add_negated_atom_lemma(
-                            &$self.ctx.terms, $solver,
+                            &mut $self.ctx.terms, $solver,
                             &mut $ltv, &mut $lvt,
                             &mut $lnv, &mut $neg,
                             idx_eq, (split.disequality_term, is_distinct),
@@ -593,8 +548,9 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         lemmas,
                         &mut $tls,
                     );
+                let mut _sld_original_ids = Vec::with_capacity(_sld_new_lemmas.len());
                 for lemma in &_sld_new_lemmas {
-                    $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                    _sld_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                         &$self.ctx.terms,
                         $solver,
                         &mut $ltv,
@@ -602,12 +558,20 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                         &mut $lnv,
                         &mut $neg,
                         &lemma.clause,
-                    );
+                    ));
                 }
                 if $pe {
                     $neg.sync_pending(&mut $self.ctx.terms);
                 }
-                for lemma in &_sld_new_lemmas {
+                // #trust->0 C3: DT registries, once per batch (proofs-on only).
+                let _c3_dt = if $pe {
+                    $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+                } else {
+                    None
+                };
+                for (lemma, _sld_original_id) in
+                    _sld_new_lemmas.iter().zip(_sld_original_ids)
+                {
                     if $pe {
                         let terms: Vec<ay_core::TermId> = lemma
                             .clause
@@ -623,28 +587,30 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                                 }
                             })
                             .collect();
-                        let kind =
-                            $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                        // #trust->0 C3: funnel classifies + records; adopt its
+                        // validator-ordered clause.
+                        let (kind, terms) =
+                            $crate::theory_inference::record_funnel_classified_lemma(
+                                &mut $self.proof_tracker,
                                 &$self.ctx.terms,
-                                &terms,
+                                terms,
+                                _c3_dt.as_ref(),
                             );
-                        match kind {
-                            ay_core::TheoryLemmaKind::Generic => {
-                                let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                            }
-                            _ => {
-                                let _ = $self
-                                    .proof_tracker
-                                    .add_theory_lemma_with_kind(terms.clone(), kind);
-                            }
+                        if let Some(_sld_original_id) = _sld_original_id {
+                            $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                &$solver,
+                                _sld_original_id,
+                                None,
+                                Some(ay_core::TheoryLemmaProof {
+                                    clause: terms,
+                                    kind,
+                                    farkas: None,
+                                    lia: None,
+                                }),
+                                &mut $lcp,
+                                &mut $ltp,
+                            );
                         }
-                        $lcp.push(None);
-                        $ltp.push(Some(ay_core::TheoryLemmaProof {
-                            clause: terms,
-                            kind,
-                            farkas: None,
-                            lia: None,
-                        }));
                     }
                     $tl.push(lemma.clone());
                 }

@@ -230,7 +230,7 @@ impl PdrSolver {
         // free-var values so transitions become enabled and forward-sim can advance.
         // SOUND: these extra points only feed the UNCHANGED affine kernel + admission
         // oracle, which rejects any non-inductive relation.
-        if std::env::var("AY_CHC_FWDSIM_FIX").ok().as_deref() != Some("0") {
+        if crate::ab_switches::get().fwdsim_fix {
             const MAX_EXTRA: usize = 16;
             'outer: for var in int_vars.iter().take(8) {
                 for &threshold in &[1i128, 3, 8] {

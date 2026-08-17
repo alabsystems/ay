@@ -24,8 +24,7 @@ use crate::smt::SmtValue;
 /// it lets the strict model verifier VALIDATE (or reject) exact rational
 /// witnesses instead of abstaining as Indeterminate on every Real atom.
 pub(super) fn real_eval_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("AY_LRA_REAL_EVAL").ok().as_deref(), Some("0")))
+    true // B24: kill-switch env retired.
 }
 
 /// Exact rational evaluator for Real-sorted (LRA) arithmetic expressions.

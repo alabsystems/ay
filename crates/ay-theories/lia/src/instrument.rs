@@ -12,7 +12,7 @@
 //!
 //! ## Release-byte-identical / zero verdict dependence
 //!
-//! Every counter is incremented ONLY when `AY_LIA_INSTRUMENT` is set in the
+//! Every counter is incremented ONLY when `--lia-instrument` is passed in the
 //! environment; the state read is a single cached relaxed atomic-u8 load. The
 //! verdict path NEVER reads any counter — they are write-only telemetry. When
 //! the env var is unset each `bump` returns after one relaxed load with no
@@ -23,7 +23,7 @@
 //!
 //! ## Usage
 //!
-//! `AY_LIA_INSTRUMENT=1` enables counting. A background reporter thread dumps
+//! `--lia-instrument` enables counting. A background reporter thread dumps
 //! the counter snapshot to stderr every `AY_LIA_INSTRUMENT_SECS` seconds
 //! (default 3) so the counters are observable even when the solve diverges or
 //! is killed by an external timeout without ever returning from `check()`.
@@ -173,7 +173,7 @@ pub(crate) fn enabled() -> bool {
 
 #[cold]
 fn init_enabled() -> bool {
-    let on = std::env::var_os("AY_LIA_INSTRUMENT").is_some();
+    let on = ay_core::misc_cli_flags().lia_instrument;
     ENABLED.store(if on { 2 } else { 1 }, Relaxed);
     if on {
         start_reporter();
@@ -201,11 +201,9 @@ fn start_reporter() {
     if REPORTER_STARTED.swap(true, Relaxed) {
         return;
     }
-    let secs: u64 = std::env::var("AY_LIA_INSTRUMENT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let secs = secs.max(1);
+    // B9: fixed cadence (the AY_LIA_INSTRUMENT_SECS override nothing set is
+    // retired). The reporter only runs when instrumentation is enabled at all.
+    let secs: u64 = 3;
     std::thread::spawn(move || {
         let start = std::time::Instant::now();
         loop {
@@ -230,7 +228,7 @@ pub(crate) fn dump(elapsed_secs: f64) {
 // + externally-bumpable counters for ay-dpll (combiner N-O loop, lazy split
 // rounds, round-end propagation discard). Same contract as the rest of the
 // module: every entry point is a no-op returning after one relaxed load when
-// `AY_LIA_INSTRUMENT` is unset — write-only telemetry, never read by any
+// no --lia-instrument is passed — write-only telemetry, never read by any
 // verdict path.
 // ---------------------------------------------------------------------------
 
@@ -293,7 +291,7 @@ pub fn add_round_props_discarded(props: u64, pending: u64) {
 // ---------------------------------------------------------------------------
 // #verify-memo: verify-lane caller-partition bumps for ay-dpll. Same contract
 // as every other entry point — no-op after one relaxed load when
-// `AY_LIA_INSTRUMENT` is unset; write-only telemetry, never read by verdicts.
+// no --lia-instrument is passed; write-only telemetry, never read by verdicts.
 // ---------------------------------------------------------------------------
 
 /// A propagation was SELECTED for semantic verification by the sampling

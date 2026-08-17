@@ -10,6 +10,9 @@ pub mod spawn;
 #[path = "group_lra/qf_lra_additive_lane_6579.rs"]
 mod qf_lra_additive_lane_6579;
 
+#[path = "group_lra/qf_lra_release_fixture_integrity.rs"]
+mod qf_lra_release_fixture_integrity;
+
 #[path = "group_lra/qf_lra_cli_release_soundness_6564.rs"]
 mod qf_lra_cli_release_soundness_6564;
 

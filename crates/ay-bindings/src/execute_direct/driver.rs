@@ -75,8 +75,7 @@ pub(super) fn execute_typed_with_details_impl(
             },
             |reason| {
                 Err(Ok(ExecuteTypedResult::Unknown(format!(
-                    "constraint translation panic: {}",
-                    reason
+                    "constraint translation panic: {reason}"
                 ))))
             },
         );
@@ -110,7 +109,7 @@ pub(super) fn execute_typed_with_details_impl(
                 |reason| {
                     Err(ExecuteDegradation {
                         kind: ExecuteDegradationKind::SolverPanic,
-                        message: format!("solver panic: {}", reason),
+                        message: format!("solver panic: {reason}"),
                     })
                 },
             )
@@ -125,7 +124,7 @@ pub(super) fn execute_typed_with_details_impl(
                 |reason| {
                     Err(ExecuteDegradation {
                         kind: ExecuteDegradationKind::SolverPanic,
-                        message: format!("solver panic: {}", reason),
+                        message: format!("solver panic: {reason}"),
                     })
                 },
             )
@@ -160,8 +159,8 @@ pub(super) fn execute_typed_with_details_impl(
         Ok(SolveResult::Sat) => {
             // Extract model, catching ay panics during extraction
             let model_result: Result<ExecuteValueMap<ModelValue>, String> = catch_execute_stage(
-                || extract_model_typed(&ctx).map_err(|e| format!("model extraction failed: {}", e)),
-                |reason| Err(format!("model extraction panic: {}", reason)),
+                || extract_model_typed(&ctx).map_err(|e| format!("model extraction failed: {e}")),
+                |reason| Err(format!("model extraction panic: {reason}")),
             );
             match model_result {
                 Ok(model) => {
@@ -170,9 +169,9 @@ pub(super) fn execute_typed_with_details_impl(
                         catch_execute_stage(
                             || {
                                 extract_get_values_typed(&ctx)
-                                    .map_err(|e| format!("get-value extraction failed: {}", e))
+                                    .map_err(|e| format!("get-value extraction failed: {e}"))
                             },
-                            |reason| Err(format!("get-value extraction panic: {}", reason)),
+                            |reason| Err(format!("get-value extraction panic: {reason}")),
                         );
                     match values_result {
                         Ok(values) => Ok(ExecuteTypedDetails {

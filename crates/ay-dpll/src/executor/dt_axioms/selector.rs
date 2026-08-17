@@ -313,9 +313,8 @@ impl Executor {
         // model the census then rejects. Raising the cap covers more pairs
         // eagerly (O(reads) via fresh scalar arrays) so the base model is
         // congruent. Sound at any value: these are select-congruence tautologies.
-        let max_proj_axioms: usize = std::env::var("AY_PROJ_AXIOM_BUDGET")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
+        let max_proj_axioms: usize = ay_core::misc_cli_flags()
+            .proj_axiom_budget
             .unwrap_or(50_000);
 
         let base_term_len = self.ctx.terms.len();
@@ -474,7 +473,7 @@ impl Executor {
                 break;
             }
         }
-        if std::env::var_os("AY_PHASE_TRACE").is_some() && !axioms.is_empty() {
+        if ay_core::misc_cli_flags().phase_trace && !axioms.is_empty() {
             eprintln!(
                 "c phase-trace dt-select-scalar-projection groups={n_groups} axioms={}",
                 axioms.len()
@@ -861,7 +860,7 @@ impl Executor {
                 &mut axioms,
             );
         }
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-ctor-field-axioms hits={} axioms={}",
                 seen.len(),
@@ -1803,7 +1802,7 @@ impl Executor {
                 indices_by_sort.entry(idx_key).or_default().push(witness);
             }
         }
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-array-eq-read array_eqs={} value_eqs={} indices={}",
                 eq_atoms.len(),

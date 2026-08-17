@@ -1150,16 +1150,9 @@ impl LraSolver {
     #[inline]
     pub(crate) fn check_pivot_budget(&self) -> u32 {
         const MAX_CHECK_PIVOT_BUDGET: u64 = 1_000_000;
-        // This is consulted on EVERY pivot, so the env override is read once per
-        // process, never per iteration.
-        static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        if let Some(n) = *OVERRIDE.get_or_init(|| {
-            std::env::var("AY_LRA_CHECK_PIVOT_BUDGET")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-        }) {
-            return n;
-        }
+        // (B16: the AY_LRA_CHECK_PIVOT_BUDGET per-process override nothing
+        // set is deleted; the scaled formula below IS the budget, and probing
+        // a different one means editing it.)
         let scaled = (self.rows.len() as u64)
             .saturating_mul(4)
             .max(CHECK_PIVOT_BUDGET as u64)

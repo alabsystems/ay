@@ -19,9 +19,15 @@ use ay_frontend::{CheckedProjectionBinding, ProjectionBindingRequest, SourceCont
 use ay_proof::{AuthenticatedBoolBvUnsatQuery, AuthenticatedBvLiaUnsatQuery};
 use num_bigint::BigInt;
 
+mod assumption_source;
+mod certification_source;
+mod pending_nested_array;
 mod probe;
+use certification_source::{CertificationSource, StrictProofPresentationFailure};
+pub(super) use pending_nested_array::PendingNestedArrayBoolBvUnsat;
 pub(in crate::executor) use probe::probe_cert_reject;
-
+#[path = "unsat_cert/internal_certificate_scope.rs"]
+mod internal_certificate_scope;
 use super::{Executor, QuantifierDeadlinePolicy};
 use crate::executor::exact_exists_bounds::CheckedExactExistsUnsat;
 use crate::executor::exact_forall_exists::CheckedExactForallExistsUnsat;
@@ -116,6 +122,20 @@ enum UnsatCertificateKind {
     CheckedExactClosedForall(CheckedExactClosedForallUnsat),
     CheckedExactForallUfGround(CheckedExactForallUfGroundUnsat),
     CheckedExactFiniteExpansion(CheckedExactFiniteExpansionUnsat),
+    /// #proof-capability B3 — the competition-mode raw admission carve-out.
+    ///
+    /// The exact public-query scope is authenticated (same unweakened epoch,
+    /// source-context, term-entry, and assumption checks as every certified
+    /// lane; proof-source provenance is the one policy-relaxed conjunct —
+    /// see `authenticate_unsat_query_scope`), but NO checked refutation
+    /// backs the verdict. Mintable
+    /// only while `Executor::competition_shedding_active()` — any proof
+    /// demand, strict mode, or self-check makes the minting lane dead code —
+    /// and consumable only while shedding is STILL active. Every trust-class
+    /// probe (`strict_proof_verified`, `independently_verified`,
+    /// `exact_semantic_verified`) reports false for it, so diagnostics and
+    /// cross-check policy can never relabel a raw admission as a checked one.
+    CompetitionRaw(AuthenticatedUnsatScope),
 }
 
 /// Sealed evidence that one authored top-level universal has an exact closed
@@ -1043,7 +1063,15 @@ fn exact_scalar_literal_has_sort(terms: &CoreTermStore, literal: TermId, sort: &
         return false;
     }
     match (sort, terms.get(literal)) {
-        (CoreSort::Int, TermData::Const(Constant::Int(_)))
+        // `Bool` is a scalar literal sort on exactly the same footing as `Int`:
+        // `Constant::Bool` is a closed, fully-interpreted value of the sort, and
+        // the evaluator decides a Boolean instance without consulting any model
+        // entry. Both the mint (`try_authorize_current_query_exact_closed_forall_unsat`)
+        // and the re-check (`CheckedExactClosedForallUnsat::is_current`) route
+        // through this one predicate, so admitting it here keeps the two sides
+        // symmetric by construction.
+        (CoreSort::Bool, TermData::Const(Constant::Bool(_)))
+        | (CoreSort::Int, TermData::Const(Constant::Int(_)))
         | (CoreSort::Real, TermData::Const(Constant::Rational(_))) => true,
         (CoreSort::BitVec(bitvec_sort), TermData::Const(Constant::BitVec { width, .. })) => {
             bitvec_sort.width == *width
@@ -1183,6 +1211,25 @@ impl AuthenticatedUnsatScope {
     }
 
     fn is_current(&self, executor: &Executor) -> bool {
+        self.is_current_with_provenance_policy(executor, true)
+    }
+
+    /// Scope currentness with the proof-provenance conjunct parameterized.
+    ///
+    /// Every checked certification kind requires the installed proof-source
+    /// provenance to still bind these exact assertions (`require_provenance`
+    /// true — [`Self::is_current`]). The #proof-capability B3 CompetitionRaw
+    /// token instead tolerates ABSENT provenance: competition shedding skips
+    /// the proof bookkeeping that installs it
+    /// (`install_proof_source_provenance` self-gates on
+    /// `produce_proofs_enabled`), so absence is the shed-mode norm — but a
+    /// PRESENT provenance bound to different assertions remains the same
+    /// tripwire in both policies.
+    fn is_current_with_provenance_policy(
+        &self,
+        executor: &Executor,
+        require_provenance: bool,
+    ) -> bool {
         let Some(epoch) = executor.unsat_query_epoch.as_ref() else {
             return false;
         };
@@ -1221,12 +1268,12 @@ impl AuthenticatedUnsatScope {
                 (None, None) => true,
                 _ => false,
             }
-            && executor
-                .proof_problem_assertion_provenance
-                .as_ref()
-                .is_some_and(|provenance| {
+            && match executor.proof_problem_assertion_provenance.as_ref() {
+                Some(provenance) => {
                     provenance.original_problem_assertions == self.assertions.as_ref()
-                })
+                }
+                None => !require_provenance,
+            }
     }
 }
 
@@ -1325,6 +1372,11 @@ pub(super) enum CommandUnsatAdmission {
     CheckedExactClosedForall,
     CheckedExactForallUfGround,
     CheckedExactFiniteExpansion,
+    /// #proof-capability B3 — scope-authenticated raw admission under
+    /// competition shedding. Deliberately absent from every
+    /// `last_command_unsat_was_*_verified` class: it is an admission record,
+    /// not a verification claim.
+    CompetitionRaw,
 }
 
 impl UnsatCertificate {
@@ -1350,7 +1402,8 @@ impl UnsatCertificate {
             | UnsatCertificateKind::CheckedSatRefutation { .. }
             | UnsatCertificateKind::CheckedBoolBv(_)
             | UnsatCertificateKind::CheckedBvLia(_)
-            | UnsatCertificateKind::DischargedTrust(_) => false,
+            | UnsatCertificateKind::DischargedTrust(_)
+            | UnsatCertificateKind::CompetitionRaw(_) => false,
         }
     }
 
@@ -1379,6 +1432,22 @@ impl UnsatCertificate {
         )
     }
 
+    /// Whether this token represents a checked exact-query refutation that may
+    /// cross an internal disposable-solver boundary.
+    ///
+    /// Public UNSAT certification has three sound authority classes: a strict
+    /// proof, an independently checked refutation, or one of the exact semantic
+    /// theorems above. Keep their internal admission policy centralized here so
+    /// callers do not accidentally require one presentation of a refutation
+    /// after the public funnel already authenticated another. The competition
+    /// raw carve-out reports false for all three probes and therefore cannot be
+    /// upgraded into checked internal authority.
+    pub(crate) fn confirms_checked_unsat_emission(&self) -> bool {
+        self.strict_proof_verified()
+            || self.independently_verified()
+            || self.exact_semantic_verified()
+    }
+
     pub(super) fn command_admission(&self) -> CommandUnsatAdmission {
         match &self.0 {
             UnsatCertificateKind::StrictProof(_) => CommandUnsatAdmission::StrictProof,
@@ -1403,6 +1472,7 @@ impl UnsatCertificate {
             UnsatCertificateKind::CheckedExactFiniteExpansion(_) => {
                 CommandUnsatAdmission::CheckedExactFiniteExpansion
             }
+            UnsatCertificateKind::CompetitionRaw(_) => CommandUnsatAdmission::CompetitionRaw,
         }
     }
 }
@@ -1420,26 +1490,22 @@ pub(super) struct UnsatQueryEpoch {
     assertion_entries: Vec<TermEntryStamp>,
     assumptions: Option<Vec<TermId>>,
     assumption_entries: Option<Vec<TermEntryStamp>>,
+    /// The external query supplied literal `false`: either parsed text or an
+    /// exact canonical-false handle at the public native API boundary.
+    ///
+    /// This is never inferred by an internal TermId-only binder: arbitrary
+    /// assumption terms may also elaborate to canonical false.
+    literal_false_assumption_source: bool,
+    /// Public proof output requested when this query began.
+    proof_output_requested: bool,
     /// The solver-declared EXTENSION of this query's obligation.
-    ///
-    /// Empty for every ordinary query, and writable only through
-    /// [`Executor::declare_pareto_front_exhaustion_extension`], which consumes
-    /// the opaque blocker package built for the exact seed probe. That package
-    /// is bound to the public query epoch, source scope, authored roots, and
-    /// objective inventory; no caller can supply or retarget an arbitrary term
-    /// slice, so this cannot become a general escape hatch.
-    ///
-    /// #pareto-terminal-obligation — a Pareto `(check-sat)` after N emitted
-    /// points does not ask "is the authored formula unsatisfiable"; it asks
-    /// "is there a feasible point no emitted point dominates-or-equals". The
-    /// refutation the seed probe produces is of `authored AND blocking`, and
-    /// that is exactly the claim `unsat` makes there (Z3 behaves the same).
-    /// Certifying it against `authored` ALONE rejects a correct refutation.
-    ///
-    /// This certifies the refutation only. It deliberately does NOT cover the
-    /// separate enumeration-completeness claim that the emitted set IS the
-    /// whole front — that rests on the lex-push construction and its debug
-    /// assertions, exactly as before.
+    /// Empty for ordinary queries and writable only through
+    /// [`Executor::declare_pareto_front_exhaustion_extension`], with an opaque
+    /// blocker bound to this epoch, source, roots, and objectives; callers cannot retarget it.
+    /// #pareto-terminal-obligation — Pareto queries ask whether an un-emitted
+    /// feasible point remains. Their `authored AND blocking` refutation is the
+    /// published claim (matching Z3), not a certificate of enumeration completeness; that
+    /// separate claim rests on the lex-push construction and its assertions.
     declared_extension: Vec<TermId>,
     declared_extension_entries: Vec<TermEntryStamp>,
     /// Exact objective inventory that justified a Pareto obligation extension.
@@ -1509,6 +1575,10 @@ impl UnsatQueryEpoch {
             .is_same_epoch(&executor.query_authority_epoch)
             && self.source_context_stamp == executor.ctx.source_context_stamp()
             && self.term_entries_are_current(executor)
+    }
+
+    pub(super) fn proof_output_is_current(&self, executor: &Executor) -> bool {
+        self.proof_output_requested && self.is_current(executor)
     }
 }
 
@@ -2019,7 +2089,7 @@ impl Executor {
     /// requirement or SMT-LIB `:produce-proofs true` makes the missing
     /// translation verdict-relevant. Strict verification modes impose the same
     /// requirement even when proof export itself was not requested.
-    fn strict_unsat_presentation_required(&self) -> bool {
+    pub(in crate::executor) fn strict_unsat_presentation_required(&self) -> bool {
         self.proof_artifact_required
             || self.self_check()
             || self.verification_level().has_proof_checking()
@@ -2045,6 +2115,7 @@ impl Executor {
         statistic: &'static str,
     ) -> SolveResult {
         self.last_unsat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         self.last_sat_certificate = None;
         self.last_model = None;
         self.last_model_validated = false;
@@ -2193,6 +2264,7 @@ impl Executor {
     /// snapshot once command elaboration has materialized authenticated
     /// schematic instances, but no solver-owned transformation may intervene.
     pub(super) fn begin_unsat_query_epoch(&mut self, assertions: &[TermId]) {
+        self.pending_nested_array_bool_bv_unsat = None;
         let Some(assertion_entries) = UnsatQueryEpoch::capture_entries(self, assertions) else {
             self.unsat_query_epoch = None;
             self.last_unsat_certificate = None;
@@ -2205,6 +2277,8 @@ impl Executor {
             assertion_entries,
             assumptions: None,
             assumption_entries: None,
+            literal_false_assumption_source: false,
+            proof_output_requested: self.is_producing_proofs(),
             declared_extension: Vec::new(),
             declared_extension_entries: Vec::new(),
             declared_extension_objectives: None,
@@ -2222,6 +2296,7 @@ impl Executor {
     /// before solving starts. Any lifecycle violation drops the epoch so a
     /// later provisional UNSAT fails closed instead of borrowing authority.
     pub(super) fn rebind_unsat_query_epoch_assertions(&mut self, assertions: &[TermId]) -> bool {
+        self.pending_nested_array_bool_bv_unsat = None;
         let can_rebind = self.unsat_query_epoch.as_ref().is_some_and(|epoch| {
             epoch.assumptions.is_none()
                 && epoch.assumption_entries.is_none()
@@ -2251,48 +2326,6 @@ impl Executor {
         } else {
             self.last_unsat_certificate = None;
             false
-        }
-    }
-
-    /// Bind the exact caller-supplied assumptions before entering a solve.
-    ///
-    /// Rebinding is accepted only when it is byte-for-byte identical. This lets
-    /// narrow wrapper layers be idempotent without permitting an internal retry
-    /// to change the authority of an already-started public query.
-    pub(crate) fn bind_unsat_query_assumptions(&mut self, assumptions: &[TermId]) {
-        // Binding is a pre-solve authority mutation. Even an idempotent or
-        // rejected late bind must retire a previously minted one-shot token.
-        self.last_unsat_certificate = None;
-        let Some(assumption_entries) = UnsatQueryEpoch::capture_entries(self, assumptions) else {
-            self.unsat_query_epoch = None;
-            return;
-        };
-        let Some(epoch) = self.unsat_query_epoch.as_ref() else {
-            return;
-        };
-        if !epoch.is_current(self) {
-            self.unsat_query_epoch = None;
-            return;
-        }
-        let retire = match (&epoch.assumptions, &epoch.assumption_entries) {
-            (Some(bound), Some(_)) if bound != assumptions => {
-                // Preserve the first binding. Certification will reject the
-                // wrapper's later, mismatching assumption slice.
-                false
-            }
-            (Some(_), Some(bound_entries)) => bound_entries != &assumption_entries,
-            (None, None) => false,
-            _ => true,
-        };
-        if retire {
-            self.unsat_query_epoch = None;
-            return;
-        }
-        if let Some(epoch) = self.unsat_query_epoch.as_mut() {
-            if epoch.assumptions.is_none() {
-                epoch.assumptions = Some(assumptions.to_vec());
-                epoch.assumption_entries = Some(assumption_entries);
-            }
         }
     }
 
@@ -2400,6 +2433,7 @@ impl Executor {
         &mut self,
         extension: super::optimization::ParetoFrontExhaustionExtension,
     ) -> bool {
+        self.pending_nested_array_bool_bv_unsat = None;
         if self.ctx.objectives().is_empty() {
             return false;
         }
@@ -2429,11 +2463,27 @@ impl Executor {
         }
     }
 
-    /// Strictly certify a provisional public UNSAT result and mint its token.
-    fn mint_unsat_certificate(
-        &mut self,
+    /// Authenticate the exact public-query scope for one provisional UNSAT.
+    ///
+    /// This is the certification-lane-independent prefix shared by every
+    /// UNSAT admission path: epoch currency, source-context stamp, term-entry
+    /// stamps, bound-assumption equality, proof-source provenance, the
+    /// foreign-internal-assumption tripwire, and finally
+    /// [`AuthenticatedUnsatScope::capture`]. [`Self::mint_unsat_certificate`]
+    /// runs it with `require_proof_provenance` — its certification lanes
+    /// consume the proof artifact the provenance authorizes — and the
+    /// #proof-capability B3 [`Self::mint_competition_raw_certificate`]
+    /// carve-out runs the same checks with the ONE documented relaxation:
+    /// competition shedding skips the proof bookkeeping that installs the
+    /// provenance (`install_proof_source_provenance` self-gates on
+    /// `produce_proofs_enabled`), so ABSENT provenance is accepted there,
+    /// while a present-but-mismatched provenance stays a hard error under
+    /// both policies. No lane may weaken any other individual check.
+    fn authenticate_unsat_query_scope(
+        &self,
         assumptions: &[TermId],
-    ) -> Result<UnsatCertificate, UnsatCertificationError> {
+        require_proof_provenance: bool,
+    ) -> Result<AuthenticatedUnsatScope, UnsatCertificationError> {
         let epoch = self
             .unsat_query_epoch
             .as_ref()
@@ -2462,33 +2512,42 @@ impl Executor {
         // authored/materialized assertion snapshot before any preprocessing or
         // theory axiom can alter the working stack. Requiring exact vector
         // equality prevents a proof from borrowing authority from an older or
-        // solver-generated assertion set.
-        let Some(provenance) = self.proof_problem_assertion_provenance.as_ref() else {
-            probe_cert_reject(|| "assertion epoch: no proof provenance is installed".to_string());
-            return Err(UnsatCertificationError::AssertionEpochMismatch);
-        };
-        if provenance.original_problem_assertions != epoch.assertions {
-            probe_cert_reject(|| {
-                let render = |ids: &[TermId]| -> String {
-                    ids.iter()
-                        .enumerate()
-                        .map(|(i, t)| {
-                            let rendered = ay_proof::format_term_alethe(&self.ctx.terms, *t);
-                            format!("    [{i}] {rendered}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                format!(
-                    "assertion epoch mismatch\n  provenance.original_problem_assertions \
-                     ({}):\n{}\n  epoch.assertions ({}):\n{}",
-                    provenance.original_problem_assertions.len(),
-                    render(&provenance.original_problem_assertions),
-                    epoch.assertions.len(),
-                    render(&epoch.assertions),
-                )
-            });
-            return Err(UnsatCertificationError::AssertionEpochMismatch);
+        // solver-generated assertion set. Under competition shedding the
+        // installer self-gates (no proof is being built), so the B3 raw lane
+        // passes `require_proof_provenance = false`: absence is accepted
+        // there, while a PRESENT provenance must still match exactly.
+        match self.proof_problem_assertion_provenance.as_ref() {
+            Some(provenance) if provenance.original_problem_assertions != epoch.assertions => {
+                probe_cert_reject(|| {
+                    let render = |ids: &[TermId]| -> String {
+                        ids.iter()
+                            .enumerate()
+                            .map(|(i, t)| {
+                                let rendered = ay_proof::format_term_alethe(&self.ctx.terms, *t);
+                                format!("    [{i}] {rendered}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    format!(
+                        "assertion epoch mismatch\n  provenance.original_problem_assertions \
+                         ({}):\n{}\n  epoch.assertions ({}):\n{}",
+                        provenance.original_problem_assertions.len(),
+                        render(&provenance.original_problem_assertions),
+                        epoch.assertions.len(),
+                        render(&epoch.assertions),
+                    )
+                });
+                return Err(UnsatCertificationError::AssertionEpochMismatch);
+            }
+            Some(_) => {}
+            None if !require_proof_provenance => {}
+            None => {
+                probe_cert_reject(|| {
+                    "assertion epoch: no proof provenance is installed".to_string()
+                });
+                return Err(UnsatCertificationError::AssertionEpochMismatch);
+            }
         }
 
         // Named-core redirects temporarily move authored assertions into the
@@ -2515,35 +2574,54 @@ impl Executor {
             "BUG: the Pareto obligation extension leaked into last_assumptions"
         );
 
-        let authenticated_scope = AuthenticatedUnsatScope::capture(self, epoch, assumptions)
-            .ok_or(UnsatCertificationError::StaleTermEntry)?;
+        AuthenticatedUnsatScope::capture(self, epoch, assumptions)
+            .ok_or(UnsatCertificationError::StaleTermEntry)
+    }
 
-        enum CertificationSource {
-            StrictProof,
-            CheckedSatRefutation,
-            CheckedBoolBv {
-                evidence: AuthenticatedBoolBvUnsatQuery,
-                exact_roots: Box<[TermId]>,
-            },
-            CheckedBvLia {
-                evidence: AuthenticatedBvLiaUnsatQuery,
-                exact_roots: Box<[TermId]>,
-            },
-            DischargedTrust,
-        }
-        enum StrictProofPresentationFailure {
-            Missing,
-            Rejected(ay_proof::ProofCheckError),
-        }
+    /// Mint the shed-mode raw admission token (#proof-capability B3).
+    ///
+    /// Called ONLY from the competition-shedding lane in
+    /// [`Self::certify_unsat_presentation`]. The scope authentication is the
+    /// same unweakened prefix every certified lane runs; the carve-out is
+    /// solely the absence of a checked refutation behind the verdict.
+    fn mint_competition_raw_certificate(
+        &self,
+        assumptions: &[TermId],
+    ) -> Result<UnsatCertificate, UnsatCertificationError> {
+        debug_assert!(
+            self.competition_shedding_active(),
+            "BUG: the CompetitionRaw admission lane is reachable outside \
+             competition shedding — any proof demand, strict mode, or \
+             self-check must keep it dead code (#proof-capability B3)"
+        );
+        // Provenance is the one relaxed conjunct: shedding skips the proof
+        // bookkeeping that installs it, so absence is the shed-mode norm.
+        let scope = self.authenticate_unsat_query_scope(assumptions, false)?;
+        Ok(UnsatCertificate(UnsatCertificateKind::CompetitionRaw(
+            scope,
+        )))
+    }
 
-        let strict_presentation = match self.last_proof.as_ref() {
-            Some(proof) => self
-                .check_proof_strict_with_datatypes(proof)
-                .map(|_| ())
-                .map_err(StrictProofPresentationFailure::Rejected),
-            None => Err(StrictProofPresentationFailure::Missing),
-        };
+    /// Strictly certify a provisional public UNSAT result and mint its token.
+    fn mint_unsat_certificate(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<UnsatCertificate, UnsatCertificationError> {
+        // Affine handoff: every mint attempt consumes the quarantine token,
+        // including scope failures and stronger proof/sidecar wins.
+        let pending_nested_array = self.pending_nested_array_bool_bv_unsat.take();
+        let authenticated_scope = self.authenticate_unsat_query_scope(assumptions, true)?;
+        let epoch = self
+            .unsat_query_epoch
+            .as_ref()
+            .ok_or(UnsatCertificationError::MissingEpoch)?;
+        let pending_nested_array = self.require_current_pending_nested_array_for_mint(
+            pending_nested_array,
+            epoch,
+            assumptions,
+        )?;
 
+        let strict_presentation = self.check_strict_unsat_presentation();
         let certification_source = match strict_presentation {
             Ok(()) => CertificationSource::StrictProof,
             Err(presentation_failure) => {
@@ -2558,6 +2636,11 @@ impl Executor {
                     None
                 } else if self.checked_sat_refutation_authorizes(epoch, assumptions) {
                     Some(CertificationSource::CheckedSatRefutation)
+                } else if let Some(pending) = pending_nested_array {
+                    // The final quarantine already paid for and replayed this
+                    // exact finite-array refutation. Move it forward; never
+                    // authenticate the same query a second time here.
+                    Some(CertificationSource::PendingNestedArray(pending))
                 } else if let Some((evidence, exact_roots)) =
                     self.authenticate_bool_bv_query(epoch, assumptions)?
                 {
@@ -2614,59 +2697,7 @@ impl Executor {
             }
         };
 
-        let kind = match certification_source {
-            CertificationSource::StrictProof => {
-                UnsatCertificateKind::StrictProof(authenticated_scope)
-            }
-            CertificationSource::CheckedSatRefutation => {
-                let checked = self.last_checked_sat_refutation.take().ok_or_else(|| {
-                    UnsatCertificationError::StrictProofRejected {
-                        reason: "checked SAT-refutation authority disappeared before token mint"
-                            .to_string(),
-                    }
-                })?;
-                UnsatCertificateKind::CheckedSatRefutation {
-                    checked,
-                    scope: authenticated_scope,
-                }
-            }
-            CertificationSource::CheckedBoolBv {
-                evidence,
-                exact_roots,
-            } => {
-                let checked = CheckedBoolBvUnsat::bind(
-                    authenticated_scope,
-                    evidence,
-                    &self.ctx.terms,
-                    &exact_roots,
-                )
-                .ok_or_else(|| UnsatCertificationError::StrictProofRejected {
-                    reason: "source-level Bool/BV authority became stale before token mint"
-                        .to_string(),
-                })?;
-                UnsatCertificateKind::CheckedBoolBv(checked)
-            }
-            CertificationSource::CheckedBvLia {
-                evidence,
-                exact_roots,
-            } => {
-                let checked = CheckedBvLiaUnsat::bind(
-                    authenticated_scope,
-                    evidence,
-                    &self.ctx.terms,
-                    &exact_roots,
-                )
-                .ok_or_else(|| UnsatCertificationError::StrictProofRejected {
-                    reason: "source-level BV/LIA authority became stale before token mint"
-                        .to_string(),
-                })?;
-                UnsatCertificateKind::CheckedBvLia(checked)
-            }
-            CertificationSource::DischargedTrust => {
-                UnsatCertificateKind::DischargedTrust(authenticated_scope)
-            }
-        };
-        Ok(UnsatCertificate(kind))
+        self.bind_unsat_certification_source(certification_source, authenticated_scope)
     }
 
     /// Whether the independent SAT-resolution sidecar proves this exact public
@@ -2701,10 +2732,11 @@ impl Executor {
     }
 
     /// Independently prove the exact source query in the bounded Bool/BV
-    /// fragment. Unsupported source forms leave publication to the original
-    /// proof-failure policy; a supported query that is SAT or whose proof cannot
-    /// be surfaced fails closed instead of trying another solver lane after
-    /// contradictory semantic evidence.
+    /// fragment. Unsupported source forms -- and forms this lane ran out of
+    /// bounded budget on -- leave publication to the original proof-failure
+    /// policy; a supported query that is SAT, or whose surfaced proof fails
+    /// independent replay, fails closed instead of trying another solver lane
+    /// after contradictory semantic evidence.
     fn authenticate_bool_bv_query(
         &self,
         epoch: &UnsatQueryEpoch,
@@ -2742,7 +2774,13 @@ impl Executor {
             self.current_solve_deadline(),
         ) {
             Ok(evidence) => Ok(Some((evidence, exact_roots.into_boxed_slice()))),
-            Err(error) if error.is_unsupported_fragment() => Ok(None),
+            // A lane that cannot answer must DECLINE, not veto -- the same rule
+            // `authenticate_bv_lia_query` below already follows. Exhausting this
+            // lane's own bounded envelope (node/gate/deadline budgets) is not
+            // evidence against the verdict, and rejecting on it killed the
+            // deferred-trust discharge that runs next. `Satisfiable` and
+            // `Replay` still fail closed: those ARE contradictory evidence.
+            Err(error) if error.is_capability_decline() => Ok(None),
             Err(error) => Err(UnsatCertificationError::StrictProofRejected {
                 reason: format!("independent source-level Bool/BV check rejected query: {error}"),
             }),
@@ -2906,7 +2944,7 @@ impl Executor {
         exec.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
         exec.set_memory_limit(self.memory_limit());
         exec.set_solve_controls(self.solve_interrupt.clone(), self.solve_deadline.get());
-        let trace_rc = std::env::var_os("AY_PHASE_TRACE").is_some();
+        let trace_rc = ay_core::misc_cli_flags().phase_trace;
         let verdict = exec.check_sat();
         if !matches!(verdict, Ok(ref result) if result.is_unsat()) {
             if trace_rc {
@@ -3260,6 +3298,14 @@ impl Executor {
         // silently destroys correct refutations.
         let decls = self.datatype_decls_for_strict_proof();
         let selectors = self.ctor_selector_decls_for_strict_proof();
+        let member_signatures = self
+            .datatype_member_signatures_for_strict_proof()
+            .ok_or_else(|| {
+                reject(
+                    "executor datatype registries lack an exact sticky member signature"
+                        .to_string(),
+                )
+            })?;
         let problem = self.problem_assertions_for_strict_proof();
         if self.redecides_definitive_sat_within(&problem, FORGED_GUARD_BUDGET_MS) {
             return Err(reject(
@@ -3275,11 +3321,12 @@ impl Executor {
             .last_proof
             .as_ref()
             .ok_or(UnsatCertificationError::MissingProof)?;
-        let collected = ay_proof::check_proof_collecting_trust_with_context(
+        let collected = ay_proof::check_proof_collecting_trust_with_typed_context(
             proof,
             &self.ctx.terms,
             (!decls.is_empty()).then_some(decls.as_slice()),
             (!selectors.is_empty()).then_some(selectors.as_slice()),
+            member_signatures.as_slice(),
             Some(problem.as_slice()),
         )
         .map_err(|error| {
@@ -3356,6 +3403,7 @@ impl Executor {
         // origin. Publish that Unknown through the canonical revocation boundary
         // before any prechecked or freshly minted token can become observable.
         self.last_unsat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         if !self.is_producing_proofs() {
             self.proof_tracker.disable();
         }
@@ -3369,12 +3417,15 @@ impl Executor {
     /// missing. ay 0.5 published `UnknownReason::ProofTrusted` for this; 0.6
     /// deleted the variant and moved the decision into the `ay` binary, so a
     /// consumer that links `ay-dpll` and sets `:check-proofs-strict true` still
-    /// received a raw `SolveResult::Unsat` for a proof no checker can confirm.
+    /// received a raw `SolveResult::Unsat` for a proof containing known
+    /// unproved Alethe fallbacks.
     /// The predicate is not a weaker restatement of what the certification
     /// funnel already does: a `Seq` refutation can be clean — zero `trust`,
     /// zero `hole`, every `assume` provenance-backed — mint a certificate, and
-    /// still be unpresentable to carcara. Certification asks "did AY check
-    /// it?"; this asks "can anyone else?".
+    /// still require an honest wire `hole`. Certification asks whether AY's
+    /// native checker accepted the derivation. This separate, conservative
+    /// deny list screens known structural Alethe gaps; it does not claim to be
+    /// an external checker's semantic acceptance predicate.
     ///
     /// Applied to the verdict that certification is about to publish, never
     /// earlier. That ordering is the whole point: it mirrors the CLI's
@@ -3389,13 +3440,14 @@ impl Executor {
         &mut self,
         published: SolveResult,
     ) -> SolveResult {
-        if !published.is_unsat()
-            || !self.strict_proofs_enabled()
-            || !self.unsat_proof_terminal_trust_detected()
-        {
+        if !published.is_unsat() || !self.strict_proofs_enabled() {
+            return published;
+        }
+        if !self.unsat_proof_terminal_trust_detected() && !self.unsat_proof_has_known_wire_gap() {
             return published;
         }
         self.last_unsat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         if !self.is_producing_proofs() {
             self.proof_tracker.disable();
         }
@@ -3415,7 +3467,12 @@ impl Executor {
         assumptions: &[TermId],
     ) -> SolveResult {
         let published = self.certify_unsat_presentation(proposed, assumptions);
-        self.decline_trust_bearing_unsat_under_strict_proofs(published)
+        let published = self.decline_trust_bearing_unsat_under_strict_proofs(published);
+        // Certification can perform the final strict proof check while minting
+        // the public capability. Snapshot only after the complete publication
+        // funnel so statistics include that authority check on every exit.
+        self.publish_strict_check_counters();
+        published
     }
 
     /// Certification proper. Every UNSAT it returns is one the mandatory
@@ -3431,14 +3488,16 @@ impl Executor {
                 return unknown;
             }
         }
-        // A narrow exact-source lane may already have performed its complete
-        // semantic check inside this same authored transaction. Preserve only
-        // such a DISTINCT token, and only while its full query/source/term
+        // Preserve a narrow exact-source token only when its full query/source/term
         // snapshot is still current. An ordinary strict-proof token is never
         // preserved here, so this cannot mask a later structural rejection.
         let prechecked = self.last_unsat_certificate.take();
         if proposed.is_unsat()
             && assumptions.is_empty()
+            // An exact semantic token certifies the verdict, not the promised
+            // translated artifact. Explicit proof/strict modes must still run
+            // the normal presentation gate and fail closed on a wire hole.
+            && !self.strict_unsat_presentation_required()
             && prechecked
                 .as_ref()
                 .is_some_and(|certificate| certificate.checked_exact_semantic_is_current(self))
@@ -3449,6 +3508,7 @@ impl Executor {
                 return unknown;
             }
             self.last_unsat_certificate = prechecked;
+            self.pending_nested_array_bool_bv_unsat = None;
             if !self.is_producing_proofs() {
                 self.proof_tracker.disable();
             }
@@ -3456,10 +3516,40 @@ impl Executor {
         }
         self.last_unsat_certificate = None;
         if !proposed.is_unsat() {
+            self.pending_nested_array_bool_bv_unsat = None;
             if !self.is_producing_proofs() {
                 self.proof_tracker.disable();
             }
             return self.finalize_unknown_publication(proposed);
+        }
+
+        // #proof-capability B3 — the CompetitionRaw admission carve-out.
+        //
+        // In competition shedding mode ONLY (competition mode with zero proof
+        // demand in scope — see `competition_shedding_active`), a raw UNSAT
+        // verdict publishes without a checked certificate. This is the
+        // documented product carve-out from the "no uncertified unsat"
+        // invariant established at `begin_public_solve` (lifecycle.rs),
+        // authorized by the explicit competition opt-in. It is bounded on
+        // every side:
+        // - the exact query scope still authenticates: epoch, source-context,
+        //   term-entry stamps, bound-assumption equality, and the
+        //   foreign-assumption tripwire all run unweakened, and the token
+        //   still carries `AuthenticatedUnsatScope`. Proof-source provenance
+        //   is the one policy-relaxed conjunct — shedding skips the
+        //   bookkeeping that installs it, so ABSENCE is accepted while a
+        //   present-but-mismatched provenance still hard-fails;
+        // - external stops still revoke publication before the token becomes
+        //   observable, exactly like the minted-certificate path below;
+        // - the token reports false for every trust-class probe and records
+        //   its own `CommandUnsatAdmission::CompetitionRaw` class, so nothing
+        //   can relabel a raw admission as a checked certification;
+        // - any proof demand (`--proof`/`:produce-proofs`,
+        //   `:check-proofs-strict`, self-check) makes this branch DEAD CODE:
+        //   `competition_shedding_active()` is false and the certified path
+        //   below runs byte-identically to a build without this branch.
+        if self.competition_shedding_active() {
+            return self.publish_competition_raw_unsat(proposed, assumptions);
         }
 
         let minted = self.mint_unsat_certificate(assumptions);
@@ -3488,6 +3578,53 @@ impl Executor {
         published
     }
 
+    /// Validate and discard any stricter pending theorem, then publish the
+    /// separately classified competition raw admission.
+    fn publish_competition_raw_unsat(
+        &mut self,
+        proposed: SolveResult,
+        assumptions: &[TermId],
+    ) -> SolveResult {
+        // CompetitionRaw must not launder a stale capability left by the final
+        // nested-array quarantine. A current token is deliberately discarded:
+        // shedding publishes only its distinct unverified admission class.
+        let pending = self.pending_nested_array_bool_bv_unsat.take();
+        let raw = if pending.as_ref().is_some_and(|candidate| {
+            !self.pending_nested_array_bool_bv_unsat_is_current(candidate, assumptions)
+        }) {
+            Err(UnsatCertificationError::StrictProofRejected {
+                reason: "pending nested finite-array Bool/BV authority became stale before CompetitionRaw admission"
+                    .to_string(),
+            })
+        } else {
+            self.mint_competition_raw_certificate(assumptions)
+        };
+        // Scope authentication performs structural work; a stop arriving
+        // during it must still dominate publication.
+        if let Some(unknown) = self.stop_declines_unsat_publication() {
+            return unknown;
+        }
+        let published = match raw {
+            Ok(certificate) => {
+                self.last_unsat_certificate = Some(certificate);
+                proposed
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "rejecting shed-mode raw UNSAT whose public-query scope failed authentication"
+                );
+                probe_cert_reject(|| error.to_string());
+                self.reject_uncertified_verdict_for_publication(format!(
+                    "shed-mode raw UNSAT rejected: public-query scope authentication failed: {error}"
+                ))
+            }
+        };
+        // The branch guard guarantees there is no proof demand in scope.
+        self.proof_tracker.disable();
+        published
+    }
+
     /// Whether the active solve is a public exact-query epoch whose eventual
     /// UNSAT publication must carry authored-scope certification.
     ///
@@ -3501,6 +3638,7 @@ impl Executor {
 
     /// Consume the one-shot capability for the immediately preceding verdict.
     pub(crate) fn take_unsat_certificate(&mut self) -> Option<UnsatCertificate> {
+        self.pending_nested_array_bool_bv_unsat = None;
         let certificate = self.last_unsat_certificate.take()?;
         let epoch = self.unsat_query_epoch.as_ref()?;
         let bound_assumptions = epoch.assumptions.as_deref()?;
@@ -3548,6 +3686,15 @@ impl Executor {
             UnsatCertificateKind::CheckedExactFiniteExpansion(evidence) => {
                 self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
             }
+            // #proof-capability B3 — the raw token dies the instant any proof
+            // demand appears: consumption re-requires ACTIVE shedding, so the
+            // carve-out cannot outlive the mode that authorized it, and a
+            // future edit that widens the minting gate still cannot publish a
+            // raw UNSAT into a certified-mode session.
+            UnsatCertificateKind::CompetitionRaw(scope) => {
+                self.competition_shedding_active()
+                    && scope.is_current_with_provenance_policy(self, false)
+            }
         };
         current.then_some(certificate)
     }
@@ -3564,6 +3711,8 @@ mod tests {
     use super::*;
     use crate::executor::exact_exists_bounds::ExactExistsDecision;
     use crate::executor_types::UnknownReason;
+
+    mod pending_nested_array;
 
     fn strict_boolean_contradiction(executor: &mut Executor) -> Vec<TermId> {
         // Match the small contradiction used by the established independent
@@ -3810,7 +3959,6 @@ mod tests {
             .expect("rebound epoch remains installed but stale")
             .term_entries_are_current(&executor));
     }
-
     #[test]
     fn source_bool_bv_refutation_mints_distinct_snapshot_bound_authority() {
         // Signed four-bit 7 + 1 wraps to -8, contradicting the asserted
@@ -4248,6 +4396,7 @@ mod tests {
             .take_unsat_certificate()
             .expect("exact closed-forall token must cross publication once");
         assert!(certificate.exact_semantic_verified());
+        assert!(certificate.confirms_checked_unsat_emission());
         assert!(executor.take_unsat_certificate().is_none());
     }
 
@@ -5221,6 +5370,7 @@ mod tests {
         assert!(!certificate.strict_proof_verified());
         assert!(certificate.independently_verified());
         assert!(!certificate.exact_semantic_verified());
+        assert!(certificate.confirms_checked_unsat_emission());
     }
 
     #[test]
@@ -5334,6 +5484,79 @@ mod tests {
         assert_eq!(
             executor.unknown_reason(),
             Some(UnknownReason::SelfCheckRejected)
+        );
+    }
+
+    /// #proof-capability B3 — the shed-mode funnel mints the CompetitionRaw
+    /// token (never a checked kind) and its one-shot consumption reports the
+    /// raw admission class with every verification probe false.
+    #[test]
+    fn shedding_funnel_mints_and_consumes_competition_raw() {
+        let mut executor = Executor::new();
+        executor.set_competition_mode(true);
+        let _roots = strict_boolean_contradiction(&mut executor);
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let proposed = executor
+            .check_sat()
+            .expect("contradictory Boolean units must solve");
+        assert!(proposed.is_unsat());
+        assert!(executor.competition_shedding_active());
+
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+        assert!(
+            published.is_unsat(),
+            "shed-mode UNSAT must publish through the raw admission lane"
+        );
+        let certificate = executor
+            .take_unsat_certificate()
+            .expect("the raw token must be consumable while shedding is active");
+        assert!(matches!(
+            certificate.0,
+            UnsatCertificateKind::CompetitionRaw(_)
+        ));
+        assert_eq!(
+            certificate.command_admission(),
+            CommandUnsatAdmission::CompetitionRaw
+        );
+        assert!(!certificate.strict_proof_verified());
+        assert!(!certificate.independently_verified());
+        assert!(!certificate.exact_semantic_verified());
+        assert!(
+            !certificate.confirms_checked_unsat_emission(),
+            "a raw competition admission must not cross a checked probe boundary"
+        );
+    }
+
+    /// #proof-capability B3 — the raw token cannot outlive its authorizing
+    /// mode: a proof demand arriving between mint and consumption kills it,
+    /// so a raw UNSAT can never be admitted into a certified-mode session.
+    #[test]
+    fn competition_raw_token_dies_when_shedding_deactivates_before_consumption() {
+        let mut executor = Executor::new();
+        executor.set_competition_mode(true);
+        let _roots = strict_boolean_contradiction(&mut executor);
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let proposed = executor
+            .check_sat()
+            .expect("contradictory Boolean units must solve");
+        assert!(proposed.is_unsat());
+
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+        assert!(published.is_unsat());
+        assert!(matches!(
+            executor.last_unsat_certificate,
+            Some(UnsatCertificate(UnsatCertificateKind::CompetitionRaw(_)))
+        ));
+
+        // A proof demand appears before the one-shot consumption: shedding is
+        // no longer active and the raw token must fail closed.
+        executor.set_produce_proofs(true);
+        assert!(!executor.competition_shedding_active());
+        assert!(
+            executor.take_unsat_certificate().is_none(),
+            "a CompetitionRaw token must not be consumable outside shedding"
         );
     }
 }

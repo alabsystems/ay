@@ -84,6 +84,17 @@ impl Drop for IsolatedEvalMemo {
     }
 }
 
+/// Evaluate one exact semantic obligation in a fresh memo universe.
+///
+/// The closure boundary keeps callers from forgetting the isolation guard.
+/// Its nested session permits local DAG memoization, while the outer session
+/// and all entries are restored byte-for-byte after return or unwinding.
+pub(in crate::executor) fn with_isolated_eval_memo<R>(f: impl FnOnce() -> R) -> R {
+    let _isolation = IsolatedEvalMemo::new();
+    let _session = EvalMemoSession::new();
+    f()
+}
+
 /// Look up a cached value; `None` if no session is active or on a miss.
 pub(super) fn get(term_id: TermId) -> Option<EvalValue> {
     EVAL_MEMO.with(|c| {

@@ -102,7 +102,7 @@ fn signed_symmetry_runs_only_for_an_explicit_one_shot_solver() {
     let (unsat, changed) = solver.preprocess_symmetry();
     assert!(!unsat);
 
-    if std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some() {
+    if ay_core::sat_ab_switches().signed_symmetry {
         // The opt-in route runs before the ordinary detector. This formula has
         // two verified signed generators; their SBPs can be binary or unit.
         assert!(changed);
@@ -174,7 +174,7 @@ fn signed_symmetry_search_telemetry_survives_later_route_outcomes() {
         solver.cold.symmetry_stats.last_skipped_reason,
         Some(crate::symmetry::SymmetrySkipReason::NoPairs)
     );
-    if std::env::var_os("AY_SAT_SIGNED_SYMMETRY").is_some() {
+    if ay_core::sat_ab_switches().signed_symmetry {
         assert!(solver
             .cold
             .symmetry_stats

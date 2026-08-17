@@ -3337,13 +3337,9 @@ const COUNTING_MIN_TERMS: usize = 48;
 /// counting vs the legacy watched-slack path with the same binary; defaults to
 /// counting enabled. Soundness does not depend on this — both paths are sound.
 fn counting_disabled_by_env() -> bool {
-    use std::sync::OnceLock;
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("AY_PB_DISABLE_COUNTING")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-    })
+    // B14: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    // (Name kept: callers say "disabled", the switch stores the positive.)
+    !crate::ab_switches::get().counting
 }
 
 /// A coefficient counts as "big" for `big_count` when it is at least a quarter

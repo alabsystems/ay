@@ -356,38 +356,21 @@ pub(crate) fn substitute_objective_singletons_with_deadline(
         }
         row_origin.push(row_index);
     }
-    let mut emitted_objective = Vec::new();
-    let mut exact_objective = Vec::new();
-    for (original, coefficient) in objective.iter().enumerate() {
-        if original % 256 == 0 && deadline_expired(deadline) {
-            return None;
-        }
-        if !coefficient.is_zero() {
-            let mapped = map.get(original).copied().flatten()?;
-            let proxy = coefficient.to_f64()?;
-            if !proxy.is_finite() {
-                return None;
-            }
-            if exact_differs_from_proxy(coefficient, proxy) {
-                exact_objective.push((mapped, coefficient.clone()));
-            }
-            emitted_objective.push((mapped, proxy));
-        }
-    }
-    reduced.set_objective(&emitted_objective, model.sense());
-    for (column, coefficient) in exact_objective {
-        reduced.record_inexact_obj_coeff(column.0, coefficient);
-    }
-    reduced.set_objective_offset(model.objective_offset());
-    let exact_offset = model.obj_offset_exact();
-    if exact_differs_from_proxy(&exact_offset, model.objective_offset()) {
-        reduced.record_inexact_obj_offset(exact_offset);
-    }
+    emit_objective(&mut reduced, model, &objective, &map, deadline)?;
 
     if trace_enabled() {
+        let inexact_obj = (0..objective.len())
+            .filter(|&j| {
+                map[j].is_some()
+                    && !objective[j].is_zero()
+                    && objective[j]
+                        .to_f64()
+                        .is_some_and(|p| exact_differs_from_proxy(&objective[j], p))
+            })
+            .count();
         eprintln!(
-            "AY_MILP_TRACE objective-singleton-sub: eliminated {} continuous cols/rows; \
-             model {nr}r/{n}c -> {}r/{}c",
+            "--trace objective-singleton-sub: eliminated {} continuous cols/rows; \
+             model {nr}r/{n}c -> {}r/{}c; inexact-obj-cols {inexact_obj}",
             recover.len(),
             reduced.num_rows(),
             reduced.num_cols(),
@@ -413,128 +396,50 @@ fn exact_differs_from_proxy(value: &BigRational, proxy: f64) -> bool {
     BigRational::from_float(proxy).as_ref() != Some(value)
 }
 
-#[cfg(test)]
-mod tests {
-    use num_traits::One;
-
-    use super::*;
-
-    #[test]
-    fn aggregate_slack_exposes_and_eliminates_a_second_layer() {
-        let mut model = Model::new();
-        let t = model.add_int_col(5.0, 10.0);
-        let slack = model.add_col(0.0, f64::INFINITY);
-        let aggregate = model.add_col(0.0, f64::INFINITY);
-        model.add_row(f64::NEG_INFINITY, 3.0, &[(t, 1.0), (slack, -1.0)]);
-        model.add_row(f64::NEG_INFINITY, 0.0, &[(slack, 1.0), (aggregate, -1.0)]);
-        model.set_objective(&[(aggregate, 1.0)], Sense::Minimize);
-
-        let (reduced, post) =
-            substitute_objective_singletons(&model).expect("both layers eliminate");
-        assert_eq!(reduced.num_cols(), 1);
-        assert_eq!(reduced.num_rows(), 0);
-        assert_eq!(post.recover.len(), 2);
-        assert_eq!(reduced.obj_coeff(Col(0)), 1.0);
-        assert_eq!(*post.const_delta(), BigRational::from_integer((-3).into()));
-        let reduced_point = vec![BigRational::from_integer(7.into())];
-        let full = post.widen(&reduced_point);
-        assert_eq!(
-            full,
-            vec![
-                BigRational::from_integer(7.into()),
-                BigRational::from_integer(4.into()),
-                BigRational::from_integer(4.into())
-            ]
-        );
-        assert!(model.check_point(&full).is_ok());
-        assert_eq!(
-            model.objective_value_at(&full),
-            reduced.objective_value_at(&reduced_point) + post.const_delta()
-        );
+fn emit_objective(
+    reduced: &mut Model,
+    model: &Model,
+    objective: &[BigRational],
+    map: &[Option<Col>],
+    deadline: Option<Instant>,
+) -> Option<()> {
+    let mut emitted = Vec::new();
+    let mut exact_coefficients = Vec::new();
+    for (original, coefficient) in objective.iter().enumerate() {
+        if original % 256 == 0 && deadline_expired(deadline) {
+            return None;
+        }
+        if !coefficient.is_zero() {
+            let mapped = map.get(original).copied().flatten()?;
+            let proxy = coefficient.to_f64()?;
+            if !proxy.is_finite() {
+                return None;
+            }
+            if exact_differs_from_proxy(coefficient, proxy) {
+                exact_coefficients.push((mapped, coefficient.clone()));
+            }
+            emitted.push((mapped, proxy));
+        }
     }
-
-    #[test]
-    fn rational_fold_stays_available_to_exact_routes() {
-        let mut model = Model::new();
-        let decision = model.add_binary_col();
-        let objective = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
-        // 10*objective - decision = 0, hence objective = decision/10.
-        // The transform is exact even though its f64 advice coefficient 0.1
-        // cannot represent the authoritative rational 1/10.
-        model.add_row(0.0, 0.0, &[(objective, 10.0), (decision, -1.0)]);
-        model.set_objective(&[(objective, 1.0)], Sense::Minimize);
-
-        let (reduced, post) =
-            substitute_objective_singletons(&model).expect("singleton must eliminate");
-        assert_eq!(reduced.num_cols(), 1);
-        assert_eq!(reduced.num_rows(), 0);
-        assert!(
-            reduced.has_inexact_objective_coeffs(),
-            "the exact 1/10 cost must remain in the side store"
-        );
-        let reduced_decision = post.map[decision.index()].expect("decision survives");
-        assert_eq!(
-            reduced.obj_coeff_exact_at(reduced_decision.0, reduced.obj_coeff(reduced_decision)),
-            BigRational::new(1.into(), 10.into())
-        );
-
-        let reduced_point = vec![BigRational::one()];
-        let full = post.widen(&reduced_point);
-        assert!(model.check_point(&full).is_ok());
-        assert_eq!(
-            full[objective.index()],
-            BigRational::new(1.into(), 10.into())
-        );
-        assert_eq!(
-            model.objective_value_at(&full),
-            reduced.objective_value_at(&reduced_point) + post.const_delta()
-        );
+    reduced.set_objective(&emitted, model.sense());
+    for (column, coefficient) in exact_coefficients {
+        reduced.record_inexact_obj_coeff(column.0, coefficient);
     }
-
-    #[test]
-    fn a_box_that_can_bind_before_the_row_declines_piecewise_elimination() {
-        let mut model = Model::new();
-        let t = model.add_int_col(0.0, 10.0);
-        let slack = model.add_col(0.0, f64::INFINITY);
-        model.add_row(f64::NEG_INFINITY, 3.0, &[(t, 1.0), (slack, -1.0)]);
-        model.set_objective(&[(slack, 1.0)], Sense::Minimize);
-        // s=max(0,t-3), not one affine expression over t's box.
-        assert!(substitute_objective_singletons(&model).is_none());
+    reduced.set_objective_offset(model.objective_offset());
+    let exact_offset = model.obj_offset_exact();
+    if exact_differs_from_proxy(&exact_offset, model.objective_offset()) {
+        reduced.record_inexact_obj_offset(exact_offset);
     }
-
-    #[test]
-    fn maximization_uses_the_opposite_oriented_row_side() {
-        let mut model = Model::new();
-        let t = model.add_int_col(0.0, 5.0);
-        let reward = model.add_col(f64::NEG_INFINITY, 10.0);
-        model.add_row(0.0, f64::INFINITY, &[(t, -1.0), (reward, -1.0)]);
-        model.set_objective(&[(reward, 1.0)], Sense::Maximize);
-        let (reduced, post) = substitute_objective_singletons(&model).expect("upper target");
-        assert_eq!(post.recover[0].side, ObjectiveSingletonSide::Lower);
-        let full = post.widen(&[BigRational::one()]);
-        assert_eq!(full[1], BigRational::from_integer((-1).into()));
-        assert!(model.check_point(&full).is_ok());
-        assert_eq!(reduced.obj_coeff(Col(0)), -1.0);
-    }
-
-    #[test]
-    fn expired_deadline_declines_without_a_partial_transform() {
-        let mut model = Model::new();
-        let decision = model.add_binary_col();
-        let cost = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
-        model.add_row(0.0, 0.0, &[(cost, 1.0), (decision, -2.0)]);
-        model.set_objective(&[(cost, 1.0)], Sense::Minimize);
-
-        assert!(
-            substitute_objective_singletons_with_deadline(&model, Some(Instant::now())).is_none()
-        );
-    }
+    Some(())
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Cached trace predicate; see the live-read ratchet in `tests/env_ledger.rs`.
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 /// Force this module's cached env accessor at solve entry, so a consumer that

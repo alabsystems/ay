@@ -234,7 +234,10 @@ impl ChcPdrProofRun {
                 else {
                     // Env-gated dump so the failing obligation is a runnable
                     // reproducer instead of just a name in an error string.
-                    if let Ok(dir) = std::env::var("AY_CHC_DUMP_FAILED_REPLAY_OBLIGATION") {
+                    if let Some(dir) = ay_core::misc_cli_flags()
+                        .chc_dump_failed_replay_obligation
+                        .as_deref()
+                    {
                         let path = format!("{dir}/{}.smt2", obligation.name);
                         if std::fs::write(&path, &obligation.smtlib).is_ok() {
                             eprintln!("[ay-chc] wrote failing replay obligation to {path}");

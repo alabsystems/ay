@@ -58,9 +58,8 @@ use super::{
 /// Kill switch: `AY_CHC_DISABLE_GROUND_TABLE_CONCRETIZATION=1` (or any value
 /// other than `0`) disables the pass. Default: enabled.
 pub(crate) fn ground_table_concretization_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_GROUND_TABLE_CONCRETIZATION")
-        .map(|v| v == "0")
-        .unwrap_or(true)
+    // B27: CLI-owned; env retired.
+    crate::ab_switches::get().ground_table_concretization
 }
 
 /// Ground-table read concretization (see module docs).

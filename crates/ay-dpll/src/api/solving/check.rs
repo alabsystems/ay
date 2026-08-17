@@ -24,6 +24,12 @@ enum NativeCheckAuthorityOrigin {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeQueryBoundary {
+    External,
+    Continuation,
+}
+
 /// One immutable control envelope for a complete native solve/publication
 /// transaction.
 ///
@@ -61,7 +67,7 @@ pub(super) fn reject_bv_cnf_export_operation(operation: &'static str) -> Result<
 }
 
 impl Solver {
-    /// Env-gated query capture (`AY_DUMP_QUERY_DIR`): serialize the live
+    /// Env-gated query capture (`--dump-query-dir`): serialize the live
     /// assertion stack (plus the call's assumptions, asserted — a
     /// satisfiability-equivalent batch rendering of `check-sat-assuming`) as a
     /// self-contained SMT-LIB2 script into the given directory, one file per
@@ -69,7 +75,7 @@ impl Solver {
     /// alters solving. Intended for extracting embedded-consumer queries
     /// (e.g. verifier VCs) into standalone repro files.
     fn dump_query_if_requested(&self, assumptions: &[Term]) {
-        let Ok(dir) = std::env::var("AY_DUMP_QUERY_DIR") else {
+        let Some(dir) = ay_core::misc_cli_flags().dump_query_dir.clone() else {
             return;
         };
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -81,7 +87,7 @@ impl Solver {
         let _ = std::fs::write(path, script);
     }
 
-    /// Build the exact script `AY_DUMP_QUERY_DIR` would write for a check with
+    /// Build the exact script `--dump-query-dir` would write for a check with
     /// the given assumptions: the live assertion stack plus the assumptions,
     /// serialized as a self-contained SMT-LIB2 script (sort + symbol
     /// declarations included). Exposed crate-internally so the dump format is
@@ -164,11 +170,31 @@ impl Solver {
         clear_assumptions: bool,
         preserve_pareto_enumeration: bool,
     ) {
+        self.clear_last_solve_state_at_boundary(
+            clear_assumptions,
+            preserve_pareto_enumeration,
+            NativeQueryBoundary::External,
+        );
+    }
+
+    fn clear_last_solve_state_at_boundary(
+        &mut self,
+        clear_assumptions: bool,
+        preserve_pareto_enumeration: bool,
+        boundary: NativeQueryBoundary,
+    ) {
         // Do this BEFORE preflight. An interrupt/timeout/memory rejection never
         // enters Executor, but it still supersedes the previous query and must
         // revoke that query's model/certificate/objective artefacts.
-        self.executor
-            .begin_public_solve(preserve_pareto_enumeration);
+        match boundary {
+            NativeQueryBoundary::External => self
+                .executor
+                .begin_external_decision_query(preserve_pareto_enumeration),
+            NativeQueryBoundary::Continuation => {
+                self.executor
+                    .begin_public_solve(preserve_pareto_enumeration);
+            }
+        }
         if clear_assumptions {
             self.last_assumptions = None;
         }
@@ -444,7 +470,10 @@ impl Solver {
     /// checked constructive model certificate admitted the result. Part of
     /// #5748, #5973.
     pub fn check_sat(&mut self) -> VerifiedSolveResult {
-        self.check_sat_with_authority_origin(NativeCheckAuthorityOrigin::AuthoredPlain)
+        self.check_sat_with_authority_origin(
+            NativeCheckAuthorityOrigin::AuthoredPlain,
+            NativeQueryBoundary::External,
+        )
     }
 
     /// Run a solver-internal feasibility query without caller-authored query
@@ -455,20 +484,34 @@ impl Solver {
     /// Ordinary embedders should call [`Self::check_sat`].
     #[doc(hidden)]
     pub fn check_sat_internal_query(&mut self) -> VerifiedSolveResult {
-        self.check_sat_with_authority_origin(NativeCheckAuthorityOrigin::Internal)
+        self.check_sat_with_authority_origin(
+            NativeCheckAuthorityOrigin::Internal,
+            NativeQueryBoundary::External,
+        )
     }
 
     /// Run a native feasibility probe that must never acquire authored-query
     /// authority from reusing the public `Solver` object.
     pub(crate) fn check_sat_internal_api(&mut self) -> VerifiedSolveResult {
-        self.check_sat_internal_query()
+        self.check_sat_with_authority_origin(
+            NativeCheckAuthorityOrigin::Internal,
+            NativeQueryBoundary::Continuation,
+        )
+    }
+
+    pub(super) fn check_sat_authored_continuation(&mut self) -> VerifiedSolveResult {
+        self.check_sat_with_authority_origin(
+            NativeCheckAuthorityOrigin::AuthoredPlain,
+            NativeQueryBoundary::Continuation,
+        )
     }
 
     fn check_sat_with_authority_origin(
         &mut self,
         authority_origin: NativeCheckAuthorityOrigin,
+        boundary: NativeQueryBoundary,
     ) -> VerifiedSolveResult {
-        self.clear_last_solve_state(true, false);
+        self.clear_last_solve_state_at_boundary(true, false, boundary);
         self.executor.bind_unsat_query_assumptions(&[]);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         if let Some(rejected) = self.reject_native_array_ext_witness_capture(&[]) {
@@ -535,6 +578,7 @@ impl Solver {
     {
         self.check_sat_interruptible_with_authority_origin(
             NativeCheckAuthorityOrigin::AuthoredPlain,
+            NativeQueryBoundary::External,
             should_stop,
         )
     }
@@ -555,6 +599,7 @@ impl Solver {
     {
         self.check_sat_interruptible_with_authority_origin(
             NativeCheckAuthorityOrigin::Internal,
+            NativeQueryBoundary::External,
             should_stop,
         )
     }
@@ -562,12 +607,13 @@ impl Solver {
     fn check_sat_interruptible_with_authority_origin<F>(
         &mut self,
         authority_origin: NativeCheckAuthorityOrigin,
+        boundary: NativeQueryBoundary,
         should_stop: F,
     ) -> VerifiedSolveResult
     where
         F: Fn() -> bool + Send + 'static,
     {
-        self.clear_last_solve_state(true, false);
+        self.clear_last_solve_state_at_boundary(true, false, boundary);
         self.executor.bind_unsat_query_assumptions(&[]);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
         if let Some(rejected) = self.reject_mixed_soft_ownership() {
@@ -687,6 +733,26 @@ impl Solver {
     /// assert_eq!(solver.check_sat_assuming(&[x_eq_1]), SolveResult::Sat);
     /// ```
     pub fn check_sat_assuming(&mut self, assumptions: &[Term]) -> VerifiedSolveResult {
+        self.check_sat_assuming_at_boundary(assumptions, NativeQueryBoundary::External)
+    }
+
+    pub(super) fn check_sat_assuming_continuation(
+        &mut self,
+        assumptions: &[Term],
+    ) -> VerifiedSolveResult {
+        self.check_sat_assuming_at_boundary(assumptions, NativeQueryBoundary::Continuation)
+    }
+
+    fn check_sat_assuming_at_boundary(
+        &mut self,
+        assumptions: &[Term],
+        boundary: NativeQueryBoundary,
+    ) -> VerifiedSolveResult {
+        // A malformed/foreign handle still starts a new decision query. Retire
+        // the previous result and replenish external query budgets before the
+        // first fallible lookup so an early resolution error cannot expose a
+        // stale model/certificate or leave a spent finite-array ledger active.
+        self.clear_last_solve_state_at_boundary(true, false, boundary);
         let assumption_ids = match self.resolve_terms("check_sat_assuming", assumptions) {
             Ok(ids) => ids,
             Err(error) => {
@@ -694,8 +760,7 @@ impl Solver {
                 return self.preflight_unknown(UnknownReason::Incomplete);
             }
         };
-        self.clear_last_solve_state(false, false);
-        self.executor.bind_unsat_query_assumptions(&assumption_ids);
+        self.executor.bind_native_query_assumptions(&assumption_ids);
         self.record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
             assumptions: assumption_ids.clone(),
         });

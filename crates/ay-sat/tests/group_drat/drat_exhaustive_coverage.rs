@@ -553,7 +553,7 @@ fn drat_coverage_feature_congruence_only() {
         assert!(
             s.inprocessing_feature_profile().congruence,
             "DRAT proof mode must honor congruence requests (registry \
-             drat=true since 2026-07-10; kill-switch AY_AB_DRAT_SUBST=0)"
+             drat=true since 2026-07-10; kill-switch --sat-no-drat-subst)"
         );
     });
 }
@@ -576,7 +576,7 @@ fn drat_coverage_feature_decompose_only() {
         assert!(
             s.inprocessing_feature_profile().decompose,
             "DRAT proof mode must honor decompose requests (registry drat=true \
-             since 2026-07-09; kill-switch AY_AB_DRAT_SUBST=0)"
+             since 2026-07-09; kill-switch --sat-no-drat-subst)"
         );
     });
 }

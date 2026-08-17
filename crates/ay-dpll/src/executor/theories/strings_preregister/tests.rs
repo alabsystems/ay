@@ -902,7 +902,7 @@ fn term_contains(terms: &ay_core::TermStore, root: TermId, needle: TermId) -> bo
 }
 
 // ---------------------------------------------------------------------------
-// Strings increment P2 (`AY_STR_P2`): symbolic substr + indexof reductions.
+// Strings increment P2 (`--dpll-no-str-p2`): symbolic substr + indexof reductions.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1066,7 +1066,7 @@ fn detect_negative_only_witnesses_rejects_positive_and_structural_vars() {
 }
 
 // ---------------------------------------------------------------------------
-// Strings increment P3 (`AY_STR_P3`): to_int / from_int digit-string ↔ LIA.
+// Strings increment P3 (`--dpll-no-str-p3`): to_int / from_int digit-string ↔ LIA.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1252,25 +1252,22 @@ fn preregister_to_int_reductions_emits_from_int_axioms_and_roundtrip() {
     );
 }
 
-/// P3 went DEFAULT-ON (`AY_STR_P3=0` is the kill switch); this test previously
+/// P3 went DEFAULT-ON (`--dpll-no-str-p3` is the kill switch); this test previously
 /// asserted the pre-default-on contract and had gone stale. What still needs
 /// pinning is the TEST OVERRIDE: it must force the gate on regardless of the
-/// env default, and clearing it must return the gate to whatever the env says.
+/// CLI default, and clearing it must return the gate to the default.
 #[test]
-fn str_p3_gate_default_and_test_override_track_the_env() {
+fn str_p3_gate_default_and_test_override() {
     use super::super::strings_preregister::{str_p3_enabled, STR_P3_TEST_OVERRIDE};
-    let env_default = !matches!(std::env::var("AY_STR_P3").ok().as_deref(), Some("0"));
-    assert_eq!(
+    assert!(
         str_p3_enabled(),
-        env_default,
-        "P3 is DEFAULT-ON; only AY_STR_P3=0 turns it off"
+        "P3 must default ON (`--dpll-no-str-p3` kills it)"
     );
     STR_P3_TEST_OVERRIDE.with(|c| c.set(true));
     assert!(str_p3_enabled(), "test override must enable the P3 gate");
     STR_P3_TEST_OVERRIDE.with(|c| c.set(false));
-    assert_eq!(
+    assert!(
         str_p3_enabled(),
-        env_default,
-        "clearing the override must return the gate to the env default"
+        "clearing the override must return the gate to the default"
     );
 }

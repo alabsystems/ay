@@ -321,8 +321,6 @@ impl cold::ColdState {
             glucose_restarts: self.glucose_restarts,
             theory_conflict_ratio: self.theory_conflict_ratio,
             ext_conflict_count: self.ext_conflict_count,
-            trail_ema_slow: self.trail_ema_slow,
-            trail_ema_count: self.trail_ema_count,
             consecutive_ema_restarts: self.consecutive_ema_restarts,
             geometric_restarts: self.geometric_restarts,
             geometric_initial: self.geometric_initial,
@@ -471,6 +469,7 @@ impl cold::ColdState {
             level0_proof_id: self.level0_proof_id.clone(),
             level0_proof_sign: self.level0_proof_sign.clone(),
             lrat_level0_unit_materialize_cursor: 0,
+            lrat_level0_unit_materialize_pinned: Vec::new(),
             proof_bookkeeping_budget: None,
             next_clause_id: self.next_clause_id,
             next_original_clause_id: self.next_original_clause_id,
@@ -566,6 +565,10 @@ impl cold::ColdState {
             incremental_watch_boundary: self.incremental_watch_boundary,
             symmetry_enabled: self.symmetry_enabled,
             symmetry_stats: self.symmetry_stats.clone(),
+            capability_ledger: self.capability_ledger.clone(),
+            symmetry_signed_disabled: self.symmetry_signed_disabled,
+            symmetry_auxfree_disabled: self.symmetry_auxfree_disabled,
+            symmetry_orbitope_disabled: self.symmetry_orbitope_disabled,
 
             // Tracing (NOT cloned — these own file handles / writers)
             tla_trace: None,

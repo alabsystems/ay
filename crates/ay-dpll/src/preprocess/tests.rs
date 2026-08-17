@@ -6,6 +6,13 @@ use super::*;
 use ay_core::Sort;
 use num_bigint::BigInt;
 
+impl Preprocessor {
+    fn new_with_subst() -> (Self, Arc<Mutex<VariableSubstitution>>) {
+        let (preprocessor, var_subst, _) = Self::new_with_subst_and_propagation();
+        (preprocessor, var_subst)
+    }
+}
+
 #[test]
 fn test_preprocessor_with_no_assertions() {
     let mut terms = TermStore::new();

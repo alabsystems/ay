@@ -449,7 +449,7 @@ fn gate_condition_drat_proof_verification() {
 /// Congruence is DRAT-open since 2026-07-10 (registry `Congruence { drat:
 /// true }`, wf_ff5991a1: complementary-contradiction-edge skip + vivify
 /// garbage-husk exclusion; externally verified via dpr-trim + cake_lpr on
-/// congruence-active UNSAT runs; kill-switch AY_AB_DRAT_SUBST=0). The
+/// congruence-active UNSAT runs; kill-switch --sat-no-drat-subst). The
 /// request must be honored and the emitted proof must still verify —
 /// barrel6 is the instance whose FINALIZE_SAT_FAIL motivated the old clamp.
 #[test]
@@ -464,7 +464,7 @@ fn gate_congruence_drat_request_is_honored_barrel6() {
     assert!(
         solver.inprocessing_feature_profile().congruence,
         "DRAT proof mode must honor congruence requests (registry drat=true \
-         since 2026-07-10; kill-switch AY_AB_DRAT_SUBST=0)"
+         since 2026-07-10; kill-switch --sat-no-drat-subst)"
     );
     for clause in formula.clauses {
         solver.add_clause(clause);
@@ -482,7 +482,7 @@ fn gate_congruence_drat_request_is_honored_barrel6() {
 // the full pairwise oracle comparison below.
 
 /// Decompose is DRAT-open since 2026-07-09 (registry `Decompose { drat: true }`,
-/// externally verified via dpr-trim + cake_lpr; kill-switch AY_AB_DRAT_SUBST=0).
+/// externally verified via dpr-trim + cake_lpr; kill-switch --sat-no-drat-subst).
 /// The request must be honored and the emitted proof must still verify.
 #[test]
 #[timeout(120_000)]
@@ -496,7 +496,7 @@ fn gate_decompose_drat_request_is_honored() {
     assert!(
         solver.inprocessing_feature_profile().decompose,
         "DRAT proof mode must honor decompose requests (registry drat=true \
-         since 2026-07-09; kill-switch AY_AB_DRAT_SUBST=0)"
+         since 2026-07-09; kill-switch --sat-no-drat-subst)"
     );
     for clause in formula.clauses {
         solver.add_clause(clause);

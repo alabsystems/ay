@@ -630,14 +630,19 @@ impl Solver {
                     // SAFETY: guarded by i < binary_count <= watch_len, so the
                     // lookahead read is in bounds.
                     let next_entry = unsafe { *entries_ptr.add(i) };
-                    // SAFETY: the entry blocker is a Literal index < vals.len()
-                    // (same invariant as blocker_raw below); the pointer is
-                    // only passed to prefetch, never dereferenced.
-                    ay_prefetch::prefetch_read_l1(unsafe {
-                        vals_ptr.add(entry_blocker_raw(next_entry) as usize)
-                    });
+                    // The blocker is expected to be a live literal index, but
+                    // a prefetch hint never dereferences its address. Use
+                    // wrapping arithmetic so speculative lookahead does not
+                    // depend on that invariant for pointer construction.
+                    ay_prefetch::prefetch_read_l1(
+                        vals_ptr.wrapping_add(entry_blocker_raw(next_entry) as usize),
+                    );
                 }
 
+                debug_assert!(
+                    (blocker_raw as usize) < vals_len,
+                    "BUG: blocker_raw {blocker_raw} >= vals_len {vals_len} — stale watch entry after compaction?",
+                );
                 // SAFETY: blocker_raw is a Literal index. The invariant
                 // Literal::index() < 2 * num_vars == vals.len() is maintained
                 // by construction. Stale watch entries after compaction are
@@ -645,10 +650,6 @@ impl Solver {
                 // Removing the per-blocker bounds check (#8547 → #9301)
                 // eliminates one cmp+branch from the hottest BCP inner loop,
                 // matching CaDiCaL/GipSAT's unchecked `vals[lit]` pattern.
-                debug_assert!(
-                    (blocker_raw as usize) < vals_len,
-                    "BUG: blocker_raw {blocker_raw} >= vals_len {vals_len} — stale watch entry after compaction?",
-                );
                 let blocker_val: i8 = unsafe { *vals_ptr.add(blocker_raw as usize) };
 
                 if blocker_val > 0 {
@@ -748,6 +749,8 @@ impl Solver {
                 // SAFETY: i < end = watch_len, so entries_ptr.add(i) is in bounds.
                 // j <= i (compaction invariant), so entries_ptr.add(j) is in bounds.
                 let entry = unsafe { *entries_ptr.add(i) };
+                // SAFETY: j <= i < end = watch_len, and entries_ptr spans all
+                // watch_len packed entries, so the compaction write is in bounds.
                 unsafe { *entries_ptr.add(j) = entry };
                 i += 1;
 
@@ -772,24 +775,25 @@ impl Solver {
                     0
                 };
                 if prefetch_vals && i < end {
-                    // SAFETY: the entry blocker is a Literal index < vals.len()
-                    // (same invariant as blocker_raw below); the pointer is
-                    // only passed to prefetch, never dereferenced.
+                    // The blocker is expected to be a live literal index, but
+                    // a prefetch hint never dereferences its address. Use
+                    // wrapping arithmetic so speculative lookahead does not
+                    // depend on that invariant for pointer construction.
                     // (#shave6: gated — the next_entry load above stays
                     // unconditional because the clause prefetch on the
                     // blocker-miss path reuses it.)
-                    ay_prefetch::prefetch_read_l1(unsafe {
-                        vals_ptr.add(entry_blocker_raw(next_entry) as usize)
-                    });
+                    ay_prefetch::prefetch_read_l1(
+                        vals_ptr.wrapping_add(entry_blocker_raw(next_entry) as usize),
+                    );
                 }
 
-                // SAFETY: blocker_raw is a Literal index. The invariant
-                // Literal::index() < 2 * num_vars == vals.len() is maintained
-                // by construction (same reasoning as the binary prefix above).
                 debug_assert!(
                     (blocker_raw as usize) < vals_len,
                     "BUG: blocker_raw {blocker_raw} >= vals_len {vals_len} — stale watch entry after compaction?",
                 );
+                // SAFETY: blocker_raw is a Literal index. The invariant
+                // Literal::index() < 2 * num_vars == vals.len() is maintained
+                // by construction (same reasoning as the binary prefix above).
                 let blocker_val: i8 = unsafe { *vals_ptr.add(blocker_raw as usize) };
 
                 if blocker_val > 0 {
@@ -818,16 +822,13 @@ impl Solver {
                 // ~60-80 cycles of main-memory latency per long clause access.
                 // Reuses the `next_entry` loaded above (#shave5).
                 if i < end && !entry_is_binary(next_entry) {
-                    // SAFETY (prefetch pointer): words_ptr.add(offset)
-                    // computes a speculative address for prefetching. Even if
-                    // the offset is a corrupt value pointing outside the
-                    // arena, prefetch instructions (PRFM/PREFETCHT1) are hint
-                    // instructions that never fault — the CPU silently ignores
-                    // invalid addresses. The pointer is ONLY passed to
-                    // prefetch_read_l2, never dereferenced.
-                    ay_prefetch::prefetch_read_l2(unsafe {
-                        words_ptr.add(entry_clause_off(next_entry) as usize)
-                    });
+                    // `next_entry` is speculative and may carry a stale arena
+                    // offset. `wrapping_add` forms the hint address without the
+                    // in-allocation requirement of `ptr.add`; the result is
+                    // never dereferenced and prefetch instructions do not fault.
+                    ay_prefetch::prefetch_read_l2(
+                        words_ptr.wrapping_add(entry_clause_off(next_entry) as usize),
+                    );
                 }
 
                 // Read BCP header via unchecked raw pointer (#8465).
@@ -870,6 +871,8 @@ impl Solver {
                 // SAFETY: off + HEADER_WORDS + 0 and off + HEADER_WORDS + 1
                 // are within arena bounds (clause has >= 2 literals).
                 let lit0_raw = unsafe { *words_ptr.add(off + HEADER_WORDS) };
+                // SAFETY: the same validated two-literal clause extent covers
+                // off + HEADER_WORDS + 1.
                 let lit1_raw = unsafe { *words_ptr.add(off + HEADER_WORDS + 1) };
                 let lit0 = Literal(lit0_raw);
                 let lit1 = Literal(lit1_raw);
@@ -880,18 +883,18 @@ impl Solver {
                      with watched lits {lit0:?}, {lit1:?} — neither matches"
                 );
                 let first = Literal(lit0_raw ^ lit1_raw ^ false_lit.0);
-                // SAFETY: first is derived from XOR of two watched literals
-                // which are both valid Literal indices (validated at watch
-                // creation). The invariant Literal::index() < 2*num_vars ==
-                // vals.len() is maintained by construction. Removing the
-                // per-clause bounds check (#8547 → #9301) eliminates one
-                // cmp+branch from the long-clause path.
                 debug_assert!(
                     first.index() < vals_len,
                     "BUG: first.index() {} >= vals_len {} — stale clause?",
                     first.index(),
                     vals_len,
                 );
+                // SAFETY: first is derived from XOR of two watched literals
+                // which are both valid Literal indices (validated at watch
+                // creation). The invariant Literal::index() < 2*num_vars ==
+                // vals.len() is maintained by construction. Removing the
+                // per-clause bounds check (#8547 → #9301) eliminates one
+                // cmp+branch from the long-clause path.
                 let first_val: i8 = unsafe { *vals_ptr.add(first.index()) };
 
                 if first_val > 0 {
@@ -982,6 +985,8 @@ impl Solver {
                             // against words_len above; lit2_raw is a clause
                             // literal, a valid index < vals.len().
                             let lit2_raw = unsafe { *words_ptr.add(lits_base + 2) };
+                            // SAFETY: lit2_raw came from the validated clause
+                            // extent and clause literals are valid vals indices.
                             let v2: i8 = unsafe { *vals_ptr.add(lit2_raw as usize) };
                             if v2 >= 0 {
                                 replacement_k = 2;
@@ -1001,6 +1006,8 @@ impl Solver {
                             // against words_len above; lit2_raw is a clause
                             // literal, a valid index < vals.len().
                             let lit2_raw = unsafe { *words_ptr.add(lits_base + 2) };
+                            // SAFETY: lit2_raw came from the validated clause
+                            // extent and clause literals are valid vals indices.
                             let v2: i8 = unsafe { *vals_ptr.add(lit2_raw as usize) };
                             if v2 >= 0 {
                                 replacement_k = 2;
@@ -1018,6 +1025,8 @@ impl Solver {
                                 // against words_len above; lit3_raw is a clause
                                 // literal, a valid index < vals.len().
                                 let lit3_raw = unsafe { *words_ptr.add(lits_base + 3) };
+                                // SAFETY: lit3_raw came from the validated clause
+                                // extent and clause literals are valid vals indices.
                                 let v3: i8 = unsafe { *vals_ptr.add(lit3_raw as usize) };
                                 if v3 >= 0 {
                                     replacement_k = 3;
@@ -1038,6 +1047,8 @@ impl Solver {
                             // against words_len above; lit2_raw is a clause
                             // literal, a valid index < vals.len().
                             let lit2_raw = unsafe { *words_ptr.add(lits_base + 2) };
+                            // SAFETY: lit2_raw came from the validated clause
+                            // extent and clause literals are valid vals indices.
                             let v2: i8 = unsafe { *vals_ptr.add(lit2_raw as usize) };
                             if v2 >= 0 {
                                 replacement_k = 2;
@@ -1055,6 +1066,8 @@ impl Solver {
                                 // against words_len above; lit3_raw is a clause
                                 // literal, a valid index < vals.len().
                                 let lit3_raw = unsafe { *words_ptr.add(lits_base + 3) };
+                                // SAFETY: lit3_raw came from the validated clause
+                                // extent and clause literals are valid vals indices.
                                 let v3: i8 = unsafe { *vals_ptr.add(lit3_raw as usize) };
                                 if v3 >= 0 {
                                     replacement_k = 3;
@@ -1072,6 +1085,8 @@ impl Solver {
                                     // words_len above; lit4_raw is a clause
                                     // literal, a valid index < vals.len().
                                     let lit4_raw = unsafe { *words_ptr.add(lits_base + 4) };
+                                    // SAFETY: lit4_raw came from the validated clause
+                                    // extent and clause literals are valid vals indices.
                                     let v4: i8 = unsafe { *vals_ptr.add(lit4_raw as usize) };
                                     if v4 >= 0 {
                                         replacement_k = 4;
@@ -1160,6 +1175,8 @@ impl Solver {
                         // words_len; the loaded literal is a valid index
                         // < vals.len() by construction.
                         saved_start_lit_raw = unsafe { *words_ptr.add(lits_base + pos) };
+                        // SAFETY: saved_start_lit_raw came from the validated
+                        // clause extent and clause literals are valid vals indices.
                         saved_start_val = unsafe { *vals_ptr.add(saved_start_lit_raw as usize) };
                         if COLLECT_BCP_TELEMETRY {
                             self.stats.bcp_long_saved_pos_scans += 1;
@@ -1259,6 +1276,8 @@ impl Solver {
                                 // lit_k_raw is a clause literal, a valid
                                 // index < vals.len().
                                 let lit_k_raw = unsafe { *words_ptr.add(lits_base + $k) };
+                                // SAFETY: lit_k_raw came from the validated clause
+                                // extent and clause literals are valid vals indices.
                                 let v: i8 = unsafe { *vals_ptr.add(lit_k_raw as usize) };
                                 if v >= 0 {
                                     replacement_k = $k;
@@ -1624,6 +1643,8 @@ impl Solver {
                             // words_len; next_lit_raw is a clause literal, a
                             // valid index < vals.len().
                             let next_lit_raw = unsafe { *words_ptr.add(lits_base + next_k) };
+                            // SAFETY: next_lit_raw came from the validated clause
+                            // extent and clause literals are valid vals indices.
                             let next_val: i8 = unsafe { *vals_ptr.add(next_lit_raw as usize) };
                             if next_val >= 0 {
                                 next_k
@@ -1820,8 +1841,9 @@ impl Solver {
                     // position j from the speculative copy above.
                     j += 1;
                     self.unsafe_copy_remaining_entries(entries_ptr, &mut j, i, end);
-                    // SAFETY: j <= end. All entries in [0, j) are valid.
                     if j != end {
+                        // SAFETY: unsafe_copy_remaining_entries preserves
+                        // j <= end and initializes every entry in [0, j).
                         unsafe {
                             self.watches
                                 .get_watches_mut(false_lit)
@@ -1839,12 +1861,13 @@ impl Solver {
                 // Keep current watcher — the full entry is already at position
                 // j from the speculative copy above; refresh only the blocker
                 // half (clause half preserved).
-                // SAFETY: j <= i < end, entries_ptr.add(j) in bounds.
                 let skip_unit_blocker_refresh =
                     disable_learned_1963_no_replacement_unit_blocker_refresh
                         && clause_is_learned
                         && (19..=63).contains(&clause_len);
                 if !skip_unit_blocker_refresh {
+                    // SAFETY: the scan already advanced past this entry, so
+                    // j < i <= end and therefore j indexes entries_ptr.
                     unsafe {
                         *entries_ptr.add(j) = entry_with_blocker(entry, first.0);
                     }
@@ -1872,10 +1895,9 @@ impl Solver {
                 j <= watch_len,
                 "BCP unsafe: final j ({j}) > watch_len ({watch_len})"
             );
-            // SAFETY: j <= watch_len = original length. All entries in [0, j)
-            // were written by the loop above (either copied from the original
-            // position or updated with new blocker values).
             if j != watch_len {
+                // SAFETY: j <= watch_len = original length, and the loop wrote
+                // valid packed entries throughout [0, j).
                 unsafe {
                     self.watches
                         .get_watches_mut(false_lit)
@@ -2025,6 +2047,8 @@ impl Solver {
         extra_flags: u8,
     ) {
         let vi = lit.variable().index();
+        // SAFETY: The caller guarantees `vi` indexes phase/var_data/vals and
+        // that the trail has spare capacity, as detailed in the contract above.
         unsafe {
             *self.phase.get_unchecked_mut(vi) = lit.sign_i8();
             ay_prefetch::val_set(&mut self.vals, lit.index(), 1);
@@ -2081,7 +2105,12 @@ impl Solver {
         );
         debug_assert!(!self.chrono_enabled);
         let dl = self.decision_level;
-        // SAFETY: as in enqueue_bcp_nochrono_fast.
+        // SAFETY: the only call site passes an unassigned blocker from a live
+        // binary watcher. The watch/rebuild invariant keeps that literal below
+        // `2 * num_vars`, so its variable indexes phase/VarData. Because each
+        // variable has at most one trail entry, this unassigned variable gives
+        // `trail.len() < num_vars`; the BCP entry reserved at least `num_vars`
+        // slots, so the raw trail push also remains within capacity.
         unsafe {
             self.assign_bcp_unchecked(lit, dl, reason.0, VarData::FLAG_BINARY_REASON_PUB);
         }
@@ -2112,7 +2141,12 @@ impl Solver {
             }
         }
         let dl = self.decision_level;
-        // SAFETY: as in enqueue_bcp_nochrono_fast.
+        // SAFETY: the only call site passes an unassigned blocker from a live
+        // binary watcher. The watch/rebuild invariant keeps that literal below
+        // `2 * num_vars`, so its variable indexes phase/VarData; shortening
+        // `reason_lit` changes only encoded reason data. One trail entry per
+        // assigned variable gives `trail.len() < num_vars`, and the BCP entry
+        // reserved at least `num_vars` slots before this unchecked push.
         unsafe {
             self.assign_bcp_unchecked(
                 lit,

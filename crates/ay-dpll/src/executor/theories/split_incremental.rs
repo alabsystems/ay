@@ -233,7 +233,11 @@ fn encode_atom_delta(
     let state =
         negations.take_tseitin_encoder(local_term_to_var, local_var_to_term, *local_next_var);
     let prev_next_var = state.next_var;
-    let mut tseitin = Tseitin::from_state(terms, state);
+    let mut tseitin = if negations.proof_enabled() {
+        Tseitin::from_state_with_proofs(terms, state)
+    } else {
+        Tseitin::from_state(terms, state)
+    };
     let enc = tseitin.encode_assertion(atom);
     let state = tseitin.into_state();
     let new_next_var = state.next_var;
@@ -276,7 +280,12 @@ fn encode_atom_delta(
     // writes land in the live persisted state.
     negations.put_tseitin_encoder(state);
 
-    add_def_clauses(solver, &enc.def_clauses);
+    add_def_clauses(
+        solver,
+        &enc.def_clauses,
+        enc.def_proof_annotations.as_deref(),
+        negations,
+    );
 
     enc.root_lit
 }
@@ -287,8 +296,16 @@ fn encode_atom_delta(
 /// literal `lit` maps to `SatVariable::new(|lit| - 1)`. `encode_assertion`
 /// excludes the root-asserting unit, so (unlike the former
 /// `add_split_def_clauses`) there is no unit clause to skip.
-fn add_def_clauses(solver: &mut SatSolver, def_clauses: &[CnfClause]) {
-    for clause in def_clauses {
+fn add_def_clauses(
+    solver: &mut SatSolver,
+    def_clauses: &[CnfClause],
+    annotations: Option<&[Option<ay_core::ClausificationProof>]>,
+    negations: &mut IncrementalNegationCache,
+) {
+    if let Some(annotations) = annotations {
+        assert_eq!(annotations.len(), def_clauses.len());
+    }
+    for (index, clause) in def_clauses.iter().enumerate() {
         let lits: Vec<SatLiteral> = clause
             .literals()
             .iter()
@@ -312,7 +329,14 @@ fn add_def_clauses(solver: &mut SatSolver, def_clauses: &[CnfClause]) {
                 clause.literals(),
             );
         }
+        let before = solver.issued_original_clause_id_max();
         solver.add_clause(lits);
+        if let (Some(original_id), Some(Some(annotation))) = (
+            single_issued_original_id_since(solver, before),
+            annotations.map(|all| all[index].clone()),
+        ) {
+            negations.note_clausification_authority(original_id, annotation);
+        }
     }
 }
 
@@ -388,15 +412,49 @@ pub(crate) fn ensure_incremental_atom_encoded(
 
             let root_sat_var = SatVariable::new(sat_var);
             let atom_sat_var = SatVariable::new(atom_var);
+            let adapter_complement = match terms.get(atom) {
+                TermData::Not(inner) => Some(*inner),
+                _ => None,
+            };
             // v_atom <=> root_lit, where root_lit is negative in this branch.
+            let first_before = solver.issued_original_clause_id_max();
             solver.add_clause(vec![
                 SatLiteral::negative(atom_sat_var),
                 SatLiteral::negative(root_sat_var),
             ]);
+            if let (Some(original_id), Some(complement)) = (
+                single_issued_original_id_since(solver, first_before),
+                adapter_complement,
+            ) {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: vec![complement, atom],
+                        kind: ay_core::TheoryLemmaKind::BoolTautology,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            }
+            let second_before = solver.issued_original_clause_id_max();
             solver.add_clause(vec![
                 SatLiteral::positive(atom_sat_var),
                 SatLiteral::positive(root_sat_var),
             ]);
+            if let (Some(original_id), Some(complement)) = (
+                single_issued_original_id_since(solver, second_before),
+                adapter_complement,
+            ) {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: vec![atom, complement],
+                        kind: ay_core::TheoryLemmaKind::BoolTautology,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            }
 
             local_term_to_var.insert(atom, atom_var);
             local_var_to_term.insert(atom_var, atom);
@@ -564,7 +622,10 @@ pub(in crate::executor) fn replay_incremental_bound_refinements(
 pub(in crate::executor) enum BlockingClauseResult {
     /// Primary clause was added to the SAT solver, plus all mappable
     /// extra_conflicts. Continue the SAT loop.
-    Added,
+    Added {
+        primary_original_id: Option<u64>,
+        extra_original_ids: Vec<(usize, u64)>,
+    },
     /// The conflict mapped to an empty clause, meaning unconditional UNSAT.
     /// The caller should pop the SAT scope and return `SolveResult::Unsat`.
     Unsat,
@@ -656,14 +717,19 @@ pub(in crate::executor) fn map_conflict_to_blocking_clause(
     // (old behavior) unless the solver's `unguarded_theory_conflict_lemmas`
     // flag is set (the inc-engine QF_LRA lane), in which case it persists
     // across pop() in the deletable learned tier.
-    solver.add_theory_conflict_lemma(clause);
+    let primary_before = solver.issued_original_clause_id_max();
+    let _ = solver.add_theory_conflict_lemma(clause);
+    let primary_original_id = single_issued_original_id_since(solver, primary_before);
 
     // Add blocking clauses for remaining batch-collected bound conflicts (#5117).
     // Skip any extra clause where a conflict term fails to map — a partial
     // clause is stronger than what the theory proved and could cause false UNSAT.
-    add_extra_blocking_clauses(solver, extra_conflicts, local_term_to_var);
+    let extra_original_ids = add_extra_blocking_clauses(solver, extra_conflicts, local_term_to_var);
 
-    BlockingClauseResult::Added
+    BlockingClauseResult::Added {
+        primary_original_id,
+        extra_original_ids,
+    }
 }
 
 /// Encode a split pair into the incremental SAT solver, build a disjunctive
@@ -677,7 +743,7 @@ pub(in crate::executor) fn map_conflict_to_blocking_clause(
 /// `solve_incremental_split_loop_pipeline!` (#6321).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::executor) fn encode_and_add_split_clause(
-    terms: &TermStore,
+    terms: &mut TermStore,
     solver: &mut SatSolver,
     local_term_to_var: &mut HashMap<TermId, u32>,
     local_var_to_term: &mut HashMap<u32, TermId>,
@@ -712,11 +778,28 @@ pub(in crate::executor) fn encode_and_add_split_clause(
         SatLiteral::positive(left_var),
         SatLiteral::positive(right_var),
     ];
+    let mut proof_clause = vec![left_atom, right_atom];
     if let Some((diseq_term, is_distinct)) = disequality_guard {
         if let Some(guard_lit) =
             split_guard_clause_literal(terms, local_term_to_var, diseq_term, is_distinct)
         {
             clause.push(guard_lit);
+            let guard_term = if guard_lit.is_positive() {
+                local_var_to_term
+                    .get(&(guard_lit.variable().index() as u32))
+                    .copied()
+            } else {
+                local_var_to_term
+                    .get(&(guard_lit.variable().index() as u32))
+                    .copied()
+                    .map(|term| match terms.get(term) {
+                        TermData::Not(inner) => *inner,
+                        _ => terms.mk_not(term),
+                    })
+            };
+            if let Some(guard_term) = guard_term {
+                proof_clause.push(guard_term);
+            }
         }
     }
     // ORIGINAL-ledger route (scoped): split progress clauses are added once
@@ -731,7 +814,32 @@ pub(in crate::executor) fn encode_and_add_split_clause(
     // registers the clause in the scoped original ledger, which every
     // rebuild path re-adds; this also matches the non-incremental
     // pipelines, where split clauses are re-encoded as input clauses.
+    let cover_before = solver.issued_original_clause_id_max();
     let mut added_any = solver.add_clause(clause);
+    if let Some(original_id) = single_issued_original_id_since(solver, cover_before) {
+        let kind =
+            if ay_core::proof_validation::recognize_int_bounds_tautology(terms, &proof_clause) {
+                Some(ay_core::TheoryLemmaKind::IntBoundsTautology)
+            } else if ay_core::proof_validation::recognize_arith_disequality_split(
+                terms,
+                &proof_clause,
+            ) {
+                Some(ay_core::TheoryLemmaKind::ArithDisequalitySplit)
+            } else {
+                None
+            };
+        if let Some(kind) = kind {
+            negations.note_theory_authority(
+                original_id,
+                ay_core::TheoryLemmaProof {
+                    clause: proof_clause,
+                    kind,
+                    farkas: None,
+                    lia: None,
+                },
+            );
+        }
+    }
 
     // #8762 optimization: disequality and expression splits encode genuinely
     // mutually exclusive branches — `x <= c-1` and `x >= c+1` for int splits,
@@ -757,11 +865,49 @@ pub(in crate::executor) fn encode_and_add_split_clause(
     // at-least-one already forced `v=true`, which is the correct semantics for
     // a tautologically-true split.
     if left_var != right_var {
+        let not_left = terms.mk_not(left_atom);
+        let not_right = terms.mk_not(right_atom);
         let mutex_clause = vec![
             SatLiteral::negative(left_var),
             SatLiteral::negative(right_var),
         ];
+        let mutex_before = solver.issued_original_clause_id_max();
         added_any |= solver.add_clause(mutex_clause);
+        if let Some(original_id) = single_issued_original_id_since(solver, mutex_before) {
+            let proof_clause = vec![not_left, not_right];
+            if ay_core::proof_validation::recognize_int_bounds_tautology(terms, &proof_clause) {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: proof_clause,
+                        kind: ay_core::TheoryLemmaKind::IntBoundsTautology,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            } else {
+                let conflict = vec![
+                    TheoryLit::new(left_atom, true),
+                    TheoryLit::new(right_atom, true),
+                ];
+                let farkas = ay_core::FarkasAnnotation::from_ints(&[1, 1]);
+                if ay_core::proof_validation::verify_farkas_conflict_lits_full(
+                    terms, &conflict, &farkas,
+                )
+                .is_ok()
+                {
+                    negations.note_theory_authority(
+                        original_id,
+                        ay_core::TheoryLemmaProof {
+                            clause: proof_clause,
+                            kind: ay_core::TheoryLemmaKind::LraFarkas,
+                            farkas: Some(farkas),
+                            lia: None,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     (left_var, right_var, added_any)
@@ -781,7 +927,7 @@ pub(in crate::executor) fn encode_and_add_split_clause(
 /// disequality, merely without the convergence help).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::executor) fn encode_and_add_negated_atom_lemma(
-    terms: &TermStore,
+    terms: &mut TermStore,
     solver: &mut SatSolver,
     local_term_to_var: &mut HashMap<TermId, u32>,
     local_var_to_term: &mut HashMap<u32, TermId>,
@@ -824,7 +970,31 @@ pub(in crate::executor) fn encode_and_add_negated_atom_lemma(
     let clause = vec![SatLiteral::negative(atom_var), guard_lit];
     // ORIGINAL-ledger route: same rebuild-survival rationale as the split
     // clauses in `encode_and_add_split_clause` above.
-    solver.add_clause(clause)
+    let before = solver.issued_original_clause_id_max();
+    let added = solver.add_clause(clause);
+    if let Some(original_id) = single_issued_original_id_since(solver, before) {
+        let not_atom = terms.mk_not(atom);
+        let guard_term = if guard_lit.is_positive() {
+            local_var_to_term
+                .get(&(guard_lit.variable().index() as u32))
+                .copied()
+        } else {
+            local_var_to_term
+                .get(&(guard_lit.variable().index() as u32))
+                .copied()
+                .map(|term| match terms.get(term) {
+                    TermData::Not(inner) => *inner,
+                    _ => terms.mk_not(term),
+                })
+        };
+        // The native checker has an exact schema for this optimization, but
+        // the pinned external checker still lacks a premise-free presentation
+        // for its congruence contrapositive. Deliberately leave the indexed
+        // authority absent: a strict proof depending on the clause fails
+        // closed instead of exporting a hole.
+        let _ = (original_id, not_atom, guard_term);
+    }
+    added
 }
 
 /// #qfuflia-diseq-preencode: eagerly encode the arithmetic case split for
@@ -1136,8 +1306,9 @@ pub(in crate::executor) fn add_extra_blocking_clauses(
     solver: &mut SatSolver,
     extra_conflicts: &[TheoryConflict],
     local_term_to_var: &HashMap<TermId, u32>,
-) {
-    for extra in extra_conflicts {
+) -> Vec<(usize, u64)> {
+    let mut original_ids = Vec::new();
+    for (source_index, extra) in extra_conflicts.iter().enumerate() {
         if let Ok(extra_clause) = map_conflict_lits(&extra.literals, local_term_to_var) {
             if !extra_clause.is_empty() {
                 // #unguarded-tvalid-lemmas STAGE 1: batch bound conflicts are
@@ -1146,9 +1317,24 @@ pub(in crate::executor) fn add_extra_blocking_clauses(
                 // conflict) — route through the conflict-lemma gate so the
                 // inc-engine lane retains them across pop(). Scoped (old
                 // behavior) whenever the solver flag is off.
-                solver.add_theory_conflict_lemma(extra_clause);
+                let before = solver.issued_original_clause_id_max();
+                let _ = solver.add_theory_conflict_lemma(extra_clause);
+                if let Some(id) = single_issued_original_id_since(solver, before) {
+                    original_ids.push((source_index, id));
+                }
             }
         }
         // Err = some terms unmapped → skip this clause (partial mapping is unsound)
     }
+    original_ids
+}
+
+pub(crate) fn single_issued_original_id_since(solver: &SatSolver, before: u64) -> Option<u64> {
+    let after = solver.issued_original_clause_id_max();
+    if after <= before {
+        return None;
+    }
+    let mut issued = (before + 1..=after).filter(|&id| solver.is_issued_original_clause_id(id));
+    let id = issued.next()?;
+    issued.next().is_none().then_some(id)
 }

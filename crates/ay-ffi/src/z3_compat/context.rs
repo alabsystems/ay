@@ -47,7 +47,9 @@ pub unsafe extern "C" fn Z3_del_config(c: Z3_config) {
 /// Only `timeout` is currently honored by AY.
 ///
 /// # Safety
-/// All pointers must be valid.
+/// `c` must point to a live config that is not concurrently accessed. Both
+/// string pointers must remain readable through their NUL terminators for this
+/// call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_set_param_value(
     c: Z3_config,
@@ -57,11 +59,17 @@ pub unsafe extern "C" fn Z3_set_param_value(
     if c.is_null() || param_id.is_null() || param_value.is_null() {
         return;
     }
-    // SAFETY: both pointers are non-null and valid NUL-terminated strings per
-    // the caller contract; the helper bounds each scan and clone.
-    let (Ok(key), Ok(value)) = (unsafe { ffi_read_bounded_text(param_id) }, unsafe {
-        ffi_read_bounded_text(param_value)
-    }) else {
+    let key = {
+        // SAFETY: `param_id` was null-checked above and the caller guarantees it
+        // remains a valid NUL-terminated string while the bounded helper clones it.
+        unsafe { ffi_read_bounded_text(param_id) }
+    };
+    let value = {
+        // SAFETY: `param_value` was null-checked above and the caller guarantees it
+        // remains a valid NUL-terminated string while the bounded helper clones it.
+        unsafe { ffi_read_bounded_text(param_value) }
+    };
+    let (Ok(key), Ok(value)) = (key, value) else {
         return;
     };
     // SAFETY: `c` was null-checked above and points to a live `Z3Config` that

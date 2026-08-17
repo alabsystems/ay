@@ -47,7 +47,7 @@ fn expression_limits(depth: usize) -> BvExprProofLimits {
         max_estimated_gate_work: 100_000,
         max_construction_bytes: 128 * 1024 * 1024,
         max_resolution_steps: 250_000,
-        max_expanded_literals: 2_000_000,
+        max_expanded_literals: BOUNDED_MAX_EXPANDED_LITERALS,
         max_expansion_work: 50_000_000,
         max_expansion_bytes: 128 * 1024 * 1024,
         resolution,

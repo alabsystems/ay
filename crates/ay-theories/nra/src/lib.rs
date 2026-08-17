@@ -25,10 +25,10 @@
     clippy::type_complexity,
     clippy::wrong_self_convention
 )]
-
 pub mod algebraic;
 mod check_loop;
 pub(crate) mod feasible_set;
+mod grounding;
 mod icp;
 mod monomial;
 mod nlsat;
@@ -46,6 +46,8 @@ mod univariate;
 mod verification;
 
 #[cfg(test)]
+mod scaled_product_tests;
+#[cfg(test)]
 mod theory_tests;
 
 // #8529: Use deterministic hash maps in all builds.
@@ -60,43 +62,21 @@ use ay_core::{TheoryLit, TheoryPropagation, TheoryResult, TheorySolver};
 
 use feasible_set::FeasibleSet;
 use monomial::Monomial;
-use num_traits::One;
+use num_traits::{One, Zero};
 use sign::SignConstraint;
 
-/// The rational value of `term` if it is a numeric literal, else `None`.
-///
-/// Handles `Int` literals, `Rational` literals, and unary negation of either —
-/// SMT-LIB writes negative literals as `(- 2)`, which is an `App`, not a `Const`.
-/// Used by `#nra-const-factor` to separate the constant factors of a flattened
-/// product from its variable factors.
-fn constant_value_of(terms: &TermStore, term: TermId) -> Option<BigRational> {
-    match terms.get(term) {
-        TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
-        TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
-        TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
-            constant_value_of(terms, args[0]).map(|c| -c)
-        }
-        _ => None,
-    }
+use ay_core::nonlinear::{constant_factor_of, constant_value_of};
+
+/// Compound linear factors are not interned by LRA when they occur inside a
+/// nonlinear product, so NRA must assert their exact definitions explicitly.
+fn is_compound_linear_term(terms: &TermStore, term: TermId) -> bool {
+    matches!(
+        terms.get(term),
+        TermData::App(Symbol::Named(name), _) if name == "+" || name == "-"
+    )
 }
 
-/// The product of the constant factors of `term` when it is a `*` application,
-/// else `1`. `#nra-const-factor` invariant helper: a term that may be used as a
-/// monomial `aux_var` must have a constant factor of exactly 1.
-fn constant_factor_of(terms: &TermStore, term: TermId) -> BigRational {
-    match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if name == "*" => {
-            let mut product = BigRational::one();
-            for &arg in args {
-                if let Some(c) = constant_value_of(terms, arg) {
-                    product *= c;
-                }
-            }
-            product
-        }
-        _ => BigRational::one(),
-    }
-}
+const LINEAR_DEFINITION_MAX_DEPTH: usize = 64;
 
 /// A purified division: `(/ num denom)` → fresh LRA variable `div_term`,
 /// with side constraint `denom * div_term = num`.
@@ -133,6 +113,11 @@ pub use ay_lra::LraModel;
 /// target rather than an `#[ignore]`d test that never runs.
 #[doc(hidden)]
 pub use subresultant::diag_subresultant_incumbent_versus_fraction_free;
+/// Exact rational square root (`None` unless the argument is the square of a
+/// rational). Exposed so model-side rational-point searches solve their
+/// quadratics with the SAME exact primitive the algebraic kernel uses, rather
+/// than a second implementation.
+pub use univariate::exact_rational_sqrt;
 
 /// Trail entry for sign constraint push/pop (#8626).
 /// Records which map received an addition so it can be undone on pop.
@@ -150,10 +135,16 @@ pub struct NraSolver<'a> {
     terms: &'a TermStore,
     /// Underlying LRA solver for linear constraints
     pub(crate) lra: ay_lra::LraSolver,
-    /// Tracked monomials: sorted var list -> Monomial info
+    /// Representative product for each sorted variable multiset.
     pub(crate) monomials: HashMap<Vec<TermId>, Monomial>,
-    /// Auxiliary variable to monomial mapping (reverse index)
+    /// Additional differently-scaled terms over a represented multiset.
+    pub(crate) scaled_aliases: Vec<Monomial>,
+    /// Auxiliary variable to monomial mapping, including scaled aliases.
     aux_to_monomial: HashMap<TermId, Vec<TermId>>,
+    /// Compound linear factors whose exact LRA definitions must be emitted.
+    compound_factors: Vec<TermId>,
+    /// Compound-factor identities already emitted in the active LRA scope.
+    compound_defs_emitted: HashSet<TermId>,
     /// Sign constraints on monomials
     sign_constraints: HashMap<Vec<TermId>, Vec<(SignConstraint, TermId)>>,
     /// Sign constraints on variables
@@ -193,29 +184,27 @@ pub struct NraSolver<'a> {
     tangent_lemma_count: u64,
     patch_count: u64,
     sign_cut_count: u64,
-    /// Number of tentative LRA scopes active (sign-cut + patch scopes).
-    /// The sign-cut path (lib.rs:322) and try_tentative_patch (patch.rs:245)
-    /// each push one scope. undo_tentative_patch() must pop ALL of them
-    /// to avoid leaking model-dependent bounds into future queries.
+    /// Active sign-cut and patch scopes; `undo_tentative_patch` pops all of them
+    /// so model-dependent bounds cannot leak into later queries.
     tentative_depth: u32,
 
     // --- clauseSMT NLSAT techniques (#8445) ---
-    /// Per-variable feasible sets: intersection of clause-level feasible sets.
-    /// Updated during clause-level propagation when a clause becomes univariate.
-    /// Maps term_id of variables involved in nonlinear constraints to their
-    /// current feasible sets.
+    /// Per-variable intersections of clause-level feasible sets, updated when a
+    /// clause becomes univariate.
     pub(crate) feasible_sets: HashMap<TermId, FeasibleSet>,
 
-    /// Variables whose feasible set has become empty (blocked).
-    /// These are prioritized for branching (highest priority).
+    /// Empty-feasible-set variables, given highest branching priority.
     pub(crate) blocked_vars: Vec<TermId>,
 
-    /// Variables whose feasible set has become a single point (fixed).
-    /// Second-highest priority for branching.
+    /// Singleton-feasible-set variables, given second-highest branching priority.
     pub(crate) fixed_vars: Vec<(TermId, BigRational)>,
 
     /// Count of feasible-set computations for statistics.
     feasible_set_count: u64,
+
+    /// Assertion-derived fixed values and identities emitted in the current scope.
+    pub(crate) fixed_factor_values: HashMap<TermId, BigRational>,
+    pub(crate) fixed_lin_emitted: HashSet<TermId>,
 
     /// All registered (internalized) theory atoms. Used by suggest_decision_atom
     /// to find unassigned atoms involving blocked/fixed variables. Unlike
@@ -305,7 +294,10 @@ impl<'a> NraSolver<'a> {
             terms,
             lra,
             monomials: HashMap::default(),
+            scaled_aliases: Vec::new(),
             aux_to_monomial: HashMap::default(),
+            compound_factors: Vec::new(),
+            compound_defs_emitted: HashSet::default(),
             sign_constraints: HashMap::default(),
             var_sign_constraints: HashMap::default(),
             sign_constraint_trail: Vec::new(),
@@ -326,6 +318,8 @@ impl<'a> NraSolver<'a> {
             blocked_vars: Vec::new(),
             fixed_vars: Vec::new(),
             feasible_set_count: 0,
+            fixed_factor_values: HashMap::default(),
+            fixed_lin_emitted: HashSet::default(),
             registered_atoms: Vec::new(),
             asserted_atom_set: HashSet::default(),
             algebraic_model: Vec::new(),
@@ -372,33 +366,44 @@ impl<'a> NraSolver<'a> {
         self.lra.get_value(var)
     }
 
-    /// Register a monomial
-    ///
-    /// INVARIANT (`#nra-const-factor`): `aux_var` must denote EXACTLY
-    /// `product(vars)`, with no residual constant factor. Every consumer of a
-    /// registered monomial (sign lemmas, McCormick/tangent cuts, even-power
-    /// non-negativity, `check_monomial_consistency`, `propagate_monomial_signs`)
-    /// relies on that equality; registering `c * product(vars)` under the key
-    /// `vars` makes them enforce a FALSE relation and can yield a wrong `unsat`.
-    fn register_monomial(&mut self, vars: Vec<TermId>, aux_var: TermId) {
-        debug_assert!(
-            constant_factor_of(self.terms, aux_var).is_one(),
-            "#nra-const-factor: register_monomial called with a SCALED aux term \
-             {aux_var:?} (constant factor {:?} != 1); aux_var must equal \
-             product(vars) exactly or every monomial consumer enforces a false \
-             relation (wrong-unsat)",
-            constant_factor_of(self.terms, aux_var)
-        );
+    /// Iterate every tracked product, including differently-scaled aliases.
+    pub(crate) fn products(&self) -> impl Iterator<Item = &Monomial> {
+        self.monomials.values().chain(self.scaled_aliases.iter())
+    }
+
+    /// Register `aux_var == coeff * product(vars)` exactly.
+    fn register_product(&mut self, vars: Vec<TermId>, aux_var: TermId, coeff: BigRational) {
+        debug_assert_eq!(constant_factor_of(self.terms, aux_var), coeff);
+        debug_assert!(!coeff.is_zero());
+        if coeff.is_zero() || self.aux_to_monomial.contains_key(&aux_var) {
+            return;
+        }
         if self.debug {
             tracing::debug!(
-                "[NRA] register_monomial: vars={:?}, aux_var={:?}",
+                "[NRA] register_product: vars={:?}, aux_var={:?}, coeff={:?}",
                 vars,
-                aux_var
+                aux_var,
+                coeff
             );
         }
-        let mon = Monomial::new(vars.clone(), aux_var);
+        for &factor in &vars {
+            if is_compound_linear_term(self.terms, factor)
+                && !self.compound_factors.contains(&factor)
+            {
+                self.compound_factors.push(factor);
+            }
+        }
+        let is_alias = self
+            .monomials
+            .get(&vars)
+            .is_some_and(|representative| representative.aux_var != aux_var);
+        let mon = Monomial::new_scaled(vars.clone(), aux_var, coeff);
         self.aux_to_monomial.insert(aux_var, vars.clone());
-        self.monomials.insert(vars, mon);
+        if is_alias {
+            self.scaled_aliases.push(mon);
+        } else {
+            self.monomials.insert(vars, mon);
+        }
     }
 
     /// Recursively scan a term for nonlinear subterms and register them
@@ -407,35 +412,9 @@ impl<'a> NraSolver<'a> {
             TermData::App(Symbol::Named(name), args) => {
                 match name.as_str() {
                     "*" => {
-                        // SOUNDNESS (`#nra-const-factor`, sibling of
-                        // `#nia-const-factor` in nia/src/tangent_add.rs).
-                        //
-                        // The frontend flattens nested products, so
-                        // `(* x (* y (- 2)))` arrives here as the single n-ary
-                        // node `(* x y (- 2))`. Splitting the args into
-                        // constants and variables and then registering the WHOLE
-                        // node as the aux var of the monomial `[x, y]` asserts
-                        // `aux_var == x*y` for a term whose value is `-2*x*y`.
-                        // Every consumer then reasons with that false equality:
-                        //   * `record_sign_constraint` files the atom's sign
-                        //     verbatim on the bare monomial, so `-2*x*y <= 0`
-                        //     becomes `x*y <= 0` — the OPPOSITE of what was
-                        //     asserted — and `check_sign_consistency` reports a
-                        //     conflict against `x > 0, y > 0`. That is a wrong
-                        //     `unsat` (a false theorem), the P0 meti-tarski bug.
-                        //   * McCormick/tangent cuts (tangent.rs) and
-                        //     `add_even_power_nonneg` inject linear bounds that
-                        //     are false for the scaled term.
-                        //   * `check_monomial_consistency` (check_loop.rs)
-                        //     enforces `c*prod == prod`.
-                        //
-                        // Track the product of the constant factors and only
-                        // register when it is exactly 1, so the invariant
-                        // `aux_var == product(vars)` holds. Otherwise leave the
-                        // term as an opaque LRA variable: LRA over-approximates
-                        // it (any value), which is sound — it can cost
-                        // completeness (`unknown` instead of a verdict) but can
-                        // never produce a wrong answer.
+                        // Carry the flattened node's exact constant factor.
+                        // Omitting it either leaves the product opaque or makes
+                        // every downstream cut reason about a false identity.
                         let mut var_args = Vec::new();
                         let mut const_product = BigRational::one();
                         for &arg in args {
@@ -445,15 +424,12 @@ impl<'a> NraSolver<'a> {
                             }
                         }
 
-                        if var_args.len() >= 2 && const_product.is_one() {
+                        if var_args.len() >= 2 && !const_product.is_zero() {
                             var_args.sort_by_key(|t| t.0);
-                            if !self.monomials.contains_key(&var_args) {
-                                self.register_monomial(var_args, term);
-                            }
+                            self.register_product(var_args, term, const_product);
                         } else if var_args.len() >= 2 && self.debug {
                             tracing::debug!(
-                                "[NRA] Skipping scaled monomial {:?} (const factor {:?} != 1) \
-                                 to preserve aux==product(vars) invariant",
+                                "[NRA] leaving zero-scaled product {:?} opaque ({:?})",
                                 term,
                                 const_product
                             );

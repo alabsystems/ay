@@ -84,18 +84,21 @@ impl Solver {
         hints: &[u64],
         kind: ProofAddKind,
     ) -> io::Result<u64> {
-        // Soundness-triage tripwire (AY_AB_TRIAGE_CLAUSE="d1,d2,..." DIMACS
+        // Soundness-triage tripwire (--sat-ab-triage-clause "d1,d2,..." DIMACS
         // lits): dump the live DB the moment this exact clause is emitted.
         {
             use std::sync::OnceLock;
             static TARGET: OnceLock<Option<Vec<i64>>> = OnceLock::new();
             let target = TARGET.get_or_init(|| {
-                std::env::var("AY_AB_TRIAGE_CLAUSE").ok().map(|s| {
-                    let mut v: Vec<i64> =
-                        s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-                    v.sort_unstable();
-                    v
-                })
+                ay_core::misc_cli_flags()
+                    .ab_triage_clause
+                    .as_deref()
+                    .map(|s| {
+                        let mut v: Vec<i64> =
+                            s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                        v.sort_unstable();
+                        v
+                    })
             });
             if target.is_some() {
                 let mut mine: Vec<i64> = clause
@@ -457,42 +460,6 @@ impl Solver {
         clause: &[Literal],
         clause_id: u64,
     ) -> io::Result<()> {
-        // Soundness-triage tripwire: attribute deletions of the target clause.
-        {
-            use std::sync::OnceLock;
-            static TARGET: OnceLock<Option<Vec<i64>>> = OnceLock::new();
-            let target = TARGET.get_or_init(|| {
-                std::env::var("AY_AB_TRIAGE_ARENA_CLAUSE").ok().map(|s| {
-                    let mut v: Vec<i64> =
-                        s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-                    v.sort_unstable();
-                    v
-                })
-            });
-            if target.is_some() {
-                let mut mine: Vec<i64> = clause
-                    .iter()
-                    .map(|l| {
-                        let v = i64::from(l.variable().0) + 1;
-                        if l.is_positive() {
-                            v
-                        } else {
-                            -v
-                        }
-                    })
-                    .collect();
-                mine.sort_unstable();
-                if target.as_ref() == Some(&mine) {
-                    eprintln!(
-                        "TRIAGE_DELETE: pass={:?} level={} cid={}\n{}",
-                        self.cold.diagnostic_pass,
-                        self.decision_level,
-                        clause_id,
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                }
-            }
-        }
         #[cfg(debug_assertions)]
         self.assert_proof_mode_stable();
 

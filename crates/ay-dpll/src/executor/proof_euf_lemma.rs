@@ -944,8 +944,17 @@ mod tests {
             .expect("canonical-surface EUF promotion must pass strict checking");
     }
 
+    /// CONTRACT CHANGE (8da8562aa): this test used to pin that the whole proof
+    /// stays strict-REJECTED, because a `Generic` lemma had no strict
+    /// validator. Since `validate_linear_ideal_refutation` landed, the strict
+    /// checker discharges Generic ARITHMETIC lemmas it can reconstruct itself:
+    /// the negation of `(<= x x)` normalizes to the constant-false `0 > 0`
+    /// (`const_refuted`), so the lemma — and therefore the proof — is now
+    /// certified. What this test still pins is the EUF-promotion half: the
+    /// clause is not an EUF shape, so `promote_certified_generic_euf_leaves`
+    /// must leave every step byte-identical (no retag to a congruence kind).
     #[test]
-    fn unsupported_generic_tautology_is_left_unchanged() {
+    fn arith_generic_tautology_is_not_retagged_but_strict_certifies_it() {
         let mut exec = Executor::new();
         let terms = &mut exec.ctx.terms;
         let x = terms.mk_var("unsupported_euf_x", Sort::Int);
@@ -957,6 +966,44 @@ mod tests {
         let generic =
             proof.add_theory_lemma_with_kind("EUF", vec![le_xx], TheoryLemmaKind::Generic);
         proof.add_resolution(Vec::new(), le_xx, generic, h);
+
+        let before = format!("{:?}", proof.steps);
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+        assert_eq!(format!("{:?}", proof.steps), before);
+        // The validator itself is the proof of the new contract: the Generic
+        // lemma is discharged by the linear-ideal refutation path, with the
+        // step left untouched (still TheoryLemmaKind::Generic).
+        ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+            .expect("strict checker must discharge the (<= x x) Generic lemma itself");
+        assert!(proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                ..
+            }
+        )));
+    }
+
+    /// The surviving half of the ORIGINAL contract: a Generic tautology that
+    /// no strict discharge path supports is left unchanged by the EUF
+    /// promotion AND keeps the whole proof strict-rejected. `(<= 0 (* x x))`
+    /// is genuinely valid over Int, but the linear-ideal rule never uses
+    /// `x*x >= 0` (order conjuncts carry no equational content for it), it is
+    /// not an EUF shape, and no other validator claims it.
+    #[test]
+    fn unsupported_generic_nonlinear_tautology_is_left_unchanged() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let x = terms.mk_var("unsupported_euf_nl_x", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let x_sq = terms.mk_app(Symbol::named("*"), [x, x], Sort::Int);
+        let le = terms.mk_app(Symbol::named("<="), [zero, x_sq], Sort::Bool);
+        let not_le = terms.mk_not_raw(le);
+
+        let mut proof = Proof::new();
+        let h = proof.add_assume(not_le, None);
+        let generic = proof.add_theory_lemma_with_kind("EUF", vec![le], TheoryLemmaKind::Generic);
+        proof.add_resolution(Vec::new(), le, generic, h);
 
         let before = format!("{:?}", proof.steps);
         exec.promote_certified_generic_euf_leaves(&mut proof);

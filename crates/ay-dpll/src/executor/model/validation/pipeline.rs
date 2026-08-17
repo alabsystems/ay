@@ -44,7 +44,7 @@ impl Executor {
         detail: impl Into<String>,
     ) {
         let detail = detail.into();
-        if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+        if ay_core::misc_cli_flags().debug_read_pin {
             eprintln!("[validation-unknown] {detail}");
         }
         // LOUD, UNCONDITIONALLY. Reaching here means AY built a candidate model
@@ -289,9 +289,9 @@ impl Executor {
                         ..Default::default()
                     });
                 }
-                if std::env::var_os("AY_F1_DIAG").is_some() {
+                if ay_core::misc_cli_flags().f1_diag {
                     eprintln!(
-                        "AY_F1_DIAG: Sat with last_model=None at validate_model_attempt\n{}",
+                        "--f1-diag: Sat with last_model=None at validate_model_attempt\n{}",
                         std::backtrace::Backtrace::force_capture()
                     );
                 }
@@ -962,7 +962,7 @@ impl Executor {
         if let Some(model) = self.last_model.as_mut() {
             model.revoke_all_quantified_model_seals();
         }
-        let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_read_pin;
         let TermData::Not(inner) = self.ctx.terms.get(rejected) else {
             return;
         };
@@ -1320,7 +1320,7 @@ impl Executor {
         if let Some(model) = self.last_model.as_mut() {
             model.revoke_all_quantified_model_seals();
         }
-        let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_read_pin;
         // Definition map (#qfax-sf-defchase): sf variants flatten chains
         // through variable definitions (= a_k (store a_j i v)). The walk
         // chases them so a Var that IS a defined chain keeps unfolding;
@@ -2282,7 +2282,7 @@ impl Executor {
         let Some(literals) = self.qfax_blocking_literals(dependencies) else {
             return;
         };
-        if std::env::var_os("AY_DEBUG_CEGAR").is_some() {
+        if ay_core::misc_cli_flags().debug_cegar {
             eprintln!(
                 "[qfax-cegar] blocking clause with {} literals",
                 literals.len()
@@ -2589,7 +2589,7 @@ impl Executor {
         if groups.is_empty() {
             return 0;
         }
-        let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_read_pin;
         // Phase 2: candidate trials, bounded.
         let mut trials_left = 24usize;
         let mut cells_fixed = 0usize;
@@ -2759,7 +2759,7 @@ impl Executor {
         if n_changed == 0 {
             return 0;
         }
-        let dbg = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_read_pin;
         {
             let model = self.last_model.as_mut().expect("checked above");
             if let Some(euf) = model.euf_model.as_mut() {
@@ -2895,7 +2895,7 @@ impl Executor {
     fn repair_asserted_array_read_pins(&mut self) {
         use ay_core::term::TermData;
         if !matches!(self.last_result, Some(SolveResult::Sat)) || self.last_model.is_none() {
-            if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+            if ay_core::misc_cli_flags().debug_read_pin {
                 eprintln!(
                     "[read-pin-repair] bail: result={:?} model={}",
                     self.last_result,
@@ -3070,7 +3070,7 @@ impl Executor {
                     } else {
                         continue;
                     };
-                    // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default
+                    // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`; default
                     // off is byte-identical — one `var_os` probe, no I/O and no
                     // state change). This shift is the only producer of the
                     // `1_000_003+` sentinel values that later show up in strict
@@ -3078,7 +3078,7 @@ impl Executor {
                     // value is what says whether the extracted model dropped a
                     // variable (both sides default) or merged two arithmetic
                     // points. WRITE-ONLY: no verdict path reads it.
-                    if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                    if ay_core::misc_cli_flags().model_reject_dump {
                         eprintln!(
                             "[diseq-shift] {} := {} (was {}, collided with {} on assertion {})",
                             self.format_term(target),
@@ -3145,7 +3145,7 @@ impl Executor {
                         }
                         total_shifted += 1;
                     }
-                    if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+                    if ay_core::misc_cli_flags().debug_read_pin {
                         eprintln!("[read-pin-repair] diseq_shifts={}", diseq_shifts.len());
                     }
                     // Re-collect pins under the separated values.
@@ -3543,7 +3543,7 @@ impl Executor {
             }
             let mut fresh_idx: i64 = 3_000_001;
             let mut fresh_val: i64 = 5_000_001;
-            if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+            if ay_core::misc_cli_flags().debug_read_pin {
                 eprintln!("[witness-dbg] targets={}", targets.len());
             }
             for (eq_term, chain_a, chain_b, k_term) in targets {
@@ -3561,7 +3561,7 @@ impl Executor {
                             TermData::Not(i) if *i == eq_term
                         )
                 });
-                if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+                if ay_core::misc_cli_flags().debug_read_pin {
                     eprintln!(
                         "[witness-dbg] target eq={} force={} stored={:?}",
                         eq_term.0,
@@ -3713,7 +3713,7 @@ impl Executor {
                     for atom in &written_atoms {
                         let ca = cell(self, &wa, atom);
                         let cb = cell(self, &wb, atom);
-                        if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+                        if ay_core::misc_cli_flags().debug_read_pin {
                             eprintln!("[witness-dbg]   cell@{atom}: a={ca:?} b={cb:?}");
                         }
                         if let (Some(x), Some(y)) = (ca, cb) {
@@ -3726,7 +3726,7 @@ impl Executor {
                     if witness.is_some() {
                         break;
                     }
-                    if std::env::var_os("AY_DEBUG_READ_PIN").is_some() && attempt == 0 {
+                    if ay_core::misc_cli_flags().debug_read_pin && attempt == 0 {
                         eprintln!(
                             "[witness-dbg] eq={} idx_vars={} written={} no-diff-yet",
                             eq_term.0,
@@ -3922,7 +3922,7 @@ impl Executor {
             self.last_model_validated = false;
             self.revoke_cegqi_uf_recompletion_authority();
         }
-        if std::env::var_os("AY_DEBUG_READ_PIN").is_some()
+        if ay_core::misc_cli_flags().debug_read_pin
             && (total_applied > 0 || total_shifted > 0 || resynced > 0)
         {
             eprintln!(
@@ -4191,11 +4191,11 @@ impl Executor {
             // trace): the strict definitive-false oracle caught a model that
             // falsifies an assertion. Emitted while `last_model` is still live.
             let term = self.format_term(assertion);
-            // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`): name the
+            // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`): name the
             // rejecting SITE and oracle. Three different code paths print the
             // same soundness banner; a census that cannot tell them apart
             // cannot attribute a rejection. WRITE-ONLY.
-            if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+            if ay_core::misc_cli_flags().model_reject_dump {
                 eprintln!("[reject-site] apply_strict_model_gate oracle={oracle} idx={idx}");
             }
             self.report_caught_invalid_model(assertion, &term);
@@ -4291,7 +4291,7 @@ impl Executor {
             }
             for (a, b) in pairs {
                 let normalized = self.compare_array_models_normalized(model, a, b);
-                if std::env::var_os("AY_DEBUG_UNWITNESSED").is_some() {
+                if ay_core::misc_cli_flags().debug_unwitnessed {
                     let sb = self.compare_same_base_store_chains(model, a, b);
                     let ap =
                         super::definitive_eval::ArrayOracle::concrete_select_pairs(self, model, a);
@@ -4712,7 +4712,7 @@ impl Executor {
         // which returns `Some(k)` ONLY for all-nullary datatypes (any field makes
         // the domain unbounded → `None`, untouched).
         if let Some((sort, used, k)) = self.enum_cardinality_violation() {
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace model-gate enum-cardinality used={used} k={k}");
             }
             self.last_statistics.model_validation_failures += 1;
@@ -4748,7 +4748,7 @@ impl Executor {
         // Complete it here, as a model-completion step, so the strict oracle
         // below and every downstream gate (independent, authoritative,
         // postcondition) re-check the COMPLETED witness with NO gate weakened.
-        // Env-gated (`AY_UFLIA_WITNESS_COMPLETE=1`); default off is a no-op.
+        // Env-gated (`--uflia-witness-complete=1`); default off is a no-op.
         // A completion the gates refute degrades to `unknown` exactly as the
         // uncompleted model does today — never a wrong `sat`.
         self.uflia_complete_free_uf_chain_witness();
@@ -4838,14 +4838,14 @@ impl Executor {
                 .set_string("model_validation.strict.oracle", oracle);
             self.last_statistics
                 .set_string("model_validation.strict.term", self.format_term(assertion));
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 let t = self.format_term(assertion);
                 let t = if t.len() > 400 { &t[..400] } else { &t[..] };
                 eprintln!(
                     "c phase-trace model-gate definitive-false-oracle idx={idx} oracle={oracle} term={t}"
                 );
             }
-            // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default off is
+            // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`; default off is
             // byte-identical — a single `var_os` probe and no I/O). Unlike
             // `apply_strict_model_gate`, this DEFERRED-validation rejection site
             // is silent: it records the violated assertion in the statistics but
@@ -4856,7 +4856,7 @@ impl Executor {
             // included) so both strict sites report the same evidence shape.
             // WRITE-ONLY: nothing in any verdict path reads this, and the
             // degrade below is unchanged.
-            if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+            if ay_core::misc_cli_flags().model_reject_dump {
                 let dump_term = self.format_term(assertion);
                 self.report_caught_invalid_model(assertion, &dump_term);
             }
@@ -4918,7 +4918,7 @@ impl Executor {
                     });
                     if let Some(lemma) = lemma {
                         if !self.cegar_emitted_lemmas.contains(&lemma) {
-                            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().phase_trace {
                                 eprintln!("c phase-trace cegar-lemma-distilled kind=strict-oracle");
                             }
                             self.cegar_pending_lemma = Some(lemma);
@@ -5013,14 +5013,14 @@ impl Executor {
             if let Some(model) = self.last_model.take() {
                 let _t_census = std::time::Instant::now();
                 let certified = self.datatype_array_census_certifies(&model);
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace TIMING dt-array-census {:.1}s certified={certified}",
                         _t_census.elapsed().as_secs_f64()
                     );
                 }
                 if certified {
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace model-gate dt-array-census-certified");
                     }
                     self.last_model = Some(model);
@@ -5061,7 +5061,7 @@ impl Executor {
                     if let Some(model) = self.last_model.take() {
                         if let Some(lemma) = self.census_congruence_cegar_lemma(&model) {
                             if !self.cegar_emitted_lemmas.contains(&lemma) {
-                                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                                if ay_core::misc_cli_flags().phase_trace {
                                     eprintln!("c phase-trace cegar-lemma-distilled kind=dt-array");
                                 }
                                 self.cegar_pending_lemma = Some(lemma);
@@ -5074,7 +5074,7 @@ impl Executor {
                 // came from the depth-invariant datatype-array degrade gate, so the DT
                 // iterative-deepening loop can return it immediately instead of
                 // re-solving at deeper frontiers (both gate inputs are depth-invariant).
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace model-gate datatype-array-degrade");
                 }
                 self.last_degrade_was_datatype_array = true;
@@ -5115,7 +5115,7 @@ impl Executor {
         if self.problem_has_array() {
             if let Some(model) = self.last_model.take() {
                 if self.array_select_congruence_violated(&model) {
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace model-gate array-select-congruence-degrade");
                     }
                     // CEGAR (#array-select-congruence-gate): distill the violated
@@ -5125,7 +5125,7 @@ impl Executor {
                     if self.cegar_rounds_remaining > 0 && self.cegar_pending_lemma.is_none() {
                         if let Some(lemma) = self.census_congruence_cegar_lemma(&model) {
                             if !self.cegar_emitted_lemmas.contains(&lemma) {
-                                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                                if ay_core::misc_cli_flags().phase_trace {
                                     eprintln!("c phase-trace cegar-lemma-distilled kind=array");
                                 }
                                 self.cegar_pending_lemma = Some(lemma);

@@ -264,6 +264,85 @@ pub fn recognize_lia_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
     recognize_rounded_integer_bounds_gap(terms, clause)
 }
 
+/// Recognize an exact two-literal integer clause whose simultaneous falsity
+/// would impose contradictory rounded bounds on the same linear form.
+/// Unlike the historical bounds-gap recognizer, literals may be positive
+/// (cover clause) or negated (mutex clause); [`parse_int_bound`] converts each
+/// blocking literal to the constraint asserted by the clause's negation.
+#[must_use]
+pub fn recognize_int_bounds_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
+    recognize_rounded_integer_bounds_gap(terms, clause)
+}
+
+/// Recognize the exact guarded split generated for an arithmetic
+/// disequality. The first two literals are the split branches and the third is
+/// the equality guard. Integer branches leave exactly the one-value equality
+/// gap; Real branches are the two strict orders on the guarded operands.
+#[must_use]
+pub fn recognize_arith_disequality_split(terms: &TermStore, clause: &[TermId]) -> bool {
+    use crate::term::{Symbol, TermData};
+    use crate::Sort;
+
+    let [first, second, guard] = clause else {
+        return false;
+    };
+    let decode_equality = |term: TermId| match terms.get(term) {
+        TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
+            Some((args[0], args[1]))
+        }
+        TermData::Not(inner) => match terms.get(*inner) {
+            TermData::App(Symbol::Named(name), args) if name == "distinct" && args.len() == 2 => {
+                Some((args[0], args[1]))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((lhs, rhs)) = decode_equality(*guard) else {
+        return false;
+    };
+    if terms.sort(lhs) != terms.sort(rhs) {
+        return false;
+    }
+
+    match terms.sort(lhs) {
+        Sort::Real => {
+            let decode_lt = |term: TermId| match terms.get(term) {
+                TermData::App(Symbol::Named(name), args) if name == "<" && args.len() == 2 => {
+                    Some((args[0], args[1]))
+                }
+                _ => None,
+            };
+            let a = decode_lt(*first);
+            let b = decode_lt(*second);
+            // The external lowering pairs the forward non-strict inequality
+            // with the reverse strict branch and vice versa. Keep the producer
+            // order exact instead of silently accepting a permutation for
+            // which that derivation would be invalid.
+            a == Some((lhs, rhs)) && b == Some((rhs, lhs))
+        }
+        Sort::Int => {
+            let Some((eq_coeffs, eq_target)) = canonical_int_equality(terms, lhs, rhs) else {
+                return false;
+            };
+            let Some((a_coeffs, a_upper, a_value)) = parse_int_comparison(terms, *first, true)
+            else {
+                return false;
+            };
+            let Some((b_coeffs, b_upper, b_value)) = parse_int_comparison(terms, *second, true)
+            else {
+                return false;
+            };
+            if a_coeffs != eq_coeffs || b_coeffs != eq_coeffs || !a_upper || b_upper {
+                return false;
+            }
+            a_value == &eq_target - num_bigint::BigInt::from(1)
+                && b_value == &eq_target + num_bigint::BigInt::from(1)
+        }
+        _ => false,
+    }
+}
+
 fn recognize_rounded_integer_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
     let [first, second] = clause else {
         return false;
@@ -453,22 +532,35 @@ fn parse_int_bound(
     bool,
     num_bigint::BigInt,
 )> {
-    use crate::term::{Symbol, TermData};
-    let bound = match terms.get(lit) {
-        TermData::Not(i) => *i,
-        _ => return None,
+    use crate::term::TermData;
+    let (bound, asserted_value) = match terms.get(lit) {
+        TermData::Not(i) => (*i, true),
+        _ => (lit, false),
     };
+    parse_int_comparison(terms, bound, asserted_value)
+}
+
+fn parse_int_comparison(
+    terms: &TermStore,
+    bound: TermId,
+    asserted_value: bool,
+) -> Option<(
+    std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+    bool,
+    num_bigint::BigInt,
+)> {
+    use crate::term::{Symbol, TermData};
     let (op, a, b) = match terms.get(bound) {
         TermData::App(Symbol::Named(n), args) if args.len() == 2 => (n.as_str(), args[0], args[1]),
         _ => return None,
     };
     let (coeffs, c0) = int_linear_diff(terms, a, b)?;
     // `A op B` with `A - B = L + c₀`: solve for the bound on `L`.
-    let (is_upper, val) = match op {
-        "<=" => (true, -c0),
-        "<" => (true, -c0 - 1),
-        ">=" => (false, -c0),
-        ">" => (false, -c0 + 1),
+    let (is_upper, val) = match (op, asserted_value) {
+        ("<=", true) | (">", false) => (true, -c0),
+        ("<", true) | (">=", false) => (true, -c0 - 1),
+        (">=", true) | ("<", false) => (false, -c0),
+        (">", true) | ("<=", false) => (false, -c0 + 1),
         _ => return None,
     };
     // Canonicalize the sign so the SAME `L` written either way compares equal:
@@ -485,6 +577,27 @@ fn parse_int_bound(
         return Some((coeffs, !is_upper, -val));
     }
     Some((coeffs, is_upper, val))
+}
+
+fn canonical_int_equality(
+    terms: &TermStore,
+    lhs: TermId,
+    rhs: TermId,
+) -> Option<(
+    std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+    num_bigint::BigInt,
+)> {
+    use num_traits::Signed;
+    let (coeffs, c0) = int_linear_diff(terms, lhs, rhs)?;
+    let flip = coeffs
+        .values()
+        .next()
+        .is_some_and(num_bigint::BigInt::is_negative);
+    if flip {
+        Some((coeffs.into_iter().map(|(v, c)| (v, -c)).collect(), c0))
+    } else {
+        Some((coeffs, -c0))
+    }
 }
 
 /// Validate a CuttingPlane LIA proof.

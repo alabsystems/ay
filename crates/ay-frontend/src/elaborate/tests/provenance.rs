@@ -145,6 +145,37 @@ fn builtin_colliding_private_declaration_is_positive_and_epoch_bound() {
 }
 
 #[test]
+fn canonical_application_bypasses_same_spelled_private_declaration() {
+    let mut context = elaborate(
+        r#"
+        (declare-fun = (Int Int) Bool)
+        (assert (= 0 1))
+        "#,
+    );
+    let private_identity = context
+        .symbol_info("=")
+        .and_then(|info| info.internal_name.clone())
+        .expect("builtin-colliding declaration has a private identity");
+    assert!(matches!(
+        context.terms.get(context.assertions[0]),
+        TermData::App(Symbol::Named(name), _) if name == &private_identity
+    ));
+
+    let zero = context.terms.mk_int(0.into());
+    let one = context.terms.mk_int(1.into());
+    let canonical = context
+        .elaborate_canonical_theory_application("=", &[zero, one])
+        .expect("canonical equality");
+    assert!(
+        context.terms.is_false(canonical),
+        "the core identity must retain builtin equality semantics"
+    );
+    assert!(context
+        .elaborate_canonical_theory_application(&private_identity, &[zero, one])
+        .is_err());
+}
+
+#[test]
 fn map_target_definitions_have_private_identity_and_expand_by_surface_name() {
     let cases: &[(&str, &[&str])] = &[
         (

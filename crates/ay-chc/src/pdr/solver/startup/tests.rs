@@ -37,6 +37,19 @@ fn timeout_cap_test_solver(config: PdrConfig) -> PdrSolver {
     PdrSolver::new(ChcParser::parse(smt2).unwrap(), config)
 }
 
+#[cfg(feature = "optional-chc25-repo-corpus-tests")]
+fn optional_chc25_repo_fixture(relative: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/chc-comp/chc-comp25-repo")
+        .join(relative);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "optional CHC-COMP 2025 repository fixture {} must be provisioned: {error}",
+            path.display()
+        )
+    })
+}
+
 #[test]
 fn startup_smt_timeout_cap_uses_direct_solve_timeout_before_solve_init() {
     let config = PdrConfig {
@@ -409,11 +422,9 @@ fn startup_parity_retry_recovers_count_by_2_m_nest_after_inlining() {
 #[cfg(feature = "optional-chc25-repo-corpus-tests")]
 #[test]
 fn startup_nonfixpoint_builds_splitter_resistant_simple_bv_fact_bundle() {
-    let input = include_str!(
-        "../../../../../../benchmarks/chc-comp/chc-comp25-repo/vmt-chc-benchmarks/bv/simple.c_000.smt2"
-    );
+    let input = optional_chc25_repo_fixture("vmt-chc-benchmarks/bv/simple.c_000.smt2");
 
-    let solver = PdrSolver::new(ChcParser::parse(input).unwrap(), PdrConfig::default());
+    let solver = PdrSolver::new(ChcParser::parse(&input).unwrap(), PdrConfig::default());
     let pred = solver.problem.predicates()[0].id;
     let vars = solver.canonical_vars(pred).unwrap().to_vec();
     let must_summary = ChcExpr::and_all([

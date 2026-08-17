@@ -5,8 +5,8 @@
 #![allow(clippy::panic)]
 
 use super::lemmas::{
-    apply_theory_lemma_incremental, apply_theory_lemma_incremental_persistent,
-    take_new_theory_lemmas,
+    apply_string_lemma_incremental, apply_theory_lemma_incremental,
+    apply_theory_lemma_incremental_persistent, take_new_theory_lemmas,
 };
 use super::{
     add_extra_blocking_clauses, bias_split_clause_vars, encode_and_add_split_clause,
@@ -14,7 +14,9 @@ use super::{
     map_conflict_to_blocking_clause, replay_incremental_bound_refinements, BlockingClauseResult,
     BoundRefinementReplayKey,
 };
-use crate::incremental_proof_cache::{IncrementalNegationCache, TheoryLemmaSeenSet};
+use crate::incremental_proof_cache::{
+    IncrementalNegationCache, PendingOriginalClauseAuthority, TheoryLemmaSeenSet,
+};
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{BoundRefinementRequest, Sort, TermStore, TheoryConflict, TheoryLemma, TheoryLit};
@@ -27,6 +29,53 @@ struct DuplicateReplayCheckpoint {
     terms: usize,
     next_var: u32,
     mapping_len: usize,
+}
+
+#[test]
+fn exact_integer_split_queues_stable_id_authorities() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let upper = terms.mk_le(x, zero);
+    let lower = terms.mk_ge(x, one);
+    let mut solver = SatSolver::new(0);
+    let mut term_to_var = super::HashMap::default();
+    let mut var_to_term = super::HashMap::default();
+    let mut next_var = 0;
+    let mut keys = HashSet::default();
+    let mut negations = IncrementalNegationCache::seed(&mut terms, [], true);
+
+    let _ = encode_and_add_split_clause(
+        &mut terms,
+        &mut solver,
+        &mut term_to_var,
+        &mut var_to_term,
+        &mut next_var,
+        &mut negations,
+        upper,
+        lower,
+        None,
+        &mut keys,
+    );
+
+    let authorities = negations
+        .drain_original_authorities()
+        .filter_map(|authority| match authority {
+            PendingOriginalClauseAuthority::Theory { original_id, proof } => {
+                Some((original_id, proof.kind))
+            }
+            PendingOriginalClauseAuthority::Clausification { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(authorities.len(), 2, "cover and mutex need authority");
+    assert!(
+        authorities[0].0 < authorities[1].0,
+        "IDs preserve emission order"
+    );
+    assert!(authorities
+        .iter()
+        .all(|(_, kind)| *kind == ay_core::TheoryLemmaKind::IntBoundsTautology));
 }
 
 fn assert_duplicate_refinement_replay_state(
@@ -140,7 +189,7 @@ fn encode_and_add_split_clause_skips_duplicate_clause_issue_6586() {
     let mut negations = IncrementalNegationCache::seed(&mut terms, std::iter::empty(), false);
 
     let (first_left, first_right, first_added) = encode_and_add_split_clause(
-        &terms,
+        &mut terms,
         &mut solver,
         &mut local_term_to_var,
         &mut local_var_to_term,
@@ -155,7 +204,7 @@ fn encode_and_add_split_clause_skips_duplicate_clause_issue_6586() {
     let clauses_after_first = solver.num_clauses();
 
     let (second_left, second_right, second_added) = encode_and_add_split_clause(
-        &terms,
+        &mut terms,
         &mut solver,
         &mut local_term_to_var,
         &mut local_var_to_term,
@@ -226,7 +275,7 @@ fn encode_and_add_split_clause_blocks_cached_assignment_issue_8785() {
     assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
 
     let (_, _, added) = encode_and_add_split_clause(
-        &terms,
+        &mut terms,
         &mut solver,
         &mut local_term_to_var,
         &mut local_var_to_term,
@@ -279,7 +328,7 @@ fn encode_and_add_split_clause_negates_not_wrapped_disequality_guard_9604() {
         not_eq_zero,
     );
     let (le_var, ge_var, added) = encode_and_add_split_clause(
-        &terms,
+        &mut terms,
         &mut solver,
         &mut local_term_to_var,
         &mut local_var_to_term,
@@ -346,7 +395,7 @@ fn map_conflict_to_blocking_clause_blocks_cached_assignment_issue_8785() {
         &[],
         &local_term_to_var,
     );
-    assert!(matches!(result, BlockingClauseResult::Added));
+    assert!(matches!(result, BlockingClauseResult::Added { .. }));
     assert!(
         solver.solve().into_inner().is_unsat(),
         "blocking clause (not p v q) should immediately invalidate the current p/not-q model"
@@ -700,7 +749,7 @@ fn apply_theory_lemma_incremental_persistent_respects_scope_issue_6719() {
     let mut negations = IncrementalNegationCache::seed(&mut terms, std::iter::empty(), false);
 
     solver.push();
-    let recorded = apply_theory_lemma_incremental_persistent(
+    let (recorded, original_id) = apply_theory_lemma_incremental_persistent(
         &mut solver,
         &mut term_to_var,
         &mut var_to_term,
@@ -711,6 +760,7 @@ fn apply_theory_lemma_incremental_persistent_respects_scope_issue_6719() {
         recorded,
         "unit theory lemma should be retained in the SAT original-clause ledger"
     );
+    assert_eq!(original_id, Some(1));
     assert_eq!(
         solver
             .clause_trace()
@@ -763,7 +813,7 @@ fn apply_theory_lemma_incremental_persistent_skips_tautology_trace_issue_6719() 
         .expect("clause trace enabled")
         .original_clauses()
         .count();
-    let tautology_recorded = apply_theory_lemma_incremental_persistent(
+    let (tautology_recorded, original_id) = apply_theory_lemma_incremental_persistent(
         &mut solver,
         &mut term_to_var,
         &mut var_to_term,
@@ -774,6 +824,7 @@ fn apply_theory_lemma_incremental_persistent_skips_tautology_trace_issue_6719() 
         !tautology_recorded,
         "tautological theory lemmas must not claim a SAT original-clause slot"
     );
+    assert_eq!(original_id, Some(1));
     assert_eq!(
         solver
             .clause_trace()
@@ -783,6 +834,92 @@ fn apply_theory_lemma_incremental_persistent_skips_tautology_trace_issue_6719() 
         trace_original_count,
         "tautological no-split lemma must not grow the clause trace"
     );
+}
+
+#[test]
+fn persistent_tautology_reserves_id_before_next_recorded_lemma() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let mut solver = SatSolver::new(0);
+    solver.enable_clause_trace();
+    let mut term_to_var = super::HashMap::default();
+    let mut var_to_term = super::HashMap::default();
+    let mut negations = IncrementalNegationCache::seed(&mut terms, std::iter::empty(), false);
+
+    assert!(
+        !apply_theory_lemma_incremental_persistent(
+            &mut solver,
+            &mut term_to_var,
+            &mut var_to_term,
+            &mut negations,
+            &[TheoryLit::new(p, true), TheoryLit::new(p, false)],
+        )
+        .0
+    );
+    assert!(
+        apply_theory_lemma_incremental_persistent(
+            &mut solver,
+            &mut term_to_var,
+            &mut var_to_term,
+            &mut negations,
+            &[TheoryLit::new(q, true)],
+        )
+        .0
+    );
+
+    let ids = solver
+        .clause_trace()
+        .expect("clause trace enabled")
+        .original_clauses()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![2],
+        "the omitted tautology consumes stable ID 1, so its None ledger slot is load-bearing"
+    );
+}
+
+#[test]
+fn string_lemma_returns_the_exact_flattened_sat_clause() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let r = terms.mk_var("r", Sort::Bool);
+    let inner = terms.mk_app(ay_core::Symbol::named("or"), [q, r], Sort::Bool);
+    let outer = terms.mk_app(ay_core::Symbol::named("or"), [p, inner], Sort::Bool);
+    let mut solver = SatSolver::new(0);
+    solver.enable_clause_trace();
+    let mut term_to_var = super::HashMap::default();
+    let mut var_to_term = super::HashMap::default();
+    let mut next_var = 0;
+    let mut negations = IncrementalNegationCache::seed(&mut terms, std::iter::empty(), false);
+
+    let (lowered, original_id) = apply_string_lemma_incremental(
+        &terms,
+        &mut solver,
+        &mut term_to_var,
+        &mut var_to_term,
+        &mut next_var,
+        &mut negations,
+        &[outer],
+    );
+    assert_eq!(lowered, vec![p, q, r]);
+    assert_eq!(original_id, Some(1));
+
+    let traced = solver
+        .clause_trace()
+        .expect("clause trace enabled")
+        .original_clauses()
+        .next()
+        .expect("string lemma SAT clause");
+    let traced_terms = traced
+        .clause
+        .iter()
+        .map(|lit| var_to_term[&(lit.variable().index() as u32)])
+        .collect::<Vec<_>>();
+    assert_eq!(traced_terms, lowered);
 }
 
 #[test]

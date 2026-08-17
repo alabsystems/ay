@@ -16,8 +16,11 @@
 //! publication must remain fail-closed rather than cite invented assumptions.
 //!
 //! Both shapes are genuinely UNSAT. The distinction here is proof authority,
-//! not solver semantics: direct roots publish `unsat`; unsupported premise
-//! decomposition publishes `unknown` and revokes the artifact.
+//! not solver semantics: direct roots publish `unsat` with a native strict
+//! certificate when no external-wire promise was requested; unsupported
+//! premise decomposition publishes `unknown` and revokes the artifact. The
+//! separate strict-wire test covers the required decline for the honest Alethe
+//! `hole` rendering.
 
 use ay_core::{ProofStep, TheoryLemmaKind};
 use ay_dpll::Executor;
@@ -75,7 +78,6 @@ fn direct_binary_pigeonhole_script(constructors: usize) -> String {
     let places = constructors + 1;
     let mut script = String::from(
         "(set-option :produce-proofs true)\n\
-         (set-option :check-proofs-strict true)\n\
          (set-logic QF_DT)\n\
          (declare-datatype Unit (",
     );

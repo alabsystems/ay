@@ -41,10 +41,9 @@ fn test_unknown_reason_quantifiers() {
     }
 }
 
-/// A dead trigger controls instantiation only; it does not weaken the asserted
-/// first-order universal. In particular, an E-matching-only (`no_mbqi`)
-/// quantifier can have an impossible body even when its trigger head has no
-/// ground occurrence. The old vacuous-trigger shortcut fabricated SAT here.
+/// A dead trigger controls instantiation only; it does not weaken the universal.
+/// An E-matching-only (`no_mbqi`) quantifier can have an impossible body even
+/// without a ground trigger head; the old vacuous-trigger shortcut fabricated SAT.
 #[test]
 fn no_mbqi_dead_trigger_with_impossible_body_never_sat() {
     let mut executor = Executor::new();
@@ -409,9 +408,8 @@ fn check_sat_output(smt: &str) -> String {
     outputs.last().cloned().unwrap_or_default()
 }
 
-/// (#p2-nested-forall) Directly nested forall towers are merged and decided:
-/// `∀x.∀y. p(x,y) → x<y` with a ground violation is UNSAT (z3 parity; was
-/// Unknown(QuantifierUnhandled) before the binder-merge prepass).
+/// (#p2-nested-forall) Nested forall towers are merged and decided: a ground violation is UNSAT
+/// (z3 parity; previously `Unknown(QuantifierUnhandled)` before binder merging).
 #[test]
 fn test_nested_forall_tower_merged_unsat() {
     let out = check_sat_output(
@@ -938,3 +936,5 @@ fn test_negated_exists_diagonal_still_refutes() {
         "negated-exists dual universal must keep its diagonal refutation"
     );
 }
+
+mod negated_exists_sat;

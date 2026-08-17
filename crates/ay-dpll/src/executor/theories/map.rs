@@ -83,6 +83,10 @@ impl Executor {
             );
         }
 
+        // Map value/domain carriers are arrays; close any finite-index
+        // equalities exposed by the route-local subset axioms before solving.
+        let _ = self.add_finite_index_array_closure();
+
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
         solve_incremental_split_loop_pipeline!(self,

@@ -14,9 +14,10 @@ fn s(v: &[char]) -> String {
 fn w6_defaults_on_with_kill_switch() {
     // DEFAULT-ON: 16 of the last 27 sat-side misses convert, all confirmed by
     // AY's own fail-closed --self-check. Contract is on-unless-killed (=0).
-    if std::env::var("AY_STR_W6").is_err() {
-        assert!(str_w6_enabled(), "AY_STR_W6 must default ON");
-    }
+    assert!(
+        str_w6_enabled(),
+        "W6 must default ON (`--dpll-no-str-w6` kills it)"
+    );
 }
 
 #[test]

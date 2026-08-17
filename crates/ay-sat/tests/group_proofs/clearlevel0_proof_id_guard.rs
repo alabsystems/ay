@@ -33,6 +33,10 @@ fn conflict_analysis_lrat_specialized_source() -> &'static str {
     include_str!("../../src/solver/conflict_analysis_lrat_specialized.rs")
 }
 
+fn conflict_analysis_lrat_level0_conflict_source() -> &'static str {
+    include_str!("../../src/solver/conflict_analysis_lrat_specialized/level0_conflict.rs")
+}
+
 fn vivify_source() -> String {
     [
         include_str!("../../src/solver/inprocessing/vivify/mod.rs"),
@@ -67,6 +71,8 @@ fn conflict_analysis_combined() -> String {
     combined.push_str(conflict_analysis_lrat_unit_chain_source());
     combined.push('\n');
     combined.push_str(conflict_analysis_lrat_specialized_source());
+    combined.push('\n');
+    combined.push_str(conflict_analysis_lrat_level0_conflict_source());
     combined
 }
 

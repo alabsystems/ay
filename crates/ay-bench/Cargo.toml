@@ -24,7 +24,7 @@ ay-proof-complexity.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "time", "user"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ay-sys.workspace = true
 
 [dev-dependencies]

@@ -28,7 +28,7 @@ fn test_vpm2_30_never_returns_unsat_8347() -> Result<()> {
     // are whitelisted), so a clean checkout has no corpus. Gate on presence the
     // same way the two sibling tests below already do, rather than hard-failing
     // on an absent fixture. The soundness guard (never UNSAT) is unchanged.
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "SKIP test_vpm2_30_never_returns_unsat_8347: corpus benchmark not found: {}",
             path.display()
@@ -54,7 +54,7 @@ fn test_vpm2_30_never_returns_unsat_8347() -> Result<()> {
 #[ntest::timeout(30_000)]
 fn test_sc6_induction3_never_returns_unsat_8347() -> Result<()> {
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/sc-6.induction3.cvc.smt2");
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!("Benchmark not found, skipping: {}", path.display());
         return Ok(());
     }
@@ -73,7 +73,7 @@ fn test_sc6_induction3_never_returns_unsat_8347() -> Result<()> {
 #[ntest::timeout(30_000)]
 fn test_sc8_induction3_never_returns_unsat_8347() -> Result<()> {
     let path = workspace_path("benchmarks/smtcomp/QF_LRA/sc-8.induction3.cvc.smt2");
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!("Benchmark not found, skipping: {}", path.display());
         return Ok(());
     }

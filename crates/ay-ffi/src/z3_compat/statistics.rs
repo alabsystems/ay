@@ -302,7 +302,8 @@ pub unsafe extern "C" fn Z3_stats_is_uint(c: Z3_context, s: Z3_stats, idx: c_uin
 /// `c` must be a valid context pointer; `s`, when non-null, a valid stats handle.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_stats_is_double(c: Z3_context, s: Z3_stats, idx: c_uint) -> bool {
-    // SAFETY: see `Z3_stats_is_uint`.
+    // SAFETY: `c` and `s` satisfy the caller contract; `ffi_guard_int`
+    // null-checks `c`, and the closure checks `s` before reading its entries.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
             let Some(handle) = s.as_ref() else {

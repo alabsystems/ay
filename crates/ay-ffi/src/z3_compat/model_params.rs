@@ -1577,7 +1577,8 @@ pub unsafe extern "C" fn Z3_model_get_func_decl(
     if m.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: see `Z3_model_get_func_interp`.
+    // SAFETY: `m` was null-checked above and the caller guarantees it is a live
+    // model handle; `ffi_guard_ptr` checks `c` before reading its tables.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let interps = &(*m).func_interps;

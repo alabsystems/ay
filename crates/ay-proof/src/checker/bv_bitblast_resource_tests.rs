@@ -172,6 +172,35 @@ fn expired_deadline_stops_lowering_before_visiting_a_term() {
         .expect_err("resource exhaustion must not be reported as unsupported syntax");
     assert!(matches!(
         error,
-        BoolBvUnsatAuthenticationError::Refutation { .. }
+        BoolBvUnsatAuthenticationError::ResourceLimit { .. }
     ));
+    // An exhausted envelope carries no semantic information, so this lane must
+    // DECLINE and let the remaining certification routes run.
+    assert!(error.is_capability_decline());
+}
+
+/// The decline introduced for exhausted envelopes must NOT extend to the two
+/// errors that are positive evidence the claimed UNSAT is wrong. If either of
+/// these ever starts declining, a refuted verdict would be published.
+#[test]
+fn satisfiable_and_replay_failures_are_never_capability_declines() {
+    let satisfiable = BoolBvUnsatAuthenticationError::Satisfiable;
+    assert!(!satisfiable.is_capability_decline());
+    assert!(!satisfiable.is_unsupported_fragment());
+
+    let replay = BoolBvUnsatAuthenticationError::Replay {
+        reason: "gate clause 7 does not follow".to_string(),
+    };
+    assert!(!replay.is_capability_decline());
+    assert!(!replay.is_unsupported_fragment());
+
+    let refutation = BoolBvUnsatAuthenticationError::Refutation {
+        reason: "not surfaceable as pure-RUP resolution".to_string(),
+    };
+    assert!(!refutation.is_capability_decline());
+
+    let exhausted = BoolBvUnsatAuthenticationError::ResourceLimit {
+        reason: "proof resource `expression nodes` exceeds limit 4096".to_string(),
+    };
+    assert!(exhausted.is_capability_decline());
 }

@@ -7,9 +7,11 @@
 //!
 //! Proof ID queries and level-0 unit chain BFS are in
 //! `conflict_analysis_lrat_unit_chain.rs`.
+//! Resolution-chain traversal is in `conflict_analysis_lrat/resolution_chain.rs`.
+
+mod resolution_chain;
 
 use super::*;
-use crate::kani_compat::DetHashSet;
 use crate::solver_log::solver_log;
 
 impl Solver {
@@ -46,18 +48,21 @@ impl Solver {
             "BUG: learned clause contains duplicate literals"
         );
 
-        // Soundness-triage (AY_AB_TRIAGE_CLAUSE): dump the resolution chain
+        // Soundness-triage (--sat-ab-triage-clause): dump the resolution chain
         // with arena content + garbage flags when learning the target clause.
         {
             use std::sync::OnceLock;
             static TARGET: OnceLock<Option<Vec<i64>>> = OnceLock::new();
             let target = TARGET.get_or_init(|| {
-                std::env::var("AY_AB_TRIAGE_CLAUSE").ok().map(|s| {
-                    let mut v: Vec<i64> =
-                        s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
-                    v.sort_unstable();
-                    v
-                })
+                ay_core::misc_cli_flags()
+                    .ab_triage_clause
+                    .as_deref()
+                    .map(|s| {
+                        let mut v: Vec<i64> =
+                            s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                        v.sort_unstable();
+                        v
+                    })
             });
             if target.is_some() {
                 let mut mine: Vec<i64> = lits
@@ -276,111 +281,6 @@ impl Solver {
         }
 
         clause_ref
-    }
-
-    /// `rup_satisfied`: literals satisfied by the RUP assumption for the derived
-    /// clause. Reason clauses containing any of these literals are trivially
-    /// satisfied and must be omitted from the hint chain — strict checkers
-    /// (lrat-check) reject hints with non-falsified literals (#5026).
-    /// Pass an empty set when no filtering is needed.
-    pub(crate) fn collect_resolution_chain(
-        &mut self,
-        seed_clause: ClauseRef,
-        skip_var: Option<usize>,
-        rup_satisfied: &DetHashSet<Literal>,
-    ) -> Vec<u64> {
-        let mut chain = Vec::new();
-        // Reuse solver-owned LRAT bits in minimize_flags with sparse cleanup to avoid
-        // O(num_vars) allocation/zeroing on every chain collection.
-        // This function only needs one mark bit, so LRAT_A in minimize_flags is reused.
-        for &idx in &self.min.lrat_to_clear {
-            self.min.minimize_flags[idx] &= !LRAT_A;
-        }
-        self.min.lrat_to_clear.clear();
-
-        let seed_id = self.clause_id(seed_clause);
-        let seed_lits = self.arena.literals(seed_clause.0 as usize);
-        // Filter the seed (conflict) clause if it contains a literal
-        // satisfied by the RUP assumption. Under RUP, the checker assumes
-        // the negation of the derived clause — a hint clause containing one
-        // of those negated literals has a non-falsified (true) literal and
-        // can never produce a conflict. Only its transitive dependencies
-        // are still collected below. (#7108)
-        let seed_is_satisfied =
-            !rup_satisfied.is_empty() && seed_lits.iter().any(|l| rup_satisfied.contains(l));
-        if seed_id != 0 && !seed_is_satisfied {
-            chain.push(seed_id);
-        }
-        for &lit in seed_lits {
-            let vi = lit.variable().index();
-            if vi < self.num_vars && self.min.minimize_flags[vi] & LRAT_A == 0 {
-                self.min.minimize_flags[vi] |= LRAT_A;
-                self.min.lrat_to_clear.push(vi);
-            }
-        }
-
-        for &trail_lit in self.trail.iter().rev() {
-            let vi = trail_lit.variable().index();
-            if vi >= self.num_vars
-                || self.min.minimize_flags[vi] & LRAT_A == 0
-                || skip_var == Some(vi)
-            {
-                continue;
-            }
-            let vd = self.var_data[vi];
-            let reason_raw = vd.reason;
-            // #8467: a lazy theory reason stores a `lazy_theory_reasons` TABLE
-            // INDEX in `reason` (bit 31 clear, so `is_clause_reason` alone
-            // cannot distinguish it from an arena offset). Interpreting the
-            // index as a ClauseRef reads an unrelated clause — injecting a
-            // bogus antecedent into the chain — or panics OOB past the arena
-            // end. Treat it like a deleted reason: fall through to the
-            // unit/level-0 proof-id fallback below (omitting an antecedent is
-            // fail-closed for the proof; fabricating one is not).
-            if is_clause_reason(reason_raw) && !vd.is_lazy_theory_reason() {
-                let reason_ref = ClauseRef(reason_raw);
-                // Check if the reason clause is satisfied by the RUP assumption.
-                // If so, skip adding it as a hint but still traverse its literals
-                // for transitive dependencies (#5026).
-                let reason_lits = self.arena.literals(reason_ref.0 as usize);
-                let reason_is_satisfied = !rup_satisfied.is_empty()
-                    && reason_lits.iter().any(|l| rup_satisfied.contains(l));
-                let reason_id = self.clause_id(reason_ref);
-                if !reason_is_satisfied && reason_id != 0 {
-                    chain.push(reason_id);
-                }
-                for &reason_lit in reason_lits {
-                    let rvi = reason_lit.variable().index();
-                    if rvi < self.num_vars && self.min.minimize_flags[rvi] & LRAT_A == 0 {
-                        self.min.minimize_flags[rvi] |= LRAT_A;
-                        self.min.lrat_to_clear.push(rvi);
-                    }
-                }
-                continue;
-            }
-            // For unit_proof_id / level0_proof_id fallback: the original reason
-            // clause was deleted; we can't inspect its literals. Check if the
-            // variable itself has its trail literal in rup_satisfied, meaning
-            // its original reason clause (which contained that trail literal)
-            // would be satisfied. (#5026)
-            if !rup_satisfied.is_empty() && rup_satisfied.contains(&trail_lit) {
-                continue;
-            }
-            if let Some(unit_id) = self.visible_unit_proof_id_for_lit(trail_lit) {
-                chain.push(unit_id);
-            } else if let Some(id) = self.level0_var_proof_id(vi) {
-                // Fallback: ClearLevel0 cleared reason[vi] but level0_proof_id
-                // preserves the clause ID for LRAT derivation chains (#4617).
-                chain.push(id);
-            }
-        }
-
-        for &idx in &self.min.lrat_to_clear {
-            self.min.minimize_flags[idx] &= !LRAT_A;
-        }
-        self.min.lrat_to_clear.clear();
-
-        chain
     }
 
     /// Add a learned clause and return its reference (test-only convenience).

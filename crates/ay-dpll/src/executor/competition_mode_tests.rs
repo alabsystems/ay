@@ -14,12 +14,17 @@
 //! - the `(set-option :check-proofs-strict true)` context option,
 //! - `set_self_check(true)`.
 //!
-//! Publication semantics are v1 (pre-B3): shedding removes tracking cost, but
-//! UNSAT publication still fail-closes — an `unsat` may only be published
-//! with a minted certificate; otherwise it degrades to `unknown`. The
-//! raw-admission lane (`CompetitionRaw`) is a later milestone gated on the
-//! B2 dormant-lane audit.
+//! Publication semantics (#proof-capability B3): while shedding is active,
+//! UNSAT publishes through the `CompetitionRaw` admission lane — the exact
+//! public-query scope authenticates (unweakened epoch/source/term-entry/
+//! assumption checks; proof-source provenance self-gates under shedding and
+//! is the one tolerated absence) but no checked refutation backs the verdict.
+//! This is the documented product carve-out, and the tests below prove its
+//! boundary from both sides: EVERY shed-mode UNSAT admits (a missed admission
+//! arm would silently score 0 as `unknown`), and ANY proof demand makes the
+//! raw lane dead code with certified-mode behavior unchanged.
 
+use super::unsat_cert::CommandUnsatAdmission;
 use super::Executor;
 use ay_frontend::parse;
 
@@ -227,13 +232,13 @@ fn demanded_proofs_keep_certified_unsat_publication_in_competition_mode() {
     );
 }
 
-/// v1 fail-closed publication with shedding active: whatever the verdict, an
-/// `unsat` may ONLY be published when a certification lane minted a token —
-/// shedding never buys an uncertified `unsat`. (Degrading to `unknown` is the
-/// EXPECTED cost of shedding until the B3 raw-admission lane lands behind the
-/// B2 audit.)
+/// B3 publication with shedding active: an `unsat` is never published without
+/// an admission token. Post-B3 the token is the scope-authenticated
+/// `CompetitionRaw` carve-out, and its admission class plus the
+/// `unsat_admission=competition-raw` statistic are both recorded — nothing can
+/// pass a raw admission off as a checked certification.
 #[test]
-fn shedding_never_publishes_uncertified_unsat() {
+fn shedding_publishes_raw_admitted_unsat_with_recorded_class() {
     let mut exec = Executor::new();
     exec.set_competition_mode(true);
     let outputs = run(
@@ -248,17 +253,196 @@ fn shedding_never_publishes_uncertified_unsat() {
         (check-sat)
         ",
     );
-    let verdict = outputs.last().expect("check-sat output");
-    assert!(
-        verdict == "unsat" || verdict == "unknown",
-        "shed-mode refutation must publish unsat-with-certificate or degrade \
-         to unknown, got {verdict}"
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("unsat"),
+        "shed-mode refutation must publish through the raw admission lane"
     );
-    if verdict == "unsat" {
-        assert!(
-            exec.last_command_unsat_admission.is_some(),
-            "published unsat without a certification admission — the \
-             fail-closed gate was weakened"
+    assert_eq!(
+        exec.last_command_unsat_admission,
+        Some(CommandUnsatAdmission::CompetitionRaw),
+        "shed-mode unsat must record the raw admission class"
+    );
+    assert_eq!(
+        exec.statistics().get_string("unsat_admission"),
+        Some("competition-raw"),
+        "the raw admission must be visible in the statistics surface"
+    );
+    // A raw admission is an admission record, never a verification claim.
+    assert!(!exec.last_command_unsat_was_strictly_verified());
+    assert!(!exec.last_command_unsat_was_independently_verified());
+    assert!(!exec.last_command_unsat_was_exact_semantically_verified());
+}
+
+/// #proof-capability B3 every-UNSAT-admits matrix: in shedding mode EVERY
+/// refutation family publishes `unsat` through the `CompetitionRaw` lane. A
+/// missed admission arm would not fail loudly — the verdict would silently
+/// degrade to `unknown` and score 0 — so each family asserts the exact
+/// verdict AND the exact admission class.
+#[test]
+fn shed_mode_every_unsat_family_admits_competition_raw() {
+    for (family, script) in [
+        (
+            "propositional resolution",
+            r"
+            (set-logic QF_UF)
+            (declare-const p Bool)
+            (declare-const q Bool)
+            (assert (or p q))
+            (assert (or (not p) q))
+            (assert (not q))
+            (check-sat)
+            ",
+        ),
+        (
+            "EUF congruence",
+            r"
+            (set-logic QF_UF)
+            (declare-sort U 0)
+            (declare-fun f (U) U)
+            (declare-const a U)
+            (declare-const b U)
+            (assert (= a b))
+            (assert (distinct (f a) (f b)))
+            (check-sat)
+            ",
+        ),
+        (
+            "LIA bounds",
+            r"
+            (set-logic QF_LIA)
+            (declare-const x Int)
+            (assert (< x 0))
+            (assert (> x 0))
+            (check-sat)
+            ",
+        ),
+        (
+            "BV equality",
+            r"
+            (set-logic QF_BV)
+            (declare-const v (_ BitVec 8))
+            (assert (= v #x01))
+            (assert (= v #x02))
+            (check-sat)
+            ",
+        ),
+        (
+            "check-sat-assuming",
+            r"
+            (set-logic QF_UF)
+            (declare-const p Bool)
+            (assert p)
+            (check-sat-assuming ((not p)))
+            ",
+        ),
+    ] {
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        let outputs = run(&mut exec, script);
+        assert_eq!(
+            outputs.last().map(String::as_str),
+            Some("unsat"),
+            "{family}: shed-mode UNSAT must ADMIT, not silently degrade to \
+             unknown (a missed admission arm scores 0)"
         );
+        assert_eq!(
+            exec.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CompetitionRaw),
+            "{family}: shed-mode unsat must publish through the CompetitionRaw \
+             admission lane"
+        );
+        assert_eq!(
+            exec.statistics().get_string("unsat_admission"),
+            Some("competition-raw"),
+            "{family}: the raw admission statistic must be recorded"
+        );
+    }
+}
+
+/// #proof-capability B3 unreachability invariant: with ANY proof demand in
+/// scope — or without competition mode at all — the raw lane is dead code.
+/// Each demand row runs TWIN executors, competition+demand vs demand-only,
+/// and requires identical outputs and identical admission class: the
+/// competition switch must be unobservable outside shedding. No row may
+/// admit through `CompetitionRaw` and the `unsat_admission` statistic key
+/// must never appear.
+#[test]
+fn competition_raw_is_dead_under_every_proof_demand() {
+    const SCRIPT: &str = r"
+        (set-logic QF_UF)
+        (declare-const p Bool)
+        (assert p)
+        (assert (not p))
+        (check-sat)
+    ";
+    let demands: [(&str, fn(&mut Executor)); 5] = [
+        ("no demand (certified default twin)", |_| {}),
+        ("set_produce_proofs(true)", |exec| {
+            exec.set_produce_proofs(true);
+        }),
+        ("in-script :produce-proofs true", |exec| {
+            run(exec, "(set-option :produce-proofs true)");
+        }),
+        (":check-proofs-strict true", |exec| {
+            run(exec, "(set-option :check-proofs-strict true)");
+        }),
+        ("set_self_check(true)", |exec| {
+            exec.set_self_check(true);
+        }),
+    ];
+    for (demand, arm) in demands {
+        let mut certified = Executor::new();
+        arm(&mut certified);
+        let mut competition = Executor::new();
+        competition.set_competition_mode(true);
+        arm(&mut competition);
+        if demand == "no demand (certified default twin)" {
+            // The one row where shedding IS active on the competition twin:
+            // it exercises the raw lane and is asserted separately by
+            // `shed_mode_every_unsat_family_admits_competition_raw`. Here
+            // only the certified twin's surface is pinned.
+            let outputs = run(&mut certified, SCRIPT);
+            assert_eq!(outputs.last().map(String::as_str), Some("unsat"));
+            assert_ne!(
+                certified.last_command_unsat_admission,
+                Some(CommandUnsatAdmission::CompetitionRaw),
+                "{demand}: certified default must never admit raw"
+            );
+            assert_eq!(
+                certified.statistics().get_string("unsat_admission"),
+                None,
+                "{demand}: certified statistics must not carry the raw marker"
+            );
+            continue;
+        }
+        assert!(
+            !competition.competition_shedding_active(),
+            "{demand}: the demand must deactivate shedding"
+        );
+        let certified_outputs = run(&mut certified, SCRIPT);
+        let competition_outputs = run(&mut competition, SCRIPT);
+        assert_eq!(
+            certified_outputs, competition_outputs,
+            "{demand}: with the demand in scope the competition switch must \
+             be unobservable"
+        );
+        assert_eq!(
+            certified.last_command_unsat_admission, competition.last_command_unsat_admission,
+            "{demand}: both twins must publish through the same admission lane"
+        );
+        assert_ne!(
+            competition.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CompetitionRaw),
+            "{demand}: the raw lane must be unreachable outside shedding"
+        );
+        for (twin, exec) in [("certified", &certified), ("competition", &competition)] {
+            assert_eq!(
+                exec.statistics().get_string("unsat_admission"),
+                None,
+                "{demand}: {twin} twin statistics must not carry the raw \
+                 admission marker"
+            );
+        }
     }
 }

@@ -699,8 +699,6 @@ fn certificate_mode_bypasses_the_crash_unknown_wrapper() {
         .arg(&dump)
         .arg(&input)
         .env("AY_INTERNAL_TEST_ABORT_SOLVE_CHILD", "1")
-        .env_remove("AY_DUMP_BV_CNF")
-        .env_remove("AY_DUMP_BV_DIMACS")
         .output()
         .expect("spawn certificate-mode no-wrapper check");
 
@@ -979,25 +977,16 @@ fn paired_drat_hard_link_alias_of_input_is_rejected() {
 #[test]
 #[timeout(60_000)]
 fn non_solve_early_modes_reject_requested_export_and_remove_stale_artifact() {
-    for mode in ["features", "z3-params"] {
+    // B58: the `-p` z3-compat parameter dump lost its arm here — the retired
+    // env alias was the ONLY channel that could smuggle an export request
+    // into that early mode, so the rejection property now holds by
+    // construction (there is nothing to reject).
+    for mode in ["features"] {
         let temp = TempDir::new(mode);
         let dump = temp.write("stale.cnf", "STALE-DUMP-SENTINEL\n");
         let mut command = Command::new(ay_binary());
         command.arg("solve");
-        if mode == "features" {
-            command.arg("--dump-bv-cnf").arg(&dump).arg("--features");
-        } else {
-            // `-p` is the parameter dump. This arm asserted `--z3-print-params`,
-            // a flag AY has never had -- clap rejected it as an unknown
-            // argument, so the arm proved nothing about early-mode export
-            // rejection. The property it was written for is real and now
-            // holds: a parameter dump never runs a check-sat, so a requested
-            // export is refused and any stale artifact removed.
-            command
-                .arg("-p")
-                .env("AY_DUMP_BV_CNF", &dump)
-                .env_remove("AY_DUMP_BV_DIMACS");
-        }
+        command.arg("--dump-bv-cnf").arg(&dump).arg("--features");
         let output = command.output().expect("spawn incompatible early mode");
         let (stdout, stderr) = output_text(&output);
         assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
@@ -1108,7 +1097,9 @@ fn dynamic_output_channels_are_forbidden_in_certificate_mode() {
 
 #[test]
 #[timeout(60_000)]
-fn legacy_bv_dimacs_environment_alias_uses_the_faithful_writer() {
+fn retired_bv_dimacs_environment_alias_is_inert() {
+    // B58: the env aliases are retired; `--dump-bv-cnf` is the one carrier.
+    // Setting the legacy names must neither export nor change the verdict.
     let temp = TempDir::new("legacy_alias");
     let input = temp.write("input.smt2", CONSTRAINED_BV_SAT);
     let dump = temp.path("legacy.cnf");
@@ -1117,15 +1108,15 @@ fn legacy_bv_dimacs_environment_alias_uses_the_faithful_writer() {
         .arg("solve")
         .arg("--no-verify-proof")
         .arg(&input)
-        .env_remove("AY_DUMP_BV_CNF")
+        .env("AY_DUMP_BV_CNF", &dump)
         .env("AY_DUMP_BV_DIMACS", &dump)
         .output()
-        .expect("spawn ay with legacy BV DIMACS environment alias");
+        .expect("spawn ay with retired BV dump env names set");
     assert_smt_verdict(&output, "sat");
-
-    let (_, formula) = read_cnf(&dump);
-    assert!(formula.num_vars > 0 && !formula.clauses.is_empty());
-    assert_sat_replay(&dump);
+    assert!(
+        !dump.exists(),
+        "retired env aliases must not produce an export"
+    );
 }
 
 /// A single invocation `ay --dump-bv-cnf CNF --proof DRAT input.smt2` emits BOTH

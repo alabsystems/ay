@@ -599,9 +599,12 @@ impl Executor {
         }
         if opaque_terms != 0 {
             let guard = datatype_guard.as_ref()?;
+            // Registered bounded schemas, not the exact rendered fragment: see
+            // `RenderedDatatypeGuard::is_registered` for why requiring
+            // exactness here silently degraded scalar-payload datatypes.
             if dt_terms
                 .iter()
-                .any(|term| !guard.is_exact(self.ctx.terms.sort(*term)))
+                .any(|term| !guard.is_registered(self.ctx.terms.sort(*term)))
             {
                 return None;
             }

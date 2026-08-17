@@ -25,6 +25,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::path::Path;
+use std::sync::atomic::AtomicU8;
 
 use crate::loader::open_local;
 use crate::loader::Library;
@@ -36,6 +37,14 @@ type W = usize;
 
 /// The on_clause callback shape (`Z3_on_clause_eh`).
 type OnClauseEh = unsafe extern "C" fn(*mut c_void, W, c_uint, *const c_uint, W);
+
+type ReduceAppEh = unsafe extern "C" fn(*mut c_void, W, c_uint, *const W, *mut W);
+type ReduceAssignEh = unsafe extern "C" fn(*mut c_void, W, c_uint, *const W, c_uint, *const W);
+type NewLemmaEh = unsafe extern "C" fn(*mut c_void, W, c_uint);
+type PredecessorEh = unsafe extern "C" fn(*mut c_void);
+type UnfoldEh = unsafe extern "C" fn(*mut c_void);
+
+static FIXEDPOINT_CALLBACK_STATE: AtomicU8 = AtomicU8::new(0);
 
 /// The raw C entry points the probes drive, resolved per library.
 #[allow(non_snake_case)]
@@ -65,8 +74,6 @@ struct Api {
     Z3_mk_char_from_bv: unsafe extern "C" fn(W, W) -> W,
     Z3_mk_transitive_closure: unsafe extern "C" fn(W, W) -> W,
     Z3_mk_type_variable: unsafe extern "C" fn(W, W) -> W,
-    Z3_get_relation_arity: unsafe extern "C" fn(W, W) -> c_uint,
-    Z3_get_relation_column: unsafe extern "C" fn(W, W, c_uint) -> W,
     Z3_mk_solver: unsafe extern "C" fn(W) -> W,
     Z3_solver_register_on_clause: unsafe extern "C" fn(W, W, *mut c_void, OnClauseEh),
     Z3_mk_fixedpoint: unsafe extern "C" fn(W) -> W,
@@ -78,9 +85,10 @@ struct Api {
     Z3_fixedpoint_add_cover: unsafe extern "C" fn(W, W, c_int, W, W),
     Z3_fixedpoint_add_constraint: unsafe extern "C" fn(W, W, W, c_uint),
     Z3_fixedpoint_set_predicate_representation: unsafe extern "C" fn(W, W, W, c_uint, *const W),
-    Z3_fixedpoint_set_reduce_app_callback: unsafe extern "C" fn(W, W, W),
-    Z3_fixedpoint_set_reduce_assign_callback: unsafe extern "C" fn(W, W, W),
-    Z3_fixedpoint_add_callback: unsafe extern "C" fn(W, W, *mut c_void, W, W, W),
+    Z3_fixedpoint_set_reduce_app_callback: unsafe extern "C" fn(W, W, ReduceAppEh),
+    Z3_fixedpoint_set_reduce_assign_callback: unsafe extern "C" fn(W, W, ReduceAssignEh),
+    Z3_fixedpoint_add_callback:
+        unsafe extern "C" fn(W, W, *mut c_void, NewLemmaEh, PredecessorEh, UnfoldEh),
     Z3_mk_params: unsafe extern "C" fn(W) -> W,
     Z3_params_inc_ref: unsafe extern "C" fn(W, W),
     Z3_params_set_symbol: unsafe extern "C" fn(W, W, W, W),
@@ -137,8 +145,6 @@ fn load(lib: &Library) -> Result<Api, String> {
         Z3_mk_char_from_bv,
         Z3_mk_transitive_closure,
         Z3_mk_type_variable,
-        Z3_get_relation_arity,
-        Z3_get_relation_column,
         Z3_mk_solver,
         Z3_solver_register_on_clause,
         Z3_mk_fixedpoint,
@@ -212,7 +218,9 @@ impl<'a> Session<'a> {
     }
 
     fn err(&self) -> c_uint {
-        // SAFETY: live context.
+        // SAFETY: `self.ctx` was returned by this same loaded API's
+        // `Z3_mk_context`, remains owned by the `Session`, and is not deleted
+        // until `Drop`, after this error-code query completes.
         unsafe { (self.api.Z3_get_error_code)(self.ctx) }
     }
 
@@ -297,7 +305,9 @@ fn probe_char_to_bv(s: &Session<'_>) -> Outcome {
 
 /// `Z3_mk_char_from_bv` on a width-8 bit-vector: both libs must REJECT.
 fn probe_char_from_bv_wrong_width(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `s.ctx` remains owned by this single-threaded session. The BV
+    // sort and numeral are created by the same API in that context and are
+    // passed back only while the context-owned handles remain alive.
     unsafe {
         let bv8 = (s.api.Z3_mk_bv_sort)(s.ctx, 8);
         let v = (s.api.Z3_mk_unsigned_int64)(s.ctx, 65, bv8);
@@ -308,7 +318,9 @@ fn probe_char_from_bv_wrong_width(s: &Session<'_>) -> Outcome {
 
 /// `Z3_mk_char_from_bv` on a width-18 bit-vector: both libs must ACCEPT.
 fn probe_char_from_bv_ok(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `s.ctx` remains owned by this single-threaded session. Every
+    // sort and AST queried below is returned by the same API for that context;
+    // `class_of_ast` runs the sort queries only after the character is nonzero.
     unsafe {
         let bv18 = (s.api.Z3_mk_bv_sort)(s.ctx, 18);
         let v = (s.api.Z3_mk_unsigned_int64)(s.ctx, 65, bv18);
@@ -322,7 +334,9 @@ fn probe_char_from_bv_ok(s: &Session<'_>) -> Outcome {
 
 /// Declare `R : Int × Int → Bool` on the session and return the decl.
 fn binary_int_pred(s: &Session<'_>, name: &str) -> W {
-    // SAFETY: live context/handles.
+    // SAFETY: both sort handles and the symbol belong to `s.ctx`. `dom`
+    // contains exactly the two initialized entries promised by arity 2 and
+    // remains allocated for the duration of `Z3_mk_func_decl`.
     unsafe {
         let int = (s.api.Z3_mk_int_sort)(s.ctx);
         let boolean = (s.api.Z3_mk_bool_sort)(s.ctx);
@@ -333,7 +347,9 @@ fn binary_int_pred(s: &Session<'_>, name: &str) -> W {
 
 /// `Z3_mk_transitive_closure` on a valid binary predicate: both must ACCEPT.
 fn probe_transitive_closure_ok(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `binary_int_pred` creates `f` in `s.ctx` with the required
+    // binary Bool range, and the session retains that context-owned declaration
+    // throughout the transitive-closure call and result classification.
     unsafe {
         let f = binary_int_pred(s, "R");
         let tc = (s.api.Z3_mk_transitive_closure)(s.ctx, f);
@@ -341,25 +357,30 @@ fn probe_transitive_closure_ok(s: &Session<'_>) -> Outcome {
     }
 }
 
-/// `Z3_mk_transitive_closure` on `Int × Int → Int`: both must REJECT.
-fn probe_transitive_closure_bad_range(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+/// `Z3_mk_transitive_closure` on `Bool × Bool → Bool`.
+fn probe_transitive_closure_bool_domain(s: &Session<'_>) -> Outcome {
+    // SAFETY: the domain and range are the same live Bool sort from `s.ctx`.
+    // `dom` supplies the two initialized entries required by the declaration,
+    // so `f` satisfies the documented binary-relation precondition.
     unsafe {
-        let int = (s.api.Z3_mk_int_sort)(s.ctx);
-        let dom = [int, int];
-        let f = (s.api.Z3_mk_func_decl)(s.ctx, s.sym("F3"), 2, dom.as_ptr(), int);
+        let boolean = (s.api.Z3_mk_bool_sort)(s.ctx);
+        let dom = [boolean, boolean];
+        let f = (s.api.Z3_mk_func_decl)(s.ctx, s.sym("R_bool"), 2, dom.as_ptr(), boolean);
         let tc = (s.api.Z3_mk_transitive_closure)(s.ctx, f);
         class_of_ast(s, tc, || "func-decl".to_string())
     }
 }
 
-/// `Z3_mk_transitive_closure` on a unary predicate: both must REJECT.
-fn probe_transitive_closure_unary(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+/// `Z3_mk_transitive_closure` on `BV8 × BV8 → Bool`.
+fn probe_transitive_closure_bv_domain(s: &Session<'_>) -> Outcome {
+    // SAFETY: the two domain entries use the same live BV8 sort and the range
+    // is the live Bool sort from `s.ctx`. The two-element `dom` remains valid
+    // through declaration construction, so `f` is a valid binary relation.
     unsafe {
-        let int = (s.api.Z3_mk_int_sort)(s.ctx);
+        let bv8 = (s.api.Z3_mk_bv_sort)(s.ctx, 8);
         let boolean = (s.api.Z3_mk_bool_sort)(s.ctx);
-        let f = (s.api.Z3_mk_func_decl)(s.ctx, s.sym("F1"), 1, &raw const int, boolean);
+        let dom = [bv8, bv8];
+        let f = (s.api.Z3_mk_func_decl)(s.ctx, s.sym("R_bv8"), 2, dom.as_ptr(), boolean);
         let tc = (s.api.Z3_mk_transitive_closure)(s.ctx, f);
         class_of_ast(s, tc, || "func-decl".to_string())
     }
@@ -373,6 +394,37 @@ unsafe extern "C" fn on_clause_cb(
     _cl: W,
 ) {
 }
+
+fn fixedpoint_callback_state() -> *mut c_void {
+    std::ptr::from_ref(&FIXEDPOINT_CALLBACK_STATE)
+        .cast_mut()
+        .cast()
+}
+
+extern "C" fn reduce_app_noop(
+    _state: *mut c_void,
+    _decl: W,
+    _num_args: c_uint,
+    _args: *const W,
+    _result: *mut W,
+) {
+}
+
+extern "C" fn reduce_assign_noop(
+    _state: *mut c_void,
+    _decl: W,
+    _num_args: c_uint,
+    _args: *const W,
+    _num_out: c_uint,
+    _outs: *const W,
+) {
+}
+
+extern "C" fn new_lemma_noop(_state: *mut c_void, _lemma: W, _level: c_uint) {}
+
+extern "C" fn predecessor_noop(_state: *mut c_void) {}
+
+extern "C" fn unfold_noop(_state: *mut c_void) {}
 
 /// `Z3_solver_register_on_clause`: the REGISTRATION contract (accepted, no
 /// error) — the exact point at issue for AY's accept-never-fire
@@ -407,7 +459,10 @@ fn probe_register_on_clause(s: &Session<'_>) -> Outcome {
 
 /// Fresh fixedpoint with `p : Int → Bool` registered; optionally spacer-mode.
 fn fixedpoint_with_pred(s: &Session<'_>, spacer: bool) -> (W, W) {
-    // SAFETY: live context/handles.
+    // SAFETY: all fixedpoint, parameter, sort, symbol, and declaration handles
+    // are created by the same API in `s.ctx`. Required fixedpoint/parameter
+    // references are incremented before reuse, and the one-element domain
+    // pointer matches arity 1 for the duration of declaration construction.
     unsafe {
         let fp = (s.api.Z3_mk_fixedpoint)(s.ctx);
         // Fixedpoint objects require refcounting in libz3 EVEN on non-RC
@@ -429,19 +484,23 @@ fn fixedpoint_with_pred(s: &Session<'_>, spacer: bool) -> (W, W) {
     }
 }
 
-/// `Z3_fixedpoint_init(NULL state)`: deprecated hook — inert in both?
+/// `Z3_fixedpoint_init` with process-lifetime opaque state.
 fn probe_fixedpoint_init(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fixedpoint_with_pred` returns a referenced fixedpoint allocated
+    // by this API in `s.ctx`. The non-null state points to process-lifetime
+    // storage and is opaque to the API, so it remains valid if retained.
     unsafe {
         let (fp, _p) = fixedpoint_with_pred(s, false);
-        (s.api.Z3_fixedpoint_init)(s.ctx, fp, std::ptr::null_mut());
+        (s.api.Z3_fixedpoint_init)(s.ctx, fp, fixedpoint_callback_state());
         class_of_void(s)
     }
 }
 
 /// `Z3_fixedpoint_get_reachable` with no query run (default engine).
 fn probe_fixedpoint_get_reachable(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fp` and registered predicate `p` are created and retained by
+    // `fixedpoint_with_pred` in `s.ctx`; the session keeps their common context
+    // alive while the reachable AST is produced and classified.
     unsafe {
         let (fp, p) = fixedpoint_with_pred(s, false);
         let r = (s.api.Z3_fixedpoint_get_reachable)(s.ctx, fp, p);
@@ -451,7 +510,9 @@ fn probe_fixedpoint_get_reachable(s: &Session<'_>) -> Outcome {
 
 /// `Z3_fixedpoint_get_cover_delta(level = 0)` on a spacer-mode fixedpoint.
 fn probe_fixedpoint_cover_delta_finite(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fp` is configured for spacer and `p` is registered on it by
+    // `fixedpoint_with_pred`; both handles belong to the still-owned `s.ctx`,
+    // and level zero is passed by value with no borrowed storage.
     unsafe {
         let (fp, p) = fixedpoint_with_pred(s, true);
         let r = (s.api.Z3_fixedpoint_get_cover_delta)(s.ctx, fp, 0, p);
@@ -462,7 +523,9 @@ fn probe_fixedpoint_cover_delta_finite(s: &Session<'_>) -> Outcome {
 /// `Z3_fixedpoint_add_cover(level = 2, p, true)` on a spacer-mode fixedpoint
 /// with DEFAULT parameters (slicing on).
 fn probe_fixedpoint_add_cover_finite(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fp` and registered predicate `p` belong to `s.ctx`, and `t` is
+    // constructed in that same context immediately before use. All handles
+    // remain context-owned through the finite-level cover update.
     unsafe {
         let (fp, p) = fixedpoint_with_pred(s, true);
         let t = (s.api.Z3_mk_true)(s.ctx);
@@ -473,7 +536,9 @@ fn probe_fixedpoint_add_cover_finite(s: &Session<'_>) -> Outcome {
 
 /// `Z3_fixedpoint_add_constraint(true, lvl = 3)` (a FINITE level).
 fn probe_fixedpoint_add_constraint_finite(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: the referenced spacer fixedpoint and the true AST are both
+    // allocated by this API in `s.ctx`; the session retains their context
+    // through the finite-level constraint update and error classification.
     unsafe {
         let (fp, _p) = fixedpoint_with_pred(s, true);
         let t = (s.api.Z3_mk_true)(s.ctx);
@@ -484,7 +549,9 @@ fn probe_fixedpoint_add_constraint_finite(s: &Session<'_>) -> Outcome {
 
 /// `Z3_fixedpoint_set_predicate_representation(p, ["interval_relation"])`.
 fn probe_fixedpoint_set_pred_repr(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fp`, registered predicate `p`, and `kind` are all owned by
+    // `s.ctx`. `&raw const kind` supplies the one initialized representation
+    // symbol promised by count 1 and remains alive for the entire C call.
     unsafe {
         let (fp, p) = fixedpoint_with_pred(s, false);
         let kind = s.sym("interval_relation");
@@ -493,76 +560,82 @@ fn probe_fixedpoint_set_pred_repr(s: &Session<'_>) -> Outcome {
     }
 }
 
-/// The datalog reduce-callback pair, registered as NULL (the minimal input).
+/// Register non-null no-op datalog reduce callbacks.
 fn probe_fixedpoint_reduce_callbacks(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: `fp` is a referenced fixedpoint allocated in `s.ctx` and remains
+    // alive for initialization and both registrations. The opaque state has
+    // process lifetime, and both function pointers exactly match the declared
+    // callback ABIs; no fixedpoint operation follows that could invoke them.
     unsafe {
         let (fp, _p) = fixedpoint_with_pred(s, false);
-        (s.api.Z3_fixedpoint_set_reduce_app_callback)(s.ctx, fp, 0);
+        (s.api.Z3_fixedpoint_init)(s.ctx, fp, fixedpoint_callback_state());
         if s.err() != 0 {
             return Outcome {
                 class: Class::Error,
                 detail: s.err_msg(),
             };
         }
-        (s.api.Z3_fixedpoint_set_reduce_assign_callback)(s.ctx, fp, 0);
-        class_of_void(s)
-    }
-}
-
-/// `Z3_fixedpoint_add_callback` with NULL handlers (the minimal input).
-fn probe_fixedpoint_add_callback(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
-    unsafe {
-        let (fp, _p) = fixedpoint_with_pred(s, true);
-        (s.api.Z3_fixedpoint_add_callback)(s.ctx, fp, std::ptr::null_mut(), 0, 0, 0);
-        class_of_void(s)
-    }
-}
-
-/// `Z3_get_relation_arity` on the Int sort (NOT a relation sort — the only
-/// input class AY can ever receive, since it has no relation sorts).
-fn probe_relation_arity(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
-    unsafe {
-        let int = (s.api.Z3_mk_int_sort)(s.ctx);
-        let arity = (s.api.Z3_get_relation_arity)(s.ctx, int);
+        (s.api.Z3_fixedpoint_set_reduce_app_callback)(s.ctx, fp, reduce_app_noop);
         if s.err() != 0 {
-            Outcome {
+            return Outcome {
                 class: Class::Error,
                 detail: s.err_msg(),
-            }
-        } else {
-            Outcome {
-                class: Class::OkValue(format!("arity={arity}")),
-                detail: String::new(),
-            }
+            };
         }
+        (s.api.Z3_fixedpoint_set_reduce_assign_callback)(s.ctx, fp, reduce_assign_noop);
+        class_of_void(s)
     }
 }
 
-/// `Z3_get_relation_column` on the Int sort.
-fn probe_relation_column(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+/// `Z3_fixedpoint_add_callback` with non-null no-op handlers.
+fn probe_fixedpoint_add_callback(s: &Session<'_>) -> Outcome {
+    // SAFETY: `fp` is a referenced spacer fixedpoint owned by `s.ctx`. The
+    // opaque state has process lifetime and all three function pointers match
+    // their declared callback ABIs. Only the subsequent error query runs, so
+    // the registered callbacks cannot observe temporary Rust storage.
     unsafe {
-        let int = (s.api.Z3_mk_int_sort)(s.ctx);
-        let col = (s.api.Z3_get_relation_column)(s.ctx, int, 0);
-        class_of_ast(s, col, || "sort".to_string())
+        let (fp, _p) = fixedpoint_with_pred(s, true);
+        (s.api.Z3_fixedpoint_add_callback)(
+            s.ctx,
+            fp,
+            fixedpoint_callback_state(),
+            new_lemma_noop,
+            predecessor_noop,
+            unfold_noop,
+        );
+        class_of_void(s)
     }
 }
 
 /// Polymorphic INSTANTIATION: declare `f : α → α`, apply to an Int numeral.
 fn probe_polymorphic_instantiation(s: &Session<'_>) -> Outcome {
-    // SAFETY: live context/handles.
+    // SAFETY: all handles are constructed by this API in `s.ctx`. The two
+    // symbols, type variable, declaration, Int sort, and numeral are checked
+    // before dependent use; `class_of_ast` checks the application before its
+    // sort queries. Each arity-1 pointer addresses one live initialized handle.
     unsafe {
-        let alpha = (s.api.Z3_mk_type_variable)(s.ctx, s.sym("alpha"));
+        let alpha_name = s.sym("alpha");
+        if alpha_name == 0 || s.err() != 0 {
+            return Outcome {
+                class: Class::Error,
+                detail: s.err_msg(),
+            };
+        }
+        let alpha = (s.api.Z3_mk_type_variable)(s.ctx, alpha_name);
         if alpha == 0 || s.err() != 0 {
             return Outcome {
                 class: Class::Error,
                 detail: s.err_msg(),
             };
         }
-        let f = (s.api.Z3_mk_func_decl)(s.ctx, s.sym("f"), 1, &raw const alpha, alpha);
+        let f_name = s.sym("f");
+        if f_name == 0 || s.err() != 0 {
+            return Outcome {
+                class: Class::Error,
+                detail: s.err_msg(),
+            };
+        }
+        let f = (s.api.Z3_mk_func_decl)(s.ctx, f_name, 1, &raw const alpha, alpha);
         if f == 0 || s.err() != 0 {
             return Outcome {
                 class: Class::Error,
@@ -570,7 +643,19 @@ fn probe_polymorphic_instantiation(s: &Session<'_>) -> Outcome {
             };
         }
         let int = (s.api.Z3_mk_int_sort)(s.ctx);
+        if int == 0 || s.err() != 0 {
+            return Outcome {
+                class: Class::Error,
+                detail: s.err_msg(),
+            };
+        }
         let five = (s.api.Z3_mk_int)(s.ctx, 5, int);
+        if five == 0 || s.err() != 0 {
+            return Outcome {
+                class: Class::Error,
+                detail: s.err_msg(),
+            };
+        }
         let app = (s.api.Z3_mk_app)(s.ctx, f, 1, &raw const five);
         class_of_ast(s, app, || {
             let sort = (s.api.Z3_get_sort)(s.ctx, app);
@@ -686,15 +771,15 @@ pub(crate) fn run(ay_path: &Path, z3_path: &Path, json: bool) -> i32 {
             probe_transitive_closure_ok,
         ),
         (
-            "Z3_mk_transitive_closure(Int²→Int)",
-            probe_transitive_closure_bad_range,
+            "Z3_mk_transitive_closure(Bool²→Bool)",
+            probe_transitive_closure_bool_domain,
         ),
         (
-            "Z3_mk_transitive_closure(unary)",
-            probe_transitive_closure_unary,
+            "Z3_mk_transitive_closure(BV8²→Bool)",
+            probe_transitive_closure_bv_domain,
         ),
         ("Z3_solver_register_on_clause", probe_register_on_clause),
-        ("Z3_fixedpoint_init(NULL)", probe_fixedpoint_init),
+        ("Z3_fixedpoint_init(opaque state)", probe_fixedpoint_init),
         (
             "Z3_fixedpoint_get_reachable(no query)",
             probe_fixedpoint_get_reachable,
@@ -716,15 +801,13 @@ pub(crate) fn run(ay_path: &Path, z3_path: &Path, json: bool) -> i32 {
             probe_fixedpoint_set_pred_repr,
         ),
         (
-            "Z3_fixedpoint_set_reduce_{app,assign}_callback(NULL)",
+            "Z3_fixedpoint_set_reduce_{app,assign}_callback(no-op)",
             probe_fixedpoint_reduce_callbacks,
         ),
         (
-            "Z3_fixedpoint_add_callback(NULL handlers)",
+            "Z3_fixedpoint_add_callback(no-op handlers)",
             probe_fixedpoint_add_callback,
         ),
-        ("Z3_get_relation_arity(Int sort)", probe_relation_arity),
-        ("Z3_get_relation_column(Int sort)", probe_relation_column),
         (
             "polymorphic instantiation (f:α→α at Int)",
             probe_polymorphic_instantiation,

@@ -24,6 +24,22 @@ const MAX_ORDER_VARIABLES: usize = 6;
 const MAX_REACHABLE_TERMS: usize = 512;
 const MAX_EVAL_DEPTH: usize = 128;
 
+/// Number of representative assignments enumerated for an order-ITE lemma
+/// with `variable_count` distinct numeric leaves.
+///
+/// Invalid fragments with more than [`MAX_ORDER_VARIABLES`] variables are
+/// rejected before enumeration. Resource preflight still uses the maximum
+/// accepted count for those fragments so calculating a rejection never
+/// understates the semantic checker work.
+pub(crate) fn assignment_count(variable_count: usize) -> usize {
+    let bounded = variable_count.min(MAX_ORDER_VARIABLES);
+    if bounded == 0 {
+        1
+    } else {
+        bounded.pow(bounded as u32)
+    }
+}
+
 /// Return whether `clause` is a tautology in the exact bounded total-order /
 /// term-`ite` fragment accepted by `OrderIteTautology` proof steps.
 ///
@@ -70,11 +86,7 @@ pub(crate) fn validate_order_ite_tautology(
     }
 
     let domain = variables.len().max(1);
-    let assignment_count = if variables.is_empty() {
-        1
-    } else {
-        domain.pow(variables.len() as u32)
-    };
+    let assignment_count = assignment_count(variables.len());
     let mut values = vec![0usize; variables.len()];
     for mut code in 0..assignment_count {
         for value in &mut values {
@@ -317,6 +329,16 @@ fn eval_bool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assignment_count_matches_the_validator_domain_and_caps_rejections() {
+        assert_eq!(assignment_count(0), 1);
+        assert_eq!(assignment_count(1), 1);
+        assert_eq!(assignment_count(3), 27);
+        assert_eq!(assignment_count(MAX_ORDER_VARIABLES), 46_656);
+        assert_eq!(assignment_count(MAX_ORDER_VARIABLES + 1), 46_656);
+        assert_eq!(assignment_count(usize::MAX), 46_656);
+    }
 
     fn cmp(terms: &mut TermStore, op: &str, lhs: TermId, rhs: TermId) -> TermId {
         terms.mk_app(Symbol::named(op), [lhs, rhs], Sort::Bool)

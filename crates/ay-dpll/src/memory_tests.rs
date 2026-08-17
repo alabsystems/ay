@@ -38,3 +38,26 @@ fn test_memory_exceeded_tiny_limit() {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert!(memory_exceeded(Some(1024)));
 }
+
+#[test]
+fn stale_peak_does_not_exhaust_a_later_solver() {
+    let current = observed_memory_bytes(64 * 1024 * 1024, || 2 * 1024 * 1024 * 1024);
+
+    assert_eq!(current, 64 * 1024 * 1024);
+    assert!(!memory_exceeded_at(Some(128 * 1024 * 1024), current));
+}
+
+#[test]
+fn live_footprint_over_the_limit_still_exhausts_the_solver() {
+    let current = observed_memory_bytes(192 * 1024 * 1024, || 2 * 1024 * 1024 * 1024);
+
+    assert!(memory_exceeded_at(Some(128 * 1024 * 1024), current));
+}
+
+#[test]
+fn peak_rss_is_the_conservative_fallback_when_live_measurement_fails() {
+    let current = observed_memory_bytes(0, || 2 * 1024 * 1024 * 1024);
+
+    assert_eq!(current, 2 * 1024 * 1024 * 1024);
+    assert!(memory_exceeded_at(Some(128 * 1024 * 1024), current));
+}

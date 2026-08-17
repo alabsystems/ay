@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 //! Centralized property-test crate for the AY workspace.
 //!
 //! Keep migrated property tests in integration-test modules under `tests/` so

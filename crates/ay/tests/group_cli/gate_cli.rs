@@ -130,6 +130,11 @@ fn solver_gate_can_list_native_steps_without_running_heavy_gate() {
         "solver_gate_wiring\t<native>",
         "critical_solver_policy\tbash scripts/check_critical_solver_policy.sh",
         "debug_ay_smtlib_conformance_summary\tcargo test --locked -p ay --features cli --test group_smt",
+        "debug_ay_dpll_qf_abv_packet\tcargo test --locked -p ay-dpll --test group_theory_misc smt_soundness_gate::abv:: -- --nocapture",
+        "release_only_ay_dpll_lra_regressions\tcargo test --locked -p ay-dpll --release --test group_lra qf_lra_release_soundness_ -- --nocapture",
+        "debug_ay_lra_release_fixture_integrity\tcargo test --locked -p ay --features cli --test group_lra qf_lra_release_fixture_integrity::qf_lra_release_fixtures_exist_and_match_pinned_bytes -- --exact --nocapture",
+        "release_ay_lra_cli_mechanism_regressions\tcargo test --locked -p ay --features cli --release --test group_lra qf_lra_cli_release_mechanism_ -- --nocapture",
+        "release_ay_lra_cli_hermetic_sweep\tAY_QF_LRA_RELEASE_FULL_SWEEP=0 cargo test --locked -p ay --features cli --release --test group_lra qf_lra_cli_release_sweep_6564::qf_lra_cli_release_soundness_selected_batch_6564 -- --exact --nocapture",
         "release_ay_dpll_qf_bv_differential_strict\tZ3_DIFFERENTIAL_REQUIRED=1 cargo test",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");

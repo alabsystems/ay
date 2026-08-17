@@ -11,7 +11,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{Sort, TermData, TermId, TermStore};
+use ay_core::{Sort, TermData, TermId};
 
 use super::super::model::EvalValue;
 use super::super::Executor;
@@ -21,6 +21,10 @@ use crate::ematching::{contains_quantifier, subst_vars};
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
 use crate::logic_detection::LogicCategory;
+
+#[cfg(test)]
+use super::unsupported_arith::unsupported_int_div_mod_mentions_ce_var;
+use super::unsupported_arith::{term_mentions_any, unsupported_arith_mentions_ce_var};
 
 impl Executor {
     /// Attempt multi-round CEGQI arithmetic refinement.
@@ -440,138 +444,6 @@ impl Executor {
     }
 }
 
-pub(in crate::executor) fn unsupported_arith_mentions_ce_var(
-    terms: &TermStore,
-    roots: &[TermId],
-    cegqi_state: &[(TermId, CegqiInstantiator)],
-) -> bool {
-    let ce_vars: HashSet<TermId> = cegqi_state
-        .iter()
-        .flat_map(|(_, inst)| inst.ce_variables().values().copied())
-        .collect();
-    if ce_vars.is_empty() {
-        return false;
-    }
-
-    let mut visited = HashSet::default();
-    roots
-        .iter()
-        .any(|&root| unsupported_arith_mentions_any(terms, root, &ce_vars, &mut visited))
-}
-
-fn unsupported_arith_mentions_any(
-    terms: &TermStore,
-    term: TermId,
-    ce_vars: &HashSet<TermId>,
-    visited: &mut HashSet<TermId>,
-) -> bool {
-    if !visited.insert(term) {
-        return false;
-    }
-
-    match terms.get(term) {
-        TermData::App(sym, args) => {
-            let name = sym.name();
-            let unsupported_here =
-                if matches!(name, "div" | "mod") && matches!(terms.sort(term), Sort::Int) {
-                    // Rank-9 step 2 (2026-07-08): `div`/`mod` by a NONZERO
-                    // CONSTANT no longer bails. The bail predates the rank-3
-                    // constant-path `mod_div_elim` rewrites and the rank-6 i128
-                    // widening: constant-divisor div/mod is now eliminated
-                    // EXACTLY in LIA preprocessing (no opaque auxiliary
-                    // variables survive to stall bound extraction), and the
-                    // refinement instances it produces fold to definite ground
-                    // truth values. The lift is purely a completeness change:
-                    // refinement only ever adds sound instances of the
-                    // universal and re-solves, so proceeding cannot flip a
-                    // verdict — it can only decide problems that previously
-                    // failed closed to Unknown(QuantifierCegqiIncomplete).
-                    // SYMBOLIC (or literal-zero) divisors keep the bail: their
-                    // elimination introduces case-split auxiliaries that still
-                    // prevent CEGQI convergence (#6042/#6889), and `div _ 0` is
-                    // underspecified (#57).
-                    let nonzero_constant_divisor = args.len() == 2
-                        && terms
-                            .extract_integer_constant(args[1])
-                            .is_some_and(|c| !num_traits::Zero::is_zero(&c));
-                    !nonzero_constant_divisor
-                        && args
-                            .iter()
-                            .any(|&arg| term_mentions_any(terms, arg, ce_vars))
-                } else if name == "*" && args.len() >= 2 {
-                    let non_const_count = args
-                        .iter()
-                        .filter(|&&arg| !matches!(terms.get(arg), TermData::Const(_)))
-                        .count();
-                    non_const_count >= 2
-                        && args
-                            .iter()
-                            .any(|&arg| term_mentions_any(terms, arg, ce_vars))
-                } else if name == "/" && args.len() >= 2 {
-                    !matches!(terms.get(args[1]), TermData::Const(_))
-                        && args
-                            .iter()
-                            .any(|&arg| term_mentions_any(terms, arg, ce_vars))
-                } else {
-                    false
-                };
-            unsupported_here
-                || args
-                    .iter()
-                    .any(|&arg| unsupported_arith_mentions_any(terms, arg, ce_vars, visited))
-        }
-        TermData::Not(inner) => unsupported_arith_mentions_any(terms, *inner, ce_vars, visited),
-        TermData::Ite(cond, then_term, else_term) => {
-            unsupported_arith_mentions_any(terms, *cond, ce_vars, visited)
-                || unsupported_arith_mentions_any(terms, *then_term, ce_vars, visited)
-                || unsupported_arith_mentions_any(terms, *else_term, ce_vars, visited)
-        }
-        TermData::Let(bindings, body) => {
-            bindings
-                .iter()
-                .any(|(_, value)| unsupported_arith_mentions_any(terms, *value, ce_vars, visited))
-                || unsupported_arith_mentions_any(terms, *body, ce_vars, visited)
-        }
-        TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-            unsupported_arith_mentions_any(terms, *body, ce_vars, visited)
-        }
-        TermData::Const(_) | TermData::Var(_, _) => false,
-        _ => false,
-    }
-}
-
-fn term_mentions_any(terms: &TermStore, root: TermId, targets: &HashSet<TermId>) -> bool {
-    let mut visited = HashSet::default();
-    let mut stack = vec![root];
-    while let Some(term) = stack.pop() {
-        if !visited.insert(term) {
-            continue;
-        }
-        if targets.contains(&term) {
-            return true;
-        }
-        match terms.get(term) {
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(cond, then_term, else_term) => {
-                stack.push(*cond);
-                stack.push(*then_term);
-                stack.push(*else_term);
-            }
-            TermData::Let(bindings, body) => {
-                for (_, value) in bindings {
-                    stack.push(*value);
-                }
-                stack.push(*body);
-            }
-            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
-            TermData::Const(_) | TermData::Var(_, _) => {}
-            _ => {}
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,7 +511,7 @@ mod tests {
 
     #[test]
     fn cegqi_unsupported_arith_guard_ignores_ground_mod_unrelated_to_ce_vars() {
-        let mut terms = TermStore::new();
+        let mut terms = ay_core::TermStore::new();
         let x = terms.mk_var("x", Sort::Int);
         let zero = terms.mk_int(0.into());
         let predicate = terms.mk_app(Symbol::Named("p".to_string()), vec![x], Sort::Bool);
@@ -660,7 +532,7 @@ mod tests {
 
     #[test]
     fn cegqi_unsupported_arith_guard_blocks_mod_over_ce_var() {
-        let mut terms = TermStore::new();
+        let mut terms = ay_core::TermStore::new();
         let x = terms.mk_var("x", Sort::Int);
         let zero = terms.mk_int(0.into());
         let body = terms.mk_ge(x, zero);
@@ -677,11 +549,17 @@ mod tests {
             vec![five, ce_x],
             Sort::Int,
         );
+        let state = [(forall, inst)];
 
         assert!(
-            unsupported_arith_mentions_ce_var(&terms, &[sym_div], &[(forall, inst)]),
+            unsupported_arith_mentions_ce_var(&terms, &[sym_div], &state),
             "CEGQI refinement should still fail closed when div/mod has a symbolic divisor"
         );
+        assert!(unsupported_int_div_mod_mentions_ce_var(
+            &terms,
+            &[sym_div],
+            &state
+        ));
     }
 
     /// Rank-9 step 2: a NONZERO CONSTANT divisor over a CE-var dividend no
@@ -690,7 +568,7 @@ mod tests {
     /// (underspecified semantics, #57).
     #[test]
     fn cegqi_constant_nonzero_divisor_over_ce_var_is_supported() {
-        let mut terms = TermStore::new();
+        let mut terms = ay_core::TermStore::new();
         let x = terms.mk_var("x", Sort::Int);
         let zero = terms.mk_int(0.into());
         let body = terms.mk_ge(x, zero);
@@ -702,15 +580,21 @@ mod tests {
             .expect("x counterexample variable");
         let two = terms.mk_int(2.into());
         let const_div = terms.mk_app(Symbol::Named("div".to_string()), vec![ce_x, two], Sort::Int);
+        let state = [(forall, inst)];
         assert!(
-            !unsupported_arith_mentions_ce_var(&terms, &[const_div], &[(forall, inst)]),
+            !unsupported_arith_mentions_ce_var(&terms, &[const_div], &state),
             "nonzero-constant-divisor div over a CE var must not bail (rank-9 step 2)"
         );
+        assert!(!unsupported_int_div_mod_mentions_ce_var(
+            &terms,
+            &[const_div],
+            &state
+        ));
     }
 
     #[test]
     fn cegqi_zero_constant_divisor_over_ce_var_keeps_bail() {
-        let mut terms = TermStore::new();
+        let mut terms = ay_core::TermStore::new();
         let x = terms.mk_var("x", Sort::Int);
         let zero = terms.mk_int(0.into());
         let body = terms.mk_ge(x, zero);
@@ -725,9 +609,49 @@ mod tests {
             vec![ce_x, zero],
             Sort::Int,
         );
+        let state = [(forall, inst)];
         assert!(
-            unsupported_arith_mentions_ce_var(&terms, &[zero_div], &[(forall, inst)]),
+            unsupported_arith_mentions_ce_var(&terms, &[zero_div], &state),
             "literal-zero divisor must keep the fail-closed bail (#57 semantics)"
+        );
+        assert!(unsupported_int_div_mod_mentions_ce_var(
+            &terms,
+            &[zero_div],
+            &state
+        ));
+    }
+
+    #[test]
+    fn predispatch_div_guard_ignores_supported_ce_nonlinearity() {
+        let mut terms = ay_core::TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let body = terms.mk_ge(x, zero);
+        let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        let inst = CegqiInstantiator::new(forall, &mut terms).expect("CEGQI instantiator");
+        let ce_x = *inst
+            .ce_variables()
+            .get("x")
+            .expect("x counterexample variable");
+        let product = terms.mk_mul(vec![ce_x, ce_x]);
+
+        // This unrelated ground term makes StaticFeatures::has_int_div_mod
+        // true, but its nonzero constant divisor is supported and it has no CE
+        // dependency. The narrow pre-dispatch guard must therefore ignore the
+        // separate CE-dependent nonlinear product.
+        let a = terms.mk_var("a", Sort::Int);
+        let five = terms.mk_int(5.into());
+        let ground_mod = terms.mk_app(Symbol::Named("mod".to_string()), vec![a, five], Sort::Int);
+        let state = [(forall, inst)];
+        let roots = [ground_mod, product];
+
+        assert!(
+            unsupported_arith_mentions_ce_var(&terms, &roots, &state),
+            "the general linear-logic refinement guard still sees CE nonlinearity"
+        );
+        assert!(
+            !unsupported_int_div_mod_mentions_ce_var(&terms, &roots, &state),
+            "the div/mod liveness guard must not conflate unrelated operations"
         );
     }
 }

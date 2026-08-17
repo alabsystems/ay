@@ -9,8 +9,8 @@
 //! (`MultiPoly`, `Rel`, `MultiConstraint`) and the whole LP/PSD/verify machinery
 //! are copied verbatim here (with slim reps identical to NRA's) so NIA gains the
 //! same certificate-gated UNSAT pre-phase without a risky cross-crate migration.
-//! NRA is left completely untouched. **TODO: de-duplicate this and the NRA copy
-//! into a shared crate later.**
+//! NRA is left completely untouched. A future cohesion pass should extract the
+//! common audited checker into a shared crate instead of maintaining two copies.
 //!
 //! ## Why a REAL SOS refutation is sound for INTEGER UNSAT
 //!

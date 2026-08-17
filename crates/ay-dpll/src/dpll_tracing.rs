@@ -36,13 +36,13 @@ pub(crate) fn u64_to_i64(value: u64) -> i64 {
 }
 
 impl<T: TheorySolver> DpllT<'_, T> {
-    /// Enable TLA2 trace emission on the internal SAT solver from `AY_TRACE_FILE`.
+    /// Enable TLA2 trace emission on the internal SAT solver from `--trace-file`.
     pub fn maybe_enable_tla_trace_from_env(&mut self) {
         self.sat.maybe_enable_tla_trace_from_env();
         self.maybe_enable_dpll_tla_trace_from_env();
     }
 
-    /// Enable SAT diagnostic trace from `AY_DIAGNOSTIC`/`AY_DIAGNOSTIC_FILE` env vars.
+    /// Enable SAT diagnostic trace (`--diagnostic-file`, or `AY_DIAGNOSTIC=1` auto-path).
     pub fn maybe_enable_diagnostic_trace_from_env(&mut self) {
         self.sat.maybe_enable_diagnostic_trace_from_env();
     }
@@ -72,7 +72,7 @@ impl<T: TheorySolver> DpllT<'_, T> {
         Ok(())
     }
 
-    /// Enable DPLL(T) TLA2 trace from `AY_DPLL_TRACE_FILE`.
+    /// Enable DPLL(T) TLA2 trace from `--dpll-trace-file` (B72).
     pub fn maybe_enable_dpll_tla_trace_from_env(&mut self) {
         let Some(path) = crate::theory_debug_flags::dpll_trace_file_path() else {
             return;
@@ -91,12 +91,12 @@ impl<T: TheorySolver> DpllT<'_, T> {
         self.sat.maybe_enable_decision_trace_from_env();
     }
 
-    /// Enable SAT deterministic replay checking from `AY_REPLAY_TRACE_FILE`.
+    /// Enable SAT deterministic replay checking from `--replay-trace`.
     pub fn maybe_enable_replay_trace_from_env(&mut self) {
         self.sat.maybe_enable_replay_trace_from_env();
     }
 
-    /// Load a solution witness from `AY_SOLUTION_FILE` for Sam Buss trick debugging.
+    /// Load a solution witness from `--solution-file` for Sam Buss trick debugging.
     pub fn maybe_load_solution_from_env(&mut self) {
         self.sat.maybe_load_solution_from_env();
     }

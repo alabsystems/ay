@@ -4,6 +4,8 @@
 
 //! EUF, DT, and Array+EUF solving.
 
+#[cfg(test)]
+mod array_axiom_attribution_tests;
 mod array_congruence;
 mod array_fixpoint;
 mod array_patterns;
@@ -24,14 +26,14 @@ use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore, TheoryLemmaKind};
 use ay_euf::EufSolver;
 
-/// `AY_EUF_BOOL_ARG_REPAIR=1` enables the targeted Bool-arg congruence repair
+/// `--euf-bool-arg-repair` enables the targeted Bool-arg congruence repair
 /// loop in `solve_euf`. DEFAULT OFF: unset keeps the historical behaviour of
 /// surrendering the check-sat to `Unknown` when the post-SAT guard rejects a
 /// non-congruent model, so the default path is byte-identical. Single cached
 /// env read.
 fn bool_arg_repair_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_EUF_BOOL_ARG_REPAIR").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().euf_bool_arg_repair)
 }
 
 /// Collect all TermIds transitively reachable from the given root terms (#6726).
@@ -191,6 +193,63 @@ impl Executor {
         if axiom == self.ctx.terms.true_term() {
             return;
         }
+        self.trace_array_axiom_assertion_site(axiom, site);
+        self.ctx.assertions.push(axiom);
+        self.record_array_axiom_proof(axiom);
+    }
+
+    /// Ensure a cached solver axiom is installed in the current assertion
+    /// view and registered in the current proof session.
+    ///
+    /// Assertion swaps and proof-tracker checkpoints have independent
+    /// lifetimes: an axiom term can remain live while either its assertion or
+    /// its proof lemma is absent. Cache hits therefore deduplicate the former
+    /// but always replay the latter. Returns whether a new assertion entry was
+    /// appended.
+    pub(in crate::executor) fn ensure_array_axiom_assertion_site(
+        &mut self,
+        axiom: TermId,
+        site: &str,
+    ) -> bool {
+        if axiom == self.ctx.terms.true_term() {
+            return false;
+        }
+        let inserted = if self.ctx.assertions.contains(&axiom) {
+            false
+        } else {
+            self.trace_array_axiom_assertion_site(axiom, site);
+            self.ctx.assertions.push(axiom);
+            true
+        };
+        self.record_array_axiom_proof(axiom);
+        inserted
+    }
+
+    /// Batch form of [`Self::ensure_array_axiom_assertion_site`].
+    ///
+    /// Exact finite-array closure can replay thousands of cached axioms in one
+    /// invocation. Re-scanning the assertion vector for every replay makes that
+    /// path quadratic, so its caller builds one exact active-membership set and
+    /// updates it alongside the assertion vector through this helper.
+    pub(in crate::executor) fn ensure_array_axiom_assertion_site_with_active_set(
+        &mut self,
+        axiom: TermId,
+        site: &str,
+        active_assertions: &mut HashSet<TermId>,
+    ) -> bool {
+        if axiom == self.ctx.terms.true_term() {
+            return false;
+        }
+        let inserted = active_assertions.insert(axiom);
+        if inserted {
+            self.trace_array_axiom_assertion_site(axiom, site);
+            self.ctx.assertions.push(axiom);
+        }
+        self.record_array_axiom_proof(axiom);
+        inserted
+    }
+
+    fn trace_array_axiom_assertion_site(&self, axiom: TermId, site: &str) {
         if ay_core::debug_channel_active(ay_core::DebugChannel::ArrayAxiomSite) {
             let pretty = self.pretty_print_term_for_debug(axiom, 3);
             eprintln!(
@@ -198,7 +257,9 @@ impl Executor {
                 site, axiom.0, pretty
             );
         }
-        self.ctx.assertions.push(axiom);
+    }
+
+    fn record_array_axiom_proof(&mut self, axiom: TermId) {
         if self.produce_proofs_enabled() {
             // Attribution is a semantic boundary: only the checker's exact
             // array/EUF recognizers may choose a rule. Other consequences stay
@@ -207,7 +268,31 @@ impl Executor {
                 TermData::App(sym, args) if sym.name() == "or" => args.clone(),
                 _ => vec![axiom],
             };
-            if let Some(kind) = ay_proof::recognize_array_theory_lemma(&self.ctx.terms, &clause) {
+            // Finite enum carriers cannot be authenticated from the term store:
+            // datatype applications intentionally retain `Uninterpreted` sorts.
+            // Supply the same exact declaration/signature authority used by
+            // strict proof checking so enum expansion lemmas receive an honest
+            // finite-array rule instead of falling back to explicit trust.
+            let array_kind = ay_proof::recognize_array_theory_lemma(&self.ctx.terms, &clause)
+                .or_else(|| {
+                    // Only enum-carrier finite-array schemas need declaration
+                    // authority. Keep the ubiquitous ROW/default/congruence
+                    // proof path allocation-free, and do not let an unrelated
+                    // malformed datatype registry demote a schema the ordinary
+                    // term-store recognizer already authenticated.
+                    let datatype_declarations = self.datatype_decls_for_strict_proof();
+                    let constructor_selectors = self.ctor_selector_decls_for_strict_proof();
+                    let datatype_member_signatures =
+                        self.datatype_member_signatures_for_strict_proof()?;
+                    ay_proof::recognize_array_theory_lemma_with_typed_context(
+                        &self.ctx.terms,
+                        &clause,
+                        &datatype_declarations,
+                        &constructor_selectors,
+                        &datatype_member_signatures,
+                    )
+                });
+            if let Some(kind) = array_kind {
                 let _ = self
                     .proof_tracker
                     .add_theory_lemma_with_kind(vec![axiom], kind);
@@ -216,7 +301,7 @@ impl Executor {
                     .proof_tracker
                     .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::EufCongruent);
             } else {
-                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+                let _ = self.proof_tracker.add_explicit_trust_lemma(vec![axiom]);
             }
         }
     }
@@ -586,138 +671,5 @@ impl Executor {
                 verify_unsat_after_splits: true
             )
         })
-    }
-}
-
-#[cfg(test)]
-mod array_axiom_attribution_tests {
-    use super::*;
-    use ay_core::{ArraySort, ProofStep, Sort, Symbol};
-
-    fn int_array_sort() -> Sort {
-        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)))
-    }
-
-    #[test]
-    fn push_array_axiom_assertion_site_attributes_row1_as_positive() {
-        let mut exec = Executor::new();
-        exec.proof_tracker.enable();
-        let a = exec.ctx.terms.mk_var("a", int_array_sort());
-        let i = exec.ctx.terms.mk_var("i", Sort::Int);
-        let v = exec.ctx.terms.mk_var("v", Sort::Int);
-        let store = exec.ctx.terms.mk_store(a, i, v);
-        // Preserve the primitive ROW1 syntax: `mk_select` intentionally folds
-        // this exact read to `v` before proof attribution can inspect it.
-        let select = exec
-            .ctx
-            .terms
-            .mk_app(Symbol::named("select"), [store, i], Sort::Int);
-        let row1 = exec.ctx.terms.mk_eq(select, v);
-
-        exec.push_array_axiom_assertion_site(row1, "row1_trivial");
-        let proof = exec.proof_tracker.take_proof();
-
-        match &proof.steps[0] {
-            ProofStep::TheoryLemma { kind, clause, .. } => {
-                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: true });
-                assert_eq!(clause, &vec![row1]);
-            }
-            other => panic!("expected theory lemma, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn push_array_axiom_assertion_site_attributes_row2_as_negative() {
-        let mut exec = Executor::new();
-        exec.proof_tracker.enable();
-        let a = exec.ctx.terms.mk_var("a", int_array_sort());
-        let i = exec.ctx.terms.mk_var("i", Sort::Int);
-        let j = exec.ctx.terms.mk_var("j", Sort::Int);
-        let v = exec.ctx.terms.mk_var("v", Sort::Int);
-        let store = exec.ctx.terms.mk_store(a, i, v);
-        let select_store = exec.ctx.terms.mk_select(store, j);
-        let select_base = exec.ctx.terms.mk_select(a, j);
-        let idx_eq = exec.ctx.terms.mk_eq(i, j);
-        let row2_eq = exec.ctx.terms.mk_eq(select_store, select_base);
-        let row2 = exec.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
-
-        exec.push_array_axiom_assertion_site(row2, "row2_clause");
-        let proof = exec.proof_tracker.take_proof();
-
-        match &proof.steps[0] {
-            ProofStep::TheoryLemma { kind, clause, .. } => {
-                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: false });
-                assert_eq!(clause, &vec![row2]);
-            }
-            other => panic!("expected theory lemma, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn push_array_axiom_assertion_site_keeps_unchecked_extensionality_generic() {
-        let mut exec = Executor::new();
-        exec.proof_tracker.enable();
-        let a = exec.ctx.terms.mk_var("a", int_array_sort());
-        let b = exec.ctx.terms.mk_var("b", int_array_sort());
-        let k = exec.ctx.terms.mk_var("k", Sort::Int);
-        let array_eq = exec.ctx.terms.mk_eq(a, b);
-        let sel_a = exec.ctx.terms.mk_select(a, k);
-        let sel_b = exec.ctx.terms.mk_select(b, k);
-        let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_b);
-        let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
-        let ext = exec.ctx.terms.mk_or(vec![array_eq, not_sel_eq]);
-
-        exec.push_array_axiom_assertion_site(ext, "ext_axiom");
-        let proof = exec.proof_tracker.take_proof();
-
-        match &proof.steps[0] {
-            ProofStep::TheoryLemma { kind, clause, .. } => {
-                assert_eq!(*kind, TheoryLemmaKind::Generic);
-                assert_eq!(clause, &vec![ext]);
-            }
-            other => panic!("expected theory lemma, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn push_array_axiom_assertion_site_uses_shape_not_site_name() {
-        let mut exec = Executor::new();
-        exec.proof_tracker.enable();
-        let a = exec.ctx.terms.mk_var("a", int_array_sort());
-        let i = exec.ctx.terms.mk_var("i", Sort::Int);
-        let j = exec.ctx.terms.mk_var("j", Sort::Int);
-        let v = exec.ctx.terms.mk_var("v", Sort::Int);
-        let store = exec.ctx.terms.mk_store(a, i, v);
-        let select_store = exec.ctx.terms.mk_select(store, j);
-        let select_base = exec.ctx.terms.mk_select(a, j);
-        let idx_eq = exec.ctx.terms.mk_eq(i, j);
-        let row2_eq = exec.ctx.terms.mk_eq(select_store, select_base);
-        let row2 = exec.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
-
-        // Deliberately pass a ROW1-looking diagnostic label.  The exact clause
-        // shape, not this string, must determine proof attribution.
-        exec.push_array_axiom_assertion_site(row2, "row1_trivial");
-        let proof = exec.proof_tracker.take_proof();
-
-        match &proof.steps[0] {
-            ProofStep::TheoryLemma { kind, clause, .. } => {
-                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: false });
-                assert_eq!(clause, &vec![row2]);
-            }
-            other => panic!("expected theory lemma, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn push_array_axiom_assertion_site_skips_true_axioms() {
-        let mut exec = Executor::new();
-        exec.proof_tracker.enable();
-        let assertions_before = exec.ctx.assertions.len();
-
-        let truth = exec.ctx.terms.true_term();
-        exec.push_array_axiom_assertion_site(truth, "store_value_cong");
-
-        assert_eq!(exec.ctx.assertions.len(), assertions_before);
-        assert_eq!(exec.proof_tracker.num_steps(), 0);
     }
 }

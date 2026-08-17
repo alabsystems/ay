@@ -26,49 +26,40 @@
 //! The mechanism half of this suite lives in `bab.rs`'s own test module, where
 //! `Node` and `push_children` are in scope: `a_child_inherits_the_bound_that_
 //! covers_its_box` pins the inheritance itself on both arms of
-//! `AY_MILP_NO_BOUND_COVER`, and `dedup_root_reduction_fires_and_preserves_the_
+//! `the no-bound-cover knob`, and `dedup_root_reduction_fires_and_preserves_the_
 //! optimum` pins that the model below really does reduce.
 
 use ay_milp::{BabSession, Col, Model, Outcome, Sense, SolveOpts};
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use num_rational::BigRational;
 use num_traits::ToPrimitive as _;
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// The engine's node cap, the fix's A/B arm and the node counter are all
-/// PROCESS-global, so every test here holds this lock across its whole solve.
+/// PROCESS-global, so every test here holds the shared environment lock across
+/// its whole solve.
 /// Cargo runs the tests in this binary on parallel threads; without it one
-/// test's `AY_MILP_MAX_NODES` would silently cap another's tree and the suite
+/// test's `with_max_nodes` would silently cap another's tree and the suite
 /// would be measuring nothing in particular.
-static ENV: Mutex<()> = Mutex::new(());
-
 /// One solve under a deterministic node cap. Returns `(outcome, nodes)`.
 ///
 /// The node cap, not the clock, is what stops these trees: this box is contended
 /// and a wall-clock interrupt would make the node count — and with it the bound —
 /// depend on the load. The wall limit below is only a backstop against a hang.
 fn solve_capped(model: &Model, cap: u64, cover_off: bool, opts: &SolveOpts) -> (Outcome, u64) {
-    let _g = ENV
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // SAFETY: the lock above makes this the only thread in this test binary
-    // touching these names, and both are removed before it is released.
-    unsafe {
-        std::env::set_var("AY_MILP_MAX_NODES", cap.to_string());
-        if cover_off {
-            std::env::set_var("AY_MILP_NO_BOUND_COVER", "1");
-        }
-    }
+    let _env_lock = lock_env();
+    let opts = opts.clone().with_engine(
+        opts.engine()
+            .with_max_nodes(usize::try_from(cap).expect("cap fits usize"))
+            .with_bound_cover(!cover_off),
+    );
+    let opts = &opts;
     ay_milp::reset_nodes_explored();
     let out = BabSession::new(model.clone(), opts)
         .expect("valid model")
         .check()
         .expect("solve");
     let nodes = ay_milp::nodes_explored();
-    unsafe {
-        std::env::remove_var("AY_MILP_MAX_NODES");
-        std::env::remove_var("AY_MILP_NO_BOUND_COVER");
-    }
     (out, nodes)
 }
 

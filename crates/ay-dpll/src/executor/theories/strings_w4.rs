@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W4 — length-indexed per-position character witness synthesizer
-//! (default ON, `AY_STR_W4=0` kill switch).
+//! (default ON, `--dpll-no-str-w4` kill switch).
 //!
 //! ## Why
 //!
@@ -69,7 +69,7 @@
 //! `str.substr`/`str.at` only, so a violated atom whose haystack is rooted at
 //! `str.++`/`str.replace`, or that is keyed on an `str.indexof` RESULT, yields
 //! no edit at all and the climb plateaus. That measured residue is
-//! [`super::strings_w5`]'s (default ON, `AY_STR_W5=0` kill switch), which searches WHERE
+//! [`super::strings_w5`]'s (default ON, `--dpll-no-str-w5` kill switch), which searches WHERE
 //! the needle lands and hands the rest back to the loop below.
 
 // #8529: Use deterministic hash maps in all builds.
@@ -106,7 +106,7 @@ fn w4_test_enabled_override(value: bool) -> W4EnabledTestOverride {
     W4EnabledTestOverride { previous }
 }
 
-/// Master switch (default ON, `AY_STR_W4=0` kill switch → byte-identical pipeline).
+/// Master switch (default ON, `--dpll-no-str-w4` kill switch → byte-identical pipeline).
 pub(in crate::executor) fn str_w4_enabled() -> bool {
     #[cfg(test)]
     if let Some(value) = W4_ENABLED_TEST_OVERRIDE.with(std::cell::Cell::get) {
@@ -115,8 +115,8 @@ pub(in crate::executor) fn str_w4_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 31/92 sat-side conversions (26 attributable to W4), 29 of
     // 31 models z3-PINNED, 0 disagreements, 0 regressions on a 404-file solved
-    // sweep, 2x500 differential+pin-model fuzz clean. AY_STR_W4=0 kills it.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_W4").ok().as_deref(), Some("0")))
+    // sweep, 2x500 differential+pin-model fuzz clean. --dpll-no-str-w4 kills it.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_w4)
 }
 
 /// Longest witness W4 will synthesize (characters). Bounds work, not
@@ -154,7 +154,7 @@ const MAX_W4_SEED_POOL: usize = 10;
 /// See [`Executor::w4_work_deadline`] for why this is counted, not timed.
 ///
 /// Sized from a census, not taste. Over the 600-file QF_S + QF_SLIA canary,
-/// with the budget OFF (`AY_STR_W4_WORK=0`), 92 files have a W4/W5/W6 witness
+/// with the budget OFF (`--str-w4-work`), 92 files have a W4/W5/W6 witness
 /// accepted by the full validation battery. The COSTLIEST of those searches
 /// finishes in 84.4M units (`pyex/httplib2-entry-disposition/c788221f…`;
 /// runner-up 82.4M, then a long tail at 30.7M and below). The starvation cases
@@ -218,7 +218,7 @@ fn w4_test_work_budget_override(value: Option<u64>) -> W4WorkTestOverride {
     W4WorkTestOverride { previous }
 }
 
-/// Per-pass work cap. `AY_STR_W4_WORK=0` restores the pre-budget unbounded
+/// Per-pass work cap. `--str-w4-work` restores the pre-budget unbounded
 /// search exactly (the kill switch and the A/B knob in one).
 pub(super) fn w4_search_work_budget() -> Option<u64> {
     #[cfg(test)]
@@ -226,12 +226,9 @@ pub(super) fn w4_search_work_budget() -> Option<u64> {
         return value;
     }
     static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| match std::env::var("AY_STR_W4_WORK").ok() {
-        Some(s) => match s.trim().parse::<u64>() {
-            Ok(0) => None,
-            Ok(n) => Some(n),
-            Err(_) => Some(MAX_W4_SEARCH_WORK),
-        },
+    *V.get_or_init(|| match ay_core::misc_cli_flags().str_w4_work {
+        Some(0) => None, // explicit 0 = unbounded
+        Some(n) => Some(n),
         None => Some(MAX_W4_SEARCH_WORK),
     })
 }
@@ -277,7 +274,7 @@ impl Executor {
             return Ok(None);
         }
         let vars = self.collect_string_variables();
-        // W6 (`AY_STR_W6=1`) raises the joint-variable work bound: the
+        // W6 raises the joint-variable work bound: the
         // `full_str_int` `lib_int-ipaddress` family declares 9 variables and
         // W4's cap of 8 declines it before any synthesis happens. A work bound
         // only — every candidate still rides the full validation battery.
@@ -318,12 +315,12 @@ impl Executor {
         // instance55083` (3 atoms, all regex/length) and the already-solved
         // file degraded sat → unknown.
         //
-        // W5 (`AY_STR_W5=1`) widens the evidence to `str.indexof` equalities
+        // W5 widens the evidence to `str.indexof` equalities
         // and character-window couplings (`(= (str.at s i) (str.at s j))`,
         // which reaches here rewritten to `str.substr`): both pin positions
         // while carrying no string constant on either side, so W4's own gate
         // cannot see them. See `strings_w5.rs`.
-        // W6 (`AY_STR_W6=1`) adds two more evidence kinds: a `str.to_int` read
+        // W6 adds two more evidence kinds: a `str.to_int` read
         // of a window (the `full_str_int` family pins DIGITS at every position
         // it reads, and carries no string constant at all) and a membership
         // whose haystack is a window. Both ADD to the gate; nothing is removed.
@@ -386,7 +383,7 @@ impl Executor {
             let Some(mut viol) = self.w4_violations_complete(&atoms, &assign) else {
                 break;
             };
-            // W5 (`AY_STR_W5=1`): the per-character climb plateaus whenever a
+            // W5: the per-character climb plateaus whenever a
             // violated atom's haystack is rooted at `str.++`/`str.replace` or
             // keyed on an `str.indexof` result — `w4_origin` cannot name a
             // position, so no edit is emitted. Search WHERE the needle lands
@@ -551,7 +548,7 @@ impl Executor {
         if depth > 64 {
             return false;
         }
-        // W7 (`AY_STR_W7=1`): a DEFINED variable mentions whatever its defining
+        // W7: a DEFINED variable mentions whatever its defining
         // right-hand side mentions, so an atom about `_EXTEND_VAR_3` counts as
         // an atom about the `ip_str` it is carved out of. `None` outside W7's
         // own pass, so W4/W5/W6 are unchanged. See `strings_w7.rs`.

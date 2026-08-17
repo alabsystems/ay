@@ -43,6 +43,7 @@ mod euf;
 mod incremental_conflict_gate_tests;
 mod incremental_scope;
 pub(crate) use euf::reachable_term_set;
+pub(in crate::executor) use incremental_scope::ProofCheckpointBudget;
 mod fp;
 mod fp_model;
 // pub(in crate::executor): the model-validation pipeline re-runs the #A1

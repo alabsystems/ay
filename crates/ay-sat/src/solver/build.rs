@@ -66,7 +66,7 @@ impl Solver {
             None => num_vars.saturating_mul(4),
         };
         let literals_capacity = clauses_capacity.saturating_mul(3); // avg 3 lits/clause
-                                                                    // `AY_SAT_MEM_PROBE=1`: attribute construction memory per sub-structure.
+                                                                    // `--sat-mem-probe`: attribute construction memory per sub-structure.
                                                                     //
                                                                     // AY pays ~849 resident bytes per variable before it has seen a clause —
                                                                     // a two-clause CNF that merely mentions variable 6737543 costs 5.72 GB,
@@ -75,7 +75,7 @@ impl Solver {
                                                                     // each num_vars-sized sub-structure standalone and reports what it
                                                                     // actually commits. Diagnostic only: the probes are dropped immediately
                                                                     // and nothing here runs without the env var.
-        if std::env::var_os("AY_SAT_MEM_PROBE").is_some() {
+        if ay_core::misc_cli_flags().sat_mem_probe {
             let mut last = ay_sys::current_footprint_bytes();
             let step = |label: &str, live: &mut usize| {
                 let now = ay_sys::current_footprint_bytes();

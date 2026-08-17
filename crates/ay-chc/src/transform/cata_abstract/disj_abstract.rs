@@ -216,7 +216,7 @@ pub(crate) fn solve_abstract_disjunctive(
         }
     }
 
-    if std::env::var_os("AY_CATA_TRACE").is_some() {
+    if ay_core::misc_cli_flags().chc_cata_trace {
         for pred in preds {
             let masks = &reach[&pred.id];
             let f = build_pred_invariant(&atoms[&pred.id], masks);

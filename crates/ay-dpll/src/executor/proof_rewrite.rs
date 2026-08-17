@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Proof term rewriting for surface-syntax preservation.
-//!
 //! Canonical operators need authenticated source syntax for external assumes.
 
 // #8529: Use deterministic hash maps in all builds.
@@ -16,15 +15,19 @@ use super::proof_surface_syntax::{
     surface_override_map_is_bounded,
 };
 use super::Executor;
+
+mod ordered_tail;
+mod surface_pairs;
+use surface_pairs::{MAX_OVERRIDE_PAIRS, MAX_OVERRIDE_SOURCE_SCAN};
+
 impl Executor {
-    /// Whether an internally valid arithmetic `evaluate` step is outside the
-    /// portable Alethe evaluator implemented by Carcara.
+    /// Whether a valid arithmetic `evaluate` is outside Carcara's portable evaluator.
     ///
     /// Carcara has no integer `rem` operator, and its current `div`/`mod`
     /// evaluator uses host truncating remainder semantics for negative inputs.
     /// AY's strict checker follows SMT-LIB/Z3 Euclidean semantics.  Keep those
-    /// internally certified verdicts, but suppress a printable certificate
-    /// rather than emit a rule whose external meaning differs.  The traversal
+    /// internally certified verdicts, but suppress a printable certificate rather
+    /// than emit a rule whose external meaning differs. The traversal
     /// is bounded and fails closed on excessive proof terms.
     fn proof_has_nonportable_ground_evaluate(terms: &ay_core::TermStore, proof: &Proof) -> bool {
         const WORK_LIMIT: usize = 100_000;
@@ -213,7 +216,8 @@ impl Executor {
         if self.ctx.assertions.is_empty() {
             return;
         }
-        if !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
+        if !self.proof_source_work.spend(
+            super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxRewrite,
             self.ctx.assertions_parsed(),
         ) {
             let mut poisoned = Proof::new();
@@ -228,18 +232,14 @@ impl Executor {
         let mut term_overrides: HashMap<TermId, String> = HashMap::default();
         let problem_assertions = self.proof_problem_assertions();
         let original_problem_assertions = self.proof_original_problem_assertions();
-        // Borrow, don't deep-clone: the parsed assertion ASTs are only read
-        // while building `override_pairs` (which clones exactly the pairs it
+        // Borrow parsed assertion ASTs while building `override_pairs`, which clones only pairs it
         // keeps); the wholesale `.to_vec()` doubled that cost on every UNSAT
         // (#proof-tax: recursive `Term::clone` of the whole problem was the
         // single largest rewrite-pass leaf on the qg5 QF_UF family).
         let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
-        // Select and deduplicate borrowed source indices before cloning any
-        // parsed AST. Provenance may mention the same source through many
-        // derived assertions, so pair count and repeated source work are
+        // Deduplicate borrowed source indices before cloning parsed ASTs. Provenance may mention
+        // one source through many assertions, so pair count and repeated source work are
         // bounded explicitly.
-        const MAX_OVERRIDE_PAIRS: usize = 8_192;
-        const MAX_OVERRIDE_SOURCE_SCAN: usize = 100_000;
         let mut override_plan_valid = problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN
             && original_problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN;
         let mut source_scan_work = problem_assertions.len();
@@ -342,6 +342,7 @@ impl Executor {
         } else {
             Vec::new()
         };
+        surface_pairs::retain_available_surface_pairs(&mut pair_specs, parsed_assertions.len());
         let canonical_plan_is_bounded =
             super::proof_surface_syntax::surface_override_roots_have_bounded_work(
                 &self.ctx.terms,
@@ -350,10 +351,8 @@ impl Executor {
         if !override_plan_valid
             || pair_specs.len() > MAX_OVERRIDE_PAIRS
             || !canonical_plan_is_bounded
-            || pair_specs
-                .iter()
-                .any(|(_, index)| *index >= parsed_assertions.len())
-            || !super::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
+            || !self.proof_source_work.spend(
+                super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxOverridePairs,
                 pair_specs
                     .iter()
                     .filter_map(|(_, index)| parsed_assertions.get(*index)),
@@ -520,31 +519,7 @@ impl Executor {
             Self::fixup_resolution_conclusions(&self.ctx.terms, proof);
         }
 
-        if !term_overrides.is_empty() {
-            self.last_proof_term_overrides = Some(term_overrides);
-        }
-        let extended_assertions = self.proof_exportable_assertions(&rewrites);
-        Self::demote_auxiliary_non_problem_assumptions(
-            proof,
-            &extended_assertions,
-            &aux_assume_steps,
-        );
-        // Conjunct assumes introduced by top-level and-flattening are DERIVED
-        // from their asserted conjunction (assume + and_pos + th_resolution)
-        // before the demotion below would turn them into unverified `trust`
-        // steps and fail-close the strict checker on the whole proof.
-        Self::derive_conjunct_assumptions_from_problem_roots(
-            &mut self.ctx.terms,
-            proof,
-            &extended_assertions,
-        );
-        Self::demote_non_problem_assumptions(proof, &extended_assertions);
-        // Last resort for proofs the demotion left trust-bearing (substituted
-        // input clauses whose link to the original assertions was lost in
-        // preprocessing): re-prove the contradiction directly from the
-        // ORIGINAL problem assertions with certified theory lemmas. No-op on
-        // trust-free proofs; keeps the existing proof on any failure.
-        self.rebuild_trust_leaf_proof_from_original_assertions(proof);
+        self.finish_input_syntax_rewrite(proof, &rewrites, term_overrides, &aux_assume_steps);
     }
 }
 

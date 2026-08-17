@@ -12,12 +12,11 @@ use ay_strings::we_regex::{find_witness_bounded, find_witnesses_bounded, WeRegex
 fn w7_defaults_on_with_kill_switch() {
     // DEFAULT-ON after measurement: 6 conversions, all confirmed by AY's own
     // fail-closed --self-check; 0 losses on the 600-file sweep. Contract is
-    // now on-unless-killed with `=0`.
-    match std::env::var("AY_STR_W7").ok().as_deref() {
-        Some("0") => assert!(!str_w7_enabled()),
-        None => assert!(str_w7_enabled(), "AY_STR_W7 must default ON"),
-        _ => assert!(str_w7_enabled()),
-    }
+    // now on-unless-killed (`--dpll-no-str-w7`).
+    assert!(
+        str_w7_enabled(),
+        "W7 must default ON (`--dpll-no-str-w7` kills it)"
+    );
 }
 
 #[test]

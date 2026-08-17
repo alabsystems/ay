@@ -12,7 +12,7 @@ mod arrays_to_lia;
 mod lira;
 
 use crate::combined_solvers::combiner::{
-    CrossTheoryEqualityReplay, EufArrayNotifyReplayEdge, TheoryCombiner,
+    CrossTheoryEqualityReplay, EufArrayNotifyReplayState, TheoryCombiner,
 };
 use crate::combined_solvers::{UfNiaSolver, UfNraSolver};
 use crate::executor::model::{EvalValue, Model};
@@ -563,13 +563,9 @@ enum UfliaSplitArm {
 /// `augment_farkas_with_shared_reasons`; the detour budget limits their impact
 /// on the hybrid route.
 fn uflia_split_arm() -> UfliaSplitArm {
-    static ARM: std::sync::OnceLock<UfliaSplitArm> = std::sync::OnceLock::new();
-    *ARM.get_or_init(|| match std::env::var("AY_UFLIA_ARM").ok().as_deref() {
-        Some("eager") => UfliaSplitArm::Eager,
-        Some("lazy") => UfliaSplitArm::Lazy,
-        Some("hybrid") => UfliaSplitArm::Hybrid,
-        _ => UfliaSplitArm::Hybrid,
-    })
+    // B23: the arm env spelling is retired; Hybrid is the shipped measured
+    // default (the pure lazy arm regresses).
+    UfliaSplitArm::Hybrid
 }
 
 /// Env-gated phase-timeline diagnostic for the UFLIA hybrid
@@ -578,8 +574,9 @@ fn uflia_split_arm() -> UfliaSplitArm {
 /// conflict/decision counters). Measurement-only; never affects routing.
 /// Process-cached.
 fn uflia_phase_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_UFLIA_PHASE").is_some())
+    // B23: the phase-timeline diagnostic env is retired; flip for a
+    // measurement run.
+    false
 }
 
 /// Bounded lazy-DETOUR conflict budget for the hybrid arm
@@ -590,13 +587,7 @@ fn uflia_phase_debug() -> bool {
 /// fraction of the solve budget. Override: `AY_UFLIA_DETOUR_CONFLICTS`
 /// (measurement/tuning only). Process-cached.
 fn uflia_detour_conflict_budget() -> u64 {
-    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("AY_UFLIA_DETOUR_CONFLICTS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10_000)
-    })
+    10_000
 }
 
 /// #detour-snapshot-extend: wall quantum for the SPECULATIVE detour
@@ -659,14 +650,7 @@ fn uflia_detour_conflict_budget() -> u64 {
 /// `AY_UFLIA_DETOUR_EXTEND_MS` (`0` disables the extension and restores
 /// the fixed 40% window byte-identically). Process-cached.
 fn uflia_detour_extend_quantum() -> Option<std::time::Duration> {
-    static QUANTUM: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *QUANTUM.get_or_init(|| {
-        let ms = std::env::var("AY_UFLIA_DETOUR_EXTEND_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20_000);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
+    Some(std::time::Duration::from_secs(20))
 }
 
 /// #detour-snapshot-extend: HARVEST-RESUME reserve — the extension's budget
@@ -699,14 +683,7 @@ fn uflia_detour_extend_quantum() -> Option<std::time::Duration> {
 /// `AY_UFLIA_DETOUR_RESUME_RESERVE_MS` (measurement/tuning only, e.g. 3500
 /// restores the pre-change window). Process-cached.
 fn uflia_detour_resume_reserve() -> std::time::Duration {
-    static RESERVE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *RESERVE.get_or_init(|| {
-        let ms = std::env::var("AY_UFLIA_DETOUR_RESUME_RESERVE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2_000);
-        std::time::Duration::from_millis(ms)
-    })
+    std::time::Duration::from_secs(2)
 }
 
 /// #detour-snapshot-extend: minimum extension worth paying the continuation
@@ -715,7 +692,7 @@ fn uflia_detour_resume_reserve() -> std::time::Duration {
 /// that overhead). Below this the speculation is skipped entirely.
 const UFLIA_DETOUR_EXTEND_MIN: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Inc5 #fused-detour: FUSED detour arm (`AY_UFLIA_FUSED_DETOUR=1`, default
+/// Inc5 #fused-detour: FUSED detour arm (`--uflia-fused-detour=1`, default
 /// OFF — flags-off byte-identical). Process-cached env read.
 ///
 /// the development design notes §2 Inc5 +
@@ -740,7 +717,7 @@ const UFLIA_DETOUR_EXTEND_MIN: std::time::Duration = std::time::Duration::from_m
 /// exercises (eager1 ext → detour plain → fused ext).
 fn uflia_fused_detour_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_UFLIA_FUSED_DETOUR").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().uflia_fused_detour)
 }
 
 /// UFLIA model extraction shared by ALL split-loop invocations of the hybrid
@@ -5193,7 +5170,7 @@ impl Executor {
             }
         }
 
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
         self.ctx.assertions.extend(bridge_assertions);
         let arithmetic_result = if extra_roots.is_empty() {
             self.solve_auf_lia()
@@ -5201,7 +5178,7 @@ impl Executor {
             let scoped_assertions = self.ctx.assertions.clone();
             self.solve_auf_lia_with_assumptions(&scoped_assertions, extra_roots)
         };
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
 
         match arithmetic_result? {
             SolveResult::Unsat(_) => Ok(SolveResult::unsat()),
@@ -5960,7 +5937,7 @@ impl Executor {
                                 d
                             );
                             // Inc0-0b: synchronous per-arm LIA counter snapshot
-                            // (non-draining; only when AY_LIA_INSTRUMENT is
+                            // (non-draining; only when --lia-instrument is
                             // also set) — attributes the check-call totals to a
                             // specific arm via phase-edge deltas.
                             if let Some(lia_line) = ay_lia::instrument::snapshot_line() {
@@ -6360,7 +6337,7 @@ impl Executor {
                     // extension CDCL loop; isolation is the sanctioned clean
                     // re-run seam and sidesteps that entirely).
                     //
-                    // Inc5 #fused-detour (`AY_UFLIA_FUSED_DETOUR=1`, default
+                    // Inc5 #fused-detour (`--uflia-fused-detour=1`, default
                     // off): the slot instead runs the FUSED arm — the same
                     // eager split-loop macro, but on the SHARED persistent
                     // solver (no `with_isolated_incremental_state`), RETAINING
@@ -7156,7 +7133,7 @@ impl Executor {
         // (#6813). Rebuilding the combined solver each check-sat preserves
         // soundness while we keep the pure fast path for non-incremental solves.
         if !self.incremental_mode
-            && (std::env::var_os("AY_FORCE_ARRAY_EUF").is_some()
+            && (ay_core::misc_cli_flags().force_array_euf
                 || !crate::term_helpers::has_substantive_int_constraints(
                     &self.ctx.terms,
                     &self.ctx.assertions,
@@ -7188,6 +7165,12 @@ impl Executor {
 
         let (preprocessed_assertions, proof_provenance, var_subst) =
             self.preprocess_auflia_assertions_with_proof_provenance();
+        // The AUFLIA legacy array fixpoint runs inside preprocessing and may
+        // synthesize nested array-valued equalities. Exact finite closure must
+        // therefore run on this final surface, not on the authored store-flat
+        // aliases seen by the route-independent dispatcher.
+        let preprocessed_assertions =
+            self.close_finite_arrays_in_owned_assertion_window(preprocessed_assertions, &[]);
 
         if assertion_window_has_syntactic_contradiction(&self.ctx.terms, &preprocessed_assertions) {
             return Ok(SolveResult::unsat());
@@ -7325,7 +7308,7 @@ impl Executor {
         let mut persistent_array_exact_select_model_eqs: ay_core::kani_compat::DetHashSet<
             ExactSelectModelEqKey,
         > = ay_core::kani_compat::DetHashSet::default();
-        let mut persistent_euf_array_notify_edges: Vec<EufArrayNotifyReplayEdge> = Vec::new();
+        let mut persistent_euf_array_notify_edges = EufArrayNotifyReplayState::default();
         let mut persistent_array_equality_replays: Vec<ArrayPropagatedEqualityReplay> = Vec::new();
         let mut persistent_cross_theory_equality_replays: Vec<CrossTheoryEqualityReplay> =
             Vec::new();
@@ -7432,7 +7415,7 @@ impl Executor {
                                 |terms, euf_model, lia| {
                                     let _bf_assertions = _fixup_assertions.clone();
                                     let Some(model) = lia.as_mut() else { return };
-                                    let dbg_fix = std::env::var_os("AY_DEBUG_FIXUP").is_some();
+                                    let dbg_fix = ay_core::misc_cli_flags().debug_fixup;
                                     if dbg_fix {
                                         eprintln!(
                                             "[fixup-dbg] main pre: t12={:?} t13={:?}",
@@ -7524,7 +7507,7 @@ impl Executor {
                         theory.import_cross_theory_equality_replays(
                             &persistent_cross_theory_equality_replays,
                         );
-                        theory.import_euf_array_notify_replay_edges(
+                        theory.import_euf_array_notify_replay_state(
                             &persistent_euf_array_notify_edges,
                         );
                     },
@@ -7697,12 +7680,25 @@ impl Executor {
         let assumption_terms: Vec<TermId> = final_assumptions.iter().map(|(t, _)| *t).collect();
         let mut final_assertions = artifacts.assertions;
         {
+            // Run the legacy fixpoint on the exact preprocessed window it will
+            // feed to the solver, not on the authored context prefix. Activate
+            // finite coverage first so generic Skolem extensionality can skip
+            // only equalities that genuinely have a live exact biconditional.
+            // The authored assertion vector is restored byte-for-byte below.
+            let saved_assertions = std::mem::replace(&mut self.ctx.assertions, final_assertions);
+            let _ = self.add_finite_index_array_closure_with_roots(&assumption_terms);
             let axiom_start = self.ctx.assertions.len();
             self.run_array_axiom_full_fixpoint_at_with_roots(axiom_start, &assumption_terms);
             let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
+            final_assertions = std::mem::replace(&mut self.ctx.assertions, saved_assertions);
             let generated_axioms = self.ctx.terms.expand_select_store_all(&generated_axioms);
             final_assertions.extend(generated_axioms);
         }
+        // Final boundary after ROW/fixpoint synthesis and select-store
+        // expansion. This reuses the active pre-fixpoint axioms without
+        // recharging them and closes any newly exposed array-valued cells.
+        final_assertions =
+            self.close_finite_arrays_in_owned_assertion_window(final_assertions, &assumption_terms);
         // #array-deadline-forward phase-boundary poll (see above): the eager
         // array-axiom fixpoint can be dense on deep store chains.
         if self.should_abort_theory_loop() {
@@ -7781,7 +7777,7 @@ impl Executor {
                         &model_roots,
                         |terms, euf_model, lia| {
                             let Some(model) = lia.as_mut() else { return };
-                            let dbg_fix = std::env::var_os("AY_DEBUG_FIXUP").is_some();
+                            let dbg_fix = ay_core::misc_cli_flags().debug_fixup;
                             let dump = |model: &LiaModel, tag: &str| {
                                 if dbg_fix {
                                     eprintln!(
@@ -7882,6 +7878,12 @@ impl Executor {
         // disjunction (i = j ∨ ROW2-consequence) into SAT where LRA resolves it.
         //
         // Drain generated axioms to prevent phantom accumulation in push/pop (#6733).
+        let original_assertions = self.ctx.assertions.clone();
+        // AUFLRA has no destructive array preprocessing before this point, so
+        // activate exact coverage directly on the route-owned authored window
+        // before generic extensionality. A second closure below covers every
+        // equality synthesized by the fixpoint.
+        let _ = self.add_finite_index_array_closure();
         let axiom_start = self.ctx.assertions.len();
         self.run_array_axiom_full_fixpoint();
         // The full fixpoint runs with dedup_protect = 0 (it deduplicates the
@@ -7894,9 +7896,9 @@ impl Executor {
         let axiom_start = axiom_start.min(self.ctx.assertions.len());
         let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
 
-        let original_assertions = self.ctx.assertions.clone();
-        let mut assertions = original_assertions.clone();
+        let mut assertions = self.ctx.assertions.clone();
         assertions.extend(generated_axioms);
+        let assertions = self.close_finite_arrays_in_owned_assertion_window(assertions, &[]);
         let proof_provenance =
             ProofProblemAssertionProvenance::passthrough(&original_assertions, &assertions);
         let solve_interrupt = self.solve_interrupt.clone();

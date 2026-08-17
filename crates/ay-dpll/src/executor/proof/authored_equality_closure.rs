@@ -43,6 +43,9 @@ impl Executor {
     ///    premise `i` links argument position `i`;
     ///  * [`AletheRule::EqReflexive`] — `validate_eq_reflexive` re-checks that the
     ///    unit equality's two sides are the same term;
+    ///  * [`AletheRule::Or`] + resolution, to clausify an exact authored
+    ///    disjunction of disequalities and close it only after EVERY refuted
+    ///    equality has been derived;
     ///  * [`TheoryLemmaKind::DatatypeDistinct`] — validated against the datatype
     ///    constructor REGISTRY, so two applications are declared unequal only when
     ///    the declarations say they are different constructors of one datatype.
@@ -69,9 +72,23 @@ impl Executor {
         // Work bounds. This pass runs on every refutation the strict checker
         // rejects, and declining an oversized problem leaves today's behaviour
         // exactly as it is, so the bounds can only cost completeness.
-        const MAX_AUTHORED_ROOTS: usize = 32;
+        // The live verification-consumer snapshot-alias obligation has 33 distinct authored
+        // roots after deduplication (72 source rows, most repeated equality
+        // bridges). Keep a bounded margin above that exact observed shape.
+        // Resource parity remains explicit: root collection is linear and is
+        // followed by the independent 64-leaf / 96-universe / 192-derived /
+        // 3-round caps below, so widening this admission count does not unbound
+        // either pairwise saturation loop. Every emitted premise is still
+        // checked against `authored`, and the completed candidate is committed
+        // only after strict replay.
+        const MAX_AUTHORED_ROOTS: usize = 64;
         const MAX_LEAVES: usize = 64;
-        const MAX_DERIVED: usize = 48;
+        // `fmap_deref`-class WP obligations carry several independent
+        // equality components. Pairwise saturation can produce well over 48
+        // checked recipes before the two four-edge goal chains are complete.
+        // 192 remains a hard completeness-only work bound; the emitted
+        // dependency cone and the final strict gate retain soundness.
+        const MAX_DERIVED: usize = 192;
         const MAX_ROUNDS: usize = 3;
         const MAX_UNIVERSE: usize = 96;
 
@@ -104,7 +121,7 @@ impl Executor {
         // 2. Seed the derived-equality set with the leaves that ARE equalities,
         //    and collect the leaves that are DISEQUALITIES as closing targets.
         let mut derived: Vec<AuthoredDerivedEq> = Vec::new();
-        let mut goals: Vec<(TermId, usize)> = Vec::new();
+        let mut goals: Vec<AuthoredEqGoal> = Vec::new();
         for (index, leaf) in leaves.iter().enumerate() {
             if let Some((a, b)) = decode_eq_local(&self.ctx.terms, leaf.term) {
                 if a != b {
@@ -123,7 +140,43 @@ impl Executor {
             if let TermData::Not(inner) = self.ctx.terms.get(leaf.term) {
                 let inner = *inner;
                 if decode_eq_local(&self.ctx.terms, inner).is_some() {
-                    goals.push((inner, index));
+                    goals.push(AuthoredEqGoal::Disequality {
+                        equality: inner,
+                        leaf: index,
+                    });
+                    continue;
+                }
+            }
+            // A common WP postcondition shape is
+            // `(or (not (= a x)) (not (= b y)))`: refuting it requires BOTH
+            // equalities. Keep this narrowly structural and bounded. The
+            // eventual `or` and resolution steps are checked independently;
+            // a malformed or incomplete candidate cannot pass the final
+            // strict commit gate.
+            if let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(leaf.term) {
+                const MAX_DISEQUALITY_DISJUNCTS: usize = 8;
+                if name == "or" && (2..=MAX_DISEQUALITY_DISJUNCTS).contains(&args.len()) {
+                    let mut equalities = Vec::with_capacity(args.len());
+                    for &disjunct in args {
+                        let TermData::Not(inner) = self.ctx.terms.get(disjunct) else {
+                            equalities.clear();
+                            break;
+                        };
+                        let inner = *inner;
+                        if decode_eq_local(&self.ctx.terms, inner).is_none()
+                            || equalities.contains(&inner)
+                        {
+                            equalities.clear();
+                            break;
+                        }
+                        equalities.push(inner);
+                    }
+                    if !equalities.is_empty() {
+                        goals.push(AuthoredEqGoal::DisequalityDisjunction {
+                            equalities,
+                            leaf: index,
+                        });
+                    }
                 }
             }
         }
@@ -320,11 +373,16 @@ impl Executor {
         &mut self,
         leaves: &[AuthoredLeaf],
         derived: &[AuthoredDerivedEq],
-        goals: &[(TermId, usize)],
+        goals: &[AuthoredEqGoal],
     ) -> Option<Proof> {
         for (index, entry) in derived.iter().enumerate() {
             // Closer 1: the derived equality is exactly an authored disequality.
-            let Some(&(_, leaf_index)) = goals.iter().find(|(term, _)| *term == entry.eq) else {
+            let Some(leaf_index) = goals.iter().find_map(|goal| match goal {
+                AuthoredEqGoal::Disequality { equality, leaf } if *equality == entry.eq => {
+                    Some(*leaf)
+                }
+                _ => None,
+            }) else {
                 continue;
             };
             let mut builder = AuthoredEqProofBuilder::new(leaves, derived);
@@ -335,12 +393,36 @@ impl Executor {
             return Some(candidate);
         }
 
+        // Closer 2: every disjunct of an exact authored `(or (not e1) ..)`
+        // has been refuted by a derived equality. The builder clausifies that
+        // exact authored root with `or`, then resolves each checked equality
+        // unit against its matching disequality literal.
+        for goal in goals {
+            let AuthoredEqGoal::DisequalityDisjunction { equalities, leaf } = goal else {
+                continue;
+            };
+            let mut sources = Vec::with_capacity(equalities.len());
+            for equality in equalities {
+                let Some(index) = derived.iter().position(|entry| entry.eq == *equality) else {
+                    sources.clear();
+                    break;
+                };
+                sources.push(index);
+            }
+            if sources.len() != equalities.len() {
+                continue;
+            }
+            let mut builder = AuthoredEqProofBuilder::new(leaves, derived);
+            builder.emit_disequality_disjunction(&mut self.ctx.terms, *leaf, &sources)?;
+            return Some(builder.finish());
+        }
+
         let datatype_decls = self.datatype_decls_for_strict_proof();
         if datatype_decls.is_empty() {
             return None;
         }
         for (index, entry) in derived.iter().enumerate() {
-            // Closer 2: the two sides are DIFFERENT constructors of one
+            // Closer 3: the two sides are DIFFERENT constructors of one
             // datatype. Whether they are is decided by the CHECKER'S OWN
             // registry-backed recognizer, never by this producer.
             let disequality_term = self.ctx.terms.mk_not_raw(entry.eq);
@@ -378,6 +460,20 @@ struct AuthoredLeaf {
     root: TermId,
     path: Vec<u32>,
     term: TermId,
+}
+
+/// An authored negative equality target. A direct disequality needs one
+/// derived equality; an `or` of disequalities needs all of them.
+#[derive(Clone, Debug)]
+enum AuthoredEqGoal {
+    Disequality {
+        equality: TermId,
+        leaf: usize,
+    },
+    DisequalityDisjunction {
+        equalities: Vec<TermId>,
+        leaf: usize,
+    },
 }
 
 /// How a derived equality was obtained. Recorded WITHOUT emitting proof steps so
@@ -557,6 +653,42 @@ impl<'a> AuthoredEqProofBuilder<'a> {
         }
         self.emitted_leaves.push((index, current));
         Some(current)
+    }
+
+    /// Close an exact authored disjunction of disequalities after the matching
+    /// equality unit for every disjunct has been emitted.
+    fn emit_disequality_disjunction(
+        &mut self,
+        terms: &mut TermStore,
+        leaf_index: usize,
+        derived_indices: &[usize],
+    ) -> Option<ProofId> {
+        let leaf_term = self.leaves.get(leaf_index)?.term;
+        let TermData::App(Symbol::Named(name), args) = terms.get(leaf_term) else {
+            return None;
+        };
+        if name != "or" || args.len() != derived_indices.len() {
+            return None;
+        }
+        let clause = args.clone();
+        let root = self.emit_leaf(terms, leaf_index)?;
+        let mut current =
+            self.proof
+                .add_rule_step(AletheRule::Or, clause.clone(), vec![root], Vec::new());
+        let mut residual = clause;
+        for &derived_index in derived_indices {
+            let equality = self.derived.get(derived_index)?.eq;
+            let disequality = terms.mk_not_raw(equality);
+            let at = residual
+                .iter()
+                .position(|literal| *literal == disequality)?;
+            let _ = residual.remove(at);
+            let equality_unit = self.emit_derived(terms, derived_index)?;
+            current = self
+                .proof
+                .add_resolution(residual.clone(), equality, current, equality_unit);
+        }
+        residual.is_empty().then_some(current)
     }
 
     /// Derive one recorded equality as a UNIT clause `[eq]`.

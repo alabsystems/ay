@@ -118,8 +118,8 @@ impl Solver {
 
     /// Proof from the last `check_sat` call.
     ///
-    /// Returns `None` if the last result was not UNSAT or if proof production
-    /// was not enabled.
+    /// Returns `None` unless the last result was UNSAT and proof output was requested
+    /// when that solve began; later setting changes cannot relabel the artifact.
     #[must_use]
     pub fn last_proof(&self) -> Option<&ay_core::Proof> {
         self.executor.last_proof()

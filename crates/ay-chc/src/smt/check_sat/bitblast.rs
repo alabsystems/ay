@@ -36,14 +36,8 @@ const DEFAULT_BITBLAST_MAX_WIDTH: u32 = 16_384;
 /// ChcExpr-level gate in `check_sat`/`check_sat_with_executor_fallback` and the
 /// term-level backstop guard in `attach_bv_bitblasting`.
 pub(super) fn bitblast_max_width() -> u32 {
-    static WIDTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *WIDTH.get_or_init(|| {
-        std::env::var("AY_BITBLAST_MAX_WIDTH")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&w| w > 0)
-            .unwrap_or(DEFAULT_BITBLAST_MAX_WIDTH)
-    })
+    // B25: env override retired; the named constant is the value.
+    DEFAULT_BITBLAST_MAX_WIDTH
 }
 
 /// Default CUMULATIVE bit-blast budget: the maximum SUM of BV bit-widths across
@@ -119,8 +113,8 @@ fn bitblast_dynamic_abort_enabled() -> bool {
             _ => {}
         }
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_BITBLAST_DYNAMIC_ABORT").as_deref() != Ok("0"))
+    // B27: CLI-owned (--chc-no-bitblast-dynamic-abort); env retired.
+    crate::ab_switches::get().bitblast_dynamic_abort
 }
 
 /// Test-only override for the dynamic abort: `0` = env/default path,
@@ -170,14 +164,8 @@ pub(super) fn bitblast_max_total_bits() -> u64 {
             return ov;
         }
     }
-    static BITS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BITS.get_or_init(|| {
-        std::env::var("AY_BITBLAST_MAX_TOTAL_BITS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&b| b > 0)
-            .unwrap_or(DEFAULT_BITBLAST_MAX_TOTAL_BITS)
-    })
+    // B25: env override retired; the named constant is the value.
+    DEFAULT_BITBLAST_MAX_TOTAL_BITS
 }
 
 /// The two-operand BV predicate symbols `BvSolver::bitblast_predicate` handles.

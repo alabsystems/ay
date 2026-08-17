@@ -1799,7 +1799,8 @@ pub unsafe extern "C" fn Z3_solver_translate(
             h.tactic.clone(),
         )
     });
-    // SAFETY: `ffi_guard_ptr` validates/guards `target`.
+    // SAFETY: `target` is live by caller contract; `ffi_guard_ptr` handles a
+    // null pointer defensively before granting mutable context access.
     unsafe {
         ffi_guard_ptr(target, |tgt| {
             let Some((assertions, scope_markers, tracked, tracked_scope_markers, tactic)) =
@@ -2264,7 +2265,8 @@ pub unsafe extern "C" fn Z3_solver_get_trail(c: Z3_context, s: Z3_solver) -> Z3_
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_get_help(c: Z3_context, _s: Z3_solver) -> Z3_string {
-    // SAFETY: `ffi_guard_const_ptr` guards `c`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_const_ptr` checks for
+    // null before the closure accesses context-owned string storage.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
             let help = "\
@@ -2294,7 +2296,9 @@ pub unsafe extern "C" fn Z3_solver_congruence_root(
     _s: Z3_solver,
     a: Z3_ast,
 ) -> Z3_ast {
-    // SAFETY: `ffi_guard_ast` guards `c`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ast` handles a null
+    // pointer defensively before resetting context state. `a` is an opaque
+    // integer handle and is not dereferenced by this singleton operation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
             if a == 0 {
@@ -2323,7 +2327,9 @@ pub unsafe extern "C" fn Z3_solver_congruence_next(
     _s: Z3_solver,
     a: Z3_ast,
 ) -> Z3_ast {
-    // SAFETY: `ffi_guard_ast` guards `c`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ast` handles a null
+    // pointer defensively before resetting context state. `a` is an opaque
+    // integer handle and is not dereferenced by this singleton operation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
             if a == 0 {

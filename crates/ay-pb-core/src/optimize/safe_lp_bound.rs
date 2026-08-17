@@ -123,6 +123,8 @@ pub(crate) fn safe_lp_enabled() -> bool {
         .is_some_and(enabled)
 }
 
+mod transpose;
+
 /// IEEE-754 binary64 unit roundoff `u = 2^-53`.
 const UNIT_ROUNDOFF: f64 = 1.110_223_024_625_157e-16; // 2^-53.
 
@@ -491,6 +493,7 @@ pub(crate) fn safe_lp_duals_from_raw(
         c,
         offset: 0.0,
         rows,
+        upper: None,
     };
     match model.solve_target(should_stop, target) {
         Some(SimplexResult { dual, .. }) if dual.len() == model.rows.len() => {
@@ -528,6 +531,7 @@ pub(crate) fn safe_lp_duals_and_primal_from_raw(
         c,
         offset: 0.0,
         rows,
+        upper: None,
     };
     match model.solve_target(should_stop, target) {
         Some(SimplexResult { dual, primal }) if dual.len() == model.rows.len() => {
@@ -570,6 +574,12 @@ struct LpF64 {
     offset: f64,
     /// Sparse `>=` rows.
     rows: Vec<RowF64>,
+    /// Per-variable upper bound. `None` means the default box `[0, 1]`, which is
+    /// what every pseudo-Boolean caller wants. [`transpose::solve_transposed_for_box_lp`]
+    /// uses `Some` to give the dual variables `[0, +inf)`; the simplex already
+    /// handles infinite uppers (surplus columns have always used them), so this
+    /// only widens what a caller may express.
+    upper: Option<Vec<f64>>,
 }
 
 /// A sparse `>=` row: `coeffs · x >= b`, in **original** variable space.
@@ -639,7 +649,13 @@ impl LpF64 {
             }
         }
 
-        Some(Self { n, c, offset, rows })
+        Some(Self {
+            n,
+            c,
+            offset,
+            rows,
+            upper: None,
+        })
     }
 
     /// Solves the LP relaxation `min c·x s.t. Ax >= b, 0 <= x <= 1` with the
@@ -1022,6 +1038,11 @@ pub(crate) fn approx_dual_for_box_lp_with_iteration_budget(
     )
 }
 
+/// Test-only switch forcing the primal path, so a differential test can drive
+/// BOTH forms on the SAME model and compare. Production always reads `false`.
+#[cfg(test)]
+static FORCE_PRIMAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn approx_dual_for_box_lp_with_limits(
     n: usize,
     c: Vec<f64>,
@@ -1040,11 +1061,25 @@ fn approx_dual_for_box_lp_with_limits(
         .into_iter()
         .map(|(coeffs, b)| RowF64 { coeffs, b })
         .collect();
+    // ROW-HEAVY MODELS GO THROUGH THE TRANSPOSE. The simplex's basis is one entry
+    // per ROW, so its cost is set by `m`, not `n`. When a model has far more rows
+    // than columns, solving the DUAL — whose basis is one entry per COLUMN — is
+    // the same LP through a much smaller basis. See `solve_transposed_for_box_lp`.
+    if transpose::should_transpose_model(&c, rows.len()) {
+        if let Some(out) = transpose::solve_transposed_for_box_lp(n, &c, &rows, limits, should_stop)
+        {
+            return Some(out);
+        }
+        // Falling through on a declined transpose is free: the primal path below
+        // is the pre-existing behaviour, unchanged.
+    }
+
     let model = LpF64 {
         n,
         c,
         offset: 0.0, // unused by the simplex; the caller owns the offset.
         rows,
+        upper: None,
     };
     let m = model.rows.len();
     if m == 0 {
@@ -1187,6 +1222,10 @@ struct PhaseStats {
 struct RunStats {
     phase1: LoopExit,
     phase2: LoopExit,
+    /// Whether the FINAL basic solution was verified primal-feasible. See
+    /// [`RunStats::converged`] — reduced-cost optimality alone does not imply the
+    /// point is inside the polytope.
+    primal_feasible: bool,
     /// Phase-I / Phase-II effort. Read only by the regressions that assert on
     /// pricing and crash quality (`covering_crash_is_immediately_feasible_...`),
     /// which is the point: they turn "the simplex got slower" into a test
@@ -1199,8 +1238,20 @@ struct RunStats {
 
 impl RunStats {
     /// The advisory convergence signal: BOTH phases reached their own optimum.
+    /// `converged` is what licenses the certified tier to trust this dual, so it
+    /// must never be true on a point that is not actually an optimum.
+    ///
+    /// Reduced-cost optimality is NOT sufficient on its own: Phase II's exit test
+    /// only inspects reduced costs, so a basic variable that drifted outside its
+    /// bounds (the ratio test's tolerance expansion can displace one, and nothing
+    /// re-anchors it — `recompute_xb` re-derives `x_B = B^-1(b - N x_N)`
+    /// faithfully and so REPRODUCES the drift) leaves the loop reporting `Optimal`
+    /// at a point OUTSIDE the polytope, with a correspondingly non-optimal dual.
+    /// Measured on an oracle corpus, that produced `converged = true` with the
+    /// objective 0.514 low. Requiring verified primal feasibility closes it at the
+    /// source rather than by suppressing whichever pivot rule exposed it.
     fn converged(&self) -> bool {
-        self.phase1 == LoopExit::Optimal && self.phase2 == LoopExit::Optimal
+        self.phase1 == LoopExit::Optimal && self.phase2 == LoopExit::Optimal && self.primal_feasible
     }
 }
 
@@ -1378,7 +1429,7 @@ impl Simplex {
         let mut upper = vec![0.0f64; cols];
         for j in 0..n {
             lower[j] = 0.0;
-            upper[j] = 1.0;
+            upper[j] = model.upper.as_ref().map_or(1.0, |u| u[j]);
         }
         for j in n..cols {
             lower[j] = 0.0;
@@ -1779,13 +1830,49 @@ impl Simplex {
         // still produces a point + duals; NS stays sound because it clamps `y` and
         // never trusts the primal.
         self.recompute_xb();
-        let (phase2, stats2) = self.simplex_loop(false, should_stop, limits, target);
+        let (mut phase2, stats2) = self.simplex_loop(false, should_stop, limits, target);
+
+        // FEASIBILITY VERIFICATION, and one repair attempt. Recompute the basic
+        // values exactly and check them against their bounds. If the optimum we
+        // just "reached" is outside the polytope, re-run Phase I to restore
+        // feasibility and Phase II to re-optimise from there, then re-check. A
+        // point that still fails is reported as NOT converged, so the certified
+        // tier declines to it rather than trusting a dual that attains nothing.
+        self.recompute_xb();
+        let mut primal_feasible = self.basic_feasibility_violation() <= self.feas_tol();
+        if !primal_feasible && !should_stop() {
+            let (_, _) = self.simplex_loop(true, should_stop, limits, None);
+            self.recompute_xb();
+            let (p2, _) = self.simplex_loop(false, should_stop, limits, target);
+            phase2 = p2;
+            self.recompute_xb();
+            primal_feasible = self.basic_feasibility_violation() <= self.feas_tol();
+        }
+
         RunStats {
             phase1,
             phase2,
+            primal_feasible,
             stats1,
             stats2,
         }
+    }
+
+    /// Worst amount by which any basic variable violates its own bounds under the
+    /// exactly-recomputed `xb`. Zero iff the current basic solution is primal
+    /// feasible.
+    fn basic_feasibility_violation(&self) -> f64 {
+        let mut worst = 0.0f64;
+        for i in 0..self.m {
+            let j = self.basis[i];
+            let v = self.xb_val[i];
+            if v < self.lower[j] {
+                worst = worst.max(self.lower[j] - v);
+            } else if v > self.upper[j] {
+                worst = worst.max(v - self.upper[j]);
+            }
+        }
+        worst
     }
 
     /// Effective objective cost of a column under the current phase. Phase II uses
@@ -1838,31 +1925,13 @@ impl Simplex {
         // Harris tolerance expansion: how far a basic variable may be pushed past
         // its bound to buy a longer step / bigger pivot.
         //
-        // DISABLED (0), and the reason is measured. The expansion bounds each row's
-        // displacement PER ITERATION, but nothing ever pushes a drifted basic
-        // variable back inside its bounds — `recompute_xb` re-derives
-        // `x_B = B^-1 (b - N x_N)` faithfully, so if the basis genuinely has
-        // out-of-bound basics it REPRODUCES them rather than re-anchoring them (an
-        // earlier comment here claimed the opposite; it was wrong). Phase II's
-        // optimality test checks reduced costs, not feasibility, so the loop then
-        // terminates `Optimal` at a point OUTSIDE the polytope with a
-        // correspondingly non-optimal dual — i.e. `converged = true` on a wrong
-        // answer, which is the one thing that flag must never do, because it gates
-        // whether the certified tier trusts the dual at all.
-        //
-        // Measured on the oracle corpus: drift reached 8.1e-4 against a delta of
-        // 2.5e-5 — 32x, i.e. accumulated — giving `converged=true` with the
-        // objective 0.514 low on `degen_star_n200_m900`. Scaling the tolerance
-        // showed the error is monotone in it (x0 and x0.01 -> 6.8e-6; x1 -> 5.1e-1).
-        // Zeroing it makes the corpus clean AND faster (44.3s vs 45.8s) and cuts
-        // iterations on the target family (domset_467 1728 -> 1639).
-        //
-        // A textbook Harris pairs the expansion with bound shifting or a
-        // feasibility cleanup. Neither exists here; add one before re-enabling.
-        // `harris_select` and the largest-pivot tie-break stay — at delta 0 the
-        // tie-break simply applies to exact ties.
-        let harris_delta = 0.0f64;
-        let _ = feas_tol;
+        // Safe to use because `run_instrumented` now VERIFIES primal feasibility
+        // before reporting `converged`, and repairs once if the expansion has
+        // walked the basis outside the polytope. Before that guard existed this
+        // expansion could end Phase II `Optimal` at an infeasible point (drift
+        // accumulated to 32x delta and nothing re-anchored it), which is exactly
+        // the failure the guard now catches at the source.
+        let harris_delta = 0.5 * feas_tol;
 
         let iteration_cap = limits.iterations_per_phase.min(MAX_SIMPLEX_ITERS);
         for iter in 0..iteration_cap {
@@ -3639,125 +3708,7 @@ mod tests {
         assert_eq!(choice.step, 0.0);
     }
 
-    #[test]
-    fn covering_crash_is_immediately_feasible_and_phase_two_converges() {
-        // A random unicost covering LP in the shape of the domset family that
-        // motivated this work: every coefficient positive, every rhs positive, so
-        // `x = 1` satisfies every row. The crash must recognise that and hand
-        // Phase I a feasible point, and Phase II must then reach its own optimum.
-        let mut rng = Rng(0xfeed_face_0000_0001);
-        let n = 120usize;
-        let mut rows: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
-        for r in 0..n {
-            let mut coeffs = vec![(r, 30.0)];
-            for _ in 0..6 {
-                let v = (rng.next() % n as u64) as usize;
-                if v != r && !coeffs.iter().any(|&(u, _)| u == v) {
-                    coeffs.push((v, 1.0 + (rng.next() % 19) as f64));
-                }
-            }
-            coeffs.sort_unstable_by_key(|&(v, _)| v);
-            rows.push((coeffs, 30.0));
-        }
-        let c = vec![1.0f64; n];
-        let model = LpF64 {
-            n,
-            c: c.clone(),
-            offset: 0.0,
-            rows: rows
-                .iter()
-                .map(|(coeffs, b)| RowF64 {
-                    coeffs: coeffs.clone(),
-                    b: *b,
-                })
-                .collect(),
-        };
-        let m = model.rows.len();
-        let mut simplex = Simplex::new(&model, n, m, n + m);
-        // Every structural must crash at UPPER on an all-positive covering LP.
-        assert!(
-            (0..n).all(|j| simplex.at[j] == AtBound::Upper),
-            "covering columns must crash at their upper bound"
-        );
-        let stats = simplex.run_instrumented(&never_stop, SimplexLimits::iterations(20_000), None);
-        assert_eq!(
-            stats.stats1.iters, 1,
-            "Phase I must find the crash point already feasible and exit at its \
-             first feasibility check, not pivot toward feasibility"
-        );
-        assert!(
-            stats.phase1 == LoopExit::Optimal,
-            "Phase I must reach Optimal"
-        );
-        assert!(
-            stats.phase2 == LoopExit::Optimal,
-            "Phase II must reach Optimal on a degenerate covering LP"
-        );
-        assert!(stats.converged());
-        assert_eq!(
-            stats.stats2.bland_iters, 0,
-            "Devex must keep Bland's anti-cycling fallback from engaging at all"
-        );
-        // PRICING QUALITY, not just termination. Measured on this fixture:
-        // Devex reaches the optimum in 294 Phase-II iterations, Dantzig
-        // (`score = |rc|`) needs 421 for the same optimum. The ceiling sits
-        // between them, so reverting pricing to Dantzig — or any future change
-        // that costs as much as that revert does — fails here rather than
-        // silently slowing every LP bound in the solver.
-        assert!(
-            stats.stats2.iters <= 350,
-            "Phase II took {} iterations; Devex pricing reaches this optimum in \
-             294 and Dantzig needs 421, so this is a pricing regression",
-            stats.stats2.iters
-        );
-
-        // Zero duality gap: the point returned really is the LP optimum.
-        let result = simplex.extract(&model);
-        let objective: f64 = c.iter().zip(&result.primal).map(|(cj, x)| cj * x).sum();
-        let y = clamp_dual(&result.dual);
-        let mut ns: f64 = rows.iter().zip(&y).map(|((_, b), yr)| yr * b).sum();
-        let mut aty = vec![0.0f64; n];
-        for ((coeffs, _), yr) in rows.iter().zip(&y) {
-            for &(v, a) in coeffs {
-                aty[v] += yr * a;
-            }
-        }
-        for v in 0..n {
-            ns += (c[v] - aty[v]).min(0.0);
-        }
-        assert!(
-            (objective - ns).abs() <= 1e-6 * (1.0 + objective.abs()),
-            "duality gap {} between primal {objective} and dual {ns}",
-            objective - ns
-        );
-
-        // NEGATIVE CONTROL: the same rule must NOT fire on a packing LP, where
-        // `x = 1` is maximally infeasible. `-x_i - x_j >= -1` has only negative
-        // coefficients, so `crash_at_upper` must decline every column and
-        // reproduce the classic all-lower crash.
-        let packing: Vec<(Vec<(usize, f64)>, f64)> = (0..8)
-            .map(|i| (vec![(i, -1.0), ((i + 1) % 9, -1.0)], -1.0))
-            .collect();
-        let packing_model = LpF64 {
-            n: 9,
-            c: vec![-1.0; 9],
-            offset: 0.0,
-            rows: packing
-                .iter()
-                .map(|(coeffs, b)| RowF64 {
-                    coeffs: coeffs.clone(),
-                    b: *b,
-                })
-                .collect(),
-        };
-        let pm = packing_model.rows.len();
-        let packing_simplex = Simplex::new(&packing_model, 9, pm, 9 + pm);
-        assert!(
-            (0..9).all(|j| packing_simplex.at[j] == AtBound::Lower),
-            "packing columns must keep the classic all-lower crash"
-        );
-    }
-
+    mod convergence_contracts;
     #[test]
     fn devex_pivot_row_is_the_ratio_the_update_needs() {
         // The subtle step in `devex_update` is WHICH basis its `rho` belongs to.
@@ -3797,6 +3748,7 @@ mod tests {
                     b: *b,
                 })
                 .collect(),
+            upper: None,
         };
         let m = model.rows.len();
         let mut simplex = Simplex::new(&model, n, m, n + m);

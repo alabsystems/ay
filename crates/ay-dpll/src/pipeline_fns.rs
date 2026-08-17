@@ -24,11 +24,11 @@ use crate::executor_types::{SolveResult, Statistics, UnknownReason};
 ///
 /// Diagnostic-only exit-site logger for the split-loop pipeline macros.
 ///
-/// Prints the exit site tag when `AY_DEBUG_SPLIT_EXIT` is set. Used to
+/// Prints the exit site tag when `--debug-split-exit` is set. Used to
 /// attribute an `unknown` verdict to the exact give-up point inside the
 /// pipeline macros without a debugger. Zero-cost unless the env var is set.
 pub(crate) fn debug_split_exit(site: &str) {
-    if std::env::var_os("AY_DEBUG_SPLIT_EXIT").is_some() {
+    if ay_core::misc_cli_flags().debug_split_exit {
         safe_eprintln!("[split-exit] {}", site);
     }
 }
@@ -70,8 +70,7 @@ pub(crate) fn effective_decision_allowance(
 /// (`AY_NO_GROUND_BUDGET=1`), cached once. For A/B verdict experiments only —
 /// the default path never reads the environment per solve.
 pub(crate) fn ground_budget_env_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("AY_NO_GROUND_BUDGET").is_some())
+    false // B23: A/B opt-out retired; typed :rlimit is the carrier.
 }
 
 /// SAT-solver statistics snapshot, taken from the SAT solver by value so the
@@ -117,7 +116,7 @@ pub(crate) fn assert_top_level_arith_diseq_facts<T: ay_core::TheorySolver>(
     const MAX_FACTS: usize = 20_000;
     let is_arith = |t: ay_core::TermId| matches!(terms.sort(t), Sort::Int | Sort::Real);
     let mut asserted = 0usize;
-    let dbg_sync = std::env::var_os("AY_DEBUG_FC_SYNC").is_some();
+    let dbg_sync = ay_core::misc_cli_flags().debug_fc_sync;
     for &a in assertions {
         if asserted >= MAX_FACTS {
             break;
@@ -390,6 +389,7 @@ pub(crate) fn pipeline_add_bound_axiom_clauses(
             } else {
                 ay_sat::Literal::negative(ay_sat::Variable::new(v2))
             };
+            let authority_before = solver.issued_original_clause_id_max();
             solver.add_clause(vec![l1, l2]);
             if proof_enabled {
                 let clause_terms = vec![
@@ -419,12 +419,44 @@ pub(crate) fn pipeline_add_bound_axiom_clauses(
                     farkas_store[ba_i] = ba_new_farkas.clone();
                     ba_new_farkas
                 };
-                let kind =
+                let (kind, ordered) =
                     crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
                         &*terms,
                         &clause_terms,
                         farkas.as_ref(),
+                        None,
                     );
+                let evidence_compatible = matches!(
+                    kind,
+                    ay_core::TheoryLemmaKind::LraFarkas | ay_core::TheoryLemmaKind::LiaGeneric
+                );
+                // #trust->0 C3: adopt the funnel's validator-ordered clause.
+                // A Farkas certificate is positional over the CALLER's order,
+                // so no non-arithmetic classification may retain it, even
+                // when the caller order already satisfies the validator. With
+                // incompatible evidence, keep the pre-C3
+                // Generic-with-certificate recording instead (fail-closed —
+                // the certificate remains the recorded evidence).
+                let (kind, clause_terms) = if farkas.is_some() && !evidence_compatible {
+                    (ay_core::TheoryLemmaKind::Generic, clause_terms)
+                } else {
+                    match ordered {
+                        std::borrow::Cow::Borrowed(_) => (kind, clause_terms),
+                        std::borrow::Cow::Owned(reordered) if farkas.is_none() => (kind, reordered),
+                        std::borrow::Cow::Owned(_) => {
+                            (ay_core::TheoryLemmaKind::Generic, clause_terms)
+                        }
+                    }
+                };
+                let kind = if farkas.is_none()
+                    && matches!(
+                        kind,
+                        ay_core::TheoryLemmaKind::LraFarkas | ay_core::TheoryLemmaKind::LiaGeneric
+                    ) {
+                    ay_core::TheoryLemmaKind::Generic
+                } else {
+                    kind
+                };
                 match (&kind, &farkas) {
                     (_, Some(farkas)) => {
                         let _ = proof_tracker.add_theory_lemma_with_farkas_and_kind(
@@ -434,20 +466,26 @@ pub(crate) fn pipeline_add_bound_axiom_clauses(
                         );
                     }
                     (ay_core::TheoryLemmaKind::Generic, None) => {
-                        let _ = proof_tracker.add_theory_lemma(clause_terms.clone());
+                        let _ = proof_tracker.add_explicit_trust_lemma(clause_terms.clone());
                     }
                     (_, None) => {
                         let _ =
                             proof_tracker.add_theory_lemma_with_kind(clause_terms.clone(), kind);
                     }
                 }
-                local_clausification_proofs.push(None);
-                local_original_clause_theory_proofs.push(Some(ay_core::TheoryLemmaProof {
-                    clause: clause_terms,
-                    kind,
-                    farkas,
-                    lia: None,
-                }));
+                let _ = place_single_original_clause_authority(
+                    solver,
+                    authority_before,
+                    None,
+                    Some(ay_core::TheoryLemmaProof {
+                        clause: clause_terms,
+                        kind,
+                        farkas,
+                        lia: None,
+                    }),
+                    local_clausification_proofs,
+                    local_original_clause_theory_proofs,
+                );
             }
             bac_added += 1;
         } else {
@@ -479,8 +517,11 @@ pub(crate) fn apply_pending_activations(
     for &(root, _depth) in pending {
         solver.add_clause(vec![root]);
         if proof_enabled {
-            clausification_proofs.push(None);
-            original_clause_theory_proofs.push(None);
+            align_original_clause_authority_ledgers(
+                solver,
+                clausification_proofs,
+                original_clause_theory_proofs,
+            );
         }
     }
 }
@@ -499,8 +540,11 @@ pub(crate) fn apply_pending_activations_immediate(
             solver.add_clause_at_scope_depth(vec![root], depth);
         }
         if proof_enabled {
-            clausification_proofs.push(None);
-            original_clause_theory_proofs.push(None);
+            align_original_clause_authority_ledgers(
+                solver,
+                clausification_proofs,
+                original_clause_theory_proofs,
+            );
         }
     }
 }
@@ -638,8 +682,11 @@ pub(crate) fn reactivate_all_in_scope(
             if seen.insert(root) {
                 solver.add_clause(vec![root]);
                 if proof_enabled {
-                    clausification_proofs.push(None);
-                    original_clause_theory_proofs.push(None);
+                    align_original_clause_authority_ledgers(
+                        solver,
+                        clausification_proofs,
+                        original_clause_theory_proofs,
+                    );
                 }
             }
         }
@@ -756,7 +803,44 @@ pub(crate) fn encode_model_equality(
             // the stale checks downstream treat an already-requested eq as
             // settled ("treat as Sat"), so a wiped learned-tier clause turns
             // into a livelock or an accepted model violating the implication.
+            let before = solver.issued_original_clause_id_max();
             let _ = solver.add_clause(implied_clause);
+            if negations.proof_enabled() {
+                let mut proof_clause = Vec::with_capacity(eq_reason.len() + 1);
+                for reason_lit in eq_reason {
+                    proof_clause.push(if reason_lit.value {
+                        terms.mk_not(reason_lit.term)
+                    } else {
+                        reason_lit.term
+                    });
+                }
+                proof_clause.push(eq_atom);
+                let (kind, ordered) =
+                    crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas(
+                        terms,
+                        &proof_clause,
+                        None,
+                        None,
+                    );
+                if !matches!(
+                    kind,
+                    ay_core::TheoryLemmaKind::Generic
+                        | ay_core::TheoryLemmaKind::LraFarkas
+                        | ay_core::TheoryLemmaKind::LiaGeneric
+                ) {
+                    if let Some(original_id) = crate::executor::theories::split_incremental::single_issued_original_id_since(solver, before) {
+                        negations.note_theory_authority(
+                            original_id,
+                            ay_core::TheoryLemmaProof {
+                                clause: ordered.into_owned(),
+                                kind,
+                                farkas: None,
+                                lia: None,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -792,19 +876,74 @@ pub(crate) fn encode_model_equality(
             // added once per eq atom (added_model_eqs dedup) and every
             // downstream stale check assumes they stay present — see the
             // implied-clause note above.
+            let not_eq = terms.mk_not(eq_atom);
+            let not_le = terms.mk_not(le_atom);
+            let not_ge = terms.mk_not(ge_atom);
+
+            let first_before = solver.issued_original_clause_id_max();
             let _ = solver.add_clause(vec![
                 ay_sat::Literal::negative(eq_var),
                 ay_sat::Literal::positive(le_var),
             ]);
+            if let Some(original_id) =
+                crate::executor::theories::split_incremental::single_issued_original_id_since(
+                    solver,
+                    first_before,
+                )
+            {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: vec![not_eq, le_atom],
+                        kind: ay_core::TheoryLemmaKind::ArithEqImpliesBound,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            }
+            let second_before = solver.issued_original_clause_id_max();
             let _ = solver.add_clause(vec![
                 ay_sat::Literal::negative(eq_var),
                 ay_sat::Literal::positive(ge_var),
             ]);
+            if let Some(original_id) =
+                crate::executor::theories::split_incremental::single_issued_original_id_since(
+                    solver,
+                    second_before,
+                )
+            {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: vec![not_eq, ge_atom],
+                        kind: ay_core::TheoryLemmaKind::ArithEqImpliesBound,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            }
+            let third_before = solver.issued_original_clause_id_max();
             let _ = solver.add_clause(vec![
                 ay_sat::Literal::negative(le_var),
                 ay_sat::Literal::negative(ge_var),
                 ay_sat::Literal::positive(eq_var),
             ]);
+            if let Some(original_id) =
+                crate::executor::theories::split_incremental::single_issued_original_id_since(
+                    solver,
+                    third_before,
+                )
+            {
+                negations.note_theory_authority(
+                    original_id,
+                    ay_core::TheoryLemmaProof {
+                        clause: vec![not_le, not_ge, eq_atom],
+                        kind: ay_core::TheoryLemmaKind::ArithEqTriangle,
+                        farkas: None,
+                        lia: None,
+                    },
+                );
+            }
         }
 
         // #8254: theory variant currently unused; retained for restoration.
@@ -827,7 +966,7 @@ pub(crate) fn encode_model_equality(
 /// returns this verdict and the (still-macro) shim performs the actual `break`.
 pub(crate) enum AddConflictClauseOutcome {
     /// Clause added (or root-conflict handled); caller proceeds normally.
-    Added,
+    Added { original_id: Option<u64> },
     /// Caller should `break Ok(result)` out of its incremental solve loop.
     Break(SolveResult),
 }
@@ -850,6 +989,7 @@ pub(crate) fn add_incremental_conflict_clause(
     tag: &str,
     set_unknown_on_error: bool,
     unmapped_message: &str,
+    proof_enabled: bool,
 ) -> AddConflictClauseOutcome {
     let mut clause: Vec<ay_sat::Literal> = conflict_terms
         .iter()
@@ -880,18 +1020,29 @@ pub(crate) fn add_incremental_conflict_clause(
         *last_result = Some(SolveResult::unsat());
         return AddConflictClauseOutcome::Break(SolveResult::unsat());
     }
-    // #8424: Pre-minimize conflict clause with level-0 removal.
-    let _minimize_removed =
+    // #8424: Pre-minimize conflict clauses in the ordinary solving lane.  In
+    // proof mode the theory annotation authenticates the complete blocking
+    // clause; removing level-0 literals would require a separate weakening
+    // premise that the indexed direct annotation cannot represent.
+    let _minimize_removed = if proof_enabled {
+        0
+    } else {
         crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
             solver.var_level(var)
-        });
+        })
+    };
     if clause.is_empty() {
         // All conflict literals were at level 0 — this is an UNSAT root conflict.
         *last_result = Some(SolveResult::unsat());
         return AddConflictClauseOutcome::Break(SolveResult::unsat());
     }
+    let before = solver.issued_original_clause_id_max();
     solver.add_clause(clause);
-    AddConflictClauseOutcome::Added
+    AddConflictClauseOutcome::Added {
+        original_id: crate::executor::theories::split_incremental::single_issued_original_id_since(
+            solver, before,
+        ),
+    }
 }
 
 /// Proof data captured for an incremental-split UNSAT exit (#6725): everything
@@ -914,7 +1065,7 @@ pub(crate) struct CapturedSplitUnsatProof {
 /// disjointly from the `&mut self` the shim later needs for `build_unsat_proof`);
 /// the shim assigns the returned data to `Executor::last_*` and breaks the loop.
 /// Provenance introspection for proof-reconstruction var maps
-/// (`AY_PROOF_INTROSPECT=<path>`).
+/// (`--proof-introspect=<path>`).
 ///
 /// `var_to_term` is known to cover only a dense PREFIX of the SAT variable
 /// space at the CONSUMING end, and any clause mentioning an index above it is
@@ -923,7 +1074,7 @@ pub(crate) struct CapturedSplitUnsatProof {
 /// solver's own counts; a site whose `map_len` is far below `num_vars` is the
 /// one pairing a stale map with a larger trace.
 pub(crate) fn record_var_map_provenance(site: &str, solver: &ay_sat::Solver, map_len: usize) {
-    let Some(path) = std::env::var_os("AY_PROOF_INTROSPECT") else {
+    let Some(path) = ay_core::misc_cli_flags().proof_introspect.as_deref() else {
         return;
     };
     use std::io::Write as _;
@@ -951,7 +1102,7 @@ pub(crate) fn record_var_map_provenance_trace(
     map_len: usize,
     trace: Option<&ay_sat::ClauseTrace>,
 ) {
-    let Some(path) = std::env::var_os("AY_PROOF_INTROSPECT") else {
+    let Some(path) = ay_core::misc_cli_flags().proof_introspect.as_deref() else {
         return;
     };
     use std::io::Write as _;
@@ -980,16 +1131,12 @@ pub(crate) fn capture_split_unsat_proof(
     if !proof_enabled {
         return None;
     }
+    align_original_clause_authority_ledgers(
+        solver,
+        local_clausification_proofs,
+        local_theory_proofs,
+    );
     let clause_trace = solver.snapshot_clause_trace();
-    if let Some(ref trace) = clause_trace {
-        let original_count = trace.original_clauses().count();
-        if local_clausification_proofs.len() < original_count {
-            local_clausification_proofs.resize(original_count, None);
-        }
-        if local_theory_proofs.len() < original_count {
-            local_theory_proofs.resize(original_count, None);
-        }
-    }
     record_var_map_provenance("split_eager", solver, local_var_to_term.len());
     Some(CapturedSplitUnsatProof {
         clause_trace,
@@ -999,6 +1146,16 @@ pub(crate) fn capture_split_unsat_proof(
         negations: negations.clone(),
     })
 }
+
+/// Original-clause proof-authority ledgers. Split out of this file because
+/// every one of its guards used to be a production `assert!` — see the module
+/// docs for why a producer-side placement must never panic.
+pub(crate) mod original_clause_authority;
+
+pub(crate) use original_clause_authority::{
+    align_original_clause_authority_ledgers, drain_pending_original_clause_authorities,
+    place_original_clause_authority_at_id, place_single_original_clause_authority,
+};
 
 #[cfg(test)]
 mod tests {

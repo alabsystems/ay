@@ -25,11 +25,9 @@ tracks = ["DEC-LIN", "OPT-LIN", "DEC-NLC", "OPT-NLC", "SOFT-LIN", "PARTIAL-LIN"]
 commandline = "DIR/run.sh BENCHNAME"
 complete = "Y"
 
+# B31: the BNN_FEAS/BNN_SCHED/SLS_NLC/WBO_SLS exports are gone — those lanes
+# are in-engine defaults now (--no-pb-* opts out).
 [entry.env]
-AY_PB_BNN_FEAS = "1"
-AY_PB_BNN_SCHED = "1"
-AY_PB_SLS_NLC = "1"
-AY_PB_WBO_SLS = "1"
 AY_PB_PARALLEL = "auto"
 
 # The certified entry: CERT tracks, VeriPB proof to PROOFFILE. The proof
@@ -51,10 +49,6 @@ complete = "Y"
 uncheckeddel = true
 
 [entry.env]
-AY_PB_BNN_FEAS = "1"
-AY_PB_BNN_SCHED = "1"
-AY_PB_SLS_NLC = "1"
-AY_PB_WBO_SLS = "1"
 AY_PB_PARALLEL = "off"
 AY_PB_PROOF_TAP_SOFT_CAP_MIB = "65536"
 
@@ -69,8 +63,4 @@ commandline = "DIR/run.sh BENCHNAME"
 complete = "Y"
 
 [entry.env]
-AY_PB_BNN_FEAS = "1"
-AY_PB_BNN_SCHED = "1"
-AY_PB_SLS_NLC = "1"
-AY_PB_WBO_SLS = "1"
 AY_PB_PARALLEL = "off"

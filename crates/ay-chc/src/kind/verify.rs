@@ -497,8 +497,8 @@ impl KindSolver {
 
         // Dump the extracted TS formulas for external Z3 cross-check.
         // Read from the centralized `TraceConfig` singleton (#8495, #8834);
-        // populated via `--kind-dump-dir=DIR` (preferred) or the deprecated
-        // `AY_KIND_DUMP_DIR` env var.
+        // populated via `--kind-dump-dir=DIR` (B72: the env fallback is
+        // retired).
         if let Some(dump_dir) = ay_core::trace_config().kind_dump_dir.as_deref() {
             let dump_path = std::path::Path::new(dump_dir);
             if let Err(e) = std::fs::create_dir_all(dump_path) {

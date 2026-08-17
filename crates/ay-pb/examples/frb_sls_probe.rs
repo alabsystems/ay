@@ -21,6 +21,11 @@ use ay_pb::CnfEncoder;
 use ay_pb::{parse_opb, verify_all_constraints, PbInstance, PbRel};
 use ay_sat::{Literal, SatResult};
 
+#[path = "frb_sls_probe/cli.rs"]
+mod cli;
+
+use cli::{flag as cli_flag, val as cli_val};
+
 // Local xorshift64* RNG (no external dep; deterministic per seed).
 struct Rng(u64);
 impl Rng {
@@ -414,10 +419,7 @@ fn solve_clique(
     let mut since_decay = 0u64;
     // Full-restart threshold (steps stuck at the plateau). Lower = more frequent
     // restarts = more independent "lottery tickets" for the heavy-tailed fast solve.
-    let restart_thresh: u64 = std::env::var("AY_CLIQUE_RESTART")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
+    let restart_thresh: u64 = cli_val("--clique-restart").unwrap_or(30_000);
     let mut best = 0usize;
     let mut best_assign = vec![false; n];
 
@@ -713,7 +715,7 @@ fn solve_csp(
         return None;
     }
 
-    let coord_repair = std::env::var("AY_CSP_NOCOORD").is_err();
+    let coord_repair = !cli_flag("--csp-nocoord");
     let mut rng = Rng::new(base_seed);
     let mut cur = vec![0usize; nb];
     let selected = |cur: &[usize], v0: usize| -> bool {
@@ -793,20 +795,11 @@ fn solve_csp(
             (w, u)
         };
 
-        let max_moves: u64 = std::env::var("AY_CSP_MAXMOVES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(200_000);
+        let max_moves: u64 = cli_val("--csp-maxmoves").unwrap_or(200_000);
         // Iterated local search: when stuck for `stag` moves, perturb `kick`
         // random blocks (keeps the descent's progress, escapes local minima).
-        let stag: u64 = std::env::var("AY_CSP_STAG")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(800);
-        let kick: usize = std::env::var("AY_CSP_KICK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
+        let stag: u64 = cli_val("--csp-stag").unwrap_or(800);
+        let kick: usize = cli_val("--csp-kick").unwrap_or(3);
         let mut best_this_try = usize::MAX;
         let mut since_improve = 0u64;
         let mut moves = 0u64;
@@ -1020,10 +1013,7 @@ fn walksat(
 ) -> Option<Vec<bool>> {
     let m = clauses.len();
     // probSAT break-exponent: enabled when AY_PROBSAT_CB > 0 (e.g. 2.5).
-    let probsat_cb: f64 = std::env::var("AY_PROBSAT_CB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
+    let probsat_cb: f64 = cli_val("--probsat-cb").unwrap_or(0.0);
     let mut occ: Vec<Vec<(usize, bool)>> = vec![Vec::new(); n];
     for (ci, cl) in clauses.iter().enumerate() {
         for &(v, s) in cl {
@@ -1077,10 +1067,7 @@ fn walksat(
         let mut best_this_try = usize::MAX;
         let mut since_improve = 0u64;
 
-        let mult: u64 = std::env::var("AY_MAXFLIPS_PER_N")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2000);
+        let mult: u64 = cli_val("--maxflips-per-n").unwrap_or(2000);
         let max_flips: u64 = (n as u64).saturating_mul(mult).max(2_000_000);
         let mut flips = 0u64;
         while flips < max_flips {
@@ -1226,7 +1213,7 @@ fn walksat(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: frb_sls_probe <file.opb> [secs] [seed] [noise] [mode=full|core]");
+        eprintln!("{}", cli::USAGE);
         std::process::exit(2);
     }
     let path = &args[1];
@@ -1439,7 +1426,7 @@ fn main() {
         );
 
         // Optional: solve the cleaned core with AY's real CDCL instead of SLS.
-        if std::env::var("AY_CORE_CDCL").is_ok() {
+        if cli_flag("--core-cdcl") {
             let mut solver = ay_sat::Solver::new(pb_nvars);
             for cl in &clauses {
                 let lits: Vec<Literal> = cl

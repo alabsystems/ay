@@ -9,13 +9,13 @@ use super::*;
 use crate::kani_compat::det_hash_set_new;
 use crate::solver_log::solver_log;
 
-// Soundness-triage antecedent recorder (AY_AB_TRIAGE_CLAUSE): collects every
+// Soundness-triage antecedent recorder (--sat-ab-triage-clause): collects every
 // clause ref resolved during the current conflict analysis so the learning
 // tripwire can dump the exact antecedents of the target learned clause.
 pub(super) fn triage_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_AB_TRIAGE_CLAUSE").is_some())
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_triage_clause.is_some())
 }
 thread_local! {
     pub(super) static TRIAGE_ANTECEDENTS: std::cell::RefCell<Vec<u32>> =
@@ -252,16 +252,10 @@ impl Solver {
                         self.cold.debug_jit_flags_buf.clear();
                         for i in 0..jit_seen_count {
                             let var_idx = self.jit_conflict_output.seen_var(i) as usize;
-                            // SAFETY: var_data is repr(C), 16 bytes per entry,
-                            // flags at offset 12. var_idx < num_vars guaranteed
-                            // by JIT bounds. This is the same raw access pattern
-                            // the JIT itself uses.
-                            let base = self.var_data.as_mut_ptr().cast::<u8>();
-                            let flags_ptr = unsafe { base.add(var_idx * 16 + 12) };
-                            let post_flags = unsafe { *flags_ptr };
+                            let post_flags = self.var_data[var_idx].flags;
                             self.cold.debug_jit_flags_buf.push((var_idx, post_flags));
                             // Clear seen bit to restore pre-JIT state.
-                            unsafe { *flags_ptr = post_flags & !1 };
+                            self.var_data[var_idx].flags = post_flags & !VarData::FLAG_SEEN_PUB;
                         }
 
                         // Reuse persistent interpreter output from cold state

@@ -930,7 +930,7 @@ impl AdaptivePortfolio {
         // args) have ZERO Int vars, so the Int-only count could never let
         // the init-cube splitter fire there and the disjunctive fallback
         // always died with "no phase splitters mined". Kill switch shared
-        // with the mixed-CNF pool class (`AY_CHC_DISABLE_QUAL_MIXED=1`
+        // with the mixed-CNF pool class (`--chc-no-qual-mixed`
         // restores the Int-only count).
         let wide_arity = state_vars
             .iter()
@@ -1530,9 +1530,8 @@ fn contains_flag(pool: &[HoudiniCandidate], seed_literal: &ChcExpr) -> bool {
 /// FLIPS=0); ay-chc suite green. Soundness is by construction — every candidate
 /// invariant is validated against the original clauses.
 fn disjunctive_enrichment_enabled() -> bool {
-    std::env::var("AY_HOUDINI_DISJUNCTIVE")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    // B27: CLI-owned; env retired.
+    crate::ab_switches::get().houdini_disjunctive
 }
 
 /// Whether the Bool-arg ↔ Int-bound guarded-implication candidate class is
@@ -1544,19 +1543,15 @@ fn disjunctive_enrichment_enabled() -> bool {
 /// `validate_invariant_against_clauses` as all other Houdini candidates, so a
 /// non-inductive row is simply discarded and can never produce a wrong `sat`.
 fn guarded_impl_hints_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("AY_CHC_GUARDED_IMPL_HINTS").ok().as_deref() != Some("0"))
+    // B15: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().guarded_impl_hints
 }
 
 /// Whether the inc-16 Stage-5 widening classes are enabled. DEFAULT ON;
 /// `AY_HOUDINI_STAGE5=0` restores the pre-inc-16 pools byte-for-byte.
 fn stage5_widening_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_HOUDINI_STAGE5")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
+    // B27: CLI-owned; env retired.
+    crate::ab_switches::get().houdini_stage5
 }
 
 /// Int state-var pairs co-occurring in a `+`/`-` linear subterm of the
@@ -2413,9 +2408,9 @@ fn propagate_background(expr: &ChcExpr) -> ChcExpr {
     }
 }
 
-/// Env-gated debug tracing for Houdini refinement (`AY_HOUDINI_DEBUG=1`).
+/// Env-gated debug tracing for Houdini refinement (`--chc-houdini-debug`).
 fn houdini_debug() -> bool {
-    std::env::var_os("AY_HOUDINI_DEBUG").is_some_and(|v| v == "1")
+    ay_core::misc_cli_flags().chc_houdini_debug
 }
 
 /// Whether the Houdini prepass accepts single-predicate BV problems (#11
@@ -2424,7 +2419,7 @@ fn houdini_debug() -> bool {
 /// Sound either way: the gate only selects WHERE the drop-loop runs; every
 /// surviving invariant is still validated against the original clauses.
 fn houdini_bv_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_HOUDINI_BV").ok().as_deref() != Some("1")
+    crate::ab_switches::get().houdini_bv // B27: CLI-owned; env retired.
 }
 
 /// Whether the Phase-B fast-path is enabled (`AY_CHC_HOUDINI_PHASEB_FAST`).
@@ -2442,8 +2437,8 @@ fn houdini_bv_enabled() -> bool {
 /// any subset (dropping only weakens the antecedent), so the greatest inductive
 /// subset reached is identical.
 fn houdini_phaseb_fast_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("AY_CHC_HOUDINI_PHASEB_FAST").ok().as_deref() != Some("0"))
+    // B15: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().houdini_phaseb_fast
 }
 
 /// Project the post-state out of a consecution counterexample model:

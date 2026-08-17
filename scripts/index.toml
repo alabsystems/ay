@@ -27,6 +27,24 @@ exempt = [
 ]
 
 [[script]]
+name    = "flag-baseline-reconcile"
+path    = "scripts/flag_baseline_reconcile.py"
+lang    = "python"
+group   = "quality"
+summary = "Reconcile the env-flag exact-set baseline after deleting flags: prune entries, rebuild the key-site section sorted from the failing gate's own report."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "flag-audit"
+path    = "scripts/flag_audit.py"
+lang    = "python"
+group   = "quality"
+summary = "Compatibility/listing audit for the historical regex count (338 after B1); the Rust ay-quality-gate exact-set scanner is the build ratchet."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
 name    = "sat-sweep"
 path    = "scripts/sweep.py"
 lang    = "python"

@@ -3,10 +3,14 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use crate::combined_solvers::combiner::{CrossTheoryEqualityReplay, EufArrayNotifyReplayEdge};
+use crate::combined_solvers::combiner::{
+    CrossTheoryEqualityReplay, EufArrayNotifyReplayEdge, EufArrayNotifyReplayState,
+};
 use ay_arrays::ArrayPropagatedEqualityReplay;
 use ay_core::term::{TermId, TermStore};
 use ay_core::ExpressionSplitRequest;
+
+mod replay_cache;
 
 fn arrays_check_count(combiner: &TheoryCombiner<'_>) -> u64 {
     arrays_stat(combiner, "arrays_checks")
@@ -791,14 +795,14 @@ fn test_euf_array_notification_export_prunes_current_paths_8785() {
     combiner.assert_literal(guard_bc, true);
     combiner.assert_literal(guard_ac, true);
 
-    let mut persistent_edges = vec![
+    let mut persistent_edges = EufArrayNotifyReplayState::from_edges(&[
         redundant_ac.clone(),
         stale_edge,
         edge_bc.clone(),
         edge_ab.clone(),
         // Exact duplicate: must be dropped by the hash dedup.
         edge_ab.clone(),
-    ];
+    ]);
     combiner.prune_current_euf_array_notify_replay_edges(&mut persistent_edges);
 
     // #no-replay-quadratic M2 (superset retention): pruning drops edges whose
@@ -808,7 +812,7 @@ fn test_euf_array_notification_export_prunes_current_paths_8785() {
     // BFS that used to drop it was 100% of solver samples on cs_lazy.i_6.
     // Output is sorted by (reason length, target, source).
     assert_eq!(
-        persistent_edges,
+        persistent_edges.to_edges(),
         vec![edge_ab, edge_bc, redundant_ac],
         "AUFLIA/ArrayEUF export should retain currently-valid replay edges (including covered ones) and drop stale or duplicate edges"
     );
@@ -987,47 +991,10 @@ fn test_reasoned_euf_array_notification_replays_after_pop_8785() {
 
 #[test]
 fn test_imported_reasoned_euf_array_notification_survives_soft_reset_8785() {
-    let mut terms = TermStore::new();
-    let arr_sort = Sort::array(Sort::Int, Sort::Int);
+    replay_cache::assert_imported_replay_survives_soft_reset();
+}
 
-    let a = terms.mk_var("a", arr_sort.clone());
-    let b = terms.mk_var("b", arr_sort);
-    let guard = terms.mk_var("guard", Sort::Bool);
-
-    let mut first = TheoryCombiner::array_euf(&terms);
-    first.assert_literal(guard, true);
-    assert_eq!(
-        first.notify_arrays_of_euf_equalities(&[DiscoveredEquality::new(
-            a,
-            b,
-            vec![TheoryLit::new(guard, true)],
-        )]),
-        1
-    );
-    let edges = first.export_euf_array_notify_replay_edges();
-    assert_eq!(edges.len(), 1);
-
-    let mut current = TheoryCombiner::array_euf(&terms);
-    current.import_euf_array_notify_replay_edges(&edges);
-    current.soft_reset();
-    current.assert_literal(guard, true);
-    assert!(
-        current.euf_array_notify_replay_edge_reasons_hold(&edges[0]),
-        "current true guard should make the imported replay edge persistence-eligible"
-    );
-    assert_eq!(
-        current.replay_valid_euf_array_notifications(),
-        1,
-        "extension soft reset must not discard imported reason-validated replay edges"
-    );
-    assert_eq!(current.euf_array_notify_parent.get(&b), Some(&a));
-
-    let mut stale = TheoryCombiner::array_euf(&terms);
-    stale.import_euf_array_notify_replay_edges(&edges);
-    stale.soft_reset();
-    stale.assert_literal(guard, false);
-    assert!(
-        !stale.euf_array_notify_replay_edge_reasons_hold(&edges[0]),
-        "current false guard should make the imported replay edge ineligible for persistence"
-    );
+#[test]
+fn test_group_activation_permutation_preserves_replay_connectivity() {
+    replay_cache::assert_group_activation_permutation_preserves_connectivity();
 }

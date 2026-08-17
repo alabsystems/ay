@@ -344,7 +344,7 @@ fn run_seed(
 ) {
     // Progress/diagnosis aid for the heavy runs: identifies the active seed
     // when an instance is pathologically slow. Off by default.
-    if std::env::var_os("AY_FUZZ_VERBOSE").is_some() {
+    if ay_core::misc_cli_flags().fuzz_verbose {
         eprintln!("[qflia-fuzz] seed={seed}");
     }
     let assertions = gen_instance(seed);

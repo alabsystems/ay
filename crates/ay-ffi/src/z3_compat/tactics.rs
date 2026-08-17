@@ -232,7 +232,9 @@ pub unsafe extern "C" fn Z3_tactic_or_else(
     t1: Z3_tactic,
     t2: Z3_tactic,
 ) -> Z3_tactic {
-    // SAFETY: see `Z3_tactic_and_then`.
+    // SAFETY: the caller guarantees `c` and both non-null tactic handles are
+    // live; `combine_tactics` checks each handle for null before cloning it,
+    // then guards the context mutation that stores the combined tactic.
     unsafe { combine_tactics(c, t1, t2, TacticCombinator::OrElse) }
 }
 
@@ -471,7 +473,8 @@ pub unsafe extern "C" fn Z3_tactic_skip(c: Z3_context) -> Z3_tactic {
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_tactic_fail(c: Z3_context) -> Z3_tactic {
-    // SAFETY: see `Z3_tactic_skip`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ptr` handles a null
+    // pointer defensively before storing the context-owned tactic handle.
     unsafe { ffi_guard_ptr(c, |ctx| store_tactic(ctx, Tactic::Fail)) }
 }
 
@@ -517,7 +520,8 @@ pub unsafe extern "C" fn Z3_tactic_fail_if(c: Z3_context, p: Z3_probe) -> Z3_tac
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_tactic_fail_if_not_decided(c: Z3_context) -> Z3_tactic {
-    // SAFETY: see `Z3_tactic_skip`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ptr` handles a null
+    // pointer defensively before storing the context-owned tactic handle.
     unsafe { ffi_guard_ptr(c, |ctx| store_tactic(ctx, Tactic::FailIfNotDecided)) }
 }
 

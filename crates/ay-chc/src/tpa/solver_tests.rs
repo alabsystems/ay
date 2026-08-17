@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use crate::{CancellationToken, ChcSort, ClauseBody, ClauseHead, HornClause};
+use crate::{CancellationToken, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};
 use ntest::timeout;
 
 fn make_reachability_test_solver(cancellation_token: Option<CancellationToken>) -> TpaSolver {

@@ -28,7 +28,7 @@ fn test_set_resolution_hints_returns_false_for_missing_id() {
 
     // ID 1 exists: should succeed
     assert!(trace.set_resolution_hints(1, vec![10, 20]));
-    assert_eq!(trace.entries()[0].resolution_hints, vec![10, 20]);
+    assert_eq!(trace.entries().at(0).resolution_hints, vec![10, 20]);
 
     // ID 2 doesn't exist: returns false, no panic
     assert!(!trace.set_resolution_hints(2, vec![30]));
@@ -37,7 +37,7 @@ fn test_set_resolution_hints_returns_false_for_missing_id() {
     assert!(!trace.set_resolution_hints(0, vec![40]));
 
     // Original entry unchanged after failed set
-    assert_eq!(trace.entries()[0].resolution_hints, vec![10, 20]);
+    assert_eq!(trace.entries().at(0).resolution_hints, vec![10, 20]);
 }
 
 /// Verify that set_resolution_hints overwrites previous hints.
@@ -52,11 +52,11 @@ fn test_set_resolution_hints_overwrites_previous() {
     trace.add_clause(1, vec![Literal::positive(Variable::new(0))], false);
 
     assert!(trace.set_resolution_hints(1, vec![10, 20]));
-    assert_eq!(trace.entries()[0].resolution_hints, vec![10, 20]);
+    assert_eq!(trace.entries().at(0).resolution_hints, vec![10, 20]);
 
     // Second call overwrites
     assert!(trace.set_resolution_hints(1, vec![30, 40, 50]));
-    assert_eq!(trace.entries()[0].resolution_hints, vec![30, 40, 50]);
+    assert_eq!(trace.entries().at(0).resolution_hints, vec![30, 40, 50]);
 }
 
 /// Verify that add_clause_with_hints records both clause and hints atomically.
@@ -78,7 +78,7 @@ fn test_add_clause_with_hints_is_atomic() {
     );
 
     assert_eq!(trace.len(), 1);
-    let entry = &trace.entries()[0];
+    let entry = trace.entries().at(0);
     assert_eq!(entry.id, 42);
     assert!(!entry.is_original);
     assert_eq!(entry.resolution_hints, vec![10, 20, 30]);
@@ -101,8 +101,8 @@ fn test_set_resolution_hints_updates_first_duplicate_id_only() {
     assert!(trace.set_resolution_hints(5, vec![100]));
 
     // rfind updates the last (most recent) entry with the matching ID
-    assert!(trace.entries()[0].resolution_hints.is_empty());
-    assert_eq!(trace.entries()[1].resolution_hints, vec![100]);
+    assert!(trace.entries().at(0).resolution_hints.is_empty());
+    assert_eq!(trace.entries().at(1).resolution_hints, vec![100]);
 }
 
 /// Verify empty clause detection via add_clause_with_hints.

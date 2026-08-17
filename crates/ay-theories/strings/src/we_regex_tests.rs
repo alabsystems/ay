@@ -11,16 +11,11 @@ fn m(r: &WeRegex, s: &str) -> bool {
 }
 
 #[test]
-fn witness_max_len_defaults_and_accepts_overrides() {
-    assert_eq!(parse_witness_max_len(None, false), WITNESS_MAX_LEN);
-    assert_eq!(parse_witness_max_len(Some("64"), false), 64);
-    assert_eq!(
-        parse_witness_max_len(Some("invalid"), false),
-        WITNESS_MAX_LEN
-    );
-    // S1 lifts the DEFAULT only; an explicit override still wins.
-    assert_eq!(parse_witness_max_len(None, true), WITNESS_MAX_LEN_S1);
-    assert_eq!(parse_witness_max_len(Some("7"), true), 7);
+fn witness_max_len_s1_lifts_the_cap() {
+    // B9: the env override is retired; the cap is the compiled per-mode
+    // constant, and S1 must strictly lift it or the S1 lane is pointless.
+    assert!(WITNESS_MAX_LEN_S1 > WITNESS_MAX_LEN);
+    assert!(WITNESS_MAX_LEN > 0);
 }
 
 #[test]

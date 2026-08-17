@@ -297,13 +297,19 @@ impl EufSolver<'_> {
         let debug = self.debug_euf;
         let mut iterations = 0;
         let initial_pending = self.to_merge.len();
+        #[cfg(debug_assertions)]
+        let mut changed_nodes = Vec::with_capacity(initial_pending.saturating_mul(2));
 
         while let Some(merge) = self.to_merge.pop_front() {
             iterations += 1;
+            #[cfg(debug_assertions)]
+            changed_nodes.extend([merge.a, merge.b]);
             self.incremental_merge(merge.a, merge.b, merge.reason);
             // #8469: Track merge epoch for disequality dirty tracking.
             self.merge_epoch = self.merge_epoch.wrapping_add(1);
         }
+        #[cfg(debug_assertions)]
+        self.debug_assert_changed_enode_classes(changed_nodes);
 
         if debug && iterations > 0 {
             safe_eprintln!(

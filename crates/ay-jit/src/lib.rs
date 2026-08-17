@@ -3,6 +3,10 @@
 // Licensed under the Apache License, Version 2.0
 
 // Andrew Yates <andrewyates.name@gmail.com>
+// Dedicated executable-memory/ABI boundary; unsafe sites are locally audited.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! # ay-jit: JIT compilation infrastructure for the ay SMT solver
 //!
 //! This crate provides native machine code generation for performance-critical

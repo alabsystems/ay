@@ -14,6 +14,11 @@ use crate::kani_compat::DetHashSet as HashSet;
 
 /// Sweep effort as per-mille of search ticks since last sweep call.
 /// CaDiCaL: `sweepeffort = 100` (options.hpp). 100 per-mille = 10%.
+/// Sweep-deepening default (B4: was AY_AB_SWEEP_DEEPEN; ships OFF).
+const SWEEP_DEEPEN_DEFAULT: bool = false;
+/// Min-effort floor when deepening (B4: was AY_AB_SWEEP_MINEFF).
+#[allow(dead_code)]
+const SWEEP_DEEPEN_MIN_EFFORT_FLOOR: u64 = 10_000_000;
 const SWEEP_EFFORT_PERMILLE: u64 = 100;
 
 /// Maximum sweep effort (ticks) per call.
@@ -146,25 +151,18 @@ impl Solver {
             0
         };
 
-        // ── Sweep-deepening lever (AY_AB_SWEEP_DEEPEN) ──────────────────────
+        // ── Sweep-deepening lever (B4: env reads deleted; constants) ────────
         // AY's SWEEP_MIN_EFFORT is 0, so on large formulas the proportional
         // budget (10% of Δsearch_ticks) plus the ≤2M first-call cap probe only
         // ~0.03–0.28% of variables per call. kissat clamps its sweep effort to
-        // a floor of ~1M–10M ticks (max(REFERENCE, sweepmineff)), letting each
-        // call probe far more variables. Under the lever, raise the per-call
-        // floor (AY_AB_SWEEP_MINEFF, default 10M) so — together with the
+        // a floor of ~1M–10M ticks, letting each call probe far more variables.
+        // Under the lever, raise the per-call floor (default 10M) so — with the
         // persistent cursor in sweep_with_kitten — coverage actually deepens.
-        // Wall-clock is still bounded by AY_AB_SWEEP_WALL_MS in sweep_with_kitten.
-        // Lever OFF: min-effort floor stays 0 (SWEEP_MIN_EFFORT) — behaviour
-        // is unchanged.
-        let deepen = std::env::var("AY_AB_SWEEP_DEEPEN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // The lever ships OFF; flipping it belongs to a priced batch via a
+        // typed option, not an env var nothing sets (B8 in the migration spec).
+        let deepen = SWEEP_DEEPEN_DEFAULT;
         let min_effort_floor = if deepen {
-            std::env::var("AY_AB_SWEEP_MINEFF")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10_000_000)
+            SWEEP_DEEPEN_MIN_EFFORT_FLOOR
         } else {
             SWEEP_MIN_EFFORT
         };

@@ -20,8 +20,7 @@ use super::*;
 use crate::literal::{Literal, Variable};
 use crate::watched::Watcher;
 
-/// Minimum number of inactive variables before compaction triggers.
-/// CaDiCaL: `compactmin = 100` (options.hpp).
+/// Minimum inactive variables before compaction; CaDiCaL: `compactmin = 100`.
 const COMPACT_MIN_INACTIVE: usize = 100;
 
 /// Inactive fraction threshold (per-mille of max_var).
@@ -340,6 +339,7 @@ impl Solver {
             map.remap_var_vec(&mut self.cold.level0_proof_sign);
         }
         self.cold.lrat_level0_unit_materialize_cursor = 0;
+        self.cold.lrat_level0_unit_materialize_pinned.clear();
         map.remap_var_vec(&mut self.cold.scope_selector_set);
         map.remap_var_vec(&mut self.glue_stamp);
         map.remap_var_vec(&mut self.shrink_stamp);

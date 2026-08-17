@@ -29,8 +29,14 @@ pub(super) mod proof_farkas_validation;
 pub(super) mod proof_trust_surgery;
 #[path = "proof_trust_surgery_ite.rs"]
 pub(super) mod proof_trust_surgery_ite;
+#[path = "proof_trust_surgery_ite_branch.rs"]
+mod proof_trust_surgery_ite_branch;
 #[path = "proof_trust_surgery_ite_emit.rs"]
 mod proof_trust_surgery_ite_emit;
+#[path = "proof_trust_surgery_ite_plan.rs"]
+mod proof_trust_surgery_ite_plan;
+#[path = "proof_trust_surgery_ite_substituted_bound.rs"]
+mod proof_trust_surgery_ite_substituted_bound;
 #[cfg(test)]
 #[path = "proof_trust_surgery_ite_tests.rs"]
 mod proof_trust_surgery_ite_tests;

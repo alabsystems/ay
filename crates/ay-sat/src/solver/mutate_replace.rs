@@ -134,7 +134,7 @@ impl Solver {
             // for variables that shared this clause (#8100).
             self.invalidate_reason_clause_marks();
             if self.cold.lrat_enabled {
-                self.lower_lrat_level0_unit_materialize_cursor_for_var(vi);
+                self.pin_lrat_level0_unit_materialize_for_var(vi);
             }
             self.var_data[vi].reason = NO_REASON;
         }

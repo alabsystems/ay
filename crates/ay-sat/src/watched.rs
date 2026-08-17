@@ -318,8 +318,8 @@ impl WatchList {
     ///
     /// CaDiCaL propagate.cpp:160-166: `__builtin_prefetch(&ws[0], 0, 1)`.
     /// BCP will scan entries on the next propagation step. Prefetch
-    /// is isolated in the `ay-prefetch` crate to preserve ay-sat's
-    /// `#![forbid(unsafe_code)]`.
+    /// is isolated in `ay-prefetch`; ay-sat's own audited unsafe exceptions
+    /// remain confined to their hot-path modules.
     #[inline]
     #[allow(dead_code)] // audited-unused: kept pending the next dead-code cleanup slice
     pub(crate) fn prefetch_first(&self) {

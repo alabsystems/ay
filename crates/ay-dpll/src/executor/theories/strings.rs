@@ -255,7 +255,7 @@ impl Executor {
                         // `str.at` lowers to `(str.substr x i 1)`, so this also
                         // links `str.at` results to `contains`.
                         //
-                        // P2 (`AY_STR_P2=1`) carve-out: substr terms with
+                        // P2 carve-out: substr terms with
                         // NON-CONSTANT bounds are now eagerly reduced
                         // (`x = pre ++ skt ++ suf` + exact length coupling), which
                         // subsumes this containment fact structurally. Emitting it
@@ -502,7 +502,7 @@ impl Executor {
             );
         }
         if self.pivot_enum_depth == 0 {
-            let __tr = std::env::var("AY_STR_PREPASS_STATS").ok().as_deref() == Some("1");
+            let __tr = ay_core::misc_cli_flags().str_prepass_stats;
             macro_rules! timed {
                 ($name:literal, $e:expr) => {{
                     let __t = std::time::Instant::now();
@@ -549,7 +549,7 @@ impl Executor {
             if let Some(result) = timed!("nielsen", self.try_word_equation_nielsen()?) {
                 return Ok(result);
             }
-            // Early W6 shortcut (`AY_STR_W6=0` kill switch): two structurally-
+            // Early W6 shortcut (`--dpll-no-str-w6` kill switch): two structurally-
             // narrow SAT constructions hoisted ahead of the per-variable witness
             // passes below (W1b, the cheap W1b probe, W4), which decide their
             // targets either far more slowly or catastrophically —
@@ -595,7 +595,7 @@ impl Executor {
             if let Some(result) = timed!("w1b", self.try_regex_construct_witnesses()?) {
                 return Ok(result);
             }
-            // W4 (default ON, `AY_STR_W4=0` kill switch): length-indexed per-position
+            // W4 (default ON, `--dpll-no-str-w4` kill switch): length-indexed per-position
             // character witness synthesizer (see `strings_w4.rs`). Same
             // validated-candidate contract as the passes above — a failed
             // synthesis falls through and never concludes UNSAT.
@@ -604,7 +604,7 @@ impl Executor {
                     return Ok(result);
                 }
             }
-            // W6 (default ON, `AY_STR_W6=0` kill switch): regex-driven joint word
+            // W6 (default ON, `--dpll-no-str-w6` kill switch): regex-driven joint word
             // construction (see `strings_w6.rs`). Same validated-candidate
             // contract — a failed construction never concludes UNSAT.
             if super::strings_w6::str_w6_enabled() {
@@ -612,7 +612,7 @@ impl Executor {
                     return Ok(result);
                 }
             }
-            // W7 (default ON, `AY_STR_W7=0` kill switch): chain-definition, multi-atom
+            // W7 (default ON, `--dpll-no-str-w7` kill switch): chain-definition, multi-atom
             // placement and distinct-witness moves (see `strings_w7.rs`).
             // LAST in the cascade, deliberately: W6 measured that moving a
             // later witness pass earlier costs the earlier passes' own

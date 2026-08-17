@@ -458,10 +458,10 @@ fn test_propositional_multi_clause_resolution_proof() {
 
 /// QF_BV proof: independently replayed bit-blast theorem + resolution.
 ///
-/// AY's strict checker regenerates and checks the exact BV refutation. Alethe
-/// 1.0/Carcara has no compatible rule for AY's bit-blast convention, so the
-/// external rendering honestly marks that already-internally-certified theorem
-/// as `hole`; this must not be confused with authority in the proof IR.
+/// AY's strict checker regenerates and checks the exact BV refutation. Generic
+/// `BvBitBlast` clauses still render as honest `hole` steps because Alethe
+/// 1.0/Carcara has no compatible monolithic rule. This exact authored shape is
+/// stronger: transitivity yields a ground disequality lowered through `evaluate`.
 #[test]
 #[timeout(5_000)]
 fn test_bv_proof_end_to_end_strict_internal_certificate() {
@@ -491,9 +491,23 @@ fn test_bv_proof_end_to_end_strict_internal_certificate() {
 
     let proof = &outputs[1];
 
+    // REPINNED after 1e10745f2 (fix(proof): BvLiaTautology fallback ran
+    // before the authored BV cascade, silently downgrading bv_bitblast
+    // certificates to holes) — verified by running this test at 1e10745f2
+    // (the hole disappears) and its parent b868972b5 (hole still printed).
+    // With the authored BV cascade restored, the ground BV disequality closes
+    // through the f466f0dda evaluate cascade (each step an implemented
+    // carcara rule), so the exported Alethe document no longer needs the
+    // honest `hole` this test previously pinned. The capability moved
+    // forward; pin the hole-free rendering and the `evaluate` closure that
+    // now carries it.
     assert!(
-        proof.contains(":rule hole"),
-        "Alethe must honestly expose its missing AY-style BV rule:\n{proof}"
+        !proof.contains(":rule hole"),
+        "the BV disequality closure must stay hole-free:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule evaluate"),
+        "the constant-fold closure must be spelled with carcara's evaluate:\n{proof}"
     );
     assert!(
         !proof.contains(":rule trust"),
@@ -1491,14 +1505,15 @@ fn test_smt_proof_pipeline_qf_lia_composed_authored_root_strict() {
         .expect("composed QF_LIA proof should export in the authored problem scope");
     assert!(
         alethe.contains(":rule eq_congruent")
-            && alethe.contains(":rule lia_generic")
+            && alethe.contains(":rule evaluate")
             && alethe.contains(":rule eq_transitive"),
-        "affine equality must export as congruence + linear identity + transitivity:\n{alethe}"
+        "affine equality must export as congruence + checked ground evaluation + transitivity:\n{alethe}"
     );
     assert!(
         !alethe.contains(":rule trust")
             && !alethe.contains(":rule hole")
-            && !alethe.contains(":rule la_generic"),
+            && !alethe.contains(":rule la_generic")
+            && !alethe.contains(":rule lia_generic"),
         "affine equality export must not hide authority or encode a disequality case split as one la_generic step:\n{alethe}"
     );
 }

@@ -777,7 +777,7 @@ impl TheorySolver for LraSolver {
         // *suggests* a decision atom (the SAT core owns the sat/unsat verdict)
         // — and returns from the same candidate set the slow path would (same
         // phase-hint / not-asserted / category filters), only in a different
-        // order. Gated behind AY_LRA_FAST_DECISION (default on) so the exact
+        // order. Gated behind --no-lra-fast-decision (default on) so the exact
         // legacy scan can be restored for differential comparison.
         if fast_decision_enabled() {
             self.suggest_decision_atom_fast()
@@ -822,7 +822,7 @@ impl LraSolver {
         None
     }
 
-    /// Legacy two-scan path, preserved verbatim for `AY_LRA_FAST_DECISION=0`
+    /// Legacy two-scan path, preserved verbatim for `--no-lra-fast-decision`
     /// differential comparison. Two full O(registered_atoms) passes.
     pub(crate) fn suggest_decision_atom_slow(&self) -> Option<(TermId, bool)> {
         // Priority 1: Equality atoms with LP-model-consistent phase. Equality
@@ -910,21 +910,13 @@ impl LraSolver {
     }
 }
 
-/// Whether the STAGE B fast decision-suggestion path is enabled. Read once per
-/// process from `AY_LRA_FAST_DECISION` (default on; set to `0`/`false`/`off` to
-/// force the legacy scan). The index is maintained unconditionally so the fast
-/// and slow paths can be compared directly in tests regardless of this flag;
-/// only which path `suggest_decision_atom` takes is gated.
+/// Whether the STAGE B fast decision-suggestion path is enabled (default on;
+/// `--no-lra-fast-decision` forces the legacy scan). The index is maintained
+/// unconditionally so the fast and slow paths can be compared directly in
+/// tests regardless of this switch; only which path `suggest_decision_atom`
+/// takes is gated.
 pub(crate) fn fast_decision_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_LRA_FAST_DECISION")
-            .map(|v| {
-                let v = v.trim();
-                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-            })
-            .unwrap_or(true)
-    })
+    !ay_core::theory_disable_flags().no_lra_fast_decision
 }
 
 /// Helper methods for `suggest_decision_atom` LP-model evaluation.

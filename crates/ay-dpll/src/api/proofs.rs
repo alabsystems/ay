@@ -13,13 +13,16 @@
 
 use ay_core::{AletheRule, ProofStep};
 use ay_proof::{
-    check_proof_collecting_trust_with_context, check_proof_partial, check_proof_with_quality,
-    AlethePrintError, PartialProofCheck, ProofCheckError, ProofQuality,
+    check_proof_collecting_trust_with_typed_context, check_proof_partial, check_proof_with_quality,
+    AlethePrintError, DatatypeMemberSignature, PartialProofCheck, ProofCheckError, ProofQuality,
 };
 use num_rational::BigRational;
 
 use crate::array_proof_check::{check_array_clause, ArrayStepVerdict};
 use crate::bv_proof_check::{check_bv_assertions_unsat, check_bv_clause, BvStepVerdict};
+
+mod bv_lia_source_replay;
+use bv_lia_source_replay::discharge_source_bv_lia;
 
 /// Exported strict-verification verdict for an UNSAT proof artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,11 +233,17 @@ fn strict_verdict_with_deferred_trust(
         .ctor_selectors_iter()
         .map(|(constructor, selectors)| (constructor.clone(), selectors.clone()))
         .collect();
-    let collected = match check_proof_collecting_trust_with_context(
+    let Some(datatype_member_signatures) = exact_datatype_member_signatures(resolve_ctx) else {
+        return StrictProofVerdict::Rejected(
+            "datatype registries lack an exact sticky member signature".to_string(),
+        );
+    };
+    let collected = match check_proof_collecting_trust_with_typed_context(
         proof,
         terms,
         (!datatype_declarations.is_empty()).then_some(datatype_declarations.as_slice()),
         (!constructor_selectors.is_empty()).then_some(constructor_selectors.as_slice()),
+        datatype_member_signatures.as_slice(),
         Some(assertions),
     ) {
         Ok(collected) => collected,
@@ -288,6 +297,31 @@ fn strict_verdict_with_deferred_trust(
             )
         }
     }
+}
+
+fn exact_datatype_member_signatures(
+    context: &ay_frontend::Context,
+) -> Option<Vec<DatatypeMemberSignature>> {
+    let mut signatures = Vec::new();
+    for (_, constructors) in context.datatype_iter() {
+        for constructor in constructors {
+            let fields = context.constructor_selectors(constructor)?;
+            let tester = format!("is-{constructor}");
+            for identity in std::iter::once(constructor.as_str())
+                .chain(std::iter::once(tester.as_str()))
+                .chain(fields.iter().map(String::as_str))
+            {
+                let info = context.exact_datatype_member_info(identity)?;
+                signatures.push(DatatypeMemberSignature {
+                    identity: identity.to_string(),
+                    argument_sorts: info.arg_sorts.clone(),
+                    result_sort: info.sort.clone(),
+                    nullary_term: info.term,
+                });
+            }
+        }
+    }
+    Some(signatures)
 }
 
 /// Independent whole-problem UNSAT re-confirmation through the COMPLETE `Executor`
@@ -362,25 +396,10 @@ pub(crate) fn executor_redecides_definitive_sat(resolve_ctx: &ay_frontend::Conte
     matches!(exec.check_sat(), Ok(result) if result.is_sat())
 }
 
-/// Independently discharge a single deferred trust step via the fail-closed
-/// semantic checkers. Returns `Some(())` ONLY when an independent solver run
-/// confirms the step's content UNSAT under the BV or array theory; `None` for
-/// any `Unchecked`/`Invalid`/unmodellable outcome.
-///
-/// Two shapes are handled, both fail-closed:
-///
-/// 1. NON-EMPTY trust clause `C`: prove `C` is a genuine theory tautology by
-///    refuting `¬C`. Try the BV checker first; on `Unchecked` fall back to the
-///    array checker. A clause accepted by EITHER is genuine; a clause both
-///    reject stays unaccepted.
-/// 2. EMPTY trust clause: this is the terminal `⊢ ⊥` certificate-free fallback
-///    `ay` emits when it decided the WHOLE problem UNSAT without a structured
-///    proof. There is nothing in the proof to re-check, so the only honest
-///    independent certificate is to re-solve the ORIGINAL problem `assertions`
-///    in a fresh solver and confirm they are jointly UNSAT
-///    ([`check_bv_assertions_unsat`]). A SAT/Unknown/unmodellable result keeps
-///    the step unaccepted. An empty assertion set is never accepted (an empty
-///    conjunction is satisfiable).
+/// Independently discharge a deferred trust step, accepting only a checked
+/// non-empty theory tautology or a fresh strict refutation of the exact
+/// authored assertions for a terminal empty clause. All unsupported,
+/// satisfiable, unknown, malformed, or resource-limited cases fail closed.
 pub(crate) fn discharge_trust_clause(
     terms: &ay_core::TermStore,
     clause: &[ay_core::TermId],
@@ -412,11 +431,11 @@ pub(crate) fn discharge_trust_clause(
         ArrayStepVerdict::Skipped | ArrayStepVerdict::Unchecked { .. } => {}
     }
 
-    let mut discharge_terms = terms.clone();
-    let negated: Vec<ay_core::TermId> = clause
-        .iter()
-        .map(|&literal| discharge_terms.mk_not(literal))
-        .collect();
+    if discharge_source_bv_lia(terms, clause, assertions) {
+        return Some(());
+    }
+    let mut arena = terms.clone();
+    let negated: Vec<_> = clause.iter().map(|&term| arena.mk_not(term)).collect();
 
     // ENTAILMENT DISCHARGE (#unsat-cert-entailment).
     //
@@ -444,7 +463,7 @@ pub(crate) fn discharge_trust_clause(
     // only accepting outcome; Sat, Unknown, and timeout all decline.
     if !assertions.is_empty() {
         let mut entail = ay_frontend::Context::new();
-        entail.terms = discharge_terms.clone();
+        entail.terms = arena.clone();
         entail.assertions = assertions.to_vec();
         entail.assertions.extend_from_slice(&negated);
         let mut exec = crate::Executor::new();
@@ -479,7 +498,7 @@ pub(crate) fn discharge_trust_clause(
     // inconsistency. `Sat`, `Unknown`, timeout, missing proof, or any trust/hole
     // in that proof all decline.
     let mut probe = ay_frontend::Context::new();
-    probe.terms = discharge_terms;
+    probe.terms = arena;
     probe.assertions = negated.clone();
     let mut exec = crate::Executor::new();
     exec.ctx = probe;
@@ -678,7 +697,7 @@ impl super::Solver {
     ///
     /// Returns `None` if:
     /// - The last result was not UNSAT
-    /// - Proof production was not enabled
+    /// - Proof output was not requested for that solve
     /// - No proof was generated
     /// - A query-sealed proof has no current authenticated Alethe surface
     /// - Bounded Alethe rendering fails or exhausts its work budget
@@ -760,16 +779,17 @@ impl super::Solver {
     /// Offline re-checking establishes the bundle's internal soundness; it does
     /// not authenticate that the producer supplied the intended external
     /// problem. A consumer must independently verify that every obligation
-    /// assertion is a member of the intended query and compare the datatype,
-    /// selector, and complete free-symbol declaration context described by
-    /// [`SerializableProofBundle`].
+    /// assertion is a member of the intended query, compare the embedded
+    /// datatype tables, and independently obtain and compare the complete
+    /// free-symbol declaration context required by the
+    /// [`SerializableProofBundle`] binding contract.
     ///
     /// Unlike [`export_last_unsat_artifact`](Self::export_last_unsat_artifact),
     /// this native bundle does not require an authenticated Alethe surface. A
     /// surface-less sealed finite-enum proof can therefore export a bundle even
     /// when textual Alethe export declines. It still returns `None` when the
-    /// last result was not UNSAT, no proof was generated, or the bounded bundle
-    /// snapshot/current-query checks fail.
+    /// last result was not UNSAT, proof output was not requested, no proof was
+    /// generated, or the bounded bundle snapshot/current-query checks fail.
     #[must_use]
     pub fn export_last_unsat_bundle(&self) -> Option<ay_proof::SerializableProofBundle> {
         let proof = self.executor.last_proof()?;
@@ -778,29 +798,35 @@ impl super::Solver {
         if finite_enum && !self.executor.last_proof_is_checked_finite_enum() {
             return None;
         }
-        let (datatype_declarations, constructor_selectors) = if finite_enum {
-            if !self
-                .executor
-                .checked_finite_enum_bundle_export_is_bounded(proof)
-            {
-                return None;
-            }
-            self.executor
-                .checked_finite_enum_export_declarations(proof)?
-        } else {
-            (
-                self.executor.datatype_decls_for_strict_proof(),
-                self.executor.ctor_selector_decls_for_strict_proof(),
-            )
-        };
+        let (datatype_declarations, constructor_selectors, datatype_member_signatures) =
+            if finite_enum {
+                if !self
+                    .executor
+                    .checked_finite_enum_bundle_export_is_bounded(proof)
+                {
+                    return None;
+                }
+                self.executor
+                    .checked_finite_enum_export_declarations(proof)?
+            } else {
+                (
+                    self.executor.datatype_decls_for_strict_proof(),
+                    self.executor.ctor_selector_decls_for_strict_proof(),
+                    self.executor
+                        .datatype_member_signatures_for_strict_proof()?,
+                )
+            };
         let assertions = self.executor.problem_assertions_for_strict_proof();
-        Some(ay_proof::SerializableProofBundle::from_proof_with_context(
-            proof,
-            terms,
-            assertions,
-            datatype_declarations,
-            constructor_selectors,
-        ))
+        Some(
+            ay_proof::SerializableProofBundle::from_proof_with_typed_context(
+                proof,
+                terms,
+                assertions,
+                datatype_declarations,
+                constructor_selectors,
+                datatype_member_signatures,
+            ),
+        )
     }
 
     /// Render a term to a canonical, store-INDEPENDENT S-expression string
@@ -811,8 +837,9 @@ impl super::Solver {
     /// [`SerializableProofBundle`] produced by another solver, without sharing
     /// term ids. Canonical text does not include the complete declaration
     /// environment, so it is not sufficient to authenticate an external
-    /// obligation by itself; consumers must also compare the bundle's full
-    /// datatype, selector, and free-symbol signature context.
+    /// obligation by itself; consumers must compare the embedded datatype
+    /// tables and independently obtain and compare the complete free-symbol
+    /// declaration context required by the bundle binding contract.
     #[must_use]
     pub fn render_term_canonical(&self, term: super::Term) -> String {
         let term = self.require_term("render_term_canonical", term);
@@ -821,8 +848,8 @@ impl super::Solver {
 
     /// Export the last UNSAT proof as rendered Alethe text.
     ///
-    /// Returns `None` if the last result was not UNSAT, proofs were not enabled,
-    /// no current authenticated surface is available, or rendering fails.
+    /// Returns `None` if the last result was not UNSAT, proof output was not requested for
+    /// that solve, no current authenticated surface is available, or rendering fails.
     #[must_use]
     pub fn export_last_proof_alethe(&self) -> Option<String> {
         self.executor
@@ -835,7 +862,7 @@ impl super::Solver {
     /// This returns the same non-strict summary as `UnsatProofArtifact::quality`.
     /// For the strict verdict, use [`last_strict_proof_quality`](Self::last_strict_proof_quality).
     ///
-    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    /// Returns `None` if the last result was not UNSAT or proof output was not requested.
     #[must_use]
     pub fn last_proof_quality(&self) -> Option<ProofQuality> {
         let proof = self.executor.last_proof()?;
@@ -850,10 +877,14 @@ impl super::Solver {
     /// - `Some(Ok(quality))` — strict validation succeeded
     /// - `Some(Err(error))` — strict validation rejected the proof
     ///
-    /// This is the authoritative proof validation result. Unlike
+    /// This is the authoritative *native* proof validation result. Unlike
     /// [`last_proof_quality`](Self::last_proof_quality), the strict checker
     /// rejects theory lemmas without semantic validators and unvalidated
-    /// generic Alethe rules.
+    /// generic Alethe rules. A semantically revalidated `Generic` arithmetic
+    /// lemma can therefore return `Ok` while its diagnostic quality still has
+    /// `trust_count > 0` and its Alethe rendering honestly contains `hole`.
+    /// The conservative strict-proofs publication policy refuses this known
+    /// diagnostic class without changing native validation.
     #[must_use]
     pub fn last_strict_proof_quality(&self) -> Option<Result<ProofQuality, ProofCheckError>> {
         let proof = self.executor.last_proof()?;
@@ -862,7 +893,7 @@ impl super::Solver {
 
     /// Get partial check result for the last UNSAT proof.
     ///
-    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    /// Returns `None` if the last result was not UNSAT or proof output was not requested.
     #[must_use]
     pub fn last_partial_proof_check(&self) -> Option<PartialProofCheck> {
         let proof = self.executor.last_proof()?;
@@ -871,3 +902,7 @@ impl super::Solver {
         Some(partial)
     }
 }
+
+#[cfg(test)]
+#[path = "proofs/deferred_trust_source_replay_tests.rs"]
+mod deferred_trust_source_replay_tests;

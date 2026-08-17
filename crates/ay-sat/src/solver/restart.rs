@@ -9,37 +9,28 @@
 use super::*;
 use crate::solver::solver_stats::RestartAttribution;
 
-/// A/B #1 helper: resolve the focused-mode restart margin, allowing an env
-/// override (`AY_AB_FOCUSED_MARGIN`) for A/B comparison. Cached on first read
-/// so the per-conflict hot path stays branch-light.
+/// Focused-mode restart margin. (B4: the AY_AB_FOCUSED_MARGIN env override is
+/// deleted; the constant stands.)
 fn ab_focused_margin() -> f64 {
-    use std::sync::OnceLock;
-    static MARGIN: OnceLock<f64> = OnceLock::new();
-    *MARGIN.get_or_init(|| {
-        std::env::var("AY_AB_FOCUSED_MARGIN")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|m| m.is_finite() && *m > 0.0)
-            .unwrap_or(RESTART_MARGIN_FOCUSED)
-    })
+    RESTART_MARGIN_FOCUSED
 }
 
 impl Solver {
-    /// Equiticks progress-gate window in conflicts (`AY_AB_EQT_PROGRESS`),
+    /// Equiticks progress-gate window in conflicts (`--sat-eqt-progress`),
     /// read once per solve and cached. Returns 0 when disabled (the default),
     /// which makes the progress-gated stable-phase extension fully inert. A
     /// value of `1` selects `EQT_PROGRESS_WINDOW_DEFAULT`; any `N > 1` sets the
     /// window directly (used to sweep the window in A/B). The gate additionally
     /// requires equiticks to be active (`stable_tick_hardcap > 0`), so setting
-    /// this without `AY_AB_MODE_EQUITICKS` has no effect.
+    /// this without `--sat-mode-equiticks` has no effect.
     fn eqt_progress_window(&mut self) -> u64 {
         match self.cold.eqt_progress_cached {
             Some(w) => w,
             None => {
-                let w = match std::env::var("AY_AB_EQT_PROGRESS").ok().as_deref() {
-                    Some("1") => EQT_PROGRESS_WINDOW_DEFAULT,
-                    Some(s) => s.parse::<u64>().ok().filter(|&n| n > 1).unwrap_or(0),
-                    None => 0,
+                let w = match ay_core::sat_ab_switches().eqt_progress {
+                    Some(1) => EQT_PROGRESS_WINDOW_DEFAULT,
+                    Some(n) if n > 1 => n,
+                    _ => 0,
                 };
                 self.cold.eqt_progress_cached = Some(w);
                 w
@@ -89,7 +80,7 @@ impl Solver {
         // rephases still carry it across the focused/stable boundary.
         if self.stable_mode && conflict_free_len > self.target_trail_len {
             self.target_trail_len = conflict_free_len;
-            // Equiticks progress gate (AY_AB_EQT_PROGRESS): stamp the conflict at
+            // Equiticks progress gate (--sat-eqt-progress): stamp the conflict at
             // which the stable frontier last deepened. The switch test reads this
             // to keep a still-converging stable phase alive past the equal-effort
             // budget. Unconditional write (one field store); only READ when the
@@ -296,14 +287,13 @@ impl Solver {
                 //     3s margin) -> clause cap 300K excludes it (449K).
                 // In-band floor members hold under equiticks: 70da0b78@1s,
                 // 31e843c5@105s (improved from ~109s), 3f67f676@90s.
-                // Env override: AY_AB_MODE_EQUITICKS=1 forces ON everywhere,
-                // =0 forces OFF everywhere (kill-switch).
+                // CLI override: `--sat-mode-equiticks true` forces ON
+                // everywhere, `false` forces OFF everywhere (kill-switch).
                 let equiticks = match self.cold.mode_equiticks_cached {
                     Some(v) => v,
                     None => {
-                        let v = match std::env::var("AY_AB_MODE_EQUITICKS").ok().as_deref() {
-                            Some("1") => true,
-                            Some("0") => false,
+                        let v = match ay_core::sat_ab_switches().mode_equiticks {
+                            Some(forced) => forced,
                             // DEFAULT OFF (2026-07-16 full-400 certification):
                             // the <=300K & ratio<=20 banded default was NOT
                             // net-positive — it flipped 59fc779f/3ef7fa06/
@@ -319,7 +309,7 @@ impl Solver {
                             // original_ledger.num_clauses() <= 300_000 AND
                             // parsed clause/var ratio <= 20, with vars = the
                             // pre-extension count first_extension_var_index).
-                            _ => false,
+                            None => false,
                         };
                         self.cold.mode_equiticks_cached = Some(v);
                         v
@@ -340,7 +330,7 @@ impl Solver {
                 if self.cold.stabilize_tick_limit <= base_ticks {
                     self.cold.stabilize_tick_limit = base_ticks + 1;
                 }
-                // Equiticks progress-gate hardcap (AY_AB_EQT_PROGRESS): the
+                // Equiticks progress-gate hardcap (--sat-eqt-progress): the
                 // default nlogpow4 schedule delta is the absolute ceiling a
                 // deferred (still-converging) stable phase may run to. Compute
                 // it only under equiticks; the non-equiticks path already uses
@@ -619,15 +609,6 @@ impl Solver {
             }
             let fires = conflict_gate && ema_condition;
             if fires {
-                // Glucose trail-based restart blocking (Audemard & Simon, CP 2012):
-                // suppress the restart if the current trail is significantly longer
-                // than the slow-moving average, indicating productive search.
-                // This lets the solver continue exploring a promising subtree
-                // instead of restarting and losing progress (#8449).
-                if self.should_block_restart_by_trail() {
-                    self.stats.trail_blocked_restarts += 1;
-                    return false;
-                }
                 self.stats.focused_ema_fires += 1;
             }
             if fires {
@@ -700,58 +681,6 @@ impl Solver {
             self.cold.lbd_ema_slow_biased
         };
     }
-
-    /// Update trail-length EMA for restart blocking.
-    ///
-    /// Called once per conflict (from analyze_and_backtrack) before backtracking.
-    /// Tracks the slow-moving average of trail length so that
-    /// `should_block_restart_by_trail` can detect above-average trails.
-    ///
-    /// Reference: Audemard & Simon, "Refining Restarts Strategies for SAT and
-    /// UNSAT" (CP 2012), Section 3. CaDiCaL restart.cpp:90-96.
-    pub(super) fn update_trail_ema(&mut self) {
-        let trail_len = self.trail.len() as f64;
-        let alpha = 1.0 - TRAIL_EMA_DECAY;
-        self.cold.trail_ema_slow += alpha * (trail_len - self.cold.trail_ema_slow);
-        self.cold.trail_ema_count += 1;
-    }
-
-    /// Check if the current trail length justifies blocking a restart.
-    ///
-    /// Glucose trail-based restart blocking (Audemard & Simon, CP 2012):
-    /// block restarts when the current trail is significantly longer than
-    /// the slow-moving average, indicating the solver is making productive
-    /// progress and a restart would be counterproductive.
-    ///
-    /// Only active in focused mode (stable mode uses reluctant doubling which
-    /// already handles restart pacing). Requires warmup period for EMA accuracy.
-    ///
-    /// Note: CaDiCaL does not implement this technique, but Glucose, MapleSAT,
-    /// and competition solvers (AE-Kissat-MAB) do. Trail blocking complements
-    /// the Glucose EMA restart trigger by suppressing restarts when the solver
-    /// is exploring a productive search subtree (#8449).
-    fn should_block_restart_by_trail(&self) -> bool {
-        // A/B #1 (restart cadence toward Kissat): trail-based restart blocking
-        // is Kissat-absent machinery. AY under-restarts on structured UNSAT
-        // (c7552: baseline blocked 3129 restarts, leaving only 131 vs Kissat's
-        // 1138 — 8.7x too rare). Disabling blocking lets focused-mode Glucose
-        // restarts fire as the EMA dictates: c7552 -20.7% conflicts / -20% wall,
-        // SCPC -12.1% conflicts / -11% wall, avg LBD down on both. This is the
-        // robust restart-cadence win (margin tuning was instance-dependent).
-        // Set AY_AB_TRAIL_BLOCK to restore the old blocking behavior for A/B.
-        if std::env::var_os("AY_AB_TRAIL_BLOCK").is_none() {
-            return false;
-        }
-        if self.stable_mode {
-            return false;
-        }
-        if self.cold.trail_ema_count < TRAIL_BLOCKING_WARMUP {
-            return false;
-        }
-        let trail_len = self.trail.len() as f64;
-        trail_len > TRAIL_BLOCKING_MARGIN * self.cold.trail_ema_slow
-    }
-
     /// Compute the level to backtrack to when restarting, reusing trail decisions
     ///
     /// CaDiCaL's trail reuse optimization: instead of backtracking to level 0,

@@ -2,11 +2,10 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-// SAFETY: LraSolver uses a raw pointer to TermStore for persistent solver
-// across split-loop iterations (#6590 Packet 2). The pointer is valid only
-// within set_terms() / unset_terms() brackets. All unsafe code is confined
-// to the terms() accessor and Send/Sync impls.
-#![warn(unsafe_code)]
+// SAFETY BOUNDARY: unsafe code supports the bracketed raw TermStore pointer,
+// the typed arena, and the optional JIT boundary. Each site documents its
+// local invariant; workspace lints deny unsafe operations in unsafe functions.
+#![allow(unsafe_code)]
 
 //! AY LRA - Linear Real Arithmetic theory solver
 //!
@@ -182,6 +181,7 @@ mod atom_parsing;
 mod bound_assertion;
 mod bound_axioms;
 mod check_atoms;
+mod direct_bound;
 mod disequality_check;
 mod expression_forced;
 mod farkas;
@@ -616,7 +616,7 @@ pub struct LraSolver {
     /// Prevents duplicate registration when both atom and NOT(atom) are registered.
     registered_atoms: HashSet<TermId>,
     /// STAGE B: incremental decision-candidate index (unasserted eq/ineq atoms).
-    /// Read by `suggest_decision_atom` under `AY_LRA_FAST_DECISION`; maintained
+    /// Read by `suggest_decision_atom` under `--no-lra-fast-decision`; maintained
     /// on register/assert/pop and rebuilt at reset/snapshot boundaries.
     decision_index: DecisionCandidateIndex,
     /// Atoms grouped by their single arithmetic variable, for bound propagation.
@@ -899,7 +899,7 @@ pub struct LraSolver {
     /// still runs at final check, preserving eager-arm completeness.
     bcp_implied_single_pass: bool,
     /// #lra-inc-engine S3 (warm theory): set when this check-sat runs on a theory
-    /// solver REUSED across check-sats (AY_LRA_INC_WARM). Caps the implied-bounds
+    /// solver REUSED across check-sats (`--dpll-no-lra-inc-warm` opts out). Caps the implied-bounds
     /// recursive cascade so a stale warm cache on a region shift can't explode
     /// (implied_row_recursive). The monotone benefit is unaffected (it
     /// early-returns via #inc-cib-nodelta before the cascade). Sound: advisory.
@@ -1100,7 +1100,8 @@ pub struct LraSolver {
     /// Avoids the O(trail) scan on every check() call by recording disequalities
     /// when they are first asserted. Managed via push/pop for backtracking (#4919).
     disequality_trail: Vec<(TermId, LinearExpr, bool)>,
-    /// A5 core (demand-driven equality rows, AY_A5_CORE=1): equality atoms
+    /// A5 core (demand-driven equality rows; B35: the env opt-in is retired,
+    /// the field stays test-settable): equality atoms
     /// asserted during BCP-time checks are DEFERRED (no tableau bounds);
     /// after each full-check simplex-Sat, violated deferrals MATERIALIZE and
     /// the solve iterates. (term, expr, value) in assertion order.
@@ -1141,7 +1142,7 @@ pub struct LraSolver {
     /// Set to false after `rebuild_infeasible_heap()`. When false, incremental
     /// `track_var_feasibility()` calls keep the heap current (#8782).
     heap_stale: bool,
-    /// #warm-simplex (`AY_LRA_WARM_SIMPLEX_STATE`, default OFF): delta-only
+    /// #warm-simplex (`--no-lra-warm-simplex` opts out): delta-only
     /// simplex bookkeeping across pops — persistent infeasible-candidate
     /// structures, a non-basic dirty set replacing the O(vars) SAT-exit scan,
     /// and a last-feasible value delta for conflict recovery. See
@@ -1381,12 +1382,10 @@ impl LraSolver {
             debug_lra_nelson_oppen: false,
             debug_intern: false,
             no_theory_propagation: false,
-            // #warm-theory probe: AY_LRA_NO_IMPLIED disables compute_implied_bounds
-            // (sound: weaker propagation, feasibility still owned by the dual
-            // simplex) — used to test whether the implied-bounds cascade over
-            // accumulated rows is the O(depth²) wall on the warm-theory lane.
-            no_implied_bounds: std::env::var("AY_LRA_NO_IMPLIED")
-                .is_ok_and(|v| v != "0" && !v.is_empty()),
+            // (B9: the #warm-theory AY_LRA_NO_IMPLIED probe switch is retired —
+            // the O(depth²) implied-bounds question it existed to test is
+            // settled; flip this field directly for any future probe.)
+            no_implied_bounds: false,
             no_bound_refinement: false,
             max_fixpoint_rounds: None,
             check_count: 0,
@@ -1492,7 +1491,7 @@ impl LraSolver {
             implied_bounds_fresh: false,
             disequality_trail: Vec::new(),
             deferred_eq_atoms: Vec::new(),
-            a5_core: std::env::var_os("AY_A5_CORE").is_some(),
+            a5_core: false, // B35: the never-set AY_A5_CORE opt-in is retired; the lane is test-reachable only.
             disequality_trail_scopes: Vec::new(),
             shared_disequality_trail: Vec::new(),
             shared_disequality_trail_scopes: Vec::new(),

@@ -316,7 +316,7 @@ fn test_storecomm_invalid_two_store_skolem_no_false_unsat_8785() -> Result<()> {
 #[ntest::timeout(20_000)]
 fn test_storecomm_invalid_10_001_smallest_live_sat_target_8785() -> Result<()> {
     let path = workspace_path(STORECOMM_INVALID_10_001);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storecomm_invalid benchmark not checked into repo: {}",
             path.display()
@@ -338,7 +338,7 @@ fn test_storecomm_invalid_10_001_smallest_live_sat_target_8785() -> Result<()> {
 #[ntest::timeout(20_000)]
 fn test_storecomm_valid_10_001_smallest_live_unsat_target_9177() -> Result<()> {
     let path = workspace_path(STORECOMM_VALID_10_001);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storecomm benchmark not checked into repo: {}",
             path.display()
@@ -360,7 +360,7 @@ fn test_storecomm_valid_10_001_smallest_live_unsat_target_9177() -> Result<()> {
 #[ntest::timeout(20_000)]
 fn test_storecomm_invalid_30_008_bounded_no_false_unsat_8785() -> Result<()> {
     let path = workspace_path(STORECOMM_INVALID_30_008);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storecomm_invalid benchmark not checked into repo: {}",
             path.display()
@@ -399,7 +399,7 @@ fn test_storecomm_invalid_30_008_tracked_fixture_no_false_unsat_8785() -> Result
 #[ntest::timeout(25_000)]
 fn test_storecomm_invalid_30_008_tracks_open_sat_target_8785() -> Result<()> {
     let path = workspace_path(STORECOMM_INVALID_30_008);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storecomm_invalid benchmark not checked into repo: {}",
             path.display()

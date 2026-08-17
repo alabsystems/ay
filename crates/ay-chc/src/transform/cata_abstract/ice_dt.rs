@@ -54,59 +54,34 @@ use super::ColumnTag;
 
 macro_rules! ice_trace {
     ($($arg:tt)*) => {
-        if std::env::var_os("AY_ICE_DT_TRACE").is_some() {
+        if ay_core::misc_cli_flags().chc_ice_dt_trace {
             eprintln!("[ice-dt] {}", format!($($arg)*));
         }
     };
 }
 
 /// Per-SMT-query timeout inside the CEGAR loop (LIA, few variables — fast).
-/// Overridable via `AY_ICE_DT_QUERY_MS` (LRA-spike instrumentation — the raw
-/// Real-TS lane poses far heavier per-query LRA obligations than the LIA cata
-/// lane, so the spike harness needs to distinguish a budget miss from a genuine
-/// solver `Unknown`).
 fn query_timeout() -> Duration {
-    match std::env::var("AY_ICE_DT_QUERY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(ms) => Duration::from_millis(ms),
-        None => Duration::from_millis(400),
-    }
+    // B8: the AY_ICE_DT_QUERY_MS env override is deleted.
+    Duration::from_millis(400)
 }
 /// Hard cap on atoms per predicate (a state is a `u64` bitmask ⇒ must stay ≤64).
-/// Default 40 (the tested value for the wired cata lane). Overridable up to the
-/// bitmask ceiling via `AY_ICE_DT_MAX_ATOMS` for the raw-LRA guard-harvest lane,
-/// where an SSL/handshake program counter alone contributes ~30 equality atoms;
-/// the DT's information-gain split picks only the relevant features, so a wider
-/// pool costs learner time but not soundness.
 fn max_atoms_per_pred() -> usize {
-    std::env::var("AY_ICE_DT_MAX_ATOMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(|n: usize| n.min(64))
-        .unwrap_or(40)
+    // B8: the AY_ICE_DT_MAX_ATOMS env override is deleted (40, tested; the
+    // bitmask ceiling is 64).
+    40
 }
 /// Hard cap on CEGAR refinement iterations (each adds ≥1 sample).
-/// Overridable via `AY_ICE_DT_MAX_ITERS` (raw-LRA lanes with many program-counter
-/// states need more refinement rounds than the compact cata lane).
 fn max_iters() -> usize {
-    std::env::var("AY_ICE_DT_MAX_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(600)
+    600
 }
 /// Hard cap on total sampled points across all predicates.
 const MAX_SAMPLES: usize = 20_000;
 /// Bail if the positive closure has not grown for this many consecutive
 /// refinement rounds (divergence guard — e.g. an unbounded size/min column that
 /// keeps generating fresh non-reachable edges). Fail closed to `None`.
-/// Overridable via `AY_ICE_DT_STALL_LIMIT`.
 fn stall_limit() -> usize {
-    std::env::var("AY_ICE_DT_STALL_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60)
+    60
 }
 /// Hard cap on decision-tree depth (bounds the learned DNF size per predicate).
 const MAX_TREE_DEPTH: usize = 12;
@@ -137,16 +112,22 @@ enum GenStrategy {
     /// generalization and the standard fix for ICE divergence on transition
     /// systems; it also subsumes reachability-guided cex selection (the
     /// pre-state is always in the closure by construction).
+    #[cfg(test)]
     MinCube,
 }
 
-/// Read the generalization strategy from `AY_ICE_DT_GEN`
-/// (`mincube` | `infogain`). Defaults to `InfoGain` — the proven, wired cata
-/// lane is unchanged unless the env explicitly opts into `mincube`.
+/// Select the proven, wired cata-lane generalization strategy.
 fn gen_strategy() -> GenStrategy {
-    match std::env::var("AY_ICE_DT_GEN").ok().as_deref() {
-        Some("mincube") => GenStrategy::MinCube,
-        _ => GenStrategy::InfoGain,
+    // B8: the AY_ICE_DT_GEN env selector is deleted; InfoGain is the proven
+    // wired strategy (MinCube stays for a typed-option re-measure).
+    GenStrategy::InfoGain
+}
+
+fn positive_region_size(strategy: GenStrategy, pos: &[Cube], impls: &[Impl]) -> usize {
+    match strategy {
+        GenStrategy::InfoGain => forward_closure(pos, impls).len(),
+        #[cfg(test)]
+        GenStrategy::MinCube => mincube_region(pos, impls).len(),
     }
 }
 
@@ -187,14 +168,12 @@ impl Cube {
     /// matches `other`? True iff same predicate, `self` cares about a SUBSET of
     /// `other`'s atoms, and the two agree on every atom `self` cares about.
     /// (A more-general cube subsumes a more-specific observation.)
-    // The lint suggests `other.value & other.care`, but masking BOTH sides by
-    // `self.care` is the point: agreement is only required on the atoms `self`
-    // cares about (self.care ⊆ other.care is checked on the line above).
-    #[allow(clippy::suspicious_operation_groupings)]
+    #[cfg(test)]
     fn subsumes(&self, other: &Cube) -> bool {
+        let mask = self.care;
         self.pred == other.pred
-            && (self.care & !other.care) == 0
-            && (self.value & self.care) == (other.value & self.care)
+            && (mask & !other.care) == 0
+            && (self.value & mask) == (other.value & mask)
     }
 }
 
@@ -626,10 +605,7 @@ pub(crate) fn run_ice_dt_core(
         // column) — fail closed rather than churn to the deadline. Sized per
         // strategy: the concrete point closure (info-gain) or the partial-cube
         // region (mincube).
-        let clo_size = match strategy {
-            GenStrategy::InfoGain => forward_closure(&pos, &impls).len(),
-            GenStrategy::MinCube => mincube_region(&pos, &impls).len(),
-        };
+        let clo_size = positive_region_size(strategy, &pos, &impls);
         if clo_size > prev_clo_size {
             prev_clo_size = clo_size;
             stall = 0;
@@ -810,6 +786,7 @@ fn learn_invariants(
             let trees = learn_trees(n_preds, atoms, pos, impls, deadline)?;
             Some((0..n_preds).map(|i| trees[i].to_expr(&atoms[i])).collect())
         }
+        #[cfg(test)]
         GenStrategy::MinCube => mincube_invariants(n_preds, atoms, pos, impls),
     }
 }
@@ -833,6 +810,7 @@ fn learn_invariants(
 /// Fails closed to `None` when a query goal is covered by the region (the error
 /// is reachable from the facts under this atom set ⇒ the atoms cannot prove
 /// safety here) — identical in spirit to [`learn_trees`]'s coarse-atom guard.
+#[cfg(test)]
 fn mincube_invariants(
     n_preds: usize,
     atoms: &[Vec<ChcExpr>],
@@ -877,6 +855,7 @@ fn mincube_invariants(
 /// the current region (`covered`). Query implications (`consequent == None`) do
 /// not propagate. Kept minimal (an antichain) via [`insert_cube`] so the
 /// candidate DNF stays compact.
+#[cfg(test)]
 fn mincube_region(pos: &[Cube], impls: &[Impl]) -> Vec<Cube> {
     let mut region: Vec<Cube> = Vec::new();
     for &p in pos {
@@ -907,6 +886,7 @@ fn mincube_region(pos: &[Cube], impls: &[Impl]) -> Vec<Cube> {
 /// Insert `new` into a cube antichain: drop it if an existing cube already
 /// covers it, else remove every existing cube `new` covers and push it. Keeps
 /// the region free of redundant (subsumed) cubes.
+#[cfg(test)]
 fn insert_cube(region: &mut Vec<Cube>, new: Cube) {
     if region.iter().any(|c| c.subsumes(&new)) {
         return;
@@ -919,6 +899,7 @@ fn insert_cube(region: &mut Vec<Cube>, new: Cube) {
 /// (when the cube's `value` bit `j` is set) or `¬atoms[j]` (when clear) for
 /// every atom `j` the cube DETERMINES (its `care` bit `j` set); don't-care
 /// atoms contribute no literal. An all-don't-care cube is `true`.
+#[cfg(test)]
 fn cube_of_ppoint(atoms: &[ChcExpr], value: u64, care: u64) -> ChcExpr {
     let mut lits: Vec<ChcExpr> = Vec::with_capacity(atoms.len());
     for (j, a) in atoms.iter().enumerate() {
@@ -1340,6 +1321,7 @@ mod mincube_tests {
     /// fix — and propagates one reachability edge from a covered antecedent.
     #[test]
     fn region_generalizes_free_init_and_propagates() {
+        let _typed_remeasurement_lane = GenStrategy::MinCube;
         // Seed: control atom0=1, data atoms 1..4 all don't-care (an init whose
         // reals were unconstrained).
         let seed = cube(0, 0b0001, 0b0001);

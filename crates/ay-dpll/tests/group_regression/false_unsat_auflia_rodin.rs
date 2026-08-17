@@ -51,7 +51,7 @@ fn rodin_benchmark() -> PathBuf {
 #[test]
 fn auflia_rodin_smt4579745768945200905_is_never_unsat() {
     let path = rodin_benchmark();
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "SKIP: corpus benchmark absent at {}. Fetch with \
              `ay-z3-parity fetch benchmarks/smtlib-all --divisions AUFLIA`.",

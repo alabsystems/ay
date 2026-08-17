@@ -150,7 +150,9 @@ pub unsafe extern "C" fn Z3_parser_context_inc_ref(c: Z3_context, pc: Z3_parser_
 /// context handle owned by `c`.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_parser_context_dec_ref(c: Z3_context, pc: Z3_parser_context) {
-    // SAFETY: see `Z3_parser_context_inc_ref`.
+    // SAFETY: the caller guarantees `c` is live and a non-null `pc` is a live
+    // handle owned by it; the guard handles null `c` defensively, and `as_mut`
+    // checks null `pc` before updating its private counter.
     unsafe {
         ffi_guard_void(c, |_ctx| {
             if let Some(handle) = pc.as_mut() {

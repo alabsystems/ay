@@ -255,6 +255,21 @@ impl Solver {
         self.cold.scope_selectors.len()
     }
 
+    /// Exact SAT literals that activate the currently live assertion scopes.
+    ///
+    /// Scoped clauses are guarded with a positive selector and each live scope
+    /// is activated by assuming that selector false. Proof consumers must use
+    /// these literals as explicit fixed premises; treating selector-bearing
+    /// clauses as if they lived in the user/Tseitin namespace drops proof rows.
+    pub(crate) fn active_scope_assumptions(&self) -> Vec<Literal> {
+        self.cold
+            .scope_selectors
+            .iter()
+            .copied()
+            .map(Literal::negative)
+            .collect()
+    }
+
     /// Whether any push() scope is active with scoped BVE tracking (#8369).
     pub fn has_scoped_bve(&self) -> bool {
         !self.cold.scope_var_starts.is_empty()

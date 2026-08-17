@@ -96,6 +96,7 @@ mod milp_fastpath;
 mod proof_artifact;
 mod proof_verify;
 mod run;
+mod solve_ab_switches;
 mod stats_output;
 mod tracing_setup;
 mod z3_catalog;
@@ -495,6 +496,9 @@ enum CliSatTechnique {
     Jit,
     Walk,
     Warmup,
+    SymmetrySigned,
+    SymmetryAuxfree,
+    SymmetryOrbitope,
 }
 
 impl From<CliSatTechnique> for ay_sat::SatTechnique {
@@ -523,184 +527,89 @@ impl From<CliSatTechnique> for ay_sat::SatTechnique {
             CliSatTechnique::Jit => Self::Jit,
             CliSatTechnique::Walk => Self::Walk,
             CliSatTechnique::Warmup => Self::Warmup,
+            CliSatTechnique::SymmetrySigned => Self::SymmetrySigned,
+            CliSatTechnique::SymmetryAuxfree => Self::SymmetryAuxfree,
+            CliSatTechnique::SymmetryOrbitope => Self::SymmetryOrbitope,
         }
     }
 }
 
-/// CLI wrapper for [`ay_core::DebugChannel`].
-///
-/// Exhaustive `From` match — adding a canonical variant without updating
-/// this enum is a compile error.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-enum CliDebugChannel {
-    Theory,
-    Lia,
-    LiaCheck,
-    LiaBranch,
-    LiaNelsonOppen,
-    Gcd,
-    GcdTab,
-    Dioph,
-    Hnf,
-    Mod,
-    Enum,
-    Patch,
-    Lra,
-    LraBounds,
-    LraAssert,
-    LraReset,
-    LraNelsonOppen,
-    LraForced,
-    Intern,
-    FarkasRow,
-    Cube,
-    Gomory,
-    Euf,
-    EufNelsonOppen,
-    NelsonOppen,
-    Nia,
-    Nra,
-    Fp,
-    Dt,
-    BoolIte,
-    StringCore,
-    Dpll,
-    Sync,
-    Model,
-    VarSubst,
-    Verify,
-    IteEq,
-    ConcatEq,
-    Auflia,
-    IteConditions,
-    Linking,
-    Preprocessed,
-    SatCongruence,
-    TransredTrace,
-    TransredClause,
-    Unknown,
-    Prop,
-    ChcSmt,
-    Algebraic,
-    ArrayAxiomSite,
-    AufliaFix,
-    Row2Components,
-    Regex,
-    EufFallback,
-    Pcr,
-    AufliaFixSummary,
-}
-
-impl From<CliDebugChannel> for ay_core::DebugChannel {
-    fn from(cli: CliDebugChannel) -> Self {
-        match cli {
-            CliDebugChannel::Theory => Self::Theory,
-            CliDebugChannel::Lia => Self::Lia,
-            CliDebugChannel::LiaCheck => Self::LiaCheck,
-            CliDebugChannel::LiaBranch => Self::LiaBranch,
-            CliDebugChannel::LiaNelsonOppen => Self::LiaNelsonOppen,
-            CliDebugChannel::Gcd => Self::Gcd,
-            CliDebugChannel::GcdTab => Self::GcdTab,
-            CliDebugChannel::Dioph => Self::Dioph,
-            CliDebugChannel::Hnf => Self::Hnf,
-            CliDebugChannel::Mod => Self::Mod,
-            CliDebugChannel::Enum => Self::Enum,
-            CliDebugChannel::Patch => Self::Patch,
-            CliDebugChannel::Lra => Self::Lra,
-            CliDebugChannel::LraBounds => Self::LraBounds,
-            CliDebugChannel::LraAssert => Self::LraAssert,
-            CliDebugChannel::LraReset => Self::LraReset,
-            CliDebugChannel::LraNelsonOppen => Self::LraNelsonOppen,
-            CliDebugChannel::LraForced => Self::LraForced,
-            CliDebugChannel::Intern => Self::Intern,
-            CliDebugChannel::FarkasRow => Self::FarkasRow,
-            CliDebugChannel::Cube => Self::Cube,
-            CliDebugChannel::Gomory => Self::Gomory,
-            CliDebugChannel::Euf => Self::Euf,
-            CliDebugChannel::EufNelsonOppen => Self::EufNelsonOppen,
-            CliDebugChannel::NelsonOppen => Self::NelsonOppen,
-            CliDebugChannel::Nia => Self::Nia,
-            CliDebugChannel::Nra => Self::Nra,
-            CliDebugChannel::Fp => Self::Fp,
-            CliDebugChannel::Dt => Self::Dt,
-            CliDebugChannel::BoolIte => Self::BoolIte,
-            CliDebugChannel::StringCore => Self::StringCore,
-            CliDebugChannel::Dpll => Self::Dpll,
-            CliDebugChannel::Sync => Self::Sync,
-            CliDebugChannel::Model => Self::Model,
-            CliDebugChannel::VarSubst => Self::VarSubst,
-            CliDebugChannel::Verify => Self::Verify,
-            CliDebugChannel::IteEq => Self::IteEq,
-            CliDebugChannel::ConcatEq => Self::ConcatEq,
-            CliDebugChannel::Auflia => Self::Auflia,
-            CliDebugChannel::IteConditions => Self::IteConditions,
-            CliDebugChannel::Linking => Self::Linking,
-            CliDebugChannel::Preprocessed => Self::Preprocessed,
-            CliDebugChannel::SatCongruence => Self::SatCongruence,
-            CliDebugChannel::TransredTrace => Self::TransredTrace,
-            CliDebugChannel::TransredClause => Self::TransredClause,
-            CliDebugChannel::Unknown => Self::Unknown,
-            CliDebugChannel::Prop => Self::Prop,
-            CliDebugChannel::ChcSmt => Self::ChcSmt,
-            CliDebugChannel::Algebraic => Self::Algebraic,
-            CliDebugChannel::ArrayAxiomSite => Self::ArrayAxiomSite,
-            CliDebugChannel::AufliaFix => Self::AufliaFix,
-            CliDebugChannel::Row2Components => Self::Row2Components,
-            CliDebugChannel::Regex => Self::Regex,
-            CliDebugChannel::EufFallback => Self::EufFallback,
-            CliDebugChannel::Pcr => Self::Pcr,
-            CliDebugChannel::AufliaFixSummary => Self::AufliaFixSummary,
+fn disabled_sat_startup_capabilities(args: &SolveArgs) -> Vec<&'static str> {
+    let disabled = |target: CliSatTechnique| args.disable.contains(&target);
+    let mut capabilities = Vec::new();
+    let mut add = |capability| {
+        if !capabilities.contains(&capability) {
+            capabilities.push(capability);
+        }
+    };
+    for (is_disabled, capability) in [
+        (
+            args.no_preprocess || disabled(CliSatTechnique::Preprocess),
+            "preprocess",
+        ),
+        (args.no_bve || disabled(CliSatTechnique::Bve), "bve"),
+        (args.no_probe || disabled(CliSatTechnique::Probe), "probe"),
+        (
+            args.no_congruence || disabled(CliSatTechnique::Congruence),
+            "congruence",
+        ),
+        (disabled(CliSatTechnique::Decompose), "decompose"),
+        (disabled(CliSatTechnique::Sweep), "sweep"),
+        (disabled(CliSatTechnique::Condition), "condition"),
+        (
+            args.no_vivify || disabled(CliSatTechnique::Vivify),
+            "vivify",
+        ),
+        (
+            args.no_subsume || disabled(CliSatTechnique::Subsume),
+            "subsume",
+        ),
+        (args.no_bce || disabled(CliSatTechnique::Bce), "bce"),
+        (disabled(CliSatTechnique::Cce), "cce"),
+        (disabled(CliSatTechnique::Transred), "transred"),
+        (disabled(CliSatTechnique::Htr), "htr"),
+        (disabled(CliSatTechnique::Gate), "gate"),
+        (disabled(CliSatTechnique::Factor), "factor"),
+        (disabled(CliSatTechnique::Sbva), "sbva"),
+        (disabled(CliSatTechnique::Shrink), "shrink"),
+        (disabled(CliSatTechnique::Walk), "walk"),
+        (disabled(CliSatTechnique::Warmup), "warmup"),
+    ] {
+        if is_disabled {
+            add(capability);
         }
     }
-}
-
-/// CLI wrapper for proof format selection via `--proof-format`.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-enum CliProofFormat {
-    Drat,
-    Lrat,
-    Lean4,
-    Alethe,
-}
-
-impl From<CliProofFormat> for ProofFormat {
-    fn from(cli: CliProofFormat) -> Self {
-        match cli {
-            CliProofFormat::Drat => Self::Drat,
-            CliProofFormat::Lrat => Self::Lrat,
-            CliProofFormat::Lean4 => Self::Lean4,
-            CliProofFormat::Alethe => Self::Alethe,
+    // `--disable inprocess` eagerly disables these gates on the solver.
+    // The older `--no-inprocess` convenience flag only suppresses periodic
+    // inprocessing and does not disable the same gates during preprocessing,
+    // so it must not claim a gate-wide Off startup decision here.
+    if disabled(CliSatTechnique::Inprocess) {
+        for capability in [
+            "vivify",
+            "subsume",
+            "probe",
+            "bve",
+            "bce",
+            "condition",
+            "decompose",
+            "factor",
+            "sbva",
+            "transred",
+            "htr",
+            "gate",
+            "congruence",
+            "sweep",
+            "backbone",
+            "reorder",
+            "cce",
+        ] {
+            add(capability);
         }
     }
+    capabilities
 }
 
-/// CLI wrapper for [`explain_reason::ExplainFormat`] (#8693 Phase 1).
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-enum CliExplainFormat {
-    #[default]
-    Plain,
-    Json,
-}
-
-/// CLI wrapper for solution visualization output (#8702).
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-enum CliVisualizationFormat {
-    Ascii,
-    Svg,
-}
-
-impl From<CliVisualizationFormat> for ay::VisualizationFormat {
-    fn from(format: CliVisualizationFormat) -> Self {
-        match format {
-            CliVisualizationFormat::Ascii => Self::Ascii,
-            CliVisualizationFormat::Svg => Self::Svg,
-        }
-    }
-}
+include!("main/cli_value_types.rs");
 
 // ---------------------------------------------------------------------------
 // Clap top-level structures
@@ -835,8 +744,8 @@ enum Command {
     #[command(name = "z3-audit", hide = true)]
     Z3Audit(cmd_z3_audit::Z3AuditArgs),
     /// Generate competition submission skeletons
-    #[command(subcommand, hide = true)]
-    Submission(cmd_submission::SubmissionCommand),
+    #[command(hide = true)]
+    Submission(cmd_submission::SubmissionArgs),
     /// Audit AY's readiness as the SMT backend for Creusot/Why3 & Verus
     #[command(name = "verifier-audit", hide = true)]
     VerifierAudit(cmd_verifier_audit::VerifierAuditArgs),
@@ -865,6 +774,17 @@ enum SatExitCodes {
 /// Arguments for `ay solve` (the default subcommand).
 #[derive(clap::Args, Default)]
 #[command(after_help = "\
+Rigor (--rigor <LEVEL>): how much AY proves and re-checks its OWN answer.
+The verdict is always sound at every level -- AY never publishes a wrong sat/unsat;
+this only controls proof/self-check work, not confidence in the answer.
+  fast       just the answer, like z3 -- no proof, no re-check (was --competition)
+  standard   default: validate the answer, emit a proof, re-check that proof
+  strict     strict proof checker; a terminal-trust unsat it cannot prove -> unknown (was --strict-proofs)
+  certified  fail-closed: emit only answers AY can self-verify, else unknown (was --self-check)
+
+Proof artifact:
+  --proof FILE [--proof-format alethe|drat|lrat|lean4] [--proof-binary]
+
 SAT primary path:
   ay solve --sat-variant default FILE.cnf
   ay solve --sat-variant default --proof proof.lrat FILE.cnf
@@ -951,6 +871,37 @@ struct SolveArgs {
     #[arg(long)]
     verbose: bool,
 
+    /// Rigor: how much AY proves and re-checks its OWN answer, on one
+    /// mutually-exclusive ladder (default: standard). The verdict is ALWAYS
+    /// SOUND at every level — AY never publishes a wrong `sat`/`unsat`; this dial
+    /// controls proof/self-check work, not confidence in the answer.
+    ///
+    ///   fast       just the answer, like z3 (was --competition): no default
+    ///              validation / proof emission / proof re-check. Soundness
+    ///              defaults (incl. the always-on model gate) UNCHANGED.
+    ///              Auto-forced by a SAT-competition env.
+    ///   standard   the default: validate the answer, emit a proof, and
+    ///              re-check that proof.
+    ///   strict     strict proof checker (was --strict-proofs); a terminal
+    ///              Trust-backed `unsat` it cannot prove is downgraded to
+    ///              `unknown`.
+    ///   certified  fail-closed (was --self-check): emit only answers AY can
+    ///              self-verify, else `unknown`.
+    ///
+    /// Being a single enum, the levels are mutually exclusive by construction.
+    /// Resolution is MONOTONE: the STRONGEST level any given flag requests wins
+    /// (certified > strict > standard > fast), so a stronger flag is never
+    /// silently downgraded — `--self-check --rigor fast` stays certified.
+    /// `--assurance` is accepted as a hidden alias of `--rigor`.
+    #[arg(
+        long = "rigor",
+        alias = "assurance",
+        value_enum,
+        value_name = "LEVEL",
+        help_heading = "Rigor"
+    )]
+    assurance: Option<CliAssuranceLevel>,
+
     /// DEPRECATED / no-op: runtime result validation is ON BY DEFAULT now.
     /// Kept as a hidden accepted flag so existing scripts don't break. Use
     /// `--no-validate` (or `--competition`) to turn validation off.
@@ -959,7 +910,10 @@ struct SolveArgs {
 
     /// Turn OFF the default runtime result validation (a speed opt-out).
     /// Validation is on by default (batteries included); this disables it.
-    #[arg(long)]
+    /// Hidden fine-grained knob: the `--assurance` ladder is the primary
+    /// surface (`fast` turns this off as one of the batteries), but this flag
+    /// keeps working unchanged for scripts that toggle validation alone.
+    #[arg(long, hide = true)]
     no_validate: bool,
 
     /// Competition / benchmark mode: turn the overhead "batteries" OFF for
@@ -970,7 +924,9 @@ struct SolveArgs {
     /// engine selection) are UNCHANGED. Also implied when an official
     /// SAT-competition wrapper env signal is present, so existing competition
     /// harnesses stay on the fast path automatically.
-    #[arg(long)]
+    ///
+    /// Hidden legacy alias for `--assurance fast`; kept working unchanged.
+    #[arg(long, hide = true)]
     competition: bool,
 
     /// Fail-closed self-check: only emit a result AY can verify itself.
@@ -981,7 +937,9 @@ struct SolveArgs {
     /// active problem. Any answer AY cannot self-check becomes `unknown`. This
     /// shares AY's trust boundary; replay with a separately implemented checker
     /// remains the independent acceptance path.
-    #[arg(long = "self-check")]
+    ///
+    /// Hidden legacy alias for `--assurance certified`; kept working unchanged.
+    #[arg(long = "self-check", hide = true)]
     self_check: bool,
 
     /// Strict proof diagnostic and terminal-trust screen
@@ -990,7 +948,9 @@ struct SolveArgs {
     /// downgrades a terminal Trust-backed `unsat` to `unknown`. Other checker
     /// failures remain diagnostics. This is neither the fail-closed
     /// `--self-check` gate nor independent external replay.
-    #[arg(long)]
+    ///
+    /// Hidden legacy alias for `--assurance strict`; kept working unchanged.
+    #[arg(long, hide = true)]
     strict_proofs: bool,
 
     /// Write diagnostic firewall Lean lemmas into DIR on UNSAT (one file per
@@ -998,7 +958,12 @@ struct SolveArgs {
     /// / strings). These lemmas audit covered theory steps but do not certify
     /// the complete UNSAT derivation. Requires a persistent Alethe proof,
     /// either from `--proof FILE.alethe` or default SMT-LIB file emission.
-    #[arg(long = "emit-firewall-lean", value_name = "DIR")]
+    ///
+    /// Hidden diagnostic flag; kept working unchanged. Not folded into the
+    /// `--proof`/`--proof-format` dial: it emits a DIRECTORY of per-theory Lean
+    /// lemmas (not a single proof file) and requires a persistent Alethe proof,
+    /// so it does not map onto the single-file proof-format selector.
+    #[arg(long = "emit-firewall-lean", value_name = "DIR", hide = true)]
     emit_firewall_lean: Option<PathBuf>,
 
     /// Fail-closed diagnostic firewall gate for AY's own `unsat`.
@@ -1013,7 +978,11 @@ struct SolveArgs {
     /// the pinned Lean toolchain project and `lake` is auto-located.
     /// Supported only by the SMT-LIB DPLL(T) route; DIMACS, CHC/fixedpoint, and
     /// forced `--chc`/`--portfolio` routes are rejected rather than bypassing it.
-    #[arg(long = "verify-firewall")]
+    ///
+    /// Hidden diagnostic gate; kept working unchanged. Paired with
+    /// `--emit-firewall-lean`, and likewise not folded into the proof-format
+    /// dial (it always downgrades a current UNSAT to sound `unknown`).
+    #[arg(long = "verify-firewall", hide = true)]
     verify_firewall: bool,
 
     /// Print periodic progress lines to stderr (~5s)
@@ -1076,11 +1045,15 @@ struct SolveArgs {
     /// ay build provenance, input/proof hashes, proof format, theory metadata,
     /// and the proof payload in a schema accepted by Lean 4's artifact parser.
     /// CHC certificates do not yet have this envelope and reject the request.
+    ///
+    /// Hidden legacy flag; kept working unchanged. Rides alongside the
+    /// `--proof` artifact dial rather than being a separate primary switch.
     #[arg(
         long,
         value_name = "FILE",
         help_heading = "Proof verification",
-        conflicts_with = "no_proof"
+        conflicts_with = "no_proof",
+        hide = true
     )]
     proof_artifact: Option<PathBuf>,
 
@@ -1316,6 +1289,20 @@ struct SolveArgs {
     /// Disable theory-level propagation
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_theory_propagation: bool,
+
+    /// Disable the BCP implied-bounds restraint (debug kill switch; B5: was
+    /// the AY_NO_BCP_IMPLIED_RESTRAINT env var)
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    no_bcp_implied_restraint: bool,
+
+    #[command(flatten)]
+    ab_switches: solve_ab_switches::SolveAbSwitches,
+
+    /// Test-only: force the re-exec supervisor fallback (B5: was the
+    /// AY_INTERNAL_FORCE_REEXEC_SUPERVISOR env var). Read pre-parse from the
+    /// raw args in run_wrapped_solve_session; declared here so clap accepts it.
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    force_reexec_supervisor: bool,
 
     /// Disable implied bound inference
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -1585,6 +1572,8 @@ struct SolveArgs {
     )]
     debug_transred_clause: Option<u32>,
 }
+
+include!("main/assurance_resolution.rs");
 
 // ---------------------------------------------------------------------------
 // Timeout, exit, and utility functions
@@ -3265,7 +3254,6 @@ fn inject_solve_subcommand(args: &mut Vec<String>) {
 fn solve_session_needs_wrapper(processed: &[String]) -> bool {
     if env::var_os(SESSION_PROVENANCE_CHILD_ENV).is_some()
         || env::var_os("CARGO_TARGET_TMPDIR").is_some()
-        || ay_core::bv_cnf_dump_path_from_env().is_some()
     {
         return false;
     }
@@ -3765,12 +3753,13 @@ fn run_wrapped_solve_session(raw_args: &[String]) {
     #[cfg(unix)]
     {
         // Fail-closed guard: take the fork path only when provably single-threaded.
-        // `AY_INTERNAL_FORCE_REEXEC_SUPERVISOR` is a test-only override that forces
-        // the fallback so the gate can prove the re-exec supervisor still converts a
-        // crash to a sound `unknown` (never set on any production invocation).
-        if process_is_single_threaded()
-            && env::var_os("AY_INTERNAL_FORCE_REEXEC_SUPERVISOR").is_none()
-        {
+        // `--force-reexec-supervisor` (hidden; B5: was the
+        // AY_INTERNAL_FORCE_REEXEC_SUPERVISOR env var) is a test-only override
+        // that forces the fallback so a gate can prove the re-exec supervisor
+        // still converts a crash to a sound `unknown`. Checked on the RAW args
+        // because this runs before clap parses anything.
+        let force_reexec = raw_args.iter().any(|a| a == "--force-reexec-supervisor");
+        if process_is_single_threaded() && !force_reexec {
             match fork_supervised_solve_session(start) {
                 ForkSupervise::ChildContinue => return, // solve in-line in the child
                 ForkSupervise::FallBack => {}           // fork() failed → re-exec
@@ -4527,10 +4516,7 @@ fn run_solve(args: &SolveArgs) {
     // The catalog requests are deliberately NOT covered: unlike `-p` they are
     // not terminal, so a solve may still follow and produce the export.
     if args.z3_parameter_request.is_some() {
-        let requested_dump = args
-            .dump_bv_cnf
-            .clone()
-            .or_else(|| ay_core::bv_cnf_dump_path_from_env().map(PathBuf::from));
+        let requested_dump = args.dump_bv_cnf.clone();
         if let Some(path) = requested_dump.as_deref() {
             let _ = std::fs::remove_file(path);
             safe_eprintln!(
@@ -4615,10 +4601,7 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
-    let dump_bv_cnf_path = args
-        .dump_bv_cnf
-        .clone()
-        .or_else(|| ay_core::bv_cnf_dump_path_from_env().map(PathBuf::from));
+    let dump_bv_cnf_path = args.dump_bv_cnf.clone();
     // Path-collision preflight runs in ONE documented, deterministic order:
     // the BV CNF certificate-transaction boundary (`bv_cnf_dump_collision`,
     // which names the certificate member as the subject of every rejection)
@@ -4821,28 +4804,7 @@ fn run_solve(args: &SolveArgs) {
         let _ = DISABLED_SAT_TECHNIQUES.set(techniques);
     }
 
-    // Theory feature disable flags are also CLI-owned in the binary.
-    {
-        let max_fixpoint_rounds = args
-            .max_fixpoint_rounds
-            .map(|n| n as usize)
-            .filter(|&n| n > 0);
-        let theory_flags = ay_core::TheoryDisableFlags {
-            no_bound_axioms: args.no_bound_axioms,
-            no_theory_propagation: args.no_theory_propagation,
-            no_bcp_theory_check: args.no_bcp_theory_check,
-            no_ite_deferral: args.no_ite_deferral,
-            disable_theory_check: false,
-            no_inline_lemmas: args.no_inline_lemmas,
-            no_implied_bounds: args.no_implied_bounds,
-            no_bound_refinement: args.no_bound_refinement,
-            // Debug kill switch for the Fix #2 BCP implied-bounds restraint
-            // (sat-side-model-search): env-driven, no dedicated CLI arg.
-            no_bcp_implied_restraint: env::var_os("AY_NO_BCP_IMPLIED_RESTRAINT").is_some(),
-            max_fixpoint_rounds,
-        };
-        let _ = ay_core::set_global_theory_disable_flags(theory_flags);
-    }
+    args.install_solver_switches();
 
     // -- CLI → global config population (#8835) ---------------------------
     //
@@ -4882,29 +4844,7 @@ fn run_solve(args: &SolveArgs) {
         let _ = ay_core::set_global_chc_debug_env_flags(chc_debug);
     }
 
-    // MiscCliFlags — dump_auflia_assertions/sat_variant/dpll_{diagnostic_file,
-    //                diagnostic,trace_file}
-    //
-    // Note: --dump-encoding, --kind-dump-dir, and --debug-transred-clause now
-    // live on TraceConfig and SatDebugEnvFlags respectively (merged in via
-    // #8834 — the fields were added to those existing singletons rather than
-    // duplicated in MiscCliFlags).
-    {
-        let misc = ay_core::MiscCliFlags {
-            dump_auflia_assertions: args.dump_auflia_assertions,
-            sat_variant: args.sat_variant.clone(),
-            dpll_diagnostic_file: args
-                .dpll_diagnostic_file
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            dpll_diagnostic_enabled: args.dpll_diagnostic,
-            dpll_trace_file: args
-                .dpll_trace_file
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-        };
-        let _ = ay_core::set_global_misc_cli_flags(misc);
-    }
+    args.install_misc_cli_flags();
 
     // Verbose/stats
     let stats_human = args.stats;
@@ -5069,6 +5009,8 @@ fn run_solve(args: &SolveArgs) {
         std::process::exit(1);
     }
     let visualization = args.visualize.map(Into::into);
+
+    args.install_chc_ab_switches();
 
     // Determine CHC mode
     let chc_mode = if args.portfolio {
@@ -5696,13 +5638,13 @@ fn main() {
     let cli = Cli::parse_from(processed);
 
     match cli.command {
-        Some(Command::Solve(args)) => {
+        Some(Command::Solve(mut args)) => {
+            args.resolve_assurance();
             run_solve(&args);
         }
         None => {
-            // preprocess_args always injects "solve", so this shouldn't happen.
-            // Handle defensively: run interactive mode with defaults.
-            let args = SolveArgs::default();
+            let mut args = SolveArgs::default();
+            args.resolve_assurance();
             run_solve(&args);
         }
         Some(Command::Check(cmd)) => {
@@ -5952,7 +5894,7 @@ fn main() {
             }
         },
         Some(Command::Submission(cmd)) => {
-            if let Err(e) = cmd_submission::run(cmd) {
+            if let Err(e) = cmd_submission::run_args(cmd) {
                 safe_eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }

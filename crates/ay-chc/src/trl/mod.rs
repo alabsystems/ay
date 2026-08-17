@@ -53,7 +53,7 @@ use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornCl
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use std::time::Duration;
 
-const TRP_N_VAR_NAME: &str = "__trp_n";
+pub(crate) const TRP_N_VAR_NAME: &str = "__trp_n";
 /// Self-loop saturation detection threshold (#1665).
 /// When the same self-loop is detected this many times consecutively,
 /// TRL returns Unknown to allow fallback to other CHC engines.

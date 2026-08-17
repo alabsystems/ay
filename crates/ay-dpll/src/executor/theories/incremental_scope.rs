@@ -18,6 +18,9 @@ use ay_core::TermId;
 use super::super::Executor;
 use super::solve_harness::ProofProblemAssertionProvenance;
 
+mod proof_checkpoint;
+pub(in crate::executor) use proof_checkpoint::ProofCheckpointBudget;
+
 impl Executor {
     /// Run a closure with a fresh `IncrementalTheoryState`, restoring the
     /// original state afterward.
@@ -58,6 +61,16 @@ impl Executor {
     where
         F: FnOnce(&mut Self) -> Result<SolveResult>,
     {
+        // Snapshot preflight is cumulative. A rejection performs no proof-ledger
+        // clone and does not swap solver state; only resource/Unknown bookkeeping
+        // changes before the caller receives one coherent decline.
+        let proof_window = match self.bounded_proof_rollback_checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(origin) => {
+                self.record_unknown_from_origin(origin);
+                return Ok(SolveResult::Unknown);
+            }
+        };
         let saved_state = self.incr_theory_state.take();
         self.incr_theory_state = Some(IncrementalTheoryState::new());
         // #qmg-incr-bv-scope-leak: the persistent BV incremental state must be
@@ -73,7 +86,6 @@ impl Executor {
         // when the tracker is disabled the ledger is empty and the clone is
         // free, and a closure that self-enables proof production mid-window
         // is still rolled back on failure.
-        let proof_window = self.proof_tracker.rollback_checkpoint();
         let saved_assertions = assertions
             .map(|new_assertions| std::mem::replace(&mut self.ctx.assertions, new_assertions));
         let result = catch_unwind(AssertUnwindSafe(|| f(self)));
@@ -185,6 +197,10 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "incremental_scope_budget_tests.rs"]
+mod checkpoint_budget_tests;
 
 #[cfg(test)]
 mod tests {
@@ -324,7 +340,7 @@ mod tests {
 
         let mut recorded_id = None;
         let result = exec.with_isolated_incremental_state(None, |this| {
-            recorded_id = this.proof_tracker.add_theory_lemma(vec![term]);
+            recorded_id = this.proof_tracker.add_explicit_trust_lemma(vec![term]);
             assert!(recorded_id.is_some());
             Ok(SolveResult::unsat())
         });

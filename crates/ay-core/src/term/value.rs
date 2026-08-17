@@ -178,6 +178,7 @@ impl fmt::Display for Symbol {
 
 /// Constant values
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum Constant {
     /// Boolean constant

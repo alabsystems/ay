@@ -80,9 +80,9 @@ impl Executor {
         }
 
         // Authored `forall` roots with their binders and body, in authored
-        // order. A `forall` whose body is itself a binder is skipped here: the
-        // strict `forall_inst` validator fails closed on nested binders, so
-        // proposing one could only produce a candidate it rejects.
+        // order. A `forall` whose body is itself a binder is skipped because
+        // this flat complement-matching lane deliberately leaves nested chains
+        // to `authored_nested_forall`.
         let forall_roots: Vec<(TermId, Vec<(String, Sort)>, TermId)> = authored
             .iter()
             .filter_map(|&root| {
@@ -183,7 +183,7 @@ impl Executor {
     /// This decides NOTHING. Its output is re-derived from scratch by
     /// `validate_forall_inst`, so an imprecise match can only cost this pass a
     /// candidate, never buy an unsound one.
-    fn match_forall_body_instance(
+    pub(super) fn match_forall_body_instance(
         terms: &TermStore,
         body: TermId,
         instance: TermId,

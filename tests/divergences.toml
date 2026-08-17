@@ -1,0 +1,136 @@
+# ay-dpll divergence ledger — owned, EXPIRING quarantine rows.
+#
+# Modelled on Trust's tests/trust-comprehensive/divergences.toml.
+#
+# A row here documents a test that is known-red and states WHY it is not fixed
+# now, WHO owns it, and WHEN the exemption dies. A row does not make the suite
+# green: the tests still run and still fail. This file is the audit trail that
+# distinguishes "known, owned, and dated" from "nobody noticed".
+#
+# THE RULES THIS FILE IS BOUND BY
+#
+#   1. NEVER quarantine a soundness defect. A test that asserts a fail-closed
+#      obligation and observes a published `sat`, or any test whose failure is
+#      AY's own `[AY SOUNDNESS GATE] caught an INVALID model` banner, may not
+#      appear here at any expiry. Those stay visibly red until fixed.
+#      Four such rows are red as of 2026-08-13 and are deliberately ABSENT
+#      from this file — they are listed under "EXPLICITLY NOT QUARANTINED"
+#      below so their omission is auditable rather than accidental.
+#   2. Quarantine is the LAST resort, not a triage convenience. The 132 red
+#      rows in ay-dpll at this commit are overwhelmingly REAL DEFECTS with
+#      identified mechanisms; they are recorded in
+#      the development design notes and left red on purpose.
+#      Only 9 rows are quarantined here.
+#   3. Never weaken an assertion, loosen a bound, or delete a test to retire a
+#      row from this file. Fix the defect, or let the row expire and be
+#      re-reviewed.
+#
+# EXPLICITLY NOT QUARANTINED — soundness defects, red and staying visible:
+#   executor_tests::quantifier::unknown_and_misc::
+#       test_bv_uf_definition_axiom_ground_counterexample_fails_closed
+#   auflia_verification_consumer_9185_reducers::
+#       seq_concat_len_and_bucket_ix_definitions_are_soundly_unknown_without_joint_model
+#   api::tests::test_native_replay::
+#       native_replay_verification_consumer_hashmap_get_restore_bridge_fails_closed
+#   auflia_verification_consumer_ext_eq_7956::
+#       test_quantifier_consumer_ext_eq_tseitin_fails_closed_without_total_model_7956
+
+schema_version = "0.1.0"
+reviewed_sha = "4c293515e"
+reviewed_on = "2026-08-13"
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENTAL — the benchmark fixture is not in the repository at all.
+# ---------------------------------------------------------------------------
+
+[[divergences]]
+id = "ay-dpll.group_lra.2026-08-13.missing-smtcomp-fixtures"
+binary = "group_lra"
+tests = [
+    "qf_lra_release_soundness_6564::test_constraints_tempo_width_10_is_always_sat_in_release_6564",
+    "qf_lra_release_soundness_6582::test_constraints_tempo_width_10_release_sat_6582",
+    "qf_lra_release_soundness_6582::test_constraints_tempo_width_60_release_no_false_unsat_6582",
+    "qf_lra_release_soundness_6582::test_simple_startup_6nodes_release_no_false_unsat_6582",
+]
+status = "active"
+owner = "@ay-benchmarks"
+reviewed_on = "2026-08-13"
+expires_on = "2026-10-01"
+classification = "environmental_missing_fixture"
+cause = """
+The tests fail with `Benchmark not found`, not with a verdict. Three fixtures
+are absent from the working tree AND from the repository:
+benchmarks/smtcomp/QF_LRA/constraints-tempo-width-10.smt2,
+constraints-tempo-width-60.smt2, and simple_startup_6nodes.missing.induct.smt2.
+`benchmarks/.gitignore:25` ignores `smtcomp/**/*.smt2` wholesale; the two
+QF_LRA files that DO exist were force-added past that rule, and these three
+never were. So the fixtures were never committed — this is not local drift.
+"""
+why_not_fixed_now = """
+Fixing it means committing benchmark inputs (or force-adding them past the
+gitignore), which is a repository-content decision with licensing and size
+implications that belongs to the benchmark owner, not to a test-triage pass.
+No solver behaviour is implicated: AY is never invoked on these rows.
+"""
+required_action = """
+Either force-add the three fixtures as their siblings were, or delete the four
+tests as unrunnable. Do NOT make them pass by relaxing the benchmark loader to
+skip a missing file — these are release SOUNDNESS rows (no-false-unsat /
+always-sat), and a loader that silently skips its input would convert real
+coverage into a green that tests nothing.
+"""
+note = """
+These are #[cfg(not(debug_assertions))] rows, so they are invisible in any
+debug run and appear only in a release measurement.
+"""
+
+# ---------------------------------------------------------------------------
+# CAPABILITY REGRESSION — deliberate, documented, owner-blocked.
+# ---------------------------------------------------------------------------
+
+[[divergences]]
+id = "ay-dpll.datatypes.2026-08-13.c5b-validators-withdrawn"
+binary = "group_datatypes, group_proofs"
+tests = [
+    "dt_d1_lazy_propagation::test_derived_merge_selector_conflict_unsat",
+    "dt_d1_lazy_propagation::test_frame_chain_commitment_unsat_and_control",
+    "dt_d2_lazy_lane::test_deep_ground_towers_unsat",
+    "dt_d2_lazy_lane::test_ground_diseq_frame_chain_unsat",
+    "proof_boundary_unsat_9037::dt_occurs_check_publishes_uncheckable_certificate",
+]
+status = "active"
+owner = "@ay-proof"
+reviewed_on = "2026-08-13"
+expires_on = "2026-10-01"
+classification = "declared_capability_regression"
+cause = """
+`f94bec6c8 quality: enforce hard debt and unsafe boundaries` REMOVED the C5b
+datatype validators — validate_datatype_injective, validate_datatype_acyclic_direct,
+validate_datatype_value_eq_congruence (datatype_axiom.rs, -1460/+255) — with no
+replacement. `ay-core/src/proof.rs` now documents those kinds as "Reserved ...
+the former validator was removed pending an iterative, progress-polled resource
+and stack-safety review", and `executor/proof/tests.rs` pins that the promotion
+stays disabled.
+
+Consequence: DT lemmas emerge as `Generic`, deferred-trust discharge collects
+them (8 and 22 clauses respectively), none is a standalone theory tautology,
+and the whole-problem re-solve declines, so each row loses a correctly computed
+UNSAT at certification. `test_ground_diseq_frame_chain_unsat` needs exactly
+injectivity + distinctness; `dt_occurs_check` needs exactly acyclicity.
+
+These rows are FAIL-CLOSED (`unsat` demoted to `unknown`). No wrong verdict is
+published, which is why they are quarantinable at all.
+"""
+why_not_fixed_now = """
+Re-enabling the validators is an owner decision plus the resource and
+stack-safety work the removal commit explicitly deferred — it is not a
+test-triage edit. The capability was withdrawn on purpose and has its own
+pinning tests asserting it stays withdrawn; "fixing" these five rows without
+that work would mean re-landing code its author removed for stated reasons.
+"""
+required_action = """
+Restore the three validators with the iterative, progress-polled implementation
+the removal commit demands, then flip the pinning test in
+executor/proof/tests.rs in the SAME commit. Do not route these lemmas around
+the strict checker to retire this row.
+"""

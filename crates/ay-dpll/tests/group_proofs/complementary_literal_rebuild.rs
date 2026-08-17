@@ -220,15 +220,29 @@ fn test_native_api_enum_initiation_bundle_recheck_strict() {
 /// ORIGINAL authored assertions in a fresh `Executor` and requires UNSAT. So
 /// the VERDICT is certified by an independent re-solve, and `unsat` publishes.
 ///
-/// THE PROOF IS NOT EXTERNALLY CHECKABLE, and this test still pins that.
-/// The independent re-solve certifies the CONCLUSION, not the document: the
-/// exported certificate is unchanged and still terminates in
-/// `(step t1 (cl false) :rule hole)`. `check_proof_strict` must keep REJECTING
-/// it, so AY's own `--self-check` / `--strict-proofs` gate answers `unknown`
-/// for this query while default mode answers `unsat`. That divergence is the
-/// honest state of affairs, not a bug in this test. Should AY ever learn a real
-/// nonlinear proof rule for this shape, the strict-rejection assertion below is
-/// what will fire and demand this test be promoted.
+/// PROMOTED (2026-08-13) — AY LEARNED THE RULE. The previous revision of this
+/// doc ended: *"Should AY ever learn a real nonlinear proof rule for this
+/// shape, the strict-rejection assertion below is what will fire and demand
+/// this test be promoted."* It fired. This is that promotion, not a relaxation.
+///
+/// `43431e481 feat(proof): strict-certifiable pure-NRA UNSAT` gave `ay-proof`
+/// an interval kernel for nonlinear conflicts, and `theory_inference::funnel`
+/// classifies this conflict through `ay_proof::recognize_nra_interval_unsat` —
+/// literally the strict checker's own decider (`nra_interval.rs`: "recognize ==
+/// validate-success by construction", one `decide_nra_interval_unsat` shared by
+/// both). So the lemma carries NO forgeable payload: strict checking re-derives
+/// the refutation from the clause alone. Measured at this commit, the internal
+/// proof is `assume, assume, TheoryLemma{kind: NraIntervalUnsat}, th_resolution`
+/// with `trust_count == 0` and `hole_count == 0`.
+///
+/// WHAT DID NOT CHANGE — THE WIRE DOCUMENT. The Alethe printer has no spec rule
+/// name for an interval refutation, so `(get-proof)` still discloses
+/// `(step t2 ... :rule hole)`. Internal certification and the exported document
+/// therefore now DISAGREE, and that asymmetry is what this test pins from here
+/// on: the strict checker must succeed (or the NRA kernel silently regressed),
+/// AND the wire text must stay honestly unproved (or the printer started
+/// dressing an unnamed kind up as a checkable rule). Both halves are still
+/// soundness guards; only the side that carries the gap moved.
 #[test]
 #[timeout(10_000)]
 fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
@@ -262,19 +276,37 @@ fn test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate() {
         "get-proof must succeed after certified publication: {outputs:?}"
     );
 
-    // SOUNDNESS GUARD (the point of this test): the rebuild must NOT fabricate
-    // a strict derivation for a shape it cannot prove. The published document
-    // is honest about its gap — it retains an unproved step and the strict
-    // checker rejects it.
-    let strict = check_proof_strict(proof, exec.terms());
-    assert!(
-        strict.is_err(),
-        "no strict certificate exists for this nonlinear shape; the checker \
-         must not accept a fabricated one: {strict:?}"
+    // SOUNDNESS GUARD 1 — the acceptance must be EARNED, not fabricated. The
+    // NRA interval kernel reconstructs the refutation from the clause, so the
+    // strict check succeeds with no trust and no hole steps. A regression that
+    // lost the kernel would show as `Err` here; a regression that started
+    // waving trust/hole steps through would show in the counts.
+    let strict = check_proof_strict(proof, exec.terms())
+        .expect("the NRA interval kernel must strictly certify this refutation");
+    assert_eq!(
+        strict.trust_count, 0,
+        "an accepted strict certificate must contain no trust step: {strict:?}"
     );
+    assert_eq!(
+        strict.hole_count, 0,
+        "an accepted strict certificate must contain no hole step: {strict:?}"
+    );
+    assert!(
+        strict.trust_theory_kinds.is_empty(),
+        "no theory lemma may be admitted on trust: {strict:?}"
+    );
+    assert_eq!(
+        strict.theory_lemma_count, 1,
+        "exactly one theory lemma — the interval refutation — carries this proof: {strict:?}"
+    );
+
+    // SOUNDNESS GUARD 2 — the WIRE document must not overclaim. The printer has
+    // no Alethe rule name for `NraIntervalUnsat`, so it must keep disclosing the
+    // step as unproved rather than borrowing some other rule's name.
     let alethe = outputs.get(1).expect("get-proof output");
     assert!(
         alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
+        "the exported document has no rule name for the interval refutation and \
+         must stay honestly unproved:\n{alethe}"
     );
 }

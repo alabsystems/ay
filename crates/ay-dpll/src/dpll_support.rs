@@ -32,8 +32,7 @@ pub(crate) fn debug_sync_enabled() -> bool {
 /// phase-edge companion in `executor/theories/combined/mod.rs`.
 #[inline]
 pub(crate) fn uflia_phase_round_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_UFLIA_PHASE").ok().as_deref() == Some("2"))
+    false // B23: the phase-2 diagnostic env spelling is retired.
 }
 
 /// Iterate var->term mappings in deterministic variable order.

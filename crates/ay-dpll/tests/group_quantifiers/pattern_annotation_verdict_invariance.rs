@@ -12,7 +12,7 @@
 //! difference between them is a defect, never an incompleteness trade.
 //!
 //! AY returned `sat` for the first and `unknown` for the second. Traced with
-//! `AY_DEBUG_CERT=1`, the cause was NOT a quantifier-completeness gap — the
+//! `--debug-cert`, the cause was NOT a quantifier-completeness gap — the
 //! quantifier lane already returned `Sat`:
 //!
 //! ```text

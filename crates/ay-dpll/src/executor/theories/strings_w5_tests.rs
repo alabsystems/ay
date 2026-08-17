@@ -14,9 +14,10 @@ fn s(v: &[char]) -> String {
 fn w5_defaults_on_with_kill_switch() {
     // DEFAULT-ON: 31/58 remaining sat-side conversions, all z3-PIN-verified,
     // 478/478 solved-file regression exact. The contract is on-unless-killed.
-    if std::env::var("AY_STR_W5").is_err() {
-        assert!(str_w5_enabled(), "AY_STR_W5 must default ON");
-    }
+    assert!(
+        str_w5_enabled(),
+        "W5 must default ON (`--dpll-no-str-w5` kills it)"
+    );
 }
 
 #[test]

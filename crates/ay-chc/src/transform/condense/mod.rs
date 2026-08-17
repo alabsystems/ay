@@ -87,29 +87,18 @@ const DEFAULT_CONDENSE_MEAN_NODE_GATE: usize = 2048;
 const MEAN_NODE_GATE_CLAUSE_CAP_FACTOR: usize = 4;
 
 fn condense_wall_budget_from_env() -> Option<Duration> {
-    match std::env::var("AY_CHC_CONDENSE_BUDGET_SECS") {
-        Ok(v) => match v.trim().parse::<f64>() {
-            Ok(secs) if secs > 0.0 && secs.is_finite() => Some(Duration::from_secs_f64(secs)),
-            Ok(_) => None, // 0 (or negative) disables the wall budget.
-            Err(_) => Some(Duration::from_secs_f64(DEFAULT_CONDENSE_BUDGET_SECS)),
-        },
-        Err(_) => Some(Duration::from_secs_f64(DEFAULT_CONDENSE_BUDGET_SECS)),
-    }
+    // B8: the AY_CHC_CONDENSE_BUDGET_SECS env override is deleted.
+    Some(Duration::from_secs_f64(DEFAULT_CONDENSE_BUDGET_SECS))
 }
 
 fn condense_mean_node_gate_from_env() -> usize {
-    std::env::var("AY_CHC_CONDENSE_MAX_MEAN_NODES")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_CONDENSE_MEAN_NODE_GATE)
+    DEFAULT_CONDENSE_MEAN_NODE_GATE
 }
 
-/// Kill switch: `AY_CHC_DISABLE_CONDENSE=1` (or any value other than `0`)
-/// disables the condense superpass. Default: enabled.
+/// Kill switch: `--chc-no-condense` disables the condense superpass.
+/// Default: enabled.
 pub(crate) fn condense_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_CONDENSE")
-        .map(|v| v == "0")
-        .unwrap_or(true)
+    crate::ab_switches::get().condense
 }
 
 /// Unified fixpoint condense superpass (see module docs).

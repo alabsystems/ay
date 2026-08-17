@@ -84,9 +84,8 @@ const CONST_ENV_PROPAGATION_ROUNDS: usize = 4;
 /// Kill switch: `AY_CHC_DISABLE_PC_SPLIT=1` (any non-`0` non-empty value)
 /// disables pc-directed location splitting.
 pub(crate) fn pc_split_disabled_by_env() -> bool {
-    std::env::var("AY_CHC_DISABLE_PC_SPLIT")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    // B27: CLI-owned (--chc-no-pc-split); env retired.
+    !crate::ab_switches::get().pc_split
 }
 
 /// SLayerCF-shaped pc-directed location splitting transformer.

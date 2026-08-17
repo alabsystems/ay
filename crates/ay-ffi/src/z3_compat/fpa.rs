@@ -107,7 +107,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_sort(c: Z3_context, ebits: c_uint, sbits: c_u
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_fpa_sort_half(c: Z3_context) -> Z3_sort {
-    // SAFETY: see Z3_mk_fpa_sort.
+    // SAFETY: `c` is live by caller contract; `Z3_mk_fpa_sort` null-checks it,
+    // and these fixed format widths satisfy its validated bounds.
     unsafe { Z3_mk_fpa_sort(c, 5, 11) }
 }
 
@@ -117,7 +118,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_sort_half(c: Z3_context) -> Z3_sort {
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_fpa_sort_single(c: Z3_context) -> Z3_sort {
-    // SAFETY: see Z3_mk_fpa_sort.
+    // SAFETY: `c` is live by caller contract; `Z3_mk_fpa_sort` null-checks it,
+    // and these fixed format widths satisfy its validated bounds.
     unsafe { Z3_mk_fpa_sort(c, 8, 24) }
 }
 
@@ -127,7 +129,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_sort_single(c: Z3_context) -> Z3_sort {
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_fpa_sort_double(c: Z3_context) -> Z3_sort {
-    // SAFETY: see Z3_mk_fpa_sort.
+    // SAFETY: `c` is live by caller contract; `Z3_mk_fpa_sort` null-checks it,
+    // and these fixed format widths satisfy its validated bounds.
     unsafe { Z3_mk_fpa_sort(c, 11, 53) }
 }
 
@@ -137,7 +140,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_sort_double(c: Z3_context) -> Z3_sort {
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_fpa_sort_quadruple(c: Z3_context) -> Z3_sort {
-    // SAFETY: see Z3_mk_fpa_sort.
+    // SAFETY: `c` is live by caller contract; `Z3_mk_fpa_sort` null-checks it,
+    // and these fixed format widths satisfy its validated bounds.
     unsafe { Z3_mk_fpa_sort(c, 15, 113) }
 }
 
@@ -154,7 +158,8 @@ pub unsafe extern "C" fn Z3_mk_fpa_sort_quadruple(c: Z3_context) -> Z3_sort {
 /// `c` must be a valid context pointer.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_fpa_rounding_mode_sort(c: Z3_context) -> Z3_sort {
-    // SAFETY: see Z3_mk_fpa_sort.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ptr` handles a null
+    // pointer defensively before allocating the context-owned sentinel sort.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             alloc_sort(ctx, Sort::Uninterpreted("RoundingMode".to_string()))

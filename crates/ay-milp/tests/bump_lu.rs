@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Integration guard for the BUMP LU base factor in `refactorize`
-//! (`AY_MILP_NO_BUMP_LU` is its kill switch; here the lever is FORCED onto
+//! (`--no-bump-lu` is its kill switch; here the lever is FORCED onto
 //! tiny LPs instead: the triangular-crash peel on, the bump floor at 1, the
 //! refactor cadence at 1 so every pivot rebuilds through the peel + bump-LU
 //! path). A cycle system's basis is one whole SCC — the peel finds no
@@ -25,14 +25,8 @@ fn rat(n: i64) -> BigRational {
 /// Force the BUMP-LU lane on for the duration of `f`, serialized + restored on
 /// exit through the one workspace env choke point.
 fn with_forced_bump_lu_env<T>(f: impl FnOnce() -> T) -> T {
-    ay_test_support::env::with_serialized_env_vars(
-        &[
-            ("AY_MILP_TRI_CRASH", "1"),
-            ("AY_MILP_BUMP_LU_MIN", "1"),
-            ("AY_MILP_REFACTOR_EVERY", "1"),
-        ],
-        f,
-    )
+    let _levers = ay_milp::debug_flags::force_bump_lu_for_test();
+    f()
 }
 
 /// Odd cycle x_i + x_{i+1 mod n} = 2 has the unique solution x == 1; the

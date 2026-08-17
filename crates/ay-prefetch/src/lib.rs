@@ -2,14 +2,18 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+// Dedicated architecture-intrinsic boundary; unsafe sites are locally audited.
+#![allow(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! Platform-specific software prefetch hints.
 //!
 //! Provides a single function [`prefetch_read_l2`] that issues a non-blocking
 //! L2 cache prefetch hint for a memory address. Used by ay-sat's BCP loop
 //! to hide main-memory latency (~60-80 cycles) when scanning watch lists.
 //!
-//! This crate exists to isolate the `unsafe` inline assembly required for
-//! prefetch hints, allowing ay-sat to maintain `#![forbid(unsafe_code)]`.
+//! This crate isolates the `unsafe` inline assembly required for prefetch hints
+//! instead of adding another unsafe exception to ay-sat.
 //!
 //! # Platform support
 //!

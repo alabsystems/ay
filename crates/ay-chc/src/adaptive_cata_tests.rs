@@ -385,7 +385,8 @@ fn cata_route_never_reports_false_safe_on_broken_sortedness() {
     // The CATA v3 element/ordering levels are on by default, so the route
     // exercises the `Sorted`/`Min` catamorphisms on this problem. Guard against
     // a sibling test leaving the opt-out kill switch set (restored on exit).
-    let _cata_elements = ScopedEnvVar::unset("AY_CHC_DISABLE_CATA_ELEMENTS");
+    // (B27: the cata-elements hygiene unset is gone with its env — the
+    // carrier is set-once CLI and nothing ambient can disable the lane.)
     let solver = route_solver(broken_sortedness_unsafe_problem());
     let outcome = solver.try_cata_abstraction_route(None);
     match outcome {
@@ -401,8 +402,10 @@ fn cata_route_never_reports_false_safe_on_broken_sortedness() {
 
 #[test]
 fn cata_route_respects_kill_switch() {
-    let _guard = lock_env();
-    let _cata = ScopedEnvVar::set("AY_CHC_DISABLE_CATA", "1");
+    let _cata = crate::ab_switches::TestOverride::set(crate::ab_switches::ChcAbSwitches {
+        cata_route: false,
+        ..Default::default()
+    });
     let solver = route_solver(equal_shape_safe_problem());
     let result = solver.try_cata_abstraction_route(None);
     assert!(result.is_none(), "kill switch must disable the cata lane");

@@ -112,9 +112,8 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
                 let unquoted = &name[1..name.len() - 1];
                 return Ok(ctx.solver.string_const(unquoted));
             }
-            ctx.lookup_var(name).ok_or_else(|| {
-                ExecuteError::ExprTranslation(format!("undefined variable: {}", name))
-            })
+            ctx.lookup_var(name)
+                .ok_or_else(|| ExecuteError::ExprTranslation(format!("undefined variable: {name}")))
         }
 
         // Packet 1C bridge variants are translated centrally in
@@ -206,8 +205,7 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
         | ExprValue::SeqIndexOf(_, _, _)
         | ExprValue::SeqReplace(_, _, _)
         | ExprValue::FuncApp { .. } => Err(ExecuteError::Internal(format!(
-            "translate_bridge did not handle bridged expression: {}",
-            expr
+            "translate_bridge did not handle bridged expression: {expr}"
         ))),
 
         // Note: Real arithmetic (RealAdd, RealSub, RealMul, RealDiv, RealNeg,
@@ -234,8 +232,7 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
                 .get(datatype_name)
                 .ok_or_else(|| {
                     ExecuteError::ExprTranslation(format!(
-                        "undeclared datatype '{}' in constructor application",
-                        datatype_name
+                        "undeclared datatype '{datatype_name}' in constructor application"
                     ))
                 })?
                 .clone();
@@ -251,7 +248,7 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
             ..
         } => {
             let translated = translate_expr(ctx, inner)?;
-            let result_sort = translate_sort(&expr.sort())?;
+            let result_sort = translate_sort(expr.sort())?;
             ctx.solver
                 .try_datatype_selector(selector_name, translated, result_sort)
                 .map_err(|e| ExecuteError::ExprTranslation(e.to_string()))
@@ -581,9 +578,16 @@ fn translate_expr_inner(ctx: &mut ExecutionContext, expr: &Expr) -> Result<Term,
 
 /// Translate a quantifier (forall or exists) to ay_dpll terms.
 ///
-/// Creates bound variables via `declare_const`, translates the body with those
-/// variables in scope, then builds the quantifier term (with optional triggers).
-/// Restores the variable scope afterward to avoid leaking bound variables.
+/// Creates bound variables via `try_declare_const`, translates the body with
+/// those variables in scope, then builds the quantifier term (with optional
+/// triggers). Restores the variable scope afterward to avoid leaking bound
+/// variables.
+///
+/// A binder whose name collides with an existing declaration of a DIFFERENT
+/// sort is a recoverable embedder mistake and must surface as `ExecuteError`:
+/// the panicking `Solver::declare_const` here unwound into whatever process
+/// embeds ay — in compiler_consumer, a full ICE for any contract whose quantifier binder
+/// shadows a variable of another type.
 fn translate_quantifier(
     ctx: &mut ExecutionContext,
     vars: &[(String, Sort)],
@@ -602,7 +606,10 @@ fn translate_quantifier(
     let mut var_terms = Vec::with_capacity(vars.len());
 
     for ((name, _), api_sort) in vars.iter().zip(api_sorts) {
-        let term = ctx.solver.declare_const(name, api_sort);
+        let term = expr_solver_op(
+            ctx.solver.try_declare_const(name, api_sort),
+            "declare_const",
+        )?;
         scope.insert(name.clone(), term);
         var_terms.push(term);
     }

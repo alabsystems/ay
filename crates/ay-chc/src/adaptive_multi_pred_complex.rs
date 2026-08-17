@@ -1400,14 +1400,14 @@ impl AdaptivePortfolio {
     /// The real risk is budget theft from the downstream safety stages, which is
     /// why the slice is a minority share and the lane is opt-in for now.
     ///
-    /// Default OFF (`AY_CHC_ARRAY_TREE_REFUTATION=1` to arm): the first
+    /// Default OFF (`--chc-array-tree-refutation` to arm): the first
     /// measurement must not be able to regress the standing score by taking
     /// budget from lanes that currently win.
     pub(crate) fn try_array_bounded_tree_refutation(
         &self,
         deadline: Option<Instant>,
     ) -> Option<PortfolioResult> {
-        if !std::env::var("AY_CHC_ARRAY_TREE_REFUTATION").is_ok_and(|v| v != "0") {
+        if !ay_core::misc_cli_flags().chc_array_tree_refutation {
             return None;
         }
         if !self.problem.has_array_sorts()

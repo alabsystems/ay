@@ -94,7 +94,127 @@ pub(crate) fn validate_la_disequality(
     Ok(())
 }
 
-/// Validate an `LiaGeneric` theory lemma in strict mode.
+/// Validate the exact flat conclusion of [`validate_la_disequality`].
+pub(crate) fn validate_arith_eq_triangle(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: &str| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: format!("invalid arithmetic equality triangle: {reason}"),
+    };
+    let [not_forward, not_reverse, equality] = clause else {
+        return Err(invalid("clause must contain exactly three literals"));
+    };
+    let decode_eq = |term| match terms.get(term) {
+        TermData::App(Symbol::Named(name), operands) if name == "=" && operands.len() == 2 => {
+            Some((operands[0], operands[1]))
+        }
+        _ => None,
+    };
+    let decode_not_le = |term| {
+        let TermData::Not(inner) = terms.get(term) else {
+            return None;
+        };
+        match terms.get(*inner) {
+            TermData::App(Symbol::Named(name), operands) if name == "<=" && operands.len() == 2 => {
+                Some((operands[0], operands[1]))
+            }
+            _ => None,
+        }
+    };
+    let (lhs, rhs) =
+        decode_eq(*equality).ok_or_else(|| invalid("third literal must be a binary equality"))?;
+    let sort = terms.sort(lhs);
+    if sort != terms.sort(rhs) || !matches!(sort, Sort::Int | Sort::Real) {
+        return Err(invalid("equality operands must share Int or Real sort"));
+    }
+    if decode_not_le(*not_forward) != Some((lhs, rhs))
+        || decode_not_le(*not_reverse) != Some((rhs, lhs))
+    {
+        return Err(invalid(
+            "first two literals must negate the forward and reverse <= atoms",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate one exact equality-adapter implication, `a=b => a<=b` (or its
+/// reverse bound).  The kind cannot authorize an arbitrary arithmetic clause.
+pub(crate) fn validate_arith_eq_implies_bound(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: &str| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: format!("invalid arithmetic equality implication: {reason}"),
+    };
+    let [not_equality, bound] = clause else {
+        return Err(invalid("clause must contain exactly two literals"));
+    };
+    let TermData::Not(equality) = terms.get(*not_equality) else {
+        return Err(invalid("first literal must negate an equality"));
+    };
+    let TermData::App(Symbol::Named(eq_name), eq_args) = terms.get(*equality) else {
+        return Err(invalid("first literal must negate a binary equality"));
+    };
+    if eq_name != "=" || eq_args.len() != 2 {
+        return Err(invalid("first literal must negate a binary equality"));
+    }
+    let (lhs, rhs) = (eq_args[0], eq_args[1]);
+    let sort = terms.sort(lhs);
+    if sort != terms.sort(rhs) || !matches!(sort, Sort::Int | Sort::Real) {
+        return Err(invalid("equality operands must share Int or Real sort"));
+    }
+    let TermData::App(Symbol::Named(bound_name), bound_args) = terms.get(*bound) else {
+        return Err(invalid("second literal must be a <= atom"));
+    };
+    if bound_name != "<=" || bound_args.len() != 2 {
+        return Err(invalid("second literal must be a <= atom"));
+    }
+    if (bound_args[0], bound_args[1]) != (lhs, rhs) && (bound_args[0], bound_args[1]) != (rhs, lhs)
+    {
+        return Err(invalid(
+            "bound operands must be exactly the equality operands",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_int_bounds_tautology(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_int_bounds_tautology(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "integer split clause does not negate to contradictory exact bounds"
+                .to_string(),
+        })
+    }
+}
+
+pub(crate) fn validate_arith_disequality_split(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_arith_disequality_split(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "guarded arithmetic split does not match its equality operands".to_string(),
+        })
+    }
+}
+
+/// Validate an `LiaGeneric` theory lemma under a caller-owned envelope.
 ///
 /// Strategy:
 /// 1. If an `LiaAnnotation` is present, use the LIA-specific validator.
@@ -102,12 +222,13 @@ pub(crate) fn validate_la_disequality(
 ///    to the shared Farkas validator (same as LRA). This handles the common
 ///    case where LIA conflicts are simple bounds gaps.
 /// 3. If neither annotation is present, reject.
-pub(crate) fn validate_lia_generic(
+pub(crate) fn validate_metered(
     terms: &TermStore,
     step_id: ProofId,
     clause: &[TermId],
     farkas: Option<&FarkasAnnotation>,
     lia: Option<&LiaAnnotation>,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
     if let Some(lia_ann) = lia {
         // LIA-specific validation
@@ -120,7 +241,7 @@ pub(crate) fn validate_lia_generic(
         })
     } else if farkas.is_some() {
         // Fall back to Farkas validation (same as LRA)
-        super::lra_farkas::validate_lra_farkas(terms, step_id, clause, farkas)
+        super::lra_farkas::validate_metered(terms, step_id, clause, farkas, progress)
     } else {
         Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,

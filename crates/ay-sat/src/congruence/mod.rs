@@ -26,11 +26,11 @@ use crate::literal::{Literal, Variable};
 use union_find::UnionFind;
 
 /// Cached check for the congruence debug channel.
-/// Env-gated merge/unit provenance dump for soundness triage (AY_AB_SUBST_DUMP_MERGES=1).
+/// Env-gated merge/unit provenance dump for soundness triage (--sat-ab-subst-dump-merges).
 pub(crate) fn dump_merges_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_AB_SUBST_DUMP_MERGES").is_some())
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_subst_dump_merges)
 }
 
 /// Structured justification for a merge edge, recorded at merge time and
@@ -91,7 +91,7 @@ pub struct CongruenceStats {
     pub non_rup_equivalences: u64,
     /// XOR full-collapse units accepted without RUP because their polarity is
     /// the machine-checked-exact parity proven in the development proof harness
-    /// (only counted under the default-off `AY_AB_CONGRUENCE_PARITY_TRUST` knob).
+    /// (only counted under the default-off `--sat-congruence-parity-trust` knob).
     pub parity_certified_units_applied: u64,
     /// XOR matching ladders successfully emitted for equivalence edges in
     /// DRAT proof mode (#15 T3).
@@ -642,7 +642,7 @@ impl CongruenceClosure {
             }
         }
 
-        if std::env::var_os("AY_AB_SUBST_DUMP_GATES").is_some() {
+        if ay_core::misc_cli_flags().ab_subst_dump_gates {
             for g in &gates {
                 eprintln!(
                     "DUMP_GATE: type={:?} out={} neg_out={} inputs={:?} def_clauses={}",
@@ -654,7 +654,7 @@ impl CongruenceClosure {
                 );
             }
         }
-        if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+        if ay_core::misc_cli_flags().ab_subst_stats {
             let ite = gates
                 .iter()
                 .filter(|g| g.gate_type == GateType::Ite)
@@ -706,6 +706,6 @@ pub(crate) struct CongruenceResult {
     /// construction — correct extraction, valid UF/level-0 substitutions, and
     /// now machine-checked parity — so the `#7137` RUP guard may accept them
     /// even when AY's post-hoc RUP cannot reconstruct the (ambiguous) XOR chain.
-    /// Consumed only behind the default-off `AY_AB_CONGRUENCE_PARITY_TRUST` knob.
+    /// Consumed only behind the default-off `--sat-congruence-parity-trust` knob.
     pub parity_certified_units: Vec<Literal>,
 }

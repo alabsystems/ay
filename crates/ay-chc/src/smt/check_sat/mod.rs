@@ -88,17 +88,12 @@ pub(super) struct CnfState {
 }
 
 /// Trace level for per-check_sat phase diagnostics (inc-10 overstay
-/// attribution): `AY_CHECKSAT_TRACE=1` logs check entry/exit and stage
+/// attribution): `--chc-checksat-trace=1` logs check entry/exit and stage
 /// boundaries; `=2` additionally logs every theory-loop phase transition
 /// (see `theory_loop.rs`). Cached after first read; zero overhead when unset.
 pub(super) fn checksat_trace_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| {
-        std::env::var("AY_CHECKSAT_TRACE")
-            .ok()
-            .and_then(|v| v.parse::<u8>().ok())
-            .unwrap_or(0)
-    })
+    *LEVEL.get_or_init(|| ay_core::misc_cli_flags().chc_checksat_trace.unwrap_or(0))
 }
 
 /// Eligibility scan for the inc-18 EqDiffVar retry: the inc-14 pass only
@@ -961,7 +956,7 @@ impl SmtContext {
             // (its executor-fallback tail is bounded by the thread SMT
             // deadline, so the repeat attempt cannot double the budget).
         }
-        // Inc-10 overstay-attribution trace (AY_CHECKSAT_TRACE>=1).
+        // Inc-10 overstay-attribution trace (--chc-checksat-trace>=1).
         let trace = checksat_trace_level() >= 1;
         let start = ay_core::time::Instant::now();
         // Internal-first SLICE (#23 Stage 2.5): the internal DPLL(T) gets

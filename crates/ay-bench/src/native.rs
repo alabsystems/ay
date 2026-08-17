@@ -1933,7 +1933,7 @@ fn run_external_solver(
 }
 
 fn progress_every_from_env() -> usize {
-    std::env::var("AY_BENCH_PROGRESS_EVERY")
+    std::env::var("--progress-every")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -2466,19 +2466,17 @@ fn finalize_selected_artifacts(mut run: NativeSolverRun) -> NativeResultItem {
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_noclobber(source: &Path, destination: &Path) -> std::io::Result<()> {
-    nix::fcntl::renameat2(
-        None,
-        source,
-        None,
-        destination,
-        nix::fcntl::RenameFlags::RENAME_NOREPLACE,
-    )
-    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+    // renameat2(RENAME_NOREPLACE) on Linux, renamex_np(RENAME_EXCL) on macOS —
+    // via the audited ay-sys boundary (this crate forbids unsafe code). B9:
+    // until the proof-artifact test lost its env gate and actually ran here,
+    // the macOS arm was a hard Unsupported error and every native proof run
+    // on this platform failed at finalization.
+    ay_sys::fs::rename_noreplace(source, destination)
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_noclobber(_source: &Path, _destination: &Path) -> std::io::Result<()> {
     // A destination existence check followed by `std::fs::rename` is not a
     // no-clobber operation: another process can create the destination in
@@ -5959,13 +5957,17 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     #[cfg(unix)]
     #[test]
     fn actual_ay_binary_emits_unsat_proof_to_absent_work_path() {
-        let Some(ay_path) = std::env::var_os("AY_BENCH_TEST_AY_BIN").map(PathBuf::from) else {
+        // B9: auto-locate the workspace `ay` binary instead of requiring the
+        // old AY_BENCH_TEST_AY_BIN env opt-in nothing set. Test executables
+        // live in target/<profile>/deps/, the bin one directory up; skip when
+        // `ay` was not built (unit-test-only invocations).
+        let ay_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| Some(p.parent()?.parent()?.join("ay")))
+            .filter(|p| p.is_file());
+        let Some(ay_path) = ay_path else {
             return;
         };
-        assert!(
-            ay_path.is_file(),
-            "AY_BENCH_TEST_AY_BIN must name an AY executable"
-        );
 
         let temp = tempfile::tempdir().expect("tempdir");
         let benchmark = temp.path().join("contradiction.cnf");
@@ -6095,7 +6097,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         );
     }
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn atomic_noclobber_rename_preserves_an_existing_destination() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -6117,7 +6119,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         );
     }
 
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn unavailable_noclobber_rename_fails_without_mutating_either_path() {
         let temp = tempfile::tempdir().expect("tempdir");

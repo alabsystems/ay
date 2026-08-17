@@ -21,11 +21,12 @@ use crate::interpolant_validation::collect_conjuncts_for_interpolation;
 use crate::interpolation::{interpolating_sat_constraints, InterpolatingSatResult};
 use crate::lawi::art::{AbstractReachabilityTree, ArtVertexId};
 use crate::lawi::covering::CoveringRelation;
-use crate::lawi::path_encoding::art_edge_formula_at;
 use crate::smt::{SmtContext, SmtResult};
 use crate::transition_system::TransitionSystem;
 use crate::{ChcExpr, ChcProblem, ChcSort};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
+
+mod art_steps;
 
 /// LAWI solver configuration.
 #[derive(Debug, Clone)]
@@ -190,18 +191,7 @@ impl LawiSolver {
 
         let mut iterations = 0usize;
         let root = self.art().root();
-
-        // Initialize root label to the init constraint.
-        // Without this, root's label stays TRUE, allowing spurious covering:
-        // any vertex at the same location with label TRUE would be covered by root
-        // (TRUE ⇒ TRUE), preventing exploration of deeper error paths.
-        // Reference: In Golem's LAWI, the root corresponds to the source vertex
-        // of the CHC graph; the init constraint flows through the first edge.
-        // Since our ART root is placed at the predicate location (not a source),
-        // we embed the init constraint directly in the root's label.
-        self.labels.strengthen(root, ts.init.clone());
-
-        let mut worklist = vec![root];
+        let mut worklist = Self::initial_worklist(&mut self.labels, root, &ts.init);
 
         while let Some(vertex) = worklist.pop() {
             if self.config.base.is_cancelled() {
@@ -254,12 +244,7 @@ impl LawiSolver {
                 }
             }
 
-            // Non-error vertex: expand and push children to worklist.
-            let children = self.art_mut().expand(vertex);
-
-            // Initialize children labels to `true` (implicit in LabelingFunction).
-            // Push children in reverse order for DFS (last child processed first).
-            worklist.extend(children.into_iter().rev());
+            self.expand_worklist(vertex, &mut worklist);
         }
 
         // No uncovered leaves remain — system is Safe.
@@ -368,27 +353,9 @@ impl LawiSolver {
             return RefineResult::Failed;
         }
 
-        // Build the concrete ART path formula:
-        //   init@0 ∧ edge_0@0 ∧ edge_1@1 ∧ ... ∧ edge_{k-1}@(k-1)
-        //
-        // Each ART edge stores the original clause index selected during
-        // expansion. LAWI refinement must assert those selected edge formulas,
-        // not the whole transition relation, otherwise a spurious ART branch is
-        // checked against an over-approximate k-step reachability query.
-        let init = ts.init_at(0);
-        let mut path_parts: Vec<ChcExpr> = Vec::with_capacity(k + 1);
-        path_parts.push(init);
-
-        for (step, edge_id) in path_edges.iter().enumerate() {
-            let Some(edge) = self.art().edge(*edge_id) else {
-                return RefineResult::Failed;
-            };
-            let Some(step_formula) = art_edge_formula_at(ts, &self.problem, edge.clause_idx, step)
-            else {
-                return RefineResult::Failed;
-            };
-            path_parts.push(step_formula);
-        }
+        let Some(path_parts) = self.refinement_path_parts(ts, &path_edges, k) else {
+            return RefineResult::Failed;
+        };
 
         // Check satisfiability of the full path.
         let full_path = ChcExpr::and_all(path_parts.iter().cloned());

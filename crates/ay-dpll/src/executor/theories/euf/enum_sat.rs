@@ -169,7 +169,9 @@ impl Executor {
     pub(in crate::executor) fn try_solve_enum_finite_domain(
         &mut self,
     ) -> Result<Option<SolveResult>> {
-        if std::env::var_os("AY_ENUM_SAT_DISABLE").is_some() {
+        // B17: CLI-populated global (--no-enum-sat) replaced the never-set
+        // env var.
+        if ay_core::theory_disable_flags().no_enum_sat {
             return Ok(None);
         }
         // The lane sees only `ctx.assertions`: bail when assumptions are in
@@ -185,13 +187,12 @@ impl Executor {
         // Encoding-size budget: fall through on instances whose one-hot
         // channeling would dwarf the time limit anyway. Estimated from atom
         // shapes only (upper bound; the Boolean skeleton is linear in input).
-        let max_clauses = std::env::var("AY_ENUM_SAT_MAX_CLAUSES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_EXTRA_CLAUSES);
+        // B10: compiled constant (the AY_ENUM_SAT_MAX_CLAUSES override
+        // nothing set is retired).
+        let max_clauses = DEFAULT_MAX_EXTRA_CLAUSES;
         let estimate = estimate_extra_clauses(&scan);
         if estimate > max_clauses {
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace enum-sat-lane skip reason=clause-budget estimate={estimate}"
                 );
@@ -199,7 +200,7 @@ impl Executor {
             return Ok(None);
         }
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace enum-sat-lane hit sorts={} rows={} atoms={} est_clauses={estimate}",
                 scan.sorts.len(),
@@ -300,7 +301,7 @@ impl Executor {
                 } else {
                     // Gate-rejected model: degrade to the general lane, never
                     // answer from an unverified encoding (fail-closed).
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace enum-sat-lane gate-rejected-sat fallback");
                     }
                     self.last_statistics

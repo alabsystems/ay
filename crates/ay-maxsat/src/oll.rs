@@ -47,11 +47,11 @@ use ay_sat::{AssumeResult, Literal, Solver as SatSolver, Variable};
 use crate::dpw::{dpw_size, gte_size, DpwEnc};
 use crate::solver::MaxSatStats;
 
-/// Diagnostics gate: set `AY_MAXSAT_DEBUG=1` to trace engine decisions on
+/// Diagnostics gate: set `--maxsat-debug` to trace engine decisions on
 /// stderr. Zero cost when unset.
 fn debug_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AY_MAXSAT_DEBUG").is_some())
+    *ON.get_or_init(|| std::env::var_os("--maxsat-debug").is_some())
 }
 
 /// Weight type for soft clauses.
@@ -159,12 +159,12 @@ const AM1_OVERLAP_MIN_DISTINCT_WEIGHTS: usize = 20;
 /// lb 112419 where the ascending-degree order pays 113275 (99.8% of the 113503
 /// optimum, matching cgss). The shared order still WINS elsewhere
 /// (cat_paths_60_150_0004: +171), so neither dominates and max-of-both is the
-/// safe choice. `AY_AB_MAXSAT_AM1_MAXCOVER=0` restores the shared-only landed
+/// safe choice. `--maxsat-no-am1-maxcover` restores the shared-only landed
 /// cover bit-identically; low-weight/unweighted is untouched (overlap gate).
 fn am1_maxcover_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_AM1_MAXCOVER").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_am1_maxcover)
 }
 
 /// #tot-eqs budget constants — CGSS2's `add_eq_max_decs` / `add_eq_max_cost` /
@@ -233,9 +233,9 @@ const TOT_EQ_CLAUSE_BUDGET_FLOOR: i64 = 200_000;
 /// per unit of lower bound on the deep lb-proving UNSAT calls, where cgss
 /// proves the same optima in ~7x fewer conflicts.
 fn tot_eqs_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_TOT_EQS").as_deref() != Ok("0"))
+    // B17: CLI-populated global (--maxsat-no-tot-eqs) replaced the never-set
+    // env var; default on.
+    !ay_core::misc_cli_flags().maxsat_no_tot_eqs
 }
 
 /// #core-clause gate (env A/B). Adds the extracted core's own disjunction
@@ -254,7 +254,7 @@ fn tot_eqs_enabled() -> bool {
 fn core_clause_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_CORE_CLAUSE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_maxsat_core_clause)
 }
 
 /// Active-soft cap for the EAGER initial probe (#maxsat-am1-probe eager init).
@@ -291,14 +291,14 @@ const MAXSAT_INCR_INPROBE_DIVISOR: u64 = 100;
 /// Kill switch for BMO layer promotion (#maxsat-bmo-promote). DEFAULT ON
 /// since the net-positive full-track leg (weighted 304 -> 321, +21/-4, zero
 /// wrong: drmx x11, abstraction, frb, CSG, auctions, css, haplotyping,
-/// quantum, spot5): `AY_AB_MAXSAT_BMO=0` disables. Uniform-weight
+/// quantum, spot5): `--maxsat-no-bmo` disables. Uniform-weight
 /// (unweighted-track) instances are structurally unaffected — the boundary
 /// rule requires a non-empty strictly-lower mass, which a single distinct
 /// weight never has.
 fn maxsat_bmo_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_BMO").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_bmo)
 }
 
 /// Conflict budget for one BMO joint-satisfiability check
@@ -319,10 +319,10 @@ const BMO_MAX_CHECK_CLAUSES: usize = 2_000_000;
 
 /// Kill switch for the one-shot MaxSAT preprocessor. DEFAULT ON since the
 /// net-positive full-track leg (fired subset +3/-0 at the 1M-hards gate, zero
-/// wrong): `AY_AB_MAXSAT_PREPROC=0` disables. Matches the ay-sat `AY_AB_*`
+/// wrong): `--maxsat-no-preproc` disables. Matches the ay-sat `AY_AB_*`
 /// convention's kill-switch form.
 /// Opt-in gate for the BCE-first one-shot config (#maxsat-bce-preprocess).
-/// When AY_AB_MAXSAT_BCE=1 the one-shot fires from this lower hard-clause
+/// When --maxsat-bce the one-shot fires from this lower hard-clause
 /// threshold (so the LP-extracted mid-size families qualify) AND arms BCE.
 const BCE_ONESHOT_MIN_HARDS: usize = 100_000;
 
@@ -346,12 +346,12 @@ const BCE_ONESHOT_MIN_HARDS: usize = 100_000;
 /// the measured-good no-preprocessing trajectory. Raising the reduction bar
 /// instead does NOT work (measured: the edges are already gone by then).
 ///
-/// With BCE unarmed (`AY_AB_MAXSAT_BCE` unset) the risky count is 0, so the
+/// With BCE unarmed (`--maxsat-bce` unset) the risky count is 0, so the
 /// predicate collapses to the legacy rule and the default lane is unchanged.
 fn bce_risky_revert_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_BCE_REVERT").as_deref() != Ok("0"))
+    // B17: CLI-populated global (--maxsat-no-bce-revert) replaced the
+    // never-set env var; default on.
+    !ay_core::misc_cli_flags().maxsat_no_bce_revert
 }
 
 /// #bce-risky-revert: install exactly the size-banded SAT configuration the
@@ -380,7 +380,7 @@ fn install_non_oneshot_sat_config(sat: &mut SatSolver, n_hard: usize) {
 /// hand-copied duplicate of these bands. The copy asserted `hard.len() >= 1M`,
 /// an invariant that held while `ONESHOT_PREPROC_MIN_HARDS` (1M) was the only
 /// gate and was broken the same day by `BCE_ONESHOT_MIN_HARDS` (100k), which
-/// `AY_AB_MAXSAT_BCE=1` lowers the gate to. A 242,578-hard instance then ran
+/// `--maxsat-bce` lowers the gate to. A 242,578-hard instance then ran
 /// its whole solve on a profile meant for a formula 4x larger — every
 /// inprocessing technique disabled where the correct path leaves them on. On
 /// `tcp_wt-tcp_students_112_it_5` that cost a ~5,000x conflict blow-up
@@ -420,25 +420,25 @@ fn non_oneshot_inprocessing_profile(n_hard: usize) -> Option<ay_sat::Inprocessin
 }
 
 /// Opt-in switch for BCE-first one-shot preprocessing
-/// (#maxsat-bce-preprocess): `AY_AB_MAXSAT_BCE=1`. DEFAULT OFF — net-negative
+/// (#maxsat-bce-preprocess): `--maxsat-bce`. DEFAULT OFF — net-negative
 /// under bench jobs=10 contention, net-positive at the jobs=1 competition
 /// protocol (metro x4 etc.). Use for competition submissions.
 fn maxsat_bce_preproc_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_BCE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().maxsat_bce)
 }
 
 fn maxsat_oneshot_preproc_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_PREPROC").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_preproc)
 }
 
 /// Kill switch for RATE-AWARE descent entry (#cold-core-descent). DEFAULT ON:
-/// `AY_AB_MAXSAT_COLD_DESCENT=0` restores the pre-2026-08-02 gate, so the lever
+/// `--maxsat-no-cold-descent` restores the pre-2026-08-02 gate, so the lever
 /// can be measured as a paired A/B — with an A/A control — from ONE binary, the
-/// way `AY_AB_MAXSAT_EARLY_DESCENT` and `AY_AB_MAXSAT_DESCENT_RESIDUAL` are.
+/// way `--maxsat-no-early-descent` and `--maxsat-no-descent-residual` are.
 ///
 /// THE DEFECT. The organic descent gate's core conjunct is
 /// `cores_found >= lsu_min_cores` (64), a FLAT COUNT that is blind to how fast
@@ -477,7 +477,7 @@ fn maxsat_oneshot_preproc_enabled() -> bool {
 fn cold_core_descent_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_COLD_DESCENT").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_cold_descent)
 }
 
 /// #cold-core-descent: how many of the MOST RECENT search-derived inter-core
@@ -494,7 +494,7 @@ fn cold_core_descent_enabled() -> bool {
 /// is worse than a constant, because the comment stops people re-deriving it.
 ///
 /// MEASURED, both statistics against the same real gap streams
-/// (`AY_MAXSAT_DEBUG=1`, this box):
+/// (`--maxsat-debug`, this box):
 ///
 ///   causal-discovery_wt-causal_n6_i2_N500_uai13_log_int @240s — 53 intervals,
 ///   ramping 20ms -> 21.3s (last sixteen: 13.5 8.6 9.1 3.8 10.1 9.2 21.3 8.1
@@ -543,7 +543,7 @@ const COLD_CORE_DROUGHT_MULT: u64 = 12;
 /// least that much on a descent, so "we have gone longer than that without a
 /// core" is the natural bar for calling the walk over.
 ///
-/// Traced on causal n6 at 900s (`AY_MAXSAT_DEBUG=1`, this box), inter-core gaps
+/// Traced on causal n6 at 900s (`--maxsat-debug`, this box), inter-core gaps
 /// in seconds:
 ///
 ///   cores #21-32 (t=9..18):    0.08 0.24 0.74 0.08 0.08 0.14 1.30 1.64 ...
@@ -692,7 +692,7 @@ fn descent_slice_len(
 }
 
 /// Kill switch for the expensive-core early descent kick
-/// (#expensive-core-descent). DEFAULT ON: `AY_AB_MAXSAT_EARLY_DESCENT=0`
+/// (#expensive-core-descent). DEFAULT ON: `--maxsat-no-early-descent`
 /// restores the pre-fix gate. Motivation (rna-alignment_wt-k100 family): on a
 /// large hard formula each assumption solve costs ~1s, so OLL reaches neither
 /// the 64-core organic descent bar nor the 20s ub-stale kick floor within
@@ -705,7 +705,7 @@ fn descent_slice_len(
 fn maxsat_early_descent_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_EARLY_DESCENT").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_early_descent)
 }
 
 /// #descent-organic-slice: bound the ORGANIC descent entry the same way kick
@@ -724,11 +724,11 @@ fn maxsat_early_descent_enabled() -> bool {
 /// so a productive descent still runs to completion. What it removes is the
 /// case where an UNPRODUCTIVE descent owns the rest of the run.
 ///
-/// DEFAULT OFF pending the paired A/B; `AY_AB_MAXSAT_DESCENT_ORGANIC_SLICE=1`.
+/// DEFAULT OFF pending the paired A/B; `--ab-maxsat-descent-organic-slice`.
 fn descent_organic_slice_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_ORGANIC_SLICE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_maxsat_descent_organic_slice)
 }
 
 /// Organic descent slice when the engine is budget-blind (no deadline set).
@@ -750,11 +750,11 @@ const ORGANIC_DESCENT_SLICE_MAX: Duration = Duration::from_mins(5);
 /// ABSOLUTE kick gap bar (`DESCENT_KICK_GAP`, ignoring the objective's own
 /// granularity). Exists only so the scale-relative bar can be measured against
 /// its predecessor as a paired A/B; delete once that measurement is banked.
-/// `AY_AB_MAXSAT_KICK_GAP_ABS=1`.
+/// `--ab-maxsat-kick-gap-abs`.
 fn kick_gap_abs_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_KICK_GAP_ABS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_maxsat_kick_gap_abs)
 }
 
 /// Floor of the kick gap bar; see [`OllEngine::descent_kick_gap_cap`] for the
@@ -797,14 +797,14 @@ fn dpw_beats_gte(dpw_clauses: usize, gte_clauses: usize) -> bool {
     dpw_clauses.saturating_mul(DPW_MIN_ADVANTAGE) <= gte_clauses
 }
 
-/// #dpw-descent escape hatch. DEFAULT ON. `AY_AB_MAXSAT_DPW=0` never selects
+/// #dpw-descent escape hatch. DEFAULT ON. `--maxsat-no-dpw` never selects
 /// DPW, leaving encoding choice bit-identical to the pre-lever engine, so the
 /// lever can be measured as a paired A/B — with an A/A control — from ONE
-/// binary (the discipline `AY_AB_MAXSAT_DESCENT_RESIDUAL=0` exists for).
+/// binary (the discipline `--maxsat-no-descent-residual` exists for).
 fn dpw_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DPW").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_dpw)
 }
 
 /// The measured kick slice, and the floor of the budget-scaled form.
@@ -821,15 +821,15 @@ const RESIDUAL_MAX_BUILDS: u32 = 8;
 /// for the encodings and the additive rationale, and
 /// [`OllEngine::descent_residual_cap`] for the soundness invariant.
 ///
-/// DEFAULT ON. `AY_AB_MAXSAT_DESCENT_RESIDUAL=0` is an ESCAPE HATCH: it builds
+/// DEFAULT ON. `--maxsat-no-descent-residual` is an ESCAPE HATCH: it builds
 /// and tightens no residual cut, leaving the descent bit-identical to the
 /// pre-lever engine (encoding SELECTION is untouched either way). Kept, as
-/// `AY_AB_MAXSAT_EARLY_DESCENT=0` is, so the lever can be measured as a paired
+/// `--maxsat-no-early-descent` is, so the lever can be measured as a paired
 /// A/B — with an A/A control — from one binary.
 fn descent_residual_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_RESIDUAL").as_deref() != Ok("0"))
+    *ON.get_or_init(|| !ay_core::misc_cli_flags().maxsat_no_descent_residual)
 }
 
 /// #descent-kick-scale: budget-scale the KICK descent slice, which is otherwise
@@ -849,19 +849,17 @@ fn descent_residual_enabled() -> bool {
 /// the answer rather than a gamble. The downside is bounded by one dry slice.
 ///
 /// DEFAULT OFF — the 10s kick is measured behaviour and scaling it changes the
-/// default path. `AY_AB_MAXSAT_DESCENT_KICK_SCALE=1`.
+/// default path. `--ab-maxsat-descent-kick-scale`.
 fn descent_kick_scale_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_KICK_SCALE").as_deref() == Ok("1"))
+    *ON.get_or_init(|| ay_core::misc_cli_flags().ab_maxsat_descent_kick_scale)
 }
 
-/// Diagnostic: print the residual cost-identity residue on every descent model.
-/// `AY_MAXSAT_IDENTITY_CHECK=1`. Never changes search.
+/// Retired diagnostic gate for the residual cost-identity trace.
+/// B24 removed its never-set environment opt-in; it is always disabled.
 fn identity_check_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_MAXSAT_IDENTITY_CHECK").as_deref() == Ok("1"))
+    false // B24: never-set diagnostic opt-in retired.
 }
 
 /// Wall-clock budget for one core-exhaustion SAT probe.
@@ -981,7 +979,7 @@ pub(crate) struct OllTuning {
     /// gate, `Some(b)` forces the lever (tests pin it ON so the
     /// brute-force cross-checks cover the reverse-direction clauses).
     pub(crate) tot_eqs: Option<bool>,
-    /// #core-clause override: `None` defers to `AY_AB_MAXSAT_CORE_CLAUSE`.
+    /// #core-clause override: `None` defers to `--ab-maxsat-core-clause`.
     pub(crate) core_clause: Option<bool>,
 }
 
@@ -2002,7 +2000,7 @@ enum DescentEnc {
     ///
     /// ⚠️ MEASURED COST OF THAT CHOICE — RSS. On
     /// `af-synthesis_wt-af-synthesis_stb_50_120_5` at 900s, sampled every 5s,
-    /// same binary, `AY_AB_MAXSAT_DPW` the only difference (2 runs each, both
+    /// same binary, `--maxsat-no-dpw` the only difference (2 runs each, both
     /// legs identical in outcome within a leg):
     ///
     /// | t | DPW RSS | GTE RSS |
@@ -2031,7 +2029,7 @@ enum DescentEnc {
 /// THE PROBLEM. Every `DescentEnc` above encodes the ORIGINAL objective capped
 /// at `ub - preproc_cost` — the WHOLE objective — so on a proof-bound instance
 /// the closing UNSAT call re-derives from scratch the bound OLL already paid
-/// cores for. Traced on MSE24 exact-weighted at 300s with `AY_MAXSAT_DEBUG=1`,
+/// cores for. Traced on MSE24 exact-weighted at 300s with `--maxsat-debug`,
 /// reading the two caps off the same descent entry:
 ///
 /// | instance | original cap | residual cap (`ub - lb`) | discarded |
@@ -2096,7 +2094,7 @@ struct ResidualBound {
 
 /// Encoding behind a [`ResidualBound`], picked by the residual objective's own
 /// weight shape: counting totalizer when its live weights are uniform (much the
-/// cheapest — this is the case the retired `AY_AB_MAXSAT_DESCENT_RESIDUAL=1`
+/// cheapest — this is the case the retired `--maxsat-no-descent-residual`
 /// prototype was restricted to), else the same `gte_build` / `adder_build` pair
 /// the original objective already uses.
 enum ResidualBoundEnc {
@@ -2260,7 +2258,7 @@ impl OllEngine {
             (hard, soft, soft_weights)
         };
         let mut sat = SatSolver::new(num_vars as usize);
-        // #witness-oracle: `AY_SOLUTION_FILE` installs a known-good model, after
+        // #witness-oracle: `--solution-file` installs a known-good model, after
         // which ay-sat checks EVERY clause at insertion and every shrunken
         // clause, panicking on the first one the model falsifies. A sound
         // derivation can never falsify a true model, so a panic names the exact
@@ -2277,11 +2275,8 @@ impl OllEngine {
         // domain BCP for +5 is now REMOVED: the underlying regression is fixed
         // directly — see #maxsat-domain-bcp-fix (propagate_domain_bcp's fused
         // out-of-domain skip) in propagation_bcp.rs. Domain BCP is re-enabled and
-        // recovers the full regression. Escape hatch to force full BCP still
-        // exists via AY_AB_NO_DOMAIN_BCP.)
-        if std::env::var_os("AY_AB_NO_DOMAIN_BCP").is_some() {
-            sat.set_domain_bcp_min_vars(100_000_000);
-        }
+        // recovers the full regression. B9: the AY_AB_NO_DOMAIN_BCP escape
+        // hatch is deleted with the rest of the never-set env surface.)
         // #maxsat-inproc-throttle: scale the incremental inprocessing re-fire
         // interval with clause count. Between OLL core-extraction solves the
         // SAT engine re-runs subsumption + vivification, each an O(arena) scan;
@@ -2310,7 +2305,7 @@ impl OllEngine {
         // automatic per solve). This is the UWr/MaxPre win on rna-alignment
         // (73% hard-only vars) and the timetabling/causal families. It is
         // size-gated and has a default-on environment kill switch.
-        // #maxsat-bce-preprocess (opt-in, AY_AB_MAXSAT_BCE=1): the BCE-first
+        // #maxsat-bce-preprocess (opt-in, --maxsat-bce): the BCE-first
         // one-shot config for the COMPETITION protocol (one instance per
         // machine ~ jobs=1). BCE reproduces MaxPre's hard-clause reduction
         // natively (metro 246k->112k, 54%) and flips metro/synplicate/causal,
@@ -2505,7 +2500,7 @@ impl OllEngine {
             let removed = clauses_before.saturating_sub(clauses_after) as u64;
             let free = removed.saturating_sub(risky);
             let mostly_risky = risky > free;
-            if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
+            if std::env::var("--maxsat-debug").is_ok() {
                 eprintln!(
                     "c ONESHOT-PREPROC: clauses {clauses_before} -> {clauses_after} \
                      (bce removed {bce_removed}, pure {bce_pure}, risky {risky}, free {free}{})",
@@ -2526,16 +2521,13 @@ impl OllEngine {
             let reverted = bce_risky_revert_enabled() && mostly_risky;
             if reverted {
                 let mut fresh = SatSolver::new(num_vars as usize);
-                if std::env::var_os("AY_AB_NO_DOMAIN_BCP").is_some() {
-                    fresh.set_domain_bcp_min_vars(100_000_000);
-                }
                 fresh.set_incremental_inprobe_divisor(Some(MAXSAT_INCR_INPROBE_DIVISOR));
                 for clause in hard.iter() {
                     fresh.add_clause(clause.to_vec());
                 }
                 install_non_oneshot_sat_config(&mut fresh, hard.len());
                 sat = fresh;
-                if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
+                if std::env::var("--maxsat-debug").is_ok() {
                     eprintln!(
                         "c ONESHOT-PREPROC: REVERTED (risky {risky} > free {free}); \
                          rebuilt {} hard clauses without preprocessing",
@@ -7115,7 +7107,7 @@ impl OllEngine {
             // #cold-core-descent: the RATE arm of the organic gate's core
             // conjunct. Computed unconditionally (a handful of comparisons) so
             // the trace below reports the signal even in the
-            // `AY_AB_MAXSAT_COLD_DESCENT=0` leg — that is what makes the A/B
+            // `--maxsat-no-cold-descent` leg — that is what makes the A/B
             // legible: leg A shows when the signal WOULD have fired, leg B
             // shows the descent that followed it.
             let cores_cold = self.core_discovery_cold(started);
@@ -7138,7 +7130,7 @@ impl OllEngine {
                 && Instant::now() >= descent_not_before;
             if debug_trace() && !cold_signal_traced && cold_ready {
                 // The first instant the RATE arm opens the gate. Printed even in
-                // the `AY_AB_MAXSAT_COLD_DESCENT=0` leg (the predicate itself is
+                // the `--maxsat-no-cold-descent` leg (the predicate itself is
                 // hatch-free) so an A/B shows when the arm WOULD have fired.
                 cold_signal_traced = true;
                 eprintln!(
@@ -7723,7 +7715,7 @@ mod tot_tests {
     /// They used to be hand-copied duplicates. The dry copy hard-coded the
     /// >500k disables while asserting `hard.len() >= 1M`, an invariant broken
     /// when `BCE_ONESHOT_MIN_HARDS` (100k) lowered the gate under
-    /// `AY_AB_MAXSAT_BCE=1`. Instances in the 100k..=500k band then ran every
+    /// `--maxsat-bce`. Instances in the 100k..=500k band then ran every
     /// solve with vivify/subsume/probe/transred/sweep disabled, which produced
     /// wrong answers on `tcp_wt-tcp_students_112_it_5` (242,578 hards):
     /// `o 3441`/`3477`/`3549` against a true optimum of 3366.

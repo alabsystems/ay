@@ -81,7 +81,7 @@ fn test_bve_post_collapse_unlock_requires_env_and_collapse() {
     // count_removed() == 0, so the post-collapse unlock must stay closed
     // regardless of the env knob — with the default-ON knob (wf_55735963)
     // the collapse requirement is what keeps elimination-only instances
-    // inert, and AY_AB_BVE_POST_COLLAPSE=0 closes it outright.
+    // inert, and --sat-no-bve-post-collapse closes it outright.
     let mut solver = Solver::new(PREPROCESS_EXPENSIVE_MAX_VARS + 1);
     add_duplicate_and_gate_formula(&mut solver);
     solver.initialize_watches();

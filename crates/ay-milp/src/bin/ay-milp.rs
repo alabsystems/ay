@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 //! `ay-milp` — the solver's command line, with certificates as a first-class
 //! exit.
 //!
@@ -34,6 +36,9 @@ use ay_milp::{BabSession, ColKind, MpsProblem, Outcome, SolveOpts, UnknownReason
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
+
+use ay_milp::engine_cli as engine_flags;
+use ay_milp::engine_cli::Flags;
 
 const USAGE: &str = "\
 ay-milp — MILP/LP engine with certified verdicts
@@ -152,69 +157,6 @@ fn flag_or_env(flags: &Flags, flag: &str, env: &str) -> Option<String> {
     flags.get(flag).cloned().or_else(|| std::env::var(env).ok())
 }
 
-// ---------------------------------------------------------------------------
-// Argument plumbing (hand-rolled: this crate does not take a CLI dependency)
-// ---------------------------------------------------------------------------
-
-struct Flags {
-    positional: Vec<String>,
-    named: Vec<(String, String)>,
-    switches: Vec<String>,
-}
-
-impl Flags {
-    fn parse(args: &[String], value_flags: &[&str]) -> Result<Self, String> {
-        let mut f = Flags {
-            positional: Vec::new(),
-            named: Vec::new(),
-            switches: Vec::new(),
-        };
-        let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
-            if let Some(name) = a.strip_prefix("--") {
-                let (name, inline) = match name.split_once('=') {
-                    Some((n, v)) => (n, Some(v.to_string())),
-                    None => (name, None),
-                };
-                if value_flags.contains(&name) {
-                    let v = match inline {
-                        Some(v) => v,
-                        None => {
-                            i += 1;
-                            args.get(i)
-                                .ok_or_else(|| format!("--{name} needs a value"))?
-                                .clone()
-                        }
-                    };
-                    f.named.push((name.to_string(), v));
-                } else {
-                    if inline.is_some() {
-                        return Err(format!("--{name} takes no value"));
-                    }
-                    f.switches.push(name.to_string());
-                }
-            } else {
-                f.positional.push(a.clone());
-            }
-            i += 1;
-        }
-        Ok(f)
-    }
-
-    fn get(&self, name: &str) -> Option<&String> {
-        self.named
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v)
-    }
-
-    fn has(&self, name: &str) -> bool {
-        self.switches.iter().any(|s| s == name)
-    }
-}
-
 fn die(msg: &str) -> ExitCode {
     eprintln!("ay-milp: {msg}");
     ExitCode::from(2)
@@ -241,21 +183,7 @@ enum Require {
 
 #[allow(clippy::too_many_lines)]
 fn cmd_solve(args: &[String]) -> ExitCode {
-    let vf = [
-        "time-limit",
-        "threads",
-        "seed",
-        "memory-budget",
-        "tree-cert-leaves",
-        "seed-solution",
-        "require",
-        "emit-cert",
-        "emit-cert-max-bytes",
-        "emit-witness",
-        "witness-format",
-        "format",
-    ];
-    let flags = match Flags::parse(args, &vf) {
+    let flags = match Flags::parse(args, engine_flags::VALUE_FLAGS) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
@@ -300,8 +228,11 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     if require == Require::Full {
         opts = opts.with_require_certificates(true);
     }
-    let tree_cert_leaves_explicit =
-        flag_or_env(&flags, "tree-cert-leaves", "AY_MILP_TREE_CERT_LEAVES");
+    opts = match engine_flags::apply(&flags, opts) {
+        Ok(opts) => opts,
+        Err(message) => return die(&message),
+    };
+    let tree_cert_leaves_explicit = flags.get("tree-cert-leaves").cloned(); // B22: env fallback retired.
     if let Some(v) = &tree_cert_leaves_explicit {
         match v.parse::<usize>() {
             Ok(n) => opts = opts.with_tree_cert_leaves(n),
@@ -319,7 +250,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     //
     // `--require full` is EXCLUDED because that posture must be able to refuse a
     // verdict it cannot back: the evidence has to exist even when it is not written.
-    // An explicit `--tree-cert-leaves`/`AY_MILP_TREE_CERT_LEAVES` is also honoured —
+    // An explicit `--tree-cert-leaves` is also honoured —
     // asking for a budget outright is a deliberate act, and silently zeroing it would
     // make the knob lie.
     //
@@ -348,7 +279,8 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     if flags.has("no-deterministic") {
         opts = opts.with_determinism(false);
     }
-    if let Some(v) = flag_or_env(&flags, "memory-budget", "AY_MILP_OPEN_BYTES") {
+    // B7: the AY_MILP_OPEN_BYTES env alias is deleted; --memory-budget is the interface.
+    if let Some(v) = flags.get("memory-budget").cloned() {
         match v.parse::<usize>() {
             Ok(n) => opts = opts.with_memory_budget(Some(n)),
             Err(_) => return die("--memory-budget needs an integer"),
@@ -364,7 +296,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    if let Some(seedf) = flag_or_env(&flags, "seed-solution", "AY_MILP_SEED_SOL") {
+    if let Some(seedf) = flags.get("seed-solution").cloned() {
         match std::fs::read_to_string(&seedf) {
             Ok(text) => {
                 let idx = name_index(&col_names);
@@ -465,7 +397,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
 
     // --emit-witness works on EVERY verdict that has a point, which is the whole
     // point: `AY_DUMP_SOL` only ever fired on `Feasible`.
-    let witness_path = flag_or_env(&flags, "emit-witness", "AY_DUMP_SOL");
+    let witness_path = flags.get("emit-witness").cloned(); // B22: env fallback retired.
     let wfmt = flags.get("witness-format").map_or_else(
         || {
             // The env alias keeps its historical `name <decimal>` shape so the
@@ -1209,11 +1141,8 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         "margin-row" => {
-            let spec = flags
-                .get("row")
-                .cloned()
-                .or_else(|| std::env::var("AY_MILP_MARGIN_ROW").ok())
-                .unwrap_or_else(|| "last".into());
+            // B22: --row is the carrier; the env fallback is retired.
+            let spec = flags.get("row").cloned().unwrap_or_else(|| "last".into());
             let nrows = p.model.num_rows();
             let row_idx = if spec.eq_ignore_ascii_case("last") {
                 nrows.checked_sub(1)
@@ -1232,11 +1161,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         "cross-check" => {
-            let Some(sol) = flags
-                .get("solution")
-                .cloned()
-                .or_else(|| std::env::var("AY_CHECK_SOL").ok())
-            else {
+            let Some(sol) = flags.get("solution").cloned() else {
                 return die("diag cross-check needs --solution <path>");
             };
             let Ok(stext) = std::fs::read_to_string(&sol) else {

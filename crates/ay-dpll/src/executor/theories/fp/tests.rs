@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::executor_types::SolveResult;
+use crate::executor_types::{SolveResult, UnknownOrigin};
 use crate::Executor;
 use ay_core::term::Symbol;
 use ay_core::Sort;
@@ -62,6 +62,105 @@ fn qf_afpbv_alias_row1_fp_value_contradiction_is_unsat() {
 "#;
 
     assert_eq!(run_script(input), vec!["unsat"]);
+}
+
+#[test]
+#[timeout(60_000)]
+fn qf_abvfp_incomplete_final_finite_array_closure_revokes_sat() {
+    let input = r#"
+(set-logic QF_ABVFP)
+(declare-fun a () (Array (_ BitVec 32) (_ BitVec 8)))
+(assert (bvult (_ bv3 8) (select a (_ bv0 32))))
+(assert (fp.isNaN ((_ to_fp 5 11) (concat (select a (_ bv1 32)) (select a (_ bv0 32))))))
+"#;
+    let commands = parse(input).expect("SMT-LIB script should parse");
+    let mut exec = Executor::new();
+    exec.execute_all(&commands)
+        .expect("SMT-LIB setup should execute");
+    let original_assertions = exec.ctx.assertions.clone();
+
+    assert_eq!(
+        exec.solve_abvfp().expect("baseline ABVFP solve should run"),
+        SolveResult::Sat,
+        "the budgeted run below must exercise Sat revocation, not an unrelated Unknown"
+    );
+    assert_eq!(exec.ctx.assertions, original_assertions);
+    exec.begin_external_decision_query(false);
+    // This query is decided through the constant-index-read flattening plan.
+    // Exhausting the scan allowance on that transformed, array-free final
+    // window forces the closure ledger incomplete just before its otherwise-Sat
+    // result is published.
+    exec.finite_array_expansion.remaining_scan_nodes = 0;
+
+    let result = exec.solve_abvfp().expect("ABVFP solve should not error");
+
+    assert_eq!(result, SolveResult::Unknown);
+    assert_eq!(
+        exec.unknown_origin(),
+        Some(UnknownOrigin::DeterministicResourceBudget)
+    );
+    assert!(!exec.finite_array_expansion.is_complete());
+    assert_eq!(exec.ctx.assertions, original_assertions);
+    assert!(exec.last_model.is_none());
+}
+
+#[test]
+#[timeout(60_000)]
+fn qf_abvfp_flattened_final_window_runs_finite_closure() {
+    let input = r#"
+(set-logic QF_ABVFP)
+(declare-const a (Array (_ BitVec 1) (_ BitVec 1)))
+(assert (= (select a #b0) #b0))
+"#;
+    let commands = parse(input).expect("SMT-LIB script should parse");
+    let mut exec = Executor::new();
+    exec.execute_all(&commands)
+        .expect("SMT-LIB setup should execute");
+    let original_assertions = exec.ctx.assertions.clone();
+    // The successful flatten plan is array-free. Exhausting its scan-node
+    // allowance proves that the exact closure boundary runs on that transformed
+    // final window before its otherwise-SAT Decided return.
+    exec.finite_array_expansion.remaining_scan_nodes = 0;
+
+    let result = exec.solve_abvfp().expect("ABVFP solve should not error");
+
+    assert_eq!(result, SolveResult::Unknown);
+    assert_eq!(
+        exec.statistics().get_string("abvfp_flatten.status"),
+        Some("fired")
+    );
+    assert_eq!(
+        exec.unknown_origin(),
+        Some(UnknownOrigin::DeterministicResourceBudget)
+    );
+    assert!(!exec.finite_array_expansion.is_complete());
+    assert_eq!(exec.ctx.assertions, original_assertions);
+}
+
+#[test]
+#[timeout(60_000)]
+fn qf_abvfp_incomplete_final_finite_array_closure_preserves_unsat() {
+    let input = r#"
+(set-logic QF_ABVFP)
+(declare-const a (Array (_ BitVec 1) (_ BitVec 1)))
+(declare-const b (Array (_ BitVec 1) (_ BitVec 1)))
+(declare-const p Bool)
+(assert (= a b))
+(assert p)
+(assert (not p))
+"#;
+    let commands = parse(input).expect("SMT-LIB script should parse");
+    let mut exec = Executor::new();
+    exec.execute_all(&commands)
+        .expect("SMT-LIB setup should execute");
+    let original_assertions = exec.ctx.assertions.clone();
+    exec.finite_array_expansion.remaining_index_points = 0;
+
+    let result = exec.solve_abvfp().expect("ABVFP solve should not error");
+
+    assert!(result.is_unsat());
+    assert!(!exec.finite_array_expansion.is_complete());
+    assert_eq!(exec.ctx.assertions, original_assertions);
 }
 
 // Regression for the QF_FP false-SAT bug: a Float32-declared variable

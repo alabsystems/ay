@@ -79,20 +79,20 @@ fn classify(after: &str) -> Option<Shape> {
 fn ground_truth() -> Vec<(&'static str, Vec<Shape>)> {
     vec![
         // Presence tests: "has the operator expressed an opinion at all".
-        ("AY_MILP_ROOT_PROBE", vec![Shape::On]),
-        ("AY_MILP_NODE_CUTS", vec![Shape::On]),
-        ("AY_MILP_DFS", vec![Shape::On]),
+        ("--root-probe", vec![Shape::On]),
+        ("--node-cuts", vec![Shape::On]),
+        ("--dfs", vec![Shape::On]),
         // On unless explicitly "0".
-        ("AY_MILP_PLUNGE", vec![Shape::OnUnlessZero]),
-        // TWO SHAPES, ONE NAME. `AY_MILP_GMI_ROUNDS` is a PRESENCE test at three
+        ("--plunge", vec![Shape::OnUnlessZero]),
+        // TWO SHAPES, ONE NAME. `--gmi-rounds` is a PRESENCE test at three
         // sites in bab.rs (guarding the tiny / gi-ext / bottleneck-ext gates: "did
         // the operator override the rounds at all") and a PARSED NUMBER at
         // cuts.rs:1422 (the rounds themselves). Both are deliberate and neither is
         // redundant, which is exactly why a migration must classify PER SITE. A
         // per-name rewriter would flatten one of them and silently change what an
         // override means.
-        ("AY_MILP_GMI_ROUNDS", vec![Shape::On, Shape::Num]),
-        ("AY_MILP_ROOT_CUTS_PER_ROUND", vec![Shape::Num]),
+        ("--gmi-rounds", vec![Shape::On, Shape::Num]),
+        ("--root-cuts-per-round", vec![Shape::Num]),
     ]
 }
 
@@ -153,14 +153,14 @@ fn the_classifier_reproduces_the_shipped_accessor() {
 
 /// A NAME READ WITH TWO SHAPES CANNOT BE MIGRATED PER NAME.
 ///
-/// `AY_MILP_GMI_ROUNDS` is the in-tree instance. This pins the property that makes
+/// `--gmi-rounds` is the in-tree instance. This pins the property that makes
 /// the classifier per-site: if it ever collapses to one shape here, a rewriter built
 /// on it would silently change what an override means at three of the four sites.
 #[test]
 fn a_name_may_carry_more_than_one_shape() {
     let want = ground_truth()
         .into_iter()
-        .find(|(n, _)| *n == "AY_MILP_GMI_ROUNDS")
+        .find(|(n, _)| *n == "--gmi-rounds")
         .map(|(_, s)| s)
         .expect("fixture");
     assert!(

@@ -4,11 +4,29 @@
 
 use super::*;
 use crate::Sort;
+use std::collections::BTreeMap;
 
 #[test]
 fn test_tseitin_state_default_is_dimacs_1_indexed() {
     let state = TseitinState::default();
     assert_eq!(state.next_var, 1);
+}
+
+#[test]
+fn test_tseitin_result_rejects_misaligned_proof_annotations() {
+    let result = TseitinResult::new(
+        vec![CnfClause::unit(1)],
+        BTreeMap::new(),
+        BTreeMap::new(),
+        1,
+        1,
+    )
+    .with_parallel_proof_annotations(Some(Vec::new()));
+
+    assert!(
+        result.proof_annotations.is_none(),
+        "a positional proof ledger with the wrong length must fail closed"
+    );
 }
 
 #[test]

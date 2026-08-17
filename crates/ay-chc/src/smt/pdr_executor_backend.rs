@@ -234,7 +234,7 @@ impl PdrExecutorBackend {
             });
         // Kill switch (default ON): AY_BACKEND_SORT_RESET=0 disables the reset,
         // restoring the pre-fix behavior for controlled before/after measurement.
-        let reset_enabled = std::env::var_os("AY_BACKEND_SORT_RESET").map_or(true, |v| v != "0");
+        let reset_enabled = true; // B24: kill-switch env retired; reset stays on.
         if conflict && reset_enabled {
             tracing::debug!(
                 "pdr_executor_backend: variable sort conflict across queries \
@@ -295,11 +295,13 @@ impl PdrExecutorBackend {
 
         // Diagnostic (spike, #ite-lift): dump each query as a self-contained
         // SMT2 file BEFORE check-sat, so even a query that hangs is captured.
-        // Gated behind AY_PDR_DUMP=<dir>; no effect when unset. The directory is
+        // Gated behind --chc-pdr-dump=<dir>; no effect when unset. The directory is
         // read once and cached, so an unset switch costs nothing on the PDR hot
         // path (hundreds of queries per solve).
         static PDR_DUMP_DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        if let Some(dir) = PDR_DUMP_DIR.get_or_init(|| std::env::var("AY_PDR_DUMP").ok()) {
+        if let Some(dir) =
+            PDR_DUMP_DIR.get_or_init(|| ay_core::misc_cli_flags().chc_pdr_dump.clone())
+        {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static PDR_DUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
             let n = PDR_DUMP_SEQ.fetch_add(1, Ordering::Relaxed);

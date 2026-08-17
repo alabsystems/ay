@@ -25,16 +25,11 @@ impl TheorySolver for NraSolver<'_> {
         self.collect_nonlinear_terms(term);
 
         if let Some((subject, constraint)) = sign::extract_sign_constraint(self.terms, term, val) {
-            // Record trail entries for efficient push/pop (#8626).
-            if let Some(vars) = self.aux_to_monomial.get(&subject).cloned() {
-                self.sign_constraint_trail
-                    .push(SignConstraintTrailEntry::Monomial(vars));
-            }
             if matches!(self.terms.get(subject), TermData::Var(_, _)) {
                 self.sign_constraint_trail
                     .push(SignConstraintTrailEntry::Variable(subject));
             }
-            sign::record_sign_constraint(
+            if let Some(vars) = sign::record_sign_constraint(
                 self.terms,
                 &self.aux_to_monomial,
                 &mut self.sign_constraints,
@@ -42,7 +37,10 @@ impl TheorySolver for NraSolver<'_> {
                 subject,
                 constraint,
                 term,
-            );
+            ) {
+                self.sign_constraint_trail
+                    .push(SignConstraintTrailEntry::Monomial(vars));
+            }
         }
 
         self.lra.assert_literal(literal, value);
@@ -152,7 +150,10 @@ impl TheorySolver for NraSolver<'_> {
 
     fn reset(&mut self) {
         self.monomials.clear();
+        self.scaled_aliases.clear();
         self.aux_to_monomial.clear();
+        self.compound_factors.clear();
+        self.compound_defs_emitted.clear();
         self.sign_constraints.clear();
         self.var_sign_constraints.clear();
         self.sign_constraint_trail.clear();
@@ -163,6 +164,8 @@ impl TheorySolver for NraSolver<'_> {
         self.scopes.clear();
         self.tentative_depth = 0;
         self.reset_feasible_sets();
+        self.fixed_factor_values.clear();
+        self.fixed_lin_emitted.clear();
         self.registered_atoms.clear();
         self.asserted_atom_set.clear();
         self.algebraic_model.clear();

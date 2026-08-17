@@ -76,6 +76,7 @@ use ay_frontend::command::Term as FrontendTerm;
 use super::proof_euf_lemma::{EufLemmaPlan, EufTarget};
 use super::proof_surface_syntax::strip_frontend_annotations;
 use super::proof_trust_surgery_ite::ProvenanceItePlan;
+use super::proof_trust_surgery_ite_plan::IteLiftPlan;
 use super::proof_trust_surgery_provenance::{
     canonical_term_work as quant_canonical_term_work, prepare_rebuilt_premise_append,
     retained_surface_plan_mix_is_safe, surface_or_decomposition_matches, surface_source_is_bounded,
@@ -1378,51 +1379,6 @@ enum AndDistinctKind {
     },
 }
 
-/// A recognized ite-lift trust step: a preprocessed input `(cl (ite c A B))`
-/// obtained by lifting a term-level ite out of an original assertion
-/// `P(ite c u v)` (`A = P[ite/u]`, `B = P[ite/v]`). Replaced by an assume of
-/// the original assertion plus a certified `ite_intro` → `equiv_pos2` →
-/// `and_pos` → `ite1`/`ite2` → opaque-atom `la_generic` → `ite_neg1`/
-/// `ite_neg2` derivation of the lifted clause (validated end-to-end against
-/// Carcara).
-struct IteLiftPlan {
-    /// The original assertion `P(s)` (canonical term; printed via the
-    /// surface overrides so the assume matches the problem file). In the
-    /// defined-equality variant this is the defining equality
-    /// `(= d (ite c u v))` and `bound` carries the second original.
-    orig: TermId,
-    /// The CANONICAL original assertion whose parsed surface spells `orig`,
-    /// when `orig` is a re-interned surface form rather than the canonical
-    /// term itself (the defined-equality variant, where elaboration lifts
-    /// the defining equality to a formula-level ite). Its surface override
-    /// is collected on commit and copied onto `orig` so the re-added assume
-    /// prints like the problem file.
-    defining_source: Option<TermId>,
-    /// Defined-equality substitution variant (TWO originals feed the lifted
-    /// clause): the bound original `P(d)` over the defined term `d`, so
-    /// `A = P[d/u]`, `B = P[d/v]`. Its literal joins the transfer lemmas
-    /// (quads instead of triples) and is discharged by its own assume.
-    bound: Option<TermId>,
-    /// The lifted-condition / branch formulas of the trust clause.
-    cond: TermId,
-    lifted_then: TermId,
-    lifted_else: TermId,
-    /// The trust clause's single literal `(ite cond A B)`.
-    goal: TermId,
-    /// The term-level `(ite cond u v)` named by both branch equalities.
-    ite_term: TermId,
-    /// `(= s u)` / `(= s v)` (the `ite_intro` definition equalities;
-    /// `s = (ite cond u v)` is the term-level ite inside `orig`).
-    eq_then: TermId,
-    eq_else: TermId,
-    /// `(ite cond (= s u) (= s v))`.
-    ite_def: TermId,
-    /// `(and orig ite_def)`.
-    and_term: TermId,
-    /// `(= orig and_term)` — the `ite_intro` conclusion.
-    intro_eq: TermId,
-}
-
 /// A recognized preprocessor-derived unit trust step `(cl L)` where an
 /// original disjunctive assertion (surface `(or ...)` or De Morgan
 /// `(not (and ...))`) contains `L` and every OTHER disjunct is refuted by
@@ -2545,8 +2501,8 @@ impl Executor {
                 continue;
             }
             if let Some(plan) = provenance_ite_lifts.get(&idx) {
-                let Some(derived) =
-                    self.emit_provenance_ite_lift(&mut new_proof, plan, &lift_assume)
+                let surface = prepared_surface_overrides.as_ref();
+                let Some(derived) = self.emit_ite_lift(&mut new_proof, plan, &lift_assume, surface)
                 else {
                     return false;
                 };
@@ -2636,38 +2592,14 @@ impl Executor {
                         Some((bound, not_bound, bound_assume))
                     }
                 };
-                let (b_then, b_else) = match bound_info {
-                    None => (
-                        Self::add_triple_lemma(
-                            &mut new_proof,
-                            not_eq_then,
-                            not_orig,
-                            plan.lifted_then,
-                        ),
-                        Self::add_triple_lemma(
-                            &mut new_proof,
-                            not_eq_else,
-                            not_orig,
-                            plan.lifted_else,
-                        ),
-                    ),
-                    Some((_, not_bound, _)) => (
-                        Self::add_quad_lemma(
-                            &mut new_proof,
-                            not_eq_then,
-                            not_orig,
-                            not_bound,
-                            plan.lifted_then,
-                        ),
-                        Self::add_quad_lemma(
-                            &mut new_proof,
-                            not_eq_else,
-                            not_orig,
-                            not_bound,
-                            plan.lifted_else,
-                        ),
-                    ),
-                };
+                let (b_then, b_else) = Self::add_ite_transfer_lemmas(
+                    &mut new_proof,
+                    plan,
+                    not_eq_then,
+                    not_eq_else,
+                    not_orig,
+                    bound_info.map(|(_, not_bound, _)| not_bound),
+                );
                 // ite_neg2 ⊢ (cl G (not c) (not A)); ite_neg1 ⊢ (cl G c (not B))
                 let n2 = new_proof.add_rule_step(
                     AletheRule::IteNeg2,
@@ -3428,9 +3360,15 @@ impl Executor {
                 }
             } else {
                 let mut gate_proof = new_proof.clone();
+                // #trust->0 C3: same registries the mint-time check uses.
+                let c3_dt_data = crate::theory_inference::dt_funnel_registry_data(&self.ctx);
+                let c3_dt = c3_dt_data
+                    .as_ref()
+                    .map(crate::theory_inference::DatatypeRegistries::from_data);
                 Self::promote_generic_theory_lemma_kinds_after_rewrite(
                     &self.ctx.terms,
                     &mut gate_proof,
+                    c3_dt.as_ref(),
                 );
                 self.promote_array_extensionality_axioms(&mut gate_proof);
                 // The contextual variant supplies the datatype/selector
@@ -3763,25 +3701,7 @@ impl Executor {
             }
             // Collect the term-level ite subterms of `orig` that share the
             // lifted condition.
-            let mut candidates: Vec<(TermId, TermId, TermId)> = Vec::new();
-            let mut stack = vec![orig];
-            let mut seen = HashSet::default();
-            while let Some(t) = stack.pop() {
-                if !seen.insert(t) {
-                    continue;
-                }
-                match self.ctx.terms.get(t) {
-                    TermData::Not(inner) => stack.push(*inner),
-                    TermData::Ite(c, a, b) => {
-                        if *c == cond && *self.ctx.terms.sort(t) != Sort::Bool {
-                            candidates.push((t, *a, *b));
-                        }
-                        stack.extend([*c, *a, *b]);
-                    }
-                    TermData::App(_, args) => stack.extend(args.iter().copied()),
-                    _ => {}
-                }
-            }
+            let candidates = self.term_ite_candidates_with_cond(orig, cond);
             for (ite_term, u, v) in candidates {
                 if !planning.spend_terms(&self.ctx.terms, &[orig, orig]) {
                     return None;
@@ -3817,6 +3737,8 @@ impl Executor {
                     ite_def,
                     and_term,
                     intro_eq,
+                    then_coeffs: FarkasAnnotation::from_ints(&[1, 1, 1]),
+                    else_coeffs: FarkasAnnotation::from_ints(&[1, 1, 1]),
                 });
             }
         }
@@ -3930,11 +3852,13 @@ impl Executor {
                         ite_def,
                         and_term,
                         intro_eq,
+                        then_coeffs: FarkasAnnotation::from_ints(&[1, 1, 1, 1]),
+                        else_coeffs: FarkasAnnotation::from_ints(&[1, 1, 1, 1]),
                     });
                 }
             }
         }
-        None
+        self.plan_ite_lift_over_substituted_bound(originals, cond, lifted_then, lifted_else, goal)
     }
 
     /// Build and shape-check the `ite_intro` derivation's connective terms
@@ -5192,7 +5116,19 @@ impl Executor {
     /// `la_generic` lemma per the independent Farkas checker (the equality
     /// `eq` and atom `p` asserted true, `concl` asserted false).
     fn triple_lemma_valid(&self, eq: TermId, p: TermId, concl: TermId) -> bool {
-        let farkas = FarkasAnnotation::from_ints(&[1, 1, 1]);
+        self.triple_lemma_valid_with(eq, p, concl, &FarkasAnnotation::from_ints(&[1, 1, 1]))
+    }
+
+    /// [`Self::triple_lemma_valid`] against EXPLICIT Farkas coefficients (the
+    /// coefficients the emitter will print, so validation and export cannot
+    /// diverge).
+    fn triple_lemma_valid_with(
+        &self,
+        eq: TermId,
+        p: TermId,
+        concl: TermId,
+        farkas: &FarkasAnnotation,
+    ) -> bool {
         let lits: Vec<TheoryLit> = [eq, p]
             .iter()
             .map(|&l| match self.ctx.terms.get(l) {
@@ -5210,21 +5146,74 @@ impl Executor {
         ay_core::proof_validation::verify_farkas_conflict_lits_linear(
             &self.ctx.terms,
             &lits,
-            &farkas,
+            farkas,
         )
         .is_ok()
     }
 
-    /// Emit a `[1, 1, 1]` `la_generic` theory lemma `(cl a b c)`. Only called
-    /// for triples already validated by [`Self::triple_lemma_valid`].
-    fn add_triple_lemma(new_proof: &mut Proof, a: TermId, b: TermId, c: TermId) -> ProofId {
+    /// Emit a `la_generic` theory lemma `(cl a b c)` carrying `farkas`. Only
+    /// called for triples already validated by [`Self::triple_lemma_valid`]
+    /// / [`Self::triple_lemma_valid_with`] against THESE coefficients.
+    fn add_triple_lemma(
+        new_proof: &mut Proof,
+        a: TermId,
+        b: TermId,
+        c: TermId,
+        farkas: FarkasAnnotation,
+    ) -> ProofId {
         new_proof.add_step(ProofStep::TheoryLemma {
             theory: "LRA".to_string(),
             clause: vec![a, b, c],
-            farkas: Some(FarkasAnnotation::from_ints(&[1, 1, 1])),
+            farkas: Some(farkas),
             kind: TheoryLemmaKind::LraFarkas,
             lia: None,
         })
+    }
+
+    fn add_ite_transfer_lemmas(
+        proof: &mut Proof,
+        plan: &IteLiftPlan,
+        not_eq_then: TermId,
+        not_eq_else: TermId,
+        not_orig: TermId,
+        not_bound: Option<TermId>,
+    ) -> (ProofId, ProofId) {
+        match not_bound {
+            None => (
+                Self::add_triple_lemma(
+                    proof,
+                    not_eq_then,
+                    not_orig,
+                    plan.lifted_then,
+                    plan.then_coeffs.clone(),
+                ),
+                Self::add_triple_lemma(
+                    proof,
+                    not_eq_else,
+                    not_orig,
+                    plan.lifted_else,
+                    plan.else_coeffs.clone(),
+                ),
+            ),
+            Some(bound) => (
+                Self::add_quad_lemma(
+                    proof,
+                    not_eq_then,
+                    not_orig,
+                    bound,
+                    plan.lifted_then,
+                    plan.then_coeffs.clone(),
+                ),
+                Self::add_quad_lemma(
+                    proof,
+                    not_eq_else,
+                    not_orig,
+                    bound,
+                    plan.lifted_else,
+                    plan.else_coeffs.clone(),
+                ),
+            ),
+        }
     }
 
     /// Whether `(cl (not eq) (not p) (not q) concl)` is a valid
@@ -5232,7 +5221,18 @@ impl Executor {
     /// (the equality `eq` and atoms `p`, `q` asserted true, `concl` asserted
     /// false).
     fn quad_lemma_valid(&self, eq: TermId, p: TermId, q: TermId, concl: TermId) -> bool {
-        let farkas = FarkasAnnotation::from_ints(&[1, 1, 1, 1]);
+        self.quad_lemma_valid_with(eq, p, q, concl, &FarkasAnnotation::from_ints(&[1, 1, 1, 1]))
+    }
+
+    /// [`Self::quad_lemma_valid`] against EXPLICIT Farkas coefficients.
+    pub(super) fn quad_lemma_valid_with(
+        &self,
+        eq: TermId,
+        p: TermId,
+        q: TermId,
+        concl: TermId,
+        farkas: &FarkasAnnotation,
+    ) -> bool {
         let lits: Vec<TheoryLit> = [eq, p, q]
             .iter()
             .map(|&l| match self.ctx.terms.get(l) {
@@ -5248,24 +5248,26 @@ impl Executor {
         ay_core::proof_validation::verify_farkas_conflict_lits_linear(
             &self.ctx.terms,
             &lits,
-            &farkas,
+            farkas,
         )
         .is_ok()
     }
 
-    /// Emit a `[1, 1, 1, 1]` `la_generic` theory lemma `(cl a b c d)`. Only
-    /// called for quads already validated by [`Self::quad_lemma_valid`].
+    /// Emit a `la_generic` theory lemma `(cl a b c d)` carrying `farkas`.
+    /// Only called for quads already validated by [`Self::quad_lemma_valid`]
+    /// / [`Self::quad_lemma_valid_with`] against THESE coefficients.
     fn add_quad_lemma(
         new_proof: &mut Proof,
         a: TermId,
         b: TermId,
         c: TermId,
         d: TermId,
+        farkas: FarkasAnnotation,
     ) -> ProofId {
         new_proof.add_step(ProofStep::TheoryLemma {
             theory: "LRA".to_string(),
             clause: vec![a, b, c, d],
-            farkas: Some(FarkasAnnotation::from_ints(&[1, 1, 1, 1])),
+            farkas: Some(farkas),
             kind: TheoryLemmaKind::LraFarkas,
             lia: None,
         })
@@ -6027,6 +6029,7 @@ impl Executor {
         proof: &mut Proof,
         originals: &[(TermId, FrontendTerm)],
         authored_originals: &[(TermId, FrontendTerm)],
+        allow_premise_binding_fallback: bool,
     ) -> bool {
         // (1) Recognize the whole-proof collapse shape on the LIVE steps.
         let Some(live) = taut_surface::live_steps(proof) else {
@@ -6173,7 +6176,8 @@ impl Executor {
                     // rebuild applies (e.g. a DATATYPE refutation — Alethe has
                     // no datatype rules, and neither does any checker). Still
                     // bind the premises: see the doc comment.
-                    || self.rebuild_premise_binding_collapse(proof, originals);
+                    || (allow_premise_binding_fallback
+                        && self.rebuild_premise_binding_collapse(proof, originals));
             }
             return false;
         }

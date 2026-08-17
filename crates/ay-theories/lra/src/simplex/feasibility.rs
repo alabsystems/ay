@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// #group-l-shortpoly: cached `AY_LRA_SHORTEST_POLY` gate — DEFAULT-ON (opt out =0).
+/// #group-l-shortpoly: cached `--no-lra-shortest-poly` gate — DEFAULT-ON (opt out =0).
 /// See `pivot_error_key`. Cheap OnceLock atomic-load in the pivot-selection hot path.
 /// Adopted from OpenSMT (2025 Inc QF_LRA winner): the shortest-polynomial leaving-
 /// variable rule beats AY's prior Z3/Dantzig most-violated rule on the scored
@@ -13,7 +13,7 @@ use super::*;
 /// construction: leaving-variable choice never changes the Farkas conflict.
 fn shortest_poly_pivot_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AY_LRA_SHORTEST_POLY").map_or(true, |v| v != "0"))
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_lra_shortest_poly)
 }
 
 #[inline]
@@ -88,11 +88,11 @@ impl LraSolver {
         0.0
     }
 
-    /// #group-l-shortpoly (`AY_LRA_SHORTEST_POLY`): the pivot leaving-variable
+    /// #group-l-shortpoly (`--no-lra-shortest-poly`): the pivot leaving-variable
     /// selection key. Default for rational LRA (ON) = OpenSMT's
     /// shortest-polynomial rule; integer-mode LIA always retains the historical
     /// Z3/Dantzig most-violated rule because this QF_LRA heuristic can perturb
-    /// integer invariant discovery. `AY_LRA_SHORTEST_POLY=0` opts rational LRA
+    /// integer invariant discovery. `--no-lra-shortest-poly` opts rational LRA
     /// out as well.
     ///
     /// The shortest-polynomial rule:

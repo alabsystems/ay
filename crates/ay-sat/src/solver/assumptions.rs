@@ -749,7 +749,7 @@ impl Solver {
                             let (mut core, incomplete) =
                                 self.minimize_unsat_core(&seed, &is_assumption, &assumption_lit);
                             if incomplete {
-                                if std::env::var("AY_SAT_L0_UNSAT_TRACE").is_ok() {
+                                if ay_core::misc_cli_flags().sat_l0_unsat_trace {
                                     eprintln!(
                                         "c CORE-FAILSAFE: minimized={} -> certified={} (conflicts={})",
                                         core.len(),

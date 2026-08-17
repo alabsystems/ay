@@ -227,7 +227,7 @@ impl PdrSolver {
         // Kill switch: AY_CHC_DISABLE_EARLY_SAFETY_CHECK.
         if self.startup_converged
             && !self.skip_startup_direct_safety_proof()
-            && std::env::var_os("AY_CHC_DISABLE_EARLY_SAFETY_CHECK").is_none()
+            && crate::ab_switches::get().early_safety_check
         {
             let _t_early = ay_core::time::Instant::now();
             if let Some(model) = self.check_invariants_prove_safety() {

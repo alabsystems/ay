@@ -7,6 +7,48 @@ use crate::features::StaticFeatures;
 use super::LogicCategory;
 
 impl LogicCategory {
+    /// Whether this category has a dedicated array route that runs exact
+    /// finite-index array expansion after its own preprocessing.
+    ///
+    /// The route-independent pre-dispatch pass must defer these categories:
+    /// expanding store-flat equalities before array substitution makes the
+    /// generated biconditionals retain every alias and defeats the substitution
+    /// that is specifically intended to collapse them.
+    pub(crate) const fn owns_post_preprocess_finite_array_expansion(self) -> bool {
+        matches!(
+            self,
+            Self::QfAx
+                | Self::QfAuflia
+                | Self::QfAuflra
+                | Self::QfAuflira
+                | Self::Auflia
+                | Self::Auflra
+                | Self::Auflira
+                | Self::QfSet
+                | Self::QfSetlia
+                | Self::QfMultiset
+                | Self::QfMslia
+                | Self::QfMap
+                | Self::QfMaplia
+                | Self::QfAbv
+                | Self::QfAufbv
+                | Self::QfAbvfp
+                | Self::DtAuflia
+                | Self::DtAuflra
+                | Self::DtAuflira
+                | Self::DtAufbv
+                | Self::DtAx
+                | Self::Aufdt
+                | Self::Aufdtlia
+                | Self::Aufdtlira
+                // AUFDTLRA shares this category with array-free UFDTLRA.
+                // Its plain and assumption routes are both array-aware
+                // DT+AUFLRA pipelines and must close finite arrays only after
+                // their DT/arithmetic preprocessing has exposed final cells.
+                | Self::Ufdtlra
+        )
+    }
+
     /// Upgrade a logic category to its DT-combined variant when datatypes
     /// are declared but the user specified a non-DT logic (#3223).
     pub(crate) fn with_datatypes(self) -> Self {
@@ -414,5 +456,29 @@ impl LogicCategory {
             // Non-arithmetic logics — no upgrade needed
             _ => self,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abvfp_owns_finite_array_closure_after_its_array_transforms() {
+        assert!(LogicCategory::QfAbvfp.owns_post_preprocess_finite_array_expansion());
+        assert!(!LogicCategory::QfBvfp.owns_post_preprocess_finite_array_expansion());
+    }
+
+    #[test]
+    fn aufdt_owns_finite_array_closure_after_dt_axioms() {
+        assert!(LogicCategory::Aufdt.owns_post_preprocess_finite_array_expansion());
+        assert!(!LogicCategory::Ufdt.owns_post_preprocess_finite_array_expansion());
+    }
+
+    #[test]
+    fn aufdtlra_alias_owns_finite_array_closure_after_combined_preprocessing() {
+        let category = LogicCategory::from_logic("AUFDTLRA");
+        assert_eq!(category, LogicCategory::Ufdtlra);
+        assert!(category.owns_post_preprocess_finite_array_expansion());
     }
 }

@@ -349,6 +349,27 @@ fn test_memory_stats_conflict_counts_minimization_buffers() {
 }
 
 #[test]
+fn test_memory_stats_clause_ids_counts_lrat_materialization_pinned_capacity() {
+    let mut solver = Solver::new(0);
+    let before = solver.memory_stats();
+
+    solver.cold.lrat_level0_unit_materialize_pinned = Vec::with_capacity(37);
+    assert!(
+        solver.cold.lrat_level0_unit_materialize_pinned.is_empty(),
+        "fixture must isolate retained capacity from logical entries"
+    );
+    let retained_bytes =
+        solver.cold.lrat_level0_unit_materialize_pinned.capacity() * size_of::<usize>();
+
+    let after = solver.memory_stats();
+    assert_eq!(
+        after.clause_ids,
+        before.clause_ids + retained_bytes,
+        "clause_ids bucket must include the retained LRAT materialization retry buffer"
+    );
+}
+
+#[test]
 fn test_memory_stats_watches_use_outer_capacity_after_var_growth() {
     let mut solver = Solver::new(0);
     while solver.watches.outer_capacity() == solver.num_vars * 2 {
@@ -393,6 +414,36 @@ fn test_memory_stats_support_counts_mapping_and_walk_buffers() {
     assert_eq!(
         stats.support, expected,
         "memory_stats support bucket must match live mapping/lifecycle/walk buffers"
+    );
+}
+
+#[test]
+fn test_memory_stats_support_counts_capability_ledger_retained_heap() {
+    use crate::auto::{CapabilityDecision, CapabilityLedger, CapabilityState, DecisionSource};
+
+    let mut solver = Solver::new(0);
+    let before = solver.memory_stats();
+    let mut because = String::with_capacity(73);
+    because.push_str("adaptive-instance-profile");
+    let mut ledger = CapabilityLedger::default();
+    ledger.record(CapabilityDecision {
+        capability: "bve",
+        state: CapabilityState::On,
+        source: DecisionSource::Auto,
+        because,
+    });
+    let retained_bytes = ledger.heap_bytes();
+    assert!(
+        retained_bytes > 73,
+        "fixture must retain both ledger allocations"
+    );
+
+    solver.set_capability_ledger(ledger);
+    let after = solver.memory_stats();
+    assert_eq!(
+        after.support,
+        before.support + retained_bytes,
+        "support bucket must include the ledger vector and reason strings"
     );
 }
 

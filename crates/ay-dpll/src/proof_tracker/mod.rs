@@ -48,8 +48,22 @@
 //! }
 //! ```
 
+use std::sync::Arc;
+
+#[cfg(test)]
+mod explicit_trust_census_tests;
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod checkpoint_budget;
+
+#[cfg(test)]
+#[path = "checkpoint_budget_tests.rs"]
+mod checkpoint_budget_tests;
+mod lemma_dedup;
+mod vacuous_collapse;
+
+use lemma_dedup::{LemmaDedupMap, LemmaKey};
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
@@ -59,13 +73,6 @@ use ay_core::{
     TheoryLemmaKind, TheoryLit,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct LemmaKey {
-    kind: TheoryLemmaKind,
-    clause: Vec<TermId>,
-    farkas: Option<Vec<(i64, i64)>>,
-}
-
 /// Opaque snapshot for a speculative proof-tracking window.
 ///
 /// Proof steps and the tracker's deduplication/scope metadata form one ledger:
@@ -74,42 +81,20 @@ struct LemmaKey {
 /// step/map/scope ledger through [`ProofTracker::rollback_to`]. A ledger
 /// replacement is detected and reported because the moved proof may have
 /// escaped to another artifact.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ProofTrackerCheckpoint {
     steps: Vec<ProofStep>,
+    ledger_identity: Arc<()>,
     ledger_epoch: u64,
     assumption_map: HashMap<TermId, ProofId>,
-    lemma_map: HashMap<LemmaKey, ProofId>,
+    lemma_map: LemmaDedupMap,
     named_steps: HashMap<String, ProofId>,
     scope_stack: Vec<usize>,
     scope_assumption_maps: Vec<HashMap<TermId, ProofId>>,
-    scope_lemma_maps: Vec<HashMap<LemmaKey, ProofId>>,
+    scope_lemma_maps: Vec<LemmaDedupMap>,
     scope_named_steps: Vec<HashMap<String, ProofId>>,
     enabled: bool,
     theory_name: String,
-}
-
-impl LemmaKey {
-    fn new(kind: TheoryLemmaKind, clause: &[TermId], farkas: Option<&FarkasAnnotation>) -> Self {
-        Self {
-            kind,
-            clause: clause.to_vec(),
-            farkas: farkas.map(|f| {
-                f.coefficients
-                    .iter()
-                    .map(|c| {
-                        let mut numer = *c.numer();
-                        let mut denom = *c.denom();
-                        if denom < 0 {
-                            numer = -numer;
-                            denom = -denom;
-                        }
-                        (numer, denom)
-                    })
-                    .collect()
-            }),
-        }
-    }
 }
 
 /// Proof tracker for collecting SMT proof steps during solving
@@ -125,14 +110,14 @@ impl LemmaKey {
 /// added since the matching `push()` are removed, along with their
 /// deduplication entries. This prevents stale theory lemmas from appearing
 /// in proofs after a scope retraction (#4534).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ProofTracker {
     /// The accumulated proof
     proof: Proof,
     /// Mapping from assertion term IDs to their proof step IDs
     assumption_map: HashMap<TermId, ProofId>,
-    /// Mapping from theory lemma content to proof step IDs
-    lemma_map: HashMap<LemmaKey, ProofId>,
+    /// Hash-first mapping from theory lemma content to proof step IDs (#A4)
+    lemma_map: LemmaDedupMap,
     /// Whether proof tracking is enabled
     enabled: bool,
     /// Theory name for the current solving context
@@ -143,13 +128,22 @@ pub(crate) struct ProofTracker {
     /// alias an older `ProofId` without adding a step, so an ID cutoff alone
     /// cannot identify everything that push/pop must remove.
     scope_assumption_maps: Vec<HashMap<TermId, ProofId>>,
-    scope_lemma_maps: Vec<HashMap<LemmaKey, ProofId>>,
+    scope_lemma_maps: Vec<LemmaDedupMap>,
     scope_named_steps: Vec<HashMap<String, ProofId>>,
     /// Changes whenever the proof ledger is moved/replaced. Ordinary
     /// truncation is exactly reversible because checkpoints own the complete
     /// retained step/map/scope prefix; a moved proof may have escaped and is
     /// therefore reported rather than reconstructed.
+    // `ProofTracker` deliberately remains non-Clone: duplicating this Arc into
+    // two live trackers would make unrelated ledgers pass the identity check.
+    ledger_identity: Arc<()>,
     ledger_epoch: u64,
+}
+
+impl Default for ProofTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProofTracker {
@@ -159,13 +153,14 @@ impl ProofTracker {
         Self {
             proof: Proof::new(),
             assumption_map: HashMap::default(),
-            lemma_map: HashMap::default(),
+            lemma_map: LemmaDedupMap::default(),
             enabled: false,
             theory_name: "UNKNOWN".to_string(),
             scope_stack: Vec::new(),
             scope_assumption_maps: Vec::new(),
             scope_lemma_maps: Vec::new(),
             scope_named_steps: Vec::new(),
+            ledger_identity: Arc::new(()),
             ledger_epoch: 0,
         }
     }
@@ -198,6 +193,11 @@ impl ProofTracker {
             .expect("proof tracker ledger epoch exhausted");
     }
 
+    fn replace_ledger_identity(&mut self) {
+        self.ledger_identity = Arc::new(());
+        self.advance_ledger_epoch();
+    }
+
     fn clear_scope_ledger_snapshots(&mut self) {
         self.scope_stack.fill(0);
         for map in &mut self.scope_assumption_maps {
@@ -228,8 +228,7 @@ impl ProofTracker {
         // from authored roots (Skolemization, arithmetic normalization, packed
         // theory clause). Reuse that derivation; never add a second, stronger
         // `Assume` for the solver-visible replacement.
-        let derived_key = LemmaKey::new(TheoryLemmaKind::Generic, &[term], None);
-        if let Some(&id) = self.lemma_map.get(&derived_key) {
+        if let Some(id) = self.lemma_map.get(TheoryLemmaKind::Generic, &[term], None) {
             self.assumption_map.insert(term, id);
             return Some(id);
         }
@@ -239,22 +238,36 @@ impl ProofTracker {
         Some(id)
     }
 
-    /// Record a theory lemma (conflict clause from theory solver)
+    /// Record a bare `Generic` theory lemma — an EXPLICIT TRUST admission
+    /// (#trust->0 C6 API ratchet; formerly `add_theory_lemma`).
     ///
     /// The clause is the disjunction of literals that the theory solver derived.
     /// Returns the proof step ID for this lemma, or None if tracking is disabled.
-    pub(crate) fn add_theory_lemma(&mut self, clause: Vec<TermId>) -> Option<ProofId> {
+    ///
+    /// `Generic` is the only trust kind (`is_trust()`), so every step recorded
+    /// here can enter a published proof only through the deferred-trust
+    /// discharge lane — it is never strict-checkable on its own. The name makes
+    /// that cost visible at the call site: a NEW caller must either supply a
+    /// typed kind (`add_theory_lemma_with_kind`,
+    /// `add_theory_lemma_with_farkas_and_kind`, or the `theory_inference`
+    /// classifier funnel) or name the trust by writing this method — and every
+    /// call site is inventoried by the census test
+    /// (`proof_tracker/explicit_trust_census_tests.rs`), so a new site fails
+    /// the build until it is vetted there. Behavior is byte-identical to the
+    /// old `add_theory_lemma`.
+    #[doc(hidden)]
+    pub(crate) fn add_explicit_trust_lemma(&mut self, clause: Vec<TermId>) -> Option<ProofId> {
         if !self.enabled {
             return None;
         }
 
-        let key = LemmaKey::new(TheoryLemmaKind::Generic, &clause, None);
-
-        // Check if we already have this lemma
-        if let Some(&id) = self.lemma_map.get(&key) {
+        // Check if we already have this lemma (hash-first: no allocation on
+        // the dedup hit path, #A4).
+        if let Some(id) = self.lemma_map.get(TheoryLemmaKind::Generic, &clause, None) {
             return Some(id);
         }
 
+        let key = LemmaKey::new(TheoryLemmaKind::Generic, &clause, None);
         let id = self.proof.add_theory_lemma(&self.theory_name, clause);
         self.lemma_map.insert(key, id);
         Some(id)
@@ -285,7 +298,7 @@ impl ProofTracker {
             "BUG: weakened theory lemma requires the core to be a prefix of the full clause"
         );
         if full.len() < core.len() || full[..core.len()] != core[..] {
-            return self.add_theory_lemma(full);
+            return self.add_explicit_trust_lemma(full);
         }
         let core_id = self.add_theory_lemma_with_kind(core, kind)?;
         Some(
@@ -315,13 +328,12 @@ impl ProofTracker {
         } else {
             kind
         };
-        let key = LemmaKey::new(kind, &clause, None);
-        if let Some(&id) = self.lemma_map.get(&key) {
+        if let Some(id) = self.lemma_map.get(kind, &clause, None) {
             return Some(id);
         }
 
-        let generic_unit_key =
-            (clause.len() == 1).then(|| LemmaKey::new(TheoryLemmaKind::Generic, &clause, None));
+        let key = LemmaKey::new(kind, &clause, None);
+        let generic_unit_term = (clause.len() == 1).then(|| clause[0]);
         let id = self
             .proof
             .add_theory_lemma_with_kind(&self.theory_name, clause, kind);
@@ -330,12 +342,13 @@ impl ProofTracker {
         // `add_assumption(term)`. Index an already certified singleton under
         // that generic unit lookup too, so registration reuses the theorem
         // instead of adding a stronger free `Assume` for the same term.
-        if let Some(generic_unit_key) = generic_unit_key {
+        if let Some(term) = generic_unit_term {
             // Preserve an older certified singleton at an outer scope. If an
             // inner specialized lemma shadowed this alias, `pop()` could remove
             // the inner id but could not reconstruct the overwritten mapping,
             // orphaning the still-live outer proof step from deduplication.
-            self.lemma_map.entry(generic_unit_key).or_insert(id);
+            self.lemma_map
+                .or_insert(LemmaKey::new(TheoryLemmaKind::Generic, &[term], None), id);
         }
         Some(id)
     }
@@ -357,11 +370,11 @@ impl ProofTracker {
             clause.len()
         );
 
-        let key = LemmaKey::new(kind, &clause, Some(&farkas));
-        if let Some(&id) = self.lemma_map.get(&key) {
+        if let Some(id) = self.lemma_map.get(kind, &clause, Some(&farkas)) {
             return Some(id);
         }
 
+        let key = LemmaKey::new(kind, &clause, Some(&farkas));
         let id = self.proof.add_theory_lemma_with_farkas_and_kind(
             &self.theory_name,
             clause,
@@ -443,11 +456,11 @@ impl ProofTracker {
             return None;
         }
 
-        let key = LemmaKey::new(TheoryLemmaKind::Generic, &clause, None);
-        if let Some(&id) = self.lemma_map.get(&key) {
+        if let Some(id) = self.lemma_map.get(TheoryLemmaKind::Generic, &clause, None) {
             return Some(id);
         }
 
+        let key = LemmaKey::new(TheoryLemmaKind::Generic, &clause, None);
         let split = self.proof.add_rule_step(
             AletheRule::LaDisequality,
             vec![or_term],
@@ -755,8 +768,7 @@ impl ProofTracker {
         for &arg in &final_args {
             let unit = *unit_ids.get(&arg)?;
             self.lemma_map
-                .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[arg], None))
-                .or_insert(unit);
+                .or_insert(LemmaKey::new(TheoryLemmaKind::Generic, &[arg], None), unit);
         }
         self.lemma_map.insert(
             LemmaKey::new(TheoryLemmaKind::Generic, &[skolemized_body], None),
@@ -765,13 +777,6 @@ impl ProofTracker {
         Some(current_id)
     }
 
-    /// Derive one exact ground instance from a directly asserted `forall`.
-    ///
-    /// The E-matcher supplies the source quantifier, positional binding, and
-    /// generated instance. Recompute the simultaneous substitution here before
-    /// emitting any authority. The proof is the authored forall `Assume`, a
-    /// strict-checker-supported premiseless `forall_inst` implication, Boolean
-    /// `or` clausification, and resolution to the ground unit.
     pub(crate) fn add_forall_instantiated_assertion(
         &mut self,
         terms: &mut TermStore,
@@ -817,9 +822,10 @@ impl ProofTracker {
         let unit = self
             .proof
             .add_resolution(vec![instance], quantified, clausified, source_id);
-        self.lemma_map
-            .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None))
-            .or_insert(unit);
+        self.lemma_map.or_insert(
+            LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None),
+            unit,
+        );
 
         // If the exact instance is itself arithmetically impossible, close the
         // refutation here before downstream ground preprocessing can fold it to
@@ -1129,9 +1135,10 @@ impl ProofTracker {
         if current_clause != [instance] {
             return None;
         }
-        self.lemma_map
-            .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None))
-            .or_insert(current_id);
+        self.lemma_map.or_insert(
+            LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None),
+            current_id,
+        );
         Some(current_id)
     }
 
@@ -1153,8 +1160,9 @@ impl ProofTracker {
         if !self.enabled || source == target {
             return None;
         }
-        let source_key = LemmaKey::new(TheoryLemmaKind::Generic, &[source], None);
-        let source_id = *self.lemma_map.get(&source_key)?;
+        let source_id = self
+            .lemma_map
+            .get(TheoryLemmaKind::Generic, &[source], None)?;
         let TermData::App(Symbol::Named(source_name), source_args) = terms.get(source).clone()
         else {
             return None;
@@ -1362,9 +1370,10 @@ impl ProofTracker {
         // boundary so no rewritten atom is later introduced as a free Assume.
         for &target_arg in &target_args {
             let unit = *target_units.get(&target_arg)?;
-            self.lemma_map
-                .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[target_arg], None))
-                .or_insert(unit);
+            self.lemma_map.or_insert(
+                LemmaKey::new(TheoryLemmaKind::Generic, &[target_arg], None),
+                unit,
+            );
         }
         self.lemma_map.insert(
             LemmaKey::new(TheoryLemmaKind::Generic, &[target], None),
@@ -1384,7 +1393,7 @@ impl ProofTracker {
         self.assumption_map.clear();
         self.lemma_map.clear();
         self.clear_scope_ledger_snapshots();
-        self.advance_ledger_epoch();
+        self.replace_ledger_identity();
         proof
     }
 
@@ -1392,84 +1401,6 @@ impl ProofTracker {
     #[must_use]
     pub(crate) fn num_steps(&self) -> usize {
         self.proof.len()
-    }
-
-    /// Capture a coherent proof-ledger snapshot for speculative work.
-    #[must_use]
-    pub(crate) fn rollback_checkpoint(&self) -> ProofTrackerCheckpoint {
-        ProofTrackerCheckpoint {
-            steps: self.proof.steps.clone(),
-            ledger_epoch: self.ledger_epoch,
-            assumption_map: self.assumption_map.clone(),
-            lemma_map: self.lemma_map.clone(),
-            named_steps: self.proof.named_steps.clone(),
-            scope_stack: self.scope_stack.clone(),
-            scope_assumption_maps: self.scope_assumption_maps.clone(),
-            scope_lemma_maps: self.scope_lemma_maps.clone(),
-            scope_named_steps: self.scope_named_steps.clone(),
-            enabled: self.enabled,
-            theory_name: self.theory_name.clone(),
-        }
-    }
-
-    /// Restore non-positional tracker configuration without changing steps.
-    ///
-    /// This is used only by a fail-safe lane that deliberately retains a
-    /// speculative ledger (and therefore its terms) while still restoring the
-    /// enclosing solve's configuration for subsequent proof producers.
-    pub(crate) fn restore_checkpoint_metadata(&mut self, checkpoint: &ProofTrackerCheckpoint) {
-        self.enabled = checkpoint.enabled;
-        self.theory_name.clone_from(&checkpoint.theory_name);
-    }
-
-    /// Discard every proof artifact added after `checkpoint`.
-    ///
-    /// Besides proof steps, this truncates all maps containing positional
-    /// `ProofId`s and drops nested scopes opened by the discarded work.  The
-    /// retained scope snapshots are restored with the ledger.
-    ///
-    /// Returns `true` when the original ledger was still present and its
-    /// prefix was restored exactly. A `false` return means the speculative
-    /// work replaced/moved the ledger; the replacement ledger is cleared to
-    /// prevent `ProofId` aliasing. Because the moved proof may have escaped to
-    /// another artifact, callers that pair this with a `TermStore` rollback
-    /// must retain the terms on `false`.
-    #[must_use]
-    pub(crate) fn rollback_to(&mut self, checkpoint: ProofTrackerCheckpoint) -> bool {
-        let same_ledger = checkpoint.ledger_epoch == self.ledger_epoch;
-        if same_ledger {
-            self.proof.steps.clone_from(&checkpoint.steps);
-        } else {
-            // The entry ledger was moved/reset during the speculative window.
-            // Every step in the replacement ledger is post-checkpoint.
-            self.proof.steps.clear();
-        }
-
-        if same_ledger {
-            self.assumption_map.clone_from(&checkpoint.assumption_map);
-            self.lemma_map.clone_from(&checkpoint.lemma_map);
-            self.proof.named_steps.clone_from(&checkpoint.named_steps);
-            self.scope_stack.clone_from(&checkpoint.scope_stack);
-            self.scope_assumption_maps
-                .clone_from(&checkpoint.scope_assumption_maps);
-            self.scope_lemma_maps
-                .clone_from(&checkpoint.scope_lemma_maps);
-            self.scope_named_steps
-                .clone_from(&checkpoint.scope_named_steps);
-        } else {
-            self.assumption_map.clear();
-            self.lemma_map.clear();
-            self.proof.named_steps.clear();
-            self.scope_stack = vec![0; checkpoint.scope_stack.len()];
-            self.scope_assumption_maps = vec![HashMap::default(); checkpoint.scope_stack.len()];
-            self.scope_lemma_maps = vec![HashMap::default(); checkpoint.scope_stack.len()];
-            self.scope_named_steps = vec![HashMap::default(); checkpoint.scope_stack.len()];
-        }
-        self.restore_checkpoint_metadata(&checkpoint);
-        if !same_ledger {
-            self.advance_ledger_epoch();
-        }
-        same_ledger
     }
 
     /// Whether a producer has already closed an explicit proof dependency
@@ -1495,7 +1426,7 @@ impl ProofTracker {
         self.proof = Proof::new();
         self.assumption_map.clear();
         self.lemma_map.clear();
-        self.advance_ledger_epoch();
+        self.replace_ledger_identity();
         // Scope stack preserved — push/pop balance maintained across check-sat calls.
         // Update watermarks to point into the now-empty proof.
         self.clear_scope_ledger_snapshots();
@@ -1543,7 +1474,7 @@ impl crate::incremental_state::IncrementalSubsystem for ProofTracker {
         self.scope_assumption_maps.clear();
         self.scope_lemma_maps.clear();
         self.scope_named_steps.clear();
-        self.advance_ledger_epoch();
+        self.replace_ledger_identity();
         // Keep enabled state and theory name
     }
 }

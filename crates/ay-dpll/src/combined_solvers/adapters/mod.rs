@@ -4,6 +4,7 @@
 
 mod auf_lira;
 mod auf_lira_bridge;
+mod auf_lira_state;
 mod lira;
 mod strings_lia;
 mod uf_map_lia;

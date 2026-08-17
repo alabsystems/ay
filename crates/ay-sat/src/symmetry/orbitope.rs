@@ -324,14 +324,13 @@ pub(crate) struct OrbitopeStats {
 /// clique-first column ordering here differing from the reference's, since that
 /// changes which columns the staircase fixes and in what order.
 fn alo_only_columns_enabled() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
     // DEFAULT ON since 2026-08-11. It was off because zeroin.i.3.29 emitted a
     // certificate dsr-trim rejected; that is fixed — the synthesized AMO
     // variables are now frozen so BVE cannot eliminate them and delete a clause
     // the refutation needs. Measured after the fix: 10 of the 11 official
     // colouring instances solve AND their certificates verify.
-    *F.get_or_init(|| std::env::var("AY_SAT_ORBITOPE_ALO_COLUMNS").map_or(true, |v| v != "0"))
+    // B26: CLI-owned opt-out (--sat-no-orbitope-alo-columns); env retired.
+    !ay_core::sat_ab_switches().no_orbitope_alo_columns
 }
 
 /// Find row-interchangeable at-most-one matrices inside `clauses`.

@@ -188,7 +188,7 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
     /// would silently reintroduce the real relaxation this lane exists to
     /// avoid) and must place the extracted model in `TheoryModels::lia` rather
     /// than `lra`, which needs an `LraModel` -> `LiaModel` conversion. Gate it
-    /// behind an env flag like `AY_RDL_ENGINE` and run a full-division
+    /// behind a flag like `--dpll-no-rdl-engine` and run a full-division
     /// differential before default-on. See the development design notes §3a2.
     pub(crate) fn new_int(terms: &'a TermStore) -> Self {
         let mut this = Self::new(terms);
@@ -451,9 +451,6 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
     /// Mark the solver unusable for the current scope (fail closed).
     fn raise_unsupported(&mut self) {
         if self.unsupported.is_none() {
-            if std::env::var("AY_RDL_ENGINE_DEBUG").is_ok_and(|v| v != "0" && !v.is_empty()) {
-                ay_core::safe_eprintln!("[RDL] raise_unsupported at scope {}", self.scope_depth);
-            }
             self.unsupported = Some(self.scope_depth);
         }
     }
@@ -575,20 +572,7 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
                 }
             }
             // `Unsupported`, or (impossible) a missing entry: fail closed.
-            other => {
-                if std::env::var("AY_RDL_ENGINE_DEBUG").is_ok_and(|v| v != "0" && !v.is_empty()) {
-                    let what = match other {
-                        Some(AtomKind::Unsupported) => "Unsupported atom",
-                        None => "UNCLASSIFIED atom (missing entry)",
-                        _ => "other",
-                    };
-                    ay_core::safe_eprintln!(
-                        "[RDL] unsupported: {} term={:?} data={:?}",
-                        what,
-                        term,
-                        self.terms.get(term)
-                    );
-                }
+            _ => {
                 self.raise_unsupported();
                 return;
             }
@@ -729,15 +713,11 @@ fn strip_negations(terms: &TermStore, mut term: TermId, mut value: bool) -> (Ter
 fn prop_budget_from_env() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("AY_RDL_PROP_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            // Default OFF. Measured on the QF_RDL corpus, propagation at
-            // budget 256 costs far more than the search it prunes: on
-            // tempo-depth-4 it turned a 13.4s `sat` into a 27s timeout. The
-            // machinery is sound and stays available for experiments
-            // (`AY_RDL_PROP_BUDGET=N`), but it does not pay for itself yet.
-            .unwrap_or(0)
+        // Default OFF. Measured on the QF_RDL corpus, propagation at budget
+        // 256 costs far more than the search it prunes: on tempo-depth-4 it
+        // turned a 13.4s `sat` into a 27s timeout. The machinery is sound;
+        // B25: re-arm by editing this constant for an experiment.
+        0
     })
 }
 

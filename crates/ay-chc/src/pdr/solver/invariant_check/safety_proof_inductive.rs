@@ -10,21 +10,13 @@
 
 use super::*;
 
+mod outcome;
+pub(super) use outcome::InductiveSubsetOutcome;
+
 // THE per-lemma acceptance conjunction — shared, trust-checkable core.
 // the development proof harness include!s the same source
 // and discharges its no-false-accept obligation (NO TWIN).
 use super::inductive_accept_core::lemma_admitted_inductive;
-
-/// Result of the inductive-subset model search.
-pub(super) enum InductiveSubsetOutcome {
-    /// Found a verified model that blocks all errors.
-    Proven(InvariantModel),
-    /// Inductive subset was tried but doesn't block errors (multi-pred).
-    /// The caller should skip the verification cascade.
-    Insufficient,
-    /// No result from inductive subset; returns the model for cascade.
-    Cascade(InvariantModel),
-}
 
 impl PdrSolver {
     /// Inductive-subset fast-accept (#5425/#5401).

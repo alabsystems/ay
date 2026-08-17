@@ -5,7 +5,8 @@
 //! Linear, surface-safe rendering of flat Boolean `and_pos` steps.
 
 use super::{
-    split_alethe_application_bounded, AlethePrintError, AlethePrinter, AletheSurfaceParseError,
+    split_alethe_application_bounded, split_application, AlethePrintError, AlethePrinter,
+    AletheSurfaceParseError,
 };
 use ay_core::{AletheRule, ProofId, Sort, Symbol, TermData, TermId};
 
@@ -204,6 +205,105 @@ impl AlethePrinter<'_> {
         Ok(Some(format!(
             "(step {id} (cl {expected_gate} {selected_surface}) :rule and_pos :args ({surface_index}))"
         )))
+    }
+
+    /// Rebuild an `and_pos` tautology when the authored spelling wraps the
+    /// canonical conjunction in `(or false C)`.
+    ///
+    /// Elaboration simplifies that wrapper to `C`, so the proof IR correctly
+    /// records `and_pos` over `C`; the source override must nevertheless print
+    /// the authored root so its `assume` matches the problem.  Printing the IR
+    /// step directly would claim `and_pos` over an `or`.  Compose the exact
+    /// Boolean rules instead:
+    ///
+    /// `or_pos(ROOT)`, `false`, and `and_pos(C)` resolve to `¬ROOT ∨ Ak`.
+    pub(super) fn resugar_and_pos_false_or_and(
+        &self,
+        id: ProofId,
+        rule: &AletheRule,
+        clause: &[TermId],
+        args: &[TermId],
+    ) -> Option<String> {
+        let AletheRule::AndPos(i) = rule else {
+            return None;
+        };
+        let [source] = args else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(name), conjuncts) = self.terms.get(*source) else {
+            return None;
+        };
+        if name != "and" || clause.len() != 2 {
+            return None;
+        }
+        let ak = *conjuncts.get(*i as usize)?;
+        let ak_str = self.format_term(ak);
+        let printed: [String; 2] = [self.format_term(clause[0]), self.format_term(clause[1])];
+        let ak_pos = printed.iter().position(|literal| *literal == ak_str)?;
+        let gate = clause[1 - ak_pos];
+        // The gate literal must be a negation of the SOURCE conjunction, in
+        // either of the two spellings the tracer produces:
+        //
+        //   * the direct `(not C)` gate of an ordinary Tseitin `and_pos`, or
+        //   * its De Morgan surface `(or (not A1) .. (not An))`.
+        //
+        // Both are re-slotted to the spec-shaped `(cl (not ROOT) Ak)` the
+        // composition below derives. Requiring the De Morgan form ALONE (as
+        // this guard originally did) left the direct-gate case — which is what
+        // `(assert (or false (and ..)))` actually traces — with no certified
+        // bridge at all: the printer fell through to the fail-loud
+        // `and_pos source no longer prints as an and-term` rejection and the
+        // whole proof came out as an `UNVERIFIABLE PROOF` error string, even
+        // though the composition below applies verbatim. Nothing is loosened:
+        // a gate that is neither spelling is still declined, and every printed
+        // shape used below is re-derived from `format_term` and re-checked by
+        // `split_application`.
+        let gate_is_direct_negation =
+            matches!(self.terms.get(gate), TermData::Not(inner) if *inner == *source);
+        if !gate_is_direct_negation && !self.is_demorgan_negation(gate, *source) {
+            return None;
+        }
+
+        let root = self.format_term(*source);
+        let root_operands = split_application(&root, "or")?;
+        if root_operands.len() != 2 {
+            return None;
+        }
+        let (false_operand, inner) = if root_operands[0] == "false" {
+            (&root_operands[0], &root_operands[1])
+        } else if root_operands[1] == "false" {
+            (&root_operands[1], &root_operands[0])
+        } else {
+            return None;
+        };
+        let inner_operands = split_application(inner, "and")?;
+        let inner_index = inner_operands
+            .iter()
+            .position(|operand| operand == &ak_str)?;
+        // Require an exact one-to-one printed conjunction. A nested/reordered
+        // spelling needs a navigation proof; declining here is safer than
+        // guessing an `and_pos` index.
+        if inner_operands.len() != conjuncts.len()
+            || inner_operands
+                .iter()
+                .filter(|operand| *operand == &ak_str)
+                .count()
+                != 1
+        {
+            return None;
+        }
+
+        let or_id = format!("{id}.ow0");
+        let false_id = format!("{id}.ow1");
+        let and_id = format!("{id}.ow2");
+        let drop_id = format!("{id}.ow3");
+        Some(format!(
+            "(step {or_id} (cl (not {root}) {false_operand} {inner}) :rule or_pos)\n\
+             (step {false_id} (cl (not {false_operand})) :rule false)\n\
+             (step {and_id} (cl (not {inner}) {ak_str}) :rule and_pos :args ({inner_index}))\n\
+             (step {drop_id} (cl (not {root}) {inner}) :rule resolution :premises ({or_id} {false_id}))\n\
+             (step {id} (cl (not {root}) {ak_str}) :rule resolution :premises ({drop_id} {and_id}))"
+        ))
     }
 
     /// Bridge an `and_pos` whose indexed conjunct is an and-term ERASED from

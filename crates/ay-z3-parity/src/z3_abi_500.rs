@@ -1003,7 +1003,10 @@ unsafe fn run_finite_set_probes_unsafe(
     api: &Api,
     selected_semantic: Option<&str>,
 ) -> Result<BTreeMap<String, String>, String> {
-    // SAFETY: upheld by `run_finite_set_probes`.
+    // SAFETY: `api.mk_config` was resolved from this library's
+    // `Z3_mk_config` symbol at the declared no-argument C signature. No foreign
+    // handles are supplied, and its returned configuration is null-checked
+    // before it is passed to any other API entry point.
     let config = unsafe { (api.mk_config)() };
     let config = require_ptr(config, "Z3_mk_config")?;
     // SAFETY: `config` belongs to this API.
@@ -1575,8 +1578,10 @@ fn record_ast_observation(
             .enumerate()
             .all(|(index, expected)| {
                 // SAFETY: the index is below the observed application arity,
-                // and all compared AST handles belong to `context`.
+                // and `app` belongs to `context`.
                 let actual = unsafe { (api.get_app_arg)(context, app, index as u32) };
+                // SAFETY: the non-null `actual` and `expected` AST handles both
+                // belong to the live probe `context`.
                 !actual.is_null() && unsafe { (api.is_eq_ast)(context, actual, *expected) }
             });
     observed.insert(format!("ast.{id}.args-match"), args_match.to_string());

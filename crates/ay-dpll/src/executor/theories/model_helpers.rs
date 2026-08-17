@@ -107,7 +107,7 @@ impl Executor {
                     lra.values.remove(var);
                 }
             }
-            self.nra_algebraic_model = models.nra_algebraic.drain(..).collect();
+            self.nra_algebraic_model.set(&mut models.nra_algebraic);
         }
         // DT e-graph model export (#mv-dt-single-source): stash it aside and
         // attach it only AFTER the verdict is stored and stands as Sat — the

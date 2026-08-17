@@ -21,7 +21,7 @@
 //! overflowing instances return honest `Unknown`; the API never labels the
 //! executor's count/greedy fallback as an optimum.
 
-use ay_frontend::{Command, SoftAssertion};
+use ay_frontend::SoftAssertion;
 
 use crate::api::types::maxsmt::{MaxSmtResult, SoftConstraint};
 use crate::api::types::{NativeReplayEventKind, SolveResult, SolverError, Term};
@@ -165,6 +165,7 @@ impl Solver {
         }
 
         if self.soft_constraints.is_empty() {
+            self.clear_last_solve_state(true, false);
             let result = self.check_sat_internal_api();
             return Ok(if result.is_sat() {
                 MaxSmtResult::optimal(0, 0, Vec::new())
@@ -237,7 +238,7 @@ impl Solver {
         #[cfg(test)]
         let configured_term_memory_limit = self.term_memory_limit;
         self.install_solve_controls(controls);
-        let execution = self.executor.execute(&Command::CheckSat);
+        let execution = self.executor.execute_native_maxsmt_check_sat();
         let outcome = (|| -> Result<MaxSmtResult, SolverError> {
             #[cfg(test)]
             if self.interrupt_native_maxsmt_after_execution {

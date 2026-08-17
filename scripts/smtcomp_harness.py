@@ -925,6 +925,21 @@ class Invocation:
     argv: list[str]
     stdin_path: str | None = None  # feed this file on stdin instead of argv
     smtcomp_command: list[str] | None = None  # the exact 2025 command recorded
+    env: dict[str, str] | None = None  # extra child env (part of run identity)
+
+
+# --competition (run subcommand, default OFF): sets AY_COMPETITION=1 on AY
+# invocations so the solver sheds its internal proof cycle and publishes UNSAT
+# through the CompetitionRaw admission lane (#proof-capability B3/B4). OFF
+# means certified runs are byte-identical to before this flag existed: no env
+# entry is added and the run-cache identity of every existing row is unchanged.
+#
+# A/B DISCIPLINE (smtcomp-measurement-traps): compare --competition against
+# certified ONLY as interleaved same-day runs on the same host — alternate the
+# two configurations within one session, never across days, hosts, or against
+# historical result rows. The env is part of the persisted run identity below,
+# so the cache can never conflate the two configurations.
+AY_COMPETITION_MODE = False
 
 
 def canonical_json(value: object) -> str:
@@ -1048,11 +1063,17 @@ def invocation_identity(inv: Invocation, input_path: str) -> dict:
     def normalize(value: str | None) -> str | None:
         return "{INPUT}" if value == input_path else value
 
-    return {
+    identity = {
         "argv": [normalize(arg) for arg in inv.argv],
         "stdin": normalize(inv.stdin_path),
         "smtcomp_command": inv.smtcomp_command,
     }
+    # Present ONLY when extra env is set (--competition): absent keeps every
+    # pre-existing cached run identity byte-identical, present forks the cache
+    # key so competition and certified rows can never be conflated.
+    if inv.env:
+        identity["env"] = dict(sorted(inv.env.items()))
+    return identity
 
 
 def build_invocation(sol: Solver, track: str, logic: str, tmp: str,
@@ -1066,15 +1087,19 @@ def build_invocation(sol: Solver, track: str, logic: str, tmp: str,
         # DEFAULT_SAFETY_DEADLINE (check_sat.rs) — a harness budget >300 s
         # silently shrinks to 300 s effective. Leave ~5 s for output flush.
         timeout = [f"-T:{max(timeout_s - 5, 1)}"] if timeout_s > 0 else []
+        # AY_COMPETITION=1 alongside --z3-mode (#proof-capability B4), behind
+        # the harness --competition flag, default OFF — see AY_COMPETITION_MODE
+        # above for the interleaved same-day A/B rule.
+        env = {"AY_COMPETITION": "1"} if AY_COMPETITION_MODE else None
         if track == "inc":
             # 6d0d0823 remapped -in from --stdin to --incremental; passing
             # both made clap exit 2 (duplicate) — every post-07-13 harness
             # inc run of AY scored 0. --incremental alone reads stdin here.
             return Invocation([str(sol.binary), "--z3-mode", *memory,
                                *timeout, "--incremental"],
-                              stdin_path=tmp)
+                              stdin_path=tmp, env=env)
         return Invocation([str(sol.binary), "--z3-mode", *memory, *timeout,
-                           tmp])
+                           tmp], env=env)
     if sol.kind == "z3":
         # z3 enforces `-memory:` itself and reports `unknown`; that is a real
         # in-process ceiling, unlike the RSS watchdog, which is a Python thread
@@ -1250,6 +1275,8 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
     child_env = os.environ.copy()
     if resource_envelope is not None:
         child_env["NBCORE"] = str(resource_envelope["nbcore"])
+    if inv.env:
+        child_env.update(inv.env)
 
     out_buf, err_buf = bytearray(), bytearray()
     out_total = [0]
@@ -1799,6 +1826,8 @@ def run_one(sol: Solver, inst: Instance, track: str, timeout_s: int,
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    global AY_COMPETITION_MODE
+    AY_COMPETITION_MODE = bool(getattr(args, "competition", False))
     track = args.track
     tasks = load_manifest(track, args.division)
     if args.only:
@@ -1859,6 +1888,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             assert inv is not None
             feed = f"  (stdin <- {inv.stdin_path})" if inv.stdin_path else ""
             print(f"[dry-run] {sol.name}: argv = {inv.argv}{feed}")
+            if inv.env:
+                print(f"[dry-run]   extra env: {inv.env}")
             if inv.smtcomp_command:
                 print(f"[dry-run]   2025 submission command: {inv.smtcomp_command}")
         print(f"[dry-run] resource envelope: {canonical_json(resource_envelope)}")
@@ -3151,6 +3182,12 @@ def main() -> None:
     rp.add_argument("--seed", type=int, default=2025)
     rp.add_argument("--overwrite", action="store_true",
                     help="discard existing results for the selected solvers")
+    rp.add_argument("--competition", action="store_true",
+                    help="run AY with AY_COMPETITION=1 (B3 raw-admission "
+                         "shedding). Default OFF: certified runs and their "
+                         "cached identities are unchanged. A/B against "
+                         "certified ONLY as interleaved same-day runs "
+                         "(see AY_COMPETITION_MODE)")
     rp.add_argument("--dry-run", action="store_true",
                     help="print argv + temp file for the first instance and exit")
     rp.set_defaults(func=cmd_run)

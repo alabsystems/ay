@@ -36,6 +36,8 @@ pub(crate) fn collect_assumptions_and_theory_lemmas(
     (assumptions, theory_lemmas)
 }
 
+mod trust_closer;
+
 /// Try to derive the empty clause via a th_resolution chain (#340 Phase 0).
 pub(crate) fn try_derive_empty_via_th_resolution(terms: &TermStore, proof: &mut Proof) -> bool {
     let (assumptions, theory_lemmas) = collect_assumptions_and_theory_lemmas(proof);
@@ -717,12 +719,7 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
         })
         .collect();
 
-    // This trust fallback is used during SAT proof reconstruction
-    // when resolution cannot derive the empty clause from existing steps.
-    // It is an inherent trust step (not a theory lemma), so Generic is correct
-    // until proper SAT proof reconstruction eliminates the need for it.
-    let lemma_id =
-        proof.add_theory_lemma_with_kind("trust", negated_clause.clone(), TheoryLemmaKind::Generic);
+    let lemma_id = trust_closer::add_head(terms, proof, &negated_clause);
 
     let mut current_clause = negated_clause;
     let mut current_id = lemma_id;

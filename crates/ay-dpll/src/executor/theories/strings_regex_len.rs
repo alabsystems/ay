@@ -239,7 +239,7 @@ impl Executor {
         }
         let length_bounds = self.regex_var_length_bounds();
 
-        // W1b (default ON, `AY_STR_WITNESS=0` kill switch): CONTENT-POSITIVE construction
+        // W1b (default ON, `--dpll-no-str-witness` kill switch): CONTENT-POSITIVE construction
         // for the variables the finite enumeration above had to skip.
         //
         // The enumeration is content-BLIND: it needs a derivable length window

@@ -5,6 +5,8 @@
 
 use crate::error::ParseError;
 
+mod number;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Literals
@@ -109,134 +111,6 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             break;
-        }
-    }
-
-    fn read_number(&mut self) -> Result<Token, ParseError> {
-        let start = self.pos;
-        let line = self.line;
-        let negative = self.peek() == Some(b'-');
-        if negative {
-            self.advance();
-        }
-
-        // FlatZinc integer literals include lower-case hexadecimal and octal
-        // prefixes. Parse through i128 so -0x8000000000000000 can represent
-        // i64::MIN before the final checked conversion.
-        if self.peek() == Some(b'0') {
-            let prefix = self.input.get(self.pos + 1).copied();
-            let radix = match prefix {
-                Some(b'x') => Some(16),
-                Some(b'o') => Some(8),
-                _ => None,
-            };
-            if let Some(radix) = radix {
-                self.advance();
-                self.advance();
-                let digits_start = self.pos;
-                while self.peek().is_some_and(|ch| match radix {
-                    16 => ch.is_ascii_hexdigit(),
-                    8 => matches!(ch, b'0'..=b'7'),
-                    _ => false,
-                }) {
-                    self.advance();
-                }
-                let literal = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
-                    ParseError::InvalidInt {
-                        line,
-                        value: "invalid UTF-8 integer literal".to_string(),
-                    }
-                })?;
-                if self.pos == digits_start {
-                    return Err(ParseError::InvalidInt {
-                        line,
-                        value: literal.to_string(),
-                    });
-                }
-                let digits =
-                    std::str::from_utf8(&self.input[digits_start..self.pos]).map_err(|_| {
-                        ParseError::InvalidInt {
-                            line,
-                            value: literal.to_string(),
-                        }
-                    })?;
-                let magnitude =
-                    i128::from_str_radix(digits, radix).map_err(|_| ParseError::InvalidInt {
-                        line,
-                        value: literal.to_string(),
-                    })?;
-                let signed = if negative { -magnitude } else { magnitude };
-                let value = i64::try_from(signed).map_err(|_| ParseError::InvalidInt {
-                    line,
-                    value: literal.to_string(),
-                })?;
-                return Ok(Token::IntLit(value));
-            }
-        }
-
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        // Check for float: digits followed by '.' and more digits
-        let has_fraction = self.peek() == Some(b'.')
-            && self.input.get(self.pos + 1).is_some_and(u8::is_ascii_digit);
-        if has_fraction {
-            self.advance(); // consume '.'
-            while let Some(ch) = self.peek() {
-                if ch.is_ascii_digit() {
-                    self.advance();
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // The exponent-only form (for example `3e8`) is a float too.
-        let has_exponent = self.peek() == Some(b'e') || self.peek() == Some(b'E');
-        if has_exponent {
-            self.advance();
-            if self.peek() == Some(b'+') || self.peek() == Some(b'-') {
-                self.advance();
-            }
-            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                self.advance();
-            }
-        }
-
-        if has_fraction || has_exponent {
-            let s = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
-                ParseError::InvalidFloat {
-                    line,
-                    value: "invalid UTF-8 float literal".to_string(),
-                }
-            })?;
-            let val: f64 = s.parse().map_err(|_| ParseError::InvalidFloat {
-                line,
-                value: s.to_string(),
-            })?;
-            if !val.is_finite() {
-                return Err(ParseError::InvalidFloat {
-                    line,
-                    value: s.to_string(),
-                });
-            }
-            Ok(Token::FloatLit(val))
-        } else {
-            let s = std::str::from_utf8(&self.input[start..self.pos]).map_err(|_| {
-                ParseError::InvalidInt {
-                    line,
-                    value: "invalid UTF-8 integer literal".to_string(),
-                }
-            })?;
-            let val: i64 = s.parse().map_err(|_| ParseError::InvalidInt {
-                line,
-                value: s.to_string(),
-            })?;
-            Ok(Token::IntLit(val))
         }
     }
 

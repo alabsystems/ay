@@ -565,8 +565,7 @@ fn parse_shard_size(value: &str) -> Result<usize, String> {
         Ok(parsed)
     } else {
         Err(format!(
-            "shard size must be in 1..={}, got {parsed}",
-            MAX_NATIVE_SHARD_SIZE
+            "shard size must be in 1..={MAX_NATIVE_SHARD_SIZE}, got {parsed}"
         ))
     }
 }

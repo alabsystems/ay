@@ -349,10 +349,12 @@ fn windows_submission_toolchain_available() -> bool {
 
 #[cfg(windows)]
 fn ay_submission_command(ay_bin: &str) -> Command {
+    // B41: --gzip is a CLI arg on the submission surface; callers append it
+    // after the subcommand (global = true).
     let mut command = Command::new(ay_bin);
     command
         .env("PATH", windows_submission_tool_path())
-        .env("AY_GZIP", r"C:\msys64\usr\bin\gzip.exe");
+        .args(["--gzip", r"C:\msys64\usr\bin\gzip.exe"]);
     command
 }
 

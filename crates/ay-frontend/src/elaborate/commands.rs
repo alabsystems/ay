@@ -546,9 +546,9 @@ impl Context {
     ///
     /// * outermost scope only (a `pop` could otherwise drop the justifying
     ///   assertion while the macro persisted);
-    /// * plain un-annotated `forall` whose body is `(= (f x1 … xk) rhs)`
-    ///   with the binder list applied exactly, in order, binder names
-    ///   distinct, and exactly ONE side an `f`-application;
+    /// * plain un-annotated, single-binder `forall` whose body is
+    ///   `(= (f x) rhs)`, with the binder applied exactly and exactly ONE side
+    ///   an `f`-application (wider definitions remain quantified, fail closed);
     /// * `f` user-declared, arity and binder sorts matching the declaration,
     ///   not already defined/recursive/datatype-internal, and NOT referenced
     ///   by any existing assertion/soft-assertion/objective (a raw pre-macro
@@ -568,7 +568,7 @@ impl Context {
         let PT::Forall(pvars, pbody) = term else {
             return None;
         };
-        if pvars.is_empty() {
+        if pvars.len() != 1 {
             return None;
         }
         // Distinct binder names (duplicate binders make the "applied exactly

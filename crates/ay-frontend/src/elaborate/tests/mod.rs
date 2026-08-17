@@ -40,6 +40,7 @@ mod core;
 mod datatypes;
 mod finite_sets_z3_500;
 mod floating_point;
+mod macro_adoption;
 mod numerics;
 mod provenance;
 mod pseudo_boolean;

@@ -32,7 +32,7 @@ impl Solver {
             );
         }
 
-        // Post-collapse BVE eligibility re-derivation (AY_AB_BVE_POST_COLLAPSE,
+        // Post-collapse BVE eligibility re-derivation (--sat-no-bve-post-collapse,
         // default ON since 2026-07-10 wf_55735963; =0 kill-switch): on the
         // huge substitution-heavy instances the
         // congruence/decompose collapse frequently completes during
@@ -50,7 +50,7 @@ impl Solver {
         if !self.inproc_ctrl.bve.enabled && self.bve_post_collapse_unlock_active() {
             self.inproc_ctrl.bve.enabled = true;
             self.enforce_inprocessing_proof_overrides();
-            if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+            if ay_core::misc_cli_flags().ab_subst_stats {
                 eprintln!(
                     "AB_BVE_POST_COLLAPSE: armed bve={} in inprocessing (num_vars={} active={} removed={})",
                     self.inproc_ctrl.bve.enabled,
@@ -562,7 +562,7 @@ impl Solver {
         // not by clause count or density. CaDiCaL runs sweep unconditionally
         // with tick-based effort limits.
         //
-        // Post-collapse re-derivation (AY_AB_BVE_POST_COLLAPSE=1, default
+        // Post-collapse re-derivation (--sat-no-bve-post-collapse=1, default
         // OFF): this gate keys on the ORIGINAL num_vars, which is never
         // re-derived after congruence+decompose substitute away a large
         // fraction of the variables. When the post-collapse unlock holds

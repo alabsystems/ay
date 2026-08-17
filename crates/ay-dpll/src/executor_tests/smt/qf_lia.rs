@@ -269,6 +269,8 @@ fn arithmetic_ite_successor_failure_or_has_strict_proof() {
     );
 }
 
+mod wrapping_refutations;
+
 // ---------------------------------------------------------------------------
 // Integer div/mod-by-zero soundness (#div0).
 //

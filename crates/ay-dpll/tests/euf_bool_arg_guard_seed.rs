@@ -48,16 +48,18 @@ mod common;
 /// answers at all — without it both the fixed and the broken build report
 /// `sat unknown unknown`, so the flag is what makes the test discriminating.
 ///
-/// Set here rather than by the caller because each `tests/*.rs` file is its own
-/// test binary: this is the only test in this file, so the variable is set
-/// before anything can read it into a `OnceLock`.
-const REPAIR_ENV: &str = "AY_EUF_BOOL_ARG_REPAIR";
+// B69: the repair arm rides the set-once typed carrier — installed below
+// before anything can read it into a `OnceLock` (single-test binary).
 
 const BENCH: &str = "benchmarks/smt/regression/euf_bool_arg_guard_seed/clearsy_00302_prefix3.smt2";
 
 #[test]
 fn bool_arg_guard_scratch_union_find_is_seeded_with_euf_classes() {
-    std::env::set_var(REPAIR_ENV, "1");
+    ay_core::set_global_misc_cli_flags(ay_core::MiscCliFlags {
+        euf_bool_arg_repair: true,
+        ..Default::default()
+    })
+    .expect("first install in this single-test binary");
 
     let path = common::workspace_path(BENCH);
     assert!(

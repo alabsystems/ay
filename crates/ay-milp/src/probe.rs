@@ -176,7 +176,7 @@ pub(crate) fn root_probe(model: &Model, deadline: Option<Instant>, cfg: ProbeCfg
             probes: 0,
         };
     }
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+    let trace = crate::debug_flags::milp_debug_flags().trace;
     let expired = || deadline.is_some_and(|d| Instant::now() >= d);
     let cands = candidates(model, cfg);
     let n = model.num_cols();
@@ -322,7 +322,7 @@ pub(crate) fn root_probe(model: &Model, deadline: Option<Instant>, cfg: ProbeCfg
 
     if trace {
         eprintln!(
-            "AY_MILP_TRACE root-probe: {probes} binaries probed, FORCED={} \
+            "--trace root-probe: {probes} binaries probed, FORCED={} \
              (cascaded box), {implied_total} implied fixings, {cliques} clique rows",
             forced.len()
         );

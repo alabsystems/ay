@@ -15,15 +15,15 @@ use crate::executor::dl_theory::{atom_is_routable, DiffLogicTheory};
 use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult};
 
-/// Kill switch for the QF_RDL difference-logic lane (`AY_RDL_ENGINE=0`).
+/// Kill switch for the QF_RDL difference-logic lane (`--dpll-no-rdl-engine`).
 ///
 /// Default ON. Follows the repo convention for solver-lane switches
-/// (`AY_LRA_INC_ENGINE`, `AY_LRA_INC_WARM`, ...): cached in a `OnceLock`, and
+/// (`--dpll-no-lra-inc-engine`, `--dpll-no-lra-inc-warm`, ...): cached in a `OnceLock`, and
 /// only the literal `0` disables, so the whole route can be turned off without
 /// a rebuild.
 fn rdl_engine_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("AY_RDL_ENGINE").is_ok_and(|v| v == "0"))
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_rdl_engine)
 }
 
 /// Opt-in escape hatch to take the lane in a PROOF-PRODUCING session
@@ -38,34 +38,21 @@ fn rdl_engine_enabled() -> bool {
 /// posture as `solve_lra_inc_engine`, which also excludes proof sessions from
 /// its new lane.
 fn rdl_engine_proofs_allowed() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_RDL_ENGINE_PROOFS").is_ok_and(|v| v != "0" && !v.is_empty())
-    })
+    // B23: DL conflicts carry no Farkas annotations; the proofs hatch is
+    // retired and proof sessions stay excluded from the lane.
+    false
 }
 
 /// Restart schedule for the QF_RDL lane: `AY_RDL_RESTART=initial,factor,randfreq`.
 fn restart_tuning() -> (f64, f64, f64) {
-    static V: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let Ok(raw) = std::env::var("AY_RDL_RESTART") else {
-            return (100.0, 1.5, 0.01);
-        };
-        let p: Vec<f64> = raw
-            .split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .collect();
-        match p.as_slice() {
-            [i, f, v] => (*i, *f, *v),
-            _ => (100.0, 1.5, 0.01),
-        }
-    })
+    // B25: the tuning env is retired; the shipped schedule is the constant.
+    (100.0, 1.5, 0.01)
 }
 
 /// Optional one-line routing trace (`AY_RDL_ENGINE_DEBUG=1`).
 fn rdl_engine_debug() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AY_RDL_ENGINE_DEBUG").is_ok_and(|v| v != "0" && !v.is_empty()))
+    // B23: the debug trace env spelling is retired; flip for a diagnosis.
+    false
 }
 
 /// Rewrite every ARITHMETIC equality into a conjunction of two inequalities.
@@ -157,7 +144,7 @@ impl Executor {
     ///
     /// # Fall-through conditions (each hands the problem to `solve_lra`)
     ///
-    /// * `AY_RDL_ENGINE=0`;
+    /// * `--dpll-no-rdl-engine`;
     /// * push/pop incremental mode, or a proof-producing session (the DL engine
     ///   emits no Farkas/proof artifacts);
     /// * ANY reachable theory atom that is not a pure Real difference-logic
@@ -330,7 +317,7 @@ impl Executor {
 // QF_IDL: the same engine over integer-tightened bounds
 // ---------------------------------------------------------------------------
 
-/// DEFAULT ON, disable with `AY_IDL_ENGINE=0` — same polarity as
+/// DEFAULT ON, disable with `--dpll-no-idl-engine` — same polarity as
 /// [`rdl_engine_enabled`], and for the same reason: it earned it.
 ///
 /// Full-division differential, 138 files even-strided over all 2,528, T:20,
@@ -348,7 +335,7 @@ impl Executor {
 /// budget.
 fn idl_engine_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("AY_IDL_ENGINE").is_ok_and(|v| v == "0"))
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_idl_engine)
 }
 
 /// Exact `LraModel` → `LiaModel`, FAIL-CLOSED on any non-integral value.

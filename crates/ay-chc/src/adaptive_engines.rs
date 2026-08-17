@@ -42,12 +42,8 @@ const FRONT_PROBE_CLAMP_AFTER: Duration = Duration::from_secs(9);
 /// Kill switch for the inc-16 S1b front-probe clamp: `AY_FRONT_PROBE_CLAMP=0`
 /// restores the unclamped probe (full ~25%-of-remaining budget).
 fn front_probe_clamp_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_FRONT_PROBE_CLAMP")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true)
-    })
+    // B27: CLI-owned; env retired.
+    crate::ab_switches::get().front_probe_clamp
 }
 
 impl AdaptivePortfolio {
@@ -240,13 +236,13 @@ impl AdaptivePortfolio {
     /// non-Unsafe result falls through to the normal safety pipeline). It can
     /// never emit a wrong answer — soundness rests entirely on the witness
     /// replay gate, not on the datatype model's fidelity. Kill switch
-    /// `AY_CHC_DISABLE_DT_BMC`.
+    /// `--chc-no-dt-bmc`.
     pub(crate) fn try_datatype_bounded_bmc_refutation(
         &self,
         features: &ProblemFeatures,
         deadline: Option<Instant>,
     ) -> Option<(PortfolioResult, ValidationEvidence)> {
-        if std::env::var_os("AY_CHC_DISABLE_DT_BMC").is_some() {
+        if !crate::ab_switches::get().dt_bmc {
             return None;
         }
         if !self.problem.has_datatype_sorts()

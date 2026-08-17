@@ -18,6 +18,9 @@ use num_traits::{One, Zero};
 use super::NraSolver;
 use crate::sign;
 
+mod factor_definition;
+mod global_recheck;
+
 impl NraSolver<'_> {
     /// Undo all tentative scopes (sign-cut + patch) if any are active.
     /// Both the sign-cut scope (pushed at lib.rs:322) and the patch scope
@@ -28,6 +31,7 @@ impl NraSolver<'_> {
             self.lra.pop();
             self.tentative_depth -= 1;
         }
+        self.compound_defs_emitted.clear();
     }
 
     /// Inject model-derived sign bounds for original variables into a tentative
@@ -242,42 +246,27 @@ impl NraSolver<'_> {
         added
     }
 
-    /// Check if a monomial's value is consistent with its factors
-    fn check_monomial_consistency(&self, mon: &crate::monomial::Monomial) -> bool {
-        let mut product = BigRational::one();
-        for &var in &mon.vars {
-            if let Some(val) = self.var_value(var) {
-                product *= val;
-            } else {
-                return true;
-            }
-        }
-
-        if let Some(aux_val) = self.var_value(mon.aux_var) {
-            aux_val == product
-        } else {
-            true
-        }
-    }
-
     /// Generate refinement lemmas for inconsistent monomials.
     ///
     /// Uses McCormick envelopes (sound, globally valid for bounded variables)
     /// and tangent hyperplanes (model-point approximations) as Gomory cuts.
     ///
-    /// Returns `(total_added, used_approximation)` where `used_approximation`
-    /// is true if tangent hyperplanes (model-point approximations) were added.
-    fn generate_refinement_lemmas(&mut self) -> (usize, bool) {
+    /// Returns the number of constraints added.
+    fn generate_refinement_lemmas(&mut self) -> usize {
+        let definitions = self.emit_factor_definitions();
         // McCormick envelopes + tangent hyperplanes
-        let (tangent_added, used_tangent) = self.add_tangent_constraints_for_incorrect_monomials();
+        let (tangent_added, _) = self.add_tangent_constraints_for_incorrect_monomials();
         self.tangent_lemma_count += tangent_added as u64;
 
-        (tangent_added, used_tangent)
+        definitions + tangent_added
     }
 
     /// Check sign consistency: propagate factor signs, then detect conflicts.
     fn check_signs(&mut self) -> Option<TheoryResult> {
-        sign::propagate_monomial_signs(&self.monomials, &mut self.var_sign_constraints);
+        sign::propagate_product_signs(
+            self.monomials.values().chain(self.scaled_aliases.iter()),
+            &mut self.var_sign_constraints,
+        );
         if let Some(conflict) = sign::check_sign_consistency(
             &self.monomials,
             &self.sign_constraints,
@@ -305,7 +294,7 @@ impl NraSolver<'_> {
     /// because LRA re-discovers the same model-value equalities on every
     /// re-entry. The linear constraints are satisfied (LRA found Sat before
     /// discovering the equalities), so treating these as Sat is sound.
-    fn normalize_lra_result(&self, result: TheoryResult) -> TheoryResult {
+    pub(crate) fn normalize_lra_result(&self, result: TheoryResult) -> TheoryResult {
         match &result {
             TheoryResult::NeedModelEquality(_) | TheoryResult::NeedModelEqualities(_) => {
                 // LRA found Sat but also wants model equalities. Inside NRA,
@@ -395,16 +384,20 @@ impl NraSolver<'_> {
     /// Following Z3's NLA check sequence (nla_core.cpp):
     /// sign consistency, model patching, then tangent plane refinement.
     fn nra_check_loop_impl(&mut self) -> TheoryResult {
+        // Capture asserted-pin authority at iteration 0 in the clean base state.
+        // The snapshot trusts asserted atoms, never LRA bounds or tentative scope.
+        self.fixed_factor_values.clear();
+        self.fixed_lin_emitted.clear();
+        self.compound_defs_emitted.clear();
+
         // Exact INTERVAL-PROPAGATION UNSAT pre-phase (sound, BigRational-only).
-        // Decides bounded MULTIVARIATE infeasibilities by a single forward pass
-        // of exact interval arithmetic — e.g. `x>2 ∧ x^2+y^2<1` (UNSAT) — that
-        // the tangent/McCormick linearization leaves as `unknown` and that the
+        // A forward exact-interval pass decides bounded multivariate infeasibilities such as
+        // `x>2 ∧ x^2+y^2<1`, left `unknown` by tangent/McCormick and
         // univariate / linear-substitution paths cannot reach (the constraint
         // genuinely couples two variables). It computes a SOUND interval
         // over-approximation of each constraint polynomial over the per-variable
-        // bound box and reports UNSAT only when a single constraint's interval
-        // lies entirely on the wrong side of its relation. It NEVER emits SAT
-        // (interval feasibility gives no witness) — SAT falls through unchanged.
+        // bound box and reports UNSAT only when one constraint lies wholly outside its relation.
+        // It NEVER emits SAT (interval feasibility gives no witness).
         // See univariate.rs (`try_interval_unsat`).
         match self.try_interval_unsat() {
             crate::univariate::UniResult::Unsat => {
@@ -422,15 +415,14 @@ impl NraSolver<'_> {
             | crate::univariate::UniResult::Unknown => {}
         }
 
-        // Exact SUM-OF-SQUARES / quadratic-form positivity UNSAT pre-phase
-        // (sound, BigRational-only). Decides MULTIVARIATE infeasibilities that
+        // Exact BigRational sum-of-squares/quadratic positivity UNSAT pre-phase.
+        // Decides multivariate infeasibilities that
         // couple variables through a cross term and so escape the interval phase
         // — e.g. `(x+y)^2 < 0`, `x^2+y^2 < 0`, `x^2+y^2+1 = 0`. For a single
         // constraint whose polynomial is a homogeneous quadratic form plus a
         // constant, it computes a SOUND global range via an exact LDL^T
-        // PSD/NSD test and reports UNSAT only when that range lies entirely on
-        // the wrong side of the relation. It NEVER emits SAT; Unknown falls
-        // through unchanged. See univariate.rs (`try_sos_unsat`).
+        // PSD/NSD test and reports UNSAT only when the range misses the relation.
+        // It NEVER emits SAT; Unknown falls through. See `try_sos_unsat`.
         match self.try_sos_unsat() {
             crate::univariate::UniResult::Unsat => {
                 let conflict: Vec<TheoryLit> = self
@@ -447,15 +439,12 @@ impl NraSolver<'_> {
         }
 
         // Exact `is_int` decision pre-phase (sound, BigRational-only, #9139).
-        // Decides the affine/univariate `is_int` fragment — `is_int(a*x+c)`
-        // together with linear comparisons and provably-nonzero self-divisions
+        // Decides affine/univariate `is_int(a*x+c)`, linear comparisons, and nonzero self-division
         // `(/ e e) -> 1` — that pure LRA cannot settle (it ignores integrality).
         // Like the other exact pre-phases it can ONLY turn unknown into a
         // correct sat/unsat: SAT is gated by re-verifying a concrete rational
-        // witness against EVERY asserted atom (integrality + division guards);
-        // UNSAT only fires for an unambiguously empty integrality region. Any
-        // uncertainty returns Unknown and falls through unchanged. See
-        // univariate.rs (`try_is_int_decide`).
+        // witness against every atom; UNSAT requires an empty integrality region.
+        // Uncertainty falls through unchanged. See `try_is_int_decide`.
         match self.try_is_int_decide() {
             crate::univariate::UniResult::Sat(model) => {
                 self.inject_univariate_model(&model);
@@ -479,8 +468,7 @@ impl NraSolver<'_> {
         }
 
         // Exact LINEAR-EQUALITY SUBSTITUTION pre-phase (sound, BigRational-only).
-        // Eliminates variables fixed by a linear equality `xi = (linear expr)`,
-        // reducing a multivariate problem to a univariate one the exact decider
+        // Eliminates variables fixed by `xi = (linear expr)`, reducing to the univariate decider
         // below can settle (e.g. `y=2 ; x^2+y^2=5`). Like the univariate path it
         // can ONLY convert unknown -> correct sat/unsat: SAT is gated by
         // re-verifying the full back-substituted model against every original
@@ -637,17 +625,15 @@ impl NraSolver<'_> {
         // fires on genuinely pathological cases.
         #[cfg(not(debug_assertions))]
         const MAX_ITERATIONS: usize = 500;
-        // Track whether tangent hyperplane approximations were used (#5959).
-        // Tangent planes are model-point linearizations that may exclude valid
-        // NRA solutions (e.g., near irrational points like sqrt(2)). When tangent
-        // planes were used and LRA becomes UNSAT, the UNSAT is unreliable.
-        // McCormick envelopes, even-power non-negativity, and sign cuts do NOT
-        // set this flag — they provide sound bounds for bounded variables.
-        let mut used_tangent_approximation = false;
 
+        // SAT-only bilinear-template fallback: private exact residuals, gated
+        // by original-atom verification; see `grounding` for its full contract.
+        let mut grounding = self.build_grounding_plan();
         for iteration in 0..=MAX_ITERATIONS {
             let lra_result = self.lra.check();
             let lra_result = self.normalize_lra_result(lra_result);
+
+            self.snapshot_fixed_factors_on_first_iteration(iteration);
 
             match &lra_result {
                 TheoryResult::Sat | TheoryResult::Unknown => {
@@ -677,6 +663,15 @@ impl NraSolver<'_> {
                             return TheoryResult::Unknown;
                         }
                         return TheoryResult::Sat;
+                    }
+
+                    // Try early points densely, then sparse fresh points.
+                    if crate::grounding::scheduled(iteration) {
+                        if let Some(plan) = grounding.as_mut() {
+                            if self.try_model_guided_grounding(plan) {
+                                return TheoryResult::Sat;
+                            }
+                        }
                     }
 
                     // clauseSMT Technique 1 (#8445): feasible-set look-ahead.
@@ -765,18 +760,43 @@ impl NraSolver<'_> {
                         }
                     }
 
-                    let (mut added, used_tangent) = self.generate_refinement_lemmas();
-                    if used_tangent {
-                        used_tangent_approximation = true;
-                    }
+                    let mut added = self.generate_refinement_lemmas();
                     // Division refinement: tangent planes for denom * div = num (#6811).
                     // These are model-point approximations (same class as tangent planes).
                     let div_added = self.generate_division_refinement();
                     if div_added > 0 {
                         added += div_added;
-                        used_tangent_approximation = true;
+                    }
+                    if added == 0 && iteration < MAX_ITERATIONS {
+                        // A bound or tentative patch may make the current model
+                        // consistent while adding no refinement. Re-enter so a
+                        // fresh LRA check plus the ordinary consistency gates
+                        // decides it; otherwise decline below.
+                        if !self.has_inconsistent_monomials() && !self.has_inconsistent_divisions()
+                        {
+                            continue;
+                        }
                     }
                     if added == 0 || iteration == MAX_ITERATIONS {
+                        // Distinct SAT-only last chance after the exact
+                        // fixed-factor retry; duplicate points are free.
+                        if let Some(plan) = grounding.as_mut() {
+                            if self.try_model_guided_grounding(plan) {
+                                return TheoryResult::Sat;
+                            }
+                        }
+                        if self.debug {
+                            let bad = self
+                                .products()
+                                .filter(|m| !self.check_monomial_consistency(m))
+                                .count();
+                            tracing::debug!(
+                                "[NRA] give up at iter={} (added={}, {} monomials still inconsistent)",
+                                iteration,
+                                added,
+                                bad
+                            );
+                        }
                         return TheoryResult::Unknown;
                     }
                     continue;
@@ -787,88 +807,17 @@ impl NraSolver<'_> {
                         // Pre-refinement: pure linear UNSAT is a genuine UNSAT.
                         return lra_result.clone();
                     }
-                    if used_tangent_approximation {
-                        // Tangent hyperplanes were used — UNSAT may be spurious
-                        // (#5959). Recheck: pop refinements, re-add only exact
-                        // lemmas (even-power nonneg, McCormick, sign cuts, and
-                        // division refinement at fresh model point), then iterate
-                        // to propagate bounds.
-                        self.undo_tentative_patch();
-                        self.lra.push();
-                        self.tentative_depth += 1;
-                        self.inject_tentative_sign_cuts();
-                        // Use mem::take to avoid cloning all Monomial values (#8599).
-                        // Temporarily steal the map; restored after the recheck loop.
-                        let mons = std::mem::take(&mut self.monomials);
-                        for mon in mons.values() {
-                            self.add_even_power_nonneg(mon);
-                            self.add_mccormick_constraints(mon);
-                        }
-                        // Re-add division refinement at fresh model point (#6811)
-                        self.generate_division_refinement();
-                        let mut recheck_proved = false;
-                        // Multi-pass: McCormick on nested monomials may need
-                        // LRA to propagate inner bounds before outer McCormick
-                        // becomes effective (e.g., a*(b*c) needs bounds on b*c).
-                        for _ in 0..3 {
-                            let recheck = self.lra.check();
-                            let recheck = self.normalize_lra_result(recheck);
-                            match &recheck {
-                                TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => {
-                                    recheck_proved = true;
-                                    break;
-                                }
-                                _ => {
-                                    // Re-add McCormick and division refinement
-                                    // with potentially updated bounds/model
-                                    let mut added_any = false;
-                                    for mon in mons.values() {
-                                        if self.add_mccormick_constraints(mon) > 0 {
-                                            added_any = true;
-                                        }
-                                    }
-                                    if self.generate_division_refinement() > 0 {
-                                        added_any = true;
-                                    }
-                                    if !added_any {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        self.monomials = mons;
-                        self.undo_tentative_patch();
-                        if recheck_proved {
-                            let conflict: Vec<TheoryLit> = self
-                                .asserted
-                                .iter()
-                                .map(|&(t, v)| TheoryLit { term: t, value: v })
-                                .collect();
-                            return TheoryResult::Unsat(conflict);
-                        }
-                        return TheoryResult::Unknown;
-                    }
-                    // Only exact lemmas (McCormick envelopes, even-power
-                    // non-negativity, sign cuts) were used. UNSAT is genuine.
-                    let conflict: Vec<TheoryLit> = self
-                        .asserted
-                        .iter()
-                        .map(|&(t, v)| TheoryLit { term: t, value: v })
-                        .collect();
-                    return TheoryResult::Unsat(conflict);
+                    // Any post-refinement UNSAT may depend on a model-sign
+                    // branch, model-derived bound, or division tangent plane.
+                    // Re-establish it from the base state with authenticated
+                    // global lemmas only.
+                    return self.recheck_with_global_lemmas();
                 }
                 _ => return lra_result.clone(),
             }
         }
 
         TheoryResult::Unknown
-    }
-
-    /// Check if any tracked monomial has an inconsistent value
-    pub(crate) fn has_inconsistent_monomials(&self) -> bool {
-        self.monomials
-            .values()
-            .any(|m| !self.check_monomial_consistency(m))
     }
 
     /// Inject the exact rational witnesses found by the univariate decision
@@ -881,7 +830,7 @@ impl NraSolver<'_> {
     /// the witness values rather than stale defaults. This is purely a
     /// model-reporting convenience: satisfiability was already proven exactly by
     /// substitution in `try_univariate_decide`.
-    fn inject_univariate_model(&mut self, model: &[(TermId, BigRational)]) {
+    pub(crate) fn inject_univariate_model(&mut self, model: &[(TermId, BigRational)]) {
         use ay_lra::GomoryCut;
         if model.is_empty() {
             return;

@@ -17,7 +17,8 @@
 //! - `eval_bv`: Bitvector expression evaluation under partial models
 //! - `implicant`: Implicant extraction from formulas under partial models
 //! - `project`: Core projection orchestration (project, project_with_residuals)
-//! - `theory`: Theory-specific variable elimination (LIA, LRA) and bound extraction
+//! - `theory`: Theory-specific variable elimination (LIA and LRA)
+//! - `theory_bounds`: Arithmetic bound extraction and linear coefficient normalization
 //! - `theory_bv`: BV-specific variable projection (Fourier-Motzkin analogue for bitvectors)
 //! - `mbqi`: MBQI-style term substitution for unprojectable variables
 
@@ -33,6 +34,7 @@ mod mbqi;
 mod project;
 mod project_residuals;
 mod theory;
+mod theory_bounds;
 mod theory_bv;
 
 #[cfg(test)]

@@ -81,6 +81,10 @@ fn authenticates_derived_equal_index_same_array_read_conflict() {
     let evidence = authenticate_bool_bv_unsat_query(&fixture.terms, &roots, None)
         .expect("array congruence plus checked BV cancellation must authenticate UNSAT");
     assert!(evidence.is_current_for(&fixture.terms, &roots));
+    assert!(
+        !evidence.used_exact_finite_arrays(),
+        "the separate U-element congruence weakening is not exact finite-array scalarization"
+    );
 }
 
 #[test]

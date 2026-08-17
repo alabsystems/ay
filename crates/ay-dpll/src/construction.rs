@@ -16,7 +16,7 @@ use crate::{DpllConstructionTimings, DpllSatState, DpllT, PhaseTimer};
 impl<'a, T: TheorySolver> DpllT<'a, T> {
     /// Create a DPLL(T) solver from a Tseitin transformation result.
     ///
-    /// Automatically enables TLA2 JSONL trace emission when `AY_TRACE_FILE` is set.
+    /// Automatically enables TLA2 JSONL trace emission when `--trace-file` is set.
     pub fn from_tseitin(
         terms: &'a TermStore,
         tseitin_result: &ay_core::TseitinResult,

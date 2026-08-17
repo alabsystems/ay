@@ -4,7 +4,7 @@
 
 #![allow(clippy::panic)]
 
-//! INTERFACE-DIET (`AY_INTERFACE_DIET`) M1 blocking pins.
+//! INTERFACE-DIET (`--interface-diet`) M1 blocking pins.
 //!
 //! The diet withholds POSITIVE pure-UF=UF Int equalities from the LIA
 //! Nelson-Oppen interface and value-certifies the arrangement against RAW LIA
@@ -25,14 +25,15 @@ use std::time::Duration;
 use ay_dpll::Executor;
 use ay_frontend::parse;
 
-/// Solve `smt` under `AY_INTERFACE_DIET=on` in a worker thread with a hard cap,
-/// returning the final verdict line. The env var is set before every solve so
-/// the diet is armed regardless of test execution order.
+/// Solve `smt` with the interface diet armed, in a worker thread with a hard
+/// cap, returning the final verdict line. Every test in this binary wants the
+/// diet ON, so the set-once typed install is consistent regardless of order.
 fn solve_diet(smt: &str, timeout: Duration) -> String {
-    // Serialized + restore-on-exit via the workspace env choke point; the diet
-    // is armed for the whole solve (read once per process at combiner
-    // construction, which happens inside the worker spawned below).
-    ay_test_support::env::with_serialized_env_vars(&[("AY_INTERFACE_DIET", "on")], || {
+    let _ = ay_core::set_global_misc_cli_flags(ay_core::MiscCliFlags {
+        interface_diet: Some("on".to_string()),
+        ..Default::default()
+    });
+    {
         let src = smt.to_string();
         let interrupt = Arc::new(AtomicBool::new(false));
         let interrupt_worker = Arc::clone(&interrupt);
@@ -55,7 +56,7 @@ fn solve_diet(smt: &str, timeout: Duration) -> String {
                 "unknown".to_string()
             }
         }
-    })
+    }
 }
 
 /// Pin (i): `f(x) <= 4 /\ g(x) = 5 /\ f(x) = g(x)` — the pure-UF=UF link

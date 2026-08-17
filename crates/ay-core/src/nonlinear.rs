@@ -14,6 +14,10 @@ use num_rational::BigRational;
 use num_traits::{One, Zero};
 
 /// A tracked monomial representing a nonlinear product.
+///
+/// The exact invariant is `value(aux_var) == coeff * product(value(vars))`.
+/// Constant factors must remain explicit because the term store flattens
+/// products such as `(* x (* y (- 2)))` into one scaled product node.
 #[derive(Debug, Clone)]
 pub struct Monomial {
     /// Variables in the product (sorted for canonical form).
@@ -22,17 +26,53 @@ pub struct Monomial {
     pub aux_var: TermId,
     /// Degree of the monomial (number of factors).
     pub degree: usize,
+    /// Non-zero constant factor relating the auxiliary term to the bare product.
+    pub coeff: BigRational,
 }
 
 impl Monomial {
-    /// Create a new monomial from variables and auxiliary variable.
+    /// Create an unscaled monomial from variables and auxiliary variable.
     pub fn new(vars: Vec<TermId>, aux_var: TermId) -> Self {
+        Self::new_scaled(vars, aux_var, BigRational::one())
+    }
+
+    /// Create a monomial satisfying `aux_var == coeff * product(vars)`.
+    pub fn new_scaled(vars: Vec<TermId>, aux_var: TermId, coeff: BigRational) -> Self {
+        debug_assert!(
+            !coeff.is_zero(),
+            "a zero-scaled product does not constrain its variable product"
+        );
         let degree = vars.len();
         Self {
             vars,
             aux_var,
             degree,
+            coeff,
         }
+    }
+
+    /// Whether the auxiliary term carries a non-unit constant factor.
+    pub fn is_scaled(&self) -> bool {
+        !self.coeff.is_one()
+    }
+
+    /// Sign of the non-zero coefficient.
+    pub fn coeff_sign(&self) -> i32 {
+        if self.coeff < BigRational::zero() {
+            -1
+        } else {
+            1
+        }
+    }
+
+    /// Recover the bare product value from an auxiliary-term value.
+    pub fn product_from_aux(&self, aux_value: &BigRational) -> BigRational {
+        aux_value / &self.coeff
+    }
+
+    /// Compute the auxiliary-term value from a bare product value.
+    pub fn aux_from_product(&self, product: &BigRational) -> BigRational {
+        &self.coeff * product
     }
 
     /// Check if this is a binary product (x*y).
@@ -184,45 +224,37 @@ pub fn extract_sign_constraint(
 ///
 /// Handles `Int` and `Rational` literals and unary negation of either — SMT-LIB
 /// writes a negative literal as `(- 2)`, which is an `App`, not a `Const`.
-fn constant_value(terms: &TermStore, term: TermId) -> Option<BigRational> {
+pub fn constant_value_of(terms: &TermStore, term: TermId) -> Option<BigRational> {
     match terms.get(term) {
         TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
         TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
         TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
-            constant_value(terms, args[0]).map(|c| -c)
+            constant_value_of(terms, args[0]).map(|c| -c)
         }
         _ => None,
     }
 }
 
-/// True iff `term` is a `*` application carrying a constant factor other than 1.
-///
-/// `#nra-const-factor` / `#nia-const-factor` safety net. A monomial's `aux_var`
-/// must denote EXACTLY `product(vars)`; the theory collectors enforce that by
-/// refusing to register a scaled product. This predicate lets the consumer that
-/// would draw a FALSE conclusion from a scaled aux term fail closed even if that
-/// registration guard is ever broken again — `debug_assert!`s are compiled out
-/// of the release binary, so a release-only regression would otherwise be a
-/// silent wrong-`unsat`.
-fn has_non_unit_constant_factor(terms: &TermStore, term: TermId) -> bool {
-    let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
-        return false;
-    };
-    if name != "*" {
-        return false;
+/// Product of all literal factors of a multiplication term, or one otherwise.
+pub fn constant_factor_of(terms: &TermStore, term: TermId) -> BigRational {
+    match terms.get(term) {
+        TermData::App(Symbol::Named(name), args) if name == "*" => args
+            .iter()
+            .filter_map(|&arg| constant_value_of(terms, arg))
+            .fold(BigRational::one(), |product, factor| product * factor),
+        _ => BigRational::one(),
     }
-    let mut saw_constant = false;
-    let mut product_is_one = true;
-    for &arg in args {
-        let value = constant_value(terms, arg);
-        if let Some(c) = value {
-            saw_constant = true;
-            if !c.is_one() {
-                product_is_one = false;
-            }
-        }
+}
+
+/// Mirror a sign relation after multiplication by a negative coefficient.
+pub fn mirror_sign_constraint(constraint: SignConstraint) -> SignConstraint {
+    match constraint {
+        SignConstraint::Positive => SignConstraint::Negative,
+        SignConstraint::Negative => SignConstraint::Positive,
+        SignConstraint::Zero => SignConstraint::Zero,
+        SignConstraint::NonNegative => SignConstraint::NonPositive,
+        SignConstraint::NonPositive => SignConstraint::NonNegative,
     }
-    saw_constant && !product_is_one
 }
 
 /// Record a sign constraint for a subject term (variable or monomial).
@@ -234,25 +266,27 @@ pub fn record_sign_constraint(
     subject: TermId,
     constraint: SignConstraint,
     assertion: TermId,
-) {
-    // SOUNDNESS: the sign asserted about `subject` is transferred VERBATIM onto
-    // the monomial key. That step is valid only when `subject == product(vars)`.
-    // If `subject` is `c * product(vars)` the transfer is invalid — for `c < 0`
-    // it yields the exact NEGATION of the asserted fact (`-2*m <= 0` recorded as
-    // `m <= 0`), which excises genuine models and produces a wrong `unsat`.
-    // Fail closed rather than record a fact that does not follow.
+) -> Option<Vec<TermId>> {
+    // The keyed constraint is about the bare product, while `subject` denotes
+    // `coeff * product`. A negative coefficient mirrors every order relation.
+    let mut recorded_monomial = None;
     if let Some(vars) = aux_to_monomial.get(&subject).cloned() {
-        let scaled_subject = has_non_unit_constant_factor(terms, subject);
+        let coeff = constant_factor_of(terms, subject);
         debug_assert!(
-            !scaled_subject,
-            "#nra-const-factor: aux_to_monomial maps a SCALED term {subject:?} to \
-             {vars:?}; the registration guard has been broken"
+            !coeff.is_zero(),
+            "zero-scaled terms must never be registered as monomials"
         );
-        if !scaled_subject {
+        if !coeff.is_zero() {
+            let bare_constraint = if coeff < BigRational::zero() {
+                mirror_sign_constraint(constraint)
+            } else {
+                constraint
+            };
             sign_constraints
-                .entry(vars)
+                .entry(vars.clone())
                 .or_default()
-                .push((constraint, assertion));
+                .push((bare_constraint, assertion));
+            recorded_monomial = Some(vars);
         }
     }
     if matches!(terms.get(subject), TermData::Var(_, _)) {
@@ -261,6 +295,7 @@ pub fn record_sign_constraint(
             .or_default()
             .push((constraint, assertion));
     }
+    recorded_monomial
 }
 
 /// Check whether a monomial has all variables appearing an even number of times.
@@ -365,12 +400,12 @@ pub fn check_sign_consistency(
 }
 
 /// Propagate sign information from factors to monomial auxiliary variables.
-pub fn propagate_monomial_signs(
-    monomials: &HashMap<Vec<TermId>, Monomial>,
+pub fn propagate_product_signs<'a>(
+    products: impl IntoIterator<Item = &'a Monomial>,
     var_sign_constraints: &mut HashMap<TermId, Vec<(SignConstraint, TermId)>>,
 ) {
     let mut derived: Vec<(TermId, SignConstraint, TermId)> = Vec::new();
-    for mon in monomials.values() {
+    for mon in products {
         if !mon.is_binary() {
             continue;
         }
@@ -382,7 +417,7 @@ pub fn propagate_monomial_signs(
         let x_sign = sign_from_constraints_with_assertion(var_sign_constraints.get(&x));
         let y_sign = sign_from_constraints_with_assertion(var_sign_constraints.get(&y));
         if let (Some((xs, x_assertion)), Some((ys, _))) = (x_sign, y_sign) {
-            let prod = product_sign(&[xs, ys]);
+            let prod = product_sign(&[xs, ys]) * mon.coeff_sign();
             let constraint = match prod {
                 1 => SignConstraint::Positive,
                 -1 => SignConstraint::Negative,
@@ -398,6 +433,14 @@ pub fn propagate_monomial_signs(
             .or_default()
             .push((constraint, assertion));
     }
+}
+
+/// Propagate signs for the ordinary one-representative-per-key map.
+pub fn propagate_monomial_signs(
+    monomials: &HashMap<Vec<TermId>, Monomial>,
+    var_sign_constraints: &mut HashMap<TermId, Vec<(SignConstraint, TermId)>>,
+) {
+    propagate_product_signs(monomials.values(), var_sign_constraints);
 }
 
 /// Collect original factor variables from monomials that lack a definite sign.
@@ -432,45 +475,5 @@ pub fn vars_needing_model_sign(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_product_sign_basic() {
-        assert_eq!(product_sign(&[1, 1]), 1);
-        assert_eq!(product_sign(&[1, -1]), -1);
-        assert_eq!(product_sign(&[-1, -1]), 1);
-        assert_eq!(product_sign(&[1, 0]), 0);
-        assert_eq!(product_sign(&[0, -1]), 0);
-    }
-
-    #[test]
-    fn test_sign_contradicts() {
-        assert!(sign_contradicts(SignConstraint::Positive, 0));
-        assert!(sign_contradicts(SignConstraint::Positive, -1));
-        assert!(!sign_contradicts(SignConstraint::Positive, 1));
-        assert!(sign_contradicts(SignConstraint::Negative, 0));
-        assert!(sign_contradicts(SignConstraint::Negative, 1));
-        assert!(!sign_contradicts(SignConstraint::Negative, -1));
-        assert!(sign_contradicts(SignConstraint::Zero, 1));
-        assert!(sign_contradicts(SignConstraint::Zero, -1));
-        assert!(!sign_contradicts(SignConstraint::Zero, 0));
-        assert!(sign_contradicts(SignConstraint::NonNegative, -1));
-        assert!(!sign_contradicts(SignConstraint::NonNegative, 0));
-        assert!(sign_contradicts(SignConstraint::NonPositive, 1));
-        assert!(!sign_contradicts(SignConstraint::NonPositive, 0));
-    }
-
-    #[test]
-    fn test_monomial_accessors() {
-        let tid = |n: u32| TermId(n);
-        let m = Monomial::new(vec![tid(1), tid(2)], tid(10));
-        assert!(m.is_binary());
-        assert!(!m.is_square());
-        assert_eq!(m.x(), Some(tid(1)));
-        assert_eq!(m.y(), Some(tid(2)));
-        let sq = Monomial::new(vec![tid(3), tid(3)], tid(11));
-        assert!(sq.is_binary());
-        assert!(sq.is_square());
-    }
-}
+#[path = "nonlinear_tests.rs"]
+mod tests;

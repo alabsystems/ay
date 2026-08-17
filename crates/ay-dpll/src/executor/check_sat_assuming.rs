@@ -22,16 +22,15 @@ use crate::executor_types::{
 };
 use crate::logic_detection::{LogicCategory, TheoryKind};
 
-/// Which public boundary owns SAT emission for an assumption solve.
-///
-/// Direct `check-sat-assuming` calls emit locally. Plain `check-sat`'s named
-/// core redirect is already inside the outer solve pipeline, so it must return
-/// a bare proposal and let that pipeline consume any affine certificate model
-/// exactly once after the original assertion stack is restored.
+#[path = "check_sat_assuming/publication.rs"]
+mod publication;
+pub(in crate::executor) use publication::AssumptionSatPublication;
+
+/// Which wrapper owns the one final nested-array UNSAT quarantine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::executor) enum AssumptionSatPublication {
-    EmitHere,
-    DeferToPlainCheckSat,
+enum AssumptionNestedArrayQuarantine {
+    Local,
+    DeferToCaller,
 }
 
 impl Executor {
@@ -43,7 +42,11 @@ impl Executor {
     /// `pub(crate)`: External consumers MUST use `api::Solver::check_sat_assuming()`
     /// which returns `VerifiedSolveResult`. Part of #5787 (Phase 6).
     pub(crate) fn check_sat_assuming(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
-        self.check_sat_assuming_with_publication(assumptions, AssumptionSatPublication::EmitHere)
+        self.check_sat_assuming_with_publication(
+            assumptions,
+            AssumptionSatPublication::EmitHere,
+            AssumptionNestedArrayQuarantine::Local,
+        )
     }
 
     /// Named-core redirect used from inside plain `check-sat`.
@@ -58,6 +61,21 @@ impl Executor {
         self.check_sat_assuming_with_publication(
             assumptions,
             AssumptionSatPublication::DeferToPlainCheckSat,
+            AssumptionNestedArrayQuarantine::DeferToCaller,
+        )
+    }
+
+    /// Inner solve for the direct public named-core wrapper. SAT still emits
+    /// here, but the outer wrapper owns nested-array authority after restoring
+    /// assertions and completing core work.
+    fn check_sat_assuming_deferred_to_named_outer(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<SolveResult> {
+        self.check_sat_assuming_with_publication(
+            assumptions,
+            AssumptionSatPublication::EmitHere,
+            AssumptionNestedArrayQuarantine::DeferToCaller,
         )
     }
 
@@ -65,8 +83,10 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
         publication: AssumptionSatPublication,
+        quarantine: AssumptionNestedArrayQuarantine,
     ) -> Result<SolveResult> {
         self.last_sat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         let mut symbolic_power_roots = self.ctx.assertions.clone();
         symbolic_power_roots.extend_from_slice(assumptions);
         if contains_symbolic_integer_power(&self.ctx.terms, &symbolic_power_roots) {
@@ -78,10 +98,10 @@ impl Executor {
             );
             return Ok(SolveResult::Unknown);
         }
-        // Keep the original assertion+assumption roots for the shared
-        // nested-array UNSAT authorization boundary. The inner solver may
-        // rewrite either collection while deriving its raw result.
-        let decision_roots = self.public_solve_roots(assumptions);
+        // Deferred public wrappers already own an unsplit root snapshot. Avoid
+        // cloning a second, temporarily stripped window on those paths.
+        let decision_roots = matches!(quarantine, AssumptionNestedArrayQuarantine::Local)
+            .then(|| self.public_solve_roots(assumptions));
         let export_requested = bv_cnf_dump::requested();
         let mut dump_roots = if export_requested {
             self.ctx.assertions.clone()
@@ -115,11 +135,15 @@ impl Executor {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
         })?;
-        // `None`: the residue rescue is deliberately unavailable here. An
-        // assumption literal is not a hard constraint, so the hard assertions
-        // alone are NOT the problem that was refuted — a residue drawn from
-        // them could not license this verdict. Fail closed exactly as before.
-        Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, None, result))
+        match (quarantine, decision_roots) {
+            (AssumptionNestedArrayQuarantine::Local, Some(decision_roots)) => {
+                // `None`: an assumption literal is not a hard constraint, so
+                // the nested-array-free residue rescue is unavailable here.
+                Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, None, result))
+            }
+            (AssumptionNestedArrayQuarantine::DeferToCaller, None) => Ok(result),
+            _ => unreachable!("quarantine ownership and root snapshot must agree"),
+        }
     }
 
     /// `check-sat-assuming` entry for USER-FACING queries (the SMT-LIB
@@ -149,100 +173,31 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
     ) -> Result<SolveResult> {
-        if self.produce_unsat_cores_enabled() {
-            let term_to_name: HashMap<TermId, String> = self
-                .ctx
-                .named_terms_iter()
-                .map(|(name, tid)| (tid, name.to_string()))
-                .collect();
+        // Capture the public query before named assertions move into the
+        // solver-assumption slot. The inner solve, rescue, and minimizer can
+        // all grow the term store; finite-array evidence is therefore sealed
+        // only by this wrapper's final quarantine after they finish.
+        let decision_roots = self.public_solve_roots(assumptions);
+        let result = self.check_sat_assuming_with_named_cores_inner(assumptions)?;
+        Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, None, result))
+    }
 
-            if !term_to_name.is_empty() {
-                // Split assertions: named become assumptions, unnamed stay as base
-                // (mirrors the plain check-sat redirect in check_sat.rs).
-                let mut named_assumptions = Vec::new();
-                let mut unnamed_assertions = Vec::new();
-                for &assertion in &self.ctx.assertions {
-                    if term_to_name.contains_key(&assertion) {
-                        named_assumptions.push(assertion);
-                    } else {
-                        unnamed_assertions.push(assertion);
-                    }
-                }
-
-                if !named_assumptions.is_empty() {
-                    // combined = named ++ user assumptions, deduplicated by
-                    // TermId with the first occurrence winning: an assumption
-                    // literal textually identical to a named assertion shares
-                    // its TermId and must not be passed twice.
-                    let mut seen: HashSet<TermId> = HashSet::default();
-                    let mut combined: Vec<TermId> =
-                        Vec::with_capacity(named_assumptions.len() + assumptions.len());
-                    for &term in named_assumptions.iter().chain(assumptions.iter()) {
-                        if seen.insert(term) {
-                            combined.push(term);
-                        }
-                    }
-
-                    // Temporarily replace assertions with unnamed-only.
-                    let original_assertions =
-                        std::mem::replace(&mut self.ctx.assertions, unnamed_assertions);
-
-                    let result = self.check_sat_assuming(&combined);
-                    // Certificate gate while the base is still stripped: a
-                    // harvested proper-subset core must re-prove UNSAT on its
-                    // own or it is discarded (#unsat-core-miscount).
-                    let result = self.certify_assumption_core(&combined, result);
-
-                    // Completeness rescue (#named-cores-ground-sat): the
-                    // named→assumption redirect is a core-TRACKING strategy,
-                    // not a verdict authority — on Unknown, re-solve the
-                    // un-named equivalent (base ∧ named ∧ literals through
-                    // the plain pipeline) while the base is still stripped.
-                    // See `rescue_named_core_redirect_unknown`.
-                    let (result, rescue_elapsed) = match result {
-                        Ok(SolveResult::Unknown) => {
-                            let rescue_started = Instant::now();
-                            let rescued = self.rescue_named_core_redirect_unknown(
-                                &combined,
-                                AssumptionSatPublication::EmitHere,
-                            );
-                            (rescued, Some(rescue_started.elapsed()))
-                        }
-                        other => (other, None),
-                    };
-
-                    // Deletion-based EUF/ArrayEuf core minimization while the
-                    // base is still stripped (#uc-core-minimize): shrinks the
-                    // certified core — including the empty-harvest→pad-all
-                    // theory-refutation case AND the rescue's conservative
-                    // all-assumptions core — by re-solving subsets, budget-
-                    // aware and fail-closed (only solve-verified subsets are
-                    // adopted). Runs AFTER the rescue: the measured
-                    // reduction-0 families (QG-classification, storecomm)
-                    // reach unsat through it.
-                    let result = self.minimize_assumption_core(&combined, result, rescue_elapsed);
-
-                    // Restore original assertions BEFORE propagating any error:
-                    // internal callers `?` through this path and a lost
-                    // assertion stack would corrupt subsequent commands.
-                    self.ctx.assertions = original_assertions;
-
-                    // Set the core bookkeeping AFTER check_sat_assuming (which
-                    // clears both fields as part of its own state reset):
-                    // - the name snapshot lets get-unsat-core print named core
-                    //   members as their labels;
-                    // - last_assumptions is narrowed back to the USER literals
-                    //   so get-unsat-assumptions keeps its SMT-LIB subset
-                    //   contract (⊆ the literals the user passed).
-                    self.last_core_term_to_name = Some(term_to_name);
-                    self.last_assumptions = Some(assumptions.to_vec());
-
-                    return result;
-                }
-            }
+    fn check_sat_assuming_with_named_cores_inner(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<SolveResult> {
+        if let Some((term_to_name, named_assumptions, unnamed_assertions)) =
+            self.named_core_redirect_partition()
+        {
+            return self.run_named_core_redirect(
+                assumptions,
+                term_to_name,
+                named_assumptions,
+                unnamed_assertions,
+            );
         }
 
-        let result = self.check_sat_assuming(assumptions);
+        let result = self.check_sat_assuming_deferred_to_named_outer(assumptions);
         // #A7: `(get-unsat-assumptions)` publishes the harvest as a
         // CERTIFICATE — SMT-LIB 2.6 requires the returned subset to be
         // unsatisfiable together with the asserted formulas, and a consumer
@@ -266,6 +221,79 @@ impl Executor {
             return certified;
         }
         result
+    }
+
+    /// Partition the authored stack for the named-to-assumption redirect.
+    fn named_core_redirect_partition(
+        &self,
+    ) -> Option<(HashMap<TermId, String>, Vec<TermId>, Vec<TermId>)> {
+        if !self.produce_unsat_cores_enabled() {
+            return None;
+        }
+        let term_to_name: HashMap<TermId, String> = self
+            .ctx
+            .named_terms_iter()
+            .map(|(name, tid)| (tid, name.to_string()))
+            .collect();
+        if term_to_name.is_empty() {
+            return None;
+        }
+
+        let (named, unnamed): (Vec<TermId>, Vec<TermId>) = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .partition(|assertion| term_to_name.contains_key(assertion));
+        (!named.is_empty()).then_some((term_to_name, named, unnamed))
+    }
+
+    /// Run the stripped named-core transaction and restore the authored stack
+    /// before its result or error can escape.
+    fn run_named_core_redirect(
+        &mut self,
+        assumptions: &[TermId],
+        term_to_name: HashMap<TermId, String>,
+        named_assumptions: Vec<TermId>,
+        unnamed_assertions: Vec<TermId>,
+    ) -> Result<SolveResult> {
+        // Named terms precede user assumptions; exact TermId duplicates retain
+        // the first occurrence so the solver never receives one literal twice.
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let combined: Vec<TermId> = named_assumptions
+            .into_iter()
+            .chain(assumptions.iter().copied())
+            .filter(|term| seen.insert(*term))
+            .collect();
+        let original_assertions = std::mem::replace(&mut self.ctx.assertions, unnamed_assertions);
+        let result = self.complete_named_core_redirect(&combined);
+
+        // Restoration precedes propagation of any error. Core bookkeeping is
+        // then narrowed back to the caller's literals for the SMT-LIB subset
+        // contract; the name snapshot remains available to get-unsat-core.
+        self.ctx.assertions = original_assertions;
+        self.last_core_term_to_name = Some(term_to_name);
+        self.last_assumptions = Some(assumptions.to_vec());
+        result
+    }
+
+    /// Certify, rescue, and minimize while named roots remain in the temporary
+    /// solver-assumption slot. No nested-array quarantine is allowed here.
+    fn complete_named_core_redirect(&mut self, combined: &[TermId]) -> Result<SolveResult> {
+        let result = self.check_sat_assuming_deferred_to_named_outer(combined);
+        let result = self.certify_assumption_core(combined, result);
+        let (result, rescue_elapsed) = match result {
+            Ok(SolveResult::Unknown) => {
+                let rescue_started = Instant::now();
+                let rescued = self.rescue_named_core_redirect_unknown(
+                    combined,
+                    AssumptionSatPublication::EmitHere,
+                );
+                (rescued, Some(rescue_started.elapsed()))
+            }
+            other => (other, None),
+        };
+        self.minimize_assumption_core(combined, result, rescue_elapsed)
     }
 
     /// Check if produce-unsat-assumptions is enabled (SMT-LIB 2.6 §4.1.7).
@@ -410,7 +438,7 @@ impl Executor {
         assumptions: &[TermId],
         publication: AssumptionSatPublication,
     ) -> Result<SolveResult> {
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!("c phase-trace named-core-redirect direct=unknown rescue=scoped");
         }
         // Fresh per-call deadline, mirroring the raw `check_sat_assuming`
@@ -437,26 +465,6 @@ impl Executor {
         result
     }
 
-    fn publish_or_defer_assumption_sat(
-        &mut self,
-        assumptions: &[TermId],
-        publication: AssumptionSatPublication,
-    ) -> Result<SolveResult> {
-        match publication {
-            AssumptionSatPublication::EmitHere => {
-                self.emit_sat_verdict(SolveResult::Sat, assumptions)
-            }
-            AssumptionSatPublication::DeferToPlainCheckSat => {
-                self.last_sat_certificate = None;
-                if self.ctx.assertions.is_empty() && assumptions.is_empty() {
-                    self.last_model = Some(crate::executor::model::Model::empty());
-                    self.last_model_validated = true;
-                }
-                Ok(SolveResult::Sat)
-            }
-        }
-    }
-
     fn check_sat_assuming_with_controls(
         &mut self,
         assumptions: &[TermId],
@@ -464,18 +472,17 @@ impl Executor {
     ) -> Result<SolveResult> {
         // Scope-transience for the RM domain axioms the inner gate may push
         // (#P0.2 Pass B): the assumption routes have no
-        // `scope_tracked_assertions` restore of their own, so truncate back to
-        // the entry length on EVERY exit path. Inner paths that grow the
-        // assertion vector restore it themselves (e.g. the BV arm), so the
-        // entry length is exactly the pre-axiom length.
-        let base_len = self.ctx.assertions.len();
+        // `scope_tracked_assertions` restore of their own, so restore the exact
+        // entry vector on EVERY exit path. This must not be length-only: an
+        // inner combined/array solve may destructively rewrite the prefix while
+        // retaining its length.
+        let base_assertions_exact = self.ctx.assertions.clone();
         let result = self.check_sat_assuming_with_controls_inner(assumptions, publication);
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
         result
     }
 
-    /// Per-check solve-session state reset shared by the
-    /// `check-sat-assuming` entry and the unsat-core minimization pass's
+    /// Per-check reset shared by `check-sat-assuming` and the unsat-core minimization pass's
     /// scoped subset re-solves (#uc-core-minimize).
     ///
     /// FACTORED OUT for the minimization loop: `solve_scoped_assumptions`
@@ -492,11 +499,13 @@ impl Executor {
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
+        self.proof_source_work.reset();
         self.last_lrat_certificate = None;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
         self.last_checked_sat_refutation = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
@@ -514,11 +523,9 @@ impl Executor {
         // from an earlier public query.
         self.strict_check_invocations.set(0);
         self.strict_check_steps_validated.set(0);
-        // Keep the immutable authority snapshot installed at the public-query
-        // boundary. Core minimization and scoped subset re-solves must not
-        // promote their temporary assertion windows to authored premises.
-        self.quant_expansion_records.clear();
-        self.ematching_proof_records.clear();
+        // Keep public-query authority immutable: subset re-solves must not
+        // promote temporary assertion windows to authored premises.
+        self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
@@ -580,7 +587,6 @@ impl Executor {
         if let Some(result) = self.reject_unsupported_fp_model_format(&solve_roots) {
             return Ok(result);
         }
-
         // Datatype-carrying-array degrade-gate bypass for the assumption
         // routes: computed at ENTRY (assertions + assumptions still in their
         // original shape, before preprocessing erases array structure) and
@@ -599,8 +605,7 @@ impl Executor {
         // assertions and the passed assumptions.
         if self.terms_contain_set_has_size(&solve_roots) {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            let _ = self.finalize_unknown_publication(SolveResult::Unknown);
-            return Ok(SolveResult::Unknown);
+            return Ok(self.finalize_assumption_unknown(publication));
         }
 
         // RoundingMode finite-domain axioms (#P0.2 symbolic RoundingMode,
@@ -634,8 +639,7 @@ impl Executor {
             }
             crate::executor::rm_domain::RmDomainAxioms::FailClose => {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                let _ = self.finalize_unknown_publication(SolveResult::Unknown);
-                return Ok(SolveResult::Unknown);
+                return Ok(self.finalize_assumption_unknown(publication));
             }
         }
 
@@ -656,10 +660,12 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
 
-        // Use the base assertions from context, assumptions are passed separately
-        let base_assertions = self.ctx.assertions.clone();
+        // Snapshot the pre-route base. Exact finite-array owners may append
+        // route-local axioms below; quantified fallback needs this authored
+        // window, while direct ground dispatch receives the post-gate snapshot.
+        let initial_base_assertions = self.ctx.assertions.clone();
 
-        if base_assertions.is_empty() && assumptions.is_empty() {
+        if initial_base_assertions.is_empty() && assumptions.is_empty() {
             // SOUNDNESS: No assertions and no assumptions means the formula is
             // trivially satisfiable (empty conjunction = true). This fast path
             // bypasses check_sat_guarded() and finalize_sat_model_validation(),
@@ -680,7 +686,7 @@ impl Executor {
             return self.publish_or_defer_assumption_sat(assumptions, publication);
         }
 
-        let mut all_assertions = base_assertions.clone();
+        let mut all_assertions = initial_base_assertions.clone();
         all_assertions.extend(assumptions.iter().copied());
 
         let (_, pre_quantifier_features) = self.detect_logic_category(&all_assertions);
@@ -700,18 +706,36 @@ impl Executor {
             .copied()
             .any(|assertion| contains_quantifier(&self.ctx.terms, assertion))
         {
-            let result =
-                self.solve_quantified_assumptions(&base_assertions, assumptions, publication)?;
+            let result = self.solve_quantified_assumptions(
+                &initial_base_assertions,
+                assumptions,
+                publication,
+            )?;
             return Ok(self.finish_check_sat_assuming_result(assumptions, result, publication));
         }
 
         let (category, features) = self.detect_logic_category(&all_assertions);
         self.last_statistics
             .set_string("solver.logic_category", format!("{category:?}"));
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!("c phase-trace check-sat-assuming category={category:?}");
         }
         self.set_active_solve_phase("assumption-solving", format!("theory:{category:?}"));
+
+        // One route-aware assumption boundary covers base and temporary roots.
+        // Dedicated array routes defer here because they must enumerate after
+        // substitution/fixpoint preprocessing; every other array category gets
+        // exact closure before its assertion snapshot is handed to the solver.
+        if features.has_arrays {
+            if self.should_defer_finite_array_extensionality_to_route(category) {
+                self.record_finite_array_extensionality_route_deferral();
+            } else {
+                let _ = self.add_finite_index_array_closure_with_roots(assumptions);
+            }
+        }
+        // Include any route-independent generated axioms in the direct solver's
+        // base window. Post-preprocessing owners add their axioms internally.
+        let base_assertions = self.ctx.assertions.clone();
 
         // Use assumption-based solving for supported theories
         let result = match category {
@@ -1098,7 +1122,7 @@ impl Executor {
                     assumptions,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace qfdt-assuming direct=unknown retry=scoped");
                     }
                     self.solve_scoped_assumptions(
@@ -1161,7 +1185,7 @@ impl Executor {
                     assumptions,
                 )?;
                 if matches!(direct, SolveResult::Unknown) {
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!("c phase-trace dtax-assuming direct=unknown retry=scoped");
                     }
                     self.solve_scoped_assumptions(
@@ -1173,11 +1197,19 @@ impl Executor {
                     Ok(direct)
                 }
             }
-            // Quantified DT logics (#7150): route to DT-combined solvers
-            LogicCategory::Ufdt | LogicCategory::Aufdt => self.solve_with_assumptions_for_theory(
+            // Quantified DT logics (#7150): keep array-free UFDT on the pure
+            // DT assumption engine. AUFDT must use the array-aware DT flow so
+            // DT-generated finite cell equalities receive final exact closure.
+            LogicCategory::Ufdt => self.solve_with_assumptions_for_theory(
                 &base_assertions,
                 assumptions,
                 TheoryKind::Dt,
+            ),
+            LogicCategory::Aufdt => self.dt_combined_check_sat_assuming(
+                &base_assertions,
+                assumptions,
+                None,
+                DtSolverDispatch::Theory(TheoryKind::ArrayEuf),
             ),
             LogicCategory::Ufdtlia | LogicCategory::Aufdtlia => self
                 .dt_combined_check_sat_assuming(
@@ -1217,6 +1249,7 @@ impl Executor {
                 }
             }
         }?;
+        let result = self.fail_close_incomplete_finite_array_sat(Ok(result))?;
 
         let result = if result == SolveResult::Sat {
             // Direct queries emit here. A named-core redirect nested under
@@ -1393,7 +1426,7 @@ impl Executor {
             // isolated and transports no solver state.
             self.last_assumption_core = Some(core);
             self.last_model = None;
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-assumption-core reverify=confirmed");
             }
             Ok(result)
@@ -1401,7 +1434,7 @@ impl Executor {
             self.last_assumption_core = None;
             self.last_model = None;
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-assumption-core reverify=FAILED demote=unknown");
             }
             Ok(SolveResult::Unknown)
@@ -1475,7 +1508,6 @@ impl Executor {
                 "BUG: UNSAT assumption core contains terms not in the original assumptions"
             );
         }
-
         // SOUNDNESS (QF_LRA false-UNSAT, multi-path): the check-sat-assuming
         // path does NOT route through solve_lra_incremental, so it bypasses the
         // plain-check-sat disequality/distinct re-verify guard. A differential
@@ -1505,11 +1537,12 @@ impl Executor {
             && self.lra_roots_contain_disequality(assumptions)
         {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
-            let _ = self.finalize_unknown_publication(SolveResult::Unknown);
-            self.finalize_unknown_diagnostics();
-            return SolveResult::Unknown;
+            let result = self.finalize_assumption_unknown(publication);
+            if publication == AssumptionSatPublication::EmitHere {
+                self.finalize_unknown_diagnostics();
+            }
+            return result;
         }
-
         // PROOF NET (mirrors the plain path's `check_sat.rs:2388` / `:3608`).
         //
         // The mandatory UNSAT funnel refuses to publish `unsat` without a
@@ -1545,7 +1578,7 @@ impl Executor {
             self.build_unsat_proof();
         }
 
-        let result = self.finalize_unknown_publication(result);
+        let result = self.finalize_assumption_result(result, publication);
         self.last_result = Some(result);
         // Output completion is part of emit_sat_verdict and therefore precedes
         // certificate minting. Keep this post-emission path model-immutable.
@@ -1558,36 +1591,6 @@ impl Executor {
 #[cfg(test)]
 mod solve_session_reset_tests {
     use super::*;
-
-    #[test]
-    fn deferred_publication_carries_ground_candidate_to_outer_sat_funnel() {
-        let mut exec = Executor::new();
-        let named_assertion = exec.ctx.terms.true_term();
-        exec.last_model = Some(crate::executor::model::Model::empty());
-        exec.last_model_validated = false;
-
-        let proposed = exec
-            .publish_or_defer_assumption_sat(
-                &[named_assertion],
-                AssumptionSatPublication::DeferToPlainCheckSat,
-            )
-            .expect("deferred publication does not error");
-
-        assert_eq!(proposed, SolveResult::Sat);
-        assert!(exec.last_model.is_some());
-        assert!(!exec.last_model_validated);
-        assert!(exec.last_sat_certificate.is_none());
-
-        // Plain check-sat restores the original named assertion stack before
-        // consuming the proposal through its sole public SAT funnel.
-        exec.ctx.assertions.push(named_assertion);
-        let emitted = exec
-            .emit_sat_verdict(proposed, &[])
-            .expect("outer SAT funnel does not error");
-        assert_eq!(emitted, SolveResult::Sat);
-        assert!(exec.last_model_validated);
-        assert!(exec.last_sat_certificate.is_some());
-    }
 
     #[test]
     fn solve_session_reset_revokes_result_authorization_markers() {
@@ -1743,102 +1746,4 @@ mod nested_recheck_authority_tests {
 }
 
 #[cfg(test)]
-mod nested_recheck_certification_tests {
-    use super::*;
-
-    /// END-TO-END pin for the forged-authority defect, run through the REAL
-    /// mandatory certification gate (`certify_unsat_for_publication` ->
-    /// `mint_unsat_certificate`) and then through the strict Alethe checker
-    /// that gate calls.
-    ///
-    /// Shape (a minimal model of the deductive-checks `*_push_appends_entailed`
-    /// obligations that surfaced this): a public assumption query whose
-    /// SAT-level failed-assumption harvest is a MISATTRIBUTED proper subset --
-    /// the "wrong-but-AUTHENTIC" input `certify_assumption_core` exists to
-    /// reject. Its re-solve of that subset is Unknown, and the Unknown
-    /// publication funnel clears `proof_problem_assertion_provenance`; the
-    /// deterministic restore-solve that follows then rebuilds provenance from
-    /// its own transformed working set (`preserving_authority_from(None)` is
-    /// an identity), promoting solver-generated terms to authored authority.
-    /// `mint_unsat_certificate` correctly refuses that with
-    /// `AssertionEpochMismatch`, and a CORRECT refutation is published as
-    /// `unknown` / `SelfCheckRejected`.
-    ///
-    /// A shape-only assertion would not have caught this: the emitted steps
-    /// were always well-formed. Only running the emitter's own artifact
-    /// through the gate -- verdict AND `check_proof_strict` -- pins it.
-    #[test]
-    fn misattributed_harvest_recheck_keeps_the_authored_proof_authority() {
-        // Base assertion is deliberately INDEPENDENT of the quantified pair so
-        // the injected subset is satisfiable-but-undecided (Unknown) while the
-        // full assumption set is refuted propositionally by `p and not p`.
-        let script = r#"
-            (set-option :produce-proofs true)
-            (set-logic UFLIA)
-            (declare-fun f (Int) Int)
-            (declare-fun g (Int) Int)
-            (declare-fun h (Int) Int)
-            (declare-const p Bool)
-            (assert (>= (h 0) 0))
-            (assert (forall ((x Int)) (exists ((y Int)) (> (f y) (g x)))))
-            (assert (forall ((x Int)) (< (f x) 0)))
-            (assert p)
-            (assert (not p))
-        "#;
-        let commands = ay_frontend::parse(script).expect("script parses");
-        let mut exec = Executor::new();
-        exec.execute_all(commands.as_slice())
-            .expect("setup commands execute");
-
-        // Reproduce the named-core redirect's split: the base stays asserted,
-        // everything else is assumption-tracked.
-        let all = exec.ctx.assertions.clone();
-        assert_eq!(all.len(), 5, "setup asserted an unexpected number of roots");
-        let base = vec![all[0]];
-        let assumed: Vec<TermId> = all[1..].to_vec();
-        exec.ctx.assertions = base.clone();
-
-        exec.begin_public_solve(false);
-        exec.bind_unsat_query_assumptions(&assumed);
-        let first = exec.check_sat_assuming(&assumed);
-        assert!(
-            matches!(first, Ok(SolveResult::Unsat(_))),
-            "setup solve must refute the full assumption set: {first:?}"
-        );
-
-        // The misattributed harvest: a proper subset that does NOT re-prove
-        // UNSAT (here: undecided). This is the documented defect class the
-        // certificate gate exists for, injected rather than waited for.
-        exec.last_assumption_core = Some(vec![assumed[0], assumed[1]]);
-        let certified = exec
-            .certify_assumption_core(&assumed, first)
-            .expect("core certification does not error");
-
-        // 1. The authored authority survived the nested re-solves.
-        let provenance = exec
-            .proof_problem_assertion_provenance
-            .as_ref()
-            .expect("authored proof authority must not be lost");
-        assert_eq!(
-            provenance.original_problem_assertions, base,
-            "a nested re-solve promoted its own working set to authored authority"
-        );
-
-        // 2. The mandatory gate accepts -- this is the exact call the SMT-LIB
-        //    dispatcher makes, and the one that returned Unknown downstream.
-        let published = exec.certify_unsat_for_publication(certified, &assumed);
-        assert!(
-            !published.is_unknown(),
-            "mandatory certification rejected a correct refutation: {:?}",
-            exec.unknown_reason()
-        );
-
-        // 3. The emitter's OWN proof passes the strict Alethe checker.
-        let proof = exec
-            .last_proof
-            .clone()
-            .expect("a certified UNSAT publishes its proof");
-        ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
-            .expect("the emitted proof must pass strict Alethe checking");
-    }
-}
+mod nested_publication_tests;

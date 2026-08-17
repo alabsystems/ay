@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W6 — digit/arithmetic-aware and regex-word witness moves
-//! (default ON, `AY_STR_W6=0` kill switch).
+//! (default ON, `--dpll-no-str-w6` kill switch).
 //!
 //! ## The measured gap W6 closes
 //!
@@ -89,7 +89,7 @@
 //! * **A failed construction never justifies UNSAT.** W6's only outcomes are
 //!   "a validated model" or "nothing".
 //! * **No guard removed.** W4's targeting gate is not relaxed; W6 only ADDS
-//!   evidence kinds to it under `AY_STR_W6=1`, exactly as W5 did.
+//!   evidence kinds to it under enabled, exactly as W5 did.
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -103,14 +103,14 @@ use super::super::model::{EvalValue, Model};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, w4_trial_model, MAX_W4_LEN};
 
-/// Master switch (default ON, `AY_STR_W6=0` kill switch → byte-identical to W5-only).
+/// Master switch (default ON, `--dpll-no-str-w6` kill switch → byte-identical to W5-only).
 pub(in crate::executor) fn str_w6_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 16 of the last 27 sat-side misses convert, ALL 16 confirmed
     // by AY's own fail-closed `--self-check` (not z3); +17 decided on the
     // 600-file sweep with 0 losses and 0 soundness flips; flags-off identity
-    // measured 600/600. AY_STR_W6=0 is the kill switch.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_W6").ok().as_deref(), Some("0")))
+    // measured 600/600. --dpll-no-str-w6 is the kill switch.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_w6)
 }
 
 /// Windows of the target one violated atom may be repaired through.
@@ -587,7 +587,7 @@ impl Executor {
     /// as surely as `(= (str.at v 0) "c")` does — but carries no string
     /// constant next to a window, so neither W4's nor W5's gate can see it.
     ///
-    /// This ADDS evidence kinds under `AY_STR_W6=1`; it does not weaken the
+    /// This ADDS evidence kinds under enabled; it does not weaken the
     /// existing gate (with the flag off the predicate is never consulted).
     pub(super) fn w6_is_positional_atom(&self, term: TermId) -> bool {
         let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(term) else {
@@ -742,7 +742,7 @@ impl Executor {
     /// [`Self::w4_validate_candidates`] pins each candidate and re-solves under
     /// the FULL model validation, so this emits only a validated SAT model and
     /// otherwise declines — verdict-preserving by construction. Gated by
-    /// `str_w6_enabled()` so `AY_STR_W6=0` stays byte-identical.
+    /// `str_w6_enabled()` so `--dpll-no-str-w6` stays byte-identical.
     pub(in crate::executor) fn try_w6_early_shortcut(&mut self) -> Result<Option<SolveResult>> {
         if !str_w6_enabled() || self.pivot_enum_depth != 0 {
             return Ok(None);

@@ -5,7 +5,7 @@
 
 Runs each corpus instance in two (optionally three) modes and reports the
 wall-clock overhead ratio distribution:
-  - dense-tap : AY_PB_PROOF_TAP=1  ay-pb pb solve --proof <tmp>   (the payload)
+  - dense-tap : ay-pb pb solve --proof <tmp>   (the default payload)
   - plain     : ay-pb pb solve                                    (preprocessed)
   - plain-unpp: ay-pb pb solve, preprocessing disabled if a flag exists
                 (proof mode runs UNpreprocessed per cdcl.rs:1628, so the tap's
@@ -100,8 +100,10 @@ def run(bin_path: str, inst: Path, timeout_ms: int, wall_cap: float, memlimit_mb
     args = [bin_path, "pb", "solve", "--timeout", str(timeout_ms)]
     proof_path = None
     if mode in ("dense", "legacy"):
-        # dense = the tap (default post-flip; force with =1); legacy = escape hatch.
-        env["AY_PB_PROOF_TAP"] = "1" if mode == "dense" else "legacy"
+        # dense = the tap (the default); legacy = the escape hatch
+        # (B31: --proof-tap-legacy replaced AY_PB_PROOF_TAP=legacy.)
+        if mode == "legacy":
+            args.append("--proof-tap-legacy")
         proof_path = proof_dir / f"{inst.stem}.{mode}.{os.getpid()}.pbp"
         args += ["--proof", str(proof_path)]
     args.append(str(inst))

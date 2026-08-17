@@ -104,8 +104,8 @@ pub(super) const EMA_SLOW_DECAY: f64 = 0.99999;
 /// CaDiCaL restartmarginfocused=10 → (100+10)/100 = 1.10.
 /// A/B #1 finding: lowering this to 1.00/1.05 helps c7552 but over-restarts
 /// SCPC (conflicts +30%), so the margin is kept at the calibrated 1.10. The
-/// robust restart-cadence win came from disabling trail-based restart blocking
-/// (see `should_block_restart_by_trail`), not from changing this margin.
+/// robust restart-cadence win came from removing the default-off trail-blocking
+/// experiment, not from changing this margin.
 /// Overridable at runtime via `AY_AB_FOCUSED_MARGIN` for A/B experiments.
 pub(super) const RESTART_MARGIN_FOCUSED: f64 = 1.10;
 
@@ -163,23 +163,6 @@ pub(super) const DENSE_MUTEX_FOCUSED_RESTART_MIN_BINARY_PERCENT: usize = 95;
 pub(super) const DENSE_MUTEX_FOCUSED_RESTART_MIN_GATE: u64 = 40;
 pub(super) const DENSE_MUTEX_FOCUSED_RESTART_MAX_GATE: u64 = 100;
 
-/// Trail-length EMA decay for restart blocking (slow EMA).
-/// Tracks average trail length over ~5000 conflicts.
-/// Audemard & Simon (SAT 2012): block restarts when current trail is
-/// significantly longer than average, indicating productive search.
-pub(super) const TRAIL_EMA_DECAY: f64 = 1.0 - 1.0 / 5000.0;
-
-/// Margin for trail-based restart blocking (Glucose, Audemard & Simon CP 2012).
-/// Block restart if trail_len > margin * trail_ema_slow.
-/// Active in focused mode only. Suppresses restarts when the solver is
-/// exploring a productive search subtree (#8449).
-pub(super) const TRAIL_BLOCKING_MARGIN: f64 = 1.25;
-
-/// Warmup period (conflicts) before trail blocking activates.
-/// The trail EMA needs sufficient samples before the blocking decision
-/// is statistically meaningful.
-pub(super) const TRAIL_BLOCKING_WARMUP: u64 = 100;
-
 /// Minimum conflicts before considering Glucose-style restarts.
 ///
 /// CaDiCaL has NO warmup gate — it relies entirely on ADAM-style EMA bias
@@ -233,7 +216,7 @@ pub(super) const THEORY_RATIO_EMA_DECAY: f64 = 1.0 - 1.0 / 64.0;
 pub(super) const STABLE_PHASE_INIT: u64 = 1000;
 
 /// Default window (in conflicts) for the equiticks progress gate
-/// (`AY_AB_EQT_PROGRESS`, opt-in). While the stable-mode `target_trail_len`
+/// (`--sat-eqt-progress`, opt-in). While the stable-mode `target_trail_len`
 /// improved within the last this-many conflicts, the stable->focused switch is
 /// deferred past the equal-effort tick budget (up to the nlogpow4 hardcap), so
 /// a still-converging stable phase is not starved by the equal-effort split.
@@ -933,7 +916,7 @@ pub(super) const FASTELIM_WALL_CLOCK_LIMIT_SECS: u64 = 2;
 /// Minimum var count for the DEEP lever. Below this, formulas fit the default
 /// sparse band (<=150K vars) where the non-deep unlock already performs well
 /// and deep would only waste time; deep targets the huge formulas that enter
-/// only when the operator raises AY_BVE_SPARSE_MAX_VARS above the default.
+/// only when the operator raises --sat-bve-sparse-max-vars above the default.
 ///
 /// DO NOT LOWER THIS TO CHASE MEDIUM SAT LOSSES — measured negative
 /// (wf_13a96c15, replicating wf_eab7d219 / wf_e2bdf6e1). Lowering the floor
@@ -1252,7 +1235,7 @@ pub(super) const FACTOR_MAX_EFFORT: u64 = 1_000_000_000;
 /// First-call factor init budget for the DENSE band (density >=
 /// [`FACTOR_DENSE_MIN_DENSITY`]), replacing [`FACTOR_INIT_TICKS`]'s 500M on
 /// the first (`factor_rounds == 0`) call only. Kill-switched via
-/// `AY_AB_FACTOR_DENSE_INIT=0` (restores 500M) and A/B-tunable via
+/// `--sat-no-factor-dense-init` (restores 500M) and A/B-tunable via
 /// `AY_FACTOR_DENSE_INIT_TICKS` — see
 /// `config_preprocess_policy::factor_dense_init_ticks`.
 ///
@@ -1410,7 +1393,7 @@ pub(super) const PREPROCESS_EXPENSIVE_MAX_CLAUSES: usize = 3_000_000;
 /// enough to justify the time spent.
 pub(super) const CONGRUENCE_MAX_CLAUSES: usize = 3_000_000;
 
-/// Raised congruence caps under AY_AB_SUBST_AUTO (#15, 2026-07-03). The
+/// Raised congruence caps under --sat-no-subst-auto (#15, 2026-07-03). The
 /// clause-driven XOR extraction made congruence cheap enough (15ms/70da) to
 /// afford on the large ternary-dominant substitution instances the winner
 /// (Kissat) cracks in seconds but AY was skipping (full-400: 07cea7 783k,
@@ -1483,10 +1466,10 @@ pub(super) const AUTO_GIANT_PREPROCESS_BUDGET_SECS: u64 = 12;
 /// proceed exactly as in the flip measurements.
 pub(super) const AUTO_DECOMPOSE_RERUN_MAX_CLAUSES: usize = 8_000_000;
 
-/// Post-collapse BVE eligibility cap (AY_AB_BVE_POST_COLLAPSE, default ON
+/// Post-collapse BVE eligibility cap (--sat-no-bve-post-collapse, default ON
 /// since 2026-07-10 wf_55735963; =0 kill-switch).
 ///
-/// With AY_AB_SUBST_AUTO the congruence+decompose collapse substitutes away
+/// With --sat-no-subst-auto the congruence+decompose collapse substitutes away
 /// hundreds of thousands of variables on the large substitution-heavy prize
 /// instances (ebbda8d9 723K vars: ~200K equivs; 07cea7a6 783K: ~275K; df813fe7
 /// 521K: ~170K), but every BVE eligibility gate keys on the ORIGINAL

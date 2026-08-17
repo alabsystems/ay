@@ -24,7 +24,9 @@ macro_rules! pipeline_add_incremental_conflict_clause {
         conflict_terms: $conflict_terms:expr,
         tag: $tag:expr,
         set_unknown_on_error: $set_unknown:expr,
-        unmapped_message: $unmapped_message:literal
+        unmapped_message: $unmapped_message:literal,
+        proof_enabled: $proof_enabled:expr,
+        theory_proof: $theory_proof:expr
     ) => {{
         match $crate::pipeline_fns::add_incremental_conflict_clause(
             &mut $self.last_result,
@@ -35,8 +37,30 @@ macro_rules! pipeline_add_incremental_conflict_clause {
             $tag,
             $set_unknown,
             $unmapped_message,
+            $proof_enabled,
         ) {
-            $crate::pipeline_fns::AddConflictClauseOutcome::Added => {}
+            $crate::pipeline_fns::AddConflictClauseOutcome::Added { original_id } => {
+                let __acc_theory_proof = $theory_proof;
+                if let (Some(__acc_id), Some(__acc_proof)) = (original_id, __acc_theory_proof) {
+                    if !matches!(__acc_proof.kind, ay_core::TheoryLemmaKind::Generic) {
+                        $crate::pipeline_fns::place_original_clause_authority_at_id(
+                            &$solver,
+                            __acc_id,
+                            None,
+                            Some(__acc_proof),
+                            &mut $state.clausification_proofs,
+                            &mut $state.original_clause_theory_proofs,
+                        );
+                    }
+                }
+                if $proof_enabled {
+                    $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                        &$solver,
+                        &mut $state.clausification_proofs,
+                        &mut $state.original_clause_theory_proofs,
+                    );
+                }
+            }
             $crate::pipeline_fns::AddConflictClauseOutcome::Break(__acc_result) => {
                 break Ok(__acc_result)
             }
@@ -68,7 +92,7 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
         local_term_to_var: $local_term_to_var:ident,
         conflict_terms: $conflict_terms:expr,
         proof_enabled: $proof_enabled:expr,
-        negations: $negations:expr,
+        negations: $negations:ident,
         local_var_to_term: $local_var_to_term:expr,
         local_clausification_proofs: $local_clausification_proofs:ident,
         local_theory_proofs: $local_theory_proofs:ident,
@@ -95,24 +119,26 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
             }
             BlockingClauseResult::Unsat => {
                 if $proof_enabled {
+                    $crate::pipeline_fns::drain_pending_original_clause_authorities(
+                        &$solver,
+                        &mut $negations,
+                        &mut $local_clausification_proofs,
+                        &mut $local_theory_proofs,
+                    );
                     let _pmc_clause_trace = $solver.snapshot_clause_trace();
                     let (_pmc_clausification_proofs, _pmc_theory_proofs) = {
-                        if let Some(ref _pmc_trace) = _pmc_clause_trace {
-                            let _pmc_count = _pmc_trace.original_clauses().count();
-                            if $local_clausification_proofs.len() < _pmc_count {
-                                $local_clausification_proofs.resize(_pmc_count, None);
-                            }
-                            if $local_theory_proofs.len() < _pmc_count {
-                                $local_theory_proofs.resize(_pmc_count, None);
-                            }
-                        }
+                        $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                            &$solver,
+                            &mut $local_clausification_proofs,
+                            &mut $local_theory_proofs,
+                        );
                         (
                             $local_clausification_proofs.clone(),
                             $local_theory_proofs.clone(),
                         )
                     };
                     let _pmc_vtm = $local_var_to_term.clone();
-                    let _pmc_neg = $negations.clone();
+                    let _pmc_neg = $negations.as_map().clone();
                     let _ = $solver.pop();
                     $self.last_clause_trace = _pmc_clause_trace;
                     $self.last_clausification_proofs = Some(_pmc_clausification_proofs);
@@ -127,10 +153,50 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
                 $self.last_result = Some(SolveResult::unsat());
                 break $label Ok(SolveResult::unsat());
             }
-            BlockingClauseResult::Added => {
-                if let Some(_pmc_theory_proof) = $theory_proof {
-                    $local_clausification_proofs.push(None);
-                    $local_theory_proofs.push(Some(_pmc_theory_proof));
+            BlockingClauseResult::Added {
+                primary_original_id,
+                extra_original_ids,
+            } => {
+                if let (Some(_pmc_theory_proof), Some(_pmc_original_id)) =
+                    ($theory_proof, primary_original_id)
+                {
+                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                        &$solver,
+                        _pmc_original_id,
+                        None,
+                        Some(_pmc_theory_proof),
+                        &mut $local_clausification_proofs,
+                        &mut $local_theory_proofs,
+                    );
+                } else if $proof_enabled {
+                    $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                        &$solver,
+                        &mut $local_clausification_proofs,
+                        &mut $local_theory_proofs,
+                    );
+                }
+                if $proof_enabled {
+                    for (_pmc_source_index, _pmc_original_id) in extra_original_ids {
+                        let _pmc_extra = &extra_conflicts[_pmc_source_index];
+                        let _pmc_annotation =
+                            $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
+                                &mut $self.proof_tracker,
+                                Some(&$self.ctx.terms),
+                                $negations.as_map(),
+                                _pmc_extra,
+                            )
+                            .1;
+                        if let Some(_pmc_annotation) = _pmc_annotation {
+                            $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                &$solver,
+                                _pmc_original_id,
+                                None,
+                                Some(_pmc_annotation),
+                                &mut $local_clausification_proofs,
+                                &mut $local_theory_proofs,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -339,7 +405,7 @@ macro_rules! pipeline_build_eager_extension {
         // memo into the eager conflict verifiers (trust-true-only; failures
         // always re-verify — see TheoryExtension::verify_conflict_semantic_memo).
         .with_verify_memo(&mut $self.conflict_semantic_verify_memo)
-        // #verify-memo (AY_VERIFY_MEMO=1): the sampled propagation-verification
+        // #verify-memo (--verify-memo=1): the sampled propagation-verification
         // memo — Executor-owned so accepts survive per-iteration extension
         // rebuilds; inert unless the env flag is armed.
         .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);
@@ -475,7 +541,7 @@ macro_rules! pipeline_build_eager_extension {
         // memo into the eager conflict verifiers (trust-true-only; failures
         // always re-verify — see TheoryExtension::verify_conflict_semantic_memo).
         .with_verify_memo(&mut $self.conflict_semantic_verify_memo)
-        // #verify-memo (AY_VERIFY_MEMO=1): the sampled propagation-verification
+        // #verify-memo (--verify-memo=1): the sampled propagation-verification
         // memo — Executor-owned so accepts survive per-iteration extension
         // rebuilds; inert unless the env flag is armed.
         .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);

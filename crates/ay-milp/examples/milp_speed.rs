@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20
-//! AY_MILP_SMT=1 cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20
+//! --smt-lane cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20
 //! ```
 
 use std::fmt::Write as _;
@@ -142,13 +142,21 @@ fn to_mps_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(30);
-    let m: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-    let seed: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2_026);
+    // B40b: `--smt-lane` replaces the --smt-lane env force.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let flags = ay_milp::engine_cli::Flags::parse(&raw, ay_milp::engine_cli::VALUE_FLAGS)
+        .unwrap_or_else(|e| {
+            eprintln!("usage: milp_speed [n m seed] [--smt-lane]: {e}");
+            std::process::exit(2);
+        });
+    let args = &flags.positional;
+    let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2_026);
 
     let (model, cols, rows) = build(n, m, seed);
-    let lane = if std::env::var_os("AY_MILP_SMT").is_some() {
+    let smt_lane = flags.has("smt-lane");
+    let lane = if smt_lane {
         "ay-dpll smt lane"
     } else {
         "native branch-and-bound"
@@ -178,6 +186,9 @@ fn main() {
     // — which is what makes a like-for-like comparison against another solver's
     // time-limited run possible at all.
     let mut opts = SolveOpts::new();
+    if smt_lane {
+        opts = opts.with_engine(ay_milp::EngineEconomics::new().with_smt_lane(true));
+    }
     if let Ok(secs) = std::env::var("TIME_LIMIT") {
         if let Ok(secs) = secs.parse::<f64>() {
             opts = opts.with_time_limit(std::time::Duration::from_secs_f64(secs));
@@ -230,7 +241,7 @@ fn main() {
             if let Some(db) = dual_bound {
                 println!("dual bound (rigorous) = {db}");
             }
-            if std::env::var_os("AY_MILP_PRINT_POINT").is_some() {
+            if false {
                 let s: String = model_values
                     .iter()
                     .map(|v| {

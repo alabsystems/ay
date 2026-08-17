@@ -8,6 +8,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+ay-core.workspace = true
 # Non-optional on purpose: this crate ships a bin target, and every bin must
 # be able to arm the kernel memory bound (see crates/ay-sys/src/govern.rs).
 ay-sys.workspace = true

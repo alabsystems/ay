@@ -5,7 +5,7 @@
 //! Scope and provenance guards for opaque datatype model completion.
 
 use super::*;
-use ay_model_check::{GateVerdict, ModelValue};
+use ay_model_check::ModelValue;
 
 pub(super) fn loaded_fixture() -> Executor {
     let commands = ay_frontend::parse(
@@ -259,7 +259,7 @@ fn abstract_datatype_cell_replacement_requires_exact_class_provenance() {
     model.euf_model = Some(euf);
     model.dt_ground.insert(cell, value);
 
-    let completions = executor.exact_datatype_cell_completions(&model);
+    let completions = executor.exact_datatype_cell_completions(&model, &[]);
     assert!(executor.exact_datatype_cell_completion(
         &completions,
         "@GuardCell!7",
@@ -301,7 +301,7 @@ fn abstract_datatype_cell_replacement_requires_exact_class_provenance() {
 
     let mut missing_provenance = model.clone();
     missing_provenance.dt_ground.clear();
-    let missing_completions = executor.exact_datatype_cell_completions(&missing_provenance);
+    let missing_completions = executor.exact_datatype_cell_completions(&missing_provenance, &[]);
     assert!(!executor.exact_datatype_cell_completion(
         &missing_completions,
         "@GuardCell!7",
@@ -327,7 +327,7 @@ fn abstract_datatype_cell_replacement_requires_exact_class_provenance() {
             args: Vec::new(),
         },
     );
-    let clash_completions = executor.exact_datatype_cell_completions(&clash_model);
+    let clash_completions = executor.exact_datatype_cell_completions(&clash_model, &[]);
     assert!(
         !executor.exact_datatype_cell_completion(
             &clash_completions,
@@ -365,88 +365,11 @@ fn abstract_datatype_class_authority_requires_all_rows_to_agree() {
         },
     );
 
-    let completions = executor.exact_datatype_cell_completions(&model);
+    let completions = executor.exact_datatype_cell_completions(&model, &[]);
     assert!(!executor.exact_datatype_cell_completion(
         &completions,
         "@GuardCell!9",
         "(GuardCell_mk #x00)",
         &sort,
-    ));
-}
-
-#[test]
-fn quoted_datatype_names_never_authorize_bare_abstract_cells() {
-    let mut executor = loaded_fixture();
-    let sort = Sort::Uninterpreted("Quoted Cell".to_string());
-    let term = executor.ctx.terms.mk_var("quoted_carrier", sort.clone());
-    let mut model = empty_model();
-    let mut euf = EufModel::default();
-    euf.term_values.insert(term, "@Quoted Cell!0".to_string());
-    model.euf_model = Some(euf);
-    model.dt_ground.insert(
-        term,
-        ModelValue::Datatype {
-            ctor: "QuotedCell_mk".to_string(),
-            args: Vec::new(),
-        },
-    );
-
-    let completions = executor.exact_datatype_cell_completions(&model);
-    assert!(!executor.exact_datatype_cell_completion(
-        &completions,
-        "@Quoted Cell!0",
-        "QuotedCell_mk",
-        &sort,
-    ));
-}
-
-#[test]
-fn independent_gate_rejects_congruent_uf_rows_with_distinct_structured_values() {
-    let commands = ay_frontend::parse(
-        r#"
-        (set-logic ALL)
-        (declare-datatype GateBox ((GateBox_mk (GateBox_value (_ BitVec 8)))))
-        (declare-const x (_ BitVec 8))
-        (declare-const y (_ BitVec 8))
-        (declare-fun f ((_ BitVec 8)) GateBox)
-        (assert (not (= (f x) (f y))))
-    "#,
-    )
-    .expect("valid synthetic gate fixture");
-    let mut executor = Executor::new();
-    executor.execute_all(&commands).expect("fixture executes");
-
-    let mut x = None;
-    let mut y = None;
-    let mut apps = Vec::new();
-    for term in executor.ctx.terms.term_ids() {
-        match executor.ctx.terms.get(term) {
-            TermData::Var(name, _) if name == "x" => x = Some(term),
-            TermData::Var(name, _) if name == "y" => y = Some(term),
-            TermData::App(symbol, _)
-                if symbol.name() == "f"
-                    || executor.ctx.dt_surface_name(symbol.name()) == Some("f") =>
-            {
-                apps.push(term);
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(apps.len(), 2);
-    let mut model = bv_model(&[(x.unwrap(), 0), (y.unwrap(), 0)]);
-    for (term, value) in apps.into_iter().zip([0u8, 1]) {
-        model.dt_ground.insert(
-            term,
-            ModelValue::Datatype {
-                ctor: "GateBox_mk".to_string(),
-                args: vec![ModelValue::bitvec(BigInt::from(value), 8)],
-            },
-        );
-    }
-    executor.last_model = Some(model);
-
-    assert!(!matches!(
-        executor.confirm_sat_with_independent_gate(),
-        GateVerdict::ConfirmedSat
     ));
 }

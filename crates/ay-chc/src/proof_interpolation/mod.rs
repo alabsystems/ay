@@ -165,7 +165,7 @@ use strategies::{
 use zero_farkas::try_zero_farkas_interpolant;
 use zero_farkas::{select_shrunk_b_occurrences, try_zero_farkas_interpolant_candidate};
 
-/// Returns true if IUC tracing is enabled via AY_IUC_TRACE environment variable.
+/// Returns true if IUC tracing is enabled via `--iuc-trace` (B72).
 ///
 /// Used by both proof_interpolation and iuc_solver modules for consistent tracing.
 pub(crate) fn iuc_trace_enabled() -> bool {
@@ -175,7 +175,8 @@ pub(crate) fn iuc_trace_enabled() -> bool {
 
 /// Returns true if zero-Farkas fallbacks should be treated as a hard diagnostic.
 ///
-/// Set `AY_IUC_REQUIRE_FARKAS=1` (or `true`) to force a debug assertion when
+/// The require-farkas hard diagnostic (B24: env retired; flip the flag in
+/// `ChcDebugEnvFlags` for a debug run) forces a debug assertion when
 /// `compute_interpolant_from_smt_farkas_history` observes UNSAT with no Farkas
 /// conflicts. This is used to investigate #2450 regressions where interpolation
 /// quality may degrade due to missing theory certificates.
@@ -215,7 +216,7 @@ pub(super) fn trace_zero_farkas_diagnostic(
 
     if iuc_require_farkas_enabled() {
         let message = format!(
-            "AY_IUC_REQUIRE_FARKAS triggered: UNSAT query reached zero-Farkas fallback ({diagnostic_message})"
+            "require-farkas triggered: UNSAT query reached zero-Farkas fallback ({diagnostic_message})"
         );
         safe_eprintln!("[IUC] {message}");
     }

@@ -27,8 +27,7 @@
 //!
 //! Kill-switch: `AY_PDR_LEMMA_SANITIZE=0` disables (default ON).
 
-use std::env;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
@@ -42,13 +41,12 @@ pub(crate) const LEMMA_NODE_SOFT_CAP: usize = 50_000;
 
 /// Kill-switch: `AY_PDR_LEMMA_SANITIZE=0` disables sanitization (default ON).
 pub(crate) fn lemma_sanitize_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        lemma_sanitize_enabled_for(env::var("AY_PDR_LEMMA_SANITIZE").ok().as_deref())
-    })
+    // B27: CLI-owned (--chc-no-pdr-lemma-sanitize); env retired.
+    crate::ab_switches::get().pdr_lemma_sanitize
 }
 
 /// Testable core of the kill-switch parse: only the literal "0" disables.
+#[cfg(test)]
 fn lemma_sanitize_enabled_for(value: Option<&str>) -> bool {
     !matches!(value, Some("0"))
 }

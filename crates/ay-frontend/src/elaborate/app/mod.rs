@@ -8,7 +8,10 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use crate::command::Term as ParsedTerm;
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
-use super::{Context, ElaborateError, Result, SymbolInfo, MAX_FUN_EXPANSION_DEPTH};
+use super::{
+    is_canonical_theory_operator_identity, Context, ElaborateError, Result, SymbolInfo,
+    MAX_FUN_EXPANSION_DEPTH,
+};
 
 mod arithmetic;
 mod bitvectors;
@@ -457,31 +460,7 @@ impl Context {
                 .mk_app(Symbol::named(&declared_app_name), arg_ids, sort));
         }
 
-        if let Some(term) = self.try_elaborate_core_app(name, &mut arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_string_or_regex_app(name, &mut arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_sequence_app(name, &mut arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_set_app(name, &arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_multiset_app(name, &arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_map_app(name, &arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_arithmetic_app(name, &mut arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_bitvector_app(name, &arg_ids)? {
-            return Ok(term);
-        }
-        if let Some(term) = self.try_elaborate_floating_point_app(name, &arg_ids)? {
+        if let Some(term) = self.try_elaborate_builtin_app(name, &mut arg_ids)? {
             return Ok(term);
         }
 
@@ -491,6 +470,68 @@ impl Context {
             return Err(ElaborateError::UndefinedSymbol(name.to_string()));
         };
         Ok(self.terms.mk_app(Symbol::named(name), arg_ids, result_sort))
+    }
+
+    /// Elaborate one authenticated canonical theory application directly from
+    /// existing term-store operands.
+    ///
+    /// Unlike surface elaboration, this entrypoint deliberately bypasses live
+    /// declarations and definitions with the same spelling. Its caller must
+    /// already have authenticated `name` as a canonical core identity; the
+    /// guard here enforces that boundary again before invoking the same builtin
+    /// dispatch used by ordinary elaboration.
+    #[doc(hidden)]
+    pub fn elaborate_canonical_theory_application(
+        &mut self,
+        name: &str,
+        args: &[TermId],
+    ) -> std::result::Result<TermId, ElaborateError> {
+        if !is_canonical_theory_operator_identity(name)
+            || args.iter().any(|term| term.index() >= self.terms.len())
+        {
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        }
+        let mut args = args.to_vec();
+        self.try_elaborate_builtin_app(name, &mut args)?
+            .ok_or_else(|| ElaborateError::UndefinedSymbol(name.to_string()))
+    }
+
+    /// Dispatch a named builtin after its operands have already been
+    /// elaborated. Keeping this shared by the surface and canonical-identity
+    /// paths prevents their supported operator sets and sort checks drifting.
+    fn try_elaborate_builtin_app(
+        &mut self,
+        name: &str,
+        args: &mut [TermId],
+    ) -> Result<Option<TermId>> {
+        if let Some(term) = self.try_elaborate_core_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_string_or_regex_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_sequence_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_set_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_multiset_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_map_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_arithmetic_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_bitvector_app(name, args)? {
+            return Ok(Some(term));
+        }
+        if let Some(term) = self.try_elaborate_floating_point_app(name, args)? {
+            return Ok(Some(term));
+        }
+        Ok(None)
     }
 
     /// True when `term` has a (non-recursive or recursive) datatype sort — i.e.

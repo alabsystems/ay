@@ -17,9 +17,8 @@ use crate::{ChcExpr, ChcOp};
 
 /// `AY_CHC_DISEQ_SWAP` kill-switch (default ON; only the literal "0" disables).
 pub(in crate::pdr::solver) fn diseq_swap_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("AY_CHC_DISEQ_SWAP").ok().as_deref() != Some("0"))
+    // B15: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().diseq_swap
 }
 
 /// Strict refinements of any disequality disjunct in `formula`.

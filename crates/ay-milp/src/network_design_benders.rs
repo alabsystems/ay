@@ -51,7 +51,7 @@ pub(crate) fn try_solve_projection(
             .map(|component| component.flow_columns.len())
             .sum();
         eprintln!(
-            "AY_MILP_TRACE network-benders: admitted master-cols={} master-rows={} \
+            "--trace network-benders: admitted master-cols={} master-rows={} \
              seed-hoffman-rows={} components={} balance-rows={} flow-cols={}",
             projection.master.num_cols(),
             initial_rows,
@@ -200,7 +200,7 @@ fn trace_result(
 ) {
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE network-benders: master-cols={} initial-rows={} components={} \
+            "--trace network-benders: master-cols={} initial-rows={} components={} \
              lazy-cuts={} verdict={} pb-wall={:.6}s separation-wall={:.6}s \
              install-wall={:.6}s wall={:.6}s",
             projection.master.num_cols(),
@@ -226,7 +226,7 @@ fn trace_iteration(
 ) {
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE network-benders: lazy-cuts={} master-rows={} pb-wall={:.6}s \
+            "--trace network-benders: lazy-cuts={} master-rows={} pb-wall={:.6}s \
              separation-wall={:.6}s install-wall={:.6}s wall={:.6}s",
             cuts,
             projection.master.num_rows(),
@@ -244,7 +244,7 @@ fn trace_enabled() -> bool {
     // `set_var` can race, which priming cannot help. `OnceLock` is the shape
     // that ratchet asks for and `simplex.rs` already uses.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 /// Force this module's cached env accessor at solve entry, so a consumer that

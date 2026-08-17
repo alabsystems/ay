@@ -326,8 +326,7 @@ fn test_nra_statistics_collected() {
     assert!(check_count >= 1, "should have performed at least one check");
 }
 
-/// McCormick envelope: tangent plane at zero factors should produce valid
-/// (non-NaN, non-infinite) bounds.
+/// McCormick at zero factors must produce finite bounds.
 #[test]
 fn test_mccormick_zero_bounds() {
     // McCormick with one bound at zero: xL=0, yL=0
@@ -348,8 +347,7 @@ fn test_mccormick_zero_bounds() {
     assert_eq!(lb2_at_half, rat(0));
 }
 
-/// Tangent hyperplane with zero-valued factor should handle the
-/// degenerate case (partial derivative = 0 when factor = 0).
+/// Zero-valued factors must handle the degenerate zero partial derivative.
 #[test]
 fn test_tangent_hyperplane_with_zero_factor() {
     let vals = [rat(0), rat(3)];
@@ -844,3 +842,5 @@ fn test_tangent_plane_small_fractions() {
     let t_at_ab = &a * &b + &b * &a - &a * &b;
     assert_eq!(t_at_ab, expected);
 }
+
+include!("tangent_tests/fixed_factor.rs");

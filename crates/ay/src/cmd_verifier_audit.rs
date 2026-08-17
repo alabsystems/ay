@@ -261,7 +261,7 @@ const PROBES: &[Probe] = &[
         smt2: "(set-logic QF_UF)\n(declare-sort U 0)\n(declare-const a U) (declare-const b U) (declare-const c U)\n(assert (= a b)) (assert (= b c)) (assert (not (= a c)))\n(check-sat)\n",
         expect: Expect::ProofCarrying,
         requires: &["(step", "(cl)"],
-        note: "DIFFERENTIATOR: every AY unsat can export a machine-checkable Alethe certificate (checkable by Carcara/Lean). Z3 and Alt-Ergo do not; this turns 'trust the solver' into 'check the proof' — a direct upgrade for Creusot/Why3.",
+        note: "DIFFERENTIATOR: outside the explicit proof-shedding competition lane, every AY unsat can export a machine-checkable Alethe certificate (checkable by Carcara/Lean). Z3 and Alt-Ergo do not; this turns 'trust the solver' into 'check the proof' — a direct upgrade for Creusot/Why3.",
     },
 ];
 

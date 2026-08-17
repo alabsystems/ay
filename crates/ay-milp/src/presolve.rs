@@ -43,6 +43,11 @@ pub(crate) use binary_complement::{
     substitute_binary_complements, BinaryComplementPostsolve, BinaryComplementRowOrigin,
     BinaryComplementSide,
 };
+pub(crate) mod structure;
+#[cfg(test)]
+mod structure_adversary;
+mod structure_attack;
+pub(crate) use structure::{eliminate_structure, struct_elim_enabled, StructurePostsolve};
 pub(crate) mod objective_singleton;
 pub(crate) use objective_singleton::{
     substitute_objective_singletons, substitute_objective_singletons_with_deadline,
@@ -132,7 +137,7 @@ pub(crate) fn tighten_bounds_opt(
         .map(|j| model.col_kind(Col(j as u32)).is_integral())
         .collect();
 
-    // FLOAT SCOUT (advice lane; `AY_MILP_NO_PRESOLVE_SCOUT` kills it). The
+    // FLOAT SCOUT (advice lane; `--no-presolve-scout` kills it). The
     // OUTPUT of this function only ever differs from the input model through
     // (a) an integral column's bound moving, (b) an originally-OPEN bound
     // closing, or (c) infeasibility — a continuous column's already-finite
@@ -155,13 +160,15 @@ pub(crate) fn tighten_bounds_opt(
     // still decided in exact rationals. A scout miss (float noise hiding a
     // just-past-threshold tightening) costs bound tightness, never
     // correctness.
-    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
-    let plan: Option<Vec<u32>> = if std::env::var_os("AY_MILP_NO_PRESOLVE_SCOUT").is_none() {
+    let trace = crate::debug_flags::milp_debug_flags().trace;
+    let plan: Option<Vec<u32>> = if crate::tune::caller_flag(crate::tune::Knob::NoPresolveScout)
+        != Some(true)
+    {
         let _t_scout = std::time::Instant::now();
         let p = scout_plan(model, &integral, deadline);
         if trace {
             eprintln!(
-                "AY_MILP_TRACE presolve: scout {} in {:.3}s",
+                "--trace presolve: scout {} in {:.3}s",
                 match &p {
                     None => "FULL LANE".to_string(),
                     Some(v) if v.is_empty() => "NOTHING VISIBLE (skip exact sweeps)".to_string(),
@@ -187,7 +194,7 @@ pub(crate) fn tighten_bounds_opt(
         return Presolved::Infeasible;
     }
 
-    if std::env::var_os("AY_MILP_TRACE").is_some() {
+    if crate::debug_flags::milp_debug_flags().trace {
         let mut newly_finite = 0;
         let mut biggest: f64 = 0.0;
         for j in 0..n {
@@ -200,7 +207,7 @@ pub(crate) fn tighten_bounds_opt(
             }
         }
         eprintln!(
-            "AY_MILP_TRACE presolve: {newly_finite} columns gained a finite bound; \
+            "--trace presolve: {newly_finite} columns gained a finite bound; \
              largest bound magnitude {biggest:.3e}"
         );
     }
@@ -250,12 +257,12 @@ pub(crate) fn tighten_bounds_opt(
     // (see `tighten_coefficients`). This must read the box `out` actually carries — not the
     // tighter rational bounds above — because its validity argument quantifies over exactly
     // the points the output model admits.
-    if coef_tighten && std::env::var_os("AY_MILP_NO_COEF_TIGHTEN").is_none() {
+    if coef_tighten && !crate::tune::on(crate::tune::Knob::NoCoefTighten) {
         let _t_coef = std::time::Instant::now();
         let tightened = tighten_coefficients(&mut out, deadline);
         if trace {
             eprintln!(
-                "AY_MILP_TRACE presolve: coef-tighten wall={:.3}s applied={tightened}",
+                "--trace presolve: coef-tighten wall={:.3}s applied={tightened}",
                 _t_coef.elapsed().as_secs_f64()
             );
         }
@@ -285,7 +292,7 @@ pub(crate) fn tighten_bounds_opt(
         // Strengthening a row the LP is not sitting on buys nothing and perturbs everything.
         //
         // `AY_MILP_NO_COND_TIGHTEN` restores the pre-2026-07-26 behaviour byte-identically;
-        // `AY_MILP_COND_TIGHTEN` is kept as the explicit-on A/B arm.
+        // `the cond-tighten knob` is kept as the explicit-on A/B arm.
         //
         // REVERTED TO OPT-IN (2026-07-29). The default-on justification above was measured and
         // was true when written: strict improvement where it fires, provably inert elsewhere.
@@ -308,17 +315,18 @@ pub(crate) fn tighten_bounds_opt(
         // wins" is only as durable as the interactions it was measured against. This one was
         // re-checked three days later and had flipped sign. Shipped defaults on this codebase
         // need periodic re-measurement, not just verification at merge time.
-        // Both arms stay live: `AY_MILP_COND_TIGHTEN` opts in, `AY_MILP_NO_COND_TIGHTEN`
+        // Both arms stay live: `the cond-tighten knob` opts in, `AY_MILP_NO_COND_TIGHTEN`
         // force-disables even if the opt-in is set, so a campaign script that sets the
         // kill switch keeps working exactly as it did while this was a default.
-        if std::env::var_os("AY_MILP_COND_TIGHTEN").is_some()
-            && std::env::var_os("AY_MILP_NO_COND_TIGHTEN").is_none()
+        if crate::tune::caller_flag(crate::tune::Knob::CondTighten) == Some(true)
+        // B7: the AY_MILP_NO_COND_TIGHTEN off-switch is deleted (always enabled
+        // when the opt-in above holds).
         {
             let _t_cond = std::time::Instant::now();
             let rewritten = tighten_coefficients_conditional(&mut out, deadline);
             if trace {
                 eprintln!(
-                    "AY_MILP_TRACE presolve: cond-tighten wall={:.3}s applied={rewritten}",
+                    "--trace presolve: cond-tighten wall={:.3}s applied={rewritten}",
                     _t_cond.elapsed().as_secs_f64()
                 );
             }
@@ -358,7 +366,7 @@ pub(crate) fn propagate(
 ) -> bool {
     use ay_lra::rational::Rational;
     let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
-    // Round-level economics (`AY_MILP_TRACE`): where the presolve share
+    // Round-level economics (`--trace`): where the presolve share
     // actually goes at the 7.5M-nnz scale — wall per sweep, rows reached
     // before the deadline, bounds moved. Diagnostic only.
     for round in 0..ROUNDS {
@@ -368,7 +376,7 @@ pub(crate) fn propagate(
         let mut changed = false;
         if expired() {
             if trace {
-                eprintln!("AY_MILP_TRACE presolve: round {round} skipped (deadline)");
+                eprintln!("--trace presolve: round {round} skipped (deadline)");
             }
             break; // keep whatever has been derived so far -- it is all still valid
         }
@@ -473,7 +481,7 @@ pub(crate) fn propagate(
         }
         if trace {
             eprintln!(
-                "AY_MILP_TRACE presolve: round {round} wall={:.3}s rows={rows_done}/{row_count} moves={moves}{}",
+                "--trace presolve: round {round} wall={:.3}s rows={rows_done}/{row_count} moves={moves}{}",
                 _t_round.elapsed().as_secs_f64(),
                 if expired() { " EXPIRED" } else { "" }
             );
@@ -900,7 +908,7 @@ pub(crate) fn tighten_coefficients(
                 let (Some(af), Some(bf)) = (as_exact_f64(&a_new), as_exact_f64(&b_new)) else {
                     continue;
                 };
-                if std::env::var_os("AY_MILP_COEF_TIGHTEN_DEBUG").is_some() {
+                if crate::debug_flags::milp_debug_flags().coef_tighten_debug {
                     eprintln!(
                         "COEF_TIGHTEN row {r} col {c}: a {} -> {af} | rhs {} -> {bf} (level {level}, d {d})",
                         signed(model.rows[r].coeffs[i].1),
@@ -1109,7 +1117,7 @@ pub(crate) fn tighten_coefficients_conditional(
     let mut scout_budget = COND_SCOUT_BUDGET / nnz;
     let one = BigRational::one();
     let min_gain = exact(MIN_GAIN).expect("MIN_GAIN is finite");
-    let debug = std::env::var_os("AY_MILP_COEF_TIGHTEN_DEBUG").is_some();
+    let debug = crate::debug_flags::milp_debug_flags().coef_tighten_debug;
     let mut applied = 0usize;
 
     // FLOAT SCOUT (advice lane, same bargain as `scout_plan`'s). A candidate costs an exact
@@ -1121,7 +1129,7 @@ pub(crate) fn tighten_coefficients_conditional(
     // applied rewrite is still decided in exact rationals. A scout miss (float noise hiding a
     // just-past-threshold `d`) costs a tightening, never correctness — not tightening is always
     // sound.
-    let scout = std::env::var_os("AY_MILP_NO_COND_SCOUT").is_none();
+    let scout = crate::tune::caller_flag(crate::tune::Knob::NoCondScout) != Some(true);
     let (mut flo, mut fup) = (vec![0.0f64; n], vec![0.0f64; n]);
     for j in 0..n {
         let (l, u) = model.col_bounds(Col(j as u32));
@@ -1400,7 +1408,7 @@ fn cond_scout_worth_it(
 
 /// The f64 that denotes `v` exactly, if one exists. Anything else — too many mantissa bits,
 /// out of range — is `None`: the caller must skip, not round.
-fn as_exact_f64(v: &BigRational) -> Option<f64> {
+pub(crate) fn as_exact_f64(v: &BigRational) -> Option<f64> {
     let f = v.to_f64()?;
     if !f.is_finite() {
         return None;
@@ -1691,7 +1699,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
         }
     }
 
-    if std::env::var_os("AY_MILP_SINGLETON_DIAG").is_some() {
+    if crate::debug_flags::milp_debug_flags().trace {
         let cont = (0..n)
             .filter(|&j| model.col_kind(Col(j as u32)) == ColKind::Continuous)
             .count();
@@ -1718,7 +1726,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
             }
         }
         eprintln!(
-            "AY_MILP_SINGLETON_DIAG: cols={n} cont={cont} cont_deg1={cont_deg1} eq_rows={eq_rows}/{nr} cont_singletons_in_eq={singleton_in_eq}"
+            "--trace singleton-sub: cols={n} cont={cont} cont_deg1={cont_deg1} eq_rows={eq_rows}/{nr} cont_singletons_in_eq={singleton_in_eq}"
         );
     }
 
@@ -1732,7 +1740,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
     // Original row -> its `recover` entry, for the rows that eliminated a column.
     let mut recover_of_row: Vec<Option<usize>> = vec![None; nr];
     let mut row_fate: Vec<RowFate> = (0..nr).map(|_| RowFate::Keep).collect();
-    let diag = std::env::var_os("AY_MILP_SINGLETON_DIAG").is_some();
+    let diag = crate::debug_flags::milp_debug_flags().trace;
     let (mut sk_multi, mut sk_range, mut sk_obj, mut n_drop, mut n_rebound) = (0, 0, 0, 0, 0);
 
     // Cached exact box bounds (None == infinite).
@@ -1905,7 +1913,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
 
     if diag {
         eprintln!(
-            "AY_MILP_SINGLETON_DIAG: eliminated={} (drop={n_drop} rebound={n_rebound}) skipped: multi_deg1={sk_multi} range_inexact={sk_range} obj_inexact={sk_obj}",
+            "--trace singleton-sub: eliminated={} (drop={n_drop} rebound={n_rebound}) skipped: multi_deg1={sk_multi} range_inexact={sk_range} obj_inexact={sk_obj}",
             recover.len()
         );
     }
@@ -1981,13 +1989,13 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
     out.set_objective(&obj_terms, model.sense());
     out.set_objective_offset(model.objective_offset());
 
-    if std::env::var_os("AY_MILP_TRACE").is_some() {
+    if crate::debug_flags::milp_debug_flags().trace {
         let onz: usize = (0..nr).map(|r| model.row(Row(r as u32)).0.len()).sum();
         let rnz: usize = (0..out.num_rows())
             .map(|r| out.row(Row(r as u32)).0.len())
             .sum();
         eprintln!(
-            "AY_MILP_TRACE singleton-sub: eliminated {} col ({n_drop} row-drop, {n_rebound} row-rebound); model {}r/{}c/{}nnz -> {}r/{}c/{}nnz",
+            "--trace singleton-sub: eliminated {} col ({n_drop} row-drop, {n_rebound} row-rebound); model {}r/{}c/{}nnz -> {}r/{}c/{}nnz",
             recover.len(),
             nr,
             n,
@@ -2012,6 +2020,8 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
 mod tests {
     use super::*;
     use crate::model::Sense;
+
+    mod scout_skip;
 
     /// The case the whole module is for: a column the modeller left open above, which a row
     /// pins anyway.
@@ -2436,9 +2446,9 @@ mod tests {
             let (mut scouted, mut exact_only) = (m.clone(), m.clone());
             let n_scouted = tighten_coefficients_conditional(&mut scouted, None);
             // SAFETY: single-threaded test, and the name is read only inside the call below.
-            unsafe { std::env::set_var("AY_MILP_NO_COND_SCOUT", "1") };
+            unsafe { std::env::set_var("the no-cond-scout knob", "1") };
             let n_exact = tighten_coefficients_conditional(&mut exact_only, None);
-            unsafe { std::env::remove_var("AY_MILP_NO_COND_SCOUT") };
+            unsafe { std::env::remove_var("the no-cond-scout knob") };
             assert!(
                 n_scouted <= n_exact,
                 "the scout let through {n_scouted} rewrites the exact lane would not have made \
@@ -2771,27 +2781,5 @@ mod tests {
             );
         }
         assert!(fired > 50, "test is vacuous: only {fired} cases fired");
-    }
-
-    /// SCOUT GUARD: when nothing output-visible can move, the sweeps are
-    /// skipped and the output box is BYTE-IDENTICAL to the input — which is
-    /// also exactly what the full lane would have shipped (its continuous
-    /// refinements are discarded, its integral candidates are immaterial).
-    #[test]
-    fn scout_skip_ships_the_input_box_when_nothing_visible_moves() {
-        let mut m = Model::new();
-        let z = m.add_int_col(0.0, 1.0);
-        let x = m.add_col(0.0, 10.0);
-        // x <= 8: a real workspace tightening, invisible at output.
-        m.add_row(f64::NEG_INFINITY, 8.0, &[(x, 1.0)]);
-        // z + x <= 50: slack — z's derived cap (50 - 0 = 50, floor 42-ish
-        // territory) never beats its existing ub 1.
-        m.add_row(f64::NEG_INFINITY, 50.0, &[(z, 1.0), (x, 1.0)]);
-        m.set_objective(&[(z, 1.0)], Sense::Maximize);
-        let Presolved::Tightened(out) = tighten_bounds(&m, None) else {
-            panic!("the model is feasible");
-        };
-        assert_eq!(out.col_bounds(z), (0.0, 1.0));
-        assert_eq!(out.col_bounds(x), (0.0, 10.0));
     }
 }

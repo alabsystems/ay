@@ -10,10 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
-use clap::Subcommand;
-
 use crate::stats_output::{RunStatistics, SolveMode};
+use anyhow::{Context, Result};
 use ay_pb::{
     eval_objective_exact, gf2_parity_detects_unsat_with_recovery, gf2_parity_unsat_cp_checked,
     is_linear, linearize, matching_cardinality_unsat_cp_checked, parse_opb_interruptible,
@@ -37,39 +35,9 @@ const NONLINEAR_OPT_FRONTEND_TIMEOUT_RESERVE_MS: u64 = 600;
 /// process is killed before any answer is emitted.
 const DECISION_FRONTEND_TIMEOUT_RESERVE_MS: u64 = 500;
 
-/// PB solver subcommands.
-#[derive(Subcommand)]
-pub(crate) enum PbCommand {
-    /// Solve an OPB or WBO pseudo-Boolean instance.
-    Solve {
-        /// Input file in OPB or WBO format.
-        file: PathBuf,
+mod command;
 
-        /// Timeout in milliseconds.
-        #[arg(short = 't', long, value_name = "MS")]
-        timeout: Option<u64>,
-
-        /// Write VeriPB proof to file.
-        #[arg(long, value_name = "FILE")]
-        proof: Option<PathBuf>,
-
-        /// Print PB-specific comments before the result.
-        #[arg(long)]
-        stats: bool,
-
-        /// Print shared stats envelope as JSON to stderr.
-        #[arg(long)]
-        stats_json: bool,
-
-        /// INTERNAL benchmarking override: force the native PB CDCL engine and
-        /// bypass automatic engine selection. Not a normal solving option — the
-        /// solver already picks the best engine per instance automatically
-        /// (`portfolio::select_strategy`). Kept hidden for A/B measurement
-        /// (development sweep tooling) and tests only.
-        #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
-        native: bool,
-    },
-}
+pub(crate) use command::PbCommand;
 
 pub(crate) fn run(cmd: &PbCommand) -> Result<PbStatus> {
     let stdout = io::stdout();
@@ -135,6 +103,7 @@ pub(crate) fn run_z3_compat(
         stats: false,
         stats_json: false,
         native: false,
+        ab_switches: Default::default(),
     };
     let mut captured = Vec::new();
     let status = run_with_writer(&command, &mut captured)?;
@@ -142,8 +111,8 @@ pub(crate) fn run_z3_compat(
     let transcript = String::from_utf8(captured).context("PB solver emitted non-UTF-8 output")?;
     let objective = transcript
         .lines()
-        .filter_map(|line| line.strip_prefix("o "))
-        .last();
+        .rev()
+        .find_map(|line| line.strip_prefix("o "));
     let assignment = parse_competition_assignment(&transcript)?;
 
     match status {
@@ -198,6 +167,7 @@ fn emit_z3_boolean_model(assignment: &[bool]) {
 }
 
 fn run_with_writer<W: Write>(cmd: &PbCommand, writer: W) -> Result<PbStatus> {
+    cmd.install_ab_switches()?;
     match cmd {
         PbCommand::Solve {
             file,
@@ -206,6 +176,7 @@ fn run_with_writer<W: Write>(cmd: &PbCommand, writer: W) -> Result<PbStatus> {
             stats,
             stats_json,
             native,
+            ab_switches,
         } => run_solve(
             file,
             proof.as_deref(),
@@ -213,6 +184,7 @@ fn run_with_writer<W: Write>(cmd: &PbCommand, writer: W) -> Result<PbStatus> {
             *stats,
             *stats_json,
             *native,
+            ab_switches.proof_tap_legacy(),
             writer,
         ),
     }
@@ -277,6 +249,12 @@ fn apply_memory_limit() {
     }
 }
 
+/// `--proof-tap-legacy` (B31; was `AY_PB_PROOF_TAP=legacy`). Process-constant,
+/// stored at dispatch: the consumer sits under the decision proof phase two
+/// call layers down, and the choice is per-process exactly like the retired
+/// env var was (mirrors the standalone `ay-pb` binary).
+static PROOF_TAP_LEGACY: AtomicBool = AtomicBool::new(false);
+
 fn run_solve<W: Write>(
     file: &Path,
     proof: Option<&Path>,
@@ -284,10 +262,10 @@ fn run_solve<W: Write>(
     stats: bool,
     stats_json: bool,
     native: bool,
+    proof_tap_legacy: bool,
     writer: W,
 ) -> Result<PbStatus> {
-    apply_memory_limit();
-    let solve_start = std::time::Instant::now();
+    let solve_start = prepare_pb_process(proof_tap_legacy);
     let sigterm = SigtermMonitor::install().context("failed to install SIGTERM monitor")?;
     let term_flag = sigterm.flag();
     let mut out = PbOutputWriter::new(writer);
@@ -543,7 +521,7 @@ fn solve_pb<W: Write>(
                 }));
             }
             // Root EDAC/VAC-lite lower-bound probe over the reconstructed
-            // WCSP view (campaign soft-1; opt-in AY_PB_WCSP_EDAC=1, default
+            // WCSP view (campaign soft-1; opt-in --pb-wcsp-edac, default
             // OFF). Soundness of the UNSAT verdict: the probe's `c0` is a
             // trail-CHECKED floor on the falsified-soft cost of EVERY
             // assignment satisfying the instance's hard one-hot rows (the
@@ -753,7 +731,7 @@ fn solve_opb<W: Write>(
     // holds unconditionally here (the proof branch returned earlier in `solve_opb`),
     // keeping the certified-proof path on its own dedicated emission route.
     if instance.objective.is_none() && proof.is_none() && structural_unsat_self_checked(instance) {
-        if std::env::var_os("AY_CERT_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().cert_debug {
             eprintln!(
                 "c refutation self-checked EARLY: structural 0>=1 (kernel-algebra), \
                  emitting s UNSATISFIABLE"
@@ -826,7 +804,7 @@ fn solve_opb<W: Write>(
     // set (P1 = the full sequential routing on a dedicated core, the internally
     // linearizing SAT-encoded arms, and the product-native `nlc-sls-opt`
     // primal) and enforces the wall clock itself via the coordinator's hard
-    // collection deadline. With parallelism unavailable (`AY_PB_PARALLEL=0` /
+    // collection deadline. With parallelism unavailable (`the --pb-parallel policy=0` /
     // single core / memory clamp) this sequential wrapper path is
     // byte-identical to before.
     if wbo_projection.is_none()
@@ -876,7 +854,7 @@ fn solve_opb<W: Write>(
         cache_exact_solution(best_solution, exact_solution);
     };
     // PARALLEL OPTIMIZATION TRACK (batteries-included default; design §2.3):
-    // when the memory-clamped core budget is >= 2 (`AY_PB_PARALLEL` unset
+    // when the memory-clamped core budget is >= 2 (`the --pb-parallel policy` unset
     // defaults to AUTO, `NBCORE`-sized; `=0` disables) and the instance is
     // eligible (`should_parallelize_optimization` — linear, the NLC-safe
     // non-linear subset, and WBO reductions, which are linear by
@@ -1506,13 +1484,11 @@ fn solve_decision_with_proof(
         };
         // Proof-tap spec PHASE 4 default flip: the DENSE conflict path with
         // async micro-op capture is the DEFAULT for proof-on. The legacy
-        // synchronous CpConstraint proof path is the escape hatch, selected by
-        // AY_PB_PROOF_TAP=legacy (or =0); AY_PB_PROOF_TAP=1 and any other value
-        // (including unset) stay on the tap. Fail-closed on both paths: any tap
-        // failure surfaces via conclude_proof and no proof commits.
-        let tap_enabled = std::env::var("AY_PB_PROOF_TAP").map_or(true, |v| {
-            !matches!(v.trim().to_ascii_lowercase().as_str(), "legacy" | "0")
-        });
+        // synchronous CpConstraint proof path is the escape hatch
+        // (`--proof-tap-legacy`; B31 retired the env spelling). Fail-closed
+        // on both paths: any tap failure surfaces via conclude_proof and no
+        // proof commits.
+        let tap_enabled = !PROOF_TAP_LEGACY.load(Ordering::Relaxed);
         let mut solver = if tap_enabled {
             PbCdclSolver::with_proof_tap_interruptible(
                 instance,
@@ -2038,25 +2014,7 @@ fn clique_conflict_row_import_map_sidecar_path(proof_path: &Path) -> PathBuf {
     sidecar_path
 }
 
-fn proof_temp_path(proof_path: &Path) -> PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let mut temp_path = proof_path.to_path_buf();
-    let temp_extension = proof_path
-        .extension()
-        .map(|extension| {
-            format!(
-                "{}.tmp-{}-{nonce}",
-                extension.to_string_lossy(),
-                std::process::id()
-            )
-        })
-        .unwrap_or_else(|| format!("tmp-{}-{nonce}", std::process::id()));
-    temp_path.set_extension(temp_extension);
-    temp_path
-}
+include!("cmd_pb/process_support.rs");
 
 fn pb_cdcl_result_to_solution(result: PbCdclResult, num_pb_vars: u32) -> PbSolution {
     match result {

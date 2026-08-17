@@ -151,14 +151,14 @@ impl WitnessWorkBudget {
 
 /// Default maximum witness length when no exact length is requested.
 /// Env-tunable via `AY_WE_WITNESS_MAX_LEN` (strings S1 feasibility knob):
-/// flags-off default unchanged; `AY_WE_S1=1` lifts the default to
+/// flags-off default unchanged; `--no-we-s1=1` lifts the default to
 /// [`WITNESS_MAX_LEN_S1`] (an explicit `AY_WE_WITNESS_MAX_LEN` still wins).
 /// Found witnesses are model-validated fail-closed downstream, so a larger
 /// budget can only convert or cost time, never mis-answer.
 const WITNESS_MAX_LEN: usize = 12;
 const WITNESS_MAX_LEN_S1: usize = 64;
 
-/// Strings increment S1 master switch (`AY_WE_S1`, default OFF).
+/// Strings increment S1 master switch (`--no-we-s1`, default OFF).
 ///
 /// OFF keeps every S1 lane byte-identical to the pre-S1 solver. ON lifts the
 /// WeRegex budgets (witness length/states/alphabet, emptiness states/critical
@@ -172,9 +172,8 @@ const WITNESS_MAX_LEN_S1: usize = 64;
 pub fn s1_enabled() -> bool {
     // DEFAULT-ON since the 281-file sweep: 116 conversions, all z3-agreeing
     // (DISAGREE=0 per-file), 0 regressions on solved files, 1100-case
-    // differential+pin-model fuzz clean. AY_WE_S1=0 is the kill switch.
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !matches!(std::env::var("AY_WE_S1").ok().as_deref(), Some("0")))
+    // differential+pin-model fuzz clean. `--no-we-s1` is the kill switch.
+    !ay_core::theory_disable_flags().no_we_s1
 }
 
 fn witness_max_states() -> usize {
@@ -193,22 +192,14 @@ fn witness_alphabet_cap() -> usize {
     }
 }
 
-fn parse_witness_max_len(value: Option<&str>, s1: bool) -> usize {
-    value.and_then(|s| s.parse().ok()).unwrap_or(if s1 {
+// B9: the AY_WE_WITNESS_MAX_LEN override nothing set is retired; the cap is
+// the compiled per-mode constant.
+pub(crate) fn witness_max_len() -> usize {
+    if s1_enabled() {
         WITNESS_MAX_LEN_S1
     } else {
         WITNESS_MAX_LEN
-    })
-}
-
-pub(crate) fn witness_max_len() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        parse_witness_max_len(
-            std::env::var("AY_WE_WITNESS_MAX_LEN").ok().as_deref(),
-            s1_enabled(),
-        )
-    })
+    }
 }
 
 impl WeRegex {

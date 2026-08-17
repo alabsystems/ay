@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use crate::dimacs::parse_str;
+use crate::dimacs::{parse_str, DimacsFormula};
 use crate::features::SatFeatures;
 use crate::literal::{Literal, Variable};
 use std::sync::atomic::AtomicBool;
@@ -360,41 +360,14 @@ fn test_portfolio_worker_solver_wires_shared_interrupt_flag() {
     );
 }
 
-/// Test: portfolio UNSAT with LRAT output verified by built-in LRAT checker (#8428).
-///
-/// Solves a non-trivial UNSAT formula (all 8 sign combinations of 3 variables)
-/// with proof mode enabled, extracts the forward LRAT proof bytes from the
-/// winning solver thread, parses them, and feeds each step to the `LratChecker`
-/// to verify that every derived clause has a valid RUP chain. This is the
-/// acceptance criterion for #8428: proof file output from portfolio solving.
-#[test]
-fn test_portfolio_proof_verified_by_lrat_checker() {
+fn assert_lrat_proof_verifies(
+    formula: &DimacsFormula,
+    proof_bytes: Vec<u8>,
+    empty_clause_message: &str,
+) {
     use crate::lrat_checker::LratChecker;
 
-    // All 8 sign combinations of 3 variables: always UNSAT.
-    let cnf = "\
-        p cnf 3 8\n\
-        1 2 3 0\n\
-        1 2 -3 0\n\
-        1 -2 3 0\n\
-        1 -2 -3 0\n\
-        -1 2 3 0\n\
-        -1 2 -3 0\n\
-        -1 -2 3 0\n\
-        -1 -2 -3 0\n";
-    let formula = parse_str(cnf).expect("valid DIMACS");
-
-    let mut portfolio = PortfolioSolver::new(2);
-    portfolio.set_proof_mode(true);
-    let (result, proof_bytes) = portfolio.solve_with_proof_bytes(&formula);
-
-    assert!(result.is_unsat(), "expected UNSAT, got {result:?}");
-    let bytes = proof_bytes.expect("proof_mode UNSAT must produce raw LRAT proof bytes");
-    assert!(!bytes.is_empty(), "LRAT proof bytes must be non-empty");
-
-    let proof_text = String::from_utf8(bytes).expect("LRAT proof must be valid UTF-8");
-
-    // Parse LRAT and verify with LratChecker.
+    let proof_text = String::from_utf8(proof_bytes).expect("LRAT proof must be valid UTF-8");
     let mut checker = LratChecker::new(formula.num_vars);
 
     // Add original clauses (1-indexed IDs matching LRAT convention).
@@ -421,13 +394,12 @@ fn test_portfolio_proof_verified_by_lrat_checker() {
             }
             continue;
         }
+
         // Addition line: "<id> <lit1> ... 0 <hint1> ... 0"
         let tokens: Vec<&str> = line.split_whitespace().collect();
         assert!(!tokens.is_empty(), "non-empty LRAT line must have tokens");
-
         let clause_id: u64 = tokens[0].parse().expect("clause ID must parse");
 
-        // Parse literals until first "0".
         let mut lits = Vec::new();
         let mut idx = 1;
         while idx < tokens.len() && tokens[idx] != "0" {
@@ -443,7 +415,6 @@ fn test_portfolio_proof_verified_by_lrat_checker() {
         }
         idx += 1; // skip the "0" terminator
 
-        // Parse hints until second "0".
         let mut hints = Vec::new();
         while idx < tokens.len() && tokens[idx] != "0" {
             let hint: u64 = tokens[idx].parse().expect("hint must parse");
@@ -451,22 +422,53 @@ fn test_portfolio_proof_verified_by_lrat_checker() {
             idx += 1;
         }
 
-        // Verify the derived clause via the LRAT checker.
         checker.add_derived(clause_id, &lits, &hints);
-
         if lits.is_empty() {
             derived_empty_clause = true;
         }
     }
 
-    assert!(
-        derived_empty_clause,
-        "LRAT proof must derive the empty clause for UNSAT"
-    );
+    assert!(derived_empty_clause, "{empty_clause_message}");
     assert_eq!(
         checker.failures(),
         0,
         "LRAT checker must report zero failures"
+    );
+}
+
+/// Test: portfolio UNSAT with LRAT output verified by built-in LRAT checker (#8428).
+///
+/// Solves a non-trivial UNSAT formula (all 8 sign combinations of 3 variables)
+/// with proof mode enabled, extracts the forward LRAT proof bytes from the
+/// winning solver thread, parses them, and feeds each step to the `LratChecker`
+/// to verify that every derived clause has a valid RUP chain. This is the
+/// acceptance criterion for #8428: proof file output from portfolio solving.
+#[test]
+fn test_portfolio_proof_verified_by_lrat_checker() {
+    // All 8 sign combinations of 3 variables: always UNSAT.
+    let cnf = "\
+        p cnf 3 8\n\
+        1 2 3 0\n\
+        1 2 -3 0\n\
+        1 -2 3 0\n\
+        1 -2 -3 0\n\
+        -1 2 3 0\n\
+        -1 2 -3 0\n\
+        -1 -2 3 0\n\
+        -1 -2 -3 0\n";
+    let formula = parse_str(cnf).expect("valid DIMACS");
+
+    let mut portfolio = PortfolioSolver::new(2);
+    portfolio.set_proof_mode(true);
+    let (result, proof_bytes) = portfolio.solve_with_proof_bytes(&formula);
+
+    assert!(result.is_unsat(), "expected UNSAT, got {result:?}");
+    let bytes = proof_bytes.expect("proof_mode UNSAT must produce raw LRAT proof bytes");
+    assert!(!bytes.is_empty(), "LRAT proof bytes must be non-empty");
+    assert_lrat_proof_verifies(
+        &formula,
+        bytes,
+        "LRAT proof must derive the empty clause for UNSAT",
     );
 }
 
@@ -476,8 +478,6 @@ fn test_portfolio_proof_verified_by_lrat_checker() {
 /// which bypasses thread spawning (#8428).
 #[test]
 fn test_portfolio_proof_single_thread_verified() {
-    use crate::lrat_checker::LratChecker;
-
     let cnf = "p cnf 2 4\n1 2 0\n1 -2 0\n-1 2 0\n-1 -2 0\n";
     let formula = parse_str(cnf).expect("valid DIMACS");
 
@@ -487,67 +487,7 @@ fn test_portfolio_proof_single_thread_verified() {
 
     assert!(result.is_unsat(), "expected UNSAT, got {result:?}");
     let bytes = proof_bytes.expect("proof_mode UNSAT must produce raw LRAT proof bytes");
-    let proof_text = String::from_utf8(bytes).expect("LRAT proof must be valid UTF-8");
-
-    let mut checker = LratChecker::new(formula.num_vars);
-    for (i, clause) in formula.clauses.iter().enumerate() {
-        checker.add_original((i + 1) as u64, &clause.clone());
-    }
-
-    let mut derived_empty_clause = false;
-    for line in proof_text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with("d ") {
-            let tokens: Vec<&str> = line.split_whitespace().skip(1).collect();
-            for tok in tokens {
-                if tok == "0" {
-                    break;
-                }
-                let id: u64 = tok.parse().expect("deletion ID must parse");
-                checker.delete(id);
-            }
-            continue;
-        }
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let clause_id: u64 = tokens[0].parse().expect("clause ID must parse");
-        let mut lits = Vec::new();
-        let mut idx = 1;
-        while idx < tokens.len() && tokens[idx] != "0" {
-            let dimacs_lit: i32 = tokens[idx].parse().expect("literal must parse");
-            let var = Variable::new(dimacs_lit.unsigned_abs() - 1);
-            let lit = if dimacs_lit > 0 {
-                Literal::positive(var)
-            } else {
-                Literal::negative(var)
-            };
-            lits.push(lit);
-            idx += 1;
-        }
-        idx += 1;
-        let mut hints = Vec::new();
-        while idx < tokens.len() && tokens[idx] != "0" {
-            let hint: u64 = tokens[idx].parse().expect("hint must parse");
-            hints.push(hint);
-            idx += 1;
-        }
-        checker.add_derived(clause_id, &lits, &hints);
-        if lits.is_empty() {
-            derived_empty_clause = true;
-        }
-    }
-
-    assert!(
-        derived_empty_clause,
-        "LRAT proof must derive the empty clause"
-    );
-    assert_eq!(
-        checker.failures(),
-        0,
-        "LRAT checker must report zero failures"
-    );
+    assert_lrat_proof_verifies(&formula, bytes, "LRAT proof must derive the empty clause");
 }
 
 // --- Instance-aware algorithm selection tests ---

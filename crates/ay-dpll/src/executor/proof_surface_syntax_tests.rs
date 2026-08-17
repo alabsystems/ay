@@ -112,3 +112,78 @@ fn bound_collector_retains_nonidentity_constant_spellings() {
         assert_eq!(overrides.get(&canonical), Some(&authored));
     }
 }
+
+/// A surface override inside a binder may re-spell a term, never re-write it.
+///
+/// Elaboration folds `(+ x 0)` and `(* 1 x)` to the bare bound variable `x`.
+/// Attaching either composite spelling to that leaf would rename every `x` in
+/// an exported proof and can give one Skolem witness incompatible choice
+/// renderings.  The comparison itself is different: canonical `(<= x y)`
+/// strictly contains both operands, so retaining its authored spelling is a
+/// genuine re-spelling.  Pin both sides so the containment guard cannot pass
+/// merely by dropping every override.
+#[test]
+fn bound_collector_respells_comparisons_without_rewriting_folded_leaves() {
+    for (operator, identity) in [("+", "0"), ("*", "1")] {
+        let mut ctx = Context::new();
+        for (name, sort) in [("y", "Int"), ("p", "Bool")] {
+            ctx.process_command(&ay_frontend::Command::DeclareConst(
+                name.to_string(),
+                FrontendSort::Simple(sort.to_string()),
+            ))
+            .expect("fixture declaration succeeds");
+        }
+
+        let folded_lhs = FrontendTerm::App(
+            operator.to_string(),
+            vec![
+                FrontendTerm::Symbol("x".to_string()),
+                FrontendTerm::Const(FrontendConstant::Numeral(identity.to_string())),
+            ],
+        );
+        let comparison = FrontendTerm::App(
+            "<=".to_string(),
+            vec![folded_lhs.clone(), FrontendTerm::Symbol("y".to_string())],
+        );
+        let quantified = FrontendTerm::Forall(
+            vec![("x".to_string(), FrontendSort::Simple("Int".to_string()))],
+            Box::new(FrontendTerm::App(
+                "or".to_string(),
+                vec![comparison.clone(), FrontendTerm::Symbol("p".to_string())],
+            )),
+        );
+        let canonical = ctx
+            .elaborate_surface_subterm(&quantified)
+            .expect("quantified fixture elaborates");
+        let mut overrides = HashMap::default();
+        assert!(collect_surface_term_overrides(
+            &mut ctx,
+            canonical,
+            &quantified,
+            &mut overrides,
+        ));
+
+        for (&term, spelling) in &overrides {
+            let is_leaf = matches!(ctx.terms.get(term), TermData::Var(..) | TermData::Const(..));
+            assert!(
+                !(is_leaf && spelling.starts_with('(')),
+                "({operator} x {identity}): a surface override rewrote leaf {term:?} \
+                 ({:?}) as composite `{spelling}`",
+                ctx.terms.get(term),
+            );
+        }
+
+        let authored_comparison = format_frontend_term(&comparison);
+        assert_eq!(
+            authored_comparison,
+            format!("(<= ({operator} x {identity}) y)"),
+            "fixture must retain the intended authored spelling",
+        );
+        assert!(
+            overrides
+                .values()
+                .any(|spelling| spelling == &authored_comparison),
+            "the genuine comparison re-spelling must survive; collected {overrides:?}",
+        );
+    }
+}

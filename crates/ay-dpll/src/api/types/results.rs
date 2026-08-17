@@ -262,6 +262,23 @@ impl VerifiedSolveResult {
     /// one-shot token. The token keeps literal strict-proof acceptance,
     /// independently checked refutations, and the narrow semantic theorem
     /// mutually exclusive.
+    ///
+    /// # Invariant: raw admissions never mint a certified wrapper
+    ///
+    /// (#proof-capability B3.) Every VERIFIED token carries exactly one
+    /// verification class. The competition-shedding `CompetitionRaw` admission
+    /// token deliberately carries ZERO classes — it is scope-authenticated but
+    /// backed by no checked refutation — and it cannot reach this constructor
+    /// today: `api::Solver` exposes no competition setter, so the executor a
+    /// native solve drives never sheds (pinned by the
+    /// `native_api_surface_has_no_competition_exposure` census). Should a
+    /// future change expose competition mode on the native API boundary, a
+    /// zero-class token must NOT yield a certified result: this constructor
+    /// fails closed to the non-verified `Unknown` classification (no definite
+    /// verdict, no emission witness, every verification bit false) instead of
+    /// panicking the debug build on the exactly-one assertion below. The
+    /// native wrapper deliberately under-claims relative to whatever the
+    /// competition frontend printed.
     pub(crate) fn certified_unsat(
         result: SmtProofCertificate,
         certificate: UnsatCertificate,
@@ -269,12 +286,17 @@ impl VerifiedSolveResult {
         let unsat_strictly_verified = certificate.strict_proof_verified();
         let unsat_independently_verified = certificate.independently_verified();
         let unsat_exact_semantically_verified = certificate.exact_semantic_verified();
-        debug_assert_eq!(
-            usize::from(unsat_strictly_verified)
-                + usize::from(unsat_independently_verified)
-                + usize::from(unsat_exact_semantically_verified),
-            1
-        );
+        let verification_classes = usize::from(unsat_strictly_verified)
+            + usize::from(unsat_independently_verified)
+            + usize::from(unsat_exact_semantically_verified);
+        if verification_classes == 0 {
+            // A zero-class token is the shed-mode raw admission (or a future
+            // kind that likewise declines every verification probe). It is
+            // unreachable through today's native API; if one ever arrives,
+            // publish the non-verified classification, never a certified one.
+            return Self::unknown();
+        }
+        debug_assert_eq!(verification_classes, 1);
         Self {
             result: SolveResult::Unsat(result),
             model_validated: false,

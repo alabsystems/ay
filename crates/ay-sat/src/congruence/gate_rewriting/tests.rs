@@ -196,7 +196,7 @@ fn test_xnor_complementary_inputs_collapse_to_negative_unit() {
     );
     // #7137-relax: the forced ¬z is a full XOR-collapse (arity-0) unit, so its
     // polarity is the machine-checked-exact parity — it must be reported in the
-    // parity-certified channel that the default-off AY_AB_CONGRUENCE_PARITY_TRUST
+    // parity-certified channel that the default-off --sat-congruence-parity-trust
     // consumer accepts without post-hoc RUP.
     assert!(
         result.parity_certified_units.contains(&lit(0, false)),

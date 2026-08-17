@@ -121,6 +121,55 @@ fn native_replay_with_checked_proof_returns_the_same_strict_artifact() {
     assert!(!proof.alethe.contains(":rule hole"));
 }
 
+/// TrustWP's snapshot-alias preservation obligation has 33 distinct authored
+/// equality roots after native replay.  Keep that exact cardinality on the
+/// public replay surface: the equality-closure reconstruction must return a
+/// strict, trust-free artifact rather than stopping at its former 32-root cap.
+#[cfg(feature = "proof-checker")]
+#[test]
+fn native_replay_checked_proof_accepts_thirty_three_root_equality_closure() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let one = solver.int_const(1);
+    let k = solver.declare_const("wp_replay_33_k", Sort::Int);
+    let v = solver.declare_const("wp_replay_33_v", Sort::Int);
+    let mut roots = Vec::new();
+    for (prefix, end) in [("k", k), ("v", v)] {
+        let left = solver.declare_const(&format!("wp_replay_33_{prefix}_left"), Sort::Int);
+        let right = solver.declare_const(&format!("wp_replay_33_{prefix}_right"), Sort::Int);
+        roots.push(solver.eq(one, left));
+        roots.push(solver.eq(left, right));
+        roots.push(solver.eq(right, end));
+    }
+    for index in 0..26 {
+        let left = solver.declare_const(&format!("wp_replay_33_decoy_{index}_left"), Sort::Int);
+        let right = solver.declare_const(&format!("wp_replay_33_decoy_{index}_right"), Sort::Int);
+        roots.push(solver.eq(left, right));
+    }
+    let k_eq_one = solver.eq(k, one);
+    let v_eq_one = solver.eq(v, one);
+    let not_k_eq_one = solver.not(k_eq_one);
+    let not_v_eq_one = solver.not(v_eq_one);
+    roots.push(solver.or(not_k_eq_one, not_v_eq_one));
+    assert_eq!(roots.len(), 33);
+    for (index, root) in roots.into_iter().enumerate() {
+        solver
+            .try_assert_named(root, &format!("dn{index}"))
+            .expect("name authored root");
+    }
+
+    let source = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let (replay, proof) =
+        Solver::replay_native_replay_artifact_with_checked_proof(&source, Duration::from_secs(5))
+            .expect("33-root equality closure must retain strict replay authority");
+    assert!(replay.result.is_unsat());
+    let proof = proof.expect("strict replay must retain an Alethe artifact");
+    proof
+        .accept_for_consumer(ProofAcceptanceMode::Strict)
+        .expect("33-root replay proof must carry strict consumer authority");
+    assert!(!proof.alethe.contains(":rule trust"));
+    assert!(!proof.alethe.contains(":rule hole"));
+}
+
 #[cfg(feature = "proof-checker")]
 #[test]
 fn native_replay_with_proofs_checks_lia_equality_against_negated_bound() {
@@ -679,7 +728,7 @@ fn native_replay_preserves_builtin_colliding_uf_identity() {
 }
 
 #[test]
-fn native_replay_rejects_legacy_canonical_core_hijack() {
+fn native_replay_omits_unused_builtin_colliding_function() {
     let mut solver = Solver::try_new(Logic::All).expect("solver");
     let user_equality = solver
         .try_declare_fun("=", &[Sort::Int, Sort::Int], Sort::Bool)
@@ -687,10 +736,51 @@ fn native_replay_rejects_legacy_canonical_core_hijack() {
     assert_ne!(user_equality.core_name(), "=");
 
     // Construct the builtin application without constant folding so the
-    // artifact contains the raw canonical `=` head. The user UF is unused but
-    // legacy surface-based dependency capture retained its declaration.
+    // artifact contains the raw canonical `=` head. Reachability must compare
+    // that identity against the declaration's private core, not its surface.
     let zero = solver.int_const(0);
     let one = solver.int_const(1);
+    let builtin_equality_id = solver.terms_mut().mk_app(
+        Symbol::Named("=".to_string()),
+        vec![zero.id(), one.id()],
+        Sort::Bool,
+    );
+    let builtin_equality = solver.wrap_term(builtin_equality_id);
+    solver.try_assert_term(builtin_equality).expect("assert");
+    assert!(solver.check_sat().is_unsat());
+
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    assert!(artifact
+        .function_declarations
+        .iter()
+        .all(|declaration| declaration.name != "="));
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(&node.data, TermData::App(Symbol::Named(name), _) if name == "=")
+    }));
+    let replay = Solver::replay_native_replay_artifact(&artifact)
+        .expect("unused private UF must not enter the replay context");
+    assert!(replay.result.result().is_unsat());
+}
+
+#[test]
+fn native_replay_preserves_canonical_core_alongside_colliding_uf() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let user_equality = solver
+        .try_declare_fun("=", &[Sort::Int, Sort::Int], Sort::Bool)
+        .expect("declare user equality");
+    assert_ne!(user_equality.core_name(), "=");
+
+    let zero = solver.int_const(0);
+    let one = solver.int_const(1);
+    let user_application = solver
+        .try_apply(&user_equality, &[zero, one])
+        .expect("apply private user equality");
+    solver
+        .try_assert_term(user_application)
+        .expect("assert private user equality");
+
+    // The same artifact now needs both identities. A raw canonical head must
+    // bypass the live surface declaration during replay.
     let builtin_equality_id = solver.terms_mut().mk_app(
         Symbol::Named("=".to_string()),
         vec![zero.id(), one.id()],
@@ -705,13 +795,20 @@ fn native_replay_rejects_legacy_canonical_core_hijack() {
         .function_declarations
         .iter()
         .find(|declaration| declaration.name == "=")
-        .expect("legacy surface dependency retains declaration");
+        .expect("reachable private equality declaration");
     assert_ne!(declaration.core_name, "=");
     assert!(artifact.terms.iter().any(|node| {
         matches!(&node.data, TermData::App(Symbol::Named(name), _) if name == "=")
     }));
+    assert!(artifact.terms.iter().any(|node| {
+        matches!(
+            &node.data,
+            TermData::App(Symbol::Named(name), _)
+                if name == user_equality.core_name()
+        )
+    }));
     let replay = Solver::replay_native_replay_artifact(&artifact)
-        .expect("authenticated private UF must not capture builtin equality");
+        .expect("canonical equality must remain distinct from the private UF");
     assert!(replay.result.result().is_unsat());
 
     let mut legacy_json = artifact.to_json_value();

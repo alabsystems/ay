@@ -310,7 +310,7 @@ impl QuantifierManager {
             for p in parked_this_round.drain(..) {
                 self.demand.parked.push_back(p);
             }
-            if std::env::var_os("AY_DEMAND_DEBUG").is_some() {
+            if ay_core::misc_cli_flags().demand_debug {
                 eprintln!(
                     "c demand-round F={} gated_bindings={gated_bindings} gated_passed={gated_passed} max_gated_gen={max_gated_gen} parked_this_round={frontier_parked}",
                     self.demand.frontier,

@@ -125,7 +125,7 @@ impl DtLazyPropagator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            transfer_enabled: std::env::var_os("AY_DT_D1_TRANSFER").is_none_or(|v| v != "0"),
+            transfer_enabled: true, // B24: kill-switch env retired.
             ..Self::default()
         }
     }

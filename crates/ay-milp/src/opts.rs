@@ -4,73 +4,16 @@
 
 //! Solve options.
 
-use crate::tune::{Knob, Profile, Setting};
+use crate::tune::Knob;
 use std::time::{Duration, Instant};
 
-/// A rejected [`EngineEconomics`] setting.
-///
-/// Returned at *construction*, not at solve time. The alternative — accept
-/// anything and clamp during the solve — was measured to be the worse contract
-/// for the crate's primary in-process consumer: `AY_MILP_SAT_STOP_MULT=-1`
-/// reached `Duration::mul_f64`, which panics, so a malformed value inherited
-/// from a CI shell could abort a verifier worker mid-solve
-/// (the development design notes §M1, consequence 3). A typed
-/// error at the builder puts the failure where the caller can act on it, and
-/// makes an accepted `EngineEconomics` a value the solve path can trust
-/// without re-checking.
-#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum EngineConfigError {
-    /// A NaN or infinite setting.
-    #[error("{knob} must be finite, got {value}")]
-    NotFinite {
-        /// The knob's stable name, as an operator would spell it.
-        knob: &'static str,
-        /// The rejected value.
-        value: f64,
-    },
-    /// A finite setting outside the knob's admissible range.
-    #[error("{knob} must lie in [{low}, {high}], got {value}")]
-    OutOfRange {
-        /// The knob's stable name, as an operator would spell it.
-        knob: &'static str,
-        /// The rejected value.
-        value: f64,
-        /// Inclusive lower bound.
-        low: f64,
-        /// Inclusive upper bound.
-        high: f64,
-    },
-}
+mod branch_and_bound;
+mod config;
+mod dual_simplex;
+mod profile;
 
-fn checked(knob: Knob, value: f64, low: f64, high: f64) -> Result<f64, EngineConfigError> {
-    if !value.is_finite() {
-        return Err(EngineConfigError::NotFinite {
-            knob: knob.env(),
-            value,
-        });
-    }
-    if value < low || value > high {
-        return Err(EngineConfigError::OutOfRange {
-            knob: knob.env(),
-            value,
-            low,
-            high,
-        });
-    }
-    Ok(value)
-}
-
-/// Seconds ceiling for a [`Duration`]-valued knob: the engine's own real-knob
-/// domain, so the builder cannot admit a value the accessor would then discard.
-///
-/// `Duration::MAX.as_secs_f64()` rounds *up* past `u64::MAX`, so a caller
-/// spelling "no cap" as `Duration::MAX` would hand the consuming site a value
-/// that panics `Duration::from_secs_f64` on the way back. Clamping — rather
-/// than erroring — is right here because the intent is unambiguous: ~31 million
-/// years is "no cap" by any reading, and refusing it would be pedantry, where a
-/// negative share is a genuine mistake worth reporting.
-const MAX_KNOB_SECS: f64 = crate::tune::MAX_REAL;
+pub use config::EngineConfigError;
+use config::{checked, MAX_KNOB_SECS};
 
 /// Per-solve engine search economics.
 ///
@@ -137,6 +80,157 @@ pub struct EngineEconomics {
     certificate_decoupling: Option<bool>,
     feasibility_conflict: Option<bool>,
     cold_root_lu: Option<bool>,
+    vub: Option<bool>,
+    mir_genint: Option<bool>,
+    sep_screen: Option<bool>,
+    ft_fast: Option<bool>,
+    ftran_fast: Option<bool>,
+    ftran_nz_fast: Option<bool>,
+    countsort: Option<bool>,
+    coef_tighten: Option<bool>,
+    orbitope: Option<bool>,
+    ft_growth_tol: Option<f64>,
+    dual_anatomy: Option<bool>,
+    verify_after: Option<usize>,
+    fused_rt: Option<bool>,
+    rt_kind: Option<bool>,
+    iter_profile: Option<bool>,
+    rt_bits_key: Option<bool>,
+    wide_bloom: Option<bool>,
+    eta_reuse: Option<bool>,
+    devex: Option<bool>,
+    cold_dual: Option<bool>,
+    tri_crash: Option<bool>,
+    chain_devex: Option<usize>,
+    cutoff_stop: Option<bool>,
+    node_lu: Option<bool>,
+    tall_lu: Option<bool>,
+    dual_churn_band: Option<bool>,
+    dual_bloom_cap: Option<usize>,
+    flowcover_agg: Option<bool>,
+    gi_ext: Option<bool>,
+    bottleneck_ext: Option<bool>,
+    clique: Option<bool>,
+    odd_cycle_off: Option<bool>,
+    cover_ext: Option<bool>,
+    flowcover: Option<bool>,
+    snap: Option<bool>,
+    splns: Option<bool>,
+    ms_walk: Option<bool>,
+    sweep_prove: Option<bool>,
+    rins_rescue: Option<bool>,
+    sym: Option<bool>,
+    submip_best_bound: Option<bool>,
+    zero_half: Option<bool>,
+    odd_cycle_on: Option<bool>,
+    flip_reach: Option<bool>,
+    prop_sweeps: Option<usize>,
+    prop_queue: Option<usize>,
+    splns_exposed: Option<usize>,
+    splns_budget: Option<usize>,
+    splns_stall_secs: Option<f64>,
+    ms_walk_moves: Option<usize>,
+    gub_meas_every: Option<usize>,
+    diag_cost_perturb: Option<f64>,
+    fc_mode: Option<usize>,
+    flip_solve: Option<FlipSolveMode>,
+    gub_branch: Option<bool>,
+    dedup_cols: Option<bool>,
+    binary_complement_sub: Option<bool>,
+    lb_activity: Option<bool>,
+    gi_dfs: Option<bool>,
+    impl_cut: Option<bool>,
+    impl_tab: Option<bool>,
+    knap_redirect: Option<bool>,
+    dive_skip: Option<bool>,
+    cut_fma: Option<bool>,
+    odd_lift: Option<bool>,
+    strongcg: Option<bool>,
+    dense_gmi_lu: Option<bool>,
+    chain_shape: Option<bool>,
+    chain_preorder: Option<bool>,
+    bump_lu: Option<bool>,
+    full_pricing: Option<bool>,
+    dual_bypass: Option<usize>,
+    eager_perturb: Option<usize>,
+    mir_knap: Option<bool>,
+    bound_branch: Option<bool>,
+    child_order: Option<usize>,
+    cuts_per_round: Option<usize>,
+    cut_eff_floor: Option<f64>,
+    ft_spike: Option<usize>,
+    gub_sb: Option<bool>,
+    ng_box: Option<bool>,
+    ng_branch_pct: Option<f64>,
+    node_prop: Option<bool>,
+    sb_sustain: Option<bool>,
+    plunge: Option<bool>,
+    gmi_rounds: Option<usize>,
+    root_cuts_per_round: Option<usize>,
+    root_probe: Option<bool>,
+    dfs: Option<bool>,
+    node_cuts: Option<bool>,
+    sym_branch_band: Option<f64>,
+    rins: Option<usize>,
+    dualfix_all: Option<bool>,
+    implied_bound: Option<bool>,
+    lifted_cover: Option<bool>,
+    lnp_budget: Option<usize>,
+    lattice_bkz_beta: Option<usize>,
+    dual_perturb: Option<f64>,
+    cert_grace_secs: Option<f64>,
+    anchor_first_refusal_ms: Option<usize>,
+    rins_every: Option<usize>,
+    rins_drycap: Option<usize>,
+    pump_share: Option<f64>,
+    setpart_share: Option<f64>,
+    parity: Option<bool>,
+    margin_reframe: Option<bool>,
+    sym_mode: Option<usize>,
+    heur_share: Option<f64>,
+    sb_rel: Option<usize>,
+    sb_cands: Option<usize>,
+    sb_total: Option<usize>,
+    presolve: Option<bool>,
+    presolve_scout: Option<bool>,
+    vsids: Option<bool>,
+    root_probe_all: Option<bool>,
+    sepstat: Option<bool>,
+    lp_stats: Option<bool>,
+    step_trace: Option<usize>,
+    bump_diag: Option<bool>,
+    bumpdiff_lanes: Option<usize>,
+    diag_plain_cold: Option<bool>,
+    dump_vertex: Option<bool>,
+    smt_lane: Option<bool>,
+    max_nodes: Option<usize>,
+    struct_elim: Option<bool>,
+    bound_cover: Option<bool>,
+    pump_iter_mult: Option<f64>,
+    pump_iter_cap: Option<bool>,
+    ng_up: Option<bool>,
+    cut_shadow: Option<u8>,
+    chain_agg: Option<bool>,
+    auto_margin: Option<bool>,
+    impl_lane: Option<bool>,
+    impl_arm: Option<usize>,
+    prop_conflict: Option<bool>,
+    lb_conflict: Option<u8>,
+    lb_arm: Option<usize>,
+    lb_strict: Option<bool>,
+    dual_cutoff: Option<f64>,
+}
+
+/// Which arm solves the dual long-step's flip aggregate (B19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipSolveMode {
+    /// Per-commit density test (the FT-spike predicted-marked-set rule),
+    /// dense on ties. The default.
+    Auto,
+    /// Force the sparse Gilbert–Peierls arm (needs a live LU engine).
+    Sparse,
+    /// Force the dense sweep (the historical default arm).
+    Dense,
 }
 
 impl EngineEconomics {
@@ -147,7 +241,7 @@ impl EngineEconomics {
         Self::default()
     }
 
-    /// Run the market-split lattice detector (`AY_MILP_NO_LATTICE`).
+    /// Run the market-split lattice detector (`--no-lattice`).
     ///
     /// Default on. It is self-gating on the markshare1 shape and silent on
     /// every other model, but it can return `Optimal { cert: None }`, so a
@@ -161,7 +255,7 @@ impl EngineEconomics {
         self
     }
 
-    /// Run the flip-LNS saturation stop (`AY_MILP_NO_SAT_STOP`).
+    /// Run the flip-LNS saturation stop (`--no-sat-stop`).
     ///
     /// Default on, scoped to `tall_lu` models. It hands a saturated incumbent
     /// walk's remaining budget to the tree.
@@ -172,7 +266,7 @@ impl EngineEconomics {
     }
 
     /// Dry-spell floor before the flip-LNS walk counts as saturated
-    /// (`AY_MILP_SAT_STOP_SECS`; default 15 s).
+    /// (`--sat-stop-secs`; default 15 s).
     #[must_use]
     pub fn with_saturation_stop_floor(mut self, floor: Duration) -> Self {
         self.saturation_stop_floor = Some(floor.as_secs_f64().min(MAX_KNOB_SECS));
@@ -180,7 +274,7 @@ impl EngineEconomics {
     }
 
     /// Multiplier on the largest observed improvement gap, above which a dry
-    /// spell counts as saturation (`AY_MILP_SAT_STOP_MULT`; default 1.5).
+    /// spell counts as saturation (`--sat-stop-mult`; default 1.5).
     ///
     /// # Errors
     ///
@@ -196,7 +290,7 @@ impl EngineEconomics {
     }
 
     /// Relax the bloom cap on tall-degenerate warm dual walks
-    /// (`AY_MILP_NO_BLOOM_RELAX`).
+    /// (`--no-bloom-relax`).
     ///
     /// Default on. Verdict-neutral either way: it changes only the float pivot
     /// sequence, and every exit is re-checked and every leaf re-derived
@@ -208,7 +302,7 @@ impl EngineEconomics {
     }
 
     /// Absolute cap on the flip-LNS window for `tall_lu` models
-    /// (`AY_MILP_FLIP_CAP_SECS`).
+    /// (`--flip-cap-secs`).
     ///
     /// Ignored when [`with_flip_lns_share`](Self::with_flip_lns_share) is also
     /// set, which opts into the pure fractional schedule — the same coupling
@@ -220,7 +314,7 @@ impl EngineEconomics {
     }
 
     /// Fraction of the remaining budget given to the flip-LNS incumbent walk
-    /// (`AY_MILP_FLIP_SHARE`).
+    /// (`--flip-share`).
     ///
     /// Setting this also **disables the absolute cap**, restoring the pure
     /// fractional schedule on both LP lanes.
@@ -235,7 +329,7 @@ impl EngineEconomics {
     }
 
     /// Install an LU engine in the pooled bound-change re-solver
-    /// (`AY_MILP_WARM_LU`).
+    /// (`--warm-lu`).
     ///
     /// Default **off**, and deliberately so: the LU inverse is not bitwise the
     /// eta inverse, so it can move which LP vertex the flip-LNS lands on and
@@ -248,7 +342,7 @@ impl EngineEconomics {
     }
 
     /// Fraction of the remaining budget given to bound-propagation presolve
-    /// (`AY_MILP_PRESOLVE_SHARE`).
+    /// (`--presolve-share`).
     ///
     /// A short presolve deadline yields weaker-but-valid partial bounds, never
     /// a wrong one: the cap trades bound tightness for tree budget and cannot
@@ -262,7 +356,7 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Separate cuts at the root (`AY_MILP_NO_CUTS`).
+    /// Separate cuts at the root (`--no-cuts`).
     ///
     /// Default on.
     #[must_use]
@@ -271,7 +365,90 @@ impl EngineEconomics {
         self
     }
 
-    /// Feasibility-pump restart allowance (`AY_MILP_PUMP_RESTARTS`).
+    /// Extract variable upper bounds for cut separation. Default on.
+    /// (B11: carried here; the never-set `AY_MILP_NO_VUB` env read is gone.)
+    #[must_use]
+    pub fn with_vub(mut self, enabled: bool) -> Self {
+        self.vub = Some(enabled);
+        self
+    }
+
+    /// Admit all-integral models with general-integer columns to the MIR
+    /// family (the narrowed gate). Default on.
+    #[must_use]
+    pub fn with_mir_genint(mut self, enabled: bool) -> Self {
+        self.mir_genint = Some(enabled);
+        self
+    }
+
+    /// Screen separation candidates before exact delta derivation. Default on.
+    #[must_use]
+    pub fn with_sep_screen(mut self, enabled: bool) -> Self {
+        self.sep_screen = Some(enabled);
+        self
+    }
+
+    /// Forrest–Tomlin fast (bounds-check-elided) update path. Default on;
+    /// both arms are byte-identical, this is an A/B lane.
+    #[must_use]
+    pub fn with_ft_fast(mut self, enabled: bool) -> Self {
+        self.ft_fast = Some(enabled);
+        self
+    }
+
+    /// Dense `ftran` fast path. Default on; byte-identical A/B lane.
+    #[must_use]
+    pub fn with_ftran_fast(mut self, enabled: bool) -> Self {
+        self.ftran_fast = Some(enabled);
+        self
+    }
+
+    /// Sparse `ftran_nz` fast path. Default on; byte-identical A/B lane.
+    #[must_use]
+    pub fn with_ftran_nz_fast(mut self, enabled: bool) -> Self {
+        self.ftran_nz_fast = Some(enabled);
+        self
+    }
+
+    /// O(m) counting sort for sparse-solve reach sets. Default on; the
+    /// comparison sort produces the identical unique order.
+    #[must_use]
+    pub fn with_countsort(mut self, enabled: bool) -> Self {
+        self.countsort = Some(enabled);
+        self
+    }
+
+    /// Presolve coefficient tightening. Default on.
+    #[must_use]
+    pub fn with_coef_tighten(mut self, enabled: bool) -> Self {
+        self.coef_tighten = Some(enabled);
+        self
+    }
+
+    /// Static orbitope assembly from symmetry generators. Default on; off
+    /// keeps every generator on the per-branch orbit walk (the A/B lane).
+    #[must_use]
+    pub fn with_orbitope(mut self, enabled: bool) -> Self {
+        self.orbitope = Some(enabled);
+        self
+    }
+
+    /// Forrest–Tomlin growth tolerance (refactorization trigger).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineConfigError`] unless `tol` is finite and positive.
+    pub fn with_ft_growth_tol(mut self, tol: f64) -> Result<Self, EngineConfigError> {
+        self.ft_growth_tol = Some(checked(
+            Knob::FtGrowthTol,
+            tol,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+        )?);
+        Ok(self)
+    }
+
+    /// Feasibility-pump restart allowance (`--pump-restarts`).
     ///
     /// `0` skips the pump outright. Unset leaves the engine's own
     /// shape-dependent allowance in force, which is not a single number — so
@@ -283,7 +460,7 @@ impl EngineEconomics {
     }
 
     /// Cap on the pins the terminal-salvage dive commits
-    /// (`AY_MILP_DIVE_MAX_PINS`; default uncapped).
+    /// (`--dive-max-pins`; default uncapped).
     ///
     /// Capping both reproduces a solvable pin set run-to-run and stops paying
     /// for doomed deeper probes. Note this knob is instance-family-tuned by
@@ -295,7 +472,7 @@ impl EngineEconomics {
         self
     }
 
-    /// Run dual fixing by lock counting (`AY_MILP_NO_DUALFIX`).
+    /// Run dual fixing by lock counting (`--no-dualfix`).
     ///
     /// Default on for models with an identically-zero objective. This is a
     /// **WLOG reduction, not a valid inequality**: it preserves the ANSWER, not
@@ -309,7 +486,7 @@ impl EngineEconomics {
         self
     }
 
-    /// Run the AHL kernel reformulation (`AY_MILP_NO_KERNEL_REFORM`).
+    /// Run the AHL kernel reformulation (`--no-kernel-reform`).
     ///
     /// Admits only the isolated shape. A consumer whose models could present an
     /// equality block whose support is entirely integral, and who would rather
@@ -321,7 +498,7 @@ impl EngineEconomics {
     }
 
     /// Decouple root reductions from certificate capture
-    /// (`AY_MILP_NO_CERT_DECOUPLE`).
+    /// (`EngineEconomics::with_certificate_decoupling(false)`).
     ///
     /// Default on: reductions run even with capture armed, and the artifact is
     /// harvested by re-solving the original model. Off restores the prior
@@ -335,7 +512,7 @@ impl EngineEconomics {
     }
 
     /// Arm the zero-objective feasibility conflict class
-    /// (`AY_MILP_NO_FEAS_CONFLICT`).
+    /// (`--no-feas-conflict`).
     ///
     /// Default on. Nogood unit propagation, nogood-guided branching and VSIDS,
     /// gated on the objective being identically zero rather than on model size.
@@ -348,7 +525,7 @@ impl EngineEconomics {
     }
 
     /// Route the COLD ROOT LP to the LU lane inside the measured row band
-    /// (`AY_MILP_NO_COLD_LU`).
+    /// (`--no-cold-lu`).
     ///
     /// Default on for `m` in the band. Off restores the historical eta-file
     /// cold root byte-for-byte. Verdict-neutral: it changes which optimal
@@ -460,69 +637,6 @@ impl EngineEconomics {
     pub fn dive_max_pins(&self) -> Option<usize> {
         self.dive_max_pins
     }
-
-    /// Lower these settings into the engine's internal knob carrier.
-    ///
-    /// The `No*` inversions happen here and only here: the public surface is
-    /// positive-sense (`with_cuts(false)`) because that is what reads correctly
-    /// at a call site, while the knob keeps the environment's own spelling
-    /// because an operator's `AY_MILP_NO_CUTS=1` has to keep meaning what it
-    /// has always meant.
-    pub(crate) fn profile(&self) -> Profile {
-        let mut p = Profile::EMPTY;
-        if let Some(v) = self.lattice {
-            p = p.with(Knob::NoLattice, Setting::Flag(!v));
-        }
-        if let Some(v) = self.saturation_stop {
-            p = p.with(Knob::NoSatStop, Setting::Flag(!v));
-        }
-        if let Some(v) = self.saturation_stop_floor {
-            p = p.with(Knob::SatStopSecs, Setting::Real(v));
-        }
-        if let Some(v) = self.saturation_stop_multiplier {
-            p = p.with(Knob::SatStopMult, Setting::Real(v));
-        }
-        if let Some(v) = self.bloom_cap_relaxation {
-            p = p.with(Knob::NoBloomRelax, Setting::Flag(!v));
-        }
-        if let Some(v) = self.flip_lns_cap {
-            p = p.with(Knob::FlipCapSecs, Setting::Real(v));
-        }
-        if let Some(v) = self.flip_lns_share {
-            p = p.with(Knob::FlipShare, Setting::Real(v));
-        }
-        if let Some(v) = self.warm_lu {
-            p = p.with(Knob::WarmLu, Setting::Flag(v));
-        }
-        if let Some(v) = self.presolve_share {
-            p = p.with(Knob::PresolveShare, Setting::Real(v));
-        }
-        if let Some(v) = self.cuts {
-            p = p.with(Knob::NoCuts, Setting::Flag(!v));
-        }
-        if let Some(v) = self.pump_restarts {
-            p = p.with(Knob::PumpRestarts, Setting::Count(v));
-        }
-        if let Some(v) = self.dive_max_pins {
-            p = p.with(Knob::DiveMaxPins, Setting::Count(v));
-        }
-        if let Some(v) = self.dual_fixing {
-            p = p.with(Knob::NoDualfix, Setting::Flag(!v));
-        }
-        if let Some(v) = self.kernel_reformulation {
-            p = p.with(Knob::NoKernelReform, Setting::Flag(!v));
-        }
-        if let Some(v) = self.certificate_decoupling {
-            p = p.with(Knob::NoCertDecouple, Setting::Flag(!v));
-        }
-        if let Some(v) = self.feasibility_conflict {
-            p = p.with(Knob::NoFeasConflict, Setting::Flag(!v));
-        }
-        if let Some(v) = self.cold_root_lu {
-            p = p.with(Knob::NoColdLu, Setting::Flag(!v));
-        }
-        p
-    }
 }
 
 /// Default-off warm-start strategy for complete fixed assignment trees.
@@ -609,7 +723,7 @@ pub struct SolveOpts {
     /// [`crate::MilpInfeasibilityCertificate`] — stays reachable and testable
     /// on models a routed lane would otherwise claim first. Turning it off
     /// never changes a verdict, only which engine (and therefore which proof
-    /// SHAPE) produces it. `AY_MILP_NO_STRUCTURE_ROUTE=1` forces it off
+    /// SHAPE) produces it. `SolveOpts::with_structure_routing(false)` forces it off
     /// process-wide for A/B measurement.
     pub structure_routing: bool,
     /// Bytes the branch-and-bound may RETAIN in its open node set (the
@@ -631,6 +745,11 @@ pub struct SolveOpts {
     /// the caller's model frame yields `tree_cert: None` and the verdict is
     /// unaffected. `0` disables capture entirely.
     pub tree_cert_leaves: usize,
+    /// Diagnostic warm start: a whitespace `col value` file whose integer
+    /// columns are pinned and completed exactly before the search starts.
+    /// Verified feasible before use; a bad seed is discarded, never believed.
+    /// (B13: was the never-set `AY_MILP_SEED_SOL` env var.)
+    pub seed_solution_file: Option<std::path::PathBuf>,
     /// Admit the range-logical triangular-crash LP path for this solve.
     ///
     /// This is an advice-only, default-off path choice. The historical exact
@@ -639,7 +758,7 @@ pub struct SolveOpts {
     pub(crate) range_logical_triangular_crash: bool,
     /// Per-session override for the cold affine-chain distress-probe iteration
     /// budget. `None` preserves the historical
-    /// `AY_MILP_CHAIN_PROBE`/20,000-iteration policy; `Some(0)` disables the
+    /// `the chain-probe knob`/20,000-iteration policy; `Some(0)` disables the
     /// probe for LPs lowered by this session.
     pub(crate) chain_distress_probe_iters: Option<u64>,
     /// Default-off float-basis strategy for the complete fixed assignment-tree
@@ -668,6 +787,7 @@ impl Default for SolveOpts {
             structure_routing: true,
             memory_budget: Some(2 << 30), // 2 GiB
             tree_cert_leaves: 256,
+            seed_solution_file: None,
             range_logical_triangular_crash: false,
             chain_distress_probe_iters: None,
             fixed_assignment_tree_warm_start: None,
@@ -764,6 +884,14 @@ impl SolveOpts {
         self
     }
 
+    /// Seed the search from a `col value` solution file (see
+    /// [`SolveOpts::seed_solution_file`]).
+    #[must_use]
+    pub fn with_seed_solution_file(mut self, path: std::path::PathBuf) -> Self {
+        self.seed_solution_file = Some(path);
+        self
+    }
+
     /// Request the range-logical triangular-crash LP path for this solve.
     ///
     /// The option is scoped to sessions built from these options and does not
@@ -789,7 +917,7 @@ impl SolveOpts {
     /// lowered by this session.
     ///
     /// `None` preserves the historical process policy
-    /// (`AY_MILP_CHAIN_PROBE`, defaulting to 20,000 iterations). `Some(0)`
+    /// (`the chain-probe knob`, defaulting to 20,000 iterations). `Some(0)`
     /// disables the probe without mutating process-global environment.
     #[must_use]
     pub fn with_chain_distress_probe_iters(mut self, iters: Option<u64>) -> Self {
@@ -901,10 +1029,6 @@ impl SolveOpts {
 mod tests {
     use super::*;
 
-    /// The no-behaviour-change property. A `SolveOpts` that was never handed
-    /// an `EngineEconomics` carries one that says nothing, and a profile that
-    /// says nothing resolves every knob to the environment-and-default it
-    /// resolved to before the carrier existed.
     #[test]
     fn engine_economics_default_to_no_opinion() {
         let engine = SolveOpts::new().engine();
@@ -1004,7 +1128,7 @@ mod tests {
         assert_eq!(
             EngineEconomics::new().with_presolve_share(1.5),
             Err(EngineConfigError::OutOfRange {
-                knob: "AY_MILP_PRESOLVE_SHARE",
+                knob: "presolve-share",
                 value: 1.5,
                 low: 0.0,
                 high: 1.0,
@@ -1013,7 +1137,7 @@ mod tests {
         assert_eq!(
             EngineEconomics::new().with_flip_lns_share(-0.25),
             Err(EngineConfigError::OutOfRange {
-                knob: "AY_MILP_FLIP_SHARE",
+                knob: "flip-share",
                 value: -0.25,
                 low: 0.0,
                 high: 1.0,
@@ -1022,7 +1146,7 @@ mod tests {
         assert_eq!(
             EngineEconomics::new().with_saturation_stop_multiplier(-1.0),
             Err(EngineConfigError::OutOfRange {
-                knob: "AY_MILP_SAT_STOP_MULT",
+                knob: "sat-stop-mult",
                 value: -1.0,
                 low: 0.0,
                 high: MAX_KNOB_SECS,
@@ -1031,7 +1155,7 @@ mod tests {
         assert_eq!(
             EngineEconomics::new().with_presolve_share(f64::INFINITY),
             Err(EngineConfigError::NotFinite {
-                knob: "AY_MILP_PRESOLVE_SHARE",
+                knob: "presolve-share",
                 value: f64::INFINITY,
             })
         );

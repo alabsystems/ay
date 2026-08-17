@@ -1465,7 +1465,7 @@ impl Executor {
         if self.body_is_pure_arith_bool(*body, &bound) {
             return false;
         }
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if ay_core::misc_cli_flags().debug_cert {
             eprintln!(
                 "CERT/quant: term_supported={} const_def={} uf_def={}",
                 self.term_supported_by_uf_completion(*body),
@@ -3224,7 +3224,7 @@ impl Executor {
         // A while `CheckedMbqiSatAuthority::for_current` sealed whatever model
         // B happened to remain in `self.last_model` after nested probes.
         let model = &checked_model;
-        let debug = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let debug = ay_core::misc_cli_flags().debug_cert;
         if forall_quants.is_empty() {
             return None;
         }
@@ -3720,7 +3720,7 @@ impl Executor {
     /// evaluation, so the sort restriction of the strict fragment adds
     /// nothing there.
     fn term_in_bv_bool_euf_lia_or_uninterpreted_fragment(&self, term: TermId) -> bool {
-        let debug = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let debug = ay_core::misc_cli_flags().debug_cert;
         let mut visited: HashSet<TermId> = HashSet::default();
         let mut stack = vec![term];
         while let Some(t) = stack.pop() {
@@ -4862,7 +4862,7 @@ impl Executor {
             self.defer_model_validation = false;
             self.last_model_validated = true;
             self.last_unknown_reason = None;
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
+            if ay_core::misc_cli_flags().debug_cert {
                 eprintln!("CERT/empty-universe: checked singleton model SAT over exact carriers");
             }
             return Some(SolveResult::Sat);
@@ -4873,14 +4873,14 @@ impl Executor {
                 if !checked.consume(self, &sub_assertions) {
                     return None;
                 }
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!("CERT/empty-universe: strict checked singleton-instance UNSAT");
                 }
                 Some(SolveResult::unsat())
             }
             Some(CheckedGroundDecision::Sat(checked)) => {
                 let _declined = checked.consume(self, &sub_assertions);
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!("CERT/empty-universe: checked model transport declined SAT");
                 }
                 None
@@ -5302,7 +5302,7 @@ impl Executor {
     ) -> Option<()> {
         use num_bigint::BigInt;
 
-        let debug = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let debug = ay_core::misc_cli_flags().debug_cert;
         let decline = |reason: &str| {
             if debug {
                 eprintln!("CERT/finite-table: decline ({reason})");
@@ -5653,7 +5653,7 @@ impl Executor {
                 return None;
             };
             if all_foralls_hold {
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!(
                         "CERT/finite-table: certified SAT ({} foralls, {} grounds, {} table syms, {} pins)",
                         infos.len(),
@@ -6069,7 +6069,7 @@ impl Executor {
                     &defaults,
                     checked_table_bindings,
                 )?;
-                if std::env::var_os("AY_DEBUG_CERT").is_some() {
+                if ay_core::misc_cli_flags().debug_cert {
                     eprintln!(
                         "CERT/default-row: certified SAT ({} foralls, {} table syms)",
                         infos.len(),
@@ -6705,7 +6705,7 @@ impl Executor {
             }
         }
         let trace_decline = |reason: &str| {
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-cert-model-install-decline reason={reason}");
             }
         };
@@ -6823,7 +6823,7 @@ impl Executor {
         for &ground in grounds {
             let value = self.evaluate_term(&completed, ground);
             if !matches!(value, EvalValue::Bool(true)) {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace dt-cert-model-install-decline reason=ground-recheck term={} value={value:?} expr={}",
                         ground.0,
@@ -10518,7 +10518,7 @@ impl Executor {
         snapshot: &[TermId],
         _fallback_category: LogicCategory,
     ) -> Option<CheckedExactClosedSentenceSat> {
-        let debug = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let debug = ay_core::misc_cli_flags().debug_cert;
         if snapshot.is_empty() {
             return None;
         }
@@ -10594,17 +10594,13 @@ impl Executor {
         // deferred-trust discharge uses. Bisected to the merge and verified
         // on both parents; see the a735ef4031 investigation.
         //
-        // Kill switch AY_CLOSED_SENTENCE_CERT=off|shadow (default on): `off`
-        // declines outright, `shadow` runs the refutations and logs the
-        // would-be grant without granting.
+        // Kill switch: `--dpll-no-closed-sentence-cert` (default on).
         if !needs_refutation_evidence.is_empty() {
-            let mode = std::env::var("AY_CLOSED_SENTENCE_CERT").unwrap_or_default();
-            if mode == "off" {
+            // B28: CLI-owned (--dpll-no-closed-sentence-cert); the env mode
+            // string is retired and the never-exercised `shadow` arm removed.
+            if ay_core::theory_disable_flags().no_closed_sentence_cert {
                 if debug {
-                    eprintln!(
-                        "CERT/valid-sentence decline: general arm disabled \
-                         (AY_CLOSED_SENTENCE_CERT=off)"
-                    );
+                    eprintln!("CERT/valid-sentence decline: general arm disabled by CLI");
                 }
                 return None;
             }
@@ -10634,14 +10630,6 @@ impl Executor {
                     }
                     return None;
                 }
-            }
-            if mode == "shadow" {
-                eprintln!(
-                    "CERT/valid-sentence SHADOW: general arm would certify SAT \
-                     ({} checked negation refutations); grant withheld",
-                    needs_refutation_evidence.len()
-                );
-                return None;
             }
         }
         if debug {
@@ -13144,7 +13132,7 @@ pub(crate) fn dt_cert_bridge_route_enabled() -> bool {
     )
 }
 
-/// Shadow-log a DT-certificate decision (reuse of the `reject_instrument`
+/// Shadow-log a DT-certificate decision (reuse of the rejection-instrument
 /// env-gated telemetry pattern). Silent when the gate is `Off`.
 fn dt_cert_note(mode: DtCertMode, msg: &str) {
     if !matches!(mode, DtCertMode::Off) {
@@ -13267,7 +13255,7 @@ impl FiniteTableWitnessState {
             model,
         } = self
         else {
-            if std::env::var_os("AY_DEBUG_CERT").is_some() {
+            if ay_core::misc_cli_flags().debug_cert {
                 eprintln!("CERT/finite-table-current: state is not pending");
             }
             return false;
@@ -13290,7 +13278,7 @@ impl FiniteTableWitnessState {
             && bindings_current
             && pins_current
             && defaults_current;
-        if !current && std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if !current && ay_core::misc_cli_flags().debug_cert {
             eprintln!(
                 "CERT/finite-table-current: epoch={epoch_current} source={source_current} roots={roots_current} entries={entries_current} bindings={bindings_current} pins={pins_current} defaults={defaults_current} certified_roots={:?} requested_roots={roots:?}",
                 scope.roots
@@ -13582,19 +13570,24 @@ thread_local! {
 pub(crate) enum ConstInterpCertMode {
     /// `off` / `0`: never runs — byte-identical (no scan, no mint, no log).
     Off,
-    /// `shadow` / `log`: runs and logs its verdict, but NEVER grants `Sat`.
+    /// Runs and logs its verdict, but NEVER grants `Sat`. (B17: currently
+    /// unconstructed — the env spelling that selected it is retired; a CLI
+    /// mode can reinstate it if a measurement needs it.)
+    #[allow(dead_code)]
     Shadow,
     /// Anything else, INCLUDING UNSET: runs and GRANTS `Sat` on success.
     On,
 }
 
-/// Read the `AY_CONST_INTERP_CERT` gate fresh (the consult path is cold, so no
-/// cache is needed and per-call reads keep test set/unset semantics reliable).
+/// The constant-interpretation certificate gate. B17: the CLI-populated
+/// global (--no-const-interp-cert) replaced the never-set env var; the
+/// diagnostic shadow mode retired with it, unmeasured — reinstate it as a
+/// CLI mode if a measurement ever needs it.
 pub(crate) fn const_interp_cert_mode() -> ConstInterpCertMode {
-    match std::env::var("AY_CONST_INTERP_CERT").ok().as_deref() {
-        Some("off") | Some("0") | Some("no") => ConstInterpCertMode::Off,
-        Some("shadow") | Some("log") => ConstInterpCertMode::Shadow,
-        _ => ConstInterpCertMode::On,
+    if ay_core::theory_disable_flags().no_const_interp_cert {
+        ConstInterpCertMode::Off
+    } else {
+        ConstInterpCertMode::On
     }
 }
 
@@ -13632,9 +13625,9 @@ fn const_interp_rebuild_folds_name(name: &str) -> bool {
 ///
 /// The gate defaults to `On`, so — unlike `dt_cert_note` — this must NOT print
 /// merely because the certificate is enabled. It speaks only in `Shadow` mode
-/// or under the existing `AY_DEBUG_CERT` trace channel.
+/// or under the existing `--debug-cert` trace channel.
 fn const_interp_note(mode: ConstInterpCertMode, msg: &str) {
-    if matches!(mode, ConstInterpCertMode::Shadow) || std::env::var_os("AY_DEBUG_CERT").is_some() {
+    if matches!(mode, ConstInterpCertMode::Shadow) || ay_core::misc_cli_flags().debug_cert {
         eprintln!("c CERT/const-interp {msg}");
     }
 }
@@ -14206,7 +14199,7 @@ mod const_interp_ground_conjunct_tests {
     /// That query nevertheless still answers `unknown` end-to-end, because on
     /// its route the verdict is degraded in `executor/model/validation` before
     /// any certificate consult site is reached (measured: `:unknown.phase
-    /// "model-validation"`, and `AY_DEBUG_CERT` shows no const-interp line at
+    /// "model-validation"`, and `--debug-cert` shows no const-interp line at
     /// all). This test pins WHERE the remaining gap is: the certificate is
     /// ready, the consult arm is missing.
     #[test]

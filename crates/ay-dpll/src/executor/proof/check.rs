@@ -9,13 +9,15 @@
 //!
 //! Extracted from `proof.rs` for code health (#5970).
 
+use super::super::Executor;
 use ay_core::TermStore;
 use ay_core::{AletheRule, Proof, ProofStep, TermId};
 #[cfg(feature = "proof-checker")]
 use ay_proof::{check_proof_partial, PartialProofCheck};
 use ay_proof::{ProofCheckError, ProofQuality};
-
-use super::super::Executor;
+#[path = "strict_check_progress.rs"]
+mod strict_check_progress;
+use self::strict_check_progress::check_with_executor_progress;
 
 #[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_FAILURES_KEY: &str = "proof_checker_failures";
@@ -76,7 +78,7 @@ impl BoundedFirewallArtifacts {
 
 impl Executor {
     /// Populate statistics extra map with proof quality metrics.
-    pub(super) fn populate_proof_quality_stats(&mut self, quality: &ProofQuality) {
+    pub(in crate::executor) fn populate_proof_quality_stats(&mut self, quality: &ProofQuality) {
         use crate::executor_types::StatValue;
         // Keep the typed field and the extensible compatibility statistic in
         // lockstep. Native replay and other structured consumers read the
@@ -108,11 +110,11 @@ impl Executor {
     }
 
     /// M0(a): dump the per-publication strict-check attribution counters into
-    /// `last_statistics`. Called wherever proof statistics are already being
-    /// recorded AND at command admission, so the final published values also
-    /// cover the mint-time strict re-check (`unsat_cert.rs`) that runs after
-    /// proof-quality stats are populated. Later calls simply overwrite with
-    /// fresher totals — the counters are cumulative within one publication.
+    /// `last_statistics`. Proof-quality population records an intermediate
+    /// snapshot; the outer UNSAT publication funnel records the final snapshot
+    /// after certificate minting and terminal-trust review. Later calls simply
+    /// overwrite with fresher totals — the counters are cumulative within one
+    /// publication.
     pub(in crate::executor) fn publish_strict_check_counters(&mut self) {
         let invocations = self.strict_check_invocations.get();
         let steps = self.strict_check_steps_validated.get();
@@ -1246,9 +1248,7 @@ impl Executor {
         out.finish()
     }
 
-    /// Strict proof check that also validates datatype constructor-distinctness
-    /// lemmas (#8419 / trust_count→0).
-    ///
+    /// Strict proof check that also validates datatype constructor-distinctness lemmas (#8419).
     /// `DatatypeDistinct` steps (promoted from `Generic` at proof finalization
     /// by `promote_datatype_distinct_lemmas`) cannot be validated from the
     /// `TermStore` alone — runtime datatype terms carry `Sort::Uninterpreted`.
@@ -1281,18 +1281,26 @@ impl Executor {
                 &assumptions,
                 &capability.datatype_decls,
                 &capability.selector_decls,
+                &capability.member_signatures,
             );
         }
         let decls = self.datatype_decls_for_strict_proof();
         let selectors = self.ctor_selector_decls_for_strict_proof();
+        let member_signatures = self
+            .datatype_member_signatures_for_strict_proof()
+            .ok_or_else(|| ProofCheckError::InvalidDatatypeSignatureContext {
+                reason: "executor datatype registries lack an exact sticky member signature"
+                    .to_string(),
+            })?;
         // A non-matching candidate must never inherit a narrow scope merely
         // because the current stored proof has a finite-enum capability.
         let problem = self.complete_problem_assertions_for_strict_proof();
-        ay_proof::check_proof_strict_with_context(
+        check_with_executor_progress(
+            self,
             proof,
-            &self.ctx.terms,
             (!decls.is_empty()).then_some(decls.as_slice()),
             (!selectors.is_empty()).then_some(selectors.as_slice()),
+            member_signatures.as_slice(),
             Some(problem.as_slice()),
         )
     }
@@ -1319,6 +1327,12 @@ impl Executor {
     ) -> Result<ProofQuality, ProofCheckError> {
         let decls = self.datatype_decls_for_strict_proof();
         let selectors = self.ctor_selector_decls_for_strict_proof();
+        let member_signatures = self
+            .datatype_member_signatures_for_strict_proof()
+            .ok_or_else(|| ProofCheckError::InvalidDatatypeSignatureContext {
+                reason: "executor datatype registries lack an exact sticky member signature"
+                    .to_string(),
+            })?;
         let assumptions: Vec<TermId> = proof
             .steps
             .iter()
@@ -1327,11 +1341,12 @@ impl Executor {
                 _ => None,
             })
             .collect();
-        ay_proof::check_proof_strict_with_context(
+        check_with_executor_progress(
+            self,
             proof,
-            &self.ctx.terms,
             (!decls.is_empty()).then_some(decls.as_slice()),
             (!selectors.is_empty()).then_some(selectors.as_slice()),
+            member_signatures.as_slice(),
             Some(assumptions.as_slice()),
         )
     }
@@ -1399,6 +1414,35 @@ impl Executor {
             .ctor_selectors_iter()
             .map(|(ctor, selectors)| (ctor.clone(), selectors.clone()))
             .collect()
+    }
+
+    /// Complete exact core signatures for every sticky datatype constructor,
+    /// selector, and tester in the declaration registries used by strict proof
+    /// checking. Returns `None` on any registry/signature mismatch so callers
+    /// fail closed rather than silently dropping typed authority.
+    pub(crate) fn datatype_member_signatures_for_strict_proof(
+        &self,
+    ) -> Option<Vec<ay_proof::DatatypeMemberSignature>> {
+        let mut signatures = Vec::new();
+        for (_, constructors) in self.ctx.datatype_iter() {
+            for constructor in constructors {
+                let fields = self.ctx.constructor_selectors(constructor)?;
+                let tester = format!("is-{constructor}");
+                for identity in std::iter::once(constructor.as_str())
+                    .chain(std::iter::once(tester.as_str()))
+                    .chain(fields.iter().map(String::as_str))
+                {
+                    let info = self.ctx.exact_datatype_member_info(identity)?;
+                    signatures.push(ay_proof::DatatypeMemberSignature {
+                        identity: identity.to_string(),
+                        argument_sorts: info.arg_sorts.clone(),
+                        result_sort: info.sort.clone(),
+                        nullary_term: info.term,
+                    });
+                }
+            }
+        }
+        Some(signatures)
     }
 
     /// Validate proof and collect quality metrics.
@@ -1491,7 +1535,7 @@ impl Executor {
     }
 
     #[cfg(feature = "proof-checker")]
-    pub(super) fn run_internal_proof_check(&mut self, proof: &Proof) {
+    pub(in crate::executor) fn run_internal_proof_check(&mut self, proof: &Proof) {
         // Strict mode (#4420): when enabled, reject trust and hole steps.
         // This gates on the SMT-LIB option `(set-option :check-proofs-strict true)`.
         if self.strict_proofs_enabled() {
@@ -1546,26 +1590,26 @@ impl Executor {
     }
 
     /// Whether the last UNSAT was backed by a refutation proof that AY's own
-    /// internal checker fully verified: the checker reported no errors
-    /// (`proof_check_ok`), the proof has at least one step, and no step is a
-    /// trust/`Hole` placeholder (`skipped_hole_steps == 0`). This is the
+    /// internal checker fully verified: `proof_check_ok`, a nonempty proof, and
+    /// no trust/`Hole` placeholder (`skipped_hole_steps == 0`). This is the
     /// certification `--self-check` requires before emitting `unsat`.
     ///
-    /// When the `proof-checker` feature is compiled out there is no internal
-    /// checker to certify with, so this conservatively returns `false` (every
-    /// UNSAT degrades to `unknown` under self-check).
+    /// Without `proof-checker`, this conservatively returns `false`.
+    /// Reconstruction-suppressed verdicts also return `false` even if an
+    /// internal diagnostic proof remains retained: it is not authored-scope
+    /// publication authority.
     pub(in crate::executor) fn unsat_proof_self_certified(&self) -> bool {
         #[cfg(feature = "proof-checker")]
         {
-            let Some(proof) = self.last_proof() else {
+            if self.last_unsat_proof_reconstruction_suppressed {
+                return false;
+            }
+            let Some(proof) = self.last_proof.as_ref() else {
                 return false;
             };
-            // Every step must be a real, checked derivation: no `Hole`
-            // placeholders and no `Trust` steps (a Trust step means "believe the
-            // solver, no derivation" — exactly what self-certification must
-            // reject; e.g. the LIA `not-exists` residue wrong-UNSAT emits a
-            // single Trust step). Assume steps are fine (problem hypotheses).
-            //
+            // Reject `Hole`/`Trust` steps; `Assume` remains valid for problem hypotheses.
+            // For example, LIA `not-exists` residue wrong-UNSAT emits one Trust step.
+            // Trust-kind theory lemmas require the same fail-closed treatment.
             // A `TheoryLemma` whose `kind.is_trust()` (i.e. `Generic`) is ALSO
             // an untrusted step: the Alethe printer renders it as `:rule trust`
             // (alethe_printer.rs), so it is a certificate-free "believe the
@@ -1686,7 +1730,9 @@ impl Executor {
             // assume) would otherwise self-certify and ship a bare `unsat`
             // alongside a proof no external checker can confirm. Degrade to
             // `unknown` instead.
-            if self.unsat_proof_references_uncheckable_seq_theory() {
+            if self.unsat_proof_references_uncheckable_seq_theory()
+                && !self.is_current_authenticated_seq_extensional_companion_proof(proof)
+            {
                 return false;
             }
             // The internal checker accepted it AND it genuinely derives the

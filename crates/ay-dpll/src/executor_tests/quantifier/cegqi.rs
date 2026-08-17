@@ -70,19 +70,19 @@ fn test_cegqi_valid_implication() {
 }
 #[test]
 fn test_cegqi_invalid_strict_positive() {
-    // forall x. x > 0 is NOT valid (counterexample: x = 0 or x = -1)
-    // #3441: Enumerative instantiation finds ground term 0, adds (0 > 0) = false.
+    // `forall x. x > 0` is invalid; #3441 instantiates 0, adding false `(0 > 0)`.
     // This directly refutes the forall, proving UNSAT.
     let input = r#"
         (set-logic QF_LIA)
+        (set-option :produce-proofs true)
         (assert (forall ((x Int)) (> x 0)))
         (check-sat)
     "#;
 
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
     let outputs = exec.execute_all(&commands).unwrap();
-
     // Invalid forall: enumerative instantiation with x=0 produces false,
     // proving the formula unsatisfiable.
     assert_eq!(outputs, vec!["unsat"]);
@@ -725,7 +725,7 @@ fn test_cegqi_never_recompletes_interpreted_arithmetic_heads() {
 // `unknown.phase = "independent-model-check-gate"` and the `(deferred:` detail
 // unique to that site.
 //
-// ROOT CAUSE (measured with `AY_DEBUG_QMG=1`): the conjunct the gate receives
+// ROOT CAUSE (measured with `--debug-qmg`): the conjunct the gate receives
 // is `(forall ((x Int)) (or (forall ((y Int)) (not (= 1 x))) (not (= 0 x))))`
 // — `y` is VACUOUS (the const-array `select` already folded to `1`). Neither
 // decision route can handle a binder buried in the matrix: the prefix route

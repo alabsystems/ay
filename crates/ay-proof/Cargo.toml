@@ -19,6 +19,7 @@ thiserror.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 proptest.workspace = true
+wait-timeout.workspace = true
 ay-lrat-check.workspace = true
 # Differential-fuzz ORACLES ONLY (tests/string_ground_diff_fuzz.rs). The
 # checker's ground string/regex evaluator must stay independent of the solver,

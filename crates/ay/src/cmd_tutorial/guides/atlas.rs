@@ -5,6 +5,10 @@ use anyhow::Result;
 
 use super::FeatureSection;
 
+fn print_block(text: &str) {
+    println!("{text}");
+}
+
 pub(super) fn run(selected: Option<FeatureSection>, interactive: bool) -> Result<()> {
     println!();
     println!("=== AY Feature Atlas ===");
@@ -40,8 +44,7 @@ pub(super) fn run(selected: Option<FeatureSection>, interactive: bool) -> Result
 }
 
 fn solving() {
-    println!(
-        "{}",
+    print_block(
         r#"Primary entry point: ay solve FILE  (or simply: ay FILE)
 
   SMT-LIB 2.6   Arithmetic, UF, bit-vectors, arrays, floating point,
@@ -67,8 +70,7 @@ optimum from a best incumbent. UNKNOWN is information, never â€œprobably false.â
 }
 
 fn proofs() {
-    println!(
-        "{}",
+    print_block(
         r#"AY is proof-oriented: search and acceptance are separate questions.
 
   SMT UNSAT       Alethe on supported paths; replay with Carcara
@@ -99,8 +101,7 @@ record its acceptance verdict before calling an artifact certified.
 }
 
 fn optimization() {
-    println!(
-        "{}",
+    print_block(
         r#"There are several optimization layers because their proof methods differ.
 
   SMT OMT          (minimize ...), (maximize ...), (get-objectives)
@@ -124,8 +125,7 @@ certificate claim to another solver family.
 }
 
 fn exploration() {
-    println!(
-        "{}",
+    print_block(
         r#"A solver is useful after the first model too.
 
   ay allsat FORMULA.cnf
@@ -155,8 +155,7 @@ and `ay tutorial play sudoku` exposes a live solver-backed model.
 }
 
 fn integration() {
-    println!(
-        "{}",
+    print_block(
         r#"Choose the narrowest integration boundary that fits the application.
 
   Process / SMT-LIB   Stable, inspectable, language-neutral
@@ -182,8 +181,7 @@ Start with:
 }
 
 fn tooling() {
-    println!(
-        "{}",
+    print_block(
         r#"AY ships tools that turn one solve into reproducible evidence.
 
   ay bench list / run / score / diff

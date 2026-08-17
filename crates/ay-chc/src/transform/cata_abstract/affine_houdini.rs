@@ -185,8 +185,8 @@ pub(crate) fn solve_abstract_affine(
     }
 
     // Diagnostic: the fixpoint invariant per predicate. Env-gated (like
-    // AY_CHC_CATA_DUMP_OBLIGATIONS) so it costs nothing on the hot path.
-    if std::env::var_os("AY_CATA_TRACE").is_some() {
+    // --chc-cata-dump-obligations) so it costs nothing on the hot path.
+    if ay_core::misc_cli_flags().chc_cata_trace {
         for pred in preds {
             let cands = inv.get(&pred.id).map(Vec::as_slice).unwrap_or(&[]);
             let f = ChcExpr::and_all(cands.iter().cloned());

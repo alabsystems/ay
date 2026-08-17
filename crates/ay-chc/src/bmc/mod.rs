@@ -113,7 +113,7 @@ const MAX_NESTED_ARRAY_CANDIDATE_TOKENS: usize = 4096;
 const MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES: usize = 8192;
 
 fn log_nested_array_candidate(args: std::fmt::Arguments<'_>) {
-    if std::env::var("AY_CHC_BMC_NESTED_DEBUG").is_ok_and(|value| value != "0") {
+    if ay_core::misc_cli_flags().chc_bmc_nested_debug {
         safe_eprintln!("BMC nested-array candidate: {args}");
     }
 }
@@ -7283,8 +7283,7 @@ impl BmcSolver {
     /// fall back to the previous activation-literal/fresh-executor routes.
     fn ts_incremental_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED
-            .get_or_init(|| std::env::var("AY_CHC_BMC_TS_INCREMENTAL").map_or(true, |v| v != "0"))
+        *ENABLED.get_or_init(|| crate::ab_switches::get().bmc_ts_incremental)
     }
 
     /// Whether THIS run sweeps past a spurious / non-strictly-confirmable
@@ -7299,14 +7298,9 @@ impl BmcSolver {
     /// completeness-affecting: with it OFF the sweep can only find FEWER
     /// counterexamples, never a wrong verdict either way.
     fn sweep_past_spurious_sat(&self) -> bool {
-        static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-        OVERRIDE
-            .get_or_init(|| {
-                std::env::var("AY_CHC_BMC_SWEEP_PAST_SPURIOUS_SAT")
-                    .ok()
-                    .map(|v| v != "0")
-            })
-            .unwrap_or(self.config.sweep_past_spurious_sat)
+        // B15: the config field IS the carrier; the never-set env override
+        // shim on top of it is deleted.
+        self.config.sweep_past_spurious_sat
     }
 
     /// Classify a flat-BMC SAT model at depth `k` into either a
@@ -7734,8 +7728,8 @@ impl BmcSolver {
     /// (inc-9). Default ON; set `AY_CHC_BMC_MULTIPRED_TS=0` to fall back to
     /// the activation-literal/fresh-executor routes for multipred problems.
     fn multipred_ts_incremental_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("AY_CHC_BMC_MULTIPRED_TS").map_or(true, |v| v != "0"))
+        // B27: CLI-owned; env retired.
+        crate::ab_switches::get().bmc_multipred_ts
     }
 
     /// Build a synthetic single-predicate transition system for a LINEAR
@@ -12244,9 +12238,9 @@ impl BmcSolver {
 
     /// Kill switch for the datatype-aware bounded BMC refutation lane
     /// ([`Self::solve_datatype_bounded_refutation`]). Enabled by default;
-    /// `AY_CHC_DISABLE_DT_BMC` set (to any value) disables it.
+    /// `--chc-no-dt-bmc` set (to any value) disables it.
     fn dt_bmc_refutation_enabled() -> bool {
-        std::env::var_os("AY_CHC_DISABLE_DT_BMC").is_none()
+        crate::ab_switches::get().dt_bmc
     }
 
     /// Bounded datatype-aware derivation-TREE refutation for CHC problems over
@@ -12386,7 +12380,7 @@ impl BmcSolver {
                         }
                     }
                 }
-                let trace = std::env::var_os("AY_DT_BMC_TRACE").is_some();
+                let trace = ay_core::misc_cli_flags().chc_dt_bmc_trace;
                 if capped {
                     // Node cap hit; deeper unfoldings are only larger.
                     if trace {
@@ -12599,7 +12593,9 @@ impl BmcSolver {
     /// committed formula to check-sat, isolating the pass in bisection. Depending
     /// on executor capability this may lose completeness, but never soundness.
     fn dt_bmc_elim_enabled() -> bool {
-        std::env::var_os("AY_DT_BMC_NO_ELIM").is_none()
+        // B15: typed A/B switch (`ab_switches`); the never-set env read is
+        // gone.
+        crate::ab_switches::get().dt_bmc_elim
     }
 
     /// True for the datatype-BMC tree encoding's node-argument variables

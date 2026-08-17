@@ -92,12 +92,6 @@ impl ForwardChecker {
         }
     }
 
-    /// Whether this checker uses sampled mode.
-    #[cfg(all(test, not(debug_assertions)))]
-    pub(crate) fn is_sampled(&self) -> bool {
-        self.sample_period > 0
-    }
-
     /// The sampling period (0 = check every clause).
     pub(crate) fn sample_period(&self) -> u64 {
         self.sample_period

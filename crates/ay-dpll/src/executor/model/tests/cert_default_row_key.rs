@@ -127,7 +127,7 @@ fn assert_printed_model_satisfies(model: &str, assertions: &str) {
     let commands = parse(&replay).expect("printed model re-parses as input");
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).expect("replay executes");
-    if std::env::var_os("AY_DEBUG_CERT").is_some() {
+    if ay_core::misc_cli_flags().debug_cert {
         for &assertion in &exec.ctx.assertions {
             eprintln!(
                 "CERT/default-row-replay-root: {assertion:?} {}",

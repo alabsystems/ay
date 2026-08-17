@@ -7,7 +7,7 @@
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::TermId;
 
-use crate::solver::{atom_filter_from_env, EufSolver};
+use crate::solver::{atom_filter_enabled, EufSolver};
 
 impl EufSolver<'_> {
     /// Pre-index same-sorted equality terms, optionally restricted to SAT atoms.
@@ -52,7 +52,7 @@ impl EufSolver<'_> {
 
     /// Collect and install the executor's assignable equality terms.
     pub fn install_sat_atom_filter(&mut self, term_to_var: &DetHashMap<TermId, u32>) {
-        if !atom_filter_from_env() {
+        if !atom_filter_enabled() {
             return;
         }
         let atoms = term_to_var

@@ -100,5 +100,19 @@ fn datatype_cell_authority_has_an_aggregate_value_budget() {
     }
     model.euf_model = Some(euf);
 
-    assert!(executor.exact_datatype_cell_completions(&model).is_empty());
+    assert!(executor
+        .exact_datatype_cell_completions(&model, &[])
+        .is_empty());
+}
+
+#[test]
+fn datatype_cell_authority_rejects_nonterm_assumption_roots_without_panicking() {
+    let executor = dt_opaque_completion_scope::loaded_fixture();
+    let mut model = empty_model();
+    model.euf_model = Some(EufModel::default());
+    let marker = TermId(u32::MAX - 7);
+    assert!(executor.ctx.terms.entry_stamp(marker).is_none());
+    assert!(executor
+        .exact_datatype_cell_completions(&model, &[marker])
+        .is_empty());
 }

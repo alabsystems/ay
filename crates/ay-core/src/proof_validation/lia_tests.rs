@@ -131,6 +131,59 @@ fn rounded_integer_bounds_gap_rejects_real_relaxation() {
 }
 
 #[test]
+fn exact_integer_split_schemas_accept_producer_order_only() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let y_minus_one = terms.mk_sub(vec![y, one]);
+    let y_plus_one = terms.mk_add(vec![y, one]);
+    let upper = terms.mk_le(x, y_minus_one);
+    let lower = terms.mk_le(y_plus_one, x);
+    let equality = terms.mk_eq(x, y);
+
+    // Without the equality guard these two branches deliberately exclude
+    // x=y, so the two-literal cover is not itself a tautology.
+    assert!(!super::lia::recognize_int_bounds_tautology(
+        &terms,
+        &[upper, lower]
+    ));
+    let not_upper = terms.mk_not(upper);
+    let not_lower = terms.mk_not(lower);
+    assert!(super::lia::recognize_int_bounds_tautology(
+        &terms,
+        &[not_upper, not_lower]
+    ));
+    assert!(super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[upper, lower, equality]
+    ));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[lower, upper, equality]
+    ));
+}
+
+#[test]
+fn exact_real_disequality_split_rejects_branch_permutation() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let forward = terms.mk_lt(x, y);
+    let reverse = terms.mk_lt(y, x);
+    let equality = terms.mk_eq(x, y);
+
+    assert!(super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[forward, reverse, equality]
+    ));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[reverse, forward, equality]
+    ));
+}
+
+#[test]
 fn test_divisibility_rejects_unverified_clause_fail_closed() {
     // META-FALSE-PROVE regression: a Divisibility lemma carries no Farkas
     // certificate, and the GCD reasoning is not implemented. The clause here is

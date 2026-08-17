@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Source-bound UNSAT certificate for exact integer `forall`/`exists` theorems.
+//! Source-bound UNSAT certificate for exact quantified integer theorems.
 //!
 //! The general quantified solver proves these formulas after Skolemization, but
 //! its isolated ground refutation is not an authored-scope proof.  This module
@@ -19,9 +19,13 @@
 //! square is `0` or `1` modulo `4`; the second has no witness for any `x`,
 //! because its two bounds imply `x + 1 <= x`. The third is false because the
 //! unnegated sentence is valid: `y = max(x, C) + 1` satisfies both strict lower
-//! bounds. Every other shape declines. Successful evidence is bound to the exact public query,
-//! source scope, ordered root vector, and term-store snapshot; publication
-//! re-runs this small checker.
+//! bounds. A sibling checker also covers contradictory bounded existentials and
+//! the exact duality between a pointwise Boolean-UF definition and a bounded
+//! existential over that UF. Every other shape declines. Successful evidence
+//! is bound to the exact public query, source scope, ordered root vector, and
+//! term-store snapshot; publication re-runs these small checkers.
+
+mod bounded_bool_uf;
 
 use std::collections::HashSet;
 
@@ -37,7 +41,7 @@ use super::{Executor, QueryAuthorityEpoch};
 /// A legal colliding declaration receives a private identity.  Observing a
 /// declaration that still owns one of these canonical identities means the
 /// frontend identity invariant was bypassed, so authority is refused.
-const CHECKED_CORE_OPERATORS: [&str; 6] = ["and", "=", "*", "<=", "+", "<"];
+const CHECKED_CORE_OPERATORS: [&str; 9] = ["and", "=", "*", "<=", "+", "-", "<", ">=", ">"];
 
 /// Bound malformed low-level DAGs independently of the ordinary parser.
 const MAX_REACHABLE_NODES: usize = 64;
@@ -98,13 +102,20 @@ impl Executor {
 }
 
 fn exact_root_is_unsat(ctx: &Context, roots: &[TermId]) -> bool {
-    let [root] = roots else {
-        return false;
-    };
-    if !core_operators_are_unshadowed(ctx) || require_sort(&ctx.terms, *root, &Sort::Bool).is_none()
+    if roots.is_empty()
+        || !core_operators_are_unshadowed(ctx)
+        || roots
+            .iter()
+            .any(|&root| require_sort(&ctx.terms, root, &Sort::Bool).is_none())
     {
         return false;
     }
+    if bounded_bool_uf::exact_bounded_bool_uf_is_unsat(ctx, roots) {
+        return true;
+    }
+    let [root] = roots else {
+        return false;
+    };
 
     let terms = &ctx.terms;
     is_false_forall_exists(terms, *root) || is_negated_unbounded_above_forall_exists(terms, *root)
@@ -307,130 +318,4 @@ fn unique_named_var(terms: &TermStore, root: TermId, name: &str) -> Option<TermI
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ay_frontend::{parse, Command};
-
-    fn executor_for(script: &str) -> Executor {
-        let commands = parse(script).expect("valid quantified fixture");
-        let mut executor = Executor::new();
-        executor
-            .execute_all(&commands)
-            .expect("quantified fixture elaborates");
-        executor
-    }
-
-    fn evidence_for(executor: &Executor) -> Option<CheckedExactForallExistsUnsat> {
-        executor.try_authorize_exact_forall_exists_roots(&executor.ctx.assertions)
-    }
-
-    #[test]
-    fn recognizes_exact_unsat_theorems() {
-        let square = executor_for(
-            "(set-logic NIA)\
-             (assert (forall ((x Int)) (exists ((y Int)) (= (* y y) x))))",
-        );
-        assert!(evidence_for(&square).is_some());
-
-        let interval = executor_for(
-            "(set-logic LIA)\
-             (assert (forall ((x Int)) (exists ((y Int))\
-                (and (<= y x) (>= y (+ x 1))))))",
-        );
-        assert!(evidence_for(&interval).is_some());
-
-        let negated_valid = executor_for(
-            "(set-logic LIA)\
-             (assert (not (forall ((x Int)) (exists ((y Int))\
-                (and (> y x) (> y -17))))))",
-        );
-        assert!(evidence_for(&negated_valid).is_some());
-    }
-
-    #[test]
-    fn generic_text_boundary_publishes_all_checked_theorems() {
-        for script in [
-            "(set-logic NIA)\
-             (assert (forall ((x Int)) (exists ((y Int)) (= (* y y) x))))\
-             (check-sat)",
-            "(set-logic LIA)\
-             (assert (forall ((x Int)) (exists ((y Int))\
-                (and (<= y x) (>= y (+ x 1))))))\
-             (check-sat)",
-            "(set-logic LIA)\
-             (assert (not (forall ((x Int)) (exists ((y Int))\
-                (and (> y x) (> y 5))))))\
-             (check-sat)",
-        ] {
-            let commands = parse(script).expect("valid exact theorem script");
-            let mut executor = Executor::new();
-            assert_eq!(
-                executor
-                    .execute_all(&commands)
-                    .expect("checked exact theorem must execute"),
-                vec!["unsat"]
-            );
-            assert!(executor.last_command_unsat_was_exact_semantically_verified());
-        }
-    }
-
-    #[test]
-    fn satisfiable_near_misses_and_private_operator_identity_decline() {
-        for script in [
-            "(set-logic LIA)\
-             (assert (forall ((x Int)) (exists ((y Int)) (= y x))))",
-            "(set-logic NIA)\
-             (assert (forall ((x Int)) (exists ((y Int)) (= (* y y) (* x x)))))",
-            "(set-logic LIA)\
-             (assert (forall ((x Int)) (exists ((y Int))\
-                (and (<= y x) (>= y x)))))",
-            "(set-logic LIA)\
-             (assert (not (forall ((x Int)) (exists ((y Int))\
-                (and (> y x) (< y 5))))))",
-            "(set-logic LIA)\
-             (assert (forall ((x Int)) (exists ((y Int))\
-                (and (> y x) (> y 5)))))",
-            "(set-logic ALL)\
-             (declare-fun * (Int Int) Int)\
-             (assert (forall ((x Int)) (exists ((y Int)) (= (* y y) x))))",
-            "(set-logic ALL)\
-             (declare-fun < (Int Int) Bool)\
-             (assert (not (forall ((x Int)) (exists ((y Int))\
-                (and (< x y) (< 5 y))))))",
-        ] {
-            let executor = executor_for(script);
-            assert!(evidence_for(&executor).is_none());
-        }
-    }
-
-    #[test]
-    fn evidence_rejects_forged_roots_and_stale_epoch_source_and_snapshot() {
-        let script = "(set-logic LIA)\
-            (assert (forall ((x Int)) (exists ((y Int))\
-                (and (<= y x) (>= y (+ x 1))))))";
-
-        let mut forged = executor_for(script);
-        let evidence = evidence_for(&forged).expect("expected exact UNSAT evidence");
-        let sat = forged.ctx.terms.true_term();
-        forged.ctx.assertions = vec![sat];
-        assert!(!evidence.is_current(&forged));
-
-        let mut epoch = executor_for(script);
-        let evidence = evidence_for(&epoch).expect("expected exact UNSAT evidence");
-        epoch.advance_query_authority_epoch();
-        assert!(!evidence.is_current(&epoch));
-
-        let mut source = executor_for(script);
-        let evidence = evidence_for(&source).expect("expected exact UNSAT evidence");
-        source
-            .ctx
-            .process_command(&Command::Push(1))
-            .expect("push changes the source/scope stamp");
-        assert!(!evidence.is_current(&source));
-
-        let mut snapshot = executor_for(script);
-        let evidence = evidence_for(&snapshot).expect("expected exact UNSAT evidence");
-        let _ = snapshot.ctx.terms.mk_var("later", Sort::Int);
-        assert!(!evidence.is_current(&snapshot));
-    }
-}
+mod tests;

@@ -1319,7 +1319,7 @@ impl Executor {
                 continue;
             }
             let Some(idx_key) = self.census_index_key(model, index) else {
-                if std::env::var_os("AY_CENSUS_TRACE").is_some() {
+                if ay_core::misc_cli_flags().census_trace {
                     eprintln!(
                         "c census-reject undecidable-index sort={}",
                         self.ctx.terms.sort(index)
@@ -1354,7 +1354,7 @@ impl Executor {
                     ) {
                         Some(true) => {}
                         Some(false) => {
-                            if std::env::var_os("AY_CENSUS_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().census_trace {
                                 eprintln!(
                                     "c census-reject congruence-conflict {} vs {}",
                                     self.census_value_key(model, reads[i], CANON_DEPTH)
@@ -1366,7 +1366,7 @@ impl Executor {
                             return false; // congruence conflict (definite)
                         }
                         None => {
-                            if std::env::var_os("AY_CENSUS_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().census_trace {
                                 eprintln!(
                                     "c census-reject undecidable-value sort={}",
                                     self.ctx.terms.sort(reads[i]),
@@ -1593,7 +1593,7 @@ impl Executor {
                         CANON_DEPTH,
                     ) == Some(false)
                     {
-                        if std::env::var_os("AY_CENSUS_TRACE").is_some() {
+                        if ay_core::misc_cli_flags().census_trace {
                             eprintln!(
                                 "c select-cong-violation {} vs {}",
                                 self.census_value_key(model, reads[i], CANON_DEPTH)
@@ -2058,7 +2058,7 @@ impl Executor {
                 .map(|s| s.to_vec())
                 .unwrap_or_default();
             for sel in selectors {
-                let dbg = std::env::var_os("AY_CENSUS_TRACE").is_some();
+                let dbg = ay_core::misc_cli_flags().census_trace;
                 let (Some(a1), Some(a2)) = (
                     self.find_dt_selector_app(&sel, t1),
                     self.find_dt_selector_app(&sel, t2),
@@ -2088,7 +2088,7 @@ impl Executor {
             return Some(true);
         }
         // Scalar / EUF leaf: compare evaluated values (undecidable -> None).
-        let dbg = std::env::var_os("AY_CENSUS_TRACE").is_some();
+        let dbg = ay_core::misc_cli_flags().census_trace;
         let k1 = self.census_value_key(model, t1, depth);
         let k2 = self.census_value_key(model, t2, depth);
         if dbg && (k1.is_none() || k2.is_none()) {
@@ -2286,8 +2286,7 @@ impl Executor {
         // Pin the boundary values and let the full evaluator finish the assertion.
         let _guard = OverrideGuard::install(overrides);
         let result = self.evaluate_term(model, term);
-        if std::env::var_os("AY_PHASE_TRACE").is_some() && matches!(result, EvalValue::Bool(false))
-        {
+        if ay_core::misc_cli_flags().phase_trace && matches!(result, EvalValue::Bool(false)) {
             if let TermData::App(sym, args) = self.ctx.terms.get(term) {
                 if matches!(sym.name(), "=" | "distinct") && args.len() == 2 {
                     let a = self.dt_mat_canonical(model, args[0], 64);
@@ -3084,7 +3083,7 @@ impl Executor {
             let Some(arg_str) = arg_val else {
                 // A committed case with no representable key cannot be part of
                 // a faithful total definition — drop the definition.
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace mv-total-sel-drop sel={name} reason=arg-unrenderable tid={} arg={}",
                         tid.0, args[0].0
@@ -3098,7 +3097,7 @@ impl Executor {
                 // reliable `(= @p0 …)` guard — fail closed (M4 F2; the former
                 // silent case-skip let the default arm override a committed
                 // gate-checked value: a voiding channel).
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace mv-total-sel-drop sel={name} reason=abstract-key tid={} arg_str={arg_str}",
                         tid.0
@@ -3119,7 +3118,7 @@ impl Executor {
                 self.term_value_string(model, tid).ok()
             };
             let Some(val_str) = app_val else {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!(
                         "c phase-trace mv-total-sel-drop sel={name} reason=value-unrenderable tid={} arg_str={arg_str}",
                         tid.0
@@ -3143,7 +3142,7 @@ impl Executor {
                         "conflicting committed selector values for one argument \
                          value; dropping the selector's total definition"
                     );
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!(
                             "c phase-trace mv-total-sel-drop sel={name} reason=conflict tid={} arg_str={arg_str} val={val_str} prev={prev}",
                             tid.0

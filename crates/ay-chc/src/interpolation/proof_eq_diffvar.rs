@@ -69,10 +69,11 @@ const MAX_DV_SCAN_NODES: usize = 200_000;
 /// harnesses can toggle within a process, matching
 /// `ay_dpll::preprocess::eq_diffvar_enabled`.
 pub(crate) fn eq_diffvar_proof_enabled() -> bool {
-    if std::env::var("AY_EQ_DIFFVAR").is_ok_and(|v| v == "0") {
+    if false {
+        // B23: the inc-14 master kill switch env is retired; the pass is on.
         return false;
     }
-    std::env::var("AY_EQ_DIFFVAR_PROOF").map_or(true, |v| v != "0")
+    true // B24: kill-switch env retired.
 }
 
 /// Outcome of the script-level reduction.

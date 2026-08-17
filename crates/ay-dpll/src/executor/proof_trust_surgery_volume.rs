@@ -12,6 +12,7 @@ use super::super::proof_euf_lemma::{EufLemmaPlan, EufTarget};
 use super::super::proof_trust_surgery_ite::{
     ProvenanceFarkasLemma, ProvenanceItePlan, ProvenanceIteSource,
 };
+use super::super::proof_trust_surgery_ite_branch::ProvenanceBranchLemma;
 use super::super::proof_trust_surgery_provenance_or::{ProvenanceOrPlan, ProvenanceOrRefutation};
 use super::super::proof_trust_surgery_provenance_or_transfer::ProvenanceOrBridge;
 use super::taut_surface::MAX_EMITTED_CLAUSE_WIDTH;
@@ -96,14 +97,18 @@ fn spend_farkas_chain(volume: &mut Volume, lemma: &ProvenanceFarkasLemma) -> boo
     volume.clause(width) && volume.spend(width) && volume.decreasing(width, lemma.supports.len())
 }
 
-fn spend_ite_branch(volume: &mut Volume, lemma: &ProvenanceFarkasLemma) -> bool {
-    let width = lemma.clause.len();
+fn spend_ite_branch(volume: &mut Volume, lemma: &ProvenanceBranchLemma) -> bool {
+    let width = lemma.clause().len();
+    let certificate = match lemma {
+        ProvenanceBranchLemma::Farkas(_) => volume.spend(width),
+        ProvenanceBranchLemma::Transitive { .. } => true,
+    };
     volume.clause(3)
         && volume.clause(width)
-        && volume.spend(width)
+        && certificate
         && volume.clause(width.saturating_add(1))
         && volume.clause(width)
-        && volume.decreasing(width, lemma.supports.len())
+        && volume.decreasing(width, lemma.supports().len())
 }
 
 fn spend_provenance_ite(volume: &mut Volume, plan: &ProvenanceItePlan) -> bool {

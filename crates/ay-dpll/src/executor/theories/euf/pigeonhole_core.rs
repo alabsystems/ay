@@ -347,7 +347,7 @@ impl CliqueGraph {
             if self.complete_greedy(&mut clique, &mut cand, target, seed_domain, budget, true) {
                 return Some(clique); // an all-seed (k+1)-clique: residual 0
             }
-            if std::env::var_os("AY_DEBUG_PIGEONHOLE").is_some() {
+            if ay_core::misc_cli_flags().debug_pigeonhole {
                 eprintln!(
                     "c sfc-debug start={} phase1_len={} budget={}",
                     self.nodes[start].0,
@@ -504,7 +504,7 @@ impl Executor {
         &mut self,
         named: &HashMap<TermId, String>,
     ) -> Option<Vec<TermId>> {
-        let debug = std::env::var_os("AY_DEBUG_PIGEONHOLE").is_some();
+        let debug = ay_core::misc_cli_flags().debug_pigeonhole;
         // Cheap gate: the pass only ever fires over declared datatypes.
         if self.ctx.datatype_iter().next().is_none() {
             if debug {
@@ -653,14 +653,10 @@ impl Executor {
 
     /// Effective enrichment gate: sorts with `k >=` this threshold get the
     /// neighbourhood-edge enrichment (see `UC_ENRICH_K_DEFAULT` for the
-    /// measured rationale). Env-tunable via `AY_UC_ENRICH_K` for probing a
-    /// different cutoff (each probe instance was validated through exactly
-    /// this override before the default moved).
+    /// measured rationale). (B10: the AY_UC_ENRICH_K probe override is
+    /// retired; probing a different cutoff means editing the constant.)
     fn uc_enrich_k_threshold() -> usize {
-        std::env::var("AY_UC_ENRICH_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(UC_ENRICH_K_DEFAULT)
+        UC_ENRICH_K_DEFAULT
     }
 
     /// Core assembly: the EDGE CLOSURE over the clique vertex set — every
@@ -1655,24 +1651,23 @@ mod tests {
         }
     }
 
-    /// DEFAULT THRESHOLD: 43 without the env override — exactly the
-    /// dual-validated enrichment set: e97 (k=43), b98 (k=81), b79 (k=83)
-    /// and b89 (k=86) enrich; e91 (k=24) and every smaller validated probe
-    /// instance (k <= 20) stay byte-identical on the un-enriched path.
+    /// DEFAULT THRESHOLD: 43 — exactly the dual-validated enrichment set:
+    /// e97 (k=43), b98 (k=81), b79 (k=83) and b89 (k=86) enrich; e91 (k=24)
+    /// and every smaller validated probe instance (k <= 20) stay
+    /// byte-identical on the un-enriched path. (B10: unconditional — the
+    /// AY_UC_ENRICH_K override this guard once excluded is retired.)
     #[test]
     fn test_default_enrich_threshold_covers_validated_set() {
-        if std::env::var_os("AY_UC_ENRICH_K").is_none() {
-            let t = Executor::uc_enrich_k_threshold();
-            assert_eq!(t, 43);
-            for k in [43, 81, 83, 86] {
-                assert!(k >= t, "validated-enriched instance k={k} must enrich");
-            }
-            for k in [12, 16, 19, 20, 24] {
-                assert!(
-                    k < t,
-                    "below-threshold instance k={k} must stay un-enriched"
-                );
-            }
+        let t = Executor::uc_enrich_k_threshold();
+        assert_eq!(t, 43);
+        for k in [43, 81, 83, 86] {
+            assert!(k >= t, "validated-enriched instance k={k} must enrich");
+        }
+        for k in [12, 16, 19, 20, 24] {
+            assert!(
+                k < t,
+                "below-threshold instance k={k} must stay un-enriched"
+            );
         }
     }
 

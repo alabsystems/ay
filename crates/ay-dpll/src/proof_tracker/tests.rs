@@ -5,7 +5,8 @@
 use super::*;
 use crate::incremental_state::IncrementalSubsystem;
 use crate::theory_inference::{
-    record_theory_conflict_unsat, record_theory_conflict_unsat_with_farkas,
+    record_theory_conflict_unsat, record_theory_conflict_unsat_with_annotation,
+    record_theory_conflict_unsat_with_farkas,
 };
 use ay_core::TheoryLit;
 use ay_core::{ProofStep, Sort, TermStore, TheoryConflict};
@@ -34,7 +35,7 @@ fn add_outer_entries(tracker: &mut ProofTracker) -> (ProofId, ProofId) {
         .add_assumption(TermId(1), Some("h_outer".to_string()))
         .expect("proof tracking enabled");
     let outer_lemma = tracker
-        .add_theory_lemma(vec![TermId(10)])
+        .add_explicit_trust_lemma(vec![TermId(10)])
         .expect("proof tracking enabled");
     (outer_assumption, outer_lemma)
 }
@@ -88,7 +89,7 @@ fn assert_outer_entries_dedup(
     assert_eq!(outer_assumption_again, expected_assumption);
 
     let outer_lemma_again = tracker
-        .add_theory_lemma(vec![TermId(10)])
+        .add_explicit_trust_lemma(vec![TermId(10)])
         .expect("proof tracking enabled");
     assert_eq!(outer_lemma_again, expected_lemma);
 }
@@ -608,18 +609,18 @@ fn test_theory_lemma() {
     tracker.set_theory("EUF");
 
     let clause = vec![TermId(1), TermId(2)];
-    let id = tracker.add_theory_lemma(clause.clone());
+    let id = tracker.add_explicit_trust_lemma(clause.clone());
     assert!(id.is_some());
     assert_eq!(tracker.num_steps(), 1);
 
     // Adding same lemma returns same ID
-    let id2 = tracker.add_theory_lemma(clause);
+    let id2 = tracker.add_explicit_trust_lemma(clause);
     assert_eq!(id, id2);
     assert_eq!(tracker.num_steps(), 1);
 
     // A different ordering is treated as distinct (order is significant for Alethe rules)
     let clause2 = vec![TermId(2), TermId(1)];
-    let id3 = tracker.add_theory_lemma(clause2);
+    let id3 = tracker.add_explicit_trust_lemma(clause2);
     assert_ne!(id, id3);
     assert_eq!(tracker.num_steps(), 2);
 }
@@ -660,7 +661,7 @@ fn scoped_singleton_alias_preserves_outer_generic_lemma() {
     let packed_axiom = TermId(18);
 
     let outer = tracker
-        .add_theory_lemma(vec![packed_axiom])
+        .add_explicit_trust_lemma(vec![packed_axiom])
         .expect("proof tracking enabled");
     tracker.push();
     let inner = tracker
@@ -854,7 +855,7 @@ fn test_push_pop_discards_scoped_steps() {
 
     // Scoped: add assumption B and a theory lemma
     tracker.add_assumption(TermId(2), Some("h1".to_string()));
-    tracker.add_theory_lemma(vec![TermId(3), TermId(4)]);
+    tracker.add_explicit_trust_lemma(vec![TermId(3), TermId(4)]);
     assert_eq!(tracker.num_steps(), 3);
 
     // Pop: scoped steps discarded
@@ -879,24 +880,24 @@ fn test_push_pop_removes_scoped_lemmas() {
     tracker.set_theory("LRA");
 
     let outer_clause = vec![TermId(10), TermId(11)];
-    tracker.add_theory_lemma(outer_clause.clone());
+    tracker.add_explicit_trust_lemma(outer_clause.clone());
     assert_eq!(tracker.num_steps(), 1);
 
     tracker.push();
     let inner_clause = vec![TermId(20), TermId(21)];
-    tracker.add_theory_lemma(inner_clause.clone());
+    tracker.add_explicit_trust_lemma(inner_clause.clone());
     assert_eq!(tracker.num_steps(), 2);
 
     tracker.pop();
     assert_eq!(tracker.num_steps(), 1, "scoped lemma should be removed");
 
     // The outer lemma still deduplicates (its ProofId is below the watermark)
-    let outer_id2 = tracker.add_theory_lemma(outer_clause);
+    let outer_id2 = tracker.add_explicit_trust_lemma(outer_clause);
     assert!(outer_id2.is_some());
     assert_eq!(tracker.num_steps(), 1, "outer lemma should deduplicate");
 
     // The inner lemma is fresh after pop (its dedup entry was removed)
-    let inner_id2 = tracker.add_theory_lemma(inner_clause);
+    let inner_id2 = tracker.add_explicit_trust_lemma(inner_clause);
     assert!(inner_id2.is_some());
     assert_eq!(tracker.num_steps(), 2, "inner lemma should be re-added");
 }
@@ -956,14 +957,16 @@ fn test_checkpoint_rollback_restores_entire_proof_ledger() {
 
     tracker.push();
     let (outer_assumption, outer_lemma) = add_outer_entries(&mut tracker);
-    let checkpoint = tracker.rollback_checkpoint();
+    let checkpoint = tracker
+        .rollback_checkpoint()
+        .expect("small test ledger fits checkpoint budget");
 
     tracker
         .add_assumption(TermId(2), Some("discarded_assumption".to_string()))
         .expect("proof tracking enabled");
     tracker.push();
     tracker
-        .add_theory_lemma(vec![TermId(20), TermId(21)])
+        .add_explicit_trust_lemma(vec![TermId(20), TermId(21)])
         .expect("proof tracking enabled");
     tracker.set_theory("BV");
     tracker.disable();
@@ -1005,7 +1008,9 @@ fn test_checkpoint_rollback_rejects_replacement_ledger_id_aliases() {
     tracker
         .add_assumption(TermId(1), Some("entry".to_string()))
         .expect("proof tracking enabled");
-    let checkpoint = tracker.rollback_checkpoint();
+    let checkpoint = tracker
+        .rollback_checkpoint()
+        .expect("small test ledger fits checkpoint budget");
 
     let moved = tracker.take_proof();
     assert_eq!(moved.steps.len(), 1);
@@ -1028,18 +1033,23 @@ fn test_checkpoint_rollback_rejects_replacement_ledger_id_aliases() {
 }
 
 #[test]
-fn test_checkpoint_rollback_snapshot_can_be_reused_without_proof_id_aliasing() {
+fn test_checkpoint_rollback_can_repeat_without_proof_id_aliasing() {
     let mut tracker = ProofTracker::new();
     tracker.enable();
     tracker
         .add_assumption(TermId(1), Some("entry".to_string()))
         .expect("proof tracking enabled");
-    let checkpoint = tracker.rollback_checkpoint();
+    let checkpoint = tracker
+        .rollback_checkpoint()
+        .expect("small test ledger fits checkpoint budget");
     tracker
         .add_assumption(TermId(2), Some("discarded".to_string()))
         .expect("proof tracking enabled");
 
-    assert!(tracker.rollback_to(checkpoint.clone()));
+    assert!(tracker.rollback_to(checkpoint));
+    let checkpoint = tracker
+        .rollback_checkpoint()
+        .expect("restored small test ledger fits checkpoint budget");
     let reused = tracker
         .add_assumption(TermId(3), Some("reused_id".to_string()))
         .expect("proof tracking enabled");
@@ -1059,9 +1069,11 @@ fn test_checkpoint_rollback_removes_new_map_alias_to_old_step() {
     tracker.set_theory("EUF");
     let term = TermId(40);
     let lemma = tracker
-        .add_theory_lemma(vec![term])
+        .add_explicit_trust_lemma(vec![term])
         .expect("proof tracking enabled");
-    let checkpoint = tracker.rollback_checkpoint();
+    let checkpoint = tracker
+        .rollback_checkpoint()
+        .expect("small test ledger fits checkpoint budget");
 
     let alias = tracker
         .add_assumption(term, Some("post_checkpoint_alias".to_string()))
@@ -1083,7 +1095,7 @@ fn test_scope_rollback_pop_removes_new_map_alias_to_old_step() {
     tracker.set_theory("EUF");
     let term = TermId(41);
     tracker
-        .add_theory_lemma(vec![term])
+        .add_explicit_trust_lemma(vec![term])
         .expect("proof tracking enabled");
     tracker.push();
 
@@ -1109,11 +1121,11 @@ fn test_push_pop_nested_scopes() {
     assert_eq!(tracker.num_steps(), 1);
 
     tracker.push(); // scope 1
-    tracker.add_theory_lemma(vec![TermId(20)]); // step 1
+    tracker.add_explicit_trust_lemma(vec![TermId(20)]); // step 1
     assert_eq!(tracker.num_steps(), 2);
 
     tracker.push(); // scope 2
-    tracker.add_theory_lemma(vec![TermId(30)]); // step 2
+    tracker.add_explicit_trust_lemma(vec![TermId(30)]); // step 2
     assert_eq!(tracker.num_steps(), 3);
 
     tracker.pop(); // pop scope 2
@@ -1186,7 +1198,7 @@ fn test_reset_session_preserves_scope_stack() {
     assert_eq!(tracker.num_steps(), 1);
 
     tracker.push(); // scope 2
-    tracker.add_theory_lemma(vec![TermId(10), TermId(11)]);
+    tracker.add_explicit_trust_lemma(vec![TermId(10), TermId(11)]);
     assert_eq!(tracker.num_steps(), 2);
 
     // reset_session clears proof content but preserves scope stack
@@ -1225,7 +1237,7 @@ fn test_reset_session_watermarks_zeroed() {
 
     // Add new content in scope 1
     tracker.add_assumption(TermId(10), None);
-    tracker.add_theory_lemma(vec![TermId(20)]);
+    tracker.add_explicit_trust_lemma(vec![TermId(20)]);
     assert_eq!(tracker.num_steps(), 2);
 
     // Pop scope 1: watermark was zeroed, so all new content is removed
@@ -1251,7 +1263,7 @@ fn test_push_pop_proof_isolation() {
 
     let a_assumption = tracker.add_assumption(TermId(100), Some("hA".to_string()));
     assert!(a_assumption.is_some());
-    let a_lemma = tracker.add_theory_lemma(vec![TermId(100), TermId(101)]);
+    let a_lemma = tracker.add_explicit_trust_lemma(vec![TermId(100), TermId(101)]);
     assert!(a_lemma.is_some());
     assert_eq!(tracker.num_steps(), 2); // assume + lemma
 
@@ -1270,7 +1282,7 @@ fn test_push_pop_proof_isolation() {
 
     let b_assumption = tracker.add_assumption(TermId(200), Some("hB".to_string()));
     assert!(b_assumption.is_some());
-    let b_lemma = tracker.add_theory_lemma(vec![TermId(200), TermId(201)]);
+    let b_lemma = tracker.add_explicit_trust_lemma(vec![TermId(200), TermId(201)]);
     assert!(b_lemma.is_some());
     assert_eq!(tracker.num_steps(), 2);
 
@@ -1387,6 +1399,49 @@ fn test_record_theory_conflict_unsat_integer_bounds_use_lra_farkas_when_unit_cer
         }
         other => panic!("expected TheoryLemma step, got {other:?}"),
     }
+}
+
+#[test]
+fn conflict_trace_annotation_matches_recorded_unit_farkas_authority() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("LIA");
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let zero = terms.mk_int(BigInt::from(0));
+    let ge = terms.mk_ge(x, one);
+    let le = terms.mk_le(x, zero);
+    let mut negations = HashMap::default();
+    negations.insert(ge, terms.mk_not(ge));
+    negations.insert(le, terms.mk_not(le));
+    let conflict = vec![TheoryLit::new(ge, true), TheoryLit::new(le, true)];
+
+    let (id, annotation) = record_theory_conflict_unsat_with_annotation(
+        &mut tracker,
+        Some(&terms),
+        &negations,
+        &conflict,
+    );
+    let id = id.expect("recorded conflict");
+    let annotation = annotation.expect("materialized conflict annotation");
+    let proof = tracker.take_proof();
+    let Some(ProofStep::TheoryLemma {
+        clause,
+        kind,
+        farkas,
+        lia,
+        ..
+    }) = proof.get_step(id)
+    else {
+        panic!("expected theory lemma");
+    };
+    assert_eq!(annotation.clause, *clause);
+    assert_eq!(annotation.kind, *kind);
+    assert_eq!(annotation.farkas, *farkas);
+    assert_eq!(annotation.lia, *lia);
+    assert!(annotation.farkas.is_some());
 }
 
 #[test]

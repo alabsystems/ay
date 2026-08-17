@@ -8,6 +8,7 @@
 
 use super::*;
 
+mod algorithm_audit;
 mod cycle_detection;
 mod extf_and_int;
 mod inequality_and_audit;

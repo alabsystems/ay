@@ -383,7 +383,7 @@ underlying techniques began here.
 - **Structure-directed exact solving.** Dedicated paths recognize algebraic
   forms such as market-split 0/1 equalities and switch to meet-in-the-middle
   or lattice methods, with candidate witnesses rechecked before admission. See
-  [`market_split.rs`](crates/ay-pb/src/optimize/market_split.rs) and
+  [`market_split.rs`](crates/ay-pb-core/src/optimize/market_split.rs) and
   [`lattice.rs`](crates/ay-milp/src/lattice.rs).
 
 ### Engineering
@@ -392,7 +392,7 @@ underlying techniques began here.
   streams cutting-planes events through a bounded ring to an asynchronous
   VeriPB serializer. Backpressure, serializer failure, or incomplete draining
   voids the certificate rather than committing partial evidence. See the
-  [proof tap](crates/ay-pb/src/proof/tap/mod.rs).
+  [proof tap](crates/ay-pb-core/src/proof/tap/mod.rs).
 - **A cooperative CHC portfolio.** Formula and graph features choose an engine
   order; later engines can reuse lemmas and hints through a shared blackboard;
   every accepted candidate crosses an original-problem validation firewall.
@@ -660,14 +660,15 @@ community expectations.
 
 ## Maintainer commands
 
-AY ships the machinery that gates its own releases — the same commands the
-project runs in CI. They are part of every build but kept out of the default
-`ay --help` so the everyday verb set stays small; anyone can inspect and run
-what a release must pass:
+AY ships the machinery that gates its own releases. The project deliberately
+uses a checked-in local publication process rather than hosted GitHub Actions.
+These commands are part of every build but kept out of the default `ay --help`
+so the everyday verb set stays small; anyone can inspect and run what a release
+must pass:
 
 | Command | What it does |
 | --- | --- |
-| `ay gate` | Run the checked-in CI/release gates |
+| `ay gate` | Run the checked-in local solver and publication gates |
 | `ay launch-gate` | Run the release-readiness gate |
 | `ay release` | Generate and verify release evidence |
 | `ay launch-packet` | Generate launch benchmark-packet metadata |

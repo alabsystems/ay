@@ -30,7 +30,7 @@
 //! formula is `S_n`-invariant (checked), the sorted model `M'` still satisfies
 //! it, and `M'` satisfies the ordering constraint. So a solution survives in
 //! every orbit. No idempotence / cell-value assumption is made — sorting by a
-//! boolean signature is ALWAYS achievable by a permutation. Env `AY_EUF_LNH`.
+//! boolean signature is ALWAYS achievable by a permutation. Kill switch `--dpll-no-euf-lnh`.
 //!
 //! # Least-index orbit-prefix scheme (preferred when it applies)
 //!
@@ -52,11 +52,11 @@ use ay_core::Sort;
 
 /// Enabled by DEFAULT (validated sound: oracle differential 2010 solved / 0
 /// disagreements / 0 false-UNSAT incl. quasigroup SAT; executor_tests 968/968
-/// with it on). `AY_EUF_LNH=0` disables (escape hatch). Only ever APPLIES when a
+/// with it on). `--dpll-no-euf-lnh` disables (escape hatch). Only ever APPLIES when a
 /// finite-model domain is detected AND proven S_n-interchangeable AND n>=6, so it
 /// is a no-op on the vast majority of instances.
 pub(crate) fn lnh_enabled() -> bool {
-    std::env::var_os("AY_EUF_LNH").is_none_or(|v| v != "0")
+    !ay_core::theory_disable_flags().no_euf_lnh // B28: CLI-owned; env retired.
 }
 
 fn is_builtin(sym: &Symbol) -> bool {
@@ -229,9 +229,9 @@ const MAX_LEX_ATOMS: usize = 600;
 /// SEQ/QG finite-model family to level-0 unit-propagation cascades.
 ///
 /// Enabled by default when the least-index scheme applies;
-/// `AY_LNH_LEASTIDX=0` falls back to the lex-leader for A/B.
+/// `--dpll-no-lnh-leastidx` falls back to the lex-leader for A/B.
 fn least_index_enabled() -> bool {
-    std::env::var_os("AY_LNH_LEASTIDX").is_none_or(|v| v != "0")
+    !ay_core::theory_disable_flags().no_lnh_leastidx // B28: CLI-owned; env retired.
 }
 
 /// Terms `t` with an asserted TOTALITY clause `(or (= t c_0) .. (= t c_{n-1}))`
@@ -390,7 +390,6 @@ fn add_least_index_symmetry_breaking(
     assertions: &mut Vec<TermId>,
     domain: &[TermId],
     dsort: &Sort,
-    diag: bool,
 ) -> usize {
     let subjects = collect_totality_terms(terms, assertions, domain, dsort);
     if subjects.is_empty() {
@@ -494,12 +493,6 @@ fn add_least_index_symmetry_breaking(
         used.push(next);
         added += 1;
     }
-    if diag {
-        ay_core::safe_eprintln!(
-            "[LNH] least-index subjects={} clauses_added={added}",
-            subjects.len()
-        );
-    }
     added
 }
 
@@ -526,7 +519,7 @@ pub(crate) fn add_lnh_symmetry_breaking(
     // cert2->cert3: QF_AX same-file 0.69x, read5 195ms->14s). Equisatisfiability
     // is unaffected either way — this is a PROFITABILITY gate, mirroring the
     // domain-size gate below. Overridable for experiments via AY_LNH_ON_ARRAYS=1.
-    let allow_arrays = std::env::var("AY_LNH_ON_ARRAYS").is_ok_and(|v| v == "1");
+    let allow_arrays = false; // B23: retired (measured 2-70x regressions).
     if !allow_arrays
         && terms.term_ids().any(
             |id| matches!(terms.get(id), TermData::App(s, _) if matches!(s.name(), "select" | "store")),
@@ -542,18 +535,13 @@ pub(crate) fn add_lnh_symmetry_breaking(
     // and the lex-leader constraint overhead would slow them (net-negative in an
     // efficacy sweep: all losses were n<=5, all gains n>=6). Only apply where the
     // S_n blowup actually causes timeouts. Overridable via AY_LNH_MIN_N.
-    let min_n: usize = std::env::var("AY_LNH_MIN_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6);
+    // B25: env override retired; the named constant is the value.
+    let min_n: usize = 6;
     // The least-index scheme is a handful of short clauses (vs the lex-leader's
     // Tseitin chains), so it stays profitable one size below the lex gate
-    // (measured: PEQ013_size5 3413 -> 15 conflicts). `AY_LNH_LEASTIDX_MIN_N`
-    // overrides.
-    let li_min_n: usize = std::env::var("AY_LNH_LEASTIDX_MIN_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    // (measured: PEQ013_size5 3413 -> 15 conflicts). (B10: compiled constant;
+    // the AY_LNH_LEASTIDX_MIN_N override nothing set is retired.)
+    let li_min_n: usize = 5;
     let try_lex = n >= min_n.max(2);
     let try_li = least_index_enabled() && n >= li_min_n.max(2);
     if !try_lex && !try_li {
@@ -562,19 +550,12 @@ pub(crate) fn add_lnh_symmetry_breaking(
 
     let funcs = find_binary_funcs(terms, &dsort);
     let preds = find_unary_predicates(terms, &dsort);
-    let diag = std::env::var_os("AY_LNH_DIAG").is_some();
-    if diag {
-        ay_core::safe_eprintln!("[LNH] n={n} binfuncs={} preds={}", funcs.len(), preds.len());
-    }
     if funcs.is_empty() && preds.is_empty() && !try_li {
         return 0; // no atoms to canonicalize over
     }
 
     // SOUNDNESS GATE: only apply if the domain is PROVABLY interchangeable.
     let interchangeable = domain_is_interchangeable(terms, assertions, &domain);
-    if diag {
-        ay_core::safe_eprintln!("[LNH] interchangeable={interchangeable}");
-    }
     if !interchangeable {
         return 0;
     }
@@ -584,7 +565,7 @@ pub(crate) fn add_lnh_symmetry_breaking(
     // satisfiability-preserving, but their canonical-model choices differ, so
     // stacking both could exclude every model of a satisfiable orbit.
     if try_li {
-        let added = add_least_index_symmetry_breaking(terms, assertions, &domain, &dsort, diag);
+        let added = add_least_index_symmetry_breaking(terms, assertions, &domain, &dsort);
         if added > 0 {
             return added;
         }
@@ -638,9 +619,6 @@ pub(crate) fn add_lnh_symmetry_breaking(
             assertions.push(le);
             added += 1;
         }
-    }
-    if diag {
-        ay_core::safe_eprintln!("[LNH] atoms={} constraints_added={added}", atoms.len());
     }
     added
 }

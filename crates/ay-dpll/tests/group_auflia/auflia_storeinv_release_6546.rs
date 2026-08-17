@@ -46,7 +46,7 @@ fn assert_release_unsat_path(relative_path: &str, allow_missing: bool) -> Result
     let _guard = lock_storeinv_release();
 
     let path = workspace_path(relative_path);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         if allow_missing {
             eprintln!(
                 "skipping optional storeinv release benchmark not checked into repo: {}",
@@ -182,7 +182,7 @@ fn assert_release_not_unsat_file(relative_path: &str) -> Result<()> {
     let _guard = lock_storeinv_release();
 
     let path = workspace_path(relative_path);
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         eprintln!(
             "skipping optional storeinv soundness benchmark: {}",
             path.display()

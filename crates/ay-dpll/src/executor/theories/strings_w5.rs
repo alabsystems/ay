@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! W5 — position-aware witness search (default ON, `AY_STR_W5=0` kill switch).
+//! W5 — position-aware witness search (default ON, `--dpll-no-str-w5` kill switch).
 //!
 //! ## The measured gap W5 closes
 //!
@@ -88,13 +88,13 @@ use super::super::model::{EvalValue, Model};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, w4_pick_char, w4_set_char, MAX_W4_LEN};
 
-/// Master switch (default ON, `AY_STR_W5=0` kill switch → byte-identical to W4-only).
+/// Master switch (default ON, `--dpll-no-str-w5` kill switch → byte-identical to W4-only).
 pub(in crate::executor) fn str_w5_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 31/58 remaining sat-side conversions, ALL 31 z3-PIN-verified
     // (0 pin failures), 478/478 solved-file regression exact, 0 disagreements,
-    // 2x500 differential fuzz clean. AY_STR_W5=0 is the kill switch.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_W5").ok().as_deref(), Some("0")))
+    // 2x500 differential fuzz clean. --dpll-no-str-w5 is the kill switch.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_w5)
 }
 
 /// Longest needle W5 will try to place.

@@ -13,6 +13,8 @@ fn parser_fixture() -> Executor {
         (set-logic ALL)
         (declare-datatype GuardCell
             ((GuardCell_mk (GuardCell_value (_ BitVec 8)))))
+        (declare-datatype IntCell
+            ((IntCell_mk (IntCell_value Int))))
     "#,
     )
     .expect("valid rendered-datatype fixture");
@@ -21,6 +23,33 @@ fn parser_fixture() -> Executor {
         .execute_all(&commands)
         .expect("fixture declarations execute");
     executor
+}
+
+#[test]
+fn array_cell_parser_admits_only_concrete_bounded_integer_payloads() {
+    let executor = parser_fixture();
+    let sort = Sort::Uninterpreted("IntCell".to_string());
+    let guard = rendered_dt_guard::RenderedDatatypeGuard::new(&executor);
+    assert!(
+        !guard.is_exact(&sort),
+        "unbounded integer schemas remain outside ordinary opaque completion"
+    );
+    assert!(
+        guard.is_exact_array_cell(&sort),
+        "a concrete rendered cell is bounded by the value parser's resource envelope"
+    );
+    assert!(matches!(
+        executor.parse_rendered_dt_value_cached("(IntCell_mk (- 7))", &sort, &guard),
+        Some(ModelValue::Datatype { ctor, args })
+            if ctor == "IntCell_mk"
+                && matches!(args.as_slice(), [ModelValue::Int(value)] if value == &BigInt::from(-7))
+    ));
+    assert!(
+        executor
+            .parse_rendered_dt_value_cached("(IntCell_mk (/ 1 2))", &sort, &guard)
+            .is_none(),
+        "a non-integral payload cannot inhabit Int"
+    );
 }
 
 fn is_guard_cell_42(value: Option<ModelValue>) -> bool {

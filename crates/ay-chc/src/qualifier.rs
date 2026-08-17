@@ -10,6 +10,8 @@
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseHead, HornClause};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 
+mod linear_templates;
+
 /// A set of problem-derived qualifier templates.
 #[derive(Debug, Clone)]
 pub(crate) struct QualifierSet {
@@ -64,125 +66,6 @@ impl QualifierSet {
             constants,
             coefficients,
         }
-    }
-
-    /// Instantiate a set of candidate qualifiers over the given variables.
-    ///
-    /// This produces a conservative template family over integer variables:
-    /// - `v ∘ c`, where ∘ ∈ {=, ≤, ≥}
-    /// - `v1 ∘ v2`, where ∘ ∈ {=, ≤, ≥}
-    pub(crate) fn instantiate(&self, vars: &[ChcVar]) -> Vec<ChcExpr> {
-        let mut candidates: FxHashSet<ChcExpr> = FxHashSet::default();
-
-        let mut int_vars: Vec<ChcVar> = vars
-            .iter()
-            .filter(|v| matches!(v.sort, ChcSort::Int))
-            .cloned()
-            .collect();
-        int_vars.sort_by(|a, b| a.name.cmp(&b.name));
-
-        let mut constants: Vec<i128> = self.constants.iter().copied().collect();
-        constants.sort_unstable();
-
-        for v in &int_vars {
-            for c in &constants {
-                candidates.insert(ChcExpr::eq(ChcExpr::var(v.clone()), ChcExpr::int(*c)));
-                candidates.insert(ChcExpr::le(ChcExpr::var(v.clone()), ChcExpr::int(*c)));
-                candidates.insert(ChcExpr::ge(ChcExpr::var(v.clone()), ChcExpr::int(*c)));
-            }
-        }
-
-        for (i, v1) in int_vars.iter().enumerate() {
-            for v2 in int_vars.iter().skip(i + 1) {
-                let a = ChcExpr::var(v1.clone());
-                let b = ChcExpr::var(v2.clone());
-                candidates.insert(ChcExpr::eq(a.clone(), b.clone()));
-                candidates.insert(ChcExpr::le(a.clone(), b.clone()));
-                candidates.insert(ChcExpr::ge(a.clone(), b.clone()));
-                candidates.insert(ChcExpr::le(b.clone(), a.clone()));
-                candidates.insert(ChcExpr::ge(b, a));
-            }
-        }
-
-        // Sum-relation qualifiers: v1 + v2 {=, <=, >=} v3
-        // These capture relational invariants like A + B = C which are
-        // common in multi-phase counting loops (gj2007_m_1, dillig02_m).
-        if int_vars.len() >= 3 {
-            for (i, v1) in int_vars.iter().enumerate() {
-                for (j, v2) in int_vars.iter().enumerate().skip(i + 1) {
-                    let sum = ChcExpr::add(ChcExpr::var(v1.clone()), ChcExpr::var(v2.clone()));
-                    for (k, v3) in int_vars.iter().enumerate() {
-                        if k == i || k == j {
-                            continue;
-                        }
-                        let rhs = ChcExpr::var(v3.clone());
-                        candidates.insert(ChcExpr::eq(sum.clone(), rhs.clone()));
-                        candidates.insert(ChcExpr::le(sum.clone(), rhs.clone()));
-                        candidates.insert(ChcExpr::ge(sum.clone(), rhs.clone()));
-                    }
-                }
-            }
-        }
-
-        // Sum-constant qualifiers: v1 + v2 {=, <=, >=} c
-        // Captures conservation invariants like x0 + x1 = 0 (s_multipl_25).
-        for (i, v1) in int_vars.iter().enumerate() {
-            for v2 in int_vars.iter().skip(i + 1) {
-                let sum = ChcExpr::add(ChcExpr::var(v1.clone()), ChcExpr::var(v2.clone()));
-                for c in &constants {
-                    candidates.insert(ChcExpr::eq(sum.clone(), ChcExpr::int(*c)));
-                    candidates.insert(ChcExpr::le(sum.clone(), ChcExpr::int(*c)));
-                    candidates.insert(ChcExpr::ge(sum.clone(), ChcExpr::int(*c)));
-                }
-            }
-        }
-
-        // Difference-relation qualifiers: v1 - v2 {=, <=, >=} c
-        // for constants in the problem, capturing difference invariants.
-        for (i, v1) in int_vars.iter().enumerate() {
-            for v2 in int_vars.iter().skip(i + 1) {
-                let diff = ChcExpr::sub(ChcExpr::var(v1.clone()), ChcExpr::var(v2.clone()));
-                for c in &constants {
-                    candidates.insert(ChcExpr::eq(diff.clone(), ChcExpr::int(*c)));
-                    candidates.insert(ChcExpr::le(diff.clone(), ChcExpr::int(*c)));
-                    candidates.insert(ChcExpr::ge(diff.clone(), ChcExpr::int(*c)));
-                }
-            }
-        }
-
-        // Scaled-difference qualifiers: v1 - k*v2 {=, <=, >=} c
-        // for multiplication coefficients k found in the problem.
-        // Critical for multi-phase loop invariants (gj2007_m_1: A - 5*C >= -6).
-        let mut sorted_coeffs: Vec<i128> = self.coefficients.iter().copied().collect();
-        sorted_coeffs.sort_unstable();
-        for &k in &sorted_coeffs {
-            for (i, v1) in int_vars.iter().enumerate() {
-                for (j, v2) in int_vars.iter().enumerate() {
-                    if i == j {
-                        continue;
-                    }
-                    // v1 - k*v2
-                    let scaled = ChcExpr::mul(ChcExpr::int(k), ChcExpr::var(v2.clone()));
-                    let diff = ChcExpr::sub(ChcExpr::var(v1.clone()), scaled);
-                    for c in &constants {
-                        candidates.insert(ChcExpr::eq(diff.clone(), ChcExpr::int(*c)));
-                        candidates.insert(ChcExpr::le(diff.clone(), ChcExpr::int(*c)));
-                        candidates.insert(ChcExpr::ge(diff.clone(), ChcExpr::int(*c)));
-                    }
-                }
-            }
-        }
-
-        // NOTE: Self-product (v*v) and cross-product (v1*v2) qualifiers are NOT
-        // included here. They are injected unconditionally via
-        // `instantiate_product_predicates()` in CEGAR's refinement path,
-        // bypassing the MIN/MAX template budget. Including them here would
-        // displace linear qualifiers in the budget-limited fallback because
-        // `(* ...)` sorts lexicographically before `(+ ...)` and `(= ...)`.
-
-        let mut out: Vec<ChcExpr> = candidates.into_iter().collect();
-        out.sort_by_cached_key(ToString::to_string);
-        out
     }
 
     /// Instantiate product/quadratic qualifiers over the given variables.

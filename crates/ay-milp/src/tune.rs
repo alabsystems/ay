@@ -92,179 +92,8 @@
 
 use crate::model::{ColKind, Model};
 
-/// A tunable the engine may decide for itself.
-///
-/// Only *performance-relevant* settings belong here. The great majority of the
-/// crate's environment variables are diagnostics (`AY_MILP_TRACE`,
-/// `AY_MILP_*_DEBUG`) or A/B kill switches that exist so a measurement can
-/// disable one mechanism; neither is something the engine should decide, and
-/// neither appears in this enum.
-///
-/// The second block is different in kind: those twelve are the knobs an
-/// embedding *consumer* configures per solve. They are here because
-/// [`crate::EngineEconomics`] needs a typed carrier for them and this is the
-/// crate's one table mapping a setting to its historical environment spelling;
-/// giving them a second, parallel table is how a kill switch and its typed
-/// setter come to disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Knob {
-    /// Full GMI/MIR separation rounds at the root.
-    GmiRounds,
-    /// Cuts retained per round at the root (node budget is separate).
-    RootCutsPerRound,
-    /// Run implication probing at the root.
-    RootProbe,
-    /// Depth-first node selection.
-    Dfs,
-    /// Separate cuts at nodes below the root.
-    NodeCuts,
-    /// Dive toward a leaf after branching, to buy an incumbent.
-    Plunge,
-
-    // The twelve `crates/ny-mip/src/ay_lib.rs` pins today, per
-    // the development design notes §M1. Negative senses
-    // (`No*`) are kept exactly as the environment spells them, because the
-    // accessor convention is per *variable*, not per concept: inverting one
-    // here to read positively would flip what an operator's existing
-    // `AY_MILP_NO_CUTS=1` means. The public builder is positive-sense
-    // (`with_cuts(false)`) and does the one inversion, in one place.
-    /// Disable the market-split lattice detector (`lattice::try_prove`).
-    NoLattice,
-    /// Disable the flip-LNS saturation stop.
-    NoSatStop,
-    /// Saturation-stop dry-spell floor, in seconds.
-    SatStopSecs,
-    /// Saturation-stop multiplier on the largest observed improvement gap.
-    SatStopMult,
-    /// Disable the tall-degenerate bloom-cap relaxation.
-    NoBloomRelax,
-    /// Absolute cap on the flip-LNS window for `tall_lu` models, in seconds.
-    FlipCapSecs,
-    /// Flip-LNS share of the remaining budget. Setting it at all also opts out
-    /// of the absolute cap — see the call site at `bab.rs:19251`.
-    FlipShare,
-    /// Install an LU engine in the pooled `WarmSolver`.
-    WarmLu,
-    /// Share of the remaining budget handed to bound-propagation presolve.
-    PresolveShare,
-    /// Disable root cut separation.
-    NoCuts,
-    /// Feasibility-pump restart allowance (`0` skips the pump).
-    PumpRestarts,
-    /// Cap on committed pins in the terminal-salvage dive.
-    DiveMaxPins,
-
-    // The REDUCTION knobs. These are not search economics: three of them gate
-    // transformations that change the model a verdict is proved against, and a
-    // consumer whose admission requires certificates needs to reach them by
-    // value, not by exporting a variable. `ny` cannot export one at all -- its
-    // policy forbids writing `AY_MILP_*` -- so before these existed it had no
-    // in-policy way to quarantine a reduction. Same negative spelling
-    // convention as the block above: the variable keeps its name, the public
-    // builder is positive-sense and does the single inversion.
-    /// Disable dual fixing by lock counting (`dualfix::dual_fix`). A WLOG
-    /// reduction: it preserves the ANSWER, not the feasible set.
-    NoDualfix,
-    /// Disable the AHL kernel reformulation (`lattice::reformulate_kernel`).
-    NoKernelReform,
-    /// Disable decoupling root reductions from certificate capture, restoring
-    /// the prior `tree_cert_leaves == 0` gating byte-identically.
-    NoCertDecouple,
-    /// Disable the zero-objective feasibility conflict class (nogood
-    /// propagation, nogood-guided branching, VSIDS).
-    NoFeasConflict,
-    /// Disable the cold-root LU band, restoring the historical eta-file cold
-    /// root byte-for-byte.
-    NoColdLu,
-}
-
-impl Knob {
-    /// The environment variable that overrides this knob.
-    ///
-    /// One table, so a call site can never disagree with the harness about the
-    /// spelling of its own knob.
-    pub(crate) const fn env(self) -> &'static str {
-        match self {
-            Self::GmiRounds => "AY_MILP_GMI_ROUNDS",
-            Self::RootCutsPerRound => "AY_MILP_ROOT_CUTS_PER_ROUND",
-            Self::RootProbe => "AY_MILP_ROOT_PROBE",
-            Self::Dfs => "AY_MILP_DFS",
-            Self::NodeCuts => "AY_MILP_NODE_CUTS",
-            Self::Plunge => "AY_MILP_PLUNGE",
-            Self::NoLattice => "AY_MILP_NO_LATTICE",
-            Self::NoSatStop => "AY_MILP_NO_SAT_STOP",
-            Self::SatStopSecs => "AY_MILP_SAT_STOP_SECS",
-            Self::SatStopMult => "AY_MILP_SAT_STOP_MULT",
-            Self::NoBloomRelax => "AY_MILP_NO_BLOOM_RELAX",
-            Self::FlipCapSecs => "AY_MILP_FLIP_CAP_SECS",
-            Self::FlipShare => "AY_MILP_FLIP_SHARE",
-            Self::WarmLu => "AY_MILP_WARM_LU",
-            Self::PresolveShare => "AY_MILP_PRESOLVE_SHARE",
-            Self::NoCuts => "AY_MILP_NO_CUTS",
-            Self::PumpRestarts => "AY_MILP_PUMP_RESTARTS",
-            Self::DiveMaxPins => "AY_MILP_DIVE_MAX_PINS",
-            Self::NoDualfix => "AY_MILP_NO_DUALFIX",
-            Self::NoKernelReform => "AY_MILP_NO_KERNEL_REFORM",
-            Self::NoCertDecouple => "AY_MILP_NO_CERT_DECOUPLE",
-            Self::NoFeasConflict => "AY_MILP_NO_FEAS_CONFLICT",
-            Self::NoColdLu => "AY_MILP_NO_COLD_LU",
-        }
-    }
-
-    const ALL: [Knob; 23] = [
-        Self::GmiRounds,
-        Self::RootCutsPerRound,
-        Self::RootProbe,
-        Self::Dfs,
-        Self::NodeCuts,
-        Self::Plunge,
-        Self::NoLattice,
-        Self::NoSatStop,
-        Self::SatStopSecs,
-        Self::SatStopMult,
-        Self::NoBloomRelax,
-        Self::FlipCapSecs,
-        Self::FlipShare,
-        Self::WarmLu,
-        Self::PresolveShare,
-        Self::NoCuts,
-        Self::PumpRestarts,
-        Self::DiveMaxPins,
-        Self::NoDualfix,
-        Self::NoKernelReform,
-        Self::NoCertDecouple,
-        Self::NoFeasConflict,
-        Self::NoColdLu,
-    ];
-
-    const fn slot(self) -> usize {
-        match self {
-            Self::GmiRounds => 0,
-            Self::RootCutsPerRound => 1,
-            Self::RootProbe => 2,
-            Self::Dfs => 3,
-            Self::NodeCuts => 4,
-            Self::Plunge => 5,
-            Self::NoLattice => 6,
-            Self::NoSatStop => 7,
-            Self::SatStopSecs => 8,
-            Self::SatStopMult => 9,
-            Self::NoBloomRelax => 10,
-            Self::FlipCapSecs => 11,
-            Self::FlipShare => 12,
-            Self::WarmLu => 13,
-            Self::PresolveShare => 14,
-            Self::NoCuts => 15,
-            Self::PumpRestarts => 16,
-            Self::DiveMaxPins => 17,
-            Self::NoDualfix => 18,
-            Self::NoKernelReform => 19,
-            Self::NoCertDecouple => 20,
-            Self::NoFeasConflict => 21,
-            Self::NoColdLu => 22,
-        }
-    }
-}
+mod knob;
+pub(crate) use knob::Knob;
 
 /// A value chosen for a knob, by the policy or by the caller.
 ///
@@ -712,143 +541,6 @@ fn policy(k: Knob) -> Option<Setting> {
     ACTIVE.with(|a| a.borrow().last().and_then(|f| f.policy.get(k)))
 }
 
-// ------------------------------------------------------------ env  snapshot
-
-/// The `AY_MILP_*` environment as it stood the first time the engine looked.
-///
-/// # Why a snapshot and not a read
-///
-/// ay-milp is consumed in-process by a heavily multi-threaded verifier
-/// (the development design notes §M1), and `std::env::set_var`
-/// races with a concurrent `getenv` — which is precisely why it is `unsafe` in
-/// edition 2024. A solver that reads the environment *during* a solve makes
-/// that race the consumer's problem: the downstream optimization consumer's recorded mitigation is to rewrite the
-/// same constant values before every window solve, which works only because
-/// every value it writes is constant.
-///
-/// Capturing once and resolving from the capture removes the read from the
-/// solve path entirely while preserving the operator workflow verbatim: a
-/// variable exported before the process starts is seen exactly as before.
-/// What it does *not* preserve is mutating the environment mid-process and
-/// expecting a live solve to notice — no shipped lane did that, and the
-/// in-crate A/B tests that do are handled by the test seam below.
-struct EnvSnapshot {
-    values: [Option<std::ffi::OsString>; Knob::ALL.len()],
-}
-
-impl EnvSnapshot {
-    /// Read every knob's variable once. Values are stored as `OsString`, not
-    /// `String`: `on` tests *presence* (`var_os`) while the parsing accessors
-    /// use `var`, and only keeping the raw bytes preserves the difference for a
-    /// non-UTF-8 value, which `var` reports as absent and `var_os` as present.
-    fn capture() -> Self {
-        Self {
-            values: std::array::from_fn(|i| std::env::var_os(Knob::ALL[i].env())),
-        }
-    }
-
-    fn get(&self, k: Knob) -> Option<&std::ffi::OsStr> {
-        self.values[k.slot()].as_deref()
-    }
-}
-
-/// The snapshot layer for one knob.
-///
-/// # The test build reads live, and that is the seam
-///
-/// Under `cfg(test)` this reads the process environment on every call. The
-/// crate's own kill-switch coverage sets variables *at runtime* with
-/// `ay_test_support::env::ScopedEnvVar` (`AY_MILP_NO_CUTS` alone at five sites
-/// in `bab.rs`), and a frozen snapshot would turn every one of those into a
-/// test that silently exercises the opposite configuration from the one it
-/// names. The behaviour under test is identical either way — the layer supplies
-/// the same bytes, only the moment of the read differs — and the capture itself
-/// is covered directly by [`tests::snapshot_captures_the_environment`] rather
-/// than by whichever variables happen to be exported.
-#[cfg(not(test))]
-fn env_layer(k: Knob) -> Option<std::borrow::Cow<'static, std::ffi::OsStr>> {
-    static SNAPSHOT: std::sync::OnceLock<EnvSnapshot> = std::sync::OnceLock::new();
-    SNAPSHOT
-        .get_or_init(EnvSnapshot::capture)
-        .get(k)
-        .map(std::borrow::Cow::Borrowed)
-}
-
-#[cfg(test)]
-fn env_layer(k: Knob) -> Option<std::borrow::Cow<'static, std::ffi::OsStr>> {
-    std::env::var_os(k.env()).map(std::borrow::Cow::Owned)
-}
-
-/// One knob as the shipped `env_layer` and a fresh `EnvSnapshot` see it.
-///
-/// # Why this is `pub` at all
-///
-/// `env_layer` forks on `cfg(test)`, and the arm every release resolves from —
-/// the frozen `OnceLock` capture — is the one no test in this module can reach:
-/// a unit test compiles the live-read arm instead. An integration test links
-/// the crate *without* `cfg(test)` and so gets the shipped arm, but cannot see
-/// a private module. The result before this existed was that the shipped arm
-/// was asserted about by nothing: replacing its `var_os` with `var` would have
-/// collapsed the presence-vs-UTF-8 distinction `on` rests on — a non-UTF-8
-/// `AY_MILP_NO_CUTS` would have read as *absent*, silently turning a consumer's
-/// kill switch off — and passed the entire suite.
-///
-/// `tests/env_layer_snapshot.rs` is that coverage and this is the narrowest
-/// surface that supports it: no `Knob`, no `Profile`, no way to *install*
-/// anything, and `#[doc(hidden)]` so it is not a documented API.
-#[doc(hidden)]
-#[derive(Debug, Clone, PartialEq)]
-pub struct EnvLayerProbe {
-    /// The variable this knob reads.
-    pub name: &'static str,
-    /// What the shipped `env_layer` resolved: the frozen snapshot outside
-    /// `cfg(test)`, a live read inside it.
-    pub layer: Option<std::ffi::OsString>,
-    /// A *fresh* `EnvSnapshot::capture` of the same variable, taken now. Equal
-    /// to `layer` while the environment has not moved since the capture, and
-    /// deliberately not equal after it has — which is how a test tells a frozen
-    /// snapshot from a live read.
-    pub capture: Option<std::ffi::OsString>,
-    /// `on`: presence, via `var_os`. True for a non-UTF-8 value.
-    pub on: bool,
-    /// `real_opt`: parses, via `var`. `None` for a non-UTF-8 value.
-    pub real_opt: Option<f64>,
-    /// `count_opt`: parses, via `var`. `None` for a non-UTF-8 value.
-    pub count_opt: Option<usize>,
-}
-
-/// Probe the environment layer for the knob spelled `env_name`, or `None` if no
-/// knob reads that variable.
-///
-/// **This call may be what first captures the snapshot**, since the capture is
-/// lazy. A test that wants a variable in the snapshot must export it before
-/// calling this.
-#[doc(hidden)]
-#[must_use]
-pub fn diag_env_layer(env_name: &str) -> Option<EnvLayerProbe> {
-    let k = Knob::ALL.into_iter().find(|k| k.env() == env_name)?;
-    Some(EnvLayerProbe {
-        name: k.env(),
-        layer: env_layer(k).map(std::borrow::Cow::into_owned),
-        capture: EnvSnapshot::capture().get(k).map(std::ffi::OsStr::to_owned),
-        on: on(k),
-        real_opt: real_opt(k),
-        count_opt: count_opt(k),
-    })
-}
-
-/// The snapshot layer as `std::env::var(K).ok()` would have reported it.
-///
-/// By reference, not by value: the shipped path borrows from the snapshot, so
-/// the historical `String` allocation per read disappears with it. A non-UTF-8
-/// value is `None` here and `Some` to [`on`], matching `var`/`var_os`.
-fn with_env_str<R>(k: Knob, f: impl FnOnce(Option<&str>) -> R) -> R {
-    match env_layer(k) {
-        Some(v) => f(v.to_str()),
-        None => f(None),
-    }
-}
-
 // ----------------------------------------------------------------- accessors
 //
 // One accessor per environment-variable convention already in the crate. The
@@ -874,7 +566,7 @@ fn with_env_str<R>(k: Knob, f: impl FnOnce(Option<&str>) -> R) -> R {
 ///
 /// # Trap, preserved deliberately
 ///
-/// `AY_MILP_DFS=0` reads as **on**, because presence is the whole test. That is
+/// `--dfs` reads as **on**, because presence is the whole test. That is
 /// surprising, and it is what the call sites have always done
 /// (`bab.rs:16538`); changing it here would silently flip behaviour for anyone
 /// who has ever written `=0` expecting off. The inconsistency is real and
@@ -883,9 +575,6 @@ fn with_env_str<R>(k: Knob, f: impl FnOnce(Option<&str>) -> R) -> R {
 pub(crate) fn on(k: Knob) -> bool {
     if let Some(Setting::Flag(b)) = caller(k) {
         return b;
-    }
-    if env_layer(k).is_some() {
-        return true;
     }
     matches!(policy(k), Some(Setting::Flag(true)))
 }
@@ -897,10 +586,7 @@ pub(crate) fn on_strict(k: Knob) -> bool {
     if let Some(Setting::Flag(b)) = caller(k) {
         return b;
     }
-    with_env_str(k, |v| match v {
-        Some(v) => v == "1",
-        None => matches!(policy(k), Some(Setting::Flag(true))),
-    })
+    matches!(policy(k), Some(Setting::Flag(true)))
 }
 
 /// On unless explicitly `"0"`, and on by default:
@@ -910,13 +596,10 @@ pub(crate) fn on_unless_zero(k: Knob) -> bool {
     if let Some(Setting::Flag(b)) = caller(k) {
         return b;
     }
-    with_env_str(k, |v| match v {
-        Some(v) => v != "0",
-        None => match policy(k) {
-            Some(Setting::Flag(b)) => b,
-            _ => true,
-        },
-    })
+    match policy(k) {
+        Some(Setting::Flag(b)) => b,
+        _ => true,
+    }
 }
 
 /// A numeric budget. Resolution order:
@@ -930,7 +613,7 @@ pub(crate) fn on_unless_zero(k: Knob) -> bool {
 /// It does **not** fall through to the policy, and the distinction is not
 /// pedantic. The call sites spell this as `.ok().and_then(|v| v.parse().ok())
 /// .unwrap_or(DEFAULT)` (`bab.rs:17368`, `cuts.rs:1422`), so under the old code
-/// `AY_MILP_GMI_ROUNDS=garbage` yields `DEFAULT`. Routing garbage to the policy
+/// `--gmi-rounds=garbage` yields `DEFAULT`. Routing garbage to the policy
 /// would make migration behaviour-preserving only while the policy is empty,
 /// and would silently change what a malformed environment means on the day the
 /// first rule lands. Preserving it here means a migrated call site behaves
@@ -947,7 +630,7 @@ pub(crate) fn on_unless_zero(k: Knob) -> bool {
 /// and `cuts.rs:1457` spell it `.ok().and_then(|v| v.parse().ok())`,
 /// `finite_nonnegative_setting` (`bab.rs:3961`) spells it
 /// `raw.and_then(|value| value.parse::<f64>().ok())` — so
-/// `AY_MILP_DIVE_MAX_PINS=" 5"` parse-failed and left the dive uncapped at
+/// `--dive-max-pins` parse-failed and left the dive uncapped at
 /// `usize::MAX`. A `.trim()` here would silently reinterpret that exact recipe
 /// as a cap of five: a 10^18 change in the knob, and a *different measured arm*
 /// from the one the journal recorded against the identical string. Every result
@@ -965,10 +648,7 @@ pub(crate) fn num(k: Knob, default: i64) -> i64 {
     if let Some(n) = caller(k).and_then(Setting::as_num) {
         return n;
     }
-    with_env_str(k, |v| match v {
-        Some(v) => v.parse::<i64>().unwrap_or(default),
-        None => policy(k).and_then(Setting::as_num).unwrap_or(default),
-    })
+    policy(k).and_then(Setting::as_num).unwrap_or(default)
 }
 
 /// [`num`] clamped to `usize`, for budgets and counts.
@@ -983,15 +663,12 @@ pub(crate) fn count(k: Knob, default: usize) -> usize {
     if let Some(n) = caller(k).and_then(Setting::as_count) {
         return n;
     }
-    with_env_str(k, |v| match v {
-        Some(v) => v.parse::<usize>().unwrap_or(default),
-        None => policy(k).and_then(Setting::as_count).unwrap_or(default),
-    })
+    policy(k).and_then(Setting::as_count).unwrap_or(default)
 }
 
 /// A count whose *absence* is meaningful, for the call sites that spell the
 /// read `env::var(K).ok().and_then(|v| v.parse().ok())` and then branch on the
-/// `Option` (`AY_MILP_PUMP_RESTARTS`, `bab.rs:18873`).
+/// `Option` (`--pump-restarts`, `bab.rs:18873`).
 ///
 /// An unparseable explicit value is `None`, exactly as `.ok().and_then(..)`
 /// made it — and, following [`num`], it does not fall through to the policy.
@@ -999,10 +676,7 @@ pub(crate) fn count_opt(k: Knob) -> Option<usize> {
     if let Some(n) = caller(k).and_then(Setting::as_count) {
         return Some(n);
     }
-    with_env_str(k, |v| match v {
-        Some(v) => v.parse::<usize>().ok(),
-        None => policy(k).and_then(Setting::as_count),
-    })
+    policy(k).and_then(Setting::as_count)
 }
 
 /// A finite, non-negative real: a share, a multiplier, or a seconds value.
@@ -1011,7 +685,7 @@ pub(crate) fn count_opt(k: Knob) -> Option<usize> {
 ///
 /// Every consumer of these knobs feeds the value to `Duration::from_secs_f64`
 /// or `Duration::mul_f64`, **both of which panic** on a negative or non-finite
-/// input. So `AY_MILP_SAT_STOP_MULT=-1` was an abort, in-process, inside a
+/// input. So `--sat-stop-mult=-1` was an abort, in-process, inside a
 /// consumer's solve — which is the third of the three consequences ny recorded
 /// against the environment surface: *"malformed inherited values must never
 /// panic an in-process verifier worker"*. Rejecting the value here is the fix,
@@ -1030,15 +704,12 @@ pub(crate) fn real(k: Knob, default: f64) -> f64 {
     if let Some(v) = caller(k).and_then(Setting::as_real) {
         return v;
     }
-    with_env_str(k, |v| match v {
-        Some(v) => parse_real(v).unwrap_or(default),
-        None => policy(k).and_then(Setting::as_real).unwrap_or(default),
-    })
+    policy(k).and_then(Setting::as_real).unwrap_or(default)
 }
 
 /// [`real`] where absence is meaningful.
 ///
-/// `AY_MILP_FLIP_SHARE` is the case: setting it at all *also* opts out of the
+/// `--flip-share` is the case: setting it at all *also* opts out of the
 /// absolute flip-LNS cap (`bab.rs:19265`), so "set to the same value as the
 /// default" and "unset" are different instructions and cannot share a
 /// signature.
@@ -1046,24 +717,18 @@ pub(crate) fn real_opt(k: Knob) -> Option<f64> {
     if let Some(v) = caller(k).and_then(Setting::as_real) {
         return Some(v);
     }
-    with_env_str(k, |v| match v {
-        Some(v) => parse_real(v),
-        None => policy(k).and_then(Setting::as_real),
-    })
+    policy(k).and_then(Setting::as_real)
 }
 
 /// The environment half of [`real`]/[`real_opt`]: parse the raw value exactly
 /// as `finite_nonnegative_setting` (`bab.rs:3961`) did, then apply the domain.
 /// Not trimmed, for the reason [`num`] gives.
-fn parse_real(raw: &str) -> Option<f64> {
-    raw.parse::<f64>().ok().filter(|v| in_real_domain(*v))
-}
 
 /// The admissible domain for every [`Setting::Real`], shared by the accessors
 /// and by [`crate::EngineEconomics`]'s builders so one number defines it.
 ///
 /// The upper bound is not decoration. `Duration::from_secs_f64` panics above
-/// `u64::MAX` seconds, so `AY_MILP_SAT_STOP_SECS=1e26` — a perfectly
+/// `u64::MAX` seconds, so `--sat-stop-secs=1e26` — a perfectly
 /// well-formed `f64` — aborted the process at `bab.rs:12338`. `1e15` seconds
 /// is ~31 million years: past any deadline anyone will ever set, and far
 /// enough below the panic threshold that a consumer multiplying it by a
@@ -1078,28 +743,8 @@ fn in_real_domain(v: f64) -> bool {
 mod tests {
     use super::*;
     use crate::model::Sense;
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use ay_test_support::env::lock_env;
     use std::time::Duration;
-
-    /// Environment reads are process-global, so tests that set them cannot run
-    /// concurrently with tests that read them.
-    ///
-    /// This is the CRATE-WIDE lock, not a module-local one, and it has to be:
-    /// `Knob::ALL` now covers `AY_MILP_NO_CUTS`, `AY_MILP_WARM_LU` and ten more
-    /// variables that `bab.rs`'s and `cuts.rs`'s kill-switch tests set at
-    /// runtime under `ay_test_support::env::lock_env`. Two independent mutexes
-    /// over one process environment serialize nothing.
-    ///
-    /// `ScopedEnvVar` rather than raw `set_var`/`remove_var` for the same
-    /// reason it exists: it restores the previous value on drop, including on
-    /// panic, so a test cannot strip an operator's exported configuration from
-    /// the rest of the run.
-    fn unset_all_knobs() -> Vec<ScopedEnvVar> {
-        Knob::ALL
-            .iter()
-            .map(|k| ScopedEnvVar::unset(k.env()))
-            .collect()
-    }
 
     fn tiny_model() -> Model {
         let mut m = Model::new();
@@ -1157,7 +802,6 @@ mod tests {
     #[test]
     fn empty_policy_is_a_no_op() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         let profile = Policy::select(&Shape::of(&tiny_model()));
         assert!(profile.is_empty(), "shipped policy must select nothing");
         let _g = activate_profile(profile);
@@ -1173,63 +817,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn environment_beats_policy() {
-        let _lock = lock_env();
-        let k = Knob::GmiRounds;
-        let _g = activate_profile(
-            Profile::EMPTY
-                .with(k, Setting::Num(10))
-                .with(Knob::Dfs, Setting::Flag(true)),
-        );
-        {
-            let _clean = ScopedEnvVar::unset(k.env());
-            assert_eq!(num(k, 2), 10, "policy applies when the env is unset");
-        }
-        {
-            let _set = ScopedEnvVar::set(k.env(), "3");
-            assert_eq!(num(k, 2), 3, "an explicit env var outranks the policy");
-        }
-        let _clean = ScopedEnvVar::unset(k.env());
-        assert_eq!(num(k, 2), 10);
-
-        let _no_dfs = ScopedEnvVar::unset(Knob::Dfs.env());
-        assert!(on(Knob::Dfs), "policy can turn a flag on");
-        let _dfs = ScopedEnvVar::set(Knob::Dfs.env(), "0");
-        assert!(
-            !on_strict(Knob::Dfs),
-            "an explicit 0 outranks a policy true"
-        );
-    }
-
-    /// An explicitly set but unparseable value resolves to the COMPILED
-    /// DEFAULT, not to the policy and not to zero. This is what makes a
-    /// migrated call site behave identically for every input string whether or
-    /// not a policy rule exists for the knob — see [`num`].
-    #[test]
-    fn unparseable_env_takes_the_compiled_default_not_the_policy() {
-        let _lock = lock_env();
-        let k = Knob::RootCutsPerRound;
-        let _g = activate_profile(Profile::EMPTY.with(k, Setting::Num(16)));
-        {
-            let _set = ScopedEnvVar::set(k.env(), "not-a-number");
-            assert_eq!(num(k, 4), 4, "garbage must read as the compiled default");
-        }
-        {
-            let _set = ScopedEnvVar::set(k.env(), "");
-            assert_eq!(num(k, 4), 4, "empty must read as the compiled default");
-        }
-        let _clean = ScopedEnvVar::unset(k.env());
-        assert_eq!(num(k, 4), 16, "unset still reaches the policy");
-    }
-
     /// A `usize` default above `i64::MAX` must not wrap into a negative and
     /// come back as garbage.
     #[test]
     fn count_saturates_instead_of_wrapping() {
-        let _lock = lock_env();
         let k = Knob::RootCutsPerRound;
-        let _clean = ScopedEnvVar::unset(k.env());
         assert_eq!(count(k, usize::MAX), usize::MAX);
         let _g = activate_profile(Profile::EMPTY.with(k, Setting::Num(-3)));
         assert_eq!(count(k, 5), 5, "a negative count takes the default");
@@ -1240,9 +832,7 @@ mod tests {
     /// `i64`-widthed `Num` would return `i64::MAX`.
     #[test]
     fn a_caller_count_round_trips_at_full_usize_width() {
-        let _lock = lock_env();
         let k = Knob::DiveMaxPins;
-        let _clean = ScopedEnvVar::unset(k.env());
         let _g = activate_caller(Profile::EMPTY.with(k, Setting::Count(usize::MAX)));
         assert_eq!(count(k, 16), usize::MAX);
     }
@@ -1271,9 +861,7 @@ mod tests {
     /// has to survive that.
     #[test]
     fn nested_activation_restores_the_outer_profile() {
-        let _lock = lock_env();
         let k = Knob::GmiRounds;
-        let _clean = ScopedEnvVar::unset(k.env());
         let _outer = activate_profile(Profile::EMPTY.with(k, Setting::Num(2)));
         assert_eq!(num(k, 0), 2);
         {
@@ -1286,7 +874,6 @@ mod tests {
     #[test]
     fn no_active_profile_is_the_compiled_default() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         assert_eq!(num(Knob::GmiRounds, 2), 2);
         assert!(!on(Knob::RootProbe));
     }
@@ -1296,7 +883,6 @@ mod tests {
     #[test]
     fn activating_for_a_model_selects_nothing_today() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         let _g = activate(&tiny_model());
         assert!(!on(Knob::NoCuts));
         assert_eq!(real(Knob::PresolveShare, 0.35), 0.35);
@@ -1310,21 +896,20 @@ mod tests {
     /// consumer — it can turn a knob OFF that a stray inherited `AY_MILP_*`
     /// turns on.
     #[test]
-    fn the_caller_layer_outranks_the_environment() {
-        let _lock = lock_env();
+    fn the_caller_layer_outranks_the_policy() {
         let k = Knob::NoCuts;
-        let _env = ScopedEnvVar::set(k.env(), "1");
-        assert!(on(k), "the environment alone still turns the knob on");
+        let p = activate_profile(Profile::EMPTY.with(k, Setting::Flag(true)));
+        assert!(on(k), "the policy alone still turns the knob on");
 
         let g = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
-        assert!(!on(k), "the caller's setting outranks the environment");
+        assert!(!on(k), "the caller's setting outranks the policy");
         drop(g);
         assert!(on(k), "and stops applying when the solve ends");
+        drop(p);
 
         let share = Knob::PresolveShare;
-        let _bad = ScopedEnvVar::set(share.env(), "0.9");
         let _g = activate_caller(Profile::EMPTY.with(share, Setting::Real(0.02)));
-        assert_eq!(real(share, 0.35), 0.02);
+        assert_eq!(real(share, 0.3), 0.02, "a typed real wins over the default");
     }
 
     /// Two concurrent solves configured differently must not see each other's
@@ -1333,7 +918,6 @@ mod tests {
     #[test]
     fn two_concurrent_solves_do_not_interfere() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
         let ready = std::sync::Arc::clone(&barrier);
@@ -1371,7 +955,6 @@ mod tests {
     #[test]
     fn a_sub_solve_inherits_and_may_override_the_caller_layer() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         let _outer = activate_caller(
             Profile::EMPTY
                 .with(Knob::NoCuts, Setting::Flag(true))
@@ -1383,147 +966,6 @@ mod tests {
             assert_eq!(count(Knob::DiveMaxPins, usize::MAX), 4, "overridden");
         }
         assert_eq!(count(Knob::DiveMaxPins, usize::MAX), 16);
-    }
-
-    /// A policy is selected for one model's shape and must not leak into a
-    /// sub-model it was never derived for.
-    #[test]
-    fn a_sub_solve_does_not_inherit_the_policy_layer() {
-        let _lock = lock_env();
-        let _clean = unset_all_knobs();
-        let _outer = activate_profile(Profile::EMPTY.with(Knob::GmiRounds, Setting::Num(9)));
-        assert_eq!(num(Knob::GmiRounds, 2), 9);
-        let _sub = activate_caller(Profile::EMPTY);
-        assert_eq!(
-            num(Knob::GmiRounds, 2),
-            2,
-            "the sub-solve starts unopinionated"
-        );
-    }
-
-    // ------------------------------------------------------ malformed  input
-
-    const GARBAGE: [&str; 9] = [
-        "",
-        " ",
-        "not-a-number",
-        "-0.5",
-        "nan",
-        "inf",
-        "1e400",
-        "0x10",
-        "1,5",
-    ];
-
-    /// The knobs a malformed value may be PUBLISHED to the process environment
-    /// for, because every consumer reads them through a parse that rejects it:
-    ///
-    /// ```text
-    /// SatStopSecs    real       bab.rs:13030        garbage -> 15.0
-    /// SatStopMult    real       bab.rs:13034        garbage -> 1.5
-    /// PresolveShare  real       bab.rs:18193        garbage -> PRESOLVE_SHARE
-    /// FlipCapSecs    real       bab.rs:20144        garbage -> the compiled cap
-    /// FlipShare      real_opt   bab.rs:20129        garbage -> None == unset
-    /// PumpRestarts   count_opt  bab.rs:19747        garbage -> None == unset
-    /// DiveMaxPins    count      bab.rs:6849         garbage -> usize::MAX
-    /// ```
-    ///
-    /// So for these seven, "set to garbage" and "unset" are the same
-    /// configuration and a concurrent solve cannot tell them apart.
-    ///
-    /// # Why the other eleven are excluded
-    ///
-    /// `ScopedEnvVar::set` mutates the PROCESS environment, and the crate-wide
-    /// `lock_env` does not make that private: `bab.rs` has 83 `#[test]`
-    /// functions and 13 of them take the lock, so ~70 may be running a solve
-    /// while this test holds it. Every excluded knob is read as *presence*, and
-    /// every garbage string is present — so sweeping them would publish
-    /// cuts-off, depth-first, probing-on or node-cuts-on for the microseconds
-    /// each value is live, to a solve that never asked for any of it:
-    ///
-    /// ```text
-    /// NoCuts        bab.rs:3990       tune::on           -> root cuts off
-    /// NoSatStop     bab.rs:13029      tune::on           -> saturation stop off
-    /// NoLattice     lattice.rs:647    tune::on           -> detector off
-    /// NoBloomRelax  simplex.rs:1168   tune::on           -> bloom cap restored
-    /// WarmLu        simplex.rs:1431   tune::on           -> LU in the warm pool
-    /// Dfs           bab.rs:17366      var_os().is_some() -> depth-first
-    /// RootProbe     bab.rs:8058       var_os().is_none() -> probing on
-    /// NodeCuts      bab.rs:18644      var_os().is_some() -> node separation on
-    /// GmiRounds     bab.rs:4174       var_os().is_none() -> shape override off
-    /// ```
-    ///
-    /// (`Plunge` and `RootCutsPerRound` happen to survive garbage too, but they
-    /// buy nothing here and would have to be re-justified whenever their call
-    /// sites move.)
-    ///
-    /// Nothing is lost. No accessor branches on knob identity — `real(k, d)` is
-    /// the same code for every `k` — so the STRINGS are covered end to end
-    /// below, and every KNOB is covered by
-    /// `malformed_settings_never_panic_through_the_caller_or_policy`, which
-    /// touches no process state at all.
-    const ENV_SWEEPABLE: [Knob; 7] = [
-        Knob::SatStopSecs,
-        Knob::SatStopMult,
-        Knob::PresolveShare,
-        Knob::FlipCapSecs,
-        Knob::FlipShare,
-        Knob::PumpRestarts,
-        Knob::DiveMaxPins,
-    ];
-
-    /// NO INPUT MAY PANIC. A stray `AY_MILP_*` in a CI environment must not be
-    /// able to take down an in-process consumer — the third consequence ny
-    /// recorded against the environment surface. Note `-1` and `inf`: those are
-    /// not hypothetical, they are the values that reached
-    /// `Duration::from_secs_f64` and `Duration::mul_f64`, both of which panic.
-    ///
-    /// This is the END-TO-END arm: the string goes in through the process
-    /// environment, exactly as an operator's does, and comes out of the same
-    /// `Duration` constructors that used to abort. See [`ENV_SWEEPABLE`] for why
-    /// it runs on seven knobs rather than eighteen.
-    #[test]
-    fn malformed_environment_values_never_panic() {
-        let _lock = lock_env();
-        for k in ENV_SWEEPABLE {
-            for raw in GARBAGE {
-                let _set = ScopedEnvVar::set(k.env(), raw);
-                assert!(on(k), "{:?}={:?}: presence is presence", k, raw);
-                let _ = on_strict(k);
-                let _ = on_unless_zero(k);
-                assert_eq!(num(k, 7), 7, "{:?}={:?}", k, raw);
-                assert_eq!(count(k, 9), 9, "{:?}={:?}", k, raw);
-                assert_eq!(real(k, 0.25), 0.25, "{:?}={:?}", k, raw);
-                assert_eq!(count_opt(k), None, "{:?}={:?}", k, raw);
-                assert_eq!(real_opt(k), None, "{:?}={:?}", k, raw);
-                // The consumers, not just the accessors: these are the two
-                // calls that used to abort the process.
-                let _ = Duration::from_secs_f64(real(k, 15.0));
-                let _ = Duration::from_secs(1).mul_f64(real(k, 1.5));
-            }
-            // `-1` is well-formed as an integer and malformed as a duration:
-            // what rejects it is the accessor's DOMAIN, not the string's
-            // syntax. It is listed separately because `num` legitimately
-            // returns it.
-            let _neg = ScopedEnvVar::set(k.env(), "-1");
-            assert_eq!(num(k, 7), -1);
-            assert_eq!(count(k, 9), 9);
-            assert_eq!(real(k, 15.0), 15.0);
-            assert_eq!(real_opt(k), None);
-            let _ = Duration::from_secs_f64(real(k, 15.0));
-            // ...and the mirror image: `1e26` is a fine `f64` and overflows
-            // every integer accessor. Neither may panic, and neither may
-            // borrow the other's verdict on the string.
-            let _big = ScopedEnvVar::set(k.env(), "99999999999999999999999999");
-            assert_eq!(num(k, 7), 7);
-            assert_eq!(count(k, 9), 9);
-            assert_eq!(
-                real(k, 15.0),
-                15.0,
-                "1e26 is a fine f64 and a Duration overflow"
-            );
-            let _ = Duration::from_secs_f64(real(k, 15.0));
-        }
     }
 
     /// The same property for EVERY knob and for the layers that carry a value
@@ -1540,13 +982,12 @@ mod tests {
     /// arriving with no syntax to be wrong.
     ///
     /// `1e26` and `MAX_REAL * 2.0` are the [`MAX_REAL`] ceiling from the
-    /// `AY_MILP_SAT_STOP_SECS=1e26` abort; `-1.0` is the
-    /// `AY_MILP_SAT_STOP_MULT=-1` abort. Both must be refused here as well, or
+    /// `--sat-stop-secs=1e26` abort; `-1.0` is the
+    /// `--sat-stop-mult=-1` abort. Both must be refused here as well, or
     /// the two aborts simply move from the environment to the typed API.
     #[test]
     fn malformed_settings_never_panic_through_the_caller_or_policy() {
         let _lock = lock_env();
-        let _clean = unset_all_knobs();
         const OUT_OF_DOMAIN: [f64; 7] = [
             -1.0,
             -0.5,
@@ -1586,119 +1027,17 @@ mod tests {
         }
     }
 
-    /// The string half of the malformed-input property, for every knob, with no
-    /// process state touched: [`parse_real`] is what the environment arm of
-    /// [`real`]/[`real_opt`] resolves through, so a string it accepts is a
-    /// string that reaches `Duration::from_secs_f64`.
-    ///
-    /// This exists because the end-to-end sweep above is restricted to the seven
-    /// knobs it is safe to publish to. It is knob-independent by construction —
-    /// which is also the argument that the restriction costs no coverage.
-    #[test]
-    fn no_malformed_string_survives_the_real_domain() {
-        for raw in GARBAGE
-            .iter()
-            .copied()
-            .chain(["-1", "99999999999999999999999999", "1e15.5"])
-        {
-            assert_eq!(parse_real(raw), None, "{:?} must not reach a Duration", raw);
-        }
-        // The good cases still get through, and the ceiling is inclusive.
-        assert_eq!(parse_real("0"), Some(0.0));
-        assert_eq!(parse_real("1.5"), Some(1.5));
-        assert_eq!(parse_real("1e15"), Some(MAX_REAL));
-        let _ = Duration::from_secs_f64(parse_real("1e15").expect("in domain"));
-    }
-
-    /// A LEADING SPACE STILL PARSE-FAILS, exactly as it did before this module
-    /// existed. `AY_MILP_DIVE_MAX_PINS=" 5"` left the dive uncapped at the old
-    /// call site (`bab.rs:6849` reads `usize::MAX`) and must still leave it
-    /// uncapped, or the identical recipe measures a different arm than the
-    /// journal recorded for it. See [`num`].
-    #[test]
-    fn a_padded_value_does_not_parse() {
-        let _lock = lock_env();
-        let _pins = ScopedEnvVar::set(Knob::DiveMaxPins.env(), " 5");
-        assert_eq!(count(Knob::DiveMaxPins, usize::MAX), usize::MAX);
-        let _pump = ScopedEnvVar::set(Knob::PumpRestarts.env(), "3 ");
-        assert_eq!(count_opt(Knob::PumpRestarts), None);
-        let _mult = ScopedEnvVar::set(Knob::SatStopMult.env(), " 2.5");
-        assert_eq!(real(Knob::SatStopMult, 1.5), 1.5);
-        assert_eq!(num(Knob::SatStopMult, 7), 7);
-    }
-
-    /// A well-formed value still reaches the call site unchanged — the
-    /// malformed-input hardening above must not have swallowed the good cases.
-    #[test]
-    fn well_formed_environment_values_still_apply() {
-        let _lock = lock_env();
-        let _secs = ScopedEnvVar::set(Knob::SatStopSecs.env(), "30");
-        let _mult = ScopedEnvVar::set(Knob::SatStopMult.env(), "2.5");
-        let _share = ScopedEnvVar::set(Knob::FlipShare.env(), "0.25");
-        let _pump = ScopedEnvVar::set(Knob::PumpRestarts.env(), "0");
-        assert_eq!(real(Knob::SatStopSecs, 15.0), 30.0);
-        assert_eq!(real(Knob::SatStopMult, 1.5), 2.5);
-        assert_eq!(real_opt(Knob::FlipShare), Some(0.25));
-        assert_eq!(count_opt(Knob::PumpRestarts), Some(0));
-    }
-
-    /// The snapshot is what the shipped build resolves from, so its capture is
-    /// tested directly rather than through whichever variables the test binary
-    /// happens to inherit.
-    #[test]
-    fn snapshot_captures_the_environment() {
-        let _lock = lock_env();
-        let k = Knob::PresolveShare;
-        {
-            let _set = ScopedEnvVar::set(k.env(), "0.02");
-            let snap = EnvSnapshot::capture();
-            assert_eq!(snap.get(k), Some(std::ffi::OsStr::new("0.02")));
-            assert_eq!(
-                snap.get(Knob::NoCuts),
-                std::env::var_os(Knob::NoCuts.env()).as_deref()
-            );
-        }
-        let _clean = ScopedEnvVar::unset(k.env());
-        assert_eq!(
-            EnvSnapshot::capture().get(k),
-            None,
-            "an unset variable is absent from the capture, not empty in it"
-        );
-    }
-
     #[test]
     fn knob_env_names_are_distinct() {
         let mut seen = std::collections::HashSet::new();
         for k in Knob::ALL {
-            assert!(seen.insert(k.env()), "duplicate env name for {:?}", k);
+            if let Some(name) = k.env() {
+                assert!(seen.insert(name), "duplicate env name for {:?}", k);
+            }
             assert_eq!(Knob::ALL[k.slot()], k, "slot must round-trip");
         }
     }
 
-    /// THE UNIFICATION PIN. This crate has two knob tables by design and they
-    /// must never drift: [`crate::knobs::KNOBS`] is the LEDGER (every `AY_*`
-    /// name, bucketed, powering `ay-milp knobs --list` and the typo guard), and
-    /// [`Knob`] is the TYPED subset the engine resolves per solve.
-    ///
-    /// Two tables is the right factoring — one is a catalogue of every name that
-    /// exists, the other is the handful with a typed setter — but only while
-    /// every entry in the second appears in the first. A tuned knob missing from
-    /// the ledger is invisible to `knobs --list` and, worse, would be reported by
-    /// the unknown-name guard as a probable TYPO when an operator sets the very
-    /// variable the engine reads.
-    #[test]
-    fn every_tuned_knob_is_in_the_ledger() {
-        for k in Knob::ALL {
-            assert!(
-                crate::knobs::KNOBS.iter().any(|e| e.name == k.env()),
-                "tune::Knob::{:?} reads {} but that name is absent from knobs.rs's ledger: \
-                 `ay-milp knobs --list` would omit it and the unknown-name guard would call \
-                 it a typo",
-                k,
-                k.env(),
-            );
-        }
-    }
     /// THE PROPERTY THE REDUCTION KNOBS EXIST FOR: a typed caller value beats an
     /// inherited `AY_MILP_*` export, in BOTH directions.
     ///
@@ -1709,45 +1048,37 @@ mod tests {
     /// Asserting only "caller can turn it on" would pass even if the environment
     /// silently won whenever it disagreed, so both directions are pinned.
     #[test]
-    fn a_typed_reduction_setting_outranks_an_inherited_export() {
-        let _lock = lock_env();
+    fn a_typed_reduction_setting_is_authoritative() {
         for k in [
             Knob::NoDualfix,
             Knob::NoKernelReform,
             Knob::NoFeasConflict,
             Knob::NoColdLu,
         ] {
-            // Environment says "disabled" (presence == on for these).
-            let _env = ScopedEnvVar::set(k.env(), "1");
+            {
+                let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(true)));
+                assert!(on(k), "{}: a typed `true` engages the switch", k.label());
+            }
             {
                 let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
-                assert!(
-                    !on(k),
-                    "{}: a typed `false` must beat an inherited export",
-                    k.env()
-                );
+                assert!(!on(k), "{}: a typed `false` disengages it", k.label());
             }
-            // And with no caller opinion the export still applies, so the
-            // migration did not quietly strip operator control.
             assert!(
-                on(k),
-                "{}: with no caller opinion the environment must still be honoured",
-                k.env()
+                !on(k),
+                "{}: no opinion resolves to the compiled default",
+                k.label()
             );
         }
     }
 
-    /// The same property for the one knob deliberately NOT routed through `on`.
+    /// The same property for the knob deliberately NOT routed through `on`.
     ///
-    /// `AY_MILP_NO_CERT_DECOUPLE`'s spelling is not plain presence — `0`/`off`
-    /// mean "keep the decoupling" — so it keeps its own env parse and consults
-    /// the caller layer first. That asymmetry is only safe if the typed value
-    /// still wins, which is what this pins.
+    /// `certificate_decoupling`'s historical env spelling was not plain
+    /// presence, so its site takes the caller layer and otherwise falls
+    /// through to the compiled default (B29: the env parse is retired).
     #[test]
-    fn cert_decouple_takes_the_caller_layer_before_its_own_env_parse() {
-        let _lock = lock_env();
+    fn cert_decouple_takes_the_caller_layer() {
         let k = Knob::NoCertDecouple;
-        let _env = ScopedEnvVar::set(k.env(), "1");
         {
             let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
             assert_eq!(caller_flag(k), Some(false));
@@ -1755,7 +1086,7 @@ mod tests {
         assert_eq!(
             caller_flag(k),
             None,
-            "with no caller opinion the site must fall through to its env parse"
+            "with no caller opinion the site must fall through to its compiled default"
         );
     }
 }
@@ -1776,12 +1107,7 @@ mod tests {
 /// `env_layer` anyway — 18 live `var_os` calls that stored nothing. Harmless, and
 /// the doc was still false; a review caught it. The `cfg` split below makes the
 /// sentence true rather than merely nearly-true.
-#[cfg(not(test))]
-pub(crate) fn prime_env() {
-    for k in Knob::ALL {
-        let _ = env_layer(k);
-    }
-}
-
-#[cfg(test)]
+/// B38: the env snapshot layer is gone; priming is a no-op kept so the
+/// `bab::prime_env_all` choke point keeps one shape while its other cached
+/// holes retire.
 pub(crate) fn prime_env() {}

@@ -99,9 +99,8 @@ pub(crate) use split_sym::{split_sym_enabled, SymbolSplitter};
 /// Set `AY_CHC_DISABLE_WORD_BV=1` to restore the pre-hardening behavior
 /// (plain UF fallbacks, no interval strengthening / mod discharge).
 pub(crate) fn word_bv_hardening_disabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_WORD_BV")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    // B27: CLI-owned (--chc-no-word-bv); env retired.
+    !crate::ab_switches::get().word_bv
 }
 
 // ============================================================================

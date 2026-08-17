@@ -88,10 +88,7 @@ fn require_carcara_or_skip() -> Option<PathBuf> {
 }
 
 fn keep_artifacts() -> bool {
-    matches!(
-        std::env::var("AY_KEEP_ALETHE_ARTIFACTS").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    )
+    ay_core::misc_cli_flags().keep_alethe_artifacts
 }
 
 fn assert_carcara_valid(carcara: &Path, proof: &str) {

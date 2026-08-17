@@ -12,7 +12,7 @@
 use super::*;
 
 /// Drop guard that logs total accept_or_reject duration under
-/// AY_ACCEPT_PROFILE=1 regardless of which early-return path fires.
+/// --chc-accept-profile regardless of which early-return path fires.
 struct AcceptProfileSpan {
     enabled: bool,
     start: ay_core::time::Instant,

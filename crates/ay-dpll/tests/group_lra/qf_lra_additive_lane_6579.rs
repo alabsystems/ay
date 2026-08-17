@@ -385,7 +385,7 @@ fn test_measure_additive_lane_6579() {
 
     for (label, rel_path) in &benchmarks {
         let path = repo_root.join(rel_path);
-        if !path.exists() {
+        if !path.exists() && crate::common::corpus_skip_allowed(&path) {
             println!("SKIP {label}: {rel_path} not found");
             continue;
         }

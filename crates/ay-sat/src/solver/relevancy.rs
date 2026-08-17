@@ -85,9 +85,13 @@ struct RelevancyConfig {
     /// Overridable via `AY_RELEVANCY_RATIO`.
     wander_ratio: u64,
     /// Verbose: emit one line on the first engaged decision per solver.
-    /// Enabled by `AY_RELEVANCY=2`.
+    /// Enabled by `--sat-relevancy`.
     verbose: bool,
 }
+/// Relevancy warmup, in conflicts (B4: was AY_RELEVANCY_WARMUP).
+const RELEVANCY_WARMUP_CONFLICTS: u64 = 200;
+/// Wander ratio denominator (B4: was AY_RELEVANCY_RATIO).
+const RELEVANCY_WANDER_RATIO: u64 = 5;
 
 /// Process-cached relevancy config. Each solver run is a fresh process, so a
 /// `OnceLock` read of the env is correct and keeps the decision hot path free of
@@ -95,15 +99,10 @@ struct RelevancyConfig {
 fn relevancy_config() -> RelevancyConfig {
     static CFG: OnceLock<RelevancyConfig> = OnceLock::new();
     *CFG.get_or_init(|| {
-        let warmup_conflicts = std::env::var("AY_RELEVANCY_WARMUP")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(200);
-        let wander_ratio = std::env::var("AY_RELEVANCY_RATIO")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        let verbose = std::env::var("AY_RELEVANCY").ok().as_deref() == Some("2");
+        // B4: the AY_RELEVANCY_{WARMUP,RATIO} env overrides are deleted.
+        let warmup_conflicts = RELEVANCY_WARMUP_CONFLICTS;
+        let wander_ratio = RELEVANCY_WANDER_RATIO;
+        let verbose = ay_core::misc_cli_flags().sat_relevancy == Some(2);
         RelevancyConfig {
             warmup_conflicts,
             wander_ratio,
@@ -152,21 +151,21 @@ impl Solver {
 
     /// Explicit tri-state env override for relevancy branching.
     ///
-    /// `AY_RELEVANCY=0` => `Some(false)` (kill switch, beats any caller default);
-    /// `AY_RELEVANCY=1|2` => `Some(true)` (`2` also enables the engage marker);
-    /// unset/other => `None` (caller decides the default). Process-cached.
+    /// `--sat-relevancy` => `Some(false)` (kill switch, beats any caller default);
+    /// `--sat-relevancy 1|2` => `Some(true)` (`2` also enables the engage
+    /// marker); `--sat-relevancy 0` => `Some(false)`; unset => `None` (caller
+    /// decides the default). B36: was the --sat-relevancy tri-state env.
     pub fn relevancy_env_override() -> Option<bool> {
-        static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
-        *OVERRIDE.get_or_init(|| match std::env::var("AY_RELEVANCY").ok().as_deref() {
-            Some("0") => Some(false),
-            Some("1") | Some("2") => Some(true),
-            _ => None,
-        })
+        match ay_core::misc_cli_flags().sat_relevancy {
+            Some(0) => Some(false),
+            Some(_) => Some(true),
+            None => None,
+        }
     }
 
     /// Whether the split-loop lanes should enable the relevancy brancher when
     /// the caller supplies no default (Increment 1 semantics: OFF unless
-    /// `AY_RELEVANCY=1|2`).
+    /// `--sat-relevancy 1|2`).
     pub fn relevancy_env_enabled() -> bool {
         Self::relevancy_env_override().unwrap_or(false)
     }
@@ -321,7 +320,7 @@ impl Solver {
             let first = self.relevancy_decisions == 0;
             self.relevancy_decisions += 1;
             if first && relevancy_config().verbose {
-                // One-line engage marker (AY_RELEVANCY=2) for observability.
+                // One-line engage marker (--sat-relevancy) for observability.
                 ay_core::safe_eprintln!(
                     "[relevancy] engaged: conflicts={} decisions={} num_vars={}",
                     self.num_conflicts,

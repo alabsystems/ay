@@ -94,7 +94,7 @@ pub const ARMED_ENV: &str = "AY_GOVERN_ARMED";
 /// the real binary (see the module docs). A caller that spawned `ay` and wants
 /// to bind provenance to "the process I started" therefore CANNOT use
 /// `std::process::id()` from inside the solver: by the time anything runs, the
-/// image has been through `execv(taskpolicy)` and `taskpolicy`'s own exec of
+/// image has been through `exec(taskpolicy)` and `taskpolicy`'s own exec of
 /// the real binary, and the observed pid need not be the one the caller holds.
 ///
 /// This is not hypothetical: external-codegen binds its exported BV CNF to the pid it
@@ -102,7 +102,7 @@ pub const ARMED_ENV: &str = "AY_GOVERN_ARMED";
 /// launched — which made that binding permanently unsatisfiable.
 ///
 /// `arm` records the root pid here BEFORE the exec chain. The environment
-/// survives `execv`, and the re-exec'd image returns early from `arm` (it is
+/// survives `exec`, and the re-exec'd image returns early from `arm` (it is
 /// already armed), so the value is written exactly once, by the process the
 /// caller spawned.
 pub const ROOT_PID_ENV: &str = "AY_ROOT_PID";
@@ -176,17 +176,6 @@ const DEFAULT_BUDGET_DIVISOR: usize = 16;
 #[cfg(target_os = "macos")]
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 
-/// Darwin major version of macOS 14 (Sonoma), the first release whose
-/// `taskpolicy` accepts `-m <MB>`. Used ONLY to skip the probe in
-/// [`imp::l1_installable`] — never to conclude the flag is missing.
-#[cfg(target_os = "macos")]
-const DARWIN_SONOMA: u32 = 23;
-
-/// Program the `taskpolicy` probe runs. Needs only to exist and exit 0, so
-/// that a non-zero status isolates `taskpolicy`'s own rejection of `-m`.
-#[cfg(target_os = "macos")]
-const PROBE_PROGRAM: &str = "/usr/bin/true";
-
 /// Exit code used when the bound cannot be established.
 ///
 /// Deliberately the shell's "found but not executable" code, matching
@@ -237,15 +226,29 @@ pub fn active_budget_bytes() -> Option<usize> {
 }
 
 #[cfg(target_os = "macos")]
+mod spawn;
+
+#[cfg(target_os = "macos")]
+fn fail_closed(why: &str) -> ! {
+    eprintln!(
+        "ay: FATAL: {why}. Refusing to run ungoverned -- an unbounded solver on \
+         this machine is a kernel panic (four so far; the last was 2026-08-02, \
+         355.7 GB on a 128 GB box)."
+    );
+    std::process::exit(EXIT_UNGOVERNED);
+}
+
+#[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        budget_mb, ARMED_ENV, AS_SLACK, DARWIN_SONOMA, EXIT_UNGOVERNED, MIN_AS_HEADROOM_MB,
-        PROBE_PROGRAM, ROOT_PID_ENV, TASKPOLICY,
+        budget_mb, fail_closed,
+        spawn::{l1_installable, reexec_self_governed, self_path},
+        ARMED_ENV, AS_SLACK, MIN_AS_HEADROOM_MB, ROOT_PID_ENV, TASKPOLICY,
     };
-    use std::ffi::{CString, OsString};
     use std::mem::{size_of, zeroed};
-    use std::os::unix::ffi::OsStringExt;
-    use std::process::{Command, Stdio};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
 
     /// This process's current address space, which IS the smallest settable
     /// `RLIMIT_AS`. Read directly rather than searched for: `govern-exec`
@@ -277,77 +280,6 @@ mod imp {
         } else {
             None
         }
-    }
-
-    /// The absolute path of the running executable.
-    ///
-    /// Resolved from the kernel's record via `std::env::current_exe`
-    /// (`_NSGetExecutablePath` + `realpath` underneath), **never from
-    /// `argv[0]`**. Renaming is precisely what `ay-base` and `ay-fixed` did, and
-    /// a governor that trusts `argv[0]` re-execs the wrong file — or, if the
-    /// name is not on `PATH`, nothing at all.
-    fn self_path() -> Option<CString> {
-        let exe = std::env::current_exe().ok()?;
-        CString::new(OsString::from(exe).into_vec()).ok()
-    }
-
-    /// This kernel's Darwin major version, e.g. `22` for `22.6.0`.
-    ///
-    /// `uname` rather than a `sysctl` name lookup or a spawned `sw_vers`: one
-    /// syscall, no string table, no process.
-    fn darwin_major() -> Option<u32> {
-        // SAFETY: `uname` writes into an owned, zeroed, exclusively-borrowed
-        // `utsname`. The return value is checked before any field is read.
-        let mut u = unsafe { zeroed::<libc::utsname>() };
-        if unsafe { libc::uname(&raw mut u) } != 0 {
-            return None;
-        }
-        // `release` is a NUL-terminated C string in a fixed-size array.
-        let release: Vec<u8> = u
-            .release
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        std::str::from_utf8(&release)
-            .ok()?
-            .split('.')
-            .next()?
-            .parse()
-            .ok()
-    }
-
-    /// Can L1 — the `taskpolicy -m <MB>` jetsam footprint cap — actually be
-    /// installed on this system?
-    ///
-    /// This has to be answered BEFORE the `execv` below, because that `execv`
-    /// **succeeds** on a system whose `taskpolicy` lacks `-m`: the binary is
-    /// present, it simply rejects the argument. By then this process has been
-    /// replaced, so there is no `fail_closed` left to reach — the caller just
-    /// sees `taskpolicy`'s usage text where `ay`'s output should be, and an
-    /// exit code attributed to nothing. Every invocation on such a host dies
-    /// that way, with no diagnostic naming `ay` at all.
-    ///
-    /// Answered by RUNNING `taskpolicy`, not by consulting a version table:
-    /// the question is whether this exact binary takes the flag. The Darwin
-    /// check is a fast path only — it can skip the probe, never fail it — so a
-    /// stale table costs at most one spawn and can never silently drop the
-    /// guard. That matters because the probe costs ~3.3 ms against the ~4.4 ms
-    /// reference solve that already ruled out the bisecting `as_floor`
-    /// alternative above; on a supported host it must not be paid at all.
-    fn l1_installable(budget: u64) -> bool {
-        if darwin_major().is_some_and(|major| major >= DARWIN_SONOMA) {
-            return true;
-        }
-        Command::new(TASKPOLICY)
-            .arg("-m")
-            .arg(budget.to_string())
-            .arg(PROBE_PROGRAM)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
     }
 
     /// Apply L2, then re-exec this image under `taskpolicy` to apply L1.
@@ -388,121 +320,37 @@ mod imp {
 
         // Ask before the point of no return. `execv` cannot report that
         // `taskpolicy` rejected `-m`, because by then we are gone.
-        if !l1_installable(budget) {
-            fail_closed(&format!(
-                "{TASKPOLICY} does not accept `-m <MB>` on this system, so L1 -- \
-                 the jetsam footprint cap -- cannot be installed (`-m` is a macOS \
-                 14+ flag; this kernel is Darwin {}). L2 (RLIMIT_AS) is NOT a \
-                 substitute: it bounds ADDRESS SPACE, and the runaway this guard \
-                 exists to stop grows the FOOTPRINT inside already-mapped arena \
-                 pages, which never crosses it",
-                darwin_major().map_or_else(|| "unknown".to_owned(), |m| m.to_string())
-            ));
-        }
-
         let Some(exe) = self_path() else {
             fail_closed("could not resolve this executable's own path");
         };
 
-        // Mark BEFORE exec: the re-exec'd image reads this and falls through.
-        // SAFETY: single-threaded here -- arm() is the first statement of main,
-        // before any thread is spawned -- so there is no concurrent getenv.
-        unsafe { std::env::set_var(ARMED_ENV, "1") };
-
-        // Record the ROOT pid before the exec chain, for callers that bind
-        // provenance to the process they spawned. This is the last point at
-        // which `std::process::id()` is still that pid: below, `execv` hands
-        // off to `taskpolicy`, which execs the real image. See `ROOT_PID_ENV`.
-        // SAFETY: as above -- still single-threaded, no concurrent getenv.
-        unsafe { std::env::set_var(ROOT_PID_ENV, std::process::id().to_string()) };
+        // `taskpolicy -m` is a macOS 14+ CLI flag, but the KERNEL capability it
+        // wraps is older: taskpolicy just sets a jetsam attribute on the child
+        // it spawns. Do the same thing directly rather than refusing to run.
+        //
+        // This is the SAME L1 bound by the route taskpolicy itself uses, not a
+        // weaker substitute — L2 (RLIMIT_AS) would be, since it bounds ADDRESS
+        // SPACE while the runaway grows FOOTPRINT inside already-mapped arena
+        // pages and never crosses it.
+        if !l1_installable(budget) {
+            reexec_self_governed(budget, &exe);
+        }
 
         // L1 LAST: taskpolicy must be the IMMEDIATE exec'ing parent of the real
         // image, because any subsequent execve destroys the memlimit. Nothing
         // may be inserted between taskpolicy and this binary.
-        let mb = CString::new(budget.to_string()).expect("budget digits are NUL-free");
-        let Ok(tp) = CString::new(TASKPOLICY) else {
-            fail_closed("taskpolicy path is not a valid C string");
-        };
-        let Ok(arg0) = CString::new("taskpolicy") else {
-            fail_closed("argv[0] is not a valid C string");
-        };
-        let Ok(flag) = CString::new("-m") else {
-            fail_closed("flag is not a valid C string");
-        };
-
-        let mut owned: Vec<CString> = vec![arg0, flag, mb, exe];
-        for a in std::env::args_os().skip(1) {
-            match CString::new(a.into_vec()) {
-                Ok(c) => owned.push(c),
-                // An argument containing NUL cannot round-trip through execv.
-                // It also cannot have reached us from a real shell. Refuse
-                // rather than silently dropping a caller's argument.
-                Err(_) => fail_closed("an argument contains an interior NUL byte"),
-            }
-        }
-        let mut argv: Vec<*const libc::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
-        argv.push(std::ptr::null());
-
-        // SAFETY: `tp` is a valid NUL-terminated path and `argv` is a
-        // NULL-terminated array of pointers to NUL-terminated strings, all of
-        // which outlive the call (`owned` is still in scope). On success execv
-        // does not return.
-        unsafe { libc::execv(tp.as_ptr(), argv.as_ptr()) };
-
-        fail_closed(&format!(
-            "exec {TASKPOLICY} failed ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    /// Report why the bound could not be established and exit without running.
-    fn fail_closed(why: &str) -> ! {
-        eprintln!(
-            "ay: FATAL: {why}. Refusing to run ungoverned -- an unbounded solver on \
-             this machine is a kernel panic (four so far; the last was 2026-08-02, \
-             355.7 GB on a 128 GB box)."
-        );
-        std::process::exit(EXIT_UNGOVERNED);
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::{darwin_major, l1_installable, Command, Stdio, PROBE_PROGRAM, TASKPOLICY};
-
-        /// The Darwin fast path exists only to SKIP the probe, so it must never
-        /// disagree with it. If this fires on some host, `DARWIN_SONOMA` is
-        /// wrong there — and a wrong table either refuses a machine that could
-        /// be governed, or (worse) skips the probe on one that cannot.
-        #[test]
-        fn darwin_fast_path_agrees_with_the_taskpolicy_probe() {
-            let authority = Command::new(TASKPOLICY)
-                .arg("-m")
-                .arg("64")
-                .arg(PROBE_PROGRAM)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
-
-            assert_eq!(
-                l1_installable(64),
-                authority,
-                "the Darwin {} fast path disagrees with actually running \
-                 `{TASKPOLICY} -m`; DARWIN_SONOMA is wrong for this host",
-                darwin_major().map_or_else(|| "?".to_owned(), |m| m.to_string())
-            );
-        }
-
-        /// A `None` here silently sends every host down the probe path.
-        #[test]
-        fn darwin_major_is_readable() {
-            assert!(
-                darwin_major().is_some_and(|major| major >= 8),
-                "uname gave no usable Darwin major version: {:?}",
-                darwin_major()
-            );
-        }
+        let executable = std::ffi::OsStr::from_bytes(exe.as_bytes());
+        let error = Command::new(TASKPOLICY)
+            .arg("-m")
+            .arg(budget.to_string())
+            .arg(executable)
+            .args(std::env::args_os().skip(1))
+            // Install markers only in the replacement image. `Command::env`
+            // builds the exec environment without process-global mutation.
+            .env(ARMED_ENV, "1")
+            .env(ROOT_PID_ENV, std::process::id().to_string())
+            .exec();
+        fail_closed(&format!("exec {TASKPOLICY} failed ({error})"));
     }
 }
 
@@ -519,7 +367,8 @@ mod imp {
 ///
 /// Call this as the **first statement of `main`**, before any allocation or
 /// thread spawn — it re-execs the process, so anything done beforehand is
-/// discarded work, and [`std::env::set_var`] requires single-threadedness.
+/// discarded work. Governance markers are passed only to the replacement
+/// image through its explicit exec environment.
 ///
 /// On macOS this normally does not return: the process is replaced by itself
 /// running under `taskpolicy`. The replacement re-enters here, observes

@@ -6,9 +6,9 @@
 //! and the **feasibility pump** (Fischetti, Glover & Lodi, 2005).
 //!
 //! These complement the always-on RINS/RENS/relax-random LNS in
-//! [`crate::optimize::lns`]. They are opt-in behind the `AY_PB_LNS2` env flag
-//! (default OFF) so the default proof path is byte-for-byte unchanged unless the
-//! caller deliberately enables them.
+//! [`crate::optimize::lns`]. They are enabled by default; `--no-pb-lns2`
+//! restores the prior path for controlled A/B runs without weakening the
+//! incumbent verification gates.
 //!
 //! # Local branching (incumbent IMPROVEMENT)
 //! Around an incumbent x̄, add the *local-branching* row
@@ -50,20 +50,11 @@ use crate::solver::eval_objective;
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
 
 /// Whether the stronger LNS2 neighborhoods (local branching + feasibility pump)
-/// are enabled. Default ON (the pump is a deadline-safe, re-verified FALLBACK that
-/// fires only when there is no feasible incumbent and never emits a global
-/// verdict). Disable explicitly via `AY_PB_LNS2` ∈ {0,false,no,off} to recover the
-/// prior default-off behavior. Any other (or unset) value enables it.
+/// are enabled. Default ON (the pump is a deadline-safe, re-verified FALLBACK
+/// that fires only when there is no feasible incumbent and never emits a
+/// global verdict). `--no-pb-lns2` recovers the prior default-off behavior.
 pub(crate) fn lns2_enabled() -> bool {
-    match std::env::var_os("AY_PB_LNS2").as_deref() {
-        None => true,
-        Some(v) => v.to_str().map_or(true, |v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        }),
-    }
+    crate::ab_switches::get().lns2
 }
 
 /// Upper bound on instance size for LNS2. Above this, cloning the instance and

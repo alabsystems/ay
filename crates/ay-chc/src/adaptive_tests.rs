@@ -6179,7 +6179,11 @@ fn test_array_ghost_pair_preprocess_reconstructs_compacted_model_before_certific
     // Keep the regression specifically on ClauseInliner's compaction/model
     // reconstruction rather than letting the earlier condense superpass
     // remove the wrappers first.
-    let condense_disable = ScopedEnvVar::set("AY_CHC_DISABLE_CONDENSE", "1");
+    let condense_disable =
+        crate::ab_switches::TestOverride::set(crate::ab_switches::ChcAbSwitches {
+            condense: false,
+            ..Default::default()
+        });
 
     let original = create_array_ghost_pair_compaction_safe_problem();
     let spec = GhostPairSpec::analyze(&original, 1);

@@ -101,8 +101,8 @@ impl EufSolver<'_> {
     /// Returns `false` (emit EAGER, materialized reason) when:
     /// - the consumer never opted in via `set_lazy_propagation_supported`
     ///   (legacy `DpllT` loop, verification instances) or the
-    ///   `AY_EUF_LAZY_EXPLAIN=0` kill switch is set;
-    /// - `AY_EUF_GAP_STATS` profiling is on (`record_emission` needs the
+    ///   `--no-euf-lazy-explain` kill switch is set;
+    /// - `--euf-gap-stats` profiling is on (`record_emission` needs the
     ///   materialized reason set);
     /// - `AY_DEBUG_EUF` tracing is on (debug lines print reason counts);
     /// - the emission falls in the warmup-then-sample EAGER carve-out: the

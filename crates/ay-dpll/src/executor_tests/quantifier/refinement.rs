@@ -4,6 +4,12 @@
 
 use super::*;
 
+fn run(input: &str) -> Vec<String> {
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    exec.execute_all(&commands).unwrap()
+}
+
 /// Phase B1c (#3325): E-matching refinement with theory-provided model.
 ///
 /// This test exercises the Phase B1c refinement loop: after the theory solver
@@ -231,9 +237,7 @@ fn test_forall_square_nonneg_is_sat_s2() {
         (assert (forall ((x Int)) (>= (* x x) 0)))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(outputs, vec!["unsat"], "valid forall must never be refuted");
     assert_eq!(outputs, vec!["sat"]);
 }
@@ -247,9 +251,7 @@ fn test_forall_abs_nonneg_is_sat() {
         (assert (forall ((x Int)) (>= (abs x) 0)))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(outputs, vec!["unsat"], "valid forall must never be refuted");
     assert_eq!(outputs, vec!["sat"]);
 }
@@ -264,9 +266,7 @@ fn test_forall_mod_nonneg_is_sat() {
         (assert (forall ((x Int)) (>= (mod x 3) 0)))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(outputs, vec!["unsat"], "valid forall must never be refuted");
     assert_eq!(outputs, vec!["sat"]);
 }
@@ -282,9 +282,7 @@ fn test_forall_infeasible_linear_eq_still_unsat() {
         (assert (forall ((x Int)) (= (* 4 x) 7)))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_eq!(outputs, vec!["unsat"]);
 }
 
@@ -307,9 +305,7 @@ fn test_forall_exists_perfect_square_unsat_s3() {
         (assert (forall ((x Int)) (exists ((y Int)) (= (* y y) x))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["sat"],
@@ -332,9 +328,7 @@ fn test_s3_fixture_file_end_to_end_unsat() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/quantifier/forall_exists_perfect_square_unsat.smt2"
     ));
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(outputs, vec!["sat"], "S3 fixture must never answer sat");
     assert_eq!(
         outputs,
@@ -358,9 +352,7 @@ fn test_forall_exists_greater_sat() {
         (assert (forall ((x Int)) (exists ((y Int)) (> y x))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["unsat"],
@@ -387,9 +379,7 @@ fn test_forall_exists_empty_witness_never_sat() {
         (assert (forall ((x Int)) (exists ((y Int)) (and (<= y x) (>= y (+ x 1))))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["sat"],
@@ -417,9 +407,7 @@ fn test_forall_exists_square_conjunct_affine_probe_sat() {
         (assert (forall ((x Int)) (exists ((y Int)) (and (> (* y y) -3) (= y (+ x -2))))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["unsat"],
@@ -442,9 +430,7 @@ fn test_forall_exists_square_conjunct_affine_probe_mutant_never_sat() {
         (assert (forall ((x Int)) (exists ((y Int)) (and (> (* y y) 3) (= y (+ x -2))))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["sat"],
@@ -466,9 +452,7 @@ fn test_forall_exists_square_conjunct_unwitnessable_never_sat() {
             (and (> (* y y) -3) (<= y x) (>= y (+ x 1))))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["sat"],
@@ -489,9 +473,7 @@ fn test_forall_exists_square_ge_never_unsat() {
         (assert (forall ((x Int)) (exists ((y Int)) (>= (* y y) x))))
         (check-sat)
     "#;
-    let commands = parse(input).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
+    let outputs = run(input);
     assert_ne!(
         outputs,
         vec!["unsat"],

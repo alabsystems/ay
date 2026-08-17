@@ -622,17 +622,12 @@ fn houdini_cand_violated(
 }
 
 /// Kill switch for the relational ARRAY-equality invariant lane
-/// (`AY_CHC_DISABLE_ARRAY_RELATIONAL=1`). DEFAULT ON (lane enabled). Any value
+/// (`--chc-no-array-relational`). DEFAULT ON (lane enabled). Any value
 /// other than `1`/`true` (including unset) leaves the lane enabled. This gates
 /// only the array branch of [`try_relational_equality_houdini`]; the BV reve
 /// path is unaffected.
 fn array_relational_disabled() -> bool {
-    matches!(
-        std::env::var("AY_CHC_DISABLE_ARRAY_RELATIONAL")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    !crate::ab_switches::get().array_relational
 }
 
 /// True if `pred` looks like an llreve two-copy PRODUCT summary over arrays:
@@ -681,7 +676,7 @@ fn has_relational_array_pair(problem: &ChcProblem) -> bool {
 /// `(scalar range coupling) ⇒ (arrₐ = arr_b)`. Array (dis)equality candidates
 /// are certified by exact SMT during the fixpoint and by `verify_model_per_rule`
 /// on the ORIGINAL clauses before any Safe — an undischargeable candidate is
-/// withheld (fail-closed). Kill switch: `AY_CHC_DISABLE_ARRAY_RELATIONAL=1`.
+/// withheld (fail-closed). Kill switch: `--chc-no-array-relational`.
 ///
 /// For every non-nullary predicate it seeds all same-sort argument equalities
 /// `argᵢ = argⱼ` as candidate invariants, then does classic model-based dropping:
@@ -1000,8 +995,8 @@ fn try_relational_equality_houdini(
 // lane before any Safe. SOUND BY CONSTRUCTION: an ill-chosen candidate can only
 // cost completeness; the exact SMT fixpoint (Unknown ⇒ None), the query pass, and
 // `verify_model_per_rule` never let an uncertified Safe escape. Kill switches:
-// `AY_CHC_DISABLE_ARRAY_RELATIONAL` (whole array lane) or
-// `AY_CHC_DISABLE_ARRAY_RELATIONAL_V2` (just the v2 templates).
+// `--chc-no-array-relational` (whole array lane) or
+// `--chc-no-array-relational-v2` (just the v2 templates).
 // ===========================================================================
 
 /// Per-candidate SMT timeout cap in the v2 fixpoint: keeps one hard array-theory
@@ -1020,16 +1015,11 @@ fn classify_smt(r: &SmtResult) -> &'static str {
     }
 }
 
-/// v2 kill switch. `AY_CHC_DISABLE_ARRAY_RELATIONAL_V2=1` disables just the
+/// v2 kill switch. `--chc-no-array-relational-v2` disables just the
 /// richer templates (affine alignment + select couplings); the foundation array
-/// lane stays on. `AY_CHC_DISABLE_ARRAY_RELATIONAL=1` disables both.
+/// lane stays on. `--chc-no-array-relational` disables both.
 fn array_relational_v2_disabled() -> bool {
-    matches!(
-        std::env::var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    !crate::ab_switches::get().array_relational_v2
 }
 
 /// An affine term over a predicate's argument positions: `Σ (coeff · arg[pos]) +
@@ -1553,7 +1543,7 @@ fn try_array_relational_houdini_v2(
     if total_cands > 700 {
         return None;
     }
-    let dbg = std::env::var("AY_V2_DEBUG").is_ok();
+    let dbg = ay_core::misc_cli_flags().chc_v2_debug;
     if dbg {
         for (pid, cands) in &invs {
             safe_eprintln!("[v2dbg] pred {:?}: {} candidates", pid, cands.len());
@@ -5286,13 +5276,8 @@ impl AdaptivePortfolio {
         // (stripFullBoth sat@82 s → 115 s) re-converts at 119 s, comfortably inside
         // the 900 s competition-equivalent budget, so at competition budgets the
         // bump strictly dominates: 42→48 solved.
-        let v2_budget = capped(
-            std::env::var("AY_V2_BUDGET_SECS")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or_else(|| Duration::from_secs(45)),
-        );
+        // B8: the AY_V2_BUDGET_SECS env override is deleted.
+        let v2_budget = capped(Duration::from_secs(45));
         if v2_budget.is_zero() {
             return None;
         }
@@ -7157,12 +7142,25 @@ impl AdaptivePortfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The one workspace env choke point: serialized, restore-on-exit env
-    // mutation (unifies the former ARRAY_REL_ENV_LOCK onto it).
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use crate::ab_switches::{ChcAbSwitches, TestOverride};
 
     fn parse_problem(smt: &str) -> ChcProblem {
         crate::parser::ChcParser::parse(smt).expect("test CHC should parse")
+    }
+
+    #[cfg(feature = "optional-chc-comp25-corpus-tests")]
+    fn triangle_bv_fixture(number: u8) -> String {
+        let relative = format!(
+            "../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/\
+             ch-triangle-location-nr.{number}-bv_000.smt2"
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "optional CHC-COMP 2025 corpus fixture {} must be provisioned: {error}",
+                path.display()
+            )
+        })
     }
 
     #[test]
@@ -7253,9 +7251,8 @@ mod tests {
     #[test]
     #[cfg(feature = "optional-chc-comp25-corpus-tests")]
     fn original_bv_bmc_lane_detects_triangle_bv_first_smoke_fixture_9698() {
-        let problem = parse_problem(include_str!(
-            "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.1-bv_000.smt2"
-        ));
+        let fixture = triangle_bv_fixture(1);
+        let problem = parse_problem(&fixture);
 
         let plan = original_bv_bmc_lane_plan(&problem, Duration::from_secs(30));
 
@@ -7268,9 +7265,8 @@ mod tests {
     #[test]
     #[cfg(feature = "optional-chc-comp25-corpus-tests")]
     fn triangle_bv_first_smoke_route_source_validates_counterexample_9698() {
-        let problem = parse_problem(include_str!(
-            "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.1-bv_000.smt2"
-        ));
+        let fixture = triangle_bv_fixture(1);
+        let problem = parse_problem(&fixture);
         let adaptive = AdaptivePortfolio::new(
             problem,
             crate::AdaptiveConfig::with_budget(Duration::from_secs(5), false),
@@ -7294,15 +7290,9 @@ mod tests {
     #[test]
     #[cfg(feature = "optional-chc-comp25-corpus-tests")]
     fn original_bv_bmc_lane_detects_triangle_bv_bar_fixtures_9728() {
-        for smt in [
-            include_str!(
-                "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.2-bv_000.smt2"
-            ),
-            include_str!(
-                "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.6-bv_000.smt2"
-            ),
-        ] {
-            let problem = parse_problem(smt);
+        for number in [2, 6] {
+            let fixture = triangle_bv_fixture(number);
+            let problem = parse_problem(&fixture);
             let plan = original_bv_bmc_lane_plan(&problem, Duration::from_secs(30));
 
             assert_eq!(plan.mode, OriginalBvBmcLaneMode::TriangleBvDiffBounds);
@@ -7315,45 +7305,10 @@ mod tests {
     #[test]
     #[cfg(feature = "optional-chc-comp25-corpus-tests")]
     fn triangle_bv_family_route_source_validates_known_unsat_fixtures_9728() {
-        for (name, smt) in [
-            (
-                "nr.1",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.1-bv_000.smt2"
-                ),
-            ),
-            (
-                "nr.2",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.2-bv_000.smt2"
-                ),
-            ),
-            (
-                "nr.3",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.3-bv_000.smt2"
-                ),
-            ),
-            (
-                "nr.4",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.4-bv_000.smt2"
-                ),
-            ),
-            (
-                "nr.5",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.5-bv_000.smt2"
-                ),
-            ),
-            (
-                "nr.6",
-                include_str!(
-                    "../../../benchmarks/chc/chc-comp25-benchmarks/eldarica-misc/BV/Consistency/ch-triangle-location-nr.6-bv_000.smt2"
-                ),
-            ),
-        ] {
-            let problem = parse_problem(smt);
+        for number in 1..=6 {
+            let name = format!("nr.{number}");
+            let fixture = triangle_bv_fixture(number);
+            let problem = parse_problem(&fixture);
             let adaptive = AdaptivePortfolio::new(
                 problem,
                 crate::AdaptiveConfig::with_budget(Duration::from_secs(5), false),
@@ -7564,9 +7519,8 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // #chc25-array-relational: relational ARRAY-equality Houdini tests.
-    // The env-var kill switch is process-global, so the array tests serialize
-    // on the one workspace env lock (`lock_env`) to keep the enabled/disabled
-    // assertions race-free.
+    // Thread-local carrier overrides isolate enabled/disabled assertions from
+    // concurrently running tests.
     // ---------------------------------------------------------------------
 
     // A two-copy INV over (Int, (Array Int Int)) ×2 where both copies perform
@@ -7575,9 +7529,7 @@ mod tests {
     // must synthesize it AND it must re-verify inductive on the original CHC.
     #[test]
     fn relational_array_equality_houdini_certifies_two_copy_safe() {
-        let _guard = lock_env();
-        // Enabled for the whole test; restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7620,9 +7572,7 @@ mod tests {
     // is NOT inductive; the lane must NOT certify Safe (fail-closed to None).
     #[test]
     fn relational_array_equality_no_false_safe_on_diverging_arrays() {
-        let _guard = lock_env();
-        // Enabled for the whole test; restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7648,11 +7598,11 @@ mod tests {
         );
     }
 
-    // Kill switch: `AY_CHC_DISABLE_ARRAY_RELATIONAL=1` disables the array branch
+    // Kill switch: `--chc-no-array-relational` disables the array branch
     // (returns None even on the certifiable Safe problem); unset re-enables it.
     #[test]
     fn relational_array_equality_kill_switch_disables_lane() {
-        let _guard = lock_env();
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7672,12 +7622,15 @@ mod tests {
 "#;
         let problem = parse_problem(input);
         let disabled = {
-            let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL", "1");
+            let _disable = TestOverride::set(ChcAbSwitches {
+                array_relational: false,
+                ..Default::default()
+            });
             super::try_relational_equality_houdini(&problem, std::time::Duration::from_secs(15))
         };
         assert!(
             disabled.is_none(),
-            "kill switch AY_CHC_DISABLE_ARRAY_RELATIONAL=1 must disable the array lane"
+            "kill switch --chc-no-array-relational must disable the array lane"
         );
         let enabled =
             super::try_relational_equality_houdini(&problem, std::time::Duration::from_secs(15));
@@ -7742,10 +7695,7 @@ mod tests {
     // required. v2 must certify Safe AND re-verify inductive on the original CHC.
     #[test]
     fn array_relational_v2_certifies_affine_index_alignment() {
-        let _guard = lock_env();
-        // Both lanes enabled for the whole test; restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7794,10 +7744,7 @@ mod tests {
     // `a[idx]`, so the foundation FAILS; v2's select-value coupling is required.
     #[test]
     fn array_relational_v2_certifies_select_value_coupling() {
-        let _guard = lock_env();
-        // Both lanes enabled for the whole test; restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV ((Array Int Int) Int Int (Array Int Int)) Bool)
@@ -7843,10 +7790,7 @@ mod tests {
     // is reachable, and v2 must fail closed to None — NEVER a Safe.
     #[test]
     fn array_relational_v2_no_false_safe_on_diverging_alignment() {
-        let _guard = lock_env();
-        // Both lanes enabled for the whole test; restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7870,16 +7814,13 @@ mod tests {
         );
     }
 
-    // Kill switch: `AY_CHC_DISABLE_ARRAY_RELATIONAL_V2=1` disables just the v2
+    // Kill switch: `--chc-no-array-relational-v2` disables just the v2
     // templates (the certifiable affine-alignment Safe yields None); unset
-    // re-enables. The umbrella `AY_CHC_DISABLE_ARRAY_RELATIONAL=1` also disables.
+    // re-enables. The umbrella `--chc-no-array-relational` also disables.
     #[test]
     fn array_relational_v2_kill_switch_disables_lane() {
-        let _guard = lock_env();
-        // Both lanes enabled baseline for the whole test; the v2 kill-switch is
-        // toggled in a nested guard below. Restored on scope exit.
-        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        // The nested kill switch restores this explicit enabled baseline.
+        let _enabled = TestOverride::set(ChcAbSwitches::default());
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7897,7 +7838,10 @@ mod tests {
 "#;
         let problem = parse_problem(input);
         let disabled = {
-            let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2", "1");
+            let _disable = TestOverride::set(ChcAbSwitches {
+                array_relational_v2: false,
+                ..Default::default()
+            });
             super::try_array_relational_houdini_v2(&problem, std::time::Duration::from_secs(20))
         };
         assert!(

@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+// Unsafe is denied by default; audited hot paths opt in only at the narrow
+// function/module boundary carrying their local invariant.
 #![deny(unsafe_code)]
 // SAT solvers use many domain acronyms (BCE, BVE, VSIDS, HTR, CDCL, etc.).
 #![allow(clippy::upper_case_acronyms)]
@@ -101,6 +103,7 @@ pub(crate) mod cce;
 // paths, so large parts are intentionally retained while unused from the
 // solver itself. Audited and kept pending the next dead-code cleanup slice
 // (same convention as ay-chc's documented per-module allows).
+pub mod auto;
 #[allow(dead_code)]
 pub mod circuit_equiv_packet;
 #[allow(dead_code)]
@@ -328,7 +331,10 @@ impl Default for InprocessingFeatureProfile {
 // -- Public API: types used by downstream crates and integration tests --
 pub use adaptive::adjust_features_for_instance;
 pub use clause_provenance::{ClauseProvenance, CoreProvenanceSummary};
-pub use clause_trace::{ClauseTrace, ClauseTraceEntry, HintOmission, HintOmissionStats};
+pub use clause_trace::{
+    ClauseTrace, ClauseTraceEntry, ClauseTraceEntryRef, HintOmission, HintOmissionStats,
+    TraceEntries, TraceEntriesIter,
+};
 pub use clause_trace_resolution::{
     validate_clause_trace_resolution, validate_clause_trace_resolution_interruptible,
     validate_clause_trace_resolution_with_unit_premises_interruptible, ClauseTraceOriginalMapping,

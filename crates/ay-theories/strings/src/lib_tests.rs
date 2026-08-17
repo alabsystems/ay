@@ -1465,14 +1465,11 @@ fn soft_reset_preserves_statistics_and_reduced_terms() {
 /// it (measured wrong-UNSAT witness — see
 /// `NF_CLOSURES_REQUIRING_EXPLICIT_OPT_IN`), while the closures that are
 /// still trusted stay reachable. Naming it explicitly in
-/// `AY_STR_NF_CLOSURES` remains possible for repair work.
+/// `--str-nf-closures` remains possible for repair work.
 #[test]
 fn nf_closure_5_is_not_enabled_by_the_master_switch_alone() {
-    // `AY_STR_NF_CLOSURES` is unset in the test process, so the subset is
+    // No closure subset is installed in the test process, so the subset is
     // `None` and the quarantine list is the only thing that can exclude 5.
-    if std::env::var("AY_STR_NF_CLOSURES").is_ok() {
-        return;
-    }
     STR_NF_TEST_OVERRIDE.with(|c| c.set(true));
     let five = str_nf_closure_enabled(5);
     let trusted: Vec<bool> = (1u8..=4)

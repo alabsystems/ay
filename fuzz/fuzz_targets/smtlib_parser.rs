@@ -9,9 +9,10 @@
 //! handle malformed input and return appropriate errors.
 
 #![no_main]
+#![forbid(unsafe_code)]
 
-use libfuzzer_sys::fuzz_target;
 use ay_frontend::parse;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Try to interpret bytes as UTF-8 string

@@ -62,14 +62,253 @@
 //! There is no payload to forge: the checker re-derives the combination itself
 //! and accepts only what it can reconstruct.
 
+use std::collections::BTreeMap;
+use std::mem::size_of;
+
 use ay_core::{ProofId, TermId, TermStore};
 use num_traits::Zero;
 
-use super::nra_poly::{extract_constraints, MPoly, Monomial, Rel, WorkMeter};
+use super::nra_poly::{
+    bit_scaled, ensure_coeff_width, extract_constraints, rat_bits, MPoly, Monomial, Rel, WorkMeter,
+    WORK_METER_RESOURCE_LIMIT,
+};
 use super::ProofCheckError;
 
 /// Bound on elimination steps, so a wide lemma cannot spend unbounded work.
 const MAX_ELIMINATION_STEPS: u64 = 100_000;
+/// Maximum equality constraints admitted to the span calculation.
+const MAX_EQUALITY_ROWS: usize = 2_048;
+/// Maximum disequalities inspected for membership in the equality span.
+const MAX_DISEQUALITY_ROWS: usize = 1_024;
+/// Maximum nonzero rows retained by the echelon basis.
+const MAX_BASIS_ROWS: usize = 1_024;
+/// Cumulative polynomial terms materialized by extraction and elimination.
+const MAX_MATERIALIZED_TERMS: usize = 200_000;
+/// Cumulative logical accounting limit for polynomial/key/coefficient state.
+///
+/// This is deliberately not advertised as allocator-exact peak RSS: BTree node
+/// layouts and Vec spare capacity are implementation details. The hard
+/// pre-allocation envelope instead comes from the shared 200k produced-
+/// monomial meter, degree-256 key bound, and 4096-bit coefficient cap. This
+/// tighter logical counter limits how much of that finite envelope elimination
+/// may cumulatively copy/materialize.
+const MAX_MATERIALIZED_BYTES: u64 = 64 * 1024 * 1024;
+
+type PivotBasis = BTreeMap<Monomial, MPoly>;
+
+/// Private finite envelope for equality-span bookkeeping.
+///
+/// The shared [`WorkMeter`] bounds rational word operations and monomial/DAG
+/// production before extraction allocates it; degree and coefficient caps bound
+/// each key/value. This companion meter is cumulative *logical* accounting,
+/// not an allocator-exact peak-memory claim. Elimination clone/scale/subtract
+/// outputs are charged by a deterministic logical upper bound before their
+/// allocation, while already-extracted polynomials are accounted immediately
+/// afterward under the shared hard pre-allocation bounds. Every counter uses
+/// checked arithmetic and a cap trip is a refusal, never an acceptance.
+#[derive(Default)]
+struct IdealEnvelope {
+    materialized_terms: usize,
+    materialized_bytes: u64,
+}
+
+impl IdealEnvelope {
+    fn charge_allocation(&mut self, terms: usize, bytes: u64, what: &str) -> Result<(), String> {
+        self.materialized_terms = self
+            .materialized_terms
+            .checked_add(terms)
+            .ok_or_else(|| "linear-ideal term accounting overflow".to_string())?;
+        if self.materialized_terms > MAX_MATERIALIZED_TERMS {
+            return Err(format!(
+                "linear-ideal materialized-term cap exceeded while {what}"
+            ));
+        }
+        self.materialized_bytes = self
+            .materialized_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| "linear-ideal byte accounting overflow".to_string())?;
+        if self.materialized_bytes > MAX_MATERIALIZED_BYTES {
+            return Err(format!(
+                "linear-ideal materialized-byte cap exceeded while {what}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge_poly(
+        &mut self,
+        poly: &MPoly,
+        meter: &mut WorkMeter<'_>,
+        what: &str,
+    ) -> Result<(), String> {
+        let mut bytes = u64::try_from(size_of::<MPoly>())
+            .map_err(|_| "linear-ideal size accounting overflow".to_string())?;
+        precharge_poly_scan(poly, meter)?;
+        for (index, (monomial, coeff)) in poly.terms.iter().enumerate() {
+            meter.poll_loop(index)?;
+            ensure_coeff_width(coeff)?;
+            let key_items = u64::try_from(monomial.len())
+                .map_err(|_| "linear-ideal key accounting overflow".to_string())?;
+            let key_item_bytes = u64::try_from(size_of::<(TermId, u32)>())
+                .map_err(|_| "linear-ideal key accounting overflow".to_string())?;
+            let key_bytes = key_items
+                .checked_mul(key_item_bytes)
+                .ok_or_else(|| "linear-ideal key accounting overflow".to_string())?;
+            let coeff_bytes = rat_bits(coeff).saturating_add(7) / 8;
+            bytes = bytes
+                .checked_add(key_bytes)
+                .and_then(|n| n.checked_add(coeff_bytes))
+                .and_then(|n| n.checked_add(64)) // deterministic logical node/value overhead
+                .ok_or_else(|| "linear-ideal byte accounting overflow".to_string())?;
+        }
+        self.charge_allocation(poly.terms.len(), bytes, what)
+    }
+
+    /// Precharge one output whose monomial keys are a subset of `shape` and
+    /// whose coefficients may grow up to the global width cap.
+    fn charge_poly_upper(
+        &mut self,
+        shape: &MPoly,
+        meter: &mut WorkMeter<'_>,
+        what: &str,
+    ) -> Result<(), String> {
+        let mut bytes = u64::try_from(size_of::<MPoly>())
+            .map_err(|_| "linear-ideal size accounting overflow".to_string())?;
+        precharge_poly_scan(shape, meter)?;
+        for (index, (monomial, coeff)) in shape.terms.iter().enumerate() {
+            meter.poll_loop(index)?;
+            ensure_coeff_width(coeff)?;
+            let key_items = u64::try_from(monomial.len())
+                .map_err(|_| "linear-ideal key accounting overflow".to_string())?;
+            let key_item_bytes = u64::try_from(size_of::<(TermId, u32)>())
+                .map_err(|_| "linear-ideal key accounting overflow".to_string())?;
+            let key_bytes = key_items
+                .checked_mul(key_item_bytes)
+                .ok_or_else(|| "linear-ideal key accounting overflow".to_string())?;
+            let max_coeff_bytes = super::nra_poly::MAX_POLY_COEFF_BITS.saturating_add(7) / 8;
+            bytes = bytes
+                .checked_add(key_bytes)
+                .and_then(|n| n.checked_add(max_coeff_bytes))
+                .and_then(|n| n.checked_add(64))
+                .ok_or_else(|| "linear-ideal byte accounting overflow".to_string())?;
+        }
+        self.charge_allocation(shape.terms.len(), bytes, what)
+    }
+
+    fn charge_pivot_lookup(
+        &mut self,
+        basis_len: usize,
+        pivot: &Monomial,
+        meter: &mut WorkMeter<'_>,
+    ) -> Result<(), String> {
+        // `BTreeMap` gives indexed deterministic lookup. Charge the stronger
+        // full-row/key-width bound, so implementation details of its node
+        // fanout cannot make the accounting optimistic.
+        let rows = u64::try_from(basis_len.saturating_add(1))
+            .map_err(|_| "linear-ideal pivot accounting overflow".to_string())?;
+        let key_width = u64::try_from(pivot.len().saturating_add(1))
+            .map_err(|_| "linear-ideal pivot accounting overflow".to_string())?;
+        let work = rows
+            .checked_mul(key_width)
+            .ok_or_else(|| "linear-ideal pivot accounting overflow".to_string())?;
+        meter.charge_ops(work)
+    }
+
+    fn charge_leading_lookup(
+        &mut self,
+        poly_len: usize,
+        meter: &mut WorkMeter<'_>,
+    ) -> Result<(), String> {
+        // Charge a full deterministic map scan although `next_back` is
+        // logarithmic/constant-amortized. This covers traversal plus every
+        // possible monomial-key comparison with room to spare.
+        let rows = u64::try_from(poly_len.saturating_add(1))
+            .map_err(|_| "linear-ideal leading accounting overflow".to_string())?;
+        let key_width = u64::from(super::nra_poly::MAX_POLY_DEGREE).saturating_add(1);
+        meter.charge_ops(
+            rows.checked_mul(key_width)
+                .ok_or_else(|| "linear-ideal leading accounting overflow".to_string())?,
+        )
+    }
+
+    fn leading_term<'poly>(
+        &mut self,
+        poly: &'poly MPoly,
+        meter: &mut WorkMeter<'_>,
+    ) -> Result<Option<(&'poly Monomial, &'poly num_rational::BigRational)>, String> {
+        self.charge_leading_lookup(poly.terms.len(), meter)?;
+        Ok(poly.terms.iter().next_back())
+    }
+
+    fn clone_leading(
+        &mut self,
+        monomial: &Monomial,
+        coeff: &num_rational::BigRational,
+        meter: &mut WorkMeter<'_>,
+    ) -> Result<(Monomial, num_rational::BigRational), String> {
+        ensure_coeff_width(coeff)?;
+        let key_items = u64::try_from(monomial.len())
+            .map_err(|_| "linear-ideal leading-key accounting overflow".to_string())?;
+        let work = key_items
+            .checked_add(bit_scaled(1, rat_bits(coeff)))
+            .ok_or_else(|| "linear-ideal leading-clone accounting overflow".to_string())?;
+        meter.charge_ops(work)?;
+        let key_bytes = key_items
+            .checked_mul(
+                u64::try_from(size_of::<(TermId, u32)>())
+                    .map_err(|_| "linear-ideal leading-key accounting overflow".to_string())?,
+            )
+            .ok_or_else(|| "linear-ideal leading-key accounting overflow".to_string())?;
+        let bytes = key_bytes
+            .checked_add(rat_bits(coeff).saturating_add(7) / 8)
+            .ok_or_else(|| "linear-ideal leading-clone accounting overflow".to_string())?;
+        self.charge_allocation(1, bytes, "cloning a leading pivot and coefficient")?;
+        meter.charge_structural_monomials(1)?;
+        let clone = (monomial.clone(), coeff.clone());
+        ensure_coeff_width(&clone.1)?;
+        Ok(clone)
+    }
+
+    fn reciprocal(
+        &mut self,
+        coeff: &num_rational::BigRational,
+        meter: &mut WorkMeter<'_>,
+    ) -> Result<num_rational::BigRational, String> {
+        ensure_coeff_width(coeff)?;
+        meter.charge_ops(bit_scaled(1, rat_bits(coeff)))?;
+        if coeff.is_zero() {
+            return Err("zero leading coefficient in linear-ideal basis".to_string());
+        }
+        let bytes = rat_bits(coeff)
+            .saturating_add(7)
+            .checked_div(8)
+            .and_then(|payload| {
+                payload.checked_add(u64::try_from(size_of::<num_rational::BigRational>()).ok()?)
+            })
+            .ok_or_else(|| "linear-ideal reciprocal accounting overflow".to_string())?;
+        let caller_bytes =
+            usize::try_from(bytes).map_err(|_| WORK_METER_RESOURCE_LIMIT.to_string())?;
+        meter.charge_private_allocation(0, caller_bytes)?;
+        self.charge_allocation(0, bytes, "materializing a leading-coefficient reciprocal")?;
+        meter.charge_rational_scratch(rat_bits(coeff).saturating_add(1))?;
+        let inverse = coeff.recip();
+        ensure_coeff_width(&inverse)?;
+        Ok(inverse)
+    }
+}
+
+fn precharge_poly_scan(poly: &MPoly, meter: &mut WorkMeter<'_>) -> Result<(), String> {
+    let terms = u64::try_from(poly.terms.len())
+        .map_err(|_| "linear-ideal scan accounting overflow".to_string())?;
+    let per_term = u64::from(super::nra_poly::MAX_POLY_DEGREE)
+        .checked_add(bit_scaled(1, super::nra_poly::MAX_POLY_COEFF_BITS))
+        .ok_or_else(|| "linear-ideal scan accounting overflow".to_string())?;
+    meter.charge_ops(
+        terms
+            .checked_mul(per_term)
+            .ok_or_else(|| "linear-ideal scan accounting overflow".to_string())?,
+    )
+}
 
 /// Validate a `Generic` arithmetic lemma whose refutation is a linear
 /// combination of equalities over the monomial basis.
@@ -77,22 +316,51 @@ const MAX_ELIMINATION_STEPS: u64 = 100_000;
 /// Returns `Ok(())` only when the checker has itself reconstructed the
 /// combination; every other outcome — including "outside this fragment" — is an
 /// error, so the caller keeps its existing fail-closed behaviour.
+#[cfg(test)]
 pub(crate) fn validate_linear_ideal_refutation(
     terms: &TermStore,
     step_id: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
-    decide_linear_ideal_refutation(terms, clause).map_err(|reason| {
-        ProofCheckError::InvalidTheoryLemma {
-            step: step_id,
-            reason: format!("linear_ideal_refutation: {reason}"),
+    let mut unbounded = |_: usize, _: usize| true;
+    validate_linear_ideal_refutation_with_progress(terms, step_id, clause, &mut unbounded)
+}
+
+#[cfg(test)]
+fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Result<(), String> {
+    let mut unbounded = |_: usize, _: usize| true;
+    decide_linear_ideal_refutation_with_progress(terms, clause, &mut unbounded)
+}
+
+pub(crate) fn validate_linear_ideal_refutation_with_progress(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    decide_linear_ideal_refutation_with_progress(terms, clause, progress).map_err(|reason| {
+        if reason == WORK_METER_RESOURCE_LIMIT {
+            ProofCheckError::ResourceLimit
+        } else {
+            ProofCheckError::InvalidTheoryLemma {
+                step: step_id,
+                reason: format!("linear_ideal_refutation: {reason}"),
+            }
         }
     })
 }
 
-fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Result<(), String> {
-    let mut meter = WorkMeter::new();
+fn decide_linear_ideal_refutation_with_progress(
+    terms: &TermStore,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), String> {
+    let mut meter = WorkMeter::with_progress(progress);
+    meter.poll()?;
     let extraction = extract_constraints(terms, clause, &mut meter)?;
+    meter.poll()?;
+    let mut envelope = IdealEnvelope::default();
+    account_extracted_constraints(&extraction.constraints, &mut meter, &mut envelope)?;
 
     // A conjunct that evaluated to FALSE refutes the negation outright.
     if extraction.const_refuted {
@@ -102,9 +370,32 @@ fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Resul
     let mut equalities: Vec<&MPoly> = Vec::new();
     let mut disequalities: Vec<&MPoly> = Vec::new();
     for constraint in &extraction.constraints {
+        meter.poll()?;
         match constraint.rel {
-            Rel::Eq => equalities.push(&constraint.poly),
-            Rel::Ne => disequalities.push(&constraint.poly),
+            Rel::Eq => {
+                if equalities.len() == MAX_EQUALITY_ROWS {
+                    return Err(format!(
+                        "linear-ideal equality-row cap {MAX_EQUALITY_ROWS} exceeded"
+                    ));
+                }
+                meter.charge_container_slot::<&MPoly>()?;
+                equalities
+                    .try_reserve(1)
+                    .map_err(|_| "linear-ideal equality-row allocation refused".to_string())?;
+                equalities.push(&constraint.poly);
+            }
+            Rel::Ne => {
+                if disequalities.len() == MAX_DISEQUALITY_ROWS {
+                    return Err(format!(
+                        "linear-ideal disequality-row cap {MAX_DISEQUALITY_ROWS} exceeded"
+                    ));
+                }
+                meter.charge_container_slot::<&MPoly>()?;
+                disequalities
+                    .try_reserve(1)
+                    .map_err(|_| "linear-ideal disequality-row allocation refused".to_string())?;
+                disequalities.push(&constraint.poly);
+            }
             // Order constraints carry no equational content for this rule.
             // Ignoring them is conservative (see the module note).
             _ => {}
@@ -117,19 +408,35 @@ fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Resul
 
     // Row-echelon basis of the equality span, each row normalized to leading
     // coefficient 1 so reduction is a single scale-and-subtract.
-    let mut basis: Vec<(Monomial, MPoly)> = Vec::new();
+    let mut basis = PivotBasis::new();
     for poly in &equalities {
-        let residual = reduce(poly, &basis, &mut meter)?;
-        if let Some((lead, coeff)) = leading(&residual) {
-            let inverse = coeff.recip();
+        meter.poll()?;
+        let residual = reduce(poly, &basis, &mut meter, &mut envelope)?;
+        if let Some((lead_ref, coeff_ref)) = envelope.leading_term(&residual, &mut meter)? {
+            if basis.len() == MAX_BASIS_ROWS {
+                return Err(format!(
+                    "linear-ideal basis-row cap {MAX_BASIS_ROWS} exceeded"
+                ));
+            }
+            let (lead, coeff) = envelope.clone_leading(lead_ref, coeff_ref, &mut meter)?;
+            envelope.charge_pivot_lookup(basis.len(), &lead, &mut meter)?;
+            let inverse = envelope.reciprocal(&coeff, &mut meter)?;
+            envelope.charge_poly_upper(
+                &residual,
+                &mut meter,
+                "precharging a normalized basis row",
+            )?;
             let normalized = residual.scale(&inverse, &mut meter)?;
-            basis.push((lead, normalized));
+            if basis.insert(lead, normalized).is_some() {
+                return Err("duplicate pivot survived linear-ideal reduction".to_string());
+            }
         }
     }
 
     // `G` is in the span iff it reduces to the zero polynomial.
     for poly in &disequalities {
-        let residual = reduce(poly, &basis, &mut meter)?;
+        meter.poll()?;
+        let residual = reduce(poly, &basis, &mut meter, &mut envelope)?;
         if residual.terms.is_empty() {
             return Ok(());
         }
@@ -141,15 +448,16 @@ fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Resul
     ))
 }
 
-/// Leading (monomial, coefficient) under the shared monomial order.
-///
-/// `MPoly` prunes zero coefficients on every update, so a non-empty `terms` map
-/// always has a genuinely non-zero leading entry.
-fn leading(poly: &MPoly) -> Option<(Monomial, num_rational::BigRational)> {
-    poly.terms
-        .iter()
-        .next_back()
-        .map(|(monomial, coeff)| (monomial.clone(), coeff.clone()))
+fn account_extracted_constraints(
+    constraints: &[super::nra_poly::Constraint],
+    meter: &mut WorkMeter<'_>,
+    envelope: &mut IdealEnvelope,
+) -> Result<(), String> {
+    for constraint in constraints {
+        meter.poll()?;
+        envelope.charge_poly(&constraint.poly, meter, "accounting extracted constraints")?;
+    }
+    Ok(())
 }
 
 /// Reduce `poly` against the echelon `basis`, cancelling leading monomials.
@@ -159,16 +467,21 @@ fn leading(poly: &MPoly) -> Option<(Monomial, num_rational::BigRational)> {
 /// well-founded order. The meter bounds the work regardless.
 fn reduce(
     poly: &MPoly,
-    basis: &[(Monomial, MPoly)],
-    meter: &mut WorkMeter,
+    basis: &PivotBasis,
+    meter: &mut WorkMeter<'_>,
+    envelope: &mut IdealEnvelope,
 ) -> Result<MPoly, String> {
+    envelope.charge_poly(poly, meter, "precharging an elimination-residual clone")?;
+    meter.charge_structural_monomials(poly.terms.len())?;
     let mut residual = poly.clone();
     let mut steps: u64 = 0;
     loop {
-        let Some((lead, coeff)) = leading(&residual) else {
+        meter.poll()?;
+        let Some((lead, coeff)) = envelope.leading_term(&residual, meter)? else {
             return Ok(residual);
         };
-        let Some((_, row)) = basis.iter().find(|(monomial, _)| *monomial == lead) else {
+        envelope.charge_pivot_lookup(basis.len(), lead, meter)?;
+        let Some(row) = basis.get(lead) else {
             return Ok(residual);
         };
         steps += 1;
@@ -177,105 +490,20 @@ fn reduce(
         }
         meter.charge_ops(1)?;
         debug_assert!(!coeff.is_zero(), "MPoly prunes zero coefficients");
+        let (_, coeff) = envelope.clone_leading(lead, coeff, meter)?;
         // `row` has leading coefficient 1 at `lead`, so this cancels it exactly.
+        envelope.charge_poly_upper(row, meter, "precharging a scaled basis row")?;
         let scaled = row.scale(&coeff, meter)?;
-        residual = residual.sub(&scaled, meter)?;
+        // `sub` starts by cloning `residual` and can then insert every key from
+        // `scaled`; charging both shapes is a conservative upper bound on the
+        // one result map, including coefficient growth to the global cap.
+        envelope.charge_poly_upper(&residual, meter, "precharging a reduced residual (left)")?;
+        envelope.charge_poly_upper(&scaled, meter, "precharging a reduced residual (right)")?;
+        let next = residual.sub(&scaled, meter)?;
+        residual = next;
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ay_core::Sort;
-
-    fn int_var(terms: &mut TermStore, name: &str) -> TermId {
-        terms.mk_var(name, Sort::Int)
-    }
-
-    fn int_const(terms: &mut TermStore, n: i64) -> TermId {
-        terms.mk_int(n.into())
-    }
-
-    /// The motivating shape: loop-invariant consecution, where the nonlinear
-    /// monomials cancel. Clause is `(or (not INV) INV_NEXT)`.
-    #[test]
-    fn accepts_invariant_consecution() {
-        let mut terms = TermStore::new();
-        let n = int_var(&mut terms, "n");
-        let sum = int_var(&mut terms, "sum");
-        let counter = int_var(&mut terms, "counter");
-        let one = int_const(&mut terms, 1);
-
-        // sum + counter*n = n*n
-        let counter_n = terms.mk_mul(vec![counter, n]);
-        let n_n = terms.mk_mul(vec![n, n]);
-        let inv_lhs = terms.mk_add(vec![sum, counter_n]);
-        let inv = terms.mk_eq(inv_lhs, n_n);
-
-        // (sum + n) + (counter - 1)*n = n*n
-        let sum_next = terms.mk_add(vec![sum, n]);
-        let counter_next = terms.mk_sub(vec![counter, one]);
-        let counter_next_n = terms.mk_mul(vec![counter_next, n]);
-        let inv_next_lhs = terms.mk_add(vec![sum_next, counter_next_n]);
-        let inv_next = terms.mk_eq(inv_next_lhs, n_n);
-
-        let clause = vec![terms.mk_not_raw(inv), inv_next];
-        validate_linear_ideal_refutation(&terms, ProofId(0), &clause)
-            .expect("consecution clause is a polynomial identity and must validate");
-    }
-
-    /// A clause that is NOT valid must be refused: the goal equality is not a
-    /// combination of the premise equality (an off-by-one in the update).
-    #[test]
-    fn rejects_non_identity() {
-        let mut terms = TermStore::new();
-        let n = int_var(&mut terms, "n");
-        let sum = int_var(&mut terms, "sum");
-        let counter = int_var(&mut terms, "counter");
-        let one = int_const(&mut terms, 1);
-
-        let counter_n = terms.mk_mul(vec![counter, n]);
-        let n_n = terms.mk_mul(vec![n, n]);
-        let inv_lhs = terms.mk_add(vec![sum, counter_n]);
-        let inv = terms.mk_eq(inv_lhs, n_n);
-
-        // WRONG update: sum + 1 instead of sum + n.
-        let sum_next = terms.mk_add(vec![sum, one]);
-        let counter_next = terms.mk_sub(vec![counter, one]);
-        let counter_next_n = terms.mk_mul(vec![counter_next, n]);
-        let inv_next_lhs = terms.mk_add(vec![sum_next, counter_next_n]);
-        let inv_next = terms.mk_eq(inv_next_lhs, n_n);
-
-        let clause = vec![terms.mk_not_raw(inv), inv_next];
-        validate_linear_ideal_refutation(&terms, ProofId(0), &clause)
-            .expect_err("a non-identity must NOT validate");
-    }
-
-    /// The rule must not accept a clause with no disequality to refute, even
-    /// when the equalities themselves are consistent.
-    #[test]
-    fn rejects_without_disequality() {
-        let mut terms = TermStore::new();
-        let x = int_var(&mut terms, "x");
-        let zero = int_const(&mut terms, 0);
-        let ge = terms.mk_ge(x, zero);
-        let clause = vec![ge];
-        validate_linear_ideal_refutation(&terms, ProofId(0), &clause)
-            .expect_err("no disequality conjunct means nothing is refuted");
-    }
-
-    /// Order constraints alone must never suffice: `x > 0` does not refute
-    /// `x >= 0`. This pins the "ignoring inequalities is conservative" claim —
-    /// the rule must decline rather than infer from them.
-    #[test]
-    fn rejects_order_only_conflict() {
-        let mut terms = TermStore::new();
-        let x = int_var(&mut terms, "x");
-        let zero = int_const(&mut terms, 0);
-        let gt = terms.mk_gt(x, zero);
-        let lt = terms.mk_lt(x, zero);
-        let clause = vec![terms.mk_not_raw(gt), terms.mk_not_raw(lt)];
-        validate_linear_ideal_refutation(&terms, ProofId(0), &clause)
-            .expect_err("this rule decides equalities only; order conflicts belong to Farkas");
-    }
-}
+#[path = "nia_linear_ideal_tests.rs"]
+mod tests;

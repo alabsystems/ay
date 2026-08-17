@@ -122,13 +122,8 @@ pub(crate) fn native_lp_bound_enabled() -> bool {
 /// used to A/B the dense-PB restart win. Without the floor, dense-PB search can
 /// run with ZERO restarts because the glucose LBD ratio never fires.
 pub(crate) fn restart_floor_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("AY_PB_NO_RESTART_FLOOR")
-            .map(|v| v.is_empty() || v == "0")
-            .unwrap_or(true)
-    })
+    // B14: typed A/B switch (`ab_switches`); the never-set env read is gone.
+    crate::ab_switches::get().restart_floor
 }
 
 /// Learned-constraint activity decay: the per-conflict increment is divided by
@@ -5540,16 +5535,13 @@ const EQ_AGG_MAX_VARS: usize = 6000;
 // floor (never the incumbent), so a poll-driven decline is always sound.
 
 /// Emit a one-line trace of each equality-aggregation work-proxy decision
-/// (rows, universe, cost, admit/decline) when `AY_PB_EQAGG_DEBUG` is set, so the
+/// (rows, universe, cost, admit/decline) when `--pb-eqagg-debug` is set, so the
 /// OPT-LIN A/B can confirm the new threshold sheds only the runaway shapes and
 /// loses no real floor. Off by default (no cost on the hot path).
 fn eqagg_debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("AY_PB_EQAGG_DEBUG") {
-        Ok(v) => !(v.is_empty() || v == "0" || v == "false" || v == "no" || v == "off"),
-        Err(_) => false,
-    })
+    *ON.get_or_init(|| ay_core::misc_cli_flags().pb_eqagg_debug)
 }
 
 /// Folds a slice of linear single-literal `PbTerm`s into exact-rational net

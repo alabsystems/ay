@@ -548,13 +548,9 @@ fn run_search(
         .map(|k| k.len() as u64)
         .sum::<u64>()
         .max(1);
-    // Deterministic work ceiling for the whole search, in edge-visits. Sized so
-    // detection stays in the tens of milliseconds on the instances it fires on
-    // while never dominating an easy solve. Overridable for experiments.
-    let work_budget: u64 = std::env::var("AY_SAT_IR_WORK_BUDGET")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000_000);
+    // B2: the work ceiling is the shared constant in `symmetry/mod.rs`; the
+    // env override is deleted.
+    let work_budget: u64 = super::IR_WORK_BUDGET;
 
     let mut search = Search {
         adj: &graph.adj,

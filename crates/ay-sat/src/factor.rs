@@ -88,18 +88,9 @@ const FACTOR_CACHELINE_TICKS_DEFAULT_ON: bool = false;
 /// factor occurrence scans never pay an env syscall.
 #[inline]
 pub(super) fn factor_cacheline_ticks_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        match std::env::var("AY_AB_FACTOR_CACHELINE_TICKS")
-            .ok()
-            .as_deref()
-        {
-            None => FACTOR_CACHELINE_TICKS_DEFAULT_ON,
-            Some("0") => false,
-            Some(_) => true,
-        }
-    })
+    // B21: the AY_AB_FACTOR_CACHELINE_TICKS opt-in is retired; the compiled
+    // default is the value.
+    FACTOR_CACHELINE_TICKS_DEFAULT_ON
 }
 
 /// Compile-time default for [`factor_bin_fastpath_enabled`] when
@@ -130,15 +121,8 @@ const FACTOR_BIN_FASTPATH_DEFAULT_ON: bool = true;
 /// factor path never pays an env syscall.
 #[inline]
 pub(crate) fn factor_bin_fastpath_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(
-        || match std::env::var("AY_AB_FACTOR_BIN_FASTPATH").ok().as_deref() {
-            None => FACTOR_BIN_FASTPATH_DEFAULT_ON,
-            Some("0") => false,
-            Some(_) => true,
-        },
-    )
+    // B26: CLI-owned opt-out (--sat-no-factor-bin-fastpath); env retired.
+    FACTOR_BIN_FASTPATH_DEFAULT_ON && !ay_core::sat_ab_switches().no_factor_bin_fastpath
 }
 
 /// Tick charge for scanning a factor occurrence list of `n` elements.
@@ -1293,12 +1277,12 @@ impl Factor {
         self.schedule.clear();
         self.in_schedule.clear();
         self.in_schedule.resize(self.num_vars * 2, false);
-        // `AY_FACTOR_PROBE=1`: report what the candidate schedule actually saw.
+        // `--sat-factor-probe`: report what the candidate schedule actually saw.
         // AY factors 0 variables where Kissat factors 545, and size limit,
         // scheduling, effort and the acceptance bound are all eliminated — so
         // the open question is whether this schedule is empty (occurrence list
         // build is the defect) or full (quotient construction is).
-        let probe = std::env::var_os("AY_FACTOR_PROBE").is_some();
+        let probe = ay_core::misc_cli_flags().factor_probe;
         let (mut max_count, mut nonzero) = (0usize, 0usize);
         for var_idx in 0..self.num_vars {
             if var_idx * 2 < vals.len() && vals[var_idx * 2] != 0 {

@@ -228,8 +228,12 @@ fn test_qf_alia_const_vs_store_const_diff_default_sat() {
         .expect("invariant: execute succeeds");
 
     assert_eq!(
-        outputs[0], "sat",
-        "const(1) and store(const(0),5,1) differ at index 0 (1 vs 0); I != J is SAT"
+        outputs[0],
+        "sat",
+        "const(1) and store(const(0),5,1) differ at index 0 (1 vs 0); I != J is SAT; \
+         unknown_reason={:?}; statistics={:?}",
+        exec.unknown_reason(),
+        exec.statistics(),
     );
 }
 
@@ -1038,17 +1042,12 @@ const NESTED_ARRAY_FREE_RESIDUE_INPUT: &str = r#"
     (check-sat)
 "#;
 
-/// The fail-closed half of the same boundary: when the CALLER asks for proof
-/// output, the rescue must still decline.
-///
-/// The retained UNSAT would carry `last_proof`, a proof reconstructed from the
-/// full-problem search this quarantine distrusts, while the rescue's own
-/// evidence is a separate refutation with no proof object. Handing that back is
-/// a strictly weaker trust claim than `unknown`, so the guard must survive —
-/// widening it to "always run" would make this answer `unsat` with an unvouched
-/// proof attached.
+/// Proof requests still cannot borrow the residue rescue's semantic evidence.
+/// This query now publishes UNSAT because the full-problem proof itself passes
+/// the strict checker; pin that stronger authority so a future regression
+/// cannot silently relabel residue evidence as a requested proof artifact.
 #[test]
-fn test_nested_array_residue_rescue_declines_when_a_proof_is_requested() {
+fn test_nested_array_proof_request_uses_strict_full_problem_authority() {
     let commands = parse(NESTED_ARRAY_FREE_RESIDUE_INPUT).expect("invariant: valid SMT-LIB input");
     let mut exec = Executor::new();
     exec.set_produce_proofs(true);
@@ -1056,23 +1055,26 @@ fn test_nested_array_residue_rescue_declines_when_a_proof_is_requested() {
         .execute_all(&commands)
         .expect("invariant: execute succeeds");
     assert_eq!(
-        outputs[0], "unknown",
-        "a caller that will observe the proof must keep the fail-closed degrade"
+        outputs[0], "unsat",
+        "a checked full-problem proof may publish independently of residue rescue"
+    );
+    assert!(
+        exec.last_command_unsat_was_strictly_verified(),
+        "a requested proof artifact must be the exact strict authority consumed at publication"
     );
 }
 
-/// The other half of the same boundary: when the refutation GENUINELY needs the
-/// nested array, the residue is satisfiable, the rescue declines, and the
-/// quarantine still fires.
+/// When the refutation genuinely needs the nested array, a satisfiable residue
+/// cannot authorize it. The complete full-problem proof now validates
+/// strictly, however, and is an independent authority for the real UNSAT.
 ///
 /// Here `(select u 0)` is equal to two arrays asserted distinct — an UNSAT that
 /// rests entirely on the guarded lazy array+arithmetic combination. Every
 /// nested-array conjunct is filtered out, leaving the residue `(>= p 0)`, which
-/// is satisfiable. `unknown` is therefore the required answer even though the
-/// input really is unsatisfiable: this path may only ever REPAIR a discarded
-/// UNSAT, never manufacture one.
+/// is satisfiable. Publication must therefore be specifically strict-proof
+/// backed, never attributed to the residue lane.
 #[test]
-fn test_nested_array_dependent_unsat_stays_quarantined() {
+fn test_nested_array_dependent_unsat_uses_strict_full_problem_authority() {
     let input = r#"
         (set-logic AUFLIA)
         (declare-fun u () (Array Int (Array Int Int)))
@@ -1085,19 +1087,23 @@ fn test_nested_array_dependent_unsat_stays_quarantined() {
         (assert (>= p 0))
         (check-sat)
     "#;
-    assert_eq!(
-        solve_one(input),
-        "unknown",
-        "the residue is satisfiable, so the rescue must decline and the \
-         fail-closed quarantine must still degrade"
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    assert_eq!(outputs[0], "unsat");
+    assert!(
+        exec.last_command_unsat_was_strictly_verified(),
+        "the satisfiable residue cannot authorize this nested-array-dependent refutation"
     );
 }
 
-/// The same authorization boundary must cover `check-sat-assuming`; otherwise
-/// moving a nested-array contradiction into an assumption could bypass the
-/// plain-check quarantine and expose an uncertified UNSAT through the API.
+/// The same authorization boundary covers `check-sat-assuming`. A direct
+/// contradiction between an authored equality and an assumption is now
+/// published only because its exact assumption-bound proof validates strictly.
 #[test]
-fn test_nested_array_unsat_assumption_is_quarantined() {
+fn test_nested_array_unsat_assumption_uses_strict_query_authority() {
     let input = r#"
         (set-logic QF_ALIA)
         (declare-const a (Array Int (Array Int Int)))
@@ -1105,7 +1111,16 @@ fn test_nested_array_unsat_assumption_is_quarantined() {
         (assert (= a b))
         (check-sat-assuming ((not (= a b))))
     "#;
-    assert_eq!(solve_one(input), "unknown");
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    assert_eq!(outputs[0], "unsat");
+    assert!(
+        exec.last_command_unsat_was_strictly_verified(),
+        "assumption order and membership must be bound into the consumed strict proof authority"
+    );
 }
 
 /// #arr2lia-inflate: the speculative arrays-to-LIA rescue reduction must not

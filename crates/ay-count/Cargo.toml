@@ -12,6 +12,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+ay-core.workspace = true
 ay-sat.workspace = true
 ay-sys.workspace = true
 num-bigint.workspace = true

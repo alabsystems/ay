@@ -27,13 +27,457 @@
 //! declarations supplied), strict mode fails closed — it never assumes
 //! distinctness by shape alone, which would be unsound.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use ay_core::kani_compat::det_hash_set_with_capacity;
 use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
+use serde::{Deserialize, Serialize};
 
 use super::ProofCheckError;
 
 /// Datatype declarations supplied by the executor: `(datatype_name, [constructor_name, ..])`.
 pub(crate) type DatatypeDecls<'a> = &'a [(String, Vec<String>)];
+
+/// Exact core signature of one datatype constructor, selector, or tester.
+///
+/// The identity is the sticky, collision-free symbol carried by [`TermData`],
+/// not a source-level spelling.  Strict proof checking uses this table to
+/// authenticate both sides of every datatype-member application: declaration
+/// registries that contain names and arities alone are not sufficient because
+/// a caller can construct an [`TermData::App`] with arbitrary argument and
+/// result sorts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatatypeMemberSignature {
+    /// Exact internal constructor, selector, or tester identity.
+    pub identity: String,
+    /// Exact argument sorts, in declaration order.
+    pub argument_sorts: Vec<Sort>,
+    /// Exact result sort.
+    pub result_sort: Sort,
+    /// Exact bound term for a nullary constructor. `None` for every selector,
+    /// tester, and non-nullary constructor.
+    ///
+    /// A name-and-sort-equivalent [`TermData::Var`] is not constructor
+    /// authority: source shadowing may create another variable with the same
+    /// spelling. The live frontend records the one exact bound constructor
+    /// term and schema-v3 bundles preserve its positional [`TermId`].
+    pub nullary_term: Option<TermId>,
+}
+fn invalid_signature_context(reason: impl Into<String>) -> ProofCheckError {
+    ProofCheckError::InvalidDatatypeSignatureContext {
+        reason: reason.into(),
+    }
+}
+
+type DatatypeSignatureMap<'a> = BTreeMap<&'a str, &'a DatatypeMemberSignature>;
+
+/// Validate one complete typed datatype declaration context and every use of
+/// its member identities in the term store.
+///
+/// This is deliberately a whole-store preflight.  Once an identity is claimed
+/// as a datatype member, no malformed occurrence of that identity may coexist
+/// in the authenticated store, even when a particular proof step happens not
+/// to visit it.  The declaration/name registries and typed table are required
+/// to be exact, complete, and mutually consistent.
+pub(crate) fn validate_datatype_signature_context(
+    terms: &TermStore,
+    dt_decls: Option<DatatypeDecls<'_>>,
+    ctor_selectors: Option<SelectorDecls<'_>>,
+    member_signatures: &[DatatypeMemberSignature],
+) -> Result<(), ProofCheckError> {
+    let declarations = dt_decls.unwrap_or(&[]);
+    let selectors = ctor_selectors.unwrap_or(&[]);
+    let signatures = collect_member_signatures(member_signatures)?;
+    let mut expected_members = BTreeSet::new();
+    let constructor_carriers =
+        collect_constructor_declarations(declarations, &mut expected_members)?;
+    let selector_lists =
+        collect_selector_declarations(selectors, &constructor_carriers, &mut expected_members)?;
+
+    validate_declared_member_signatures(
+        terms,
+        &signatures,
+        &constructor_carriers,
+        &selector_lists,
+    )?;
+    validate_exact_member_set(&signatures, &expected_members)?;
+    validate_datatype_member_terms(terms, &signatures)
+}
+
+fn collect_member_signatures(
+    member_signatures: &[DatatypeMemberSignature],
+) -> Result<DatatypeSignatureMap<'_>, ProofCheckError> {
+    let mut signatures = BTreeMap::new();
+    for signature in member_signatures {
+        if signature.identity.is_empty() {
+            return Err(invalid_signature_context(
+                "datatype member signature has an empty identity",
+            ));
+        }
+        if signatures
+            .insert(signature.identity.as_str(), signature)
+            .is_some()
+        {
+            return Err(invalid_signature_context(format!(
+                "datatype member signature {:?} is duplicated",
+                signature.identity
+            )));
+        }
+    }
+    Ok(signatures)
+}
+
+fn collect_constructor_declarations<'a>(
+    declarations: DatatypeDecls<'a>,
+    expected_members: &mut BTreeSet<String>,
+) -> Result<BTreeMap<&'a str, &'a str>, ProofCheckError> {
+    let mut datatype_names = BTreeSet::new();
+    let mut constructor_carriers = BTreeMap::new();
+    for (datatype, constructors) in declarations {
+        if datatype.is_empty() || !datatype_names.insert(datatype.as_str()) {
+            return Err(invalid_signature_context(format!(
+                "datatype declaration name {datatype:?} is empty or duplicated"
+            )));
+        }
+        if constructors.is_empty() {
+            return Err(invalid_signature_context(format!(
+                "datatype {datatype:?} has no constructors"
+            )));
+        }
+        for constructor in constructors {
+            if constructor.is_empty()
+                || constructor_carriers
+                    .insert(constructor.as_str(), datatype.as_str())
+                    .is_some()
+            {
+                return Err(invalid_signature_context(format!(
+                    "constructor declaration name {constructor:?} is empty or duplicated"
+                )));
+            }
+            if !expected_members.insert(constructor.clone()) {
+                return Err(invalid_signature_context(format!(
+                    "datatype member identity {constructor:?} is ambiguous"
+                )));
+            }
+            let tester = format!("is-{constructor}");
+            if !expected_members.insert(tester.clone()) {
+                return Err(invalid_signature_context(format!(
+                    "derived tester identity {tester:?} is ambiguous"
+                )));
+            }
+        }
+    }
+    Ok(constructor_carriers)
+}
+
+fn collect_selector_declarations<'a>(
+    selectors: SelectorDecls<'a>,
+    constructor_carriers: &BTreeMap<&str, &str>,
+    expected_members: &mut BTreeSet<String>,
+) -> Result<BTreeMap<&'a str, &'a [String]>, ProofCheckError> {
+    let mut selector_lists = BTreeMap::new();
+    for (constructor, fields) in selectors {
+        if !constructor_carriers.contains_key(constructor.as_str()) {
+            return Err(invalid_signature_context(format!(
+                "selector declaration references unknown constructor {constructor:?}"
+            )));
+        }
+        if selector_lists
+            .insert(constructor.as_str(), fields.as_slice())
+            .is_some()
+        {
+            return Err(invalid_signature_context(format!(
+                "selector declaration for constructor {constructor:?} is duplicated"
+            )));
+        }
+        for selector in fields {
+            if selector.is_empty() || !expected_members.insert(selector.clone()) {
+                return Err(invalid_signature_context(format!(
+                    "selector identity {selector:?} is empty or ambiguous"
+                )));
+            }
+        }
+    }
+    Ok(selector_lists)
+}
+
+fn validate_declared_member_signatures(
+    terms: &TermStore,
+    signatures: &DatatypeSignatureMap<'_>,
+    constructor_carriers: &BTreeMap<&str, &str>,
+    selector_lists: &BTreeMap<&str, &[String]>,
+) -> Result<(), ProofCheckError> {
+    for (&constructor, &datatype) in constructor_carriers {
+        let Some(&fields) = selector_lists.get(constructor) else {
+            return Err(invalid_signature_context(format!(
+                "constructor {constructor:?} is missing its complete selector declaration"
+            )));
+        };
+        let constructor_signature =
+            validate_constructor_signature(terms, signatures, constructor, datatype, fields)?;
+        validate_tester_signature(signatures, constructor, constructor_signature)?;
+        validate_selector_signatures(signatures, fields, constructor_signature)?;
+    }
+    Ok(())
+}
+
+fn validate_constructor_signature<'a>(
+    terms: &TermStore,
+    signatures: &DatatypeSignatureMap<'a>,
+    constructor: &str,
+    datatype: &str,
+    fields: &[String],
+) -> Result<&'a DatatypeMemberSignature, ProofCheckError> {
+    let Some(signature) = signatures.get(constructor).copied() else {
+        return Err(invalid_signature_context(format!(
+            "constructor {constructor:?} is missing its exact typed signature"
+        )));
+    };
+    if !sort_matches_datatype(&signature.result_sort, datatype) {
+        return Err(invalid_signature_context(format!(
+            "constructor {constructor:?} has result sort {}, expected datatype {datatype:?}",
+            signature.result_sort
+        )));
+    }
+    if signature.argument_sorts.len() != fields.len() {
+        return Err(invalid_signature_context(format!(
+            "constructor {constructor:?} has {} typed arguments but {} declared selectors",
+            signature.argument_sorts.len(),
+            fields.len()
+        )));
+    }
+    match (signature.argument_sorts.is_empty(), signature.nullary_term) {
+        (true, Some(term)) => {
+            if term.index() >= terms.len() {
+                return Err(invalid_signature_context(format!(
+                    "nullary constructor {constructor:?} binds missing term {term}"
+                )));
+            }
+            if !matches!(
+                terms.get(term),
+                TermData::Var(identity, _) if identity == constructor
+            ) || terms.sort(term) != &signature.result_sort
+            {
+                return Err(invalid_signature_context(format!(
+                    "nullary constructor {constructor:?} does not bind its exact same-name variable of the declared result sort"
+                )));
+            }
+        }
+        (true, None) => {
+            return Err(invalid_signature_context(format!(
+                "nullary constructor {constructor:?} is missing its exact bound term"
+            )));
+        }
+        (false, Some(term)) => {
+            return Err(invalid_signature_context(format!(
+                "non-nullary constructor {constructor:?} unexpectedly binds nullary term {term}"
+            )));
+        }
+        (false, None) => {}
+    }
+    Ok(signature)
+}
+
+fn validate_tester_signature(
+    signatures: &DatatypeSignatureMap<'_>,
+    constructor: &str,
+    constructor_signature: &DatatypeMemberSignature,
+) -> Result<(), ProofCheckError> {
+    let tester = format!("is-{constructor}");
+    let Some(signature) = signatures.get(tester.as_str()).copied() else {
+        return Err(invalid_signature_context(format!(
+            "tester {tester:?} is missing its exact typed signature"
+        )));
+    };
+    if signature.argument_sorts.as_slice()
+        != std::slice::from_ref(&constructor_signature.result_sort)
+        || signature.result_sort != Sort::Bool
+    {
+        return Err(invalid_signature_context(format!(
+            "tester {tester:?} does not have the exact signature ({}) -> Bool",
+            constructor_signature.result_sort
+        )));
+    }
+    if signature.nullary_term.is_some() {
+        return Err(invalid_signature_context(format!(
+            "tester {tester:?} unexpectedly carries a nullary constructor binding"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_selector_signatures(
+    signatures: &DatatypeSignatureMap<'_>,
+    fields: &[String],
+    constructor_signature: &DatatypeMemberSignature,
+) -> Result<(), ProofCheckError> {
+    for (index, selector) in fields.iter().enumerate() {
+        let Some(signature) = signatures.get(selector.as_str()).copied() else {
+            return Err(invalid_signature_context(format!(
+                "selector {selector:?} is missing its exact typed signature"
+            )));
+        };
+        if signature.argument_sorts.as_slice()
+            != std::slice::from_ref(&constructor_signature.result_sort)
+            || signature.result_sort != constructor_signature.argument_sorts[index]
+        {
+            return Err(invalid_signature_context(format!(
+                "selector {selector:?} does not have the exact declared field-{index} signature"
+            )));
+        }
+        if signature.nullary_term.is_some() {
+            return Err(invalid_signature_context(format!(
+                "selector {selector:?} unexpectedly carries a nullary constructor binding"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_exact_member_set(
+    signatures: &DatatypeSignatureMap<'_>,
+    expected_members: &BTreeSet<String>,
+) -> Result<(), ProofCheckError> {
+    let actual_members: BTreeSet<&str> = signatures.keys().copied().collect();
+    let expected_member_refs: BTreeSet<&str> =
+        expected_members.iter().map(String::as_str).collect();
+    if actual_members != expected_member_refs {
+        let missing: Vec<_> = expected_member_refs
+            .difference(&actual_members)
+            .copied()
+            .collect();
+        let extra: Vec<_> = actual_members
+            .difference(&expected_member_refs)
+            .copied()
+            .collect();
+        return Err(invalid_signature_context(format!(
+            "typed datatype member table is not exact (missing {missing:?}, extra {extra:?})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_datatype_member_terms(
+    terms: &TermStore,
+    signatures: &DatatypeSignatureMap<'_>,
+) -> Result<(), ProofCheckError> {
+    for node_index in 0..terms.len() {
+        let raw_id = u32::try_from(node_index).map_err(|_| {
+            invalid_signature_context("term-store index does not fit the TermId representation")
+        })?;
+        let term = TermId::new(raw_id);
+        match terms.get(term) {
+            TermData::Var(identity, _) => {
+                let Some(signature) = signatures.get(identity.as_str()).copied() else {
+                    continue;
+                };
+                validate_member_variable(terms, term, identity, signature)?;
+            }
+            TermData::App(Symbol::Named(identity), arguments) => {
+                let Some(signature) = signatures.get(identity.as_str()).copied() else {
+                    continue;
+                };
+                validate_member_application(terms, term, identity, arguments, signature)?;
+            }
+            TermData::App(Symbol::Indexed(identity, _), _)
+                if signatures.contains_key(identity.as_str()) =>
+            {
+                return Err(invalid_signature_context(format!(
+                    "datatype member term {term} `{identity}` uses an indexed symbol"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_member_variable(
+    terms: &TermStore,
+    term: TermId,
+    identity: &str,
+    signature: &DatatypeMemberSignature,
+) -> Result<(), ProofCheckError> {
+    if signature.nullary_term != Some(term) {
+        return Err(invalid_signature_context(format!(
+            "datatype member variable {term} `{identity}` is not its declaration's exact nullary constructor binding"
+        )));
+    }
+    if terms.sort(term) != &signature.result_sort {
+        return Err(invalid_signature_context(format!(
+            "datatype member term {term} `{identity}` has result sort {}, expected {}",
+            terms.sort(term),
+            signature.result_sort
+        )));
+    }
+    Ok(())
+}
+
+/// Validate one `App(Named(identity), arguments)` occurrence of a datatype
+/// member.
+///
+/// A NULLARY constructor has two authenticated core representations, and both
+/// reach here:
+///
+/// - `declare-datatype` binds it as an exact [`TermData::Var`], recorded as
+///   [`DatatypeMemberSignature::nullary_term`] (see
+///   `elaborate::datatypes::register_elaborated_datatype_constructors`).
+/// - The embedder path `try_declare_fun(C, &[], dt)` + `try_apply(&C, &[])`,
+///   and the SMT-LIB `(C)` spelling, instead build a ZERO-ARGUMENT
+///   `App(Named(C), [])`.
+///
+/// The datatype solver treats the two identically: `euf::dt` classifies any
+/// `App(Symbol::Named(name), args)` whose `name` `is_constructor` as a
+/// constructor term, arity 0 included. So the application form is not a
+/// malformed occurrence — declining it rejected proofs of obligations the
+/// solver had correctly refuted.
+///
+/// Authority for an application comes from the exact member identity, which is
+/// already the rule for every non-nullary constructor, selector, and tester
+/// application below. Only the [`TermData::Var`] form needs the extra TermId
+/// pin (see [`validate_member_variable`]), because a shadowing source variable
+/// can share a constructor's spelling while an application of the exact
+/// internal identity cannot.
+///
+/// A nullary constructor applied to a NON-EMPTY argument list is still
+/// rejected: its `argument_sorts` are empty, so the arity check below fails.
+fn validate_member_application(
+    terms: &TermStore,
+    term: TermId,
+    identity: &str,
+    arguments: &[TermId],
+    signature: &DatatypeMemberSignature,
+) -> Result<(), ProofCheckError> {
+    if arguments.len() != signature.argument_sorts.len() {
+        return Err(invalid_signature_context(format!(
+            "datatype member term {term} `{identity}` has {} arguments, expected {}",
+            arguments.len(),
+            signature.argument_sorts.len()
+        )));
+    }
+    for (index, (&argument, expected_sort)) in arguments
+        .iter()
+        .zip(signature.argument_sorts.iter())
+        .enumerate()
+    {
+        if terms.sort(argument) != expected_sort {
+            return Err(invalid_signature_context(format!(
+                "datatype member term {term} `{identity}` argument {index} has sort {}, expected {expected_sort}",
+                terms.sort(argument)
+            )));
+        }
+    }
+    if terms.sort(term) != &signature.result_sort {
+        return Err(invalid_signature_context(format!(
+            "datatype member term {term} `{identity}` has result sort {}, expected {}",
+            terms.sort(term),
+            signature.result_sort
+        )));
+    }
+    Ok(())
+}
 
 /// Recognize whether `clause` is a valid datatype constructor-distinctness
 /// lemma under the given declarations — i.e. whether
@@ -132,7 +576,7 @@ pub fn recognize_datatype_tester_eval(
     clause: &[TermId],
     dt_decls: &[(String, Vec<String>)],
 ) -> bool {
-    validate_datatype_tester_eval(terms, ProofId(0), clause, dt_decls, None).is_ok()
+    validate_datatype_tester_eval(terms, ProofId(0), clause, dt_decls, None, true).is_ok()
 }
 
 /// Declaration-complete recognizer used by the executor for tester axioms that
@@ -144,7 +588,15 @@ pub fn recognize_datatype_tester_eval_with_selectors(
     dt_decls: &[(String, Vec<String>)],
     ctor_selectors: &[(String, Vec<String>)],
 ) -> bool {
-    validate_datatype_tester_eval(terms, ProofId(0), clause, dt_decls, Some(ctor_selectors)).is_ok()
+    validate_datatype_tester_eval(
+        terms,
+        ProofId(0),
+        clause,
+        dt_decls,
+        Some(ctor_selectors),
+        true,
+    )
+    .is_ok()
 }
 
 /// Validate an exact datatype tester axiom.
@@ -168,6 +620,7 @@ pub(crate) fn validate_datatype_tester_eval(
     clause: &[TermId],
     dt_decls: DatatypeDecls<'_>,
     ctor_selectors: Option<&[(String, Vec<String>)]>,
+    typed_member_context: bool,
 ) -> Result<(), ProofCheckError> {
     let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
         step: step_id,
@@ -186,6 +639,12 @@ pub(crate) fn validate_datatype_tester_eval(
 
     // Concrete unit evaluation: `is-C(C(..))` / `¬is-C(D(..))`.
     if let [literal] = literals.as_slice() {
+        if !typed_member_context {
+            return Err(invalid(
+                "concrete datatype tester evaluation requires exact typed member signatures"
+                    .to_string(),
+            ));
+        }
         let (tester, positive) = match terms.get(*literal) {
             TermData::Not(inner) => (*inner, false),
             _ => (*literal, true),
@@ -719,6 +1178,264 @@ pub(crate) fn validate_datatype_selector_project(
          for a registered field-i selector"
             .to_string(),
     ))
+}
+
+/// Recognize whether `clause` is a valid datatype constructor-coverage
+/// (exhaustiveness) lemma under the given declarations — i.e. whether
+/// [`validate_datatype_exhaustive`] would accept it.
+///
+/// The DT axiom recorder (`ay-dpll`) calls this to tag the eagerly injected
+/// exhaustiveness disjunctions with the strict-checkable `DatatypeExhaustive`
+/// kind. Because it IS the strict validator, classifier and checker cannot
+/// drift: a clause is tagged only if strict mode will independently
+/// re-validate it.
+#[must_use]
+pub fn recognize_datatype_exhaustive(
+    terms: &TermStore,
+    clause: &[TermId],
+    dt_decls: &[(String, Vec<String>)],
+) -> bool {
+    validate_datatype_exhaustive(terms, ProofId(0), clause, dt_decls).is_ok()
+}
+
+/// Validate a `DatatypeExhaustive` lemma in strict mode against the datatype
+/// declarations.
+///
+/// Accepted shape: `(cl (is-C1 t) ... (is-Ck t))` — one POSITIVE tester per
+/// declared constructor of `t`'s datatype, every tester applied to the SAME
+/// scrutinee `t`, with the tester set covering the declared constructor list
+/// EXACTLY (no omission, no duplicate, no foreign tester). For a
+/// single-constructor datatype the disjunction degenerates to the unit
+/// `(cl (is-C t))` (that is what `mk_or` interns), which is accepted.
+///
+/// The coverage list is re-derived from the declaration registry — the clause
+/// is never trusted to name "all" constructors by itself, so an exhaustiveness
+/// claim over a truncated tester set fails closed. The scrutinee must NOT
+/// itself be a registered constructor application: the emitter never generates
+/// coverage over an explicit constructor (it is redundant there), and that
+/// shape belongs to the tester-EVALUATION family with its own validator —
+/// keeping the two lanes disjoint. Rejecting more is always fail-closed.
+pub(crate) fn validate_datatype_exhaustive(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+
+    let literals = flatten_clause_literals(terms, clause);
+    if literals.is_empty() {
+        return Err(invalid(
+            "datatype exhaustiveness clause must be non-empty".to_string(),
+        ));
+    }
+
+    let mut subject: Option<TermId> = None;
+    let mut datatype: Option<&str> = None;
+    let mut tester_names: Vec<&str> = Vec::new();
+    for &literal in &literals {
+        if matches!(terms.get(literal), TermData::Not(_)) {
+            return Err(invalid(
+                "datatype exhaustiveness requires POSITIVE testers only".to_string(),
+            ));
+        }
+        let (ctor, value) = tester_application(terms, literal).ok_or_else(|| {
+            invalid("datatype exhaustiveness clause has a non-tester literal".to_string())
+        })?;
+        let dt = constructor_datatype(dt_decls, ctor).ok_or_else(|| {
+            invalid("datatype exhaustiveness tester names an unregistered constructor".to_string())
+        })?;
+        if subject
+            .replace(value)
+            .is_some_and(|previous| previous != value)
+        {
+            return Err(invalid(
+                "datatype exhaustiveness testers must share ONE scrutinee".to_string(),
+            ));
+        }
+        if datatype.replace(dt).is_some_and(|previous| previous != dt) {
+            return Err(invalid(
+                "datatype exhaustiveness testers must belong to ONE datatype".to_string(),
+            ));
+        }
+        if tester_names.contains(&ctor) {
+            return Err(invalid(
+                "datatype exhaustiveness repeats a constructor tester".to_string(),
+            ));
+        }
+        tester_names.push(ctor);
+    }
+    let (Some(dt), Some(subject)) = (datatype, subject) else {
+        return Err(invalid(
+            "datatype exhaustiveness clause has no tester".to_string(),
+        ));
+    };
+    if !sort_matches_datatype(terms.sort(subject), dt) {
+        return Err(invalid(
+            "datatype exhaustiveness scrutinee sort does not match the testers' datatype"
+                .to_string(),
+        ));
+    }
+    if constructor_head(terms, dt_decls, subject).is_some() {
+        return Err(invalid(
+            "datatype exhaustiveness scrutinee must not itself be a constructor \
+             application; that shape is tester EVALUATION"
+                .to_string(),
+        ));
+    }
+    let constructors = dt_decls
+        .iter()
+        .find_map(|(name, constructors)| (name == dt).then_some(constructors))
+        .ok_or_else(|| invalid("datatype declaration disappeared during validation".to_string()))?;
+    if tester_names.len() == constructors.len()
+        && constructors
+            .iter()
+            .all(|ctor| tester_names.contains(&ctor.as_str()))
+    {
+        Ok(())
+    } else {
+        Err(invalid(
+            "datatype exhaustiveness omits or adds a constructor relative to the \
+             declared constructor list"
+                .to_string(),
+        ))
+    }
+}
+
+/// Recognize whether `clause` is a valid guarded constructor-reconstruction
+/// lemma under the given registries — i.e. whether
+/// [`validate_datatype_constructor_reconstruct`] would accept it.
+///
+/// The DT axiom recorder (`ay-dpll`) calls this to tag the eagerly injected
+/// constructor axioms (`is-C(t) => t = C(sel_1(t), ..)`, desugared to the
+/// guarded disjunction at `mk_implies`) with the strict-checkable
+/// `DatatypeConstructorReconstruct` kind. Shares the exact validator, so the
+/// classifier and checker cannot drift.
+#[must_use]
+pub fn recognize_datatype_constructor_reconstruct(
+    terms: &TermStore,
+    clause: &[TermId],
+    dt_decls: &[(String, Vec<String>)],
+    ctor_selectors: &[(String, Vec<String>)],
+) -> bool {
+    validate_datatype_constructor_reconstruct(terms, ProofId(0), clause, dt_decls, ctor_selectors)
+        .is_ok()
+}
+
+/// Validate a `DatatypeConstructorReconstruct` lemma in strict mode against
+/// the datatype AND constructor→selector registries.
+///
+/// Accepted shape — exactly what the DT axiom emitter interns for its
+/// constructor family (`mk_implies` desugars `=>` to a disjunction whose
+/// literal order is canonicalized, and `mk_eq` orients the equality
+/// arbitrarily, so both orders of both are accepted):
+///
+/// ```text
+/// (cl (not (is-C t)) (= t (C (sel_1 t) .. (sel_k t))))   k >= 1
+/// (cl (not (is-C t)) (= t C))                            C nullary
+/// ```
+///
+/// Soundness: if `t` is built by constructor `C` then each `sel_i(t)` is
+/// `t`'s field `i`, so re-applying `C` to ALL its selector projections in
+/// declared field order rebuilds `t`; otherwise the guard literal holds. The
+/// argument rests on `sel_1 .. sel_k` being EXACTLY `C`'s declared selector
+/// list in declared order — re-derived here from the registry, never from the
+/// clause — so a permuted (`C(snd(t), fst(t))`), truncated, repeated, or
+/// foreign selector chain fails closed, as does an unregistered constructor,
+/// a tester/equality subject mismatch, or a scrutinee whose sort is not `C`'s
+/// datatype. Nullary reconstruction requires the registry to record `C` with
+/// ZERO fields; term shape alone (`Var` / zero-arg `App`) is forgeable.
+pub(crate) fn validate_datatype_constructor_reconstruct(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+    ctor_selectors: SelectorDecls<'_>,
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+
+    let literals = flatten_clause_literals(terms, clause);
+    if literals.len() != 2 {
+        return Err(invalid(format!(
+            "datatype constructor reconstruction has {} literals; expected the guarded \
+             disjunction (cl (not (is-C t)) (= t (C (sel_1 t) ..)))",
+            literals.len()
+        )));
+    }
+
+    // `mk_or` canonicalizes literal order, `mk_eq` orients its operands: try
+    // both literal assignments and both equality orientations.
+    for (guard, conclusion) in [(literals[0], literals[1]), (literals[1], literals[0])] {
+        let TermData::Not(tester) = terms.get(guard) else {
+            continue;
+        };
+        let Some((ctor, scrutinee)) = tester_application(terms, *tester) else {
+            continue;
+        };
+        let Some(dt) = constructor_datatype(dt_decls, ctor) else {
+            continue;
+        };
+        if !sort_matches_datatype(terms.sort(scrutinee), dt) {
+            continue;
+        }
+        let Some((eq_lhs, eq_rhs)) = equality_sides(terms, conclusion) else {
+            continue;
+        };
+        for (subject_side, rebuilt_side) in [(eq_lhs, eq_rhs), (eq_rhs, eq_lhs)] {
+            if subject_side == scrutinee
+                && reconstruction_matches(terms, ctor_selectors, ctor, scrutinee, rebuilt_side)
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(invalid(
+        "datatype constructor reconstruction does not match \
+         (cl (not (is-C t)) (= t (C (sel_1 t) .. (sel_k t)))) for a registered \
+         constructor with its FULL declared selector list in declared field order"
+            .to_string(),
+    ))
+}
+
+/// True when `rebuilt` is `ctor` applied to EXACTLY its registered selector
+/// list, each selector applied to `scrutinee`, in declared field order — or,
+/// for a REGISTRY-nullary `ctor`, the bare constructor constant.
+fn reconstruction_matches(
+    terms: &TermStore,
+    ctor_selectors: SelectorDecls<'_>,
+    ctor: &str,
+    scrutinee: TermId,
+    rebuilt: TermId,
+) -> bool {
+    // The selector registry is the sole authority on the constructor's field
+    // list (and, via emptiness, its nullarity). No entry -> fail closed.
+    let Some((_, selectors)) = ctor_selectors
+        .iter()
+        .find(|(constructor, _)| constructor == ctor)
+    else {
+        return false;
+    };
+    match terms.get(rebuilt) {
+        TermData::App(Symbol::Named(name), args) if name == ctor => {
+            args.len() == selectors.len()
+                && args.iter().zip(selectors.iter()).all(|(&arg, selector)| {
+                    matches!(
+                        terms.get(arg),
+                        TermData::App(Symbol::Named(sel_name), sel_args)
+                            if sel_name == selector
+                                && sel_args.as_slice() == [scrutinee]
+                    )
+                })
+        }
+        TermData::Var(name, _) if name == ctor => selectors.is_empty(),
+        _ => false,
+    }
 }
 
 /// Decode `(sel (C a_0 .. a_n))` into `(ctor_name, [a_0 .. a_n], sel_name)`.

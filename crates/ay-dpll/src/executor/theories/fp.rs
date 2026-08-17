@@ -30,7 +30,7 @@ use ay_fp::FpSolver;
 use ay_sat::{SatResult, Solver as SatSolver};
 
 use super::super::Executor;
-use crate::executor_types::{Result, SolveResult, UnknownReason};
+use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 
 use support::{check_fp_support, FpPredicateResult, FpSupportStatus};
 use to_real::offset_cnf_lit;
@@ -432,15 +432,15 @@ impl Executor {
         if expanded_assertions.contains(&false_term) {
             return Ok(SolveResult::unsat());
         }
-        let result = if expanded_assertions == self.ctx.assertions {
-            self.solve_bvfp()
-        } else {
-            let original_assertions =
-                std::mem::replace(&mut self.ctx.assertions, expanded_assertions);
-            let result = self.solve_bvfp();
-            self.ctx.assertions = original_assertions;
-            result
-        };
+        // Install the post-expansion window even when the rewrite was an
+        // identity. Exact finite-array closure belongs on this final surface,
+        // immediately before the BVFP solve; running it on the authored window
+        // would retain store/read aliases that this transform removes. Restore
+        // the exact original vector because the inner FP pipeline can rewrite
+        // assertion contents without changing their length.
+        let original_assertions = std::mem::replace(&mut self.ctx.assertions, expanded_assertions);
+        let result = self.solve_abvfp_final_array_window();
+        self.ctx.assertions = original_assertions;
 
         // Abstention telemetry: attribute the `unknown` to the specific side
         // condition that stopped the read elimination, instead of letting the
@@ -459,11 +459,47 @@ impl Executor {
         result
     }
 
+    /// Solve one final, post-array-transform ABVFP assertion window.
+    ///
+    /// A bounded finite-array prefix contains only valid tautologies, so an
+    /// UNSAT refutation remains authoritative. SAT does not: it is revoked by
+    /// the shared lifecycle transition whenever exact closure is incomplete.
+    /// An already-Unknown incomplete attempt is terminal for this query too;
+    /// retrying another ABVFP transform cannot replenish the cumulative ledger.
+    fn solve_abvfp_final_array_window(&mut self) -> Result<SolveResult> {
+        let _ = self.add_finite_index_array_closure();
+        let result = self.solve_bvfp();
+        match result {
+            Ok(SolveResult::Sat) => {
+                self.fail_close_incomplete_finite_array_sat(Ok(SolveResult::Sat))
+            }
+            Ok(SolveResult::Unknown) if !self.finite_array_expansion.is_complete() => {
+                // Preserve a more specific external stop that fired during
+                // closure/solving; otherwise attribute this terminal Unknown
+                // to the exhausted deterministic finite-array envelope.
+                let origin = match self.unknown_origin() {
+                    Some(
+                        origin @ (UnknownOrigin::InterruptFlag
+                        | UnknownOrigin::SolveDeadline
+                        | UnknownOrigin::MemoryBudget),
+                    ) => origin,
+                    _ => self
+                        .external_stop_reason()
+                        .map(UnknownReason::origin)
+                        .unwrap_or(UnknownOrigin::DeterministicResourceBudget),
+                };
+                self.publish_unknown_from_origin(origin);
+                Ok(SolveResult::Unknown)
+            }
+            other => other,
+        }
+    }
+
     /// Constant-index array-read elimination for the ABVFP lane — see the
     /// `flatten_reads` module docs for the equisatisfiability argument and the
     /// side conditions that make it an equivalence rather than a relaxation.
     ///
-    /// Disable with `AY_ABVFP_FLATTEN=0` (default ON; the pass is additive —
+    /// Disable with `--dpll-no-abvfp-flatten` (default ON; the pass is additive —
     /// see `FlattenOutcome::Undecided`).
     fn try_flatten_constant_index_reads(&mut self) -> Result<FlattenOutcome> {
         if !flatten_reads_enabled() {
@@ -490,7 +526,10 @@ impl Executor {
             .set_int("abvfp_flatten.cells", plan.cells.len() as u64);
 
         let saved = std::mem::replace(&mut self.ctx.assertions, plan.assertions);
-        let result = self.solve_bvfp();
+        // The plan is now the final, array-eliminated assertion window. Run the
+        // common exact-closure boundary here so a Decided result cannot bypass
+        // it, then restore the authored vector exactly on every outcome.
+        let result = self.solve_abvfp_final_array_window();
         self.ctx.assertions = saved;
 
         match result {
@@ -517,6 +556,12 @@ impl Executor {
                         .set_string("abvfp_flatten.status", "fired: array model incomplete");
                     Ok(FlattenOutcome::Undecided)
                 }
+            }
+            // Finite-array exhaustion is query-cumulative. It is terminal even
+            // when the flattened attempt was otherwise Unknown: the untouched
+            // fallback cannot replenish exact closure and must not retry.
+            Ok(SolveResult::Unknown) if !self.finite_array_expansion.is_complete() => {
+                Ok(FlattenOutcome::Decided(SolveResult::Unknown))
             }
             // Unknown from the flattened solve: drop its model (the array reads
             // were substituted away, so it does not pin them) and fall through
@@ -601,11 +646,6 @@ enum FlattenOutcome {
 
 /// Is the constant-index read elimination enabled? Default ON; `=0` disables.
 fn flatten_reads_enabled() -> bool {
-    match std::env::var("AY_ABVFP_FLATTEN") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    }
+    // B28: CLI-owned (--dpll-no-abvfp-flatten); env retired.
+    !ay_core::theory_disable_flags().no_abvfp_flatten
 }

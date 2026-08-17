@@ -53,6 +53,36 @@ pub(crate) fn workspace_path(relative: impl AsRef<Path>) -> PathBuf {
         .join(relative)
 }
 
+/// Whether an optional corpus file may be silently skipped.
+///
+/// Dozens of tests read benchmarks under `benchmarks/smtcomp/`, which is
+/// gitignored, and skip-and-PASS when the file is absent. `workspace_path`
+/// resolves against `CARGO_MANIFEST_DIR` — the tree that COMPILED the binary —
+/// so in a scratch git worktree the corpus is simply not there and those tests
+/// pass vacuously.
+///
+/// That cost two full attribution rounds on 2026-08-15: a bisect declared a
+/// window "clean" at 13-passed/0-failed in 0.52s, when the real signal was
+/// 10-passed/3-failed in ~6s. The 12x "slowdown" was the module skipping versus
+/// running, and the "regression window" it produced was fiction — both ends of
+/// it behaved identically once the corpus was present.
+///
+/// Set `AY_REQUIRE_CORPUS=1` in any bisect, attribution, or A/B harness. A
+/// missing corpus then FAILS instead of quietly passing, so a vacuous run can
+/// never be mistaken for a good end.
+pub(crate) fn corpus_skip_allowed(path: &Path) -> bool {
+    if std::env::var_os("AY_REQUIRE_CORPUS").is_some() {
+        panic!(
+            "AY_REQUIRE_CORPUS is set but the corpus file is missing: {}\n\
+             This run would otherwise PASS VACUOUSLY. If you are bisecting or \
+             attributing, point the worktree at the corpus (symlink \
+             benchmarks/smtcomp) rather than trusting this result.",
+            path.display()
+        );
+    }
+    true
+}
+
 pub(crate) fn check_z3_or_skip() -> bool {
     let available = *Z3_AVAILABLE.get_or_init(|| {
         ProcessCommand::new("z3")

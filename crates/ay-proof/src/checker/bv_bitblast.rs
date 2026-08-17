@@ -40,17 +40,27 @@ use super::{
     bv_lia_query::{MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA, MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA},
     ProofCheckError,
 };
+#[cfg(test)]
+use crate::BvExprExportError;
 use crate::{
     bv_blast_export::BvBlastValidateLimits,
     bv_blast_solver::{export_bv_blast_proof_expr_with_limits, BvExprProofLimits},
-    BvExpr, BvExprExportError,
+    BvExpr,
 };
 
 mod array_congruence;
+mod array_finite;
+mod authenticated_query;
+
+pub use authenticated_query::{
+    authenticate_bool_bv_unsat_query, authenticate_uf_leaf_bool_bv_unsat_query,
+};
 
 #[cfg(test)]
 mod array_congruence_tests;
 
+#[cfg(test)]
+mod array_finite_tests;
 /// Recognize whether `clause` is a strict-checkable (ungated) bit-blast lemma —
 /// i.e. whether [`validate_bv_bitblast`] with no gate annotation would accept it.
 ///
@@ -69,6 +79,12 @@ pub fn recognize_bv_bitblast(terms: &TermStore, clause: &[TermId]) -> bool {
 /// proof-producing bit-blast/LRAT fallback or the bounded BV/LIA interpreter.
 /// Both have large finite private limits; this whole-proof cap prevents an
 /// untrusted proof from multiplying those limits without bound.
+///
+/// This is a STRUCTURAL ceiling, not a promise that every eight-lemma mixture
+/// fits a caller's aggregate progress envelope. The aggregate checker sums the
+/// published per-kind charges with checked arithmetic and may fail closed at a
+/// lower count. Keeping the structural ceiling separate lets callers admit the
+/// common one-expensive-lemma case without reserving eight worst cases up front.
 pub const MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF: usize = 8;
 
 /// Backward-compatible name for the shared expensive-BV whole-proof cap.
@@ -86,6 +102,26 @@ pub const MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA: u64 = 50_000_000;
 /// capability. It is an admission/precharge bound, not an internally enforced
 /// process-RSS limit; callers that require a hard peak must still enforce one.
 pub const MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA: usize = 768 * 1024 * 1024;
+
+/// Largest WORK precharge for one expensive BV-family proof lemma.
+///
+/// Executor-owned progress envelopes use this as a reserve on top of their
+/// ordinary proof-validation allowance. `u64` is the portable publication
+/// type: conversion to a platform `usize` remains checked by each caller.
+pub const MAX_EXPENSIVE_BV_WORK_PER_LEMMA: u64 =
+    if MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA > MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA {
+        MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA
+    } else {
+        MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA
+    };
+
+/// Largest BYTE precharge for one expensive BV-family proof lemma.
+pub const MAX_EXPENSIVE_BV_BYTES_PER_LEMMA: usize =
+    if MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA > MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA {
+        MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA
+    } else {
+        MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA
+    };
 
 /// Whether validating `clause` can require the proof-producing fallback.
 ///
@@ -136,7 +172,8 @@ pub(crate) fn validate_expensive_bv_budget(
                     MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
                 ))
             }
-            TheoryLemmaKind::BvLiaTautology => Some((
+            TheoryLemmaKind::BvLiaTautology
+            | TheoryLemmaKind::SeqExtensionalCompanionContradiction => Some((
                 usize::try_from(MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA)
                     .map_err(|_| ProofCheckError::ResourceLimit)?,
                 MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
@@ -331,6 +368,38 @@ pub(crate) fn validate_bool_tautology(
     validate_bounded_clause_semantics(terms, step_id, clause)
 }
 
+/// Membership indexes over one packed unit's top-level disjuncts.
+///
+/// Every membership question this recognizer asks is a pure set query, so the
+/// two indexes below answer each of them in O(1) and make the whole recognizer
+/// LINEAR in the unit's term payload. The literal `Vec` scans they replace made
+/// it `O(D^2 + D * sum(M))`, i.e. quadratic in the payload — which the
+/// strict-check pre-charge then had to reserve for, so a large packed unit was
+/// unverifiable by construction. See `SemanticChargeClass::BoundedAssignmentEval`.
+struct PackedDisjunctIndex {
+    /// Every top-level disjunct.
+    present: HashSet<TermId>,
+    /// `x` for every top-level disjunct of the exact form `(not x)`.
+    negated_inners: HashSet<TermId>,
+}
+
+impl PackedDisjunctIndex {
+    fn build(terms: &TermStore, disjuncts: &[TermId]) -> Self {
+        let mut present = HashSet::with_capacity(disjuncts.len());
+        let mut negated_inners = HashSet::new();
+        for &disjunct in disjuncts {
+            present.insert(disjunct);
+            if let TermData::Not(inner) = terms.get(disjunct) {
+                negated_inners.insert(*inner);
+            }
+        }
+        Self {
+            present,
+            negated_inners,
+        }
+    }
+}
+
 fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
     let TermData::App(symbol, disjuncts) = terms.get(term) else {
         return false;
@@ -344,6 +413,7 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
     {
         return false;
     }
+    let index = PackedDisjunctIndex::build(terms, disjuncts);
     for &negated in disjuncts {
         let TermData::Not(inner) = terms.get(negated) else {
             continue;
@@ -351,7 +421,7 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
         if terms.sort(*inner) != &Sort::Bool {
             continue;
         }
-        if disjuncts.contains(inner) {
+        if index.present.contains(inner) {
             return true;
         }
         let TermData::App(join_symbol, members) = terms.get(*inner) else {
@@ -364,19 +434,22 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
             continue;
         }
         match join_symbol.name() {
+            // `and_pos`: some disjunct other than `negated` is also a member of
+            // the negated conjunction. Quantifying over `members` instead of
+            // over `disjuncts` names the SAME intersection, one side indexed.
             "and"
-                if disjuncts
+                if members
                     .iter()
-                    .any(|other| *other != negated && members.contains(other)) =>
+                    .any(|&member| member != negated && index.present.contains(&member)) =>
             {
                 return true;
             }
+            // `or_pos`: every member of the negated disjunction is itself a
+            // disjunct other than `negated`.
             "or" if !members.is_empty()
-                && members.iter().all(|member| {
-                    disjuncts
-                        .iter()
-                        .any(|other| *other != negated && other == member)
-                }) =>
+                && members
+                    .iter()
+                    .all(|&member| member != negated && index.present.contains(&member)) =>
             {
                 return true;
             }
@@ -400,8 +473,7 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
     // over non-Bool-bounded atoms (e.g. an EUF equality) reached the strict
     // checker as a bare `assume` and a correct QF_UF refutation under
     // `:produce-unsat-cores` was rejected as "assumes term outside the supplied
-    // problem obligation", publishing `unknown` where z3 says `unsat`
-    // (#uc-and-neg-packed-tautology).
+    // problem obligation", publishing `unknown` where z3 says `unsat`.
     for &positive in disjuncts {
         let TermData::App(join_symbol, members) = terms.get(positive) else {
             continue;
@@ -409,15 +481,17 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
         if members.is_empty() || members.iter().any(|&m| terms.sort(m) != &Sort::Bool) {
             continue;
         }
-        let negation_present = |member: TermId| {
-            disjuncts.iter().any(|&other| {
-                other != positive
-                    && matches!(terms.get(other), TermData::Not(inner) if *inner == member)
-            })
+        // `(not member)` occurs as a disjunct, or `member` IS `(not other)` for
+        // some other disjunct. The first case can never name `positive` itself,
+        // which is an `App`, not a `Not`; the second is checked explicitly.
+        let complement_present = |member: TermId| {
+            index.negated_inners.contains(&member)
+                || matches!(terms.get(member), TermData::Not(inner)
+                    if *inner != positive && index.present.contains(inner))
         };
         match join_symbol.name() {
-            "and" if members.iter().all(|&m| negation_present(m)) => return true,
-            "or" if members.iter().any(|&m| negation_present(m)) => return true,
+            "and" if members.iter().all(|&m| complement_present(m)) => return true,
+            "or" if members.iter().any(|&m| complement_present(m)) => return true,
             _ => {}
         }
     }
@@ -716,7 +790,13 @@ fn bitvec_width(sort: &Sort) -> Option<u32> {
 // risking exponential work on real proofs. Wider closed concat evaluation uses
 // the separate, non-symbolic `evaluate` validator above.
 const MAX_BOUNDED_BV_WIDTH: u32 = 4;
-const MAX_BOUNDED_ASSIGNMENT_BITS: u32 = 8;
+/// Assignment-bit ceiling of the exhaustive bounded Bool/BV evaluator.
+///
+/// Published to the strict-check charge model, which must reserve the
+/// evaluator's exact worst case (`2^BITS` assignments over an environment of at
+/// most `BITS` variables) rather than a looser polynomial guess. See
+/// `SemanticChargeClass::BoundedAssignmentEval`.
+pub(crate) const MAX_BOUNDED_ASSIGNMENT_BITS: u32 = 8;
 const MAX_EVALUATED_BV_WIDTH: u32 = u64::BITS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,7 +847,8 @@ const MAX_PROOF_PRODUCING_EXPANDED_LITERALS: usize = 4_000_000;
 const PROOF_PRODUCING_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Source-bound evidence that one exact ordered Bool/BV query, optionally with
-/// the narrow same-array read-congruence extension, is unsatisfiable.
+/// exact finite arrays or the narrow same-array read-congruence extension, is
+/// unsatisfiable.
 ///
 /// The constructor is private.  Evidence is issued only after the query has
 /// been lowered from the live [`TermStore`], bit-blasted into provenance-bearing
@@ -779,6 +860,8 @@ const PROOF_PRODUCING_DEADLINE: Duration = Duration::from_secs(3);
 pub struct AuthenticatedBoolBvUnsatQuery {
     term_snapshot: TermStoreSnapshotStamp,
     roots: Box<[TermId]>,
+    used_exact_finite_arrays: bool,
+    used_uninterpreted_leaves: bool,
 }
 
 impl AuthenticatedBoolBvUnsatQuery {
@@ -795,6 +878,31 @@ impl AuthenticatedBoolBvUnsatQuery {
     #[must_use]
     pub fn term_snapshot_is_current(&self, terms: &TermStore) -> bool {
         self.term_snapshot == terms.snapshot_stamp()
+    }
+
+    /// Whether exact, full-domain finite-array scalarization contributed to
+    /// this authentication.
+    ///
+    /// This flag is deliberately false for the separate same-array
+    /// read-congruence weakening. It becomes true only when the source lowerer
+    /// successfully handles at least one supported array sort or operator.
+    #[must_use]
+    pub fn used_exact_finite_arrays(&self) -> bool {
+        self.used_exact_finite_arrays
+    }
+
+    /// Whether the congruence-free uninterpreted-application leaf abstraction
+    /// contributed to this authentication (#bitblast-original-clause-authority).
+    ///
+    /// Only [`authenticate_uf_leaf_bool_bv_unsat_query`] can set this.  The
+    /// abstraction maps each ground uninterpreted application to one free leaf
+    /// keyed by its canonical term identity, which over-approximates the model
+    /// class: a refutation of the abstraction refutes the exact query, so the
+    /// minted capability's UNSAT claim is unchanged.  A SATISFIABLE abstraction
+    /// says nothing about the exact query and never mints or vetoes anything.
+    #[must_use]
+    pub fn used_uninterpreted_leaves(&self) -> bool {
+        self.used_uninterpreted_leaves
     }
 }
 
@@ -834,6 +942,14 @@ pub enum BoolBvUnsatAuthenticationError {
         /// Independent replay diagnostic.
         reason: String,
     },
+    /// A deterministic bound or the caller deadline was exhausted before this
+    /// lane could decide the query. Carries NO semantic information about the
+    /// claimed refutation.
+    #[error("Bool/BV authentication exhausted a bounded resource: {reason}")]
+    ResourceLimit {
+        /// Exhausted bounded resource diagnostic.
+        reason: String,
+    },
 }
 
 impl BoolBvUnsatAuthenticationError {
@@ -844,111 +960,27 @@ impl BoolBvUnsatAuthenticationError {
     pub fn is_unsupported_fragment(&self) -> bool {
         matches!(self, Self::UnsupportedFragment { .. })
     }
-}
 
-/// Authenticate that the conjunction of `roots` is UNSAT in the supported
-/// quantifier-free Bool/BV fragment, including one exact same-array read
-/// congruence reduction.
-///
-/// This is deliberately independent of the production solver's bit-blast CNF:
-/// it lowers the exact source roots again, constructs provenance-bearing gate
-/// clauses, obtains a pure-RUP refutation, and replays every gate and resolution
-/// step before returning an opaque capability. Internal bit-vector terms may
-/// be up to 128 bits subject to the finite proof-production envelope; the
-/// serialized/top-level `BvBlastProof` width contract remains unchanged.
-/// `caller_deadline`, when present, is clamped with this checker's fixed
-/// three-second ceiling.
-pub fn authenticate_bool_bv_unsat_query(
-    terms: &TermStore,
-    roots: &[TermId],
-    caller_deadline: Option<Instant>,
-) -> Result<AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError> {
-    if roots.is_empty() {
-        return Err(BoolBvUnsatAuthenticationError::EmptyQuery);
+    /// Whether this error means "this lane cannot answer", as opposed to "the
+    /// claimed refutation is wrong".
+    ///
+    /// This lane is an ADDITIONAL independent authenticator, not a gate: it
+    /// runs after the Alethe presentation has already failed, and a lane that
+    /// merely ran out of its own bounded envelope must DECLINE so the remaining
+    /// certification routes -- in particular
+    /// `discharge_trust_steps_for_certification` -- still get to run. Vetoing
+    /// on budget exhaustion discards refutations this checker never examined.
+    ///
+    /// [`Self::Satisfiable`] and [`Self::Replay`] are deliberately EXCLUDED:
+    /// they are positive evidence that the claimed UNSAT is wrong, and must
+    /// keep failing closed.
+    #[must_use]
+    pub fn is_capability_decline(&self) -> bool {
+        matches!(
+            self,
+            Self::UnsupportedFragment { .. } | Self::ResourceLimit { .. }
+        )
     }
-    if roots.len() > MAX_PROOF_PRODUCING_TERM_NODES {
-        return Err(BoolBvUnsatAuthenticationError::Refutation {
-            reason: format!(
-                "source query has {} roots, above the bounded proof-producing limit {}",
-                roots.len(),
-                MAX_PROOF_PRODUCING_TERM_NODES
-            ),
-        });
-    }
-    if let Some(&root) = roots.iter().find(|root| root.index() >= terms.len()) {
-        return Err(BoolBvUnsatAuthenticationError::InvalidRoot { root });
-    }
-
-    let (limits, deadline) = proof_producing_limits(caller_deadline);
-    let term_snapshot = terms.snapshot_stamp();
-    let mut used_array_congruence = false;
-    let ordinary_lowering = {
-        let mut lowerer = ProofProducingLowerer::new(terms, deadline);
-        match lowerer.lower_bool_terms(roots) {
-            Ok(lowered) => Ok(lowered),
-            Err(reason) if lowerer.resource_exhausted => {
-                return Err(BoolBvUnsatAuthenticationError::Refutation { reason });
-            }
-            Err(reason) => Err(reason),
-        }
-    };
-    let lowered = match ordinary_lowering {
-        Ok(lowered) => lowered,
-        Err(pure_reason) => {
-            let mut reduction_lowerer = ProofProducingLowerer::new(terms, deadline);
-            match array_congruence::lower_same_array_read_disequalities(
-                terms,
-                roots,
-                &mut reduction_lowerer,
-            ) {
-                Ok(Some(lowered)) => {
-                    used_array_congruence = true;
-                    lowered
-                }
-                Ok(None) => {
-                    return Err(BoolBvUnsatAuthenticationError::UnsupportedFragment {
-                        reason: pure_reason,
-                    });
-                }
-                Err(reason) if reduction_lowerer.resource_exhausted => {
-                    return Err(BoolBvUnsatAuthenticationError::Refutation { reason });
-                }
-                Err(reason) => {
-                    return Err(BoolBvUnsatAuthenticationError::UnsupportedFragment {
-                        reason: format!(
-                            "{pure_reason}; exact array-congruence reduction declined: {reason}"
-                        ),
-                    });
-                }
-            }
-        }
-    };
-    let conjunction = balanced_bool_expr(lowered, true, BvExpr::and)
-        .map_err(|reason| BoolBvUnsatAuthenticationError::Refutation { reason })?;
-    let false_expr = BvExpr::const_val(0, 1);
-    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
-        .map_err(|error| match error {
-            BvExprExportError::NoRefutation if used_array_congruence => {
-                BoolBvUnsatAuthenticationError::UnsupportedFragment {
-                    reason: "same-array read-congruence reduction is satisfiable".to_string(),
-                }
-            }
-            BvExprExportError::NoRefutation => BoolBvUnsatAuthenticationError::Satisfiable,
-            other => BoolBvUnsatAuthenticationError::Refutation {
-                reason: other.to_string(),
-            },
-        })?;
-    let replay_limits = proof_replay_limits(&limits);
-    proof
-        .validate_with_limits(&replay_limits)
-        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
-            reason: error.to_string(),
-        })?;
-
-    Ok(AuthenticatedBoolBvUnsatQuery {
-        term_snapshot,
-        roots: roots.into(),
-    })
 }
 
 /// Allocation ceiling used by the independent replay validator alone.
@@ -967,6 +999,7 @@ pub(super) const MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH: u32 = 128;
 enum ProofProducingExpr {
     Bool(BvExpr),
     BitVec(BvExpr, u32),
+    Array(array_finite::FiniteArrayExpr),
 }
 
 fn balanced_bool_expr(
@@ -994,11 +1027,37 @@ fn balanced_bool_expr(
 }
 
 fn proof_producing_expr_nodes(expr: &ProofProducingExpr) -> Result<usize, String> {
-    let root = match expr {
-        ProofProducingExpr::Bool(expr) | ProofProducingExpr::BitVec(expr, _) => expr,
+    let roots: &[BvExpr] = match expr {
+        ProofProducingExpr::Bool(expr) | ProofProducingExpr::BitVec(expr, _) => {
+            std::slice::from_ref(expr)
+        }
+        ProofProducingExpr::Array(array) => &array.cells,
     };
-    let mut stack = vec![(root, 1_usize)];
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(MAX_PROOF_PRODUCING_EXPR_DEPTH + 1)
+        .map_err(|error| format!("BvExpr traversal allocation failed: {error}"))?;
     let mut nodes = 0_usize;
+    for root in roots {
+        nodes = bv_expr_nodes_from(root, nodes, &mut stack)?;
+    }
+    Ok(nodes)
+}
+
+fn bv_expr_nodes(expr: &BvExpr) -> Result<usize, String> {
+    let mut stack = Vec::new();
+    stack
+        .try_reserve_exact(MAX_PROOF_PRODUCING_EXPR_DEPTH + 1)
+        .map_err(|error| format!("BvExpr traversal allocation failed: {error}"))?;
+    bv_expr_nodes_from(expr, 0, &mut stack)
+}
+
+fn bv_expr_nodes_from<'a>(
+    root: &'a BvExpr,
+    mut nodes: usize,
+    stack: &mut Vec<(&'a BvExpr, usize)>,
+) -> Result<usize, String> {
+    stack.push((root, 1_usize));
     while let Some((expr, depth)) = stack.pop() {
         if depth > MAX_PROOF_PRODUCING_EXPR_DEPTH {
             return Err(format!(
@@ -1151,6 +1210,39 @@ fn proof_producing_limits(caller_deadline: Option<Instant>) -> (BvExprProofLimit
     )
 }
 
+/// Reserved SMT-LIB Core, BitVec-theory, and array vocabulary that the
+/// uninterpreted-leaf abstraction must NEVER treat as a free function symbol
+/// (#bitblast-original-clause-authority).
+///
+/// The list deliberately includes BV operators this lowerer does not (yet)
+/// interpret — `bvudiv`, `rotate_left`, … — so an interpreted-theory gap stays
+/// an honest `UnsupportedFragment` decline instead of silently becoming a
+/// weaker free-leaf query. Abstracting them WOULD still be sound for UNSAT
+/// (free leaves over-approximate every total interpretation), but declining
+/// keeps this lane's diagnostics exact.
+fn reserved_bool_bv_symbol(name: &str) -> bool {
+    // `true`/`false`/`const` are deliberately ABSENT: the frontend lowers the
+    // Boolean constants to `TermData::Const` (never named applications), and a
+    // user `(declare-fun const …)` is an ordinary uninterpreted symbol — by
+    // declaration identity it IS a free function, so abstracting it is exactly
+    // right (the name-authority audit owns this invariant).
+    matches!(
+        name,
+        // Core.
+        "not" | "and" | "or" | "xor" | "=>" | "implies" | "=" | "distinct" | "ite"
+            // Arrays (the exact finite-array lowering owns these).
+            | "select" | "store"
+            // BitVec theory, interpreted by this lowerer.
+            | "bvnot" | "bvneg" | "bvadd" | "bvsub" | "bvmul" | "bvand" | "bvor" | "bvxor"
+            | "bvnand" | "bvnor" | "bvxnor" | "bvshl" | "bvlshr" | "bvashr" | "concat"
+            | "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
+            // BitVec theory, currently outside this lowerer's fragment.
+            | "bvudiv" | "bvurem" | "bvsdiv" | "bvsrem" | "bvsmod" | "bvcomp" | "bvredand"
+            | "bvredor" | "repeat" | "rotate_left" | "rotate_right" | "zero_extend"
+            | "sign_extend" | "extract"
+    )
+}
+
 struct ProofProducingLowerer<'a> {
     terms: &'a TermStore,
     deadline: Instant,
@@ -1162,6 +1254,20 @@ struct ProofProducingLowerer<'a> {
     constructed_expr_nodes: usize,
     depth: usize,
     resource_exhausted: bool,
+    used_exact_finite_arrays: bool,
+    exact_finite_array_work: usize,
+    /// Opt-in (#bitblast-original-clause-authority): lower a Bool- or
+    /// BV-sorted application of a NON-reserved symbol to one free leaf keyed
+    /// by the application's canonical term identity, instead of rejecting the
+    /// query. Sound for UNSAT only: every model of the exact query assigns
+    /// each application term a single value, so it induces a valuation of the
+    /// leaves — a refutation over free leaves therefore refutes the exact
+    /// query, while a satisfiable abstraction proves nothing (the caller must
+    /// NOT surface it as `Satisfiable`). Reserved Core/BV theory symbols are
+    /// never abstracted; identical applications share one leaf; distinct
+    /// applications never alias (congruence is deliberately forgotten).
+    uninterpreted_leaves: bool,
+    used_uninterpreted_leaves: bool,
 }
 
 impl<'a> ProofProducingLowerer<'a> {
@@ -1177,7 +1283,44 @@ impl<'a> ProofProducingLowerer<'a> {
             constructed_expr_nodes: 0,
             depth: 0,
             resource_exhausted: false,
+            used_exact_finite_arrays: false,
+            exact_finite_array_work: 0,
+            uninterpreted_leaves: false,
+            used_uninterpreted_leaves: false,
         }
+    }
+
+    /// Construct the uninterpreted-leaf variant. Kept as a separate
+    /// constructor so every existing call site provably retains the exact
+    /// (reject-on-UF) semantics without a flag audit.
+    fn new_with_uninterpreted_leaves(terms: &'a TermStore, deadline: Instant) -> Self {
+        Self {
+            uninterpreted_leaves: true,
+            ..Self::new(terms, deadline)
+        }
+    }
+
+    /// Whether `symbol` must be abstracted as a free leaf under the opt-in
+    /// uninterpreted-leaf mode.
+    ///
+    /// Only plain named symbols outside the reserved Core/BV vocabulary
+    /// qualify: indexed symbols are always theory syntax, and reserved names
+    /// keep their exact interpreted lowering (or its honest "unsupported"
+    /// rejection) so a fragment gap is never silently weakened into a free
+    /// leaf. User declarations can never collide with reserved names — the
+    /// frontend rejects redeclaring theory symbols — so a `bv`-prefixed USER
+    /// function (e.g. `bvshadow`) is correctly abstracted by declaration
+    /// identity, not spelling.
+    fn take_uninterpreted_leaf(&mut self, symbol: &Symbol) -> bool {
+        if !self.uninterpreted_leaves {
+            return false;
+        }
+        let eligible =
+            matches!(symbol, Symbol::Named(name) if !reserved_bool_bv_symbol(name.as_str()));
+        if eligible {
+            self.used_uninterpreted_leaves = true;
+        }
+        eligible
     }
 
     fn lower_bool_terms(&mut self, terms: &[TermId]) -> Result<Vec<BvExpr>, String> {
@@ -1199,6 +1342,9 @@ impl<'a> ProofProducingLowerer<'a> {
                 "term {} is BitVec({width}), not Bool",
                 term.index()
             )),
+            ProofProducingExpr::Array(_) => {
+                Err(format!("term {} is Array, not Bool", term.index()))
+            }
         }
     }
 
@@ -1207,6 +1353,9 @@ impl<'a> ProofProducingLowerer<'a> {
             ProofProducingExpr::BitVec(expr, width) => Ok((expr, width)),
             ProofProducingExpr::Bool(_) => {
                 Err(format!("term {} is Bool, not BitVec", term.index()))
+            }
+            ProofProducingExpr::Array(_) => {
+                Err(format!("term {} is Array, not BitVec", term.index()))
             }
         }
     }
@@ -1251,12 +1400,14 @@ impl<'a> ProofProducingLowerer<'a> {
         if !self.active.insert(term) {
             return Err("cyclic term DAG".to_string());
         }
-        let sort = match self.terms.sort(term) {
-            Sort::Bool => Sort::Bool,
-            Sort::BitVec(width) => Sort::BitVec(width.clone()),
-            _ => {
+        let sort = match array_finite::classify_source_sort(self.terms.sort(term)) {
+            Ok(sort) => sort,
+            Err(error) => {
+                if error.is_resource_limit() {
+                    self.resource_exhausted = true;
+                }
                 self.active.remove(&term);
-                return Err("unsupported non-Bool/BitVec source sort".to_string());
+                return Err(error.into_reason());
             }
         };
         let child_count = match self.terms.get(term) {
@@ -1285,17 +1436,11 @@ impl<'a> ProofProducingLowerer<'a> {
             }
         };
         let result = match sort {
-            Sort::Bool => self.lower_bool_node(term, data),
-            Sort::BitVec(width)
-                if width.width > 0 && width.width <= MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH =>
-            {
-                self.lower_bv_node(term, width.width, data)
+            array_finite::FiniteSourceSort::Bool => self.lower_bool_node(term, data),
+            array_finite::FiniteSourceSort::BitVec(width) => self.lower_bv_node(term, width, data),
+            array_finite::FiniteSourceSort::Array(shape) => {
+                self.lower_exact_finite_array_node(term, shape, data)
             }
-            Sort::BitVec(width) => Err(format!(
-                "BitVec width {} is outside proof-producing range 1..={}",
-                width.width, MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH
-            )),
-            other => Err(format!("unsupported sort {other:?} in Bool/BV clause")),
         };
         self.active.remove(&term);
         let result = result?;
@@ -1333,7 +1478,7 @@ impl<'a> ProofProducingLowerer<'a> {
                     width: *width,
                 }))
             }
-            TermData::Const(_) => Err("unsupported Bool/BitVec constant".to_string()),
+            TermData::Const(_) => Err("unsupported Bool/BV/array constant".to_string()),
             TermData::Var(_, id) => Ok(TermData::Var(String::new(), *id)),
             TermData::Not(inner) => Ok(TermData::Not(*inner)),
             TermData::Ite(condition, then_term, else_term) => {
@@ -1341,14 +1486,14 @@ impl<'a> ProofProducingLowerer<'a> {
             }
             TermData::App(symbol, args) => {
                 if symbol.name().len() > 32 {
-                    return Err("unsupported Bool/BitVec operator".to_string());
+                    return Err("unsupported Bool/BV/array operator".to_string());
                 }
                 let symbol = match symbol {
                     Symbol::Named(name) => Symbol::Named(name.clone()),
                     Symbol::Indexed(name, indices) if indices.len() <= 2 => {
                         Symbol::Indexed(name.clone(), indices.clone())
                     }
-                    _ => return Err("unsupported indexed Bool/BitVec operator".to_string()),
+                    _ => return Err("unsupported indexed Bool/BV/array operator".to_string()),
                 };
                 let mut cloned_args = Vec::new();
                 if let Err(error) = cloned_args.try_reserve_exact(args.len()) {
@@ -1358,7 +1503,7 @@ impl<'a> ProofProducingLowerer<'a> {
                 cloned_args.extend_from_slice(args);
                 Ok(TermData::App(symbol, cloned_args))
             }
-            _ => Err("unsupported Bool/BitVec source node".to_string()),
+            _ => Err("unsupported Bool/BV/array source node".to_string()),
         }
     }
 
@@ -1371,7 +1516,31 @@ impl<'a> ProofProducingLowerer<'a> {
             TermData::Const(Constant::Bool(value)) => BvExpr::const_val(u128::from(value), 1),
             TermData::Var(_, _) => BvExpr::leaf(&format!("proof_bool_{}", term.index()), 1),
             TermData::Not(inner) => BvExpr::not(self.lower_bool(inner)?),
-            TermData::App(symbol, args) => self.lower_bool_app(&symbol, &args)?,
+            TermData::App(Symbol::Named(name), args) if name == "select" => {
+                match self.lower_exact_finite_array_select(
+                    term,
+                    &args,
+                    &array_finite::FiniteSortShape::bool_scalar(),
+                )? {
+                    ProofProducingExpr::Bool(expr) => expr,
+                    _ => {
+                        return Err(
+                            "array select did not produce its declared Bool sort".to_string()
+                        )
+                    }
+                }
+            }
+            TermData::App(symbol, args) => {
+                if self.take_uninterpreted_leaf(&symbol) {
+                    // One free Boolean leaf per canonical application term:
+                    // the `proof_bool_{index}` namespace is shared with `Var`
+                    // leaves, and distinct terms have distinct indices, so an
+                    // application leaf can never alias a variable leaf.
+                    BvExpr::leaf(&format!("proof_bool_{}", term.index()), 1)
+                } else {
+                    self.lower_bool_app(&symbol, &args)?
+                }
+            }
             TermData::Ite(condition, then_term, else_term) => {
                 let condition = self.lower_bool(condition)?;
                 let then_expr = self.lower_bool(then_term)?;
@@ -1414,6 +1583,9 @@ impl<'a> ProofProducingLowerer<'a> {
                 ) => {
                     Self::require_same_width(name, lhs_width, rhs_width)?;
                     Ok(BvExpr::eq(lhs, rhs))
+                }
+                (ProofProducingExpr::Array(lhs), ProofProducingExpr::Array(rhs)) => {
+                    self.lower_exact_finite_array_equality(lhs, rhs)
                 }
                 _ => Err("equality operands have different Bool/BV sorts".to_string()),
             },
@@ -1472,7 +1644,31 @@ impl<'a> ProofProducingLowerer<'a> {
                 BvExpr::leaf(&format!("proof_bv_{}", term.index()), expected_width),
                 expected_width,
             ),
-            TermData::App(symbol, args) => self.lower_bv_app(&symbol, &args)?,
+            TermData::App(Symbol::Named(name), args) if name == "select" => {
+                let expected = array_finite::FiniteSortShape::bitvec_scalar(expected_width);
+                match self.lower_exact_finite_array_select(term, &args, &expected)? {
+                    ProofProducingExpr::BitVec(expr, width) => (expr, width),
+                    _ => {
+                        return Err(
+                            "array select did not produce its declared BitVec sort".to_string()
+                        )
+                    }
+                }
+            }
+            TermData::App(symbol, args) => {
+                if self.take_uninterpreted_leaf(&symbol) {
+                    // One free BV leaf per canonical application term at the
+                    // application's declared width (`classify_source_sort`
+                    // already enforced the internal width ceiling, exactly as
+                    // for `Var` leaves).
+                    (
+                        BvExpr::leaf(&format!("proof_bv_{}", term.index()), expected_width),
+                        expected_width,
+                    )
+                } else {
+                    self.lower_bv_app(&symbol, &args)?
+                }
+            }
             TermData::Ite(condition, then_term, else_term) => {
                 let condition = self.lower_bool(condition)?;
                 let (then_expr, then_width) = self.lower_bv(then_term)?;
@@ -1610,132 +1806,11 @@ impl<'a> ProofProducingLowerer<'a> {
 }
 
 #[cfg(test)]
-mod authenticated_query_tests {
-    use ay_core::{Sort, Symbol, TermStore};
-    use num_bigint::BigInt;
-
-    use super::{
-        authenticate_bool_bv_unsat_query, BoolBvUnsatAuthenticationError,
-        MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH,
-    };
-
-    fn signed_add_safety_query(
-        terms: &mut TermStore,
-        lhs_value: u32,
-        rhs_value: u32,
-    ) -> Vec<ay_core::TermId> {
-        const WIDTH: u32 = 4;
-        let lhs = terms.mk_var("auth_bv_lhs", Sort::bitvec(WIDTH));
-        let rhs = terms.mk_var("auth_bv_rhs", Sort::bitvec(WIDTH));
-        let lhs_literal = terms.mk_bitvec(BigInt::from(lhs_value), WIDTH);
-        let rhs_literal = terms.mk_bitvec(BigInt::from(rhs_value), WIDTH);
-        let lhs_eq = terms.mk_app(Symbol::named("="), [lhs, lhs_literal], Sort::Bool);
-        let rhs_eq = terms.mk_app(Symbol::named("="), [rhs, rhs_literal], Sort::Bool);
-
-        let zero = terms.mk_bitvec(BigInt::from(0_u8), WIDTH);
-        let sum = terms.mk_app(Symbol::named("bvadd"), [lhs, rhs], Sort::bitvec(WIDTH));
-        let lhs_positive = terms.mk_app(Symbol::named("bvsgt"), [lhs, zero], Sort::Bool);
-        let rhs_positive = terms.mk_app(Symbol::named("bvsgt"), [rhs, zero], Sort::Bool);
-        let both_positive = terms.mk_and(vec![lhs_positive, rhs_positive]);
-        let sum_positive = terms.mk_app(Symbol::named("bvsgt"), [sum, zero], Sort::Bool);
-        let no_positive_overflow = terms.mk_implies(both_positive, sum_positive);
-        vec![lhs_eq, rhs_eq, no_positive_overflow]
-    }
-
-    fn wide_signed_keep_max_query(
-        terms: &mut TermStore,
-        negate_difference_positive: bool,
-    ) -> Vec<ay_core::TermId> {
-        const WIDTH: u32 = 128;
-        let lo = terms.mk_var("auth_wide_lo", Sort::bitvec(WIDTH));
-        let hi = terms.mk_var("auth_wide_hi", Sort::bitvec(WIDTH));
-        let zero = terms.mk_bitvec(BigInt::from(0_u8), WIDTH);
-        let one = terms.mk_bitvec(BigInt::from(1_u8), WIDTH);
-        let difference = terms.mk_app(Symbol::named("bvsub"), [hi, lo], Sort::bitvec(WIDTH));
-        let difference_positive =
-            terms.mk_app(Symbol::named("bvslt"), [zero, difference], Sort::Bool);
-        let first = if negate_difference_positive {
-            terms.mk_not_raw(difference_positive)
-        } else {
-            difference_positive
-        };
-        vec![
-            first,
-            terms.mk_app(Symbol::named("bvslt"), [lo, hi], Sort::Bool),
-            terms.mk_app(Symbol::named("bvsle"), [one, lo], Sort::Bool),
-        ]
-    }
-
-    #[test]
-    fn source_bound_query_authenticates_signed_overflow_and_retires_on_change() {
-        let mut terms = TermStore::new();
-        // 7 + 1 wraps to -8 in signed four-bit arithmetic.
-        let roots = signed_add_safety_query(&mut terms, 7, 1);
-        let evidence = authenticate_bool_bv_unsat_query(&terms, &roots, None)
-            .expect("the source-level signed-overflow contradiction must be proved");
-        assert!(evidence.is_current_for(&terms, &roots));
-
-        let mut reordered = roots.clone();
-        reordered.swap(0, 1);
-        assert!(!evidence.is_current_for(&terms, &reordered));
-
-        let _late_term = terms.mk_var("auth_bv_late", Sort::Bool);
-        assert!(!evidence.term_snapshot_is_current(&terms));
-        assert!(!evidence.is_current_for(&terms, &roots));
-    }
-
-    #[test]
-    fn source_bound_query_refuses_satisfiable_signed_addition() {
-        let mut terms = TermStore::new();
-        let roots = signed_add_safety_query(&mut terms, 1, 1);
-        let error = authenticate_bool_bv_unsat_query(&terms, &roots, None)
-            .expect_err("a safe concrete addition is satisfiable");
-        assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
-    }
-
-    #[test]
-    fn source_bound_query_authenticates_wide_signed_keep_max_refutation() {
-        let mut terms = TermStore::new();
-        let roots = wide_signed_keep_max_query(&mut terms, true);
-
-        let evidence = authenticate_bool_bv_unsat_query(&terms, &roots, None)
-            .expect("the wide signed keep-max contradiction must have a checked refutation");
-        assert!(evidence.is_current_for(&terms, &roots));
-    }
-
-    #[test]
-    fn source_bound_query_refuses_satisfiable_wide_signed_keep_max_twin() {
-        let mut terms = TermStore::new();
-        let roots = wide_signed_keep_max_query(&mut terms, false);
-        let error = authenticate_bool_bv_unsat_query(&terms, &roots, None)
-            .expect_err("the positive-difference twin has satisfying assignments");
-        assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
-    }
-
-    #[test]
-    fn source_bound_query_declines_width_above_internal_ceiling() {
-        const WIDTH: u32 = MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH + 1;
-        let mut terms = TermStore::new();
-        let value = terms.mk_var("auth_too_wide", Sort::bitvec(WIDTH));
-        let reflexive = terms.mk_app(Symbol::named("="), [value, value], Sort::Bool);
-        let contradiction = terms.mk_not_raw(reflexive);
-        let error = authenticate_bool_bv_unsat_query(&terms, &[contradiction], None)
-            .expect_err("widths above the internal source-checker ceiling must decline");
-        assert!(error.is_unsupported_fragment());
-    }
-
-    #[test]
-    fn source_bound_query_refuses_unsupported_theory_roots() {
-        let mut terms = TermStore::new();
-        let integer = terms.mk_var("auth_integer", Sort::Int);
-        let zero = terms.mk_int(0.into());
-        let root = terms.mk_app(Symbol::named("="), [integer, zero], Sort::Bool);
-        let error = authenticate_bool_bv_unsat_query(&terms, &[root], None)
-            .expect_err("integer equality is outside the Bool/BV proof fragment");
-        assert!(error.is_unsupported_fragment());
-    }
-}
-
+#[path = "bv_bitblast/authenticated_query_tests.rs"]
+mod authenticated_query_tests;
+#[cfg(test)]
+#[path = "bv_bitblast_packed_index_tests.rs"]
+mod packed_index_tests;
 #[cfg(test)]
 #[path = "bv_bitblast_resource_tests.rs"]
 mod resource_tests;
@@ -1833,7 +1908,7 @@ fn collect_bounded_vars_term(
     stack.push(term);
     let result = match terms.get(term) {
         TermData::Const(Constant::Bool(_)) => Some(()),
-        TermData::Const(Constant::BitVec { width, .. }) if *width <= MAX_BOUNDED_BV_WIDTH => {
+        TermData::Const(Constant::BitVec { width, .. }) if *width <= MAX_EVALUATED_BV_WIDTH => {
             Some(())
         }
         TermData::Const(_) => None,

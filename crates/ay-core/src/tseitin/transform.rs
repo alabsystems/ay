@@ -194,6 +194,16 @@ impl Tseitin<'_> {
         &self.clauses
     }
 
+    /// Return the proof annotations parallel to [`Self::all_clauses`].
+    ///
+    /// `None` means this encoder was created without proof tracking.  When
+    /// present, the slice has exactly one entry per generated clause; an entry
+    /// may itself be `None` when that clause is an authored activation unit
+    /// rather than a Tseitin tautology.
+    pub fn proof_annotations(&self) -> Option<&[Option<ClausificationProof>]> {
+        self.proof_annotations.as_deref()
+    }
+
     /// Get the current number of variables
     pub fn num_vars(&self) -> u32 {
         self.next_var - 1

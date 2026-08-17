@@ -30,8 +30,8 @@ fn early_lucky_enabled_from(val: Option<&str>) -> bool {
 }
 
 fn early_lucky_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| early_lucky_enabled_from(std::env::var("AY_AB_LUCKY").ok().as_deref()))
+    // B26: CLI-owned opt-out (--sat-no-lucky); env retired.
+    early_lucky_enabled_from(ay_core::sat_ab_switches().no_lucky.then_some("0"))
 }
 
 /// Per-probe wall budget for the early lucky phase: ~1s per million clauses,

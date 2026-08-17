@@ -1832,7 +1832,10 @@ fn circuit_multiplier22_retained_sat_model_authority_requested() -> bool {
     })
 }
 
-fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content: &str) {
+fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits(
+    content: &str,
+    stats_cfg: stats_output::StatsConfig,
+) {
     if !circuit_multiplier22_retained_sat_model_authority_requested() {
         return;
     }
@@ -1842,13 +1845,34 @@ fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content: &st
     if let Some(model) =
         formula.circuit_multiplier22_retained_sat_model_from_env(content.as_bytes())
     {
-        exit_with_circuit_multiplier22_retained_sat_model(&model);
+        exit_with_circuit_multiplier22_retained_sat_model(&model, stats_cfg);
     }
 }
 
-fn exit_with_circuit_multiplier22_retained_sat_model(model: &[bool]) -> ! {
+fn exit_with_circuit_multiplier22_retained_sat_model(
+    model: &[bool],
+    stats_cfg: stats_output::StatsConfig,
+) -> ! {
     reject_dimacs_decision_trace_or_exit();
     safe_eprintln!("c Circuit_multiplier22 retained original-DIMACS SAT model authority admitted");
+    if stats_cfg.any() {
+        let route = "retained-model-authority";
+        let reason = "retained model authority bypasses solver startup";
+        if stats_cfg.human {
+            emit_startup_capability_plan_unavailable(route, reason);
+        }
+        let mut run_stats = stats_output::RunStatistics::new(
+            stats_output::SolveMode::DimacsSat,
+            "sat",
+            global_elapsed(),
+        );
+        insert_startup_capability_plan_unavailable_stats(&mut run_stats, route, reason);
+        emit_dimacs_run_stats(
+            &run_stats,
+            stats_cfg,
+            summary_route_profile(selected_sat_variant(), None),
+        );
+    }
     crate::mark_verdict_printed();
     safe_println!("s SATISFIABLE");
     emit_dimacs_sat_model(model);
@@ -1935,13 +1959,14 @@ fn dimacs_exit_if_timed_out(solver: Option<&mut SatSolver>) {
         std::process::exit(code);
     }
 }
+use ay_sat::auto::DecisionSource;
 use ay_sat::dimacs_core::{DimacsCoreError, DimacsEvent, DimacsRecordRef};
 use ay_sat::guard_cover_sidecar::{self, GuardCoverPackingEvidence, SeparatorCoverEvidence};
 use ay_sat::{
-    adjust_features_for_instance, parse_dimacs, DimacsError, Extension, InstanceClass, Literal,
-    PortfolioSolver, ProofCertificate, ProofOutput, SatFeatureAccumulator, SatFeatures, SatResult,
-    Solver as SatSolver, SolverVariant, TlaTraceable, Variable, VariantInput, VariantProfilePlan,
-    VariantRouteProfile, VariantStartupPolicy,
+    parse_dimacs, DimacsError, Extension, Literal, PortfolioSolver, ProofCertificate, ProofOutput,
+    SatFeatureAccumulator, SatFeatures, SatResult, Solver as SatSolver, SolverVariant,
+    TlaTraceable, Variable, VariantInput, VariantProfilePlan, VariantRouteProfile,
+    VariantStartupPolicy,
 };
 
 pub(crate) fn is_dimacs_format(content: &str) -> bool {
@@ -2051,7 +2076,7 @@ const SPARSE_XOR_WIDE_CNF_WIDE_FRACTION_DENOMINATOR: usize = 5; // 80%
 /// leaves every mid-range and legitimate case on the XOR path. `total` uses
 /// `consumed + remaining`, which equals the original clause count exactly (the
 /// two sets partition the CNF) and matches the density gate's own total. Kill
-/// switch: `AY_XOR_ALLOW_RESIDUAL=1` restores the old unconditional enable
+/// switch: `--xor-allow-residual` restores the old unconditional enable
 /// (byte-identical to pre-fix).
 const XOR_RESIDUAL_DOMINANCE_NUMERATOR: usize = 17;
 const XOR_RESIDUAL_DOMINANCE_DENOMINATOR: usize = 20; // disable when residual > 85%
@@ -2071,7 +2096,7 @@ const XOR_RESIDUAL_DOMINANCE_DENOMINATOR: usize = 20; // disable when residual >
 /// the same. GE only pays for itself on small, dense XOR systems whose GE
 /// component is compact, so a conservative absolute cap keeps GE for those and
 /// routes large formulas down the standard path. Overridable via
-/// `AY_XOR_ALLOW_LARGE` for experimentation (inc6, SAT-COMP campaign).
+/// `--xor-allow-large` for experimentation (inc6, SAT-COMP campaign).
 const XOR_EXTENSION_MAX_CLAUSES: usize = 50_000;
 
 fn should_enable_xor_extension(
@@ -2096,11 +2121,11 @@ fn should_enable_xor_extension(
     // vs plain-path s UNSATISFIABLE@110s, kissat + dpr-trim + cake_lpr verified).
     // Enable XOR only when it covers a dominant fraction (residual <= 85% total).
     // `residual_total` == original clause count (consumed and remaining partition
-    // the CNF). Kill switch AY_XOR_ALLOW_RESIDUAL=1 restores the old enable.
+    // the CNF). Kill switch --xor-allow-residual restores the old enable.
     let residual_total = consumed.saturating_add(remaining);
     if remaining.saturating_mul(XOR_RESIDUAL_DOMINANCE_DENOMINATOR)
         > residual_total.saturating_mul(XOR_RESIDUAL_DOMINANCE_NUMERATOR)
-        && std::env::var_os("AY_XOR_ALLOW_RESIDUAL").is_none()
+        && !ay_core::misc_cli_flags().xor_allow_residual
     {
         return false;
     }
@@ -2108,7 +2133,7 @@ fn should_enable_xor_extension(
     // inprocessing outweighs any GF(2) benefit and risks CDCL search collapse
     // (intel047/dislog regression). Keep them on the standard CDCL +
     // inprocessing path (htr/gate/sweep/probe/vivify/backbone).
-    if total > XOR_EXTENSION_MAX_CLAUSES && std::env::var_os("AY_XOR_ALLOW_LARGE").is_none() {
+    if total > XOR_EXTENSION_MAX_CLAUSES && !ay_core::misc_cli_flags().xor_allow_large {
         return false;
     }
     // Gate-structured formulas have high binary clause fractions. XOR
@@ -2152,8 +2177,9 @@ fn should_enable_xor_extension(
 }
 
 fn selected_sat_variant() -> SolverVariant {
-    // `MiscCliFlags.sat_variant` is populated from `--sat-variant` by the CLI
-    // (#8835); falls back to `AY_SAT_VARIANT` env var for library consumers.
+    // `MiscCliFlags.sat_variant` prefers `--sat-variant` and retains the exact
+    // `AY_SAT_VARIANT` compatibility fallback for older launchers and library
+    // consumers (#8835).
     match ay_core::misc_cli_flags().sat_variant.as_deref() {
         Some(value) if value.trim().is_empty() => SolverVariant::Default,
         Some(value) => match SolverVariant::parse(value.trim()) {
@@ -2295,23 +2321,58 @@ fn env_u64(name: &str) -> Option<u64> {
 }
 
 fn official_sat_main_regular_route_from_env() -> bool {
-    if env_eq_ignore_ascii_case("AY_INTERNAL_SATCOMP_WRAPPER", SATCOMP_MAIN_REGULAR_WRAPPER)
-        || env_eq_ignore_ascii_case("AY_SAT_PROFILE_ID", "ay-sat-regular-main")
-        || env_eq_ignore_ascii_case("AY_SAT_COMPETITION_PROFILE", "regular")
-    {
-        return true;
-    }
+    official_sat_main_regular_route_decision_from_env().0
+}
 
-    if let Ok(track) = std::env::var("AY_SAT_TRACK") {
-        if !track.trim().is_empty() {
-            let ai_class =
-                std::env::var("AY_SAT_AI_CLASS").unwrap_or_else(|_| "regular".to_string());
-            return track.trim().eq_ignore_ascii_case("main")
-                && ai_class.trim().eq_ignore_ascii_case("regular");
+fn official_sat_main_regular_route_source_from_env() -> Option<DecisionSource> {
+    official_sat_main_regular_route_decision_from_env().1
+}
+
+fn official_sat_main_regular_route_decision_from_env() -> (bool, Option<DecisionSource>) {
+    let wrapper =
+        env_eq_ignore_ascii_case("AY_INTERNAL_SATCOMP_WRAPPER", SATCOMP_MAIN_REGULAR_WRAPPER);
+    let profile_id = env_eq_ignore_ascii_case("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let profile = env_eq_ignore_ascii_case("AY_SAT_COMPETITION_PROFILE", "regular");
+    let track_main = std::env::var("AY_SAT_TRACK")
+        .is_ok_and(|track| !track.trim().is_empty() && track.trim().eq_ignore_ascii_case("main"));
+    let ai_class = std::env::var("AY_SAT_AI_CLASS").ok();
+    let track = track_main
+        && ai_class
+            .as_deref()
+            .unwrap_or("regular")
+            .trim()
+            .eq_ignore_ascii_case("regular");
+    let name = match (wrapper, profile_id, profile, track) {
+        (false, false, false, false) => {
+            return if track_main && ai_class.is_some() {
+                (false, Some(DecisionSource::EnvShim("AY_SAT_AI_CLASS")))
+            } else {
+                (false, None)
+            };
         }
-    }
-
-    false
+        (true, false, false, false) => "AY_INTERNAL_SATCOMP_WRAPPER",
+        (false, true, false, false) => "AY_SAT_PROFILE_ID",
+        (false, false, true, false) => "AY_SAT_COMPETITION_PROFILE",
+        (false, false, false, true) => "AY_SAT_TRACK",
+        (true, true, false, false) => "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_PROFILE_ID",
+        (true, false, true, false) => "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_COMPETITION_PROFILE",
+        (true, false, false, true) => "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_TRACK",
+        (false, true, true, false) => "AY_SAT_PROFILE_ID+AY_SAT_COMPETITION_PROFILE",
+        (false, true, false, true) => "AY_SAT_PROFILE_ID+AY_SAT_TRACK",
+        (false, false, true, true) => "AY_SAT_COMPETITION_PROFILE+AY_SAT_TRACK",
+        (true, true, true, false) => {
+            "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_PROFILE_ID+AY_SAT_COMPETITION_PROFILE"
+        }
+        (true, true, false, true) => "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_PROFILE_ID+AY_SAT_TRACK",
+        (true, false, true, true) => {
+            "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_COMPETITION_PROFILE+AY_SAT_TRACK"
+        }
+        (false, true, true, true) => "AY_SAT_PROFILE_ID+AY_SAT_COMPETITION_PROFILE+AY_SAT_TRACK",
+        (true, true, true, true) => {
+            "AY_INTERNAL_SATCOMP_WRAPPER+AY_SAT_PROFILE_ID+AY_SAT_COMPETITION_PROFILE+AY_SAT_TRACK"
+        }
+    };
+    (true, Some(DecisionSource::EnvShim(name)))
 }
 
 fn fail_closed_satcomp_proof_setup(reason: &str) -> ! {
@@ -2903,23 +2964,28 @@ fn variant_profile_plan_for_dimacs_features(
     // the disjoint aggressive band (Default -> Aggressive, 4.0 < ratio <= 6.5,
     // 50k-250k vars; kill-switch AY_AB_AGGRESSIVE_ROUTE=0). An explicit variant
     // is always honored verbatim.
-    let variant = if sat_variant_explicitly_selected() {
-        variant
+    let requested_source = sat_variant_decision_source();
+    let (variant, source) = if sat_variant_explicitly_selected() {
+        (variant, requested_source)
     } else {
-        variant.auto_route(features)
+        variant.auto_route_with_source(features, requested_source)
     };
-    VariantProfilePlan::for_features(
+    let input = variant_input_for_dimacs(
         variant,
-        variant_input_for_dimacs(
-            variant,
-            num_vars,
-            num_clauses,
-            proof_mode,
-            lrat_mode,
-            lrat_output,
-        ),
-        features,
-    )
+        num_vars,
+        num_clauses,
+        proof_mode,
+        lrat_mode,
+        lrat_output,
+    );
+    let route_source = if input.route_profile.requires_proof_safe_specialist_routing()
+        || (matches!(variant, SolverVariant::Default) && proof_mode && lrat_mode && lrat_output)
+    {
+        official_sat_main_regular_route_source_from_env()
+    } else {
+        None
+    };
+    VariantProfilePlan::for_features_with_sources(variant, input, features, source, route_source)
 }
 
 /// Whether an explicit, non-empty `--sat-variant` (or `AY_SAT_VARIANT`) was
@@ -2931,9 +2997,31 @@ fn sat_variant_explicitly_selected() -> bool {
     )
 }
 
+fn sat_variant_decision_source() -> DecisionSource {
+    let flags = ay_core::misc_cli_flags();
+    if flags.sat_variant_from_cli
+        && flags
+            .sat_variant
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        DecisionSource::Cli
+    } else if flags
+        .sat_variant
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        DecisionSource::EnvShim("AY_SAT_VARIANT")
+    } else {
+        DecisionSource::Default
+    }
+}
+
 fn sat_variant_source_label() -> &'static str {
-    match ay_core::misc_cli_flags().sat_variant.as_deref() {
-        Some(value) if !value.trim().is_empty() => "--sat-variant",
+    let flags = ay_core::misc_cli_flags();
+    match flags.sat_variant.as_deref() {
+        Some(value) if !value.trim().is_empty() && flags.sat_variant_from_cli => "--sat-variant",
+        Some(value) if !value.trim().is_empty() => "AY_SAT_VARIANT",
         Some(_) => "--sat-variant-empty-default",
         None => "default",
     }
@@ -2959,12 +3047,13 @@ fn streaming_auto_route(
     content: &str,
     variant: SolverVariant,
     allow_auto_route: bool,
-) -> SolverVariant {
+    requested_source: DecisionSource,
+) -> (SolverVariant, DecisionSource) {
     if !allow_auto_route || content.len() > STREAMING_PROBE_ROUTE_SCAN_MAX_BYTES {
-        return variant;
+        return (variant, requested_source);
     }
     let (max_var, num_clauses, num_binary) = scan_probe_route_shape(content);
-    variant.auto_route_from_counts(max_var, num_clauses, num_binary)
+    variant.auto_route_from_counts_with_source(max_var, num_clauses, num_binary, requested_source)
 }
 
 /// One pass over DIMACS `content` returning the auto-route band inputs shared
@@ -4617,11 +4706,15 @@ fn maybe_run_dense_clique_php_proof_route(
         Some(proof),
     );
     if stats_cfg.any() {
+        if stats_cfg.human {
+            emit_startup_capability_plan(solver);
+        }
         let mut run_stats = stats_output::RunStatistics::new(
             stats_output::SolveMode::DimacsSat,
             "unsat",
             global_elapsed(),
         );
+        insert_startup_capability_plan_stats(&mut run_stats, solver);
         run_stats.insert(SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_REQUESTED_KEY, 1);
         run_stats.insert(SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_ENABLED_KEY, 1);
         run_stats.insert(SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_EXERCISED_KEY, 1);
@@ -5520,7 +5613,7 @@ fn required_dimacs_proof_gate_error(proof_config: Option<&ProofConfig>) -> Optio
 
 /// Refuse the one configuration in which an UNSAT verdict is checked by nobody.
 ///
-/// `AY_SAT_COMPOSITE_SYMMETRY` selects lex-leader symmetry breaking whose
+/// `--sat-composite-symmetry` selects lex-leader symmetry breaking whose
 /// equal-prefix aux tower is not single-witness PR, so the steps it appends are
 /// not SR-checkable. Measured on `count_p2_M21`: AY reports `s UNSATISFIABLE`
 /// in 276 ms with an 11 378-line proof, and `dsr-trim` rejects it with
@@ -5536,7 +5629,7 @@ fn required_dimacs_proof_gate_error(proof_config: Option<&ProofConfig>) -> Optio
 /// submission rather than a visible failure, so this leg refuses instead of
 /// warning. The warning stays for the re-check-on case, where it is advisory.
 fn uncertifiable_symmetry_gate_error(proof_config: Option<&ProofConfig>) -> Option<String> {
-    if std::env::var_os("AY_SAT_COMPOSITE_SYMMETRY").is_none_or(|v| v != "1") {
+    if !ay_core::sat_ab_switches().composite_symmetry {
         return None;
     }
     proof_config?;
@@ -5544,11 +5637,11 @@ fn uncertifiable_symmetry_gate_error(proof_config: Option<&ProofConfig>) -> Opti
         return None;
     }
     Some(
-        "AY_SAT_COMPOSITE_SYMMETRY writes certificates that external checkers reject \
+        "--sat-composite-symmetry writes certificates that external checkers reject \
          (its lex-leader aux tower is not single-witness PR), and proof re-checking is \
          off, so nothing would catch it. Refusing rather than emitting an unverifiable \
          UNSAT. Drop --no-verify-proof (and competition proof opt-outs) to let the \
-         internal checker gate the result, unset AY_SAT_COMPOSITE_SYMMETRY for a \
+         internal checker gate the result, unset --sat-composite-symmetry for a \
          certifiable run, or drop --proof if you do not need a certificate."
             .to_string(),
     )
@@ -5966,7 +6059,7 @@ pub(crate) fn run_dimacs_proof_from_file(
 ) {
     reject_dimacs_decision_trace_or_exit();
     enforce_required_dimacs_proof_gate(Some(proof));
-    exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(path);
+    exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(path, stats_cfg);
     if let Err(error) = reject_proof_input_alias(path, &proof.path) {
         safe_eprintln!("Error: unsafe DIMACS proof path {}: {error}", proof.path);
         std::process::exit(1);
@@ -6012,7 +6105,8 @@ pub(crate) fn run_dimacs_proof_from_file(
     }
     let input_sha256 = sha256_digest(&bytes);
     let content_max_var = scan_max_variable(&bytes);
-    // Giant-mode memory lever (`AY_AB_GIANT_MEM`, default ON): hand the byte
+    // Giant-mode memory lever (B1: unconditional; the AY_AB_GIANT_MEM
+    // kill-switch is deleted): hand the byte
     // buffer to the reader BY VALUE. `parse_dimacs_events` consumes the
     // reader, so the whole file buffer (3.4GB/7GB for the SC2025 giants
     // 1c21a43a/6ebe9012) is freed as soon as parsing ends, instead of staying
@@ -6021,52 +6115,17 @@ pub(crate) fn run_dimacs_proof_from_file(
     // `DimacsInputSource::FilePath`, NOT this buffer, so this is a pure
     // memory-lifetime change: the parsed byte stream is identical and no
     // certificate gate is touched.
-    if giant_mem_levers_enabled() {
-        run_proof_streaming_reader(
-            io::Cursor::new(bytes),
-            stats_cfg,
-            selected_sat_variant(),
-            proof,
-            DimacsInputSource::FilePath {
-                path: &canonical_input_text,
-                sha256: input_sha256,
-            },
-            Some(content_max_var),
-        );
-    } else {
-        run_proof_streaming_reader(
-            io::Cursor::new(&bytes),
-            stats_cfg,
-            selected_sat_variant(),
-            proof,
-            DimacsInputSource::FilePath {
-                path: &canonical_input_text,
-                sha256: input_sha256,
-            },
-            Some(content_max_var),
-        );
-    }
-}
-
-/// Kill-switch `AY_AB_GIANT_MEM` (default ON; unset or `=1` enables, any
-/// other explicit value disables — conservative parse matching
-/// `AY_AB_SUBST_AUTO_GIANT`): giant-instance peak-RSS levers —
-/// owned-cursor file-buffer drop after parse (`run_dimacs_proof_from_file`
-/// above) and the u32 watch-init offset collect
-/// (`ay-sat::solver::propagation::initialize_watches`, which reads the same
-/// env var). Both are memory-lifetime/width-only: verdicts, stats and
-/// certificates are unchanged. Validated on 1c21a43a (58.6M vars / 157.7M
-/// clauses): SAT@43.6s, peak RSS 16.1GB vs 15.3-25.9GB baseline spread,
-/// model independently validated. Cached OnceLock per the #8506
-/// no-per-call-syscall convention.
-pub(crate) fn giant_mem_levers_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GIANT_MEM: OnceLock<bool> = OnceLock::new();
-    *GIANT_MEM.get_or_init(|| {
-        std::env::var("AY_AB_GIANT_MEM")
-            .map(|v| v == "1")
-            .unwrap_or(true)
-    })
+    run_proof_streaming_reader(
+        io::Cursor::new(bytes),
+        stats_cfg,
+        selected_sat_variant(),
+        proof,
+        DimacsInputSource::FilePath {
+            path: &canonical_input_text,
+            sha256: input_sha256,
+        },
+        Some(content_max_var),
+    );
 }
 
 pub(crate) fn run_dimacs_proof_from_reader<R>(
@@ -6090,7 +6149,10 @@ pub(crate) fn run_dimacs_proof_from_reader<R>(
     );
 }
 
-fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(path: &str) {
+fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(
+    path: &str,
+    stats_cfg: stats_output::StatsConfig,
+) {
     if !circuit_multiplier22_retained_sat_model_authority_requested() {
         return;
     }
@@ -6104,7 +6166,7 @@ fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(path: &
         return;
     };
     if let Some(model) = formula.circuit_multiplier22_retained_sat_model_from_env(&bytes) {
-        exit_with_circuit_multiplier22_retained_sat_model(&model);
+        exit_with_circuit_multiplier22_retained_sat_model(&model, stats_cfg);
     }
 }
 
@@ -6142,7 +6204,7 @@ fn run_dimacs_from_content_impl(
         discover_and_check_separator_cover_sidecar(input_path, content.as_bytes());
 
     if let Some(proof) = proof_config {
-        exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content);
+        exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content, stats_cfg);
         if separator_cover_sidecar
             .as_ref()
             .is_some_and(|sidecar| sidecar.accepted)
@@ -6166,9 +6228,13 @@ fn run_dimacs_from_content_impl(
     if guard_cover_sidecar.is_none() && separator_cover_sidecar.is_none() {
         if let Some((_, nc)) = scan_dimacs_header(content) {
             if nc > STREAMING_CLAUSE_THRESHOLD {
-                let streaming_variant =
-                    streaming_auto_route(content, sat_variant, allow_auto_route);
-                run_streaming(content, stats_cfg, streaming_variant);
+                let (streaming_variant, streaming_source) = streaming_auto_route(
+                    content,
+                    sat_variant,
+                    allow_auto_route,
+                    sat_variant_decision_source(),
+                );
+                run_streaming(content, stats_cfg, streaming_variant, streaming_source);
                 return;
             }
         }
@@ -6185,15 +6251,18 @@ fn run_dimacs_from_content_impl(
             if let Some(model) =
                 formula.circuit_multiplier22_retained_sat_model_from_env(content.as_bytes())
             {
-                exit_with_circuit_multiplier22_retained_sat_model(&model);
+                exit_with_circuit_multiplier22_retained_sat_model(&model, stats_cfg);
             }
 
             if separator_cover_sidecar
                 .as_ref()
                 .is_some_and(|sidecar| sidecar.accepted)
             {
-                let mut solver =
-                    formula.into_solver_with_variant_routed(sat_variant, allow_auto_route);
+                let mut solver = formula.into_solver_with_variant_routed_source(
+                    sat_variant,
+                    allow_auto_route,
+                    sat_variant_decision_source(),
+                );
                 let mut sidecar_stats = separator_cover_sidecar.expect("sidecar was checked above");
                 sidecar_stats.injected_empty_cut = true;
                 let _ = solver.add_preserved_learned(Vec::new());
@@ -6212,8 +6281,11 @@ fn run_dimacs_from_content_impl(
                 .as_ref()
                 .is_some_and(|sidecar| sidecar.accepted)
             {
-                let mut solver =
-                    formula.into_solver_with_variant_routed(sat_variant, allow_auto_route);
+                let mut solver = formula.into_solver_with_variant_routed_source(
+                    sat_variant,
+                    allow_auto_route,
+                    sat_variant_decision_source(),
+                );
                 let mut sidecar_stats = guard_cover_sidecar.expect("sidecar was checked above");
                 sidecar_stats.injected_empty_cut = true;
                 // The Lean-backed sidecar proves a contradiction. Inject an
@@ -6238,7 +6310,7 @@ fn run_dimacs_from_content_impl(
                 // write the proof from the ProofCertificate post-solve.
                 if proof.format == ProofFormat::Alethe {
                     let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
-                    let variant_config = variant_profile_plan_for_dimacs_features(
+                    let variant_plan = variant_profile_plan_for_dimacs_features(
                         sat_variant,
                         formula.num_vars,
                         formula.num_clauses,
@@ -6246,14 +6318,13 @@ fn run_dimacs_from_content_impl(
                         true, // LRAT mode for backward reconstruction
                         false,
                         &features,
-                    )
-                    .config;
+                    );
 
                     let sink_output = ProofOutput::lrat_text(io::sink(), num_original_clauses);
                     let mut solver = SatSolver::with_proof_output(formula.num_vars, sink_output);
                     // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
                     solver.set_symmetry_oneshot(true);
-                    variant_config.apply_to_solver(&mut solver);
+                    variant_plan.apply_to_solver(&mut solver);
                     for clause in formula.clauses {
                         solver.add_clause(clause);
                     }
@@ -6270,7 +6341,7 @@ fn run_dimacs_from_content_impl(
                 if proof.format == ProofFormat::Lean4 {
                     let original_clauses = dimacs_original_clauses_from_literals(&formula.clauses);
                     let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
-                    let variant_config = variant_profile_plan_for_dimacs_features(
+                    let variant_plan = variant_profile_plan_for_dimacs_features(
                         sat_variant,
                         formula.num_vars,
                         formula.num_clauses,
@@ -6278,15 +6349,14 @@ fn run_dimacs_from_content_impl(
                         true, // LRAT mode for backward reconstruction
                         false,
                         &features,
-                    )
-                    .config;
+                    );
 
                     let lrat_output =
                         ProofOutput::lrat_text(Vec::<u8>::new(), num_original_clauses);
                     let mut solver = SatSolver::with_proof_output(formula.num_vars, lrat_output);
                     // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
                     solver.set_symmetry_oneshot(true);
-                    variant_config.apply_to_solver(&mut solver);
+                    variant_plan.apply_to_solver(&mut solver);
                     for clause in formula.clauses {
                         solver.add_clause(clause);
                     }
@@ -6303,7 +6373,7 @@ fn run_dimacs_from_content_impl(
 
                 let lrat_output = matches!(proof.format, ProofFormat::Lrat);
                 let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
-                let variant_config = variant_profile_plan_for_dimacs_features(
+                let variant_plan = variant_profile_plan_for_dimacs_features(
                     sat_variant,
                     formula.num_vars,
                     formula.num_clauses,
@@ -6311,8 +6381,7 @@ fn run_dimacs_from_content_impl(
                     lrat_output,
                     lrat_output,
                     &features,
-                )
-                .config;
+                );
 
                 let output = match create_configured_dimacs_proof_file(proof)
                     .and_then(|file| solver_proof_output_writer(file, proof))
@@ -6342,7 +6411,7 @@ fn run_dimacs_from_content_impl(
                 let mut solver = SatSolver::with_proof_output(formula.num_vars, output);
                 // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
                 solver.set_symmetry_oneshot(true);
-                variant_config.apply_to_solver(&mut solver);
+                variant_plan.apply_to_solver(&mut solver);
                 for clause in formula.clauses {
                     solver.add_clause(clause);
                 }
@@ -6382,7 +6451,7 @@ fn run_dimacs_from_content_impl(
                     let mut solver = SatSolver::new(formula.num_vars);
                     // One-shot DIMACS solve: see Solver::set_symmetry_oneshot.
                     solver.set_symmetry_oneshot(true);
-                    let xor_config = variant_profile_plan_for_dimacs_features(
+                    let xor_plan = variant_profile_plan_for_dimacs_features(
                         sat_variant,
                         formula.num_vars,
                         formula.num_clauses,
@@ -6390,9 +6459,8 @@ fn run_dimacs_from_content_impl(
                         false,
                         false,
                         &features,
-                    )
-                    .config;
-                    xor_config.apply_to_solver(&mut solver);
+                    );
+                    xor_plan.apply_to_solver(&mut solver);
                     // Claim trace file to prevent any nested tracers from clobbering.
                     if ay_core::trace_file_available() {
                         if let Some(path) = &ay_core::trace_config().trace_file_path {
@@ -6435,8 +6503,11 @@ fn run_dimacs_from_content_impl(
                         separator_cover_sidecar.as_ref(),
                     );
                 } else {
-                    let mut solver =
-                        formula.into_solver_with_variant_routed(sat_variant, allow_auto_route);
+                    let mut solver = formula.into_solver_with_variant_routed_source(
+                        sat_variant,
+                        allow_auto_route,
+                        sat_variant_decision_source(),
+                    );
                     // TLA trace only available on non-proof solver.
                     // Claim trace file to prevent any nested tracers from clobbering.
                     if ay_core::trace_file_available() {
@@ -6685,6 +6756,13 @@ pub(crate) fn run_dimacs_parallel(
             // Definitive stats are public result output too; emit them only
             // after every mandatory UNSAT gate and artifact publication.
             if stats_cfg.any() {
+                let unavailable_reason = "workers use distinct portfolio startup strategies";
+                if stats_cfg.human {
+                    emit_startup_capability_plan_unavailable(
+                        "parallel-portfolio",
+                        unavailable_reason,
+                    );
+                }
                 let result_str = match &result {
                     SatResult::Sat(_) => "sat",
                     SatResult::Unsat(_) => "unsat",
@@ -6696,6 +6774,11 @@ pub(crate) fn run_dimacs_parallel(
                     stats_output::SolveMode::DimacsSat,
                     result_str,
                     global_elapsed(),
+                );
+                insert_startup_capability_plan_unavailable_stats(
+                    &mut run_stats,
+                    "parallel-portfolio",
+                    unavailable_reason,
                 );
                 run_stats.insert("sat.parallel_threads", num_threads as u64);
                 run_stats.insert(
@@ -6934,6 +7017,13 @@ pub(crate) fn run_dimacs_cube_and_conquer(
             };
 
             if stats_cfg.any() {
+                let unavailable_reason = "cube and conquer workers do not share one startup plan";
+                if stats_cfg.human {
+                    emit_startup_capability_plan_unavailable(
+                        "cube-and-conquer",
+                        unavailable_reason,
+                    );
+                }
                 let result_str = match &result {
                     SatResult::Sat(_) => "sat",
                     SatResult::Unsat(_) => "unsat",
@@ -6945,6 +7035,11 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                     stats_output::SolveMode::DimacsSat,
                     result_str,
                     global_elapsed(),
+                );
+                insert_startup_capability_plan_unavailable_stats(
+                    &mut run_stats,
+                    "cube-and-conquer",
+                    unavailable_reason,
                 );
                 run_stats.insert("sat.cube_and_conquer_depth", depth as u64);
                 run_stats.insert("sat.cube_and_conquer_threads", num_threads as u64);
@@ -7791,6 +7886,54 @@ fn finish_dimacs_solve(
     );
 }
 
+fn emit_startup_capability_plan(solver: &SatSolver) {
+    for decision in solver.capability_ledger().entries() {
+        safe_eprintln!(
+            "c startup_capability: {:<12} {:<10} {:<8} {}",
+            decision.capability,
+            decision.state.label(),
+            decision.source.label(),
+            decision.because
+        );
+    }
+}
+
+fn emit_startup_capability_plan_unavailable(route: &str, because: &str) {
+    safe_eprintln!("c startup_capability_plan: unavailable route={route} because={because}");
+}
+
+fn insert_startup_capability_plan_stats(
+    run_stats: &mut stats_output::RunStatistics,
+    solver: &SatSolver,
+) {
+    run_stats.insert("sat.capability_plan.available", 1);
+    run_stats.insert_text("sat.capability_plan.status", "available");
+    for decision in solver.capability_ledger().entries() {
+        let prefix = format!("sat.capability.{}", decision.capability);
+        let source_code = match decision.source {
+            DecisionSource::Cli => 0,
+            DecisionSource::Auto => 1,
+            DecisionSource::Default => 2,
+            DecisionSource::EnvShim(_) => 3,
+        };
+        run_stats.insert(&format!("{prefix}.source"), source_code);
+        run_stats.insert_text(&format!("{prefix}.source_label"), decision.source.label());
+        run_stats.insert_text(&format!("{prefix}.state"), decision.state.label());
+        run_stats.insert_text(&format!("{prefix}.because"), decision.because.clone());
+    }
+}
+
+fn insert_startup_capability_plan_unavailable_stats(
+    run_stats: &mut stats_output::RunStatistics,
+    route: &str,
+    reason: &str,
+) {
+    run_stats.insert("sat.capability_plan.available", 0);
+    run_stats.insert_text("sat.capability_plan.status", "unavailable");
+    run_stats.insert_text("sat.capability_plan.route", route);
+    run_stats.insert_text("sat.capability_plan.reason", reason);
+}
+
 fn finish_dimacs_solve_with_source(
     solver: &mut SatSolver,
     result: SatResult,
@@ -7829,6 +7972,7 @@ fn finish_dimacs_solve_with_source(
             proof_writer_telemetry_override = None;
         }
     }
+    let finalize_rescue_used = rescue_storage.is_some();
     let solver: &mut SatSolver = match rescue_storage.as_mut() {
         Some(retry_solver) => retry_solver,
         None => solver,
@@ -8172,8 +8316,6 @@ fn finish_dimacs_solve_with_source(
                 u64::from(dense_mutex_runtime_candidate)
             );
             safe_eprintln!("c dense_rt_gate:   {dense_mutex_computed_gate:>12}");
-            let trail_blocked = solver.trail_blocked_restarts();
-            safe_eprintln!("c trail_blocked:   {trail_blocked:>12}");
             let stable_ema = solver.stable_ema_fires();
             safe_eprintln!("c reluctant_fires: {reluctant_fires:>12}");
             safe_eprintln!("c stable_ema_rst:  {stable_ema:>12}");
@@ -8309,6 +8451,18 @@ fn finish_dimacs_solve_with_source(
             // area unverifiable (the development design notes).
             for (route, outcome) in &sy.routes {
                 safe_eprintln!("c symmetry_route:  {route:<12} {outcome}");
+            }
+            // Startup capability ledger (batteries-included B0): every gate
+            // the frozen startup plan considered, its startup state, and the
+            // last startup layer that decided it. Runtime policy may later
+            // decline or degrade work; those outcomes have separate telemetry.
+            if finalize_rescue_used {
+                emit_startup_capability_plan_unavailable(
+                    "finalize-rescue",
+                    "retry startup plan differs from the discarded first attempt",
+                );
+            } else {
+                emit_startup_capability_plan(solver);
             }
             safe_eprintln!("c decomp_rounds:   {val:>12}", val = ds.rounds);
             safe_eprintln!("c decomp_subst:    {val:>12}", val = ds.substituted);
@@ -9749,10 +9903,6 @@ fn finish_dimacs_solve_with_source(
             solver.stable_reluctant_fires(),
         );
         run_stats.insert("sat.stable_ema_fires", solver.stable_ema_fires());
-        run_stats.insert(
-            "sat.trail_blocked_restarts",
-            solver.trail_blocked_restarts(),
-        );
         run_stats.insert("sat.focused_decisions", focused_decs);
         run_stats.insert("sat.stable_decisions", stable_decs);
         run_stats.insert("sat.mab_switches", mab_switches);
@@ -10414,6 +10564,15 @@ fn finish_dimacs_solve_with_source(
             ay_core::TermStore::global_term_bytes() as u64,
         );
         run_stats.insert("time.total_ms", global_elapsed().as_millis() as u64);
+        if finalize_rescue_used {
+            insert_startup_capability_plan_unavailable_stats(
+                &mut run_stats,
+                "finalize-rescue",
+                "retry startup plan differs from the discarded first attempt",
+            );
+        } else {
+            insert_startup_capability_plan_stats(&mut run_stats, solver);
+        }
         if let Some(authority) = &mut unsat_authority {
             validate_dimacs_unsat_publication_before_verdict(authority);
         }
@@ -10841,6 +11000,16 @@ fn run_proof_streaming_reader<R>(
         proof.format,
         ProofFormat::Lrat | ProofFormat::Alethe | ProofFormat::Lean4
     );
+    let variant_plan = variant_profile_plan_for_dimacs_features(
+        variant,
+        num_vars,
+        num_clauses_declared,
+        true,
+        lrat_mode,
+        matches!(proof.format, ProofFormat::Lrat),
+        &features,
+    );
+    variant_plan.apply_to_solver(&mut solver);
     maybe_run_dense_clique_php_proof_route(
         dense_clique_php_proof_route_requested,
         &mut solver,
@@ -10851,17 +11020,6 @@ fn run_proof_streaming_reader<R>(
         proof,
         source,
     );
-    let variant_config = variant_profile_plan_for_dimacs_features(
-        variant,
-        num_vars,
-        num_clauses_declared,
-        true,
-        lrat_mode,
-        matches!(proof.format, ProofFormat::Lrat),
-        &features,
-    )
-    .config;
-    variant_config.apply_to_solver(&mut solver);
 
     match proof.format {
         ProofFormat::Alethe => {
@@ -10952,7 +11110,12 @@ fn scan_max_variable(bytes: &[u8]) -> usize {
 /// Parses DIMACS bytes directly into `solver.add_clause()`, skipping all
 /// intermediate data structures. On shuffling-2 (98MB, 4.7M clauses),
 /// this reduces parse+load from >15s to ~2s.
-fn run_streaming(content: &str, stats_cfg: stats_output::StatsConfig, variant: SolverVariant) {
+fn run_streaming(
+    content: &str,
+    stats_cfg: stats_output::StatsConfig,
+    variant: SolverVariant,
+    variant_source: DecisionSource,
+) {
     use ay_sat::Literal;
 
     let bytes = content.as_bytes();
@@ -11168,22 +11331,22 @@ fn run_streaming(content: &str, stats_cfg: stats_output::StatsConfig, variant: S
         clauses_loaded += 1;
     }
 
-    // Post-parse adaptive adjustment using shared SatFeatures infrastructure (#8149).
-    // Construct a lightweight SatFeatures from the streaming counters and apply
-    // the same rules as the buffered path (conditioning gate, symmetry, reorder).
-    {
-        let features = SatFeatures::from_streaming_counters(
-            num_vars,
-            clauses_loaded,
-            ternary_count,
-            horn_count,
-        );
-        let class = InstanceClass::classify(&features);
-
-        let mut profile = solver.inprocessing_feature_profile();
-        adjust_features_for_instance(&features, &class, &mut profile);
-        solver.apply_feature_profile(&profile);
-    }
+    // Install the same resolved plan as the buffered path, including the
+    // append-only capability ledger. Applying immediately before solve
+    // preserves the existing post-parse adaptive timing while avoiding a
+    // partial `config`-only installation that would drop provenance.
+    let features =
+        SatFeatures::from_streaming_counters(num_vars, clauses_loaded, ternary_count, horn_count);
+    // Keep the exact config installed before parsing as the plan base. In
+    // particular, an untrusted header whose declared clause/variable ratio is
+    // above the conditioning limit must stay clamped even when the number of
+    // clauses actually loaded differs from that declaration.
+    let plan = VariantProfilePlan::from_config_features_with_source(
+        streaming_config,
+        &features,
+        variant_source,
+    );
+    plan.apply_postparse_to_solver(&mut solver);
 
     safe_eprintln!("c streaming parse: {clauses_loaded} clauses loaded ({num_vars} vars)");
 

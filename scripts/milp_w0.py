@@ -64,8 +64,13 @@ import subprocess
 import sys
 import time
 
-CORPUS = pathlib.Path(os.environ.get("AY_MILP_CORPUS",
-                                     pathlib.Path.home() / "ay-bench" / "milp"))
+# B20: the env locator is retired; pass --corpus <dir> or symlink at the
+# default path.
+CORPUS = (
+    pathlib.Path(sys.argv[sys.argv.index("--corpus") + 1])
+    if "--corpus" in sys.argv
+    else pathlib.Path.home() / "ay-bench" / "milp"
+)
 MANIFEST = CORPUS / "manifest.json"
 AY_BIN = os.path.abspath(os.environ.get("AY_BIN", "./target/release/examples/mps_solve"))
 

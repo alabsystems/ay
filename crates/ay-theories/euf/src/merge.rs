@@ -394,8 +394,25 @@ impl EufSolver<'_> {
             "EUF incremental merge completed"
         );
 
-        #[cfg(debug_assertions)]
-        self.debug_assert_enode_class_integrity(r2, "incremental_merge destination");
+        // Destination classes are audited once per fixed-point propagation batch.
+    }
+
+    /// Audit every class changed by a completed propagation batch.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_changed_enode_classes(&self, mut changed_nodes: Vec<u32>) {
+        // Resolve through the final partition before deduplicating. Every class
+        // changed by a direct or congruence merge contains a recorded endpoint.
+        for node in &mut changed_nodes {
+            *node = self.enode_find_const(*node);
+        }
+        changed_nodes.sort_unstable();
+        changed_nodes.dedup();
+        for root in changed_nodes {
+            self.debug_assert_enode_class_integrity(
+                root,
+                "incremental_propagate fixed-point class",
+            );
+        }
     }
 
     /// Rebuild the incremental merge queue from the current asserted state.

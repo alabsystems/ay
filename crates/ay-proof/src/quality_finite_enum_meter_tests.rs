@@ -5,6 +5,7 @@
 //! Resource-meter regressions for the bounded finite-enum proof lane.
 
 use super::*;
+use ay_core::FarkasAnnotation;
 
 const B83_MEMBERS: usize = 146;
 const B83_CHECK_WORK: usize = 250_000_000;
@@ -16,6 +17,7 @@ struct FiniteEnumFixture {
     assumptions: Vec<TermId>,
     datatype_decls: Vec<(String, Vec<String>)>,
     selector_decls: Vec<(String, Vec<String>)>,
+    member_signatures: Vec<DatatypeMemberSignature>,
 }
 
 fn finite_enum_fixture(member_count: usize) -> FiniteEnumFixture {
@@ -42,6 +44,30 @@ fn finite_enum_fixture(member_count: usize) -> FiniteEnumFixture {
     let constructors: Vec<String> = (0..member_count - 1)
         .map(|index| format!("MeteredCtor{index}"))
         .collect();
+    let constructor_terms: Vec<TermId> = constructors
+        .iter()
+        .map(|constructor| terms.mk_var(constructor.clone(), enum_sort.clone()))
+        .collect();
+    let member_signatures: Vec<DatatypeMemberSignature> = constructors
+        .iter()
+        .zip(constructor_terms)
+        .flat_map(|(constructor, constructor_term)| {
+            [
+                DatatypeMemberSignature {
+                    identity: constructor.clone(),
+                    argument_sorts: Vec::new(),
+                    result_sort: enum_sort.clone(),
+                    nullary_term: Some(constructor_term),
+                },
+                DatatypeMemberSignature {
+                    identity: format!("is-{constructor}"),
+                    argument_sorts: vec![enum_sort.clone()],
+                    result_sort: Sort::Bool,
+                    nullary_term: None,
+                },
+            ]
+        })
+        .collect();
     let selector_decls = constructors
         .iter()
         .cloned()
@@ -65,6 +91,7 @@ fn finite_enum_fixture(member_count: usize) -> FiniteEnumFixture {
         assumptions,
         datatype_decls,
         selector_decls,
+        member_signatures,
     }
 }
 
@@ -100,14 +127,16 @@ fn argument_free_unit_tail_gets_linear_charge_but_annotated_tail_does_not() {
         work: 1024,
         bytes: 4096,
         unfolded_work: 8192,
+        order_assignments: 0,
     };
 
     assert!(is_argument_free_unit_tail_resolution(&plain, &derived));
     assert!(!is_argument_free_unit_tail_resolution(&annotated, &derived));
-    let plain_charge = strict_step_charge(&plain, &derived, atoms.len() * 2, payload)
+    let plain_charge = strict_step_charge(&terms, &plain, &derived, atoms.len() * 2, payload)
         .expect("linear unit-tail charge fits usize");
-    let annotated_charge = strict_step_charge(&annotated, &derived, atoms.len() * 2, payload)
-        .expect("conservative annotated charge fits usize");
+    let annotated_charge =
+        strict_step_charge(&terms, &annotated, &derived, atoms.len() * 2, payload)
+            .expect("conservative annotated charge fits usize");
 
     assert!(plain_charge.0 >= payload.unfolded_work);
     assert!(
@@ -123,6 +152,7 @@ fn datatype_enum_charge_covers_registry_scans_and_hash_scratch() {
         work: 101,
         bytes: 2048,
         unfolded_work: 73,
+        order_assignments: 0,
     };
     let datatype_registry = RegistryPayloadStats {
         work: 37,
@@ -157,11 +187,12 @@ fn b83_scale_finite_enum_progress_fits_and_enforces_the_bounded_envelope() {
     let fixture = finite_enum_fixture(B83_MEMBERS);
     assert_eq!(fixture.assumptions.len(), 10_585);
     let (mut work, mut bytes) = (0usize, 0usize);
-    let quality = check_proof_strict_with_context_and_progress(
+    let quality = check_proof_strict_with_typed_context_and_progress(
         &fixture.proof,
         &fixture.terms,
         Some(&fixture.datatype_decls),
         Some(&fixture.selector_decls),
+        &fixture.member_signatures,
         Some(&fixture.assumptions),
         &mut |work_delta, byte_delta| {
             let Some(next_work) = work.checked_add(work_delta) else {
@@ -185,11 +216,12 @@ fn b83_scale_finite_enum_progress_fits_and_enforces_the_bounded_envelope() {
 
     let cutoff = work - 1;
     let mut replay_work = 0usize;
-    let error = check_proof_strict_with_context_and_progress(
+    let error = check_proof_strict_with_typed_context_and_progress(
         &fixture.proof,
         &fixture.terms,
         Some(&fixture.datatype_decls),
         Some(&fixture.selector_decls),
+        &fixture.member_signatures,
         Some(&fixture.assumptions),
         &mut |work_delta, _| {
             let Some(next) = replay_work.checked_add(work_delta) else {
@@ -204,4 +236,34 @@ fn b83_scale_finite_enum_progress_fits_and_enforces_the_bounded_envelope() {
     )
     .expect_err("one less work unit than the reported total must fail closed");
     assert_eq!(error, ProofCheckError::ResourceLimit);
+}
+
+#[test]
+fn farkas_without_a_progress_meter_keeps_the_static_polynomial_byte_charge() {
+    // A Farkas route that cannot prove it uses the dynamic progress meter must
+    // retain the conservative static scratch bound. Only
+    // `SemanticChargeClass::ProgressFarkas` may remove this byte precharge.
+    let step = ProofStep::TheoryLemma {
+        theory: "LIA".to_string(),
+        clause: Vec::new(),
+        farkas: Some(FarkasAnnotation::from_ints(&[])),
+        kind: TheoryLemmaKind::LiaGeneric,
+        lia: None,
+    };
+    let payload = PayloadStats {
+        work: 1_321,
+        bytes: 24_786,
+        unfolded_work: 100,
+        order_assignments: 0,
+    };
+    let (work, bytes) = semantic_validator_charge(&step, payload, SemanticChargeClass::General)
+        .expect("measured Farkas charge fits usize");
+
+    assert_eq!(work, 1_321 * 100 * 100);
+    // The static byte reservation is the LINEAR full-validator bound (see
+    // FARKAS_FULL_VALIDATOR_BYTE_FACTOR), capped by the legacy quadratic
+    // product: min(24_786 * 128, 24_786 * 100^2). It remains a-priori and
+    // strictly positive — only ProgressFarkas may remove the byte precharge.
+    assert_eq!(bytes, 24_786 * 128);
+    assert!(bytes > 0, "the static reservation must remain");
 }

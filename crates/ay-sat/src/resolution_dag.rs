@@ -1704,7 +1704,11 @@ mod tests {
 
     #[test]
     fn bounded_level0_conflict_source_guard_defers_before_legacy_allocations() {
-        let source = include_str!("solver/conflict_analysis_lrat_specialized.rs");
+        let source = [
+            include_str!("solver/conflict_analysis_lrat_specialized/level0_conflict.rs"),
+            include_str!("solver/conflict_analysis_lrat_specialized.rs"),
+        ]
+        .join("\n");
         let deferred = source
             .find("if self.cold.backward_proof_limits.is_some() {")
             .expect("bounded deferred-conflict branch");

@@ -2066,7 +2066,7 @@ fn corpus_plan_public_url(url: &str) -> (String, bool) {
             .find('/')
             .map_or(public_base.len(), |offset| authority_start + offset);
         if let Some(at) = public_base[authority_start..authority_end].rfind('@') {
-            public_base.replace_range(authority_start..authority_start + at + 1, "");
+            public_base.replace_range(authority_start..=(authority_start + at), "");
             redacted = true;
         }
     }
@@ -2784,7 +2784,7 @@ fn run_campaign_audit(args: CampaignAuditArgs) -> Result<i32> {
                 );
             }
             if !assigned_tracks.insert(track_id.as_str()) {
-                bail!("campaign assets assign track {:?} more than once", track_id);
+                bail!("campaign assets assign track {track_id:?} more than once");
             }
         }
         if !CORPUS_STATUSES.contains(&event.corpus_status.as_str()) {
@@ -3168,7 +3168,7 @@ fn validate_campaign_corpus_pin(corpus: &Corpus, manifest: &Manifest) -> Result<
 }
 
 fn validate_campaign_file_pins(corpus: &Corpus, source_label: &str) -> Result<()> {
-    if !corpus.size_bytes.is_some_and(|size| size > 0) {
+    if corpus.size_bytes.is_none_or(|size| size == 0) {
         bail!("{source_label} asset has no positive size pin");
     }
     let sha256 = corpus.sha256.as_deref().unwrap_or_default();
@@ -4820,10 +4820,10 @@ fn compare_materialized_trees(expected: &Path, installed: &Path) -> Result<()> {
             })?;
             if expected_target != installed_target {
                 bail!(
-                    "materialized symlink {} targets {:?}, expected {:?}",
+                    "materialized symlink {} targets {}, expected {}",
                     materialized_entry_label(&relative),
-                    installed_target,
-                    expected_target
+                    installed_target.display(),
+                    expected_target.display()
                 );
             }
             continue;
@@ -4918,8 +4918,8 @@ fn compare_regular_files(
         fs::File::open(expected).with_context(|| format!("open {}", expected.display()))?;
     let mut installed_file =
         fs::File::open(installed).with_context(|| format!("open {}", installed.display()))?;
-    let mut expected_buf = [0_u8; 64 * 1024];
-    let mut installed_buf = [0_u8; 64 * 1024];
+    let mut expected_buf = vec![0_u8; 64 * 1024];
+    let mut installed_buf = vec![0_u8; 64 * 1024];
     let mut remaining = expected_len;
     while remaining != 0 {
         let amount = usize::try_from(remaining.min(expected_buf.len() as u64))
@@ -5919,9 +5919,9 @@ fn validate_archive_symlink(
     if target.is_absolute() || archive_windows_absolute(target_text) {
         if symlink_policy != ArchiveSymlinkPolicy::NormalizeUniqueInArchive {
             bail!(
-                "archive symlink {} has absolute target {:?}",
+                "archive symlink {} has absolute target {}",
                 member.display(),
-                target
+                target.display()
             );
         }
         let mapped = unique_absolute_link_member(members, member, target)?;
@@ -5940,16 +5940,16 @@ fn validate_archive_symlink(
     let parent = member.parent().unwrap_or_else(|| Path::new(""));
     let resolved = resolve_relative_archive_link(parent, target).with_context(|| {
         format!(
-            "archive symlink {} target {:?} escapes extraction root",
+            "archive symlink {} target {} escapes extraction root",
             member.display(),
-            target
+            target.display()
         )
     })?;
     if !archive_member_exists(members, &resolved) {
         bail!(
-            "archive symlink {} target {:?} is missing from the archive",
+            "archive symlink {} target {} is missing from the archive",
             member.display(),
-            target
+            target.display()
         );
     }
     Ok(())
@@ -5965,9 +5965,9 @@ fn validate_archive_hard_link(
         .ok_or_else(|| anyhow!("archive hard link {} target is not UTF-8", member.display()))?;
     if target.is_absolute() || archive_windows_absolute(target_text) {
         bail!(
-            "archive hard link {} has absolute target {:?}",
+            "archive hard link {} has absolute target {}",
             member.display(),
-            target
+            target.display()
         );
     }
     let Some(normalized) = normalized_archive_member_name(target_text.as_bytes())? else {
@@ -5981,9 +5981,9 @@ fn validate_archive_hard_link(
         Some(ArchiveMemberKind::File | ArchiveMemberKind::HardLink(_))
     ) {
         bail!(
-            "archive hard link {} target {:?} is missing or not a file",
+            "archive hard link {} target {} is missing or not a file",
             member.display(),
-            target
+            target.display()
         );
     }
     Ok(())
@@ -6046,14 +6046,14 @@ fn unique_absolute_link_member(
     match matches.as_slice() {
         [mapped] => Ok(mapped.clone()),
         [] => bail!(
-            "archive symlink {} absolute target {:?} has no in-archive suffix match",
+            "archive symlink {} absolute target {} has no in-archive suffix match",
             link.display(),
-            target
+            target.display()
         ),
         _ => bail!(
-            "archive symlink {} absolute target {:?} has ambiguous in-archive suffix matches: {}",
+            "archive symlink {} absolute target {} has ambiguous in-archive suffix matches: {}",
             link.display(),
-            target,
+            target.display(),
             matches
                 .iter()
                 .map(|path| path.display().to_string())
@@ -6131,10 +6131,10 @@ fn apply_archive_symlink_rewrites(root: &Path, safety: &ArchiveSafetyPlan) -> Re
             fs::read_link(&path).with_context(|| format!("read symlink {}", path.display()))?;
         if extracted_target != rewrite.archived_target {
             bail!(
-                "archive extractor changed symlink {} target from {:?} to {:?}",
+                "archive extractor changed symlink {} target from {} to {}",
                 rewrite.member.display(),
-                rewrite.archived_target,
-                extracted_target
+                rewrite.archived_target.display(),
+                extracted_target.display()
             );
         }
         fs::remove_file(&path)
@@ -6146,9 +6146,9 @@ fn apply_archive_symlink_rewrites(root: &Path, safety: &ArchiveSafetyPlan) -> Re
         )
         .with_context(|| {
             format!(
-                "normalize archive symlink {} to {:?}",
+                "normalize archive symlink {} to {}",
                 rewrite.member.display(),
-                rewrite.materialized_target
+                rewrite.materialized_target.display()
             )
         })?;
     }

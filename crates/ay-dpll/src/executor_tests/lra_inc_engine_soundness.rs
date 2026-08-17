@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Soundness regression tests for the incremental QF_LRA engine lane (S1,
-//! `AY_LRA_INC_ENGINE` / `Executor::lra_inc_engine_override`).
+//! `--dpll-no-lra-inc-engine` / `Executor::lra_inc_engine_override`).
 //!
 //! The engine lane reuses the persist-SAT lane's session-persistent SAT solver
 //! but puts it in `set_ic3_mode()` with scoped BVE disabled and

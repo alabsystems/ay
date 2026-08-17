@@ -471,7 +471,7 @@ pub(crate) fn substitute_binary_complements(
 
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE binary-complement-sub: eliminated {eliminated} binary cols, \
+            "--trace binary-complement-sub: eliminated {eliminated} binary cols, \
              {candidate_rows} equality rows, {parallel_rows_removed} parallel rows; \
              model {}r/{}c -> {}r/{}c",
             nr,
@@ -723,7 +723,7 @@ mod tests {
 /// Cached trace predicate; see the live-read ratchet in `tests/env_ledger.rs`.
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 /// Force this module's cached env accessor at solve entry, so a consumer that

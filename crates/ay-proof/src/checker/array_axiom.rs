@@ -4,7 +4,8 @@
 
 //! Strict-mode schema validation for the array `TheoryLemmaKind`s:
 //! `ArraySelectStore`, `ArrayStorePermutation`, `ArrayRowChain`,
-//! `ArrayDefaultConst`, and `ArrayExtensionality`.
+//! `ArrayDefaultConst`, `ArrayExtensionality`, `ArrayFiniteExtensionality`,
+//! and `ArrayFiniteSelectExpansion`.
 //!
 //! Context (#8820): the previous checker accepted any non-empty clause here,
 //! so an attacker could forge an "array axiom" lemma containing arbitrary
@@ -34,6 +35,10 @@
 //!   steps and the problem's assertion set (see
 //!   [`validate_array_extensionality`]); with no registry it stays fail-closed
 //!   exactly as before.
+//! - `ArrayFiniteExtensionality` / `ArrayFiniteSelectExpansion` — exact
+//!   complete-carrier schemas validated in the sibling `array_finite` module.
+//!   Unlike Skolemized extensionality, these are tautologies by finite-domain
+//!   exhaustion and need no witness-provenance registry.
 //!
 //! Full semantic validation (#8073) is still future work for the remaining
 //! kinds. Strict mode accepts the exact read-over-write schemas and rejects
@@ -49,6 +54,8 @@ use ay_core::{
 };
 
 use super::ProofCheckError;
+
+mod chain_extensions;
 
 /// Maximum number of `store` nodes the folded-default checker will traverse.
 /// This bounds work on untrusted proof bundles independently of proof size.
@@ -336,118 +343,9 @@ pub(crate) const MAX_STORE_PERMUTATION_CHAIN: usize = 8;
 /// Everything else it reports is read straight back out of the clause: the
 /// caller re-derives the permutation from `left`/`right` and discharges each
 /// transposition against the `index_equalities` literal for that exact pair.
-pub(crate) fn array_store_permutation_printer_terms(
-    terms: &TermStore,
-    clause: &[TermId],
-) -> Option<ArrayStorePermutationPrinterTerms> {
-    if clause.len() < 2 {
-        return None;
-    }
-    if clause
-        .iter()
-        .any(|&literal| !matches!(terms.sort(literal), Sort::Bool))
-    {
-        return None;
-    }
-    // A packed unit `or` is refused above by the length check; guard the
-    // remaining reshape risk explicitly so a future clause shape cannot slip
-    // through as a differently-spelled claim.
-    if clause.len() == 1 {
-        return None;
-    }
-
-    let mut found: Option<ArrayStorePermutationPrinterTerms> = None;
-    for (row_position, &row) in clause.iter().enumerate() {
-        let Some((left_array, right_array)) = equality_sides(terms, row) else {
-            continue;
-        };
-        if !matches!(terms.sort(left_array), Sort::Array(_))
-            || terms.sort(left_array) != terms.sort(right_array)
-        {
-            continue;
-        }
-        let Sort::Array(array_sort) = terms.sort(left_array) else {
-            continue;
-        };
-        let index_sort = array_sort.index_sort.clone();
-        let (Some(left), Some(right)) = (
-            parse_store_chain(terms, left_array),
-            parse_store_chain(terms, right_array),
-        ) else {
-            continue;
-        };
-        // (1) same base array, (2) same chain length in 2..=cap.
-        if left.base != right.base || left.entries.len() != right.entries.len() {
-            continue;
-        }
-        let n = left.entries.len();
-        if !(2..=MAX_STORE_PERMUTATION_CHAIN).contains(&n) {
-            continue;
-        }
-        // (3) pairwise distinct index TERMS on the left chain.
-        let indices: Vec<TermId> = left.entries.iter().map(|&(index, _)| index).collect();
-        let distinct: DetHashSet<TermId> = indices.iter().copied().collect();
-        if distinct.len() != n {
-            continue;
-        }
-        // (4) the two chains write the same multiset of (index, value) pairs.
-        let mut left_pairs = left.entries.clone();
-        let mut right_pairs = right.entries.clone();
-        left_pairs.sort_unstable();
-        right_pairs.sort_unstable();
-        if left_pairs != right_pairs {
-            continue;
-        }
-        // (5) one `(= i_p i_q)` literal per unordered index pair, recorded with
-        // the orientation and position the clause actually spells.
-        let mut index_equalities = Vec::new();
-        let mut complete = true;
-        for (position, &first) in indices.iter().enumerate() {
-            for &second in &indices[position + 1..] {
-                let carried = clause.iter().enumerate().find_map(|(at, &literal)| {
-                    // The permutation equality must never double as its own
-                    // side condition, however the sorts happen to line up.
-                    if at == row_position {
-                        return None;
-                    }
-                    let (lhs, rhs) = equality_sides(terms, literal)?;
-                    ((lhs, rhs) == (first, second) || (lhs, rhs) == (second, first))
-                        .then_some((literal, at, lhs, rhs))
-                });
-                match carried {
-                    Some(entry) => index_equalities.push(entry),
-                    None => {
-                        complete = false;
-                        break;
-                    }
-                }
-            }
-            if !complete {
-                break;
-            }
-        }
-        if !complete {
-            continue;
-        }
-        // An ambiguous clause carrying two permutation equalities is refused:
-        // the printer must not pick which of them to derive.
-        if found.is_some() {
-            return None;
-        }
-        found = Some(ArrayStorePermutationPrinterTerms {
-            row,
-            row_position,
-            left_array,
-            right_array,
-            base: left.base,
-            left: left.entries,
-            right: right.entries,
-            index_equalities,
-            index_sort,
-        });
-    }
-    found
-}
+#[path = "array_axiom/store_permutation_printer.rs"]
+mod store_permutation_printer;
+pub(crate) use store_permutation_printer::array_store_permutation_printer_terms;
 
 /// One `store` skipped while evaluating a chain at the read index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,26 +635,9 @@ pub(crate) fn array_row_chain_printer_terms(
         }
     }
 
-    // Sub-schema (D): exact select congruence. Keep this syntactically
-    // separate from (B): accepting two unreduced endpoints in the general
-    // ROW matcher would silently broaden all of its guarded-chain shapes.
-    if let Some(congruence) = exact_array_read_congruence_terms(terms, &literals) {
-        let base_path = |root| RowChainPath {
-            root,
-            skips: Vec::new(),
-            end: RowChainEnd::Base { base: root },
-        };
-        return Some(ArrayRowChainPrinterTerms::UnderArrayEq {
-            conclusion: congruence.conclusion,
-            array_eq_lit: congruence.array_eq_lit,
-            eq_term: congruence.eq_term,
-            left_target: congruence.left_read,
-            right_target: congruence.right_read,
-            read_index: congruence.read_index,
-            left: base_path(congruence.left),
-            right: base_path(congruence.right),
-            packed_or,
-        });
+    if let Some(shape) = chain_extensions::under_array_eq_printer_terms(terms, &literals, packed_or)
+    {
+        return Some(shape);
     }
 
     // Sub-schema (B).
@@ -854,13 +735,21 @@ pub(crate) fn array_row_chain_printer_terms(
 /// (and its Lean firewall) is unchanged; the n-ary schemas only ever claim
 /// clauses that were previously `Generic`.
 ///
-/// Extensionality is intentionally NOT recognized here — see
+/// Skolemized extensionality is intentionally NOT recognized here — see
 /// [`recognize_array_select_store`] for why it needs its own emitter-side path.
+/// Complete finite-carrier extensionality is a tautology and is recognized
+/// first through the independent `array_finite` validator.
 #[must_use]
 pub fn recognize_array_theory_lemma(
     terms: &TermStore,
     clause: &[TermId],
 ) -> Option<TheoryLemmaKind> {
+    if super::array_finite::recognize_array_finite_extensionality(terms, clause) {
+        return Some(TheoryLemmaKind::ArrayFiniteExtensionality);
+    }
+    if super::array_finite::recognize_array_finite_select_expansion(terms, clause) {
+        return Some(TheoryLemmaKind::ArrayFiniteSelectExpansion);
+    }
     if let Some(index_eq) = recognize_array_select_store(terms, clause) {
         return Some(TheoryLemmaKind::ArraySelectStore { index_eq });
     }
@@ -888,6 +777,40 @@ pub fn recognize_array_theory_lemma(
         return Some(TheoryLemmaKind::ArrayRowChain);
     }
     None
+}
+
+/// Typed-context form of [`recognize_array_theory_lemma`].
+///
+/// The extra context lets the two finite-array schemas authenticate the exact
+/// nullary constructor terms of an enum index carrier. All context-independent
+/// schemas retain the same classifier and ordering as the compatibility API.
+#[must_use]
+pub fn recognize_array_theory_lemma_with_typed_context(
+    terms: &TermStore,
+    clause: &[TermId],
+    datatype_declarations: &[(String, Vec<String>)],
+    constructor_selectors: &[(String, Vec<String>)],
+    datatype_member_signatures: &[super::DatatypeMemberSignature],
+) -> Option<TheoryLemmaKind> {
+    if super::array_finite::recognize_array_finite_extensionality_with_typed_context(
+        terms,
+        clause,
+        datatype_declarations,
+        constructor_selectors,
+        datatype_member_signatures,
+    ) {
+        return Some(TheoryLemmaKind::ArrayFiniteExtensionality);
+    }
+    if super::array_finite::recognize_array_finite_select_expansion_with_typed_context(
+        terms,
+        clause,
+        datatype_declarations,
+        constructor_selectors,
+        datatype_member_signatures,
+    ) {
+        return Some(TheoryLemmaKind::ArrayFiniteSelectExpansion);
+    }
+    recognize_array_theory_lemma(terms, clause)
 }
 
 /// Validate the exact array-default/const-array schemas.
@@ -1108,7 +1031,10 @@ fn sort_provably_infinite(sort: &Sort) -> bool {
 ///
 /// SCHEMA (all conditions are necessary; any failure REJECTS):
 ///
-/// The clause must contain a POSITIVE literal `(= L R)` where
+/// The clause must contain a POSITIVE literal whose two sides name an array
+/// pair `(L, R)` — either DIRECTLY, as `(= L R)` over one array sort, or
+/// READ-THROUGH, as `(= (select L k) (select R k))` where both reads are
+/// well-sorted and use the SAME index term `k` — where
 ///  1. `L` and `R` both parse as maximal `store` chains whose every node is a
 ///     well-sorted array `store`, and both chains bottom out in the SAME base
 ///     array term (identical `TermId`);
@@ -1126,13 +1052,156 @@ fn sort_provably_infinite(sort: &Sort) -> bool {
 /// by (3)+(4) each chain maps `i_k` to `v_k` and agrees with the base array
 /// everywhere else; the two chains are therefore pointwise equal, hence equal
 /// by extensionality (SMT-LIB `ArraysEx`, the theory every array logic uses).
-/// That contradicts the assumed-false conclusion literal, so the clause is a
-/// theory tautology. Extra literals are harmless: a superset of a valid clause
-/// is valid.
+/// For the DIRECT conclusion that already contradicts the assumed-false
+/// literal. For the READ-THROUGH conclusion, `L = R` gives
+/// `select(L,k) = select(R,k)` by congruence of the well-sorted `select(_, k)`
+/// function — the read-through clause is therefore strictly WEAKER than the
+/// direct one over the same side conditions, never an independent claim. Either
+/// way the clause is a theory tautology. Extra literals are harmless: a
+/// superset of a valid clause is valid.
+/// Walk the maximal leading `store` spine of `term`, debiting one unit per node
+/// so the measurement is itself bounded and fails closed. Mirrors
+/// `chain_extensions::parse_store_chain`'s `args[0]` base spine, so it
+/// upper-bounds the nodes any single parse visits; the interned term DAG is
+/// acyclic, so the walk terminates.
+fn metered_store_spine_len(
+    terms: &TermStore,
+    term: TermId,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<usize, ProofCheckError> {
+    let mut len = 0usize;
+    let mut current = term;
+    while let TermData::App(sym, args) = terms.get(current) {
+        if !matches!(sym, Symbol::Named(name) if name == "store") || args.len() != 3 {
+            break;
+        }
+        // Debit THIS node before descending: covers this measurement walk plus
+        // `matches_store_permutation`'s single `parse_store_chain` re-walk.
+        if !progress(64, 0) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+        len += 1;
+        current = args[0];
+    }
+    Ok(len)
+}
+
+/// Debit the strict-check meter for the ACTUAL work
+/// [`validate_array_store_permutation`] is about to perform, failing closed if
+/// the caller's envelope cannot absorb it.
+///
+/// This is the store-permutation half of the `ArrayClauseSchema` fix: instead of
+/// the up-front `~8 * unfolded_work^2` precharge (QUARTIC in chain length for the
+/// store-commutativity clause, whose `O(P^2)` index-pair literals make
+/// `unfolded_work` itself `Θ(P^2)`, which withheld correctly-decided `storecomm`
+/// UNSATs), the validator now charges a TIGHT bound on
+/// [`matches_store_permutation`]'s real cost through the same progress callback
+/// `ResolutionRoute`/`ArrayRowChain` debit.
+///
+/// SOUNDNESS OF THE BOUND (it must never UNDER-charge — an unbounded check is a
+/// DoS hole as severe as a wrong verdict). Let `L = literals.len()`.
+///  * `matches_store_permutation` scans every literal once (`equality_sides` and
+///    `permutation_conclusion_arrays` are each `O(1)` per literal) and collects
+///    `PositiveEqPairs` once (`O(L)`) — covered by `64*L` up front.
+///  * For EVERY literal that is a positive array-equality candidate,
+///    `chains_are_validated_permutation` parses both store spines (walked here
+///    per node), clones and sorts the two length-`P` `(index, value)` lists
+///    (`O(P log P)`), and runs the `O(P^2)` all-unordered-index-pairs check.
+///    `P^2` per candidate upper-bounds BOTH the sort and the pair check; the
+///    per-node spine walks upper-bound the parses. Charging every candidate
+///    (rather than stopping at the first that validates) only over-approximates.
+///
+/// A genuine store-commutativity clause has ONE array equality (the conclusion)
+/// over one length-`P` chain, so the whole bound is `O(L + P^2)` and certifies
+/// cheaply; an adversarial many-equality or long-chain clause is priced in full
+/// and refused.
+fn charge_store_permutation_validation(
+    terms: &TermStore,
+    literals: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    let mul = |a: usize, b: usize| a.checked_mul(b).ok_or(ProofCheckError::ResourceLimit);
+
+    // Linear per-literal scan plus the one `PositiveEqPairs` collection.
+    if !progress(
+        mul(literals.len(), 64)?,
+        mul(literals.len(), 4 * size_of::<TermId>())?,
+    ) {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+
+    for &lit in literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        // RECOGNITION-PATH SORT COMPARISONS. `permutation_conclusion_arrays` and
+        // `well_sorted_select_parts` compare whole `Sort` trees — `Θ(sort size)`,
+        // NOT O(1) — over the sorts of `lhs`, `rhs`, and (for selects/stores)
+        // their array children, on EVERY equality literal, INCLUDING ones that are
+        // then rejected as non-candidates (a `None` return). Charge that
+        // structural work per literal so a fan-out of rejected `(= (select A i)
+        // (select A j))` literals over one huge sort cannot smuggle unbounded
+        // comparison work past the meter. Each side's own sort plus its immediate
+        // children's sorts upper-bound every comparison those recognizers make.
+        for side in [lhs, rhs] {
+            crate::quality::meter_sort(terms.sort(side), progress)?;
+            if let TermData::App(_, args) = terms.get(side) {
+                for &arg in args {
+                    crate::quality::meter_sort(terms.sort(arg), progress)?;
+                }
+            }
+        }
+        let Some((left_array, right_array)) =
+            chain_extensions::permutation_conclusion_arrays(terms, lhs, rhs)
+        else {
+            continue;
+        };
+        let left_len = metered_store_spine_len(terms, left_array, progress)?;
+        let right_len = metered_store_spine_len(terms, right_array, progress)?;
+        let p = left_len.max(right_len);
+
+        // STRUCTURAL SORT COMPARISONS. `terms.sort(x) == terms.sort(y)` compares
+        // whole `Sort` trees (nested sorts and owned names), so each is
+        // `Θ(sort size)`, NOT O(1). `parse_store_chain` does three per spine node
+        // (current/base, index, element), `permutation_conclusion_arrays` and
+        // `chains_are_validated_permutation` a few more. Because the shared chain
+        // is re-parsed FOR EACH candidate literal (the base payload walk charges
+        // the shared store nodes only once), this structural work must be charged
+        // per candidate. Measure the array sort's structural cost once (itself
+        // debited), then charge `8*P + 8` copies — a sound over-count of the
+        // `~6*P` per-node plus top-level comparisons.
+        let mut sort_work = 0usize;
+        let mut sort_bytes = 0usize;
+        {
+            let mut measure = |w: usize, b: usize| {
+                sort_work = sort_work.saturating_add(w);
+                sort_bytes = sort_bytes.saturating_add(b);
+                progress(w, b)
+            };
+            crate::quality::meter_sort(terms.sort(left_array), &mut measure)?;
+        }
+        let comparisons = mul(p, 8)?.saturating_add(8);
+        if !progress(mul(comparisons, sort_work)?, mul(comparisons, sort_bytes)?) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+
+        // The `O(P^2)` unordered-index-pair check, plus the `O(P log P)` pair
+        // sort. Scratch retained simultaneously: two parsed `(index, value)`
+        // vectors (`16P` bytes), the `indices` list (`4P`), and two cloned pair
+        // vectors (`16P`) — ~`36P` bytes; `64*P` covers that with hash-set and
+        // growth slack.
+        if !progress(mul(p, p)?, mul(p, 64)?) {
+            return Err(ProofCheckError::ResourceLimit);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_array_store_permutation(
     terms: &TermStore,
     step_id: ProofId,
     clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<(), ProofCheckError> {
     if clause.is_empty() {
         return Err(ProofCheckError::InvalidTheoryLemma {
@@ -1144,6 +1213,8 @@ pub(crate) fn validate_array_store_permutation(
 
     let literals = flatten_clause_literals(terms, clause);
     reject_non_bool_literals(terms, step_id, &literals, "array store permutation")?;
+    // Debit the validator's actual work BEFORE it runs, failing closed.
+    charge_store_permutation_validation(terms, &literals, progress)?;
     if matches_store_permutation(terms, &literals) {
         return Ok(());
     }
@@ -1151,119 +1222,15 @@ pub(crate) fn validate_array_store_permutation(
         step: step_id,
         reason: "array store-permutation clause does not match the exact schema: it needs a \
                  positive equality between two well-sorted store chains over one common base \
-                 array that are a permutation of the same (index, value) pairs, with pairwise \
+                 array (or between two well-sorted reads of them at one shared index term) \
+                 that are a permutation of the same (index, value) pairs, with pairwise \
                  distinct index terms and one `(= i j)` literal for every unordered index pair"
             .to_string(),
     })
 }
 
-/// Validate an `ArrayRowChain` lemma in strict mode.
-///
-/// SCHEMA. Write `eval(C, x)` for the partial read-over-write evaluation of an
-/// array term `C` at index `x`: walk `C`'s `store` chain OUTERMOST-FIRST; on an
-/// entry `(i, v)` return `v` when `i` IS syntactically `x`, otherwise the
-/// clause must carry a POSITIVE literal `(= x i)` (else `eval` FAILS and the
-/// lemma is rejected) and the walk continues inward; when the chain is
-/// exhausted the result is the term `(select base x)`. Every `store` node and
-/// the final `select` must be well-sorted array operations.
-///
-/// The clause is accepted when either sub-schema holds:
-///
-/// (A) CHAIN EVALUATION. A POSITIVE literal `(= P Q)` where `P` is a well-
-///     sorted `(select C x)` and `eval(C, x)` denotes exactly `Q` (or the
-///     mirror image), and `sort(P) == sort(Q)`.
-///
-/// (B) UNDER AN ARRAY EQUALITY. A NEGATIVE literal `(not (= L R))` with
-///     `sort(L) == sort(R) == Array(as)`, plus a POSITIVE literal `(= U W)`
-///     with `sort(U) == sort(W) == as.element_sort`, and an index term `x` of
-///     sort `as.index_sort` such that `eval(L, x)` denotes `U` and
-///     `eval(R, x)` denotes `W` (or the mirror image). `x` is taken from a
-///     top-level `(select _ x)` on either side of the conclusion literal; a
-///     conclusion with no such select is REJECTED (the checker will not guess a
-///     witness index).
-///
-/// (C) EQUAL STORES FORCE THE BASE ALIAS. Exactly four literals spell
-///     `¬(A = store(B,i,v)) ∨ ¬(A = store(B,j,v)) ∨ i=j ∨ B=A`, modulo
-///     equality orientation and literal order. The two store terms are exact
-///     depth-one, well-sorted stores over the same `B` with the same `v`.
-///
-/// (D) EXACT SELECT CONGRUENCE. Exactly two literals spell
-///     `not (= A B) OR (= (select A i) (select B i))`, modulo equality and
-///     literal orientation. Both reads use the exact premise roots and the
-///     same exact, well-sorted index. This is intentionally disjoint from (B):
-///     it does not relax (B)'s requirement that at least one side perform a
-///     genuine ROW reduction.
-///
-/// (E) EXACT CONST-ARRAY READ UNDER EQUALITY. Exactly two literals spell
-///     `not (= A (const-array fill)) OR (= (select A i) fill)`, modulo equality
-///     and literal orientation, with exactly one const-array side and an exact,
-///     well-sorted read of the other premise root.
-///
-/// (F) EXACT STORE CONGRUENCE. Exactly two literals spell
-///     `not (= A B) OR (= (store A i v) (store B i v))`, modulo equality and
-///     literal orientation. The roots, index, and value are exact shared terms;
-///     no chain peeling or equality side condition is consulted.
-///
-/// (G) EXACT STORE IDEMPOTENCE UNDER EQUALITY. Exactly two literals spell
-///     `not (= A S) OR (= S (store A i v))`, where `S` is exactly the
-///     depth-one, well-sorted term `(store B i v)`. All occurrences of `A`,
-///     `S`, `i`, and `v` are exact shared terms.
-///
-/// (H) GUARDED MATCHING-OUTER-STORE READ. Exactly three literals spell
-///     `i=k OR not (= (store A i v) (store C i v)) OR (= (select X k)
-///     (select Y k))`.  `X` must be either the left outer store or its exact
-///     base `A`, and `Y` must independently be either the right outer store or
-///     its exact base `C` (modulo equality orientation).  The endpoints must
-///     remain cross-side: two terms from the same store/base family are not
-///     accepted by this sub-schema.
-///
-/// SOUNDNESS. Assume the clause false. Then every `(= x i)` literal consumed by
-/// `eval` is false, i.e. `x != i`, so each skipped `store` is transparent at
-/// `x` by the read-over-write-negative axiom and each taken entry gives its
-/// value by read-over-write-positive: `select(C, x) = eval(C, x)`.
-/// For (A) that already contradicts the assumed-false conclusion.
-/// For (B) the negative literal being false gives `L = R`, so by congruence
-/// `select(L, x) = select(R, x)`, i.e. `U = W` — again contradicting the
-/// assumed-false conclusion. For (C), assuming both store equalities and
-/// `i != j`, equality of the stores at `i` and `j` forces `B[i] = v` and
-/// `B[j] = v`; therefore either write leaves `B` unchanged and `A = B`,
-/// contradicting the final assumed-false equality. (D) is ordinary equality
-/// congruence. In (E), the false negative premise identifies `A` with the
-/// constant array, whose read is `fill`. (F) is ordinary congruence of the
-/// well-sorted `store(_, i, v)` function. For (G), substituting `A=S` and the
-/// same-index overwrite law give `store(A,i,v)=store(S,i,v)=S`. Extra literals
-/// are harmless in (A)/(B). For (H), falsity of `i=k` gives `i != k`, so ROW
-/// makes each outer store read equal to its base read at `k`; the false
-/// negative premise and congruence make the two side families equal at `k`.
-/// (C)/(D)/(E)/(F)/(G)/(H) are intentionally exact.
-pub(crate) fn validate_array_row_chain(
-    terms: &TermStore,
-    step_id: ProofId,
-    clause: &[TermId],
-) -> Result<(), ProofCheckError> {
-    if clause.is_empty() {
-        return Err(ProofCheckError::InvalidTheoryLemma {
-            step: step_id,
-            reason: "array axiom clause must be non-empty".to_string(),
-        });
-    }
-    reject_non_bool_literals(terms, step_id, clause, "array read-over-write chain")?;
-
-    let literals = flatten_clause_literals(terms, clause);
-    reject_non_bool_literals(terms, step_id, &literals, "array read-over-write chain")?;
-    if matches_row_chain(terms, &literals) {
-        return Ok(());
-    }
-    Err(ProofCheckError::InvalidTheoryLemma {
-        step: step_id,
-        reason: "array read-over-write-chain clause does not match the exact schema: every \
-                 store skipped while evaluating the chain at the read index must be justified \
-                 by a positive `(= x i)` literal in the same clause, and the conclusion must be \
-                 the evaluated equality (optionally under a `(not (= L R))` array-equality \
-                 premise whose conclusion carries a top-level select at the read index)"
-            .to_string(),
-    })
-}
+mod row_chain_validation;
+pub(crate) use row_chain_validation::validate_array_row_chain;
 
 /// Validate an `ArrayExtensionality` lemma in strict mode.
 ///
@@ -2591,7 +2558,8 @@ fn unordered(a: TermId, b: TermId) -> (TermId, TermId) {
 /// argument. Every numbered condition there is enforced here.
 fn matches_store_permutation(terms: &TermStore, literals: &[TermId]) -> bool {
     // Cheap pre-filter: the schema needs at least one positive equality between
-    // two array-sorted `store` applications, plus one index-equality literal.
+    // two array-sorted `store` applications (or two reads of them at one shared
+    // index), plus one index-equality literal.
     if literals.len() < 2 {
         return false;
     }
@@ -2600,45 +2568,18 @@ fn matches_store_permutation(terms: &TermStore, literals: &[TermId]) -> bool {
         let Some((lhs, rhs)) = equality_sides(terms, lit) else {
             continue;
         };
-        if !matches!(terms.sort(lhs), Sort::Array(_)) || terms.sort(lhs) != terms.sort(rhs) {
-            continue;
-        }
-        let (Some(left), Some(right)) =
-            (parse_store_chain(terms, lhs), parse_store_chain(terms, rhs))
+        let Some((left_array, right_array)) =
+            chain_extensions::permutation_conclusion_arrays(terms, lhs, rhs)
         else {
             continue;
         };
-        // (1) same base array, (2) same chain length >= 2.
-        if left.base != right.base || left.entries.len() != right.entries.len() {
-            continue;
-        }
-        let n = left.entries.len();
-        if n < 2 {
-            continue;
-        }
-        // (3) pairwise distinct index TERMS on the left chain. Combined with
-        // (4) this makes the right chain's indices distinct as well.
-        let mut indices: Vec<TermId> = left.entries.iter().map(|&(i, _)| i).collect();
-        let distinct: DetHashSet<TermId> = indices.iter().copied().collect();
-        if distinct.len() != n {
-            continue;
-        }
-        // (4) the two chains write the same multiset of (index, value) pairs.
-        let mut left_pairs = left.entries.clone();
-        let mut right_pairs = right.entries.clone();
-        left_pairs.sort_unstable();
-        right_pairs.sort_unstable();
-        if left_pairs != right_pairs {
-            continue;
-        }
-        // (5) one `(= i_p i_q)` literal per unordered index pair.
-        let eqs = pairs.get_or_insert_with(|| PositiveEqPairs::collect(terms, literals));
-        indices.sort_unstable();
-        let all_pairs_present = indices
-            .iter()
-            .enumerate()
-            .all(|(p, &ip)| indices[p + 1..].iter().all(|&iq| eqs.contains(ip, iq)));
-        if all_pairs_present {
+        if chain_extensions::chains_are_validated_permutation(
+            terms,
+            left_array,
+            right_array,
+            literals,
+            &mut pairs,
+        ) {
             return true;
         }
     }
@@ -2736,6 +2677,7 @@ fn matches_row_chain(terms: &TermStore, literals: &[TermId]) -> bool {
         || matches_exact_store_congruence(terms, literals)
         || matches_exact_store_idempotence_under_eq(terms, literals)
         || matches_exact_guarded_matching_outer_store_read(terms, literals)
+        || chain_extensions::same_index_store_value_equality_terms(terms, literals).is_some()
 }
 
 /// Sub-schema (D): exact, two-literal select congruence.

@@ -15,10 +15,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::{
-    array_content_invariants_enabled_for, array_frontier_telemetry_enabled_for,
-    array_value_fact_candidates, IndexTermFrontier, MAX_INDEX_TERMS,
-};
+use super::{array_value_fact_candidates, IndexTermFrontier, MAX_INDEX_TERMS};
 use crate::pdr::config::PdrConfig;
 use crate::pdr::solver::PdrSolver;
 use crate::{ChcExpr, ChcParser, ChcSort, ChcVar};
@@ -59,30 +56,6 @@ const TWO_ARRAY_SMT2: &str = r#"
 fn two_array_solver() -> PdrSolver {
     let problem = ChcParser::parse(TWO_ARRAY_SMT2).expect("parse 2-array CHC");
     PdrSolver::new(problem, PdrConfig::default())
-}
-
-// ---------------------------------------------------------------------------
-// Flag parsing (default OFF)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn telemetry_flag_defaults_off() {
-    // Unset / empty / falsy values keep the pass OFF (hot path untouched).
-    assert!(!array_frontier_telemetry_enabled_for(None));
-    assert!(!array_frontier_telemetry_enabled_for(Some("")));
-    assert!(!array_frontier_telemetry_enabled_for(Some("0")));
-    assert!(!array_frontier_telemetry_enabled_for(Some("false")));
-    assert!(!array_frontier_telemetry_enabled_for(Some("nope")));
-}
-
-#[test]
-fn telemetry_flag_explicit_truthy_enables() {
-    for v in ["1", "true", "TRUE", "yes", "on", " On "] {
-        assert!(
-            array_frontier_telemetry_enabled_for(Some(v)),
-            "{v:?} should enable the telemetry pass"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,29 +210,6 @@ fn frontier_caps_and_dedups() {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// AY_CHC_ARRAY_INV flag parsing (default OFF), mirrors the telemetry flag.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn array_inv_flag_defaults_off() {
-    assert!(!array_content_invariants_enabled_for(None));
-    assert!(!array_content_invariants_enabled_for(Some("")));
-    assert!(!array_content_invariants_enabled_for(Some("0")));
-    assert!(!array_content_invariants_enabled_for(Some("false")));
-    assert!(!array_content_invariants_enabled_for(Some("nope")));
-}
-
-#[test]
-fn array_inv_flag_explicit_truthy_enables() {
-    for v in ["1", "true", "TRUE", "yes", "on", " On "] {
-        assert!(
-            array_content_invariants_enabled_for(Some(v)),
-            "{v:?} should enable the array-content invariant pass"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Candidate atom shapes per element sort.
 // ---------------------------------------------------------------------------
 
@@ -357,7 +307,7 @@ fn inner_pass_skips_when_fewer_than_two_array_params() {
 
 #[test]
 fn flag_gated_entry_point_is_noop_by_default() {
-    // With AY_CHC_ARRAY_INV unset (the test default), the public entry point must
+    // With --chc-array-inv unset (the test default), the public entry point must
     // be a no-op: 0 admitted, no frame mutation. This is the byte-for-byte
     // default-path guarantee.
     let problem = ChcParser::parse(TWO_ARRAY_VALUE_SMT2).unwrap();

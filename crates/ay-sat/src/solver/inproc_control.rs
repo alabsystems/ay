@@ -109,7 +109,7 @@ impl InprocessingProofSupport {
             // (wf_ff5991a1) — see PROOF_CAPABILITY_REGISTRY in
             // proof_capability.rs — the enforcing table; this advisory
             // descriptor mirrors the registry defaults and does not reflect
-            // the AY_AB_DRAT_SUBST kill-switch.
+            // the --sat-no-drat-subst kill-switch.
             ProofTransform::Bve
             | ProofTransform::Factor
             | ProofTransform::Sbva

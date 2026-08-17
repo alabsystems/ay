@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! #warm-simplex (`AY_LRA_WARM_SIMPLEX_STATE`) tests.
+//! #warm-simplex tests (the lane `--no-lra-warm-simplex` opts out of).
 //!
 //! The flag must be verdict-neutral: it changes WHEN the simplex pays for
 //! candidate discovery (persistent heap + dirty set + last-feasible restore
@@ -137,7 +137,7 @@ fn warm_simplex_state_randomized_differential() {
         let warm = run_sequence(&terms, &atoms, seed, true);
         assert_eq!(
             cold, warm,
-            "verdict divergence between AY_LRA_WARM_SIMPLEX_STATE off/on for seed {seed} \
+            "verdict divergence between warm-simplex off/on for seed {seed} \
              (0=unsat, 1=sat-like, 2=unknown)"
         );
         assert!(

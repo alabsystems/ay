@@ -929,8 +929,10 @@ impl SmtContext {
                         overstayed("pre_unsat_replay");
                         if let Some(trace) = sat.clause_trace() {
                             if trace.learned_clauses().next().is_some() {
-                                let orig_clauses: Vec<Vec<ay_sat::Literal>> =
-                                    trace.original_clauses().map(|e| e.clause.clone()).collect();
+                                let orig_clauses: Vec<Vec<ay_sat::Literal>> = trace
+                                    .original_clauses()
+                                    .map(|e| e.clause.to_vec())
+                                    .collect();
                                 let mut fresh = ay_sat::Solver::new(num_vars as usize);
                                 fresh.enable_clause_trace();
                                 // Internal CHC queries never consume the UNSAT

@@ -39,6 +39,8 @@ use super::bv_encoding;
 use super::euf::ArrayAxiomMode;
 use super::{debug_ite_conditions_enabled, debug_preprocessed_enabled};
 
+mod pure_preprocess;
+
 // Re-export so existing `use super::bv::BvSolveConfig` paths continue to work.
 pub(in crate::executor) use super::bv_config::BvSolveConfig;
 
@@ -144,15 +146,8 @@ const ABV_LARGE_STABLE_RESTART_PHASE_CONFLICTS: u64 = 4_096;
 /// bottleneck; there is deliberately no size-based auto-default, so an
 /// unvalidated instance class is never silently reconfigured.
 fn resolve_clause_db_bytes_limit(explicit: Option<usize>, _total_vars: u32) -> Option<usize> {
-    if let Some(raw) = std::env::var_os("AY_CLAUSE_DB_MB") {
-        if let Some(mb) = raw.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
-            return if mb == 0 {
-                None
-            } else {
-                Some(mb.saturating_mul(1024 * 1024))
-            };
-        }
-    }
+    // B17: the typed field (`clause_db_bytes_limit`) IS the carrier; the
+    // never-set AY_CLAUSE_DB_MB env shim over it is deleted.
     explicit
 }
 
@@ -181,13 +176,13 @@ fn configure_ephemeral_bv_sat_solver(
     //
     // Experiment knob (#dt-array-fc-lazy): a huge Tseitin bit-blast (20M+ vars)
     // benefits from a ONE-SHOT bounded preprocessing pass that collapses
-    // definitional vars (like z3's bit-blaster). `AY_BV_PREPROCESS=quick` runs
+    // definitional vars (like z3's bit-blaster). `--bv-preprocess=quick` runs
     // the CHEAP passes (BVE/subsumption) but skips the expensive HTR/probing
     // that motivated disabling preprocessing here (they are gated by
     // preprocessing_quick_mode and bounded by preprocess_timed_out()).
     // `=full` also runs the expensive passes. Default (unset) preserves the
     // no-preprocessing behavior exactly.
-    match std::env::var("AY_BV_PREPROCESS").ok().as_deref() {
+    match ay_core::misc_cli_flags().bv_preprocess.as_deref() {
         Some("quick") => {
             solver.set_preprocess_enabled(true);
             solver.set_full_preprocessing(false);
@@ -561,6 +556,11 @@ impl Executor {
         self.solve_bv_core(BvSolveConfig::qf_abv(), &[])
     }
 
+    #[cfg(test)]
+    pub(crate) fn solve_abv_owner_route_for_test(&mut self) -> Result<SolveResult> {
+        self.solve_abv()
+    }
+
     /// Solve QF_UFBV (UF + Bitvectors) using eager bit-blasting with UF congruence
     pub(in crate::executor) fn solve_ufbv(&mut self) -> Result<SolveResult> {
         if self.incremental_mode {
@@ -645,13 +645,11 @@ impl Executor {
             config.preprocess = false;
         }
 
-        // Env-gated phase timing (`AY_PHASE_TRACE=1`): one stderr line per phase
+        // Env-gated phase timing (`--phase-trace`): one stderr line per phase
         // boundary with elapsed seconds since this solve entered. Zero cost when
         // the env var is absent. Diagnostic-only (`c ...` comment lines), so it
         // cannot perturb transcript parsing or the verdict.
-        let phase_trace_start = std::env::var_os("AY_PHASE_TRACE")
-            .is_some()
-            .then(Instant::now);
+        let phase_trace_start = ay_core::misc_cli_flags().phase_trace.then(Instant::now);
         macro_rules! phase_trace {
             ($name:expr) => {
                 if let Some(t0) = phase_trace_start {
@@ -712,7 +710,8 @@ impl Executor {
             let mut preprocessed_source_sets = current_assertion_source_sets
                 .clone()
                 .expect("early preprocess source sets initialized");
-            let (mut preprocessor, var_subst) = Preprocessor::new_with_subst();
+            let (mut preprocessor, var_subst, propagate_values) =
+                Preprocessor::new_with_subst_and_propagation();
             let (initial_num_selects, initial_num_stores) =
                 self.count_array_op_occurrences_in_assertions();
             self.last_statistics.set_int(
@@ -772,6 +771,10 @@ impl Executor {
                     );
                 }
             }
+            // #ppp-provenance: drain the pass's rewrite records once, after
+            // the final preprocess run of this site, under the campaign kill
+            // switch (off = no records anywhere = pristine baseline).
+            self.extend_propagated_value_provenance(&propagate_values);
             if debug_preprocessed_enabled() {
                 safe_eprintln!(
                     "[preprocess] assertions after preprocessing (early/ABV): {}",
@@ -830,6 +833,19 @@ impl Executor {
         // When preprocessing is enabled (QF_ABV), assertions are already
         // preprocessed at this point (#8140).
         if config.array_axioms {
+            let cegar_rounds = self
+                .last_statistics
+                .get_int("smt.abv.array_fc_cegar.refinement_rounds")
+                .unwrap_or(0);
+            self.last_statistics
+                .set_int("smt.abv.array_fc_cegar.refinement_rounds", cegar_rounds);
+            for key in [
+                "smt.abv.array_fixpoint.runs",
+                "smt.abv.array_fixpoint.skips",
+            ] {
+                let current = self.last_statistics.get_int(key).unwrap_or(0);
+                self.last_statistics.set_int(key, current);
+            }
             // Reify array-sorted equality atoms for UF arguments (#12).
             // When a UF takes whole-array arguments (e.g. `h(a)`, `h(b)`),
             // congruence `(= a b) → (= h(a) h(b))` requires the atom `(= a b)`
@@ -860,16 +876,19 @@ impl Executor {
             // negation), leaving them unconstrained and causing unknown/wrong-SAT
             // on QF_ABV benchmarks with `(ite (= array1 array2) ...)` patterns.
             self.ensure_array_eq_ite_negations();
-            self.add_array_extensionality_axioms();
 
-            // Finite-domain extensionality for array equalities over a small
-            // BitVec index domain. The single-Skolem extensionality axiom can
-            // only witness a difference, never refute an equality that holds/
-            // fails at a specific concrete index, which left QF_ABV equalities
-            // involving `(as const ...)` / store-chains under-constrained
-            // (wrong-SAT). Expanding the exact biconditional over all 2^w
-            // indices makes them completely decided by the bit-blaster.
-            self.add_finite_bv_array_extensionality();
+            // Exact finite-domain closure must see the route's post-preprocess
+            // assertion surface before generic extensionality. Besides avoiding
+            // a redundant difference Skolem, this ordering matters recursively:
+            // the generic witness select over a nested finite array would expose
+            // an artificial fourth equality candidate in addition to the outer
+            // equality and its two concrete BV1 cells. Active exact coverage lets
+            // the generic pass suppress that witness. The final closure below is
+            // still required for equalities and reads synthesized by the legacy
+            // fixpoint, select/store rewriting, and ROW2 materialization.
+            phase_trace!("phase0b-initial-finite-array-closure");
+            let _ = self.add_finite_index_array_closure_with_roots(assumption_roots);
+            self.add_array_extensionality_axioms();
 
             // Adaptive fixpoint gate: skip the array axiom fixpoint on formulas
             // where it would cause term explosion. The fixpoint loop creates
@@ -893,9 +912,19 @@ impl Executor {
             // csplit-query QF_ABV benchmarks have 2000+ trivial selects but
             // only 8 complex ones). Skipping the fixpoint causes false SAT.
             let complex_selects = self.count_complex_array_selects_in_assertions();
+            self.last_statistics.set_int(
+                "smt.abv.array_fixpoint.complex_selects",
+                complex_selects as u64,
+            );
             let default_fixpoint_required =
                 self.has_symbolic_array_default_in_roots(assumption_roots);
             if complex_selects <= 80 || default_fixpoint_required {
+                let runs = self
+                    .last_statistics
+                    .get_int("smt.abv.array_fixpoint.runs")
+                    .unwrap_or(0);
+                self.last_statistics
+                    .set_int("smt.abv.array_fixpoint.runs", runs.saturating_add(1));
                 if assumption_roots.is_empty() {
                     if let Some(primary_formula_len) = primary_formula_len {
                         self.run_array_axiom_fixpoint_at(
@@ -908,6 +937,13 @@ impl Executor {
                 } else {
                     self.run_array_axiom_fixpoint_5_with_roots(assumption_roots);
                 }
+            } else {
+                let skips = self
+                    .last_statistics
+                    .get_int("smt.abv.array_fixpoint.skips")
+                    .unwrap_or(0);
+                self.last_statistics
+                    .set_int("smt.abv.array_fixpoint.skips", skips.saturating_add(1));
             }
 
             // Expand select(store(a, I, v), J) into ITE chains. This converts
@@ -956,11 +992,38 @@ impl Executor {
             }
         }
         if config.array_axioms {
+            // Substitution sources/replacements are discovery seeds for ROW2
+            // read materialization, not live Boolean constraints. Keep a
+            // watermark so the final exact-closure scan sees only the actual
+            // assumption roots and the new read terms materialized below.
+            // Re-scanning every eliminated source equality here resurrects the
+            // store-flat aliases that route-local preprocessing just removed
+            // (50 BV8 aliases previously expanded into 12,800 dead cells).
+            let row2_root_start = array_axiom_extra_roots.len();
             let row2_roots = self.materialize_array_row2_read_terms(&mut array_axiom_extra_roots);
             if row2_roots > 0 {
                 self.last_statistics
                     .set_int("smt.abv.row2.materialized_read_terms", row2_roots as u64);
             }
+
+            // This is the owning route's final exact-closure boundary. The
+            // legacy array fixpoint above can synthesize array-valued select
+            // equalities, select/store expansion rewrites the assertion DAG,
+            // and ROW2 materialization adds extra read roots. None of those
+            // post-initial-closure surfaces may reach Tseitin/bit-blasting
+            // without another exact scan. Context assertions are scanned
+            // implicitly; temporary logical assumptions and newly materialized
+            // branch/base reads are the only additional live surfaces.
+            phase_trace!("phase0b-final-finite-array-closure");
+            let mut finite_closure_extra_roots = Vec::with_capacity(
+                assumption_roots
+                    .len()
+                    .saturating_add(array_axiom_extra_roots.len() - row2_root_start),
+            );
+            finite_closure_extra_roots.extend_from_slice(assumption_roots);
+            finite_closure_extra_roots
+                .extend_from_slice(&array_axiom_extra_roots[row2_root_start..]);
+            let _ = self.add_finite_index_array_closure_with_roots(&finite_closure_extra_roots);
         }
 
         // --- Phase 1: Proof setup ---
@@ -980,7 +1043,8 @@ impl Executor {
         // Tseitin/BvSolver/SatSolver state management. This path only encodes NEW
         // assertions incrementally and adds definitional clauses globally.
         if config.incremental {
-            return self.solve_bv_incremental_inner(&config, proof_enabled);
+            let result = self.solve_bv_incremental_inner(&config, proof_enabled);
+            return self.fail_close_incomplete_finite_array_sat(result);
         }
 
         // Interrupt check after array axiom fixpoint and proof setup (#3070).
@@ -996,17 +1060,8 @@ impl Executor {
         // For combined theories (QF_ABV), preprocessing already ran in Phase 0.
         // This phase handles the pure BV case (no array axioms).
         let var_subst = if !early_preprocess && config.preprocess && assumptions.is_empty() {
-            let mut preprocessed = self.ctx.assertions.clone();
-            let mut preprocessed_source_sets: Vec<Vec<TermId>> = preprocessed
-                .iter()
-                .map(|&assertion| vec![assertion])
-                .collect();
-            let (mut preprocessor, var_subst) = Preprocessor::new_with_subst();
-            preprocessor.preprocess_with_sources(
-                &mut self.ctx.terms,
-                &mut preprocessed,
-                &mut preprocessed_source_sets,
-            );
+            let (var_subst, mut preprocessed, preprocessed_source_sets) =
+                self.preprocess_pure_bv_assertions();
             if debug_preprocessed_enabled() {
                 safe_eprintln!(
                     "[preprocess] assertions after preprocessing: {}",
@@ -1392,7 +1447,7 @@ impl Executor {
                 assumptions,
             );
             non_bv_congruence_bailed = congruence_outcome.bailed;
-            if non_bv_congruence_bailed && std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if non_bv_congruence_bailed && ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace non-bv-congruence-bailed");
             }
             if phase_trace_start.is_some() {
@@ -1569,6 +1624,19 @@ impl Executor {
 
             match assume_result.into_inner() {
                 AssumeResult::Sat(model) => {
+                    // Exact finite-array closure is allowed to emit a sound
+                    // prefix when its deterministic aggregate budget is
+                    // exhausted, but that relaxed formula cannot authorize a
+                    // SAT model. Assumption-bearing BV solves return directly
+                    // from this arm, so enforce the same fail-closed boundary
+                    // here before extraction/publication.
+                    if !self.finite_array_expansion.is_complete() {
+                        if let Some((_, original)) = var_subst {
+                            self.ctx.assertions = original;
+                        }
+                        let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
+                        return Ok(SolveResult::Unknown);
+                    }
                     // Item 4 Stage 2 soundness gate (see the Phase 11 twin):
                     // SAT under a bailed partial congruence axiomatization
                     // degrades to Unknown.
@@ -2047,80 +2115,23 @@ impl Executor {
         // pairs, but only 200 generated). The CEGAR loop lazily adds only
         // the FC axioms that are actually violated by the current model.
         if config.array_axioms {
-            // Env-tunable (#dt-array-fc-lazy): with a lowered eager FC budget,
-            // more real FC violations surface across rounds, so a large-array
-            // instance may need more than 16 lazy refinements to converge (it
-            // fail-closes to Unknown if the cap is hit with residual violations).
-            let max_cegar_iterations: u32 = std::env::var("AY_FC_CEGAR_ITERS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(16);
-            let mut cegar_next_var = total_vars;
-            let mut cegar_iteration = 0u32;
-            let mut already_covered = HashSet::default();
+            let max_cegar_iterations = ay_core::misc_cli_flags().fc_cegar_iters.unwrap_or(16);
+            solve_result = self.refine_array_fc_model(
+                solve_result,
+                &term_bits,
+                var_offset,
+                total_vars,
+                &mut solver,
+                max_cegar_iterations,
+            );
+        }
 
-            while let SatResult::Sat(ref model) = solve_result {
-                if cegar_iteration >= max_cegar_iterations {
-                    // Fail-closed exhaustion (#8510 + FC same-base budget): the
-                    // last refinement round added axioms and re-solved, but the
-                    // NEW model has not been re-verified. If FC violations
-                    // remain, letting this Sat escape would be a WRONG sat
-                    // (the model contradicts array functional consistency).
-                    // One final check; violations => degrade to Unknown.
-                    let residual = self.check_array_fc_violations(
-                        model,
-                        &term_bits,
-                        var_offset,
-                        cegar_next_var as usize,
-                        &mut already_covered,
-                    );
-                    if residual.is_some() {
-                        if std::env::var_os("AY_PHASE_TRACE").is_some() {
-                            eprintln!("c phase-trace cegar-exhausted-residual-violations");
-                        }
-                        self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                        solve_result = SatResult::Unknown;
-                    }
-                    break;
-                }
-                if self.should_abort_theory_loop() {
-                    solve_result = SatResult::Unknown;
-                    break;
-                }
-
-                let violations = self.check_array_fc_violations(
-                    model,
-                    &term_bits,
-                    var_offset,
-                    cegar_next_var as usize,
-                    &mut already_covered,
-                );
-
-                let Some(result) = violations else {
-                    break; // No FC violations — model is consistent
-                };
-
-                cegar_iteration += 1;
-
-                // Grow solver and add FC axiom clauses.
-                cegar_next_var += result.num_new_vars as u32;
-                let max_var = result
-                    .clauses
-                    .iter()
-                    .flat_map(|c| c.iter())
-                    .map(|l| l.variable().index() + 1)
-                    .max()
-                    .unwrap_or(0);
-                solver.ensure_num_vars(max_var);
-                for clause in result.clauses {
-                    solver.add_clause(clause);
-                }
-
-                // Re-solve with additional FC axiom clauses.
-                let should_stop = self.make_should_stop();
-                solve_result = solver.solve_interruptible(should_stop).into_inner();
-                collect_sat_stats!(self, &solver);
-            }
+        if !self.finite_array_expansion.is_complete() && matches!(solve_result, SatResult::Sat(_)) {
+            // A bounded prefix consists only of valid array tautologies, hence
+            // UNSAT remains sound. SAT may depend on a deferred equality and is
+            // withheld until exact finite-domain coverage is complete.
+            let _ = self.revoke_provisional_sat_if_finite_array_incomplete(true);
+            solve_result = SatResult::Unknown;
         }
 
         // Item 4 Stage 2 soundness gate: a SAT found under a BAILED (partial)
@@ -2473,7 +2484,7 @@ impl Executor {
         &mut self,
         error: BvValidationError,
     ) -> Result<SolveResult> {
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace bv-model-validation-failed assertion_index={}",
                 error.assertion_index

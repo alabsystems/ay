@@ -550,11 +550,9 @@ fn condense_zero_query_collapse_stays_valid_and_safe() {
     }
 }
 
-/// The kill switch default: condense is enabled unless
-/// AY_CHC_DISABLE_CONDENSE is set to a non-zero value.
+/// The kill-switch default: condense is enabled unless `--chc-no-condense`
+/// (or a test override) turns it off.
 #[test]
 fn condense_enabled_by_default() {
-    if std::env::var("AY_CHC_DISABLE_CONDENSE").is_err() {
-        assert!(condense_enabled());
-    }
+    assert!(condense_enabled());
 }

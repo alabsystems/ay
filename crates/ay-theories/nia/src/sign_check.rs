@@ -125,16 +125,11 @@ impl NiaSolver<'_> {
         constraint: SignConstraint,
         assertion: TermId,
     ) {
-        // Record trail entries BEFORE the mutation so we know what was added.
-        if let Some(vars) = self.aux_to_monomial.get(&subject).cloned() {
-            self.sign_constraint_trail
-                .push(SignConstraintTrailEntry::Monomial(vars));
-        }
         if matches!(self.terms.get(subject), TermData::Var(_, _)) {
             self.sign_constraint_trail
                 .push(SignConstraintTrailEntry::Variable(subject));
         }
-        nonlinear::record_sign_constraint(
+        if let Some(vars) = nonlinear::record_sign_constraint(
             self.terms,
             &self.aux_to_monomial,
             &mut self.sign_constraints,
@@ -142,6 +137,9 @@ impl NiaSolver<'_> {
             subject,
             constraint,
             assertion,
-        );
+        ) {
+            self.sign_constraint_trail
+                .push(SignConstraintTrailEntry::Monomial(vars));
+        }
     }
 }

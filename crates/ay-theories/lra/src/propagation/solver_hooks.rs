@@ -10,7 +10,7 @@ use super::*;
 fn guard_memo_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| {
-        std::env::var("AY_LRA_NO_GUARD_MEMO").is_ok_and(|v| v != "0" && !v.is_empty())
+        false // B24: kill-switch env retired; the memo stays on.
     })
 }
 

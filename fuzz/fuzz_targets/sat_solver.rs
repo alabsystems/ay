@@ -9,10 +9,11 @@
 //! valid CNF structures.
 
 #![no_main]
+#![forbid(unsafe_code)]
 
 use arbitrary::{Arbitrary, Unstructured};
-use libfuzzer_sys::fuzz_target;
 use ay_sat::{Literal, Solver, Variable};
+use libfuzzer_sys::fuzz_target;
 
 /// Convert DIMACS literal (1-indexed, signed) to ay Literal
 fn dimacs_to_literal(lit: i32) -> Literal {

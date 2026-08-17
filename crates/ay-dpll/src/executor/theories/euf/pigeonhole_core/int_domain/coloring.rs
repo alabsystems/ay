@@ -54,7 +54,7 @@
 //! Reused directly: [`Executor::int_domain_literal`] (the genuinely general
 //! `(= x c)` primitive, whose `Sort::Int` check is load-bearing),
 //! [`Executor::ordered_term_pair`], [`INT_DOMAIN_MAX_VALUES`], the `and`-only
-//! recursion rule, and the `AY_DEBUG_PIGEONHOLE` trace flag.
+//! recursion rule, and the `--debug-pigeonhole` trace flag.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Constant, TermData, TermId};
@@ -133,7 +133,7 @@ enum SubjectKind {
 
 /// Snapshot of the verdict-shaping state the proposal mutates, restored
 /// verbatim on every decline so a rejected proposal is byte-identical to a run
-/// with `AY_INT_COLORING=0` (the `partition_rescue::RescueStateGuard`
+/// with `--dpll-no-int-coloring` (the `partition_rescue::RescueStateGuard`
 /// contract).
 struct ColoringStateGuard {
     last_model: Option<Model>,
@@ -166,11 +166,11 @@ impl Executor {
         // off path is byte-identical to a binary without the pass — which is
         // what makes the same-binary A/B a measurement rather than a
         // comparison of two solvers. Deliberately a separate name from
-        // `AY_INT_PIGEONHOLE` so the two halves stay independently A/B-able.
-        if std::env::var_os("AY_INT_COLORING").is_some_and(|v| v == "0") {
+        // `--dpll-no-int-pigeonhole` so the two halves stay independently A/B-able.
+        if ay_core::theory_disable_flags().no_int_coloring {
             return false;
         }
-        let debug = std::env::var_os("AY_DEBUG_PIGEONHOLE").is_some();
+        let debug = ay_core::misc_cli_flags().debug_pigeonhole;
 
         let Some(plan) = self.int_domain_coloring_plan(pre_dispatch_assertions, debug) else {
             return false;
@@ -1128,13 +1128,13 @@ mod tests {
         );
     }
 
-    /// DEFAULT-ON with no env set (the `AY_INT_COLORING=0` opt-out is
+    /// DEFAULT-ON with no env set (the `--dpll-no-int-coloring` opt-out is
     /// exercised end-to-end through the binary: `std::env::set_var` is
     /// unavailable here, the crate is `#![forbid(unsafe_code)]`).
     #[test]
     fn test_int_coloring_is_default_on() {
         assert!(
-            std::env::var_os("AY_INT_COLORING").is_none(),
+            !ay_core::theory_disable_flags().no_int_coloring,
             "test env must not pin the knob"
         );
         let mut exec = exec_setup(

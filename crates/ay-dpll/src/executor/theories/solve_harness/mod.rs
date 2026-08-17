@@ -257,6 +257,173 @@ fn substitute_int_const_terms_root(
     substitute_int_const_terms(terms, replacements, cache, &bound_names, term)
 }
 
+/// Per-group member cap for licensing-source augmentation (#ppp-l3).
+///
+/// A propagation-rewritten conjunct normally cites its own original plus a
+/// handful of defining equalities; a larger set signals a pathological
+/// licensing environment, and the slot falls back to `None` (the pre-L3
+/// invalidation) rather than growing the downstream surface-override scan.
+const MAX_AUGMENTED_SOURCE_GROUP: usize = 16;
+
+/// Extend every existing source group with `extra` licensing sources, keeping
+/// each group sorted/deduped in original-id order. `None` (fail-closed) when
+/// any augmented group exceeds [`MAX_AUGMENTED_SOURCE_GROUP`].
+fn augmented_source_groups(
+    old_groups: &[Vec<TermId>],
+    extra: &[TermId],
+) -> Option<Vec<Vec<TermId>>> {
+    let mut new_groups = Vec::with_capacity(old_groups.len());
+    for group in old_groups {
+        let mut new_group = group.clone();
+        for &source in extra {
+            if !new_group.contains(&source) {
+                new_group.push(source);
+            }
+        }
+        new_group.sort_by_key(|term| term.index());
+        new_group.dedup();
+        if new_group.len() > MAX_AUGMENTED_SOURCE_GROUP {
+            return None;
+        }
+        new_groups.push(new_group);
+    }
+    Some(new_groups)
+}
+
+/// Union of the FIRST source group of each licensing definition's window
+/// slot. Each group is a sufficient justification on its own, so any one is
+/// a valid citation; the first is the deterministic choice. `None`
+/// (fail-closed) when a definition is missing from the window or carries no
+/// provenance of its own.
+fn licensing_definition_sources(
+    licensing: &[TermId],
+    slot_by_term: &HashMap<TermId, usize>,
+    slots: &[Option<Vec<Vec<TermId>>>],
+) -> Option<Vec<TermId>> {
+    let mut extra: Vec<TermId> = Vec::new();
+    for definition in licensing {
+        let &definition_slot = slot_by_term.get(definition)?;
+        let definition_groups = slots.get(definition_slot)?.as_ref()?;
+        let first_group = definition_groups.first()?;
+        for &source in first_group {
+            if !extra.contains(&source) {
+                extra.push(source);
+            }
+        }
+    }
+    Some(extra)
+}
+
+/// #ppp-l3 licensing-source augmentation for the AUFLIA
+/// `FlattenAnd`+`PropagateValues` fixpoint.
+///
+/// A slot whose assertion the pass rewrote becomes each of its existing
+/// source groups EXTENDED with the sources of the defining equalities that
+/// licensed the rewrite (the multi-source provenance form `proof_rewrite`
+/// already consumes for surface pairing and premise re-introduction),
+/// REPLACING the pre-L3 blanket invalidation. Every gap fails closed to the
+/// old `None`: kill switch off, an entry without a recorded source (harvest
+/// overflow), a definition absent from the window or without provenance, an
+/// over-cap augmented group, or an unreplayable term shape.
+fn augment_propagation_rewritten_sources(
+    terms: &mut TermStore,
+    propagate: &crate::preprocess::PropagateValues,
+    before_values: &[TermId],
+    after_values: &[TermId],
+    slots: &mut [Option<Vec<Vec<TermId>>>],
+) {
+    debug_assert_eq!(before_values.len(), after_values.len());
+    debug_assert_eq!(before_values.len(), slots.len());
+    let authority = crate::quant_unit_authority::quant_unit_authority_enabled();
+    let source_index = authority.then(|| propagate.entry_source_index());
+    let mut slot_by_term: HashMap<TermId, usize> = HashMap::default();
+    if authority {
+        for (index, &term) in before_values.iter().enumerate() {
+            slot_by_term.entry(term).or_insert(index);
+        }
+    }
+    // Plan first, write second: augmentation reads OTHER slots (the
+    // licensing definitions' groups), and although the pass never rewrites a
+    // defining equality, the two-phase discipline makes the no-feedback
+    // property structural.
+    let mut planned: Vec<(usize, Option<Vec<Vec<TermId>>>)> = Vec::new();
+    for (index, (&before, &after)) in before_values.iter().zip(after_values.iter()).enumerate() {
+        if before == after {
+            continue;
+        }
+        let plan = source_index.as_ref().and_then(|source_index| {
+            let mut visited: HashSet<TermId> = HashSet::default();
+            let mut licensing: Vec<TermId> = Vec::new();
+            propagate.collect_licensing_source_assertions(
+                terms,
+                source_index,
+                before,
+                &mut visited,
+                &mut licensing,
+            )?;
+            if licensing.is_empty() {
+                return None;
+            }
+            let extra = licensing_definition_sources(&licensing, &slot_by_term, slots)?;
+            let old_groups = slots.get(index)?.as_ref()?;
+            augmented_source_groups(old_groups, &extra)
+        });
+        planned.push((index, plan));
+    }
+    for (index, plan) in planned {
+        slots[index] = plan;
+    }
+}
+
+/// Collect the defining assertions licensing an int-constant substitution of
+/// `term`: every `replacements` key occurring in `term`, mapped through
+/// `definition_of`. Occurrences under shadowing binders over-approximate,
+/// which keeps the licensing claim true (extra authored premises never
+/// weaken an entailment). `None` (fail-closed) on a key without a recorded
+/// definition or an unknown term shape.
+fn collect_used_int_const_definitions(
+    terms: &TermStore,
+    replacements: &HashMap<TermId, TermId>,
+    definition_of: &HashMap<TermId, TermId>,
+    term: TermId,
+) -> Option<Vec<TermId>> {
+    let mut definitions: Vec<TermId> = Vec::new();
+    let mut visited: HashSet<TermId> = HashSet::default();
+    let mut stack = vec![term];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if replacements.contains_key(&current) {
+            let definition = definition_of.get(&current).copied()?;
+            if !definitions.contains(&definition) {
+                definitions.push(definition);
+            }
+            continue;
+        }
+        match terms.get(current) {
+            TermData::Const(_) | TermData::Var(_, _) => {}
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(cond, then_term, else_term) => {
+                stack.push(*cond);
+                stack.push(*then_term);
+                stack.push(*else_term);
+            }
+            TermData::Let(bindings, body) => {
+                stack.extend(bindings.iter().map(|(_, value)| *value));
+                stack.push(*body);
+            }
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                stack.push(*body);
+                stack.extend(triggers.iter().flatten().copied());
+            }
+            _ => return None,
+        }
+    }
+    (!definitions.is_empty()).then_some(definitions)
+}
+
 fn substitute_int_constants_preserving_definitions(
     terms: &mut TermStore,
     assertions: &mut [TermId],
@@ -269,6 +436,7 @@ fn substitute_int_constants_preserving_definitions(
     );
 
     let mut replacements: HashMap<TermId, TermId> = HashMap::default();
+    let mut definition_of: HashMap<TermId, TermId> = HashMap::default();
     let mut blocked: HashSet<TermId> = HashSet::default();
     let mut definition_assertions: HashSet<TermId> = HashSet::default();
     for &assertion in assertions.iter() {
@@ -282,10 +450,12 @@ fn substitute_int_constants_preserving_definitions(
         match replacements.get(&var).copied() {
             None => {
                 replacements.insert(var, value);
+                definition_of.insert(var, assertion);
             }
             Some(existing) if existing == value => {}
             Some(_) => {
                 replacements.remove(&var);
+                definition_of.remove(&var);
                 blocked.insert(var);
             }
         }
@@ -295,17 +465,44 @@ fn substitute_int_constants_preserving_definitions(
         return false;
     }
 
+    // #ppp-l3: index the window so a rewritten assertion's provenance can be
+    // augmented with its licensing definitions' own source groups instead of
+    // being invalidated. Definitions are skipped by the rewrite below, so
+    // their positions and slots stay stable while planning.
+    let authority = crate::quant_unit_authority::quant_unit_authority_enabled();
+    let mut slot_by_term: HashMap<TermId, usize> = HashMap::default();
+    if authority {
+        for (index, &assertion) in assertions.iter().enumerate() {
+            slot_by_term.entry(assertion).or_insert(index);
+        }
+    }
+
     let mut cache = HashMap::default();
     let mut changed = false;
-    for (assertion, maybe_sources) in assertions.iter_mut().zip(source_sets.iter_mut()) {
-        if definition_assertions.contains(&*assertion) {
+    for index in 0..assertions.len() {
+        let assertion = assertions[index];
+        if definition_assertions.contains(&assertion) {
             continue;
         }
         let rewritten =
-            substitute_int_const_terms_root(terms, &replacements, &mut cache, *assertion);
-        if rewritten != *assertion {
-            *assertion = rewritten;
-            *maybe_sources = None;
+            substitute_int_const_terms_root(terms, &replacements, &mut cache, assertion);
+        if rewritten != assertion {
+            // Licensing-source augmentation (#ppp-l3), fail-closed to the
+            // pre-L3 invalidation on any gap. See
+            // `augment_propagation_rewritten_sources` for the contract.
+            let planned = if authority {
+                collect_used_int_const_definitions(terms, &replacements, &definition_of, assertion)
+                    .and_then(|licensing| {
+                        let extra =
+                            licensing_definition_sources(&licensing, &slot_by_term, source_sets)?;
+                        let old_groups = source_sets.get(index)?.as_ref()?;
+                        augmented_source_groups(old_groups, &extra)
+                    })
+            } else {
+                None
+            };
+            assertions[index] = rewritten;
+            source_sets[index] = planned;
             changed = true;
         }
     }
@@ -967,10 +1164,15 @@ impl Executor {
 
     /// Build AUFLIA's temporary assertion window together with proof provenance.
     ///
-    /// This is conservative around `PropagateValues`: if the pass rewrites an
-    /// assertion, we drop provenance for that assertion because it may now
-    /// depend on multiple source assertions. Provenance is preserved only for
-    /// transformations whose source identity remains explicit.
+    /// Around `PropagateValues` and the int-constant substitution, a
+    /// rewritten assertion keeps provenance as a MULTI-source group — its
+    /// original sources plus the licensing defining equalities' sources
+    /// (#ppp-l3) — and the fixpoint's producer records are drained into the
+    /// executor store for the rebuild-lane replay. Any augmentation gap
+    /// fails closed to dropping that assertion's provenance (the pre-L3
+    /// behaviour), and `--no-quant-unit-authority` restores the drop
+    /// wholesale. Provenance stays exact for transformations whose source
+    /// identity remains explicit.
     pub(in crate::executor) fn preprocess_auflia_assertions_with_proof_provenance(
         &mut self,
     ) -> (
@@ -1113,8 +1315,16 @@ impl Executor {
             source_sets.resize_with(preprocessed_assertions.len(), || None);
         }
 
-        let saved_assertions =
-            std::mem::replace(&mut self.ctx.assertions, preprocessed_assertions.clone());
+        // Install the post-substitution assertion window before the legacy
+        // array fixpoint. Exact finite coverage must already be active when
+        // generic Skolem extensionality scans this window; otherwise the
+        // generic pass creates a redundant symbolic witness for recursively
+        // finite nested arrays and exposes an extra, avoidable array-cell
+        // equality. The owning AUFLIA route runs the same idempotent closure
+        // again after every later rewrite, immediately before solving.
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, preprocessed_assertions);
+        let source_backed_assertions = source_sets.len();
+        let _ = self.add_finite_index_array_closure();
         let axiom_start = self.ctx.assertions.len();
         // #7890 diagnostic: instrument AUFLIA preprocess blow-up (ios/qlock/pointer-safe)
         let _diag_terms_before_fixpoint = self.ctx.terms.len();
@@ -1125,7 +1335,12 @@ impl Executor {
         let _diag_terms_after_fixpoint = self.ctx.terms.len();
         let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
         let _diag_axioms_post_fixpoint = generated_axioms.len();
-        self.ctx.assertions = saved_assertions;
+        preprocessed_assertions = std::mem::replace(&mut self.ctx.assertions, saved_assertions);
+        debug_assert!(preprocessed_assertions.len() >= source_backed_assertions);
+        // Exact-closure axioms are valid generated facts, not rewrites of a
+        // particular authored assertion, so they intentionally carry no proof
+        // source mapping.
+        source_sets.resize_with(preprocessed_assertions.len(), || None);
         let expanded_axioms = self.ctx.terms.expand_select_store_all(&generated_axioms);
         // #w11-ite-sum: an axiom whose EXPANSION folds to `true` while the
         // original did not is a select-over-store LINK the fold just erased —
@@ -1193,14 +1408,23 @@ impl Executor {
             let before_values = preprocessed_assertions.clone();
             let p = propagate.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
             if p {
-                for (slot, (before, after)) in flattened_sources
-                    .iter_mut()
-                    .zip(before_values.iter().zip(preprocessed_assertions.iter()))
-                {
-                    if before != after {
-                        *slot = None;
-                    }
-                }
+                // #ppp-l3 licensing-source augmentation: a propagation-
+                // rewritten assertion is the original conjunct with
+                // equals-replaced-by-equals licensed by harvested defining
+                // equalities, so its provenance becomes each existing source
+                // group EXTENDED with the licensing definitions' own source
+                // groups (the multi-source form `proof_rewrite` already
+                // consumes) instead of being dropped. Fail-closed: any gap —
+                // kill switch off, unrecorded entry source, definition
+                // without provenance in the current window, or an over-cap
+                // group — declines to the old `None` for that slot.
+                augment_propagation_rewritten_sources(
+                    &mut self.ctx.terms,
+                    &propagate,
+                    &before_values,
+                    &preprocessed_assertions,
+                    &mut flattened_sources,
+                );
             }
 
             source_sets = flattened_sources;
@@ -1211,6 +1435,12 @@ impl Executor {
             flatten.reset();
             propagate.reset();
         }
+        // Drain the fixpoint pass's producer provenance into the executor
+        // store (#ppp-l3): the rebuild-lane replay derives the rewritten
+        // assumes from their authored roots exactly as for the L1 BV-route
+        // drains. Kill-switch gated inside; over-cap stores are withheld
+        // whole (fail-closed L1 precedent).
+        self.extend_propagated_value_provenance_direct(&mut propagate);
 
         tracing::info!(
             iters = _diag_flatten_iters,

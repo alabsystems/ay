@@ -228,7 +228,7 @@ impl SymmetryDetector {
     }
 
     /// Public accessor for the gate-checkable automorphism generators, used by
-    /// the HHW DRAT symmetry-breaking route (`AY_SAT_SYMMETRY_HHW`) which builds
+    /// the HHW DRAT symmetry-breaking route (`--sat-symmetry-hhw`) which builds
     /// a per-generator Heule-Hunt-Wetzler image-and-chain proof fragment rather
     /// than a lex-leader/PR/SR encoding. Returns the SAME generator set the
     /// composite/DPR/SR routes consume.
@@ -256,18 +256,14 @@ impl SymmetryDetector {
         // symmetries the consecutive/half-split and backtracking enumerators miss
         // on clique/coloring/PHP instances. Bounded by an IR-tree node budget so
         // preprocessing stays well under a second or two.
-        // Budget defaults are tuned so clique preprocessing stays well under a
-        // couple of seconds; overridable via env for experiments.
-        let ir_node_budget: u64 = std::env::var("AY_SAT_IR_NODE_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8_000);
-        let ir_max_gens: usize = std::env::var("AY_SAT_IR_MAX_GENERATORS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(96);
-        let mut generators =
-            super::ir::find_automorphisms(clauses, &formula_counts, ir_node_budget, ir_max_gens);
+        // B2: budgets are the shared constants in `symmetry/mod.rs`, the same
+        // ones the signed route reads — one source of truth, no env override.
+        let mut generators = super::ir::find_automorphisms(
+            clauses,
+            &formula_counts,
+            super::IR_NODE_BUDGET,
+            super::IR_MAX_GENERATORS,
+        );
 
         // FALLBACK: if IR finds nothing, try the backtracking closure finder.
         if generators.is_empty() {

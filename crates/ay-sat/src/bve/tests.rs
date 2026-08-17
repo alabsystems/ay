@@ -873,7 +873,7 @@ fn test_resolvent_budget_fastelim_uses_min_bound() {
 
 #[test]
 fn test_additive_fastelim_lever_uses_additive_budget_in_pass1() {
-    // Lever AY_AB_BVE_ADDITIVE_FASTELIM: Pass-1 fastelim adopts kissat's
+    // Lever --sat-[no-]bve-additive-fastelim: Pass-1 fastelim adopts kissat's
     // additive budget removed+bound; Pass-0 quick stays no-growth (min).
     let mut bve = BVE::new(2);
     assert!(!bve.is_additive_fastelim(), "default OFF");
@@ -902,14 +902,14 @@ fn test_additive_fastelim_lever_uses_additive_budget_in_pass1() {
 
 #[test]
 fn test_additive_fastelim_band_gated_default_by_num_vars() {
-    // Banded default (wf_e2bdf6e1): with no AY_AB_BVE_ADDITIVE_FASTELIM
+    // Banded default (wf_e2bdf6e1): with no --sat-[no-]bve-additive-fastelim
     // override, additive is ACTIVE only above the 200K band edge
     // (= PREPROCESS_EXPENSIVE_MAX_VARS). Below/at the edge stays CaDiCaL
     // no-growth baseline (6f354fbe 48K regression sentinel); above it captures
     // the ebbda8d9 723K UNKNOWN -> cake_lpr-VERIFIED UNSAT flip.
     //
     // NOTE: like the sibling lever test, this assumes the process env leaves
-    // AY_AB_BVE_ADDITIVE_FASTELIM / AY_BVE_ADDITIVE_MIN_VARS unset (as the
+    // --sat-[no-]bve-additive-fastelim / AY_BVE_ADDITIVE_MIN_VARS unset (as the
     // suite is run under the gate harness).
     assert!(
         !BVE::new(48_032).is_additive_fastelim(),

@@ -491,13 +491,10 @@ impl CongruenceClosure {
                 // no longer exists.
                 //
                 // The mechanism is kept, not deleted: if a future change
-                // reintroduces an unbounded congruence fixpoint, setting
-                // `AY_SAT_CONGRUENCE_MEMORY_BOUND=1` restores the guard without
+                // reintroduces an unbounded congruence fixpoint, passing
+                // `--sat-congruence-memory-bound` restores the guard without
                 // re-deriving it. Re-measure before making it default again.
-                std::env::var("AY_SAT_CONGRUENCE_MEMORY_BOUND")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                ay_core::sat_ab_switches().congruence_memory_bound
             })
         };
         let mut budget_ticks: u64 = 0;

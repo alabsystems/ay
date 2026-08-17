@@ -234,7 +234,8 @@ pub unsafe extern "C" fn Z3_mk_select_n(
         return 0;
     }
     if n == 0 || idxs.is_null() {
-        // SAFETY: guard null-checks `c`.
+        // SAFETY: `ffi_guard_ast` checks `c` for null before its closure
+        // mutably accesses the context to record the argument error.
         unsafe {
             return ffi_guard_ast(c, |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -301,7 +302,8 @@ pub unsafe extern "C" fn Z3_mk_store_n(
         return 0;
     }
     if n == 0 || idxs.is_null() {
-        // SAFETY: guard null-checks `c`.
+        // SAFETY: `ffi_guard_ast` checks `c` for null before its closure
+        // mutably accesses the context to record the argument error.
         unsafe {
             return ffi_guard_ast(c, |ctx| {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -1695,7 +1697,8 @@ pub unsafe extern "C" fn Z3_mk_lstring(c: Z3_context, len: c_uint, s: Z3_string)
     let value = match std::str::from_utf8(bytes) {
         Ok(v) => v.to_string(),
         Err(_) => {
-            // SAFETY: guard null-checks `c`.
+            // SAFETY: `ffi_guard_ast` checks `c` for null before its closure
+            // mutably accesses the context to record the conversion error.
             return unsafe {
                 ffi_guard_ast(c, |ctx| {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -1751,7 +1754,8 @@ pub unsafe extern "C" fn Z3_mk_u32string(
         match char::from_u32(cp) {
             Some(ch) => value.push(ch),
             None => {
-                // SAFETY: guard null-checks `c`.
+                // SAFETY: `ffi_guard_ast` checks `c` for null before its closure
+                // mutably accesses the context to record the code-point error.
                 return unsafe {
                     ffi_guard_ast(c, |ctx| {
                         ctx.last_error = Z3_INVALID_ARG;

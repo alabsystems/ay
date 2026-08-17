@@ -5,6 +5,10 @@ use anyhow::Result;
 
 use super::EngineerChapter;
 
+fn print_block(text: &str) {
+    println!("{text}");
+}
+
 pub(super) fn run(selected: Option<EngineerChapter>, interactive: bool) -> Result<()> {
     println!();
     println!("=== AY for Engineers ===");
@@ -37,8 +41,7 @@ pub(super) fn run(selected: Option<EngineerChapter>, interactive: bool) -> Resul
 }
 
 fn build() -> Result<()> {
-    println!(
-        "{}",
+    print_block(
         r#"The shift in architecture
 
 Many programs contain a hand-written search loop:
@@ -100,8 +103,7 @@ budget you plan to ship.
 Live result from the tutorial's 4x4 model:"#,
     );
     super::sudoku::print_live_result()?;
-    println!(
-        "{}",
+    print_block(
         r#"
 2. LLM token router: optimize globally instead of nesting if-statements
 
@@ -219,8 +221,7 @@ status or model.
 }
 
 fn automation() {
-    println!(
-        "{}",
+    print_block(
         r#"Build and invoke the exact binary you intend to ship:
 
   cargo build --release --locked -p ay --features cli --bin ay
@@ -269,8 +270,7 @@ identity. It is a triage tool, not a substitute for proof replay.
 }
 
 fn rust() {
-    println!(
-        "{}",
+    print_block(
         r#"For native embedding, use AY's public `ay::api` surface and pin a commit.
 
 Cargo.toml:
@@ -318,8 +318,7 @@ Use native SMT when theory-rich terms matter; use AY Search for choices + rules.
 }
 
 fn migration() {
-    println!(
-        "{}",
+    print_block(
         r#"Migrate a Z3 integration at one observable boundary at a time.
 
 1. Transcript-compatible command line
@@ -368,8 +367,7 @@ Success in one is not proof of the other two.
 }
 
 fn production() {
-    println!(
-        "{}",
+    print_block(
         r#"Production checklist
 
   [ ] Pin and record the AY commit/build provenance.

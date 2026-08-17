@@ -4,7 +4,8 @@
 
 //! Whole-proof resource regressions for expensive BV semantic checkers.
 
-use ay_core::{Proof, Sort, Symbol, TermStore, TheoryLemmaKind};
+use ay_core::{Proof, Sort, Symbol, TermId, TermStore, TheoryLemmaKind};
+use num_bigint::BigInt;
 
 use super::*;
 
@@ -53,6 +54,103 @@ fn exact_expensive_charge_keeps_bv_bitblast_classification() {
         charge.bytes,
         MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA + MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA
     );
+}
+
+#[test]
+fn ground_bv_constants_use_bounded_evaluation_without_expensive_precharge() {
+    for width in [8, 64] {
+        let mut terms = TermStore::new();
+        let five = terms.mk_bitvec(BigInt::from(5), width);
+        let ten = terms.mk_bitvec(BigInt::from(10), width);
+        let equality = terms.mk_app(Symbol::named("="), [five, ten], Sort::Bool);
+        let disequality = terms.mk_not_raw(equality);
+        let clause = [disequality];
+
+        assert!(recognize_bv_bitblast(&terms, &clause));
+        assert!(
+            !bv_bitblast_requires_proof_producer(&terms, &clause),
+            "closed width-{width} constants require one evaluation, not a SAT proof"
+        );
+        let mut proof = Proof::new();
+        let assume = proof.add_assume(equality, None);
+        let theorem =
+            proof.add_theory_lemma_with_kind("BV", clause.to_vec(), TheoryLemmaKind::BvBitBlast);
+        proof.add_resolution(Vec::new(), equality, assume, theorem);
+        crate::check_proof_strict(&proof, &terms)
+            .expect("ground constant disequality must replay without the expensive precharge");
+    }
+}
+
+#[test]
+fn symbolic_wide_and_unsupported_ground_bv_stay_expensive_and_fail_closed() {
+    let mut terms = TermStore::new();
+    let symbolic = terms.mk_var("symbolic_width_8", Sort::bitvec(8));
+    let symbolic_reflexive = terms.mk_app(Symbol::named("="), [symbolic, symbolic], Sort::Bool);
+    assert!(bv_bitblast_requires_proof_producer(
+        &terms,
+        &[symbolic_reflexive]
+    ));
+
+    let wide_zero = terms.mk_bitvec(BigInt::from(0), 65);
+    let wide_one = terms.mk_bitvec(BigInt::from(1), 65);
+    let wide_equality = terms.mk_app(Symbol::named("="), [wide_zero, wide_one], Sort::Bool);
+    let wide_disequality = terms.mk_not_raw(wide_equality);
+    assert!(bv_bitblast_requires_proof_producer(
+        &terms,
+        &[wide_disequality]
+    ));
+
+    let unsupported = terms.mk_app(
+        Symbol::named("unsupported_ground_bv"),
+        Vec::<TermId>::new(),
+        Sort::bitvec(8),
+    );
+    let unsupported_reflexive =
+        terms.mk_app(Symbol::named("="), [unsupported, unsupported], Sort::Bool);
+    assert!(bv_bitblast_requires_proof_producer(
+        &terms,
+        &[unsupported_reflexive]
+    ));
+    let mut forged = Proof::new();
+    forged.add_theory_lemma_with_kind(
+        "BV",
+        vec![unsupported_reflexive],
+        TheoryLemmaKind::BvBitBlast,
+    );
+    assert!(crate::check_proof_strict(&forged, &terms).is_err());
+}
+
+#[test]
+fn published_single_lemma_reserve_covers_each_expensive_kind() {
+    const {
+        assert!(MAX_EXPENSIVE_BV_WORK_PER_LEMMA >= MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA);
+        assert!(MAX_EXPENSIVE_BV_WORK_PER_LEMMA >= MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA);
+        assert!(MAX_EXPENSIVE_BV_BYTES_PER_LEMMA >= MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA);
+        assert!(MAX_EXPENSIVE_BV_BYTES_PER_LEMMA >= MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA);
+    }
+}
+
+#[test]
+fn structural_count_cap_does_not_promise_aggregate_admission() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("two_charged_bv", Sort::bitvec(16));
+    let equality = terms.mk_app(Symbol::named("="), vec![value, value], Sort::Bool);
+    let negated = terms.mk_not_raw(equality);
+    let mut proof = Proof::new();
+    for _ in 0..2 {
+        proof.add_theory_lemma_with_kind(
+            "BV",
+            vec![equality, negated],
+            TheoryLemmaKind::BvBitBlast,
+        );
+    }
+
+    let charge = validate_expensive_bv_budget(&proof, &terms)
+        .expect("two expensive lemmas remain below the structural count ceiling");
+    const {
+        assert!(2 <= MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF);
+    }
+    assert!(charge.bytes > MAX_EXPENSIVE_BV_BYTES_PER_LEMMA);
 }
 
 #[test]

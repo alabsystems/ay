@@ -785,10 +785,6 @@ pub(crate) struct SolverStats {
     pub dense_clique_mab_branch_route_enabled: u64,
     /// Branch decisions made while the dense-clique MAB branch route was enabled.
     pub dense_clique_mab_branch_route_exercised: u64,
-    /// Focused-mode: restart blocked by trail-length heuristic (#8449).
-    /// Glucose trail blocking (Audemard & Simon, CP 2012): suppresses restarts
-    /// when the current trail is longer than the slow-moving average.
-    pub trail_blocked_restarts: u64,
     /// Restart decisions attributed to their primary cause.
     pub restart_attribution: [u64; RESTART_ATTRIBUTION_BUCKETS],
     /// Restart decisions by current mode: [focused, stable].
@@ -2015,7 +2011,6 @@ impl SolverStats {
             dense_mutex_focused_restart_computed_gate: 0,
             dense_clique_mab_branch_route_enabled: 0,
             dense_clique_mab_branch_route_exercised: 0,
-            trail_blocked_restarts: 0,
             restart_attribution: [0; RESTART_ATTRIBUTION_BUCKETS],
             restart_attribution_modes: [0; RESTART_MODE_BUCKETS],
             pending_restart_attribution: None,

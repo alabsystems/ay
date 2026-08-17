@@ -26,7 +26,7 @@
 //!
 //! > **THE PORTFOLIO MUST PROVABLY DOMINATE ITS OWN FALLBACK.** For every model,
 //! > routing must yield a verdict at least as strong AND evidence at least as
-//! > strong as `AY_MILP_NO_STRUCTURE_ROUTE=1` would have.
+//! > strong as `SolveOpts::with_structure_routing(false)` would have.
 //!
 //! [`may_close`] is that invariant, as one function, on the verdict-ending path.
 //! It is the only thing a new lane's author has to satisfy, and satisfying it
@@ -155,7 +155,7 @@ impl ClaimKind {
 
 /// **THE ONE PLACE "how strong is the fallback" IS WRITTEN DOWN.**
 ///
-/// Returns the best evidence the ANCHOR — `AY_MILP_NO_STRUCTURE_ROUTE=1`, the
+/// Returns the best evidence the ANCHOR — `SolveOpts::with_structure_routing(false)`, the
 /// native proof-producing tree — could still attach to `claim` on this model
 /// under these options. Every entry is derived from what the anchor's own exit
 /// path actually does, not from what it aspires to:
@@ -465,7 +465,7 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 /// verdict is lost anywhere. A consumer who wants the fast path back has two
 /// principled levers rather than a secret one: `--tree-cert-leaves 0` says "I
 /// do not want a tree certificate", which lowers [`anchor_cap`] and admits the
-/// refutation immediately, and `AY_MILP_ANCHOR_FIRST_REFUSAL_MS=0` disables
+/// refutation immediately, and `--anchor-first-refusal-ms` disables
 /// deferral outright.
 ///
 /// A 2000 ms cap was tried and REJECTED, for a reason worth recording: on
@@ -479,7 +479,7 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 /// in NODES rather than milliseconds.
 pub(crate) const ANCHOR_FIRST_REFUSAL_CAP: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The cap, after `AY_MILP_ANCHOR_FIRST_REFUSAL_MS`.
+/// The cap, after `--anchor-first-refusal-ms`.
 ///
 /// `0` disables deferral outright, and that degenerate point is the whole
 /// reason the override exists: it turns "the portfolio dominates its fallback"
@@ -488,10 +488,10 @@ pub(crate) const ANCHOR_FIRST_REFUSAL_CAP: std::time::Duration = std::time::Dura
 pub(crate) fn anchor_first_refusal_cap() -> std::time::Duration {
     static CAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("AY_MILP_ANCHOR_FIRST_REFUSAL_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(ANCHOR_FIRST_REFUSAL_CAP, std::time::Duration::from_millis)
+        crate::tune::count_opt(crate::tune::Knob::AnchorFirstRefusalMs)
+            .map_or(ANCHOR_FIRST_REFUSAL_CAP, |ms| {
+                std::time::Duration::from_millis(ms as u64)
+            })
     })
 }
 
@@ -900,7 +900,7 @@ mod tests {
         );
     }
 
-    /// THE DEGENERATE POINT. `AY_MILP_ANCHOR_FIRST_REFUSAL_MS=0` switches
+    /// THE DEGENERATE POINT. `--anchor-first-refusal-ms` switches
     /// deferral off, which is what makes the dominance invariant checkable as a
     /// property of ONE program with a parameter rather than as a claim about
     /// two programs.

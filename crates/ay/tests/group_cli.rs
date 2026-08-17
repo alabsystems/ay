@@ -13,6 +13,9 @@ mod spawn_timeout_selftest;
 #[path = "group_cli/competition_mode_b1.rs"]
 mod competition_mode_b1;
 
+#[path = "group_cli/capability_ledger.rs"]
+mod capability_ledger;
+
 #[path = "group_cli/strings_kill_switches.rs"]
 mod strings_kill_switches;
 
@@ -21,6 +24,8 @@ mod allsat_phase1_8777;
 
 #[path = "group_cli/dimacs_sat_exit_codes.rs"]
 mod dimacs_sat_exit_codes;
+#[path = "group_cli/reexec_supervisor_gate.rs"]
+mod reexec_supervisor_gate;
 #[path = "group_cli/uncertifiable_symmetry_refusal.rs"]
 mod uncertifiable_symmetry_refusal;
 
@@ -116,6 +121,9 @@ mod proof_certificate_disclosure;
 
 #[path = "group_cli/fail_closed_result_authority.rs"]
 mod fail_closed_result_authority;
+
+#[path = "group_cli/rewritten_constant_premise.rs"]
+mod rewritten_constant_premise;
 
 #[path = "group_cli/lean_verify_8773.rs"]
 mod lean_verify_8773;

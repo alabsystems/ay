@@ -1762,15 +1762,13 @@ fn validate_native_per_instance_evidence(
             0
         } else if agreements
             .is_some_and(|values| values.iter().any(|agreement| agreement == "agree"))
-        {
-            1
-        } else if matches!(
-            item.expected_source.as_str(),
-            "header" | "path" | "header+path"
-        ) && item
-            .expected
-            .as_deref()
-            .is_some_and(|expected| expected == item.result)
+            || (matches!(
+                item.expected_source.as_str(),
+                "header" | "path" | "header+path"
+            ) && item
+                .expected
+                .as_deref()
+                .is_some_and(|expected| expected == item.result))
         {
             1
         } else if matches!(item.result.as_str(), "sat" | "unsat")
@@ -1801,8 +1799,7 @@ fn validate_native_per_instance_evidence(
     };
     if classified != reported {
         return Err(format!(
-            "native per-instance verdict classification {:?} does not match scorecard evidence {:?}",
-            classified, reported
+            "native per-instance verdict classification {classified:?} does not match scorecard evidence {reported:?}"
         ));
     }
     Ok(())
@@ -3153,7 +3150,7 @@ fn file_identity(path: &Path, purpose: &str) -> Result<(String, u64)> {
     }
     let mut hasher = Sha256::new();
     let mut size_bytes = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)

@@ -11,7 +11,7 @@ use super::Executor;
 const CERT_REJECT_PROBE_MAX_TERMS: usize = 32;
 const CERT_REJECT_PROBE_MAX_TERM_CHARS: usize = 8 * 1024;
 
-/// Print a certification-rejection diagnostic when `AY_PROBE_CERT_REJECT` is set.
+/// Print a certification-rejection diagnostic when `--probe-cert-reject` is set.
 ///
 /// Downstream embedders (deductive-checks) surface only the opaque
 /// `(incomplete self-check-rejected)` reason code, so the gate that actually
@@ -19,8 +19,8 @@ const CERT_REJECT_PROBE_MAX_TERM_CHARS: usize = 8 * 1024;
 /// and step it names -- is otherwise unobservable outside this crate. The
 /// message is computed lazily so an unset variable costs one `var_os` probe.
 pub(in crate::executor) fn probe_cert_reject(message: impl FnOnce() -> String) {
-    if std::env::var_os("AY_PROBE_CERT_REJECT").is_some() {
-        eprintln!("AY_PROBE_CERT_REJECT: {}", message());
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        eprintln!("--probe-cert-reject: {}", message());
     }
 }
 

@@ -91,6 +91,14 @@ pub(crate) struct SweepOutcome {
 }
 
 // COI construction limits (CaDiCaL defaults from sweep.cpp).
+/// Per-COI-solve tick cap (see the #class-3 rationale at the use site).
+/// Sweep-deepening default (B4: was AY_AB_SWEEP_DEEPEN; OFF is the measured
+/// shipped behaviour, and flipping it belongs to a priced batch).
+const SWEEP_DEEPEN_DEFAULT: bool = false;
+/// Wall cap when deepening is on (B4: was AY_AB_SWEEP_WALL_MS).
+#[allow(dead_code)]
+const SWEEP_DEEPEN_WALL_LIMIT_MS: u64 = 1_000;
+const SWEEP_PER_SOLVE_TICKS_CAP: u64 = 20_000;
 const COI_VAR_LIMIT: usize = 48;
 const COI_DEPTH_LIMIT: u32 = 4;
 const COI_CLAUSE_LIMIT: usize = 4096;
@@ -107,7 +115,7 @@ pub(crate) struct Sweeper {
     coi_vars: Vec<usize>,
     coi_depths: Vec<u32>,
     coi_clauses: HashSet<usize>,
-    // Sweep-deepening lever (AY_AB_SWEEP_DEEPEN): persistent round-robin cursor
+    // Sweep-deepening lever: persistent round-robin cursor
     // over the variable scan. Without deepening, each sweep call restarts at
     // variable 0, so on any formula larger than the per-call budget only the
     // low-index prefix is ever swept. With the cursor, successive calls resume
@@ -209,23 +217,22 @@ impl Sweeper {
         // and variable bound keep it bounded without it.
         let det_inproc = crate::determinism::deterministic_inproc_enabled();
 
-        // ── Sweep-deepening lever (AY_AB_SWEEP_DEEPEN) ──────────────────────
+        // ── Sweep-deepening lever (B4: env reads deleted; constant default) ──
         // OFF (default): restart the scan at variable 0 with the historical
         //   200ms wall cap — byte-for-byte the previous behaviour.
         // ON: resume the scan from a persistent round-robin cursor and relax
-        //   the wall cap (AY_AB_SWEEP_WALL_MS, default 1000ms) so successive
+        //   the wall cap (default 1000ms) so successive
         //   calls advance coverage into fresh variables instead of re-probing
         //   the same low-index prefix every time. Matches kissat's persistent
-        //   `sweep_schedule` (sweep.c). Env is read once per call (cheap:
-        //   sweep_with_kitten runs only a handful of times per solve).
-        let deepen = std::env::var("AY_AB_SWEEP_DEEPEN")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        //   `sweep_schedule` (sweep.c).
+        // B4: the AY_AB_SWEEP_{DEEPEN,WALL_MS} env reads are deleted. The
+        // machinery is kept: deepening is a real capability (kissat's
+        // persistent sweep_schedule) whose default decision belongs to the
+        // measured batch that prices it, via a typed option -- not to an env
+        // var nothing sets. Shipped behaviour is unchanged (OFF).
+        let deepen = SWEEP_DEEPEN_DEFAULT;
         let sweep_wall_limit_ms = if deepen {
-            std::env::var("AY_AB_SWEEP_WALL_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1_000)
+            SWEEP_DEEPEN_WALL_LIMIT_MS
         } else {
             SWEEP_WALL_LIMIT_MS_DEFAULT
         };
@@ -293,11 +300,10 @@ impl Sweeper {
             // Per-solve cap (#class-3, "cheaper coverage" principle): giving
             // each COI-solve the WHOLE remaining budget lets one hard COI
             // starve the rest (few vars covered). Cap per-solve so hard COIs
-            // fail fast and more variables get probed. Env-overridable to test.
-            let per_solve_cap = std::env::var("AY_AB_SWEEP_PERSOLVE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000);
+            // fail fast and more variables get probed.
+            // B4: the AY_AB_SWEEP_PERSOLVE override is deleted -- it was an
+            // uncached getenv PER SWEPT VARIABLE on the hot path (#8506).
+            let per_solve_cap = SWEEP_PER_SOLVE_TICKS_CAP;
             self.kitten.set_ticks_limit(remaining.min(per_solve_cap));
 
             // Build COI environment for this variable.
@@ -482,6 +488,28 @@ impl Sweeper {
             unsat: false,
             lit_map,
             new_units,
+        }
+    }
+}
+
+#[cfg(test)]
+mod hot_path_env_tests {
+    /// B4: the sweep hot path must contain zero environment reads. Before
+    /// this batch, AY_AB_SWEEP_PERSOLVE was an uncached getenv + String alloc
+    /// + parse PER SWEPT VARIABLE, and AY_AB_COI_{VARS,DEPTH} were read per
+    /// variable inside build_coi -- all three violating the #8506
+    /// no-per-call-syscall convention this module itself cites. This is the
+    /// property that regresses, so it is the property under test.
+    #[test]
+    fn no_env_read_on_the_sweep_hot_path() {
+        // Needle built by concatenation so this test's own source cannot
+        // satisfy it (include_str! sees this file, comments included).
+        let needle = concat!("env", "::", "var");
+        for src in [include_str!("mod.rs"), include_str!("coi.rs")] {
+            assert!(
+                !src.contains(needle),
+                "sweep hot path must not read the environment"
+            );
         }
     }
 }

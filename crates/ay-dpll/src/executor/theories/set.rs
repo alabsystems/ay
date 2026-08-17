@@ -153,6 +153,11 @@ impl Executor {
                 .extend(ext_axioms.into_iter().filter(|axiom| seen.insert(*axiom)));
         }
 
+        // Set elaboration and the route-local subset/cardinality passes operate
+        // on array carriers and can expose fresh finite-index equalities. This
+        // is the route's final assertion surface before Tseitin encoding.
+        let _ = self.add_finite_index_array_closure();
+
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
         solve_incremental_split_loop_pipeline!(self,

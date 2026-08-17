@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Strings increment P3: `str.to_int` / `str.from_int` digit-string ↔ LIA
-//! coupling for NON-GROUND arguments (default ON, `AY_STR_P3=0` kill switch).
+//! coupling for NON-GROUND arguments (default ON, `--dpll-no-str-p3` kill switch).
 //!
 //! SMT-LIB semantics being encoded (the ONLY source of truth for every axiom
 //! below): `(str.to_int s)` returns the non-negative decimal value of `s`
@@ -43,15 +43,15 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Strings increment P3 master switch (default ON, `AY_STR_P3=0` kill switch).
+/// Strings increment P3 master switch (default ON, `--dpll-no-str-p3` kill switch).
 ///
 /// Gates the eager NON-GROUND `str.to_int` / `str.from_int` digit-string
 /// reasoning package (range, all-digits ↔ non-negative, decimal magnitude ↔
 /// length coupling, `-1` propagation from non-digit witnesses, `from_int`
 /// canonical-form + roundtrip axioms), wired as one more escalation pass in
-/// `solve_strings_lia` after the P2 pass. `AY_STR_P3=0` keeps the solve
+/// `solve_strings_lia` after the P2 pass. `--dpll-no-str-p3` keeps the solve
 /// pipeline byte-identical to pre-P3 behavior. P3 is gated independently of
-/// `AY_STR_P2` (its escalation pass collects the P2 reduction package itself
+/// `--dpll-no-str-p2` (its escalation pass collects the P2 reduction package itself
 /// when the P2 gate is off — the substr length windows are what let LIA see
 /// through `str.at`-shaped to_int arguments).
 pub(in crate::executor) fn str_p3_enabled() -> bool {
@@ -63,9 +63,9 @@ pub(in crate::executor) fn str_p3_enabled() -> bool {
     // families = 49 conversions, every one z3-agreeing; 396-file solved
     // QF_S/QF_SLIA regression sweep with 0 losses (which is also the measured
     // answer to the verify-before-accept re-solve cost); 500-case differential
-    // + pin-model fuzz clean. `AY_STR_P3=0` is the kill switch.
+    // + pin-model fuzz clean. `--dpll-no-str-p3` is the kill switch.
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_P3").ok().as_deref(), Some("0")))
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_p3)
 }
 
 /// Largest digit count L for which the per-length magnitude coupling clauses

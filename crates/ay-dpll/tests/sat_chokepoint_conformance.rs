@@ -11,6 +11,9 @@
 
 use std::path::PathBuf;
 
+#[path = "sat_chokepoint_conformance/post_rebase.rs"]
+mod post_rebase;
+
 fn read(rel: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
@@ -42,6 +45,7 @@ fn is_chokepoint_source_fixture(relative: &str) -> bool {
         relative,
         "crates/ay-dpll/tests/sat_chokepoint_conformance.rs"
             | "crates/ay-dpll/tests/unsat_chokepoint_conformance.rs"
+            | "crates/ay-dpll/tests/sat_chokepoint_conformance/post_rebase.rs"
     )
 }
 
@@ -224,21 +228,7 @@ fn checked_projection_lane_rechecks_evidence_and_model_before_mint() {
 fn text_command_publication_consumes_private_sat_authority() {
     let executor = read("src/executor.rs");
     let executor_normalized = normalize_whitespace(&executor);
-    let text_admission = "CommandExecutionBoundary::GenericText | CommandExecutionBoundary::AuthoredText => { self.admit_command_solve_result(sat_result)";
-    assert_eq!(
-        executor_normalized.matches(text_admission).count(),
-        2,
-        "plain check-sat and check-sat-assuming must both admit before formatting"
-    );
-    for branch in executor_normalized.split(text_admission).skip(1) {
-        let display = branch
-            .find("let display = sat_result.to_string();")
-            .expect("admitted command result must be the value rendered to SMT-LIB");
-        let publish = branch
-            .find("self.last_result = Some(sat_result);")
-            .expect("admitted command result must become the recorded public result");
-        assert!(display < publish);
-    }
+    post_rebase::assert_command_boundary(&executor_normalized);
 
     let sat_emit = read("src/executor/model/sat_emit.rs");
     let start = sat_emit
@@ -249,73 +239,20 @@ fn text_command_publication_consumes_private_sat_authority() {
         .map(|offset| start + offset)
         .expect("command admission must precede the constructive minting lane");
     let admission = &sat_emit[start..end];
-    let live_stop = admission
-        .find("decline_definite_publication_on_external_stop(result)")
-        .expect("text admission must reject a live external stop");
-    let reset_unsat_admission = admission
-        .find("self.last_command_unsat_admission = None;")
-        .expect("text admission must revoke the preceding UNSAT command admission");
-    let unsat_branch = admission
-        .find("if result.is_unsat() {")
-        .expect("text admission must authenticate UNSAT separately");
-    let nondefinite_branch = admission
-        .find("if result != SolveResult::Sat {")
-        .expect("text admission must revoke tokens for non-definite results");
-    let sat_take = admission
-        .find(".take_sat_certificate()")
-        .expect("text admission must consume SAT authority");
-    let unsat_takes: Vec<_> = admission
-        .match_indices(".take_unsat_certificate()")
-        .map(|(offset, _)| offset)
-        .collect();
-    let sat_revocations: Vec<_> = admission
-        .match_indices("self.last_sat_certificate = None;")
-        .map(|(offset, _)| offset)
-        .collect();
-    assert_eq!(
-        admission.matches(".take_sat_certificate()").count(),
-        1,
-        "text SAT authority must have exactly one consumer"
-    );
-    assert_eq!(
-        unsat_takes.len(),
-        3,
-        "UNSAT authority must be consumed on UNSAT, non-definite, and SAT paths"
-    );
-    assert_eq!(
-        sat_revocations.len(),
-        2,
-        "UNSAT and non-definite paths must revoke incompatible SAT authority"
-    );
-    let confirm_sat = admission
-        .find("certificate.confirms_sat_emission()")
-        .expect("text admission must validate consumed SAT authority");
-    let reject_sat = admission
-        .find("self.reject_unadmitted_sat_publication(")
-        .expect("missing SAT authority must fail closed");
-    assert!(
-        live_stop < reset_unsat_admission
-            && reset_unsat_admission < unsat_branch
-            && unsat_branch < sat_revocations[0]
-            && sat_revocations[0] < unsat_takes[0]
-            && unsat_takes[0] < nondefinite_branch
-            && nondefinite_branch < sat_revocations[1]
-            && sat_revocations[1] < unsat_takes[1]
-            && unsat_takes[1] < unsat_takes[2]
-            && unsat_takes[2] < sat_take
-            && sat_take < confirm_sat
-            && confirm_sat < reject_sat,
-        "text admission must stop-gate, revoke incompatible authority, consume exactly the active token, validate it, then fail closed"
-    );
+    post_rebase::assert_command_admission_order(admission);
 
-    let sat_consumer_start = executor
+    // `2014dd6f5 refactor: modularize solver internals` moved the plain
+    // accessors, including this one-shot consumer, out of `executor.rs` into
+    // `executor/accessors.rs`. The pinned body is unchanged.
+    let accessors = read("src/executor/accessors.rs");
+    let sat_consumer_start = accessors
         .find("pub(crate) fn take_sat_certificate(&mut self) -> Option<SatCertificate> {")
         .expect("Executor must define the one-shot SAT authority consumer");
-    let sat_consumer_end = executor[sat_consumer_start..]
+    let sat_consumer_end = accessors[sat_consumer_start..]
         .find("pub(crate) fn last_maxsmt_outcome(")
         .map(|offset| sat_consumer_start + offset)
         .expect("SAT authority consumer must have a bounded source region");
-    let sat_consumer = &executor[sat_consumer_start..sat_consumer_end];
+    let sat_consumer = &accessors[sat_consumer_start..sat_consumer_end];
     assert!(
         sat_consumer.contains("self.last_sat_certificate.take()?")
             && sat_consumer.contains("certificate.is_current_for(self).then_some(certificate)"),
@@ -390,14 +327,15 @@ fn text_command_publication_consumes_private_sat_authority() {
 #[test]
 fn native_optimization_transfers_sat_authority_once() {
     let executor = read("src/executor.rs");
-    let native_start = executor
+    let command_boundary = read("src/executor/command_boundary.rs");
+    let native_start = command_boundary
         .find("pub(crate) fn execute_native_optimization_check_sat(")
         .expect("executor must expose one narrow unpublished optimization route");
-    let native_end = executor[native_start..]
-        .find("/// Body of [`Executor::execute`]")
+    let native_end = command_boundary[native_start..]
+        .find("/// Continue an already-started native MaxSMT query")
         .map(|offset| native_start + offset)
-        .expect("native optimization route must precede generic command dispatch");
-    let native = &executor[native_start..native_end];
+        .expect("native optimization route must precede the MaxSMT continuation");
+    let native = &command_boundary[native_start..native_end];
     assert!(
         native.contains("CommandExecutionBoundary::NativeOptimization")
             && !native.contains("CommandExecutionBoundary::AuthoredText"),
@@ -405,17 +343,20 @@ fn native_optimization_transfers_sat_authority_once() {
     );
 
     assert!(
-        executor.contains("enum CommandExecutionBoundary {")
-            && !executor.contains("enum CommandAuthorityOrigin")
-            && !executor.contains("enum CommandResultSurface"),
+        command_boundary.contains("enum CommandExecutionBoundary {")
+            && !command_boundary.contains("enum CommandAuthorityOrigin")
+            && !command_boundary.contains("enum CommandResultSurface"),
         "origin and publication must be one closed type so authored-native execution is unrepresentable"
     );
     assert_eq!(
         executor
             .matches("CommandExecutionBoundary::NativeOptimization")
-            .count(),
-        4,
-        "the native selector, early command guard, and two exhaustive admissions are an audited closed allowlist"
+            .count()
+            + command_boundary
+                .matches("CommandExecutionBoundary::NativeOptimization")
+                .count(),
+        5,
+        "the native selector, neutral query continuation, early command guard, and two exhaustive admissions are an audited closed allowlist"
     );
 
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -428,6 +369,7 @@ fn native_optimization_transfers_sat_authority_once() {
     let allowed = [
         "crates/ay-dpll/src/api/solving/optimize.rs",
         "crates/ay-dpll/src/executor.rs",
+        "crates/ay-dpll/src/executor/command_boundary.rs",
     ];
     for source in sources {
         let relative = source
@@ -594,58 +536,7 @@ fn checked_projection_authority_is_linear_and_origin_allowlisted() {
         "combined SAT authority must own both opaque evidence layers and remain non-Clone"
     );
 
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("ay-dpll lives below the workspace root")
-        .to_path_buf();
-    let mut sources = Vec::new();
-    rust_sources_below(&workspace.join("crates"), &mut sources);
-    let allowed = [
-        "crates/ay-dpll/src/api/solving/check.rs",
-        "crates/ay-dpll/src/api/solving/cross_check.rs",
-        "crates/ay-dpll/src/executor.rs",
-        "crates/ay-dpll/src/executor/quantifier_loop/projection_candidate.rs",
-        "crates/ay-dpll/src/executor/query_authority.rs",
-        "crates/ay-dpll/tests/common/mod.rs",
-        "crates/ay-dpll/tests/group_quantifiers/ufbv_checked_projection_sat.rs",
-        "crates/ay/src/run.rs",
-    ];
-    let test_only_allowed = [
-        "crates/ay-dpll/src/executor/check_sat.rs",
-        "crates/ay-dpll/src/executor/quantifier_loop/result_mapping.rs",
-    ];
-    for source in sources {
-        let relative = source
-            .strip_prefix(&workspace)
-            .expect("enumerated source is below workspace")
-            .to_string_lossy();
-        if is_chokepoint_source_fixture(relative.as_ref()) {
-            // The source audit below names each guarded authority entrypoint.
-            // Exclude inert source-search fixtures rather than allowlisting
-            // their own strings as executable callsites.
-            continue;
-        }
-        let text = std::fs::read_to_string(&source)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
-        if !text.contains("solve_authored_plain_hard_query")
-            && !text.contains("solve_interruptible_authored_plain_hard_query")
-            && !text.contains("execute_authored")
-        {
-            continue;
-        }
-        let test_only_callsite = test_only_allowed.contains(&relative.as_ref())
-            && text.find("#[cfg(test)]").is_some_and(|test_start| {
-                let production = &text[..test_start];
-                !production.contains("solve_authored_plain_hard_query")
-                    && !production.contains("solve_interruptible_authored_plain_hard_query")
-                    && !production.contains("execute_authored")
-            });
-        assert!(
-            allowed.contains(&relative.as_ref()) || test_only_callsite,
-            "new authored-authority callsite requires an explicit boundary audit: {relative}"
-        );
-    }
+    post_rebase::assert_authored_entrypoint_allowlist();
 
     assert!(
         query.contains("struct AuthoredPlainHardQuery<'a>")
@@ -931,35 +822,7 @@ fn post_validation_array_retry_propagates_both_outcomes_and_revalidates() {
 /// `emit_sat_verdict` — no bare `Ok(SolveResult::Sat)` escape remains.
 #[test]
 fn assuming_and_optimize_emit_sat_only_through_the_funnel() {
-    for rel in [
-        "src/executor/check_sat_assuming.rs",
-        "src/executor/optimization.rs",
-    ] {
-        let src = read(rel);
-        assert!(
-            src.contains("emit_sat_verdict("),
-            "{rel} must emit its SAT verdict via emit_sat_verdict"
-        );
-        // No bare `Ok(SolveResult::Sat)` verdict ESCAPE. A match arm
-        // (`Ok(SolveResult::Sat) =>`) that CONSUMES an inner result is fine — it
-        // is inspecting a verdict, not minting one. A comment mentioning the
-        // pattern is fine too. Only a CONSTRUCTED `Ok(SolveResult::Sat)`
-        // return/tail would bypass the funnel.
-        for (lineno, line) in src.lines().enumerate() {
-            if !line.contains("Ok(SolveResult::Sat)") {
-                continue;
-            }
-            let trimmed = line.trim_start();
-            let is_match_arm = line.contains("=>");
-            let is_comment = trimmed.starts_with("//") || trimmed.starts_with('*');
-            assert!(
-                is_match_arm || is_comment,
-                "{rel}:{} emits a bare `Ok(SolveResult::Sat)` — route every SAT verdict \
-                 through emit_sat_verdict so the independent + authoritative gates run:\n  {line}",
-                lineno + 1,
-            );
-        }
-    }
+    post_rebase::assert_funnelled_sat_sources();
 
     let optimization = read("src/executor/optimization.rs");
     let finalizer_start = optimization
@@ -1204,8 +1067,8 @@ fn native_maxsmt_is_transactional_exact_and_has_no_duplicate_solver() {
         .find(".replace_soft_constraints(native_softs)")
         .expect("native MaxSMT must transactionally install API softs");
     let execute = query
-        .find("self.executor.execute(&Command::CheckSat)")
-        .expect("native MaxSMT must reuse executor CheckSat dispatch");
+        .find("self.executor.execute_native_maxsmt_check_sat()")
+        .expect("native MaxSMT must reuse the sealed executor CheckSat continuation");
     let restore_softs = query
         .find(".replace_soft_constraints(parsed_softs)")
         .expect("native MaxSMT must restore the parsed soft set");
@@ -1216,6 +1079,35 @@ fn native_maxsmt_is_transactional_exact_and_has_no_duplicate_solver() {
         install < execute && execute < restore_softs && restore_softs < propagate_error,
         "native soft ownership order must be install -> execute -> restore -> classify"
     );
+
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("ay-dpll lives below the workspace root")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    rust_sources_below(&workspace.join("crates"), &mut sources);
+    let allowed = [
+        "crates/ay-dpll/src/api/solving/maxsmt.rs",
+        "crates/ay-dpll/src/executor/command_boundary.rs",
+    ];
+    for source in sources {
+        let relative = source
+            .strip_prefix(&workspace)
+            .expect("enumerated source is below workspace")
+            .to_string_lossy();
+        if is_chokepoint_source_fixture(relative.as_ref()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&source)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+        if text.contains("execute_native_maxsmt_check_sat") {
+            assert!(
+                allowed.contains(&relative.as_ref()),
+                "new MaxSMT continuation caller requires an explicit query-boundary audit: {relative}"
+            );
+        }
+    }
 
     let plan_controls = query
         .find("let controls = self.native_publication_controls();")
@@ -1312,7 +1204,10 @@ fn objective_outcomes_are_keyed_by_declaration_identity() {
         "optimizer writes must preserve objective declaration identity"
     );
 
-    let output = read("src/executor/model/output.rs");
+    // `2014dd6f5 refactor: modularize solver internals` split the objective
+    // readers out of `model/output.rs` into `model/output_objectives.rs`. The
+    // pinned reads below are unchanged; only their home moved.
+    let output = read("src/executor/model/output_objectives.rs");
     let api = read("src/api/solving/optimize.rs");
     assert!(
         output.contains("for (objective_index, obj) in self.ctx.objectives().iter().enumerate()")
@@ -1344,7 +1239,9 @@ fn unbounded_lex_prefix_never_fabricates_suffix_optima() {
         "lex must terminate and mark every suffix objective after an unbounded prefix"
     );
 
-    let output = read("src/executor/model/output.rs");
+    // Objective readers now live in `model/output_objectives.rs` (see the
+    // relocation note in `objective_outcomes_are_keyed_by_declaration_identity`).
+    let output = read("src/executor/model/output_objectives.rs");
     assert!(
         optimization.contains("self.unavailable_objectives.contains(&objective_index)")
             && output.contains("self.unavailable_objectives.contains(&objective_index)"),
@@ -1381,48 +1278,7 @@ fn unbounded_lex_prefix_never_fabricates_suffix_optima() {
 #[test]
 fn epsilon_outcome_requires_twin_proofs_and_never_fabricates_scalars() {
     let optimization = read("src/executor/optimization.rs");
-
-    // Each publication site (maximize + minimize) inserts into
-    // `infinitesimal_objectives` only AFTER two full-solver probes inside the
-    // OptimalInf arm: the refutation twin (finite part unattainable, UNSAT)
-    // and the δ-closeness twin (near-sup point exists, SAT).
-    for (fn_start, fn_end) in [
-        ("fn maximize_real_objective(", "fn minimize_real_objective("),
-        ("fn minimize_real_objective(", "fn mk_real_gt("),
-    ] {
-        let start = optimization.find(fn_start).expect("objective fn present");
-        let end = optimization[start..]
-            .find(fn_end)
-            .map(|offset| start + offset)
-            .expect("objective fn delimited");
-        let body = &optimization[start..end];
-        let arm_start = body
-            .find("SimplexOpt::OptimalInf")
-            .expect("OptimalInf arm present");
-        let insert_at = body[arm_start..]
-            .find("self.infinitesimal_objectives")
-            .map(|offset| arm_start + offset)
-            .expect("OptimalInf arm publishes the epsilon record");
-        let arm_before_insert = &body[arm_start..insert_at];
-        assert!(
-            arm_before_insert
-                .matches("self.check_sat_assuming(&[")
-                .count()
-                >= 2
-                && arm_before_insert.contains("SolveResult::Unsat(_)")
-                && arm_before_insert.contains("SolveResult::Sat"),
-            "the epsilon record must be published only after the refutation \
-             AND the δ-closeness full-solver twins: {fn_start}"
-        );
-    }
-
-    // The audit-free Optimal(k=0) lane newly sees strict-bound problems: with
-    // no verified certificate it must demand the full-solver maximality twin.
-    assert!(
-        optimization.contains("lra.has_strict_var_bound() && certificate.is_none()")
-            && optimization.matches("needs_maximality_twin").count() >= 4,
-        "strict-bound Optimal outcomes must carry the maximality-twin obligation"
-    );
+    post_rebase::assert_epsilon_publication_twins(&optimization);
 
     // Lex: an infinitesimal prefix terminates the search and marks the whole
     // suffix unavailable, exactly like the unbounded case (f6).
@@ -1441,8 +1297,13 @@ fn epsilon_outcome_requires_twin_proofs_and_never_fabricates_scalars() {
 
     // Readers resolve the epsilon record BEFORE the finite map, in both the
     // SMT-LIB renderer and the structured native reader.
-    let output = read("src/executor/model/output.rs");
-    for (name, source) in [("output.rs", &output), ("optimization.rs", &optimization)] {
+    // Objective readers now live in `model/output_objectives.rs` (see the
+    // relocation note in `objective_outcomes_are_keyed_by_declaration_identity`).
+    let output = read("src/executor/model/output_objectives.rs");
+    for (name, source) in [
+        ("output_objectives.rs", &output),
+        ("optimization.rs", &optimization),
+    ] {
         let eps = source
             .find("infinitesimal_objectives.get(&objective_index)")
             .unwrap_or_else(|| panic!("{name} must read the epsilon record"));
@@ -1556,7 +1417,8 @@ fn prior_sat_certificate_is_revoked_before_new_fallible_work() {
     let executor = read("src/executor.rs");
     assert!(
         executor.contains("if matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_)) {")
-            && executor.contains("self.begin_public_solve(true);"),
+            && executor.contains("self.begin_external_decision_query(true);")
+            && executor.contains("self.begin_public_solve(true)"),
         "SMT-LIB decision commands must retire stale artefacts before elaboration"
     );
 }

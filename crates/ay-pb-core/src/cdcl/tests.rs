@@ -6760,14 +6760,10 @@ fn test_round_to_one_preserves_sat_correctness() {
 /// catastrophic soundness failure. Skips gracefully if the file is absent.
 #[test]
 fn bnn_back_image_73_is_not_wrongly_unsat_with_counting() {
-    // Resolve under $AY_PBCOMP_BENCH_ROOT (default: the checkout-relative
-    // benchmarks/pb-comp; the corpus is not tracked in git, so this skips on
-    // fresh checkouts).
-    let root = std::env::var_os("AY_PBCOMP_BENCH_ROOT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp")
-        });
+    // Resolve under the checkout-relative benchmarks/pb-comp (B14: the env
+    // override nothing set is deleted; the corpus is not tracked in git, so
+    // this skips on fresh checkouts; a relocated corpus is a symlink).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp");
     let path = root
         .join("PB25/normalized-PB25/OPT-LIN/sakai/PB25-bnn-verification-20250419/instances/normalized-bnn_mnist_back_image_73_label5_adversarial_norm_1.opb")
         .display()

@@ -42,7 +42,7 @@ const HOUDINI_MAX_PASSES: usize = 24;
 fn fixpoint_disabled() -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| std::env::var("AY_TPA_NO_FIXPOINT").is_ok_and(|v| v == "1"))
+    *OFF.get_or_init(|| !crate::ab_switches::get().tpa_fixpoint)
 }
 
 impl TpaSolver {

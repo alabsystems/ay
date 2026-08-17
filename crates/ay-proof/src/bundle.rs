@@ -3,15 +3,14 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Serializable proof bundle for OFFLINE, producer-independent re-checking.
-//!
-//! [`check_proof_strict_with_context`](crate::check_proof_strict_with_context)
-//! validates a [`Proof`] against a [`TermStore`] and its problem assertions
-//! purely by reading terms by index (`get`/`sort`) — it never re-interns and
-//! never re-solves. That makes a proof plus a flat term snapshot a fully
-//! self-contained, re-checkable certificate: a [`SerializableProofBundle`] can
-//! be serialized (serde), shipped, and re-validated by a checker that never ran
-//! — and need not trust — the original solver.
-//!
+//! [`check_proof_strict_with_typed_context`](crate::check_proof_strict_with_typed_context)
+//! validates a [`Proof`] against a [`TermStore`], its exact typed datatype
+//! context, and its problem assertions purely by reading terms by index
+//! (`get`/`sort`) — it never re-interns and never re-solves. That makes a proof
+//! plus a flat term snapshot a fully self-contained, re-checkable certificate:
+//! a [`SerializableProofBundle`] can be serialized (serde), shipped, and
+//! re-validated by a checker that never ran — and need not trust — the original
+//! solver.
 //! The bundle carries only what the strict checker reads: the ordered proof
 //! steps, a positional `(TermData, Sort)` term table (so every embedded
 //! [`TermId`] resolves), the boolean-constant ids, the variable counter, and the
@@ -20,18 +19,21 @@
 //! declaration context needed by the corresponding strict proof rules. The
 //! obligation ids may be an authenticated UNSAT-core subset of the producer's
 //! full assertion list.
-//!
 //! Re-checking establishes that the bundle is internally sound; it does NOT
 //! authenticate the producer's claimed problem context. A consumer binding a
-//! schema-v2 bundle to an independently obtained problem must verify that every
+//! schema-v3 bundle to an independently obtained problem must verify that every
 //! obligation assertion is a member of the intended problem and compare
 //! `datatype_declarations`, `constructor_selectors`,
-//! and the complete free-symbol declaration context (exact named/indexed
-//! identity plus argument and result sorts). Canonical assertion text alone is
+//! `datatype_member_signatures`, and the complete free-symbol declaration
+//! context (exact named/indexed identity plus argument and result sorts).
+//! Canonical assertion text alone is
 //! insufficient: the same printed term can acquire different meaning from a
-//! different declaration environment. Schema v2 does not serialize a complete
+//! different declaration environment. Schema v3 does not serialize a complete
 //! arbitrary-function declaration table, so that final comparison remains a
 //! consumer responsibility.
+
+#[cfg(test)]
+mod quantifier_tests;
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
@@ -41,14 +43,16 @@ use num_bigint::Sign;
 use serde::{Deserialize, Serialize};
 
 use crate::alethe_printer::AlethePrinter;
-use crate::{check_proof_strict_with_context, ProofCheckError, ProofQuality};
+use crate::{
+    check_proof_strict_with_typed_context, DatatypeMemberSignature, ProofCheckError, ProofQuality,
+};
 
 /// Schema tag for [`SerializableProofBundle`]. The bundle is a compiled-Rust
 /// serde encoding tied to the exact `ay-core` proof/term representation that
 /// BOTH producer and consumer link — NOT a stable cross-version wire format.
 /// [`re_check_bundle_strict`] fail-closes on any other tag so a version skew is
 /// rejected rather than silently mis-decoded.
-pub const PROOF_BUNDLE_SCHEMA: &str = "ay.proofbundle/v2";
+pub const PROOF_BUNDLE_SCHEMA: &str = "ay.proofbundle/v3";
 
 /// A self-contained, serializable UNSAT proof: the proof DAG plus the minimal
 /// term table needed to re-check it offline (see module docs). "Self-contained"
@@ -56,6 +60,7 @@ pub const PROOF_BUNDLE_SCHEMA: &str = "ay.proofbundle/v2";
 /// consumers must independently bind the full declaration context described in
 /// the module-level contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SerializableProofBundle {
     /// Schema tag — see [`PROOF_BUNDLE_SCHEMA`].
     pub schema: String,
@@ -80,14 +85,16 @@ pub struct SerializableProofBundle {
     /// Constructor-to-selector declarations needed to validate datatype
     /// projection lemmas: `(constructor_name, selectors in field order)`.
     pub constructor_selectors: Vec<(String, Vec<String>)>,
+    /// Exact sticky core signatures for every constructor, selector, and
+    /// derived tester named by the datatype declaration context.
+    pub datatype_member_signatures: Vec<DatatypeMemberSignature>,
 }
-
 /// Result of [`re_check_bundle_strict`]: the strict-check quality metrics plus
 /// the set of `assume` term ids the proof used as axioms.
 #[derive(Debug, Clone)]
 pub struct BundleReCheck {
     /// Strict-mode quality metrics (the proof passed
-    /// [`check_proof_strict_with_context`]).
+    /// [`check_proof_strict_with_typed_context`]).
     pub quality: ProofQuality,
     /// The `TermId`s appearing in the proof's `Assume` steps — the axioms the
     /// terminal empty clause was derived from.
@@ -109,9 +116,12 @@ impl SerializableProofBundle {
         Self::from_proof_with_context(proof, terms, obligation_assertions, Vec::new(), Vec::new())
     }
 
-    /// Assemble a bundle with the declaration context required by datatype
-    /// proof rules. The context is serialized as part of the obligation so an
-    /// offline checker need not trust or query the producer's live frontend.
+    /// Assemble a compatibility bundle from name-only datatype context.
+    ///
+    /// Under schema v3, name-only context carries no datatype-rule authority:
+    /// offline re-checking rejects any non-empty datatype context that lacks its
+    /// exact member-signature table. Use
+    /// [`Self::from_proof_with_typed_context`] for datatype proofs.
     #[must_use]
     pub fn from_proof_with_context(
         proof: &Proof,
@@ -119,6 +129,28 @@ impl SerializableProofBundle {
         obligation_assertions: Vec<TermId>,
         datatype_declarations: Vec<(String, Vec<String>)>,
         constructor_selectors: Vec<(String, Vec<String>)>,
+    ) -> Self {
+        Self::from_proof_with_typed_context(
+            proof,
+            terms,
+            obligation_assertions,
+            datatype_declarations,
+            constructor_selectors,
+            Vec::new(),
+        )
+    }
+
+    /// Assemble a schema-v3 bundle with an exact datatype-member signature
+    /// table. The offline checker cross-checks this table against both name
+    /// registries and every member occurrence in the serialized term store.
+    #[must_use]
+    pub fn from_proof_with_typed_context(
+        proof: &Proof,
+        terms: &TermStore,
+        obligation_assertions: Vec<TermId>,
+        datatype_declarations: Vec<(String, Vec<String>)>,
+        constructor_selectors: Vec<(String, Vec<String>)>,
+        datatype_member_signatures: Vec<DatatypeMemberSignature>,
     ) -> Self {
         Self {
             schema: PROOF_BUNDLE_SCHEMA.to_string(),
@@ -130,6 +162,7 @@ impl SerializableProofBundle {
             obligation_assertions,
             datatype_declarations,
             constructor_selectors,
+            datatype_member_signatures,
         }
     }
 }
@@ -774,7 +807,7 @@ fn validate_app_signature(
     // here. Validate the structural builtins and bounded-checker operations
     // whose malformed signatures could violate checker invariants;
     // declaration-backed datatype constructors are checked separately against
-    // the v2 context in `validate_declared_constructor_terms`.
+    // the v3 context in `validate_declared_constructor_terms`.
     match symbol {
         Symbol::Named(name) => {
             validate_named_app_signature(entries, node_index, name, args, result_sort)
@@ -1171,6 +1204,28 @@ fn preflight_bundle(
     bundle: &SerializableProofBundle,
 ) -> Result<HashMap<String, &'static str>, ProofCheckError> {
     validate_term_snapshot(&bundle.term_entries)?;
+    for (signature_index, signature) in bundle.datatype_member_signatures.iter().enumerate() {
+        for (argument_index, sort) in signature.argument_sorts.iter().enumerate() {
+            validate_sort(
+                sort,
+                signature_index,
+                &format!(
+                    "datatype member signature {:?} argument {argument_index} sort",
+                    signature.identity
+                ),
+                0,
+            )?;
+        }
+        validate_sort(
+            &signature.result_sort,
+            signature_index,
+            &format!(
+                "datatype member signature {:?} result sort",
+                signature.identity
+            ),
+            0,
+        )?;
+    }
     validate_bool_constant_id(&bundle.term_entries, bundle.true_term, true)?;
     validate_bool_constant_id(&bundle.term_entries, bundle.false_term, false)?;
     for &assertion in &bundle.obligation_assertions {
@@ -1299,14 +1354,15 @@ fn validate_declared_constructor_terms(
 /// Re-check a serialized proof bundle OFFLINE — no solver, no access to the
 /// producer's term store. Rebuilds a checker-only [`TermStore`] from the
 /// snapshot and a [`Proof`] from the steps, then runs
-/// [`check_proof_strict_with_context`] (which rejects trust/hole steps, checks
-/// extensionality witnesses against `obligation_assertions`, and requires the
-/// terminal empty clause). On success returns the strict quality and the
-/// proof's `assume` axiom term ids.
+/// [`check_proof_strict_with_typed_context`] (which rejects trust/hole steps,
+/// checks extensionality witnesses against `obligation_assertions`, validates
+/// the exact datatype member signatures, and requires the terminal empty
+/// clause). On success returns the strict quality and the proof's `assume` axiom
+/// term ids.
 ///
 /// Success authenticates only the bundle's internal proof/context pairing. It
 /// does not establish that its claimed assertions or declarations match an
-/// external source problem; see the module-level schema-v2 binding contract.
+/// external source problem; see the module-level schema-v3 binding contract.
 ///
 /// Fail-closed on a schema-tag mismatch (a version skew that could mis-decode).
 pub fn re_check_bundle_strict(
@@ -1325,6 +1381,19 @@ pub fn re_check_bundle_strict(
         bundle.false_term,
         bundle.var_counter,
     );
+    let datatype_declarations = (!bundle.datatype_declarations.is_empty())
+        .then_some(bundle.datatype_declarations.as_slice());
+    let constructor_selectors = (!bundle.constructor_selectors.is_empty())
+        .then_some(bundle.constructor_selectors.as_slice());
+    // Typed declaration authority is established before restoring any
+    // certificate-derived Skolem metadata.  This keeps schema-v3 preflight
+    // fail-closed even when a malformed proof never reaches a datatype step.
+    crate::checker::validate_datatype_signature_context(
+        &terms,
+        datatype_declarations,
+        constructor_selectors,
+        &bundle.datatype_member_signatures,
+    )?;
     let proof = Proof::from_steps(bundle.steps.clone());
     // A checker-only TermStore intentionally starts with no producer-side
     // Skolem registry. Reconstruct that authority from the certificate itself:
@@ -1340,15 +1409,12 @@ pub fn re_check_bundle_strict(
     )? {
         terms.mark_skolem_symbol(name);
     }
-    let datatype_declarations = (!bundle.datatype_declarations.is_empty())
-        .then_some(bundle.datatype_declarations.as_slice());
-    let constructor_selectors = (!bundle.constructor_selectors.is_empty())
-        .then_some(bundle.constructor_selectors.as_slice());
-    let quality = check_proof_strict_with_context(
+    let quality = check_proof_strict_with_typed_context(
         &proof,
         &terms,
         datatype_declarations,
         constructor_selectors,
+        &bundle.datatype_member_signatures,
         Some(&bundle.obligation_assertions),
     )?;
     let assume_terms = proof
@@ -1373,7 +1439,7 @@ pub fn re_check_bundle_strict(
 /// against an independently-built one at the term level without sharing ids.
 /// The rendering omits datatype, selector, and arbitrary free-symbol
 /// declarations, so it is not by itself a secure external problem-binding key;
-/// compare the full schema-v2 context described in the module documentation.
+/// compare the full schema-v3 context described in the module documentation.
 #[must_use]
 pub fn render_term_canonical(terms: &TermStore, id: TermId) -> String {
     AlethePrinter::new(terms).format_term(id)
@@ -1562,6 +1628,75 @@ mod tests {
                 self.obligation_assertions.clone(),
             )
         }
+
+        fn add_bundle_option_context(&self, bundle: &mut SerializableProofBundle) {
+            let carrier = Sort::Uninterpreted("BundleOption".to_string());
+            let none_term = bundle
+                .term_entries
+                .iter()
+                .position(|(data, sort)| {
+                    matches!(data, TermData::Var(name, _) if name == "BundleNone")
+                        && sort == &carrier
+                })
+                .map_or_else(
+                    || {
+                        let term = TermId::new(
+                            u32::try_from(bundle.term_entries.len()).expect("small bundle fixture"),
+                        );
+                        let unique = bundle.var_counter;
+                        bundle.var_counter = bundle
+                            .var_counter
+                            .checked_add(1)
+                            .expect("small bundle fixture");
+                        bundle.term_entries.push((
+                            TermData::Var("BundleNone".to_string(), unique),
+                            carrier.clone(),
+                        ));
+                        term
+                    },
+                    |index| TermId::new(u32::try_from(index).expect("small bundle fixture")),
+                );
+            bundle.datatype_declarations = vec![(
+                "BundleOption".to_string(),
+                vec!["BundleNone".to_string(), "BundleSome".to_string()],
+            )];
+            bundle.constructor_selectors = vec![
+                ("BundleNone".to_string(), Vec::new()),
+                ("BundleSome".to_string(), vec!["bundle_value".to_string()]),
+            ];
+            bundle.datatype_member_signatures = vec![
+                DatatypeMemberSignature {
+                    identity: "BundleNone".to_string(),
+                    argument_sorts: Vec::new(),
+                    result_sort: carrier.clone(),
+                    nullary_term: Some(none_term),
+                },
+                DatatypeMemberSignature {
+                    identity: "is-BundleNone".to_string(),
+                    argument_sorts: vec![carrier.clone()],
+                    result_sort: Sort::Bool,
+                    nullary_term: None,
+                },
+                DatatypeMemberSignature {
+                    identity: "BundleSome".to_string(),
+                    argument_sorts: vec![Sort::Int],
+                    result_sort: carrier.clone(),
+                    nullary_term: None,
+                },
+                DatatypeMemberSignature {
+                    identity: "is-BundleSome".to_string(),
+                    argument_sorts: vec![carrier.clone()],
+                    result_sort: Sort::Bool,
+                    nullary_term: None,
+                },
+                DatatypeMemberSignature {
+                    identity: "bundle_value".to_string(),
+                    argument_sorts: vec![carrier],
+                    result_sort: Sort::Int,
+                    nullary_term: None,
+                },
+            ];
+        }
     }
 
     fn assert_skolem_declaration_collision(
@@ -1575,7 +1710,10 @@ mod tests {
             matches!(err, ProofCheckError::InvalidBooleanRule { ref reason, .. }
                 if reason.contains(expected_name)
                     && reason.contains(expected_role)
-                    && reason.contains("serialized datatype declaration-owned term namespace")),
+                    && reason.contains("serialized datatype declaration-owned term namespace"))
+                || matches!(err, ProofCheckError::InvalidDatatypeSignatureContext { ref reason }
+                    if reason.contains(expected_name)
+                        && reason.contains("datatype member variable")),
             "expected a datatype/Skolem namespace-collision rejection for {expected_name:?}, got {err:?}"
         );
     }
@@ -1592,14 +1730,7 @@ mod tests {
     fn bundle_recheck_accepts_a_skolem_disjoint_from_the_datatype_term_namespace() {
         let fixture = SkolemBundleFixture::new();
         let mut bundle = fixture.bundle();
-        bundle.datatype_declarations = vec![(
-            "BundleOption".to_string(),
-            vec!["BundleNone".to_string(), "BundleSome".to_string()],
-        )];
-        bundle.constructor_selectors = vec![
-            ("BundleNone".to_string(), Vec::new()),
-            ("BundleSome".to_string(), vec!["bundle_value".to_string()]),
-        ];
+        fixture.add_bundle_option_context(&mut bundle);
 
         let rebuilt = re_check_bundle_strict(&bundle)
             .expect("an unrelated datatype declaration must not block Skolem authentication");
@@ -1613,9 +1744,7 @@ mod tests {
             Sort::Uninterpreted("BundleOption".to_string()),
         );
         let mut bundle = fixture.bundle();
-        bundle.datatype_declarations =
-            vec![("BundleOption".to_string(), vec!["BundleNone".to_string()])];
-        bundle.constructor_selectors = vec![("BundleNone".to_string(), Vec::new())];
+        fixture.add_bundle_option_context(&mut bundle);
 
         assert_skolem_declaration_collision(&bundle, "BundleNone", "a constructor");
     }
@@ -1624,10 +1753,7 @@ mod tests {
     fn bundle_recheck_rejects_a_skolem_named_as_a_selector() {
         let fixture = SkolemBundleFixture::with_witness("bundle_value", Sort::Int);
         let mut bundle = fixture.bundle();
-        bundle.datatype_declarations =
-            vec![("BundleOption".to_string(), vec!["BundleSome".to_string()])];
-        bundle.constructor_selectors =
-            vec![("BundleSome".to_string(), vec!["bundle_value".to_string()])];
+        fixture.add_bundle_option_context(&mut bundle);
 
         assert_skolem_declaration_collision(&bundle, "bundle_value", "a selector");
     }
@@ -1636,10 +1762,7 @@ mod tests {
     fn bundle_recheck_rejects_a_skolem_named_as_a_derived_tester() {
         let fixture = SkolemBundleFixture::with_witness("is-BundleSome", Sort::Bool);
         let mut bundle = fixture.bundle();
-        bundle.datatype_declarations = vec![(
-            "BundleOption".to_string(),
-            vec!["BundleNone".to_string(), "BundleSome".to_string()],
-        )];
+        fixture.add_bundle_option_context(&mut bundle);
 
         assert_skolem_declaration_collision(&bundle, "is-BundleSome", "a derived tester");
     }
@@ -1743,6 +1866,106 @@ mod tests {
                 if reason.contains(expected)),
             "expected malformed-bundle reason containing {expected:?}, got {err:?}"
         );
+    }
+
+    fn typed_datatype_bundle() -> SerializableProofBundle {
+        let mut terms = TermStore::new();
+        let carrier = Sort::Uninterpreted("BundleColor".to_string());
+        let red = terms.mk_fresh_named_var("bundle-red", carrier.clone());
+        let green = terms.mk_fresh_named_var("bundle-green", carrier.clone());
+        let equality = terms.mk_app(Symbol::named("="), [red, green], Sort::Bool);
+        let disequality = terms.mk_not_raw(equality);
+        let mut proof = Proof::new();
+        let theorem = proof.add_theory_lemma_with_kind(
+            "DT",
+            vec![disequality],
+            TheoryLemmaKind::DatatypeDistinct,
+        );
+        let assumption = proof.add_assume(equality, None);
+        proof.add_resolution(Vec::new(), equality, theorem, assumption);
+        SerializableProofBundle::from_proof_with_typed_context(
+            &proof,
+            &terms,
+            vec![equality],
+            vec![(
+                "BundleColor".to_string(),
+                vec!["bundle-red".to_string(), "bundle-green".to_string()],
+            )],
+            vec![
+                ("bundle-red".to_string(), Vec::new()),
+                ("bundle-green".to_string(), Vec::new()),
+            ],
+            vec![
+                DatatypeMemberSignature {
+                    identity: "bundle-red".to_string(),
+                    argument_sorts: Vec::new(),
+                    result_sort: carrier.clone(),
+                    nullary_term: Some(red),
+                },
+                DatatypeMemberSignature {
+                    identity: "is-bundle-red".to_string(),
+                    argument_sorts: vec![carrier.clone()],
+                    result_sort: Sort::Bool,
+                    nullary_term: None,
+                },
+                DatatypeMemberSignature {
+                    identity: "bundle-green".to_string(),
+                    argument_sorts: Vec::new(),
+                    result_sort: carrier.clone(),
+                    nullary_term: Some(green),
+                },
+                DatatypeMemberSignature {
+                    identity: "is-bundle-green".to_string(),
+                    argument_sorts: vec![carrier],
+                    result_sort: Sort::Bool,
+                    nullary_term: None,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn schema_v3_bundle_rechecks_exact_datatype_signatures_and_rejects_forgery() {
+        let bundle = typed_datatype_bundle();
+        re_check_bundle_strict(&bundle).expect("the exact schema-v3 datatype bundle rechecks");
+
+        let mut forged = bundle.clone();
+        forged.datatype_member_signatures[0].result_sort = Sort::Int;
+        assert!(matches!(
+            re_check_bundle_strict(&forged),
+            Err(ProofCheckError::InvalidDatatypeSignatureContext { .. })
+        ));
+
+        let mut swapped_binding = bundle.clone();
+        let red_binding = swapped_binding.datatype_member_signatures[0]
+            .nullary_term
+            .expect("red has a nullary binding");
+        let green_binding = swapped_binding.datatype_member_signatures[2]
+            .nullary_term
+            .expect("green has a nullary binding");
+        swapped_binding.datatype_member_signatures[0].nullary_term = Some(green_binding);
+        swapped_binding.datatype_member_signatures[2].nullary_term = Some(red_binding);
+        assert!(matches!(
+            re_check_bundle_strict(&swapped_binding),
+            Err(ProofCheckError::InvalidDatatypeSignatureContext { .. })
+        ));
+
+        let legacy_empty_signatures = SerializableProofBundle::from_proof_with_context(
+            &Proof::from_steps(bundle.steps.clone()),
+            &TermStore::from_entries(
+                bundle.term_entries.clone(),
+                bundle.true_term,
+                bundle.false_term,
+                bundle.var_counter,
+            ),
+            bundle.obligation_assertions.clone(),
+            bundle.datatype_declarations.clone(),
+            bundle.constructor_selectors.clone(),
+        );
+        assert!(matches!(
+            re_check_bundle_strict(&legacy_empty_signatures),
+            Err(ProofCheckError::InvalidDatatypeSignatureContext { .. })
+        ));
     }
 
     #[test]
@@ -1853,6 +2076,24 @@ mod tests {
             .find(|(data, _)| matches!(data, TermData::Var(_, _)))
             .expect("fixture contains a variable");
         *recorded_sort = nested;
+        assert_malformed_bundle(&bundle, "maximum sort nesting depth");
+    }
+
+    #[test]
+    fn bundle_preflight_bounds_datatype_member_signature_sorts() {
+        let mut nested = Sort::Int;
+        for _ in 0..=MAX_BUNDLE_SORT_DEPTH {
+            nested = Sort::seq(nested);
+        }
+        let mut bundle = ArrayExtBundleFixture::new().bundle();
+        bundle
+            .datatype_member_signatures
+            .push(DatatypeMemberSignature {
+                identity: "malformed-unused-member".to_string(),
+                argument_sorts: vec![nested],
+                result_sort: Sort::Bool,
+                nullary_term: None,
+            });
         assert_malformed_bundle(&bundle, "maximum sort nesting depth");
     }
 
@@ -2182,6 +2423,7 @@ mod tests {
             obligation_assertions: vec![eq0, lt0],
             datatype_declarations: Vec::new(),
             constructor_selectors: Vec::new(),
+            datatype_member_signatures: Vec::new(),
         };
         assert!(
             matches!(

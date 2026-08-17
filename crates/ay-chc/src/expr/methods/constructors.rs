@@ -12,12 +12,12 @@ use ay_core::kani_compat::DetHashSet as FxHashSet;
 use rustc_hash::FxHasher;
 
 // Fast-core P1: wrap child expressions via the interning helper (interns leaves
-// when AY_CHC_INTERN is enabled; plain Arc::new otherwise / for interior nodes).
+// when --chc-intern is enabled; plain Arc::new otherwise / for interior nodes).
 use crate::expr::intern::arc as mk_arc;
 
-use super::{
-    extract_int_constant, maybe_grow_expr_stack, ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId,
-};
+use super::{extract_int_constant, ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
+
+mod sort;
 
 impl ChcExpr {
     // Convenience constructors
@@ -345,153 +345,6 @@ impl ChcExpr {
     /// `key_sort` is the index sort from `(as const (Array KeySort ValSort))`.
     pub fn const_array(key_sort: ChcSort, val: Self) -> Self {
         Self::ConstArray(key_sort, mk_arc(val))
-    }
-
-    /// Get the sort of this expression
-    pub fn sort(&self) -> ChcSort {
-        // Intentionally no depth bail-out: callers require exact sort results.
-        // `maybe_grow_expr_stack` bounds stack usage for deep trees.
-        maybe_grow_expr_stack(|| match self {
-            Self::Bool(_) => ChcSort::Bool,
-            Self::Int(_) => ChcSort::Int,
-            Self::Real(_, _) => ChcSort::Real,
-            Self::BitVec(_, width) => ChcSort::BitVec(*width),
-            Self::Var(v) => v.sort.clone(),
-            Self::PredicateApp(_, _, _) => ChcSort::Bool, // Predicates return Bool
-            Self::FuncApp(_, sort, _) => sort.clone(),
-            Self::Op(op, args) => match op {
-                ChcOp::Not | ChcOp::And | ChcOp::Or | ChcOp::Implies | ChcOp::Iff => ChcSort::Bool,
-                ChcOp::Eq | ChcOp::Ne | ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge => {
-                    ChcSort::Bool
-                }
-                ChcOp::Add | ChcOp::Sub | ChcOp::Mul | ChcOp::Div | ChcOp::Mod | ChcOp::Neg => {
-                    // Return the sort of the first argument
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                ChcOp::Ite => {
-                    // Follow the then-branch iteratively to avoid stack overflow on
-                    // deep ITE chains (#3031, #3074). The sort of an ITE is the sort of its
-                    // then-branch, which may itself be an ITE.
-                    let mut cur = args.get(1).map(AsRef::as_ref);
-                    loop {
-                        match cur {
-                            Some(Self::Op(ChcOp::Ite, inner_args)) => {
-                                cur = inner_args.get(1).map(AsRef::as_ref);
-                            }
-                            Some(other) => return other.sort(),
-                            None => return ChcSort::Bool,
-                        }
-                    }
-                }
-                ChcOp::Select => {
-                    // select(arr, idx) returns the value sort of the array
-                    if let Some(arr) = args.first() {
-                        if let ChcSort::Array(_, v) = arr.sort() {
-                            return (*v).clone();
-                        }
-                    }
-                    ChcSort::Int // Fallback
-                }
-                ChcOp::Store => {
-                    // store(arr, idx, val) returns the array sort
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                // BV comparisons return Bool
-                ChcOp::BvULt
-                | ChcOp::BvULe
-                | ChcOp::BvUGt
-                | ChcOp::BvUGe
-                | ChcOp::BvSLt
-                | ChcOp::BvSLe
-                | ChcOp::BvSGt
-                | ChcOp::BvSGe => ChcSort::Bool,
-                // bvcomp returns BitVec(1)
-                ChcOp::BvComp => ChcSort::BitVec(1),
-                // bv2nat returns Int
-                ChcOp::Bv2Nat => ChcSort::Int,
-                // BV arithmetic/bitwise/shift/concat: return sort of first arg
-                ChcOp::BvAdd
-                | ChcOp::BvSub
-                | ChcOp::BvMul
-                | ChcOp::BvUDiv
-                | ChcOp::BvURem
-                | ChcOp::BvSDiv
-                | ChcOp::BvSRem
-                | ChcOp::BvSMod
-                | ChcOp::BvAnd
-                | ChcOp::BvOr
-                | ChcOp::BvXor
-                | ChcOp::BvNand
-                | ChcOp::BvNor
-                | ChcOp::BvXnor
-                | ChcOp::BvNot
-                | ChcOp::BvNeg
-                | ChcOp::BvShl
-                | ChcOp::BvLShr
-                | ChcOp::BvAShr => {
-                    debug_assert!(
-                        !args.is_empty(),
-                        "BUG: BV arithmetic/bitwise/shift op has no arguments"
-                    );
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                // concat: combined width of both arguments
-                ChcOp::BvConcat => {
-                    if let (Some(a), Some(b)) = (args.first(), args.get(1)) {
-                        if let (ChcSort::BitVec(w1), ChcSort::BitVec(w2)) = (a.sort(), b.sort()) {
-                            return ChcSort::BitVec(w1 + w2);
-                        }
-                    }
-                    debug_assert!(
-                        false,
-                        "BUG: BvConcat has malformed args (expected 2 BitVec args)"
-                    );
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                // extract: hi - lo + 1 bits (hi must be >= lo)
-                ChcOp::BvExtract(hi, lo) => {
-                    if hi >= lo {
-                        ChcSort::BitVec(hi - lo + 1)
-                    } else {
-                        ChcSort::BitVec(1) // malformed: hi < lo
-                    }
-                }
-                ChcOp::BvZeroExtend(n) | ChcOp::BvSignExtend(n) => {
-                    if let Some(a) = args.first() {
-                        if let ChcSort::BitVec(w) = a.sort() {
-                            return ChcSort::BitVec(w + n);
-                        }
-                    }
-                    debug_assert!(
-                        false,
-                        "BUG: BvZeroExtend/BvSignExtend has malformed args (expected BitVec arg)"
-                    );
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                ChcOp::BvRotateLeft(_) | ChcOp::BvRotateRight(_) => {
-                    debug_assert!(!args.is_empty(), "BUG: BvRotate op has no arguments");
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                ChcOp::BvRepeat(n) => {
-                    if let Some(a) = args.first() {
-                        if let ChcSort::BitVec(w) = a.sort() {
-                            return ChcSort::BitVec(w * n);
-                        }
-                    }
-                    debug_assert!(
-                        false,
-                        "BUG: BvRepeat has malformed args (expected BitVec arg)"
-                    );
-                    args.first().map_or(ChcSort::Int, |a| a.sort())
-                }
-                ChcOp::Int2Bv(w) => ChcSort::BitVec(*w),
-            },
-            Self::ConstArrayMarker(_) => ChcSort::Bool, // Marker, shouldn't appear in real expressions
-            Self::IsTesterMarker(_) => ChcSort::Bool, // Marker, shouldn't appear in real expressions
-            Self::ConstArray(key_sort, val) => {
-                ChcSort::Array(Box::new(key_sort.clone()), Box::new(val.sort()))
-            }
-        })
     }
 
     /// Compute a structural hash of the expression using FxHasher.

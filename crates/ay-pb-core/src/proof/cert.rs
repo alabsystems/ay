@@ -77,7 +77,7 @@ pub fn certify_decision_unsat_interruptible(
     // is re-checked by the external VeriPB checker. Validated: Hamming-20-10-05-10
     // (aux-free declined) now certifies via compact; Hamming-20-10-03-08 still
     // certifies via fallback with negligible overhead.
-    if std::env::var_os("AY_PB_NO_COMPACT_CERT").is_none() {
+    if crate::ab_switches::get().compact_cert {
         if let Some(ppe) = encode_instance_proof_producing(instance) {
             if let Some(proof) = certify_decision_unsat_compact(instance, ppe, should_stop) {
                 return Some(proof);
@@ -130,7 +130,7 @@ fn certify_decision_unsat_compact(
     }
 
     let sat = solver.solve_interruptible(should_stop).into_inner();
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c [cert/compact] sat result = {sat:?}");
     }
     if !matches!(sat, SatResult::Unsat(_)) {
@@ -138,7 +138,7 @@ fn certify_decision_unsat_compact(
     }
 
     let drat = solver.take_proof_writer()?.into_vec().ok()?;
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         // Debug-only one-shot count; not worth a bytecount dependency.
         #[allow(clippy::naive_bytecount)]
         let lines = drat.iter().filter(|&&b| b == b'\n').count();
@@ -150,7 +150,7 @@ fn certify_decision_unsat_compact(
     // Check that before doing the (potentially large) telescope work; if the DRAT
     // references aux vars, decline so the caller falls back to the aux-free lift.
     if parse_aux_free_drat(&drat, instance.num_vars).is_none() {
-        if std::env::var_os("AY_CERT_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().cert_debug {
             eprintln!(
                 "c [cert/compact] DRAT references Sinz aux registers; not PB-RUP-liftable, \
                  declining (caller falls back to aux-free)"
@@ -224,7 +224,7 @@ fn certify_decision_unsat_aux_free(
     }
 
     let sat = solver.solve_interruptible(should_stop).into_inner();
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c [cert] sat result = {sat:?}");
     }
     if !matches!(sat, SatResult::Unsat(_)) {
@@ -232,7 +232,7 @@ fn certify_decision_unsat_aux_free(
     }
 
     let drat = solver.take_proof_writer()?.into_vec().ok()?;
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         // Debug-only one-shot count; not worth a bytecount dependency.
         #[allow(clippy::naive_bytecount)]
         let lines = drat.iter().filter(|&&b| b == b'\n').count();
@@ -376,7 +376,7 @@ pub fn certify_opt_lin_bounds_interruptible(
     }
 
     let sat = solver.solve_interruptible(should_stop).into_inner();
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c [cert/opt] augmented sat result = {sat:?}");
     }
     if !matches!(sat, SatResult::Unsat(_)) {
@@ -545,7 +545,7 @@ pub fn certify_opt_lin_bounds_pb_interruptible(
     )
     .ok()?;
     let result = solver.solve_refutation_only_interruptible(should_stop);
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         eprintln!(
             "c [cert/opt-pb] augmented pb-cdcl result = {result:?} ({}ms)",
             route_started.elapsed().as_millis(),
@@ -1494,7 +1494,7 @@ pub fn certify_opt_lin_bounds_compact_interruptible(
     }
 
     let sat = solver.solve_interruptible(should_stop).into_inner();
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c [cert/opt-compact] augmented sat result = {sat:?}");
     }
     if !matches!(sat, SatResult::Unsat(_)) {
@@ -1504,7 +1504,7 @@ pub fn certify_opt_lin_bounds_compact_interruptible(
     }
 
     let drat = solver.take_proof_writer()?.into_vec().ok()?;
-    if std::env::var_os("AY_CERT_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().cert_debug {
         // Debug-only one-shot count; not worth a bytecount dependency.
         #[allow(clippy::naive_bytecount)]
         let lines = drat.iter().filter(|&&b| b == b'\n').count();
@@ -1519,7 +1519,7 @@ pub fn certify_opt_lin_bounds_compact_interruptible(
     // variable, so the PB-variable bound is `instance.num_vars`. Decline (caller
     // falls back to the aux-free opt-cert) when the refutation touches aux.
     if parse_aux_free_drat(&drat, instance.num_vars).is_none() {
-        if std::env::var_os("AY_CERT_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().cert_debug {
             eprintln!(
                 "c [cert/opt-compact] DRAT references Sinz aux registers; not PB-RUP-liftable, \
                  declining (caller falls back to aux-free opt-cert)"

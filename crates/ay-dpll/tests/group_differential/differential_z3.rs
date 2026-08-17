@@ -266,7 +266,7 @@ struct DifferentialSummary {
 fn differential_test_dir(dir_path: &str) -> Result<DifferentialSummary> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir_path);
 
-    if !path.exists() {
+    if !path.exists() && crate::common::corpus_skip_allowed(&path) {
         return Err(anyhow!("benchmark directory not found: {}", path.display()));
     }
 

@@ -236,7 +236,7 @@ pub(crate) fn separate_cuts(
         separate_cg_cuts(constraints, x, should_stop, &mut cuts);
     }
     // Family-count trace (advisory; drives the cut-provenance emitter build).
-    if std::env::var_os("AY_CUT_TRACE").is_some() && !cuts.is_empty() {
+    if ay_core::misc_cli_flags().cut_trace && !cuts.is_empty() {
         let n_cg = cuts.len() - n_clique - n_cover - n_lifted;
         eprintln!("c [cuts] clique={n_clique} cover={n_cover} lifted={n_lifted} cg={n_cg}");
     }

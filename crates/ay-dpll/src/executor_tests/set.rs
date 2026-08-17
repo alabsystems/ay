@@ -1188,6 +1188,34 @@ fn set_disequality_does_not_block_the_card_witness() {
     );
 }
 
+/// The MULTI-ELEMENT twin of the case above: the forbidden witness is a
+/// two-element set, so honouring the disequality is a whole-SET comparison, not
+/// a single excluded key (#set-card-diseq-witness).
+#[test]
+fn set_disequality_against_a_two_element_set_still_witnesses() {
+    let smt = r#"
+(set-logic ALL)
+(declare-const s (Set Int))
+(assert (= (set.card s) 2))
+(assert (not (= s (set.union (set.singleton 0) (set.singleton 1)))))
+(check-sat)
+(get-model)
+(get-value ((set.card s)))
+"#;
+    let out = solve(smt);
+    assert_eq!(verdict(&out), Some("sat"), "{out}");
+    assert_eq!(printed_set_size(&out), 2, "{out}");
+    assert_eq!(get_value_int(&out), 2, "{out}");
+    let mut members = printed_carrier_members(&out, "s");
+    members.sort();
+    assert_eq!(members.len(), 2, "{out}");
+    assert_ne!(
+        members,
+        vec!["0".to_string(), "1".to_string()],
+        "witness equals the excluded two-element set:\n{out}"
+    );
+}
+
 /// A set DISEQUALITY must not merge two carriers into one witness class —
 /// they would then print the SAME set and falsify the disequality.
 #[test]

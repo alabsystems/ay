@@ -35,7 +35,7 @@
 //! `verify_model_per_rule`); a wrong candidate is dropped or fails final
 //! validation — it can never produce a wrong verdict. No new gate surface.
 //!
-//! Kill switch: `AY_CHC_DISABLE_QUAL_MINE=1` disables the pass entirely.
+//! Kill switch: `--chc-no-qual-mine` disables the pass entirely.
 
 use crate::expr::intern::arc as mk_arc;
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseHead, HornClause, PredicateId};
@@ -75,19 +75,18 @@ const QUAL_MINE_MAX_BOOLS_TRIPLE: usize = 6;
 const QUAL_MINE_MAX_ATOM_NODES: usize = 40;
 
 /// Whether the qualifier-mining pass is enabled.
-/// Kill switch: `AY_CHC_DISABLE_QUAL_MINE=1` (read fresh — the pass runs once
-/// per solve, and tests toggle the variable).
+/// Process-constant kill switch: `--chc-no-qual-mine`.
 pub(crate) fn qual_mine_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_QUAL_MINE").ok().as_deref() != Some("1")
+    crate::ab_switches::get().qual_mine
 }
 
 /// Whether the mixed control∨data CNF class (g) is enabled (fix #3
-/// QUAL-MIX). Kill switch: `AY_CHC_DISABLE_QUAL_MIXED=1` restores the
+/// QUAL-MIX). Kill switch: `--chc-no-qual-mixed` restores the
 /// previous behavior exactly — the 768-row per-predicate cap, no
 /// multi-control-literal mixed rows, and the Int-only wide-arity gate of
 /// the disjunctive init-cube splitter (`adaptive_houdini`).
 pub(crate) fn qual_mixed_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_QUAL_MIXED").ok().as_deref() != Some("1")
+    crate::ab_switches::get().qual_mixed
 }
 
 /// Per-predicate mined qualifiers over positional placeholder variables.
@@ -548,7 +547,7 @@ impl Miner<'_> {
     /// pre-dedup — priority order full-cube (bools == 4, the vmt skeleton),
     /// then pairs, then triples. Pure candidate content (G2-safe): every
     /// survivor still passes Houdini model-based dropping plus per-rule
-    /// certification. Kill switch: `AY_CHC_DISABLE_QUAL_MIXED=1`.
+    /// certification. Kill switch: `--chc-no-qual-mixed`.
     fn mixed_control_data_clauses(&mut self) {
         /// Per-predicate row budget for this class (pre-dedup).
         const MAX_MIXED_ROWS: usize = 512;
@@ -1230,10 +1229,8 @@ fn visit_all_exprs(problem: &ChcProblem, f: &mut impl FnMut(&ChcExpr)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ab_switches::{ChcAbSwitches, TestOverride};
     use crate::{ClauseBody, ClauseHead, HornClause};
-    // The one workspace env choke point: serialized, restore-on-exit env
-    // mutation for the kill-switch probes below.
-    use ay_test_support::env::with_env_edits;
 
     fn int_var(name: &str) -> ChcVar {
         ChcVar::new(name, ChcSort::Int)
@@ -1535,25 +1532,25 @@ mod tests {
         );
     }
 
-    /// The mixed-class kill switch is honored by the env probe.
+    /// The mixed-class kill switch is honored through the carrier.
     #[test]
-    fn mixed_kill_switch_env_var() {
-        with_env_edits(|env| {
-            env.set("AY_CHC_DISABLE_QUAL_MIXED", "1");
-            assert!(!qual_mixed_enabled());
-            env.remove("AY_CHC_DISABLE_QUAL_MIXED");
-            assert!(qual_mixed_enabled());
-        });
+    fn mixed_kill_switch_carrier() {
+        let mut switches = ChcAbSwitches::default();
+        switches.qual_mixed = false;
+        let off = TestOverride::set(switches);
+        assert!(!qual_mixed_enabled());
+        drop(off);
+        assert!(qual_mixed_enabled());
     }
 
-    /// Kill switch is honored by the env probe.
+    /// The whole-pass kill switch is honored through the carrier.
     #[test]
-    fn kill_switch_env_var() {
-        with_env_edits(|env| {
-            env.set("AY_CHC_DISABLE_QUAL_MINE", "1");
-            assert!(!qual_mine_enabled());
-            env.remove("AY_CHC_DISABLE_QUAL_MINE");
-            assert!(qual_mine_enabled());
-        });
+    fn kill_switch_carrier() {
+        let mut switches = ChcAbSwitches::default();
+        switches.qual_mine = false;
+        let off = TestOverride::set(switches);
+        assert!(!qual_mine_enabled());
+        drop(off);
+        assert!(qual_mine_enabled());
     }
 }

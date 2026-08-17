@@ -318,13 +318,26 @@ fn test_native_api_diseq_half_prints_trust_free() {
 /// in a fresh `Executor` and require UNSAT. That is an independent re-solve, so
 /// the VERDICT is certified and `unsat` publishes.
 ///
-/// THE PROOF IS NOT EXTERNALLY CHECKABLE, and this test still pins that.
-/// The re-solve certifies the CONCLUSION, not the document: the exported
-/// certificate is unchanged and still terminates in
-/// `(step t1 (cl false) :rule hole)`. `check_proof_strict` must keep REJECTING
-/// it, so `--self-check` answers `unknown` here while default mode answers
-/// `unsat`. If AY ever gains a real nonlinear proof rule for this shape, the
-/// strict-rejection assertion below is what fires and demands a promotion.
+/// PROMOTED (2026-08-13) — AY GAINED THE RULE. The previous revision ended:
+/// *"If AY ever gains a real nonlinear proof rule for this shape, the
+/// strict-rejection assertion below is what fires and demands a promotion."*
+/// It fired; this is that promotion, not a relaxation.
+///
+/// The refutation is no longer routed through Farkas at all.
+/// `43431e481 feat(proof): strict-certifiable pure-NRA UNSAT` added an interval
+/// kernel, and `theory_inference::funnel` classifies the conflict with
+/// `ay_proof::recognize_nra_interval_unsat` — the strict checker's OWN decider
+/// (`nra_interval.rs`: one `decide_nra_interval_unsat` backs both recognizer and
+/// validator, so "recognize == validate-success by construction"). The lemma
+/// carries no payload to forge. Measured at this commit: `assume, assume,
+/// TheoryLemma{kind: NraIntervalUnsat}, th_resolution`, `trust_count == 0`,
+/// `hole_count == 0`. The sibling case lives in
+/// `complementary_literal_rebuild::test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate`.
+///
+/// THE WIRE DOCUMENT IS UNCHANGED and this test still pins that half: the
+/// Alethe printer has no spec rule name for `NraIntervalUnsat`, so `(get-proof)`
+/// keeps disclosing an unproved step. Internal certification and the exported
+/// text now disagree, and both directions are guarded below.
 #[test]
 #[timeout(10_000)]
 fn test_nonlinear_conjunct_publishes_uncheckable_certificate() {
@@ -357,17 +370,36 @@ fn test_nonlinear_conjunct_publishes_uncheckable_certificate() {
         "get-proof must succeed after certified publication: {outputs:?}"
     );
 
-    // SOUNDNESS GUARD (the point of this test): no fabricated Farkas
-    // certificate. The document is honest about its gap.
-    let strict = check_proof_strict(proof, exec.terms());
-    assert!(
-        strict.is_err(),
-        "the nonlinear conjunct admits no Farkas certificate; the checker must \
-         not accept a fabricated one: {strict:?}"
+    // SOUNDNESS GUARD 1 — still no fabricated certificate. The acceptance must
+    // come from the interval kernel reconstructing the refutation, so it may
+    // carry no trust and no hole step. (A fabricated Farkas certificate would
+    // be a `LraFarkas`/`LiaGeneric` lemma, not the single interval lemma this
+    // pins.)
+    let strict = check_proof_strict(proof, exec.terms())
+        .expect("the NRA interval kernel must strictly certify this refutation");
+    assert_eq!(
+        strict.trust_count, 0,
+        "an accepted strict certificate must contain no trust step: {strict:?}"
     );
+    assert_eq!(
+        strict.hole_count, 0,
+        "an accepted strict certificate must contain no hole step: {strict:?}"
+    );
+    assert!(
+        strict.trust_theory_kinds.is_empty(),
+        "no theory lemma may be admitted on trust: {strict:?}"
+    );
+    assert_eq!(
+        strict.theory_lemma_count, 1,
+        "exactly one theory lemma — the interval refutation — carries this proof: {strict:?}"
+    );
+
+    // SOUNDNESS GUARD 2 — the exported document must not overclaim a rule name
+    // it does not have.
     let alethe = outputs.get(1).expect("get-proof output");
     assert!(
         alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
+        "the exported document has no rule name for the interval refutation and \
+         must stay honestly unproved:\n{alethe}"
     );
 }

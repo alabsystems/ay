@@ -6,7 +6,6 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -14,6 +13,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, UNIX_EPOCH};
 use wait_timeout::ChildExt;
+
+mod publish;
+mod solver_steps;
+use publish::is_executable_file;
+use solver_steps::solver_gate_cargo_steps;
 
 #[derive(Subcommand)]
 pub(crate) enum GateCommand {
@@ -23,7 +27,7 @@ pub(crate) enum GateCommand {
     Precommit(PrecommitGateArgs),
     /// Run the checked-in local solver gate.
     Solver(SolverGateArgs),
-    /// Run the checked-in publish gate used by CI.
+    /// Run the checked-in local publication gate.
     Publish(PublishGateArgs),
 }
 
@@ -118,7 +122,7 @@ pub(crate) fn run(command: GateCommand) -> Result<i32> {
         GateCommand::Health(args) => run_health_gate(&args),
         GateCommand::Precommit(args) => run_precommit_gate(&args),
         GateCommand::Solver(args) => run_solver_gate(&args),
-        GateCommand::Publish(args) => run_publish_gate(&args),
+        GateCommand::Publish(args) => publish::run(&args),
     }
 }
 
@@ -344,362 +348,6 @@ fn run_solver_gate(args: &SolverGateArgs) -> Result<i32> {
         run_external_step("solver-gate", &repo_root, step)?;
     }
     println!("[solver-gate] PASS");
-    Ok(0)
-}
-
-fn solver_gate_cargo_steps() -> Vec<ExternalStep> {
-    vec![
-        ExternalStep::new(
-            "debug_ay_build_version_stamp",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay",
-                "--features",
-                "cli",
-                "--test",
-                "group_misc",
-                "build_version_stamp_8870",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_cli_external_codegen_consumer_canaries",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay",
-                "--features",
-                "cli",
-                "--test",
-                "group_cli",
-                "external_codegen_consumer_canaries_8870",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_smtlib_conformance_summary",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay",
-                "--features",
-                "cli",
-                "--test",
-                "group_smt",
-                "smt_lib_conformance::test_conformance_cross_logic_summary",
-                "--",
-                "--exact",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_external_codegen_consumer_differential",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_differential",
-                "external_codegen_consumer_differential_8870",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_external_codegen_fp_canary",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_fp",
-                "external_codegen_fp16_commutativity_8870",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_sat_integration_basic",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-sat",
-                "--test",
-                "integration",
-                "basic::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_qf_lia_packet",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_theory_misc",
-                "smt_soundness_gate::lia::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_qf_lra_packet",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_theory_misc",
-                "smt_soundness_gate::lra::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_qf_uf_packet",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_theory_misc",
-                "smt_soundness_gate::uf::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_qf_bv_packet",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_theory_misc",
-                "smt_soundness_gate::bv::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "debug_ay_dpll_qf_ax_packet",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--test",
-                "group_theory_misc",
-                "smt_soundness_gate::ax::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "release_ay_sat_soundness_regressions",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-sat",
-                "--release",
-                "--test",
-                "soundness_gate",
-                "regression::",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "release_only_ay_dpll_lra_regressions",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--release",
-                "--test",
-                "group_lra",
-                "qf_lra_release_soundness_",
-                "--",
-                "--nocapture",
-            ],
-        ),
-        ExternalStep::new(
-            "release_ay_dpll_qf_bv_differential_strict",
-            "cargo",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "ay-dpll",
-                "--release",
-                "--test",
-                "group_differential",
-                "differential_z3::differential_qf_bv_vs_z3",
-                "--",
-                "--exact",
-                "--nocapture",
-            ],
-        )
-        .with_env("Z3_DIFFERENTIAL_REQUIRED", "1"),
-    ]
-}
-
-fn run_publish_gate(args: &PublishGateArgs) -> Result<i32> {
-    let repo_root = resolve_repo_root(args.repo_root.as_deref())?;
-    let critical_range = resolve_critical_range(
-        &repo_root,
-        args.critical_solver_range.as_deref(),
-        "PUBLISH_GATE_CRITICAL_SOLVER_RANGE",
-    )?;
-
-    println!("[publish-gate] Root: {}", repo_root.display());
-    println!("[publish-gate] critical_solver_range={critical_range}");
-
-    let external_steps = vec![
-        ExternalStep::new(
-            "critical_solver_policy",
-            "bash",
-            &[
-                "scripts/check_critical_solver_policy.sh",
-                "--rev-range",
-                &critical_range,
-            ],
-        ),
-        ExternalStep::new("cargo_check_workspace", "cargo", &["check", "--workspace"]),
-        ExternalStep::new(
-            "release_build_binaries",
-            "cargo",
-            &[
-                "build",
-                "--release",
-                "-p",
-                "ay",
-                "-p",
-                "ay-fzn2smt",
-                "-p",
-                "ay-drat-check",
-                "-p",
-                "ay-lrat-check",
-            ],
-        ),
-        ExternalStep::new("doc_reality", "bash", &["scripts/check_doc_reality.sh"]),
-        ExternalStep::new("doctests", "bash", &["scripts/check_api_docs.sh"]),
-    ];
-
-    if args.list_steps {
-        print_steps(
-            "publish-gate",
-            &external_steps,
-            &[
-                "release_gate_assets_present",
-                "release_gate_wiring",
-                "release_public_crate_metadata",
-                "release_tarball_surface",
-                "repository_health",
-                "ay_help",
-                "ay_version",
-                "ay_flatzinc_help",
-                "ay_flatzinc_solve_help",
-                "ay_check_help",
-                "ay_check_drat_help",
-                "ay_check_lrat_help",
-            ],
-        );
-        return Ok(0);
-    }
-
-    for step in &external_steps {
-        run_external_step("publish-gate", &repo_root, step)?;
-    }
-    run_native_step("publish-gate", "repository_health", || {
-        if run_health_checks(&repo_root, false)? {
-            bail!("repository health check failed");
-        }
-        Ok(())
-    })?;
-    run_native_step("publish-gate", "release_gate_assets_present", || {
-        check_release_gate_assets_present(&repo_root)
-    })?;
-    run_native_step("publish-gate", "release_gate_wiring", || {
-        check_publish_gate_wiring(&repo_root)
-    })?;
-    run_native_step("publish-gate", "release_public_crate_metadata", || {
-        check_public_crate_metadata(&repo_root)
-    })?;
-    run_native_step("publish-gate", "release_tarball_surface", || {
-        check_release_tarball_surface(&repo_root)
-    })?;
-
-    let ay_bin = require_built_binary(&repo_root, "ay")?;
-    run_binary_probe(&repo_root, &ay_bin, "ay_help", &["--help"], true)?;
-    run_binary_probe(&repo_root, &ay_bin, "ay_version", &["--version"], false)?;
-    run_binary_probe(
-        &repo_root,
-        &ay_bin,
-        "ay_flatzinc_help",
-        &["flatzinc", "--help"],
-        true,
-    )?;
-    run_binary_probe(
-        &repo_root,
-        &ay_bin,
-        "ay_flatzinc_solve_help",
-        &["flatzinc", "solve", "--help"],
-        true,
-    )?;
-    run_binary_probe(
-        &repo_root,
-        &ay_bin,
-        "ay_check_help",
-        &["check", "--help"],
-        true,
-    )?;
-    run_binary_probe(
-        &repo_root,
-        &ay_bin,
-        "ay_check_drat_help",
-        &["check", "drat", "--help"],
-        true,
-    )?;
-    run_binary_probe(
-        &repo_root,
-        &ay_bin,
-        "ay_check_lrat_help",
-        &["check", "lrat", "--help"],
-        true,
-    )?;
-
-    println!("[publish-gate] PASS");
     Ok(0)
 }
 
@@ -1756,258 +1404,12 @@ fn check_local_solver_gate_entrypoint(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_publish_gate_wiring(repo_root: &Path) -> Result<()> {
-    let workflow = repo_root.join(".github/workflows/publish-gate.yml");
-    let text = fs::read_to_string(&workflow)
-        .with_context(|| format!("read publish workflow {}", workflow.display()))?;
-    let expected = "run: cargo run --locked -p ay --features cli -- gate publish";
-    if text
-        .lines()
-        .map(str::trim)
-        .any(|line| !line.starts_with('#') && line == expected)
-    {
-        Ok(())
-    } else {
-        bail!("CI publish gate must invoke ay gate publish")
-    }
-}
-
 fn require_contains(text: &str, needle: &str, message: &str) -> Result<()> {
     if text.contains(needle) {
         Ok(())
     } else {
         bail!("{message}")
     }
-}
-
-fn check_release_gate_assets_present(repo_root: &Path) -> Result<()> {
-    for path in RELEASE_GATE_REQUIRED_ASSETS {
-        let full = repo_root.join(path);
-        if !full.is_file() {
-            bail!("missing required release asset: {path}");
-        }
-    }
-    Ok(())
-}
-
-const RELEASE_GATE_REQUIRED_ASSETS: &[&str] = &[
-    ".github/workflows/publish-gate.yml",
-    CRITICAL_SOLVER_POLICY_PATH,
-    "scripts/check_api_docs.sh",
-    "scripts/check_doc_reality.sh",
-    "README.md",
-    "CHANGELOG.md",
-    "KNOWN_ISSUES.md",
-    "SECURITY.md",
-    "SUPPORT.md",
-    "CODE_OF_CONDUCT.md",
-    "LICENSE",
-    "NOTICE",
-    "THIRD_PARTY.md",
-    "the development design notes",
-    "the development design notes",
-    "the development design notes",
-];
-
-fn check_public_crate_metadata(repo_root: &Path) -> Result<()> {
-    let output = command_output(
-        repo_root,
-        "cargo",
-        &["metadata", "--no-deps", "--format-version", "1"],
-        &[],
-    )?;
-    let metadata: Value = serde_json::from_slice(&output)
-        .context("parse cargo metadata --no-deps --format-version 1 JSON")?;
-    let packages = metadata
-        .get("packages")
-        .and_then(Value::as_array)
-        .context("cargo metadata missing packages array")?;
-    for crate_name in PUBLIC_RELEASE_CRATES {
-        let package = packages
-            .iter()
-            .find(|package| package.get("name").and_then(Value::as_str) == Some(*crate_name))
-            .with_context(|| {
-                format!("missing public release crate in cargo metadata: {crate_name}")
-            })?;
-        let mut missing = Vec::new();
-        for field in [
-            "description",
-            "license",
-            "repository",
-            "homepage",
-            "documentation",
-            "readme",
-        ] {
-            if package.get(field).is_none_or(is_empty_json_value) {
-                missing.push(field);
-            }
-        }
-        if package
-            .get("authors")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
-        {
-            missing.push("authors");
-        }
-        if !missing.is_empty() {
-            bail!(
-                "public release crate metadata incomplete for {crate_name}: missing {}",
-                missing.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-fn is_empty_json_value(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(text) => text.is_empty(),
-        Value::Array(items) => items.is_empty(),
-        _ => false,
-    }
-}
-
-const PUBLIC_RELEASE_CRATES: &[&str] = &[
-    "ay",
-    "ay-bindings",
-    "ay-ffi",
-    "ay-fzn2smt",
-    "ay-drat-check",
-    "ay-lrat-check",
-];
-
-fn check_release_tarball_surface(repo_root: &Path) -> Result<()> {
-    for crate_name in PUBLIC_RELEASE_CRATES {
-        let output = command_output(
-            repo_root,
-            "cargo",
-            &["package", "-p", crate_name, "--allow-dirty", "--list"],
-            &[],
-        )
-        .with_context(|| format!("list package files for {crate_name}"))?;
-        let files = String::from_utf8_lossy(&output);
-        for required in ["LICENSE", "README.md"] {
-            if !files.lines().any(|line| line == required) {
-                bail!("packaged crate missing {required}: {crate_name}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn command_output(
-    repo_root: &Path,
-    program: &str,
-    args: &[&str],
-    envs: &[(&str, &str)],
-) -> Result<Vec<u8>> {
-    let mut command = ProcessCommand::new(program);
-    command.args(args).current_dir(repo_root);
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let output = command
-        .output()
-        .with_context(|| format!("spawn {}", render_command(program, args, envs)))?;
-    if !output.status.success() {
-        bail!(
-            "{} failed with status {}:\n{}{}",
-            render_command(program, args, envs),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(output.stdout)
-}
-
-fn require_built_binary(repo_root: &Path, name: &str) -> Result<PathBuf> {
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target"));
-    let explicit = env::var_os("CARGO_TARGET_DIR").is_some();
-    let target_root = if target_dir.is_absolute() {
-        target_dir
-    } else {
-        repo_root.join(target_dir)
-    };
-    let configured_candidate = target_root.join("release").join(name);
-    if explicit {
-        if is_executable_file(&configured_candidate) {
-            return Ok(configured_candidate);
-        }
-        bail!(
-            "expected configured release binary missing for {name}: {}",
-            configured_candidate.display()
-        );
-    }
-    if is_executable_file(&configured_candidate) {
-        return Ok(configured_candidate);
-    }
-
-    let candidates = vec![
-        configured_candidate,
-        repo_root.join("target/user/release").join(name),
-        repo_root.join("target/release").join(name),
-    ];
-
-    candidates
-        .into_iter()
-        .filter(|path| is_executable_file(path))
-        .max_by_key(|path| binary_mtime_epoch(path).unwrap_or(0))
-        .with_context(|| {
-            format!(
-                "expected repo-local release binary missing for {name}; searched target/release and target/user/release"
-            )
-        })
-}
-
-fn binary_mtime_epoch(path: &Path) -> Option<u64> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn run_binary_probe(
-    repo_root: &Path,
-    binary: &Path,
-    name: &'static str,
-    args: &[&str],
-    quiet_stdout: bool,
-) -> Result<()> {
-    println!("[publish-gate] START {name}");
-    println!("[publish-gate] ay_bin={}", binary.display());
-    let mut command = ProcessCommand::new(binary);
-    command.args(args).current_dir(repo_root);
-    if quiet_stdout {
-        command.stdout(Stdio::null());
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("spawn {} {}", binary.display(), args.join(" ")))?;
-    if !status.success() {
-        bail!("{name} failed with status {status}");
-    }
-    println!("[publish-gate] DONE  {name}");
-    Ok(())
 }
 
 fn render_command<S: AsRef<str>>(
@@ -2058,18 +1460,6 @@ mod tests {
         repo
     }
 
-    fn write_publish_gate_fixture(workflow_line: &str) -> TempDir {
-        let repo = TempDir::new().expect("temporary repository");
-        let workflows = repo.path().join(".github/workflows");
-        fs::create_dir_all(&workflows).expect("create workflows directory");
-        fs::write(
-            workflows.join("publish-gate.yml"),
-            format!("steps:\n  - name: publish\n    {workflow_line}\n"),
-        )
-        .expect("write publish workflow");
-        repo
-    }
-
     fn cargo_args_before_separator(step: &ExternalStep) -> &[String] {
         assert_eq!(step.program, "cargo", "unexpected step: {}", step.name);
         let separator = step
@@ -2084,6 +1474,123 @@ mod tests {
         args.windows(2)
             .find(|pair| pair[0] == short || pair[0] == long)
             .map(|pair| pair[1].as_str())
+    }
+
+    const EXPECTED_SOLVER_GATE_STEP_NAMES: [&str; 19] = [
+        "code_quality",
+        "debug_ay_build_version_stamp",
+        "debug_ay_cli_external_codegen_consumer_canaries",
+        "debug_ay_smtlib_conformance_summary",
+        "debug_ay_dpll_external_codegen_consumer_differential",
+        "debug_ay_dpll_external_codegen_fp_canary",
+        "debug_ay_sat_integration_basic",
+        "debug_ay_dpll_qf_lia_packet",
+        "debug_ay_dpll_qf_lra_packet",
+        "debug_ay_dpll_qf_uf_packet",
+        "debug_ay_dpll_qf_bv_packet",
+        "debug_ay_dpll_qf_abv_packet",
+        "debug_ay_dpll_qf_ax_packet",
+        "release_ay_sat_soundness_regressions",
+        "release_only_ay_dpll_lra_regressions",
+        "debug_ay_lra_release_fixture_integrity",
+        "release_ay_lra_cli_mechanism_regressions",
+        "release_ay_lra_cli_hermetic_sweep",
+        "release_ay_dpll_qf_bv_differential_strict",
+    ];
+
+    const PINNED_LRA_STEPS: [(&str, &[&str]); 4] = [
+        (
+            "release_only_ay_dpll_lra_regressions",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "ay-dpll",
+                "--release",
+                "--test",
+                "group_lra",
+                "qf_lra_release_soundness_",
+                "--",
+                "--nocapture",
+            ],
+        ),
+        (
+            "debug_ay_lra_release_fixture_integrity",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "ay",
+                "--features",
+                "cli",
+                "--test",
+                "group_lra",
+                "qf_lra_release_fixture_integrity::qf_lra_release_fixtures_exist_and_match_pinned_bytes",
+                "--",
+                "--exact",
+                "--nocapture",
+            ],
+        ),
+        (
+            "release_ay_lra_cli_mechanism_regressions",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "ay",
+                "--features",
+                "cli",
+                "--release",
+                "--test",
+                "group_lra",
+                "qf_lra_cli_release_mechanism_",
+                "--",
+                "--nocapture",
+            ],
+        ),
+        (
+            "release_ay_lra_cli_hermetic_sweep",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "ay",
+                "--features",
+                "cli",
+                "--release",
+                "--test",
+                "group_lra",
+                "qf_lra_cli_release_sweep_6564::qf_lra_cli_release_soundness_selected_batch_6564",
+                "--",
+                "--exact",
+                "--nocapture",
+            ],
+        ),
+    ];
+
+    const QF_ABV_PACKET_ARGS: [&str; 9] = [
+        "test",
+        "--locked",
+        "-p",
+        "ay-dpll",
+        "--test",
+        "group_theory_misc",
+        "smt_soundness_gate::abv::",
+        "--",
+        "--nocapture",
+    ];
+
+    fn assert_step_args(steps: &[ExternalStep], name: &str, expected_args: &[&str]) {
+        let step = steps
+            .iter()
+            .find(|step| step.name == name)
+            .unwrap_or_else(|| panic!("solver gate must include {name}"));
+        assert_eq!(step.program, "cargo");
+        assert_eq!(
+            step.args.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected_args,
+            "solver gate step {name} changed"
+        );
     }
 
     #[test]
@@ -2123,71 +1630,80 @@ cli = "ay gate""#,
     }
 
     #[test]
-    fn publish_gate_wiring_remains_a_separate_workflow_contract() {
-        let repo = write_local_solver_gate_fixture(
-            r#"[[script]]
-name = "critical-solver-policy-gate"
-path = "scripts/check_critical_solver_policy.sh"
-cli = "ay gate""#,
+    fn solver_gate_cargo_step_order_and_quality_entry_are_stable() {
+        let steps = solver_gate_cargo_steps();
+        assert_eq!(
+            steps.iter().map(|step| step.name).collect::<Vec<_>>(),
+            EXPECTED_SOLVER_GATE_STEP_NAMES,
+            "solver gate step order changed"
         );
-        check_local_solver_gate_entrypoint(repo.path())
-            .expect("local solver gate fixture should be valid");
-
-        let error = check_publish_gate_wiring(repo.path())
-            .expect_err("local solver wiring must not satisfy publish wiring");
         assert!(
-            format!("{error:#}").contains(".github/workflows/publish-gate.yml"),
-            "unexpected publish wiring error: {error:#}"
+            steps.iter().any(|step| {
+                step.name == "code_quality"
+                    && step.program == "cargo"
+                    && step
+                        .args
+                        .windows(2)
+                        .any(|args| args[0] == "-p" && args[1] == "ay-quality-gate")
+            }),
+            "solver gate must enforce the in-tree code-quality ratchets"
         );
     }
 
     #[test]
-    fn publish_gate_wiring_accepts_exact_cli_command() {
-        let repo = write_publish_gate_fixture(
-            "run: cargo run --locked -p ay --features cli -- gate publish",
-        );
-
-        check_publish_gate_wiring(repo.path())
-            .expect("publish workflow should enable the ay CLI feature");
+    fn solver_gate_lra_step_arguments_are_stable() {
+        let steps = solver_gate_cargo_steps();
+        for (name, expected_args) in PINNED_LRA_STEPS {
+            assert_step_args(&steps, name, expected_args);
+        }
     }
 
     #[test]
-    fn publish_gate_wiring_rejects_noncanonical_lines() {
-        for (case, workflow_line) in [
-            (
-                "old command without CLI feature",
-                "run: cargo run --locked -p ay -- gate publish",
-            ),
-            (
-                "commented command",
-                "# run: cargo run --locked -p ay --features cli -- gate publish",
-            ),
-            (
-                "command with suffix",
-                "run: cargo run --locked -p ay --features cli -- gate publish --list-steps",
-            ),
-        ] {
-            let repo = write_publish_gate_fixture(workflow_line);
-            let error = match check_publish_gate_wiring(repo.path()) {
-                Ok(()) => panic!("publish wiring accepted {case}"),
-                Err(error) => error,
+    fn solver_gate_qf_abv_packet_arguments_are_stable() {
+        assert_step_args(
+            &solver_gate_cargo_steps(),
+            "debug_ay_dpll_qf_abv_packet",
+            &QF_ABV_PACKET_ARGS,
+        );
+    }
+
+    #[test]
+    fn solver_gate_environment_overrides_are_stable() {
+        let steps = solver_gate_cargo_steps();
+        for step in &steps {
+            let expected = match step.name {
+                "release_ay_lra_cli_hermetic_sweep" => {
+                    vec![("AY_QF_LRA_RELEASE_FULL_SWEEP", "0".to_string())]
+                }
+                "release_ay_dpll_qf_bv_differential_strict" => {
+                    vec![("Z3_DIFFERENTIAL_REQUIRED", "1".to_string())]
+                }
+                _ => Vec::new(),
             };
-            assert!(
-                format!("{error:#}").contains("CI publish gate must invoke ay gate publish"),
-                "unexpected publish wiring error for {case}: {error:#}"
-            );
+            assert_eq!(step.env, expected, "solver gate env changed: {}", step.name);
         }
     }
 
     #[test]
     fn solver_gate_cargo_steps_are_locked_and_cli_enabled() {
         let steps = solver_gate_cargo_steps();
-        assert!(!steps.is_empty());
+        assert_eq!(
+            steps.len(),
+            EXPECTED_SOLVER_GATE_STEP_NAMES.len(),
+            "solver gate cargo step count changed"
+        );
         for step in &steps {
             let cargo_args = cargo_args_before_separator(step);
+            let package = cargo_option_value(cargo_args, "-p", "--package")
+                .unwrap_or_else(|| panic!("Cargo package is missing: {}", step.rendered()));
+            let expected_subcommand = if package == "ay-quality-gate" {
+                "run"
+            } else {
+                "test"
+            };
             assert_eq!(
                 cargo_args.first().map(String::as_str),
-                Some("test"),
+                Some(expected_subcommand),
                 "solver gate Cargo subcommand must be positional: {}",
                 step.rendered()
             );
@@ -2196,8 +1712,6 @@ cli = "ay gate""#,
                 "solver gate Cargo step is not locked: {}",
                 step.rendered()
             );
-            let package = cargo_option_value(cargo_args, "-p", "--package")
-                .unwrap_or_else(|| panic!("Cargo package is missing: {}", step.rendered()));
             if package == "ay" {
                 assert_eq!(
                     cargo_option_value(cargo_args, "-F", "--features"),

@@ -42,7 +42,7 @@ pub(super) fn extract_get_values_from_terms_typed(
     }
 
     // Collect just the terms for batch evaluation
-    let translated_terms = terms.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+    let translated_terms = terms.iter().map(|(_, t)| *t).collect::<Vec<_>>();
 
     let model_values = ctx.solver.try_get_values(&translated_terms)?;
     let mut values = ay_core::kani_compat::det_hash_map_with_capacity(model_values.len());

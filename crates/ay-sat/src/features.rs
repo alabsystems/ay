@@ -422,7 +422,7 @@ impl SatFeatures {
     /// evaluated after it. The `num_vars <= 250_000` cap excludes the
     /// multi-million-var giants (the giant path handles those); the
     /// `frac_binary >= 0.70` gate keeps non-binary-dominant mid-size instances
-    /// on Default. Kill-switch: `AY_AB_AGGRESSIVE_ROUTE=0`.
+    /// on Default. Kill-switch: `--sat-no-aggressive-route`.
     #[must_use]
     pub fn matches_aggressive_route_band(&self) -> bool {
         aggressive_route_band_from_counts(self.num_vars, self.num_clauses, self.num_binary)

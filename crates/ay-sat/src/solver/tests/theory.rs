@@ -1376,9 +1376,15 @@ fn test_level0_theory_unit_conflict_trace_has_hints() {
     );
     assert_eq!(
         empty_entry.resolution_hints,
-        vec![2, 1],
-        "empty clause must preserve theory-clause + root-fact provenance"
+        vec![1, 2],
+        "empty clause must replay the root fact before the theory conflict"
     );
+    crate::validate_clause_trace_resolution(
+        trace,
+        1,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("forward theory-conflict hints must pass independent positive-RUP replay");
 }
 
 // ========================================================================

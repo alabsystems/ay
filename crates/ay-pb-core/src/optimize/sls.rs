@@ -265,10 +265,10 @@ const RESTART_INTENSIFY_KICKS: usize = 3;
 /// headroom. It therefore ships DISABLED (`0`) so the default trajectory is
 /// byte-identical to the single-flip search (guaranteed 0 regression), while
 /// remaining a live, reproducible A/B lever: set
-/// `AY_PB_SLS_ENDGAME_THRESHOLD=<1..>` to enable it.
+/// `--pb-sls-endgame-threshold=<1..>` to enable it.
 const ENDGAME_VIOLATED_THRESHOLD: usize = 0;
 
-/// Reads the endgame swap threshold from `AY_PB_SLS_ENDGAME_THRESHOLD`, falling back
+/// Reads the endgame swap threshold from `--pb-sls-endgame-threshold`, falling back
 /// to [`ENDGAME_VIOLATED_THRESHOLD`]. `0` disables the endgame swap entirely
 /// (recovering the historical single-flip search), keeping it as a live, reproducible
 /// A/B lever. Values are clamped to a sane bound so a typo cannot make the per-plateau
@@ -277,13 +277,9 @@ fn endgame_threshold() -> usize {
     /// Upper clamp: above this the violated set is no longer an "endgame" and the
     /// deterministic scan would cost too much per plateau.
     const MAX_THRESHOLD: usize = 4096;
-    match std::env::var("AY_PB_SLS_ENDGAME_THRESHOLD") {
-        Ok(v) => v
-            .trim()
-            .parse::<usize>()
-            .map(|n| n.min(MAX_THRESHOLD))
-            .unwrap_or(ENDGAME_VIOLATED_THRESHOLD),
-        Err(_) => ENDGAME_VIOLATED_THRESHOLD,
+    match ay_core::misc_cli_flags().pb_sls_endgame_threshold {
+        Some(n) => n.min(MAX_THRESHOLD),
+        None => ENDGAME_VIOLATED_THRESHOLD,
     }
 }
 
@@ -293,34 +289,18 @@ fn endgame_threshold() -> usize {
 /// PAWS search — it lost real incumbents (e.g. linpeb `layeredfan_up` r24/r33:
 /// `o 12675` / SAT under the legacy path → `UNKNOWN` under the unified loop) with
 /// no compensating gain. The legacy [`search_with_options`] is the default;
-/// set `AY_PB_SLS_UNIFIED=1` to re-enable the unified loop for measurement.
+/// pass `--pb-sls-unified` to re-enable the unified loop for measurement.
 pub(crate) fn unified_enabled() -> bool {
-    match std::env::var_os("AY_PB_SLS_UNIFIED").as_deref() {
-        None => false,
-        Some(v) => v.to_str().map_or(false, |v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        }),
-    }
+    ay_core::misc_cli_flags().pb_sls_unified
 }
 
-/// Whether the structure-aware BNN feasibility seed is enabled, per the
-/// `AY_PB_BNN_FEAS` environment variable (∈ {`1`, `true`, `yes`, `on`}). Default
-/// OFF so the all-false start path is unchanged; gated for clean A/B comparison.
-/// The seed is ADVISORY ONLY (a starting point for the same search); soundness
-/// does not depend on this flag in any way.
+/// Whether the structure-aware BNN feasibility seed is enabled. Default ON
+/// (B31: the official wrapper always exported it on; the default moved into
+/// the engine and `--no-pb-bnn-feas` is the opt-out). The seed is ADVISORY
+/// ONLY (a starting point for the same search); soundness does not depend on
+/// this switch in any way.
 fn bnn_feas_enabled() -> bool {
-    std::env::var_os("AY_PB_BNN_FEAS").is_some_and(|v| {
-        matches!(
-            v.to_str()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    crate::ab_switches::get().bnn_feas
 }
 
 /// Outcome of an SLS run: the best feasible incumbent found, or `None` if no
@@ -1501,14 +1481,14 @@ fn search_loop<T: ScoreInt>(
     // The feasibility phase finds a feasible point from here; the seed choice only
     // affects search trajectory, never soundness.
     //
-    // Opt-in (AY_PB_BNN_FEAS): on recognized binarized-neural-net OPT-LIN instances
+    // Default-on (`--no-pb-bnn-feas` opts out): on recognized BNN OPT-LIN instances,
     // (the `bnn_mnist_*` family), forward-propagate a structure-aware feasibility
     // seed instead of all-false. This is purely a different STARTING POINT for the
     // same search — ADVISORY ONLY. Every incumbent is still re-verified by
     // `try_record_incumbent` below and by `sanitize_optimization_incumbent` in the
     // portfolio, so a recognizer bug can only waste cycles, never emit a wrong
-    // answer. The flag gates it (like `AY_PB_LNS2`) for clean A/B comparison; when
-    // unset, the all-false path is byte-identical to before.
+    // answer. The opt-out gates it (like `--no-pb-lns2`) for clean A/B comparison;
+    // disabling it restores the all-false path byte-for-byte.
     let mut assignment = vec![false; num_vars];
     if bnn_feas_enabled() {
         if let Some(seed) = crate::optimize::bnn_feas::seed(instance, objective) {

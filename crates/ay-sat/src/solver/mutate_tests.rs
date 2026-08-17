@@ -1171,6 +1171,7 @@ fn solver_namespace_is_bundled_at_clause_trace_extraction() {
         .snapshot_clause_trace()
         .expect("enabled trace has a snapshot");
     assert_eq!(snapshot.solver_num_vars(), Some(solver.total_num_vars()));
+    assert_eq!(snapshot.scope_assumptions(), Some([].as_slice()));
     assert_eq!(
         solver
             .clause_trace()
@@ -1185,6 +1186,32 @@ fn solver_namespace_is_bundled_at_clause_trace_extraction() {
         .take_clause_trace()
         .expect("enabled trace can be taken");
     assert_eq!(taken.solver_num_vars(), Some(expected));
+    assert_eq!(taken.scope_assumptions(), Some([].as_slice()));
+}
+
+#[test]
+fn active_scope_authority_is_bundled_at_clause_trace_extraction() {
+    let mut solver = Solver::new(1);
+    solver.enable_clause_trace();
+    solver.push();
+    let selector = Variable::new(1);
+
+    let snapshot = solver
+        .snapshot_clause_trace()
+        .expect("enabled trace has a scoped snapshot");
+    assert_eq!(
+        snapshot.scope_assumptions(),
+        Some([Literal::negative(selector)].as_slice())
+    );
+    assert_eq!(snapshot.solver_num_vars(), Some(2));
+
+    let taken = solver
+        .take_clause_trace()
+        .expect("enabled trace can be taken");
+    assert_eq!(
+        taken.scope_assumptions(),
+        Some([Literal::negative(selector)].as_slice())
+    );
 }
 
 #[test]

@@ -298,22 +298,18 @@ impl ProofTap {
         }
     }
 
-    /// Default ring capacity (env `AY_PB_PROOF_TAP_RING_MIB` override).
+    /// Default ring capacity. (B9: the `AY_PB_PROOF_TAP_RING_MIB` env
+    /// override nothing set is retired; size the ring in `ring.rs`.)
     pub(crate) fn default_ring_capacity() -> usize {
-        std::env::var("AY_PB_PROOF_TAP_RING_MIB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&mib| (1..=1024).contains(&mib))
-            .map_or(ring::DEFAULT_RING_CAPACITY, |mib| mib << 20)
+        ring::DEFAULT_RING_CAPACITY
     }
 
-    /// Optional serializer soft byte cap (env `AY_PB_PROOF_TAP_SOFT_CAP_MIB`;
+    /// Optional serializer soft byte cap (env `--pb-proof-tap-soft-cap-mib`;
     /// unset or 0 = uncapped). Breaching it VOIDS the proof (no certificate),
     /// it never truncates.
     pub(crate) fn default_soft_cap() -> Option<u64> {
-        std::env::var("AY_PB_PROOF_TAP_SOFT_CAP_MIB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        ay_core::misc_cli_flags()
+            .pb_proof_tap_soft_cap_mib
             .filter(|&mib| mib > 0)
             .map(|mib| mib << 20)
     }

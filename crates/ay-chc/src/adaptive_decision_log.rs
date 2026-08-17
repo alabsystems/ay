@@ -4,7 +4,7 @@
 
 //! Structured decision logging for the adaptive portfolio solver.
 //!
-//! When the `AY_DECISION_LOG` environment variable is set to a file path,
+//! When the decision-log path is configured (CLI-carried trace config),
 //! every adaptive strategy decision is written as a JSON line to that file.
 //! When unset, all operations are no-ops with zero overhead.
 //!
@@ -42,14 +42,14 @@ pub(crate) struct DecisionEntry {
 /// Structured decision logger for the adaptive portfolio.
 ///
 /// Holds an optional writer protected by a `Mutex` for `&self` compatibility
-/// with `AdaptivePortfolio` methods. When `AY_DECISION_LOG` is not set, the
+/// with `AdaptivePortfolio` methods. When no path is configured, the
 /// inner `Option` is `None` and all methods are effectively no-ops.
 pub(crate) struct DecisionLog {
     writer: Mutex<Option<BufWriter<File>>>,
 }
 
 impl DecisionLog {
-    /// Create a `DecisionLog` from the `AY_DECISION_LOG` environment variable.
+    /// Create a `DecisionLog` from the configured trace-config path.
     ///
     /// Returns a log that writes JSON lines to the specified path, or a no-op
     /// log if the variable is unset or the file cannot be opened.
@@ -62,9 +62,7 @@ impl DecisionLog {
                     .map(|f| BufWriter::new(f))
                     .map_err(|e| {
                         // Use eprintln directly here — this runs once at startup.
-                        eprintln!(
-                            "Warning: AY_DECISION_LOG={path}: could not open for writing: {e}"
-                        );
+                        eprintln!("Warning: decision log {path}: could not open for writing: {e}");
                         e
                     })
                     .ok()

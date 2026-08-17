@@ -15,7 +15,7 @@
 //!
 //! Default-ON since 2026-07-10 (wf_55735963 collapse+BVE default flip):
 //!   - SCC Decompose + congruence eligibility on the Default DIMACS route via
-//!     the route-aware AY_AB_SUBST_AUTO probe (kill-switch =0). The historical
+//!     the route-aware --sat-no-subst-auto probe (kill-switch =0). The historical
 //!     reconstruction blockers were root-caused and fixed (ef818369 preprocess
 //!     subsume promotion; wf_ff5991a1 congruence emission fixes) and the
 //!     scoreboard measurement recorded +7 UNSAT flips / 0 hard losses.
@@ -43,8 +43,8 @@ fn guard_factorization_enabled_after_solve() {
 
 /// Verify the SCC-decompose default on the DIMACS route: ON via the
 /// route-aware AUTO probe since 2026-07-10 (wf_55735963; kill-switch
-/// AY_AB_SUBST_AUTO=0 — asserted hermetically when set, same tolerant
-/// pattern as the AY_AB_BVE_SPARSE tests in variant.rs).
+/// --sat-no-subst-auto — asserted hermetically when set, same tolerant
+/// pattern as the --sat-no-bve-sparse tests in variant.rs).
 #[test]
 #[timeout(5_000)]
 fn guard_decompose_default_after_solve() {
@@ -52,7 +52,7 @@ fn guard_decompose_default_after_solve() {
     let cnf = "p cnf 4 4\n1 2 0\n-1 3 0\n-3 4 0\n-4 -2 0\n";
     let formula = parse_dimacs(cnf).expect("parse");
     let mut solver = formula.into_solver();
-    match std::env::var("AY_AB_SUBST_AUTO").ok().as_deref() {
+    match std::env::var("--sat-no-subst-auto").ok().as_deref() {
         None | Some("1") => assert!(
             solver.inprocessing_feature_profile().decompose,
             "DIMACS default enables decompose eligibility (AUTO default-ON, \
@@ -60,7 +60,7 @@ fn guard_decompose_default_after_solve() {
         ),
         Some(_) => assert!(
             !solver.inprocessing_feature_profile().decompose,
-            "kill-switch (AY_AB_SUBST_AUTO=0) restores decompose-off"
+            "kill-switch (--sat-no-subst-auto) restores decompose-off"
         ),
     }
     let result = solver.solve().into_inner();

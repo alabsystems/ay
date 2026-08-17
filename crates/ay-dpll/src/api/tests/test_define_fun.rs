@@ -960,6 +960,18 @@ fn native_definitional_forall_adopts_exact_macro_and_prints_model() {
     let model = solver.try_get_model_str().unwrap();
     assert!(model.contains("define-fun native_positive"), "{model}");
     assert!(model.contains("native_definition_x"), "{model}");
+
+    let details = solver.check_sat_with_details();
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    assert!(artifact.function_declarations.is_empty());
+    assert!(
+        artifact.replay_gaps.is_empty(),
+        "{:?}",
+        artifact.replay_gaps
+    );
+    let replay = Solver::replay_native_replay_artifact(&artifact).expect("native replay");
+    assert!(replay.result.result().is_sat());
 }
 
 /// A PREDICATE definition keeps REFUSING on an earlier constrained use.

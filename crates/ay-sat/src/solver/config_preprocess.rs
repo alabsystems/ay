@@ -280,7 +280,7 @@ impl Solver {
             if self.preprocessing_should_stop(should_stop) {
                 return false;
             }
-            // Route-aware collapse probe (#15, AY_AB_SUBST_AUTO — default ON
+            // Route-aware collapse probe (#15, --sat-no-subst-auto — default ON
             // since 2026-07-10, wf_55735963): the FIRST congruence round
             // doubles as a cheap substitution-heaviness probe. Its
             // equivalence density (equivalences / active vars) separates
@@ -289,7 +289,7 @@ impl Solver {
             // when the probe says it will pay off — avoiding the measured
             // general regression (8→7) from unconditional collapse. The flag
             // is armed by VariantConfig::apply_to_solver for the Default
-            // DIMACS variant only (kill-switch AY_AB_SUBST_AUTO=0), so Custom
+            // DIMACS variant only (kill-switch --sat-no-subst-auto), so Custom
             // congruence profiles keep their historical unconditional path.
             let auto_collapse = self.cold.subst_auto_collapse;
             let mut collapse_worthy = !auto_collapse;
@@ -319,7 +319,7 @@ impl Solver {
                     // 0.05 sits well below substitution-heavy (>=0.1) and well
                     // above general (~0); calibrated on sc2025 + 2024 samples.
                     collapse_worthy = density >= 0.05;
-                    if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+                    if ay_core::misc_cli_flags().ab_subst_stats {
                         eprintln!(
                             "AB_AUTO: probe_equivs={equivs} active_vars={active_vars} density={density:.4} collapse_worthy={collapse_worthy}"
                         );
@@ -446,10 +446,9 @@ impl Solver {
             // immediately, capped at 10 rounds. Each round re-checks
             // interruption; the preprocess deadline is pushed out by the
             // loop's own elapsed time so downstream passes are not starved.
-            let want_fixpoint = matches!(
-                std::env::var("AY_AB_SUBST_FIXPOINT").ok().as_deref(),
-                Some("1")
-            ) || (auto_collapse && collapse_worthy);
+            // B21: the AY_AB_SUBST_FIXPOINT manual force-on is retired; the
+            // auto-decide arm in this same expression is the shipped rule.
+            let want_fixpoint = auto_collapse && collapse_worthy;
             if want_fixpoint
                 && self.inproc_ctrl.gate.enabled
                 && self.inproc_ctrl.congruence.enabled
@@ -478,7 +477,7 @@ impl Solver {
                     // same non-RUP edges every round while emission skips them
                     // all — decompose then substitutes nothing and the loop
                     // makes no progress (observed on 70da0b78 under
-                    // AY_AB_DRAT_SUBST: 947 edges re-skipped per round). Break
+                    // --sat-no-drat-subst: 947 edges re-skipped per round). Break
                     // when the round's ACCEPTED yield is zero.
                     {
                         let s = self.inproc.congruence.stats();
@@ -501,7 +500,7 @@ impl Solver {
             }
             _t3_decomp = _t0.elapsed().as_millis();
 
-            // Post-collapse BVE eligibility re-derivation (AY_AB_BVE_POST_COLLAPSE,
+            // Post-collapse BVE eligibility re-derivation (--sat-no-bve-post-collapse,
             // default ON since 2026-07-10 wf_55735963; =0 kill-switch). Placed
             // IMMEDIATELY after the congruence+decompose
             // collapse (steps 1/2/2a above — the re-derivation is meaningless
@@ -529,7 +528,7 @@ impl Solver {
             // the BVE wall window (deep-aware); the intermediate stages (2b
             // HTR / 3 probe / 4 factor) remain gated by skip_expensive, so the
             // extension is effectively spent on BVE only.
-            if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+            if ay_core::misc_cli_flags().ab_subst_stats {
                 eprintln!(
                     "AB_BVE_POST_COLLAPSE: check num_vars={} active={} removed={} active_clauses={} lrat={} incr={} unlock={}",
                     self.num_vars,
@@ -559,7 +558,7 @@ impl Solver {
                         _ => {}
                     }
                 }
-                if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+                if ay_core::misc_cli_flags().ab_subst_stats {
                     eprintln!(
                         "AB_BVE_POST_COLLAPSE: armed bve={} (num_vars={} active={} removed={})",
                         self.inproc_ctrl.bve.enabled,
@@ -610,7 +609,7 @@ impl Solver {
                         _ => {}
                     }
                 }
-                if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+                if ay_core::misc_cli_flags().ab_subst_stats {
                     eprintln!(
                         "AB_BVE_GIANT_RAW: armed bve={} (num_vars={} active={} removed={} active_clauses={})",
                         self.inproc_ctrl.bve.enabled,
@@ -793,7 +792,7 @@ impl Solver {
             // correctly but AY's BVE eliminates a structural ceiling of ~1,306
             // vs kissat's 104,496 on this class, so f6 stays s UNKNOWN — this
             // is measurement infra, not a solve, and ships opt-in only.
-            if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+            if ay_core::misc_cli_flags().ab_subst_stats {
                 eprintln!(
                     "AB_BVE_POST_FACTOR: check enabled={} pre_factor_clauses={} active_clauses={} factored_vars={} lrat={} incr={}",
                     config_preprocess_policy::bve_post_factor_enabled(),
@@ -822,7 +821,7 @@ impl Solver {
                         _ => {}
                     }
                 }
-                if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+                if ay_core::misc_cli_flags().ab_subst_stats {
                     eprintln!(
                         "AB_BVE_POST_FACTOR: armed bve={} (num_vars={} pre_factor_vars={} active_clauses={} pre_factor_clauses={})",
                         self.inproc_ctrl.bve.enabled,

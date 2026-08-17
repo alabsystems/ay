@@ -219,7 +219,7 @@ impl Solver {
     /// `skip_expensive_preprocessing_passes` for THIS formula.
     ///
     /// The flag is armed by the variant sparse-band predicate (density<=12,
-    /// num_vars<=AY_BVE_SPARSE_MAX_VARS, non-LRAT Default route, AY_AB_BVE_SPARSE
+    /// num_vars<=--sat-bve-sparse-max-vars, non-LRAT Default route, --sat-no-bve-sparse
     /// not killed). Here we additionally RE-CHECK the dense-skip guard on the
     /// current active clause/var counts so the bypass can never run expensive
     /// preprocess BVE on a dense formula, even if the formula densified after the
@@ -247,10 +247,10 @@ impl Solver {
 
     /// Whether the post-collapse BVE eligibility re-derivation unlock is
     /// engaged for THIS formula RIGHT NOW (kill-switched, DEFAULT ON since
-    /// 2026-07-10 wf_55735963 — `AY_AB_BVE_POST_COLLAPSE=0` disables).
+    /// 2026-07-10 wf_55735963 — `--sat-no-bve-post-collapse` disables).
     ///
     /// The congruence/decompose collapse (preprocess steps 1/2/2a, which fire
-    /// under the default-ON AY_AB_SUBST_AUTO probe) can substitute away
+    /// under the default-ON --sat-no-subst-auto probe) can substitute away
     /// hundreds of thousands of variables, but every BVE gate keys on the
     /// ORIGINAL `self.num_vars`, which is never re-derived. This predicate
     /// RE-derives eligibility from the live lifecycle counts, so it is
@@ -486,14 +486,14 @@ impl Solver {
     ///
     /// Requires ALL of:
     ///   - the sparse-band unlock flag is armed (density<=12, non-LRAT Default,
-    ///     AY_AB_BVE_SPARSE not killed) — reuses `sparse_band_bve_preprocess_unlock`
+    ///     --sat-no-bve-sparse not killed) — reuses `sparse_band_bve_preprocess_unlock`
     ///     — OR the post-collapse unlock qualified this formula (see
     ///     COMPOSITION below);
     ///   - num_vars > BVE_SPARSE_DEEP_MIN_VARS (150K). This keeps every
     ///     default-band (<=150K var) input on the existing path so the deep
     ///     wall/effort/round increases can never regress small/medium in-band
     ///     solves. Above the floor, the sparse-band arm still needs the
-    ///     operator to raise AY_BVE_SPARSE_MAX_VARS; the DEFAULT-reachable
+    ///     operator to raise --sat-bve-sparse-max-vars; the DEFAULT-reachable
     ///     entry is the post-collapse composition;
     ///   - AY_AB_BVE_SPARSE_DEEP not killed ("0" disables; unset/anything
     ///     else enables). Default flipped ON with the 3-knob stack
@@ -507,7 +507,7 @@ impl Solver {
     /// knob default-ON.
     ///
     /// COMPOSITION (post-collapse lever): the deep budgets also engage when
-    /// the post-collapse unlock (`AY_AB_BVE_POST_COLLAPSE`, default ON) is what opened
+    /// the post-collapse unlock (`--sat-no-bve-post-collapse`, default ON) is what opened
     /// BVE — the two knobs compose (deep budgets applied to the
     /// post-collapse-opened pass) without being folded: each keeps its own
     /// enable env and its own scope predicate. Ordering keeps the default
@@ -528,27 +528,14 @@ impl Solver {
         {
             return false;
         }
-        use std::sync::OnceLock;
-        // Min-var floor for deep. Default BVE_SPARSE_DEEP_MIN_VARS (150K);
-        // overridable via AY_BVE_SPARSE_DEEP_MIN_VARS (used to validate the deep
-        // reconstruction/proof path on smaller BVE-heavy instances).
-        static MIN_VARS: OnceLock<usize> = OnceLock::new();
-        let min_vars = *MIN_VARS.get_or_init(|| {
-            std::env::var("AY_BVE_SPARSE_DEEP_MIN_VARS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(BVE_SPARSE_DEEP_MIN_VARS)
-        });
+        // Min-var floor for deep: BVE_SPARSE_DEEP_MIN_VARS (150K).
+        // (B3: the AY_BVE_SPARSE_DEEP_MIN_VARS env override is deleted.)
+        let min_vars = BVE_SPARSE_DEEP_MIN_VARS;
         if self.num_vars <= min_vars {
             return false;
         }
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            !matches!(
-                std::env::var("AY_AB_BVE_SPARSE_DEEP").ok().as_deref(),
-                Some("0")
-            )
-        })
+        // B26: CLI-owned opt-out (--sat-no-bve-sparse-deep); env retired.
+        !ay_core::sat_ab_switches().no_bve_sparse_deep
     }
 
     /// Wall-clock multiplier for the preprocess-BVE budgets: 4x
@@ -610,7 +597,7 @@ impl Solver {
         // stay gated on _skip_expensive to avoid gate-extraction overhead on huge
         // formulas — this unlock is fastelim-only.
         //
-        // Post-collapse re-derivation (AY_AB_BVE_POST_COLLAPSE, default ON
+        // Post-collapse re-derivation (--sat-no-bve-post-collapse, default ON
         // since 2026-07-10 wf_55735963; =0 kill-switch):
         // a second, independent bypass for formulas whose ORIGINAL num_vars
         // exceeded the 200K cap but whose ACTIVE count collapsed under the
@@ -680,7 +667,7 @@ impl Solver {
         // shape, or the deep preprocess budget when AY_AB_BVE_SPARSE_DEEP
         // composes (mirroring the budget raise deep gets at preprocess start
         // when it is armed pre-collapse). Bounded and knob-scoped: no-op
-        // unless AY_AB_BVE_POST_COLLAPSE (default ON, =0 kills) actually
+        // unless --sat-no-bve-post-collapse (default ON, =0 kills) actually
         // unlocked this call.
         if post_collapse_unlock || giant_raw_unlock || post_factor_unlock {
             // Proof-aware (wf_0c7d84e9): see PROOF_WALL_BUDGET_SCALE.

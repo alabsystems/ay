@@ -15,7 +15,7 @@
 //!
 //! Usage:
 //! ```bash
-//! AY_DIAGNOSTIC_FILE=ay.jsonl cargo run --release -- input.cnf
+//! ay --diagnostic-file ay.jsonl input.cnf   # then: cargo run --release -- input.cnf
 //! reference/cadical/build/cadical input.cnf > cadical.txt 2>&1
 //! cargo run --release --example compare_search_fingerprint -- ay.jsonl cadical.txt
 //! ```
@@ -351,7 +351,7 @@ fn main() {
         eprintln!(
             "usage: {} <ay_trace.jsonl> <cadical_output.txt>\n\
              CTB Wave-2: finds first AY/CaDiCaL trajectory divergence.\n\
-             Generate: AY_DIAGNOSTIC_FILE=ay.jsonl ./ay input.cnf\n\
+             Generate: ./ay --diagnostic-file ay.jsonl input.cnf\n\
              Generate: cadical input.cnf > cadical.txt 2>&1",
             args[0]
         );

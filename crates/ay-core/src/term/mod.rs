@@ -77,6 +77,11 @@ pub struct TermEntryStamp(u64);
 
 #[allow(clippy::panic)]
 fn fresh_term_entry_stamp() -> TermEntryStamp {
+    // `fetch_update`, not `try_update`: identical semantics (the closure-CAS
+    // loop returning the previous value), but stable since 1.45 — `try_update`
+    // is its unstable rename (#135894) and holds every downstream consumer
+    // (model-checker-consumer pins nightly-2025-12-03, which lacks it) to a newer toolchain
+    // for no behavioral gain.
     let stamp = NEXT_TERM_ENTRY_STAMP
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)

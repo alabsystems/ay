@@ -1027,7 +1027,7 @@ impl Executor {
 }
 
 fn debug_abv_finite_array_enabled() -> bool {
-    std::env::var_os("AY_DEBUG_ABV_FINITE_ARRAY").is_some()
+    ay_core::misc_cli_flags().debug_abv_finite_array
 }
 
 fn bv_range(

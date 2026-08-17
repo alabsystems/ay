@@ -105,7 +105,7 @@ fn assert_carcara_valid(carcara: &Path, proof: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let valid = output.status.success() && stdout.trim() == "valid";
-    if valid && std::env::var_os("AY_KEEP_ALETHE_ARTIFACTS").is_none() {
+    if valid && !ay_core::misc_cli_flags().keep_alethe_artifacts {
         let _ = std::fs::remove_file(&problem_path);
         let _ = std::fs::remove_file(&proof_path);
     } else {

@@ -67,27 +67,17 @@ use std::time::{Duration, Instant};
 
 use crate::types::{PbRel, WboInstance};
 
-/// Opt-in gate for the root EDAC/VAC-lite probe: `AY_PB_WCSP_EDAC` ∈
-/// {`1`, `true`, `yes`, `on`}. Default OFF (same pattern as `AY_PB_BNB`).
+/// Opt-in gate for the root EDAC/VAC-lite probe (`--pb-wcsp-edac`).
+/// Default OFF.
 #[must_use]
 pub fn wcsp_edac_enabled() -> bool {
-    std::env::var_os("AY_PB_WCSP_EDAC").is_some_and(|v| {
-        matches!(
-            v.to_str().map(str::trim),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+    crate::ab_switches::get().wcsp_edac
 }
 
-/// Transfer time budget in milliseconds: `AY_PB_WCSP_EDAC_MS`, default 2000.
-/// Unparseable values fall back to the default (fail-closed toward LESS
-/// probe work, never more).
+/// Transfer time budget in milliseconds. (B9: compiled constant; the
+/// `AY_PB_WCSP_EDAC_MS` env override nothing set is retired.)
 fn wcsp_edac_budget_ms() -> u64 {
-    const DEFAULT_MS: u64 = 2000;
-    std::env::var("AY_PB_WCSP_EDAC_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MS)
+    2000
 }
 
 /// A CHECKED root probe result: `c0` is a floor on the falsified-soft cost of

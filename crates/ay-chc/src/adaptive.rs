@@ -4180,7 +4180,7 @@ impl AdaptivePortfolio {
         // native datatype theory; every candidate replayed on the ORIGINAL
         // clauses). Unsafe-only ⇒ purely additive; safe instances fall through
         // to the cata / native-ADT-MBP PDR routes below. Kill switch
-        // AY_CHC_DISABLE_DT_BMC.
+        // --chc-no-dt-bmc.
         if let Some(result) = self.try_datatype_bounded_bmc_refutation(&features, deadline) {
             return result;
         }

@@ -50,7 +50,7 @@ pub(crate) const ELIM_OCC_LIMIT: usize = 2_000;
 /// (options.hpp:89, elim.cpp:509).
 pub(crate) const ELIM_CLAUSE_SIZE_LIMIT: usize = 100;
 
-/// Cached per-process read of the `AY_AB_BVE_ADDITIVE_FASTELIM` kill-switch,
+/// Cached per-process read of the `--sat-[no-]bve-additive-fastelim` kill-switch,
 /// returning the explicit override (if any) rather than a final bool.
 ///
 /// Three-state (the house `AY_AB_*` kill-switch convention, extended for the
@@ -74,15 +74,16 @@ pub(crate) const ELIM_CLAUSE_SIZE_LIMIT: usize = 100;
 /// edge) captures the flip while leaving every small formula byte-identical.
 /// Read once and cached like the other `AY_AB_*` knobs.
 fn additive_fastelim_override() -> Option<bool> {
-    use std::sync::OnceLock;
-    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
-    *OVERRIDE.get_or_init(
-        || match std::env::var("AY_AB_BVE_ADDITIVE_FASTELIM").ok().as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        },
-    )
+    // B36: CLI-owned tri-state (--sat-bve-additive-fastelim /
+    // --sat-no-bve-additive-fastelim); unset keeps the band auto decision.
+    let s = ay_core::sat_ab_switches();
+    if s.no_bve_additive_fastelim {
+        Some(false)
+    } else if s.bve_additive_fastelim {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Default variable-count floor (strict `>`) above which the banded additive
@@ -97,22 +98,15 @@ fn additive_fastelim_override() -> Option<bool> {
 /// A/B tuning of the edge.
 const AY_BVE_ADDITIVE_MIN_VARS_DEFAULT: usize = 200_000;
 
-/// Cached per-process read of the banded-additive variable-count floor
-/// (`AY_BVE_ADDITIVE_MIN_VARS`, default 200K). Non-numeric / unset falls back
-/// to the default.
+/// Banded-additive variable-count floor (200K). (B3: the env override is
+/// deleted.)
 fn additive_fastelim_min_vars() -> usize {
-    use std::sync::OnceLock;
-    static MIN_VARS: OnceLock<usize> = OnceLock::new();
-    *MIN_VARS.get_or_init(|| {
-        std::env::var("AY_BVE_ADDITIVE_MIN_VARS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(AY_BVE_ADDITIVE_MIN_VARS_DEFAULT)
-    })
+    // B3: the AY_BVE_ADDITIVE_MIN_VARS env override is deleted.
+    AY_BVE_ADDITIVE_MIN_VARS_DEFAULT
 }
 
 /// Resolve the default `additive_fastelim` flag for a BVE engine covering
-/// `num_vars` variables: honour the `AY_AB_BVE_ADDITIVE_FASTELIM` kill-switch
+/// `num_vars` variables: honour the `--sat-[no-]bve-additive-fastelim` kill-switch
 /// override if set, else apply the variable-count band
 /// (`num_vars > AY_BVE_ADDITIVE_MIN_VARS`). Computed once per BVE engine at
 /// construction from the solver's current var count — the same way the env
@@ -585,7 +579,7 @@ pub(crate) struct BVE {
     neg_profile_buf: Vec<ResolveClauseProfile>,
     /// Scoped BVE (#8369): variables with index < this floor are protected.
     scope_var_floor: usize,
-    /// Lever `AY_AB_BVE_ADDITIVE_FASTELIM` (wf_eab7d219, banded wf_e2bdf6e1):
+    /// Lever `--sat-[no-]bve-additive-fastelim` (wf_eab7d219, banded wf_e2bdf6e1):
     /// when true, the Pass-1 fastelim budget (`fastelim_mode && !quick_elim_mode`)
     /// switches from CaDiCaL's no-growth `min(clauses_removed, growth_bound)` to
     /// kissat's ADDITIVE `clauses_removed + growth_bound` (resolve.c:283-294).
@@ -597,7 +591,7 @@ pub(crate) struct BVE {
     /// default (ACTIVE iff `num_vars > AY_BVE_ADDITIVE_MIN_VARS` = 200K), which
     /// captures the ebbda8d9 723K flip (UNKNOWN -> cake_lpr-VERIFIED UNSAT)
     /// while leaving the small floor byte-identical (6f354fbe 48K, the
-    /// regression sentinel, stays below the band). `AY_AB_BVE_ADDITIVE_FASTELIM=1`
+    /// regression sentinel, stays below the band). `--sat-[no-]bve-additive-fastelim`
     /// forces it ON everywhere, `=0` forces it OFF everywhere. See
     /// `resolvent_budget`, `additive_fastelim_default`, `additive_fastelim_override`.
     additive_fastelim: bool,

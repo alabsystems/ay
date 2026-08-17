@@ -10,11 +10,14 @@ fn probe_triage_matches(lits: &[Literal]) -> bool {
     use std::sync::OnceLock;
     static T: OnceLock<Option<Vec<i64>>> = OnceLock::new();
     let t = T.get_or_init(|| {
-        std::env::var("AY_AB_TRIAGE_PROBE").ok().map(|s| {
-            let mut v: Vec<i64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-            v.sort_unstable();
-            v
-        })
+        ay_core::misc_cli_flags()
+            .ab_triage_probe
+            .as_deref()
+            .map(|s| {
+                let mut v: Vec<i64> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                v.sort_unstable();
+                v
+            })
     });
     match t {
         Some(t) => {
@@ -191,7 +194,7 @@ impl Solver {
     }
 
     /// Soundness-triage: dump the probe's conflict clause and every
-    /// decision-level reason with garbage flags (AY_AB_TRIAGE_PROBE).
+    /// decision-level reason with garbage flags (--sat-ab-triage-probe).
     fn dump_probe_conflict_for_triage(&mut self, conflict_ref: ClauseRef) {
         let dump_clause = |arena: &ClauseArena, off: usize| -> String {
             let lits: Vec<String> = arena

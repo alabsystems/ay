@@ -362,7 +362,7 @@ fn occurs_check_rejects_self_referential_store() {
 
 #[test]
 fn enabled_by_default() {
-    if std::env::var("AY_CHC_DISABLE_ARRAY_STORE_FORWARDING").is_err() {
+    if crate::ab_switches::get().array_store_forwarding {
         assert!(array_store_forwarding_enabled());
     }
 }

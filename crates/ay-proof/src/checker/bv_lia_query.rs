@@ -22,6 +22,8 @@ use num_traits::{One, ToPrimitive, Zero};
 
 #[path = "bv_lia_query_eval.rs"]
 mod application_evaluation;
+#[path = "bv_lia_query_guarded.rs"]
+mod guarded_range;
 #[path = "bv_lia_query_int.rs"]
 mod integer_evaluation;
 #[path = "bv_lia_query_pins.rs"]
@@ -52,12 +54,10 @@ const MAX_TERM_DEPTH: usize = 256;
 const MAX_ENUMERATED_ASSIGNMENTS: u64 = 1 << 16;
 const MAX_PROPAGATION_ROUNDS: usize = 512;
 const MAX_WORK: u64 = MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA;
-// Keep exact integer evaluation small enough that one multiplication cannot
-// consume unmetered process memory before the logical work budget is checked.
+// Bound exact integer evaluation so multiplication cannot consume unmetered memory.
 const MAX_INTEGER_BITS: u64 = 1 << 16;
-// Bounds, dimensions, and one reusable assignment environment all retain owned
-// BigInts. Bound their combined payload independently of the logical work
-// budget so repeated source constants cannot accumulate before we decline.
+// Bound retained BigInts independently of logical work so repeated source
+// constants cannot accumulate before we decline.
 const MAX_LIVE_INTEGER_LIMBS: u64 = 1 << 20;
 
 /// Opaque evidence that one exact ordered Bool/Int/BV query is UNSAT.
@@ -956,7 +956,7 @@ impl<'a> QueryChecker<'a> {
                 return Ok(true);
             }
         }
-        Ok(false)
+        self.has_guarded_bv2nat_range_contradiction(assertions)
     }
 
     fn interval_proves_false(

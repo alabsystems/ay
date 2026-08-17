@@ -8,13 +8,12 @@ use super::*;
 use ay_frontend::parse;
 
 #[test]
-fn w4_default_tracks_the_env_kill_switch() {
-    // W4 went DEFAULT-ON (`AY_STR_W4=0` is the kill switch); this test
+fn w4_defaults_on() {
+    // W4 went DEFAULT-ON (`--dpll-no-str-w4` is the kill switch); this test
     // previously asserted the pre-default-on contract and had gone stale.
-    assert_eq!(
+    assert!(
         str_w4_enabled(),
-        !matches!(std::env::var("AY_STR_W4").ok().as_deref(), Some("0")),
-        "W4 is DEFAULT-ON; only AY_STR_W4=0 turns it off"
+        "W4 must default ON (`--dpll-no-str-w4` kills it)"
     );
 }
 
@@ -76,15 +75,10 @@ fn pick_char_prefers_fresh_then_alphabet() {
 
 #[test]
 fn work_budget_default_and_kill_switch() {
-    // Default is the calibrated cap; `AY_STR_W4_WORK=0` restores the
-    // pre-budget unbounded search exactly.
-    match std::env::var("AY_STR_W4_WORK").ok().as_deref() {
-        Some("0") => assert_eq!(w4_search_work_budget(), None),
-        Some(s) if s.trim().parse::<u64>().is_ok() => {
-            assert_eq!(w4_search_work_budget(), Some(s.trim().parse().unwrap()));
-        }
-        _ => assert_eq!(w4_search_work_budget(), Some(MAX_W4_SEARCH_WORK)),
-    }
+    // Default is the calibrated cap; `--str-w4-work 0` restores the
+    // pre-budget unbounded search exactly (B42: the override is CLI-owned,
+    // so the default arm is unconditional here).
+    assert_eq!(w4_search_work_budget(), Some(MAX_W4_SEARCH_WORK));
 }
 
 #[test]

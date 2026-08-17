@@ -965,7 +965,7 @@ impl Solver {
             false,
         );
 
-        if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+        if ay_core::misc_cli_flags().ab_subst_stats {
             eprintln!(
                 "AB_DECOMPOSE: substituted={} unsat={} units={}",
                 result.substituted,

@@ -63,4 +63,13 @@ pub enum SatTechnique {
     Walk,
     /// Search warmup phase.
     Warmup,
+    /// Signed (literal-level) symmetry search (B2: CLI opt-out replacing the
+    /// retired env gate; the route itself remains opt-in pending its default
+    /// decision).
+    SymmetrySigned,
+    /// Aux-free pigeonhole SR refutation route (default ON; this is its
+    /// opt-out).
+    SymmetryAuxfree,
+    /// Orbitope symmetry route (default ON; this is its opt-out).
+    SymmetryOrbitope,
 }

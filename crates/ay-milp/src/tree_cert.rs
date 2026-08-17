@@ -65,7 +65,7 @@ struct FloatCtx {
     warm: std::cell::RefCell<Option<(Vec<usize>, Vec<NbBound>)>>,
 }
 
-/// Finalize diagnostics (trace-only; `AY_MILP_TRACE`). Which lane certified
+/// Finalize diagnostics (trace-only; `--trace`). Which lane certified
 /// each leaf, how the float lane declined when it did, and how the
 /// size-preference lane (see [`compact_leaf`]) fared.
 mod fstats {
@@ -535,10 +535,10 @@ impl TreeCapture {
             self.leaf_cap,
             &budget,
         );
-        if std::env::var_os("AY_MILP_TRACE").is_some() {
+        if crate::debug_flags::milp_debug_flags().trace {
             use std::sync::atomic::Ordering::Relaxed;
             eprintln!(
-                "AY_MILP_TRACE FINALIZE {} in {:.2}s: leaves={} float_ok={} float_status={} float_verify={} exact_ok={} exact_fail={}",
+                "--trace FINALIZE {} in {:.2}s: leaves={} float_ok={} float_status={} float_verify={} exact_ok={} exact_fail={}",
                 if root.is_some() { "ok" } else { "FAILED" },
                 t0.elapsed().as_secs_f64(),
                 leaves_used,
@@ -549,7 +549,7 @@ impl TreeCapture {
                 fstats::EXACT_FAIL.load(Relaxed),
             );
             eprintln!(
-                "AY_MILP_TRACE COMPACT ok={} miss={} skip={} off={} float={:.2}s compaction={:.2}s",
+                "--trace COMPACT ok={} miss={} skip={} off={} float={:.2}s compaction={:.2}s",
                 fstats::COMPACT_OK.load(Relaxed),
                 fstats::COMPACT_MISS.load(Relaxed),
                 fstats::COMPACT_SKIP.load(Relaxed),
@@ -886,7 +886,7 @@ impl FinalizeBudget {
 /// | `W1_sat_v83_c328_000008` | 1980 x 1567 | grace expired, NONE   | `SUCCINCT farkas`, 5.6 ms |
 /// | `W1_sat_v91_c217_000008` | 1600 x 1290 | grace expired, NONE   | `SUCCINCT farkas`, 3.2 ms |
 ///
-/// (Both DO have a root witness: with `AY_MILP_CERT_GRACE=0` the exact rim
+/// (Both DO have a root witness: with `--cert-grace-secs` the exact rim
 /// finds one in 29.0 s and 16.4 s respectively. The evidence was never
 /// missing — only unaffordable.)
 ///

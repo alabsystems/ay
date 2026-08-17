@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W7 — chain-definition, multi-atom and witness-enumerating witness moves
-//! (default ON, `AY_STR_W7=0` kill switch).
+//! (default ON, `--dpll-no-str-w7` kill switch).
 //!
 //! ## The measured gap W7 closes
 //!
@@ -147,7 +147,7 @@
 //!   trial models change on every propagation round).
 //! * **No guard removed, nothing relaxed.** [`Executor::w7_defs`] is `None`
 //!   outside this pass, so W4/W5/W6 and every gate are byte-identical with
-//!   `AY_STR_W7` unset; the definition-unwrapping only ever changes which
+//!   `--dpll-no-str-w7` unset; the definition-unwrapping only ever changes which
 //!   CANDIDATES are built, never which are accepted.
 //! * **Branch selections and Boolean/Int pins are model CONTENT, not
 //!   assumptions.** They ride `Model::bool_overrides` / `Model::lia_model` —
@@ -166,15 +166,15 @@ use crate::executor_types::{Result, SolveResult};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, MAX_W4_LEN};
 
-/// Master switch (default ON, `AY_STR_W7=0` kill switch → byte-identical to W6-only).
+/// Master switch (default ON, `--dpll-no-str-w7` kill switch → byte-identical to W6-only).
 pub(in crate::executor) fn str_w7_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 6 further conversions (3 ip_int_from_string, Leetcode
     // partition, kaluza bettermatch1, stringfuzz regex-026), EVERY ONE
     // confirmed by AY's own fail-closed --self-check; 600-file sweep 6 gains /
     // 0 losses / 0 soundness flips; flags-off identity measured 600/600.
-    // AY_STR_W7=0 is the kill switch.
-    *V.get_or_init(|| !matches!(std::env::var("AY_STR_W7").ok().as_deref(), Some("0")))
+    // --dpll-no-str-w7 is the kill switch.
+    *V.get_or_init(|| !ay_core::theory_disable_flags().no_str_w7)
 }
 
 /// String variables W7 will handle jointly.

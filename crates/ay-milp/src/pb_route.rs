@@ -79,7 +79,7 @@ const GENERIC_PORTFOLIO_TRIAL_CAP: Duration = Duration::from_millis(500);
 ///   dcmulti   1.124s -> 0.606s    1.9x     gt2       2.787s -> 1.781s   1.6x
 /// ```
 ///
-/// (measured as `AY_MILP_NO_STRUCTURE_ROUTE=1`, which removes the whole
+/// (measured as `SolveOpts::with_structure_routing(false)`, which removes the whole
 /// prelude; the PB arm is the largest single share — a prior profile put
 /// `try_solve_production_portfolio` at 398 of 730 samples on `markshare_5_0`.)
 ///
@@ -278,7 +278,7 @@ where
         Ok(plan) => plan,
         Err(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE pb-specialized: translation-declined={reason:?}");
+                eprintln!("--trace pb-specialized: translation-declined={reason:?}");
             }
             return None;
         }
@@ -297,7 +297,7 @@ where
             let point = checked_point(model, &plan, &assignment, deadline)?;
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE pb-specialized: engine=single-row-dp vars={} constraints={} \
+                    "--trace pb-specialized: engine=single-row-dp vars={} constraints={} \
                      objective=false verdict=FEASIBLE wall={:.6}s",
                     plan.num_vars,
                     plan.num_constraints,
@@ -312,7 +312,7 @@ where
         Ok(SingleRowDpOutcome::Infeasible) => {
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE pb-specialized: engine=single-row-dp vars={} constraints={} \
+                    "--trace pb-specialized: engine=single-row-dp vars={} constraints={} \
                      objective={} verdict=INFEASIBLE wall={:.6}s",
                     plan.num_vars,
                     plan.num_constraints,
@@ -337,7 +337,7 @@ where
             )?;
             if trace_enabled() {
                 eprintln!(
-                    "AY_MILP_TRACE pb-specialized: engine=single-row-dp vars={} constraints={} \
+                    "--trace pb-specialized: engine=single-row-dp vars={} constraints={} \
                      objective=true verdict=OPTIMAL wall={:.6}s",
                     plan.num_vars,
                     plan.num_constraints,
@@ -351,7 +351,7 @@ where
         }
         Err(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE pb-specialized: single-row-dp-declined={reason:?}");
+                eprintln!("--trace pb-specialized: single-row-dp-declined={reason:?}");
             }
         }
     }
@@ -568,7 +568,7 @@ where
         Ok(plan) => plan,
         Err(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE pb-generic-trial: translation-declined={reason:?}");
+                eprintln!("--trace pb-generic-trial: translation-declined={reason:?}");
             }
             return None;
         }
@@ -647,7 +647,7 @@ where
                 PbRouteDecision::Optimal { .. } => "OPTIMAL",
             };
             eprintln!(
-                "AY_MILP_TRACE pb-generic-trial: engine=pb-cdcl vars={} constraints={} objective={} \
+                "--trace pb-generic-trial: engine=pb-cdcl vars={} constraints={} objective={} \
                  verdict={verdict} wall={:.6}s",
                 plan.num_vars,
                 plan.num_constraints,
@@ -773,7 +773,7 @@ pub(crate) fn try_solve_production_portfolio(
     let plan = translate(model, Some(admission_deadline));
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE pb-portfolio-admission: translate={:.6}s outcome={}",
+            "--trace pb-portfolio-admission: translate={:.6}s outcome={}",
             started.elapsed().as_secs_f64(),
             match &plan {
                 Ok(_) => "plan",
@@ -793,7 +793,7 @@ pub(crate) fn try_solve_production_portfolio(
         portfolio_trial_deadline(ownership, outer_deadline, started, Some(translation))?;
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE pb-portfolio-policy: class={} workers={} budget={:.6}s",
+            "--trace pb-portfolio-policy: class={} workers={} budget={:.6}s",
             ownership.trace_name(),
             workers.map_or(1, NonZeroUsize::get),
             trial_deadline
@@ -913,7 +913,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
     let detect_wall = detect_started.elapsed();
     if trace_enabled() {
         eprintln!(
-            "AY_MILP_TRACE pb-block-symmetry-source: model-candidates={} pb-candidates={} path={}",
+            "--trace pb-block-symmetry-source: model-candidates={} pb-candidates={} path={}",
             model_column_candidates.len(),
             pb_candidates.len(),
             if structural_changed {
@@ -944,7 +944,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
     {
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE pb-block-symmetry: generators={} sequential-generators={} \
+                "--trace pb-block-symmetry: generators={} sequential-generators={} \
                  lex-rows={} lex-aux-vars={} source-vars={} augmented-vars={} \
                  verdict=INVALID-AUGMENTATION detect={:.6}s wall={:.6}s",
                 symmetry.vector_transposition_generators,
@@ -962,7 +962,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
     if !compact_core_instance_admitted(&augmented) {
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE pb-block-symmetry: generators={} sequential-generators={} \
+                "--trace pb-block-symmetry: generators={} sequential-generators={} \
                  lex-rows={} lex-aux-vars={} source-vars={} augmented-vars={} \
                  constraints={} verdict=DECLINED-AUGMENTED-ENVELOPE detect={:.6}s wall={:.6}s",
                 symmetry.vector_transposition_generators,
@@ -983,7 +983,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
     if !augmentation_admitted || admission_deadline_reached {
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE pb-block-symmetry: generators={} sequential-generators={} \
+                "--trace pb-block-symmetry: generators={} sequential-generators={} \
                  lex-rows={} lex-aux-vars={} source-vars={} augmented-vars={} \
                  verdict={} detect={:.6}s wall={:.6}s",
                 symmetry.vector_transposition_generators,
@@ -1061,7 +1061,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
     if deadline_reached(Some(trial_deadline)) {
         if trace_enabled() {
             eprintln!(
-                "AY_MILP_TRACE pb-block-symmetry: generators={} sequential-generators={} \
+                "--trace pb-block-symmetry: generators={} sequential-generators={} \
                  lex-rows={} lex-aux-vars={} lex-width={} lex-coeff-bits={} \
                  source-coeff-bits={} augmented-coeff-bits={} \
                  source-vars={} augmented-vars={} solver-status={:?} verdict=DEADLINE \
@@ -1148,7 +1148,7 @@ fn try_solve_verified_block_symmetry_trial_with_candidates(
             None => "DECLINED",
         };
         eprintln!(
-            "AY_MILP_TRACE pb-block-symmetry: generators={} sequential-generators={} \
+            "--trace pb-block-symmetry: generators={} sequential-generators={} \
              lex-rows={} lex-aux-vars={} lex-width={} lex-coeff-bits={} \
              source-coeff-bits={} augmented-coeff-bits={} source-vars={} augmented-vars={} \
              constraints={} verdict={} portfolio-pre-native-ms={} portfolio-native-ms={} \
@@ -1387,7 +1387,7 @@ where
             None => "DECLINED",
         };
         eprintln!(
-            "AY_MILP_TRACE pb-portfolio-trial: vars={} constraints={} verdict={} wall={:.6}s",
+            "--trace pb-portfolio-trial: vars={} constraints={} verdict={} wall={:.6}s",
             plan.num_vars,
             plan.num_constraints,
             verdict,
@@ -1738,7 +1738,7 @@ fn trace_enabled() -> bool {
     // `set_var` can race, which priming cannot help. `OnceLock` is the shape
     // that ratchet asks for and `simplex.rs` already uses.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 #[cfg(test)]

@@ -5,6 +5,90 @@
 use super::*;
 
 impl Executor {
+    /// Translate one independently checked false arithmetic instance of an
+    /// authored universal into an authored-scope strict proof.
+    ///
+    /// The exact closed-forall lane already authenticates the source query,
+    /// binder tuple, raw substitution, and false ground instance before it
+    /// calls this helper. Translation is still independently fail-closed: the
+    /// candidate assumes only the frozen authored scope, derives the instance
+    /// through `forall_inst`, closes it with a checker-replayed Farkas lemma,
+    /// and is installed only after the ordinary strict checker accepts the
+    /// complete empty-clause derivation.  Failure leaves all proof state
+    /// untouched so the caller can retain its semantic-only authority class.
+    pub(in crate::executor) fn try_translate_arithmetic_forall_instance_unsat(
+        &mut self,
+        forall_root: TermId,
+        value: TermId,
+    ) -> bool {
+        const MAX_AUTHORED_ROOTS: usize = 64;
+        const MAX_FARKAS_PREMISES: usize = 4;
+
+        let authored = self.exact_concrete_authored_scope();
+        if authored.is_empty() || authored.len() > MAX_AUTHORED_ROOTS {
+            return false;
+        }
+        let TermData::Forall(bindings, body, _) = self.ctx.terms.get(forall_root).clone() else {
+            return false;
+        };
+        let [(binder_name, binder_sort)] = bindings.as_slice() else {
+            return false;
+        };
+        if self.ctx.terms.sort(value) != binder_sort {
+            return false;
+        }
+        let Some(instance) = Self::substitute_single_binder_structurally(
+            &mut self.ctx.terms,
+            body,
+            binder_name,
+            value,
+        ) else {
+            return false;
+        };
+        let Some(candidate) = self.build_arithmetic_forall_instance_refutation(
+            forall_root,
+            value,
+            instance,
+            &authored,
+            MAX_FARKAS_PREMISES,
+        ) else {
+            return false;
+        };
+        if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored).is_err()
+            || !Self::proof_derives_empty_clause(&candidate)
+        {
+            return false;
+        }
+        let quality = match self.check_proof_strict_with_datatypes(&candidate) {
+            Ok(quality) => quality,
+            Err(_) => return false,
+        };
+        if !quality.is_complete() {
+            return false;
+        }
+
+        self.proof_check_result = None;
+        self.proof_check_ok = false;
+        self.last_proof_quality = None;
+        #[cfg(feature = "proof-checker")]
+        {
+            self.run_internal_proof_check(&candidate);
+            if !self.proof_check_ok {
+                self.proof_check_result = None;
+                return false;
+            }
+        }
+        #[cfg(not(feature = "proof-checker"))]
+        if self.self_check() {
+            return false;
+        }
+        self.populate_proof_quality_stats(&quality);
+        self.last_proof_quality = Some(quality);
+        self.last_unsat_proof_reconstruction_suppressed = false;
+        self.last_proof = Some(candidate);
+        true
+    }
+
     /// Rebuild a UNIVERSAL-INSTANTIATION refutation whose instance is refuted
     /// by the REST of the authored problem rather than being the literal
     /// complement of one authored root (#trust-count→0).
@@ -105,40 +189,28 @@ impl Executor {
         // binder. The value search below is per-binder, and both shapes this
         // lane closes bind one variable; a multi-binder `forall` is left to the
         // complement-matching sibling, whose values are read off rather than
-        // searched. A body that is itself a binder is skipped because
-        // `validate_forall_inst` fails closed on nested binders, so proposing
-        // one could only produce a candidate the checker rejects.
-        let forall_roots: Vec<(TermId, String, Sort, TermId)> = authored
-            .iter()
-            .filter_map(|&root| {
-                let TermData::Forall(bindings, body, _) = self.ctx.terms.get(root) else {
-                    return None;
-                };
-                let body = *body;
-                let [(name, sort)] = bindings.as_slice() else {
-                    return None;
-                };
-                if matches!(
-                    self.ctx.terms.get(body),
-                    TermData::Forall(..) | TermData::Exists(..) | TermData::Let(..)
-                ) {
-                    return None;
-                }
-                Some((root, name.clone(), sort.clone(), body))
-            })
-            .collect();
+        // searched. This flat conflict lane skips nested binders because the
+        // bounded nested-chain producer owns them.
+        let forall_roots = self.flat_authored_forall_roots(&authored);
         if forall_roots.is_empty() {
             return;
         }
 
         let mut proposals = 0usize;
         for (forall_root, binder_name, binder_sort, body) in &forall_roots {
-            let values = Self::ground_instantiation_candidates(
+            let mut values = Self::ground_instantiation_candidates(
                 &self.ctx.terms,
                 &authored,
                 binder_sort,
                 MAX_INSTANTIATION_VALUES,
             );
+            // A universal can be refuted by a ground value even when the
+            // authored scope contains no ground subterm of its binder sort.
+            // Seed the arithmetic search with the canonical zero value used by
+            // the enumerative quantifier lane. This is only a producer-side
+            // hint: `forall_inst` re-checks the exact substitution and the
+            // Farkas validator independently proves the resulting conflict.
+            self.seed_canonical_arithmetic_zero(binder_sort, &mut values, MAX_INSTANTIATION_VALUES);
             for value in values {
                 proposals += 1;
                 if proposals > MAX_PROPOSALS {
@@ -167,137 +239,59 @@ impl Executor {
         }
     }
 
-    /// Producer-side HINT: ground terms of `sort` that could instantiate a
-    /// binder, drawn from the authored scope's own sub-terms.
-    ///
-    /// The scan deliberately STOPS at every binder instead of descending into
-    /// its body. That is what makes each proposal ground without a separate
-    /// occurrence check: a bound variable can only appear under its own
-    /// binder, so nothing reachable from this walk can mention one. Declared
-    /// constants (which the term store represents as variables) are therefore
-    /// eligible values, exactly as `validate_forall_inst` allows — it requires
-    /// the argument to be ground with respect to the SOURCE BINDERS, not free
-    /// of every variable.
-    ///
-    /// This decides nothing. `validate_forall_inst` re-checks the argument's
-    /// sort and groundness and re-derives the substitution, so a useless
-    /// proposal can only cost this pass one declined candidate.
-    fn ground_instantiation_candidates(
-        terms: &TermStore,
+    fn flat_authored_forall_roots(
+        &self,
         authored: &[TermId],
-        sort: &Sort,
-        limit: usize,
-    ) -> Vec<TermId> {
-        /// Sub-term visits per scan. The scope is already capped, but a single
-        /// deeply-shared assertion can still be large.
-        const MAX_SCAN_WORK: usize = 20_000;
-
-        let mut found: Vec<TermId> = Vec::new();
-        let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
-        let mut work = 0usize;
-        let mut stack: Vec<TermId> = authored.to_vec();
-        while let Some(term) = stack.pop() {
-            if !seen.insert(term) {
-                continue;
-            }
-            work += 1;
-            if work > MAX_SCAN_WORK || found.len() >= limit {
-                break;
-            }
-            if terms.sort(term) == sort {
-                found.push(term);
-            }
-            match terms.get(term) {
-                TermData::App(_, args) => stack.extend(args.iter().copied()),
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(condition, then_branch, else_branch) => {
-                    stack.extend([*condition, *then_branch, *else_branch]);
+    ) -> Vec<(TermId, String, Sort, TermId)> {
+        authored
+            .iter()
+            .filter_map(|&root| {
+                let TermData::Forall(bindings, body, _) = self.ctx.terms.get(root) else {
+                    return None;
+                };
+                let body = *body;
+                let [(name, sort)] = bindings.as_slice() else {
+                    return None;
+                };
+                if matches!(
+                    self.ctx.terms.get(body),
+                    TermData::Forall(..) | TermData::Exists(..) | TermData::Let(..)
+                ) {
+                    return None;
                 }
-                // Binders are NOT descended into — see the doc comment.
-                _ => {}
-            }
-        }
-        found
+                Some((root, name.clone(), sort.clone(), body))
+            })
+            .collect()
     }
 
-    /// Producer-side HINT: build `body[binder := value]` with RAW constructors.
-    ///
-    /// `validate_forall_inst`'s `matches_substitution` compares the instance to
-    /// the body node by node, so the instance must be the LITERAL substitution
-    /// — a folding builder (`mk_and`, `mk_ite`, `mk_or`) would collapse
-    /// `(ite (< 5 0) 0 1)` to `1` and the checker would (correctly) refuse the
-    /// result as "not the exact simultaneous binder substitution". Every node
-    /// is therefore rebuilt through `mk_app` / `mk_ite_raw` / `mk_not_raw`,
-    /// which intern without simplifying, at the ORIGINAL node's sort (only a
-    /// same-sorted variable is replaced, so no sort can change).
-    ///
-    /// Returns `None` for a body carrying a nested binder or a `let`, matching
-    /// the strict validator's own deliberate restriction.
-    fn substitute_single_binder_structurally(
-        terms: &mut TermStore,
-        body: TermId,
-        binder_name: &str,
-        value: TermId,
-    ) -> Option<TermId> {
-        /// Node budget for one substitution.
-        const MAX_SUBST_WORK: usize = 20_000;
-
-        fn walk(
-            terms: &mut TermStore,
-            term: TermId,
-            binder_name: &str,
-            value: TermId,
-            work: &mut usize,
-            memo: &mut std::collections::HashMap<TermId, Option<TermId>>,
-        ) -> Option<TermId> {
-            if let Some(&cached) = memo.get(&term) {
-                return cached;
-            }
-            *work += 1;
-            if *work > MAX_SUBST_WORK {
-                return None;
-            }
-            let sort = terms.sort(term).clone();
-            let rebuilt = match terms.get(term).clone() {
-                TermData::Var(name, _) if name == binder_name => {
-                    (terms.sort(value) == &sort).then_some(value)
-                }
-                TermData::Var(..) | TermData::Const(..) => Some(term),
-                TermData::Not(inner) => {
-                    let inner = walk(terms, inner, binder_name, value, work, memo)?;
-                    Some(terms.mk_not_raw(inner))
-                }
-                TermData::Ite(condition, then_branch, else_branch) => {
-                    let condition = walk(terms, condition, binder_name, value, work, memo)?;
-                    let then_branch = walk(terms, then_branch, binder_name, value, work, memo)?;
-                    let else_branch = walk(terms, else_branch, binder_name, value, work, memo)?;
-                    Some(terms.mk_ite_raw(condition, then_branch, else_branch))
-                }
-                TermData::App(symbol, args) => {
-                    let mut rebuilt = Vec::with_capacity(args.len());
-                    for arg in args {
-                        rebuilt.push(walk(terms, arg, binder_name, value, work, memo)?);
-                    }
-                    Some(terms.mk_app(symbol, rebuilt, sort.clone()))
-                }
-                // A nested binder or `let` is rejected rather than descended
-                // into: capture-avoidance is exactly what the strict validator
-                // refuses to approximate, and so does this.
-                _ => None,
-            };
-            memo.insert(term, rebuilt);
-            rebuilt
+    fn seed_canonical_arithmetic_zero(
+        &mut self,
+        sort: &Sort,
+        values: &mut Vec<TermId>,
+        limit: usize,
+    ) {
+        let zero = match sort {
+            Sort::Int => Some(self.ctx.terms.mk_int(BigInt::from(0))),
+            Sort::Real => Some(
+                self.ctx
+                    .terms
+                    .mk_rational(num_rational::BigRational::from_integer(BigInt::from(0))),
+            ),
+            _ => None,
+        };
+        let Some(zero) = zero else {
+            return;
+        };
+        if let Some(position) = values.iter().position(|&value| value == zero) {
+            let _ = values.remove(position);
         }
-
-        let mut work = 0usize;
-        let mut memo = std::collections::HashMap::new();
-        let instance = walk(terms, body, binder_name, value, &mut work, &mut memo)?;
-        (terms.sort(instance) == &Sort::Bool).then_some(instance)
+        values.insert(0, zero);
+        values.truncate(limit);
     }
 
     /// Emit the shared prologue `assume F` → `forall_inst` → `or` →
     /// `resolution`, leaving the unit clause `(cl instance)`.
-    fn add_forall_instance_prologue(
+    pub(super) fn add_forall_instance_prologue(
         &mut self,
         candidate: &mut Proof,
         forall_root: TermId,
@@ -323,6 +317,54 @@ impl Executor {
             Vec::new(),
         );
         candidate.add_resolution(vec![instance], forall_root, clausified, forall_assume)
+    }
+
+    /// Derive a negated, false closed arithmetic comparison with the strict
+    /// `evaluate` rule. Recognition here is deliberately only syntactic: the
+    /// proof checker re-evaluates the exact comparison and rejects the
+    /// candidate unless it really is false.
+    fn add_closed_false_comparison_unit(
+        &mut self,
+        candidate: &mut Proof,
+        instance: TermId,
+    ) -> Option<ProofId> {
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(instance) else {
+            return None;
+        };
+        if !matches!(name.as_str(), "=" | "<" | "<=" | ">" | ">=")
+            || args.is_empty()
+            || !args
+                .iter()
+                .all(|&arg| matches!(self.ctx.terms.get(arg), TermData::Const(_)))
+        {
+            return None;
+        }
+
+        let false_term = self.ctx.terms.false_term();
+        let equality =
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("="), [instance, false_term], Sort::Bool);
+        let evaluated =
+            candidate.add_rule_step(AletheRule::Evaluate, vec![equality], Vec::new(), Vec::new());
+        let not_equality = self.ctx.terms.mk_not_raw(equality);
+        let not_instance = self.ctx.terms.mk_not_raw(instance);
+        let tautology = candidate.add_rule_step(
+            AletheRule::EquivPos2,
+            vec![not_equality, not_instance, false_term],
+            Vec::new(),
+            Vec::new(),
+        );
+        let elided = candidate.add_resolution(
+            vec![not_instance, false_term],
+            equality,
+            tautology,
+            evaluated,
+        );
+        let not_false = self.ctx.terms.mk_not_raw(false_term);
+        let false_taut =
+            candidate.add_rule_step(AletheRule::True, vec![not_false], Vec::new(), Vec::new());
+        Some(candidate.add_resolution(vec![not_instance], false_term, false_taut, elided))
     }
 
     /// Build the refutation: the instance together with a subset of the
@@ -352,26 +394,36 @@ impl Executor {
         if !arithmetic_instance {
             return None;
         }
-        let trailing = vec![Self::negated_root_literal(&mut self.ctx.terms, instance)];
-        let (clause, farkas, kind, premises) =
-            self.search_authored_farkas_conflict(&trailing, authored, max_premises)?;
-
         let mut candidate = Proof::new();
         let unit = self.add_forall_instance_prologue(&mut candidate, forall_root, value, instance);
-        let mut current =
-            candidate.add_theory_lemma_with_farkas_and_kind("LRA", clause.clone(), farkas, kind);
-        let mut remaining = clause;
-        let supports: Vec<(TermId, ProofId)> = premises
-            .iter()
-            .map(|&root| (root, candidate.add_assume(root, None)))
-            .chain(std::iter::once((instance, unit)))
-            .collect();
-        for (pivot, support) in supports {
-            let negated = Self::negated_root_literal(&mut self.ctx.terms, pivot);
-            let position = remaining.iter().position(|&literal| literal == negated)?;
-            let _ = remaining.remove(position);
-            current = candidate.add_resolution(remaining.clone(), pivot, current, support);
+
+        let trailing = vec![Self::negated_root_literal(&mut self.ctx.terms, instance)];
+        if let Some((clause, farkas, kind, premises)) =
+            self.search_authored_farkas_conflict(&trailing, authored, max_premises)
+        {
+            let mut current = candidate.add_theory_lemma_with_farkas_and_kind(
+                "LRA",
+                clause.clone(),
+                farkas,
+                kind,
+            );
+            let mut remaining = clause;
+            let supports: Vec<(TermId, ProofId)> = premises
+                .iter()
+                .map(|&root| (root, candidate.add_assume(root, None)))
+                .chain(std::iter::once((instance, unit)))
+                .collect();
+            for (pivot, support) in supports {
+                let negated = Self::negated_root_literal(&mut self.ctx.terms, pivot);
+                let position = remaining.iter().position(|&literal| literal == negated)?;
+                let _ = remaining.remove(position);
+                current = candidate.add_resolution(remaining.clone(), pivot, current, support);
+            }
+            return remaining.is_empty().then_some(candidate);
         }
-        remaining.is_empty().then_some(candidate)
+
+        let negated_unit = self.add_closed_false_comparison_unit(&mut candidate, instance)?;
+        let _empty = candidate.add_resolution(Vec::new(), instance, unit, negated_unit);
+        Some(candidate)
     }
 }

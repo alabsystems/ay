@@ -9,7 +9,7 @@
 #
 #   THE PORTFOLIO MUST PROVABLY DOMINATE ITS OWN FALLBACK. For every model,
 #   routing must yield a verdict at least as strong AND evidence at least as
-#   strong as `AY_MILP_NO_STRUCTURE_ROUTE=1` would have.
+#   strong as `--no-structure-route` would have.
 #
 # `tests/portfolio_dominance.rs` pins the mechanism on synthetic models. This
 # script pins the OUTCOME on a real corpus, which is the half that actually
@@ -50,8 +50,8 @@ for m in "$DIR"/*.mps "$DIR"/*.mps.gz; do
   total=$((total + 1))
   for arm in routed anchor; do
     rm -f "$m.ayc"
-    if [ "$arm" = anchor ]; then env_pfx=(env AY_MILP_NO_STRUCTURE_ROUTE=1); else env_pfx=(env); fi
-    v=$("${env_pfx[@]}" "$BIN" solve "$m" --time-limit "$TL" 2>&1 \
+    if [ "$arm" = anchor ]; then arm_flags=(--no-structure-route); else arm_flags=(); fi
+    v=$("$BIN" solve "$m" --time-limit "$TL" "${arm_flags[@]}" 2>&1 \
         | grep -E '^(INFEASIBLE|OPTIMAL|UNKNOWN|FEASIBLE|UNBOUNDED|BOUND)' | head -1 | awk '{print $1}')
     "$BIN" verify --model "$m" --cert "$m.ayc" >/dev/null 2>&1; e=$?
     if [ "$arm" = routed ]; then rv=$v; re=$e; else av=$v; ae=$e; fi

@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! STAGE B: tests for the incremental decision-candidate index that backs the
-//! fast `suggest_decision_atom` path (`AY_LRA_FAST_DECISION`).
+//! fast `suggest_decision_atom` path (`--no-lra-fast-decision`).
 //!
 //! The index is soundness-neutral — it only reorders decision *suggestions* —
 //! so the properties under test are structural: (1) the compact set primitive

@@ -83,8 +83,7 @@ fn execute_constraint_safe(
         || execute_constraint(ctx, constraint),
         |reason| {
             Err(ExecuteError::ConstraintExecution(format!(
-                "constraint translation panic: {}",
-                reason
+                "constraint translation panic: {reason}"
             )))
         },
     )
@@ -118,8 +117,7 @@ fn append_get_values(
         },
         |reason| {
             Err(ExecuteError::ConstraintExecution(format!(
-                "constraint translation panic: {}",
-                reason
+                "constraint translation panic: {reason}"
             )))
         },
     )?;
@@ -127,9 +125,9 @@ fn append_get_values(
     let values_result: Result<ExecuteValueMap<ModelValue>, String> = catch_execute_stage(
         || {
             extract_get_values_from_terms_typed(ctx, &translated_terms)
-                .map_err(|e| format!("get-value extraction failed: {}", e))
+                .map_err(|e| format!("get-value extraction failed: {e}"))
         },
-        |reason| Err(format!("get-value extraction panic: {}", reason)),
+        |reason| Err(format!("get-value extraction panic: {reason}")),
     );
 
     match values_result {
@@ -162,7 +160,7 @@ fn run_check_sat(
             |reason| {
                 Err(ExecuteDegradation {
                     kind: ExecuteDegradationKind::SolverPanic,
-                    message: format!("solver panic: {}", reason),
+                    message: format!("solver panic: {reason}"),
                 })
             },
         )
@@ -177,7 +175,7 @@ fn run_check_sat(
             |reason| {
                 Err(ExecuteDegradation {
                     kind: ExecuteDegradationKind::SolverPanic,
-                    message: format!("solver panic: {}", reason),
+                    message: format!("solver panic: {reason}"),
                 })
             },
         )
@@ -212,8 +210,8 @@ fn run_check_sat(
         }
         Ok(SolveResult::Sat) => {
             let model_result: Result<ExecuteValueMap<ModelValue>, String> = catch_execute_stage(
-                || extract_model_typed(&ctx).map_err(|e| format!("model extraction failed: {}", e)),
-                |reason| Err(format!("model extraction panic: {}", reason)),
+                || extract_model_typed(ctx).map_err(|e| format!("model extraction failed: {e}")),
+                |reason| Err(format!("model extraction panic: {reason}")),
             );
             match model_result {
                 Ok(model) => Ok(CheckSatOutcome {

@@ -539,7 +539,7 @@ fn split_sym_routed_through_preprocess_pipeline() {
 /// AY_CHC_DISABLE_SPLIT_SYM is set to a non-zero value.
 #[test]
 fn split_sym_enabled_by_default() {
-    if std::env::var("AY_CHC_DISABLE_SPLIT_SYM").is_err() {
+    if crate::ab_switches::get().split_sym {
         assert!(split_sym_enabled());
     }
 }

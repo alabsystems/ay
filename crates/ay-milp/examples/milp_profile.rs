@@ -6,10 +6,10 @@
 //      LP engine even run" question (PFI cannot on the downstream optimization consumer's hard-six sizes),
 //   2. the full MIP feasibility solve (BabSession::check).
 //
-// The LU / Forrest-Tomlin engine is env-gated by AY_MILP_LU=1 at simplex.rs:473,
+// The LU / Forrest-Tomlin engine is env-gated by --lu at simplex.rs:473,
 // exercised by both sessions. Run:
 //   milp_profile <file.milp> <seconds> [lp|mip|both|shared|proof|family]
-// `shared` / `proof` / `family` read AY_MILP_PREFIX_COLS as comma-separated
+// `shared` / `proof` / `family` read --prefix-cols as comma-separated
 // column indices. `shared` is the staged one-root serial native frontier;
 // `proof` prepares its prefix LPs on AY_MILP_PREFIX_WORKERS owned workers;
 // `family` is the old cloned-session control under one common wall deadline.
@@ -245,18 +245,41 @@ fn build_model(text: &str, relax: bool) -> (Model, usize, usize, usize, Vec<(usi
     (model, nc, nr, bins, objective)
 }
 
+// B20: --basis-file <path> example flag (was a retired env var).
+fn basis_file_arg() -> String {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == "--basis-file" {
+            if let Some(v) = args.next() {
+                return v;
+            }
+        }
+    }
+    "/tmp/ay_root_basis.txt".into()
+}
+
 fn main() {
-    let mut args = std::env::args().skip(1);
+    // B40b: harness switches ride the shared engine CLI parser
+    // (--lu, --prefix-cols i,j, --obbt-cols <file>) instead of env.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut value_flags: Vec<&str> = ay_milp::engine_cli::VALUE_FLAGS.to_vec();
+    value_flags.push("prefix-cols");
+    value_flags.push("obbt-cols");
+    let flags = ay_milp::engine_cli::Flags::parse(&raw, &value_flags).unwrap_or_else(|e| {
+        eprintln!("usage: milp_profile <file.milp> <seconds> [lp|mip|both] [--flags]: {e}");
+        std::process::exit(2);
+    });
+    let mut args = flags.positional.iter().cloned();
     let path = args
         .next()
         .expect("usage: milp_profile <file.milp> <seconds> [lp|mip|both]");
     let secs: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
     let mode = args.next().unwrap_or_else(|| "both".to_string());
 
-    let lu = std::env::var_os("AY_MILP_LU").is_some();
+    let lu = flags.has("lu");
     eprintln!(
-        "=== AY_MILP_LU={} timeout={secs}s mode={mode} ===",
-        if lu { "1" } else { "unset" }
+        "=== lu={} timeout={secs}s mode={mode} ===",
+        if lu { "on" } else { "off" }
     );
 
     let text = std::fs::read_to_string(&path).expect("read .milp");
@@ -322,7 +345,7 @@ fn main() {
         let out = s.check();
         let dt = t2.elapsed().as_secs_f64();
         // Caller-side stamp of the finalization-split instrument (see the
-        // `AY_MILP_TRACE finalize:` lines in bab.rs): the gap between bab's
+        // `--trace finalize:` lines in bab.rs): the gap between bab's
         // "outcome built" line and this one is the session-layer + drop cost.
         eprintln!("MIP check returned: {dt:.3}s");
         let tag = match &out {
@@ -361,8 +384,10 @@ fn main() {
     }
 
     if mode == "shared" || mode == "proof" || mode == "family" {
-        let prefix_text = std::env::var("AY_MILP_PREFIX_COLS")
-            .expect("shared/proof/family mode requires AY_MILP_PREFIX_COLS=i,j,...");
+        let prefix_text = flags
+            .get("prefix-cols")
+            .cloned()
+            .expect("shared/proof/family mode requires --prefix-cols i,j,...");
         let prefix_idx: Vec<usize> = prefix_text
             .split(',')
             .map(|part| part.trim().parse().expect("integer prefix column"))
@@ -379,11 +404,9 @@ fn main() {
             let shared_opts = opts.clone().with_tree_cert_leaves(0);
             let mut session = BabSession::new(model, &shared_opts).expect("shared session setup");
             let out = if mode == "proof" {
-                let workers = std::env::var("AY_MILP_PREFIX_WORKERS")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .and_then(NonZeroUsize::new)
-                    .unwrap_or(NonZeroUsize::new(8).expect("eight is nonzero"));
+                // B7: the AY_MILP_PREFIX_WORKERS env override is deleted; the
+                // profile example uses the fixed default.
+                let workers = NonZeroUsize::new(8).expect("eight is nonzero");
                 session.check_shared_binary_prefix_proof_first(&prefix, workers)
             } else {
                 session.check_shared_binary_prefix(&prefix)
@@ -468,22 +491,21 @@ fn main() {
     }
 
     if mode == "dumproot" {
-        // MEASUREMENT: cold root LP -> dump the optimal basis (AY_BASIS_FILE).
+        // MEASUREMENT: cold root LP -> dump the optimal basis (--basis-file).
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
-        let path =
-            std::env::var("AY_BASIS_FILE").unwrap_or_else(|_| "/tmp/ay_root_basis.txt".into());
+        let path = basis_file_arg();
         println!("{}", ay_milp::diag_dump_root_basis(&model, secs, &path));
         return;
     }
 
     if mode == "pinprobe" {
-        // MEASUREMENT: reload a dumped basis (AY_BASIS_FILE) and pin-probe
-        // column AY_PIN_COL to 0 and 1 — the dive's probe shape, in minutes.
+        // MEASUREMENT: reload a dumped basis (--basis-file) and pin-probe the
+        // 4th-positional-arg column to 0 and 1 — the dive's probe shape, in
+        // minutes. (B9: the AY_PIN_COL env selector became the CLI arg.)
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
-        let path =
-            std::env::var("AY_BASIS_FILE").unwrap_or_else(|_| "/tmp/ay_root_basis.txt".into());
-        let col: usize = std::env::var("AY_PIN_COL")
-            .ok()
+        let path = basis_file_arg();
+        let col: usize = std::env::args()
+            .nth(4)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         println!("{}", ay_milp::diag_pin_probe(&model, secs, &path, col));
@@ -491,22 +513,21 @@ fn main() {
     }
 
     if mode == "bumpdiff" {
-        // DIFFERENTIAL-CORRECTNESS HARNESS: reload a dumped basis (AY_BASIS_FILE)
+        // DIFFERENTIAL-CORRECTNESS HARNESS: reload a dumped basis (--basis-file)
         // and factor it on BOTH trusted lanes (PFI slot-order vs Markowitz
         // bump-LU), reporting the max FTRAN/BTRAN diff. Near-zero (~1e-9..1e-6) =
         // the harness self-validates (the two lanes produce the same B⁻¹), so it
         // is trustworthy for the future block-triangular-factor (BTF) lane. Set
-        // AY_MILP_BUMP_LU_MIN=1 so lane 1 takes the bump-LU path on a modest bump.
+        // the bump-lu-min knob at 1 so lane 1 takes the bump-LU path on a modest bump.
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
-        let path =
-            std::env::var("AY_BASIS_FILE").unwrap_or_else(|_| "/tmp/ay_root_basis.txt".into());
+        let path = basis_file_arg();
         println!("{}", ay_milp::diag_bump_lu_diff(&model, &path));
         return;
     }
 
     if mode == "presolve" {
         // MEASUREMENT: root presolve alone (tighten_bounds -> tighten_coefficients)
-        // with `secs` as its whole deadline. AY_MILP_TRACE=1 for per-round lines.
+        // with `secs` as its whole deadline. --trace for per-round lines.
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
         println!("{}", ay_milp::diag_presolve(&model, secs));
         return;
@@ -615,10 +636,10 @@ fn main() {
     if mode == "obbt" {
         // DECOMPOSITION box-tightening: rigorous OBBT (fixpoint of NS-safe
         // min+max, outward-rounded) on the pre-activation columns named in
-        // AY_OBBT_COLS. A pre-activation whose box tightens off 0 turns its
+        // --obbt-cols. A pre-activation whose box tightens off 0 turns its
         // ReLU stable -> its binary is removable. Sound by construction: every
         // bound is a rigorous dual bound weakened outward, so a box can only
-        // over-approximate. AY_OBBT_OUT (optional) writes `col lb ub` per
+        // over-approximate. An optional 5th positional arg writes `col lb ub` per
         // tightened column for re-emission.
         use ay_milp::ObbtOpts;
         let t_parse = Instant::now();
@@ -627,10 +648,12 @@ fn main() {
             "OBBT parse+build(relaxed): {:.3}s",
             t_parse.elapsed().as_secs_f64()
         );
-        let cols_path = std::env::var("AY_OBBT_COLS")
-            .expect("obbt mode needs AY_OBBT_COLS=<file of column indices>");
+        let cols_path = flags
+            .get("obbt-cols")
+            .cloned()
+            .expect("obbt mode needs --obbt-cols <file of column indices>");
         let idxs: Vec<usize> = std::fs::read_to_string(&cols_path)
-            .expect("read AY_OBBT_COLS")
+            .expect("read --obbt-cols file")
             .lines()
             .filter_map(|l| l.trim().parse().ok())
             .collect();
@@ -646,8 +669,10 @@ fn main() {
             cols.len(),
             n_straddle0
         );
-        let rounds: usize = std::env::var("AY_OBBT_ROUNDS")
-            .ok()
+        // B9: rounds moved from the AY_OBBT_ROUNDS env var to the example's
+        // 4th positional arg.
+        let rounds: usize = std::env::args()
+            .nth(4)
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
         let mut lp = match LpSession::new(&model, &opts) {
@@ -679,7 +704,7 @@ fn main() {
             Ok(rep) => {
                 let mut freed = 0usize; // straddled at entry, no longer straddles
                 let mut narrowed = 0usize;
-                let out = std::env::var("AY_OBBT_OUT").ok();
+                let out = std::env::args().nth(5);
                 let mut lines = String::new();
                 for (k, _c) in cols.iter().enumerate() {
                     let (l0, u0) = before[k];
@@ -695,7 +720,7 @@ fn main() {
                     }
                 }
                 if let Some(p) = out {
-                    std::fs::write(&p, lines).expect("write AY_OBBT_OUT");
+                    std::fs::write(&p, lines).expect("write obbt out file");
                 }
                 println!(
                     "OBBT rounds={} cols_tightened={} cols_narrowed={} BINARIES_FREED={}/{} solve={:.1}s",

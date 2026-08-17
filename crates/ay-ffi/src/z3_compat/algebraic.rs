@@ -173,7 +173,8 @@ fn set_uncomputable(ctx: &mut Z3Context, who: &str) {
 /// or an `Int`/`Real` numeral.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_is_value(c: Z3_context, a: Z3_ast) -> bool {
     // SAFETY: `ffi_guard_int` null-checks `c` and catches panics; pure predicate.
@@ -211,40 +212,48 @@ unsafe fn algebraic_sign_pred(
 /// Return `1` if `a` is positive, `0` if zero, `-1` if negative.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_sign(c: Z3_context, a: Z3_ast) -> c_int {
-    // SAFETY: see algebraic_sign_pred.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_sign_pred` rejects a non-algebraic operand before projection.
     unsafe { algebraic_sign_pred(c, a, "Z3_algebraic_sign", |s| s) }
 }
 
 /// Return `true` if `a` is positive.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_is_pos(c: Z3_context, a: Z3_ast) -> bool {
-    // SAFETY: see algebraic_sign_pred.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_sign_pred` rejects a non-algebraic operand before this predicate.
     unsafe { algebraic_sign_pred(c, a, "Z3_algebraic_is_pos", |s| c_int::from(s > 0)) != 0 }
 }
 
 /// Return `true` if `a` is negative.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_is_neg(c: Z3_context, a: Z3_ast) -> bool {
-    // SAFETY: see algebraic_sign_pred.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_sign_pred` rejects a non-algebraic operand before this predicate.
     unsafe { algebraic_sign_pred(c, a, "Z3_algebraic_is_neg", |s| c_int::from(s < 0)) != 0 }
 }
 
 /// Return `true` if `a` is zero.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_is_zero(c: Z3_context, a: Z3_ast) -> bool {
-    // SAFETY: see algebraic_sign_pred.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_sign_pred` rejects a non-algebraic operand before this predicate.
     unsafe { algebraic_sign_pred(c, a, "Z3_algebraic_is_zero", |s| c_int::from(s == 0)) != 0 }
 }
 
@@ -255,7 +264,8 @@ pub unsafe extern "C" fn Z3_algebraic_is_zero(c: Z3_context, a: Z3_ast) -> bool 
 /// Compute a binary field operation over exact scalars and intern the result.
 ///
 /// # Safety
-/// `c` valid or null.
+/// Non-null `c` must point to a live context that is not concurrently accessed
+/// for the duration of this call.
 unsafe fn algebraic_binop(
     c: Z3_context,
     a: Z3_ast,
@@ -290,40 +300,48 @@ unsafe fn algebraic_binop(
 /// Return the exact value `a + b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_add(c: Z3_context, a: Z3_ast, b: Z3_ast) -> Z3_ast {
-    // SAFETY: see algebraic_binop.
+    // SAFETY: the caller grants exclusive access to the live context;
+    // `algebraic_binop` rejects invalid operands before allocating the result.
     unsafe { algebraic_binop(c, a, b, "Z3_algebraic_add", |x, y| x.add(y)) }
 }
 
 /// Return the exact value `a - b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_sub(c: Z3_context, a: Z3_ast, b: Z3_ast) -> Z3_ast {
-    // SAFETY: see algebraic_binop.
+    // SAFETY: the caller grants exclusive access to the live context;
+    // `algebraic_binop` rejects invalid operands before allocating the result.
     unsafe { algebraic_binop(c, a, b, "Z3_algebraic_sub", |x, y| x.add(&y.neg())) }
 }
 
 /// Return the exact value `a * b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_mul(c: Z3_context, a: Z3_ast, b: Z3_ast) -> Z3_ast {
-    // SAFETY: see algebraic_binop.
+    // SAFETY: the caller grants exclusive access to the live context;
+    // `algebraic_binop` rejects invalid operands before allocating the result.
     unsafe { algebraic_binop(c, a, b, "Z3_algebraic_mul", |x, y| x.mul(y)) }
 }
 
 /// Return the exact value `a / b` (`Z3_INVALID_ARG` on a zero divisor).
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_div(c: Z3_context, a: Z3_ast, b: Z3_ast) -> Z3_ast {
-    // SAFETY: see algebraic_binop.
+    // SAFETY: the caller grants exclusive access to the live context;
+    // `algebraic_binop` rejects invalid operands before allocating the result.
     unsafe {
         algebraic_binop(c, a, b, "Z3_algebraic_div", |x, y| {
             y.recip().and_then(|iy| x.mul(&iy))
@@ -334,7 +352,8 @@ pub unsafe extern "C" fn Z3_algebraic_div(c: Z3_context, a: Z3_ast, b: Z3_ast) -
 /// Return the exact value `a^k` (`k` unsigned; `k == 0` → `1`).
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_power(c: Z3_context, a: Z3_ast, k: c_uint) -> Z3_ast {
     // SAFETY: `ffi_guard_ast` null-checks `c` and catches panics.
@@ -377,7 +396,8 @@ pub unsafe extern "C" fn Z3_algebraic_power(c: Z3_context, a: Z3_ast, k: c_uint)
 /// Exact comparison predicate; non-value → `Z3_INVALID_ARG` + false.
 ///
 /// # Safety
-/// `c` valid or null.
+/// Non-null `c` must point to a live context that is not concurrently accessed
+/// for the duration of this call.
 unsafe fn algebraic_cmp(
     c: Z3_context,
     a: Z3_ast,
@@ -406,60 +426,72 @@ unsafe fn algebraic_cmp(
 /// Return `true` if `a < b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_lt(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_lt", |o| o == Ordering::Less) }
 }
 
 /// Return `true` if `a > b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_gt(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_gt", |o| o == Ordering::Greater) }
 }
 
 /// Return `true` if `a <= b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_le(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_le", |o| o != Ordering::Greater) }
 }
 
 /// Return `true` if `a >= b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_ge(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_ge", |o| o != Ordering::Less) }
 }
 
 /// Return `true` if `a == b` (GCD-certified equality).
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_eq(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_eq", |o| o == Ordering::Equal) }
 }
 
 /// Return `true` if `a != b`.
 ///
 /// # Safety
-/// `c` must be a valid context pointer.
+/// `c` must point to a live context that is not concurrently accessed for the
+/// duration of this call.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_algebraic_neq(c: Z3_context, a: Z3_ast, b: Z3_ast) -> bool {
-    // SAFETY: see algebraic_cmp.
+    // SAFETY: the caller supplies a valid, exclusively accessed context;
+    // `algebraic_cmp` rejects non-algebraic operands before this predicate.
     unsafe { algebraic_cmp(c, a, b, "Z3_algebraic_neq", |o| o != Ordering::Equal) }
 }
 

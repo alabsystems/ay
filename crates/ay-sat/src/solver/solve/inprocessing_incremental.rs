@@ -37,14 +37,9 @@ use super::super::*;
 /// Returns `Some(Some(n))` to force divisor n, `Some(None)` to force legacy,
 /// `None` when unset (use the configured field).
 fn incremental_inprobe_env_override() -> Option<Option<u64>> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<Option<u64>>> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("AY_SAT_INCR_INPROBE_DIV")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|n| if n > 0 { Some(n) } else { None })
-    })
+    // B21: the AY_SAT_INCR_INPROBE_DIV experimentation knob is retired; the
+    // typed field (cold.incremental_inprobe_clause_divisor) is the carrier.
+    None
 }
 
 impl Solver {

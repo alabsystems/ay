@@ -789,7 +789,8 @@ pub unsafe extern "C" fn Z3_optimize_maximize(c: Z3_context, o: Z3_optimize, t: 
 /// `t` is a u64 AST handle.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_optimize_minimize(c: Z3_context, o: Z3_optimize, t: Z3_ast) -> c_uint {
-    // SAFETY: see `Z3_optimize_maximize`.
+    // SAFETY: the caller supplies live context and optimize handles;
+    // `optimize_register_objective` null-checks both before registering `t`.
     unsafe { optimize_register_objective(c, o, t, ObjectiveSense::Minimize) }
 }
 
@@ -872,7 +873,8 @@ pub unsafe extern "C" fn Z3_optimize_get_lower(
     o: Z3_optimize,
     idx: c_uint,
 ) -> Z3_ast {
-    // SAFETY: see `Z3_optimize_get_upper`.
+    // SAFETY: the caller supplies live context and optimize handles;
+    // `optimize_get_objective_ast` null-checks them and bounds-checks `idx`.
     unsafe { optimize_get_objective_ast(c, o, idx) }
 }
 
@@ -1309,7 +1311,8 @@ pub unsafe extern "C" fn Z3_optimize_get_lower_as_vector(
     o: Z3_optimize,
     idx: c_uint,
 ) -> Z3_ast_vector {
-    // SAFETY: see `optimize_get_objective_vector`.
+    // SAFETY: the caller supplies live context and optimize handles;
+    // `optimize_get_objective_vector` null-checks them and bounds-checks `idx`.
     unsafe { optimize_get_objective_vector(c, o, idx) }
 }
 
@@ -1326,7 +1329,8 @@ pub unsafe extern "C" fn Z3_optimize_get_upper_as_vector(
     o: Z3_optimize,
     idx: c_uint,
 ) -> Z3_ast_vector {
-    // SAFETY: see `optimize_get_objective_vector`.
+    // SAFETY: the caller supplies live context and optimize handles;
+    // `optimize_get_objective_vector` null-checks them and bounds-checks `idx`.
     unsafe { optimize_get_objective_vector(c, o, idx) }
 }
 

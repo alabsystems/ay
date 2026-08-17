@@ -589,7 +589,7 @@ pub fn independent_support(
             removed += 1;
         }
     }
-    if std::env::var_os("AY_COUNT_DEBUG").is_some() {
+    if std::env::var_os("--count-debug").is_some() {
         eprintln!("c o [debug] indep support: removed {removed} of {k} candidates");
     }
     // Accept only a SUBSTANTIAL support reduction: the one corpus win

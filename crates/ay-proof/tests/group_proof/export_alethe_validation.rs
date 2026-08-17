@@ -390,7 +390,7 @@ fn exports_renested_surface_and_pos_certificate_that_carcara_accepts() {
     );
     assert!(!alethe.contains(":rule hole"), "{alethe}");
     assert!(!alethe.contains(":rule trust"), "{alethe}");
-    // The strict publication gate (`AY_PROOF_SELF_CHECK=strict`) refuses any
+    // The strict publication gate (`--proof-self-check`) refuses any
     // document AY's own round-trip checker rejects; a bridge that only
     // carcara accepts would still fail publication.
     check_alethe_document(
@@ -443,7 +443,7 @@ fn exports_flattened_conjunct_and_pos_certificate_that_carcara_accepts() {
     );
     assert!(!alethe.contains(":rule hole"), "{alethe}");
     assert!(!alethe.contains(":rule trust"), "{alethe}");
-    // The strict publication gate (`AY_PROOF_SELF_CHECK=strict`) refuses any
+    // The strict publication gate (`--proof-self-check`) refuses any
     // document AY's own round-trip checker rejects; a bridge that only
     // carcara accepts would still fail publication.
     check_alethe_document(

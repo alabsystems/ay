@@ -54,7 +54,7 @@
 //! deadline-polled exact scan of every public column, row, and objective term;
 //! any structural doubt returns `None` and hands the model straight to the
 //! normal search. Deadline expiry returns `Unknown::Timeout`, never a late
-//! verdict. Kill switch: `AY_MILP_NO_PARITY`.
+//! verdict. Kill switch: `--no-parity`.
 
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -641,7 +641,7 @@ fn enumerate_remaining(
 /// Public entry: decide the enlight-class instance exactly, or `None`.
 pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<Outcome> {
     clear_pending_infeasibility_certificate();
-    if std::env::var_os("AY_MILP_NO_PARITY").is_some() {
+    if crate::tune::caller_flag(crate::tune::Knob::NoParity) == Some(true) {
         return None;
     }
     try_solve_enabled(model, deadline)
@@ -649,7 +649,7 @@ pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<Outc
 
 /// Core of the parity solver, with the env kill-switch already handled by
 /// `try_solve`. The firing tests call this directly so they never read (and so
-/// never race) the process-global `AY_MILP_NO_PARITY` env var under parallel
+/// never race) the process-global `--no-parity` env var under parallel
 /// `cargo test`; only `kill_switch_disables_device` touches the env.
 fn try_solve_enabled(model: &Model, deadline: Option<Instant>) -> Option<Outcome> {
     try_solve_with_deadline(model, Deadline::new(deadline))
@@ -677,7 +677,7 @@ fn try_solve_with_deadline(model: &Model, deadline: Deadline<'_>) -> Option<Outc
 /// race — and that ratchet may only move DOWN.
 fn trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcome> {
@@ -686,7 +686,7 @@ fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcom
     let p = detect(model, deadline)?;
     if trace {
         eprintln!(
-            "AY_MILP_TRACE parity: lights-out shape {}x{} — GF(2) elimination",
+            "--trace parity: lights-out shape {}x{} — GF(2) elimination",
             p.m, p.n
         );
     }
@@ -694,7 +694,7 @@ fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcom
     let rr = rref(&p, deadline)?;
     if let Some(source_rows) = &rr.inconsistency {
         if trace {
-            eprintln!("AY_MILP_TRACE parity: GF(2) system INCONSISTENT — INFEASIBLE");
+            eprintln!("--trace parity: GF(2) system INCONSISTENT — INFEASIBLE");
         }
         let rows = source_rows
             .set_indices(p.m)
@@ -714,7 +714,7 @@ fn try_solve_inner(model: &Model, deadline: Deadline<'_>) -> ParityResult<Outcom
     let rank = rr.piv.len();
     let nullity = (p.n - rank) as u32;
     if trace {
-        eprintln!("AY_MILP_TRACE parity: rank {rank}, nullity {nullity}");
+        eprintln!("--trace parity: rank {rank}, nullity {nullity}");
     }
 
     // Free columns = columns that are not a pivot.
@@ -878,7 +878,7 @@ fn finish(
         // and we decline (fail-closed) rather than emit anything.
         if num.is_negative() || num.bit(0) {
             if trace {
-                eprintln!("AY_MILP_TRACE parity: slack reconstruction off — declining");
+                eprintln!("--trace parity: slack reconstruction off — declining");
             }
             return Err(ParityAbort::Declined);
         }
@@ -890,7 +890,7 @@ fn finish(
         Ok(value) => value,
         Err(ParityAbort::Declined) => {
             if trace {
-                eprintln!("AY_MILP_TRACE parity: witness rejected by exact verifier — declining");
+                eprintln!("--trace parity: witness rejected by exact verifier — declining");
             }
             return Err(ParityAbort::Declined);
         }
@@ -898,7 +898,7 @@ fn finish(
     };
     if proved_optimal {
         if trace {
-            eprintln!("AY_MILP_TRACE parity: PROVEN OPTIMAL value {value}");
+            eprintln!("--trace parity: PROVEN OPTIMAL value {value}");
         }
         deadline.check()?;
         Ok(Outcome::Optimal {
@@ -908,9 +908,7 @@ fn finish(
         })
     } else {
         if trace {
-            eprintln!(
-                "AY_MILP_TRACE parity: FEASIBLE witness value {value} (kernel too large to prove)"
-            );
+            eprintln!("--trace parity: FEASIBLE witness value {value} (kernel too large to prove)");
         }
         deadline.check()?;
         Ok(Outcome::Feasible {
@@ -1035,10 +1033,13 @@ mod tests {
     #[test]
     fn kill_switch_disables_device() {
         let m = parity_model(&[vec![1]], &[-1]);
-        let out =
-            ay_test_support::env::with_serialized_env_vars(&[("AY_MILP_NO_PARITY", "1")], || {
-                try_solve(&m, deadline())
-            });
+        let out = {
+            let _t = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+                crate::tune::Knob::NoParity,
+                crate::tune::Setting::Flag(true),
+            ));
+            try_solve(&m, deadline())
+        };
         assert!(out.is_none(), "kill switch must disable the device");
     }
 

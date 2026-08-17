@@ -1520,10 +1520,10 @@ impl Executor {
             // Temporarily add assumptions to ctx.assertions for depth axiom
             // generation (#1768). This ensures depth congruence axioms are
             // generated for assumption equalities.
-            let original_assertions_len = self.ctx.assertions.len();
+            let original_assertions_exact = self.ctx.assertions.clone();
             self.ctx.assertions.extend(assumptions.iter().copied());
             let axioms = self.dt_acyclicity_depth_axioms(sort);
-            self.ctx.assertions.truncate(original_assertions_len);
+            self.ctx.assertions = original_assertions_exact;
 
             self.dt_solver_added_axiom_terms
                 .extend(axioms.iter().copied());
@@ -1538,7 +1538,7 @@ impl Executor {
         // the scope of the non-assuming DT solve methods (#3240). Selector
         // axioms are not added here because the model evaluator lacks full
         // DT selector-constructor reduction semantics.
-        let pre_solve_len = self.ctx.assertions.len();
+        let pre_solve_assertions_exact = self.ctx.assertions.clone();
         self.ctx.assertions.extend(acyclicity_axioms);
 
         let result = match dispatch {
@@ -1554,7 +1554,7 @@ impl Executor {
         };
 
         // Restore assertions after solving.
-        self.ctx.assertions.truncate(pre_solve_len);
+        self.ctx.assertions = pre_solve_assertions_exact;
         self.dt_solver_added_axiom_terms.clear();
         result
     }

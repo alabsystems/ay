@@ -5,11 +5,11 @@
 //! SLS A/B sweep harness (Task V4). Measures the unified NuPBO-class SLS and the
 //! candidate feasibility-wall levers against the two-phase baseline on synthetic
 //! hard families (market_split / Cornuéjols-Dawande equality systems, plus
-//! covering / cardinality / partition shapes). Gated behind the `AY_SLS_SWEEP`
+//! covering / cardinality / partition shapes). Gated behind the `--sls-sweep`
 //! env var so it is a no-op in normal `cargo test`; run with:
 //!
 //! ```text
-//! AY_SLS_SWEEP=1 cargo test -p ay-pb --lib optimize::sls_sweep -- --nocapture
+//! --sls-sweep=1 cargo test -p ay-pb --lib optimize::sls_sweep -- --nocapture
 //! ```
 //!
 //! Every reported incumbent is re-verified by `verify_all_constraints`, so this
@@ -211,10 +211,9 @@ fn run_one(
                 // feasible point to the unified loop as a warm start for objective
                 // descent (crosses the equality ridge). Mirrors the shippable
                 // portfolio lever.
-                let frac: f64 = std::env::var("AY_SLS_FEAS_FRAC")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.5);
+                // B14: fixed split (the AY_SLS_FEAS_FRAC dial nothing set
+                // is retired).
+                let frac: f64 = 0.5;
                 let feas = budget.mul_f64(frac);
                 let rest = budget.saturating_sub(feas);
                 let feas_deadline = Some(Instant::now() + feas);
@@ -249,10 +248,9 @@ fn run_one(
                 // each on half the budget. The global best-incumbent aggregation
                 // gives feasibility = either-found, objective = min — strictly
                 // dominating either pass alone.
-                let frac: f64 = std::env::var("AY_SLS_FEAS_FRAC")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.34);
+                // B14: fixed split (the AY_SLS_FEAS_FRAC dial nothing set
+                // is retired).
+                let frac: f64 = 0.34;
                 let feas = budget.mul_f64(frac);
                 let rest = budget.saturating_sub(feas);
                 let r1 = search_with_options(
@@ -323,27 +321,22 @@ fn market_split_planted(m: usize, rng: &mut SplitMix64) -> (PbInstance, PbObject
 /// Gated controlled measurement: planted-feasible market split, endgame-swap A/B.
 /// Run with e.g.
 /// ```text
-/// AY_SLS_PLANTED=1 cargo test -p ay-pb --lib \
+/// --sls-planted=1 cargo test -p ay-pb --lib \
 ///   optimize::sls_sweep::market_split_planted_swap_ab -- --nocapture
 /// ```
-/// (default endgame swap on) and again with `AY_PB_SLS_ENDGAME_THRESHOLD=0` for the
+/// (default endgame swap on) and again with `--pb-sls-endgame-threshold=0` for the
 /// swap-off (single-flip) baseline. The test asserts 0-wrong (VIG) always; it never
 /// asserts a feasibility count (the lever's value is measured, not required, since
 /// some draws can still be hard).
 #[test]
 fn market_split_planted_swap_ab() {
-    if std::env::var_os("AY_SLS_PLANTED").is_none() {
+    if !ay_core::misc_cli_flags().sls_planted {
         return; // gated: no-op in normal test runs
     }
-    let budget = Duration::from_millis(
-        std::env::var("AY_SLS_SWEEP_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
-    );
-    let threshold = std::env::var("AY_PB_SLS_ENDGAME_THRESHOLD")
-        .ok()
-        .unwrap_or_else(|| "(default)".into());
+    let budget = Duration::from_secs(1);
+    let threshold = ay_core::misc_cli_flags()
+        .pb_sls_endgame_threshold
+        .map_or_else(|| "(default)".to_string(), |n| n.to_string());
     println!(
         "\n=== planted-feasible market split (budget {} ms, endgame_threshold={}) ===",
         budget.as_millis(),
@@ -353,14 +346,8 @@ fn market_split_planted_swap_ab() {
         "{:>6} {:>5} {:>10} {:>10} {:>10}",
         "m", "n", "baseline", "combined", "both"
     );
-    let count: usize = std::env::var("AY_SLS_PLANTED_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let m_list: Vec<usize> = std::env::var("AY_SLS_PLANTED_M")
-        .ok()
-        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![3usize, 4, 5, 6]);
+    let count: usize = 8;
+    let m_list: Vec<usize> = vec![3usize, 4, 5, 6];
     for &m in &m_list {
         let (mut b_feas, mut c_feas, mut t_feas) = (0, 0, 0);
         for inst_i in 0..count {
@@ -388,15 +375,10 @@ fn market_split_planted_swap_ab() {
 
 #[test]
 fn sls_feasibility_wall_sweep() {
-    if std::env::var_os("AY_SLS_SWEEP").is_none() {
+    if !ay_core::misc_cli_flags().sls_sweep {
         return; // gated: no-op in normal test runs
     }
-    let budget = Duration::from_millis(
-        std::env::var("AY_SLS_SWEEP_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1000),
-    );
+    let budget = Duration::from_secs(1);
     let modes = ["baseline", "unified", "combined", "both"];
     let nmodes = modes.len();
 

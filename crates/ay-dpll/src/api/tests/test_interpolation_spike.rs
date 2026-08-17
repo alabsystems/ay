@@ -1252,7 +1252,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
          empty_genuine={empty_clause_genuine}",
         proof.steps.len()
     );
-    if std::env::var("AY_SPIKE_DUMP").is_ok() {
+    if ay_core::misc_cli_flags().spike_dump {
         for (i, step) in proof.steps.iter().enumerate() {
             let desc = match step {
                 ProofStep::Assume(t) => {
@@ -1326,7 +1326,7 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
         "{label}: B side must be SAT alone"
     );
 
-    let verbose = std::env::var("AY_SPIKE_VERBOSE").is_ok();
+    let verbose = ay_core::misc_cli_flags().spike_verbose;
     let mut interp = Interpolator::new(&solver, &part, verbose);
     let t1 = ay_core::time::Instant::now();
     let itp = interp.interpolate(&proof);

@@ -7,6 +7,8 @@
 //! Extracted from `executor.rs` for code health — the check-sat pipeline
 //! is the largest cohesive unit in the executor.
 
+mod nested_array_quarantine;
+
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::time::Instant;
@@ -21,7 +23,7 @@ use std::time::Duration;
 
 use super::mbqi::CheckedDtSatAuthority;
 use super::quantified_sat::ProjectionSatAttempt;
-use super::quantifier_loop::unsupported_arith_mentions_ce_var;
+use super::quantifier_loop::unsupported_int_div_mod_mentions_ce_var;
 use super::theories::bv_cnf_dump;
 use super::theories::ArrayExtWitnessRootViolation;
 use super::{AuthoredPlainHardQueryPermit, Executor};
@@ -118,7 +120,7 @@ pub(super) fn contains_symbolic_integer_power(terms: &TermStore, roots: &[TermId
     false
 }
 
-/// `AY_NESTED_ARRAY_RESIDUE_RESCUE=0` opts out of the nested-array-free
+/// `--dpll-no-nested-array-residue-rescue` opts out of the nested-array-free
 /// entailed-residue rescue (AY `=0` convention), restoring byte-identical
 /// pre-change behavior: the quarantine degrades on every nested-array UNSAT.
 ///
@@ -126,7 +128,9 @@ pub(super) fn contains_symbolic_integer_power(terms: &TermStore, roots: &[TermId
 /// quarantine that would otherwise fire), and the A/B tests flip the variable
 /// within a single process.
 fn nested_array_residue_rescue_enabled() -> bool {
-    !std::env::var("AY_NESTED_ARRAY_RESIDUE_RESCUE").is_ok_and(|value| value == "0")
+    // B28: CLI-owned (--dpll-no-nested-array-residue-rescue); env retired
+    // (the "tests flip it in-process" doc claim was stale — nothing set it).
+    !ay_core::theory_disable_flags().no_nested_array_residue_rescue
 }
 
 /// Verify the finalized private CNF/DRAT pair emitted for a `--self-check`
@@ -175,17 +179,13 @@ fn has_only_uf_lia_theories(features: &StaticFeatures) -> bool {
         && !features.has_int_div_mod
 }
 
-/// Kill switch (`AY_DPLL_NO_DT_UFLIA=1`) for the array-free DT+LIA routing that
+/// Kill switch (`--dpll-no-dt-uflia`) for the array-free DT+LIA routing that
 /// sends `DtAuflia`/`Ufdtlia`/`Aufdtlia` problems through the UF+LIA combiner
 /// (`solve_dt_uf_lia`) instead of the array-enabled `solve_dt_auflia`. Cached so
 /// the per-query dispatch stays allocation-free. Default OFF (routing enabled).
 fn dt_uflia_routing_disabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("AY_DPLL_NO_DT_UFLIA")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *FLAG.get_or_init(|| ay_core::theory_disable_flags().no_dt_uflia)
 }
 
 impl Executor {
@@ -512,7 +512,7 @@ impl Executor {
         // theory route ran or which in-place passes it applied.
         let scope_tracked_assertions = self.ctx.assertions.clone();
 
-        // #ite-lift (kill-switch AY_DPLL_ITE_LIFT, default OFF): eager LINEAR
+        // #ite-lift (kill-switch --dpll-ite-lift, default OFF): eager LINEAR
         // definitional naming of term-level ITEs. Replaces the default Shannon
         // expansion (which explodes on chained min-selection ITEs compared by
         // ordering atoms — see executor::ite_lift) with fresh-variable
@@ -552,7 +552,7 @@ impl Executor {
         );
 
         // Sound symmetry breaking for finite-model QF_UF (default ON,
-        // `AY_EUF_LNH=0` disables). Prefers CADE'11 least-index prefix clauses
+        // `--dpll-no-euf-lnh` disables). Prefers CADE'11 least-index prefix clauses
         // over totality subjects (z3's symmetry-reduce; collapses SEQ/QG
         // pigeonhole cores to level-0 cascades), falling back to the
         // unary-predicate-signature lex-leader. Both gated on a proven S_n
@@ -758,21 +758,21 @@ impl Executor {
         // defer_model_validation flag on entry.
         // Vacuity elimination is semantically exact and is needed for SAT
         // completeness (notably an outer arithmetic forall containing an inner
-        // forall whose binder disappeared after const-array folding).  Its
-        // current producer does not yet emit the derivation connecting a
-        // collapsed root to the authored quantifier, so keep the transformation
-        // for solving but mark only the UNSAT artifact lane incomplete when it
-        // actually changes the assertion vector. SAT still passes through its
-        // independent total-model certificate.
-        if self.produce_proofs_enabled() {
-            let before = self.ctx.assertions.clone();
-            self.simplify_vacuous_quantifiers();
-            if self.ctx.assertions != before {
-                self.quantified_proof_translation_incomplete = true;
-            }
-        } else {
-            self.simplify_vacuous_quantifiers();
-        }
+        // forall whose binder disappeared after const-array folding).
+        // (#vacuous-quantifier-authority) The pass certifies each TOP-LEVEL
+        // single-binder collapse from its authored root at the rewrite site
+        // (sko_forall/sko_ex flat equality over a registered fresh witness
+        // plus equivalence elimination, with the vacuousness check
+        // independently replayed) and — like the baseline wrapper this
+        // replaced — still sets `quantified_proof_translation_incomplete` for
+        // every proof-mode rewrite; per-rewrite marking at the mutation site
+        // is exactly the old whole-vector before/after compare because the
+        // hoist/infeasibility rewrites only run without proof authority. A
+        // certified collapse is discharged by the strict-proof gate at the
+        // marker's read site; only the DEFAULT-OFF
+        // `--vacuous-marker-narrow` stage skips the marker for
+        // certified rewrites (see `quant_unit_authority`).
+        self.simplify_vacuous_quantifiers();
         // Deep QE pre-pass (#qe-prepass): candidate quantifier elimination
         // (Cooper for Int, Loos-Weispfenning for Real) with binder
         // descent, ∀-duality, and capped ∃-over-∨ distribution. Adopts a
@@ -847,9 +847,48 @@ impl Executor {
         // but it does not yet translate the concrete witness into the outer
         // proof.  In proof-authorized solves, let the ordinary instantiation
         // pipeline derive the same witness from the authored `forall` instead.
+        //
+        // TWO PASSES, STRICTLY ADDITIVE (#closed-universal-authored-scope).
+        // Pass 1 runs against the AUTHORED window; pass 2 is the historical
+        // pass against the live, preprocessed one.
+        //
+        // Why the authored window has to come first: the only PUBLISHABLE
+        // outcome of this precheck is the exact closed-forall certificate, and
+        // that certificate requires the refuted `forall` to be an authored
+        // top-level conjunct AND `ctx.assertions` to still equal the epoch's
+        // authored roots (`exact_plain_hard_unsat_scope_is_current`). By the
+        // time control reaches here, several in-place passes have rewritten
+        // `ctx.assertions`, so the equality fails and the certificate declines
+        // however good the witness is — leaving only the untranslated skolem
+        // lane, which `translated_unsat_proof_required` then degrades to
+        // `unknown`. The precheck's theorem is a statement about the AUTHORED
+        // problem ("an authored top-level conjunct is unconditionally false"),
+        // so running it there is also the more faithful reading, not a
+        // convenience.
+        //
+        // Pass 2 is retained verbatim so no refutation this precheck used to
+        // find can be lost: a universal that only the preprocessed window
+        // exposes is still refuted there, and still publishes exactly what it
+        // published before (a verdict-only UNSAT on a disposable solve, or the
+        // fail-closed `unknown` on a public one).
         if has_quantified_assertions && !self.is_producing_proofs() {
+            let working_assertions =
+                std::mem::replace(&mut self.ctx.assertions, scope_tracked_assertions.clone());
+            let (authored_category, _) = self.detect_logic_category(&self.ctx.assertions);
+            let authored_precheck = self.closed_universal_validity_precheck(authored_category);
+            if authored_precheck.is_none() {
+                self.ctx.assertions = working_assertions;
+            }
+            // When preprocessing left the window untouched the two passes are
+            // the same pass; running it twice would double the cost of every
+            // quantified solve for nothing.
+            let windows_differ = self.ctx.assertions != scope_tracked_assertions;
             let (precheck_category, _) = self.detect_logic_category(&self.ctx.assertions);
-            if let Some(precheck) = self.closed_universal_validity_precheck(precheck_category) {
+            if let Some(precheck) = authored_precheck.or_else(|| {
+                windows_differ
+                    .then(|| self.closed_universal_validity_precheck(precheck_category))
+                    .flatten()
+            }) {
                 self.ctx.assertions = scope_tracked_assertions;
                 if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
                     saved_quantified_incremental_state.take()
@@ -926,6 +965,25 @@ impl Executor {
                     return Ok(SolveResult::Unknown);
                 }
                 return Ok(SolveResult::Sat);
+            }
+            // The probe shares the external query's finite-array ledger. Once
+            // exact closure is incomplete, no later retry can replenish that
+            // deterministic budget, and a SAT from any such retry would still
+            // be non-authoritative. Stop before quantifier preprocessing rather
+            // than rebuilding the same relaxed obligation after the canonical
+            // SAT revocation performed inside the probe.
+            if !self.finite_array_expansion.is_complete() {
+                self.publish_unknown_from_origin(UnknownOrigin::DeterministicResourceBudget);
+                self.ctx.assertions = scope_tracked_assertions;
+                if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
+                    saved_quantified_incremental_state.take()
+                {
+                    self.incr_theory_state = incr_theory_state;
+                    self.incr_bv_state = incr_bv_state;
+                    self.quantifier_manager = quantifier_manager;
+                }
+                self.defer_model_validation = false;
+                return Ok(SolveResult::Unknown);
             }
             // The scoped DT certificate probe runs the same singleton-sort
             // closure as ordinary dispatch. If that closure hit a full resource
@@ -1052,14 +1110,13 @@ impl Executor {
             self.defer_model_validation = true;
         }
 
-        // Bail early on quantified LIA/LRA only when unsupported arithmetic
-        // depends on the CEGQI counterexample variables. A ground div/mod atom
-        // elsewhere in a QuantifierConsumer query must not preempt the normal ground solve:
-        // interleaved E-matching may still close the quantified obligation.
+        // Fail closed when symbolic/zero integer div/mod/rem depends on a CEGQI variable.
+        // Logic widening once missed this shape and entered an effectively unbounded
+        // NIA proof-classification loop; the predicate ignores unrelated ground division and
+        // supported nonlinear multiplication.
         if qr.cegqi_has_forall
             && features.has_int_div_mod
-            && matches!(category, LogicCategory::Lia | LogicCategory::Lra)
-            && unsupported_arith_mentions_ce_var(
+            && unsupported_int_div_mod_mentions_ce_var(
                 &self.ctx.terms,
                 &self.ctx.assertions,
                 &qr.cegqi_state,
@@ -1136,12 +1193,17 @@ impl Executor {
             // dispatches (which bypass solve_array_euf) also get it. Sound — the
             // biconditional is a tautology of array extensionality over a finite
             // index domain.
-            self.add_finite_index_array_extensionality();
-            // Companion: a `(select arr i)` over a finite (Bool / enum) index
-            // domain with a SYMBOLIC index `i` must equal the value at whichever
-            // domain element `i` is; emit the ITE expansion so the ground solver
-            // case-splits it (#arr-finite-symbolic-index). Sound tautology.
-            self.add_finite_index_select_expansion();
+            let defer_finite_array_closure =
+                self.should_defer_finite_array_extensionality_to_route(category);
+            if defer_finite_array_closure {
+                // QF_AX/QF_ABV-family routes perform this exact expansion on
+                // their post-substitution assertion surface. Running it here
+                // first retains every store-flat alias inside generated
+                // biconditionals and defeats the route's array substitution.
+                self.record_finite_array_extensionality_route_deferral();
+            } else {
+                let _ = self.add_finite_index_array_closure();
+            }
         }
 
         self.set_active_solve_phase("solver-dispatch", format!("theory:{category:?}"));
@@ -1169,16 +1231,16 @@ impl Executor {
             // and the outer `emit_sat_verdict` funnel re-gates it against the
             // restored USER assertion set exactly like any other model. On
             // anything it cannot fully account for the pass declines and this
-            // arm is a no-op (`AY_INT_COLORING=0` opts out entirely).
+            // arm is a no-op (`--dpll-no-int-coloring` opts out entirely).
             Ok(SolveResult::Sat)
         } else {
             self.route_to_solver(category, &features)
         };
         self.record_phase_duration("phase.solver_dispatch.seconds", solver_started_at);
-        if std::env::var_os("AY_F1_DIAG").is_some() {
+        if ay_core::misc_cli_flags().f1_diag {
             if let Ok(r) = &result {
                 eprintln!(
-                    "AY_F1_DIAG: route_to_solver({category:?}) -> {r:?} model_present={}",
+                    "--f1-diag: route_to_solver({category:?}) -> {r:?} model_present={}",
                     self.last_model.is_some()
                 );
             }
@@ -1189,6 +1251,7 @@ impl Executor {
         // into symbol-connectivity components and combine. No-op on every result
         // that already decides. See executor/partition_rescue.rs.
         let result = self.try_partition_rescue(result, &pre_dispatch_assertions);
+        let result = self.fail_close_incomplete_finite_array_sat(result);
 
         // Map theory-solve result through quantifier/CEGQI semantics and restore assertions.
         //
@@ -1212,14 +1275,18 @@ impl Executor {
         let mapping_started_at = Instant::now();
         let quantifier_loop_restores = qr.original_assertions.is_some();
         let mapped = self.map_quantifier_result(result, qr, category);
+        // Quantifier refinement and demand/MBQI certificate paths may replace
+        // the initial ground result. Re-apply the same exact finite-array SAT
+        // boundary after mapping so no later proposal can bypass it.
+        let mapped = self.fail_close_incomplete_finite_array_sat(mapped);
         self.record_phase_duration(
             "phase.quantifier_result_mapping.seconds",
             mapping_started_at,
         );
-        if std::env::var_os("AY_F1_DIAG").is_some() {
+        if ay_core::misc_cli_flags().f1_diag {
             if let Ok(r) = &mapped {
                 eprintln!(
-                    "AY_F1_DIAG: map_quantifier_result -> {r:?} model_present={}",
+                    "--f1-diag: map_quantifier_result -> {r:?} model_present={}",
                     self.last_model.is_some()
                 );
             }
@@ -1268,9 +1335,14 @@ impl Executor {
         }
         // Test-only route selector: the DT certificate has two independent
         // grant sites (this bounded pre-solve probe and the post-solve
-        // quantifier-result mapper).  Production builds do not contain this
-        // hook; tests use it to pin the latter path deterministically instead
-        // of relying on host load to make this probe miss its wall budget.
+        // quantifier-result mapper). Production builds do not contain this
+        // hook; dt_model_cert's SUBPROCESS tests set it on their child test
+        // processes to pin the latter path deterministically instead of
+        // relying on host load to make this probe miss its wall budget.
+        // (B17 first deleted this as "never-set" — WRONG: the setter is
+        // `command.env(SKIP_RESEQUENCE_ENV, "1")` through a const, which no
+        // literal pattern saw. Cross-process test IPC is a legitimate env
+        // use; the audit now recognises the const-indirection form.)
         #[cfg(test)]
         if std::env::var_os("AY_INTERNAL_DT_CERT_SKIP_RESEQUENCE").is_some() {
             return None;
@@ -1284,7 +1356,7 @@ impl Executor {
             matches!(self.ctx.terms.get(a), TermData::Forall(vars, _, _)
                 if vars.iter().any(|(_, s)| self.dt_cert_sort_is_datatype(s)))
         });
-        let dbg = std::env::var_os("AY_DEBUG_CERT").is_some();
+        let dbg = ay_core::misc_cli_flags().debug_cert;
         if !has_dt_forall {
             return None;
         }
@@ -1339,8 +1411,11 @@ impl Executor {
         let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict();
         if features.has_arrays {
             self.add_distinct_const_array_disequalities();
-            self.add_finite_index_array_extensionality();
-            self.add_finite_index_select_expansion();
+            if self.should_defer_finite_array_extensionality_to_route(category) {
+                self.record_finite_array_extensionality_route_deferral();
+            } else {
+                let _ = self.add_finite_index_array_closure();
+            }
         }
         // M5 (net-negative re-sequencing fix, item 5b): budget-cap the ground-core
         // solve. A genuine cert candidate is cheap (fullsort-class ground fragments
@@ -1359,6 +1434,7 @@ impl Executor {
         } else {
             self.route_to_solver(category, &features)
         };
+        let result = self.fail_close_incomplete_finite_array_sat(result);
         self.solve_deadline.set(saved_deadline);
         // Restore assertions + incremental state; KEEP `last_model` (the candidate).
         self.ctx.assertions = saved_assertions;
@@ -1446,6 +1522,7 @@ impl Executor {
         // Internal probes share this entry point, so retain their surrounding
         // state but never let an earlier certificate survive a new-solve error.
         self.last_sat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         // Reset the BV-DRAT self-cert flag: it is (re)armed below only for an
         // eligible top-level pure-QF_BV check-sat and set true by the BV solver
         // when it actually emits a native-checkable UNSAT DRAT for this solve.
@@ -1540,8 +1617,8 @@ impl Executor {
         // #quantifier-determinism diagnostics: opt-in per-solve budget trace
         // for calibrating the deterministic quantifier budgets against real
         // workloads (e.g. the deductive-checks calc.rs boundary chain). Zero overhead
-        // unless AY_QUANT_STATS is set.
-        if std::env::var_os("AY_QUANT_STATS").is_some() {
+        // unless --quant-stats is set.
+        if ay_core::misc_cli_flags().quant_stats {
             eprintln!(
                 "[ay-quant-stats] result={:?} time_s={:.3} ematching_rounds={} \
                  ematching_instances={} unknown_reason={:?} conflicts={} decisions={} \
@@ -2151,289 +2228,6 @@ impl Executor {
         roots
     }
 
-    /// Fail closed on an UNSAT result for an active nested-array problem.
-    ///
-    /// The current QF_ALIA/AUFLIA combination has a confirmed false-UNSAT
-    /// reproducer over `(Array Int (Array Int Int))`: its default search finds
-    /// a contradictory arithmetic bound, while a reference model satisfies the
-    /// input and AY's strict proof reconstruction cannot certify the conflict.
-    /// Until that combination bug is root-caused, no nested-array refutation is
-    /// authoritative. SAT remains available through the existing mandatory
-    /// model-validation funnel; only UNSAT is quarantined here.
-    ///
-    /// This boundary is shared by plain and assumption-based public checks so a
-    /// caller cannot bypass it by moving the same nested-array formula into an
-    /// assumption literal.
-    ///
-    /// `hard` is the caller-authored HARD assertion snapshot (pre-preprocessing)
-    /// when — and only when — the query's verdict rests on those assertions
-    /// alone; it enables the entailed-residue rescue below. Assumption and
-    /// optimization boundaries pass `None`.
-    pub(in crate::executor) fn quarantine_unverified_nested_array_unsat(
-        &mut self,
-        roots: &[TermId],
-        hard: Option<&[TermId]>,
-        result: SolveResult,
-    ) -> SolveResult {
-        // Consume-once: this marker authorizes EXACTLY the result it
-        // accompanies. `take` clears it here so a trusted refutation from an
-        // earlier query can never leak authorization into a later untrusted
-        // one (every public UNSAT funnels through this boundary).
-        let trusted_row_reduction = std::mem::take(&mut self.nested_array_row_reduction_unsat);
-        let trusted_ho_seq_unfold = std::mem::take(&mut self.ho_seq_unfold_array_free_unsat);
-
-        if !result.is_unsat() || !StaticFeatures::collect(&self.ctx.terms, roots).has_nested_arrays
-        {
-            return result;
-        }
-
-        // Exempt a trust-free store-flat read-over-write refutation
-        // (`try_ufnia_store_flat_row_refutation`). That reduction inlined every
-        // single-definition `var = store(…)` (equisatisfiable) and exact ROW1
-        // rewriting folded ALL array structure away, so the retained UNSAT was
-        // proven by the sound arithmetic solver over an ARRAY-FREE residue — it
-        // never used the fail-closed lazy array+arith combination this gate
-        // guards. Authoritative; not quarantined.
-        if trusted_row_reduction {
-            return result;
-        }
-
-        // Exempt a refutation the higher-order sequence unfolder left with no
-        // nested array to reason about (#ho-seq-array-free). The marker is set
-        // by `unfold_ho_seq_ops` BEFORE solving, so it asserts that the solver
-        // was never handed the guarded structure at all — not the far weaker
-        // post-hoc observation that the residue looks array-free. Unfolding is
-        // an equivalence, so refuting what remains refutes the original. See
-        // `note_ho_seq_unfold_left_no_nested_arrays`. Without this, every
-        // `seq.foldl`/`seq.foldli` goal is unrefutable: the curried
-        // function-as-array those combinators require is itself a nested array,
-        // so the declared-sort test above fires on all of them.
-        if trusted_ho_seq_unfold {
-            return result;
-        }
-
-        // SECOND, INDEPENDENT EVIDENCE PATH (#nested-array-residue-rescue).
-        //
-        // The gate above is a DECLARED-SORT test over the whole root DAG, not a
-        // test of what the refutation actually used. The NASA AUFLIRA family
-        // declares matrix operators over `(Array Int (Array Int Real))` while
-        // refuting on a single-level store chain, so a correct UNSAT is thrown
-        // away on evidence that never touched the guarded combination.
-        //
-        // Rather than weaken the gate, PRODUCE NEW EVIDENCE: refute a
-        // nested-array-FREE subset of the problem's own consequences. UNSAT of
-        // an entailed subset forces UNSAT of the whole (see
-        // `collect_entailed_conjuncts`), and the subset is by construction a
-        // query this very gate declares authoritative. On decline — including
-        // every `Sat`, `Unknown`, error and budget exhaustion — control falls
-        // through to the unchanged degrade below.
-        //
-        // Unreachable on any non-UNSAT outcome: the `is_unsat` test above has
-        // already returned. So this can never mint, promote or preserve a `sat`.
-        if let Some(hard) = hard {
-            if nested_array_residue_rescue_enabled() && self.nested_array_free_residue_unsat(hard) {
-                tracing::debug!(
-                    "nested-array UNSAT re-derived from a nested-array-free entailed residue; retained"
-                );
-                return result;
-            }
-        }
-
-        self.replace_last_result_with_unknown(UnknownReason::Incomplete);
-        // Attribute the degrade to the array-combination boundary that actually
-        // caused it. Without this the `Incomplete` reason inherits whatever
-        // phase the quantifier pipeline last set, and `:unknown.phase` reports
-        // `quantifier-result-mapping` — a misattribution that has already sent
-        // two corpus-mapping passes to the wrong subsystem.
-        self.set_active_solve_phase(
-            "array-combination-quarantine",
-            "nested-array-unsat-quarantine",
-        );
-        self.record_unknown_diagnostic(
-            UnknownReason::Incomplete,
-            "nested-array UNSAT is quarantined pending a trust-free theory-combination proof",
-        );
-        tracing::warn!(
-            "nested-array UNSAT lacked an authoritative theory-combination proof; degrading to Unknown"
-        );
-        SolveResult::Unknown
-    }
-
-    /// Re-derive a quarantined UNSAT from a nested-array-FREE entailed residue
-    /// (#nested-array-residue-rescue). Returns `true` iff the residue is
-    /// definitively UNSAT, which licenses retaining the outer UNSAT.
-    ///
-    /// SOUNDNESS. Two independent arguments, both required to hold:
-    ///
-    /// A. ENTAILMENT. Every residue conjunct is a logical consequence of the
-    ///    hard assertions (`collect_entailed_conjuncts` applies only
-    ///    entailment-preserving splits), and the nested-array filter only
-    ///    REMOVES conjuncts, which weakens the residue further. So
-    ///    `hard |= /\ residue`, and `/\ residue` unsatisfiable forces `hard`
-    ///    unsatisfiable. This is the same subset-of-consequences argument that
-    ///    already licenses `instance_closure_ground_unsat`; it is strictly
-    ///    weaker, since it needs only propositional conjunct extraction and no
-    ///    universal instantiation.
-    ///
-    /// B. NO NEW TRUST. The filter is LITERALLY the predicate this quarantine
-    ///    tests with, so `StaticFeatures::collect(terms, residue)
-    ///    .has_nested_arrays == false` holds by construction. The residue is
-    ///    therefore an ordinary non-nested query — exactly the class the gate
-    ///    itself declares authoritative — and the fail-closed lazy array+arith
-    ///    combination the gate guards is out of its reach.
-    ///
-    /// Together with the outer solve's own (independently computed) UNSAT, the
-    /// retained verdict rests on two agreeing derivations, one of which uses no
-    /// distrusted machinery at all.
-    ///
-    /// The rescue provably declines on the guarded false-UNSAT reproducer
-    /// (`repros/cs_stateful-1.i_2.MINIMIZED.smt2`): that input is SATISFIABLE,
-    /// so every subset of its consequences is satisfiable, so the residue solve
-    /// cannot return UNSAT.
-    ///
-    /// WORK BUDGET. Reached only when the quarantine would otherwise fire (the
-    /// search is already spent and its result about to be discarded), one
-    /// attempt per public check-sat, under a sub-deadline. Zero cost on every
-    /// other path.
-    fn nested_array_free_residue_unsat(&mut self, hard: &[TermId]) -> bool {
-        // Never start fresh work after an external stop: the outer verdict is
-        // being degraded either way, and the probe would only burn the caller's
-        // grace period.
-        if self.external_stop_reason().is_some() {
-            return false;
-        }
-        // One attempt per check-sat: the probe re-enters this very boundary.
-        if self.in_nested_array_residue_probe {
-            return false;
-        }
-        // Proof mode: the retained UNSAT would carry `last_proof`, a proof
-        // reconstructed from the DISTRUSTED full-problem search, while the
-        // rescue's evidence is a separate refutation with no proof object of
-        // its own. Handing back a proof this path cannot vouch for would be a
-        // strictly weaker trust claim than today's Unknown, so fail closed.
-        //
-        // The question is "did the CALLER ask for a proof", so the predicate is
-        // `is_producing_proofs()`, not `produce_proofs_enabled()`. The latter
-        // also reports the INTERNAL tracker, which `begin_public_solve` turns on
-        // for every public decision because the UNSAT certificate is mandatory —
-        // it is therefore unconditionally true here, and this guard was refusing
-        // 100% of the time, leaving the whole rescue DEAD CODE. Measured on the
-        // pinned regression input (`test_nested_array_free_residue_retains_unsat`,
-        // z3 = unsat): `[residue] decline: produce_proofs_enabled` fires before
-        // any residue is even built.
-        //
-        // This is the same defect, and the same repair, that `d238594eec`
-        // applied to ten other passes when the certificate became mandatory
-        // (see the doc comment on `produce_proofs_enabled`, which names this
-        // exact hazard: "a preprocessing or routing pass gated on
-        // `!produce_proofs_enabled()` is therefore DEAD, not opted out"). The
-        // rescue landed a week earlier and was missed. `is_producing_proofs()`
-        // covers BOTH the API request (`set_produce_proofs`) and the in-script
-        // `(set-option :produce-proofs true)`, so every caller that can observe
-        // a proof still gets the unchanged fail-closed decline.
-        if self.is_producing_proofs() {
-            return false;
-        }
-
-        // 1. Entailed conjuncts of the caller-authored hard assertions.
-        let mut conjuncts: Vec<TermId> = Vec::new();
-        for &assertion in hard {
-            super::quantifier_loop::collect_entailed_conjuncts(
-                &mut self.ctx.terms,
-                assertion,
-                0,
-                MAX_RESIDUE_CONJUNCTS,
-                &mut conjuncts,
-            );
-            if conjuncts.len() > MAX_RESIDUE_CONJUNCTS {
-                return false;
-            }
-        }
-
-        // 2. Filter with the quarantine's OWN predicate. This also drops every
-        //    `forall` with a nested-array binder — precisely the class partial
-        //    E-matching cannot discharge soundly.
-        let mut residue: Vec<TermId> = Vec::with_capacity(conjuncts.len());
-        let mut seen = ay_core::kani_compat::DetHashSet::<TermId>::default();
-        let mut dropped_any = false;
-        for conjunct in conjuncts {
-            if !seen.insert(conjunct) {
-                continue;
-            }
-            if StaticFeatures::collect(&self.ctx.terms, &[conjunct]).has_nested_arrays {
-                dropped_any = true;
-                continue;
-            }
-            residue.push(conjunct);
-        }
-
-        // 3. Require a STRICT, non-empty subset.
-        //    - Empty residue: nothing to refute. Never read a vacuous verdict.
-        //    - Nothing dropped: the residue is equivalent to the input, so the
-        //      re-solve would re-run the same distrusted query for no gain.
-        if residue.is_empty() || !dropped_any {
-            return false;
-        }
-
-        // 4. Re-solve the exact residue on a disposable Context clone through
-        //    the ordinary public pipeline. A bare repeated UNSAT is not
-        //    authority: the clone must emit a strict authored-root proof
-        //    certificate, and the resulting non-cloneable token must still
-        //    match this outer query/source/root/term snapshot when consumed.
-        //    This is what prevents a repeatable wrong-UNSAT engine path from
-        //    laundering the distrusted full-problem verdict through the rescue.
-        //
-        // SESSION budget gate: an incremental script has many check-sats, and
-        // a residue that failed once will usually fail again. Without this the
-        // aggregate is unbounded — measured at an 85x wall-clock blowup for
-        // zero verdict gain. Charge every probe and stop once the session
-        // allowance is gone.
-        if self.residue_probe_failures >= RESIDUE_MAX_FAILURES {
-            return false;
-        }
-        let outer_deadline = self.solve_deadline.get();
-        let Some(probe_deadline) = Self::residue_sub_deadline(outer_deadline).or(outer_deadline)
-        else {
-            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
-            return false;
-        };
-        let remaining = probe_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
-            return false;
-        }
-        let budget_ms = u64::try_from(remaining.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let refuted = self
-            .checked_exact_unsat_solve(residue.clone(), budget_ms)
-            .is_some_and(|checked| checked.consume(self, &residue));
-        if !refuted {
-            self.residue_probe_failures = self.residue_probe_failures.saturating_add(1);
-        }
-        refuted
-    }
-
-    /// Sub-deadline for the residue probe: a quarter of what the outer solve has
-    /// left, capped, so a pathological residue cannot eat the caller's budget.
-    ///
-    /// A probe stopped by this deadline returns `Unknown` and simply declines —
-    /// the deadline can change WHEN the probe gives up, never what it decides.
-    ///
-    /// `None` means the sub-deadline instant did not fit in an `Instant`; the
-    /// caller then keeps the OUTER deadline rather than running unbounded.
-    fn residue_sub_deadline(outer: Option<Instant>) -> Option<Instant> {
-        let now = Instant::now();
-        let budget = match outer {
-            Some(deadline) => (deadline.saturating_duration_since(now) / RESIDUE_BUDGET_SHARE)
-                .min(RESIDUE_MAX_BUDGET),
-            // No outer deadline in force (proof-seeking solves run this way):
-            // still bound the probe, it is an optional extra.
-            None => RESIDUE_MAX_BUDGET,
-        };
-        now.checked_add(budget)
-    }
-
     /// Fail closed when caller-authored input captures a solver-generated
     /// array-extensionality witness from an earlier public query, or contains
     /// an out-of-range raw `TermId`.
@@ -2589,12 +2383,12 @@ impl Executor {
                 self.finalize_unknown_diagnostics();
                 return Ok(SolveResult::Unknown);
             }
-            if let Some(evidence) = self.try_authorize_current_query_exact_forall_exists_unsat() {
-                let result = self.emit_checked_exact_forall_exists_unsat(evidence);
-                self.finalize_array_ext_shadow();
-                self.finalize_unknown_diagnostics();
-                return Ok(result);
-            }
+            // Prefer the permit-bound, exact-Exists checker before the broader
+            // quantified UNSAT family.  The latter deliberately contains an
+            // overlapping empty-bounded-existential fallback for callers that
+            // have no constructive-query permit; letting it run first here
+            // erases the narrower certificate identity and reports an Exists
+            // theorem as CheckedExactForallExists.
             let permit = match self.try_authorize_exact_exists_decision(permit) {
                 ExactExistsDecision::Sat(evidence) => {
                     let result = self.emit_checked_exact_exists_sat(evidence)?;
@@ -2610,6 +2404,12 @@ impl Executor {
                 }
                 ExactExistsDecision::Declined(permit) => permit,
             };
+            if let Some(evidence) = self.try_authorize_current_query_exact_forall_exists_unsat() {
+                let result = self.emit_checked_exact_forall_exists_unsat(evidence);
+                self.finalize_array_ext_shadow();
+                self.finalize_unknown_diagnostics();
+                return Ok(result);
+            }
             match self.try_authorize_projection_sat(permit) {
                 ProjectionSatAttempt::Checked(evidence) => {
                     let result = self.emit_checked_projection_sat(*evidence)?;
@@ -2663,7 +2463,7 @@ impl Executor {
             && self.uflia_congruence_lane
             && result == SolveResult::Sat
         {
-            if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
+            if ay_core::misc_cli_flags().debug_read_pin {
                 eprintln!(
                     "[model-repair] outer capture: last_model={}",
                     if self.last_model.is_some() {
@@ -2906,6 +2706,15 @@ impl Executor {
                 result = SolveResult::Unknown;
             }
         }
+
+        // The quantified/named-core machinery can finish with either a typed
+        // quantifier Unknown or an uncertified provisional UNSAT for the exact
+        // sequence-extensionality companion contradiction.  Complete that
+        // independently recognized theorem before the self-check gate: the
+        // completion constructs and strictly replays the canonical proof, so
+        // self-check still makes the final proof-authority decision below.
+        // Every non-exact query is returned byte-for-byte unchanged.
+        let result = self.try_complete_authenticated_seq_extensional_result(result);
 
         // Fail-closed self-check for UNSAT: AY may only emit `unsat` when it
         // produced a refutation proof that its OWN internal checker fully
@@ -3266,7 +3075,7 @@ impl Executor {
         if let Some(backstop) = deadline.checked_add(extra) {
             self.solve_deadline.set(Some(backstop));
         }
-        if std::env::var_os("AY_QUANT_STATS").is_some() {
+        if ay_core::misc_cli_flags().quant_stats {
             eprintln!(
                 "[ay-quant-stats] backstop installed: remaining={remaining:?} extra={extra:?}"
             );
@@ -3347,14 +3156,14 @@ impl Executor {
         // Two memory ceilings are honored here, the single inner-loop
         // checkpoint reused by every theory loop:
         //  * `self.memory_limit`: the per-solver limit set via
-        //    `Solver::set_memory_limit` (peak RSS vs that limit).
+        //    `Solver::set_memory_limit` (live footprint; peak RSS only as fallback).
         //  * `ay_sys::process_memory_exceeded()`: the process-wide ceiling set
         //    once from `main()` (`set_process_memory_limit`). It consults the
-        //    exact live-heap-bytes counter (instant, no syscall) as well as peak
-        //    RSS, so a runaway bulk allocation inside this theory loop trips
-        //    `Unknown(MemoryLimit)` here — before the OS OOM-killer can fire —
-        //    rather than only at the check-sat boundary. Soundness-neutral: it
-        //    can only drive Unknown, never a wrong SAT/UNSAT.
+        //    exact live-heap counter (instant, no syscall) plus the live OS
+        //    footprint (peak RSS fallback), so a runaway bulk allocation trips
+        //    `Unknown(MemoryLimit)` here — before the OS OOM-killer — instead of the
+        //    check-sat boundary. Soundness-neutral: it can only drive Unknown,
+        //    never a wrong SAT/UNSAT.
         if crate::memory::memory_exceeded(self.memory_limit) || ay_sys::process_memory_exceeded() {
             self.record_unknown_from_origin(UnknownOrigin::MemoryBudget);
             self.last_result = Some(SolveResult::Unknown);
@@ -3427,7 +3236,7 @@ impl Executor {
             self.ctx
                 .assertions
                 .extend(self.cegar_emitted_lemmas.iter().copied());
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace cegar-refine rounds-left={} lemma={}",
                     self.cegar_rounds_remaining, lemma.0
@@ -3609,19 +3418,20 @@ impl Executor {
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
+        self.proof_source_work.reset();
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
         self.last_checked_sat_refutation = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
         self.last_unknown_reason = None;
-        // Per-check-sat conflict-verification verdict memo (#4535): verdicts
-        // must not outlive the assertion/support state they were computed
-        // against.
+        // Per-check-sat conflict-verification verdicts must not outlive their
+        // assertion/support state (#4535).
         self.conflict_semantic_verify_memo.clear();
         // Same lifecycle for the propagation-verification memo (#verify-memo).
         self.prop_semantic_verify_memo.clear();
@@ -3631,11 +3441,9 @@ impl Executor {
         // Same for the DT e-graph model export and its derived per-class
         // value assignment (#mv-dt-single-source).
         self.clear_dt_theory_model();
-        // Proof authority is frozen by `begin_public_solve` and deliberately
-        // survives recursive/internal retries. Recapturing the current
+        // Proof authority is frozen by `begin_public_solve` across retries. Recapturing the current
         // assertion window here could authorize generated repair constraints.
-        self.quant_expansion_records.clear();
-        self.ematching_proof_records.clear();
+        self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.last_statistics = crate::executor_types::Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
@@ -4136,8 +3944,21 @@ impl Executor {
                     // stripped. A rescue UNSAT records the all-named core
                     // (reduction 0, sound by construction). See
                     // `rescue_named_core_redirect_unknown`.
+                    let mut parked_plain_query_authority = None;
                     let (result, rescue_elapsed) = match result {
                         Ok(SolveResult::Unknown) => {
+                            // The scoped plain rescue below can itself finish
+                            // Unknown.  Its ordinary finalizer correctly
+                            // revokes *its* publication state, but this call is
+                            // still inside the original public check-sat and
+                            // the stripped assertion view is only a core-
+                            // tracking transaction.  Park the independently
+                            // authenticated outer epoch/provenance so the
+                            // nested solve cannot borrow or destroy it.
+                            parked_plain_query_authority = self
+                                .park_plain_query_authority_for_named_core_rescue(
+                                    &original_assertions,
+                                );
                             let rescue_started = Instant::now();
                             let rescued = self.rescue_named_core_redirect_unknown(
                                 &named_assumptions,
@@ -4159,7 +3980,7 @@ impl Executor {
                     // reach unsat through it. Skipped when provenance is
                     // broken: the minimized core would be discarded below
                     // anyway.
-                    if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                    if ay_core::misc_cli_flags().phase_trace {
                         eprintln!(
                             "c phase-trace uc-redirect provenance_broken={} named={} parse_keys={}",
                             provenance_broken,
@@ -4175,6 +3996,16 @@ impl Executor {
 
                     // Restore original assertions
                     self.ctx.assertions = original_assertions;
+                    let restored_plain_query_authority =
+                        if let Some(parked) = parked_plain_query_authority {
+                            // Restoration re-authenticates epoch, source, term
+                            // entries, provenance, and the exact restored stack.
+                            // A mismatch simply leaves authority absent, so the
+                            // outer publication gate fails closed.
+                            self.restore_plain_query_authority_after_named_core_rescue(parked)
+                        } else {
+                            false
+                        };
 
                     if provenance_broken && matches!(result, Ok(ref r) if r.is_unsat()) {
                         self.last_assumption_core = None;
@@ -4183,6 +4014,14 @@ impl Executor {
                     // Set the term-to-name mapping AFTER check_sat_assuming
                     // (which clears it as part of its own state reset).
                     self.last_core_term_to_name = Some(term_to_name);
+                    if restored_plain_query_authority
+                        && matches!(result, Ok(ref verdict) if verdict.is_unsat())
+                    {
+                        // This exact event — not every later UNSAT
+                        // publication — authorizes the post-redirect internal
+                        // certificate refresh.
+                        self.refresh_internal_certificate_after_named_core_redirect();
+                    }
 
                     return result;
                 }
@@ -4250,6 +4089,13 @@ impl Executor {
         final_result
     }
 
+    pub(in crate::executor) fn should_defer_finite_array_extensionality_to_route(
+        &self,
+        category: LogicCategory,
+    ) -> bool {
+        category.owns_post_preprocess_finite_array_expansion()
+    }
+
     /// Route to the appropriate theory solver based on detected logic category.
     ///
     /// Extracted from `check_sat_internal` for readability — the logic routing
@@ -4284,7 +4130,7 @@ impl Executor {
                 // (live ArraysSolver + lazy Row2Down) instead of the
                 // axiom-pregeneration pipeline — measurement flag for the
                 // in-search ROW instantiation build.
-                if std::env::var_os("AY_QFAX_COMBINER_ROUTE").is_some() {
+                if ay_core::misc_cli_flags().qfax_combiner_route {
                     self.solve_auf_lia()
                 } else {
                     // #qfax-budget-ladder: the fixpoint's ROW-closure budgets
@@ -4305,7 +4151,8 @@ impl Executor {
                             if !matches!(
                                 self.last_unknown_reason,
                                 Some(UnknownReason::Timeout)
-                            ) && !self.solve_deadline.expired() =>
+                            ) && self.finite_array_expansion.is_complete()
+                                && !self.solve_deadline.expired() =>
                         {
                             self.ctx.assertions = pre_tier_assertions;
                             self.qfax_budget_multiplier = 16;
@@ -4333,11 +4180,11 @@ impl Executor {
             // FAIL-CLOSED: unless every reachable theory atom is a pure Real
             // difference atom it immediately delegates to `solve_lra()`, and any
             // non-definite verdict from the DL lane is re-solved by `solve_lra()`
-            // too. `AY_RDL_ENGINE=0` disables the lane without a rebuild.
+            // too. `--dpll-no-rdl-engine` disables the lane without a rebuild.
             LogicCategory::QfLra if self.ctx.logic() == Some("QF_RDL") => self.solve_rdl(),
             LogicCategory::QfLra => self.solve_lra(),
-            // QF_IDL: the integer sibling of the lane above, DEFAULT OFF behind
-            // `AY_IDL_ENGINE=1`. Same fail-closed shape — unless every reachable
+            // QF_IDL: the integer sibling of the lane above, DEFAULT ON
+            // (`--dpll-no-idl-engine`). Same fail-closed shape — unless every reachable
             // theory atom is a pure INT difference atom it delegates to
             // `solve_lia()`, and any non-definite verdict is re-solved there.
             // The fall-through is `solve_lia`, never `solve_lra`: handing an
@@ -4558,8 +4405,8 @@ impl Executor {
                         //   1. standard budgets            (most files)
                         //   2. ladder: 16x ROW budgets     (deep chains)
                         //   3. CEGAR pattern-blocking      (opt-in: budget-
-                        //      immune refutations; AY_QFAX_CEGAR=1)
-                        let dbg_esc = std::env::var_os("AY_DEBUG_CEGAR").is_some();
+                        //      immune refutations; --qfax-cegar)
+                        let dbg_esc = ay_core::misc_cli_flags().debug_cegar;
                         let saved_assertions = self.ctx.assertions.clone();
                         let mut stage_result = self.solve_array_euf()?;
                         self.ctx.assertions = saved_assertions.clone();
@@ -4574,6 +4421,7 @@ impl Executor {
                         }
                         let can_continue = |exec: &Self| {
                             !matches!(exec.last_unknown_reason, Some(UnknownReason::Timeout))
+                                && exec.finite_array_expansion.is_complete()
                                 && !exec.solve_deadline.expired()
                         };
                         // Stage 2: budget ladder.
@@ -4635,7 +4483,7 @@ impl Executor {
                         // rejected model's index pattern element-
                         // independently unsatisfiable; assert and re-solve.
                         let mut cegar_rounds = 0usize;
-                        while std::env::var_os("AY_QFAX_CEGAR").is_some()
+                        while ay_core::misc_cli_flags().qfax_cegar
                             && cegar_rounds < 24
                             && can_continue(self)
                         {
@@ -4690,6 +4538,7 @@ impl Executor {
                                     self.last_unknown_reason,
                                     Some(UnknownReason::Timeout)
                                 )
+                                && self.finite_array_expansion.is_complete()
                                 && !self.solve_deadline.expired() =>
                         {
                             self.last_unknown_reason = None;
@@ -4899,7 +4748,8 @@ impl Executor {
             LogicCategory::DtAx => self.solve_dt_ax(),
             // Quantified DT logics (#7150): quantifier preprocessing strips
             // quantifiers before reaching dispatch, so route to DT-combined solvers.
-            LogicCategory::Ufdt | LogicCategory::Aufdt => self.solve_dt(),
+            LogicCategory::Ufdt => self.solve_dt(),
+            LogicCategory::Aufdt => self.solve_dt_ax(),
             LogicCategory::Ufdtlia | LogicCategory::Aufdtlia => {
                 if has_native_seq_ops {
                     self.solve_dt_seq_auflia()

@@ -1935,9 +1935,9 @@ impl NiaSolver<'_> {
     }
 
     pub(crate) fn try_clausal_local_search(&mut self) -> Option<TheoryResult> {
-        // Kill switch for A/B measurement and for quarantining the lane without
-        // a rebuild (#nia-clausal-sls). Absent => lane enabled.
-        if std::env::var_os("AY_NIA_NO_CLAUSAL_SLS").is_some() {
+        // B16 CLI kill switch for A/B measurement or quarantine; the default
+        // keeps the clausal local-search lane enabled.
+        if ay_core::theory_disable_flags().no_nia_clausal_sls {
             return None;
         }
         if self.root_assertions.is_empty() {

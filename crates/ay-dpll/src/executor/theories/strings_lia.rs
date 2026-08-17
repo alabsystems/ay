@@ -22,7 +22,7 @@ use super::super::Executor;
 use super::skolem_cache::ExecutorSkolemCache;
 use super::strings_analysis::{MAX_CONSECUTIVE_DUPLICATE_LEMMAS, MAX_PIVOT_CANDIDATES};
 use super::{debug_auflia_enabled, MAX_SPLITS_LIA, MAX_STRING_LEMMA_ITERATIONS};
-
+mod state_reset;
 impl Executor {
     /// Is `pivot` provably constrained so that every character of any
     /// satisfying value comes from the formula's constant alphabet?
@@ -430,7 +430,7 @@ impl Executor {
         Ok(None)
     }
 
-    /// P2 (`AY_STR_P2=1`): guess-and-VALIDATE model search for formulas whose
+    /// P2: guess-and-VALIDATE model search for formulas whose
     /// string variables are constrained only negatively (see
     /// [`Self::detect_negative_only_witnesses`] for the eligibility rules).
     ///
@@ -1312,7 +1312,7 @@ impl Executor {
             }
         }
 
-        // P2 (`AY_STR_P2=1`): negative-only constrained variable model-guess
+        // P2: negative-only constrained variable model-guess
         // pre-pass. A variable whose polarity-decoded content constraints are
         // all NEGATIVE (`¬contains(x, c)`, `x != c`, `substr-of-x != c`, plus
         // length atoms) has trivial models over a character outside the
@@ -1328,7 +1328,7 @@ impl Executor {
             }
         }
 
-        // W4 (default ON, `AY_STR_W4=0` kill switch): length-indexed PER-POSITION
+        // W4 (default ON, `--dpll-no-str-w4` kill switch): length-indexed PER-POSITION
         // character witness synthesizer — the measured RANK-1 sat-side lever
         // (70 of the 92 sat misses are the per-position family, and 58 of them
         // never build a model at all, so every model-construction path is
@@ -1412,7 +1412,7 @@ impl Executor {
             }
         }
 
-        // W6 (default ON, `AY_STR_W6=0` kill switch): regex-driven joint word
+        // W6 (default ON, `--dpll-no-str-w6` kill switch): regex-driven joint word
         // construction — the LAST witness pre-pass, deliberately.
         //
         // The per-position synthesizer's targeting gate declines
@@ -1434,7 +1434,7 @@ impl Executor {
             }
         }
 
-        // W7 (default ON, `AY_STR_W7=0` kill switch): chain-definition search, multi-atom
+        // W7 (default ON, `--dpll-no-str-w7` kill switch): chain-definition search, multi-atom
         // placement search, and the distinct-witness enumerator — the LAST
         // witness pre-pass, with its own budget.
         //
@@ -1825,7 +1825,7 @@ impl Executor {
         // Escalation passes. `cur_assertions`/`cur_reduced` carry the growing
         // preprocessed set across passes so each escalation builds on the
         // previous one (pass 1: replace reductions, #4057; pass 2: the P2
-        // symbolic substr/indexof reductions, `AY_STR_P2=1` only).
+        // symbolic substr/indexof reductions, enabled only).
         let mut cur_assertions = preprocessed_pass0;
         let mut cur_reduced = preregistered_reduced_term_ids_pass0;
         let mut result = pass0_result;
@@ -1880,7 +1880,7 @@ impl Executor {
             }
         }
 
-        // P2 escalation (default ON, `AY_STR_P2=0` kill switch): symbolic-bounds
+        // P2 escalation (default ON, `--dpll-no-str-p2` kill switch): symbolic-bounds
         // `str.substr` + `str.indexof` first-occurrence reductions, only
         // AFTER the unchanged effort passes return Unknown — so anything the
         // default pipeline solves is decided identically first, and the P2
@@ -1936,7 +1936,7 @@ impl Executor {
             }
         }
 
-        // P3 escalation (default ON, `AY_STR_P3=0` kill switch): `str.to_int` /
+        // P3 escalation (default ON, `--dpll-no-str-p3` kill switch): `str.to_int` /
         // `str.from_int` digit-string ↔ LIA coupling for NON-GROUND
         // arguments, again only after every earlier pass returned Unknown.
         // The axioms are universally valid SMT-LIB theorems (see
@@ -2160,8 +2160,7 @@ impl Executor {
             if let Some(ref sat) = state.lia_persistent_sat {
                 state.sat_warm_state = Some(crate::SatWarmState::extract(sat));
             }
-            state.lia_persistent_sat = None;
-            state.encoded_assertions.clear();
+            state.reset_rebuilt_slia_solver();
         }
 
         let result = solve_incremental_split_loop_pipeline!(self,
@@ -2210,7 +2209,7 @@ impl Executor {
             eager_extension: true,
             disable_preprocess: true,
             pre_iter_check: |_s| self.should_abort_theory_loop(),
-            // Strings increment P3 (default ON, `AY_STR_P3=0` kill switch — the killed
+            // Strings increment P3 (default ON, `--dpll-no-str-p3` kill switch — the killed
             // lane keeps the conservative escalate-to-Unknown): opt into the
             // #6812 verify-before-accept relaxation for post-split UNSAT.
             // The full_str_int family refutes propositionally+LIA after

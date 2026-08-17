@@ -2,6 +2,8 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 fn main() -> std::process::ExitCode {
     // FIRST statement of main: arm() re-execs this process under a kernel-held
     // memory bound, so anything above it is discarded work, and it sets an env

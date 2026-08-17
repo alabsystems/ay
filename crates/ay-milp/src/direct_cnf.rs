@@ -68,7 +68,7 @@ pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<SatD
         DirectCnfAdmission::Admitted(plan) => plan,
         DirectCnfAdmission::Declined(reason) => {
             if trace_enabled() {
-                eprintln!("AY_MILP_TRACE direct-cnf: declined={reason:?}");
+                eprintln!("--trace direct-cnf: declined={reason:?}");
             }
             return None;
         }
@@ -87,7 +87,7 @@ pub(crate) fn try_solve(model: &Model, deadline: Option<Instant>) -> Option<SatD
                 SatDecision::Unsat => "UNSAT",
             };
             eprintln!(
-                "AY_MILP_TRACE direct-cnf: vars={} clauses={} verdict={verdict} wall={:.6}s",
+                "--trace direct-cnf: vars={} clauses={} verdict={verdict} wall={:.6}s",
                 plan.domains.len(),
                 plan.clauses.len(),
                 started.elapsed().as_secs_f64(),
@@ -321,7 +321,7 @@ fn trace_enabled() -> bool {
     // `set_var` can race, which priming cannot help. `OnceLock` is the shape
     // that ratchet asks for and `simplex.rs` already uses.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("AY_MILP_TRACE").is_some())
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
 #[cfg(test)]

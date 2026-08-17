@@ -20,11 +20,13 @@ fn assert_artifact_error<T>(result: Result<T, SolverError>, operation: &str) {
 fn fallible_solves_and_composite_operations_preserve_the_single_query_contract() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let dump = temp.path().join("native.cnf");
-    // Serialized + restore-on-exit via the workspace env choke point; the
-    // guards below hold for the whole test body.
-    let _env_lock = lock_env();
-    let _dump_cnf = ScopedEnvVar::set("AY_DUMP_BV_CNF", dump.to_str().expect("temp path is UTF-8"));
-    let _dump_dimacs = ScopedEnvVar::unset("AY_DUMP_BV_DIMACS");
+    // B58: the export path rides the typed set-once TraceConfig install
+    // (this file holds exactly ONE test, so the set-once global is safe).
+    ay_core::set_global_trace_config(ay_core::TraceConfig {
+        dump_bv_cnf_path: Some(dump.to_str().expect("temp path is UTF-8").to_string()),
+        ..Default::default()
+    })
+    .expect("first and only TraceConfig install in this test binary");
 
     // Fallible entrypoints must preserve the typed export failure instead of
     // reporting a successful `Ok(Unknown)` for an unsupported query.

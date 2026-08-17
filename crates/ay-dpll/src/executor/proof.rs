@@ -2,50 +2,66 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! UNSAT proof orchestration and API. Checking/quality live in `check`; Farkas synthesis in
-//! `proof_farkas`; resolution in `proof_resolution`; surface rewriting in `proof_rewrite`.
+//! UNSAT proof orchestration and API; checking, synthesis, resolution, and rewriting live in focused siblings.
 
 mod authored_array_row1;
 mod authored_array_row_value;
+mod authored_bv_lia_refutation;
 mod authored_cascade;
 mod authored_collection_subset;
 mod authored_congruence;
+mod authored_conjunct_eval;
+mod authored_consequence_replay;
 mod authored_datatype;
 mod authored_divisibility;
 mod authored_equality_closure;
 mod authored_forall;
 mod authored_forall_inst_conflict;
 mod authored_forall_inst_equality;
+mod authored_forall_substitution;
+mod authored_forall_witness;
 mod authored_guarded_linear;
 mod authored_helpers;
 mod authored_linear;
+mod authored_negated_exists;
+mod authored_nested_forall;
+mod authored_nested_forall_search;
 mod authored_store_permutation;
 mod authored_string_length;
 mod authored_string_word_identity;
+mod bv_bitblast_collapse;
 mod bvand_commutative_congruence;
 mod check;
 mod collection_axiom_promotion;
 mod contextual_array_row2;
+mod decline;
 mod double_negation;
+mod emission_budget;
+mod eq_transitive_surface;
 mod exact_array_row2;
 mod extensionality_surface;
+mod false_source;
 mod finite_enum;
 mod finite_enum_surface;
 #[cfg(test)]
 mod finite_enum_tests;
+mod generic_promotion;
+mod lane_policy;
 mod lifecycle;
+mod reconstruction_fallbacks;
+mod surface_bv_rebuild;
 mod terminal_trust;
 
+use authored_cascade::RepairEntry;
 use authored_helpers::{
     collect_select_terms_local, pair_other_side_local, DerivedUnit, GroundBinding,
     StringLengthFactProvenance, StringRelevantSubterms,
 };
 use ay_core::term::{Constant, TermData};
 use ay_core::{
-    AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TheoryLemmaKind,
-    TheoryLit,
+    AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId, TermStore,
+    TheoryLemmaKind, TheoryLit,
 };
-use ay_core::{TermId, TermStore};
 use ay_frontend::command::{
     Constant as FrontendConstant, Index as FrontendIndex, Term as FrontendTerm,
 };
@@ -54,7 +70,14 @@ use ay_frontend::{Command, CommandResult, OptionValue};
 use ay_proof::{check_proof_partial, PartialProofCheck};
 use ay_proof::{export_alethe_with_problem_scope_and_overrides, AlethePrintError};
 use bvand_commutative_congruence::add_bvand_commutative_congruence_proof;
+pub use decline::ProofDeclineMechanism;
+use emission_budget::DEFAULT_ALETHE_EMISSION_WORK_BUDGET;
 use num_bigint::BigInt;
+use surface_bv_rebuild::{
+    build_bv_atom_pterm, build_bv_const, build_bv_pterm, build_qfbv_ite_pterm,
+    build_qfbv_select_pterm, match_and_self_eq_contradiction, match_and_true_eq_contradiction,
+    match_eq_negation, parse_rendered_assertion,
+};
 
 use crate::executor_types::SolveResult;
 
@@ -62,59 +85,25 @@ use super::Executor;
 pub(in crate::executor) use finite_enum::CheckedFiniteEnumPigeonholeProof;
 use finite_enum::MAX_RENDER_WORK as MAX_FINITE_ENUM_RENDER_WORK;
 
-/// Rendering-work cap for the SYNTHESIZED-DEFAULT Alethe certificate's
-/// emission phase (#A2b), in abstract printer work units (roughly bytes
-/// touched by term formatting and surface-tautology re-derivation).
-///
-/// Sibling of `DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET` in `ay::run`: the
-/// by-default `<input>.alethe` is best-effort, so after a fast UNSAT verdict
-/// the emission must terminate in bounded time — a certificate within the
-/// budget, or the honest "no proof certificate emitted" warning (QF_ALIA
-/// pp-family: 2s solves whose emission ground for 300s+ without completing).
-/// Deterministic (work units, not wall time). Ordinary explicit `--proof`,
-/// `--strict-proofs`, `--self-check`, and `(get-proof)` paths remain uncapped;
-/// the query-sealed finite-enum exception deliberately uses the same 64 MiB
-/// ceiling on every export path because its bounded authority contract must
-/// hold independently of which API requests the diagnostic text.
-///
-/// Calibration (#A2b-recal): store-chain (dis)equality UNSAT proofs render the
-/// array-extensionality witness (`__ay_arr2lia_k` choice term inside a nested
-/// read-over-write `ite`) as a tree, not a DAG, so a handful of proof steps
-/// balloon to hundreds of MB of surface — measured 821 MB / ~1 GB on the
-/// QF_ALIA `ios_t1_*` family, at which point the whole best-effort document is
-/// discarded anyway (whole-document rejection on exhaustion). At 2 GB the
-/// "bounded time" contract failed: `ios_*00004` ground out a full 821 MB proof
-/// (~2.8s) and `ios_*00005` rendered ~1 GB before giving up (~5.9s), both AFTER
-/// a sub-0.2s UNSAT verdict. A best-effort text certificate over tens of MB is
-/// impractical for any downstream checker, so bound rendering to 64 MiB of
-/// surface: normal proofs (KB–single-digit MB — every carcara-checked test
-/// proof included) are untouched and still fully emitted; only the pathological
-/// tree-expansions truncate early to the honest "no proof certificate emitted"
-/// warning. The verdict is already out and unchanged either way.
-const DEFAULT_ALETHE_EMISSION_WORK_BUDGET: u64 = 64 * 1024 * 1024;
-
 impl Executor {
     /// Build a proof for UNSAT result
     ///
     /// Creates an Alethe-compatible proof with assumptions for each assertion
     /// and a final step deriving the empty clause.
     pub(super) fn build_unsat_proof(&mut self) {
-        // A checked SAT sidecar is authority for exactly one immutable trace /
-        // mapping / query bundle. Retire any prior candidate before inspecting
-        // the current bundle, including on reconstruction-suppressed exits.
+        // A checked SAT sidecar authorizes one immutable trace/mapping/query bundle.
+        // Retire any prior candidate before inspecting it, including on suppressed exits.
         //
         // ...but ONLY when there IS a current bundle to inspect
-        // (#checked-sat-sidecar-second-call). This method is NOT idempotent —
-        // it `take()`s `last_clause_trace` / `last_var_to_term` /
-        // `last_negations` to build the proof — so a second call on the same
+        // (#checked-sat-sidecar-second-call). This method is NOT idempotent: it `take()`s
+        // `last_clause_trace`, `last_var_to_term`, and `last_negations`, so a second call on the same
         // query arrives with the trace already consumed. Retiring
         // unconditionally then destroyed the sidecar the FIRST call had
         // correctly minted and could not re-mint it, and the certification
         // funnel fell through to the Alethe presentation, which on the DT
         // lanes is a `Generic` trust stub that strict mode rejects. Measured on
-        // QF_DT `vlsat3_b83`: "checked SAT refutation unavailable: no SAT
-        // clause trace is available" printed TWICE for one query, and a correct
-        // `unsat` published as `unknown`.
+        // QF_DT `vlsat3_b83`: "no SAT clause trace is available" printed TWICE,
+        // and a correct `unsat` published as `unknown`.
         //
         // Keeping it is not weaker. The sidecar carries its own authority and
         // is checked at USE by `is_current_for` against the query epoch, the
@@ -139,13 +128,13 @@ impl Executor {
         // The sealed path is an exception only to the existing oversized-
         // source poison. Bounded queries retain the ordinary reconstruction
         // path (including its broader accepted finite-enum source shapes).
-        if self.proof_sources_are_oversized() {
+        if let Some(mechanism) = self.proof_source_decline() {
             if self.last_finite_enum_pigeonhole.is_some()
                 && self.try_install_bounded_finite_enum_pigeonhole_proof()
             {
                 return;
             }
-            self.install_uncertifiable_proof_poison();
+            self.install_uncertifiable_proof_poison(mechanism);
             return;
         }
         if self.last_clause_trace.is_some() {
@@ -265,7 +254,16 @@ impl Executor {
         // Generic before surface-syntax rewrites may now have clause terms that
         // match a more specific kind (e.g., LIA integer equality after array
         // select/store rewriting). Re-infer the kind from the rewritten clause.
-        Self::promote_generic_theory_lemma_kinds_after_rewrite(&self.ctx.terms, &mut proof);
+        // #trust->0 C3: supply the datatype registries so DT shapes promote too.
+        let c3_dt_data = crate::theory_inference::dt_funnel_registry_data(&self.ctx);
+        let c3_dt = c3_dt_data
+            .as_ref()
+            .map(crate::theory_inference::DatatypeRegistries::from_data);
+        Self::promote_generic_theory_lemma_kinds_after_rewrite(
+            &self.ctx.terms,
+            &mut proof,
+            c3_dt.as_ref(),
+        );
         // Post-rewrite Farkas for lemmas just promoted from Generic (#6756).
         // Note: may fail for combined-theory clauses where rewriting simplified
         // linking equalities; the pre-rewrite pass above is primary.
@@ -321,7 +319,7 @@ impl Executor {
                             selected_strict_root = true;
                             break;
                         }
-                        Err(error) if std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some() => {
+                        Err(error) if ay_core::misc_cli_flags().trace_cegqi_attr => {
                             eprintln!(
                                 "[quant-proof] empty root {target} strict selection declined: {error}"
                             );
@@ -437,26 +435,7 @@ impl Executor {
         // resolution from the parsed assertion. SOUND + fail-closed; see method.
         self.promote_dt_selector_collapse(&mut proof);
 
-        // Self-equality collapse (#trust-count→0, ANY width): a `(not (= X X))`
-        // assertion with SYNTACTICALLY IDENTICAL sides (the machine-lowering-vs-IR
-        // reconstruction obligations whose two encoders coincide, e.g.
-        // `Iadd→AddRR` = `bvadd==bvadd`) folds to `false`, degenerating to the
-        // `:rule false` collapse. Reconstruct assume + `refl` + resolution — refl
-        // proves identical-sides equality at ANY sort/width, so it covers the
-        // 32/64-bit ALU family the bounded `BvBitBlast` pass below cannot. SOUND +
-        // fail-closed (only fires when the rebuilt sides are the SAME hash-consed
-        // TermId). Runs FIRST so identical-sides obligations get the width-agnostic
-        // refl proof; genuinely-distinct sides fall through to the bounded pass.
-        self.promote_self_eq_collapse(&mut proof);
-
-        // `(and P (not (= P true)))` contradiction collapse (#trust-count→0, ANY
-        // width): the external-codegen dom-bounds obligation family (a constant bounds
-        // check dominated by an IDENTICAL one) renders as `P ∧ ¬P` and folds to
-        // `false`, degenerating to the Carcara-rejected `:rule false` collapse.
-        // Reconstruct assume + and_pos/not_equiv2/true + resolutions — pure
-        // propositional rules, so ANY faithfully-rebuildable BV comparison atom
-        // `P` is covered at any width. SOUND + fail-closed; see method.
-        self.promote_and_true_eq_contradiction_collapse(&mut proof);
+        self.promote_reflexive_collapse_family(&mut proof);
 
         // Bitvector identity collapse (#trust-count→0): a small-width BV assertion
         // `(not (= (OP a b) c))` whose equality is a bounded tautology folds to
@@ -500,25 +479,24 @@ impl Executor {
         // evaluation) + resolution. SOUND + fail-closed; see method.
         self.promote_bool_tautology_collapse(&mut proof);
 
-        // BV bit-blast whole-proof collapse (C5, honest-`hole` encoding): a
-        // QF_BV UNSAT established through the eager bit-blast + SAT lane whose
-        // reconstructed proof degenerated to the single empty-clause `trust`
-        // step (and that none of the specific collapse promotions above could
-        // reconstruct). Carcara hard-rejects `:rule trust` as an unknown rule
-        // (whole-proof invalid); its BV support (`bitblast_*`) requires the
-        // cvc5-style `@bbterm` bit-blasting convention, which ay's blaster
-        // does not produce, so there is no checkable rule for this lane.
-        // Rebuild the honest maximum instead: faithful `assume`s for each
-        // parsed problem assertion + ONE attributed `hole` step concluding
-        // the disjunction of their negations (exactly the joint-UNSAT the
-        // solver established — no new claim) + the closing resolution chain,
-        // so every carcara-checkable step (assume matching, resolutions) is
-        // valid and the single unchecked gap is an attributed spec `hole`.
+        // BV bit-blast whole-proof collapse (C5): a QF_BV UNSAT established
+        // through the eager bit-blast + SAT lane whose reconstructed proof
+        // degenerated to the single empty-clause `trust` step (and that none
+        // of the specific collapse promotions above could reconstruct).
+        // Faithfully rebuild every parsed assertion, then prefer an internal
+        // `BvBitBlast` lemma only when the checker independently recognizes
+        // the joint-negation clause and the assembled proof replays strict-
+        // complete. The Alethe printer still lowers this general lemma to an
+        // attributed `hole`: carcara's BV support requires cvc5's `@bbterm`
+        // convention, which ay's blaster does not produce.
+        // If either gate declines, preserve real `assume`s plus ONE attributed
+        // `hole` for the exact joint negation/closing chain. Every checkable
+        // step remains valid, and the unchecked gap remains explicit.
         // Fail-closed: fires only on the degenerate shape, only when EVERY
         // assertion faithfully rebuilds inside the QF_BV bool/BV fragment
         // (per-node raw-application guards), and only when BV content is
-        // present. The strict-proofs gate still downgrades: `hole` steps on
-        // the empty-clause path are counted by `terminal_trust_report`.
+        // present. The strict gate rejects the fallback hole while accepting
+        // the independently checked `BvBitBlast` candidate.
         self.rescue_bv_bitblast_collapse(&mut proof);
 
         // NIA pin-substitution collapse (#trust-count→0): the residual trust step
@@ -622,9 +600,22 @@ impl Executor {
         // committed only after the strict checker validates every step and the
         // premise authorization against that same scope.
         self.replace_with_exact_authored_false_refutation(&mut proof);
-
         self.run_authored_replacement_cascade(&mut proof);
 
+        self.run_arithmetic_reconstruction_fallbacks(&mut proof);
+
+        // Some native certificate kinds are intentionally not surfaceable on
+        // the pinned Alethe wire (for example `BvLiaTautology`). They are
+        // valid internal certificates, but must not suppress an authored-root
+        // reconstruction that can produce a fully checkable document. Give
+        // the conjunction planner one final opportunity after the internal
+        // fallback; its atomic commit gate still requires a complete strict
+        // proof over the exact authored scope.
+        if self.proof_has_known_wire_gap(&proof) {
+            self.replace_with_exact_authored_conjunct_refutation(&mut proof, RepairEntry::Check);
+        }
+        false_source::demote_unattributed_assumed_false(self, &mut proof);
+        self.demote_unrenderable_eq_transitive_lemmas(&mut proof);
         // Proof validation (#4393): validates all non-Hole steps via partial
         // checker. Replaces the old check_proof + Hole-skip pattern that skipped
         // entire proofs when ANY Hole step was present.
@@ -709,26 +700,16 @@ impl Executor {
     /// closed and leaves the original (possibly trust-bearing) proof visible.
     fn replace_with_exact_authored_false_refutation(&mut self, proof: &mut Proof) {
         let false_term = self.ctx.terms.false_term();
-        // Authorization comes only from immutable source provenance.  The
-        // live `ctx.assertions` stack can contain solver-injected `false`
-        // constraints, especially when parsed-AST retention is disabled.
-        let authored_scope = self.exact_concrete_authored_scope();
         // A canonical `false` TermId is not enough: elaboration also maps any
         // authored contradiction (for example `x - x <= -1`) to that same
-        // identifier. Replacing such a proof with `assume false` silently
-        // discards the source formula and can make the Alethe surface claim a
-        // premise the problem never asserted. Require index-aligned source
-        // evidence that the author literally supplied `false`. Context keeps
-        // that one provenance bit even when full parsed-AST retention is off.
-        let literal_false_sources = self.ctx.concrete_authored_literal_false_terms();
-        if !authored_scope.iter().any(|&term| {
-            term == false_term
-                && literal_false_sources.contains(&term)
-                && matches!(
-                    self.ctx.terms.get(term),
-                    TermData::Const(Constant::Bool(false))
-                )
-        }) {
+        // identifier. The shared premise-authority gate admits only exact
+        // literal-false assertion or assumption provenance.
+        if !self.boolean_constant_premises_authored().1
+            || !matches!(
+                self.ctx.terms.get(false_term),
+                TermData::Const(Constant::Bool(false))
+            )
+        {
             return;
         }
 
@@ -745,35 +726,6 @@ impl Executor {
         if self.check_proof_strict_with_datatypes(&candidate).is_ok() {
             *proof = candidate;
         }
-    }
-
-    /// Immutable, concrete source roots that may authorize a replacement
-    /// proof: the frozen assertion epoch plus the exact caller-supplied
-    /// `check-sat-assuming` literals. There is deliberately no fallback to
-    /// `ctx.assertions`, whose live stack may contain solver-generated axioms
-    /// or folded artifacts.
-    fn exact_concrete_authored_scope(&self) -> Vec<TermId> {
-        let source = self
-            .proof_problem_assertion_provenance
-            .as_ref()
-            .map_or_else(
-                || self.ctx.concrete_authored_assertion_terms(),
-                |provenance| provenance.original_problem_assertions.clone(),
-            );
-        let mut exact = Vec::with_capacity(source.len());
-        for term in source {
-            if !exact.contains(&term) {
-                exact.push(term);
-            }
-        }
-        if let Some(assumptions) = &self.last_assumptions {
-            for &term in assumptions {
-                if !exact.contains(&term) {
-                    exact.push(term);
-                }
-            }
-        }
-        exact
     }
 
     /// Rebuild a trust-bearing refutation directly from one exact authored
@@ -793,31 +745,39 @@ impl Executor {
     ///
     /// Every candidate is atomically replayed by the strict checker and its
     /// sole assumption is independently checked against the exact source scope.
-    fn replace_with_exact_authored_conjunct_refutation(&mut self, proof: &mut Proof) {
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
+    fn replace_with_exact_authored_conjunct_refutation(
+        &mut self,
+        proof: &mut Proof,
+        entry: RepairEntry,
+    ) {
+        if entry == RepairEntry::Check && self.authored_cascade_publishable(proof) {
             return;
         }
-
         fn collect_leaves(
             terms: &TermStore,
             term: TermId,
             path: &mut Vec<u32>,
             leaves: &mut Vec<(TermId, Vec<u32>)>,
+            include_root: bool,
         ) {
             if let TermData::App(Symbol::Named(name), args) = terms.get(term) {
                 if name == "and" {
                     for (position, &child) in args.iter().enumerate() {
                         path.push(position as u32);
-                        collect_leaves(terms, child, path, leaves);
+                        collect_leaves(terms, child, path, leaves, true);
                         path.pop();
                     }
                     return;
                 }
             }
-            if !path.is_empty() {
+            if include_root || !path.is_empty() {
                 leaves.push((term, path.clone()));
             }
         }
+        // Route tags cannot collide with an `and` operand index: the source
+        // audit bounds every authored connective far below `u32::MAX`.
+        const NEGATED_IMPLIES_ANTECEDENT: u32 = u32::MAX;
+        const NEGATED_IMPLIES_CONSEQUENT: u32 = u32::MAX - 1;
 
         fn derive_leaf(
             terms: &mut TermStore,
@@ -828,7 +788,57 @@ impl Executor {
         ) -> Option<ProofId> {
             let mut current_id = root_assume;
             let mut current_term = root;
-            for &position in path {
+            let mut positions = path;
+
+            // Stable authored provenance now preserves the exact
+            // `not (=> A B)` root instead of authorizing its elaborated
+            // `(and A (not B))` surrogate. Derive the two components with the
+            // native Alethe implication rules, then continue ordinary
+            // `and_pos` projection inside A. No generated surrogate is ever
+            // assumed.
+            if let Some((&route, rest)) = positions.split_first() {
+                if matches!(
+                    route,
+                    NEGATED_IMPLIES_ANTECEDENT | NEGATED_IMPLIES_CONSEQUENT
+                ) {
+                    let TermData::Not(implication) = terms.get(root).clone() else {
+                        return None;
+                    };
+                    let TermData::App(Symbol::Named(operator), args) =
+                        terms.get(implication).clone()
+                    else {
+                        return None;
+                    };
+                    if operator != "=>" || args.len() != 2 {
+                        return None;
+                    }
+                    let component = if route == NEGATED_IMPLIES_ANTECEDENT {
+                        args[0]
+                    } else {
+                        terms.mk_not_raw(args[1])
+                    };
+                    let rule = if route == NEGATED_IMPLIES_ANTECEDENT {
+                        AletheRule::ImpliesNeg1
+                    } else {
+                        AletheRule::ImpliesNeg2
+                    };
+                    let projection = proof.add_rule_step(
+                        rule,
+                        vec![implication, component],
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    current_id =
+                        proof.add_resolution(vec![component], implication, projection, root_assume);
+                    current_term = component;
+                    positions = rest;
+                    if route == NEGATED_IMPLIES_CONSEQUENT && !positions.is_empty() {
+                        return None;
+                    }
+                }
+            }
+
+            for &position in positions {
                 let TermData::App(Symbol::Named(name), args) = terms.get(current_term) else {
                     return None;
                 };
@@ -1037,9 +1047,36 @@ impl Executor {
 
         const MAX_AUTHORED_CONJUNCTS: usize = 64;
         let authored = self.exact_concrete_authored_scope();
+        let parsed_assertions = self.ctx.assertions_parsed().to_vec();
+        let original_assertions = self.proof_original_problem_assertions();
         for &root in &authored {
             let mut leaves = Vec::new();
-            collect_leaves(&self.ctx.terms, root, &mut Vec::new(), &mut leaves);
+            let root_shape = self.ctx.terms.get(root).clone();
+            if let TermData::Not(implication) = root_shape {
+                if let TermData::App(Symbol::Named(operator), args) =
+                    self.ctx.terms.get(implication).clone()
+                {
+                    if operator == "=>" && args.len() == 2 {
+                        let mut antecedent_leaves = Vec::new();
+                        collect_leaves(
+                            &self.ctx.terms,
+                            args[0],
+                            &mut Vec::new(),
+                            &mut antecedent_leaves,
+                            true,
+                        );
+                        for (leaf, mut path) in antecedent_leaves {
+                            path.insert(0, NEGATED_IMPLIES_ANTECEDENT);
+                            leaves.push((leaf, path));
+                        }
+                        let not_consequent = self.ctx.terms.mk_not_raw(args[1]);
+                        leaves.push((not_consequent, vec![NEGATED_IMPLIES_CONSEQUENT]));
+                    }
+                }
+            }
+            if leaves.is_empty() {
+                collect_leaves(&self.ctx.terms, root, &mut Vec::new(), &mut leaves, false);
+            }
             if leaves.len() < 2 || leaves.len() > MAX_AUTHORED_CONJUNCTS {
                 continue;
             }
@@ -1063,6 +1100,11 @@ impl Executor {
                 build_affine_equality_refutation(&mut self.ctx.terms, root, &leaves)
             {
                 if self.commit_if_strictly_checked(proof, candidate, &authored) {
+                    self.restore_authored_root_surface_after_conjunct_rebuild(
+                        root,
+                        &original_assertions,
+                        &parsed_assertions,
+                    );
                     return;
                 }
             }
@@ -1141,10 +1183,54 @@ impl Executor {
                     continue;
                 }
                 if self.commit_if_strictly_checked(proof, candidate, &authored) {
+                    self.restore_authored_root_surface_after_conjunct_rebuild(
+                        root,
+                        &original_assertions,
+                        &parsed_assertions,
+                    );
                     return;
                 }
             }
         }
+    }
+
+    /// Restore only the exact authored spelling of the assumed root after the
+    /// canonical conjunction reconstruction has passed its strict commit
+    /// gate. Derived operands keep their checker-validated canonical spelling;
+    /// the root override affects the `assume` line and the negative gate in
+    /// `and_pos`, which the Alethe printer validates as exact complements.
+    fn restore_authored_root_surface_after_conjunct_rebuild(
+        &mut self,
+        root: TermId,
+        originals: &[TermId],
+        parsed: &[FrontendTerm],
+    ) {
+        if !super::proof_surface_syntax::surface_override_roots_have_bounded_work(
+            &self.ctx.terms,
+            [root],
+        ) {
+            return;
+        }
+        let Some(index) = originals.iter().position(|&term| term == root) else {
+            return;
+        };
+        let Some(source) = parsed.get(index) else {
+            return;
+        };
+        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
+        if !super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
+            return;
+        }
+        super::proof_surface_syntax::collect_root_surface_term_override(
+            &mut self.ctx,
+            root,
+            source,
+            &mut overrides,
+        );
+        if !super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
+            return;
+        }
+        self.last_proof_term_overrides = Some(overrides);
     }
 
     /// Rebuild the exact mixed LIA/EUF value-conflict lane from authored
@@ -1883,6 +1969,7 @@ impl Executor {
     fn decompose_combined_real_conflict_lemmas(terms: &mut TermStore, proof: &mut Proof) {
         use crate::theory_inference::decompose_generic_combined_real_lemma;
 
+        let mut budget = crate::theory_inference::CombinedDecompositionBudget::new();
         let mut decomposed = Vec::new();
         for (idx, step) in proof.steps.iter().enumerate() {
             let ProofStep::TheoryLemma { kind, clause, .. } = step else {
@@ -1892,7 +1979,7 @@ impl Executor {
                 continue;
             }
             if let Some((euf_kind, euf_clause, bridge_clause, bridge_farkas)) =
-                decompose_generic_combined_real_lemma(terms, clause)
+                decompose_generic_combined_real_lemma(terms, clause, &mut budget)
             {
                 decomposed.push((idx, euf_kind, euf_clause, bridge_clause, bridge_farkas));
             }
@@ -1916,76 +2003,6 @@ impl Executor {
                 farkas: Some(bridge_farkas),
                 lia: None,
             });
-        }
-    }
-
-    /// Promote `TheoryLemmaKind::Generic` proof steps to a more specific kind
-    /// when the post-rewrite clause terms allow it (#6756).
-    ///
-    /// This handles cases where the theory solver recorded a generic conflict
-    /// (e.g., a combined ArrayEUF route) but after surface-syntax rewriting the
-    /// clause is a plain integer-arithmetic contradiction that can export as
-    /// `lia_generic` instead of `trust`.
-    pub(super) fn promote_generic_theory_lemma_kinds_after_rewrite(
-        terms: &TermStore,
-        proof: &mut Proof,
-    ) {
-        use crate::theory_inference::infer_theory_lemma_kind_from_clause_terms_and_farkas;
-        for step in &mut proof.steps {
-            if let ProofStep::TheoryLemma {
-                kind,
-                clause,
-                farkas,
-                ..
-            } = step
-            {
-                if !kind.is_trust() {
-                    continue;
-                }
-                let inferred = infer_theory_lemma_kind_from_clause_terms_and_farkas(
-                    terms,
-                    clause,
-                    farkas.as_ref(),
-                );
-                if matches!(inferred, TheoryLemmaKind::LraFarkas) && farkas.is_none() {
-                    // Attach the unit certificate ONLY when it passes the FULL
-                    // semantic Farkas verifier (the opaque-atom class-4
-                    // classifier fired on exactly this check), so the printed
-                    // `:args` are exactly the verified coefficients. Pure-LA
-                    // lemmas whose unit certificate does not fully verify keep
-                    // the pre-existing flow (Farkas reconstruction, then the
-                    // demote pass) untouched.
-                    let unit = FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
-                    let conflict: Vec<TheoryLit> = clause
-                        .iter()
-                        .map(|&lit| {
-                            let (inner, neg) = strip_not_local(terms, lit);
-                            TheoryLit::new(inner, neg)
-                        })
-                        .collect();
-                    if ay_core::proof_validation::verify_farkas_conflict_lits_linear(
-                        terms, &conflict, &unit,
-                    )
-                    .is_ok()
-                    {
-                        *farkas = Some(unit);
-                        *kind = inferred;
-                    }
-                    continue;
-                }
-                if matches!(inferred, TheoryLemmaKind::LiaGeneric) && farkas.is_none() {
-                    if let Some(synth) =
-                        super::proof_farkas::synthesize_equality_farkas(terms, clause)
-                    {
-                        *farkas = Some(synth);
-                        *kind = inferred;
-                    }
-                    continue;
-                }
-                if !inferred.is_trust() {
-                    *kind = inferred;
-                }
-            }
         }
     }
 
@@ -4041,6 +4058,12 @@ impl Executor {
         None
     }
 
+    /// Whether a sticky datatype-member identity is still live under `surface`.
+    fn live_datatype_member_has_surface(&self, identity: &str, surface: &str) -> bool {
+        self.ctx.is_live_datatype_member_identity(identity)
+            && self.ctx.dt_surface_name(identity).unwrap_or(identity) == surface
+    }
+
     /// Datatype selector-projection collapse (#trust-count→0). The analogue of
     /// `promote_array_row_collapse` for datatypes: an assertion
     /// `(not (= (sel_i (C a_0 .. a_n)) a_i))` folds to `false` at elaboration
@@ -4100,12 +4123,7 @@ impl Executor {
             let mut resolved: Option<(String, Sort, String, Sort)> = None;
             let mut ambiguous = false;
             for (ctor_identity, selector_identities) in &selectors {
-                if self
-                    .ctx
-                    .dt_surface_name(ctor_identity)
-                    .unwrap_or(ctor_identity)
-                    != ctor
-                {
+                if !self.live_datatype_member_has_surface(ctor_identity, ctor) {
                     continue;
                 }
                 let Some(ctor_info) = self.ctx.exact_datatype_member_info(ctor_identity) else {
@@ -4115,12 +4133,7 @@ impl Executor {
                     continue;
                 }
                 for selector_identity in selector_identities {
-                    if self
-                        .ctx
-                        .dt_surface_name(selector_identity)
-                        .unwrap_or(selector_identity)
-                        != sel
-                    {
+                    if !self.live_datatype_member_has_surface(selector_identity, sel) {
                         continue;
                     }
                     let Some(selector_info) =
@@ -4186,6 +4199,42 @@ impl Executor {
         }
     }
 
+    /// Run the three reflexive-collapse promoters in their proof-critical order.
+    ///
+    /// Self-equality collapse (#trust-count→0, ANY width): a `(not (= X X))`
+    /// assertion with SYNTACTICALLY IDENTICAL sides (the machine-lowering-vs-IR
+    /// reconstruction obligations whose two encoders coincide, e.g.
+    /// `Iadd→AddRR` = `bvadd==bvadd`) folds to `false`, degenerating to the
+    /// `:rule false` collapse. Reconstruct assume + `refl` + resolution — refl
+    /// proves identical-sides equality at ANY sort/width, so it covers the
+    /// 32/64-bit ALU family the bounded `BvBitBlast` pass below cannot. SOUND +
+    /// fail-closed (only fires when the rebuilt sides are the SAME hash-consed
+    /// TermId). Runs FIRST so identical-sides obligations get the width-agnostic
+    /// refl proof; genuinely-distinct sides fall through to the bounded pass.
+    ///
+    /// `(and P (not (= P true)))` contradiction collapse (#trust-count→0, ANY
+    /// width): the external-codegen dom-bounds obligation family (a constant bounds
+    /// check dominated by an IDENTICAL one) renders as `P ∧ ¬P` and folds to
+    /// `false`, degenerating to the Carcara-rejected `:rule false` collapse.
+    /// Reconstruct assume + and_pos/not_equiv2/true + resolutions — pure
+    /// propositional rules, so ANY faithfully-rebuildable BV comparison atom
+    /// `P` is covered at any width. SOUND + fail-closed; see method.
+    ///
+    /// `(and P (not (= X X)))` self-equality collapse (#trust-count→0, ANY
+    /// sort): the external-codegen GUARDED-division obligation family carries its
+    /// `b ≠ 0` guard as a first conjunct, so neither the top-level
+    /// self-equality pass (needs a bare `(not (= X X))`) nor the dom-bounds
+    /// pass above (needs `(not (= P true))`) matches, and the refutation
+    /// degenerated to the `hole`-rendering rescue. Reconstruct assume +
+    /// and_pos + refl + resolutions — propositional rules plus reflexivity,
+    /// so the guard is carried verbatim and never interpreted. SOUND +
+    /// fail-closed; see method.
+    fn promote_reflexive_collapse_family(&mut self, proof: &mut Proof) {
+        self.promote_self_eq_collapse(proof);
+        self.promote_and_true_eq_contradiction_collapse(proof);
+        self.promote_and_self_eq_contradiction_collapse(proof);
+    }
+
     /// Bitvector identity collapse (#trust-count→0). A small-width BV assertion
     /// `(not (= (OP a b) c))` whose equality is a bounded BV tautology (e.g.
     /// `bvand x x = x`) folds to `false` during elaboration, degenerating the
@@ -4249,6 +4298,11 @@ impl Executor {
                 .terms
                 .mk_app(Symbol::named("="), [l_id, r_id], Sort::Bool);
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
+            // Every printed term must survive the printer's surface-override
+            // table; see `rebuilt_terms_print_faithfully`.
+            if !self.rebuilt_terms_print_faithfully(&[neg_t, eq_t]) {
+                continue;
+            }
 
             proof.steps.clear();
             proof.named_steps.clear();
@@ -4357,6 +4411,175 @@ impl Executor {
         }
     }
 
+    /// Fail-closed PRINT-FIDELITY gate for the raw-rebuilt terms of a candidate.
+    ///
+    /// A collapse promoter reconstructs the problem's assertion with raw
+    /// constructors precisely because elaboration FOLDED it. The Alethe printer
+    /// however also consults the surface-override table, and
+    /// `collect_subterm_surface_overrides` keys that table on the ELABORATED
+    /// subterm: when a child folded, the child's authored spelling is attached
+    /// to the folded RESULT. A raw rebuild that legitimately uses that result
+    /// in an UNFOLDED position then prints with the wrong spelling, the
+    /// `assume` no longer matches the problem, and an external checker reports
+    /// `invalid` — strictly worse than the honest `hole` the promoter replaced,
+    /// because no rule can run on a document whose premise is not the problem's.
+    ///
+    /// Measured instance (QF_ABV):
+    /// `(not (= (select (store ((as const (Array (_ BitVec 64) (_ BitVec 8))) d) i d) i) …))`.
+    /// `mk_select`'s read-over-write folds that read straight to `d`, so the
+    /// override table says "print `d` as `(select (store …) i)`" — and every
+    /// `d` in the rebuilt term (the const-array fill AND the stored value) came
+    /// back out as the whole read expression.
+    ///
+    /// The check is a genuine ROUND TRIP: render each term exactly as export
+    /// will (same override table), re-parse that text, rebuild it with the same
+    /// fold-guarded builder, and require the identical hash-consed `TermId`.
+    /// A faithful spelling difference passes — a BV literal printed `#b…` where
+    /// the source wrote `(_ bvN W)` re-parses to the same constant — while a
+    /// SUBSTITUTED subterm cannot. Anything that fails to render, re-parse or
+    /// rebuild is declined, so the promoter leaves the honest `hole` in place.
+    ///
+    /// Callers pass every term the candidate proof will PRINT, not just the
+    /// `assume`: an override can be faithful on the premise and unfaithful on a
+    /// term that appears only in a later clause, and one bad literal is enough
+    /// to make the document `invalid`.
+    ///
+    /// SCOPE — deliberately limited to candidates carrying ARRAY content, the
+    /// fragment these rebuilders newly admit. The hazard is worst there
+    /// (`mk_select`'s read-over-write collapses an entire read to a leaf, so the
+    /// misattributed spelling can replace any occurrence of that leaf), and
+    /// restricting it keeps every pre-existing pure-BV promotion byte-identical.
+    /// The same defect DOES exist on the BV lane — `(not (= (bvand x x) x))` at
+    /// width 4 publishes an `assume` of `(not (= (bvand (bvand x x) (bvand x x))
+    /// (bvand x x)))`, which carcara rejects — but that is a pre-existing
+    /// printer defect the in-tree suite deliberately isolates behind
+    /// `published_assumption_scope` (see
+    /// `tests/group_proofs/carcara_external_check.rs`), and repairing it is a
+    /// separate change from admitting the array fragment. Widening this gate to
+    /// the BV lane without that repair only converts those `invalid` documents
+    /// into `hole`s and breaks the tests that pin them.
+    fn rebuilt_terms_print_faithfully(&mut self, terms: &[TermId]) -> bool {
+        if !terms
+            .iter()
+            .any(|&term| term_contains_array(&self.ctx.terms, term))
+        {
+            return true;
+        }
+        let overrides = self.proof_export_term_overrides().unwrap_or_default();
+        terms.iter().all(|&term| {
+            let rendered =
+                ay_proof::format_term_alethe_with_overrides(&self.ctx.terms, term, &overrides);
+            parse_rendered_assertion(&rendered)
+                .and_then(|reparsed| build_qfbv_pterm(&mut self.ctx.terms, &reparsed))
+                == Some(term)
+        })
+    }
+
+    /// `(and P (not (= X X)))` self-equality collapse (#trust-count→0, ANY
+    /// sort). The external-codegen GUARDED-division obligation family
+    /// (`bridge_udiv_remainder_*`: `a - (a / b) * b` lowered two ways under a
+    /// `b ≠ 0` guard) renders as `(assert (and (not (= b 0)) (not (= X X))))`.
+    /// The second conjunct alone is [`Self::promote_self_eq_collapse`]'s shape,
+    /// but that pass requires a TOP-LEVEL `(not (= …))`, and
+    /// [`Self::promote_and_true_eq_contradiction_collapse`] requires the second
+    /// conjunct to be `(not (= P true))` — so neither matches and the whole
+    /// (correct) refutation degenerated to the `hole`-rendering rescue.
+    /// Reconstruct it FROM THE PARSED ASSERTION:
+    ///   assume      A = (and P (not (= X X)))
+    ///   and_pos(1)  (cl (not A) (not (= X X)))
+    ///   resolution  (cl (not (= X X)))        ; pivot A
+    ///   refl        (cl (= X X))
+    ///   resolution  □                          ; pivot (= X X)
+    /// Pure propositional rules plus `refl`, so the guard `P` is never
+    /// interpreted — it is carried verbatim into the `assume` and dropped by
+    /// `and_pos`, which is why this works at any width and needs no BV theory.
+    ///
+    /// SOUND + fail-closed: `P` and both `X` occurrences are faithfully rebuilt
+    /// (raw `mk_app`/`mk_not_raw` with a per-node fold guard), the two `X`
+    /// rebuilds must be the SAME hash-consed `TermId` (genuine syntactic
+    /// reflexivity — exactly what Alethe `refl` certifies), and every
+    /// reconstructed connective is re-read to confirm the store did not fold
+    /// it, so the `assume` mirrors the real input assertion. Any mismatch
+    /// leaves the proof untouched for the later passes.
+    fn promote_and_self_eq_contradiction_collapse(&mut self, proof: &mut Proof) {
+        if !Self::proof_is_single_empty_trust(proof) {
+            return;
+        }
+        let parsed: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
+        for asrt in &parsed {
+            let Some((side, lhs, rhs)) = match_and_self_eq_contradiction(asrt) else {
+                continue;
+            };
+            let Some(side_id) = build_qfbv_pterm(&mut self.ctx.terms, side) else {
+                continue;
+            };
+            if !matches!(self.ctx.terms.sort(side_id), Sort::Bool) {
+                continue;
+            }
+            // Same faithful rebuild pair the self-equality passes use: the BV
+            // fragment first, then the boolean layer for sides that need it.
+            let (Some(l_id), Some(r_id)) = (
+                build_bv_pterm(&mut self.ctx.terms, lhs)
+                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, lhs)),
+                build_bv_pterm(&mut self.ctx.terms, rhs)
+                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, rhs)),
+            ) else {
+                continue;
+            };
+            if l_id != r_id {
+                continue;
+            }
+            let eq_t = self
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), [l_id, r_id], Sort::Bool);
+            if !matches!(
+                self.ctx.terms.get(eq_t),
+                TermData::App(sym, a) if sym.name() == "=" && a.as_slice() == [l_id, r_id]
+            ) {
+                continue;
+            }
+            let not_eq_t = self.ctx.terms.mk_not_raw(eq_t);
+            if !matches!(self.ctx.terms.get(not_eq_t), TermData::Not(inner) if *inner == eq_t) {
+                continue;
+            }
+            let and_t =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("and"), vec![side_id, not_eq_t], Sort::Bool);
+            if !matches!(
+                self.ctx.terms.get(and_t),
+                TermData::App(sym, a) if sym.name() == "and" && a.as_slice() == [side_id, not_eq_t]
+            ) {
+                continue;
+            }
+            let not_and_t = self.ctx.terms.mk_not_raw(and_t);
+            if !matches!(self.ctx.terms.get(not_and_t), TermData::Not(inner) if *inner == and_t) {
+                continue;
+            }
+            // Every printed term must survive the printer's surface-override
+            // table; see `rebuilt_terms_print_faithfully`.
+            if !self.rebuilt_terms_print_faithfully(&[and_t, not_and_t, not_eq_t, eq_t]) {
+                continue;
+            }
+
+            proof.steps.clear();
+            proof.named_steps.clear();
+            let assume_id = proof.add_assume(and_t, None);
+            let and_pos_neq = proof.add_rule_step(
+                AletheRule::AndPos(1),
+                vec![not_and_t, not_eq_t],
+                vec![],
+                vec![],
+            );
+            let cl_neq = proof.add_resolution(vec![not_eq_t], and_t, and_pos_neq, assume_id);
+            let refl_id = proof.add_rule_step(AletheRule::Refl, vec![eq_t], vec![], vec![]);
+            proof.add_resolution(vec![], eq_t, cl_neq, refl_id);
+            self.record_rebuilt_authored_proof_premise(and_t);
+            return;
+        }
+    }
+
     fn promote_bv_identity_collapse(&mut self, proof: &mut Proof) {
         if !Self::proof_needs_schema_collapse_reconstruction(proof) {
             return;
@@ -4390,6 +4613,11 @@ impl Executor {
                 .mk_app(Symbol::named("="), [l_id, r_id], Sort::Bool);
             let reflexive = l_id == r_id;
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
+            // Every printed term must survive the printer's surface-override
+            // table; see `rebuilt_terms_print_faithfully`.
+            if !self.rebuilt_terms_print_faithfully(&[neg_t, eq_t]) {
+                continue;
+            }
 
             let mut candidate = Proof::new();
             let assume_id = candidate.add_assume(neg_t, None);
@@ -4413,106 +4641,6 @@ impl Executor {
             *proof = candidate;
             return;
         }
-    }
-
-    /// BV bit-blast whole-proof collapse rescue (C5). See the call-site comment
-    /// in `build_unsat_proof` for the full rationale. Fires ONLY when the proof
-    /// is the degenerate single-empty-trust collapse (both legacy and
-    /// `:rule false` encodings) and every parsed problem assertion faithfully
-    /// rebuilds inside the QF_BV boolean/bitvector fragment with at least one
-    /// genuinely BV-sorted node. Emission:
-    ///   assume A_1 … assume A_n            (faithful raw rebuilds; carcara
-    ///                                       checks them against the problem)
-    ///   hole   (cl (not A_1) … (not A_n))  (the joint-UNSAT the bit-blast +
-    ///                                       SAT lane established; carcara has
-    ///                                       no rule for ay's blasting, so the
-    ///                                       spec `hole` placeholder is the
-    ///                                       honest encoding — attributed,
-    ///                                       counted, and still rejected by
-    ///                                       the strict-proofs gate)
-    ///   resolution chain ⟹ (cl)
-    /// SOUND: introduces no claim beyond the verdict already established (the
-    /// hole clause is logically the same statement as the empty-clause trust
-    /// step it replaces, now anchored to the real problem assertions).
-    /// Fail-closed: any rebuild miss keeps the original proof untouched.
-    fn rescue_bv_bitblast_collapse(&mut self, proof: &mut Proof) {
-        // LAST RESORT ONLY: fire on the still-degenerate collapse, never on a
-        // proof one of the specific promoters above already reconstructed.
-        //
-        // This gate was briefly generalised to
-        // `proof_needs_schema_collapse_reconstruction` — "any proof deriving the
-        // empty clause" — to match the specific promoters. That predicate is
-        // right for THEM (they replace a proof with a strict-checkable typed
-        // lemma, so seeing more candidates can only add certificates) and wrong
-        // for this rescue, whose product is an `assume`-anchored `hole`. With the
-        // wide gate the rescue ran on every empty-clause QF_BV proof and
-        // OVERWROTE the `BvBitBlast` certificate `promote_bv_identity_collapse`
-        // had just built a few lines earlier — trading a fully strict-checked
-        // refutation (and its Lean firewall artifact) for an unchecked hole.
-        // Measured on `(not (= (bvand x x) x))`: the promoted proof became
-        // `[assume A, hole (¬A), resolution]`, failed strict checking with
-        // `HoleStep`, and was then replaced downstream by a content-free
-        // `assume false` refutation.
-        //
-        // The degenerate shape is exactly "no specific promoter reconstructed
-        // it": each promoter replaces the proof with `assume (not THEOREM)` for
-        // a real authored theorem, which is not an assumed Boolean constant.
-        if !Self::proof_is_single_empty_trust(proof) {
-            return;
-        }
-        let parsed: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
-        if parsed.is_empty() {
-            return;
-        }
-        let mut assertion_ids: Vec<TermId> = Vec::with_capacity(parsed.len());
-        for asrt in &parsed {
-            let Some(t) = build_qfbv_pterm(&mut self.ctx.terms, asrt) else {
-                return; // outside the QF_BV fragment — keep the trust proof
-            };
-            if !matches!(self.ctx.terms.sort(t), Sort::Bool) {
-                return;
-            }
-            assertion_ids.push(t);
-        }
-        // Scope guard: this rescue is the BV lane's. Require at least one
-        // BitVec-sorted node among the rebuilt assertions so pure-Boolean
-        // collapses keep their (honest) trust step for other passes/lanes.
-        if !assertion_ids
-            .iter()
-            .any(|&t| term_contains_bitvec(&self.ctx.terms, t))
-        {
-            return;
-        }
-
-        let negated: Vec<TermId> = assertion_ids
-            .iter()
-            .map(|&t| self.ctx.terms.mk_not_raw(t))
-            .collect();
-        // Faithfulness guard on the negations (mk_not_raw must not fold).
-        for (&n, &t) in negated.iter().zip(assertion_ids.iter()) {
-            if !matches!(self.ctx.terms.get(n), TermData::Not(inner) if *inner == t) {
-                return;
-            }
-        }
-
-        proof.steps.clear();
-        proof.named_steps.clear();
-        let assume_ids: Vec<ProofId> = assertion_ids
-            .iter()
-            .map(|&t| proof.add_assume(t, None))
-            .collect();
-        let mut current =
-            proof.add_rule_step(AletheRule::Hole, negated.clone(), Vec::new(), Vec::new());
-        let mut remaining = negated;
-        for (idx, &assume_id) in assume_ids.iter().enumerate() {
-            // Drop (not A_idx): resolved against assume A_idx. The removed
-            // literal's id is known by construction and deliberately unused.
-            let _ = remaining.remove(0);
-            current =
-                proof.add_resolution(remaining.clone(), assertion_ids[idx], current, assume_id);
-        }
-        debug_assert!(remaining.is_empty());
-        let _ = current;
     }
 
     /// Linear-arithmetic identity collapse (#trust-count→0). An integer assertion
@@ -5538,8 +5666,7 @@ impl Executor {
     ///
     /// Returns a proof that the assertions are unsatisfiable in Alethe format.
     pub(super) fn get_proof(&self) -> String {
-        // Mandatory internal proof tracking certifies the verdict but does not
-        // opt the user into the `(get-proof)` artifact surface.
+        // Live SMT enablement cannot relabel an old solve-time proof request.
         if !self.is_producing_proofs() {
             return "(error \"proof generation is not enabled, set :produce-proofs to true\")"
                 .to_string();
@@ -5554,7 +5681,7 @@ impl Executor {
         match self.last_result {
             Some(SolveResult::Unsat(_)) => {
                 // Export the stored proof in Alethe format
-                match &self.last_proof {
+                match self.last_proof() {
                     Some(proof) => {
                         let Some(scope) = self.proof_export_scope_assertions_for(proof) else {
                             return "(error \"finite-enum proof authority is stale\")".to_string();
@@ -5616,7 +5743,7 @@ impl Executor {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
-        let proof = self.last_proof.as_ref()?;
+        let proof = self.last_proof()?;
         // #A2b: `proof_reconstruction_step_budget` is set ONLY for the
         // synthesized-default certificate (never for explicit `--proof`,
         // `--strict-proofs`, `--self-check`, or `:produce-proofs`). Extend
@@ -5677,7 +5804,7 @@ impl Executor {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
-        let proof = self.last_proof.as_ref()?;
+        let proof = self.last_proof()?;
         // #A2b: same emission-budget contract as the String variant above.
         if self.last_proof_has_finite_enum_sidecar() {
             let Some(overrides) = self.finite_enum_surface_overrides_for_proof(proof) else {
@@ -5778,6 +5905,9 @@ impl Executor {
                 }
             }
         }
+        if !self.boolean_constant_premises_authored().1 {
+            scope.retain(|&term| term != self.ctx.terms.false_term());
+        }
         scope
     }
 
@@ -5788,15 +5918,6 @@ impl Executor {
     pub(super) fn record_rebuilt_authored_proof_premise(&mut self, premise: TermId) {
         if !self.last_proof_rebuild_originals.contains(&premise) {
             self.last_proof_rebuild_originals.push(premise);
-        }
-    }
-
-    /// Get the last serialized LRAT certificate, if proof export captured one.
-    pub(crate) fn last_lrat_certificate(&self) -> Option<&[u8]> {
-        if self.last_unsat_proof_reconstruction_suppressed {
-            None
-        } else {
-            self.last_lrat_certificate.as_deref()
         }
     }
 
@@ -5841,39 +5962,6 @@ impl Executor {
                 self.ctx.get_option("produce-proofs"),
                 Some(OptionValue::Bool(true))
             )
-    }
-
-    /// Whether an UNVETTED no-proof refutation lane may run (#proof-capability
-    /// B2, dormant-lane audit).
-    ///
-    /// Two UNSAT-originating shortcuts gate on this predicate:
-    /// `try_word_eq_constant_propagation` (strings), and
-    /// `try_lia_eager_assume_unsat_probe` (LIA). Both were written
-    /// against the OLD meaning of `!produce_proofs_enabled()` ("the user
-    /// opted out of proofs") and are DEAD on today's certified public path,
-    /// where `begin_public_solve` always arms the tracker. Competition
-    /// shedding (`competition_shedding_active`) turns the tracker off, which
-    /// would have flipped both gates LIVE for the first time under
-    /// public publication — switching ON refutation shortcuts that have
-    /// never been publicly exercised is not cost shedding. The v1 decision
-    /// keeps both exactly as dead as today in every configuration:
-    ///
-    /// - false whenever `produce_proofs_enabled()` — unchanged: these lanes
-    ///   have no proof reconstruction and must not originate an uncertified
-    ///   `Unsat` into a proof-carrying solve;
-    /// - false whenever `competition_shedding_active()` — new: shedding must
-    ///   not activate unvetted refutation lanes.
-    ///
-    /// In every non-competition configuration `competition_shedding_active()`
-    /// is false, so this predicate is exactly `!produce_proofs_enabled()` —
-    /// byte-identical behavior to the gates it replaced. A lane may move off
-    /// this predicate only after it is individually vetted for raw
-    /// publication; it then earns its own named gate and an entry in the
-    /// `proof_gate_census_tests` vetted list (which also inventories every
-    /// call site of THIS predicate, so adding another lane here fails the
-    /// census until it is vetted).
-    pub(in crate::executor) fn unvetted_no_proof_lane_allowed(&self) -> bool {
-        !self.produce_proofs_enabled() && !self.competition_shedding_active()
     }
 
     /// Skip preprocessing variable substitution when proofs are requested
@@ -5932,7 +6020,7 @@ fn clause_trace_to_lrat_bytes(trace: &ay_sat::ClauseTrace) -> Option<Vec<u8>> {
             return None;
         }
         output.advance_past(entry.id);
-        let assigned_id = output.add(&entry.clause, &entry.resolution_hints).ok()?;
+        let assigned_id = output.add(entry.clause, entry.resolution_hints).ok()?;
         if assigned_id != entry.id {
             return None;
         }
@@ -7321,258 +7409,6 @@ fn match_ite_same_negation(asrt: &FrontendTerm) -> Option<(&str, &str)> {
     None
 }
 
-/// Match `(and P (not (= P' true)))` — the external-codegen dom-bounds contradiction
-/// shape — returning the two `P` occurrences for the caller to prove
-/// identical. The `true` must be the literal boolean constant in the SECOND
-/// equality slot (exactly the shape the external-codegen renderer emits); any other
-/// shape returns `None` (fail-closed).
-fn match_and_true_eq_contradiction(asrt: &FrontendTerm) -> Option<(&FrontendTerm, &FrontendTerm)> {
-    let FrontendTerm::App(and_op, and_args) = asrt else {
-        return None;
-    };
-    if and_op != "and" || and_args.len() != 2 {
-        return None;
-    }
-    let FrontendTerm::App(not_op, not_args) = &and_args[1] else {
-        return None;
-    };
-    if not_op != "not" || not_args.len() != 1 {
-        return None;
-    }
-    let FrontendTerm::App(eq_op, eq_args) = &not_args[0] else {
-        return None;
-    };
-    if eq_op != "=" || eq_args.len() != 2 {
-        return None;
-    }
-    if !matches!(&eq_args[1], FrontendTerm::Const(FrontendConstant::True)) {
-        return None;
-    }
-    Some((&and_args[0], &eq_args[0]))
-}
-
-/// Faithfully rebuild a Bool-sorted BITVECTOR ATOM — a BV comparison
-/// (`bvult`/`bvule`/`bvugt`/`bvuge`/`bvslt`/`bvsle`/`bvsgt`/`bvsge`) or a BV
-/// equality — whose sides go through the fold-guarded [`build_bv_pterm`].
-/// Returns `None` (fail-closed) for any other op, a sort mismatch, or — the
-/// soundness guard — an application `mk_app` FOLDED (so the rebuilt atom no
-/// longer mirrors the surface term).
-fn build_bv_atom_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> {
-    let FrontendTerm::App(op, args) = pt else {
-        return None;
-    };
-    if args.len() != 2
-        || !matches!(
-            op.as_str(),
-            "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge" | "="
-        )
-    {
-        return None;
-    }
-    let a = build_bv_pterm(terms, &args[0])?;
-    let b = build_bv_pterm(terms, &args[1])?;
-    if terms.sort(a) != terms.sort(b) || !matches!(terms.sort(a), Sort::BitVec(_)) {
-        return None;
-    }
-    let atom = terms.mk_app(Symbol::named(op), vec![a, b], Sort::Bool);
-    matches!(
-        terms.get(atom),
-        TermData::App(sym, ar) if sym.name() == op && ar.as_slice() == [a, b]
-    )
-    .then_some(atom)
-}
-
-/// Match an equality negation `(not (= L R))` (theory-agnostic), returning the
-/// two sides `(L, R)` of the frontend AST. Returns `None` for any other shape.
-fn match_eq_negation(asrt: &FrontendTerm) -> Option<(&FrontendTerm, &FrontendTerm)> {
-    let FrontendTerm::App(not_op, not_args) = asrt else {
-        return None;
-    };
-    if not_op != "not" || not_args.len() != 1 {
-        return None;
-    }
-    let FrontendTerm::App(eq_op, eq_args) = &not_args[0] else {
-        return None;
-    };
-    if eq_op != "=" || eq_args.len() != 2 {
-        return None;
-    }
-    Some((&eq_args[0], &eq_args[1]))
-}
-
-/// Faithfully translate a bitvector frontend term into a `TermId` — the same
-/// translation the elaborator performs, MINUS the simplifying folds (it builds
-/// through raw `mk_app`/`mk_bitvec`). Handles BV-sorted symbols (declared
-/// consts), hex/binary literals, same-width unary/binary BV ops, and the
-/// width-changing ops (`concat`, `(_ extract …)`, `(_ zero_extend k)`,
-/// `(_ sign_extend k)`, `(_ rotate_left/right k)`, `(_ repeat k)`), recursively.
-///
-/// Returns `None` (fail-closed) for anything outside this fragment — a non-BV
-/// symbol, a non-BV literal, a width-changing or unknown op, an arity mismatch,
-/// or — the load-bearing soundness guard — an op application that `mk_app`
-/// FOLDED away (so the rebuilt term is no longer the raw `(op args..)` and would
-/// silently change the reconstructed assertion). Because every accepted node is a
-/// structure-preserving rebuild, the resulting term faithfully represents the
-/// surface assertion, so an `assume` built from it matches the real input.
-fn build_bv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> {
-    match pt {
-        FrontendTerm::Symbol(s) => {
-            // The surface snapshot stringifies a standalone indexed BV numeral
-            // `(_ bvN W)` into a SYMBOL of that spelling (it is an identifier,
-            // not an application). Recognize it before the declared-constant
-            // lookup; built via the same `mk_bitvec` the elaborator uses, so
-            // the rebuilt constant is definitionally the surface term.
-            if let Some((value, width)) = parse_indexed_bv_numeral(s) {
-                return Some(terms.mk_bitvec(value, width));
-            }
-            let id = terms.lookup(s)?;
-            matches!(terms.sort(id), Sort::BitVec(_)).then_some(id)
-        }
-        FrontendTerm::Const(c) => build_bv_const(terms, c),
-        FrontendTerm::IndexedApp(name, indices, args) if args.is_empty() => {
-            build_bv_decimal_indexed(terms, name, indices)
-        }
-        // Width-CHANGING `concat`: result width is the sum of operand widths.
-        FrontendTerm::App(op, args) if op == "concat" && args.len() == 2 => {
-            let a = build_bv_pterm(terms, &args[0])?;
-            let b = build_bv_pterm(terms, &args[1])?;
-            let width = terms
-                .sort(a)
-                .bitvec_width()?
-                .checked_add(terms.sort(b).bitvec_width()?)?;
-            let t = terms.mk_app(Symbol::named("concat"), vec![a, b], Sort::bitvec(width));
-            matches!(
-                terms.get(t),
-                TermData::App(sym, ar) if sym.name() == "concat" && ar.as_slice() == [a, b]
-            )
-            .then_some(t)
-        }
-        // Same-width unary/binary BV ops.
-        FrontendTerm::App(op, args) => {
-            let arity = bv_samewidth_op_arity(op)?;
-            if args.len() != arity {
-                return None;
-            }
-            let arg_ids: Vec<TermId> = args
-                .iter()
-                .map(|a| build_bv_pterm(terms, a))
-                .collect::<Option<_>>()?;
-            let sort = terms.sort(arg_ids[0]).clone();
-            if !matches!(sort, Sort::BitVec(_)) {
-                return None;
-            }
-            let t = terms.mk_app(Symbol::named(op), arg_ids.clone(), sort);
-            // Faithfulness guard: the rebuilt term must be the RAW application; if
-            // `mk_app` folded it (e.g. `bvnot (bvnot x) → x`), it no longer mirrors
-            // the surface term, so we decline rather than change the assertion.
-            matches!(
-                terms.get(t),
-                TermData::App(sym, a) if sym.name() == op && a.as_slice() == arg_ids.as_slice()
-            )
-            .then_some(t)
-        }
-        // Indexed width-changing BV ops: `(_ extract hi lo)`, `(_ zero_extend k)`,
-        // `(_ sign_extend k)`, `(_ rotate_left k)`, `(_ rotate_right k)`,
-        // `(_ repeat k)`. The result width is computed to match the strict
-        // checker's `eval_indexed_bv`; a mismatch only fails closed (the equality's
-        // two sides get different sorts → declined), never unsound.
-        FrontendTerm::IndexedApp(name, idx_strs, args) if args.len() == 1 => {
-            let indices: Vec<u32> = idx_strs
-                .iter()
-                .map(|index| index.as_numeral()?.parse::<u32>().ok())
-                .collect::<Option<_>>()?;
-            let arg = build_bv_pterm(terms, &args[0])?;
-            let src_width = terms.sort(arg).bitvec_width()?;
-            let width = bv_indexed_result_width(name, &indices, src_width)?;
-            let sym = Symbol::indexed(name, indices.clone());
-            let t = terms.mk_app(sym, vec![arg], Sort::bitvec(width));
-            matches!(
-                terms.get(t),
-                TermData::App(Symbol::Indexed(n, idx), ar)
-                    if n == name && idx.as_slice() == indices.as_slice() && ar.as_slice() == [arg]
-            )
-            .then_some(t)
-        }
-        // Indexed BV NUMERAL `(_ bvN W)` — a nullary indexed identifier
-        // denoting the width-`W` constant `N` (SMT-LIB 2.6 §3.5.1; the
-        // external-codegen obligation renderer's literal form, e.g. `(_ bv1024 64)`).
-        // Built via the same `mk_bitvec` the elaborator and `build_bv_const`
-        // use, so the rebuilt constant is definitionally the surface term —
-        // no fold guard needed on a literal. A malformed numeral or width
-        // fails closed.
-        FrontendTerm::IndexedApp(name, idx_strs, args)
-            if args.is_empty() && idx_strs.len() == 1 && name.starts_with("bv") =>
-        {
-            let digits = &name[2..];
-            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let value = BigInt::parse_bytes(digits.as_bytes(), 10)?;
-            // The width index must be a NUMERAL token specifically. `Index` is
-            // deliberately token-kind-typed — the numeral `8` and the quoted
-            // symbol `|8|` are distinct indices and must not collapse to the
-            // same string — so match the variant rather than stringifying.
-            let [FrontendIndex::Numeral(width_str)] = idx_strs.as_slice() else {
-                return None;
-            };
-            let width = width_str.parse::<u32>().ok()?;
-            if width == 0 {
-                return None;
-            }
-            Some(terms.mk_bitvec(value, width))
-        }
-        _ => None,
-    }
-}
-
-/// Parse the SMT-LIB indexed BV numeral spelling `(_ bvN W)` (SMT-LIB 2.6
-/// §3.5.1) into `(N, W)`. Whitespace-tolerant between the three tokens;
-/// anything else — malformed digits, a zero width, extra tokens — returns
-/// `None` (fail-closed).
-fn parse_indexed_bv_numeral(s: &str) -> Option<(BigInt, u32)> {
-    let inner = s.trim().strip_prefix('(')?.strip_suffix(')')?;
-    let mut tokens = inner.split_whitespace();
-    if tokens.next()? != "_" {
-        return None;
-    }
-    let bv_name = tokens.next()?;
-    let width_str = tokens.next()?;
-    if tokens.next().is_some() {
-        return None;
-    }
-    let digits = bv_name.strip_prefix("bv")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let value = BigInt::parse_bytes(digits.as_bytes(), 10)?;
-    let width = width_str.parse::<u32>().ok()?;
-    if width == 0 {
-        return None;
-    }
-    Some((value, width))
-}
-
-/// Build a bitvector constant term from a hex/binary frontend literal, mirroring
-/// the elaborator's parsing exactly (`#xAB` → width `len*4`, `#b101` → width
-/// `len`). Returns `None` for non-bitvector constants.
-fn build_bv_const(terms: &mut TermStore, c: &FrontendConstant) -> Option<TermId> {
-    match c {
-        FrontendConstant::Hexadecimal(s) => {
-            let hex = s.trim_start_matches("#x");
-            let value = BigInt::parse_bytes(hex.as_bytes(), 16)?;
-            let width = (hex.len() * 4) as u32;
-            Some(terms.mk_bitvec(value, width))
-        }
-        FrontendConstant::Binary(s) => {
-            let bin = s.trim_start_matches("#b");
-            let value = BigInt::parse_bytes(bin.as_bytes(), 2)?;
-            let width = bin.len() as u32;
-            Some(terms.mk_bitvec(value, width))
-        }
-        _ => None,
-    }
-}
-
 /// Faithfully translate a QF_BV assertion-level frontend term into a `TermId`
 /// — the elaborator's translation MINUS the simplifying folds (raw
 /// `mk_app`/`mk_not_raw`/`mk_ite_raw`/`mk_bitvec`). This is the boolean layer
@@ -7658,20 +7494,8 @@ fn build_qfbv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
             )
             .then_some(t)
         }
-        FrontendTerm::App(op, args) if op == "ite" && args.len() == 3 => {
-            let c = build_qfbv_pterm(terms, &args[0])?;
-            let x = build_qfbv_pterm(terms, &args[1])?;
-            let y = build_qfbv_pterm(terms, &args[2])?;
-            if !matches!(terms.sort(c), Sort::Bool)
-                || terms.sort(x) != terms.sort(y)
-                || !matches!(terms.sort(x), Sort::Bool | Sort::BitVec(_))
-            {
-                return None;
-            }
-            let t = terms.mk_ite_raw(c, x, y);
-            matches!(terms.get(t), TermData::Ite(tc, tx, ty) if (*tc, *tx, *ty) == (c, x, y))
-                .then_some(t)
-        }
+        FrontendTerm::App(op, args) if op == "ite" => build_qfbv_ite_pterm(terms, args),
+        FrontendTerm::App(op, args) if op == "select" => build_qfbv_select_pterm(terms, args),
         // Everything else BV-sorted (same-width ops, concat, indexed ops,
         // hex/binary literals, BV symbols): the existing faithful BV builder.
         // NOTE: subterms of BV ops that need the boolean layer (an `ite`
@@ -7770,6 +7594,36 @@ fn term_contains_bitvec(terms: &TermStore, root: TermId) -> bool {
             continue;
         }
         if matches!(terms.sort(t), Sort::BitVec(_)) {
+            return true;
+        }
+        match terms.get(t) {
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, x, y) => {
+                stack.push(*c);
+                stack.push(*x);
+                stack.push(*y);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `root`'s term DAG contains any Array-sorted node (iterative walk).
+///
+/// The scope discriminator for [`Executor::rebuilt_terms_print_faithfully`]:
+/// array content is exactly the fragment the faithful rebuilders newly admit,
+/// and the one where `mk_select`/`mk_store`'s folds can misattribute a whole
+/// read's authored spelling to a single leaf.
+fn term_contains_array(terms: &TermStore, root: TermId) -> bool {
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        if matches!(terms.sort(t), Sort::Array(_)) {
             return true;
         }
         match terms.get(t) {

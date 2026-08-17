@@ -39,6 +39,7 @@ use ay_core::TermId;
 
 use crate::executor::exact_exists_bounds::CheckedExactExistsSat;
 use crate::executor::quantified_sat::CheckedProjectionSatEvidence;
+use crate::executor::unsat_cert::CommandUnsatAdmission;
 use crate::executor::Executor;
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 
@@ -145,6 +146,10 @@ impl Executor {
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
 
+        if self.revoke_provisional_sat_if_finite_array_incomplete(true) {
+            return Ok(SolveResult::Unknown);
+        }
+
         if !evidence.is_current(self) {
             return Ok(self.reject_checked_exact_exists_sat(
                 "exact-exists SAT evidence was stale before model construction",
@@ -233,7 +238,17 @@ impl Executor {
         if result.is_unsat() {
             self.last_sat_certificate = None;
             if let Some(certificate) = self.take_unsat_certificate() {
-                self.last_command_unsat_admission = Some(certificate.command_admission());
+                let admission = certificate.command_admission();
+                self.last_command_unsat_admission = Some(admission);
+                // #proof-capability B3 — record the raw-admission class where
+                // operators will look for it. Emitted ONLY for the
+                // competition carve-out: certified-mode statistics stay
+                // byte-identical (no `unsat_admission` key ever appears
+                // there), which the regression tests assert.
+                if admission == CommandUnsatAdmission::CompetitionRaw {
+                    self.last_statistics
+                        .set_string("unsat_admission", "competition-raw");
+                }
                 return result;
             }
             return self.reject_uncertified_verdict_for_publication(
@@ -277,6 +292,10 @@ impl Executor {
         // installation, completion conflict, stop request, or stale epoch.
         self.last_sat_certificate = None;
         self.last_model_validated = false;
+
+        if self.revoke_provisional_sat_if_finite_array_incomplete(true) {
+            return Ok(SolveResult::Unknown);
+        }
 
         let started_at = Instant::now();
         if !evidence.is_current(self) {
@@ -467,6 +486,14 @@ impl Executor {
             if proposed != SolveResult::Sat {
                 self.last_sat_certificate = None;
                 return Ok(proposed);
+            }
+
+            // Exact finite-index array expansion is a query-wide SAT
+            // prerequisite. Every internal route also applies this boundary
+            // near its proposal so retries stop promptly; keep the sole public
+            // SAT minting funnel as the final non-bypassable backstop.
+            if self.revoke_provisional_sat_if_finite_array_incomplete(true) {
+                return Ok(SolveResult::Unknown);
             }
 
             // Certificate models are affine. Move the one already-completed

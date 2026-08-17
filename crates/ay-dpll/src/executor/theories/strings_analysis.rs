@@ -1550,7 +1550,7 @@ impl Executor {
                     && matches!(terms.get(args[0]), TermData::Var(..)))
     }
 
-    /// P2 (`AY_STR_P2=1`): witness candidates for string variables whose
+    /// P2: witness candidates for string variables whose
     /// polarity-decoded constraints include NEGATIVE content facts — negated
     /// `str.contains(H[x], "c")` (haystack may be any composite over `x`,
     /// e.g. the pyex `replace(substr(uri,..),..) ++ substr(uri,..)` chain),

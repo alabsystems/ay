@@ -437,12 +437,6 @@ fn deriv_expansion_split_condense_inline_bmc_replays_on_original() {
     use crate::transform::CondenseSuperpass;
     use crate::ChcEngineResult;
 
-    // Honor the condense kill switch so this test self-skips when condense is
-    // disabled (mirrors condense/split_sym test guards).
-    if std::env::var("AY_CHC_DISABLE_CONDENSE").is_ok() {
-        return;
-    }
-
     let problem = unsafe_tower();
     let pipeline_result = TransformationPipeline::new()
         .with(PcSplitter::new().with_enabled(true))

@@ -14,12 +14,15 @@
 //! - `result_mapping`: CEGQI/E-matching result interpretation and assertion restore.
 //! - `cegqi_refinement`: multi-round arithmetic refinement and neighbor enumeration.
 //! - `dispatch`: logic-category re-solve dispatch and interleaved E-matching.
-
 mod cegqi_refinement;
 mod dispatch;
 mod entailed_consts;
+mod exact_array_negation;
 pub(crate) mod family_classifier;
 mod preprocess;
+mod quantifier_result;
+mod skolem_witness;
+mod unsupported_arith;
 // Untrusted projection proposal plus independent semantic/source checking.
 // This module cannot emit SAT: its opaque result must still be consumed with
 // an authored-query permit at the sealed SAT authority boundary.
@@ -28,12 +31,17 @@ pub(in crate::executor) mod result_mapping;
 
 use ay_core::{Sort, TermData, TermId, TermStore};
 
-pub(in crate::executor) use cegqi_refinement::unsupported_arith_mentions_ce_var;
+pub(in crate::executor) use exact_array_negation::ExactArrayNegationEvidence;
 pub(in crate::executor) use family_classifier::write_family_class_statistics;
+pub(in crate::executor) use quantifier_result::{
+    ExactFiniteExpansionEvidence, QuantifierProcessingResult,
+};
 pub(in crate::executor) use result_mapping::CegqiUfRecompletionGrant;
+pub(in crate::executor) use unsupported_arith::unsupported_int_div_mod_mentions_ce_var;
 
-use super::{Executor, QuantExpansionRecord};
-use crate::cegqi::CegqiInstantiator;
+use quantifier_result::FiniteExpansionRecord;
+
+use super::Executor;
 use crate::ematching::{collect_quantifiers, contains_quantifier};
 use crate::quantifier_manager::QuantifierManager;
 
@@ -239,132 +247,6 @@ fn assertions_have_direct_boolean_conflict(terms: &TermStore, assertions: &[Term
     false
 }
 
-/// Exact preprocessing snapshot retained when canonical finite-domain
-/// expansion removes every quantifier before E-matching starts.
-///
-/// The records are producer provenance, not SAT authority. Result mapping must
-/// still replay the canonical expander, prove complete coverage of the authored
-/// quantified roots, validate the retained model against `expanded_assertions`,
-/// and bind any grant to that exact model.
-pub(in crate::executor) struct ExactFiniteExpansionEvidence {
-    pub(super) expanded_assertions: Box<[TermId]>,
-    pub(super) records: Box<[QuantExpansionRecord]>,
-}
-
-/// Result of quantifier preprocessing: flags consumed by `map_quantifier_result`.
-pub(in crate::executor) struct QuantifierProcessingResult {
-    /// Whether any quantifiers had no E-matching instantiations.
-    pub has_uninstantiated_quantifiers: bool,
-    /// Whether E-matching hit its round or per-round budget.
-    pub reached_instantiation_limit: bool,
-    /// Whether deferred instantiations remain.
-    pub has_deferred: bool,
-    /// Whether CEGQI handled at least one forall quantifier.
-    pub cegqi_has_forall: bool,
-    /// Whether CEGQI handled at least one exists quantifier.
-    pub cegqi_has_exists: bool,
-    /// Whether E-matching added any new ground instantiations.
-    pub ematching_added_instantiations: bool,
-    /// Assertion snapshot after finite-domain expansion and Skolemization but
-    /// before stripping quantified formulas. Interleaved refinement should use
-    /// this preprocessed view instead of reintroducing the original shapes.
-    pub refinement_assertions: Option<Vec<TermId>>,
-    /// CE lemma TermIds added by CEGQI, tracked by ID for position-independent
-    /// filtering. Refinement rounds push ground instantiations after CE lemmas,
-    /// so positional slicing from the end is incorrect (#5975 offset bug).
-    pub cegqi_ce_lemma_ids: Vec<TermId>,
-    /// Per-universal CE-conjunct groups (#cegqi-per-universal): for each
-    /// CEGQI-handled quantifier, the surviving AND-conjuncts of ITS CE lemma —
-    /// the sound unit for the disambiguation SAT flip's refutation.
-    pub cegqi_ce_lemma_groups: Vec<(TermId, Vec<TermId>)>,
-    /// Whether any quantifiers are completely unhandled (neither E-matching nor CEGQI).
-    pub has_completely_unhandled_quantifiers: bool,
-    /// Quantifiers not handled by either E-matching or CEGQI (#5971).
-    /// Passed to MBQI for model-based counterexample checking.
-    pub unhandled_quantifiers: Vec<TermId>,
-    /// Whether E-matching processed any exists quantifiers (#3593).
-    /// When true, UNSAT results are unreliable because E-matching adds exists
-    /// instances as conjunctive assertions (all must hold), but exists semantics
-    /// require a disjunction (at least one must hold).
-    pub ematching_has_exists: bool,
-    /// Number of E-matching rounds completed (#8614).
-    pub ematching_rounds_completed: u64,
-    /// Number of quantifier instances created by E-matching (#8614).
-    pub ematching_instances_created: u64,
-    /// Original assertions snapshot (before E-matching modifications).
-    /// `Some` when quantifiers were present; used to restore assertions after solving.
-    pub original_assertions: Option<Vec<TermId>>,
-    /// Canonical finite-expansion provenance for the early fully-ground exit.
-    /// Kept separate from `original_assertions`: restoration state alone is
-    /// never evidence that an expansion was exact or exhaustive.
-    pub exact_finite_expansion: Option<ExactFiniteExpansionEvidence>,
-    /// CEGQI state for refinement: (quantifier_id, instantiator) pairs.
-    /// Used by `map_quantifier_result` to compute model-based instantiations
-    /// when the CE lemma yields SAT (counterexample found).
-    pub cegqi_state: Vec<(TermId, CegqiInstantiator)>,
-    /// Any original assertion contains a `forall` whose binder sort MBQI
-    /// cannot synthesize (Array, FP, Seq, RegLan). SAT results for such
-    /// problems are unsound unless CEGQI refinement already forced UNSAT,
-    /// because the ground solver only sees a finite set of E-matched
-    /// instances of an infinite-domain quantifier (ay #8729, Z3 #6303).
-    pub has_unsafe_partial_quantifiers: bool,
-    /// True when every collected universal quantifier is a syntactic
-    /// UF-completion candidate.
-    ///
-    /// This is only a refinement hint. It is not SAT authority: the classifier
-    /// does not construct one shared interpretation for all accepted atoms, and
-    /// E-matching having produced an instance is not domain coverage.
-    pub quantifiers_supported_by_uf_completion: bool,
-}
-
-impl QuantifierProcessingResult {
-    /// Create a no-op result for the case when no quantifiers are present.
-    pub(super) fn no_quantifiers() -> Self {
-        Self {
-            has_uninstantiated_quantifiers: false,
-            reached_instantiation_limit: false,
-            has_deferred: false,
-            cegqi_has_forall: false,
-            cegqi_has_exists: false,
-            ematching_added_instantiations: false,
-            refinement_assertions: None,
-            cegqi_ce_lemma_ids: Vec::new(),
-            cegqi_ce_lemma_groups: Vec::new(),
-            has_completely_unhandled_quantifiers: false,
-            unhandled_quantifiers: Vec::new(),
-            ematching_has_exists: false,
-            ematching_rounds_completed: 0,
-            ematching_instances_created: 0,
-            original_assertions: None,
-            exact_finite_expansion: None,
-            cegqi_state: Vec::new(),
-            has_unsafe_partial_quantifiers: false,
-            quantifiers_supported_by_uf_completion: false,
-        }
-    }
-
-    /// Preserve the exact before/after expansion relation when preprocessing
-    /// has made the solve entirely ground. Returning `no_quantifiers()` here
-    /// used to discard both the authored roots and their authenticated
-    /// `QuantExpansionRecord`s, so restoration could only fail closed after a
-    /// valid ground SAT.
-    fn fully_expanded(
-        original_assertions: Vec<TermId>,
-        expanded_assertions: Vec<TermId>,
-        records: Vec<QuantExpansionRecord>,
-    ) -> Self {
-        let exact_finite_expansion = (!records.is_empty()).then(|| ExactFiniteExpansionEvidence {
-            expanded_assertions: expanded_assertions.clone().into_boxed_slice(),
-            records: records.into_boxed_slice(),
-        });
-        let mut result = Self::no_quantifiers();
-        result.refinement_assertions = Some(expanded_assertions);
-        result.original_assertions = Some(original_assertions);
-        result.exact_finite_expansion = exact_finite_expansion;
-        result
-    }
-}
-
 impl Executor {
     /// Return `true` if any assertion contains a `forall` whose binder ranges
     /// over a user-declared datatype.
@@ -473,14 +355,9 @@ impl Executor {
             self.install_proof_source_provenance(&authored_assertions);
         }
 
-        // (#choose-synth-watermark) Fix the ORIGINAL-problem term boundary before
-        // ANY witness synthesis (Skolemization, add_diagonal, MBQI/CEGQI model
-        // values) runs below. Idempotent, so on the first quantifier-bearing solve
-        // it records exactly the pre-synthesis term count; every later `mk_*` (an
-        // invented witness like `f2(-1,0)` over an LIA model value) gets a strictly
-        // greater id. Only the `no_mbqi` Hilbert-`choose` E-match guard consults it,
-        // to refuse discharging the choose existential from a synthesized witness.
-        self.ctx.terms.set_synthesis_watermark();
+        if let Some(rewritten) = self.begin_quantifier_synthesis_or_exact_array_negation() {
+            return rewritten;
+        }
 
         // 1b. (#p2-nested-forall) Merge directly nested same-polarity binder
         // towers (`∀x.∀y.B ⇒ ∀x,y.B`, alpha-renamed) BEFORE the
@@ -506,8 +383,8 @@ impl Executor {
             || self.assertions_have_forall_over_datatype();
 
         // 3. Finite-domain expansion + Skolemization. Re-check for remaining quantifiers.
-        self.expand_finite_domains();
-        self.skolemize_existentials();
+        let mut finite_expansion_records = self.expand_finite_domains();
+        self.skolemize_existentials(&mut finite_expansion_records);
 
         // (#forall-goal-boundary) Tighten GROUND integer strict bounds `(< s t)` to
         // the equivalent non-strict `(<= s (- t 1))`. Runs AFTER Skolemization, so a
@@ -584,7 +461,7 @@ impl Executor {
                 return QuantifierProcessingResult::fully_expanded(
                     original_assertions,
                     self.ctx.assertions.clone(),
-                    self.quant_expansion_records.clone(),
+                    finite_expansion_records,
                 );
             }
             // Defensive fail-closed fallback for an impossible state: without
@@ -721,7 +598,7 @@ impl Executor {
                     // SUBSET of the assertions, which need not entail these constants,
                     // so folding them in there would not be equals-for-equals.
                     let _derived_scope = crate::skolemize::scoped_derived_consts(consts);
-                    self.expand_finite_domains();
+                    let _ = self.expand_finite_domains();
                 }
             }
         }
@@ -772,7 +649,7 @@ impl Executor {
             && ground_assertions_supported_by_uf_completion
             && ground_assertions_consistent
             && forall_quantifiers_supported_by_uf_completion;
-        if std::env::var_os("AY_DEBUG_CERT").is_some() {
+        if ay_core::misc_cli_flags().debug_cert {
             eprintln!(
                 "CERT: nforall={} ground_ok={} consistent={} forall_ok={} candidate={}",
                 forall_quantifiers.len(),
@@ -872,6 +749,7 @@ impl Executor {
             ematching_instances_created,
             original_assertions,
             exact_finite_expansion: None,
+            exact_array_negation: None,
             cegqi_state: cegqi.cegqi_state,
             has_unsafe_partial_quantifiers,
             // Candidate only: result mapping may use this to schedule sound
@@ -947,6 +825,18 @@ fn closed_quantifier_free_forall_parts(
 /// remain `Unknown`), so `div`/`mod`/`rem`, the fixed Int/Real conversion
 /// operators, and fixed-width BV comparisons are safe to admit. Free
 /// declarations remain excluded.
+///
+/// `Bool` binders are admitted alongside `Int`/`Real`/`BitVec`. The binder sort
+/// bar here is exactly [`is_fixed_interpretation_sort`] — the property the lane
+/// actually needs is that the binder ranges over a domain the model may not
+/// choose, which is as true of `Bool` (exactly `{false, true}`, by the theory)
+/// as of `Int`. `Bool` was omitted, not excluded: nothing in this lane's
+/// argument distinguishes it, and its two-element domain is the one case where
+/// the candidate enumeration is EXHAUSTIVE rather than heuristic, so
+/// `(forall ((b Bool)) b)` had no publishable refutation at all and fell back
+/// to `unknown`. Authority is unchanged — a Boolean literal tuple is accepted
+/// only after the substituted instance evaluates to `Bool(false)` under the
+/// empty model, exactly as for an Int tuple.
 pub(in crate::executor) fn closed_quantifier_free_forall_literal_parts(
     terms: &TermStore,
     term: TermId,
@@ -959,7 +849,7 @@ pub(in crate::executor) fn closed_quantifier_free_forall_literal_parts(
     parts
         .0
         .iter()
-        .all(|(_, sort)| matches!(sort, Sort::Int | Sort::Real | Sort::BitVec(_)))
+        .all(|(_, sort)| matches!(sort, Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_)))
         .then_some(parts)
 }
 

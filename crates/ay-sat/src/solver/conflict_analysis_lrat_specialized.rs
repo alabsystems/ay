@@ -4,101 +4,12 @@
 
 //! Specialized LRAT helpers for level-0, probe, and empty-clause flows.
 
+mod level0_conflict;
+
 use super::*;
 use crate::kani_compat::det_hash_set_new;
 
 impl Solver {
-    /// Record the BCP resolution chain for a level-0 conflict (#4176).
-    ///
-    /// At decision level 0, all propagated literals are implied by unit clauses
-    /// and BCP. Standard 1UIP conflict analysis assumes decision_level > 0 and
-    /// has debug_asserts that fail at level 0 (backtrack_level < decision_level).
-    ///
-    /// This method walks the conflict clause and reason clauses backward through
-    /// the trail, collecting all clause IDs involved. The result is stored as an
-    /// empty learned clause with resolution hints in the clause trace, enabling
-    /// SatProofManager to reconstruct the resolution DAG.
-    pub(super) fn record_level0_conflict_chain(&mut self, conflict_ref: ClauseRef) {
-        debug_assert_eq!(
-            self.decision_level, 0,
-            "record_level0_conflict_chain called at non-zero decision level"
-        );
-        debug_assert!(
-            {
-                let ci = conflict_ref.0 as usize;
-                let lits = self.arena.literals(ci);
-                lits.iter().all(|lit| self.lit_val(*lit) < 0)
-            },
-            "BUG: level-0 conflict clause {} has non-false literal",
-            conflict_ref.0
-        );
-
-        // The bounded ResolutionDag route reconstructs the terminal proof
-        // postsolve. Do not eagerly clone the conflict clause, materialize
-        // unit proofs, build hint vectors, or allocate a trace HashSet here;
-        // those legacy structures have no caller-controlled envelope.
-        if self.cold.backward_proof_limits.is_some() {
-            self.mark_empty_clause_deferred_for_bounded_proof();
-            return;
-        }
-
-        if self.cold.clause_trace.is_none() && !self.cold.lrat_enabled {
-            self.has_empty_clause = true;
-            if self.cold.empty_clause_scope_depth == 0 {
-                self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
-            }
-            return;
-        }
-
-        if self.cold.lrat_enabled {
-            self.materialize_level0_unit_proofs();
-
-            let ci = conflict_ref.0 as usize;
-            let conflict_lits = self.arena.literals(ci).to_vec();
-            let num_vars = self.var_data.len();
-
-            for &idx in &self.min.lrat_to_clear {
-                self.min.minimize_flags[idx] &= !LRAT_A;
-            }
-            self.min.lrat_to_clear.clear();
-            for &lit in &conflict_lits {
-                let vi = lit.variable().index();
-                if vi < num_vars && self.min.minimize_flags[vi] & LRAT_A == 0 {
-                    self.min.minimize_flags[vi] |= LRAT_A;
-                    self.min.lrat_to_clear.push(vi);
-                }
-            }
-
-            let unit_chain = self.collect_level0_unit_chain();
-            let mut conflict_id = self.cached_conflict_clause_id(conflict_ref);
-
-            if conflict_id == 0 && self.proof_manager.is_some() {
-                let tt_id = self
-                    .proof_emit_add(&conflict_lits, &[], ProofAddKind::TrustedTransform)
-                    .unwrap_or(0);
-                if tt_id != 0 {
-                    if ci < self.cold.clause_ids.len() {
-                        self.cold.clause_ids[ci] = tt_id;
-                    }
-                    conflict_id = tt_id;
-                }
-            }
-
-            let mut proof_hints: Vec<u64> =
-                unit_chain.into_iter().rev().filter(|&h| h != 0).collect();
-            if conflict_id != 0 {
-                proof_hints.push(conflict_id);
-            }
-
-            let trace_chain =
-                self.collect_resolution_chain(conflict_ref, None, &det_hash_set_new());
-            self.mark_empty_clause_with_hints_and_trace(&proof_hints, trace_chain);
-        } else {
-            let chain = self.collect_resolution_chain(conflict_ref, None, &det_hash_set_new());
-            self.mark_empty_clause_with_hints_and_trace(&chain, chain.clone());
-        }
-    }
-
     /// Collect LRAT hints for a probing conflict at level 1.
     ///
     /// When probing literal `probe_lit` at level 1 causes `conflict_ref`, this

@@ -44,6 +44,7 @@ pub(in crate::executor) struct CheckedFiniteEnumPigeonholeProof {
     pub(super) surface: Option<FiniteEnumProofSurface>,
     pub(super) datatype_decls: Box<[(String, Vec<String>)]>,
     pub(super) selector_decls: Box<[(String, Vec<String>)]>,
+    pub(super) member_signatures: Box<[ay_proof::DatatypeMemberSignature]>,
 }
 
 impl CheckedFiniteEnumPigeonholeProof {
@@ -177,11 +178,16 @@ impl Executor {
     pub(crate) fn checked_finite_enum_export_declarations(
         &self,
         proof: &Proof,
-    ) -> Option<(Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>)> {
+    ) -> Option<(
+        Vec<(String, Vec<String>)>,
+        Vec<(String, Vec<String>)>,
+        Vec<ay_proof::DatatypeMemberSignature>,
+    )> {
         let capability = self.checked_finite_enum_capability_for_proof(proof)?;
         Some((
             capability.datatype_decls.to_vec(),
             capability.selector_decls.to_vec(),
+            capability.member_signatures.to_vec(),
         ))
     }
 
@@ -199,6 +205,7 @@ impl Executor {
         assumptions: &[TermId],
         datatype_decls: &[(String, Vec<String>)],
         selector_decls: &[(String, Vec<String>)],
+        member_signatures: &[ay_proof::DatatypeMemberSignature],
     ) -> Result<ay_proof::ProofQuality, ay_proof::ProofCheckError> {
         let (mut work, mut bytes) = (0usize, 0usize);
         let mut progress = |work_delta: usize, byte_delta: usize| {
@@ -212,11 +219,12 @@ impl Executor {
             bytes = next_bytes;
             work <= MAX_CHECK_WORK && bytes <= MAX_CHECK_BYTES
         };
-        ay_proof::check_proof_strict_with_context_and_progress(
+        ay_proof::check_proof_strict_with_typed_context_and_progress(
             proof,
             &self.ctx.terms,
             Some(datatype_decls),
             Some(selector_decls),
+            member_signatures,
             Some(assumptions),
             &mut progress,
         )
@@ -440,6 +448,21 @@ impl Executor {
             selector_decls.push((constructor.clone(), selectors));
         }
         let datatype_decls = vec![(sort_name, constructors)];
+        let mut member_signatures = Vec::new();
+        for constructor in &datatype_decls[0].1 {
+            let tester = format!("is-{constructor}");
+            for identity in [constructor.as_str(), tester.as_str()] {
+                let Some(info) = self.ctx.exact_datatype_member_info(identity) else {
+                    return false;
+                };
+                member_signatures.push(ay_proof::DatatypeMemberSignature {
+                    identity: identity.to_string(),
+                    argument_sorts: info.arg_sorts.clone(),
+                    result_sort: info.sort.clone(),
+                    nullary_term: info.term,
+                });
+            }
+        }
 
         let mut proof = Proof::new();
         let mut premises = Vec::new();
@@ -460,6 +483,7 @@ impl Executor {
             &assumptions,
             &datatype_decls,
             &selector_decls,
+            &member_signatures,
         ) else {
             return false;
         };
@@ -475,6 +499,7 @@ impl Executor {
             surface,
             datatype_decls: datatype_decls.into_boxed_slice(),
             selector_decls: selector_decls.into_boxed_slice(),
+            member_signatures: member_signatures.into_boxed_slice(),
         };
         if !capability.matches_proof(&proof) {
             return false;

@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+#![forbid(unsafe_code)]
+
 //! THE PARAMETER SUBSTRATE: one place a knob is declared, resolved and audited.
 //!
 //! # What this replaces
@@ -19,7 +21,7 @@
 //! [`Shape`] enumerates them rather than picking one, and a migration that changes a
 //! site's shape is a deliberate act with its own measurement.
 //!
-//! The trap worth naming: **`AY_MILP_DFS=0` reads as ON**, because [`Shape::On`]
+//! The trap worth naming: **`--dfs` reads as ON**, because [`Shape::On`]
 //! tests presence and nothing else.
 //!
 //! # No `linkme`, no `inventory`, no ctors
@@ -54,7 +56,7 @@ pub enum Shape {
     /// PRESENCE means on: `env::var_os(K).is_some()`.
     ///
     /// The trap: `K=0` reads as **on**. Documented in `tune.rs` against
-    /// `AY_MILP_DFS`, and preserved deliberately — changing it would silently flip
+    /// `--dfs`, and preserved deliberately — changing it would silently flip
     /// behaviour for anyone who ever wrote `=0` expecting off.
     On,
     /// Exactly `"1"` means on; any other explicit value means off.
@@ -66,14 +68,14 @@ pub enum Shape {
     /// An explicitly set but UNPARSEABLE value takes the compiled default, not the
     /// policy. `tune.rs` gives the reason: the pre-migration sites spell it
     /// `.ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT)`, so
-    /// `AY_MILP_GMI_ROUNDS=garbage` yields `DEFAULT`, and preserving that is what
+    /// `--gmi-rounds=garbage` yields `DEFAULT`, and preserving that is what
     /// makes a migrated site behave identically for *every* input string.
     Num,
     /// A finite, non-negative real: a share, a multiplier, or a seconds value.
     ///
     /// The domain is part of the shape, not a caller's problem: every consumer
     /// feeds these to `Duration::from_secs_f64`/`mul_f64`, **both of which panic**
-    /// on a negative or non-finite input. `AY_MILP_SAT_STOP_MULT=-1` was an abort
+    /// on a negative or non-finite input. `--sat-stop-mult=-1` was an abort
     /// inside a consumer's solve.
     Real,
 }
@@ -81,7 +83,7 @@ pub enum Shape {
 /// Values outside this range are rejected by [`Shape::Real`].
 ///
 /// The upper bound is not decoration. `Duration::from_secs_f64` panics above
-/// `u64::MAX` seconds, so `AY_MILP_SAT_STOP_SECS=1e26` — a perfectly well-formed
+/// `u64::MAX` seconds, so `--sat-stop-secs=1e26` — a perfectly well-formed
 /// `f64` — aborted the process. `1e15` seconds is ~31 million years.
 pub const MAX_REAL: f64 = 1e15;
 
@@ -112,7 +114,7 @@ pub fn resolve_flag(shape: Shape, raw: Option<&OsStr>, default: bool) -> bool {
 
 /// Resolve an integer knob. An explicit but unparseable value takes `default`.
 ///
-/// **Not trimmed.** `AY_MILP_DIVE_MAX_PINS=" 5"` parse-fails today and leaves the
+/// **Not trimmed.** `--dive-max-pins` parse-fails today and leaves the
 /// dive uncapped at `usize::MAX`; a `.trim()` here would reinterpret that exact
 /// recipe as a cap of five — a 10^18 change, and a *different measured arm* from the
 /// one the journal recorded against the identical string.
@@ -147,10 +149,10 @@ pub fn resolve_real(raw: Option<&OsStr>, default: f64) -> f64 {
 ///
 /// | input | why it is here |
 /// |---|---|
-/// | `"0"` | reads as **on** under [`Shape::On`] (`AY_MILP_DFS`) |
-/// | `" 5"` | must keep parse-failing or `AY_MILP_DIVE_MAX_PINS` moves by 10^18 |
+/// | `"0"` | reads as **on** under [`Shape::On`] (`--dfs`) |
+/// | `" 5"` | must keep parse-failing or `--dive-max-pins` moves by 10^18 |
 /// | `"1e26"` | a well-formed `f64` that aborted the process via `Duration` |
-/// | `"-1"` | `AY_MILP_SAT_STOP_MULT=-1` panicked `Duration::mul_f64` |
+/// | `"-1"` | `--sat-stop-mult=-1` panicked `Duration::mul_f64` |
 /// | `""` | present, parses as nothing |
 /// | `"on"`, `"true"` | plausible operator input that every shape rejects |
 ///
@@ -175,7 +177,7 @@ mod tests {
         let raw = Some(zero.as_os_str());
         assert!(
             resolve_flag(Shape::On, raw, false),
-            "presence-is-on reads `=0` as ON -- the documented AY_MILP_DFS trap"
+            "presence-is-on reads `=0` as ON -- the documented --dfs trap"
         );
         assert!(!resolve_flag(Shape::OnStrict, raw, false));
         assert!(!resolve_flag(Shape::OnUnlessZero, raw, true));

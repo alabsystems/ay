@@ -6,7 +6,21 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{TermId, TermStore, TheoryLit, TseitinState};
+use ay_core::{ClausificationProof, TermId, TermStore, TheoryLemmaProof, TheoryLit, TseitinState};
+
+/// Proof authority captured at the exact original-clause emission site and
+/// drained into the clause-ID-indexed ledgers before proof reconstruction.
+#[derive(Clone)]
+pub(crate) enum PendingOriginalClauseAuthority {
+    Clausification {
+        original_id: u64,
+        proof: ClausificationProof,
+    },
+    Theory {
+        original_id: u64,
+        proof: TheoryLemmaProof,
+    },
+}
 
 /// Tracks SAT-visible terms whose negations are needed for proof construction.
 ///
@@ -31,9 +45,14 @@ pub(crate) struct IncrementalNegationCache {
     /// out via `take_tseitin_encoder` for the duration of one encode and put
     /// back with `put_tseitin_encoder`.
     tseitin_encoder: Option<TseitinState>,
+    pending_original_authorities: Vec<PendingOriginalClauseAuthority>,
 }
 
 impl IncrementalNegationCache {
+    pub(crate) fn proof_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Build the initial negation map from the current SAT-visible terms.
     pub(crate) fn seed<I>(terms: &mut TermStore, initial_terms: I, enabled: bool) -> Self
     where
@@ -45,6 +64,7 @@ impl IncrementalNegationCache {
             pending_terms: Vec::new(),
             pending_set: HashSet::default(),
             tseitin_encoder: None,
+            pending_original_authorities: Vec::new(),
         };
         if enabled {
             for term in initial_terms {
@@ -154,6 +174,30 @@ impl IncrementalNegationCache {
                 state.next_var = var_0idx + 2;
             }
         }
+    }
+
+    pub(crate) fn note_clausification_authority(
+        &mut self,
+        original_id: u64,
+        proof: ClausificationProof,
+    ) {
+        if self.enabled {
+            self.pending_original_authorities
+                .push(PendingOriginalClauseAuthority::Clausification { original_id, proof });
+        }
+    }
+
+    pub(crate) fn note_theory_authority(&mut self, original_id: u64, proof: TheoryLemmaProof) {
+        if self.enabled {
+            self.pending_original_authorities
+                .push(PendingOriginalClauseAuthority::Theory { original_id, proof });
+        }
+    }
+
+    pub(crate) fn drain_original_authorities(
+        &mut self,
+    ) -> impl Iterator<Item = PendingOriginalClauseAuthority> + '_ {
+        self.pending_original_authorities.drain(..)
     }
 }
 

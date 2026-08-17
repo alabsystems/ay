@@ -939,7 +939,6 @@ mod tests {
     #[cfg(feature = "lean-integration")]
     mod lean_integration {
         use super::*;
-        use std::io::Write as _;
         use std::process::Command;
 
         fn run_lean(source: &str) -> (std::process::ExitStatus, String) {

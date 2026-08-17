@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 #![forbid(unsafe_code)]
-
 //! AY Proof - Proof production and export
 //!
 //! Generate and export proofs in Alethe format.
@@ -90,6 +89,9 @@ pub use bv_blast_solver::{
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
 pub use checker::recognize_euf_congruent;
+pub use checker::recognize_euf_congruent_pred;
+pub use checker::recognize_euf_reflexive;
+pub use checker::recognize_euf_transitive;
 pub use checker::recognize_ground_evaluate;
 pub use checker::recognize_ite_same;
 pub use checker::recognize_nra_interval_unsat;
@@ -98,6 +100,7 @@ pub use checker::recognize_order_ite_tautology;
 pub use checker::recognize_regex_intersect_empty;
 pub use checker::recognize_regex_length_lower_bound;
 pub use checker::recognize_rounding_mode_domain;
+pub use checker::recognize_seq_extensional_companion_contradiction;
 pub use checker::recognize_string_concat_cancellation;
 pub use checker::recognize_string_containment_identity;
 pub use checker::recognize_string_ground_eval;
@@ -105,9 +108,9 @@ pub use checker::recognize_string_ground_factor_conflict;
 pub use checker::recognize_string_length_lemma;
 pub use checker::regex_min_length;
 pub use checker::{
-    authenticate_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
-    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
-    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    authenticate_bool_bv_unsat_query, authenticate_uf_leaf_bool_bv_unsat_query,
+    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
+    recognize_bv_ground_evaluate, AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
     MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
     MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };
@@ -118,15 +121,20 @@ pub use checker::{
 };
 pub use checker::{
     check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,
-    ProofCheckError,
+    check_proof_collecting_trust_with_typed_context, DatatypeMemberSignature, ProofCheckError,
 };
 pub use checker::{
     recognize_array_extensionality, recognize_array_extensionality_chain,
-    recognize_array_select_store, recognize_array_theory_lemma,
+    recognize_array_finite_extensionality,
+    recognize_array_finite_extensionality_with_typed_context,
+    recognize_array_finite_select_expansion,
+    recognize_array_finite_select_expansion_with_typed_context, recognize_array_select_store,
+    recognize_array_theory_lemma, recognize_array_theory_lemma_with_typed_context,
     recognize_folded_array_extensionality, ExtDiffRegistry,
 };
 pub use checker::{
-    recognize_datatype_distinct, recognize_datatype_selector_project,
+    recognize_datatype_constructor_reconstruct, recognize_datatype_distinct,
+    recognize_datatype_exhaustive, recognize_datatype_selector_project,
     recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
 };
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
@@ -134,15 +142,20 @@ pub use checker::{
     recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_rounding_mode_domain,
 };
 pub use checker::{recognize_set_card_chain_recurrence, recognize_subset_theory_lemma};
+pub use checker::{MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_WORK_PER_LEMMA};
 pub use la_generic_signs::*;
 pub use partial::{check_proof_partial, PartialProofCheck};
 pub use quality::{
     authenticate_premise_clauses_strict_with_context,
     authenticate_premise_clauses_strict_with_context_and_progress,
+    authenticate_premise_clauses_strict_with_typed_context,
+    authenticate_premise_clauses_strict_with_typed_context_and_progress,
     authenticate_premise_clauses_with_deferred_generic_theory_and_progress,
+    authenticate_premise_clauses_with_deferred_generic_theory_and_typed_context_and_progress,
     check_proof_partial_with_quality, check_proof_strict, check_proof_strict_with_context,
     check_proof_strict_with_context_and_progress, check_proof_strict_with_datatypes,
-    check_proof_strict_with_datatypes_and_selectors, check_proof_with_quality,
+    check_proof_strict_with_datatypes_and_selectors, check_proof_strict_with_typed_context,
+    check_proof_strict_with_typed_context_and_progress, check_proof_with_quality,
     validate_array_extensionality_provenance, AuthenticatedPremiseClauses,
     PremiseClausesWithDeferredGeneric, ProofQuality,
 };
@@ -556,10 +569,10 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
     // Cost is O(preamble), not O(document): skipped outright when there is no
     // definition to check, which is the overwhelming majority of proofs. That
     // is why this can run unconditionally while the whole-document round-trip
-    // (`AY_PROOF_SELF_CHECK`) stays opt-in — the latter re-parses certificates
+    // (`--proof-self-check`) stays opt-in — the latter re-parses certificates
     // that reach hundreds of MB.
     //
-    // TODO(#alethe-free-symbol-invariant): the FULL invariant is "every free
+    // Known limitation — the full invariant is "every free
     // symbol of the emitted document is bound — problem-declared, define-fun
     // bound, or locally bound". This checks the preamble, which is the only
     // place a symbol is INTRODUCED, but not the steps. One gap survives: the
@@ -569,7 +582,7 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
     // mentions the raw witness name would leak it into a step, where it is
     // neither defined nor declined. Closing it needs the whole-document check,
     // which is exactly `AletheDocumentChecker` via `AletheSelfCheckWriter` —
-    // already wired at `crates/ay/src/run.rs` behind `AY_PROOF_SELF_CHECK` and
+    // already wired at `crates/ay/src/run.rs` behind `--proof-self-check` and
     // default-OFF because its false-reject rate over the corpus is measured,
     // not proved. Making it default-ON is a separate, measured decision.
     let (definitions, defined) = if definitions.is_empty()

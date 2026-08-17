@@ -37,7 +37,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 #[cfg(kani)]
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use ay_core::{TermId, Tseitin, TseitinEncodedAssertion};
-        use ay_sat::{Literal as SatLiteral, SatResult, Solver as SatSolver, Variable as SatVariable};
+        use ay_sat::{Literal as SatLiteral, SatResult, Variable as SatVariable};
         use $crate::executor_types::{SolveResult, UnknownReason};
         use $crate::incremental_state::{collect_active_theory_atoms_cached, IncrementalTheoryState};
         use $crate::executor::theories::freeze_var_if_needed;
@@ -277,8 +277,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // The theory's terms_ptr is null initially; set_terms() is called
         // at the start of each iteration.
         //
-        // #lra-inc-engine S3 (warm theory across check-sats): when the warm flag
-        // is set (inc-engine lane + AY_LRA_INC_WARM), REUSE a theory solver
+        // #lra-inc-engine S3 (warm theory across check-sats): when the warm lane
+        // is on (inc-engine lane, `--dpll-no-lra-inc-warm` opts out), REUSE a theory solver
         // persisted across check-sats instead of rebuilding from scratch — the
         // accumulated base bounds + implied_bounds cache carry over, so
         // re-asserting an already-set bound is a non-tightening no-op and
@@ -288,9 +288,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // state is preserved on entry; set_terms refreshes its dangling terms
         // pointer. A None / type-mismatch falls back to a fresh solver.
         // SOUNDNESS: warm theory is default ON (opt out with
-        // AY_LRA_INC_WARM=0). Scoped pops and monotone selector units preserve
+        // --dpll-no-lra-inc-warm). Scoped pops and monotone selector units preserve
         // the live constraint set, while a scope/type mismatch discards the
-        // cached solver. AY_LRA_INC_ENGINE_REVERIFY=1 remains an opt-in
+        // cached solver. --lra-inc-engine-reverify remains an opt-in
         // from-scratch disagreement backstop.
         let _islp_inc_warm = $crate::warm_theory_flag::get();
         let (mut theory, _islp_theory_reused) = if _islp_inc_warm {
@@ -583,8 +583,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     }
                     Some(ay_core::TheoryResult::NeedLemmas(lemmas)) => {
                         theory.unset_terms();
+                        let mut _islp_lemma_original_ids = Vec::with_capacity(lemmas.len());
                         for lemma in &lemmas {
-                            $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                            _islp_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                 &$self.ctx.terms,
                                 solver,
                                 &mut local_term_to_var,
@@ -592,11 +593,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 &mut local_next_var,
                                 &mut _islp_negations,
                                 &lemma.clause,
-                            );
+                            ));
                         }
                         if proof_enabled {
                             _islp_negations.sync_pending(&mut $self.ctx.terms);
-                            for lemma in &lemmas {
+                            // #trust->0 C3: DT registries, once per batch.
+                            let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                            for (lemma, _islp_original_id) in
+                                lemmas.iter().zip(_islp_lemma_original_ids)
+                            {
                                 let terms: Vec<ay_core::TermId> = lemma
                                     .clause
                                     .iter()
@@ -611,30 +616,30 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         }
                                     })
                                     .collect();
-                                let kind =
-                                    $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                                // #trust->0 C3: funnel classifies + records;
+                                // adopt its validator-ordered clause.
+                                let (kind, terms) =
+                                    $crate::theory_inference::record_funnel_classified_lemma(
+                                        &mut $self.proof_tracker,
                                         &$self.ctx.terms,
-                                        &terms,
+                                        terms,
+                                        _c3_dt.as_ref(),
                                     );
-                                match kind {
-                                    ay_core::TheoryLemmaKind::Generic => {
-                                        let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                                    }
-                                    _ => {
-                                        let _ = $self
-                                            .proof_tracker
-                                            .add_theory_lemma_with_kind(terms.clone(), kind);
-                                    }
+                                if let Some(_islp_original_id) = _islp_original_id {
+                                    $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                        &solver,
+                                        _islp_original_id,
+                                        None,
+                                        Some(ay_core::TheoryLemmaProof {
+                                            clause: terms,
+                                            kind,
+                                            farkas: None,
+                                            lia: None,
+                                        }),
+                                        &mut _islp_local_clausification_proofs,
+                                        &mut _islp_local_original_clause_theory_proofs,
+                                    );
                                 }
-                                _islp_local_clausification_proofs.push(None);
-                                _islp_local_original_clause_theory_proofs.push(Some(
-                                    ay_core::TheoryLemmaProof {
-                                        clause: terms,
-                                        kind,
-                                        farkas: None,
-                                        lia: None,
-                                    },
-                                ));
                             }
                         }
                         continue;
@@ -783,8 +788,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                                     );
                                     theory.unset_terms();
+                                    let mut _fc_lemma_original_ids = Vec::with_capacity(lemmas.len());
                                     for lemma in &lemmas {
-                                        $crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
+                                        _fc_lemma_original_ids.push($crate::executor::theories::split_incremental::apply_theory_lemma_incremental(
                                             &$self.ctx.terms,
                                             solver,
                                             &mut local_term_to_var,
@@ -792,11 +798,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                             &mut local_next_var,
                                             &mut _islp_negations,
                                             &lemma.clause,
-                                        );
+                                        ));
                                     }
                                     if proof_enabled {
                                         _islp_negations.sync_pending(&mut $self.ctx.terms);
-                                        for lemma in &lemmas {
+                                        // #trust->0 C3: DT registries, once per batch.
+                                        let _c3_dt = $crate::theory_inference::dt_funnel_registry_data(&$self.ctx);
+                                        for (lemma, _fc_original_id) in
+                                            lemmas.iter().zip(_fc_lemma_original_ids)
+                                        {
                                             let terms: Vec<ay_core::TermId> = lemma
                                                 .clause
                                                 .iter()
@@ -811,30 +821,31 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                                     }
                                                 })
                                                 .collect();
-                                            let kind =
-                                                $crate::theory_inference::infer_theory_lemma_kind_from_clause_terms(
+                                            // #trust->0 C3: funnel classifies +
+                                            // records; adopt its validator-ordered
+                                            // clause.
+                                            let (kind, terms) =
+                                                $crate::theory_inference::record_funnel_classified_lemma(
+                                                    &mut $self.proof_tracker,
                                                     &$self.ctx.terms,
-                                                    &terms,
+                                                    terms,
+                                                    _c3_dt.as_ref(),
                                                 );
-                                            match kind {
-                                                ay_core::TheoryLemmaKind::Generic => {
-                                                    let _ = $self.proof_tracker.add_theory_lemma(terms.clone());
-                                                }
-                                                _ => {
-                                                    let _ = $self
-                                                        .proof_tracker
-                                                        .add_theory_lemma_with_kind(terms.clone(), kind);
-                                                }
+                                            if let Some(_fc_original_id) = _fc_original_id {
+                                                $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                    &solver,
+                                                    _fc_original_id,
+                                                    None,
+                                                    Some(ay_core::TheoryLemmaProof {
+                                                        clause: terms,
+                                                        kind,
+                                                        farkas: None,
+                                                        lia: None,
+                                                    }),
+                                                    &mut _islp_local_clausification_proofs,
+                                                    &mut _islp_local_original_clause_theory_proofs,
+                                                );
                                             }
-                                            _islp_local_clausification_proofs.push(None);
-                                            _islp_local_original_clause_theory_proofs.push(Some(
-                                                ay_core::TheoryLemmaProof {
-                                                    clause: terms,
-                                                    kind,
-                                                    farkas: None,
-                                                    lia: None,
-                                                },
-                                            ));
                                         }
                                     }
                                     continue;
@@ -843,12 +854,33 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 // check. Previously fell through to catch-all returning
                                 // Unknown(Incomplete), causing sc-6/sc-8/simple_startup/
                                 // uart/clocksynchro benchmarks to return unknown.
-                                ay_core::TheoryResult::Unsat(conflict_lits) => {
+                                ay_core::TheoryResult::Unsat(mut conflict_lits) => {
                                     tracing::debug!(
                                         iter = _iteration,
                                         conflict_len = conflict_lits.len(),
                                         "#9224 post-SAT final check Unsat, adding conflict clause"
                                     );
+                                    $crate::verification::dedup_conflict_literals(&mut conflict_lits);
+                                    if $crate::verification::verify_conflict_semantic_memoized(
+                                        &mut $self.conflict_semantic_verify_memo,
+                                        &conflict_lits,
+                                        &$self.ctx.terms,
+                                        &$self.active_support_axioms,
+                                    )
+                                    .is_err()
+                                    {
+                                        $self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                                        $self.last_result = Some(SolveResult::Unknown);
+                                        break 'split_loop Ok(SolveResult::Unknown);
+                                    }
+                                    let _fc_conflict_annotation = if proof_enabled {
+                                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
+                                            &mut $self.proof_tracker,
+                                            Some(&$self.ctx.terms),
+                                            _islp_negations.as_map(),
+                                            &conflict_lits,
+                                        ).1
+                                    } else { None };
                                     pipeline_export_theory_state!(
                                         theory, $export_theory, $export_expr,
                                         _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
@@ -870,19 +902,69 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         }
                                     }
                                     if all_mapped && !sat_clause.is_empty() {
+                                        let _fc_before = solver.issued_original_clause_id_max();
                                         solver.add_clause(sat_clause);
+                                        if let (Some(_fc_id), Some(_fc_proof)) = (
+                                            $crate::executor::theories::split_incremental::single_issued_original_id_since(solver, _fc_before),
+                                            _fc_conflict_annotation,
+                                        ) {
+                                            if !matches!(_fc_proof.kind, ay_core::TheoryLemmaKind::Generic) {
+                                                $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                    &solver,
+                                                    _fc_id,
+                                                    None,
+                                                    Some(_fc_proof),
+                                                    &mut _islp_local_clausification_proofs,
+                                                    &mut _islp_local_original_clause_theory_proofs,
+                                                );
+                                            }
+                                        }
                                         continue;
                                     }
                                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);
                                     $self.last_result = Some(SolveResult::Unknown);
                                     break 'split_loop Ok(SolveResult::Unknown);
                                 }
-                                ay_core::TheoryResult::UnsatWithFarkas(conflict) => {
+                                ay_core::TheoryResult::UnsatWithFarkas(mut conflict) => {
                                     tracing::debug!(
                                         iter = _iteration,
                                         conflict_len = conflict.literals.len(),
                                         "#9224 post-SAT final check UnsatWithFarkas, adding conflict clause"
                                     );
+                                    $crate::verification::dedup_conflict_with_farkas(&mut conflict);
+                                    let _fc_farkas_valid = conflict.farkas.is_some()
+                                        && $crate::verification::verify_theory_conflict_with_farkas(&conflict).is_ok()
+                                        && $crate::verification::verify_theory_conflict_with_farkas_full(
+                                            &conflict,
+                                            &$self.ctx.terms,
+                                        ).is_ok();
+                                    if !_fc_farkas_valid
+                                        && $crate::verification::verify_conflict_semantic_memoized(
+                                            &mut $self.conflict_semantic_verify_memo,
+                                            &conflict.literals,
+                                            &$self.ctx.terms,
+                                            &$self.active_support_axioms,
+                                        ).is_err()
+                                    {
+                                        $self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                                        $self.last_result = Some(SolveResult::Unknown);
+                                        break 'split_loop Ok(SolveResult::Unknown);
+                                    }
+                                    let _fc_conflict_annotation = if proof_enabled && _fc_farkas_valid {
+                                        $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
+                                            &mut $self.proof_tracker,
+                                            Some(&$self.ctx.terms),
+                                            _islp_negations.as_map(),
+                                            &conflict,
+                                        ).1
+                                    } else if proof_enabled {
+                                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
+                                            &mut $self.proof_tracker,
+                                            Some(&$self.ctx.terms),
+                                            _islp_negations.as_map(),
+                                            &conflict.literals,
+                                        ).1
+                                    } else { None };
                                     pipeline_export_theory_state!(
                                         theory, $export_theory, $export_expr,
                                         _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
@@ -904,7 +986,23 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         }
                                     }
                                     if all_mapped && !sat_clause.is_empty() {
+                                        let _fc_before = solver.issued_original_clause_id_max();
                                         solver.add_clause(sat_clause);
+                                        if let (Some(_fc_id), Some(_fc_proof)) = (
+                                            $crate::executor::theories::split_incremental::single_issued_original_id_since(solver, _fc_before),
+                                            _fc_conflict_annotation,
+                                        ) {
+                                            if !matches!(_fc_proof.kind, ay_core::TheoryLemmaKind::Generic) {
+                                                $crate::pipeline_fns::place_original_clause_authority_at_id(
+                                                    &solver,
+                                                    _fc_id,
+                                                    None,
+                                                    Some(_fc_proof),
+                                                    &mut _islp_local_clausification_proofs,
+                                                    &mut _islp_local_original_clause_theory_proofs,
+                                                );
+                                            }
+                                        }
                                         continue;
                                     }
                                     $self.last_unknown_reason = Some(UnknownReason::Incomplete);

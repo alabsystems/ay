@@ -973,7 +973,9 @@ pub unsafe extern "C" fn Z3_solver_congruence_explain(
     a: Z3_ast,
     b: Z3_ast,
 ) -> Z3_ast {
-    // SAFETY: `ffi_guard_ast` guards `c`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_ast` handles a null
+    // pointer defensively before the closure accesses context state. The ASTs
+    // are opaque integer handles and are not dereferenced here.
     unsafe {
         ffi_guard_ast(c, |ctx| {
             if a == 0 || b == 0 {
@@ -1204,8 +1206,10 @@ fn generate_cube_queue(
 /// level-0 input unit; AY never fabricates a deeper level it cannot prove.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `s`, when non-null, a valid solver handle;
-/// if `sz > 0`, `levels` must point to at least `sz` writable `unsigned` elements.
+/// `c` must be a valid context pointer; `s`, when non-null, a valid solver handle
+/// owned by `c`; `literals`, when non-null, a valid AST-vector handle owned by
+/// `c`; if `sz > 0`, `levels` must point to at least `sz` writable `unsigned`
+/// elements.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_get_levels(
     c: Z3_context,
@@ -1225,11 +1229,14 @@ pub unsafe extern "C" fn Z3_solver_get_levels(
     let queried: Vec<Z3_ast> = unsafe { literals.as_ref() }
         .map(|v| v.asts.clone())
         .unwrap_or_default();
-    // SAFETY: `s`, when non-null, is a live handle; `as_ref` null-checks.
+    // SAFETY: `s`, when non-null, is a live handle owned by `c` under the caller
+    // contract; `as_ref` checks null before cloning its assertion list.
     let assertions: Vec<Term> = unsafe { s.as_ref() }
         .map(|h| h.assertions.clone())
         .unwrap_or_default();
-    // SAFETY: `ffi_guard_void` guards `c`.
+    // SAFETY: `c` is live by caller contract; `ffi_guard_void` handles a null
+    // pointer defensively. The caller guarantees the `levels` writable extent,
+    // and the closure rejects a null output when `sz > 0` before writing.
     unsafe {
         ffi_guard_void(c, |ctx| {
             if sz > 0 && levels.is_null() {
@@ -1537,14 +1544,16 @@ pub unsafe extern "C" fn Z3_solver_propagate_init(
 /// unregisters (Z3 convention).
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `fixed_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `fixed_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_fixed(
     c: Z3_context,
     s: Z3_solver,
     fixed_eh: Z3_fixed_eh,
 ) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_fixed", |prop| {
             prop.fixed_eh = fixed_eh;
@@ -1560,10 +1569,12 @@ pub unsafe extern "C" fn Z3_solver_propagate_fixed(
 /// both engines `final_eh` is the completeness point. Documented divergence.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `eq_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `eq_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_eq(c: Z3_context, s: Z3_solver, eq_eh: Z3_eq_eh) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_eq", |prop| {
             prop.eq_eh = eq_eh;
@@ -1578,10 +1589,12 @@ pub unsafe extern "C" fn Z3_solver_propagate_eq(c: Z3_context, s: Z3_solver, eq_
 /// pairs whose ground model values differ. See [`Z3_solver_propagate_eq`].
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `eq_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `eq_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_diseq(c: Z3_context, s: Z3_solver, eq_eh: Z3_eq_eh) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_diseq", |prop| {
             prop.diseq_eh = eq_eh;
@@ -1597,14 +1610,16 @@ pub unsafe extern "C" fn Z3_solver_propagate_diseq(c: Z3_context, s: Z3_solver, 
 /// exactly Z3's acceptance contract.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `final_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `final_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_final(
     c: Z3_context,
     s: Z3_solver,
     final_eh: Z3_final_eh,
 ) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_final", |prop| {
             prop.final_eh = final_eh;
@@ -1622,14 +1637,16 @@ pub unsafe extern "C" fn Z3_solver_propagate_final(
 /// informational, so the adapted timing cannot change any verdict.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `created_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `created_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_created(
     c: Z3_context,
     s: Z3_solver,
     created_eh: Z3_created_eh,
 ) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_created", |prop| {
             prop.created_eh = created_eh;
@@ -1645,14 +1662,16 @@ pub unsafe extern "C" fn Z3_solver_propagate_created(
 /// SAT/UNSAT or model correctness. Documented divergence.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `decide_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `decide_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_decide(
     c: Z3_context,
     s: Z3_solver,
     decide_eh: Z3_decide_eh,
 ) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_decide", |prop| {
             prop.decide_eh = decide_eh;
@@ -1669,14 +1688,16 @@ pub unsafe extern "C" fn Z3_solver_propagate_decide(
 /// unaffected. Documented divergence.
 ///
 /// # Safety
-/// `c` must be a valid context pointer; `on_binding_eh` (if non-null) must be valid.
+/// `c` must be a valid context pointer; `s`, when non-null, must be a live solver
+/// handle owned by `c`; `on_binding_eh` (if non-null) must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_propagate_on_binding(
     c: Z3_context,
     s: Z3_solver,
     on_binding_eh: Z3_on_binding_eh,
 ) {
-    // SAFETY: see `with_propagator`.
+    // SAFETY: a non-null `s` is live and owned by `c` under the caller contract;
+    // `with_propagator` checks null before mutation and guards context access.
     unsafe {
         with_propagator(c, s, "Z3_solver_propagate_on_binding", |prop| {
             prop.on_binding_eh = on_binding_eh;

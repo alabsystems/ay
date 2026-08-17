@@ -20,6 +20,8 @@ mod connective;
 mod copied;
 #[path = "proof_trust_surgery_surface_limits.rs"]
 mod limits;
+#[path = "proof_trust_surgery_source_work.rs"]
+mod source_work;
 #[path = "proof_trust_surgery_surface_sources.rs"]
 mod sources;
 #[cfg(test)]
@@ -29,9 +31,11 @@ mod tests;
 mod validate;
 pub(in crate::executor) use copied::copied_structural_roles_are_static;
 pub(in crate::executor) use limits::render_roots_have_bounded_payload;
+#[cfg(test)]
+pub(in crate::executor) use limits::surface_pass_work;
 pub(in crate::executor) use limits::{
     live_proof_rendering_is_static, surface_source_is_bounded, surface_source_work,
-    surface_sources_have_bounded_work, term_child_count,
+    surface_sources_have_bounded_work, term_child_count, ProofSourcePass, ProofSourceWorkEnvelope,
 };
 use limits::{render_roots_have_bounded_depth, MAX_REQUIREMENT_BYTES, MAX_SURFACE_DEPTH};
 
@@ -75,6 +79,7 @@ pub(in crate::executor) struct ProvenanceSurfaceAudit {
     generated_connective_render_uses: HashMap<TermId, usize>,
     generated_and_projection_uses: usize,
     aliases: HashSet<TermId>,
+    promoted_requirements: HashSet<TermId>,
     suppressed_overrides: HashSet<TermId>,
     farkas_lemmas: Vec<(Vec<TermId>, FarkasAnnotation)>,
     source_registrations: HashSet<(TermId, TermId, bool, bool)>,
@@ -297,6 +302,49 @@ impl ProvenanceSurfaceAudit {
             self.protect_operand(terms, operand);
         }
         self.ite_intro_roles.insert(role);
+    }
+
+    /// Demand that an already-authenticated authored spelling be INSTALLED in
+    /// the effective rendering map, not merely tolerated there.
+    ///
+    /// `collect_deep_arith_surface_overrides` registers the authored spelling
+    /// of every arithmetic subterm of a retained assertion as a COMPATIBILITY
+    /// requirement: `merge_into` checks such an entry when the active map
+    /// already carries it and otherwise SKIPS it, because a subterm that is
+    /// only ever printed inside its parent inherits the parent's authored
+    /// spelling and needs no entry of its own.
+    ///
+    /// An `ite_intro` role breaks that assumption. The lift retains the
+    /// authored whole-assertion spelling on the re-added assume — which
+    /// embeds the authored spelling of the term-level ite — while `ite1` and
+    /// `ite2` print that same ite, its condition and its branches as
+    /// independent operands of the generated defining equalities. Where the
+    /// authored spelling differs from the canonical rendering (an authored
+    /// `(= 0 r)` against the canonicalized `(= r 0)`) the two printings
+    /// disagree, the exported `la_generic` transfer row can no longer cancel
+    /// its opaque atoms, and the whole repair is discarded.
+    ///
+    /// Only a spelling already registered by `require_original*` is eligible:
+    /// those are obtained by re-elaborating the authored source subtree to
+    /// this exact hash-consed `TermId`, so nothing new is asserted here. A
+    /// term with no registered requirement renders canonically wherever it
+    /// stands alone and needs no install; should its parent's override
+    /// nevertheless spell it differently, the printed-certificate re-check in
+    /// `validate_effective` still rejects the mismatch, so this is a
+    /// completeness repair and never a trusted shortcut.
+    pub(in crate::executor) fn require_installed_surface(
+        &mut self,
+        terms: &mut ay_core::TermStore,
+        term: TermId,
+    ) {
+        if !self.requirements.contains_key(&term) {
+            return;
+        }
+        if !self.promote_registered_requirement(term) {
+            self.overflowed = true;
+            return;
+        }
+        self.protect_operand(terms, term);
     }
 
     pub(in crate::executor) fn require_same_rendering(

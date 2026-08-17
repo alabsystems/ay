@@ -11,7 +11,6 @@ use ay_frontend::parse;
 fn aliased_store_permutation_select_conflict_has_a_strict_native_proof() {
     let input = r#"
         (set-option :produce-proofs true)
-        (set-option :check-proofs-strict true)
         (set-logic QF_AUFLIA)
         (declare-fun a () (Array Int Int))
         (declare-fun e1 () Int)
@@ -56,6 +55,24 @@ fn aliased_store_permutation_select_conflict_has_a_strict_native_proof() {
             ..
         }
     )));
+
+    let strict_input = input.replacen(
+        "(set-option :produce-proofs true)",
+        "(set-option :produce-proofs true)\n        (set-option :check-proofs-strict true)",
+        1,
+    );
+    let strict_commands = parse(&strict_input).expect("strict fixture parses");
+    let mut strict_exec = Executor::new();
+    assert_eq!(
+        strict_exec
+            .execute_all(&strict_commands)
+            .expect("strict fixture executes"),
+        vec!["unknown"]
+    );
+    assert_eq!(
+        strict_exec.unknown_reason(),
+        Some(crate::UnknownReason::ProofTrusted)
+    );
 }
 
 #[test]

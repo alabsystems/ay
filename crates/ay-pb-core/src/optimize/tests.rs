@@ -640,10 +640,28 @@ fn test_engine_handles_negative_unit_objective() {
     let seed = engine
         .extract_native_core_guided_seed(&active_softs, offset)
         .expect("validated native PB assumptions should expose lower-bound progress");
-    assert_eq!(
+    // The contract is "AT LEAST one soft must be paid", so assert that — not an
+    // exact value. `extract_native_core_guided_seed` runs a CDCL probe whose
+    // effort is not deterministic (restarts, clause-DB state), so it sometimes
+    // proves two or more softs must be paid. That is a STRICTLY BETTER lower
+    // bound and equally sound, but `assert_eq!(.., offset + 1)` failed on it —
+    // an intermittent ~10-20% failure in full-suite runs that passed 5/5 in
+    // isolation, because the shared solver state differs. Pin both real
+    // invariants instead: progress, and soundness.
+    //
+    // The instance forces `sum x >= 1` and `sum x <= 1`, so exactly one variable
+    // is true and the true optimum is -1. A lower bound may never exceed it.
+    assert!(
+        seed.lower_bound > offset,
+        "native seed should prove at least one normalized soft must be paid: \
+         lower_bound {} < offset {} + 1",
         seed.lower_bound,
-        offset + 1,
-        "native seed should prove at least one normalized soft must be paid"
+        offset
+    );
+    assert!(
+        seed.lower_bound <= -1,
+        "SOUNDNESS: seed lower_bound {} exceeds the true optimum -1",
+        seed.lower_bound
     );
     assert!(
         seed.learned_clause
@@ -2213,12 +2231,12 @@ fn test_oll_agrees_with_linear_on_random_small_instances() {
 }
 
 /// Env-gated harness: runs the OLL path on a real instance file and asserts
-/// the optimum (when proven) matches `AY_OLL_EXPECT`. Skipped unless
-/// `AY_OLL_FILE` is set. Used to verify OLL on real OPT-LIN/PARTIAL/SOFT
+/// the optimum (when proven) matches `--oll-expect`. Skipped unless
+/// `--oll-file` is set. Used to verify OLL on real OPT-LIN/PARTIAL/SOFT
 /// instances against Exact-derived reference values.
 #[test]
 fn test_oll_matches_reference_on_real_instance_when_requested() {
-    let Ok(path) = std::env::var("AY_OLL_FILE") else {
+    let Some(path) = ay_core::misc_cli_flags().oll_file.clone() else {
         return;
     };
     let text = std::fs::read_to_string(&path).expect("read instance file");
@@ -2244,7 +2262,7 @@ fn test_oll_matches_reference_on_real_instance_when_requested() {
 
     let result = core_guided::solve(&mut engine);
     eprintln!("OLL result for {path}: {result:?}");
-    if let Ok(expected) = std::env::var("AY_OLL_EXPECT") {
+    if let Some(expected) = ay_core::misc_cli_flags().oll_expect.clone() {
         let expected: i128 = expected.parse().expect("parse expected");
         match result {
             OptResult::Optimal(_, value) => assert_eq!(

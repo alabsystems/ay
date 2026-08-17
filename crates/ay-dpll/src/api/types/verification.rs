@@ -157,7 +157,7 @@ pub enum VerificationLevel {
     /// model. Retaining or exporting the proof artifact is configured
     /// separately.
     ProofChecked,
-    /// Both debug-assertion checks and proof production were active.
+    /// Both debug-assertion checks and fail-closed proof checking were active.
     /// Maximum internal verification.
     FullyVerified,
 }
@@ -184,7 +184,7 @@ impl VerificationLevel {
         matches!(self, Self::DebugChecked | Self::FullyVerified)
     }
 
-    /// Returns true if proof production is active.
+    /// Returns true if fail-closed proof checking is active.
     #[must_use]
     pub fn has_proof_checking(&self) -> bool {
         matches!(self, Self::ProofChecked | Self::FullyVerified)

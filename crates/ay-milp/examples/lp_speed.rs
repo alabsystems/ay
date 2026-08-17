@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! cargo run --release -p ay-milp --example lp_speed -- 60 40
-//! AY_MILP_NO_FLOAT=1 cargo run --release -p ay-milp --example lp_speed -- 60 40
+//! cargo run --release -p ay-milp --example lp_speed -- --no-float 60 40
 //! ```
 
 use std::fmt::Write as _;
@@ -99,7 +99,7 @@ fn main() {
     let seed: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12_345);
 
     let (model, cols, rows) = build(n, m, seed);
-    let lane = if std::env::var_os("AY_MILP_NO_FLOAT").is_some() {
+    let lane = if std::env::args().any(|a| a == "--no-float") {
         "exact rim (float lane OFF)"
     } else {
         "float lane + exact certification"

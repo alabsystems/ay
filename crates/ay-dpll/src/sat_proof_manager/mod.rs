@@ -18,153 +18,24 @@
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
 mod derivation;
+mod exact_fragment;
+mod folded_unit_authority;
 #[cfg(test)]
 mod tests;
-
-use std::mem::size_of;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
-    AletheRule, ClausificationProof, Proof, ProofId, ProofStep, Symbol, TermData, TermId,
-    TermStore, TheoryLemmaProof,
+    AletheRule, ClausificationProof, Proof, ProofId, ProofStep, TermData, TermId, TermStore,
+    TheoryLemmaProof,
 };
-use ay_sat::{ClauseTrace, Literal, ResolutionValidationError, ResolutionValidationResource};
-
-/// Retained bytes reserved for each raw `Not` term that exact fragment
-/// reconstruction may need to intern. The separate one-time TermStore
-/// footprint charge covers geometric growth of all pre-existing containers;
-/// this per-term allowance covers new entries, buckets, and bucket vectors.
-const EXACT_NEW_NOT_BYTES: usize = 1024;
-
-/// Exact proof candidate for one SAT original-clause ID.
-///
-/// `clause` is the exact translated clause, canonicalized only by sorting and
-/// deduplicating literals.  It is deliberately retained alongside `proof_id`:
-/// a later premise authenticator must check both the trace identity and the
-/// clause proved at that identity rather than accepting a proof step by
-/// content alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExactOriginalClauseBinding {
-    proof_id: ProofId,
-    clause: Vec<TermId>,
-    trace_id: u64,
-    trace_index: usize,
-    source_sat_clause: Vec<Literal>,
-}
-
-impl ExactOriginalClauseBinding {
-    pub(crate) fn proof_id(&self) -> ProofId {
-        self.proof_id
-    }
-
-    pub(crate) fn clause(&self) -> &[TermId] {
-        &self.clause
-    }
-
-    pub(crate) fn trace_id(&self) -> u64 {
-        self.trace_id
-    }
-
-    pub(crate) fn trace_index(&self) -> usize {
-        self.trace_index
-    }
-
-    pub(crate) fn source_sat_clause(&self) -> &[Literal] {
-        &self.source_sat_clause
-    }
-}
-
-/// Self-contained candidate proof fragment for every original clause in a SAT
-/// trace.
-///
-/// This value is not authority by itself. Every step must still pass
-/// `ay_proof`'s strict premise authenticator and be joined back to the exact
-/// structural trace identity before it can contribute to an UNSAT certificate.
-#[derive(Debug, Clone)]
-pub(crate) struct ExactOriginalProofFragment {
-    proof: Proof,
-    bindings: HashMap<u64, ExactOriginalClauseBinding>,
-}
-
-impl ExactOriginalProofFragment {
-    pub(crate) fn proof(&self) -> &Proof {
-        &self.proof
-    }
-
-    pub(crate) fn binding(&self, trace_id: u64) -> Option<&ExactOriginalClauseBinding> {
-        self.bindings.get(&trace_id)
-    }
-
-    pub(crate) fn binding_count(&self) -> usize {
-        self.bindings.len()
-    }
-}
-
-/// Why an exact original-clause proof fragment could not be built.
-///
-/// These errors are intentionally fail-closed.  In particular, an indexed
-/// annotation that does not prove its exact trace clause is never replaced by
-/// an anonymous `Assume` step.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum ExactOriginalProofError {
-    #[error(transparent)]
-    Resource(#[from] ResolutionValidationError),
-    #[error("original clause uses reserved trace ID zero")]
-    ZeroClauseId,
-    #[error("duplicate original-clause trace ID {clause_id}")]
-    DuplicateClauseId { clause_id: u64 },
-    #[error("original clause {clause_id} is empty")]
-    EmptyOriginalClause { clause_id: u64 },
-    #[error("original clause {clause_id} references unmapped SAT variable {variable}")]
-    UnmappedVariable { clause_id: u64, variable: u32 },
-    #[error("original clause {clause_id} maps SAT variable {variable} to stale term {term:?}")]
-    StaleMappedTerm {
-        clause_id: u64,
-        variable: u32,
-        term: TermId,
-    },
-    #[error("original clause {clause_id} has two indexed proof annotations")]
-    AmbiguousIndexedAnnotations { clause_id: u64 },
-    #[error(
-        "indexed clausification annotation does not prove original clause {clause_id}: {clause:?}"
-    )]
-    InvalidClausificationAnnotation { clause_id: u64, clause: Vec<TermId> },
-    #[error("indexed theory annotation does not prove original clause {clause_id}: {clause:?}")]
-    InvalidTheoryAnnotation { clause_id: u64, clause: Vec<TermId> },
-    #[error("original clause {clause_id} has no exact proof authority: {clause:?}")]
-    UnauthenticatedOriginalClause { clause_id: u64, clause: Vec<TermId> },
-}
-
-fn exact_checked_add(
-    lhs: usize,
-    rhs: usize,
-    resource: ResolutionValidationResource,
-) -> Result<usize, ResolutionValidationError> {
-    lhs.checked_add(rhs)
-        .ok_or(ResolutionValidationError::AccountingOverflow { resource })
-}
-
-fn exact_checked_mul(
-    lhs: usize,
-    rhs: usize,
-    resource: ResolutionValidationResource,
-) -> Result<usize, ResolutionValidationError> {
-    lhs.checked_mul(rhs)
-        .ok_or(ResolutionValidationError::AccountingOverflow { resource })
-}
-
-fn exact_sort_work(len: usize) -> Result<usize, ResolutionValidationError> {
-    if len <= 1 {
-        return Ok(len);
-    }
-    let passes = (usize::BITS - (len - 1).leading_zeros()) as usize;
-    exact_checked_mul(
-        len,
-        exact_checked_add(passes, 1, ResolutionValidationResource::Work)?,
-        ResolutionValidationResource::Work,
-    )
-}
+use ay_sat::{ClauseTrace, Literal};
+#[cfg(test)]
+use exact_fragment::EXACT_NEW_NOT_BYTES;
+pub(crate) use exact_fragment::{
+    ExactOriginalProofError, ExactOriginalProofFragment, FragmentInstanceDerivation,
+    FragmentInstanceRootDerivation, FragmentPropagationEnvironment, FragmentSkolemDerivation,
+};
 
 /// SAT-level proof manager for translating clause traces to Alethe steps
 pub(crate) struct SatProofManager<'a> {
@@ -184,6 +55,18 @@ pub(crate) struct SatProofManager<'a> {
     /// clause in the trace matches a recorded theory lemma, this map provides
     /// the annotation for emitting a `TheoryLemma` proof step.
     theory_lemma_proofs: Option<&'a HashMap<Vec<TermId>, TheoryLemmaProof>>,
+    /// Solver-minted fixed-false selector variables for the exact trace
+    /// snapshot. Positive selector guards are projected away only after the
+    /// structural replay has consumed the corresponding negative premises.
+    scope_assumptions: &'a [Literal],
+    /// Executor-sealed instantiation derivations keyed by exact instance term.
+    instance_derivations: Option<&'a HashMap<TermId, FragmentInstanceDerivation>>,
+    /// Executor-sealed Skolemization derivations keyed by asserted term.
+    skolem_derivations: Option<&'a HashMap<TermId, FragmentSkolemDerivation>>,
+    /// Executor-sealed `PropagateValues` licensing environment (#ppp-c7).
+    propagation_environment: Option<&'a FragmentPropagationEnvironment>,
+    /// Executor-sealed qpf premise-forced instance roots (#ppp-c7).
+    instance_root_derivations: Option<&'a [FragmentInstanceRootDerivation]>,
     /// Number of learned clauses that fell back to Trust due to failed
     /// resolution hint reconstruction (#4585).
     trust_fallback_count: u32,
@@ -228,6 +111,11 @@ impl<'a> SatProofManager<'a> {
             clausification_proofs: None,
             original_clause_theory_proofs: None,
             theory_lemma_proofs: None,
+            scope_assumptions: &[],
+            instance_derivations: None,
+            skolem_derivations: None,
+            propagation_environment: None,
+            instance_root_derivations: None,
             trust_fallback_count: 0,
             untranslatable_entries: 0,
             unmapped_var_min: None,
@@ -239,6 +127,45 @@ impl<'a> SatProofManager<'a> {
     /// Set the deterministic RUP-replay step budget (`None` = unlimited).
     pub(crate) fn set_step_budget(&mut self, budget: Option<u64>) {
         self.step_budget = budget;
+    }
+
+    /// Install solver-minted active-scope premises from the same immutable
+    /// trace snapshot.  They must be negative, unique, and outside the SMT
+    /// variable map; every mismatch fails closed.
+    pub(crate) fn set_scope_assumptions(
+        &mut self,
+        assumptions: &'a [Literal],
+    ) -> Result<(), ExactOriginalProofError> {
+        let mut previous = None;
+        for &assumption in assumptions {
+            let variable = assumption.variable().index() as u32;
+            if assumption.is_positive() {
+                return Err(ExactOriginalProofError::PositiveScopeAssumption { variable });
+            }
+            if self.var_to_term.contains_key(&variable) {
+                return Err(ExactOriginalProofError::MappedScopeAssumption { variable });
+            }
+            if let Some(prior) = previous {
+                if variable == prior {
+                    return Err(ExactOriginalProofError::DuplicateScopeAssumption { variable });
+                }
+                if variable < prior {
+                    return Err(ExactOriginalProofError::UnorderedScopeAssumption {
+                        previous: prior,
+                        variable,
+                    });
+                }
+            }
+            previous = Some(variable);
+        }
+        self.scope_assumptions = assumptions;
+        Ok(())
+    }
+
+    fn is_scope_assumption_variable(&self, variable: u32) -> bool {
+        self.scope_assumptions
+            .binary_search_by_key(&variable, |assumption| assumption.variable().index() as u32)
+            .is_ok()
     }
 
     /// Attach clausification proof annotations from the Tseitin encoder (#6031).
@@ -268,6 +195,45 @@ impl<'a> SatProofManager<'a> {
         self.original_clause_theory_proofs = Some(proofs);
     }
 
+    /// Attach executor-sealed quantifier-instantiation derivations. Consulted
+    /// only in the `(None, None)` arm of exact fragment construction for a
+    /// non-authored unit original; the emitted `forall_inst` chain is fully
+    /// re-validated by the strict premise authenticator.
+    pub(crate) fn set_instance_derivations(
+        &mut self,
+        derivations: &'a HashMap<TermId, FragmentInstanceDerivation>,
+    ) {
+        self.instance_derivations = Some(derivations);
+    }
+
+    /// Attach executor-sealed Skolemization derivations (same contract).
+    pub(crate) fn set_skolem_derivations(
+        &mut self,
+        derivations: &'a HashMap<TermId, FragmentSkolemDerivation>,
+    ) {
+        self.skolem_derivations = Some(derivations);
+    }
+
+    /// Attach the executor-sealed `PropagateValues` licensing environment
+    /// (#ppp-c7). Consulted only by the c7 arm of exact fragment
+    /// construction for a non-authored unit original; the emitted replay
+    /// chain is fully re-validated by the strict premise authenticator.
+    pub(crate) fn set_propagation_environment(
+        &mut self,
+        environment: &'a FragmentPropagationEnvironment,
+    ) {
+        self.propagation_environment = Some(environment);
+    }
+
+    /// Attach executor-sealed qpf premise-forced instance roots (#ppp-c7,
+    /// same contract).
+    pub(crate) fn set_instance_root_derivations(
+        &mut self,
+        derivations: &'a [FragmentInstanceRootDerivation],
+    ) {
+        self.instance_root_derivations = Some(derivations);
+    }
+
     /// Attach theory lemma proof annotations (#6031 Phase 4).
     ///
     /// Keyed by normalized clause content (sorted TermIds). When an original
@@ -279,468 +245,6 @@ impl<'a> SatProofManager<'a> {
         proofs: &'a HashMap<Vec<TermId>, TheoryLemmaProof>,
     ) {
         self.theory_lemma_proofs = Some(proofs);
-    }
-
-    /// Build a fail-closed proof fragment for every `is_original` trace entry.
-    ///
-    /// This is stricter than [`Self::process_trace`].  It consults only the two
-    /// annotation tables indexed by stable clause ID: normalized-content
-    /// theory lookup, minimized-lemma superset bridging, and generic assumption
-    /// fallback are all intentionally excluded.  An unannotated entry is
-    /// accepted only when it is an exact unit assertion from
-    /// `authored_problem_terms`.
-    ///
-    /// Every original ID gets its own proof step and binding, including two
-    /// different IDs whose clauses have identical content.  That one-to-one
-    /// identity is required when a later SAT-premise authenticator composes the
-    /// fragment with a checked propositional derivation.
-    #[cfg(test)]
-    pub(crate) fn build_exact_original_proof_fragment(
-        &mut self,
-        trace: &ClauseTrace,
-        authored_problem_terms: &[TermId],
-    ) -> Result<ExactOriginalProofFragment, ExactOriginalProofError> {
-        let mut unbounded = |_: usize, _: usize| Ok(());
-        self.build_exact_original_proof_fragment_metered(
-            trace,
-            authored_problem_terms,
-            &mut unbounded,
-        )
-    }
-
-    fn clausification_preflight(
-        &self,
-        source: TermId,
-        traced_clause_len: usize,
-    ) -> Result<(usize, usize), ResolutionValidationError> {
-        let (source_arity, symbol_bytes) = match self.terms.get(source) {
-            TermData::App(symbol, args) => {
-                let index_bytes = match symbol {
-                    Symbol::Indexed(_, indices) => exact_checked_mul(
-                        indices.len(),
-                        size_of::<u32>(),
-                        ResolutionValidationResource::Bytes,
-                    )?,
-                    Symbol::Named(_) => 0,
-                    _ => 0,
-                };
-                (
-                    args.len(),
-                    exact_checked_add(
-                        symbol.name().len(),
-                        index_bytes,
-                        ResolutionValidationResource::Bytes,
-                    )?,
-                )
-            }
-            TermData::Ite(_, _, _) => (3, 3),
-            _ => (0, 0),
-        };
-        let expected_len = exact_checked_add(source_arity, 1, ResolutionValidationResource::Work)?;
-        let work = exact_checked_add(
-            exact_checked_add(
-                exact_checked_mul(source_arity, 6, ResolutionValidationResource::Work)?,
-                exact_sort_work(expected_len)?,
-                ResolutionValidationResource::Work,
-            )?,
-            exact_sort_work(traced_clause_len)?,
-            ResolutionValidationResource::Work,
-        )?;
-
-        // `canonicalize_tautology_clause` clones the application head and full
-        // argument vector even for indexed two-literal rules, and some rules
-        // additionally build complements/expected vectors. This deliberately
-        // generous per-argument envelope covers those simultaneous values and
-        // possible newly interned `Not` terms.
-        let argument_bytes =
-            exact_checked_mul(source_arity, 512, ResolutionValidationResource::Bytes)?;
-        let expected_bytes = exact_checked_mul(
-            expected_len,
-            exact_checked_mul(3, size_of::<TermId>(), ResolutionValidationResource::Bytes)?,
-            ResolutionValidationResource::Bytes,
-        )?;
-        let bytes = exact_checked_add(
-            exact_checked_add(
-                argument_bytes,
-                expected_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            exact_checked_add(symbol_bytes, 1024, ResolutionValidationResource::Bytes)?,
-            ResolutionValidationResource::Bytes,
-        )?;
-        Ok((work, bytes))
-    }
-
-    fn theory_annotation_preflight(
-        annotation: &TheoryLemmaProof,
-        traced_clause_len: usize,
-    ) -> Result<(usize, usize), ResolutionValidationError> {
-        let cutting_plane_coefficients = match annotation.lia.as_ref() {
-            Some(ay_core::LiaAnnotation::CuttingPlane(cutting_plane)) => {
-                cutting_plane.farkas.coefficients.len()
-            }
-            _ => 0,
-        };
-        let coefficient_count = exact_checked_add(
-            annotation
-                .farkas
-                .as_ref()
-                .map_or(0, |farkas| farkas.coefficients.len()),
-            cutting_plane_coefficients,
-            ResolutionValidationResource::Work,
-        )?;
-        let clause_sort_work = exact_checked_add(
-            exact_sort_work(annotation.clause.len())?,
-            exact_sort_work(traced_clause_len)?,
-            ResolutionValidationResource::Work,
-        )?;
-        let work = exact_checked_add(
-            exact_checked_mul(clause_sort_work, 3, ResolutionValidationResource::Work)?,
-            exact_checked_mul(
-                coefficient_count,
-                exact_checked_add(
-                    (usize::BITS - (annotation.clause.len().max(2) - 1).leading_zeros()) as usize,
-                    4,
-                    ResolutionValidationResource::Work,
-                )?,
-                ResolutionValidationResource::Work,
-            )?,
-            ResolutionValidationResource::Work,
-        )?;
-        let clause_terms = exact_checked_add(
-            annotation.clause.len(),
-            traced_clause_len,
-            ResolutionValidationResource::Bytes,
-        )?;
-        let bytes = exact_checked_add(
-            exact_checked_mul(clause_terms, 256, ResolutionValidationResource::Bytes)?,
-            exact_checked_add(
-                exact_checked_mul(coefficient_count, 128, ResolutionValidationResource::Bytes)?,
-                2048,
-                ResolutionValidationResource::Bytes,
-            )?,
-            ResolutionValidationResource::Bytes,
-        )?;
-        Ok((work, bytes))
-    }
-
-    fn precharge_term_store_growth(
-        &self,
-        trace: &ClauseTrace,
-        progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
-    ) -> Result<(usize, usize), ResolutionValidationError> {
-        let mut potential_new_nots = 0usize;
-        for (trace_index, entry) in trace.entries().iter().enumerate() {
-            if trace_index % 1024 == 0 {
-                progress(0, 0)?;
-            }
-            if !entry.is_original {
-                continue;
-            }
-
-            // Charge the full literal scan before inspecting polarity.
-            progress(entry.clause.len(), 0)?;
-            for literal in &entry.clause {
-                if !literal.is_positive() {
-                    potential_new_nots = exact_checked_add(
-                        potential_new_nots,
-                        1,
-                        ResolutionValidationResource::Bytes,
-                    )?;
-                }
-            }
-
-            // `canonicalize_tautology_clause` materializes `not_source` and
-            // may negate every immediate connective argument. Count the full
-            // arity even though most rules use fewer terms, so later rule
-            // additions cannot silently escape this envelope.
-            if let Some(annotation) =
-                Self::original_annotation_by_id(self.clausification_proofs, entry.id)
-            {
-                let source_arity = if annotation.source_term.index() < self.terms.len() {
-                    match self.terms.get(annotation.source_term) {
-                        TermData::App(_, args) => args.len(),
-                        TermData::Ite(_, _, _) => 3,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                potential_new_nots = exact_checked_add(
-                    potential_new_nots,
-                    exact_checked_add(source_arity, 1, ResolutionValidationResource::Bytes)?,
-                    ResolutionValidationResource::Bytes,
-                )?;
-            }
-        }
-
-        let baseline = self.terms.true_memory_bytes();
-        if potential_new_nots == 0 {
-            progress(1, 0)?;
-            return Ok((baseline, 0));
-        }
-        let new_term_bytes = exact_checked_mul(
-            potential_new_nots,
-            EXACT_NEW_NOT_BYTES,
-            ResolutionValidationResource::Bytes,
-        )?;
-        let growth_allowance = exact_checked_add(
-            baseline,
-            new_term_bytes,
-            ResolutionValidationResource::Bytes,
-        )?;
-        // Charge before the first possible `mk_not_raw`. One current
-        // footprint covers a geometric reallocation of every pre-existing
-        // TermStore container across the batch; the per-term allowance covers
-        // newly retained entries and buckets.
-        progress(1, growth_allowance)?;
-        Ok((baseline, growth_allowance))
-    }
-
-    fn reconcile_term_store_growth(
-        &self,
-        baseline: usize,
-        charged_growth: &mut usize,
-        progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
-    ) -> Result<(), ResolutionValidationError> {
-        let current = self.terms.true_memory_bytes();
-        let actual_growth =
-            current
-                .checked_sub(baseline)
-                .ok_or(ResolutionValidationError::AccountingOverflow {
-                    resource: ResolutionValidationResource::Bytes,
-                })?;
-        if actual_growth > *charged_growth {
-            let excess = actual_growth.checked_sub(*charged_growth).ok_or(
-                ResolutionValidationError::AccountingOverflow {
-                    resource: ResolutionValidationResource::Bytes,
-                },
-            )?;
-            progress(0, excess)?;
-            *charged_growth = actual_growth;
-        } else {
-            progress(0, 0)?;
-        }
-        Ok(())
-    }
-
-    /// Metered form used by the checked-SAT-refutation publication gate.
-    ///
-    /// `progress(work, bytes)` continues the caller's single conversion/replay
-    /// allowance and polls its inherited external controls. Byte charges are
-    /// conservative retained/allocation estimates; rejecting early is safe.
-    pub(crate) fn build_exact_original_proof_fragment_metered(
-        &mut self,
-        trace: &ClauseTrace,
-        authored_problem_terms: &[TermId],
-        progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
-    ) -> Result<ExactOriginalProofFragment, ExactOriginalProofError> {
-        let initial_work = exact_checked_add(
-            authored_problem_terms.len(),
-            trace.entries().len(),
-            ResolutionValidationResource::Work,
-        )?;
-        let authored_bytes = exact_checked_mul(
-            authored_problem_terms.len(),
-            64,
-            ResolutionValidationResource::Bytes,
-        )?;
-        progress(initial_work, authored_bytes)?;
-        let (term_store_baseline, mut charged_term_store_growth) =
-            self.precharge_term_store_growth(trace, progress)?;
-        let mut authored_problem_term_set = HashSet::default();
-        for (index, &term) in authored_problem_terms.iter().enumerate() {
-            if index % 1024 == 0 {
-                progress(0, 0)?;
-            }
-            authored_problem_term_set.insert(term);
-        }
-        let mut proof = Proof::new();
-        let mut bindings = HashMap::default();
-
-        for (trace_index, entry) in trace.entries().iter().enumerate() {
-            if trace_index % 1024 == 0 {
-                progress(0, 0)?;
-            }
-            if !entry.is_original {
-                continue;
-            }
-            // The fragment retains a proof step, a binding/hash entry, multiple
-            // exact clause snapshots, and occasionally a cloned annotation.
-            // Charge a deliberately generous envelope before those allocations.
-            let base_work = exact_checked_add(
-                exact_checked_mul(
-                    exact_sort_work(entry.clause.len())?,
-                    2,
-                    ResolutionValidationResource::Work,
-                )?,
-                exact_checked_add(
-                    exact_checked_mul(entry.clause.len(), 4, ResolutionValidationResource::Work)?,
-                    1,
-                    ResolutionValidationResource::Work,
-                )?,
-                ResolutionValidationResource::Work,
-            )?;
-            let base_bytes = exact_checked_add(
-                exact_checked_mul(entry.clause.len(), 256, ResolutionValidationResource::Bytes)?,
-                512,
-                ResolutionValidationResource::Bytes,
-            )?;
-            progress(base_work, base_bytes)?;
-            proof.steps.try_reserve(1).map_err(|_| {
-                ResolutionValidationError::AllocationFailed {
-                    resource: ResolutionValidationResource::Bytes,
-                }
-            })?;
-            if entry.id == 0 {
-                return Err(ExactOriginalProofError::ZeroClauseId);
-            }
-            if bindings.contains_key(&entry.id) {
-                return Err(ExactOriginalProofError::DuplicateClauseId {
-                    clause_id: entry.id,
-                });
-            }
-            if entry.clause.is_empty() {
-                return Err(ExactOriginalProofError::EmptyOriginalClause {
-                    clause_id: entry.id,
-                });
-            }
-
-            let mut clause = Vec::new();
-            clause.try_reserve_exact(entry.clause.len()).map_err(|_| {
-                ResolutionValidationError::AllocationFailed {
-                    resource: ResolutionValidationResource::Bytes,
-                }
-            })?;
-            for (literal_index, &literal) in entry.clause.iter().enumerate() {
-                if literal_index % 1024 == 0 {
-                    progress(0, 0)?;
-                }
-                let variable = literal.variable().index() as u32;
-                let Some(&mapped_term) = self.var_to_term.get(&variable) else {
-                    return Err(ExactOriginalProofError::UnmappedVariable {
-                        clause_id: entry.id,
-                        variable,
-                    });
-                };
-                if mapped_term.index() >= self.terms.len() {
-                    return Err(ExactOriginalProofError::StaleMappedTerm {
-                        clause_id: entry.id,
-                        variable,
-                        term: mapped_term,
-                    });
-                }
-                let Some(term) = self.lit_to_term(literal) else {
-                    return Err(ExactOriginalProofError::UnmappedVariable {
-                        clause_id: entry.id,
-                        variable,
-                    });
-                };
-                self.reconcile_term_store_growth(
-                    term_store_baseline,
-                    &mut charged_term_store_growth,
-                    progress,
-                )?;
-                clause.push(term);
-            }
-
-            let clausification =
-                Self::original_annotation_by_id(self.clausification_proofs, entry.id);
-            let theory =
-                Self::original_annotation_by_id(self.original_clause_theory_proofs, entry.id);
-            let proof_id = match (clausification, theory) {
-                (Some(_), Some(_)) => {
-                    return Err(ExactOriginalProofError::AmbiguousIndexedAnnotations {
-                        clause_id: entry.id,
-                    });
-                }
-                (Some(annotation), None) => {
-                    if annotation.source_term.index() >= self.terms.len() {
-                        return Err(ExactOriginalProofError::InvalidClausificationAnnotation {
-                            clause_id: entry.id,
-                            clause: Self::normalize_clause(&clause),
-                        });
-                    }
-                    let (work, bytes) =
-                        self.clausification_preflight(annotation.source_term, clause.len())?;
-                    progress(work, bytes)?;
-                    let Some(step_clause) = Self::canonicalize_tautology_clause(
-                        self.terms,
-                        &annotation.rule,
-                        annotation.source_term,
-                        &clause,
-                    ) else {
-                        return Err(ExactOriginalProofError::InvalidClausificationAnnotation {
-                            clause_id: entry.id,
-                            clause: Self::normalize_clause(&clause),
-                        });
-                    };
-                    self.reconcile_term_store_growth(
-                        term_store_baseline,
-                        &mut charged_term_store_growth,
-                        progress,
-                    )?;
-                    proof.add_rule_step(
-                        annotation.rule.clone(),
-                        step_clause,
-                        Vec::new(),
-                        vec![annotation.source_term],
-                    )
-                }
-                (None, Some(annotation)) => {
-                    let (work, bytes) =
-                        Self::theory_annotation_preflight(annotation, clause.len())?;
-                    progress(work, bytes)?;
-                    if !Self::clauses_equivalent(&annotation.clause, &clause) {
-                        return Err(ExactOriginalProofError::InvalidTheoryAnnotation {
-                            clause_id: entry.id,
-                            clause: Self::normalize_clause(&clause),
-                        });
-                    }
-                    let Some(annotation) = Self::rebind_theory_annotation(annotation, &clause)
-                    else {
-                        return Err(ExactOriginalProofError::InvalidTheoryAnnotation {
-                            clause_id: entry.id,
-                            clause: Self::normalize_clause(&clause),
-                        });
-                    };
-                    // Preserve the exact theory rule and payload. Semantic
-                    // validity (including rejecting Generic/trust) belongs to
-                    // the independent strict checker; identity authentication
-                    // must neither upgrade nor erase the producer's claim.
-                    proof.add_step(ProofStep::TheoryLemma {
-                        theory: "theory".to_owned(),
-                        clause: clause.clone(),
-                        farkas: annotation.farkas,
-                        kind: annotation.kind,
-                        lia: annotation.lia,
-                    })
-                }
-                (None, None) => {
-                    if clause.len() != 1 || !authored_problem_term_set.contains(&clause[0]) {
-                        return Err(ExactOriginalProofError::UnauthenticatedOriginalClause {
-                            clause_id: entry.id,
-                            clause: Self::normalize_clause(&clause),
-                        });
-                    }
-                    proof.add_assume(clause[0], None)
-                }
-            };
-
-            let binding = ExactOriginalClauseBinding {
-                proof_id,
-                clause: Self::normalize_clause(&clause),
-                trace_id: entry.id,
-                trace_index,
-                source_sat_clause: entry.clause.clone(),
-            };
-            let previous = bindings.insert(entry.id, binding);
-            debug_assert!(previous.is_none(), "duplicate IDs were rejected above");
-            progress(0, 0)?;
-        }
-
-        progress(0, 0)?;
-        Ok(ExactOriginalProofFragment { proof, bindings })
     }
 
     /// Convert a SAT literal to an SMT term
@@ -789,6 +293,25 @@ impl<'a> SatProofManager<'a> {
     /// Convert a SAT clause to SMT terms.
     fn clause_to_terms(&mut self, clause: &[Literal]) -> Option<Vec<TermId>> {
         clause.iter().map(|&lit| self.lit_to_term(lit)).collect()
+    }
+
+    /// Substitute every solver-minted active selector with `false`.
+    ///
+    /// `None` means the clause was satisfied by a negative selector occurrence
+    /// and may be omitted from the specialized replay database.
+    fn project_scope_clause(&self, clause: &[Literal]) -> Option<Vec<Literal>> {
+        let mut projected = Vec::with_capacity(clause.len());
+        for &literal in clause {
+            let variable = literal.variable().index() as u32;
+            if self.is_scope_assumption_variable(variable) {
+                if !literal.is_positive() {
+                    return None;
+                }
+                continue;
+            }
+            projected.push(literal);
+        }
+        Some(projected)
     }
 
     /// Canonicalized clause key (order-insensitive).
@@ -841,8 +364,24 @@ impl<'a> SatProofManager<'a> {
                 .rebind_by_literal(&annotation.clause, target_clause)?;
         }
 
+        // Clause order in the rebound artifact (#trust->0 C3): coefficient
+        // certificates are rebound positionally onto the TARGET order, so
+        // Farkas/cutting-plane annotations must carry the target clause. For
+        // every other annotation, keep the PRODUCER's exact literal order —
+        // order-sensitive strict validators (the EUF kinds) accept precisely
+        // the order the classifier recorded, and set-equivalence with the
+        // traced clause was verified above, so the denoted disjunction is
+        // unchanged. This mirrors `canonicalize_tautology_clause`, which
+        // already rebuilds Boolean-tautology clauses in their rule-mandated
+        // order instead of the trace's watched-literal permutation.
+        let clause = if rebound_farkas.is_some() || has_cutting_plane_farkas {
+            target_clause.to_vec()
+        } else {
+            annotation.clause.clone()
+        };
+
         Some(TheoryLemmaProof {
-            clause: target_clause.to_vec(),
+            clause,
             kind: annotation.kind,
             farkas: rebound_farkas,
             lia: rebound_lia,
@@ -964,7 +503,10 @@ impl<'a> SatProofManager<'a> {
                 );
                 return None;
             }
-            let Some(mut entry_clause_terms) = self.clause_to_terms(&entry.clause) else {
+            let Some(mut entry_sat_clause) = self.project_scope_clause(entry.clause) else {
+                continue;
+            };
+            let Some(mut entry_clause_terms) = self.clause_to_terms(&entry_sat_clause) else {
                 // Introspection: this trace entry is DROPPED from the replay maps
                 // entirely — its literals have no term mapping — so no later
                 // resolution can use it. Counted because a small `clause_terms`
@@ -973,8 +515,6 @@ impl<'a> SatProofManager<'a> {
                 self.untranslatable_entries += 1;
                 continue;
             };
-            let mut entry_sat_clause = entry.clause.clone();
-
             let clause_proof = if entry.is_original {
                 // Bind annotations by the stable original-clause ID. The SAT
                 // layer reserves an ID when it omits a tautological input, so
@@ -1076,8 +616,8 @@ impl<'a> SatProofManager<'a> {
             } else {
                 match self.derive_clause_from_hints(
                     &entry_clause_terms,
-                    &entry.clause,
-                    &entry.resolution_hints,
+                    &entry_sat_clause,
+                    entry.resolution_hints,
                     &clause_terms,
                     &clause_versions,
                     &latest_version_by_id,
@@ -1303,6 +843,7 @@ impl<'a> SatProofManager<'a> {
             entry.clause.iter().all(|lit| {
                 let var_idx = lit.variable().index() as u32;
                 self.var_to_term.contains_key(&var_idx)
+                    || self.is_scope_assumption_variable(var_idx)
             })
         })
     }

@@ -5,7 +5,7 @@
 //! rebuilding it from scratch every check.
 //!
 //! Set ONLY by `solve_lra_incremental` when the warm lane is enabled
-//! (`AY_LRA_WARM_THEORY`). Every other caller of that macro — LIA, and the mock
+//! (`--lra-warm-theory`). Every other caller of that macro — LIA, and the mock
 //! `incremental_conflict_gate_tests` (whose `$self` is not the Executor) — leaves
 //! it `false`, so their behaviour is byte-identical. Default OFF.
 

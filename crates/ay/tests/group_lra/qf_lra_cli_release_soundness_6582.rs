@@ -2,11 +2,13 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Release-only CLI soundness canaries for #6582.
+//! Release-only CLI soundness canaries for #6582's strict interval endpoints.
 //!
 //! The `ay-dpll` regression covers the in-process `Executor` path. This file
 //! exercises the shipped `ay` binary so the subprocess/CLI path cannot regress
-//! back to false-UNSAT on the two original slow benchmarks.
+//! back to false-UNSAT. The lower- and upper-endpoint inputs are hand-authored
+//! Apache-2.0 reductions, not copies of the externally licensed SMT-LIB
+//! benchmarks that originally exposed the defect.
 //!
 //! Part of #6582
 
@@ -17,8 +19,6 @@ use std::path::{Path, PathBuf};
 #[cfg(not(debug_assertions))]
 use std::process::{Command, Stdio};
 #[cfg(not(debug_assertions))]
-use std::sync::{Once, OnceLock};
-#[cfg(not(debug_assertions))]
 use std::time::Duration;
 #[cfg(not(debug_assertions))]
 use wait_timeout::ChildExt;
@@ -27,11 +27,6 @@ use wait_timeout::ChildExt;
 const BENCHMARK_TIMEOUT_SECS: u64 = 10;
 #[cfg(not(debug_assertions))]
 const FALSE_UNSAT_CANARY_RUNS: usize = 3;
-
-#[cfg(not(debug_assertions))]
-static Z3_AVAILABLE: OnceLock<bool> = OnceLock::new();
-#[cfg(not(debug_assertions))]
-static Z3_SKIP_LOGGED: Once = Once::new();
 
 #[cfg(not(debug_assertions))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,25 +57,6 @@ fn workspace_path(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(relative)
-}
-
-#[cfg(not(debug_assertions))]
-fn check_z3_or_skip() -> bool {
-    let available = *Z3_AVAILABLE.get_or_init(|| {
-        Command::new("z3")
-            .arg("--version")
-            .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-    });
-    if available {
-        return true;
-    }
-
-    Z3_SKIP_LOGGED.call_once(|| {
-        eprintln!("Z3 not found in PATH; skipping #6582 CLI release canaries");
-    });
-    false
 }
 
 #[cfg(not(debug_assertions))]
@@ -143,15 +119,6 @@ fn run_command_with_timeout(
 }
 
 #[cfg(not(debug_assertions))]
-fn run_z3_file(path: &Path) -> Result<SolverOutcome, String> {
-    let mut command = Command::new("z3");
-    command
-        .arg(format!("-T:{BENCHMARK_TIMEOUT_SECS}"))
-        .arg(path);
-    run_command_with_timeout(command, BENCHMARK_TIMEOUT_SECS)
-}
-
-#[cfg(not(debug_assertions))]
 fn run_ay_file(path: &Path) -> Result<SolverOutcome, String> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ay"));
     command.arg(path);
@@ -159,26 +126,16 @@ fn run_ay_file(path: &Path) -> Result<SolverOutcome, String> {
 }
 
 #[cfg(not(debug_assertions))]
-fn assert_cli_no_false_unsat_6582(name: &str, relative_path: &str) -> Result<(), String> {
+fn assert_cli_sat_6582(name: &str, relative_path: &str) -> Result<(), String> {
     let path = workspace_path(relative_path);
     assert!(path.exists(), "benchmark not found: {}", path.display());
 
-    if check_z3_or_skip() {
-        assert_eq!(
-            run_z3_file(&path)?,
-            SolverOutcome::Sat,
-            "Z3 disagrees on expected SAT for {name}"
-        );
-    }
-
     for run in 0..FALSE_UNSAT_CANARY_RUNS {
         let got = run_ay_file(&path)?;
-        assert!(
-            matches!(
-                got,
-                SolverOutcome::Sat | SolverOutcome::Unknown | SolverOutcome::Timeout
-            ),
-            "CLI release run {run} returned false-UNSAT for {name} (#6582): {got:?}"
+        assert_eq!(
+            got,
+            SolverOutcome::Sat,
+            "CLI release run {run} returned {got:?} for {name} (#6582)"
         );
     }
     Ok(())
@@ -187,19 +144,19 @@ fn assert_cli_no_false_unsat_6582(name: &str, relative_path: &str) -> Result<(),
 #[cfg(not(debug_assertions))]
 #[test]
 #[ntest::timeout(120_000)]
-fn test_constraints_tempo_width_60_cli_release_no_false_unsat_6582() -> Result<(), String> {
-    assert_cli_no_false_unsat_6582(
-        "constraints-tempo-width-60",
-        "benchmarks/smtcomp/QF_LRA/constraints-tempo-width-60.smt2",
+fn qf_lra_cli_release_mechanism_open_zero_lower_sat_6582() -> Result<(), String> {
+    assert_cli_sat_6582(
+        "open-zero lower endpoint",
+        "benchmarks/smt/regression/qf_lra_release_soundness/open_zero_lower_sat.smt2",
     )
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 #[ntest::timeout(120_000)]
-fn test_simple_startup_6nodes_cli_release_no_false_unsat_6582() -> Result<(), String> {
-    assert_cli_no_false_unsat_6582(
-        "simple_startup_6nodes.missing.induct",
-        "benchmarks/smtcomp/QF_LRA/simple_startup_6nodes.missing.induct.smt2",
+fn qf_lra_cli_release_mechanism_open_zero_upper_sat_6582() -> Result<(), String> {
+    assert_cli_sat_6582(
+        "open-zero upper endpoint",
+        "benchmarks/smt/regression/qf_lra_release_soundness/open_zero_upper_sat.smt2",
     )
 }

@@ -1067,7 +1067,7 @@ fn test_check_sat_with_details_proofs_enabled_verification_level() {
 }
 
 #[test]
-fn proof_checked_level_requires_and_reports_strict_unsat_authority() {
+fn proof_checked_level_reports_strict_authority_without_retaining_an_artifact() {
     let mut solver = Solver::new(Logic::QfUf);
     solver.set_verification_level(VerificationLevel::ProofChecked);
     let p = solver.declare_const("p", Sort::Bool);
@@ -1078,7 +1078,7 @@ fn proof_checked_level_requires_and_reports_strict_unsat_authority() {
     let details = solver.check_sat_with_details();
     assert!(details.result.is_unsat());
     assert!(details.verification_level.has_proof_checking());
-    assert!(details.verification.unsat_proof_available);
+    assert!(!details.verification.unsat_proof_available);
     assert!(details.verification.unsat_proof_strictly_verified);
 }
 
@@ -1713,20 +1713,4 @@ fn test_sat_result_retains_chokepoint_emission_witness() {
     );
 }
 
-#[test]
-fn test_unsat_result_retains_chokepoint_emission_witness() {
-    let mut solver = Solver::new(Logic::QfLia);
-    let contradiction = solver.bool_const(false);
-    solver.assert_term(contradiction);
-
-    let verified = solver.check_sat();
-    assert!(verified.is_unsat());
-    assert!(
-        verified.has_unsat_emission_witness(),
-        "query-authorized Unsat must retain its one-shot witness"
-    );
-    assert!(
-        !verified.was_unsat_strictly_verified(),
-        "ordinary QF_LIA publication must not claim a checked refutation"
-    );
-}
+mod strict_unsat_witness;

@@ -28,7 +28,7 @@ impl Solver {
     ///
     /// Must be called at decision level 0.
     pub(in crate::solver) fn congruence(&mut self) -> bool {
-        if std::env::var_os("AY_AB_DUMP_DB").is_some() {
+        if ay_core::misc_cli_flags().ab_dump_db {
             self.dump_live_db_for_triage("congruence_round_start");
         }
         let equivs_before = self.inproc.congruence.stats().equivalences_found;
@@ -36,7 +36,7 @@ impl Solver {
         let equivs_after = self.inproc.congruence.stats().equivalences_found;
         let yield_this_round = equivs_after - equivs_before;
 
-        if std::env::var_os("AY_AB_SUBST_STATS").is_some() {
+        if ay_core::misc_cli_flags().ab_subst_stats {
             let s = self.inproc.congruence.stats();
             eprintln!(
                 "AB_CONGRUENCE: equivs_total={} this_round={} non_rup_equivs={} non_rup_units={} non_rup_contradiction_units={} subsumed={} parity_certified_applied={} xor_ladders={} ladder_fails={}",
@@ -147,7 +147,7 @@ impl Solver {
                 .congruence
                 .run(&mut self.arena, Some(&self.vals), &congruence_frozen);
 
-        if std::env::var_os("AY_AB_SUBST_DUMP_EDGES").is_some() {
+        if ay_core::misc_cli_flags().ab_subst_dump_edges {
             eprintln!(
                 "DUMP_RESULT: is_unsat={} units={:?} edges={}",
                 result.is_unsat,
@@ -232,7 +232,7 @@ impl Solver {
         // never assume equivalences whose edges were SKIPPED by the proof
         // gate: subsuming with un-inserted equivalences deletes clauses that
         // are not redundant w.r.t. the real DB — observed as an internal SAT
-        // on UNSAT 70da0b78 under AY_AB_DRAT_SUBST (caught by the
+        // on UNSAT 70da0b78 under --sat-no-drat-subst (caught by the
         // FINALIZE_SAT_FAIL gate). None = all closure edges were applied.
         let mut applied_edges: Option<Vec<(Literal, Literal)>> = None;
         if self.proof_manager.is_some() && !self.cold.lrat_enabled {
@@ -468,7 +468,7 @@ impl Solver {
         // Soundness gate (#7137): skip non-RUP units to prevent wrong assignments
         // from corrupting the trail and causing false UNSAT via subsequent BCP.
         // #7137-relax: machine-checked-parity trust. When
-        // AY_AB_CONGRUENCE_PARITY_TRUST=1, accept XOR full-collapse (arity-0)
+        // --sat-congruence-parity-trust, accept XOR full-collapse (arity-0)
         // units whose emitted polarity is the deductive-checks-discharged EXACT parity
         // (the development proof harness::xor_collapse_parity_verified — proven the
         // imperative `parity_flip` XOR-accumulator equals the GF(2) mod-2
@@ -479,12 +479,7 @@ impl Solver {
         // root cause). Default-off; RUP stays the backstop for everything else,
         // so asconhash-style wrong units (and any non-XOR non-RUP unit) are
         // still rejected.
-        let parity_trust = matches!(
-            std::env::var("AY_AB_CONGRUENCE_PARITY_TRUST")
-                .ok()
-                .as_deref(),
-            Some("1")
-        );
+        let parity_trust = ay_core::sat_ab_switches().congruence_parity_trust;
         let parity_certified: HashSet<Literal> = if parity_trust {
             result.parity_certified_units.iter().copied().collect()
         } else {
@@ -685,7 +680,7 @@ impl Solver {
         }
     }
 
-    /// Soundness-triage dump (AY_AB_DUMP_DB=1): the live clause DB + trail
+    /// Soundness-triage dump (--sat-ab-dump-db): the live clause DB + trail
     /// with the current DRAT proof offset, for divergence diffing against a
     /// checker replay of the proof prefix.
     pub(in crate::solver) fn dump_live_db_for_triage(&mut self, tag: &str) {

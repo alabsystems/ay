@@ -72,8 +72,7 @@ use crate::executor_types::{Result, SolveResult, UnknownReason};
 /// capture/repair site is behind this, so unset means byte-identical
 /// behavior (the snapshot clone included).
 pub(crate) fn uflia_model_repair_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("AY_UFLIA_MODEL_REPAIR").ok().as_deref() == Some("1"))
+    false // B23: retired; the idle-box protocol measured it out.
 }
 
 /// Routing shape for the repair re-solve.
@@ -102,16 +101,15 @@ pub(crate) fn uflia_model_repair_enabled() -> bool {
 enum RepairRoute {
     Eager,
     Hybrid,
-    Detour,
 }
 
 fn uflia_model_repair_route(assertion_derived_evidence: bool) -> RepairRoute {
-    match std::env::var("AY_UFLIA_MODEL_REPAIR_ROUTE").ok().as_deref() {
-        Some("eager") => RepairRoute::Eager,
-        Some("hybrid") => RepairRoute::Hybrid,
-        Some("detour") => RepairRoute::Detour,
-        _ if assertion_derived_evidence => RepairRoute::Eager,
-        _ => RepairRoute::Hybrid,
+    // B23: the env arms are retired; the evidence-class auto decision is the
+    // route.
+    if assertion_derived_evidence {
+        RepairRoute::Eager
+    } else {
+        RepairRoute::Hybrid
     }
 }
 
@@ -161,7 +159,7 @@ impl Executor {
         &mut self,
         unchanged: SolveResult,
     ) -> Result<SolveResult> {
-        let debug = std::env::var_os("AY_DEBUG_READ_PIN").is_some();
+        let debug = ay_core::misc_cli_flags().debug_read_pin;
         let candidates = std::mem::take(&mut self.uflia_repair_candidates);
         if debug {
             eprintln!("[model-repair] entry: candidates={}", candidates.len());
@@ -280,14 +278,12 @@ impl Executor {
                 match uflia_model_repair_route(total_falsified > 0) {
                     RepairRoute::Eager => "eager",
                     RepairRoute::Hybrid => "hybrid",
-                    RepairRoute::Detour => "detour",
                 }
             );
         }
         self.arm_uflia_congruence_repair = true;
         match uflia_model_repair_route(total_falsified > 0) {
             RepairRoute::Eager => self.uflia_repair_eager_direct = true,
-            RepairRoute::Detour => self.uflia_repair_detour_direct = true,
             RepairRoute::Hybrid => {}
         }
         self.last_unknown_reason = None;

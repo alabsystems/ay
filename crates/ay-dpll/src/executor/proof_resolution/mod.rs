@@ -14,6 +14,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep};
 
+mod checked_qpf_instance_refutation;
 mod checked_sat_refutation;
 pub(crate) mod congruence;
 pub(crate) mod empty_clause;

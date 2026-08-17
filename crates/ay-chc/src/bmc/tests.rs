@@ -4,10 +4,10 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
+use crate::ab_switches::{ChcAbSwitches, TestOverride};
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::{CexVerificationResult, PdrConfig, PdrSolver};
 use crate::{ClauseBody, ClauseHead, HornClause};
-use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 
 fn create_large_acyclic_int_chain_for_exact_first_9004(pred_count: usize) -> ChcProblem {
@@ -2624,8 +2624,7 @@ fn datatype_refutation_on_bounded_instance() {
 (assert (forall ((n Nat)) (=> (and (P n) (= n (succ (succ zero)))) false)))
 (check-sat)
 "#;
-    let _guard = lock_env();
-    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _enabled = TestOverride::set(ChcAbSwitches::default());
     let builtin = run(BUILTIN, 3, std::time::Duration::from_secs(15));
     assert!(
         matches!(builtin, ChcEngineResult::Unsafe(_)),
@@ -2747,9 +2746,8 @@ fn diag_dt_bmc_formula_forms() {
 // replayed against the ORIGINAL clauses).
 // ---------------------------------------------------------------------------
 
-// Serialize the env-var kill-switch test with the other DT-BMC tests on the one
-// workspace env lock (`lock_env`) so the process-global `AY_CHC_DISABLE_DT_BMC`
-// cannot race a concurrent solve.
+// Thread-local carrier overrides isolate enabled/disabled assertions from
+// concurrently running tests.
 
 // A genuine multi-step ADT refutation over a recursive datatype: P holds for
 // every Nat reachable from `zero` by `succ`, and the query flags P(succ(succ
@@ -2758,14 +2756,10 @@ fn diag_dt_bmc_formula_forms() {
 // unfolding can find. The reconstructed witness (concrete constructor values)
 // must replay Valid on the original clauses -> a validated Unsafe.
 #[test]
-// The timeout wrapper includes time spent waiting for the process-wide env
-// lock.  Keep this above the aggregate budget of the serialized DT-BMC tests;
-// otherwise a healthy test can time out before its body starts.
+// Keep the timeout above the solver's aggregate bounded-refutation budget.
 #[timeout(300_000)]
 fn datatype_bounded_refutation_finds_nat_counterexample() {
-    let _guard = lock_env();
-    // Enabled for the whole test; restored on scope exit.
-    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _enabled = TestOverride::set(ChcAbSwitches::default());
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2803,9 +2797,7 @@ fn datatype_bounded_refutation_finds_nat_counterexample() {
 #[test]
 #[timeout(300_000)]
 fn datatype_bounded_refutation_no_false_unsafe_on_safe() {
-    let _guard = lock_env();
-    // Enabled for the whole test; restored on scope exit.
-    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _enabled = TestOverride::set(ChcAbSwitches::default());
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2831,13 +2823,13 @@ fn datatype_bounded_refutation_no_false_unsafe_on_safe() {
     );
 }
 
-// Kill switch: with `AY_CHC_DISABLE_DT_BMC` set, the lane returns Unknown even
+// Kill switch: with `--chc-no-dt-bmc` set, the lane returns Unknown even
 // on the known-unsafe fixture (it never runs), so the capability can be turned
 // off without touching any other route.
 #[test]
 #[timeout(300_000)]
 fn datatype_bounded_refutation_kill_switch_returns_unknown() {
-    let _guard = lock_env();
+    let _enabled = TestOverride::set(ChcAbSwitches::default());
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2856,7 +2848,10 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
         },
     );
     let disabled = {
-        let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_DT_BMC", "1");
+        let _disable = TestOverride::set(ChcAbSwitches {
+            dt_bmc: false,
+            ..Default::default()
+        });
         solver.solve_datatype_bounded_refutation(6, std::time::Duration::from_secs(10), 6000)
     };
     assert!(
@@ -2891,9 +2886,7 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
 #[test]
 #[timeout(300_000)]
 fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
-    let _guard = lock_env();
-    // Enabled for the whole test; restored on scope exit.
-    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _enabled = TestOverride::set(ChcAbSwitches::default());
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((list_298 0)) (((nil_331 ) (cons_296  (head_592 Int) (tail_594 list_298)))))
@@ -2908,7 +2901,9 @@ fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
   (=> (and (drop_59 A C D) (drop_59 A B D) (not (= B C))) false)))
 (check-sat)
 "#;
-    let _no_elim = ScopedEnvVar::unset("AY_DT_BMC_NO_ELIM");
+    // (B15: the AY_DT_BMC_NO_ELIM hygiene unset is gone with the env var —
+    // elimination is now the ab_switches default and nothing ambient can
+    // disable it under this test.)
     let problem = crate::parser::ChcParser::parse(input).expect("parse");
     assert!(
         problem.has_datatype_sorts(),

@@ -68,9 +68,8 @@ const MAX_CLAUSE_VALUE_BUDGET: usize = 1_000_000;
 /// Kill switch: `AY_CHC_DISABLE_SPLIT_SYM=1` (or any value other than `0`)
 /// disables the symbol splitter. Default: enabled.
 pub(crate) fn split_sym_enabled() -> bool {
-    std::env::var("AY_CHC_DISABLE_SPLIT_SYM")
-        .map(|v| v == "0")
-        .unwrap_or(true)
+    // B27: CLI-owned (--chc-no-split-sym); env retired.
+    crate::ab_switches::get().split_sym
 }
 
 /// Split-candidate state for one predicate argument position.

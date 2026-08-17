@@ -14,6 +14,8 @@ use ay_frontend::command::{
 };
 use ay_frontend::SExpr;
 
+pub(in crate::executor) use super::source_work::{ProofSourcePass, ProofSourceWorkEnvelope};
+
 #[path = "proof_trust_surgery_surface_payload.rs"]
 mod payload;
 pub(in crate::executor) use payload::render_roots_have_bounded_payload;
@@ -25,7 +27,7 @@ mod tests;
 const MAX_SURFACE_NODES: usize = 8_192;
 pub(super) const MAX_SURFACE_DEPTH: usize = 256;
 pub(super) const MAX_REQUIREMENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_AGGREGATE_SOURCE_WORK: usize = 32 * 1024 * 1024;
+pub(super) const MAX_AGGREGATE_SOURCE_WORK: usize = 32 * 1024 * 1024;
 
 /// Return child arity without cloning the term's child vector.
 pub(in crate::executor) fn term_child_count(
@@ -286,19 +288,26 @@ pub(in crate::executor) fn surface_source_is_bounded(root: &FrontendTerm) -> boo
     surface_source_work(root).is_some()
 }
 
+/// Cost of one complete pass over a parsed source stack, or `None` when the
+/// stack is unbounded or a single pass over it already exceeds the aggregate
+/// ceiling. Repeated entries are charged because downstream snapshots clone
+/// them independently.
+pub(in crate::executor) fn surface_pass_work<'a>(
+    roots: impl IntoIterator<Item = &'a FrontendTerm>,
+) -> Option<usize> {
+    roots.into_iter().try_fold(0usize, |used, root| {
+        used.checked_add(surface_source_work(root)?.max(1))
+            .filter(|&next| next <= MAX_AGGREGATE_SOURCE_WORK)
+    })
+}
+
 /// Preflight a complete parsed source stack before any recursive AST clone or
 /// formatter runs. Repeated entries are charged because downstream snapshots
 /// clone them independently.
 pub(in crate::executor) fn surface_sources_have_bounded_work<'a>(
     roots: impl IntoIterator<Item = &'a FrontendTerm>,
 ) -> bool {
-    roots
-        .into_iter()
-        .try_fold(0usize, |used, root| {
-            used.checked_add(surface_source_work(root)?.max(1))
-                .filter(|&next| next <= MAX_AGGREGATE_SOURCE_WORK)
-        })
-        .is_some()
+    surface_pass_work(roots).is_some()
 }
 
 /// Validate the complete root-to-leaf depth of every term the recursive

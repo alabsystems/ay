@@ -96,6 +96,35 @@ fn test_execute_direct_bridged_string_sort_error_returns_expr_translation() {
 }
 
 #[test]
+fn test_execute_direct_quantifier_binder_collision_returns_error_without_unwinding() {
+    // A quantifier binder that shadows a declared constant of a DIFFERENT sort
+    // is a recoverable embedder mistake. `translate_quantifier` used to declare
+    // bound variables through the PANICKING `Solver::declare_const`, so this
+    // program unwound out of `execute` — in compiler_consumer, one ICE report for any
+    // contract whose `forall`/`exists` binder shadows a variable of another
+    // type (e.g. `fn f(x: u64) ensures forall x: bool, ...`).
+    let mut program = AYProgram::new();
+    program.set_logic("LIA");
+    let _ = program.declare_const("x", Sort::int());
+    program.assert(Expr::forall(
+        vec![("x".to_string(), Sort::bool())],
+        Expr::var("x", Sort::bool()),
+    ));
+    program.check_sat();
+
+    let outer = catch_unwind(AssertUnwindSafe(|| execute(&program)));
+    let result = outer.expect("binder collision must not unwind through execute_direct");
+    let error = result.expect_err("binder collision must fail closed");
+    match error {
+        ExecuteError::ExprTranslation(reason) => assert!(
+            reason.contains("declare_const") && reason.contains("already declared"),
+            "expected the declare_const collision to be named, got: {reason}"
+        ),
+        other => panic!("expected ExprTranslation, got: {other:?}"),
+    }
+}
+
+#[test]
 fn test_execute_direct_bridged_seq_sort_error_returns_expr_translation() {
     let mut program = AYProgram::new();
     program.set_logic("QF_SEQLIA");

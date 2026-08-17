@@ -630,7 +630,6 @@ impl Executor {
     ///    bit-blasting it and replaying a surfaced LRAT refutation). A
     ///    satisfiable near-miss — two endpoints that CAN be equal — is falsified
     ///    by some assignment and rejected there.
-    ///
     /// The BV lane is what `(select a i) = #x05` together with
     /// `(select a i) = #x06` needs: the shared `select` term is opaque to both
     /// theories, the endpoints are BV constants, and the only fact required is
@@ -640,8 +639,9 @@ impl Executor {
     pub(super) fn replace_with_exact_authored_equality_chain_refutation(
         &mut self,
         proof: &mut Proof,
+        entry: RepairEntry,
     ) {
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
+        if entry == RepairEntry::Check && self.authored_cascade_publishable(proof) {
             return;
         }
         let authored = self.exact_concrete_authored_scope();

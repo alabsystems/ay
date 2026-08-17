@@ -13,6 +13,8 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TheoryLemmaKind, TheoryLit, TheorySolver};
 use ay_dt::DtSolver;
 
+mod lazy_proof_state;
+
 /// Budget for post-`Sat` model-e-graph recheck lemma rounds per
 /// `solve_with_dt_axioms` call (fail-closed Unknown past it; #dt-model-recheck).
 const DT_MODEL_RECHECK_MAX_ROUNDS: u32 = 32;
@@ -33,20 +35,6 @@ enum DtModelRecheck {
     Inconclusive,
 }
 
-/// Whether duplicating an allocation of `measured_bytes` stays within
-/// `budget_bytes`.
-///
-/// A zero measurement means the platform could not report process usage; keep
-/// the existing fail-open measurement semantics in that case. `checked_sub`
-/// expresses `2 * measured_bytes <= budget_bytes` without multiplication
-/// overflow.
-fn snapshot_clone_fits_budget(measured_bytes: usize, budget_bytes: usize) -> bool {
-    measured_bytes == 0
-        || budget_bytes
-            .checked_sub(measured_bytes)
-            .is_some_and(|remaining| measured_bytes <= remaining)
-}
-
 /// Replace a speculative AUFLIA term universe with the exact owned entry
 /// universe. Taking the snapshot by value is load-bearing: `TermStore::clone`
 /// mints a new rollback identity, so cloning here would break every checkpoint
@@ -62,7 +50,6 @@ fn restore_dt_auflia_entry_terms(current: &mut ay_core::TermStore, entry: ay_cor
 /// validation bypass, refinement lemma, model-repair latch, or TermId-keyed
 /// memo from the failed attempt can change what the eager authority accepts.
 /// Keep the transaction boundary explicit and shared by both lazy lanes.
-#[derive(Clone)]
 struct DtLazyAttemptState {
     last_assumptions: Option<Vec<TermId>>,
     last_assumption_core: Option<Vec<TermId>>,
@@ -87,7 +74,11 @@ struct DtLazyAttemptState {
     conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
     prop_semantic_verify_memo: crate::verification::PropSemanticVerifyMemo,
     named_assert_rewrites: HashMap<TermId, TermId>,
-    lemma_cache: Vec<(ay_core::TheoryLemma, usize)>,
+    // `lemma_cache` is intentionally absent. Both lazy lanes call
+    // `dt_lazy_lemma_cache_isolation_available` before capture, excluding
+    // persistence and any pre-existing entries; the attempted solve therefore
+    // cannot retain speculative TermIds there. This avoids cloning a bounded
+    // but potentially large lemma/dedup ledger.
     uflia_repair_candidates: Vec<crate::executor::model::Model>,
     uflia_repair_conflict_tables: Vec<String>,
     last_degrade_was_datatype_array: bool,
@@ -114,7 +105,7 @@ impl DtLazyAttemptState {
             last_assumptions: executor.last_assumptions.clone(),
             last_assumption_core: executor.last_assumption_core.clone(),
             last_core_term_to_name: executor.last_core_term_to_name.clone(),
-            nra_algebraic_model: executor.nra_algebraic_model.clone(),
+            nra_algebraic_model: executor.nra_algebraic_model.values().clone(),
             model_validation_delegated_assertions: executor
                 .model_validation_delegated_assertions
                 .clone(),
@@ -136,7 +127,6 @@ impl DtLazyAttemptState {
             conflict_semantic_verify_memo: executor.conflict_semantic_verify_memo.clone(),
             prop_semantic_verify_memo: executor.prop_semantic_verify_memo.clone(),
             named_assert_rewrites: executor.named_assert_rewrites.clone(),
-            lemma_cache: executor.lemma_cache.replay_lemmas().to_vec(),
             uflia_repair_candidates: executor.uflia_repair_candidates.clone(),
             uflia_repair_conflict_tables: executor.uflia_repair_conflict_tables.clone(),
             last_degrade_was_datatype_array: executor.last_degrade_was_datatype_array,
@@ -158,69 +148,34 @@ impl DtLazyAttemptState {
         }
     }
 
-    fn restore(&self, executor: &mut Executor) {
-        executor.last_assumptions.clone_from(&self.last_assumptions);
-        executor
-            .last_assumption_core
-            .clone_from(&self.last_assumption_core);
-        executor
-            .last_core_term_to_name
-            .clone_from(&self.last_core_term_to_name);
-        executor
-            .nra_algebraic_model
-            .clone_from(&self.nra_algebraic_model);
-        executor
-            .model_validation_delegated_assertions
-            .clone_from(&self.model_validation_delegated_assertions);
-        executor
-            .dt_solver_added_axiom_terms
-            .clone_from(&self.dt_solver_added_axiom_terms);
-        executor.row_seeded_terms.clone_from(&self.row_seeded_terms);
-        executor
-            .recorded_var_substitutions
-            .clone_from(&self.recorded_var_substitutions);
-        executor
-            .array_default_epsilon_by_sort
-            .clone_from(&self.array_default_epsilon_by_sort);
-        executor
-            .array_default_diag_by_sort
-            .clone_from(&self.array_default_diag_by_sort);
-        executor
-            .qfax_refinement_clause
-            .clone_from(&self.qfax_refinement_clause);
+    /// Move the entry state back without allocating after arbitrary inner growth.
+    /// The proof-coupled witness cache is returned for the caller to commit only
+    /// after the proof/term rollback succeeds.
+    fn restore(self, executor: &mut Executor) -> crate::executor::ArrayExtWitnessCache {
+        executor.last_assumptions = self.last_assumptions;
+        executor.last_assumption_core = self.last_assumption_core;
+        executor.last_core_term_to_name = self.last_core_term_to_name;
+        executor.restore_nra_values(self.nra_algebraic_model);
+        executor.model_validation_delegated_assertions = self.model_validation_delegated_assertions;
+        executor.dt_solver_added_axiom_terms = self.dt_solver_added_axiom_terms;
+        executor.row_seeded_terms = self.row_seeded_terms;
+        executor.recorded_var_substitutions = self.recorded_var_substitutions;
+        executor.array_default_epsilon_by_sort = self.array_default_epsilon_by_sort;
+        executor.array_default_diag_by_sort = self.array_default_diag_by_sort;
+        executor.qfax_refinement_clause = self.qfax_refinement_clause;
         executor.last_rejected_array_assertion = self.last_rejected_array_assertion;
         executor.cegar_pending_lemma = self.cegar_pending_lemma;
         executor.cegar_rounds_remaining = self.cegar_rounds_remaining;
-        executor
-            .cegar_emitted_lemmas
-            .clone_from(&self.cegar_emitted_lemmas);
-        executor.array_ext_shadow.clone_from(&self.array_ext_shadow);
-        executor
-            .array_axiom_scope
-            .clone_from(&self.array_axiom_scope);
-        executor.dt_lazy_splits.clone_from(&self.dt_lazy_splits);
-        executor
-            .active_support_axioms
-            .clone_from(&self.active_support_axioms);
-        executor
-            .conflict_semantic_verify_memo
-            .clone_from(&self.conflict_semantic_verify_memo);
-        executor
-            .prop_semantic_verify_memo
-            .clone_from(&self.prop_semantic_verify_memo);
-        executor
-            .named_assert_rewrites
-            .clone_from(&self.named_assert_rewrites);
-        executor.lemma_cache.clear();
-        for (lemma, scope) in &self.lemma_cache {
-            let _ = executor.lemma_cache.record_lemma(lemma.clone(), *scope);
-        }
-        executor
-            .uflia_repair_candidates
-            .clone_from(&self.uflia_repair_candidates);
-        executor
-            .uflia_repair_conflict_tables
-            .clone_from(&self.uflia_repair_conflict_tables);
+        executor.cegar_emitted_lemmas = self.cegar_emitted_lemmas;
+        executor.array_ext_shadow = self.array_ext_shadow;
+        executor.array_axiom_scope = self.array_axiom_scope;
+        executor.dt_lazy_splits = self.dt_lazy_splits;
+        executor.active_support_axioms = self.active_support_axioms;
+        executor.conflict_semantic_verify_memo = self.conflict_semantic_verify_memo;
+        executor.prop_semantic_verify_memo = self.prop_semantic_verify_memo;
+        executor.named_assert_rewrites = self.named_assert_rewrites;
+        executor.uflia_repair_candidates = self.uflia_repair_candidates;
+        executor.uflia_repair_conflict_tables = self.uflia_repair_conflict_tables;
         executor.last_degrade_was_datatype_array = self.last_degrade_was_datatype_array;
         executor.nested_array_row_reduction_unsat = self.nested_array_row_reduction_unsat;
         executor.uflia_congruence_lane = self.uflia_congruence_lane;
@@ -237,22 +192,15 @@ impl DtLazyAttemptState {
         executor.in_nested_array_residue_probe = self.in_nested_array_residue_probe;
         executor.residue_probe_failures = self.residue_probe_failures;
         executor.mod_div_or_branch_rescue_depth = self.mod_div_or_branch_rescue_depth;
-    }
-
-    /// Restore proof/term provenance only after the speculative proof ledger
-    /// has been rolled back successfully.
-    ///
-    /// Keeping this separate from [`Self::restore`] is load-bearing: when a
-    /// proof checkpoint cannot be restored, the fallback retains the
-    /// speculative terms and must retain their extensionality witnesses too.
-    fn restore_witness_cache(&self, executor: &mut Executor) {
-        executor
-            .array_ext_witness_cache
-            .clone_from(&self.array_ext_witness_cache);
+        self.array_ext_witness_cache
     }
 }
 
 impl Executor {
+    fn dt_lazy_lemma_cache_isolation_available(&self) -> bool {
+        !self.lemma_persistence && self.lemma_cache.is_empty()
+    }
+
     /// Record injected DT axioms as proof-tracker theory lemmas, upgrading
     /// `Generic` to a strict-checkable typed kind exactly when the checker's
     /// OWN recognizer accepts the recorded clause (#trust-count→0, C1.iv).
@@ -264,12 +212,13 @@ impl Executor {
     /// `ctor_selector_decls_for_strict_proof`), so a lemma is tagged only when
     /// strict mode will independently re-validate that exact clause —
     /// classifier and checker cannot drift (the `promote_datatype_distinct_lemmas`
-    /// / `push_array_axiom_assertion_site` precedent). Everything the
-    /// recognizers decline — the constructor/exhaustiveness families without
-    /// validators, the array∘DT bridge implications, guarded acyclicity
-    /// clauses, depth axioms — is recorded `Generic` exactly as before, so the
-    /// change is provably decline-only with respect to publication: no shape
-    /// the validator rejects is ever tagged.
+    /// / `push_array_axiom_assertion_site` precedent). The enabled probes stay
+    /// limited to the established C1.iv/C5 families. Everything outside those
+    /// lanes — including array∘DT bridge implications, guard-resolved and direct
+    /// acyclicity clauses, forced guard-unit literals, depth axioms, value-eq
+    /// congruence biconditionals, same-constructor structural disequalities,
+    /// and the (F1)/(F2) BARE injectivity field-equality units — is recorded
+    /// `Generic` so publication fails closed.
     ///
     /// The recorded lemma is the unit clause `[axiom]` where the axiom may be
     /// an `or`/`=>` term; the DT validators or-flatten internally
@@ -292,11 +241,38 @@ impl Executor {
                     vec![axiom],
                     TheoryLemmaKind::DatatypeSelectorProject,
                 );
+            // Family (D) constructor coverage `(or (is-C1 x) .. (is-Ck x))`
+            // over a non-constructor scrutinee (unit `(is-C x)` for a
+            // single-constructor datatype). Probed BEFORE the tester lane:
+            // the tester validator's general exhaustiveness lane accepts the
+            // k>=2 disjunctions too, so this probe only moves clauses between
+            // two strict-checkable kinds — to the one that names the family —
+            // and never widens what escapes `Generic` by mislabeling (C5).
+            } else if ay_proof::recognize_datatype_exhaustive(&self.ctx.terms, &clause, &dt_decls) {
+                let _ = self
+                    .proof_tracker
+                    .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::DatatypeExhaustive);
+            // Family (C) guarded constructor reconstruction
+            // `(or (not (is-C x)) (= x (C (sel_1 x) .. (sel_k x))))` (the
+            // emitted `mk_implies` desugars to this disjunction). Selector
+            // list + field order are re-derived from the registries by the
+            // recognizer=validator, so a permuted or truncated chain stays
+            // `Generic` (C5).
+            } else if ay_proof::recognize_datatype_constructor_reconstruct(
+                &self.ctx.terms,
+                &clause,
+                &dt_decls,
+                &ctor_selectors,
+            ) {
+                let _ = self.proof_tracker.add_theory_lemma_with_kind(
+                    vec![axiom],
+                    TheoryLemmaKind::DatatypeConstructorReconstruct,
+                );
             // Families (B)/(B') tester evaluation `is-C(C(..))` /
             // `(not (is-C' (C ..)))` (the `= true/false` forms fold to these at
             // `mk_eq`), plus whatever else the tester validator itself accepts
-            // (complete tester exhaustiveness, nullary-sibling form). The
-            // `_with_selectors` variant matches the checker dispatch exactly:
+            // (nullary-sibling exhaustiveness form). The `_with_selectors`
+            // variant matches the checker dispatch exactly:
             // `check_proof_strict_with_datatypes` always supplies both
             // registries (checker/mod.rs `DatatypeTesterEval` arm).
             } else if ay_proof::recognize_datatype_tester_eval_with_selectors(
@@ -309,7 +285,7 @@ impl Executor {
                     .proof_tracker
                     .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::DatatypeTesterEval);
             } else {
-                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+                let _ = self.proof_tracker.add_explicit_trust_lemma(vec![axiom]);
             }
         }
     }
@@ -450,7 +426,7 @@ impl Executor {
 
         // Add selector axioms to self.ctx.assertions temporarily;
         // the incremental pipeline reads assertions from there.
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
         // Record the appended axiom terms so the in-loop validation's
         // #dt-embedded-cycle compound guard exempts them (each is an entailed
         // datatype tautology; see `dt_solver_added_axiom_terms`).
@@ -494,7 +470,7 @@ impl Executor {
         );
 
         // Restore assertions to original length (remove temporary axioms).
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
         self.dt_solver_added_axiom_terms.clear();
         result
     }
@@ -615,7 +591,7 @@ impl Executor {
         // NOT armed (no classified family, or the force-eager override), the gate
         // below reads `demand_active()==false` and both fall back to the stock
         // warm-start / 64 ceiling — byte-identical to the pre-flip eager path.
-        let (mut depth, mut ceiling) = {
+        let (mut depth, ceiling) = {
             let qm_demand = self.quantifier_manager.as_ref().map(|qm| {
                 (
                     qm.demand_active(),
@@ -635,19 +611,10 @@ impl Executor {
                 ),
             }
         };
-        // INTERFACE-DIET M0(c) diagnostic (env-gated, verdict-neutral OTHER than
-        // deliberately capping the deepening for flood attribution): pin the
-        // eager DT unroll to a FIXED depth so the selector-equality flood can be
-        // attributed mint-borne (grows with depth) vs base-atom-borne (present
-        // at the minimal depth already). Only read when AY_DT_EAGER_DEPTH_OVERRIDE
-        // is set; unset ⇒ byte-identical control flow.
-        if let Some(d) = std::env::var("AY_DT_EAGER_DEPTH_OVERRIDE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            depth = d;
-            ceiling = d;
-        }
+        // (B10: the INTERFACE-DIET M0(c) depth-pin diagnostic and its
+        // AY_DT_EAGER_DEPTH_OVERRIDE env flag are deleted — the flood
+        // attribution question it existed for is settled; unset was already
+        // byte-identical control flow.)
         let mut prev_term_len: Option<usize> = None;
         // D0 model-e-graph recheck pass (#dt-model-recheck): constructed once
         // per solve so its clause dedup / fresh-EUF validation state persists
@@ -708,7 +675,7 @@ impl Executor {
                     qm.demand_tag_dt_minted(pre_axiom_term_len, end, tag_gen);
                 }
             }
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace dt-round-result depth={} result={:?} reason={:?}",
                     depth,
@@ -751,7 +718,7 @@ impl Executor {
                 )
             {
                 self.last_degrade_was_datatype_array = true;
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-array-gate-demoted-sat depth={depth}");
                 }
                 self.last_unknown_reason = Some(crate::executor_types::UnknownReason::Incomplete);
@@ -789,7 +756,7 @@ impl Executor {
                                 Some(crate::executor_types::UnknownReason::Incomplete);
                             return Ok(SolveResult::Unknown);
                         }
-                        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                        if ay_core::misc_cli_flags().phase_trace {
                             eprintln!(
                                 "c phase-trace dt-model-recheck-resolve \
                                  round={recheck_rounds} depth={depth}"
@@ -799,7 +766,7 @@ impl Executor {
                     }
                     DtModelRecheck::Inconclusive => {
                         if round_was_sat {
-                            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                            if ay_core::misc_cli_flags().phase_trace {
                                 eprintln!(
                                     "c phase-trace dt-model-recheck-inconclusive depth={depth}"
                                 );
@@ -835,7 +802,7 @@ impl Executor {
                     self.confirm_sat_with_independent_gate(),
                     ay_model_check::GateVerdict::ModelViolates { .. }
                 ) {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-deepen-refuted-witness depth={depth}");
                 }
                 self.last_unknown_reason = Some(crate::executor_types::UnknownReason::Incomplete);
@@ -846,6 +813,17 @@ impl Executor {
 
             if !matches!(&result, Ok(SolveResult::Unknown)) {
                 return result;
+            }
+
+            // Exact finite-array exhaustion is query-cumulative and
+            // depth-invariant: later DT rounds cannot replenish the ledger, so
+            // retrying would only rebuild the same relaxed obligation and risk
+            // reviving artifacts already revoked by the SAT fail-close gate.
+            if !self.finite_array_expansion.is_complete() {
+                self.publish_unknown_from_origin(
+                    crate::executor_types::UnknownOrigin::DeterministicResourceBudget,
+                );
+                return Ok(SolveResult::Unknown);
             }
 
             // Perf backstop (#dt-array-degrade-backstop): if this round's Unknown
@@ -871,7 +849,7 @@ impl Executor {
             if !grew || !advanced_vs_prev || depth >= ceiling {
                 return result;
             }
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace dt-deepening next_depth={}",
                     depth.saturating_add(1)
@@ -976,7 +954,7 @@ impl Executor {
             self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
         // Record the appended axiom terms so the in-loop validation's
         // #dt-embedded-cycle compound guard exempts them (each is an entailed
         // datatype tautology; see `dt_solver_added_axiom_terms`).
@@ -984,7 +962,7 @@ impl Executor {
             .extend(extra_axioms.iter().copied());
         self.ctx.assertions.extend(extra_axioms);
         let result = solve_fn(self);
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
         self.dt_solver_added_axiom_terms.clear();
 
         // Post-hoc soundness re-check for spurious acyclicity UNSAT
@@ -1052,7 +1030,7 @@ impl Executor {
             self.record_dt_axiom_theory_lemmas(&extra_axioms);
         }
 
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
         // Record the appended axiom terms so the in-loop validation's
         // #dt-embedded-cycle compound guard exempts them (each is an entailed
         // datatype tautology; see `dt_solver_added_axiom_terms`).
@@ -1060,7 +1038,7 @@ impl Executor {
             .extend(extra_axioms.iter().copied());
         self.ctx.assertions.extend(extra_axioms);
         let scoped_result = solve_fn(self);
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
         self.dt_solver_added_axiom_terms.clear();
 
         // Spurious iff the scoped (artifact-free) re-solve does NOT reproduce the
@@ -1329,6 +1307,9 @@ impl Executor {
         {
             return Ok(None);
         }
+        if !self.dt_lazy_lemma_cache_isolation_available() {
+            return Ok(None);
+        }
         // Eligibility: at least one RECURSIVE datatype (a constructor with a
         // datatype-sorted field). Pure enum/nullary content is handled by the
         // finite-domain lane; this route targets the recursive DT+LIA family.
@@ -1341,31 +1322,21 @@ impl Executor {
         if !self.dt_auflia_snapshot_preflight() {
             return Ok(None);
         }
+        let Ok(entry_proof_checkpoint) = self.bounded_proof_rollback_checkpoint() else {
+            // Optional lane: preserve the eager authority when the cumulative
+            // proof-snapshot allocation envelope has been exhausted.
+            return Ok(None);
+        };
 
         // Entry snapshots (mirror `try_solve_dt_lazy` isolation).
         let entry_assertions = self.ctx.assertions.clone();
         let entry_pre_lift = std::mem::take(&mut self.dt_pre_lift_assertions);
         let entry_terms_len = self.ctx.terms.len();
-        // `solve_uf_lia`/`solve_auf_lia` may restore a failed detour by
-        // replacing `ctx.terms` with a clone. That deliberately changes the
-        // TermStore rollback identity, so an entry checkpoint cannot safely
-        // compose across this call graph. This lane is opt-in; pay for an exact
-        // store snapshot rather than making identity replacement a panic edge.
+        // A failed detour may replace `ctx.terms`, changing rollback identity;
+        // this opt-in lane therefore pays for an exact store snapshot.
         let entry_terms = self.ctx.terms.clone();
         let entry_proof_steps = self.proof_tracker.num_steps();
-        let entry_var_substitutions = self.recorded_var_substitutions.clone();
-        let entry_array_default_epsilon_by_sort = self.array_default_epsilon_by_sort.clone();
-        let entry_array_default_diag_by_sort = self.array_default_diag_by_sort.clone();
-        let entry_proof_checkpoint = self.proof_tracker.rollback_checkpoint();
-        let entry_proof_problem_assertion_provenance =
-            self.proof_problem_assertion_provenance.clone();
-        let entry_quant_expansion_records = self.quant_expansion_records.clone();
-        let entry_ematching_proof_records = self.ematching_proof_records.clone();
-        let entry_last_proof_rebuild_originals = self.last_proof_rebuild_originals.clone();
-        let entry_last_proof_term_overrides = self.last_proof_term_overrides.clone();
-        let entry_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
-        let entry_quantified_proof_translation_incomplete =
-            self.quantified_proof_translation_incomplete;
+        let entry_lazy_proof_state = lazy_proof_state::DtLazyProofState::capture(self);
         let entry_attempt_state = DtLazyAttemptState::capture(self);
         let entry_lia_probe_state = ay_lia::save_probe_state();
         // A fallback can occur only once: both call sites immediately return.
@@ -1389,10 +1360,7 @@ impl Executor {
             this.revoke_dt_lazy_attempt_artifacts();
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
-            entry_attempt_state.restore(this);
-            this.recorded_var_substitutions = entry_var_substitutions;
-            this.array_default_epsilon_by_sort = entry_array_default_epsilon_by_sort;
-            this.array_default_diag_by_sort = entry_array_default_diag_by_sort;
+            let entry_array_ext_witness_cache = entry_attempt_state.restore(this);
             ay_lia::restore_probe_state(entry_lia_probe_state);
             crate::executor::model::eval_memo_clear();
 
@@ -1402,19 +1370,12 @@ impl Executor {
             // revoked on this path.
             if proof_guard_blocks_term_rollback {
                 this.proof_tracker
-                    .restore_checkpoint_metadata(&entry_proof_checkpoint);
+                    .restore_checkpoint_metadata(entry_proof_checkpoint);
                 this.clear_dt_lazy_rebuildable_term_indexes();
                 return;
             }
 
-            this.proof_problem_assertion_provenance = entry_proof_problem_assertion_provenance;
-            this.quant_expansion_records = entry_quant_expansion_records;
-            this.ematching_proof_records = entry_ematching_proof_records;
-            this.last_proof_rebuild_originals = entry_last_proof_rebuild_originals;
-            this.last_proof_term_overrides = entry_last_proof_term_overrides;
-            this.last_unsat_proof_reconstruction_suppressed = entry_proof_reconstruction_suppressed;
-            this.quantified_proof_translation_incomplete =
-                entry_quantified_proof_translation_incomplete;
+            entry_lazy_proof_state.restore(this);
             // ProofIds and TermIds are parallel positional ledgers. Discard all
             // proof-side references before TermStore can recycle its IDs.
             // The witness cache is proof/term provenance too: restore it only
@@ -1429,10 +1390,10 @@ impl Executor {
                 // than risk dangling TermIds in the moved proof.
                 return;
             }
-            this.array_ext_witness_cache = entry_attempt_state.array_ext_witness_cache;
+            this.array_ext_witness_cache = entry_array_ext_witness_cache;
             restore_dt_auflia_entry_terms(&mut this.ctx.terms, entry_terms);
             this.clear_dt_lazy_rebuildable_term_indexes();
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-auflia-lazy-rollback to={entry_terms_len}");
             }
         };
@@ -1455,10 +1416,9 @@ impl Executor {
 
         // Depth-1 syntactic axiom slice (the load-bearing floor) + guarded
         // acyclicity mining, exactly as `try_solve_dt_lazy`.
-        let depth: usize = std::env::var("AY_DT_LAZY_AUFLIA_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+        // B10: depth pinned at 1 (the AY_DT_LAZY_AUFLIA_DEPTH override
+        // nothing set is retired).
+        let depth: usize = 1;
         let base_assertions: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         let mut extra_axioms = self.dt_selector_axioms_to_depth(&base_assertions, depth);
         let assertions_snapshot = self.ctx.assertions.clone();
@@ -1479,10 +1439,11 @@ impl Executor {
         let sparse_count = sparse.len();
         extra_axioms.extend(sparse);
 
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
+        let base_len = base_assertions_exact.len();
         self.ctx.assertions.extend(extra_axioms);
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-auflia-lazy-axioms base={base_len} sparse_relevance={sparse_count} depth_floor={depth} total_asserts={}",
                 self.ctx.assertions.len()
@@ -1518,9 +1479,9 @@ impl Executor {
         let result = solve_fn(self);
         self.dt_lazy_auflia_eager_arm = saved_eager_arm;
         self.solve_deadline.set(saved_deadline);
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-auflia-lazy-lane result={:?} reason={:?}",
                 result.as_ref().map(|r| format!("{r:?}")),
@@ -1538,14 +1499,14 @@ impl Executor {
                     ay_model_check::GateVerdict::ModelViolates { .. }
                 ) =>
             {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-auflia-lazy-refuted-fallback");
                 }
                 self.last_model_validated = false;
                 Ok(SolveResult::Unknown)
             }
             Ok(SolveResult::Sat) if self.dt_lazy_sat_would_print_partial() => {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-auflia-lazy-partial-fallback");
                 }
                 self.last_model_validated = false;
@@ -1630,29 +1591,23 @@ impl Executor {
     /// Whether an exact AUFLIA rollback snapshot fits the active memory
     /// envelope.
     ///
-    /// This is predictive rather than reactive: cloning a store that already
-    /// consumes more than half of any enforced budget can cross the hard limit
-    /// before the ordinary periodic checks get a chance to return `Unknown`.
-    /// Returning `false` only skips an optional speculative lane and leaves the
-    /// eager solver as the verdict authority.
+    /// This is predictive rather than reactive: this lane clones the term
+    /// store plus disjoint rollback ledgers. Require best-effort room for
+    /// another observed process footprint as well as the TermStore's
+    /// capacity-aware per-engine clone bound. Returning `false` only skips an
+    /// optional speculative lane and leaves the eager solver authoritative.
     fn dt_auflia_snapshot_preflight(&self) -> bool {
         if self.external_stop_reason().is_some()
             || ay_core::TermStore::global_memory_exceeded()
-            || ay_sys::process_memory_exceeded_at_percent(50)
-            || crate::memory::memory_exceeded(self.memory_limit())
+            || !self.bulk_state_clone_fits_memory()
         {
             return false;
         }
-        if let Some(limit) = self.memory_limit() {
-            let current = crate::memory::current_memory_bytes();
-            if !snapshot_clone_fits_budget(current, limit) {
-                return false;
-            }
-        }
-        snapshot_clone_fits_budget(
-            self.ctx.terms.true_memory_bytes(),
-            ay_core::TermStore::per_engine_budget(),
-        )
+        let clone_limit = ay_core::TermStore::per_engine_budget() / 2;
+        self.ctx
+            .terms
+            .diagnostic_clone_memory_bytes(clone_limit)
+            .is_some()
     }
 
     /// Materialize the SPARSE on-demand DT axioms at the occurrence-driven
@@ -1972,16 +1927,26 @@ impl Executor {
         {
             return Ok(None);
         }
+        if !self.dt_lazy_lemma_cache_isolation_available() {
+            return Ok(None);
+        }
         if !self.dt_lazy_content_eligible() {
             return Ok(None);
         }
+        // Apply predictive backpressure before cloning the rollback ledgers.
+        // This optional lane leaves the eager authority unchanged on decline.
+        if !self.bulk_state_clone_fits_memory() {
+            return Ok(None);
+        }
+        let Ok(entry_proof_checkpoint) = self.bounded_proof_rollback_checkpoint() else {
+            // Optional lane: fall through before mutating assertion/term state.
+            return Ok(None);
+        };
 
-        // Entry snapshot: on FALLBACK the assertions are restored to this
-        // exact state so the eager lane runs its own flatten/lift/pre-lift
-        // mining on the ORIGINAL shapes (its `dt_pre_lift_assertions`
-        // snapshot must not see an already-lifted list, or the fuzz881
-        // pre-lift acyclicity units are silently lost). Term-store additions
-        // are append-only and unasserted — harmless to every lane.
+        // On FALLBACK restore assertions so the eager lane mines the ORIGINAL
+        // shapes; its pre-lift snapshot must not see an already-lifted list or
+        // the fuzz881 acyclicity units are lost. Unasserted appended terms are
+        // harmless to every lane.
         let entry_assertions = self.ctx.assertions.clone();
         let entry_pre_lift = std::mem::take(&mut self.dt_pre_lift_assertions);
         // Entry TERM-STORE snapshot (#dt-lazy-isolation, mv-rerun-20260718
@@ -2012,19 +1977,13 @@ impl Executor {
         // IDs or preserving failed-lane scaffolding.
         let entry_terms_len = self.ctx.terms.len();
         let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
-        let entry_proof_checkpoint = self.proof_tracker.rollback_checkpoint();
-        let entry_proof_problem_assertion_provenance =
-            self.proof_problem_assertion_provenance.clone();
-        let entry_quant_expansion_records = self.quant_expansion_records.clone();
-        let entry_ematching_proof_records = self.ematching_proof_records.clone();
-        let entry_last_proof_rebuild_originals = self.last_proof_rebuild_originals.clone();
-        let entry_last_proof_term_overrides = self.last_proof_term_overrides.clone();
-        let entry_proof_reconstruction_suppressed = self.last_unsat_proof_reconstruction_suppressed;
-        let entry_quantified_proof_translation_incomplete =
-            self.quantified_proof_translation_incomplete;
+        let entry_lazy_proof_state = lazy_proof_state::DtLazyProofState::capture(self);
         let entry_attempt_state = DtLazyAttemptState::capture(self);
         let entry_lia_probe_state = ay_lia::save_probe_state();
-        let rollback_on_fallback = |this: &mut Self| {
+        // Every fallback callsite returns immediately. Make the transaction
+        // affine so all entry snapshots are moved back rather than cloned
+        // after the inner solve may have grown the corresponding structures.
+        let rollback_on_fallback = move |this: &mut Self| {
             // #dt-lazy-isolation, repaired 2026-08-07.
             //
             // This guard used to skip the rollback whenever proof steps existed,
@@ -2046,35 +2005,26 @@ impl Executor {
             // regresses FP/BV/NRA (measured: 14 FP failures).
             // Revoke only the discarded attempt's result artifacts. The active
             // public UNSAT epoch and Pareto state belong to the enclosing query.
+            this.ctx.assertions = entry_assertions;
+            this.dt_pre_lift_assertions = entry_pre_lift;
             this.revoke_dt_lazy_attempt_artifacts();
             this.clear_dt_theory_model();
             this.dt_egraph_assignment.replace(None);
-            entry_attempt_state.restore(this);
-            ay_lia::restore_probe_state(entry_lia_probe_state.clone());
+            let entry_array_ext_witness_cache = entry_attempt_state.restore(this);
+            ay_lia::restore_probe_state(entry_lia_probe_state);
             crate::executor::model::eval_memo_clear();
-            this.proof_problem_assertion_provenance =
-                entry_proof_problem_assertion_provenance.clone();
-            this.quant_expansion_records = entry_quant_expansion_records.clone();
-            this.ematching_proof_records = entry_ematching_proof_records.clone();
-            this.last_proof_rebuild_originals = entry_last_proof_rebuild_originals.clone();
-            this.last_proof_term_overrides = entry_last_proof_term_overrides.clone();
-            this.last_unsat_proof_reconstruction_suppressed = entry_proof_reconstruction_suppressed;
-            this.quantified_proof_translation_incomplete =
-                entry_quantified_proof_translation_incomplete;
+            entry_lazy_proof_state.restore(this);
             this.clear_dt_lazy_rebuildable_term_indexes();
-            if !this
-                .proof_tracker
-                .rollback_to(entry_proof_checkpoint.clone())
-            {
+            if !this.proof_tracker.rollback_to(entry_proof_checkpoint) {
                 // The checkpoint's prefix was moved out by a nested proof
                 // reset/take. Keep the speculative terms so no escaped proof
                 // can dangle; eager fallback remains sound, just less isolated.
                 return;
             }
-            entry_attempt_state.restore_witness_cache(this);
+            this.array_ext_witness_cache = entry_array_ext_witness_cache;
             this.ctx.terms.rollback_to(entry_terms_checkpoint);
             this.clear_dt_lazy_rebuildable_term_indexes();
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!("c phase-trace dt-lazy-rollback to={entry_terms_len}");
             }
         };
@@ -2099,10 +2049,9 @@ impl Executor {
 
         // Depth-1 syntactic axiom slice + guarded acyclicity mining (both
         // entailed datatype tautology families; see method docs).
-        let depth: usize = std::env::var("AY_DT_LAZY_DEPTH")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+        // B10: depth pinned at 1 (the AY_DT_LAZY_DEPTH override nothing set
+        // is retired).
+        let depth: usize = 1;
         let base_assertions: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         let mut extra_axioms = self.dt_selector_axioms_to_depth(&base_assertions, depth);
         let assertions_snapshot = self.ctx.assertions.clone();
@@ -2115,15 +2064,13 @@ impl Executor {
             extra_axioms.extend(self.dt_guarded_acyclicity_disjuncts(&pre_lift, &[]));
             extra_axioms.extend(self.dt_guarded_acyclicity_guard_units(&pre_lift, &[]));
         }
-        let base_len = self.ctx.assertions.len();
+        let base_assertions_exact = self.ctx.assertions.clone();
         self.ctx.assertions.extend(extra_axioms);
 
         // Materialize the lane's atom families AFTER axiom generation so the
         // projection pairing also covers axiom-synthesized selector/ctor
         // terms.
         let Some((dt_registry, bases)) = self.dt_lazy_prepare() else {
-            self.ctx.assertions = entry_assertions;
-            self.dt_pre_lift_assertions = entry_pre_lift;
             rollback_on_fallback(self);
             return Ok(None);
         };
@@ -2136,8 +2083,6 @@ impl Executor {
         if let Some(deadline) = saved_deadline {
             let now = ay_core::time::Instant::now();
             if deadline <= now {
-                self.ctx.assertions = entry_assertions;
-                self.dt_pre_lift_assertions = entry_pre_lift;
                 rollback_on_fallback(self);
                 return Ok(None);
             }
@@ -2147,9 +2092,9 @@ impl Executor {
         let result = self.solve_array_euf();
         self.dt_lazy_splits = None;
         self.solve_deadline.set(saved_deadline);
-        self.ctx.assertions.truncate(base_len);
+        self.ctx.assertions = base_assertions_exact;
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-lazy-lane result={:?} reason={:?}",
                 result.as_ref().map(|r| format!("{r:?}")),
@@ -2176,7 +2121,7 @@ impl Executor {
                     ay_model_check::GateVerdict::ModelViolates { .. }
                 ) =>
             {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-lazy-refuted-fallback");
                 }
                 self.last_model_validated = false;
@@ -2192,7 +2137,7 @@ impl Executor {
             // miss is strictly better. Only the completeness CHECK is new;
             // the values themselves are untouched.
             Ok(SolveResult::Sat) if self.dt_lazy_sat_would_print_partial() => {
-                if std::env::var_os("AY_PHASE_TRACE").is_some() {
+                if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-lazy-partial-fallback");
                 }
                 self.last_model_validated = false;
@@ -2205,8 +2150,6 @@ impl Executor {
                 // Fallback: hand the eager lane the ORIGINAL assertion shapes
                 // AND the original term store (see entry snapshots above,
                 // #dt-lazy-isolation).
-                self.ctx.assertions = entry_assertions;
-                self.dt_pre_lift_assertions = entry_pre_lift;
                 rollback_on_fallback(self);
                 Ok(None)
             }
@@ -2407,7 +2350,7 @@ impl Executor {
             .sum();
         let closure_atoms: usize = enum_bases.iter().map(|(_, dt)| ctors_of(dt)).sum();
         if projection_atoms + closure_atoms > DT_LAZY_MAX_ATOMS {
-            if std::env::var_os("AY_PHASE_TRACE").is_some() {
+            if ay_core::misc_cli_flags().phase_trace {
                 eprintln!(
                     "c phase-trace dt-lazy-skip projection_atoms={projection_atoms} closure_atoms={closure_atoms}"
                 );
@@ -2456,7 +2399,7 @@ impl Executor {
             bases.push((*t, atoms));
         }
 
-        if std::env::var_os("AY_PHASE_TRACE").is_some() {
+        if ay_core::misc_cli_flags().phase_trace {
             eprintln!(
                 "c phase-trace dt-lazy-prepare sel_apps={} projection_atoms={} bases={} closure_atoms={}",
                 sel_apps.len(),
@@ -2477,12 +2420,17 @@ mod rollback_artifact_tests {
     use crate::executor::optimization::ParetoState;
 
     #[test]
-    fn auflia_snapshot_preflight_checks_exact_doubling_boundary() {
-        assert!(snapshot_clone_fits_budget(0, 0));
-        assert!(snapshot_clone_fits_budget(50, 100));
-        assert!(!snapshot_clone_fits_budget(51, 100));
-        assert!(snapshot_clone_fits_budget(usize::MAX / 2, usize::MAX));
-        assert!(!snapshot_clone_fits_budget(usize::MAX / 2 + 1, usize::MAX));
+    fn lazy_lane_cache_gate_excludes_persistence_and_existing_entries() {
+        let mut executor = Executor::new();
+        assert!(executor.dt_lazy_lemma_cache_isolation_available());
+
+        executor.lemma_persistence = true;
+        assert!(!executor.dt_lazy_lemma_cache_isolation_available());
+        executor.lemma_persistence = false;
+
+        let lemma = ay_core::TheoryLemma::new(vec![TheoryLit::new(TermId(5), true)]);
+        assert!(executor.lemma_cache.record_lemma(lemma, 0));
+        assert!(!executor.dt_lazy_lemma_cache_isolation_available());
     }
 
     #[test]
@@ -2577,8 +2525,15 @@ mod rollback_artifact_tests {
     #[test]
     fn discarded_lazy_attempt_restores_validation_and_retry_state() {
         let mut executor = Executor::new();
-        let entry_lemma = ay_core::TheoryLemma::new(vec![TheoryLit::new(TermId(5), true)]);
-        assert!(executor.lemma_cache.record_lemma(entry_lemma, 0));
+        executor
+            .recorded_var_substitutions
+            .insert(TermId(1), TermId(2));
+        executor
+            .array_default_epsilon_by_sort
+            .insert(Sort::Int, TermId(3));
+        executor
+            .array_default_diag_by_sort
+            .insert(Sort::Bool, "entry-diag".to_string());
         executor.qfax_refinement_clause = Some(vec![(TermId(7), true)]);
         executor.last_rejected_array_assertion = Some(TermId(8));
         executor.cegar_pending_lemma = Some(TermId(9));
@@ -2600,8 +2555,9 @@ mod rollback_artifact_tests {
         executor.uflia_congruence_gate_rejected = true;
         let entry = DtLazyAttemptState::capture(&executor);
 
-        let speculative_lemma = ay_core::TheoryLemma::new(vec![TheoryLit::new(TermId(50), false)]);
-        assert!(executor.lemma_cache.record_lemma(speculative_lemma, 1));
+        executor.recorded_var_substitutions.clear();
+        executor.array_default_epsilon_by_sort.clear();
+        executor.array_default_diag_by_sort.clear();
         executor.qfax_refinement_clause = None;
         executor.last_rejected_array_assertion = None;
         executor.cegar_pending_lemma = None;
@@ -2622,15 +2578,23 @@ mod rollback_artifact_tests {
         executor.uflia_congruence_lane = false;
         executor.uflia_congruence_gate_rejected = false;
 
-        entry.restore(&mut executor);
+        let _entry_witness_cache = entry.restore(&mut executor);
 
-        assert_eq!(executor.lemma_cache.len(), 1);
-        let restored_lemma = &executor.lemma_cache.replay_lemmas()[0];
         assert_eq!(
-            restored_lemma.0.clause,
-            vec![TheoryLit::new(TermId(5), true)]
+            executor.recorded_var_substitutions.get(&TermId(1)),
+            Some(&TermId(2))
         );
-        assert_eq!(restored_lemma.1, 0);
+        assert_eq!(
+            executor.array_default_epsilon_by_sort.get(&Sort::Int),
+            Some(&TermId(3))
+        );
+        assert_eq!(
+            executor
+                .array_default_diag_by_sort
+                .get(&Sort::Bool)
+                .map(String::as_str),
+            Some("entry-diag")
+        );
         assert_eq!(
             executor.qfax_refinement_clause,
             Some(vec![(TermId(7), true)])
@@ -2692,7 +2656,7 @@ mod rollback_artifact_tests {
         )
         .expect("speculative array pair should mint a witness");
 
-        entry.restore(&mut executor);
+        let entry_witness_cache = entry.restore(&mut executor);
         assert_eq!(
             executor.array_ext_witness_cache.pair_witness(
                 &executor.ctx.terms,
@@ -2703,7 +2667,7 @@ mod rollback_artifact_tests {
             "ordinary attempt-state restore must leave proof-coupled cache entries in place"
         );
 
-        entry.restore_witness_cache(&mut executor);
+        executor.array_ext_witness_cache = entry_witness_cache;
         assert_eq!(
             executor.array_ext_witness_cache.pair_witness(
                 &executor.ctx.terms,
@@ -2748,9 +2712,11 @@ mod dt_axiom_attribution_tests {
 
     use super::*;
 
-    /// C1.iv retag pass: `record_dt_axiom_theory_lemmas` must tag exactly the
-    /// shapes the ay-proof validators accept (selector projection ->
-    /// `DatatypeSelectorProject`, tester evaluation/exhaustiveness ->
+    /// C1.iv/C5 retag pass: `record_dt_axiom_theory_lemmas` must tag exactly
+    /// the shapes the ay-proof validators accept (selector projection ->
+    /// `DatatypeSelectorProject`, constructor coverage ->
+    /// `DatatypeExhaustive`, guarded reconstruction ->
+    /// `DatatypeConstructorReconstruct`, tester evaluation ->
     /// `DatatypeTesterEval`) and keep every declined shape `Generic` —
     /// classifier equals validator, decline-only.
     #[test]
@@ -2774,7 +2740,7 @@ mod dt_axiom_attribution_tests {
         let mk_pair = exec
             .ctx
             .terms
-            .mk_app(Symbol::named("mk"), vec![one, two], pair_sort);
+            .mk_app(Symbol::named("mk"), vec![one, two], pair_sort.clone());
 
         // Family (A): `(= (first (mk 1 2)) 1)` -> DatatypeSelectorProject.
         let first_app = exec
@@ -2797,8 +2763,10 @@ mod dt_axiom_attribution_tests {
                 .mk_app(Symbol::named("is-unit"), vec![mk_pair], Sort::Bool);
         let tester_neg = exec.ctx.terms.mk_not(tester_unit);
 
-        // Family (D): complete tester exhaustiveness over one subject —
-        // accepted by the tester validator's exhaustiveness branch.
+        // Family (D): constructor coverage over one scrutinee — since C5 this
+        // carries its own DatatypeExhaustive kind (probed before the tester
+        // lane, whose general exhaustiveness branch also accepts it; the move
+        // is between two strict-checkable kinds).
         let is_mk_p = exec
             .ctx
             .terms
@@ -2808,6 +2776,30 @@ mod dt_axiom_attribution_tests {
             .terms
             .mk_app(Symbol::named("is-unit"), vec![p], Sort::Bool);
         let exhaustive = exec.ctx.terms.mk_or(vec![is_mk_p, is_unit_p]);
+
+        // Family (C): the guarded reconstructions the eager pass emits via
+        // `mk_implies` -> DatatypeConstructorReconstruct (C5). Non-nullary
+        // `mk` rebuilds from its full selector chain; registry-nullary `unit`
+        // rebuilds as the bare constant (`mk_var`, exactly as the emitter
+        // interns it).
+        let first_p = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("first"), vec![p], Sort::Int);
+        let second_p = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("second"), vec![p], Sort::Int);
+        let rebuilt_p = exec.ctx.terms.mk_app(
+            Symbol::named("mk"),
+            vec![first_p, second_p],
+            pair_sort.clone(),
+        );
+        let p_eq_rebuilt = exec.ctx.terms.mk_eq(p, rebuilt_p);
+        let reconstruct_mk = exec.ctx.terms.mk_implies(is_mk_p, p_eq_rebuilt);
+        let unit_const = exec.ctx.terms.mk_var("unit".to_string(), pair_sort);
+        let p_eq_unit = exec.ctx.terms.mk_eq(p, unit_const);
+        let reconstruct_unit = exec.ctx.terms.mk_implies(is_unit_p, p_eq_unit);
 
         // No validator accepts this (acyclicity-disjunct/bridge residue
         // stand-in): `(not (= p (mk 1 2)))` must stay Generic.
@@ -2819,6 +2811,8 @@ mod dt_axiom_attribution_tests {
             tester_pos,
             tester_neg,
             exhaustive,
+            reconstruct_mk,
+            reconstruct_unit,
             generic_residue,
         ];
         exec.record_dt_axiom_theory_lemmas(&axioms);
@@ -2828,7 +2822,15 @@ mod dt_axiom_attribution_tests {
             (selector_axiom, TheoryLemmaKind::DatatypeSelectorProject),
             (tester_pos, TheoryLemmaKind::DatatypeTesterEval),
             (tester_neg, TheoryLemmaKind::DatatypeTesterEval),
-            (exhaustive, TheoryLemmaKind::DatatypeTesterEval),
+            (exhaustive, TheoryLemmaKind::DatatypeExhaustive),
+            (
+                reconstruct_mk,
+                TheoryLemmaKind::DatatypeConstructorReconstruct,
+            ),
+            (
+                reconstruct_unit,
+                TheoryLemmaKind::DatatypeConstructorReconstruct,
+            ),
             (generic_residue, TheoryLemmaKind::Generic),
         ];
         assert_eq!(proof.steps.len(), expected.len());
@@ -2851,13 +2853,146 @@ mod dt_axiom_attribution_tests {
             &[selector_axiom],
             &selectors,
         ));
-        for tester in [tester_pos, tester_neg, exhaustive] {
+        for tester in [tester_pos, tester_neg] {
             assert!(ay_proof::recognize_datatype_tester_eval_with_selectors(
                 &exec.ctx.terms,
                 &[tester],
                 &decls,
                 &selectors,
             ));
+        }
+        assert!(ay_proof::recognize_datatype_exhaustive(
+            &exec.ctx.terms,
+            &[exhaustive],
+            &decls,
+        ));
+        for reconstruction in [reconstruct_mk, reconstruct_unit] {
+            assert!(ay_proof::recognize_datatype_constructor_reconstruct(
+                &exec.ctx.terms,
+                &[reconstruction],
+                &decls,
+                &selectors,
+            ));
+        }
+    }
+
+    /// Fail-closed regression: DT axiom families without an enabled promotion
+    /// lane must remain explicit `Generic` trust, including value-equality
+    /// congruence and mined structural disequalities.
+    #[test]
+    fn dt_axiom_recording_keeps_unpromoted_families_generic() {
+        let mut exec = Executor::new();
+        let commands = parse(
+            r#"
+            (set-logic QF_DT)
+            (declare-datatype List ((nil) (cons (hd Int) (tl List))))
+            (declare-const x List)
+            (declare-const y List)
+            (declare-const g Bool)
+            "#,
+        )
+        .expect("datatype declarations parse");
+        exec.execute_all(&commands).expect("declarations execute");
+        exec.proof_tracker.enable();
+
+        let x = exec.ctx.terms.lookup("x").expect("x is declared");
+        let y = exec.ctx.terms.lookup("y").expect("y is declared");
+        let g = exec.ctx.terms.lookup("g").expect("g is declared");
+        let list_sort = exec.ctx.terms.sort(x).clone();
+        let one = exec.ctx.terms.mk_int(1.into());
+
+        // Value-eq congruence biconditional, built exactly as
+        // `emit_dt_value_eq_congruence` interns it for the two-constructor
+        // List: tester agreement per constructor + guarded field congruence
+        // per cons field.
+        let is_nil_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-nil"), vec![x], Sort::Bool);
+        let is_nil_y = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-nil"), vec![y], Sort::Bool);
+        let is_cons_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-cons"), vec![x], Sort::Bool);
+        let is_cons_y = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("is-cons"), vec![y], Sort::Bool);
+        let t_nil = exec.ctx.terms.mk_eq(is_nil_x, is_nil_y);
+        let t_cons = exec.ctx.terms.mk_eq(is_cons_x, is_cons_y);
+        let hd_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("hd"), vec![x], Sort::Int);
+        let hd_y = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("hd"), vec![y], Sort::Int);
+        let tl_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("tl"), vec![x], list_sort.clone());
+        let tl_y = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("tl"), vec![y], list_sort.clone());
+        let eq_hd = exec.ctx.terms.mk_eq(hd_x, hd_y);
+        let eq_tl = exec.ctx.terms.mk_eq(tl_x, tl_y);
+        let g_hd = exec.ctx.terms.mk_implies(is_cons_x, eq_hd);
+        let g_tl = exec.ctx.terms.mk_implies(is_cons_x, eq_tl);
+        let rhs = exec.ctx.terms.mk_and(vec![t_nil, t_cons, g_hd, g_tl]);
+        let eq_xy = exec.ctx.terms.mk_eq(x, y);
+        let value_eq_bic = exec.ctx.terms.mk_eq(eq_xy, rhs);
+
+        // Mined direct-cycle unit `(not (= x (cons 1 x)))`.
+        let cons_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("cons"), vec![one, x], list_sort.clone());
+        let eq_cycle = exec.ctx.terms.mk_eq(x, cons_x);
+        let acyclic_unit = exec.ctx.terms.mk_not(eq_cycle);
+
+        // Mined same-constructor unit whose tails are refuted by
+        // well-foundedness: `(not (= (cons 1 x) (cons 1 (cons 1 x))))`.
+        let outer = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("cons"), vec![one, cons_x], list_sort);
+        let eq_inj = exec.ctx.terms.mk_eq(cons_x, outer);
+        let injective_unit = exec.ctx.terms.mk_not(eq_inj);
+
+        // Other unsupported residues: a forced guard-unit literal and an
+        // (F1)-style BARE field equality (modus ponens against an asserted
+        // constructor equality — not a standalone theorem).
+        let guard_unit = exec.ctx.terms.mk_not(g);
+        let bare_field_eq = exec.ctx.terms.mk_eq(hd_x, one);
+
+        let axioms = [
+            value_eq_bic,
+            acyclic_unit,
+            injective_unit,
+            guard_unit,
+            bare_field_eq,
+        ];
+        exec.record_dt_axiom_theory_lemmas(&axioms);
+        let proof = exec.proof_tracker.take_proof();
+
+        assert_eq!(proof.steps.len(), axioms.len());
+        for (step, axiom) in proof.steps.iter().zip(axioms) {
+            match step {
+                ProofStep::TheoryLemma { kind, clause, .. } => {
+                    assert_eq!(clause, &vec![axiom]);
+                    assert_eq!(
+                        *kind,
+                        TheoryLemmaKind::Generic,
+                        "unsupported DT axiom must remain fail-closed: {clause:?}"
+                    );
+                }
+                other => panic!("expected theory lemma, got {other:?}"),
+            }
         }
     }
 }

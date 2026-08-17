@@ -48,7 +48,7 @@ const MAX_WE_VARS: usize = 20;
 /// Maximum total symbols (variables + literal characters) across all
 /// extracted equations. Kept well under `WeConfig::max_word_len` (512) so
 /// the initial Nielsen state is never dead on arrival. Strings S1
-/// (`AY_WE_S1`) lifts both in lockstep: industrial sanitizer benchmarks
+/// (`--no-we-s1`) lifts both in lockstep: industrial sanitizer benchmarks
 /// (slog/Stranger) inline multi-hundred-character HTML literals, and the
 /// definitional Gaussian elimination collapses them without branching, so a
 /// larger budget converts those files at bounded extra cost.
@@ -77,8 +77,8 @@ const MAX_WE_EQS: usize = 16;
 /// are skipped — sound: Unsat uses a subset of assertions, Sat candidates
 /// are validated against the full set).
 const MAX_WE_REGEX_SIZE: usize = 256;
-/// Raised cap under the strings witness-construction flag (`AY_STR_WITNESS=1`,
-/// default OFF). Industrial regex chains (automatark / stringfuzz) inline
+/// Raised cap under the strings witness-construction lane (default ON,
+/// `--dpll-no-str-witness` kills it). Industrial regex chains (automatark / stringfuzz) inline
 /// hundred-character literals and wide `re.union` classes whose EXACT
 /// translation exceeds 256 nodes, so the default cap drops the membership
 /// entirely and no witness can be constructed from it. Raising the cap changes
@@ -95,23 +95,14 @@ fn max_we_regex_size() -> usize {
     }
 }
 /// Maximum `(_ re.loop lo hi)` upper bound unrolled during translation.
-/// Env-tunable via `AY_WE_MAX_LOOP` (strings S1 feasibility knob): default
-/// unchanged; a larger unroll only grows the translated regex. The configured
-/// value is capped before allocation by `MAX_WE_REGEX_SIZE`, and the translated
-/// result is checked against that same size bound. Sat witnesses stay
-/// model-validated fail-closed.
+/// A larger unroll only grows the translated regex; the cap is clamped before
+/// allocation by `MAX_WE_REGEX_SIZE`, and the translated result is checked
+/// against that same size bound. Sat witnesses stay model-validated
+/// fail-closed. (B10: the AY_WE_MAX_LOOP override nothing set is retired.)
 const MAX_WE_LOOP: u32 = 12;
 
-fn parse_max_we_loop(value: Option<&str>) -> u32 {
-    value
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(MAX_WE_LOOP)
-        .min(MAX_WE_REGEX_SIZE as u32)
-}
-
 fn max_we_loop() -> u32 {
-    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| parse_max_we_loop(std::env::var("AY_WE_MAX_LOOP").ok().as_deref()))
+    MAX_WE_LOOP.min(MAX_WE_REGEX_SIZE as u32)
 }
 
 /// The extracted word-equation fragment plus the TermId for each variable
@@ -137,7 +128,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let __tr = std::env::var("AY_STR_PREPASS_STATS").ok().as_deref() == Some("1");
+        let __tr = ay_core::misc_cli_flags().str_prepass_stats;
         let __t = std::time::Instant::now();
         let Some(extraction) = self.extract_word_eq_problem() else {
             if __tr {
@@ -1496,13 +1487,10 @@ mod config_tests {
     use super::*;
 
     #[test]
-    fn max_we_loop_defaults_accepts_overrides_and_caps_before_allocation() {
-        assert_eq!(parse_max_we_loop(None), MAX_WE_LOOP);
-        assert_eq!(parse_max_we_loop(Some("64")), 64);
-        assert_eq!(parse_max_we_loop(Some("invalid")), MAX_WE_LOOP);
-        assert_eq!(
-            parse_max_we_loop(Some("4294967295")),
-            MAX_WE_REGEX_SIZE as u32
-        );
+    fn max_we_loop_stays_under_the_regex_size_ceiling() {
+        // B10: the env override is retired; the compiled cap must sit at or
+        // below the allocation ceiling it was always clamped to.
+        assert_eq!(max_we_loop(), MAX_WE_LOOP);
+        assert!(MAX_WE_LOOP <= MAX_WE_REGEX_SIZE as u32);
     }
 }

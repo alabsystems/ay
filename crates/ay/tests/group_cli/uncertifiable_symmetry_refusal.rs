@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `AY_SAT_COMPOSITE_SYMMETRY` must not produce an UNSAT that nobody checks.
+//! `--sat-composite-symmetry` must not produce an UNSAT that nobody checks.
 //!
 //! The composite lex-leader route breaks symmetry with an equal-prefix aux
 //! tower that is not single-witness PR, so the steps it appends to the proof
@@ -49,15 +49,13 @@ fn scratch() -> (PathBuf, DirGuard) {
     (dir.clone(), DirGuard(dir))
 }
 
-/// Run AY on `unsat.cnf`, optionally with the composite-symmetry env flag set.
+/// Run AY on `unsat.cnf`, optionally with the composite-symmetry opt-in flag.
 /// Returns `(exit code, stderr)`.
 fn run(dir: &PathBuf, composite: bool, args: &[&str]) -> (i32, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ay"));
     cmd.arg("solve").args(args).arg(dir.join("unsat.cnf"));
     if composite {
-        cmd.env("AY_SAT_COMPOSITE_SYMMETRY", "1");
-    } else {
-        cmd.env_remove("AY_SAT_COMPOSITE_SYMMETRY");
+        cmd.arg("--sat-composite-symmetry");
     }
     let output = cmd.output().expect("failed to run ay");
     let code = output.status.code().expect("ay died on a signal");
@@ -85,7 +83,7 @@ fn composite_symmetry_with_unchecked_proof_is_refused() {
         "composite symmetry + written proof + no re-check must exit 1, got {code}; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("AY_SAT_COMPOSITE_SYMMETRY"),
+        stderr.contains("--sat-composite-symmetry"),
         "the refusal must name the flag responsible; stderr: {stderr}"
     );
     // Never publish an UNSAT verdict alongside the refusal.

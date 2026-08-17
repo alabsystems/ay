@@ -241,7 +241,7 @@ enum Cell<'a> {
 fn open_cell_samples(
     s: &UPoly,
     locs: &[RootLoc],
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<Vec<BigRational>, String> {
     if locs.is_empty() {
         return Ok(vec![BigRational::zero()]);
@@ -271,7 +271,7 @@ fn cell_satisfies_all(
     cell: &Cell<'_>,
     system: &[(UPoly, Rel)],
     zero_tests: &[Option<Vec<UPoly>>],
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<bool, String> {
     for (i, (p, rel)) in system.iter().enumerate() {
         let sign = match cell {
@@ -290,7 +290,7 @@ fn root_cell_sign(
     p: &UPoly,
     loc: &RootLoc,
     zero_test: Option<&Option<Vec<UPoly>>>,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<std::cmp::Ordering, String> {
     match loc {
         RootLoc::Exact { m, .. } => Ok(poly_eval(p, m, meter)?.cmp(&BigRational::zero())),
@@ -339,7 +339,7 @@ fn isolate_roots(
     chain: &[UPoly],
     s: &UPoly,
     m: &BigRational,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<Vec<RootLoc>, String> {
     let two = BigRational::from_integer(BigInt::from(2));
     let neg_m = -m.clone();
@@ -498,7 +498,7 @@ fn poly_deg(p: &UPoly) -> Option<usize> {
     p.len().checked_sub(1)
 }
 
-fn poly_eval(p: &UPoly, x: &BigRational, meter: &mut WorkMeter) -> Result<BigRational, String> {
+fn poly_eval(p: &UPoly, x: &BigRational, meter: &mut WorkMeter<'_>) -> Result<BigRational, String> {
     // Horner on n-bit rational points: the accumulator gains ~bits(x) per
     // step, so total work is quadratic in the length — sum over steps of
     // k*bits(x) is n^2*bits(x)/2 — plus the coefficients' own width.
@@ -520,7 +520,7 @@ fn poly_neg(p: &UPoly) -> UPoly {
     p.iter().map(|c| -c).collect()
 }
 
-fn poly_mul(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn poly_mul(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     if poly_is_zero(a) || poly_is_zero(b) {
         return Ok(Vec::new());
     }
@@ -536,7 +536,7 @@ fn poly_mul(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String
     Ok(out)
 }
 
-fn poly_derivative(p: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn poly_derivative(p: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     meter.charge_ops(p.len() as u64 + 1)?;
     if p.len() <= 1 {
         return Ok(Vec::new());
@@ -551,7 +551,7 @@ fn poly_derivative(p: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
 
 /// EXACT Euclidean polynomial remainder over `BigRational` — no
 /// pseudo-remainders, so no sign-flipping scaling exists to get wrong.
-fn poly_rem(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn poly_rem(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     let db = poly_deg(b).ok_or_else(|| "polynomial division by zero".to_string())?;
     let lb = b
         .last()
@@ -582,7 +582,7 @@ fn poly_rem(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String
 
 /// EXACT polynomial quotient when `d` divides `p`; `Err` on a nonzero
 /// remainder (fail closed — never guess).
-fn poly_div_exact(p: &UPoly, d: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn poly_div_exact(p: &UPoly, d: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     let dd = poly_deg(d).ok_or_else(|| "polynomial division by zero".to_string())?;
     let ld = d
         .last()
@@ -622,7 +622,7 @@ fn poly_div_exact(p: &UPoly, d: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, 
 /// Scale by the POSITIVE rational that makes the coefficients a primitive
 /// integer vector. Positive scaling is sign-faithful — the entire
 /// normalization obligation for a Sturm chain.
-fn content_normalize(p: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn content_normalize(p: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     if poly_is_zero(p) {
         return Ok(Vec::new());
     }
@@ -663,7 +663,7 @@ fn bigint_gcd(a: &BigInt, b: &BigInt) -> BigInt {
 
 /// Polynomial gcd by exact Euclid with per-step content normalization.
 /// Returns a content-normalized gcd; a constant gcd is returned as `[1]`.
-fn poly_gcd(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn poly_gcd(a: &UPoly, b: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     let mut x = content_normalize(a, meter)?;
     let mut y = content_normalize(b, meter)?;
     if poly_deg(&x) < poly_deg(&y) {
@@ -681,7 +681,7 @@ fn poly_gcd(a: &UPoly, b: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String
 }
 
 /// Square-free part `p / gcd(p, p')` (root set preserved, all roots simple).
-fn square_free_part(p: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
+fn square_free_part(p: &UPoly, meter: &mut WorkMeter<'_>) -> Result<UPoly, String> {
     let d = poly_deg(p).ok_or_else(|| "square-free part of zero polynomial".to_string())?;
     if d == 0 {
         return content_normalize(p, meter);
@@ -699,7 +699,7 @@ fn square_free_part(p: &UPoly, meter: &mut WorkMeter) -> Result<UPoly, String> {
 /// `-rem(prev, cur)` with positive-content normalization per step. Ends in a
 /// nonzero constant (verified — a non-constant tail means the input was not
 /// square-free, which is refused).
-fn sturm_chain(s: &UPoly, meter: &mut WorkMeter) -> Result<Vec<UPoly>, String> {
+fn sturm_chain(s: &UPoly, meter: &mut WorkMeter<'_>) -> Result<Vec<UPoly>, String> {
     let d = poly_deg(s).ok_or_else(|| "sturm chain of zero polynomial".to_string())?;
     let s0 = content_normalize(s, meter)?;
     if d == 0 {
@@ -740,7 +740,7 @@ fn poly_bits(p: &UPoly) -> u64 {
 fn sign_variations(
     chain: &[UPoly],
     x: &BigRational,
-    meter: &mut WorkMeter,
+    meter: &mut WorkMeter<'_>,
 ) -> Result<usize, String> {
     let mut last: Option<bool> = None; // sign as "is_positive"
     let mut count = 0usize;

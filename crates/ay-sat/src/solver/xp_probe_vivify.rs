@@ -67,13 +67,9 @@ pub(super) fn vivify_permille() -> Option<u64> {
 /// and bounded-CDCL) for the whole run, by forcing `should_backbone()` false.
 /// Any other value (incl. unset) => backbone runs normally.
 pub(super) fn no_backbone() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
-            std::env::var("AY_XP_NO_BACKBONE").ok().as_deref(),
-            Some("1")
-        )
-    })
+    // B21: the AY_XP_NO_BACKBONE ablation switch is retired (never set, no
+    // CLI need recorded); backbone runs on its own gates.
+    false
 }
 
 /// Parse a strictly-positive `u64` from an env var; `None` on unset / parse

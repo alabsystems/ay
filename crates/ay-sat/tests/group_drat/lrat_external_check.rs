@@ -875,7 +875,7 @@ fn test_lrat_external_sweep_barrel6() {
 
 /// DRAT proof mode HONORS decompose requests since 2026-07-09 (registry
 /// `Decompose { drat: true }`, externally verified via dpr-trim + cake_lpr;
-/// kill-switch AY_AB_DRAT_SUBST=0).
+/// kill-switch --sat-no-drat-subst).
 ///
 /// The formula embeds binary equivalence chains (x13↔x14↔x15↔x16) in
 /// PHP(4,3), giving decompose a non-trivial SCC to rewrite — the emitted
@@ -925,7 +925,7 @@ p cnf 16 28
     assert!(
         solver.inprocessing_feature_profile().decompose,
         "DRAT proof mode must honor decompose requests (registry drat=true \
-         since 2026-07-09; kill-switch AY_AB_DRAT_SUBST=0)"
+         since 2026-07-09; kill-switch --sat-no-drat-subst)"
     );
 
     for clause in formula.clauses {
