@@ -126,6 +126,15 @@ pub(crate) struct PlanCx<'a> {
     in_progress: HashSet<TermId>,
     /// Shared `(cl (not false))` tautology.
     false_taut: Option<ProofId>,
+    /// The literal Boolean constant this plan's TARGET is, if it is one
+    /// (#4751). An assume that preprocessing folded all the way to
+    /// `true`/`false` is not a rewritten problem assertion to reconstruct —
+    /// it is a preprocessing-time refutation, and
+    /// `rebuild_trust_leaf_proof_from_original_assertions` already rebuilds
+    /// it from the authored roots WITH its theory certificates. The
+    /// constant-fold bridges therefore refuse to conclude it; every other
+    /// route to a constant target is untouched.
+    constant_target: Option<TermId>,
     /// Remaining node budget; exhaustion fails the plan.
     budget: usize,
 }
@@ -151,8 +160,21 @@ impl<'a> PlanCx<'a> {
             eq_memo: HashMap::default(),
             in_progress: HashSet::default(),
             false_taut: None,
+            constant_target: None,
             budget: PLAN_NODE_BUDGET,
         }
+    }
+
+    /// Record that this plan's target is the literal Boolean constant
+    /// `target` (#4751); see [`Self::constant_target`].
+    pub(crate) fn with_constant_target(mut self, target: TermId) -> Self {
+        self.constant_target = Some(target);
+        self
+    }
+
+    /// Whether `candidate` is the literal Boolean constant this plan targets.
+    pub(super) fn refuses_constant_conclusion(&self, candidate: TermId) -> bool {
+        self.constant_target == Some(candidate)
     }
 
     fn spend(&mut self, nodes: usize) -> Option<()> {
@@ -587,6 +609,9 @@ impl Executor {
                 &[],
                 false,
             );
+            if matches!(self.ctx.terms.get(term), TermData::Const(Constant::Bool(_))) {
+                cx = cx.with_constant_target(term);
+            }
             let mut planner = PropagationChainPlanner {
                 terms: &mut self.ctx.terms,
             };

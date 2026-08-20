@@ -1,3 +1,16 @@
+# Public toolchain pin, installed over the export's rust-toolchain.toml by
+# publish/transforms.sh (T3). Stock upstream, pinned rather than floating so
+# the snapshot is reproducible: the publication check runs plain `cargo`
+# against exactly this compiler ("Plain Cargo is load-bearing" —
+# publish/config.sh), and the components below are what the public
+# fmt/clippy lanes need. Byte-for-byte the pin this repo carried before the
+# 2026-08 toolchain move.
+#
+# NOTE (private-side, this comment ships and must stay export-clean): keep
+# this header free of the tokens publish/forbidden-extra.txt bans — the T2f
+# residue scan and the central guard both run over the export AFTER T3 copies
+# this file into it. The full rationale for the swap lives in
+# publish/DECISIONS.md (private) and the flip bundle's transforms-patch.md.
 [toolchain]
 channel = "1.97.1"
 profile = "minimal"

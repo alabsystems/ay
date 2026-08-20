@@ -77,16 +77,21 @@ impl PropagationChainPlanner<'_> {
             // cost the whole refutation its strict presentation.
             TermData::Not(inner) => match self.plan_derive_eq(cx, inner, stamp)? {
                 EqRes::Unchanged => Some(EqRes::Unchanged),
-                EqRes::Changed { to, id, .. } => {
+                EqRes::Changed { to, eq_term, id } => {
                     cx.spend(1)?;
                     let rebuilt = self.terms.mk_not(to);
                     // `mk_not` may fold (double negation, a constant child).
                     // The congruence conclusion is then NOT `(not to)`, so
                     // this slice declines rather than emit a step the strict
-                    // checker would have to take on faith.
+                    // checker would have to take on faith — EXCEPT for the
+                    // Boolean-constant fold, which is closed propositionally
+                    // by `plan_not_constant_fold` (#4751).
                     match self.terms.get(rebuilt) {
                         TermData::Not(rebuilt_inner) if *rebuilt_inner == to => {}
-                        _ => return None,
+                        _ => {
+                            return self
+                                .plan_not_constant_fold(cx, t, inner, to, rebuilt, eq_term, id);
+                        }
                     }
                     let eq_term = self
                         .terms
@@ -274,6 +279,125 @@ impl PropagationChainPlanner<'_> {
         })
     }
 
+    /// `(cl (= (not inner) c̄))` for the Boolean-CONSTANT fold of a
+    /// negation (#4751).
+    ///
+    /// `VariableSubstitution` rebuilds a negation through `mk_not`, which
+    /// folds a constant child: substituting `F := B`, `G := B` turns
+    /// `(not (= F G))` into `(not true)` and stores literal `false`. The
+    /// congruence slice above cannot state that — its conclusion would have
+    /// to name a `(not true)` node the store never mints — so before this
+    /// bridge the whole plan DECLINED, and with it every enclosing
+    /// disjunction. Measured on `dillig12_m` as the sole decline behind the
+    /// surviving `or#28`/`or#51` trust rejections: `plan_derive_eq` returned
+    /// `None` on `(not (<= 0 (+ G (- F))))` — whose body folds to `true` —
+    /// 28 times per run, failing the 28- and 51-ary `or` assumes that
+    /// contain it.
+    ///
+    /// The bridge is PURELY PROPOSITIONAL and adds no rule. With
+    /// `E := (= (not inner) c̄)`:
+    ///
+    /// ```text
+    /// inner = true                      inner = false
+    /// ---------------------------       ---------------------------
+    /// (cl inner)          [premise]     (cl (not inner))  [premise]
+    /// (cl E (not inner) false)          (cl E (not (not inner)) (not true))
+    ///        :rule equiv_neg2                  :rule equiv_neg1
+    /// (cl E false)        [resolve]     (cl E (not true))  [resolve]
+    /// (cl (not false))    :rule false   (cl true)          :rule true
+    /// (cl E)              [resolve]     (cl E)             [resolve]
+    /// ```
+    ///
+    /// The premise clause is itself DERIVED from the child equality — through
+    /// [`Self::plan_equiv_bridge`] against the `true` tautology, or through
+    /// [`Self::plan_not_disjunct`], the same step the disjunct-elimination
+    /// bridge already uses. Every step is re-derived by the UNTOUCHED strict
+    /// checker; each guard below falls back to today's decline.
+    fn plan_not_constant_fold(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        term: TermId,
+        inner: TermId,
+        to: TermId,
+        rebuilt: TermId,
+        eq_term: TermId,
+        eq_id: ProofId,
+    ) -> Option<EqRes> {
+        // Only the Boolean-constant fold; a double negation or a De Morgan
+        // push-down still declines exactly as before.
+        let value = match self.terms.get(to) {
+            TermData::Const(Constant::Bool(value)) => *value,
+            _ => return None,
+        };
+        let opposite = self.terms.mk_bool(!value);
+        if rebuilt != opposite || cx.refuses_constant_conclusion(rebuilt) {
+            return None;
+        }
+        // `mk_app` may fold; the emitted conclusion must name the node the
+        // resolutions actually build.
+        let equality = self
+            .terms
+            .mk_app(Symbol::named("="), [term, rebuilt], Sort::Bool);
+        match self.terms.get(equality) {
+            TermData::App(symbol, args)
+                if symbol.name() == "=" && args.as_slice() == [term, rebuilt] => {}
+            _ => return None,
+        }
+        cx.spend(8)?;
+        let (literal_id, taut_rule, taut_clause, after_literal, discharge_id) = if value {
+            // `(cl inner)` from the child equality and the `true` tautology.
+            let true_term = self.terms.true_term();
+            let true_taut =
+                cx.chain
+                    .add_rule_step(AletheRule::True, vec![true_term], Vec::new(), Vec::new());
+            let literal_id =
+                self.plan_equiv_bridge(cx, true_term, true_taut, inner, eq_term, eq_id);
+            let false_taut = self.plan_false_taut(cx);
+            (
+                literal_id,
+                AletheRule::EquivNeg2,
+                vec![equality, term, rebuilt],
+                rebuilt,
+                false_taut,
+            )
+        } else {
+            // `(cl (not inner))` from the child equality with literal `false`.
+            let literal_id = self.plan_not_disjunct(cx, inner, eq_term, eq_id);
+            let not_term = self.terms.mk_not_raw(term);
+            let not_rebuilt = self.terms.mk_not_raw(rebuilt);
+            let true_taut =
+                cx.chain
+                    .add_rule_step(AletheRule::True, vec![rebuilt], Vec::new(), Vec::new());
+            (
+                literal_id,
+                AletheRule::EquivNeg1,
+                vec![equality, not_term, not_rebuilt],
+                not_rebuilt,
+                true_taut,
+            )
+        };
+        let taut = cx
+            .chain
+            .add_rule_step(taut_rule, taut_clause, Vec::new(), Vec::new());
+        let resolved = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equality, after_literal],
+            vec![taut, literal_id],
+            Vec::new(),
+        );
+        let id = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equality],
+            vec![resolved, discharge_id],
+            Vec::new(),
+        );
+        Some(EqRes::Changed {
+            to: rebuilt,
+            eq_term: equality,
+            id,
+        })
+    }
+
     fn plan_derive_app_eq(
         &mut self,
         cx: &mut PlanCx<'_>,
@@ -436,6 +560,9 @@ impl PropagationChainPlanner<'_> {
                         new_args,
                         child_results,
                     )
+                })
+                .or_else(|| {
+                    self.plan_eq_refl_fold(cx, term, folded, symbol, args, new_args, child_results)
                 }),
         }
     }
@@ -862,6 +989,120 @@ impl PropagationChainPlanner<'_> {
             AletheRule::Trans,
             vec![term_to_folded],
             vec![congruence, normalization],
+            Vec::new(),
+        );
+        Some((term_to_folded, transitivity))
+    }
+
+    /// Reflexivity fold `(= x x) -> true` (#4751).
+    ///
+    /// A substitution that maps two DISTINCT variables to the same term
+    /// collapses an equality atom to `true`:
+    /// `VariableSubstitution` rebuilds `=` through
+    /// `mk_eq_coerce_no_ite_expand`, which recognises reflexivity, while
+    /// congruence alone reaches only the raw `(= x x)` spelling. Measured on
+    /// `dillig12_m` as the sole remaining decline behind the `or#28`/`or#51`
+    /// trust rejections once the negation fold landed: the replay produced
+    /// `(not (= (+ B 1) (+ B 1)))` where the pass stores `false`.
+    ///
+    /// The bridge adds NO rule — `refl` already concludes `(cl (= x x))` in
+    /// strict mode, and the lift to `(cl (= (= x x) true))` is the same
+    /// `equiv_neg1` + `true`-tautology pair
+    /// [`Self::plan_not_constant_fold`] uses:
+    ///
+    /// ```text
+    ///   cong        (= term R)              premises: the child equalities
+    ///   refl        (cl R)                  R := (= x x)
+    ///   equiv_neg1  (cl E (not R) (not true))   E := (= R true)
+    ///   resolve     (cl E (not true))
+    ///   true        (cl true)
+    ///   resolve     (cl E)
+    ///   trans       (= term true)
+    /// ```
+    ///
+    /// Fail-closed: the two rebuilt arguments must be the SAME node and the
+    /// recorded fold must be literal `true`, so a non-reflexive equality
+    /// declines exactly as before.
+    fn plan_eq_refl_fold(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        term: TermId,
+        folded: TermId,
+        symbol: &Symbol,
+        args: &[TermId],
+        new_args: &[TermId],
+        child_results: &[EqRes],
+    ) -> Option<(TermId, ProofId)> {
+        if symbol.name() != "=" || new_args.len() != 2 || new_args[0] != new_args[1] {
+            return None;
+        }
+        let true_term = self.terms.true_term();
+        if folded != true_term || cx.refuses_constant_conclusion(folded) {
+            return None;
+        }
+        cx.spend(6)?;
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, Sort::Bool);
+        if rebuilt == term || rebuilt == folded {
+            return None;
+        }
+        // `mk_app` may fold; `refl` must name the node it actually built.
+        match self.terms.get(rebuilt) {
+            TermData::App(rebuilt_symbol, rebuilt_args)
+                if rebuilt_symbol.name() == "=" && rebuilt_args.as_slice() == new_args => {}
+            _ => return None,
+        }
+        let equality = self
+            .terms
+            .mk_app(Symbol::named("="), [rebuilt, true_term], Sort::Bool);
+        match self.terms.get(equality) {
+            TermData::App(equality_symbol, equality_args)
+                if equality_symbol.name() == "="
+                    && equality_args.as_slice() == [rebuilt, true_term] => {}
+            _ => return None,
+        }
+        let premises = Self::congruence_premises(args, child_results, new_args)?;
+        let term_to_rebuilt = self
+            .terms
+            .mk_app(Symbol::named("="), [term, rebuilt], Sort::Bool);
+        let congruence = cx.chain.add_rule_step(
+            AletheRule::Cong,
+            vec![term_to_rebuilt],
+            premises,
+            Vec::new(),
+        );
+        let reflexivity =
+            cx.chain
+                .add_rule_step(AletheRule::Refl, vec![rebuilt], Vec::new(), Vec::new());
+        let not_rebuilt = self.terms.mk_not_raw(rebuilt);
+        let not_true = self.terms.mk_not_raw(true_term);
+        let neg1 = cx.chain.add_rule_step(
+            AletheRule::EquivNeg1,
+            vec![equality, not_rebuilt, not_true],
+            Vec::new(),
+            Vec::new(),
+        );
+        let after_refl = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equality, not_true],
+            vec![neg1, reflexivity],
+            Vec::new(),
+        );
+        let true_taut =
+            cx.chain
+                .add_rule_step(AletheRule::True, vec![true_term], Vec::new(), Vec::new());
+        let lifted = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equality],
+            vec![after_refl, true_taut],
+            Vec::new(),
+        );
+        let term_to_folded = self
+            .terms
+            .mk_app(Symbol::named("="), [term, folded], Sort::Bool);
+        let transitivity = cx.chain.add_rule_step(
+            AletheRule::Trans,
+            vec![term_to_folded],
+            vec![congruence, lifted],
             Vec::new(),
         );
         Some((term_to_folded, transitivity))

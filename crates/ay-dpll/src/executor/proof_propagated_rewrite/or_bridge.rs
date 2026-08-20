@@ -199,7 +199,7 @@ impl PropagationChainPlanner<'_> {
     /// `(cl (not dj))` from `(cl eq)` with `eq` between `dj` and literal
     /// `false`: equivalence elimination plus the `(cl (not false))`
     /// tautology.
-    fn plan_not_disjunct(
+    pub(super) fn plan_not_disjunct(
         &mut self,
         cx: &mut PlanCx<'_>,
         dj: TermId,
