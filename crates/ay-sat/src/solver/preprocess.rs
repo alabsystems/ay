@@ -487,8 +487,16 @@ impl Solver {
             }
             let lit = Literal::positive(Variable(var_idx as u32));
             self.decide(lit);
+            // The propagation must run in EVERY build: it is what advances
+            // `qhead` to the trail end, and post-SAT consumers (`minimize_model`,
+            // `flip_to_none`) gate on that quiescence. This call sat INSIDE the
+            // debug_assert! until 2026-08, so release builds skipped it entirely
+            // and every lucky-solved SAT left qhead parked at the root prefix —
+            // release-only, caught by the flip_to_none tests the first time the
+            // suite ran under --release.
+            let _conflict = self.search_propagate();
             debug_assert!(
-                self.search_propagate().is_none(),
+                _conflict.is_none(),
                 "BUG: conflict in positive monotone lucky phase"
             );
         }
@@ -533,8 +541,11 @@ impl Solver {
             }
             let lit = Literal::negative(Variable(var_idx as u32));
             self.decide(lit);
+            // Same hoisting as the positive twin above: the propagation is
+            // load-bearing (qhead quiescence), never assert-only.
+            let _conflict = self.search_propagate();
             debug_assert!(
-                self.search_propagate().is_none(),
+                _conflict.is_none(),
                 "BUG: conflict in negative monotone lucky phase"
             );
         }

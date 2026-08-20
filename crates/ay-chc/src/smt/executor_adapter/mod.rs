@@ -53,18 +53,54 @@ pub(super) fn dv_unknown_retry_enabled() -> bool {
     crate::ab_switches::get().exec_dv_retry // B27: CLI-owned; env retired.
 }
 
-fn execute_commands_via_executor(commands: &[ay_frontend::Command]) -> Result<Vec<String>, ()> {
+/// Declared consumer of one ay-dpll sub-query's verdict
+/// (#cert-accounting item 3).
+///
+/// This selects between two ay-dpll entrypoints that decide, certify, and
+/// publish IDENTICALLY. It changes no gate and no verdict; ay-dpll reads it
+/// only to attribute certification cost to the channel that paid it
+/// (`ay_dpll::CertificationAccounting`).
+///
+/// The split is nonetheless kept honest, because a later stage may key policy
+/// on it: `InternalLemma` may be declared ONLY where the verdict feeds the CHC
+/// engine's own search and the engine re-derives its published claim from
+/// scratch afterwards. Every channel on which a raw `"unsat"` BECOMES the
+/// published claim stays `Published` — in this module that is
+/// `check_unsat_smtlib_via_executor` (the ghost-pair quantified certification
+/// fallback), `smtlib_first_verdict_via_executor` (the checked-replay
+/// obligation re-execution), and the strict-unsat-cert obligation lane, none
+/// of which may ever be relabelled without re-auditing what backs their claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutorQueryRole {
+    /// The verdict is (or becomes) a published claim.
+    Published,
+    /// The verdict is consumed only as CHC search guidance.
+    InternalLemma,
+}
+
+fn execute_commands_via_executor(
+    commands: &[ay_frontend::Command],
+    role: ExecutorQueryRole,
+) -> Result<Vec<String>, ()> {
     let trace = exec_trace_enabled();
     let t_new = ay_core::time::Instant::now();
     let mut exec = ay_dpll::Executor::new();
     let new_dt = t_new.elapsed();
     let t_exec = ay_core::time::Instant::now();
     let result = ay_core::catch_ay_panics(
-        AssertUnwindSafe(|| match exec.execute_all(commands) {
-            Ok(out) => Ok(out),
-            Err(e) => {
-                tracing::debug!("executor_adapter: execution error: {e}");
-                Err(())
+        AssertUnwindSafe(|| {
+            // Both entrypoints decide, certify, and publish identically; the
+            // declaration only attributes this channel's certification cost.
+            let executed = match role {
+                ExecutorQueryRole::Published => exec.execute_all(commands),
+                ExecutorQueryRole::InternalLemma => exec.execute_all_internal_lemma(commands),
+            };
+            match executed {
+                Ok(out) => Ok(out),
+                Err(e) => {
+                    tracing::debug!("executor_adapter: execution error: {e}");
+                    Err(())
+                }
             }
         }),
         |reason| {
@@ -109,7 +145,7 @@ pub(crate) fn check_unsat_smtlib_via_executor(smt: &str) -> bool {
             return false;
         }
     };
-    match execute_commands_via_executor(&commands) {
+    match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
         Ok(outputs) => outputs.first().map(String::as_str) == Some("unsat"),
         Err(()) => false,
     }
@@ -149,7 +185,7 @@ pub(crate) fn smtlib_first_verdict_via_executor(
             return None;
         }
     };
-    match execute_commands_via_executor(&commands) {
+    match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
         Ok(outputs) => outputs.first().cloned(),
         Err(()) => None,
     }
@@ -572,7 +608,18 @@ impl SmtContext {
         };
         let parse_dt = t_parse.elapsed();
 
-        let outputs = match execute_commands_via_executor(&commands) {
+        // SHARED LANE — role must be Published. This is the executor lane of
+        // `SmtContext::check_sat`, and `SmtContext::check_sat` is what the PDR
+        // SAFETY VERIFIER runs on (`pdr/verification/model_safety.rs`,
+        // `model_inductive.rs`, both reached from `verify_model_impl`). On that
+        // path a false UNSAT becomes a false `Safe`. Labelling the lane
+        // `InternalLemma` because *some* callers are search guidance would be
+        // the caller-blind inference this role parameter exists to abolish, and
+        // the "the engine re-derives its claim afterwards" justification is
+        // circular here: the re-derivation's own queries come through here too.
+        // A caller that is genuinely internal must declare it at ITS call site,
+        // after audit. Until then the fail-safe answer is Published.
+        let outputs = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
             Ok(out) => out,
             Err(()) => return SmtResult::Unknown,
         };
@@ -740,7 +787,11 @@ pub(crate) fn check_sat_conjunction_via_executor(
         }
     };
 
-    let outputs = match execute_commands_via_executor(&commands) {
+    // SHARED LANE — role must be Published, for the same reason as the
+    // `check_sat_via_executor_with_opts` dispatch above: this incremental
+    // conjunction check is reachable from the PDR verification gate, and no
+    // audit has established that every caller is search guidance. Fail safe.
+    let outputs = match execute_commands_via_executor(&commands, ExecutorQueryRole::Published) {
         Ok(out) => out,
         Err(()) => return IncrementalCheckResult::Unknown,
     };

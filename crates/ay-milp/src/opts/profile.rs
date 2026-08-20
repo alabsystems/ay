@@ -332,6 +332,9 @@ impl EngineEconomics {
         if let Some(v) = self.impl_arm {
             p = p.with(Knob::ImplArm, Setting::Count(v));
         }
+        if let Some(v) = self.drought_dive {
+            p = p.with(Knob::DroughtDive, Setting::Count(v));
+        }
         if let Some(v) = self.prop_conflict {
             p = p.with(Knob::PropConflict, Setting::Flag(v));
         }

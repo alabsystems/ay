@@ -2406,8 +2406,21 @@ fn test_try_synthesis_mod1000_split_triangle_requires_full_validation_9692() {
     }
 }
 
+/// The assertion here is FUNCTIONAL — these four CHC-COMP benchmarks must be
+/// discharged by validated structural synthesis — and the timeout is only a
+/// hang guard, so it is sized like its sibling
+/// `test_try_synthesis_mod1000_split_triangle_requires_full_validation_9692`
+/// rather than tightly.
+///
+/// It was 10s, which the four solves nearly exhaust on their own (~8.5s
+/// isolated). Run in-lib under the default parallel runner alongside 4400+
+/// other tests, the remaining 1.5s is scheduler time, not solver time, so the
+/// test failed on contention while asserting nothing about it. The repo's usual
+/// remedy — a dedicated test binary, as `dillig12_m_deadline_4751` documents —
+/// is unavailable here because `try_synthesis` is `pub(crate)` and widening it
+/// purely to relocate a test would be the worse trade.
 #[test]
-#[timeout(10_000)]
+#[timeout(60_000)]
 fn test_try_synthesis_accepts_chccomp_extra_small_lia_safe_summaries() {
     for (name, input) in [
         (
@@ -5960,8 +5973,19 @@ fn test_top_model_query_infeasibility_rejects_satisfiable_query_constraint() {
 }
 
 #[test]
-#[timeout(15_000)]
+#[timeout(60_000)]
 fn test_top_model_query_infeasibility_solves_hcai_targets() {
+    // Wall-clock-deadline route test. Green in ISOLATION on every measured
+    // host since the 2026-08-17 wave (the Farkas byte/hole phantom charges
+    // and the 750ms validation reserve were the real defects); under a FULL
+    // 16-way parallel debug suite on a Grace box every 5s attempt window is
+    // still scheduler-starved — the env lock and bounded retries below help
+    // at moderate load but cannot beat sustained full-suite contention, and
+    // the route budget cap deliberately refuses to let a test grant more
+    // wall. Treat a full-suite-only failure here as load, not regression:
+    // `cargo test -p ay-chc --lib test_top_model_query_infeasibility` is the
+    // authoritative check.
+    let _env_guard = lock_env();
     let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../benchmarks/chc/chc-comp25-benchmarks/hcai-bench/svcomp/O0");
     for (name, file_name) in [
@@ -6010,9 +6034,21 @@ fn test_top_model_query_infeasibility_solves_hcai_targets() {
             "{name} transformed query constraint must admit the top candidate"
         );
         let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
-        let result = adaptive.try_reduced_lia_array_preprocessed_route(Some(
-            Instant::now() + Duration::from_secs(5),
-        ));
+        // Wall-clock route under a full parallel suite: one attempt's 5s
+        // deadline is scheduler-load-sensitive (measured ~4.2s in isolation
+        // on a Grace debug build once validation really checks the AUFLIA
+        // Farkas lemmas). Retry a bounded number of times so contention flake
+        // cannot masquerade as a route regression; a deterministic failure
+        // still fails every attempt.
+        let mut result = None;
+        for _ in 0..3 {
+            result = adaptive.try_reduced_lia_array_preprocessed_route(Some(
+                Instant::now() + Duration::from_secs(5),
+            ));
+            if result.is_some() {
+                break;
+            }
+        }
         let Some((PortfolioResult::Safe(_), ValidationEvidence::FullVerification)) = result else {
             panic!(
                 "{name} should be discharged by the reduced, back-translated, \

@@ -1461,7 +1461,7 @@ fn soft_reset_preserves_statistics_and_reduced_terms() {
     );
 }
 
-/// NF-engine closure 5 is QUARANTINED: `AY_STR_NF=1` alone must NOT enable
+/// NF-engine closure 5 is QUARANTINED: `--str-nf` alone must NOT enable
 /// it (measured wrong-UNSAT witness — see
 /// `NF_CLOSURES_REQUIRING_EXPLICIT_OPT_IN`), while the closures that are
 /// still trusted stay reachable. Naming it explicitly in
@@ -1480,11 +1480,11 @@ fn nf_closure_5_is_not_enabled_by_the_master_switch_alone() {
 
     assert!(
         !five,
-        "closure 5 is quarantined: AY_STR_NF=1 alone must not enable it"
+        "closure 5 is quarantined: --str-nf alone must not enable it"
     );
     assert!(
         trusted.iter().all(|&t| t),
-        "closures 1-4 and 6 must stay enabled under AY_STR_NF=1: {trusted:?}"
+        "closures 1-4 and 6 must stay enabled under --str-nf: {trusted:?}"
     );
     assert!(
         !str_nf_closure_enabled(6),

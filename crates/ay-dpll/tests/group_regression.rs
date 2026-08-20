@@ -31,6 +31,8 @@ mod false_unsat_auflia_disjunct_forall;
 mod false_unsat_auflia_exists_eq;
 #[path = "group_regression/false_unsat_auflia_rodin.rs"]
 mod false_unsat_auflia_rodin;
+#[path = "group_regression/false_unsat_incremental_store_select_syntactic.rs"]
+mod false_unsat_incremental_store_select_syntactic;
 #[path = "group_regression/false_unsat_large_coeff_ite.rs"]
 mod false_unsat_large_coeff_ite;
 #[path = "group_regression/false_unsat_to_int_mod_hnf.rs"]

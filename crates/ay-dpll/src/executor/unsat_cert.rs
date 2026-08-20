@@ -18,6 +18,7 @@ use ay_core::{Sort as CoreSort, TermId, TermStore as CoreTermStore};
 use ay_frontend::{CheckedProjectionBinding, ProjectionBindingRequest, SourceContextStamp};
 use ay_proof::{AuthenticatedBoolBvUnsatQuery, AuthenticatedBvLiaUnsatQuery};
 use num_bigint::BigInt;
+use num_rational::BigRational;
 
 mod assumption_source;
 mod certification_source;
@@ -28,6 +29,7 @@ pub(super) use pending_nested_array::PendingNestedArrayBoolBvUnsat;
 pub(in crate::executor) use probe::probe_cert_reject;
 #[path = "unsat_cert/internal_certificate_scope.rs"]
 mod internal_certificate_scope;
+use super::cert_accounting;
 use super::{Executor, QuantifierDeadlinePolicy};
 use crate::executor::exact_exists_bounds::CheckedExactExistsUnsat;
 use crate::executor::exact_forall_exists::CheckedExactForallExistsUnsat;
@@ -115,11 +117,25 @@ enum UnsatCertificateKind {
         scope: AuthenticatedUnsatScope,
     },
     CheckedBoolBv(CheckedBoolBvUnsat),
+    /// #bitblast-original-clause-authority — an independently checked
+    /// refutation of the exact public query in the Bool/BV fragment EXTENDED
+    /// by the congruence-free uninterpreted-leaf abstraction and the Bool-ATOM
+    /// abstraction over non-finitely-sorted operands.
+    ///
+    /// Deliberately a class of its own rather than a second producer of
+    /// `CheckedBoolBv`: that class means "exact fragment, nothing abstracted",
+    /// and routing an abstraction-backed theorem through it would launder the
+    /// authority into a gate that asserts something stronger. The theorem
+    /// itself is no weaker — the abstraction over-approximates the exact model
+    /// class, so its refutation refutes the exact query, and the refutation is
+    /// still independently re-lowered, gate-CNF'd, RUP-refuted and replayed.
+    CheckedUfLeafBoolBv(CheckedUfLeafBoolBvUnsat),
     CheckedBvLia(CheckedBvLiaUnsat),
     DischargedTrust(AuthenticatedUnsatScope),
     CheckedExactExists(CheckedExactExistsUnsat),
     CheckedExactForallExists(CheckedExactForallExistsUnsat),
     CheckedExactClosedForall(CheckedExactClosedForallUnsat),
+    CheckedExactClosedSentence(CheckedExactClosedSentenceUnsat),
     CheckedExactForallUfGround(CheckedExactForallUfGroundUnsat),
     CheckedExactFiniteExpansion(CheckedExactFiniteExpansionUnsat),
     /// #proof-capability B3 — the competition-mode raw admission carve-out.
@@ -173,6 +189,142 @@ pub(in crate::executor) struct CheckedExactClosedForallUnsat {
     exact_instance: TermId,
     exact_instance_entry: TermEntryStamp,
     interpreted_operators: Box<[String]>,
+    term_snapshot: TermStoreSnapshotStamp,
+}
+
+/// One checked step in a sealed closed-sentence refutation derivation.
+///
+/// `Ground*` steps are re-evaluated (empty model, isolated memo) on every
+/// currentness check.  `Nested*` steps record that the checked reconfirmation
+/// primitive ([`Executor::reconfirms_negation_refuted_for_closed_sentence`])
+/// independently re-derived `unsat` for the pinned sentence (respectively its
+/// pinned fresh negation) at mint time; like the SAT-side general arm that
+/// uses the identical primitive, that confirmation is mint-time-only and the
+/// step stays valid only while every pinned term identity and the full term
+/// snapshot remain current.
+#[derive(Debug)]
+enum ClosedSentenceObligationKind {
+    /// `evaluate_term(empty model)` returned `Bool(true)` for the pinned term.
+    GroundTrue,
+    /// `evaluate_term(empty model)` returned `Bool(false)` for the pinned term.
+    GroundFalse,
+    /// The pinned sentence itself was refuted (`unsat`) by the checked
+    /// reconfirmation primitive: the sentence is FALSE.
+    NestedRefuted,
+    /// The pinned sentence's fresh negation was refuted by the checked
+    /// reconfirmation primitive: the sentence is VALID (hence TRUE).
+    NestedNegationRefuted {
+        negation: TermId,
+        negation_entry: TermEntryStamp,
+    },
+}
+
+#[derive(Debug)]
+struct SealedClosedSentenceObligation {
+    term: TermId,
+    entry: TermEntryStamp,
+    kind: ClosedSentenceObligationKind,
+}
+
+/// Mint-time obligation before entry stamps are captured.
+#[derive(Debug)]
+struct ClosedSentenceObligation {
+    term: TermId,
+    kind: ClosedSentenceObligationKindDraft,
+}
+
+#[derive(Debug)]
+enum ClosedSentenceObligationKindDraft {
+    GroundTrue,
+    GroundFalse,
+    NestedRefuted,
+    NestedNegationRefuted { negation: TermId },
+}
+
+/// Deterministic work allowances for one closed-sentence refutation attempt.
+///
+/// Nested solves dominate the cost; the node budget bounds the skeleton walk
+/// including witness re-expansion.  Exhaustion declines — never a wrong
+/// answer, only a missed grant.
+#[derive(Debug)]
+struct ClosedSentenceRefutationBudget {
+    nested_solves: u32,
+    nodes: u32,
+}
+
+impl ClosedSentenceRefutationBudget {
+    const MAX_NESTED_SOLVES: u32 = 6;
+    const MAX_NODES: u32 = 512;
+
+    fn new() -> Self {
+        Self {
+            nested_solves: Self::MAX_NESTED_SOLVES,
+            nodes: Self::MAX_NODES,
+        }
+    }
+
+    fn take_node(&mut self) -> bool {
+        if self.nodes == 0 {
+            return false;
+        }
+        self.nodes -= 1;
+        true
+    }
+
+    fn take_nested_solve(&mut self) -> bool {
+        if self.nested_solves == 0 {
+            return false;
+        }
+        self.nested_solves -= 1;
+        true
+    }
+}
+
+/// Sealed evidence that one authored top-level closed sentence — no
+/// uninterpreted symbols, no uninterpreted binder sorts — is FALSE, refuting
+/// the whole authored conjunction.
+///
+/// This is the UNSAT sibling of the grant-only
+/// `CheckedExactClosedSentenceSat` certificate (#closed-sentence-cert): the
+/// SAT arm proves a closed sentence VALID by refuting its negation through the
+/// checked reconfirmation primitive; this arm proves a closed sentence FALSE
+/// through the SAME primitive plus empty-model ground evaluation.  A closed
+/// sentence over interpreted sorts with no uninterpreted symbols has a fixed
+/// truth value, so "one authored conjunct is false" is a complete refutation
+/// of the query.
+///
+/// The sole constructor
+/// ([`Executor::try_authorize_current_query_refuted_closed_sentence_unsat`])
+/// independently requires all of the following:
+///
+/// - the current assumption-free public query and source/declaration epoch;
+/// - every authored root closed, free of uninterpreted symbols, with every
+///   binder over an interpreted sort and no shadowed core operator;
+/// - a derivation for one authored root whose every step is either an
+///   empty-model ground evaluation or a refutation independently re-derived
+///   by the checked reconfirmation primitive (fresh executor, deterministic
+///   count bounds, structural proof screen);
+/// - witness instantiation only through capture-avoiding substitution of
+///   closed scalar candidate terms, and only where a false instance
+///   (respectively a true instance of an existential body) is the exact
+///   quantifier semantics being certified.
+///
+/// The full term-store snapshot plus individual entry stamps make the token
+/// fail closed across append, rollback, or numeric-slot reuse.  Fields are
+/// private to this module, so no other lane can relabel a provisional verdict
+/// as this theorem.
+#[derive(Debug)]
+pub(in crate::executor) struct CheckedExactClosedSentenceUnsat {
+    query_epoch: QueryAuthorityEpoch,
+    /// Also the declaration/scope revision: any push, pop, declaration,
+    /// definition, or reset retires this evidence.
+    source_declaration_stamp: SourceContextStamp,
+    roots: Box<[TermId]>,
+    root_entries: Box<[TermEntryStamp]>,
+    /// The authored top-level root the derivation certified FALSE.
+    refuted_root: TermId,
+    refuted_root_entry: TermEntryStamp,
+    obligations: Box<[SealedClosedSentenceObligation]>,
     term_snapshot: TermStoreSnapshotStamp,
 }
 
@@ -1019,6 +1171,82 @@ impl CheckedExactClosedForallUnsat {
     }
 }
 
+impl CheckedExactClosedSentenceUnsat {
+    fn is_current(&self, executor: &Executor) -> bool {
+        if crate::executor::model::scoped_term_evaluation_override_active()
+            || !self
+                .query_epoch
+                .is_same_epoch(&executor.query_authority_epoch)
+            || self.source_declaration_stamp != executor.ctx.source_context_stamp()
+            || self.roots.as_ref() != executor.ctx.assertions.as_slice()
+            || self.term_snapshot != executor.ctx.terms.snapshot_stamp()
+            || !CheckedExactClosedForallUnsat::entries_are_current(
+                &executor.ctx.terms,
+                &self.roots,
+                &self.root_entries,
+            )
+            || executor.ctx.terms.entry_stamp(self.refuted_root) != Some(self.refuted_root_entry)
+            || !self.roots.contains(&self.refuted_root)
+            || executor.ctx.terms.sort(self.refuted_root) != &CoreSort::Bool
+        {
+            return false;
+        }
+        // Re-check the whole closed-sentence partition, not just the refuted
+        // root: the class boundary ("nothing to interpret anywhere in the
+        // query") is part of what makes one false conjunct a complete
+        // refutation of a sentence with a FIXED truth value.
+        let declared: HashSet<String> = executor
+            .ctx
+            .symbol_iter()
+            .map(|(name, info)| executor.ctx.symbol_identity_name(name, info).to_string())
+            .collect();
+        if !executor.exact_closed_sentence_operators_are_unshadowed() {
+            return false;
+        }
+        for &root in self.roots.iter() {
+            if !executor.closed_sentence_without_uninterpreted_symbols(root, &declared)
+                || !executor.closed_sentence_binder_sorts_are_interpreted(root)
+            {
+                return false;
+            }
+        }
+        for obligation in self.obligations.iter() {
+            if executor.ctx.terms.entry_stamp(obligation.term) != Some(obligation.entry) {
+                return false;
+            }
+            match &obligation.kind {
+                ClosedSentenceObligationKind::GroundTrue
+                | ClosedSentenceObligationKind::GroundFalse => {
+                    let expected =
+                        matches!(obligation.kind, ClosedSentenceObligationKind::GroundTrue);
+                    let holds = crate::executor::model::with_isolated_eval_memo(|| {
+                        matches!(
+                            executor.evaluate_term(
+                                &crate::executor::model::Model::empty(),
+                                obligation.term,
+                            ),
+                            crate::executor::model::EvalValue::Bool(value) if value == expected
+                        )
+                    });
+                    if !holds {
+                        return false;
+                    }
+                }
+                ClosedSentenceObligationKind::NestedRefuted => {}
+                ClosedSentenceObligationKind::NestedNegationRefuted {
+                    negation,
+                    negation_entry,
+                } => {
+                    if executor.ctx.terms.entry_stamp(*negation) != Some(*negation_entry) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 /// Bounded source walk used only by the exact closed-forall token.
 const EXACT_CLOSED_FORALL_WORK_LIMIT: usize = 100_000;
 
@@ -1132,6 +1360,26 @@ fn exact_operator_identities_are_unshadowed(
         let identity = ctx.symbol_identity_name(surface, info);
         !operators.iter().any(|operator| operator == identity)
     })
+}
+
+/// The authored obligation the deferred-trust discharge reasons about, and
+/// whether that obligation is the WHOLE public query.
+///
+/// `premises` is the set every accepting step may use: the strict-proof
+/// problem plus the caller's exact bound `check-sat-assuming` literals, minus
+/// any literal that lacks premise authority (today: the canonical `false` term
+/// when the author did not write `false` — see
+/// `Executor::strict_proof_problem_with_bound_assumptions`).
+///
+/// `exact` is `false` exactly when something was withheld, i.e. when
+/// `premises` is a PROPER SUBSET of the query. A rejecting guard whose
+/// inference needs the whole query must abstain in that case; an accepting
+/// step is unaffected, because proving a subset unsatisfiable is the stronger
+/// claim.
+struct AuthoredProblemScope {
+    premises: Vec<TermId>,
+    authorized_assumptions: Vec<TermId>,
+    exact: bool,
 }
 
 /// Exact public-query scope retained by proof-based certification lanes.
@@ -1318,6 +1566,51 @@ impl CheckedBoolBvUnsat {
     }
 }
 
+/// A source-level Bool/BV refutation over the uninterpreted-leaf and Bool-atom
+/// abstraction, bound to one exact public-query scope.
+///
+/// Every conjunct of `CheckedBoolBvUnsat::bind` is reproduced verbatim: the
+/// epoch may declare no extension, the evidence's own term-store snapshot must
+/// still be current for these exact roots, and the roots must equal the sealed
+/// assertion vector followed by the sealed assumption vector, element for
+/// element. Binding is the only constructor, so the abstraction-backed
+/// evidence can never be retargeted at a different query than the one it was
+/// minted for.
+#[derive(Debug)]
+struct CheckedUfLeafBoolBvUnsat {
+    scope: AuthenticatedUnsatScope,
+    evidence: AuthenticatedBoolBvUnsatQuery,
+}
+
+impl CheckedUfLeafBoolBvUnsat {
+    fn bind(
+        scope: AuthenticatedUnsatScope,
+        evidence: AuthenticatedBoolBvUnsatQuery,
+        terms: &ay_core::TermStore,
+        exact_roots: &[TermId],
+    ) -> Option<Self> {
+        if !scope.declared_extension.is_empty()
+            || scope.declared_extension_objectives.is_some()
+            || !evidence.is_current_for(terms, exact_roots)
+            || !exact_roots.iter().copied().eq(scope
+                .assertions
+                .iter()
+                .chain(scope.assumptions.iter())
+                .copied())
+        {
+            return None;
+        }
+        Some(Self { scope, evidence })
+    }
+
+    fn is_current(&self, executor: &Executor) -> bool {
+        self.scope.is_current(executor)
+            && self.scope.declared_extension.is_empty()
+            && self.scope.declared_extension_objectives.is_none()
+            && self.evidence.term_snapshot_is_current(&executor.ctx.terms)
+    }
+}
+
 /// A source-level mixed Bool/Int/BV semantic refutation bound to one exact
 /// public-query scope.
 #[derive(Debug)]
@@ -1365,11 +1658,13 @@ pub(super) enum CommandUnsatAdmission {
     StrictProof,
     CheckedSatRefutation,
     CheckedBoolBv,
+    CheckedUfLeafBoolBv,
     CheckedBvLia,
     DischargedTrust,
     CheckedExactExists,
     CheckedExactForallExists,
     CheckedExactClosedForall,
+    CheckedExactClosedSentence,
     CheckedExactForallUfGround,
     CheckedExactFiniteExpansion,
     /// #proof-capability B3 — scope-authenticated raw admission under
@@ -1392,6 +1687,9 @@ impl UnsatCertificate {
             UnsatCertificateKind::CheckedExactClosedForall(evidence) => {
                 evidence.is_current(executor)
             }
+            UnsatCertificateKind::CheckedExactClosedSentence(evidence) => {
+                evidence.is_current(executor)
+            }
             UnsatCertificateKind::CheckedExactForallUfGround(evidence) => {
                 evidence.is_current(executor)
             }
@@ -1401,6 +1699,7 @@ impl UnsatCertificate {
             UnsatCertificateKind::StrictProof(_)
             | UnsatCertificateKind::CheckedSatRefutation { .. }
             | UnsatCertificateKind::CheckedBoolBv(_)
+            | UnsatCertificateKind::CheckedUfLeafBoolBv(_)
             | UnsatCertificateKind::CheckedBvLia(_)
             | UnsatCertificateKind::DischargedTrust(_)
             | UnsatCertificateKind::CompetitionRaw(_) => false,
@@ -1416,6 +1715,7 @@ impl UnsatCertificate {
             &self.0,
             UnsatCertificateKind::CheckedSatRefutation { .. }
                 | UnsatCertificateKind::CheckedBoolBv(_)
+                | UnsatCertificateKind::CheckedUfLeafBoolBv(_)
                 | UnsatCertificateKind::CheckedBvLia(_)
                 | UnsatCertificateKind::DischargedTrust(_)
         )
@@ -1427,6 +1727,7 @@ impl UnsatCertificate {
             UnsatCertificateKind::CheckedExactExists(_)
                 | UnsatCertificateKind::CheckedExactForallExists(_)
                 | UnsatCertificateKind::CheckedExactClosedForall(_)
+                | UnsatCertificateKind::CheckedExactClosedSentence(_)
                 | UnsatCertificateKind::CheckedExactForallUfGround(_)
                 | UnsatCertificateKind::CheckedExactFiniteExpansion(_)
         )
@@ -1455,6 +1756,9 @@ impl UnsatCertificate {
                 CommandUnsatAdmission::CheckedSatRefutation
             }
             UnsatCertificateKind::CheckedBoolBv(_) => CommandUnsatAdmission::CheckedBoolBv,
+            UnsatCertificateKind::CheckedUfLeafBoolBv(_) => {
+                CommandUnsatAdmission::CheckedUfLeafBoolBv
+            }
             UnsatCertificateKind::CheckedBvLia(_) => CommandUnsatAdmission::CheckedBvLia,
             UnsatCertificateKind::DischargedTrust(_) => CommandUnsatAdmission::DischargedTrust,
             UnsatCertificateKind::CheckedExactExists(_) => {
@@ -1465,6 +1769,9 @@ impl UnsatCertificate {
             }
             UnsatCertificateKind::CheckedExactClosedForall(_) => {
                 CommandUnsatAdmission::CheckedExactClosedForall
+            }
+            UnsatCertificateKind::CheckedExactClosedSentence(_) => {
+                CommandUnsatAdmission::CheckedExactClosedSentence
             }
             UnsatCertificateKind::CheckedExactForallUfGround(_) => {
                 CommandUnsatAdmission::CheckedExactForallUfGround
@@ -1636,6 +1943,7 @@ impl Executor {
                 CommandUnsatAdmission::CheckedExactExists
                     | CommandUnsatAdmission::CheckedExactForallExists
                     | CommandUnsatAdmission::CheckedExactClosedForall
+                    | CommandUnsatAdmission::CheckedExactClosedSentence
                     | CommandUnsatAdmission::CheckedExactForallUfGround
                     | CommandUnsatAdmission::CheckedExactFiniteExpansion
             )
@@ -1650,6 +1958,7 @@ impl Executor {
             Some(
                 CommandUnsatAdmission::CheckedSatRefutation
                     | CommandUnsatAdmission::CheckedBoolBv
+                    | CommandUnsatAdmission::CheckedUfLeafBoolBv
                     | CommandUnsatAdmission::CheckedBvLia
                     | CommandUnsatAdmission::DischargedTrust
             )
@@ -1684,6 +1993,48 @@ impl Executor {
     /// `ctx.assertions` participates only as a currentness equality check. This
     /// keeps a later Skolemized or instantiated working window from acquiring
     /// source-level authority by shape coincidence.
+    /// The AUTHORED hard-assertion roots of the current public UNSAT query, for
+    /// callers that will RE-DECIDE a subset of them in isolation.
+    ///
+    /// This keeps every scope conjunct of
+    /// [`Self::exact_plain_hard_unsat_scope_is_current`] that bears on whether
+    /// the verdict rests on authored HARD assertions alone — same epoch, no
+    /// assumptions, no declared extensions or objectives — and deliberately
+    /// drops the two that compare the LIVE working window
+    /// (`epoch.assertions == ctx.assertions` and the matching proof-provenance
+    /// equality).
+    ///
+    /// Dropping them is sound here and only here: those conjuncts exist so a
+    /// Skolemized/instantiated window cannot acquire SOURCE authority by shape
+    /// coincidence, whereas this accessor's callers take no authority from the
+    /// live window at all — they re-solve the authored roots from scratch on a
+    /// disposable executor, and that probe re-binds epoch, source stamp, ordered
+    /// roots, and term snapshot itself. Inside the quantifier loop the window
+    /// has necessarily been rewritten, so requiring equality would make the
+    /// accessor unconditionally `None` exactly where it is needed.
+    pub(in crate::executor) fn authored_hard_unsat_roots_for_isolated_recheck(
+        &self,
+    ) -> Option<Vec<TermId>> {
+        let epoch = self.unsat_query_epoch.as_ref()?;
+        let no_assumptions = epoch
+            .assumptions
+            .as_deref()
+            .is_none_or(<[TermId]>::is_empty);
+        if !(epoch.is_current(self)
+            && no_assumptions
+            && epoch.declared_extension.is_empty()
+            && epoch.declared_extension_entries.is_empty()
+            && epoch.declared_extension_objectives.is_none()
+            && epoch.declared_extension_objective_entries.is_none())
+        {
+            return None;
+        }
+        if self.last_assumptions.iter().flatten().next().is_some() {
+            return None;
+        }
+        Some(epoch.assertions.clone())
+    }
+
     pub(in crate::executor) fn try_authorize_current_query_exact_forall_exists_unsat(
         &self,
     ) -> Option<CheckedExactForallExistsUnsat> {
@@ -1807,6 +2158,495 @@ impl Executor {
             interpreted_operators: interpreted_operators.into_boxed_slice(),
             term_snapshot,
         })
+    }
+
+    /// Authenticate one refuted authored closed sentence for the current
+    /// public query (#closed-sentence-cert, UNSAT arm — U2).
+    ///
+    /// SYMMETRY.  `try_valid_closed_sentence_sat_certificate` proves a closed,
+    /// uninterpreted-symbol-free sentence VALID by refuting its negation with
+    /// [`Self::reconfirms_negation_refuted_for_closed_sentence`].  Before this
+    /// method there was no arm that, when the SENTENCE ITSELF is refuted by
+    /// the same checked primitive, publishes UNSAT — nested-alternation
+    /// closed sentences (`¬∃y.(range(y) ∧ ∀x.φ)`, `∀x.(guard → ∃y.ψ)`) were
+    /// excluded from every UNSAT lane: the closed-universal precheck requires
+    /// quantifier-free bodies and CEGQI cannot certify alternations.
+    ///
+    /// MECHANISM.  The primitive alone cannot decide a nested alternation (the
+    /// fresh executor's own publication funnel fails closed on exactly the
+    /// same class — MEASURED: the whole-sentence probe re-derives the internal
+    /// `unsat` and then downgrades it at the CEGQI certification arm), so the
+    /// derivation instantiates the outermost binder at a closed scalar witness
+    /// candidate and discharges the remaining CLOSED sub-sentences with the
+    /// two instruments the certificate family already trusts:
+    ///
+    /// - empty-model `evaluate_term` for quantifier-free closed parts (the
+    ///   exact instrument of `CheckedExactClosedForallUnsat`), and
+    /// - the checked reconfirmation primitive for one-level quantified parts
+    ///   (the exact instrument of the SAT-side general arm) — run on the
+    ///   sub-sentence itself to prove it FALSE, or on its fresh negation to
+    ///   prove it VALID.
+    ///
+    /// The witness candidate is an untrusted proposal (closed scalar literals
+    /// collected from the sentence plus 0/±1 defaults); every accepting step
+    /// is one of the two checked instruments above.  Substitution is the
+    /// capture-avoiding `ematching::subst_vars`.
+    ///
+    /// FAIL-CLOSED PERIMETER.  Grant-only: `None` on every doubt, leaving the
+    /// caller's fail-closed `Unknown` untouched.  The partition is the SAT
+    /// certificate's own (every root closed, symbol-free, unshadowed core
+    /// operators, interpreted binder sorts).  Nested solves are bounded by a
+    /// fixed count budget and the primitive's deterministic conflict/decision
+    /// allowances, respect the outer deadline/interrupt, and respect
+    /// `CLOSED_SENTENCE_REFUTATION_DEPTH` — inside a nested reconfirmation
+    /// solve the primitive declines at depth, so this producer cannot recurse.
+    ///
+    /// Kill switch: `--dpll-no-closed-sentence-unsat-cert` (default on).
+    pub(in crate::executor) fn try_authorize_current_query_refuted_closed_sentence_unsat(
+        &mut self,
+    ) -> Option<CheckedExactClosedSentenceUnsat> {
+        self.try_authorize_refuted_closed_sentence_unsat_with(
+            ay_core::theory_disable_flags().no_closed_sentence_unsat_cert,
+        )
+    }
+
+    /// CLI-threaded body of the mint so the kill switch is testable without
+    /// process-global flag state.  `disabled_by_cli` is the exact value of
+    /// `--dpll-no-closed-sentence-unsat-cert`.
+    pub(in crate::executor) fn try_authorize_refuted_closed_sentence_unsat_with(
+        &mut self,
+        disabled_by_cli: bool,
+    ) -> Option<CheckedExactClosedSentenceUnsat> {
+        let debug = ay_core::misc_cli_flags().debug_cert;
+        if disabled_by_cli {
+            if debug {
+                eprintln!("CERT/refuted-sentence decline: disabled by CLI");
+            }
+            return None;
+        }
+        if crate::executor::model::scoped_term_evaluation_override_active()
+            || !self.exact_plain_hard_unsat_scope_is_current()
+            || self.external_stop_reason().is_some()
+        {
+            return None;
+        }
+        // Explicit proof/strict/self-check modes cannot consume this
+        // semantic-only certificate (the common mint rejects it at emission).
+        // Decline here instead so those modes keep their original fail-closed
+        // quantifier diagnostics and pay no nested-solve work.
+        if self.strict_unsat_presentation_required() {
+            if debug {
+                eprintln!("CERT/refuted-sentence decline: strict proof presentation required");
+            }
+            return None;
+        }
+        // The accepting instrument is depth-guarded; do not spend partition
+        // and witness work when every primitive call would decline anyway.
+        if CLOSED_SENTENCE_REFUTATION_DEPTH.with(|d| d.get()) > 0 {
+            return None;
+        }
+        let (roots, root_entries) = {
+            let epoch = self.unsat_query_epoch.as_ref()?;
+            (epoch.assertions.clone(), epoch.assertion_entries.clone())
+        };
+        if roots.is_empty()
+            || !roots
+                .iter()
+                .any(|&root| crate::ematching::contains_quantifier(&self.ctx.terms, root))
+        {
+            return None;
+        }
+        // ---- PARTITION (shared with the SAT-side certificate): every root
+        // closed, free of uninterpreted symbols, unshadowed core operators,
+        // interpreted binder sorts.
+        let declared: HashSet<String> = self
+            .ctx
+            .symbol_iter()
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
+            .collect();
+        if !self.exact_closed_sentence_operators_are_unshadowed() {
+            if debug {
+                eprintln!("CERT/refuted-sentence decline: core operator is source-shadowed");
+            }
+            return None;
+        }
+        for &root in &roots {
+            if !self.closed_sentence_without_uninterpreted_symbols(root, &declared) {
+                if debug {
+                    eprintln!(
+                        "CERT/refuted-sentence decline: {root:?} is not a closed sentence \
+                         free of uninterpreted symbols"
+                    );
+                }
+                return None;
+            }
+            if !self.closed_sentence_binder_sorts_are_interpreted(root) {
+                if debug {
+                    eprintln!(
+                        "CERT/refuted-sentence decline: {root:?} binds an uninterpreted sort"
+                    );
+                }
+                return None;
+            }
+        }
+        // ---- DERIVATION: one authored root certified FALSE refutes the
+        // whole conjunction (each root is closed and symbol-free, so it has a
+        // fixed truth value; a false conjunct falsifies the query).
+        let mut refuted_root = None;
+        let mut obligations: Vec<ClosedSentenceObligation> = Vec::new();
+        for &root in &roots {
+            obligations.clear();
+            let mut budget = ClosedSentenceRefutationBudget::new();
+            if self.closed_sentence_certify_false(root, &mut budget, &mut obligations) {
+                refuted_root = Some(root);
+                break;
+            }
+        }
+        let refuted_root = refuted_root?;
+        if self.external_stop_reason().is_some() {
+            return None;
+        }
+        if debug {
+            eprintln!(
+                "CERT/refuted-sentence: certified {refuted_root:?} FALSE \
+                 ({} checked obligations)",
+                obligations.len()
+            );
+        }
+        // ---- SEAL.  Entry stamps for every pinned term; snapshot captured
+        // after all derivation-time term creation; the exact public scope is
+        // re-checked before the one-shot token is minted.
+        let refuted_root_entry = self.ctx.terms.entry_stamp(refuted_root)?;
+        let sealed = obligations
+            .into_iter()
+            .map(|obligation| {
+                let entry = self.ctx.terms.entry_stamp(obligation.term)?;
+                let kind = match obligation.kind {
+                    ClosedSentenceObligationKindDraft::GroundTrue => {
+                        ClosedSentenceObligationKind::GroundTrue
+                    }
+                    ClosedSentenceObligationKindDraft::GroundFalse => {
+                        ClosedSentenceObligationKind::GroundFalse
+                    }
+                    ClosedSentenceObligationKindDraft::NestedRefuted => {
+                        ClosedSentenceObligationKind::NestedRefuted
+                    }
+                    ClosedSentenceObligationKindDraft::NestedNegationRefuted { negation } => {
+                        ClosedSentenceObligationKind::NestedNegationRefuted {
+                            negation,
+                            negation_entry: self.ctx.terms.entry_stamp(negation)?,
+                        }
+                    }
+                };
+                Some(SealedClosedSentenceObligation {
+                    term: obligation.term,
+                    entry,
+                    kind,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let term_snapshot = self.ctx.terms.snapshot_stamp();
+        if !self.exact_plain_hard_unsat_scope_is_current()
+            || !self.unsat_query_epoch.as_ref().is_some_and(|epoch| {
+                epoch.assertions == roots && epoch.assertion_entries == root_entries
+            })
+            || term_snapshot != self.ctx.terms.snapshot_stamp()
+        {
+            return None;
+        }
+        Some(CheckedExactClosedSentenceUnsat {
+            query_epoch: self.query_authority_epoch.clone(),
+            source_declaration_stamp: self.ctx.source_context_stamp(),
+            roots: roots.into_boxed_slice(),
+            root_entries: root_entries.into_boxed_slice(),
+            refuted_root,
+            refuted_root_entry,
+            obligations: sealed.into_boxed_slice(),
+            term_snapshot,
+        })
+    }
+
+    /// Certify a closed symbol-free sentence FALSE.  Wrapper that discards the
+    /// obligations of a failed sub-derivation.
+    fn closed_sentence_certify_false(
+        &mut self,
+        term: TermId,
+        budget: &mut ClosedSentenceRefutationBudget,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        let mark = out.len();
+        let ok = self.closed_sentence_certify_false_inner(term, budget, out);
+        if !ok {
+            out.truncate(mark);
+        }
+        ok
+    }
+
+    /// Certify a closed symbol-free sentence TRUE.  Wrapper that discards the
+    /// obligations of a failed sub-derivation.
+    fn closed_sentence_certify_true(
+        &mut self,
+        term: TermId,
+        budget: &mut ClosedSentenceRefutationBudget,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        let mark = out.len();
+        let ok = self.closed_sentence_certify_true_inner(term, budget, out);
+        if !ok {
+            out.truncate(mark);
+        }
+        ok
+    }
+
+    fn closed_sentence_certify_false_inner(
+        &mut self,
+        term: TermId,
+        budget: &mut ClosedSentenceRefutationBudget,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        if !budget.take_node() || self.ctx.terms.sort(term) != &CoreSort::Bool {
+            return false;
+        }
+        if !crate::ematching::contains_quantifier(&self.ctx.terms, term) {
+            return self.closed_sentence_ground_obligation(term, false, out);
+        }
+        match self.ctx.terms.get(term).clone() {
+            TermData::Not(inner) => self.closed_sentence_certify_true(inner, budget, out),
+            TermData::App(Symbol::Named(operator), args) if operator == "and" => args
+                .iter()
+                .any(|&arg| self.closed_sentence_certify_false(arg, budget, out)),
+            TermData::App(Symbol::Named(operator), args) if operator == "or" => args
+                .iter()
+                .all(|&arg| self.closed_sentence_certify_false(arg, budget, out)),
+            TermData::App(Symbol::Named(operator), args) if operator == "=>" && args.len() == 2 => {
+                self.closed_sentence_certify_true(args[0], budget, out)
+                    && self.closed_sentence_certify_false(args[1], budget, out)
+            }
+            TermData::Forall(vars, body, _) => {
+                // The prescribed instrument first: the sentence itself refuted
+                // by the checked primitive.
+                if self.closed_sentence_nested_refutation(term, false, budget, out) {
+                    return true;
+                }
+                // Witness fallback: one false instance refutes a universal.
+                let [(name, sort)] = vars.as_slice() else {
+                    return false;
+                };
+                let (name, sort) = (name.clone(), sort.clone());
+                let candidates = self.closed_sentence_witness_candidates(term, &sort);
+                candidates.into_iter().any(|candidate| {
+                    let substitution: HashMap<String, TermId> =
+                        std::iter::once((name.clone(), candidate)).collect();
+                    let instance =
+                        crate::ematching::subst_vars(&mut self.ctx.terms, body, &substitution);
+                    self.closed_sentence_certify_false(instance, budget, out)
+                })
+            }
+            TermData::Exists(..) => {
+                // Only the checked primitive can prove an existential false.
+                self.closed_sentence_nested_refutation(term, false, budget, out)
+            }
+            _ => false,
+        }
+    }
+
+    fn closed_sentence_certify_true_inner(
+        &mut self,
+        term: TermId,
+        budget: &mut ClosedSentenceRefutationBudget,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        if !budget.take_node() || self.ctx.terms.sort(term) != &CoreSort::Bool {
+            return false;
+        }
+        if !crate::ematching::contains_quantifier(&self.ctx.terms, term) {
+            return self.closed_sentence_ground_obligation(term, true, out);
+        }
+        match self.ctx.terms.get(term).clone() {
+            TermData::Not(inner) => self.closed_sentence_certify_false(inner, budget, out),
+            TermData::App(Symbol::Named(operator), args) if operator == "and" => args
+                .iter()
+                .all(|&arg| self.closed_sentence_certify_true(arg, budget, out)),
+            TermData::App(Symbol::Named(operator), args) if operator == "or" => args
+                .iter()
+                .any(|&arg| self.closed_sentence_certify_true(arg, budget, out)),
+            TermData::App(Symbol::Named(operator), args) if operator == "=>" && args.len() == 2 => {
+                self.closed_sentence_certify_false(args[0], budget, out)
+                    || self.closed_sentence_certify_true(args[1], budget, out)
+            }
+            TermData::Forall(..) => {
+                // A universal is TRUE exactly when it is valid: refute its
+                // fresh negation with the checked primitive (the SAT-side
+                // general arm's own step).
+                self.closed_sentence_nested_refutation(term, true, budget, out)
+            }
+            TermData::Exists(vars, body, _) => {
+                if self.closed_sentence_nested_refutation(term, true, budget, out) {
+                    return true;
+                }
+                // Witness fallback: one true instance proves an existential.
+                let [(name, sort)] = vars.as_slice() else {
+                    return false;
+                };
+                let (name, sort) = (name.clone(), sort.clone());
+                let candidates = self.closed_sentence_witness_candidates(term, &sort);
+                candidates.into_iter().any(|candidate| {
+                    let substitution: HashMap<String, TermId> =
+                        std::iter::once((name.clone(), candidate)).collect();
+                    let instance =
+                        crate::ematching::subst_vars(&mut self.ctx.terms, body, &substitution);
+                    self.closed_sentence_certify_true(instance, budget, out)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Empty-model evaluation step for a quantifier-free closed sub-sentence.
+    fn closed_sentence_ground_obligation(
+        &self,
+        term: TermId,
+        expected: bool,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        let holds = crate::executor::model::with_isolated_eval_memo(|| {
+            matches!(
+                self.evaluate_term(&crate::executor::model::Model::empty(), term),
+                crate::executor::model::EvalValue::Bool(value) if value == expected
+            )
+        });
+        if holds {
+            out.push(ClosedSentenceObligation {
+                term,
+                kind: if expected {
+                    ClosedSentenceObligationKindDraft::GroundTrue
+                } else {
+                    ClosedSentenceObligationKindDraft::GroundFalse
+                },
+            });
+        }
+        holds
+    }
+
+    /// One budgeted call of the checked reconfirmation primitive.
+    ///
+    /// `negate == false`: confirm the sentence itself is refuted (FALSE).
+    /// `negate == true`: confirm its fresh negation is refuted (VALID/TRUE).
+    fn closed_sentence_nested_refutation(
+        &mut self,
+        sentence: TermId,
+        negate: bool,
+        budget: &mut ClosedSentenceRefutationBudget,
+        out: &mut Vec<ClosedSentenceObligation>,
+    ) -> bool {
+        if !budget.take_nested_solve() || self.external_stop_reason().is_some() {
+            return false;
+        }
+        if negate {
+            let negation = self.ctx.terms.mk_not(sentence);
+            if self.reconfirms_negation_refuted_for_closed_sentence(&[negation]) {
+                out.push(ClosedSentenceObligation {
+                    term: sentence,
+                    kind: ClosedSentenceObligationKindDraft::NestedNegationRefuted { negation },
+                });
+                return true;
+            }
+            false
+        } else if self.reconfirms_negation_refuted_for_closed_sentence(&[sentence]) {
+            out.push(ClosedSentenceObligation {
+                term: sentence,
+                kind: ClosedSentenceObligationKindDraft::NestedRefuted,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Closed scalar witness candidates for one binder of `sort`, collected
+    /// from the quantified sentence itself (literal endpoints are how a
+    /// bounded-interval refutation is phrased) plus small defaults.
+    /// Candidates are untrusted proposals; every use is checked downstream.
+    fn closed_sentence_witness_candidates(
+        &mut self,
+        quantifier: TermId,
+        sort: &CoreSort,
+    ) -> Vec<TermId> {
+        const MAX_SENTENCE_LITERALS: usize = 4;
+        const MAX_WALK: usize = 2_048;
+        let mut candidates: Vec<TermId> = Vec::new();
+        let mut stack = vec![quantifier];
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut walked = 0usize;
+        while let Some(term) = stack.pop() {
+            walked += 1;
+            if walked > MAX_WALK || candidates.len() >= MAX_SENTENCE_LITERALS {
+                break;
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+            match self.ctx.terms.get(term) {
+                TermData::Const(_) => {
+                    if self.ctx.terms.sort(term) == sort && !candidates.contains(&term) {
+                        candidates.push(term);
+                    }
+                }
+                TermData::App(Symbol::Named(operator), args) => {
+                    // A negated numeral (`(- 5)`) is a closed scalar witness
+                    // on the same footing as the numeral itself.
+                    if operator == "-"
+                        && args.len() == 1
+                        && self.ctx.terms.sort(term) == sort
+                        && matches!(self.ctx.terms.get(args[0]), TermData::Const(_))
+                        && !candidates.contains(&term)
+                    {
+                        candidates.push(term);
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, t, e) => {
+                    stack.push(*c);
+                    stack.push(*t);
+                    stack.push(*e);
+                }
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
+                    stack.push(*body);
+                }
+                _ => {}
+            }
+        }
+        let defaults: Vec<TermId> = match sort {
+            CoreSort::Int => vec![
+                self.ctx.terms.mk_int(BigInt::from(0)),
+                self.ctx.terms.mk_int(BigInt::from(1)),
+                self.ctx.terms.mk_int(BigInt::from(-1)),
+            ],
+            CoreSort::Real => vec![
+                self.ctx
+                    .terms
+                    .mk_rational(BigRational::from_integer(BigInt::from(0))),
+                self.ctx
+                    .terms
+                    .mk_rational(BigRational::from_integer(BigInt::from(1))),
+                self.ctx
+                    .terms
+                    .mk_rational(BigRational::from_integer(BigInt::from(-1))),
+            ],
+            CoreSort::Bool => vec![self.ctx.terms.true_term(), self.ctx.terms.false_term()],
+            CoreSort::BitVec(width) => vec![
+                self.ctx.terms.mk_bitvec(BigInt::from(0), width.width),
+                self.ctx.terms.mk_bitvec(BigInt::from(1), width.width),
+            ],
+            _ => Vec::new(),
+        };
+        for default in defaults {
+            if !candidates.contains(&default) {
+                candidates.push(default);
+            }
+        }
+        candidates
     }
 
     /// Authenticate one exact authored Int-forall instance against one exact
@@ -2188,6 +3028,25 @@ impl Executor {
         )
     }
 
+    /// Emit UNSAT from a sealed refuted authored closed sentence
+    /// (#closed-sentence-cert, UNSAT arm).  This is the symmetric sibling of
+    /// the closed-sentence VALIDITY certificate: the same checked
+    /// reconfirmation primitive, applied to the sentence side instead of the
+    /// negation side.  It is a semantic certificate distinct from a translated
+    /// authored-scope proof; explicit proof and strict verification modes
+    /// therefore continue to fail closed.
+    pub(in crate::executor) fn emit_checked_exact_closed_sentence_unsat(
+        &mut self,
+        evidence: CheckedExactClosedSentenceUnsat,
+    ) -> SolveResult {
+        self.emit_checked_exact_unsat(
+            UnsatCertificateKind::CheckedExactClosedSentence(evidence),
+            "checked exact closed-sentence UNSAT evidence was stale at emission",
+            "checked exact closed-sentence UNSAT has no translated authored-scope proof for the requested proof artifact",
+            "verdict_certification.checked_exact_closed_sentence",
+        )
+    }
+
     /// Emit UNSAT from one exact authored Int-forall instance plus its
     /// contradictory authored ground UF-value pin.  This semantic certificate
     /// does not claim a translated `forall_inst` artifact, so every explicit
@@ -2252,6 +3111,9 @@ impl Executor {
         &mut self,
         diagnostic: String,
     ) -> SolveResult {
+        // #cert-accounting item 6: count refusals so "the funnel is silently
+        // eating verdicts" is a number rather than an instrumentation session.
+        cert_accounting::record_publication_rejection();
         self.publish_unknown_from_origin(UnknownOrigin::VerdictCertification);
         self.record_model_validation_unknown_diagnostic(diagnostic);
         SolveResult::Unknown
@@ -2607,6 +3469,11 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
     ) -> Result<UnsatCertificate, UnsatCertificationError> {
+        // #cert-accounting item 6: an RAII guard, not a pair of calls, so that
+        // EVERY exit of this `?`-heavy function is measured. A dropped guard
+        // can only under-count (it cannot fire twice), and a missed
+        // measurement is a diagnostic gap, never a soundness one.
+        let _mint_timer = cert_accounting::MintTimer::start(self.query_publication_role.get());
         // Affine handoff: every mint attempt consumes the quarantine token,
         // including scope failures and stronger proof/sidecar wins.
         let pending_nested_array = self.pending_nested_array_bool_bv_unsat.take();
@@ -2620,6 +3487,8 @@ impl Executor {
             epoch,
             assumptions,
         )?;
+        // Read before the lane chain below can consume it (#missing-proof-probe).
+        let pending_nested_array_present = pending_nested_array.is_some();
 
         let strict_presentation = self.check_strict_unsat_presentation();
         let certification_source = match strict_presentation {
@@ -2655,6 +3524,19 @@ impl Executor {
                         evidence,
                         exact_roots,
                     })
+                } else if let Some((evidence, exact_roots)) =
+                    self.authenticate_uf_leaf_bool_bv_query(epoch, assumptions)?
+                {
+                    // STRICTLY LAST. Every lane above answers about the exact
+                    // query or an exact reduction of it; this one answers about
+                    // an over-approximating abstraction. Placing it here means
+                    // it can only fire where the chain already yields `None`
+                    // (and hence `MissingProof`), so no query that some earlier
+                    // lane wins today can change its admission class.
+                    Some(CertificationSource::CheckedUfLeafBoolBv {
+                        evidence,
+                        exact_roots,
+                    })
                 } else {
                     None
                 };
@@ -2664,27 +3546,55 @@ impl Executor {
                 } else {
                     match presentation_failure {
                         StrictProofPresentationFailure::Missing => {
+                            // `MissingProof` has TWO opposite causes and the
+                            // bare error names neither: the refutation is
+                            // genuinely absent (a lane published UNSAT without
+                            // ever building one), or it exists somewhere and
+                            // was not plumbed to `last_proof` — the historical
+                            // shape of this bug at `core_minimize.rs:290` (the
+                            // subset solves consumed the entry proof) and at
+                            // `check_sat.rs:2718` (the seq corroboration threw
+                            // away the proof it had just paid for). The two
+                            // need opposite fixes, so record which independent
+                            // lane could have spoken and did not.
+                            probe_cert_reject(|| {
+                                format!(
+                                    "MissingProof: last_proof=None and no independent lane \
+                                     authorized — strict_presentation_required={} \
+                                     checked_sat_refutation_present={} \
+                                     pending_nested_array_present={} \
+                                     reconstruction_suppressed={} \
+                                     proof_decline={:?} authored_roots={}",
+                                    self.strict_unsat_presentation_required(),
+                                    self.last_checked_sat_refutation.is_some(),
+                                    pending_nested_array_present,
+                                    self.last_unsat_proof_reconstruction_suppressed,
+                                    self.last_proof_decline,
+                                    epoch.assertions.len(),
+                                )
+                            });
                             return Err(UnsatCertificationError::MissingProof);
                         }
-                        // Only trust-family presentation failures are eligible
+                        // Only trust-family presentation failures, and the
+                        // caller's own metered envelope refusal, are eligible
                         // for the separate clause-discharge fallback. Explicit
                         // proof and proof-checking modes were excluded above and
                         // must see the original strict rejection.
                         //
-                        // Routed through `is_trust_kind_rejection`, the SAME
-                        // predicate the corroboration screen in
+                        // Routed through `is_deferred_discharge_rejection`, the
+                        // SAME predicate the corroboration screen in
                         // `reconfirms_unsat_within` accepts on. These two were
                         // separate enumerations of the same family, and their
                         // drift is exactly what let the fallback's entry
                         // condition become its own rejection reason. One
                         // definition, so the gate that ROUTES a proof here and
                         // the screen that ACCEPTS its result cannot disagree
-                        // about what "trust-kind" means.
+                        // about what is eligible.
                         StrictProofPresentationFailure::Rejected(ref error)
-                            if Self::is_trust_kind_rejection(error)
+                            if Self::is_deferred_discharge_rejection(error)
                                 && !self.strict_unsat_presentation_required() =>
                         {
-                            self.discharge_trust_steps_for_certification(error)?;
+                            self.discharge_trust_steps_for_certification(error, assumptions)?;
                             CertificationSource::DischargedTrust
                         }
                         StrictProofPresentationFailure::Rejected(error) => {
@@ -2783,6 +3693,80 @@ impl Executor {
             Err(error) if error.is_capability_decline() => Ok(None),
             Err(error) => Err(UnsatCertificationError::StrictProofRejected {
                 reason: format!("independent source-level Bool/BV check rejected query: {error}"),
+            }),
+        }
+    }
+
+    /// Independently authenticate the exact source query in the Bool/BV
+    /// fragment EXTENDED by the congruence-free uninterpreted-leaf abstraction
+    /// and the Bool-atom abstraction over non-finitely-sorted operands
+    /// (#bitblast-original-clause-authority).
+    ///
+    /// The roots are the SAME exact public roots `authenticate_bool_bv_query`
+    /// uses -- the sealed assertion vector followed by the bound assumptions,
+    /// in order -- and every one of that lane's preconditions is reproduced:
+    /// no declared extension, a checked root-count/allocation bound, and the
+    /// cancellation check before any proof production.
+    ///
+    /// Soundness rests on the abstraction over-approximating the exact model
+    /// class: every model of the exact query induces a valuation of the free
+    /// leaves, so a refutation of the abstraction refutes the exact query.
+    /// Only BOOLEAN leaves are minted for non-finitely-sorted terms, so no
+    /// integer is ever forced into a finite bit-width (that would be an
+    /// UNDER-approximation and a proof hole). The converse fails closed inside
+    /// `ay_proof`: a satisfiable abstraction that minted a leaf is an
+    /// `UnsupportedFragment` DECLINE, never `Satisfiable`.
+    ///
+    /// This calls the SEPARATE `authenticate_atom_leaf_*` entry point, not the
+    /// one the `CheckedQpfInstanceRefutation` lane uses, so that lane's accept
+    /// set stays bit-identical.
+    fn authenticate_uf_leaf_bool_bv_query(
+        &self,
+        epoch: &UnsatQueryEpoch,
+        assumptions: &[TermId],
+    ) -> Result<Option<(AuthenticatedBoolBvUnsatQuery, Box<[TermId]>)>, UnsatCertificationError>
+    {
+        if !epoch.declared_extension.is_empty() || epoch.declared_extension_objectives.is_some() {
+            return Ok(None);
+        }
+
+        let root_count = epoch
+            .assertions
+            .len()
+            .checked_add(assumptions.len())
+            .ok_or_else(|| UnsatCertificationError::StrictProofRejected {
+                reason: "Bool/BV+UF-leaf query root count overflow".to_string(),
+            })?;
+        let mut exact_roots = Vec::new();
+        exact_roots.try_reserve_exact(root_count).map_err(|error| {
+            UnsatCertificationError::StrictProofRejected {
+                reason: format!("Bool/BV+UF-leaf query root allocation failed: {error}"),
+            }
+        })?;
+        exact_roots.extend_from_slice(&epoch.assertions);
+        exact_roots.extend_from_slice(assumptions);
+
+        if self.make_should_stop()() {
+            return Err(UnsatCertificationError::StrictProofRejected {
+                reason: "Bool/BV+UF-leaf authentication cancelled before proof production"
+                    .to_string(),
+            });
+        }
+        match ay_proof::authenticate_atom_leaf_bool_bv_unsat_query(
+            &self.ctx.terms,
+            &exact_roots,
+            self.current_solve_deadline(),
+        ) {
+            Ok(evidence) => Ok(Some((evidence, exact_roots.into_boxed_slice()))),
+            // Same decline/veto split as every lane above: an unsupported
+            // fragment or an exhausted bounded envelope is not evidence
+            // against the verdict, so decline and let the trust-discharge
+            // fallback still run. `Satisfiable` and `Replay` remain vetoes.
+            Err(error) if error.is_capability_decline() => Ok(None),
+            Err(error) => Err(UnsatCertificationError::StrictProofRejected {
+                reason: format!(
+                    "independent source-level Bool/BV+UF-leaf check rejected query: {error}"
+                ),
             }),
         }
     }
@@ -2909,6 +3893,12 @@ impl Executor {
         if conflict_limit == Some(0) || decision_limit == Some(0) {
             return false;
         }
+        // #cert-accounting item 6: a WHOLE-PROBLEM re-solve on a fresh
+        // executor, run from inside a certificate mint. Measured on
+        // dillig12_m as 94.1% of all mint cost from only 94 of 1019 mints,
+        // so the mint is cheap EXCEPT when it reaches here. Without a
+        // standing counter that has to be rediscovered by hand.
+        let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
         let mut exec = Executor::new();
         exec.ctx = self.ctx.clone();
         // Re-decide the AUTHORED problem, NOT `self.ctx.assertions` — the same
@@ -2975,9 +3965,10 @@ impl Executor {
             // identified the defect in the first place.
             match &strict {
                 Ok(_) => eprintln!("c phase-trace reconfirm ACCEPTED"),
-                Err(e) if Self::is_trust_kind_rejection(e) => eprintln!(
+                Err(e) if Self::is_deferred_discharge_rejection(e) => eprintln!(
                     "c phase-trace reconfirm ACCEPTED: re-solve proof rejected only for a \
-                     trust-kind step ({e}), which is this fallback's entry condition"
+                     trust-kind step or a metered envelope refusal ({e}), which is this \
+                     fallback's entry condition"
                 ),
                 Err(e) => eprintln!(
                     "c phase-trace reconfirm DECLINED: strict check of re-solve proof failed: {e}"
@@ -3016,16 +4007,57 @@ impl Executor {
         // remains the only accepting verdict.
         match &strict {
             Ok(_) => true,
-            Err(error) => Self::is_trust_kind_rejection(error),
+            Err(error) => Self::is_deferred_discharge_rejection(error),
         }
     }
 
-    /// The trust family the deferred-discharge path is defined over.
+    /// The rejection family the deferred-discharge path is defined over.
     ///
-    /// Single-sourced deliberately: the eligibility gate that ROUTES a proof
-    /// into deferred discharge and the corroboration screen that ACCEPTS its
-    /// result must agree on what "trust-kind" means. When those two drifted, the
-    /// entry condition of the fallback became its own rejection reason.
+    /// Single-sourced deliberately, for the same reason `is_trust_kind_rejection`
+    /// is: the eligibility gate that ROUTES a proof into deferred discharge and
+    /// the corroboration screen that ACCEPTS its result must agree on what
+    /// counts. When those two drifted, the entry condition of the fallback
+    /// became its own rejection reason.
+    ///
+    /// Two members, and the second is a RESOURCE CLASSIFICATION, not a trust
+    /// relaxation:
+    ///
+    /// * the trust family proper (`is_trust_kind_rejection`);
+    /// * [`ay_proof::ProofCheckError::ResourceLimit`] — the caller's aggregate
+    ///   strict-check envelope refused a charge. Its own documentation calls
+    ///   this a CALIBRATION verdict: "the proof may be perfectly checkable; the
+    ///   envelope simply is not wide enough". Treating that as a structural
+    ///   defect hard-rejected correct refutations that the discharge lane can
+    ///   still certify, and it did so DETERMINISTICALLY — measured on
+    ///   `dillig12_m_000.smt2`, one hard reject in every 20s run (3/3), always
+    ///   the same step, at `work 325_621_332 + 28_693_217 of 350_000_000` with
+    ///   the byte limb at 6%. Nothing about that refusal says the step is
+    ///   unsound; it says the meter ran out one step early.
+    ///
+    /// `Cancelled` is deliberately NOT a member. It is the SEPARATE variant for
+    /// "the caller asked us to stop" (interrupt, solve deadline, memory
+    /// ceiling), and the discharge lane's re-checks are unmetered — routing a
+    /// stop into them would spend unbounded work after the caller already
+    /// demanded we stop, and would make the published verdict depend on machine
+    /// load. A stop must still fail closed.
+    ///
+    /// WHAT THE LANE STILL PROVES. Admitting a `ResourceLimit` here buys entry
+    /// to `discharge_trust_steps_for_certification`, nothing else. That lane
+    /// re-validates EVERY non-trust step of the proof under the unmetered
+    /// collecting checker and then requires either a standalone theory-tautology
+    /// discharge of every collected clause or an independent fresh-`Executor`
+    /// UNSAT re-solve of the authored obligation. No step becomes admissible
+    /// without one of those two discharges.
+    fn is_deferred_discharge_rejection(error: &ay_proof::ProofCheckError) -> bool {
+        Self::is_trust_kind_rejection(error)
+            || matches!(error, ay_proof::ProofCheckError::ResourceLimit)
+    }
+
+    /// The trust family proper.
+    ///
+    /// Kept separate from [`Self::is_deferred_discharge_rejection`] so the name
+    /// keeps meaning "trust-kind" and a future reader cannot mistake the
+    /// resource member for one.
     fn is_trust_kind_rejection(error: &ay_proof::ProofCheckError) -> bool {
         matches!(
             error,
@@ -3086,7 +4118,11 @@ impl Executor {
     /// `scope_tracked_assertions` into `ctx.assertions` on exit. If that restore
     /// ever stops happening, this scope silently becomes the post-preprocessing
     /// window and the `debug_assert!` below is what should catch it.
-    fn authored_corroboration_scope(&self, problem: &[TermId]) -> Vec<TermId> {
+    fn authored_corroboration_scope(
+        &self,
+        problem: &[TermId],
+        bound_assumptions: &[TermId],
+    ) -> Vec<TermId> {
         let mut scope = self
             .self_check_authored_assertions
             .clone()
@@ -3096,6 +4132,17 @@ impl Executor {
                 if !scope.contains(&assumption) {
                     scope.push(assumption);
                 }
+            }
+        }
+        // `last_assumptions` is the SOLVER's slot and is empty by certification
+        // time on the ordinary `check-sat-assuming` path; the caller's exact
+        // bound literals arrive separately. Without them the corroborating
+        // re-solve asks a strictly weaker question than the publication claims
+        // and can only ever answer `sat`/`unknown` on an assumption-carried
+        // refutation. See `strict_proof_problem_with_bound_assumptions`.
+        for &assumption in bound_assumptions {
+            if !scope.contains(&assumption) {
+                scope.push(assumption);
             }
         }
         for extension in self.declared_obligation_extension() {
@@ -3128,6 +4175,12 @@ impl Executor {
         if conflict_limit == Some(0) || decision_limit == Some(0) {
             return false;
         }
+        // #cert-accounting item 6: a WHOLE-PROBLEM re-solve on a fresh
+        // executor, run from inside a certificate mint. Measured on
+        // dillig12_m as 94.1% of all mint cost from only 94 of 1019 mints,
+        // so the mint is cheap EXCEPT when it reaches here. Without a
+        // standing counter that has to be rediscovered by hand.
+        let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
         let mut exec = Executor::new();
         exec.ctx = self.ctx.clone();
         // Re-decide the AUTHORED assertions, NOT `self.ctx.assertions`.
@@ -3175,9 +4228,67 @@ impl Executor {
         matches!(exec.check_sat(), Ok(result) if result.is_sat())
     }
 
+    /// The authored obligation this query actually decided.
+    ///
+    /// `problem_assertions_for_strict_proof` reaches the caller's
+    /// `check-sat-assuming` literals only through `self.last_assumptions`, and
+    /// that slot is EMPTY by certification time on the ordinary
+    /// `check-sat-assuming` path — the assumption survives in
+    /// `UnsatQueryEpoch::assumptions`, which `authenticate_unsat_query_scope`
+    /// has already proved equal to the `bound` slice passed here.
+    ///
+    /// The gap was not cosmetic. Measured on the #6736 QF_AUFBV regression
+    /// (`(assert (= (f i) v))` plus the assumption
+    /// `(not (= (select (store a i v) i) v))`), the strict-proof scope was the
+    /// single term `(= v (f i))`, so the forged-UNSAT guard re-decided a
+    /// PROPER SUBSET of the query, found it satisfiable — correctly, since the
+    /// contradiction lives entirely in the assumption — and declared a valid
+    /// refutation forged. A subset of an unsatisfiable set is routinely
+    /// satisfiable, so that answer was never evidence of forgery; the guard was
+    /// firing on a question the publication never asked. This is a whole class,
+    /// not one fixture: any `check-sat-assuming` refutation that leans on a
+    /// trust step and draws its contradiction from the assumption hit it.
+    ///
+    /// PREMISE AUTHORITY IS NOT RELAXED. `proof_export_scope_assertions`
+    /// deliberately RETAINS-OUT the canonical `false` term unless
+    /// `boolean_constant_premises_authored` says the author literally wrote
+    /// `false` (position-aligned, see `unsat_cert/assumption_source.rs`) — an
+    /// `assume false` the author did not write proves nothing about the input.
+    /// A `check-sat-assuming` literal that ELABORATED to `false` carries no
+    /// such authority, so it is never added here. That is why this returns a
+    /// two-state scope rather than a plain vector: the accepting steps get a
+    /// premise set that honours the rule, and the REJECTING forged guard is
+    /// told whether the set it would re-decide is really the whole query.
+    fn strict_proof_problem_with_bound_assumptions(
+        &self,
+        bound: &[TermId],
+    ) -> AuthoredProblemScope {
+        let mut problem = self.problem_assertions_for_strict_proof();
+        let false_term = self.ctx.terms.false_term();
+        let false_is_authored = self.boolean_constant_premises_authored().1;
+        let mut authorized_assumptions: Vec<TermId> = Vec::new();
+        let mut exact = true;
+        for &assumption in bound {
+            if assumption == false_term && !false_is_authored {
+                exact = false;
+                continue;
+            }
+            authorized_assumptions.push(assumption);
+            if !problem.contains(&assumption) {
+                problem.push(assumption);
+            }
+        }
+        AuthoredProblemScope {
+            premises: problem,
+            authorized_assumptions,
+            exact,
+        }
+    }
+
     fn discharge_trust_steps_for_certification(
         &self,
         plain_error: &ay_proof::ProofCheckError,
+        bound_assumptions: &[TermId],
     ) -> Result<(), UnsatCertificationError> {
         let reject = |reason: String| UnsatCertificationError::StrictProofRejected { reason };
 
@@ -3306,8 +4417,55 @@ impl Executor {
                         .to_string(),
                 )
             })?;
-        let problem = self.problem_assertions_for_strict_proof();
-        if self.redecides_definitive_sat_within(&problem, FORGED_GUARD_BUDGET_MS) {
+        let scope = self.strict_proof_problem_with_bound_assumptions(bound_assumptions);
+        let problem = scope.premises.clone();
+        // THE GUARD MAY ONLY SPEAK ABOUT THE WHOLE QUERY.
+        //
+        // Its inference is "a fresh solve of the authored problem returns a
+        // DEFINITIVE SAT, therefore the UNSAT is forged". That is valid only
+        // when the set re-decided IS the authored problem. A PROPER SUBSET of
+        // an unsatisfiable set is routinely satisfiable, so a SAT answer about
+        // a subset entails nothing at all — the guard would be reporting
+        // forgery on evidence it does not have.
+        //
+        // Measured on the #6736 QF_AUFBV regression: `(assert (= (f i) v))`
+        // with the `check-sat-assuming` literal
+        // `(not (= (select (store a i v) i) v))`. Before this, the guard's set
+        // was the single term `(= v (f i))` — the assumption never reached it,
+        // because `problem_assertions_for_strict_proof` collects assumptions
+        // only through `self.last_assumptions`, which is EMPTY by certification
+        // time on this path. The guard re-decided a proper subset, correctly
+        // found it satisfiable, and destroyed a correct refutation.
+        //
+        // So: run on `Exact`, ABSTAIN on `Partial`. Abstaining is not a
+        // weakening of the funnel — the guard is downgrade-only, and steps
+        // (2)/(3)/(4) below still have to accept on their own evidence, under
+        // the unchanged premise-authority rule.
+        if !scope.exact {
+            probe_cert_reject(|| {
+                "forged-guard ABSTAINED: a bound assumption has no premise \
+                 authority, so the re-decidable set is a proper subset of the \
+                 query and a SAT answer about it would be no evidence"
+                    .to_string()
+            });
+        } else if self.redecides_definitive_sat_within(&problem, FORGED_GUARD_BUDGET_MS) {
+            probe_cert_reject(|| {
+                let rendered: Vec<String> = problem
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &t)| {
+                        format!(
+                            "    [{i}] {}",
+                            ay_proof::format_term_alethe(&self.ctx.terms, t)
+                        )
+                    })
+                    .collect();
+                format!(
+                    "forged-guard re-decided set ({} terms):\n{}",
+                    problem.len(),
+                    rendered.join("\n")
+                )
+            });
             return Err(reject(
                 "forged UNSAT: a fresh Executor independently re-decides the \
                  authored assertions as DEFINITIVE SAT, so the trust-fallback \
@@ -3348,23 +4506,55 @@ impl Executor {
                 );
             }
         }
-        // Defensive: nothing deferred means the plain checker should have passed,
-        // so honour its original rejection rather than inventing an acceptance.
-        if collected.is_empty() {
+        // Defensive, and the premise is EXACTLY "the plain checker rejected this
+        // proof on STRUCTURE": for a trust-family rejection, deferring nothing is
+        // a contradiction, so honour the original rejection rather than inventing
+        // an acceptance.
+        //
+        // That premise does not hold for a metered `ResourceLimit`. There the
+        // plain checker did not object to any step — it ran out of the caller's
+        // aggregate envelope, deterministically, one step short (measured on
+        // `dillig12_m_000.smt2`: `work 325_621_332 + 28_693_217 of 350_000_000`,
+        // a 1.2% overshoot, with the byte limb at 6%). "Deferred nothing" then
+        // says the unmetered collecting checker validated every step, which is
+        // evidence FOR the proof, not against it. Rejecting on it discarded a
+        // correct refutation once per 20s run, reproducibly.
+        //
+        // Such a proof does NOT short-circuit to acceptance. It falls through to
+        // step (4), the independent fresh-`Executor` UNSAT re-solve of the
+        // authored obligation — one of the two discharges this lane has always
+        // required — and is rejected there like anything else that cannot be
+        // reconfirmed.
+        if collected.is_empty() && !matches!(plain_error, ay_proof::ProofCheckError::ResourceLimit)
+        {
             return Err(reject(format!(
                 "{plain_error}; deferred-trust discharge declined: the collecting \
                  checker deferred no clause, so the plain rejection stands"
             )));
         }
 
-        let corroboration_scope = self.authored_corroboration_scope(&problem);
+        let corroboration_scope =
+            self.authored_corroboration_scope(&problem, &scope.authorized_assumptions);
         probe_cert_reject(|| self.deferred_trust_probe_message(&collected, &corroboration_scope));
 
         // (3) Independently discharge every deferred clause.
-        let all_discharged = collected.iter().all(|(_, clause)| {
-            crate::api::proofs::discharge_trust_clause(&self.ctx.terms, clause, &problem).is_some()
-        });
+        //
+        // The emptiness test is load-bearing, not defensive noise: a metered
+        // `ResourceLimit` now reaches here with NOTHING collected, and `all()` is
+        // vacuously true on an empty list — without this conjunct such a proof
+        // would be ACCEPTED having discharged nothing at all. Require a real
+        // clause-by-clause discharge here; the empty case is step (4)'s.
+        let all_discharged = !collected.is_empty()
+            && collected.iter().all(|(_, clause)| {
+                crate::api::proofs::discharge_trust_clause(&self.ctx.terms, clause, &problem)
+                    .is_some()
+            });
         if all_discharged {
+            probe_cert_reject(|| {
+                "deferred-trust discharge ACCEPTED at (3): every collected clause \
+                 is a standalone theory tautology"
+                    .to_string()
+            });
             return Ok(());
         }
 
@@ -3384,13 +4574,19 @@ impl Executor {
         // superset — the superset carries every quantified axiom twice and
         // doubled the cost of this step. See `authored_corroboration_scope`.
         if self.reconfirms_unsat_within(&corroboration_scope, WHOLE_PROBLEM_RECONFIRMATION_LIMITS) {
+            probe_cert_reject(|| {
+                "deferred-trust discharge ACCEPTED at (4): a fresh Executor \
+                 re-decided the authored obligation as UNSAT"
+                    .to_string()
+            });
             return Ok(());
         }
 
         Err(reject(format!(
-            "{plain_error}; deferred-trust discharge failed: a collected trust \
-             clause is not a standalone theory tautology AND the authored \
-             assertions could not be independently re-solved as UNSAT"
+            "{plain_error}; deferred-trust discharge failed: no collected trust \
+             clause is a standalone theory tautology (collected {}) AND the \
+             authored assertions could not be independently re-solved as UNSAT",
+            collected.len()
         )))
     }
 
@@ -3466,6 +4662,18 @@ impl Executor {
         proposed: SolveResult,
         assumptions: &[TermId],
     ) -> SolveResult {
+        // #cert-accounting item 6. Sampled BEFORE certification runs, because
+        // `certify_unsat_presentation` disables the tracker on several exits:
+        // reading afterwards would report "not tracked" for a solve that had in
+        // fact just paid full recording cost for every step of its search.
+        // `proof_tracked` therefore means "did this decision record proof steps
+        // WHILE SOLVING", which is the quantity the dillig12_m regression is
+        // made of. Write-only: no gate below reads either counter.
+        cert_accounting::record_decision(
+            self.query_publication_role.get(),
+            self.proof_tracker.is_enabled(),
+            self.proof_tracker.recorded_step_count(),
+        );
         let published = self.certify_unsat_presentation(proposed, assumptions);
         let published = self.decline_trust_bearing_unsat_under_strict_proofs(published);
         // Certification can perform the final strict proof check while minting
@@ -3606,6 +4814,10 @@ impl Executor {
         }
         let published = match raw {
             Ok(certificate) => {
+                // #cert-accounting item 6: raw admissions are the one class
+                // that publishes UNSAT with no checked refutation behind it,
+                // so their population is worth a standing number.
+                cert_accounting::record_raw_admission();
                 self.last_unsat_certificate = Some(certificate);
                 proposed
             }
@@ -3633,7 +4845,27 @@ impl Executor {
     /// have no epoch and cannot borrow this publication requirement as
     /// authority.
     pub(crate) fn active_unsat_query_requires_strict_proof(&self) -> bool {
+        // #cert-item-3: the solve's ROLE is DECLARED, not inferred.
+        //
+        // This used to be `self.unsat_query_epoch.is_some()` alone — "an epoch
+        // exists, therefore this decision is public". That inference is what
+        // billed every disposable sub-query at public rates: the CHC portfolio
+        // opens an epoch per internal lemma exactly as it does for the user's
+        // question, so the two were indistinguishable here.
+        //
+        // The epoch conjunct is RETAINED, not replaced: no epoch still means no
+        // publication authority. The role is an ADDITIONAL requirement, and it
+        // is fail-safe — `QueryPublicationRole::default()` is `Published`, and
+        // every ay-chc call site currently declares `Published` (the shared
+        // executor lanes deliberately so: they are reachable from the PDR
+        // safety verifier, where a false UNSAT becomes a false `Safe`). So this
+        // is behaviour-identical today by construction, and stays that way
+        // until a caller is individually audited and declares otherwise.
         self.unsat_query_epoch.is_some()
+            && matches!(
+                self.query_publication_role.get(),
+                crate::executor::query_role::QueryPublicationRole::Published
+            )
     }
 
     /// Consume the one-shot capability for the immediately preceding verdict.
@@ -3670,6 +4902,7 @@ impl Executor {
                     )
             }
             UnsatCertificateKind::CheckedBoolBv(checked) => checked.is_current(self),
+            UnsatCertificateKind::CheckedUfLeafBoolBv(checked) => checked.is_current(self),
             UnsatCertificateKind::CheckedBvLia(checked) => checked.is_current(self),
             UnsatCertificateKind::CheckedExactExists(evidence) => {
                 self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
@@ -3678,6 +4911,9 @@ impl Executor {
                 self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
             }
             UnsatCertificateKind::CheckedExactClosedForall(evidence) => {
+                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
+            }
+            UnsatCertificateKind::CheckedExactClosedSentence(evidence) => {
                 self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
             }
             UnsatCertificateKind::CheckedExactForallUfGround(evidence) => {
@@ -3713,6 +4949,68 @@ mod tests {
     use crate::executor_types::UnknownReason;
 
     mod pending_nested_array;
+
+    /// The metered envelope refusal must be eligible for deferred discharge,
+    /// and the caller-stop refusal must NOT be.
+    ///
+    /// `ProofCheckError::ResourceLimit` is a CALIBRATION verdict — the proof may
+    /// be perfectly checkable and the envelope simply too narrow — so it routes
+    /// into `discharge_trust_steps_for_certification`, which still demands one
+    /// of the lane's two independent discharges. `Cancelled` is the caller
+    /// asking us to stop; the lane's re-checks are unmetered, so a stop must
+    /// keep failing closed.
+    #[test]
+    fn deferred_discharge_family_admits_budget_refusal_but_not_a_caller_stop() {
+        assert!(Executor::is_deferred_discharge_rejection(
+            &ay_proof::ProofCheckError::ResourceLimit
+        ));
+        assert!(!Executor::is_deferred_discharge_rejection(
+            &ay_proof::ProofCheckError::Cancelled
+        ));
+        assert!(!Executor::is_deferred_discharge_rejection(
+            &ay_proof::ProofCheckError::EmptyProof
+        ));
+        assert!(Executor::is_deferred_discharge_rejection(
+            &ay_proof::ProofCheckError::TrustStep {
+                step: ay_core::ProofId(0)
+            }
+        ));
+    }
+
+    /// The trust family proper must stay exactly what it was: the resource
+    /// member belongs to the discharge family only, so nothing that reads
+    /// "trust-kind" silently acquires a resource verdict.
+    #[test]
+    fn trust_kind_family_excludes_the_resource_member() {
+        assert!(!Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::ResourceLimit
+        ));
+        assert!(!Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::Cancelled
+        ));
+        assert!(Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::TrustStep {
+                step: ay_core::ProofId(0)
+            }
+        ));
+        assert!(Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::HoleStep {
+                step: ay_core::ProofId(0)
+            }
+        ));
+        assert!(Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::UnsupportedTheoryLemmaKind {
+                step: ay_core::ProofId(0),
+                kind: ay_core::TheoryLemmaKind::Generic,
+            }
+        ));
+        assert!(!Executor::is_trust_kind_rejection(
+            &ay_proof::ProofCheckError::UnsupportedTheoryLemmaKind {
+                step: ay_core::ProofId(0),
+                kind: ay_core::TheoryLemmaKind::LiaGeneric,
+            }
+        ));
+    }
 
     fn strict_boolean_contradiction(executor: &mut Executor) -> Vec<TermId> {
         // Match the small contradiction used by the established independent
@@ -3799,6 +5097,47 @@ mod tests {
         executor
             .execute_all(&commands)
             .expect("Bool/BV fixture must elaborate");
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        executor
+    }
+
+    /// One `Int`-sorted equality over an uninterpreted integer function
+    /// (outside every exact lane) beside a self-contained BitVec
+    /// contradiction.
+    fn mixed_int_bv_contradiction_executor() -> Executor {
+        let commands = ay_frontend::parse(
+            "(set-logic ALL)\n\
+             (declare-fun auth_ufi (Int) Int)\n\
+             (declare-const auth_m Int)\n\
+             (declare-const auth_v (_ BitVec 4))\n\
+             (assert (= (auth_ufi auth_m) 3))\n\
+             (assert (bvsgt auth_v #x0))\n\
+             (assert (not (bvsgt auth_v #x0)))",
+        )
+        .expect("mixed BV+Int fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("mixed BV+Int fixture must elaborate");
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        executor
+    }
+
+    /// UNSAT purely by integer ordering, which the atom abstraction forgets.
+    fn integer_ordering_contradiction_executor() -> Executor {
+        let commands = ay_frontend::parse(
+            "(set-logic ALL)\n\
+             (declare-const auth_ord Int)\n\
+             (assert (< auth_ord 0))\n\
+             (assert (> auth_ord 0))",
+        )
+        .expect("integer ordering fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("integer ordering fixture must elaborate");
         executor.begin_public_solve(false);
         executor.bind_unsat_query_assumptions(&[]);
         executor
@@ -3990,6 +5329,104 @@ mod tests {
             .terms
             .mk_var("auth_bv_late_append", ay_core::Sort::Bool);
         assert!(executor.take_unsat_certificate().is_none());
+    }
+
+    /// #bitblast-original-clause-authority — the mixed BV+Int shape that has
+    /// no exact lane. `(= (ufi m) 3)` is an `Int`-sorted equality, so the
+    /// exact Bool/BV lowering rejects the whole query at its sort
+    /// classification; the BV/LIA lane declines on the uninterpreted integer
+    /// function; and no Alethe presentation is produced. The Bool-atom
+    /// abstraction turns that one atom into a free Boolean leaf, leaving the
+    /// self-contained BitVec contradiction to refute, and the new lane
+    /// AUTHENTICATES it in its own certification class.
+    #[test]
+    fn mixed_int_bv_refutation_mints_uf_leaf_checked_authority() {
+        let mut executor = mixed_int_bv_contradiction_executor();
+        let proposed = executor
+            .check_sat()
+            .expect("the production mixed BV+Int solve must finish");
+        assert!(proposed.is_unsat());
+
+        // Force the new lane: no translated presentation, no SAT sidecar.
+        executor.last_checked_sat_refutation = None;
+        executor.last_proof = None;
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+        assert!(
+            published.is_unsat(),
+            "the abstraction-backed refutation must survive self-check, got {published:?}"
+        );
+        let certificate = executor
+            .last_unsat_certificate
+            .as_ref()
+            .expect("the atom-abstraction refutation must mint an authority token");
+        assert!(
+            matches!(&certificate.0, UnsatCertificateKind::CheckedUfLeafBoolBv(_)),
+            "the theorem must land in its OWN class, never launder through an \
+             exact-fragment carrier: {:?}",
+            certificate.0
+        );
+        assert!(certificate.independently_verified());
+        assert!(!certificate.strict_proof_verified());
+        assert!(!certificate.exact_semantic_verified());
+        assert_eq!(
+            certificate.command_admission(),
+            CommandUnsatAdmission::CheckedUfLeafBoolBv
+        );
+
+        // The one-shot publication boundary must retire the token on any
+        // structural change, exactly as for every other checked class.
+        let _late = executor
+            .ctx
+            .terms
+            .mk_var("auth_uf_leaf_late_append", ay_core::Sort::Bool);
+        assert!(executor.take_unsat_certificate().is_none());
+    }
+
+    /// FAIL-CLOSED PIN at the production boundary. `m < 0 && m > 0` is UNSAT
+    /// only by INTEGER ordering, which the abstraction deliberately forgets:
+    /// `<` and `>` are not reserved vocabulary, so each becomes an independent
+    /// free Boolean leaf and the abstraction is SATISFIABLE.
+    ///
+    /// The lane must therefore DECLINE — return `Ok(None)`, never a refutation
+    /// and never a veto. Note the query IS still published `unsat` here, by an
+    /// EARLIER lane that reasons about integers exactly; that is the whole
+    /// point of ordering this lane last, and it is why the assertion below is
+    /// about WHICH authority backed the verdict rather than about the verdict.
+    /// Asserting `!published.is_unsat()` would be testing the LIA lane, not
+    /// this one.
+    #[test]
+    fn satisfiable_atom_abstraction_never_mints_uf_leaf_authority() {
+        let mut executor = integer_ordering_contradiction_executor();
+        let proposed = executor
+            .check_sat()
+            .expect("the production integer solve must finish");
+        assert!(proposed.is_unsat());
+
+        executor.last_checked_sat_refutation = None;
+        executor.last_proof = None;
+
+        // Drive the lane itself: a satisfiable abstraction must DECLINE.
+        let epoch = executor
+            .unsat_query_epoch
+            .clone()
+            .expect("the public solve installed an epoch");
+        let declined = executor
+            .authenticate_uf_leaf_bool_bv_query(&epoch, &[])
+            .expect("a satisfiable abstraction is a DECLINE, never a veto");
+        assert!(
+            declined.is_none(),
+            "an abstraction with no refutation must not authenticate the query"
+        );
+
+        // And it must never end up as the published authority either.
+        let _published = executor.certify_unsat_for_publication(proposed, &[]);
+        if let Some(certificate) = executor.last_unsat_certificate.as_ref() {
+            assert!(
+                !matches!(&certificate.0, UnsatCertificateKind::CheckedUfLeafBoolBv(_)),
+                "a satisfiable atom abstraction must never back the verdict: {:?}",
+                certificate.0
+            );
+        }
     }
 
     #[test]
@@ -5557,6 +6994,185 @@ mod tests {
         assert!(
             executor.take_unsat_certificate().is_none(),
             "a CompetitionRaw token must not be consumable outside shedding"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #closed-sentence-cert, UNSAT arm (U2)
+    // ---------------------------------------------------------------------
+
+    /// U2a: `¬∃y.(range(y) ∧ ∀x.(x≠y ∨ x=y))` — a refuted closed LIA
+    /// not-exists-forall alternation.
+    const CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT: &str = "(set-logic LIA) \
+         (assert (not (exists ((y Int)) \
+           (and (and (>= y (- 2147483648)) (< y 2147483648)) \
+                (forall ((x Int)) (or (not (= x y)) (= x y)))))))";
+    /// U2b: `∀x∈[0,1]. ∃y∈[0,1]. x<y ≤ x+1/2` — false at the right endpoint.
+    const CLOSED_SENTENCE_UNSAT_FORALL_EXISTS_SCRIPT: &str = "(set-logic LRA) \
+         (assert (forall ((x Real)) (=> (and (<= 0.0 x) (<= x 1.0)) \
+           (exists ((y Real)) \
+             (and (<= 0.0 y) (<= y 1.0) (and (< x y) (<= y (+ x (/ 1 2)))))))))";
+    /// The U2a sentence WITHOUT the outer negation: a VALID closed sentence.
+    const CLOSED_SENTENCE_VALID_EXISTS_SCRIPT: &str = "(set-logic LIA) \
+         (assert (exists ((y Int)) \
+           (and (and (>= y (- 2147483648)) (< y 2147483648)) \
+                (forall ((x Int)) (or (not (= x y)) (= x y))))))";
+    /// The U2a shape with a declared constant occurring in the sentence:
+    /// outside the symbol-free partition regardless of refutability.
+    const CLOSED_SENTENCE_DECLARED_SYMBOL_SCRIPT: &str = "(set-logic UFLIA) \
+         (declare-fun c () Int) \
+         (assert (not (exists ((y Int)) \
+           (and (= y c) (forall ((x Int)) (or (not (= x y)) (= x y)))))))";
+    /// A binder over a declared uninterpreted sort: outside the interpreted
+    /// binder-sort partition regardless of shape.
+    const CLOSED_SENTENCE_UNINTERPRETED_SORT_SCRIPT: &str = "(set-logic ALL) \
+         (declare-sort S 0) \
+         (assert (not (exists ((y S)) \
+           (forall ((x S)) (or (not (= x y)) (= x y))))))";
+
+    fn bind_closed_sentence_query(source: &str) -> Executor {
+        let commands = ay_frontend::parse(source).expect("closed-sentence fixture must parse");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("closed-sentence fixture must elaborate");
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        executor
+    }
+
+    #[test]
+    fn closed_sentence_unsat_certifies_nested_alternations_end_to_end() {
+        for source in [
+            CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT,
+            CLOSED_SENTENCE_UNSAT_FORALL_EXISTS_SCRIPT,
+        ] {
+            let commands = ay_frontend::parse(&format!("{source} (check-sat)"))
+                .expect("closed-sentence UNSAT fixture must parse");
+            let mut executor = Executor::new();
+            let outputs = execute_authored_script(&mut executor, &commands);
+
+            assert_eq!(outputs, vec!["unsat"], "for {source}");
+            assert_eq!(
+                executor.last_command_unsat_admission,
+                Some(CommandUnsatAdmission::CheckedExactClosedSentence),
+                "the verdict must come from the closed-sentence UNSAT lane"
+            );
+            assert!(
+                executor.last_unsat_proof_reconstruction_suppressed,
+                "semantic-only UNSAT must not expose an unrelated proof trace"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_sentence_unsat_token_is_one_shot_and_snapshot_bound() {
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT);
+        let evidence = executor
+            .try_authorize_current_query_refuted_closed_sentence_unsat()
+            .expect("the refuted not-exists-forall sentence must mint evidence");
+
+        let proposed = executor.emit_checked_exact_closed_sentence_unsat(evidence);
+        assert!(proposed.is_unsat());
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+        assert!(published.is_unsat());
+        let certificate = executor
+            .take_unsat_certificate()
+            .expect("closed-sentence token must cross publication once");
+        assert!(certificate.exact_semantic_verified());
+        assert!(certificate.confirms_checked_unsat_emission());
+        assert!(!certificate.strict_proof_verified());
+        assert!(executor.take_unsat_certificate().is_none());
+
+        // Snapshot-bound: fresh evidence dies once the term store moves on.
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT);
+        let evidence = executor
+            .try_authorize_current_query_refuted_closed_sentence_unsat()
+            .expect("the refuted not-exists-forall sentence must mint evidence");
+        let _growth = executor.ctx.terms.mk_int(BigInt::from(987_654_321));
+        let proposed = executor.emit_checked_exact_closed_sentence_unsat(evidence);
+        assert!(
+            !proposed.is_unsat(),
+            "stale-snapshot closed-sentence evidence must not publish UNSAT"
+        );
+    }
+
+    #[test]
+    fn closed_sentence_unsat_declines_valid_sentence() {
+        // NEVER-UNSAT pin: a closed sentence that is VALID must never mint
+        // refutation evidence — and the full solve must still publish `sat`
+        // through the SAT-side certificate.
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_VALID_EXISTS_SCRIPT);
+        assert!(
+            executor
+                .try_authorize_current_query_refuted_closed_sentence_unsat()
+                .is_none(),
+            "a valid closed sentence must not mint UNSAT evidence"
+        );
+
+        let commands = ay_frontend::parse(&format!(
+            "{CLOSED_SENTENCE_VALID_EXISTS_SCRIPT} (check-sat)"
+        ))
+        .expect("valid closed-sentence fixture must parse");
+        let mut executor = Executor::new();
+        let outputs = execute_authored_script(&mut executor, &commands);
+        assert_eq!(
+            outputs,
+            vec!["sat"],
+            "the valid twin must keep publishing sat"
+        );
+    }
+
+    #[test]
+    fn closed_sentence_unsat_declines_declared_symbol_and_uninterpreted_sort() {
+        // Guard-removal-proven negatives: each partition conjunct is
+        // load-bearing on a shape the derivation could otherwise attempt.
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_DECLARED_SYMBOL_SCRIPT);
+        assert!(
+            executor
+                .try_authorize_current_query_refuted_closed_sentence_unsat()
+                .is_none(),
+            "a declared symbol occurring in the sentence must decline the partition"
+        );
+
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_UNINTERPRETED_SORT_SCRIPT);
+        assert!(
+            executor
+                .try_authorize_current_query_refuted_closed_sentence_unsat()
+                .is_none(),
+            "a binder over an uninterpreted sort must decline the partition"
+        );
+    }
+
+    #[test]
+    fn closed_sentence_unsat_declines_under_explicit_proof_demand() {
+        // The certificate is semantic-only; an explicit proof demand must
+        // decline at the MINT so proof modes keep their original fail-closed
+        // quantifier diagnostics (emission would reject it anyway).
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT);
+        executor.set_produce_proofs(true);
+        assert!(
+            executor
+                .try_authorize_current_query_refuted_closed_sentence_unsat()
+                .is_none(),
+            "an explicit proof demand must decline the semantic-only mint"
+        );
+    }
+
+    #[test]
+    fn closed_sentence_unsat_kill_switch_is_load_bearing() {
+        let mut executor = bind_closed_sentence_query(CLOSED_SENTENCE_UNSAT_NOT_EXISTS_SCRIPT);
+        assert!(
+            executor
+                .try_authorize_refuted_closed_sentence_unsat_with(true)
+                .is_none(),
+            "--dpll-no-closed-sentence-unsat-cert must disable the mint"
+        );
+        assert!(
+            executor
+                .try_authorize_refuted_closed_sentence_unsat_with(false)
+                .is_some(),
+            "the identical query must mint with the switch off"
         );
     }
 }

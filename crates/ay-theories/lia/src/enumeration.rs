@@ -60,7 +60,7 @@ fn enum_rref_stats_record(hit: bool) {
     static LOOKUPS: AtomicU64 = AtomicU64::new(0);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+    if !*ENABLED.get_or_init(|| ay_core::misc_cli_flags().probe_stats) {
         return;
     }
     let n = LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;

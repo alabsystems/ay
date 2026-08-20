@@ -241,13 +241,23 @@ pub(crate) fn validate_euf_congruent(
         });
     }
 
-    // Premises must match argument positions
+    // Premise equalities (all literals except the conclusion).
+    //
+    // Same identical-argument omission as `validate_euf_congruent_pred`
+    // directly below, for the same completeness reason: a position whose two
+    // terms are the SAME term id needs no premise — `t = t` holds by
+    // reflexivity and its disjunct `¬(t = t)` is false, so dropping it
+    // preserves validity and cannot admit an invalid lemma. The canonical
+    // producer is array extensionality instantiation,
+    // `¬(a = e) ∨ (select a d) = (select e d)`, where the index position is
+    // shared. Both spellings accepted; every premise must be consumed in
+    // argument order, so a spurious or out-of-order premise still rejects.
     let premises = &clause[..clause.len() - 1];
-    if premises.len() != f_args.len() {
+    if premises.len() > f_args.len() {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
             reason: format!(
-                "EufCongruent: expected {} premise equalities for {}-ary function, got {}",
+                "EufCongruent: {}-ary function admits at most {} premise equalities, got {}",
                 f_args.len(),
                 f_args.len(),
                 premises.len()
@@ -255,29 +265,46 @@ pub(crate) fn validate_euf_congruent(
         });
     }
 
-    // Each premise must be (not (= ai bi)) matching the argument positions
-    for (i, &lit) in premises.iter().enumerate() {
-        let (inner, negated) = strip_not(terms, lit);
-        if !negated {
+    let mut next_premise = 0usize;
+    for i in 0..f_args.len() {
+        let consumed = if next_premise < premises.len() {
+            let lit = premises[next_premise];
+            let (inner, negated) = strip_not(terms, lit);
+            if !negated {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!(
+                        "EufCongruent: premise {next_premise} must be a negated equality"
+                    ),
+                });
+            }
+            let (a, b) =
+                decode_eq(terms, inner).ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!("EufCongruent: premise {next_premise} is not an equality"),
+                })?;
+            let matches = (a == f_args[i] && b == g_args[i]) || (a == g_args[i] && b == f_args[i]);
+            if matches {
+                next_premise += 1;
+            }
+            matches
+        } else {
+            false
+        };
+        if !consumed && f_args[i] != g_args[i] {
             return Err(ProofCheckError::InvalidTheoryLemma {
                 step: step_id,
-                reason: format!("EufCongruent: premise {i} must be a negated equality"),
+                reason: format!(
+                    "EufCongruent: argument position {i} differs but no premise equality                      connects it"
+                ),
             });
         }
-        let (a, b) =
-            decode_eq(terms, inner).ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
-                step: step_id,
-                reason: format!("EufCongruent: premise {i} is not an equality"),
-            })?;
-
-        // The premise equality must connect f_args[i] to g_args[i] (in either order)
-        let matches = (a == f_args[i] && b == g_args[i]) || (a == g_args[i] && b == f_args[i]);
-        if !matches {
-            return Err(ProofCheckError::InvalidTheoryLemma {
-                step: step_id,
-                reason: format!("EufCongruent: premise {i} does not match argument position {i}"),
-            });
-        }
+    }
+    if next_premise != premises.len() {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "EufCongruent: unconsumed premise equality".to_string(),
+        });
     }
 
     Ok(())
@@ -285,14 +312,13 @@ pub(crate) fn validate_euf_congruent(
 
 /// Recognize the exact EUF congruence clause shape `validate_euf_congruent`
 /// accepts (#trust->0 C1.ii): `(not (= a1 b1)) .. (not (= an bn))
-/// (= (f a1..an) (f b1..bn))` with one premise per argument position, also in
-/// the packed single-literal `(or …)` form.
+/// (= (f a1..an) (f b1..bn))` with a premise per DIFFERING argument position
+/// (identical-argument positions may omit theirs, exactly as in
+/// `eq_congruent_pred`), also in the packed single-literal `(or …)` form.
 ///
 /// Recognition IS the strict validator run on the clause — classifier and
 /// checker cannot drift, and a clause is only classified `EufCongruent` when
-/// strict checking is guaranteed to accept it (fail-closed: any shape the
-/// validator rejects, e.g. Ackermann instances whose identical argument pairs
-/// were dropped at emission, stays unrecognized).
+/// strict checking is guaranteed to accept it (fail-closed).
 #[must_use]
 pub fn recognize_euf_congruent(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_euf_congruent(terms, ProofId(0), clause).is_ok()
@@ -602,6 +628,66 @@ mod euf_recognizer_tests {
         assert!(!super::recognize_euf_reflexive(
             &terms,
             &[not_ab, raw_eq_aa]
+        ));
+    }
+}
+
+#[cfg(test)]
+mod congruent_identical_argument_tests {
+    use super::*;
+    use ay_core::{ArraySort, BitVecSort, Sort};
+
+    #[test]
+    fn accepts_congruence_with_shared_argument_omitted() {
+        // `(or (not (= a e)) (= (select a d) (select e d)))` — the array
+        // extensionality-instance shape; position 1 (the index) is shared.
+        let mut terms = TermStore::new();
+        let array_sort = Sort::Array(Box::new(ArraySort {
+            index_sort: Sort::BitVec(BitVecSort { width: 64 }),
+            element_sort: Sort::BitVec(BitVecSort { width: 8 }),
+        }));
+        let a = terms.mk_var("a", array_sort.clone());
+        let e = terms.mk_var("e", array_sort);
+        let d = terms.mk_var("d", Sort::BitVec(BitVecSort { width: 64 }));
+        let bv8 = Sort::BitVec(BitVecSort { width: 8 });
+        let sel_a = terms.mk_app(Symbol::named("select"), vec![a, d], bv8.clone());
+        let sel_e = terms.mk_app(Symbol::named("select"), vec![e, d], bv8);
+        let arrays_eq = terms.mk_app(Symbol::named("="), vec![a, e], Sort::Bool);
+        let not_arrays_eq = terms.mk_not(arrays_eq);
+        let selects_eq = terms.mk_app(Symbol::named("="), vec![sel_a, sel_e], Sort::Bool);
+        let packed = terms.mk_app(
+            Symbol::named("or"),
+            vec![not_arrays_eq, selects_eq],
+            Sort::Bool,
+        );
+        assert!(recognize_euf_congruent(&terms, &[packed]));
+        assert!(recognize_euf_congruent(
+            &terms,
+            &[not_arrays_eq, selects_eq]
+        ));
+    }
+
+    #[test]
+    fn rejects_congruence_whose_differing_position_has_no_premise() {
+        // `(= (select a d1) (select e d2))` with d1 != d2 and only the array
+        // premise — falsifiable, must stay rejected.
+        let mut terms = TermStore::new();
+        let array_sort = Sort::Array(Box::new(ArraySort {
+            index_sort: Sort::Int,
+            element_sort: Sort::Int,
+        }));
+        let a = terms.mk_var("a", array_sort.clone());
+        let e = terms.mk_var("e", array_sort);
+        let d1 = terms.mk_var("d1", Sort::Int);
+        let d2 = terms.mk_var("d2", Sort::Int);
+        let sel_a = terms.mk_app(Symbol::named("select"), vec![a, d1], Sort::Int);
+        let sel_e = terms.mk_app(Symbol::named("select"), vec![e, d2], Sort::Int);
+        let arrays_eq = terms.mk_app(Symbol::named("="), vec![a, e], Sort::Bool);
+        let not_arrays_eq = terms.mk_not(arrays_eq);
+        let selects_eq = terms.mk_app(Symbol::named("="), vec![sel_a, sel_e], Sort::Bool);
+        assert!(!recognize_euf_congruent(
+            &terms,
+            &[not_arrays_eq, selects_eq]
         ));
     }
 }

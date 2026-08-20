@@ -209,6 +209,26 @@ pub(crate) fn frontend_term_is_equality(term: &FrontendTerm) -> bool {
     )
 }
 
+/// Certify the single-literal clause `(cl ¬(= a b))` whose equality is
+/// arithmetically infeasible on its own (e.g. two distinct numerals) with the
+/// unit Farkas certificate `[1]`, independently re-verified by the exact
+/// semantic checker (#ground-conflict-decomp). The LRA reconstruction cannot
+/// produce such a certificate — a constants-only row never enters its
+/// tableau — but the verifier's semantics decide it directly. Fail-closed:
+/// `None` unless the verifier accepts.
+pub(crate) fn constant_disequality_unit_farkas(
+    terms: &TermStore,
+    literal: TermId,
+) -> Option<ay_core::FarkasAnnotation> {
+    let TermData::Not(inner) = terms.get(literal) else {
+        return None;
+    };
+    let farkas = ay_core::FarkasAnnotation::from_ints(&[1]);
+    let conflict = vec![ay_core::TheoryLit::new(*inner, true)];
+    ay_core::proof_validation::verify_farkas_conflict_lits_full(terms, &conflict, &farkas).ok()?;
+    Some(farkas)
+}
+
 /// Try to reconstruct Farkas coefficients for a single theory lemma clause
 /// using the LRA solver. Returns true if successful.
 pub(crate) fn try_lra_farkas_reconstruction(

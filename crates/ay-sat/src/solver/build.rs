@@ -42,6 +42,25 @@ impl Solver {
         Self::build_with_hint(num_vars, None, Some(num_clauses))
     }
 
+    /// Reserve clause-arena room for a CNF of known shape.
+    ///
+    /// This is the trusted-producer counterpart of [`Self::with_clause_hint`].
+    /// That constructor takes a *parsed* count (a DIMACS header) and is
+    /// deliberately clamped to the `num_vars`-derived guess so a bogus header
+    /// cannot reserve gigabytes. This method takes a count the caller derived
+    /// from its own encoding plan, so there is nothing to distrust and no
+    /// clamp: an eager lowering that produces 51.9 M clauses over 564 k
+    /// variables is under-served by `num_vars * 4` by two orders of magnitude,
+    /// and the arena then doubles all the way up from that guess — ending one
+    /// doubling past what was needed, holding ~660 MB it never writes.
+    ///
+    /// Advisory: the arena grows normally if the hint turns out low, and the
+    /// reservation is capped at the arena's addressable limit. Reserving
+    /// capacity stores nothing and changes no search state.
+    pub fn reserve_clause_capacity(&mut self, num_clauses: usize, num_literals: usize) {
+        self.arena.reserve_clauses(num_clauses, num_literals);
+    }
+
     /// Shared constructor: all Solver initialization in one place.
     fn build(num_vars: usize, proof_output: Option<ProofOutput>) -> Self {
         Self::build_with_hint(num_vars, proof_output, None)

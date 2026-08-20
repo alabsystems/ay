@@ -135,12 +135,19 @@ impl Executor {
         {
             self.run_internal_proof_check(&candidate);
             if !self.proof_check_ok {
+                replay_note(|| {
+                    format!(
+                        "decline: internal proof check refused ({:?})",
+                        self.proof_check_result
+                    )
+                });
                 self.proof_check_result = None;
                 return false;
             }
         }
         #[cfg(not(feature = "proof-checker"))]
         if self.self_check() {
+            replay_note(|| "decline: self-check without proof-checker feature".into());
             return false;
         }
         self.populate_proof_quality_stats(&quality);
@@ -148,6 +155,27 @@ impl Executor {
         self.last_unsat_proof_reconstruction_suppressed = false;
         self.last_proof = Some(candidate);
         true
+    }
+
+    /// Whether `last_proof` already holds a COMPLETE strict authored-scope
+    /// refutation — e.g. the cascade member below committed a stitched
+    /// consequence-replay candidate during the live proof build
+    /// (#ground-conflict-decomp). Everything is re-validated at this exact
+    /// moment (reachable-assume scope over the exact authored roots,
+    /// empty-clause derivation, and the full strict check), so a stale or
+    /// foreign proof can only decline; publication re-checks the same proof
+    /// again at certificate-mint time. UNSAT-only, covered by
+    /// `--no-consequence-replay` at the call site.
+    pub(in crate::executor) fn authored_scope_strict_proof_installed(&mut self) -> bool {
+        let Some(candidate) = self.last_proof.clone() else {
+            return false;
+        };
+        let authored = self.exact_concrete_authored_scope();
+        ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored).is_ok()
+            && Self::proof_derives_empty_clause(&candidate)
+            && self
+                .check_proof_strict_with_datatypes(&candidate)
+                .is_ok_and(|quality| quality.is_complete())
     }
 
     /// Cascade member: rebuild a trust-rejected (or unrepairable) proof as the
@@ -167,7 +195,8 @@ impl Executor {
             return;
         };
         let authored = self.exact_concrete_authored_scope();
-        let _ = self.commit_if_strictly_checked(proof, candidate, &authored);
+        let committed = self.commit_if_strictly_checked(proof, candidate, &authored);
+        replay_note(|| format!("cascade commit: {committed}"));
     }
 
     /// Build (but do not install) the stitched authored-scope refutation.

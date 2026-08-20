@@ -80,6 +80,89 @@ pub(in crate::executor) enum ArrayAxiomMode {
 }
 
 impl Executor {
+    /// Inject the eager Bool-arg congruence lemmas
+    /// `\/_i ~(a_i = b_i) \/ (f(ā) = f(b̄))` for every reachable pair of UF
+    /// applications that differ only in Bool-sorted argument positions.
+    ///
+    /// SOUND BY CONSTRUCTION: each clause is an instance of the EUF congruence
+    /// axiom, i.e. a theory tautology, so it can neither create nor destroy a
+    /// model — only expose the Bool-arg equalities to the SAT skeleton, where
+    /// DPLL(T) can branch on them. See the long-form rationale at the call site
+    /// in `solve_euf`; the scope rule (NON-incremental only) is preserved here
+    /// so the measured incremental completeness collapse cannot recur.
+    ///
+    /// Extracted from `solve_euf` so the ARRAY-carrying routes can share it:
+    /// `purify_bool_args` hoists a compound Bool UF argument (e.g. the array
+    /// read in `(g (select s1 5))`) to a fresh `boolarg` proxy, and on the
+    /// AUFLIA/Array+EUF routes nothing then ties that proxy's truth value back
+    /// to the `true`/`false` constant the sibling application `(g true)` uses —
+    /// so `(assert (= (g true) false)) (assert (select s1 5)) (assert (g
+    /// (select s1 5)))` answered `unknown` where z3 answers `unsat`. That is
+    /// the same Bool-arg gap this lemma already closes on the pure-EUF route.
+    ///
+    /// `declared_uf_heads_only` restricts the emission to NON-builtin heads.
+    /// The collector's structural scan admits any named application with a
+    /// Bool-sorted argument, which on an array problem includes `select` — and
+    /// `select` congruence is the ARRAY theory's own obligation, already
+    /// discharged by the finite-index extensionality closure. Emitting it here
+    /// too is sound but not inert: it adds equality candidates the route-level
+    /// closure then expands, which moved
+    /// `smt.array.finite_ext.emitted_equalities` from 3 to 5 on the QF_AX
+    /// nested-extensionality gate (verdict unchanged, telemetry pin broken).
+    /// The pure-EUF caller passes `false` and stays byte-identical.
+    pub(in crate::executor) fn inject_bool_arg_congruence_lemmas(
+        &mut self,
+        declared_uf_heads_only: bool,
+    ) {
+        if self.incremental_mode {
+            return;
+        }
+        let reachable = reachable_term_set(&self.ctx.terms, &self.ctx.assertions);
+        let lemmas = collect_bool_arg_congruence_lemmas(&self.ctx.terms, &reachable);
+        if lemmas.is_empty() {
+            return;
+        }
+        let mut existing: HashSet<TermId> = HashSet::default();
+        for &assertion in &self.ctx.assertions {
+            existing.insert(assertion);
+        }
+        let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
+        for lemma in lemmas {
+            if declared_uf_heads_only {
+                let head_is_builtin = match self.ctx.terms.get(lemma.app_a) {
+                    TermData::App(sym, _) => crate::features::is_builtin_symbol_name(sym.name()),
+                    _ => true,
+                };
+                if head_is_builtin {
+                    continue;
+                }
+            }
+            if !seen.insert((lemma.app_a, lemma.app_b)) {
+                continue;
+            }
+            // Consequent: f(a) = f(b). Skip degenerate self-equalities.
+            let app_eq = self.ctx.terms.mk_eq(lemma.app_a, lemma.app_b);
+            // Build clause literals: ~(a_i = b_i) for each differing Bool
+            // position, plus the consequent app_eq.
+            let mut clause_lits: Vec<TermId> = Vec::with_capacity(lemma.bool_pairs.len() + 1);
+            for (a, b) in &lemma.bool_pairs {
+                let arg_eq = self.ctx.terms.mk_eq(*a, *b);
+                let not_arg_eq = self.ctx.terms.mk_not(arg_eq);
+                clause_lits.push(not_arg_eq);
+            }
+            clause_lits.push(app_eq);
+            let clause = self.ctx.terms.mk_or(clause_lits);
+            // Re-entry guard: the array routes inject before dispatch and
+            // `solve_euf` injects again on its own entry. Hash-consing makes the
+            // repeat clause the same `TermId`, so skipping it keeps the
+            // assertion window byte-identical to the single-injection case.
+            if existing.contains(&clause) {
+                continue;
+            }
+            self.ctx.assertions.push(clause);
+        }
+    }
+
     /// Check whether a term is in scope for array axiom generation (#6726).
     /// Returns `true` when no scope filter is active (non-incremental mode),
     /// when the term was created during the current fixpoint (idx >= start_len),
@@ -459,29 +542,7 @@ impl Executor {
         // otherwise never reach EUF. (The former
         // `AY_EUF_BOOL_ARG_LEMMA_INCREMENTAL=1` incremental force-enable is
         // removed; OFF in incremental mode is the measured-sound default.)
-        if !self.incremental_mode {
-            let reachable = reachable_term_set(&self.ctx.terms, &self.ctx.assertions);
-            let lemmas = collect_bool_arg_congruence_lemmas(&self.ctx.terms, &reachable);
-            let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
-            for lemma in lemmas {
-                if !seen.insert((lemma.app_a, lemma.app_b)) {
-                    continue;
-                }
-                // Consequent: f(a) = f(b). Skip degenerate self-equalities.
-                let app_eq = self.ctx.terms.mk_eq(lemma.app_a, lemma.app_b);
-                // Build clause literals: ~(a_i = b_i) for each differing Bool
-                // position, plus the consequent app_eq.
-                let mut clause_lits: Vec<TermId> = Vec::with_capacity(lemma.bool_pairs.len() + 1);
-                for (a, b) in &lemma.bool_pairs {
-                    let arg_eq = self.ctx.terms.mk_eq(*a, *b);
-                    let not_arg_eq = self.ctx.terms.mk_not(arg_eq);
-                    clause_lits.push(not_arg_eq);
-                }
-                clause_lits.push(app_eq);
-                let clause = self.ctx.terms.mk_or(clause_lits);
-                self.ctx.assertions.push(clause);
-            }
-        }
+        self.inject_bool_arg_congruence_lemmas(false);
 
         // #bool-arg-congruence: the SOUND post-SAT model-validation guard runs in
         // BOTH incremental and non-incremental modes. It only ever downgrades a

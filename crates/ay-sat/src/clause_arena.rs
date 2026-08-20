@@ -96,6 +96,24 @@ pub(crate) const SCOPE_LIM_MAX: u16 = 3;
 /// Maximum value of the used counter (CaDiCaL internal.hpp:315).
 pub(crate) const MAX_USED: u8 = 31;
 
+/// Arena capacity (in u32 words) above which `Vec`'s doubling is replaced by
+/// bounded-overshoot growth.
+///
+/// `Vec::push` grows by doubling, so a purely push-grown arena carries up to a
+/// full arena's worth of slack. Measured on `vlsat3_b99.smt2` (QF_DT Bouvier,
+/// 51,893,377 clauses lowered by the enum finite-domain lane): at peak the
+/// arena held `len = 259,383,464` words in `cap = 433,028,352` — 1652 MB
+/// mapped for 990 MB of clauses. That 662 MB is never written, so it never
+/// shows in RSS, but it is charged in full against `--memory`, which trips on
+/// `max(counting-allocator live bytes, phys_footprint)`.
+///
+/// Below the threshold the absolute waste is at most ~128 MB and doubling's
+/// cheaper reallocation ladder is the right trade, so small arenas keep
+/// `Vec`'s policy exactly. Above it, growth is +25% per step: still geometric
+/// (so growth stays amortized O(1)) but with the overshoot bounded to a
+/// quarter of the arena instead of all of it.
+const BOUNDED_GROWTH_THRESHOLD_WORDS: usize = 32 * 1024 * 1024; // 128 MB
+
 /// Unified clause arena with inline header + literal storage.
 ///
 /// `ClauseRef(u32)` values are word offsets directly into `words`.
@@ -144,7 +162,29 @@ pub(crate) struct ClauseArena {
     /// formula but UNSAT verdicts must be downgraded to `unknown`. Sticky: once
     /// poisoned, stays poisoned for the life of the arena.
     has_oversized_clause: bool,
+    /// Word count the clause-DB **memory heuristic** bills the arena for.
+    ///
+    /// `memory_bytes()` feeds `Solver::clause_db_memory_bytes`, which is the
+    /// byte trigger in `should_reduce_db` / `explicit_reduce_pressure` — armed
+    /// on the BV, strings, and resolution-DAG paths via
+    /// `set_max_clause_db_bytes`. It used to read `words.capacity()`, so
+    /// changing how the arena grows would move when reduction fires, i.e.
+    /// change the search. This field keeps the heuristic on its historical
+    /// basis — `Vec`'s doubling ladder — so the reduction cadence and the
+    /// search trajectory are bit-identical no matter what the allocator is
+    /// actually asked for. Same reasoning as `LEGACY_ACCOUNTING_HEADER_WORDS`
+    /// above, which pins the GC effort heuristic to the pre-slimming header
+    /// size for exactly this purpose.
+    ///
+    /// Re-seeded from the real capacity on compaction, which rebuilds `words`
+    /// through `Vec`'s own growth in every build.
+    accounted_words: usize,
 }
+
+/// `RawVec::MIN_NON_ZERO_CAP` for a 4-byte element: the floor `Vec` applies to
+/// its first amortized growth. Mirrored here so `accounted_words` reproduces
+/// the doubling ladder exactly from an empty arena.
+const VEC_MIN_NON_ZERO_CAP: usize = 4;
 
 impl Clone for ClauseArena {
     fn clone(&self) -> Self {
@@ -160,6 +200,7 @@ impl Clone for ClauseArena {
             signatures: self.signatures.clone(),
             dead_words: self.dead_words,
             has_oversized_clause: self.has_oversized_clause,
+            accounted_words: self.accounted_words,
         }
     }
 }
@@ -178,12 +219,17 @@ impl ClauseArena {
             signatures: DetHashMap::default(),
             dead_words: 0,
             has_oversized_clause: false,
+            accounted_words: 0,
         }
     }
 
     pub(crate) fn with_capacity(clause_hint: usize, literal_hint: usize) -> Self {
+        let words: Vec<u32> = Vec::with_capacity(clause_hint * HEADER_WORDS + literal_hint);
+        // Seed the heuristic's ladder from the real starting capacity: this is
+        // where `words.capacity()` began before the growth policy changed.
+        let accounted_words = words.capacity();
         Self {
-            words: Vec::with_capacity(clause_hint * HEADER_WORDS + literal_hint),
+            words,
             num_clauses: 0,
             active_count: 0,
             irredundant_count: 0,
@@ -194,6 +240,7 @@ impl ClauseArena {
             signatures: DetHashMap::default(),
             dead_words: 0,
             has_oversized_clause: false,
+            accounted_words,
         }
     }
 
@@ -247,6 +294,73 @@ impl ClauseArena {
         }
     }
 
+    /// Make room for `extra` more words, bounding the overshoot once the arena
+    /// is large (see [`BOUNDED_GROWTH_THRESHOLD_WORDS`]).
+    ///
+    /// What the solver can observe is unchanged. `ClauseRef` offsets are
+    /// `words.len()` at insertion time, `words_capacity()` is dead code, and
+    /// the IC3 pressure check reads `arena.len()`. The one heuristic that DID
+    /// read `words.capacity()` — the clause-DB byte trigger, via
+    /// `memory_bytes()` — now reads `accounted_words`, which this function
+    /// keeps on `Vec`'s doubling ladder regardless of the real allocation. So
+    /// this changes only how much address space is held, never what is stored,
+    /// in what order, or when reduction fires.
+    #[inline]
+    fn reserve_words(&mut self, extra: usize) {
+        let len = self.words.len();
+        let cap = self.words.capacity();
+        // Advance the heuristic's ladder first, on `Vec`'s own rule
+        // (`RawVec::grow_amortized`), independently of what is really
+        // allocated below. See `accounted_words`.
+        let needed_for_accounting = len.saturating_add(extra);
+        if needed_for_accounting > self.accounted_words {
+            self.accounted_words = self
+                .accounted_words
+                .saturating_mul(2)
+                .max(needed_for_accounting)
+                .max(VEC_MIN_NON_ZERO_CAP);
+        }
+        if extra <= cap - len {
+            return;
+        }
+        if cap < BOUNDED_GROWTH_THRESHOLD_WORDS {
+            // Small arena: keep `Vec`'s own amortized doubling verbatim.
+            self.words.reserve(extra);
+            return;
+        }
+        let needed = len
+            .checked_add(extra)
+            .expect("BUG: clause arena word count overflow");
+        let target = needed.max(cap + cap / 4);
+        self.words.reserve_exact(target - len);
+    }
+
+    /// Reserve room for `clauses` clauses totalling `literals` literals.
+    ///
+    /// Producers that build their CNF from a plan know its exact shape before
+    /// they emit it. Reserving the whole thing in one call skips the entire
+    /// growth ladder: no slack, and none of the double-live transients where a
+    /// realloc holds the old and new buffers at once.
+    ///
+    /// Advisory in both directions: a low hint still grows normally (via
+    /// [`Self::reserve_words`]), and a high one only wastes what it asks for.
+    /// It never shrinks an existing reservation and never reserves past the
+    /// arena's addressable limit.
+    ///
+    /// Deliberately does NOT touch `accounted_words`: the clause-DB byte
+    /// heuristic must see the same ladder it would have seen with no hint at
+    /// all, or the reduction cadence moves and the search with it.
+    pub(crate) fn reserve_clauses(&mut self, clauses: usize, literals: usize) {
+        let want = clauses
+            .saturating_mul(HEADER_WORDS)
+            .saturating_add(literals)
+            .min(crate::arena_limits::MAX_ARENA_WORDS as usize);
+        if want <= self.words.capacity() {
+            return;
+        }
+        self.words.reserve_exact(want - self.words.len());
+    }
+
     /// Add a new clause. Returns the word offset as `usize`.
     pub(crate) fn add(&mut self, lits: &[Literal], learned: bool) -> usize {
         debug_assert!(!lits.is_empty(), "BUG: ClauseArena::add() with 0 literals");
@@ -289,6 +403,9 @@ impl ClauseArena {
         }
         let stored = &lits[..lit_len as usize];
         let signature = compute_clause_signature(stored);
+        // Grow deliberately rather than letting the pushes below double the
+        // arena: exactly `HEADER_WORDS + lit_len` words are written here.
+        self.reserve_words(HEADER_WORDS + lit_len as usize);
         self.words.push(u32::from(lit_len));
         self.words.push(0u32);
         let flags: u16 = if learned { LEARNED_BIT } else { 0 };
@@ -422,25 +539,34 @@ pub(crate) struct ArenaIter<'a> {
     pos: usize,
 }
 
-impl Iterator for ArenaIter<'_> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<usize> {
-        if self.pos >= self.words.len() {
+/// One step of the header-stride arena walk shared by [`ArenaIter`] and
+/// [`ClauseArena::walk_step`].
+///
+/// Returns `(clause_offset, next_pos)`, or `None` at the end of the arena.
+/// This is the SINGLE definition of the walk: a cursor-style caller (one that
+/// needs `&mut self` inside its loop body and therefore cannot hold the
+/// iterator's borrow) must land on exactly the same offsets in the same order
+/// as `indices()` / `indices_from()`.
+fn arena_walk_step(
+    words: &[u32],
+    shrink_map: &DetHashMap<u32, u16>,
+    mut pos: usize,
+) -> Option<(usize, usize)> {
+    loop {
+        if pos >= words.len() {
             return None;
         }
         // Guard: need at least HEADER_WORDS to read the clause header.
         // A partial header at the end of the arena indicates corruption or
         // a prior stride miscalculation. Stop iteration to prevent OOB reads.
-        if self.pos + HEADER_WORDS > self.words.len() {
-            self.pos = self.words.len();
+        if pos + HEADER_WORDS > words.len() {
             return None;
         }
-        let off = self.pos;
-        let current_len = (self.words[off] & 0xFFFF) as usize;
+        let off = pos;
+        let current_len = (words[off] & 0xFFFF) as usize;
         let alloc_len = if current_len == 0 {
             // Deleted clause: alloc_len in lower 16 bits of word[1].
-            let deleted_alloc = (self.words[off + 1] & 0xFFFF) as usize;
+            let deleted_alloc = (words[off + 1] & 0xFFFF) as usize;
             if deleted_alloc == 0 {
                 // Zero alloc_len in a deleted clause header indicates double-
                 // delete or corruption (#8231). In release builds the old
@@ -448,11 +574,11 @@ impl Iterator for ArenaIter<'_> {
                 // only HEADER_WORDS, landing mid-clause on subsequent
                 // iterations and interpreting literal data as headers. Fix:
                 // skip forward by HEADER_WORDS to prevent infinite loops.
-                self.pos += HEADER_WORDS;
-                return self.next();
+                pos += HEADER_WORDS;
+                continue;
             }
             deleted_alloc
-        } else if let Some(&orig) = self.shrink_map.get(&(off as u32)) {
+        } else if let Some(&orig) = shrink_map.get(&(off as u32)) {
             // Shrunk clause: stride spans original allocation.
             orig as usize
         } else {
@@ -461,16 +587,46 @@ impl Iterator for ArenaIter<'_> {
         };
         debug_assert!(alloc_len > 0, "BUG: zero alloc_len in arena walk at {off}");
         let stride = HEADER_WORDS + alloc_len;
-        self.pos += stride;
         // Validate the clause span fits within the arena. If it doesn't,
         // the iterator landed on a misaligned position where literal data
         // was misinterpreted as a header (#8231). Skip this corrupt entry
         // to prevent downstream OOB panics in literals()/watched_literals().
-        if off + stride > self.words.len() {
-            self.pos = self.words.len();
-            return self.next();
+        if off + stride > words.len() {
+            return None;
         }
-        Some(off)
+        return Some((off, off + stride));
+    }
+}
+
+impl ClauseArena {
+    /// Cursor form of the arena walk: one clause per call, no iterator borrow.
+    ///
+    /// Yields `(clause_offset, next_pos)` for the clause at or after `pos`,
+    /// matching `indices_from(pos)` offset for offset. Callers that mutate the
+    /// solver inside the loop body (watch attachment, literal swaps) use this
+    /// instead of collecting every offset into a `Vec` first — on the SC2025
+    /// giants that collect was a multi-hundred-megabyte transient sitting
+    /// exactly at the peak-RSS moment.
+    #[inline]
+    pub(crate) fn walk_step(&self, pos: usize) -> Option<(usize, usize)> {
+        arena_walk_step(&self.words, &self.shrink_map, pos)
+    }
+}
+
+impl Iterator for ArenaIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match arena_walk_step(self.words, self.shrink_map, self.pos) {
+            Some((off, next_pos)) => {
+                self.pos = next_pos;
+                Some(off)
+            }
+            None => {
+                self.pos = self.words.len();
+                None
+            }
+        }
     }
 }
 

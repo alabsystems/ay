@@ -331,6 +331,7 @@ pub(crate) use sat_proof_manager::SatProofManager;
 pub use assume_step_result::AssumeStepResult;
 pub use ay_core::Proof;
 pub use dpll_error::DpllError;
+pub use executor::CertificationAccounting;
 pub use executor::Executor;
 pub use executor_types::{
     ExecutorError, Result as ExecutorResult, StatValue, Statistics, UnknownOrigin, UnknownReason,

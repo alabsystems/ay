@@ -689,6 +689,15 @@ impl Executor {
         if self.unit_prop_pass_enabled() {
             const MAX_UNIT_PROP_ROUNDS: usize = 8;
             let mut rewritten_total: u64 = 0;
+            // (#4751) Snapshot the pre-pass stack and record every licensed
+            // disjunct DELETION so the in-place rewrite below can be REPLAYED
+            // into proof steps. Without provenance the rewritten assertion is
+            // absent from the authored stack and `demote_non_problem_assumptions`
+            // stamps its assume a premiseless `trust`, which strict presentation
+            // rejects. Only proof-producing solves pay the clone.
+            let unit_prop_before = self.produce_proofs_enabled().then(|| assertions.clone());
+            // (deleted disjunct, licensing unit assertion) in deletion order.
+            let mut unit_prop_deletions: Vec<(TermId, TermId)> = Vec::new();
             let neg_of = |terms: &TermStore, t: TermId| -> Option<TermId> {
                 match terms.get(t) {
                     TermData::Not(inner) => Some(*inner),
@@ -728,6 +737,10 @@ impl Executor {
                     let mut used_units: Vec<usize> = Vec::new();
                     let mut satisfied = false;
                     let mut kept: Vec<TermId> = Vec::with_capacity(args.len());
+                    // (#4751) Deletions of THIS assertion, committed only if
+                    // the rewrite actually lands (a later `satisfied` disjunct
+                    // abandons the whole rewrite).
+                    let mut deleted_here: Vec<(TermId, TermId)> = Vec::new();
                     for &d in &args {
                         // disjunct asserted as a unit -> whole or is true
                         if let Some(&ui) = units.get(&d) {
@@ -745,6 +758,9 @@ impl Executor {
                         .or_else(|| neg_units.get(&d).copied().filter(|&ui| ui != i));
                         if let Some(ui) = contradicted {
                             used_units.push(ui);
+                            if unit_prop_before.is_some() {
+                                deleted_here.push((d, assertions[ui]));
+                            }
                             continue; // disjunct deleted
                         }
                         kept.push(d);
@@ -768,6 +784,7 @@ impl Executor {
                         assertions[i] = new_a;
                         changed = true;
                         rewritten_total += 1;
+                        unit_prop_deletions.append(&mut deleted_here);
                         let mut extra: Vec<TermId> = Vec::new();
                         for ui in used_units {
                             extra.extend(source_sets[ui].iter().copied());
@@ -784,6 +801,13 @@ impl Executor {
             if rewritten_total > 0 {
                 self.last_statistics
                     .set_int("preprocess.unit_prop.rewritten_assertions", rewritten_total);
+            }
+            if let Some(before) = unit_prop_before {
+                self.extend_propagated_value_provenance_from_unit_prop(
+                    &before,
+                    &assertions,
+                    &unit_prop_deletions,
+                );
             }
         }
 
@@ -848,8 +872,23 @@ impl Executor {
         // See Executor::proof_no_varsubst_enabled (option or env knob).
         let skip_subst_for_proofs =
             self.produce_proofs_enabled() && self.proof_no_varsubst_enabled();
+        // (#4751) Snapshot the pre-substitution stack so the IN-PLACE rewrite
+        // below can be REPLAYED into proof steps. Without it the rewritten
+        // assume is not in the authored stack and demotes to a premiseless
+        // `trust`, which strict presentation rejects — the exact cost this
+        // block's comment predicts. Only proof-producing solves pay the clone.
+        let pre_subst_assertions = self.produce_proofs_enabled().then(|| assertions.clone());
         let var_subst_changed =
             !skip_subst_for_proofs && var_subst.apply(&mut self.ctx.terms, &mut assertions);
+        if var_subst_changed {
+            if let Some(before) = pre_subst_assertions {
+                self.extend_propagated_value_provenance_from_var_subst(
+                    &before,
+                    &assertions,
+                    &var_subst,
+                );
+            }
+        }
         // Record eliminated-variable definitions for model completion at
         // finalize time (model/completion.rs).
         self.record_var_substitutions(&var_subst);

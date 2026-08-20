@@ -44,10 +44,14 @@
 //!
 //! Anything else — an `=` row, a negative normalized coefficient, mixed
 //! objective weights, a variable constrained but unpriced — DECLINES (returns
-//! `None`, does nothing, costs one O(nonzeros) pass). Rows that normalize to
-//! `d <= 0` are trivially true and dropped; a row whose coefficients cannot
-//! reach its own rhs makes the instance infeasible, which this heuristic
-//! cannot help with, so it declines too.
+//! `None`, does nothing, costs one O(nonzeros) pass). A negative coefficient
+//! rejects EVEN when the row's rhs normalizes to `d <= 0`: an at-most-one or
+//! implication row is not trivially true, and dropping it would leave the
+//! advisory view a strict relaxation whose candidates only die later in
+//! `record` (see `cover::collect_normalized`). Only rows that are monotone
+//! AND have `d <= 0` are trivially true and dropped; a row whose coefficients
+//! cannot reach its own rhs makes the instance infeasible, which this
+//! heuristic cannot help with, so it declines too.
 //!
 //! # Soundness (NON-NEGOTIABLE, identical posture to [`crate::optimize::sls`])
 //! This module can only ever PROPOSE feasible incumbents; it can NEVER claim a

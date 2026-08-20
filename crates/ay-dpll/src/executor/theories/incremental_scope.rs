@@ -165,8 +165,14 @@ impl Executor {
         self.ctx.assertions = saved_assertions;
         self.counterexample_style = saved_style;
         self.skip_model_eval = saved_skip;
+        // The window provenance outlives an UNSAT only for the certification /
+        // export lanes that consume it. Under competition shedding there is no
+        // outer provenance for `preserving_authority_from` to re-root onto and
+        // no consumer, so leaving it installed would hand the B3 raw lane a
+        // record bound to the PREPROCESSED window — present-but-mismatched, a
+        // hard error there. See `theory_window_provenance_survives_unsat`.
         let should_restore_provenance = match &result {
-            Ok(Ok(r)) => !r.is_unsat(),
+            Ok(Ok(r)) => !r.is_unsat() || !self.theory_window_provenance_survives_unsat(),
             Ok(Err(_)) | Err(_) => true,
         };
         if should_restore_provenance {

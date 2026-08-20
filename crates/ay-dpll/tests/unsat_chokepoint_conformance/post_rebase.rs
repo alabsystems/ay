@@ -19,11 +19,82 @@ pub(super) fn assert_certificate_mint_sites(source: &str, bind_source: &str) {
         bind_source[bind_fn..bind_capability].contains("let kind = match source {"),
         "the capability must be constructed only from a bound certification source"
     );
+    // Every exact-semantic theorem wrapper must delegate to the common mint,
+    // and every wrapper's kind must be authenticated by its own evidence in
+    // `checked_exact_semantic_is_current`. Both are DERIVED from the wrappers
+    // that exist rather than pinned to a hand-maintained count: `75630763f`
+    // added a sixth wrapper (`emit_checked_exact_finite_expansion_unsat`) that
+    // delegates correctly and is covered by the authority invariant, and the
+    // literal `5` reported that correct change as a defect. Nothing is
+    // loosened — the count equality still forbids a wrapper that mints
+    // directly, and the per-wrapper checks below are strictly stronger than a
+    // whole-file total, which one wrapper delegating twice could have
+    // satisfied while another delegated not at all.
+    let wrappers = source
+        .match_indices("pub(in crate::executor) fn emit_checked_exact_")
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    // Floor at the count that exists today, not at the count the stale literal
+    // named. Adding a wrapper is ordinary work and must not trip this; REMOVING
+    // one retires a published exact-semantic theorem and is exactly the event
+    // that deserves a review, so it stays pinned.
+    assert!(
+        wrappers.len() >= 6,
+        "the exact-semantic theorem lane must retain its published wrappers, found {}",
+        wrappers.len()
+    );
     assert_eq!(
         source.matches("self.emit_checked_exact_unsat(").count(),
-        5,
+        wrappers.len(),
         "every exact semantic theorem wrapper must delegate to the common mint"
     );
+    let semantic_current_start = source
+        .find("fn checked_exact_semantic_is_current(")
+        .expect("the exact-semantic authority invariant must exist");
+    let semantic_current_end = source[semantic_current_start..]
+        .find("pub(crate) fn strict_proof_verified(")
+        .map(|offset| semantic_current_start + offset)
+        .expect("the exact-semantic authority invariant must have a bounded source region");
+    let semantic_current = &source[semantic_current_start..semantic_current_end];
+    for (index, &start) in wrappers.iter().enumerate() {
+        let end = wrappers.get(index + 1).copied().unwrap_or(source.len());
+        let wrapper = &source[start..end];
+        assert_eq!(
+            wrapper.matches("self.emit_checked_exact_unsat(").count(),
+            1,
+            "exact semantic theorem wrapper {index} must delegate to the common mint exactly once"
+        );
+        let kind_at = wrapper
+            .find("UnsatCertificateKind::")
+            .map(|offset| offset + "UnsatCertificateKind::".len())
+            .unwrap_or_else(|| {
+                panic!("wrapper {index} must name the exact certificate kind it mints")
+            });
+        let kind = wrapper[kind_at..]
+            .split(|character: char| !character.is_alphanumeric() && character != '_')
+            .next()
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| panic!("wrapper {index} must name a certificate kind identifier"));
+        // A `=> false` arm is written `Kind(_)`, so requiring `(evidence) =>`
+        // cannot be satisfied by the denied group.
+        let arm = semantic_current
+            .split(&format!("UnsatCertificateKind::{kind}(evidence) => "))
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "exact theorem kind {kind} has no live authority arm in \
+                     checked_exact_semantic_is_current — the common mint must not \
+                     be able to accept a theorem the invariant does not authenticate"
+                )
+            });
+        assert!(
+            arm.trim_start()
+                .trim_start_matches('{')
+                .trim_start()
+                .starts_with("evidence.is_current(executor)"),
+            "exact theorem kind {kind} must be authenticated by its own sealed evidence"
+        );
+    }
     assert_eq!(
         source
             .matches("self.last_unsat_certificate = Some(UnsatCertificate(")

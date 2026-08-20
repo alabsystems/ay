@@ -159,7 +159,7 @@ pub(crate) struct CoreSolver {
     /// Reference: CVC5 purification in `theory_strings_preprocess.cpp`
     reduced_terms: HashSet<TermId>,
     /// ADDITIONAL pending lemmas queued behind `pending_lemma` (NF-engine
-    /// closure 3, `AY_STR_NF=1`): distinct extra buffered NF split lemmas and
+    /// closure 3, `--str-nf`): distinct extra buffered NF split lemmas and
     /// extra dynamic reduction requests discovered in the same check round.
     /// Drained by the executor via `take_pending_string_lemmas` so a skolem
     /// web reduces in 1-2 CEGAR rounds instead of one round per lemma.
@@ -322,7 +322,7 @@ impl CoreSolver {
         state: &SolverState,
         term: TermId,
     ) -> bool {
-        // Closure 3 (`AY_STR_NF=1`, sub-flag 3): with a lemma already pending,
+        // Closure 3 (`--str-nf`, sub-flag 3): with a lemma already pending,
         // the pre-closure path stopped here — one dynamic reduction lemma per
         // check, so a 5-substr web needed ~10 CEGAR rounds. Under the closure
         // the request is still built and QUEUED (bounded), so the executor

@@ -428,7 +428,18 @@ fn a_problem_asserted_extensionality_shaped_clause_is_never_promoted() {
 }
 
 #[test]
-fn a_bound_surface_override_fails_closed_when_alethe_artifact_is_required() {
+fn a_negated_forall_goal_with_required_artifact_certifies_strict_unsat() {
+    // HISTORY. This fixture used to pin the fail-closed downgrade: the
+    // surface-override work bound (c25240fc9c) misreported the authored
+    // `(not (forall ...))` root as unboundable, the whole presentation was
+    // poisoned to a bare trust step, and the required artifact was rejected
+    // (`unknown`, SelfCheckRejected, proof revoked). The bound now mirrors
+    // the collector's `not`-shell descent for negated universals
+    // (#forall-goal-boundary), so the SAME query must publish a certified
+    // `unsat` whose retained presentation passes the unchanged strict
+    // checker. The general revocation contract ("a rejected required
+    // presentation is revoked") remains covered by
+    // `checked_sidecar_is_independent_of_an_unrequested_alethe_presentation`.
     let input = r#"
         (set-option :produce-proofs true)
         (set-logic LIA)
@@ -440,14 +451,16 @@ fn a_bound_surface_override_fails_closed_when_alethe_artifact_is_required() {
     "#;
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
-    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unknown"]);
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let proof = exec
+        .last_proof
+        .as_ref()
+        .expect("a certified required presentation must be retained");
+    ay_proof::check_proof_strict(proof, exec.terms())
+        .expect("the retained presentation must pass the unchanged strict checker");
     assert_eq!(
         exec.get_reason_unknown(),
-        Some(crate::UnknownReason::SelfCheckRejected)
+        None,
+        "a certified publication records no unknown reason"
     );
-    assert!(
-        exec.last_proof.is_none(),
-        "a rejected required presentation must be revoked"
-    );
-    assert!(exec.take_unsat_certificate().is_none());
 }

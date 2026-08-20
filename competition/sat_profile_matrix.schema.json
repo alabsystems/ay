@@ -392,6 +392,11 @@
           ],
           "additionalProperties": { "type": "string" }
         },
+        "profile_levers": {
+          "type": "object",
+          "description": "B76: profile-owned solver lever decisions delivered as typed --sat-* CLI flags by the generated run.sh (formerly runtime_env exports).",
+          "additionalProperties": { "type": "string", "enum": ["0", "1"] }
+        },
         "runtime_comments": {
           "type": "object",
           "required": [

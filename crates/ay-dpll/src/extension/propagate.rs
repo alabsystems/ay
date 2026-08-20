@@ -98,13 +98,12 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         // above any real search over the small per-obligation CHC systems the
         // verifier emits (a genuine solve decides in well under this many
         // rounds), so a legitimate proof is never truncated — only a true spin
-        // is bounded. `TRUST_AY_MAX_PROPAGATE_ROUNDS` overrides it for solver
+        // is bounded. `--max-propagate-rounds` (B74) overrides it for solver
         // research.
         {
             const DEFAULT_MAX_PROPAGATE_ROUNDS: u64 = 50_000_000;
-            let cap = std::env::var("TRUST_AY_MAX_PROPAGATE_ROUNDS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            let cap = ay_core::misc_cli_flags()
+                .max_propagate_rounds
                 .filter(|&c| c > 0)
                 .unwrap_or(DEFAULT_MAX_PROPAGATE_ROUNDS);
             if self.eager_stats.propagate_calls > cap {

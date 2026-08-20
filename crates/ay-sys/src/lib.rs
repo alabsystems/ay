@@ -1071,7 +1071,17 @@ pub fn default_standalone_memory_limit() -> usize {
     if let Some(kernel_bytes) = govern::active_budget_bytes() {
         return standalone_limit_under_kernel_bound(kernel_bytes);
     }
-    default_standalone_memory_limit_from(physical_memory_bytes())
+    // Unarmed standalone path (no kernel budget): derive from AVAILABLE memory
+    // divided by detected peer concurrency instead of a flat 85% of TOTAL RAM.
+    // The flat sole-tenant figure is correct for one process but, multiplied by
+    // a test harness spawning many `ay` in parallel, sums past physical RAM --
+    // the failure that kernel-panicked the box on 2026-08-11. `conc <= 1` keeps
+    // the sole-tenant figure byte-for-byte.
+    default_standalone_memory_limit_from_parts(
+        system_available_bytes(),
+        physical_memory_bytes(),
+        detected_concurrency(),
+    )
 }
 
 /// Percentage of the kernel-held budget the cooperative limit is set to.
@@ -1110,6 +1120,84 @@ pub(crate) fn default_standalone_memory_limit_from(phys: usize) -> usize {
     }
     const MIN_LIMIT: usize = 2 * 1024 * 1024 * 1024; // 2 GB
     ((phys / 20) * 17).max(MIN_LIMIT.min(phys))
+}
+
+/// Concurrency- and availability-aware core of the UNARMED standalone default.
+///
+/// `conc <= 1` returns [`default_standalone_memory_limit_from`] byte-for-byte,
+/// so a genuine sole-tenant run is unchanged. `conc > 1` splits three-quarters
+/// of the currently AVAILABLE memory (not total RAM, and leaving headroom for
+/// the OS and non-`ay` work) across the peers, capped at the sole-tenant figure
+/// (it never *raises* a single process's ceiling) and floored so a solve still
+/// has room to run.
+#[must_use]
+pub(crate) fn default_standalone_memory_limit_from_parts(
+    avail: usize,
+    phys: usize,
+    conc: usize,
+) -> usize {
+    let sole_tenant = default_standalone_memory_limit_from(phys);
+    if conc <= 1 {
+        return sole_tenant;
+    }
+    if avail == 0 && phys == 0 {
+        return 0;
+    }
+    const MIN_LIMIT: usize = 2 * 1024 * 1024 * 1024; // 2 GB
+    let floor = MIN_LIMIT.min(avail.max(phys));
+    avail
+        .saturating_mul(3)
+        .saturating_div(4)
+        .saturating_div(conc)
+        .min(sole_tenant)
+        .max(floor)
+}
+
+/// How many peer `ay`-class processes to assume are competing for RAM, used to
+/// divide the unarmed [`default_standalone_memory_limit`] budget.
+///
+/// Signals, cheapest first; any failure yields `1` (== the previous sole-tenant
+/// behavior, so no regression): (1) an explicit `AY_CONCURRENCY` override wins;
+/// (2) a test-harness environment (`NEXTEST`, `NEXTEST_EXECUTION_MODE`, or
+/// `AY_TEST`) -- the exact case that overcommits -- assumes
+/// `available_parallelism()` peers, since a parallel test runner spawns roughly
+/// one child per logical CPU; (3) otherwise `1`.
+///
+/// NOTE: a runtime sibling-`ay` process probe (macOS `proc_listpids`, Linux
+/// `/proc`) and a Linux `RLIMIT_AS` kernel backstop are intended follow-ups;
+/// they are platform-specific and unverifiable on the current host, so they are
+/// deliberately left out of this change rather than shipped untested.
+#[must_use]
+fn detected_concurrency() -> usize {
+    let parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    let env_override = std::env::var("AY_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    let is_test_harness = std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
+        || std::env::var_os("AY_TEST").is_some();
+    detected_concurrency_from(env_override, is_test_harness, parallelism)
+}
+
+/// Pure core of [`detected_concurrency`], split out for deterministic tests.
+#[must_use]
+pub(crate) fn detected_concurrency_from(
+    env_override: Option<usize>,
+    is_test_harness: bool,
+    parallelism: usize,
+) -> usize {
+    let parallelism = parallelism.max(1);
+    let raw = match env_override {
+        Some(n) => n,
+        None if is_test_harness => parallelism,
+        None => 1,
+    };
+    // Bound pathological overrides so a huge value cannot drive every ceiling to
+    // the 2 GB floor on an otherwise idle box.
+    raw.clamp(1, parallelism.saturating_mul(2))
 }
 
 /// Default process memory ceiling for EMBEDDED (in-process) solver use —

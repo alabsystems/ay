@@ -374,7 +374,7 @@ impl CoreSolver {
     }
 
     /// Entailed concrete length of a string term WITH its proof-forest
-    /// justification (NF-engine closure 2, `AY_STR_NF=1`).
+    /// justification (NF-engine closure 2, `--str-nf`).
     ///
     /// Unlike `SolverState::known_length_full`, every returned fact carries
     /// the literals that justify it:
@@ -432,7 +432,7 @@ impl CoreSolver {
     }
 
     /// Justification for `len(a) = len(b)` when it is entailed by tracked
-    /// facts (NF-engine closure 2, `AY_STR_NF=1`).
+    /// facts (NF-engine closure 2, `--str-nf`).
     ///
     /// Mirrors the reason-free `are_lengths_equal_with_entail` paths that CAN
     /// be explained: same EQC, equal concrete lengths, or length terms merged
@@ -482,7 +482,7 @@ impl CoreSolver {
     }
 
     /// Prefix component-transfer candidate (NF-engine closure 2,
-    /// `AY_STR_NF=1`): given two NF components `c1`/`c2` that lead EQUAL
+    /// `--str-nf`): given two NF components `c1`/`c2` that lead EQUAL
     /// remainders of an NF comparison, find a leading sub-component of one
     /// side's concat decomposition that must equal the other side's whole
     /// component because both have the same entailed concrete length.

@@ -214,6 +214,7 @@ pub struct EngineEconomics {
     auto_margin: Option<bool>,
     impl_lane: Option<bool>,
     impl_arm: Option<usize>,
+    drought_dive: Option<usize>,
     prop_conflict: Option<bool>,
     lb_conflict: Option<u8>,
     lb_arm: Option<usize>,

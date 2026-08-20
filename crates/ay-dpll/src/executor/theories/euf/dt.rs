@@ -229,7 +229,22 @@ impl Executor {
     fn record_dt_axiom_theory_lemmas(&mut self, axioms: &[TermId]) {
         let dt_decls = self.datatype_decls_for_strict_proof();
         let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+        // An "axiom" that is literally one of the current assertions must NOT
+        // be recorded as a lemma at all: the assertion enters the proof as an
+        // `Assume`, and recording a `Generic` trust lemma for the same term
+        // first HIJACKS that — `add_assumption`'s preprocessing-producer reuse
+        // maps the assertion onto the trust step, so an AUTHORED fact enters
+        // the published proof as an unverified fallback and mandatory
+        // certification demotes the whole verdict to proof-trusted. Measured
+        // on verification-consumer's extern_spec Option::unwrap obligation: the driver's
+        // own ground facts (`(= (bridge old_opt) (bridge opt))`, tester and
+        // postcondition units) were re-mined into `extra_axioms` by the DT
+        // relevance passes and re-labeled as trust, 30 steps per proof.
+        let asserted: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         for &axiom in axioms {
+            if asserted.contains(&axiom) {
+                continue;
+            }
             let clause = [axiom];
             // Family (A) selector projection `sel_i(C(a..)) = a_i`.
             if ay_proof::recognize_datatype_selector_project(

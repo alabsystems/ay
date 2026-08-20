@@ -900,6 +900,16 @@ pub fn recognize_fp_ground_eval(terms: &TermStore, clause: &[TermId]) -> bool {
     clause_is_exact_fp_tautology(terms, clause)
 }
 
+/// The hygiene gate of [`recognize_fp_ground_eval`], on its own.
+///
+/// Exported for the same reason as
+/// [`crate::recognize_string_ground_eval`]'s gate: it is exact, and it is
+/// MONOTONE in the clause, so one walk over a whole conflict decides the gate
+/// for every sub-clause of it.
+pub fn clause_mentions_floating_point(terms: &TermStore, clause: &[TermId]) -> bool {
+    mentions_floating_point(terms, clause)
+}
+
 fn mentions_floating_point(terms: &TermStore, clause: &[TermId]) -> bool {
     let mut stack: Vec<TermId> = clause.to_vec();
     let mut seen: HashSet<TermId> = HashSet::default();
@@ -1009,6 +1019,20 @@ fn collect_residual_variables(
 }
 
 fn clause_is_exact_fp_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
+    // Shared-operand `fp.eq` conflict — the one family the bounded enumerator
+    // below cannot reach, because the shared operand is a full-width symbolic
+    // variable. If two literals `(not (fp.eq t c1))` / `(not (fp.eq t c2))`
+    // share the operand `t` and the GROUND constants are not `fp.eq`-equal
+    // themselves, the clause is valid: falsifying it requires `t` to be
+    // IEEE-equal to both, `fp.eq` demands non-NaN numeric equality on both
+    // sides, and numeric equality is transitive — forcing `fp.eq c1 c2`,
+    // contradiction. (A NaN constant makes its literal unconditionally true
+    // and is covered by the same test, since `fp.eq` with NaN is false.)
+    // Extra literals only weaken nothing: a clause containing a valid
+    // sub-disjunction is valid.
+    if clause_has_shared_operand_fp_eq_conflict(terms, clause) {
+        return true;
+    }
     let bindings = collect_bindings(terms, clause);
     let Some(variables) = collect_residual_variables(terms, clause, &bindings) else {
         return false;
@@ -1045,6 +1069,49 @@ fn clause_is_exact_fp_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
         }
     }
     true
+}
+
+/// The shared-operand `fp.eq` conflict test backing the fast path in
+/// [`clause_is_exact_fp_tautology`]. Ground constants are evaluated by the
+/// same exact evaluator (empty assignment), so every constant form the
+/// evaluator understands — `(fp ...)`, `(_ +zero eb sb)`, ground conversions —
+/// participates; anything it cannot evaluate simply never pins the operand
+/// (fail-closed).
+fn clause_has_shared_operand_fp_eq_conflict(terms: &TermStore, clause: &[TermId]) -> bool {
+    let mut evaluator = Evaluator::new(terms, HashMap::default());
+    let assignment: HashMap<TermId, Val> = HashMap::default();
+    let mut local: HashMap<TermId, Option<Val>> = HashMap::default();
+    let mut pinned: Vec<(TermId, Fp)> = Vec::new();
+    for &literal in clause {
+        let TermData::Not(inner) = terms.get(literal) else {
+            continue;
+        };
+        let TermData::App(symbol, args) = terms.get(*inner) else {
+            continue;
+        };
+        if symbol.name() != "fp.eq" || args.len() != 2 {
+            continue;
+        }
+        for (operand, constant) in [(args[0], args[1]), (args[1], args[0])] {
+            if let Some(Val::Fp(fp)) = evaluator.eval(constant, &assignment, &mut local, 0) {
+                pinned.push((operand, fp));
+            }
+        }
+    }
+    for (i, (operand_a, fp_a)) in pinned.iter().enumerate() {
+        for (operand_b, fp_b) in pinned.iter().skip(i + 1) {
+            if operand_a != operand_b || !fp_a.same_format(fp_b) {
+                continue;
+            }
+            let ieee_equal = !fp_a.is_nan()
+                && !fp_b.is_nan()
+                && fp_a.cmp_real(fp_b) == Some(std::cmp::Ordering::Equal);
+            if !ieee_equal {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Build the value an enumerated variable takes for bit pattern `slice`.

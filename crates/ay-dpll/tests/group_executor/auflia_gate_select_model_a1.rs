@@ -109,6 +109,18 @@ fn test_auflia_bool_gate_over_select_chain_sat_a1() {
 /// pins and no known-disequal pair), so one array interpretation is extracted
 /// and the strict + independent gates can CONFIRM the model. The `get-value`
 /// exercises the printer path over the unified interpretation end-to-end.
+///
+/// 2026-08-17 regression, same funnel: the `select` tables' Int rows carried
+/// STALE hard pins — internal solve-time atoms (`(= (select A1 y) 1)`,
+/// `(= (select A1 (+ base (* 8 j))) (- 1))`) still merged in the e-graph but
+/// contradicted by every row's own FINAL arithmetic value after the
+/// reconciliation fixpoints. `hard_values={"1","(- 1)"}` tripped the
+/// contradictory-pin guard, the table was conflict-marked, and the whole
+/// model discarded again. Fixed by the stale-pin guard in
+/// `combiner_models.rs`: a class constant contradicted by the row's own final
+/// value is candidate-state garbage, not hard evidence, so it no longer
+/// vetoes the congruence repair (the validation gates still decide
+/// acceptance).
 #[test]
 #[timeout(30_000)]
 fn test_auflia_congruent_store_rows_model_survives_a1() {

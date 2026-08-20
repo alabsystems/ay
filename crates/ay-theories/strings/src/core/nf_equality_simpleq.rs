@@ -205,7 +205,7 @@ impl CoreSolver {
                         else {
                             return NfCheckResult::Incomplete;
                         };
-                        // Closure 2 (`AY_STR_NF=1`, sub-flag 2): the derived
+                        // Closure 2 (`--str-nf`, sub-flag 2): the derived
                         // equality depends on len(c1) = len(c2) — include the
                         // guarding length literals so backtracking the length
                         // decision retracts the merge justification too.
@@ -223,7 +223,7 @@ impl CoreSolver {
                         infer.add_internal_equality(InferenceKind::Unify, c1, c2, explanation);
                         return NfCheckResult::Incomplete;
                     }
-                    // Closure 2 (`AY_STR_NF=1`, sub-flag 2): prefix
+                    // Closure 2 (`--str-nf`, sub-flag 2): prefix
                     // component-transfer N_UNIFY. When one component has an
                     // entailed concrete length and the other decomposes (via
                     // an EQC concat, reduced webs included) into an

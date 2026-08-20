@@ -53,7 +53,8 @@ mod array_finite;
 mod authenticated_query;
 
 pub use authenticated_query::{
-    authenticate_bool_bv_unsat_query, authenticate_uf_leaf_bool_bv_unsat_query,
+    authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
+    authenticate_uf_leaf_bool_bv_unsat_query,
 };
 
 #[cfg(test)]
@@ -365,6 +366,13 @@ pub(crate) fn validate_bool_tautology(
             return Ok(());
         }
     }
+    // The same structural shapes over the clause's own literals: a plain
+    // multi-literal clausification tautology (`(cl (not (or A B)) A B)` and
+    // friends) is exactly the packed form with the disjunction unpacked, and
+    // its atoms are just as often outside the bounded evaluator's domain.
+    if disjuncts_form_clausification_tautology(terms, clause) {
+        return Ok(());
+    }
     validate_bounded_clause_semantics(terms, step_id, clause)
 }
 
@@ -405,6 +413,22 @@ fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
         return false;
     };
     if symbol.name() != "or" || disjuncts.len() < 2 {
+        return false;
+    }
+    disjuncts_form_clausification_tautology(terms, &disjuncts.clone())
+}
+
+/// The structural tautology test proper, over an explicit disjunct list.
+///
+/// A clause IS the disjunction of its literals, so the same shapes decide a
+/// plain MULTI-LITERAL clause exactly as they decide a packed `(or ...)`
+/// unit — the atoms' theory semantics stay irrelevant either way. Split out
+/// so `validate_bool_tautology` can apply it to clause literals directly:
+/// clausification of an assertion under `or` emits the `or_pos` clause
+/// `(cl (not (or A B)) A B)` as a plain 3-literal original clause, which the
+/// bounded evaluator cannot reach when the atoms carry full-width terms.
+fn disjuncts_form_clausification_tautology(terms: &TermStore, disjuncts: &[TermId]) -> bool {
+    if disjuncts.len() < 2 {
         return false;
     }
     if disjuncts
@@ -1267,6 +1291,28 @@ struct ProofProducingLowerer<'a> {
     /// never abstracted; identical applications share one leaf; distinct
     /// applications never alias (congruence is deliberately forgotten).
     uninterpreted_leaves: bool,
+    /// Opt-in, and strictly narrower than it sounds: lower a BOOL-SORTED
+    /// application ONE of whose operands has a sort outside the finite
+    /// Bool/BitVec/array universe (`Int`, `Char`, `Real`, …) to a single free
+    /// BOOLEAN leaf keyed by the application's canonical term identity,
+    /// WITHOUT descending into the operands.
+    ///
+    /// This is the standard propositional-skeleton abstraction, and it
+    /// complements [`ProofProducingLowerer::take_uninterpreted_leaf`], which
+    /// keys on the HEAD SYMBOL. Arithmetic relations (`<=`, `<`, …) are not
+    /// reserved, so they already take the head-symbol leaf path; what needs
+    /// this flag is the RESERVED Core heads `=` and `distinct`, whose
+    /// interpreted arms eagerly lower their operands and therefore reach the
+    /// `Int` sort rejection.
+    ///
+    /// NO NON-BOOLEAN LEAF IS EVER MINTED FOR SUCH AN OPERAND. `BvExpr` has
+    /// only `Bool` and fixed-width `BitVec`, so an `Int` term modelled as a
+    /// width-`w` leaf would be an UNDER-approximation: `w`+1 pairwise-distinct
+    /// `Int` terms are satisfiable over the integers but refutable by
+    /// pigeonhole at any finite width. Abstracting the enclosing Bool ATOM
+    /// instead keeps the model map an identity on `Bool`, so every model of
+    /// the exact query still induces a valuation of the leaves.
+    non_finite_atom_leaves: bool,
     used_uninterpreted_leaves: bool,
 }
 
@@ -1286,6 +1332,7 @@ impl<'a> ProofProducingLowerer<'a> {
             used_exact_finite_arrays: false,
             exact_finite_array_work: 0,
             uninterpreted_leaves: false,
+            non_finite_atom_leaves: false,
             used_uninterpreted_leaves: false,
         }
     }
@@ -1297,6 +1344,22 @@ impl<'a> ProofProducingLowerer<'a> {
         Self {
             uninterpreted_leaves: true,
             ..Self::new(terms, deadline)
+        }
+    }
+
+    /// Construct the uninterpreted-leaf variant EXTENDED by the Bool-atom
+    /// abstraction over non-finitely-sorted operands.
+    ///
+    /// A separate constructor for the same reason as
+    /// [`Self::new_with_uninterpreted_leaves`]: the pre-existing
+    /// `authenticate_uf_leaf_bool_bv_unsat_query` entry point (and therefore
+    /// the `CheckedQpfInstanceRefutation` lane that calls it) keeps a
+    /// bit-identical accept set, because widening a lane that already exists
+    /// would make it admit queries it previously refused.
+    fn new_with_non_finite_atom_leaves(terms: &'a TermStore, deadline: Instant) -> Self {
+        Self {
+            non_finite_atom_leaves: true,
+            ..Self::new_with_uninterpreted_leaves(terms, deadline)
         }
     }
 
@@ -1317,6 +1380,41 @@ impl<'a> ProofProducingLowerer<'a> {
         }
         let eligible =
             matches!(symbol, Symbol::Named(name) if !reserved_bool_bv_symbol(name.as_str()));
+        if eligible {
+            self.used_uninterpreted_leaves = true;
+        }
+        eligible
+    }
+
+    /// Whether this BOOL-SORTED application must be abstracted as ONE free
+    /// Boolean leaf because an operand's sort lies outside the finite
+    /// Bool/BitVec/array universe.
+    ///
+    /// Three properties are load-bearing and each has a pinned test:
+    ///
+    /// * It keys on the OPERAND SORT FAMILY, never on "lowering the operand
+    ///   failed". A reserved-but-uninterpreted BV operator (`bvudiv`, …) has
+    ///   BitVec-sorted operands, so it stays outside this predicate and keeps
+    ///   declining with its operator named; likewise an out-of-range BitVec
+    ///   width and an over-nested array. A fragment or envelope gap is never
+    ///   silently weakened into a free leaf.
+    /// * It reuses `used_uninterpreted_leaves` rather than adding a parallel
+    ///   flag. That single bit is what turns a satisfiable abstraction into an
+    ///   `UnsupportedFragment` DECLINE instead of a `Satisfiable` VETO; a new
+    ///   flag not folded into that guard would itself be a proof hole.
+    /// * It never fires without [`Self::non_finite_atom_leaves`], so the exact
+    ///   entry point and the pre-existing UF-leaf entry point are unchanged.
+    ///
+    /// An operand outside the live term store is deliberately NOT eligible, so
+    /// the "outside the live term store" rejection stays reachable.
+    fn take_non_finite_atom_leaf(&mut self, args: &[TermId]) -> bool {
+        if !self.non_finite_atom_leaves {
+            return false;
+        }
+        let eligible = args.iter().any(|&arg| {
+            self.terms.entry_stamp(arg).is_some()
+                && array_finite::is_non_finite_source_sort(self.terms.sort(arg))
+        });
         if eligible {
             self.used_uninterpreted_leaves = true;
         }
@@ -1531,11 +1629,16 @@ impl<'a> ProofProducingLowerer<'a> {
                 }
             }
             TermData::App(symbol, args) => {
-                if self.take_uninterpreted_leaf(&symbol) {
+                if self.take_uninterpreted_leaf(&symbol) || self.take_non_finite_atom_leaf(&args) {
                     // One free Boolean leaf per canonical application term:
                     // the `proof_bool_{index}` namespace is shared with `Var`
                     // leaves, and distinct terms have distinct indices, so an
                     // application leaf can never alias a variable leaf.
+                    //
+                    // The second disjunct covers a RESERVED Core head (`=`,
+                    // `distinct`) over non-finitely-sorted operands: the whole
+                    // atom becomes one Boolean leaf and the operands are never
+                    // visited, so no `Int` term is ever given a finite width.
                     BvExpr::leaf(&format!("proof_bool_{}", term.index()), 1)
                 } else {
                     self.lower_bool_app(&symbol, &args)?
@@ -2378,5 +2481,59 @@ fn bv_mask(width: u32) -> u64 {
         u64::MAX
     } else {
         (1u64 << width) - 1
+    }
+}
+
+#[cfg(test)]
+mod multi_literal_clausification_tautology_tests {
+    use super::*;
+    use ay_core::TermStore;
+
+    fn bool_var(terms: &mut TermStore, name: &str) -> TermId {
+        terms.mk_var(name, Sort::Bool)
+    }
+
+    /// Opaque Bool atom the bounded evaluator cannot interpret — forces the
+    /// structural path.
+    fn opaque_atom(terms: &mut TermStore, name: &str) -> TermId {
+        let x = terms.mk_var(&format!("{name}_x"), Sort::Int);
+        let y = terms.mk_var(&format!("{name}_y"), Sort::Int);
+        terms.mk_app(ay_core::Symbol::named("="), vec![x, y], Sort::Bool)
+    }
+
+    #[test]
+    fn accepts_plain_or_pos_clause_over_opaque_atoms() {
+        // `(cl (not (or A B)) A B)` as three PLAIN literals.
+        let mut terms = TermStore::new();
+        let a = opaque_atom(&mut terms, "a");
+        let b = opaque_atom(&mut terms, "b");
+        let packed = terms.mk_app(ay_core::Symbol::named("or"), vec![a, b], Sort::Bool);
+        let not_packed = terms.mk_not(packed);
+        let clause = [not_packed, a, b];
+        assert!(recognize_bool_tautology(&terms, &clause));
+        assert!(validate_bool_tautology(&terms, ProofId(0), &clause).is_ok());
+    }
+
+    #[test]
+    fn accepts_plain_complement_pair_clause() {
+        let mut terms = TermStore::new();
+        let a = opaque_atom(&mut terms, "a");
+        let extra = bool_var(&mut terms, "p");
+        let not_a = terms.mk_not(a);
+        let clause = [extra, a, not_a];
+        assert!(recognize_bool_tautology(&terms, &clause));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_pos_clause() {
+        // `(cl (not (or A B)) A)` is falsifiable (A false, B true).
+        let mut terms = TermStore::new();
+        let a = opaque_atom(&mut terms, "a");
+        let b = opaque_atom(&mut terms, "b");
+        let packed = terms.mk_app(ay_core::Symbol::named("or"), vec![a, b], Sort::Bool);
+        let not_packed = terms.mk_not(packed);
+        let clause = [not_packed, a];
+        assert!(!recognize_bool_tautology(&terms, &clause));
+        assert!(validate_bool_tautology(&terms, ProofId(0), &clause).is_err());
     }
 }

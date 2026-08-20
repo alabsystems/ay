@@ -4,7 +4,7 @@ error[E0624]: associated function `from_structural_constraint_floor` is private
 13 |     bus.publish_lb(ay_pb::portfolio::GlobalSoundFloor::from_structural_constraint_floor(0));
    |                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
    |
-  ::: src/optimize/shared_bounds.rs
+  ::: $WORKSPACE/crates/ay-pb-core/src/optimize/shared_bounds.rs
    |
    |     pub(crate) fn from_structural_constraint_floor(value: i128) -> Self {
    |     ------------------------------------------------------------------- private associated function defined here

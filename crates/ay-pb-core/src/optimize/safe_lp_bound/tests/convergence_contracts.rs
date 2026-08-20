@@ -2,7 +2,9 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::super::transpose::{should_transpose, should_transpose_model};
+use super::super::transpose::{
+    should_transpose, should_transpose_model, solve_transposed_for_box_lp_instrumented,
+};
 use super::*;
 
 /// THE `converged` CONTRACT.
@@ -425,6 +427,26 @@ fn transpose_dispatches_on_shape_and_handles_every_cost_sign() {
         !should_transpose_model(&nonneg, n),
         "a square model must not transpose even with c >= 0"
     );
+
+    // THE MEASURED CROSSOVER PINS THE THRESHOLD (2026-08-17 replay on real
+    // f64-tier production LPs, see `TRANSPOSE_RATIO_NUM`): at 1.00:1 the
+    // primal form won 0.60-0.72x on every liu/domset base LP, and at 1.42:1
+    // the transpose won 2.7x+ on count.b and everything above it. These pin
+    // the real shapes on each side of the 5/4 gate; if either fires the other
+    // way after a threshold or cut-cap change, RE-RUN the `replay_crossover`
+    // harness on freshly dumped models before believing the new setting.
+    assert!(
+        !should_transpose(467, 466),
+        "liu/domset base shape (1.00:1) measured primal-faster; must not transpose"
+    );
+    assert!(
+        should_transpose(466, 694),
+        "count.b shape (1.49:1) measured transpose-faster (4.9x); must transpose"
+    );
+    assert!(
+        should_transpose(741, 2072),
+        "fir04 cut-augmented shape (2.80:1) measured transpose-faster (4.2x)"
+    );
 }
 
 /// THE DUAL-IMAGE CRASH IS LOAD-BEARING, and only an EFFORT assertion can say so.
@@ -439,6 +461,70 @@ fn transpose_dispatches_on_shape_and_handles_every_cost_sign() {
 /// crashing at the dual image of `x = 0` (`y = 0, z_v = max(0, -c_v)`) is feasible
 /// immediately. Measured end to end, the difference was 8.3x SLOWER versus 1.18x
 /// faster than the primal form.
+/// THE CRASH MUST ALSO START FEASIBLE FOR `c >= 0` — the complemented
+/// pseudo-Boolean case, i.e. every production model this solver builds.
+///
+/// This is the regression that was MISSING when the all-`z` "dual-image" crash
+/// shipped: it fixed the negative-cost start (tested below) while silently
+/// making every positive-cost row start INFEASIBLE (`z_v = -c_v < 0`), so on
+/// the one production instance whose shape dispatches the transpose
+/// (`edgecross14-019`, n=328 m=1746) Phase I burned ~314 iterations — one per
+/// positive-cost column — and the transposed solve ran 4-5x slower than the
+/// primal form it was supposed to beat. Answer-checking tests cannot catch
+/// that (the answers agreed); only a WORK assertion can, so this pins Phase I
+/// to its first feasibility check exactly like
+/// `covering_crash_is_immediately_feasible_and_phase_two_converges` does for
+/// the primal form's crash.
+#[test]
+fn transposed_positive_cost_crash_starts_feasible() {
+    let n = 24usize;
+    let m = n * 8; // row-heavy enough that the dispatcher would transpose
+    let mut rng = Rng(0x0dd1_c0de_6666_7777);
+    let mut rows: Vec<RowF64> = Vec::new();
+    for _ in 0..m {
+        let mut coeffs: Vec<(usize, f64)> = Vec::new();
+        for v in 0..n {
+            if rng.next() % 3 == 0 {
+                coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
+            }
+        }
+        if coeffs.is_empty() {
+            coeffs.push((0, 1.0));
+        }
+        let mass: f64 = coeffs.iter().map(|&(_, a)| a).sum();
+        rows.push(RowF64 {
+            coeffs,
+            b: (mass * 0.4).max(1.0),
+        });
+    }
+    // ALL costs positive — the complemented-PB shape production always sends.
+    let c: Vec<f64> = (0..n).map(|_| 1.0 + (rng.next() % 4) as f64).collect();
+
+    let (y, _x, stats) = solve_transposed_for_box_lp_instrumented(
+        n,
+        &c,
+        &rows,
+        SimplexLimits::iterations(200_000),
+        &never_stop,
+    )
+    .expect("a row-heavy positive-cost model must produce a dual");
+    assert_eq!(
+        stats.stats1.iters, 1,
+        "Phase I must find the positive-cost dual-image crash already feasible \
+         and exit at its first feasibility check, not pivot toward feasibility"
+    );
+    assert!(
+        stats.converged(),
+        "the transposed solve must converge on positive costs"
+    );
+    for (r, &yr) in y.iter().enumerate() {
+        assert!(
+            yr >= 0.0 && yr.is_finite(),
+            "dual y[{r}] = {yr} is not a valid multiplier"
+        );
+    }
+}
+
 #[test]
 fn transposed_negative_cost_crash_starts_feasible() {
     let n = 12usize;

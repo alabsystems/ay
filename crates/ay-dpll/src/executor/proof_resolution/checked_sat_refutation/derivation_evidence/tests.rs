@@ -377,3 +377,79 @@ fn bv_mbqi_record_with_non_false_instance_is_refused() {
     )
     .is_none());
 }
+
+/// (#mbqi-sidecar-instance) Fixture: `forall x. 0 <= x`, refuted at `x := -1`
+/// with the exact structural instance the generic-MBQI refinement now pushes
+/// and records.
+fn mbqi_refinement_record_fixture() -> (Executor, crate::ematching::ForallInstantiationProvenance) {
+    let mut executor = Executor::new();
+    let terms = &mut executor.ctx.terms;
+    let x = terms.mk_var("mri_x", Sort::Int);
+    let zero = terms.mk_int(num_bigint::BigInt::ZERO);
+    let body = terms.mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+    let quantifier = terms.mk_forall(vec![("mri_x".to_string(), Sort::Int)], body);
+    let minus_one = terms.mk_int(num_bigint::BigInt::from(-1));
+    let mut substitution = HashMap::default();
+    substitution.insert("mri_x".to_string(), minus_one);
+    let instance =
+        crate::ematching::subst_vars_exact_qf(&mut executor.ctx.terms, body, &substitution)
+            .expect("closed single-binder substitution succeeds");
+    (
+        executor,
+        crate::ematching::ForallInstantiationProvenance {
+            quantifier,
+            binding: vec![minus_one],
+            instance,
+        },
+    )
+}
+
+/// (#mbqi-sidecar-instance) A faithfully recorded generic-MBQI refinement
+/// instance is consumed by the sealed fragment derivation maps, keyed by the
+/// pushed (exact) instance itself.
+#[test]
+fn mbqi_refinement_record_feeds_sealed_instance_map() {
+    let (mut executor, record) = mbqi_refinement_record_fixture();
+    let asserted = record.instance;
+    let quantifier = record.quantifier;
+    executor.mbqi_refinement_instance_records.push(record);
+    let (instances, _skolems) = sealed_fragment_derivation_maps(&mut executor);
+    let derivation = instances
+        .get(&asserted)
+        .expect("the exact pushed instance must gain a sealed derivation");
+    assert_eq!(derivation.quantifier, quantifier);
+    assert_eq!(derivation.instance, asserted);
+}
+
+/// (#mbqi-sidecar-instance) GUARD-REMOVAL PROOF: the seal replays the exact
+/// substitution itself, so a record whose instance is NOT the recorded
+/// binding's structural substitution (e.g. a semantically folded or forged
+/// term) is refused — the producer's record carries no authority of its own.
+#[test]
+fn tampered_mbqi_refinement_record_is_refused_by_the_seal() {
+    let (mut executor, mut record) = mbqi_refinement_record_fixture();
+    record.instance = executor.ctx.terms.false_term();
+    let asserted = record.instance;
+    executor.mbqi_refinement_instance_records.push(record);
+    let (instances, _skolems) = sealed_fragment_derivation_maps(&mut executor);
+    assert!(
+        !instances.contains_key(&asserted),
+        "a record whose instance is not the exact substitution must not seal"
+    );
+}
+
+/// (#mbqi-sidecar-instance) Kill-switch coverage: with
+/// `--no-quant-unit-authority` the sealed maps are empty regardless of any
+/// recorded MBQI provenance, restoring the baseline sidecar starvation.
+#[test]
+fn mbqi_refinement_record_is_starved_by_the_kill_switch() {
+    let (mut executor, record) = mbqi_refinement_record_fixture();
+    executor.mbqi_refinement_instance_records.push(record);
+    let guard = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        no_quant_unit_authority: true,
+        ..Default::default()
+    });
+    let (instances, skolems) = sealed_fragment_derivation_maps(&mut executor);
+    drop(guard);
+    assert!(instances.is_empty() && skolems.is_empty());
+}

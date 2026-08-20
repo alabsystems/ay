@@ -876,18 +876,30 @@ min: +1 x1 +2 x2 ;\n\
     );
 }
 
+/// `+1 x1 <= 0` forces x1=0, then `x1+x2>=1` forces x2=1, so min x1+2x2 = 2.
+/// The objective floor `x1 + 2 x2 >= 2` requires `2*(x1+x2>=1) + 1*(-x1>=0)`: a
+/// positive combination that CANCELS a coefficient overshoot on x1 against the
+/// `<=` row, which the native structural cut builder cannot express.
+///
+/// That used to mean an unconditional fail-closed deferral, because the only
+/// other route was an unverifiable `rup >= 1 ;`. It no longer does: the
+/// objective-improvement RUP replay checks the step against the database VeriPB
+/// actually holds here — the two imported rows plus the improving row
+/// `x1 + 2 x2 <= 1` derived from `soli` — and unit propagation alone refutes it
+/// (`-x1 >= 0` is unit, forcing x1=0; `x1+x2>=1` then forces x2=1; the improving
+/// row reads -2 >= -1 and conflicts). So the `rup >= 1 ;` is genuinely derivable
+/// and the NATIVE proof stands, with no OPT-LIN re-derivation needed.
+///
+/// The fail-closed path is NOT dead — it still fires wherever propagation cannot
+/// close the bound, which is what
+/// `ay_pb_core::cdcl::tests::test_undecidable_lower_bound_opt_proof_defers_without_conclusion`
+/// (triangle vertex cover, needs a genuine divide-by-2 rounding cut) pins.
+///
+/// The certified OPT-LIN fallback is exercised below regardless: it is the route
+/// the CLI commits on whenever the native path DOES defer, and its proof must
+/// verify against the original `<=` rows.
 #[test]
 fn test_le_source_optimization_proof_verifies_against_original_le_rows() {
-    // `+1 x1 <= 0` forces x1=0, then `x1+x2>=1` forces x2=1, so min x1+2x2 = 2.
-    // The objective floor `x1 + 2 x2 >= 2` requires `2*(x1+x2>=1) + 1*(-x1>=0)`:
-    // a positive combination that CANCELS a coefficient overshoot on x1 against
-    // the `<=` row. The native structural cut builder cannot express that
-    // cancellation, so the native OPT proof must FAIL CLOSED
-    // (opt_lower_bound_deferred) rather than emit an unverifiable `rup >= 1 ;`
-    // that has no supporting propagation in the (learned-clause-suppressed)
-    // proof database. The certified OPT-LIN fallback then closes the bound from a
-    // real augmented-instance refutation, and THAT proof verifies against the
-    // original <= rows.
     let opb = "\
 * #variable= 2 #constraint= 2\n\
 min: +1 x1 +2 x2 ;\n\
@@ -911,28 +923,37 @@ min: +1 x1 +2 x2 ;\n\
         panic!("<= optimization canary should solve to optimum 2, got {result:?}");
     };
 
-    // Native path FAILS CLOSED: it must not ship an unverifiable `rup >= 1 ;`.
+    // Native path CONCLUDES on a CHECKED `rup >= 1 ;` — the replay proved unit
+    // propagation refutes the improving row on VeriPB's own database.
     assert!(
-        solver.opt_lower_bound_deferred(),
-        "<= OPT native lower bound (needs an overshoot-cancelling cut) must defer"
+        !solver.opt_lower_bound_deferred(),
+        "a propagation-checkable <= OPT lower bound must not defer to OPT-LIN"
     );
-    let err = solver.conclude_proof().expect_err(
-        "native <= OPT proof must fail closed when the structural cut is inexpressible",
-    );
-    assert!(
-        matches!(err, ProofError::UnprovableOptimizationLowerBound),
-        "native defer must surface as UnprovableOptimizationLowerBound, got {err:?}"
-    );
+    solver
+        .conclude_proof()
+        .expect("native <= OPT proof must conclude once its RUP step is checked");
     let native_proof = buf.as_string();
     assert!(
-        !native_proof.lines().any(|line| line == "rup >= 1 ;"),
-        "failed-closed native proof must NOT emit an unsupported `rup >= 1 ;`: {native_proof}"
+        native_proof.lines().any(|line| line == "rup >= 1 ;"),
+        "checked native proof must emit its empty-clause RUP step: {native_proof}"
     );
     assert!(
-        !native_proof
+        native_proof
             .lines()
             .any(|line| line.starts_with("conclusion BOUNDS")),
-        "failed-closed native proof must NOT claim OPT bounds: {native_proof}"
+        "checked native proof must claim its OPT bounds: {native_proof}"
+    );
+    assert!(
+        native_proof.lines().any(|line| line == "soli ~x1 x2;"),
+        "the improving row the RUP step refutes comes from `soli`: {native_proof}"
+    );
+    // And it must survive the REAL checker, not just our own replay of it.
+    assert_feasible_opt_proof_contract(
+        "le_source_opt_native_rup",
+        opb,
+        &native_proof,
+        "conclusion BOUNDS 2 2;",
+        Some("soli ~x1 x2;"),
     );
 
     // The certified OPT-LIN fallback closes the SAME <= instance from a real
@@ -1243,5 +1264,54 @@ fn test_opt_lin_cert_pb_native_withholds_certificate_for_non_optimal_incumbent()
     assert!(
         proof.is_none(),
         "PB-native OPT-LIN-CERT helper must withhold a certificate when the incumbent is not optimal: {proof:?}"
+    );
+}
+
+#[test]
+fn test_optimum_zero_native_rup_proof_verifies_externally() {
+    // `try_log_objective_lower_bound_cut_proof` short-circuits to Inexpressible
+    // for every `optimum <= 0`, so before the objective-improvement RUP replay
+    // this whole class fell through to the fail-closed path and paid for an
+    // OPT-LIN re-derivation. The `rup >= 1 ;` here is trivially checkable: the
+    // improving row `x1 + 2 x2 <= -1` has all-non-negative coefficients over
+    // boolean variables, so it is conflicting under the empty assignment and
+    // unit propagation refutes it outright.
+    let opb = "\
+* #variable= 2 #constraint= 1\n\
+min: +1 x1 +2 x2 ;\n\
++1 ~x1 +1 ~x2 >= 1 ;\n";
+    let instance = parse_opb(opb).expect("optimum-zero instance must parse");
+    let objective = instance
+        .objective
+        .as_ref()
+        .expect("optimum-zero instance must carry an objective");
+    let buf = SharedBytes::new();
+    let mut solver = PbCdclSolver::with_proof_writer(&instance, buf.clone())
+        .expect("proof writer creation must succeed");
+
+    let result = solver.solve_optimize(objective, None);
+    assert!(
+        matches!(result, PbCdclResult::Optimal(_, 0)),
+        "all-false is feasible and optimal here, got {result:?}"
+    );
+    assert!(
+        !solver.opt_lower_bound_deferred(),
+        "a checkable optimum-zero bound must not defer to OPT-LIN"
+    );
+    solver
+        .conclude_proof()
+        .expect("checked optimum-zero RUP proof must conclude");
+
+    let proof = buf.as_string();
+    assert!(
+        proof.lines().any(|line| line == "rup >= 1 ;"),
+        "the checked RUP route must emit its empty-clause step: {proof}"
+    );
+    assert_feasible_opt_proof_contract(
+        "optimum_zero_native_rup",
+        opb,
+        &proof,
+        "conclusion BOUNDS 0 0;",
+        Some("soli ~x1 ~x2;"),
     );
 }

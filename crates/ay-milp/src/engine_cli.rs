@@ -149,6 +149,7 @@ pub const VALUE_FLAGS: &[&str] = &[
     "sb-total",
     "step-trace",
     "bumpdiff-lanes",
+    "drought-dive",
 ];
 
 // `--no-x` carries false into a positive-sense builder; diagnostics carry true.
@@ -342,6 +343,7 @@ const USIZE_BUILDERS: &[(&str, UsizeBuilder)] = &[
     ("splns-budget", EngineEconomics::with_splns_budget),
     ("ms-walk-moves", EngineEconomics::with_ms_walk_moves),
     ("gub-meas-every", EngineEconomics::with_gub_meas_every),
+    ("drought-dive", EngineEconomics::with_drought_dive),
 ];
 
 const FLOAT_BUILDERS: &[(&str, FloatBuilder)] = &[

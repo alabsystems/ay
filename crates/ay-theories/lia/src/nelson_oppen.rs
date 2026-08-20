@@ -54,7 +54,7 @@ pub(crate) fn algebraic_stats() -> &'static AlgebraicStats {
     use std::sync::atomic::AtomicU64;
     static STATS: std::sync::OnceLock<AlgebraicStats> = std::sync::OnceLock::new();
     STATS.get_or_init(|| AlgebraicStats {
-        enabled: std::env::var_os("AY_ALGEBRAIC_STATS").is_some(),
+        enabled: ay_core::misc_cli_flags().algebraic_stats,
         calls: AtomicU64::new(0),
         nanos: AtomicU64::new(0),
         scan_nanos: AtomicU64::new(0),

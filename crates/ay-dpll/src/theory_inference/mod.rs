@@ -33,7 +33,10 @@ use ay_core::{
 
 use crate::proof_tracker::ProofTracker;
 
-use arith_farkas_classification::{linear_equality_arith_farkas_valid, opaque_arith_farkas_valid};
+use arith_farkas_classification::{
+    linear_equality_arith_farkas_valid_memo, opaque_arith_farkas_valid,
+    opaque_arith_farkas_valid_memo, LinearFarkasVerdict,
+};
 
 // Re-export pub(crate) items from submodules.
 pub(crate) use decompose::{decompose_generic_combined_real_lemma, CombinedDecompositionBudget};
@@ -123,6 +126,50 @@ pub(crate) fn record_theory_conflict_unsat_with_annotation(
         lia: None,
     });
     (id, annotation)
+}
+
+/// Classify a clause as the strict-checkable guarded arithmetic
+/// disequality-split tautology — `x<=c-1 ∨ x>=c+1 ∨ x=c` over Int, or the
+/// strict-order pair with its equality guard over Real — in any literal
+/// order (#ground-conflict-decomp).
+///
+/// The LIA/combined theory-conflict explanation for a violated disequality
+/// split emits exactly this clause (measured on the 2^64-guarded array-frame
+/// certification: `(cl (<= sk 0) (<= 2 sk) (= sk 1))`). Without this arm it
+/// fell through to the evidence-free integer gate, and — worse — the
+/// combined-theory core decomposition then DROPPED the equality-guard
+/// literal and recorded the remaining two bounds (falsified at `x=c`, not
+/// standalone-valid) as a Generic trust core. Recognition is delegated to
+/// the checker's own `recognize_arith_disequality_split`, so classifier and
+/// strict validator cannot drift; the clause is reordered into the
+/// validator's mandated `[branch, branch, guard]` order (a permutation of
+/// the input's literal set, so trace-side set-equivalence authentication is
+/// unaffected).
+///
+/// Covered by `--no-ground-conflict-decomp` together with the sibling
+/// guarded-split producers: with the switch off the conflict classifies
+/// byte-for-byte as at baseline.
+fn infer_arith_diseq_split_lemma(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    if clause.len() != 3 || !crate::quant_unit_authority::ground_conflict_decomp_enabled() {
+        return None;
+    }
+    for (i, j, k) in [
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    ] {
+        let candidate = vec![clause[i], clause[j], clause[k]];
+        if ay_core::proof_validation::recognize_arith_disequality_split(terms, &candidate) {
+            return Some((TheoryLemmaKind::ArithDisequalitySplit, candidate));
+        }
+    }
+    None
 }
 
 /// Classify a clause as one of the strict-checkable array kinds
@@ -413,6 +460,14 @@ fn classify_arith_conflict_kind(
     conflict: &[TheoryLit],
     farkas: Option<&FarkasAnnotation>,
 ) -> TheoryLemmaKind {
+    // The three gates below reach the SAME linear verification of the SAME
+    // `(conflict, certificate)` pair — they differ only in which conflicts they
+    // are willing to consider. Share one memo so a conflict that fails the
+    // first gate does not pay for the identical (exponential) orientation
+    // search two more times; conflict classification is the dominant solver
+    // cost on the `#8404` Seq-dense family.
+    let mut verdict = LinearFarkasVerdict::new();
+
     if let Some(farkas) = farkas {
         // A positional vector with the right length and sign is not yet proof
         // authority: SAT/theory reordering or a producer defect can attach valid-
@@ -425,14 +480,11 @@ fn classify_arith_conflict_kind(
         // First accept the pure-inequality subset. Equality rows need signed
         // orientation and therefore pass through the narrower exact gate below.
         if conflict_all_arith_literals(terms, conflict)
-            && ay_core::proof_validation::verify_farkas_conflict_lits_linear(
-                terms, conflict, farkas,
-            )
-            .is_ok()
+            && verdict.verified_linear(terms, conflict, farkas)
         {
             return TheoryLemmaKind::LraFarkas;
         }
-        if linear_equality_arith_farkas_valid(terms, conflict, farkas) {
+        if linear_equality_arith_farkas_valid_memo(&mut verdict, terms, conflict, farkas) {
             return TheoryLemmaKind::LraFarkas;
         }
     }
@@ -446,7 +498,7 @@ fn classify_arith_conflict_kind(
     // Farkas verifier with uninterpreted Int/Real atoms treated as opaque
     // variables, it is a genuine `la_generic` step. Fail-closed.
     if let Some(farkas) = farkas {
-        if opaque_arith_farkas_valid(terms, conflict, farkas) {
+        if opaque_arith_farkas_valid_memo(&mut verdict, terms, conflict, farkas) {
             return TheoryLemmaKind::LraFarkas;
         }
     }
@@ -894,12 +946,104 @@ fn classify_whole_conflict(
     conflict: &[TheoryLit],
     clause: &[TermId],
 ) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    classify_whole_conflict_gated(
+        terms,
+        negations,
+        conflict,
+        clause,
+        &SortedTheoryPresence::over(terms, clause),
+    )
+}
+
+/// Which sort-gated recognizers in the chain can possibly fire.
+///
+/// `recognize_string_ground_eval` and `recognize_fp_ground_eval` each open with
+/// a hygiene gate — "does this clause mention any String/RegLan term", "…any
+/// FloatingPoint term" — implemented as a full walk of the clause's term DAG
+/// behind a freshly allocated visited-set. On a problem in neither theory the
+/// walk runs to completion and returns `false`, every time.
+///
+/// That is invisible at one call per conflict and dominant at 512 (see
+/// `DECOMPOSE_MAX_ATTEMPTS`): profiled on the #7956 AUFLIA ext_eq refutation —
+/// no strings, no floats — the two gates were 8.9% of runtime EACH, ~18%
+/// together, entirely inside `classifiable_core_decomposition`.
+///
+/// Deciding both gates once per conflict is exact, not an approximation. Every
+/// sub-clause the decomposition builds is a SUBSET of `clause`, so the terms
+/// reachable from it are a subset of those reachable from `clause`; if no
+/// String/RegLan (resp. FloatingPoint) term is reachable from the whole clause,
+/// none is reachable from any sub-clause, and the skipped recognizer would have
+/// returned `false` anyway. No conflict changes lemma kind, so no verdict and
+/// no proof artifact changes — only the work does.
+///
+/// Both gates are computed LAZILY, and that is load-bearing rather than tidy:
+/// the chain is ordered cheap-first, and a conflict classified by EUF or Farkas
+/// never reached the string/FP arms before this change. Computing the presence
+/// eagerly would have paid the walk on exactly the conflicts that used to skip
+/// it — turning a saving into a tax on the common path.
+struct SortedTheoryPresence<'a> {
+    terms: &'a TermStore,
+    clause: &'a [TermId],
+    string_or_regex: std::cell::OnceCell<bool>,
+    floating_point: std::cell::OnceCell<bool>,
+}
+
+impl<'a> SortedTheoryPresence<'a> {
+    /// Presence over the WHOLE conflict clause. Sub-clauses of `clause` share
+    /// this instance; see the type docs for why that is exact.
+    fn over(terms: &'a TermStore, clause: &'a [TermId]) -> Self {
+        Self {
+            terms,
+            clause,
+            string_or_regex: std::cell::OnceCell::new(),
+            floating_point: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Delegates to the recognizers' OWN gate predicates, so the fast path and
+    /// the strict validator cannot drift apart.
+    fn string_or_regex(&self) -> bool {
+        *self
+            .string_or_regex
+            .get_or_init(|| ay_proof::clause_mentions_string_or_regex(self.terms, self.clause))
+    }
+
+    fn floating_point(&self) -> bool {
+        *self
+            .floating_point
+            .get_or_init(|| ay_proof::clause_mentions_floating_point(self.terms, self.clause))
+    }
+}
+
+fn classify_whole_conflict_gated(
+    terms: &TermStore,
+    negations: &HashMap<TermId, TermId>,
+    conflict: &[TheoryLit],
+    clause: &[TermId],
+    present: &SortedTheoryPresence<'_>,
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
     euf::infer_euf_lemma(terms, negations, conflict)
+        // Before the arithmetic gates: the guarded disequality-split schema
+        // contains an equality-guard literal no Farkas certificate can carry
+        // (its negation is a DISEQUALITY), so the Farkas gates can never
+        // claim it — but the evidence-free integer gate would, recording an
+        // unpromotable `LiaGeneric` for an exactly-checkable clause.
+        .or_else(|| infer_arith_diseq_split_lemma(terms, clause))
         .or_else(|| infer_arith_farkas(terms, conflict, clause))
         .or_else(|| infer_array_lemma(terms, clause))
-        .or_else(|| infer_string_ground_eval_lemma(terms, clause))
+        .or_else(|| {
+            present
+                .string_or_regex()
+                .then(|| infer_string_ground_eval_lemma(terms, clause))
+                .flatten()
+        })
         .or_else(|| infer_regex_intersect_empty_lemma(terms, clause))
-        .or_else(|| infer_fp_ground_eval_lemma(terms, clause))
+        .or_else(|| {
+            present
+                .floating_point()
+                .then(|| infer_fp_ground_eval_lemma(terms, clause))
+                .flatten()
+        })
         .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
 }
 
@@ -942,6 +1086,10 @@ fn classifiable_core_decomposition(
 
     let mut attempts = 0usize;
     let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
+    // At most one walk per gate for up to DECOMPOSE_MAX_ATTEMPTS
+    // classifications; see `SortedTheoryPresence` for why deciding it on the
+    // full clause is exact, and why it is lazy.
+    let present = SortedTheoryPresence::over(terms, clause);
 
     // Prefer the LARGEST core: dropping fewer literals keeps more of the
     // conflict inside the checked lemma.
@@ -959,9 +1107,38 @@ fn classifiable_core_decomposition(
             let sub_conflict: Vec<TheoryLit> = keep.iter().map(|&i| conflict[i]).collect();
             let sub_clause: Vec<TermId> = keep.iter().map(|&i| clause[i]).collect();
 
-            if let Some((kind, core_clause)) =
-                classify_whole_conflict(terms, negations, &sub_conflict, &sub_clause)
-            {
+            if let Some((kind, core_clause)) = classify_whole_conflict_gated(
+                terms,
+                negations,
+                &sub_conflict,
+                &sub_clause,
+                &present,
+            ) {
+                // (#ground-conflict-decomp) The weakened recorder
+                // (`add_theory_lemma_weakened` -> `add_theory_lemma_with_kind`)
+                // carries no LIA evidence, so a `LiaGeneric` core downgrades
+                // to a Generic trust CORE step there — and that is actively
+                // wrong: the integer gate classifies any all-integer
+                // sub-conflict WITHOUT semantic verification, so a
+                // manufactured core can be standalone-INVALID (measured: the
+                // guard-dropped `(cl (<= sk 0) (<= 2 sk))`, falsified at
+                // sk=1, recorded as trust). Refuse exactly that kind; the
+                // search continues, and an unclassifiable conflict falls back
+                // to the full-clause Generic exactly as before. `LraFarkas`
+                // cores are deliberately KEPT: the linear verifier accepted
+                // their certificate over the sub-conflict at classification
+                // time, so the recorded core is verified-valid (baseline
+                // behavior, and refusing them measurably regressed the
+                // un-guarded array-frame certification).
+                // Covered by `--no-ground-conflict-decomp` (off = baseline).
+                if matches!(kind, TheoryLemmaKind::LiaGeneric)
+                    && crate::quant_unit_authority::ground_conflict_decomp_enabled()
+                {
+                    if !advance_combination(&mut drop_idx, conflict.len()) {
+                        break;
+                    }
+                    continue;
+                }
                 // The classifier may reorder its literals; the core must stay a
                 // prefix, so rebuild the full clause as core ++ dropped.
                 let core_set: HashSet<TermId> = core_clause.iter().copied().collect();

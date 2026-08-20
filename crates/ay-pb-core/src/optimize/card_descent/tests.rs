@@ -99,6 +99,33 @@ fn declines_non_monotone_row() {
     );
 }
 
+/// The non-monotone reject must fire even when the row's rhs normalizes to
+/// `<= 0`. An at-most-one row (`-x1 - x2 >= -1`) and an implication row
+/// (`-x1 + x2 >= 0`) are both violated by selections ({x1, x2} and {x1}
+/// respectively), so neither is "trivially true" — dropping them from the
+/// advisory view (the pre-fix behavior) left the arm to decline fail-closed
+/// only after a wasted view build + greedy + verification (measured: 47ms on
+/// `primes-dimacs-cnf/ii16d2`, vs the microsecond structural declines).
+#[test]
+fn declines_non_monotone_row_whose_rhs_normalizes_nonpositive() {
+    let at_most_one = parse(
+        "* #variable= 3 #constraint= 2\nmin: +1 x1 +1 x2 +1 x3 ;\n\
+-1 x1 -1 x2 >= -1 ;\n+1 x1 +1 x2 +1 x3 >= 1 ;\n",
+    );
+    assert!(
+        view_of(&at_most_one).is_none(),
+        "an at-most-one row must decline structurally, not be dropped as trivial"
+    );
+    let implication = parse(
+        "* #variable= 2 #constraint= 2\nmin: +1 x1 +1 x2 ;\n\
+-1 x1 +1 x2 >= 0 ;\n+1 x1 +1 x2 >= 1 ;\n",
+    );
+    assert!(
+        view_of(&implication).is_none(),
+        "an implication row must decline structurally, not be dropped as trivial"
+    );
+}
+
 #[test]
 fn declines_constrained_but_unpriced_variable() {
     let instance = parse("* #variable= 2 #constraint= 1\nmin: +1 x1 ;\n+1 x1 +1 x2 >= 1 ;\n");

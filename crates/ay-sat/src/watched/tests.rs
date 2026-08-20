@@ -1135,3 +1135,326 @@ fn remap_preserves_binary_long_distinction_at_boundary_offsets() {
     }
     assert!(seen_long && seen_binary, "both clauses must survive remap");
 }
+
+// ─── Exact-size initial build ───────────────────────────────────────
+
+/// Build the same watch sequence twice — once through the incremental
+/// `push_entry` path (relocate-and-abandon), once through the two-pass exact
+/// path — and return both.
+///
+/// `seq` is a list of `(literal index, clause offset, is_binary)` pushes in
+/// attachment order, exactly as `initialize_watches` would issue them.
+fn build_both_ways(num_vars: usize, seq: &[(u32, u32, bool)]) -> (WatchedLists, WatchedLists) {
+    let clause_word = |off: u32, is_binary: bool| {
+        if is_binary {
+            u64::from(off) | BINARY_FLAG
+        } else {
+            u64::from(off)
+        }
+    };
+
+    let mut incremental = WatchedLists::new(num_vars);
+    for &(li, off, is_binary) in seq {
+        // Blocker is irrelevant to ordering; make it distinguishable.
+        incremental.push_entry(Literal(li), li ^ 1, clause_word(off, is_binary));
+    }
+
+    let mut exact = WatchedLists::new(num_vars);
+    let mut plan = ExactWatchPlan::new(2 * num_vars);
+    for &(li, _, _) in seq {
+        plan.count_watch(Literal(li));
+    }
+    exact.apply_exact_layout(&plan);
+    for &(li, off, is_binary) in seq {
+        exact.push_entry_presized(Literal(li), li ^ 1, clause_word(off, is_binary));
+    }
+    (incremental, exact)
+}
+
+/// The whole point of the exact build: identical watch ORDER, because watch
+/// order is propagation order and propagation order picks the conflicts.
+fn assert_same_watch_order(incremental: &WatchedLists, exact: &WatchedLists, num_vars: usize) {
+    for li in 0..(2 * num_vars) as u32 {
+        let lit = Literal(li);
+        assert_eq!(
+            incremental.len_of(lit),
+            exact.len_of(lit),
+            "watch count differs for literal {li}"
+        );
+        assert_eq!(
+            incremental.binary_count_of(lit),
+            exact.binary_count_of(lit),
+            "binary count differs for literal {li}"
+        );
+        assert_eq!(
+            incremental.entry_slice(lit),
+            exact.entry_slice(lit),
+            "watch ORDER differs for literal {li}"
+        );
+    }
+}
+
+#[test]
+fn exact_build_reproduces_incremental_watch_order_on_rotation_case() {
+    // The minimal case where the two insert paths of `push_entry` disagree:
+    // two long watches already present, then a binary. In capacity the first
+    // long rotates to the end; on a relocation the long suffix shifts right.
+    // The exact build must reproduce whichever one the incremental builder
+    // would have taken at that length.
+    let seq = vec![
+        (0u32, 10u32, false),
+        (0, 11, false),
+        (0, 12, true),
+        (0, 13, false),
+        (0, 14, true),
+        (0, 15, false),
+        (0, 16, true),
+        (0, 17, false),
+        (0, 18, true),
+    ];
+    let (incremental, exact) = build_both_ways(4, &seq);
+    assert_same_watch_order(&incremental, &exact, 4);
+}
+
+#[test]
+fn exact_build_has_no_slack_and_no_dead_slots() {
+    let seq: Vec<(u32, u32, bool)> = (0..9u32).map(|k| (0, k, k % 3 == 0)).collect();
+    let (incremental, exact) = build_both_ways(4, &seq);
+    // The incremental builder wrote 2+4+8+16 slots to retain 9 and ABANDONED
+    // the earlier regions. The presized builder reserves the same schedule
+    // capacity the incremental one would end at (16 for 9 watches) but never
+    // abandons anything, which is the dominant term — and, unlike an exact
+    // `capacity == count`, it leaves post-build `push_entry` branch selection
+    // bit-identical to the incremental path.
+    assert_eq!(exact.buf_entries.len(), 16);
+    assert_eq!(exact.dead_slots, 0);
+    assert_eq!(exact.capacity_of(Literal(0)), 16);
+    assert_eq!(exact.len_of(Literal(0)), 9);
+    assert!(
+        incremental.buf_entries.len() > exact.buf_entries.len(),
+        "incremental build should be the wasteful one"
+    );
+    assert!(incremental.dead_slots > 0);
+}
+
+proptest! {
+    /// Randomised attachment sequences: the exact build is order-identical to
+    /// the incremental build for every literal.
+    #[test]
+    fn prop_exact_build_matches_incremental_watch_order(
+        seq in prop::collection::vec(
+            (0u32..8u32, 0u32..64u32, any::<bool>()),
+            0..80,
+        ),
+    ) {
+        let num_vars = 4;
+        let (incremental, exact) = build_both_ways(num_vars, &seq);
+        for li in 0..(2 * num_vars) as u32 {
+            let lit = Literal(li);
+            prop_assert_eq!(incremental.len_of(lit), exact.len_of(lit));
+            prop_assert_eq!(incremental.binary_count_of(lit), exact.binary_count_of(lit));
+            prop_assert_eq!(incremental.entry_slice(lit), exact.entry_slice(lit));
+            // CAPACITY TOO — the field review found missing, and the one that
+            // matters most after the build: `capacity` selects which
+            // `push_entry` branch every SUBSEQUENT push takes, and the two
+            // branches order a region's long suffix differently. Comparing
+            // only entries/len/binary_count proved the build agrees while
+            // leaving the handed-over state free to diverge on the very next
+            // push. With this line, "matches the incremental builder" means
+            // the whole behaviourally-relevant region, not the visible part.
+            prop_assert_eq!(incremental.capacity_of(lit), exact.capacity_of(lit));
+        }
+        prop_assert_eq!(exact.dead_slots, 0);
+    }
+}
+
+#[test]
+fn exact_layout_gives_every_literal_its_own_exact_region() {
+    let mut watches = WatchedLists::new(3);
+    let mut plan = ExactWatchPlan::new(6);
+    // lit 0 -> 3 watches, lit 3 -> 1 watch, everything else 0.
+    for _ in 0..3 {
+        plan.count_watch(Literal(0));
+    }
+    plan.count_watch(Literal(3));
+    watches.apply_exact_layout(&plan);
+    // Capacities are the incremental schedule's round-up (3 -> 4, 1 -> 2), not
+    // the raw counts: that is what keeps post-build push branch selection, and
+    // therefore watch order, identical to the incremental builder.
+    assert_eq!(watches.capacity_of(Literal(0)), 4);
+    assert_eq!(watches.capacity_of(Literal(3)), 2);
+    assert_eq!(watches.capacity_of(Literal(1)), 0);
+    assert_eq!(watches.buf_entries.len(), 6);
+
+    for off in 0..3u32 {
+        watches.push_entry_presized(Literal(0), 1, u64::from(off));
+    }
+    watches.push_entry_presized(Literal(3), 2, 7 | BINARY_FLAG);
+    assert_eq!(watches.len_of(Literal(0)), 3);
+    assert_eq!(watches.len_of(Literal(3)), 1);
+    assert!(watches.is_binary(Literal(3), 0));
+    watches.debug_assert_binary_first();
+    // Growth after the build falls back to the amortised path and must work.
+    watches.push_entry(Literal(3), 4, 9);
+    assert_eq!(watches.len_of(Literal(3)), 2);
+}
+
+#[test]
+#[should_panic(expected = "exact watch region")]
+fn exact_build_refuses_to_overflow_a_region() {
+    let mut watches = WatchedLists::new(2);
+    let mut plan = ExactWatchPlan::new(4);
+    plan.count_watch(Literal(0));
+    watches.apply_exact_layout(&plan);
+    // count 1 reserves the schedule capacity 2, so the guard fires on the
+    // THIRD push, not the second. The property that matters is unchanged and
+    // is the reason the buffer is sized by capacity rather than count: a push
+    // can never scribble into the next literal's region. What rounding gives
+    // up is only the tighter "detect a pass-1 miscount on the very next push";
+    // a miscount of exactly one now lands in reserved slack instead.
+    watches.push_entry_presized(Literal(0), 1, 0);
+    watches.push_entry_presized(Literal(0), 1, 1);
+    watches.push_entry_presized(Literal(0), 1, 2);
+}
+
+#[test]
+fn growth_step_matches_the_incremental_capacity_schedule() {
+    // Replay the incremental builder's capacity schedule and check the
+    // closed-form predicate against it.
+    let mut cap: usize = 0;
+    for len in 0..2048usize {
+        let grows = len == cap;
+        assert_eq!(
+            grows,
+            WatchedLists::is_growth_step(len),
+            "growth-step predicate disagrees at len {len} (capacity {cap})"
+        );
+        if grows {
+            cap = if len == 0 { 2 } else { len * 2 };
+        }
+    }
+}
+
+/// A plan under `WATCH_BUF_LARGE_ENTRIES` must reserve the plan and NOTHING
+/// else.
+///
+/// The headroom exists to stop a multi-gigabyte buffer from doubling; a buffer
+/// under 32 MB has nothing worth saving and every byte of capacity divergence
+/// there would move `heap_bytes()`, which feeds the clause-DB byte-limit
+/// reduction trigger and therefore the search. Small instances stay on the
+/// stock policy exactly.
+#[test]
+fn small_exact_build_reserves_the_plan_and_no_headroom() {
+    let num_vars = 64;
+    let mut watches = WatchedLists::new(num_vars);
+    let mut plan = ExactWatchPlan::new(2 * num_vars);
+    for li in 0..(2 * num_vars) as u32 {
+        plan.count_watch(Literal(li));
+        plan.count_watch(Literal(li));
+    }
+    watches.apply_exact_layout(&plan);
+    let total = watches.buf_entries.len();
+    assert!(total < WATCH_BUF_LARGE_ENTRIES);
+    assert_eq!(
+        watches.buf_entries.capacity(),
+        total,
+        "a small exact build must not deviate from the stock reservation"
+    );
+}
+
+/// A plan at or above `WATCH_BUF_LARGE_ENTRIES` gets relocation headroom, and
+/// the headroom is CAPACITY only: length, region offsets, and region
+/// capacities are exactly the plan.
+///
+/// This is the regression: without headroom the build ends `len == capacity`,
+/// so the first post-build `grow_and_push` calls `Vec::reserve` on a full
+/// vector and Rust's amortised path DOUBLES the buffer. On vlsat3_b99 that was
+/// 1,153 MB of never-written capacity charged against `--memory`.
+#[test]
+fn large_exact_build_leaves_headroom_so_the_first_grow_does_not_double() {
+    // 2^21 literals x 2 watches = 2^22 entries = exactly the threshold.
+    let num_lits = WATCH_BUF_LARGE_ENTRIES / 2;
+    let num_vars = num_lits / 2;
+    let mut watches = WatchedLists::new(num_vars);
+    let mut plan = ExactWatchPlan::new(num_lits);
+    for li in 0..num_lits as u32 {
+        plan.count_watch(Literal(li));
+        plan.count_watch(Literal(li));
+    }
+    watches.apply_exact_layout(&plan);
+
+    let total = watches.buf_entries.len();
+    assert_eq!(total, WATCH_BUF_LARGE_ENTRIES);
+    let cap_after_build = watches.buf_entries.capacity();
+    assert!(
+        cap_after_build >= total + total / WATCH_BUF_EXACT_BUILD_HEADROOM_DIVISOR,
+        "large exact build reserved {cap_after_build} for a {total}-entry plan: no headroom"
+    );
+    // Headroom is spare capacity, not layout: every region is still planned.
+    assert_eq!(watches.capacity_of(Literal(0)), 2);
+    assert_eq!(watches.len_of(Literal(0)), 0);
+    assert_eq!(watches.dead_slots, 0);
+
+    // Fill one region to capacity, then overflow it. The relocation must land
+    // in the headroom without reallocating the buffer at all.
+    watches.push_entry_presized(Literal(0), 1, 0);
+    watches.push_entry_presized(Literal(0), 1, 1);
+    watches.push_entry(Literal(0), 1, 2);
+    assert_eq!(
+        watches.buf_entries.capacity(),
+        cap_after_build,
+        "the first post-build relocation reallocated the buffer"
+    );
+    assert_eq!(watches.len_of(Literal(0)), 3);
+}
+
+/// Above the threshold the buffer grows by a bounded STEP, never by doubling.
+///
+/// This is the backstop for the headroom: once the headroom is spent (or after
+/// a defragmentation has shrunk the buffer back to a tight fit), the next
+/// relocation must not reintroduce the doubling the headroom was added to
+/// avoid.
+#[test]
+fn large_buffer_growth_step_is_bounded_not_doubling() {
+    let mut watches = WatchedLists::new(1);
+    // Drive the buffer straight to a "large" tight-fit state, the state a
+    // defragmentation leaves behind.
+    watches.buf_entries.reserve_exact(WATCH_BUF_LARGE_ENTRIES);
+    watches.buf_entries.resize(WATCH_BUF_LARGE_ENTRIES, 0);
+    let cap_before = watches.buf_entries.capacity();
+    assert!(cap_before >= WATCH_BUF_LARGE_ENTRIES);
+
+    watches.reserve_entries(1);
+    let cap_after = watches.buf_entries.capacity();
+    assert!(
+        cap_after > cap_before,
+        "reserve_entries did not grow a full buffer"
+    );
+    assert!(
+        cap_after < cap_before * 2,
+        "large buffer still doubled: {cap_before} -> {cap_after}"
+    );
+    assert!(
+        cap_after >= cap_before + cap_before / WATCH_BUF_GROWTH_STEP_DIVISOR,
+        "growth step smaller than one defragmentation cycle: {cap_before} -> {cap_after}"
+    );
+}
+
+/// Under the threshold `reserve_entries` is `Vec::reserve`, unchanged.
+#[test]
+fn small_buffer_growth_keeps_the_stock_vec_policy() {
+    let mut watches = WatchedLists::new(1);
+    watches.buf_entries.reserve_exact(1024);
+    watches.buf_entries.resize(1024, 0);
+    let cap_before = watches.buf_entries.capacity();
+    watches.reserve_entries(1);
+    let mut stock: Vec<u64> = Vec::new();
+    stock.reserve_exact(1024);
+    stock.resize(1024, 0);
+    stock.reserve(1);
+    assert_eq!(
+        watches.buf_entries.capacity(),
+        stock.capacity(),
+        "small-buffer growth deviated from Vec::reserve ({cap_before} before)"
+    );
+}

@@ -47,11 +47,14 @@ use ay_sat::{AssumeResult, Literal, Solver as SatSolver, Variable};
 use crate::dpw::{dpw_size, gte_size, DpwEnc};
 use crate::solver::MaxSatStats;
 
-/// Diagnostics gate: set `--maxsat-debug` to trace engine decisions on
-/// stderr. Zero cost when unset.
+/// Diagnostics gate: pass `--maxsat-debug` to trace engine decisions on
+/// stderr. Zero cost when unset. B41: CLI-owned via misc_cli_flags, same
+/// OnceLock pattern as the other engine knobs below — the previous literal
+/// env::var_os read of the flag name was dead (nothing sets an env var
+/// named "--maxsat-debug").
 fn debug_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("--maxsat-debug").is_some())
+    *ON.get_or_init(|| ay_core::misc_cli_flags().maxsat_debug)
 }
 
 /// Weight type for soft clauses.
@@ -2500,7 +2503,7 @@ impl OllEngine {
             let removed = clauses_before.saturating_sub(clauses_after) as u64;
             let free = removed.saturating_sub(risky);
             let mostly_risky = risky > free;
-            if std::env::var("--maxsat-debug").is_ok() {
+            if debug_trace() {
                 eprintln!(
                     "c ONESHOT-PREPROC: clauses {clauses_before} -> {clauses_after} \
                      (bce removed {bce_removed}, pure {bce_pure}, risky {risky}, free {free}{})",
@@ -2527,7 +2530,7 @@ impl OllEngine {
                 }
                 install_non_oneshot_sat_config(&mut fresh, hard.len());
                 sat = fresh;
-                if std::env::var("--maxsat-debug").is_ok() {
+                if debug_trace() {
                     eprintln!(
                         "c ONESHOT-PREPROC: REVERTED (risky {risky} > free {free}); \
                          rebuilt {} hard clauses without preprocessing",

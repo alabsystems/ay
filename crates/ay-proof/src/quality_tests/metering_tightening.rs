@@ -134,7 +134,7 @@ fn bounded_assignment_eval_saturates_at_the_environment_width() {
 /// the development design notes
 /// is declined by a SINGLE charge of at least 137,479,682 against a 350,000,000
 /// envelope — 39% of the whole budget for one lemma — measured with
-/// `AY_PROBE_STRICT_CHECK=1`. That charge is `1 << 8` times a ~733-node
+/// `--probe-strict-check`. That charge is `1 << 8` times a ~733-node
 /// unfolded payload squared. At the same payload the tightened class bills
 /// under two million, which is why the obligation now certifies.
 ///

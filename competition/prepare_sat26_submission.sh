@@ -506,13 +506,16 @@ if unsat_proof.get("format") != proof_format:
     sys.exit(2)
 
 runtime_env = dict(profile.get("runtime_env", {}))
+# B76: profile-owned lever decisions live in `profile_levers` and reach the
+# solver as typed --sat-* CLI flags baked into run.sh, never as env exports.
+profile_levers = dict(profile.get("profile_levers", {}))
 profile_bool_overrides = {
     "SAT26_PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISION":
-        "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION",
+        "bcp_learned_1963_blocker_cert_elision",
     "SAT26_PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE":
-        "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE",
+        "bcp_learned_1963_blocker_cert_false_reject_demote",
 }
-for env_name, runtime_key in profile_bool_overrides.items():
+for env_name, lever_key in profile_bool_overrides.items():
     raw_value = os.environ.get(env_name, "").strip()
     if not raw_value:
         continue
@@ -523,9 +526,9 @@ for env_name, runtime_key in profile_bool_overrides.items():
         )
         sys.exit(2)
     if raw_value == "1":
-        runtime_env[runtime_key] = "1"
+        profile_levers[lever_key] = "1"
     else:
-        runtime_env.pop(runtime_key, None)
+        profile_levers.pop(lever_key, None)
 required_env = [
     "AY_SAT_COMPETITION_PROFILE",
     "AY_SAT_PROFILE_ID",
@@ -556,9 +559,9 @@ print(solver_variant)
 print(str(runtime_env["AY_SAT_VARIANT"]))
 print(str(runtime_env["AY_COMPETITION_JIT_MODE"]))
 print(json.dumps(runtime_env, sort_keys=True, separators=(",", ":")))
-print(str(runtime_env.get("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION", "")))
-print(str(runtime_env.get("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE", "")))
-print(str(runtime_env.get("AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE", "")))
+print(str(profile_levers.get("bcp_learned_1963_blocker_cert_elision", "")))
+print(str(profile_levers.get("bcp_learned_1963_blocker_cert_false_reject_demote", "")))
+print(str(profile_levers.get("dense_clique_php_proof_route", "")))
 PY
     )
 
@@ -696,88 +699,35 @@ for key, expected in expected_env.items():
     actual = os.environ.get(key, "")
     if actual != expected:
         errors.append(f"{key}={actual!r}, expected {expected!r}")
-if os.environ.get("AY_SOLVE_SESSION_PROVENANCE"):
-    errors.append("AY_SOLVE_SESSION_PROVENANCE was not scrubbed")
 if os.environ.get("AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT"):
     errors.append("AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT was not scrubbed")
 if os.environ.get("AY_SAT_TRACK"):
     errors.append("AY_SAT_TRACK was not scrubbed")
 if os.environ.get("AY_SAT_AI_CLASS"):
     errors.append("AY_SAT_AI_CLASS was not scrubbed")
-if os.environ.get("AY_SAT_ALLOW_MAIN_CANDIDATE_VARIANTS"):
-    errors.append("AY_SAT_ALLOW_MAIN_CANDIDATE_VARIANTS was not scrubbed")
-if os.environ.get("AY_SAT_BCP_ADVANCE_SAVED_POS"):
-    errors.append("AY_SAT_BCP_ADVANCE_SAVED_POS was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION"):
-    errors.append("AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE"):
-    errors.append("AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE"):
-    errors.append("AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_IDENTITY"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_IDENTITY was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION was not scrubbed")
-if os.environ.get("AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH"):
-    errors.append("AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH was not scrubbed")
-if os.environ.get("AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET"):
-    errors.append("AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET was not scrubbed")
-if os.environ.get("AY_SAT_DENSE_CLIQUE_MAB_BRANCH"):
-    errors.append("AY_SAT_DENSE_CLIQUE_MAB_BRANCH was not scrubbed")
-if os.environ.get("AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE"):
-    errors.append("AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE was not scrubbed")
-expected_bcp_cert_elision = os.environ.get("SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION", "")
-actual_bcp_cert_elision = os.environ.get("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION", "")
-if expected_bcp_cert_elision:
-    if actual_bcp_cert_elision != expected_bcp_cert_elision:
-        errors.append(
-            "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION="
-            f"{actual_bcp_cert_elision!r}, expected {expected_bcp_cert_elision!r}"
-        )
-elif actual_bcp_cert_elision:
-    errors.append("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION leaked without profile decision")
-expected_bcp_cert_demote = os.environ.get("SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE", "")
-actual_bcp_cert_demote = os.environ.get("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE", "")
-if expected_bcp_cert_demote:
-    if actual_bcp_cert_demote != expected_bcp_cert_demote:
-        errors.append(
-            "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE="
-            f"{actual_bcp_cert_demote!r}, expected {expected_bcp_cert_demote!r}"
-        )
-elif actual_bcp_cert_demote:
-    errors.append(
-        "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE leaked without profile decision"
-    )
-expected_clique_route = os.environ.get("SAT26_PREFLIGHT_DENSE_CLIQUE_PHP_PROOF_ROUTE", "")
-actual_clique_route = os.environ.get("AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE", "")
-if expected_clique_route:
-    if actual_clique_route != expected_clique_route:
-        errors.append(
-            "AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE="
-            f"{actual_clique_route!r}, expected {expected_clique_route!r}"
-        )
-elif actual_clique_route:
-    errors.append("AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE leaked without profile decision")
-if os.environ.get("AY_SAT_DENSE_CLIQUE_PHP_COMPACT_LRAT_PROOF"):
-    errors.append("AY_SAT_DENSE_CLIQUE_PHP_COMPACT_LRAT_PROOF was not scrubbed")
-if os.environ.get("AY_SAT_OFFICIAL_ALLOW_DESTRUCTIVE_TRANSFORMS"):
-    errors.append("AY_SAT_OFFICIAL_ALLOW_DESTRUCTIVE_TRANSFORMS was not scrubbed")
-if os.environ.get("AY_NO_DECOMPOSE"):
-    errors.append("AY_NO_DECOMPOSE was not scrubbed")
+# B76: the profile lever decisions travel as typed CLI flags on the solve
+# argv; the env spellings have no reader in the binary any more.
+def lever_flag_check(preflight_key: str, flag: str) -> None:
+    expected = os.environ.get(preflight_key, "")
+    present = any(arg == flag for arg in args)
+    if expected == "1":
+        if not present:
+            errors.append(f"{flag} missing despite profile decision")
+    elif present:
+        errors.append(f"{flag} leaked without profile decision")
+
+lever_flag_check(
+    "SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION",
+    "--sat-bcp-learned-1963-blocker-cert-elision",
+)
+lever_flag_check(
+    "SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE",
+    "--sat-bcp-learned-1963-blocker-cert-false-reject-demote",
+)
+lever_flag_check(
+    "SAT26_PREFLIGHT_DENSE_CLIQUE_PHP_PROOF_ROUTE",
+    "--sat-dense-clique-php-proof-route",
+)
 
 if flag_values("--sat-variant") != [os.environ["SAT26_PREFLIGHT_VARIANT"]]:
     errors.append("--sat-variant does not match requested variant")
@@ -1744,57 +1694,28 @@ ARGS+=(--proof "\$PROOF_OUT" --proof-format "$PROOF_FORMAT" --no-verify-proof)
 
 PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISION="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISIONS[$idx]}"
 PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTES[$idx]}"
-PROFILE_BCP_ENV=()
+# B76: profile lever decisions travel as typed CLI flags, not env exports.
 if [[ "\$PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISION" == "1" ]]; then
-    PROFILE_BCP_ENV+=(AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION=1)
+    ARGS+=(--sat-bcp-learned-1963-blocker-cert-elision)
 fi
 if [[ "\$PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE" == "1" ]]; then
-    PROFILE_BCP_ENV+=(AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE=1)
+    ARGS+=(--sat-bcp-learned-1963-blocker-cert-false-reject-demote)
 fi
 
 PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTE="${PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTES[$idx]}"
-PROFILE_ROUTE_ENV=()
 if [[ "\$PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTE" == "1" ]]; then
-    PROFILE_ROUTE_ENV+=(AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE=1)
+    ARGS+=(--sat-dense-clique-php-proof-route)
 fi
 
-exec env -u AY_SOLVE_SESSION_PROVENANCE \
-    -u AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT \
+exec env -u AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT \
     -u AY_SAT_TRACK \
     -u AY_SAT_AI_CLASS \
-    -u AY_SAT_ALLOW_MAIN_CANDIDATE_VARIANTS \
-    -u AY_SAT_BCP_ADVANCE_SAVED_POS \
-    -u AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET \
-    -u AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION \
-    -u AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION \
-    -u AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW \
-    -u AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE \
-    -u AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET \
-    -u AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET \
-    -u AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION \
-    -u AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE \
-    -u AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP \
-    -u AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE \
-    -u AY_SAT_BCP_LEARNED_1963_IDENTITY \
-    -u AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION \
-    -u AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION \
-    -u AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH \
-    -u AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET \
-    -u AY_SAT_DENSE_CLIQUE_MAB_BRANCH \
-    -u AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE \
-    -u AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE \
-    -u AY_SAT_DENSE_CLIQUE_PHP_COMPACT_LRAT_PROOF \
-    -u AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE \
-    -u AY_SAT_OFFICIAL_ALLOW_DESTRUCTIVE_TRANSFORMS \
-    -u AY_NO_DECOMPOSE \
     AY_INTERNAL_PROVENANCE_CHILD=1 \
     AY_INTERNAL_SATCOMP_WRAPPER="$TRACK-$AI_CLASS-$variant-$PROOF_FORMAT-v1" \
     AY_SAT_COMPETITION_PROFILE="${PROFILE_IDS[$idx]}" \
     AY_SAT_PROFILE_ID="${PROFILE_IDENTITIES[$idx]}" \
     AY_SAT_VARIANT="${PROFILE_RUNTIME_VARIANTS[$idx]}" \
     AY_COMPETITION_JIT_MODE="${PROFILE_JIT_MODES[$idx]}" \
-    \${PROFILE_BCP_ENV[@]+"\${PROFILE_BCP_ENV[@]}"} \
-    \${PROFILE_ROUTE_ENV[@]+"\${PROFILE_ROUTE_ENV[@]}"} \
     "\$SCRIPT_DIR/ay" "\${ARGS[@]}" \${TIMEOUT_ARGS[@]+"\${TIMEOUT_ARGS[@]}"} \${STATS_ARGS[@]+"\${STATS_ARGS[@]}"} "\$INSTANCE"
 EOF
     chmod 755 "$root_dir/run.sh"

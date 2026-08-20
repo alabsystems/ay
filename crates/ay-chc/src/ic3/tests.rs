@@ -89,6 +89,53 @@ fn test_ic3_trivially_safe() {
     }
 }
 
+/// A past/immediate deadline preempts the search at a loop head and yields the
+/// explicit `Unknown` — never a truncated `Safe`/`Unsafe`. A far-future deadline
+/// is inert (the same TS still proves `Safe`), so the plumbing does not perturb
+/// normal verdicts.
+#[test]
+fn test_ic3_deadline_yields_unknown_not_a_truncated_verdict() {
+    // Same trivially-SAFE system as test_ic3_trivially_safe (x=0, x'=x, bad x=1).
+    let build_ts = || {
+        let (sv, iv, nv, total) = make_vars(1, 0);
+        let x = sv[0];
+        let x_next = nv[0];
+        let init_clauses = vec![vec![Literal::negative(x)]];
+        let trans_clauses = vec![
+            vec![Literal::negative(x), Literal::positive(x_next)],
+            vec![Literal::positive(x), Literal::negative(x_next)],
+        ];
+        let bad_literals = vec![Literal::positive(x)];
+        BitLevelTransitionSystem::new(
+            1,
+            0,
+            sv,
+            nv,
+            iv,
+            init_clauses,
+            trans_clauses,
+            bad_literals,
+            total,
+        )
+    };
+
+    // Already-expired deadline: must return Unknown, not the Safe it would prove.
+    let expired = ay_core::time::Instant::now();
+    let mut solver = Ic3Solver::new(build_ts(), false).with_deadline(Some(expired));
+    match solver.solve() {
+        Ic3Result::Unknown => {}
+        other => panic!("expired deadline must yield Unknown, got {other:?}"),
+    }
+
+    // Far-future deadline is inert: the same system still proves Safe.
+    let far = ay_core::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut solver = Ic3Solver::new(build_ts(), false).with_deadline(Some(far));
+    match solver.solve() {
+        Ic3Result::Safe { .. } => {}
+        other => panic!("a far deadline must not perturb the Safe verdict, got {other:?}"),
+    }
+}
+
 /// Test: trivially unsafe system.
 ///
 /// Single state variable x. Init: x=1. Bad: x=1.

@@ -829,3 +829,53 @@ fn bare_named_fp_special_literals_are_not_ieee_constants() {
     validate_fp_ground_eval(&terms, ProofId(0), &[claim])
         .expect_err("indexed FP-literal widths must agree with the term's sort");
 }
+
+// ---------------------------------------------------------------------------
+// Shared-operand `fp.eq` conflict (the QF_FP proof-envelope gate shape)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn accepts_shared_operand_fp_eq_conflict_on_distinct_constants() {
+    // `[¬(fp.eq x 1.0), ¬(fp.eq x 2.0)]` over full-width symbolic F32 `x`:
+    // beyond enumeration, valid by the shared-operand transitivity argument.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", fp_sort(F32));
+    let one = fp_triple(&mut terms, 0, 127, 0, F32);
+    let two = fp_triple(&mut terms, 0, 128, 0, F32);
+    let eq_one = predicate(&mut terms, "fp.eq", vec![x, one]);
+    let eq_two = predicate(&mut terms, "fp.eq", vec![two, x]); // either orientation
+    let clause = [terms.mk_not(eq_one), terms.mk_not(eq_two)];
+    assert!(recognize_fp_ground_eval(&terms, &clause));
+    assert!(validate_fp_ground_eval(&terms, ProofId(0), &clause).is_ok());
+}
+
+#[test]
+fn rejects_shared_operand_fp_eq_conflict_on_ieee_equal_zeros() {
+    // `+zero` and `-zero` ARE `fp.eq`-equal, so `x` can satisfy both literals
+    // (`x = ±0`) and the clause is falsifiable — must be refused.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", fp_sort(F32));
+    let pos_zero = fp_literal(&mut terms, "+zero", F32);
+    let neg_zero = fp_literal(&mut terms, "-zero", F32);
+    let eq_pos = predicate(&mut terms, "fp.eq", vec![x, pos_zero]);
+    let eq_neg = predicate(&mut terms, "fp.eq", vec![x, neg_zero]);
+    let clause = [terms.mk_not(eq_pos), terms.mk_not(eq_neg)];
+    assert!(!recognize_fp_ground_eval(&terms, &clause));
+    assert!(validate_fp_ground_eval(&terms, ProofId(0), &clause).is_err());
+}
+
+#[test]
+fn rejects_fp_eq_conflict_without_a_shared_operand() {
+    // Distinct symbolic operands: `x = 1.0 ∧ y = 2.0` is satisfiable, so the
+    // clause is falsifiable — the shared-operand rule must not fire.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", fp_sort(F32));
+    let y = terms.mk_var("y", fp_sort(F32));
+    let one = fp_triple(&mut terms, 0, 127, 0, F32);
+    let two = fp_triple(&mut terms, 0, 128, 0, F32);
+    let eq_x = predicate(&mut terms, "fp.eq", vec![x, one]);
+    let eq_y = predicate(&mut terms, "fp.eq", vec![y, two]);
+    let clause = [terms.mk_not(eq_x), terms.mk_not(eq_y)];
+    assert!(!recognize_fp_ground_eval(&terms, &clause));
+    assert!(validate_fp_ground_eval(&terms, ProofId(0), &clause).is_err());
+}

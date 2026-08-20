@@ -538,6 +538,49 @@ fn parse_lin(terms: &TermStore, t: TermId) -> Option<LinTerm> {
 // Cooper's algorithm (−∞ / lower-bound form)
 // ===========================================================================
 
+/// Ceiling on the number of EXPLICIT instances Cooper's two sweeps may
+/// intern, i.e. `(1 + |B|) * δ`, checked BEFORE either sweep allocates.
+///
+/// This is a memory-safety backstop on the ONE unbounded allocation in the
+/// algorithm, not a tuning knob. It bounds both factors at once: a huge
+/// period with one bound, and a small period with many bounds.
+///
+/// HONEST SCOPE — this ceiling CAN refuse an elimination that would otherwise
+/// have been accepted. The self-check's own `DIVISOR_PERIOD_CAP` does not
+/// cover this case: it is computed from the divisors written in the INPUT
+/// literals, whereas δ here also absorbs `m`, the lcm of `x`'s COEFFICIENTS
+/// that step 1 mints as a fresh `m | x` literal. An input with large
+/// coefficients but no `mod` atom therefore has `input_divisor_lcm = 1` and
+/// slips past that cap entirely. Refusing is nonetheless always SOUND:
+/// `NotSupported` is the documented fail-closed outcome and the caller keeps
+/// the ORIGINAL quantified formula for the downstream quantifier machinery.
+/// Losing an elimination costs a proof, never correctness.
+///
+/// SIZING, and what backs it. 16_384 instances is the memory bound: each is
+/// one interned term plus subterms, so this holds the sweep to single-digit
+/// MB instead of the multi-GB it was.
+///
+/// SIZING IS A STATED MEMORY BOUND, NOT A MEASURED DEMAND. An earlier version
+/// of this comment claimed the shipped 16_384 sat "64x above observed demand",
+/// on the evidence that lowering it to 256 decided the same rows with the same
+/// verdicts. Review destroyed that inference by building a **cap = 0** binary —
+/// Cooper's instance sweeps disabled outright, verified live to refuse a δ=6
+/// elimination the shipped build performs — and it ALSO decides the same rows
+/// with 0 definite-verdict differences. The same null is produced by every cap
+/// value down to zero, so the experiment has no discriminating power and
+/// observed demand on that corpus is 0, not 256.
+///
+/// What the constant does establish is a memory ceiling: the sweep can no
+/// longer materialise an unbounded period. Whether any real input needs more
+/// than a small number of instances is UNMEASURED, and a corpus where this cap
+/// is load-bearing has not been found.
+///
+/// NOT COVERED, deliberately stated: nothing counts how often this cap
+/// actually refuses in production. A `#prepass-reachability`-style counter
+/// would make the sizing continuously checkable instead of a one-shot; it is
+/// not in this change.
+const COOPER_INSTANCE_CAP: i64 = 16_384;
+
 /// Run Cooper's −∞ elimination, returning the quantifier-free result term.
 fn cooper(terms: &mut TermStore, literals: &[Literal], var: TermId) -> Option<TermId> {
     // --- Step 1: unit-coefficient reduction -------------------------------
@@ -582,6 +625,40 @@ fn cooper(terms: &mut TermStore, literals: &[Literal], var: TermId) -> Option<Te
         if let Some(b) = lower_bound_witness(lit, var) {
             bset.push(b);
         }
+    }
+
+    // INSTANCE CEILING (fail-closed, #cooper-period-blowup).
+    //
+    // The two sweeps below materialise `(1 + |B|) * δ` instances EXPLICITLY,
+    // one interned term each, with no ceiling of any kind. δ is the lcm of
+    // the divisors, and one of those divisors is `m` — the lcm of `x`'s
+    // COEFFICIENTS, minted as `m | x` by the unit-coefficient reduction in
+    // step 1 above. So a perfectly ordinary input such as
+    // `∃v. (1048576·v = x ∧ y ≤ v)` — with no `mod` written anywhere — sets
+    // m = δ = 2^20 and asks for ~2^20 interned terms. That is unbounded growth
+    // driven by a COEFFICIENT, not by any user-written divisibility atom.
+    //
+    // MEASURED, pre-fix, on `(apply qe-light)` over that existential
+    // (`evals/repros/qe_cooper_period_blowup.smt2`): 3.07 GB peak / 8.5 s under
+    // `-memory:60000`, after which the bounded differential self-check discards
+    // the result and the goal comes back with its `exists` intact — so the
+    // whole 3 GB buys nothing. Under the DEFAULT memory limit the sweep trips
+    // it first and the run ends `unknown (:reason-unknown "memout")` at 1.50 GB
+    // / 1.8 s — i.e. 142 bytes of SMT lose the session. The sweeps poll no
+    // interrupt (`qe_prepass.rs` checks only BETWEEN eliminator invocations),
+    // so pre-fix this was uninterruptible, not merely slow.
+    //
+    // Checking the product BEFORE either loop is what makes the allocation
+    // bounded; see [`COOPER_INSTANCE_CAP`] for why refusing is sound and what
+    // it can cost.
+    let instances = i64::try_from(&delta)
+        .ok()
+        .and_then(|d| i64::try_from(bset.len()).ok().map(|b| (d, b)))
+        .and_then(|(d, b)| b.checked_add(1).and_then(|k| d.checked_mul(k)));
+    // `None` here means δ or the product overflowed i64 — far past the cap.
+    match instances {
+        Some(n) if n <= COOPER_INSTANCE_CAP => {}
+        _ => return None,
     }
 
     let mut disjuncts: Vec<TermId> = Vec::new();

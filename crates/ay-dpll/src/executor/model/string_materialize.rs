@@ -74,7 +74,7 @@ struct StringVarConstraints {
     contains: Vec<String>,
     /// Constant substrings the witness must NOT contain, from a HARD
     /// `(not (str.contains v c))` conjunct (NF-engine closure 6,
-    /// `AY_STR_NF=1`; the vector stays EMPTY when the flag is off, so every
+    /// `--str-nf`; the vector stays EMPTY when the flag is off, so every
     /// check below is a no-op and the flags-off materializer is
     /// byte-identical).
     ///
@@ -848,7 +848,7 @@ impl Executor {
                     self.collect_regex_membership(args[0], args[1], positive, out);
                     return;
                 }
-                // NF-engine closure 6 (`AY_STR_NF=1`): a hard NEGATED
+                // NF-engine closure 6 (`--str-nf`): a hard NEGATED
                 // `str.contains(v, c)` with a CONSTANT needle is the second
                 // predicate collected in the negative polarity. Like
                 // `str.in_re`, its negation is EXACTLY representable here (a

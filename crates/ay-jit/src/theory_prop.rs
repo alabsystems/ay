@@ -52,7 +52,7 @@
 ///
 /// Stores the bound value as i64 numerator/denominator when possible,
 /// enabling i128 cross-multiply comparison instead of BigRational.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundAtom {
     /// Index of this atom in the caller's atom array for this variable.
     /// Used to identify which atom was implied when returning results.
@@ -110,7 +110,7 @@ pub struct PropagationResult {
 /// for each variable that has bound atoms. During propagation, calling
 /// `check_bounds()` with the current lb/ub values returns a list of
 /// implied atoms without any BigRational allocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarPropagator {
     /// Pre-compiled atoms sorted by bound value for cache-friendly scanning.
     /// Upper atoms first (sorted by bound value ascending), then lower atoms
@@ -489,7 +489,14 @@ pub struct TheoryPropJit {
     /// when provided by the caller. Used by theory solvers to skip
     /// recompilation when the atom index is structurally identical.
     fingerprint: Option<TheoryPropFingerprint>,
+    /// Per-slot cache of emitted machine code, together with the exact table it
+    /// was emitted from. See [`TheoryPropJit::resolve_native_code`].
+    native_code_cache: Vec<Option<(VarPropagator, std::sync::Arc<NativeCode>)>>,
 }
+
+/// Emitted machine code for one variable: the function bytes plus the atom
+/// indices its result bitmap is indexed by.
+pub(crate) type NativeCode = (Vec<u8>, Vec<u32>);
 
 impl TheoryPropJit {
     /// Create a new empty JIT manager.
@@ -505,7 +512,55 @@ impl TheoryPropJit {
             native_compile_threshold: NATIVE_COMPILE_THRESHOLD,
             native_attempted: false,
             fingerprint: None,
+            native_code_cache: Vec::new(),
         }
+    }
+
+    /// Machine code for every slot, emitting only what actually changed.
+    ///
+    /// A rebuild is triggered by a single new atom, but it replaces the WHOLE
+    /// table, so the previous design re-emitted native code for every variable
+    /// on every atom registration — `O(atoms x variables)` emission over a
+    /// solve. Emission is a pure function of the per-variable table, so a slot
+    /// whose table is byte-identical to the one its cached code was emitted
+    /// from reuses that code unchanged.
+    pub(crate) fn resolve_native_code(&mut self) -> Vec<Option<std::sync::Arc<NativeCode>>> {
+        if self.native_code_cache.len() < self.propagators.len() {
+            self.native_code_cache
+                .resize_with(self.propagators.len(), || None);
+        }
+        let mut codes = Vec::with_capacity(self.propagators.len());
+        for slot in 0..self.propagators.len() {
+            let Some(prop) = self.propagators[slot].as_ref() else {
+                // The slot is gone; drop its cached code so a table that
+                // disappears cannot pin its bytes forever.
+                self.native_code_cache[slot] = None;
+                codes.push(None);
+                continue;
+            };
+            if let Some((cached_table, code)) = self.native_code_cache[slot].as_ref() {
+                if cached_table == prop {
+                    codes.push(Some(std::sync::Arc::clone(code)));
+                    continue;
+                }
+            }
+            match crate::theory_prop_native::emit_native_propagator_code(prop) {
+                Some(emitted) => {
+                    let code = std::sync::Arc::new(emitted);
+                    self.native_code_cache[slot] =
+                        Some((prop.clone(), std::sync::Arc::clone(&code)));
+                    codes.push(Some(code));
+                }
+                None => {
+                    // Ineligible for native emission (too many atoms, or a
+                    // non-small bound). The check is cheap and table-local, so
+                    // there is nothing worth caching.
+                    self.native_code_cache[slot] = None;
+                    codes.push(None);
+                }
+            }
+        }
+        codes
     }
 
     /// Compile propagators for all variables with bound atoms.
@@ -696,14 +751,6 @@ impl TheoryPropJit {
     /// Number of variables with at least one compiled atom.
     pub fn compiled_vars(&self) -> u32 {
         self.compiled_vars
-    }
-
-    /// Access the per-variable propagator list (crate-internal).
-    ///
-    /// Used by `theory_prop_native` to compile native machine code versions
-    /// of the interpreted propagators.
-    pub(crate) fn propagators(&self) -> &[Option<VarPropagator>] {
-        &self.propagators
     }
 
     /// Number of variables with native machine code propagators.

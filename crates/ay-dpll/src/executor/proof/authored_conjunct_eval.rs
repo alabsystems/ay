@@ -78,6 +78,14 @@ enum ConjunctEvalCloser {
     Reflexivity,
     /// A declaration-backed datatype evaluation.
     Datatype(TheoryLemmaKind),
+    /// A unit theory lemma one of `ay-proof`'s OWN recognizers accepts.
+    ///
+    /// The recognizer consulted here is the exact precondition of the strict
+    /// validator that will re-run on the committed lemma, so this can only
+    /// name a kind strict mode then re-derives independently (array
+    /// read-over-write chain evaluation, ground string/regex evaluation). The
+    /// `&'static str` is the `theory` tag the lemma carries on the wire.
+    TheoryLemma(&'static str, TheoryLemmaKind),
 }
 
 impl Executor {
@@ -143,12 +151,42 @@ impl Executor {
             return false;
         };
         for (leaf, path) in &nodes {
-            let TermData::Not(inner) = self.ctx.terms.get(*leaf) else {
-                continue;
+            // Two polarities of the SAME argument.
+            //
+            // NEGATED leaf `(not X)`: discharge proves `X`, and the conjunct
+            // supplies `(not X)` — the original shape.
+            //
+            // POSITIVE leaf `L`: the conjunct supplies `L` and the discharge
+            // has to prove `(not L)`. A fold-to-`false` reaches this form
+            // whenever the author wrote the false claim directly rather than
+            // negated — `(assert (= (str.++ "a" "b") "ac"))` — which the
+            // `(not X)`-only scan skipped entirely, so those queries lost the
+            // whole document to `(step t0 (cl) :rule hole)`. The pivot and the
+            // resolution operand order are the mirror image; nothing else
+            // changes, and the strict checker remains the only commit
+            // authority for either polarity.
+            let negated_inner = match self.ctx.terms.get(*leaf) {
+                TermData::Not(inner) => Some(*inner),
+                _ => None,
             };
-            let inner = *inner;
+            let (inner, negated_leaf) = match negated_inner {
+                Some(inner) => (inner, true),
+                None => (self.ctx.terms.mk_not_raw(*leaf), false),
+            };
             let Some(closer) = self.conjunct_eval_closer(inner, datatype_decls, selector_decls)
             else {
+                // A negated implication is one NNF step away from two more
+                // conjuncts; the closers themselves stay leaf-only.
+                if self.try_authored_not_implies_conjunct_refutation(
+                    proof,
+                    root,
+                    path,
+                    *leaf,
+                    datatype_decls,
+                    selector_decls,
+                ) {
+                    return true;
+                }
                 continue;
             };
             let mut candidate = Proof::new();
@@ -163,18 +201,17 @@ impl Executor {
             ) else {
                 continue;
             };
-            let discharge = match closer {
-                ConjunctEvalCloser::Reflexivity => candidate.add_rule_step(
-                    AletheRule::EqReflexive,
-                    vec![inner],
-                    Vec::new(),
-                    Vec::new(),
-                ),
-                ConjunctEvalCloser::Datatype(kind) => {
-                    candidate.add_theory_lemma_with_kind("datatype", vec![inner], kind)
-                }
-            };
-            candidate.add_resolution(Vec::new(), inner, unit, discharge);
+            let discharge = Self::emit_conjunct_eval_discharge(&mut candidate, inner, closer);
+            // `add_resolution(clause, pivot, c1, c2)` wants the premise
+            // carrying the pivot's NEGATIVE occurrence first. For a negated
+            // leaf the pivot is `inner` and the unit `(cl (not inner))` holds
+            // it; for a positive leaf the pivot is the leaf itself and the
+            // DISCHARGE `(cl (not leaf))` holds it.
+            if negated_leaf {
+                candidate.add_resolution(Vec::new(), inner, unit, discharge);
+            } else {
+                candidate.add_resolution(Vec::new(), *leaf, discharge, unit);
+            }
             // The UNCHANGED strict checker is the only authority that commits
             // this. It re-derives `and_pos` positionally, re-checks
             // reflexivity syntactically, and re-validates the datatype step
@@ -191,6 +228,137 @@ impl Executor {
             }
         }
         self.try_authored_bound_pair_refutation(proof, root, &nodes)
+    }
+
+    /// A conjunct leaf `(not (=> F1 F2))` holds two more conjuncts one NNF
+    /// step away: `F1` and `(not F2)`. The `and`-tree scan cannot descend
+    /// into it (it is not an `and`), so a fold like
+    /// `(assert (not (=> hyp (= (select (store s 1 w) 1) w))))` — the shape
+    /// the nested-array proof-authority test pins — lost the whole document
+    /// to a bare hole even though the consequent alone is a ROW tautology
+    /// every closer already recognises. Unfold exactly one level with the
+    /// strictly-validated `not_implies1`/`not_implies2` Alethe rules and
+    /// retry the SAME closers on each side; the UNCHANGED strict checker
+    /// remains the only commit authority. The desugared binary
+    /// `(not (or (not F1) F2))` form is admitted because the `not_implies`
+    /// validators accept it by the same reading.
+    fn try_authored_not_implies_conjunct_refutation(
+        &mut self,
+        proof: &mut Proof,
+        root: TermId,
+        path: &[u32],
+        leaf: TermId,
+        datatype_decls: &[(String, Vec<String>)],
+        selector_decls: &[(String, Vec<String>)],
+    ) -> bool {
+        let TermData::Not(implication) = self.ctx.terms.get(leaf) else {
+            return false;
+        };
+        let (antecedent, consequent) = match self.ctx.terms.get(*implication) {
+            TermData::App(Symbol::Named(name), args) if name == "=>" && args.len() == 2 => {
+                (args[0], args[1])
+            }
+            TermData::App(Symbol::Named(name), args) if name == "or" && args.len() == 2 => {
+                let TermData::Not(first) = self.ctx.terms.get(args[0]) else {
+                    return false;
+                };
+                (*first, args[1])
+            }
+            _ => return false,
+        };
+
+        // Consequent branch: `not_implies2` derives `(cl (not F2))`; the
+        // discharge proves `(cl F2)`.
+        let not_consequent = self.ctx.terms.mk_not_raw(consequent);
+        if let Some(closer) = self.conjunct_eval_closer(consequent, datatype_decls, selector_decls)
+        {
+            let mut candidate = Proof::new();
+            let assume_id = candidate.add_assume(root, None);
+            if let Some(unit) = Self::emit_and_pos_chain(
+                &mut self.ctx.terms,
+                &mut candidate,
+                assume_id,
+                root,
+                path,
+                leaf,
+            ) {
+                let derived = candidate.add_rule_step(
+                    AletheRule::NotImplies2,
+                    vec![not_consequent],
+                    vec![unit],
+                    Vec::new(),
+                );
+                let discharge =
+                    Self::emit_conjunct_eval_discharge(&mut candidate, consequent, closer);
+                candidate.add_resolution(Vec::new(), consequent, derived, discharge);
+                if Self::proof_derives_empty_clause(&candidate)
+                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
+                {
+                    *proof = candidate;
+                    self.record_rebuilt_authored_proof_premise(root);
+                    return true;
+                }
+            }
+        }
+
+        // Antecedent branch: `not_implies1` derives `(cl F1)`; the discharge
+        // proves `(cl (not F1))`.
+        let not_antecedent = self.ctx.terms.mk_not_raw(antecedent);
+        if let Some(closer) =
+            self.conjunct_eval_closer(not_antecedent, datatype_decls, selector_decls)
+        {
+            let mut candidate = Proof::new();
+            let assume_id = candidate.add_assume(root, None);
+            if let Some(unit) = Self::emit_and_pos_chain(
+                &mut self.ctx.terms,
+                &mut candidate,
+                assume_id,
+                root,
+                path,
+                leaf,
+            ) {
+                let derived = candidate.add_rule_step(
+                    AletheRule::NotImplies1,
+                    vec![antecedent],
+                    vec![unit],
+                    Vec::new(),
+                );
+                let discharge =
+                    Self::emit_conjunct_eval_discharge(&mut candidate, not_antecedent, closer);
+                candidate.add_resolution(Vec::new(), antecedent, discharge, derived);
+                if Self::proof_derives_empty_clause(&candidate)
+                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
+                {
+                    *proof = candidate;
+                    self.record_rebuilt_authored_proof_premise(root);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The single closer-discharge step `(cl proposition)`, shared by the
+    /// direct-leaf and `not_implies` paths.
+    fn emit_conjunct_eval_discharge(
+        candidate: &mut Proof,
+        proposition: TermId,
+        closer: ConjunctEvalCloser,
+    ) -> ProofId {
+        match closer {
+            ConjunctEvalCloser::Reflexivity => candidate.add_rule_step(
+                AletheRule::EqReflexive,
+                vec![proposition],
+                Vec::new(),
+                Vec::new(),
+            ),
+            ConjunctEvalCloser::Datatype(kind) => {
+                candidate.add_theory_lemma_with_kind("datatype", vec![proposition], kind)
+            }
+            ConjunctEvalCloser::TheoryLemma(theory, kind) => {
+                candidate.add_theory_lemma_with_kind(theory, vec![proposition], kind)
+            }
+        }
     }
 
     /// Second closer family: a PAIR of arithmetic conjuncts whose unit-weight
@@ -415,6 +583,38 @@ impl Executor {
         {
             return Some(ConjunctEvalCloser::Datatype(
                 TheoryLemmaKind::DatatypeTesterEval,
+            ));
+        }
+        // The remaining closers ask `ay-proof`'s OWN recognizers whether the
+        // unit clause `(cl term)` is a theory tautology the strict validator
+        // re-derives. Each recognizer is documented as the exact precondition
+        // of its validator, so there is no classifier/checker drift: a `true`
+        // here is a lemma `check_proof_strict_with_datatypes` accepts below,
+        // and a `false` simply leaves the erasure as it was.
+        //
+        // ARRAY read-over-write chain evaluation. This is the shape a
+        // preprocessor ROW fold leaves behind: `(assert (not (= (select
+        // (store a 0 10) 0) 10)))` folds to the constant `false` because
+        // `select(store(a,0,10),0)` evaluates to `10`, and that evaluation is
+        // exactly sub-schema (A) of the `ArrayRowChain` validator. Before this
+        // arm the fold's argument was unrecoverable and the document became
+        // `(step t0 (cl) :rule hole)`, which mandatory certification then
+        // declined by name — withdrawing a correct `unsat` to `unknown`.
+        // `is_trust()` is re-checked because a recognizer must never route a
+        // trust-family kind through a path advertised as trust-free.
+        if let Some(kind) = ay_proof::recognize_array_theory_lemma(&self.ctx.terms, &[term]) {
+            if !kind.is_trust() {
+                return Some(ConjunctEvalCloser::TheoryLemma("arrays", kind));
+            }
+        }
+        // GROUND string/regex evaluation, the QF_S counterpart of the same
+        // fold: `(assert (= (str.++ "a" "b") "ac"))` is closed and false, and
+        // the checker's independent Unicode-string evaluator decides it
+        // outright.
+        if ay_proof::recognize_string_ground_eval(&self.ctx.terms, &[term]) {
+            return Some(ConjunctEvalCloser::TheoryLemma(
+                "strings",
+                TheoryLemmaKind::StringGroundEval,
             ));
         }
         None

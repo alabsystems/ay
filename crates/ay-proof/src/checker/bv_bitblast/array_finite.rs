@@ -189,6 +189,28 @@ pub(super) fn classify_source_sort(sort: &Sort) -> Result<FiniteSourceSort, Sour
     }
 }
 
+/// Whether `sort` lies WHOLLY OUTSIDE the finite Bool/BitVec/array universe
+/// that this lowerer can bit-blast at all (`Int`, `Real`, `String`, `RegLan`,
+/// `FloatingPoint`, `Seq`, `Char`, `FiniteDomain`, `Uninterpreted`,
+/// `Datatype`, `TypeVar`).
+///
+/// This is deliberately NOT "[`classify_source_sort`] returned `Err`". A
+/// `BitVec` above [`MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH`], a zero-width
+/// `BitVec`, and an over-nested or non-finitely-indexed `Array` all fail
+/// classification, but they are BOUND failures inside a sort family this
+/// lowerer does interpret. They must keep declining: if they were routed to
+/// the atom abstraction instead, the width ceiling and the array-nesting
+/// ceiling would become route-aroundable by wrapping the offending term in
+/// `(= t t)`. Keying on the sort FAMILY keeps every such envelope decline
+/// exactly where it is.
+///
+/// `Sort` is `#[non_exhaustive]`; a future sort therefore reports `true` here
+/// (outside the universe) by default, which can only make the abstraction
+/// coarser — the safe direction for a refutation.
+pub(super) fn is_non_finite_source_sort(sort: &Sort) -> bool {
+    !matches!(sort, Sort::Bool | Sort::BitVec(_) | Sort::Array(_))
+}
+
 fn classify_finite_shape(sort: &Sort) -> Result<FiniteSortShape, SourceSortError> {
     let mut cursor = sort;
     let mut indices = Vec::new();

@@ -39,6 +39,12 @@ use crate::logic_detection::LogicCategory;
 /// Maximum MBQI refinement rounds before giving up.
 const MAX_MBQI_ROUNDS: usize = 5;
 
+/// Cap on (#mbqi-instance-provenance) records accumulated by one
+/// `try_mbqi_refinement` call — matches the consequence replay's own
+/// `MAX_INSTANCES` admission cap; overflow silently stops recording (the
+/// records are hints, never authority).
+const MAX_MBQI_INSTANCE_PROVENANCE_RECORDS: usize = 64;
+
 /// Maximum candidate substitutions per quantifier per round.
 /// Prevents combinatorial explosion for multi-variable quantifiers with many
 /// ground terms per sort.
@@ -417,6 +423,55 @@ impl Executor {
     /// # Arguments
     /// * `unhandled_quantifiers` - Universal quantifiers not covered by E-matching/CEGQI
     /// * `category` - Logic category for the re-solve dispatch
+    /// Record one falsifying MBQI-refinement instantiation's provenance and
+    /// return the term to ASSERT for it (#mbqi-instance-provenance,
+    /// #mbqi-sidecar-instance).
+    ///
+    /// When the #quant-unit-authority channel is on and the exact structural
+    /// substitution of the quantifier body is expressible
+    /// (`subst_vars_exact_qf`), the pushed assertion is that EXACT instance —
+    /// the shape the strict `forall_inst` validator and the checked
+    /// SAT-refutation sidecar's sealed instance derivations replay — instead
+    /// of the `subst_vars`-simplified `ground_body`. The two are the same
+    /// substitution applied to the same body (the exact form merely skips
+    /// producer-side constant folding), so the ground re-solve decides the
+    /// same formula and no verdict can change; only the pushed instance's
+    /// provenance becomes checkable. With `--no-quant-unit-authority`, or
+    /// when nothing was recorded (`--no-consequence-replay`, or the record
+    /// cap), the pushed term is byte-for-byte the historical simplified
+    /// instance and nothing is recorded.
+    #[allow(clippy::too_many_arguments)]
+    fn record_mbqi_refinement_instance(
+        &mut self,
+        record_instance_provenance: bool,
+        refinement_provenance: &mut Vec<crate::ematching::ForallInstantiationProvenance>,
+        quant: TermId,
+        binding: &[TermId],
+        body: TermId,
+        subst_map: &HashMap<String, TermId>,
+        ground_body: TermId,
+    ) -> TermId {
+        if !record_instance_provenance
+            || refinement_provenance.len() >= MAX_MBQI_INSTANCE_PROVENANCE_RECORDS
+        {
+            return ground_body;
+        }
+        let mut asserted = ground_body;
+        if crate::quant_unit_authority::quant_unit_authority_enabled() {
+            if let Some(exact) =
+                crate::ematching::subst_vars_exact_qf(&mut self.ctx.terms, body, subst_map)
+            {
+                asserted = exact;
+            }
+        }
+        refinement_provenance.push(crate::ematching::ForallInstantiationProvenance {
+            quantifier: quant,
+            binding: binding.to_vec(),
+            instance: asserted,
+        });
+        asserted
+    }
+
     pub(in crate::executor) fn try_mbqi_refinement(
         &mut self,
         unhandled_quantifiers: &[TermId],
@@ -469,6 +524,45 @@ impl Executor {
             }
         }
 
+        // FINITE-SORT MODEL-RELATIVE LANE (#inc-fp-no-complete-lane).
+        //
+        // A universal over a `FloatingPoint` binder reaches here undischarged:
+        // finite-domain expansion caps at 256 combinations, arithmetic CEGQI
+        // takes only Int/Real, BV-MBQI refuses non-BV binders, and E-matching
+        // produces nothing without a ground trigger. `executor/finite_model_mbqi.rs`
+        // decides it by proving the universal holds in a model of the ground
+        // slice rather than by proving the ground slice ENTAILS it — measured,
+        // the entailment is false on this whole class, so the BV lane's
+        // obligation could never discharge them.
+        //
+        // Engaged only when EVERY quantifier still in play is one this lane
+        // handles: the SAT it can return says a single structure satisfies the
+        // ground slice together with the universals it checked, which is a
+        // statement about the whole problem only if nothing else is left over.
+        if bv_quants.is_empty() {
+            let (finite_quants, rest) =
+                super::finite_model_mbqi::partition_finite_model_quantifiers(
+                    &self.ctx.terms,
+                    &forall_quants,
+                );
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "FMQ dispatch: forall={} bv={} finite={} rest={}",
+                    forall_quants.len(),
+                    bv_quants.len(),
+                    finite_quants.len(),
+                    rest.len()
+                );
+            }
+            if !finite_quants.is_empty() && rest.is_empty() {
+                if let Some(result) =
+                    self.try_finite_model_forall_refinement(&finite_quants, category)
+                {
+                    return Some(result);
+                }
+            }
+        }
+
         // If all quantifiers were BV-only and BV-MBQI didn't find counterexamples,
         // skip the generic path.
         if other_quants.is_empty() && !bv_quants.is_empty() {
@@ -483,6 +577,20 @@ impl Executor {
         };
 
         let mut seen_instantiations: HashSet<TermId> = HashSet::default();
+
+        // (#mbqi-instance-provenance) Exact (quantifier, binder values, folded
+        // instance) provenance for every instantiation this refinement pushes,
+        // accumulated locally across rounds and published to
+        // `mbqi_refinement_instance_records` ONLY at the ground re-solve UNSAT
+        // return below. The records are hints for the authored consequence
+        // replay (`try_translate_authored_consequence_replay_unsat_with`); the
+        // strict `forall_inst` validator re-derives the exact substitution, so
+        // a wrong record can only decline a translation. Recording is covered
+        // by the `--no-consequence-replay` kill switch together with its sole
+        // consumer, restoring the baseline byte-for-byte when off.
+        let record_instance_provenance = crate::quant_unit_authority::consequence_replay_enabled();
+        let mut refinement_provenance: Vec<crate::ematching::ForallInstantiationProvenance> =
+            Vec::new();
 
         // Does any quantifier here have UF-definition shape? Gates the (cheap
         // but not free) `occurring_ground` scan below.
@@ -652,7 +760,16 @@ impl Executor {
                                 None => false,
                             };
                             if !phantom && seen_instantiations.insert(ground_body) {
-                                new_instantiations.push(ground_body);
+                                let asserted = self.record_mbqi_refinement_instance(
+                                    record_instance_provenance,
+                                    &mut refinement_provenance,
+                                    quant,
+                                    &binding,
+                                    body,
+                                    &subst_map,
+                                    ground_body,
+                                );
+                                new_instantiations.push(asserted);
                             }
                             quant_all_true = false;
                             all_satisfied = false;
@@ -668,7 +785,16 @@ impl Executor {
                                 UfCompletionEval::True => {}
                                 UfCompletionEval::False => {
                                     if seen_instantiations.insert(ground_body) {
-                                        new_instantiations.push(ground_body);
+                                        let asserted = self.record_mbqi_refinement_instance(
+                                            record_instance_provenance,
+                                            &mut refinement_provenance,
+                                            quant,
+                                            &binding,
+                                            body,
+                                            &subst_map,
+                                            ground_body,
+                                        );
+                                        new_instantiations.push(asserted);
                                     }
                                     quant_all_true = false;
                                     all_satisfied = false;
@@ -701,6 +827,18 @@ impl Executor {
                                     ) && seen_instantiations.insert(ground_body)
                                     {
                                         new_instantiations.push(ground_body);
+                                        if record_instance_provenance
+                                            && refinement_provenance.len()
+                                                < MAX_MBQI_INSTANCE_PROVENANCE_RECORDS
+                                        {
+                                            refinement_provenance.push(
+                                                crate::ematching::ForallInstantiationProvenance {
+                                                    quantifier: quant,
+                                                    binding: binding.clone(),
+                                                    instance: ground_body,
+                                                },
+                                            );
+                                        }
                                     }
                                     // Unknown — can't determine yet. Mark incomplete but
                                     // continue trying other substitutions.
@@ -750,19 +888,43 @@ impl Executor {
                 self.ctx.assertions.push(*inst);
             }
 
+            // (#mbqi-sidecar-instance) Publish the accumulated provenance
+            // BEFORE the ground re-solve: the checked-SAT-refutation sidecar
+            // minted INSIDE that re-solve consumes the records through the
+            // sealed fragment derivation maps (mirroring the P3b
+            // `bv_mbqi_false_instance_records` push-site recording), so the
+            // pushed instance gains an exact-fragment `forall_inst`
+            // derivation instead of dying with "no exact proof authority".
+            // The records carry no authority of their own —
+            // `CheckedInstanceDerivation::seal` independently replays the
+            // exact substitution and stamps epoch/entry identity, so a wrong
+            // record can only decline a mint. Cleared again on every
+            // non-UNSAT outcome below, restoring the historical "records
+            // survive only a refinement UNSAT" contract.
+            if record_instance_provenance {
+                self.mbqi_refinement_instance_records = refinement_provenance.clone();
+            }
+
             let re_result = self.solve_for_category(category);
             match re_result {
                 Ok(SolveResult::Sat) => {
                     // Still SAT with new lemmas. Next round will re-check with
                     // the updated model.
+                    self.mbqi_refinement_instance_records.clear();
                     continue;
                 }
                 Ok(SolveResult::Unsat(_)) => {
                     // The counterexample instantiations made the problem UNSAT.
                     // This is genuine: the quantifiers were violated.
+                    // (#mbqi-instance-provenance) Publish the accumulated
+                    // instance provenance so the caller can attempt an
+                    // authored-scope consequence-replay translation of this
+                    // internal refutation.
+                    self.mbqi_refinement_instance_records = refinement_provenance;
                     return Some(Ok(SolveResult::unsat()));
                 }
                 other => {
+                    self.mbqi_refinement_instance_records.clear();
                     return Some(other);
                 }
             }
@@ -4827,12 +4989,16 @@ impl Executor {
         }
 
         let mut published = 0usize;
+        let mut minted_carriers = 0usize;
         let accepted = self.with_checked_same_context_ground_model(
             sub_assertions.clone(),
             2_000,
             |executor, instance_roots| {
-                published = executor
-                    .publish_singleton_universe_uf_tables(instance_roots, &empty_sort_names);
+                (published, minted_carriers) = executor.publish_singleton_universe_uf_tables(
+                    instance_roots,
+                    &empty_sort_names,
+                    &witnesses,
+                );
                 Some(())
             },
             |executor, installed| {
@@ -4858,6 +5024,12 @@ impl Executor {
             if published > 0 {
                 self.last_statistics
                     .set_int("model_completion.singleton_universe_ufs", published as u64);
+            }
+            if minted_carriers > 0 {
+                self.last_statistics.set_int(
+                    "model_completion.singleton_universe_carriers",
+                    minted_carriers as u64,
+                );
             }
             self.defer_model_validation = false;
             self.last_model_validated = true;
@@ -4974,21 +5146,117 @@ impl Executor {
     /// conflicted/defined/internal symbol, has any argument outside the
     /// singleton domain, has an unreadable argument or result value, is
     /// applied at more than the single domain point, or disagrees with itself
-    /// at one point (a congruence violation, never papered over). The pass
-    /// only FILLS an `euf_model` the solve already built: it never creates
-    /// one, because materializing an otherwise-absent EUF component would
-    /// change the `euf_backed` evidence the downstream validation gates read.
+    /// at one point (a congruence violation, never papered over).
+    ///
+    /// THE CARRIER MINT (#eu-carrier-mint). A singleton instance body can fold
+    /// away before the disposable ground solve ever sees the sort:
+    /// `∀u,v:U. (= u v)` instantiates to `(= w w)`, which hash-conses to
+    /// `true`, so the sub-model comes back with NO carrier element for the
+    /// synthesized witness and the carrier-exactness check
+    /// (`singleton_carriers_are_exact`) correctly refuses to call the model
+    /// exact — the chain then declines a SAT the singleton theorem has
+    /// already proved. The witness element is not an invented VALUE: the
+    /// caller's guards 2 and 4 prove the sort's model domain is exactly the
+    /// one synthesized witness, so this pass MINTS that sole inhabitant into
+    /// the emitted EUF component — binding the witness term to the carrier's
+    /// existing single element when the solve materialized one, or naming the
+    /// element with the canonical `@Sort!0` token when the carrier is empty.
+    /// In the empty case the EUF component is created if the solve built none;
+    /// that is sound HERE (and only here) because the minted content is
+    /// exactly the carrier the singleton theorem proves, and the enclosing
+    /// checked transaction re-evaluates every instance root against the
+    /// mutated model before the seal, so the `euf_backed` evidence upgrade
+    /// cannot mask an unchecked root. A carrier already naming two or more
+    /// elements is left untouched — the exactness check rejects it, and a
+    /// universe forced to two elements by ground terms never enters this
+    /// chain at all (its sort is not empty). `--no-singleton-carrier-mint`
+    /// is the kill switch: it restores the baseline decline byte-for-byte.
+    ///
+    /// Returns `(published_uf_tables, minted_carriers)`.
     fn publish_singleton_universe_uf_tables(
         &mut self,
         instance_roots: &[TermId],
         empty_sort_names: &HashSet<String>,
-    ) -> usize {
+        witnesses: &HashMap<String, TermId>,
+    ) -> (usize, usize) {
         let Some(mut model) = self.last_model.take() else {
-            return 0;
+            return (0, 0);
         };
+
+        // Carrier mint (#eu-carrier-mint): make the synthesized witness of
+        // every certified-empty sort denote the sort's sole carrier element,
+        // materializing that element when the disposable ground solve never
+        // did. Deterministic order: the model is a published artifact.
+        let mut minted_carriers = 0usize;
+        if !ay_core::misc_cli_flags().no_singleton_carrier_mint {
+            let mut names: Vec<&String> = empty_sort_names.iter().collect();
+            names.sort();
+            for name in names {
+                let Some(&witness) = witnesses.get(name) else {
+                    continue;
+                };
+                let bound_token = model
+                    .euf_model
+                    .as_ref()
+                    .and_then(|euf| euf.term_values.get(&witness))
+                    .cloned();
+                if let Some(token) = bound_token {
+                    // The witness already denotes an element; ensure the
+                    // carrier enumeration names it too. A non-empty carrier
+                    // that disagrees is left for the exactness check to
+                    // reject.
+                    let euf = model
+                        .euf_model
+                        .as_mut()
+                        .expect("witness binding read from euf above");
+                    let elements = euf.sort_elements.entry(name.clone()).or_default();
+                    if elements.is_empty() {
+                        elements.push(token);
+                        minted_carriers += 1;
+                    }
+                    continue;
+                }
+                let existing: Vec<String> = model
+                    .euf_model
+                    .as_ref()
+                    .and_then(|euf| euf.sort_elements.get(name))
+                    .cloned()
+                    .unwrap_or_default();
+                match existing.as_slice() {
+                    [] => {
+                        // No carrier at all: the sole inhabitant IS the
+                        // witness by construction; name it canonically.
+                        let token = format!("@{name}!0");
+                        let euf = model.euf_model.get_or_insert_with(Default::default);
+                        euf.sort_elements
+                            .entry(name.clone())
+                            .or_default()
+                            .push(token.clone());
+                        euf.term_values.insert(witness, token);
+                        minted_carriers += 1;
+                    }
+                    [sole] => {
+                        // The solve materialized exactly one element but never
+                        // bound the witness term to it; the singleton theorem
+                        // says they are the same inhabitant.
+                        let token = sole.clone();
+                        let euf = model
+                            .euf_model
+                            .as_mut()
+                            .expect("carrier enumeration read from euf above");
+                        euf.term_values.insert(witness, token);
+                        minted_carriers += 1;
+                    }
+                    // Two or more elements: not a singleton carrier. Leave it
+                    // for `singleton_carriers_are_exact` to reject.
+                    _ => {}
+                }
+            }
+        }
+
         if model.euf_model.is_none() {
             self.last_model = Some(model);
-            return 0;
+            return (0, minted_carriers);
         }
 
         // Ground uninterpreted-function applications of the exact checked
@@ -5120,7 +5388,7 @@ impl Executor {
         }
 
         self.last_model = Some(model);
-        published
+        (published, minted_carriers)
     }
 
     /// `true` iff no subterm of `root` is of an empty binder sort (except a
@@ -10646,7 +10914,10 @@ impl Executor {
     /// partition cannot see sorts, and a closed sentence quantifying over a
     /// declared uninterpreted sort stays outside the class until it has its
     /// own measured campaign.
-    fn closed_sentence_binder_sorts_are_interpreted(&self, root: TermId) -> bool {
+    pub(in crate::executor) fn closed_sentence_binder_sorts_are_interpreted(
+        &self,
+        root: TermId,
+    ) -> bool {
         let mut stack = vec![root];
         while let Some(term) = stack.pop() {
             match self.ctx.terms.get(term) {
@@ -10676,7 +10947,7 @@ impl Executor {
     /// scope incarnations; checking both surface and identity prevents a
     /// builtin-colliding declaration from becoming acceptable merely because
     /// elaboration renamed it internally.
-    fn exact_closed_sentence_operators_are_unshadowed(&self) -> bool {
+    pub(in crate::executor) fn exact_closed_sentence_operators_are_unshadowed(&self) -> bool {
         self.ctx.symbol_iter().all(|(surface, info)| {
             let identity = self.ctx.symbol_identity_name(surface, info);
             !EXACT_CLOSED_SENTENCE_OPERATORS.contains(&surface.as_str())
@@ -10902,7 +11173,7 @@ impl Executor {
     /// visits, declines. The walk carries the binder scope explicitly and does
     /// NOT memoise — memoising by `TermId` alone would conflate a shared
     /// subterm's different scopes and could accept a free variable.
-    fn closed_sentence_without_uninterpreted_symbols(
+    pub(in crate::executor) fn closed_sentence_without_uninterpreted_symbols(
         &self,
         root: TermId,
         declared: &HashSet<String>,
@@ -11973,9 +12244,24 @@ impl Executor {
                     .terms
                     .mk_const_array(array.index_sort.clone(), first)])
             }
-            // Uninterpreted sorts, sequences, datatypes, bitvectors, strings,
-            // floats: no candidate. The head stays FREE, which is sound — the
-            // nested UNSAT quantifies over every interpretation of it.
+            // Mirror of the Int family for the fixed-width domain (S2 one-off,
+            // #2885 UF-inside-BV): `0` is the workhorse (absorbing for
+            // `bvadd`/`bvor`-style axioms), `1` separates two heads a
+            // disequality forces apart. The candidates are untrusted
+            // proposals; the certificate still refutes every negated
+            // instantiated body under the interpretation through the checked
+            // ground solver before any grant, exactly as for Int/Real.
+            Sort::BitVec(bitvec) => Some(vec![
+                self.ctx
+                    .terms
+                    .mk_bitvec(num_bigint::BigInt::from(0), bitvec.width),
+                self.ctx
+                    .terms
+                    .mk_bitvec(num_bigint::BigInt::from(1), bitvec.width),
+            ]),
+            // Uninterpreted sorts, sequences, datatypes, strings, floats: no
+            // candidate. The head stays FREE, which is sound — the nested
+            // UNSAT quantifies over every interpretation of it.
             _ => None,
         }
     }
@@ -14105,6 +14391,50 @@ mod const_interp_ground_conjunct_tests {
         let mut exec = Executor::new();
         exec.execute_all(&commands).unwrap();
         exec
+    }
+
+    /// ACCEPTING DIRECTION — the BV candidate family (S2 one-off, #2885
+    /// UF-inside-BV). `∀x:Int. x≥0 → f(y)+z = z` is satisfied by the constant
+    /// interpretation `f := λ_. #x00, y := #x00, z := #x00`; before the BV
+    /// family existed the certificate declined with "no head has a
+    /// closed-constant candidate sort" and the query published `unknown`.
+    #[test]
+    fn certifies_bv_heads_with_constant_candidates() {
+        let mut exec = executor_for(
+            "(set-logic ALL)
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (declare-fun y () (_ BitVec 8))
+             (declare-fun z () (_ BitVec 8))
+             (assert (forall ((x Int)) (=> (>= x 0) (= (bvadd (f y) z) z))))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::QfBvLiaIndep)
+                .is_some(),
+            "the zero-constant BV interpretation discharges the x-independent body"
+        );
+    }
+
+    /// REJECTING DIRECTION for the BV family — a universal no CONSTANT
+    /// interpretation satisfies (`∀q:BV8. f(q) = q` forces `f` to be the
+    /// identity, which is not constant on a 256-element domain) must decline:
+    /// the nested refutation of the negated body cannot be UNSAT for any
+    /// candidate, so widening the candidate sorts must not manufacture a
+    /// grant.
+    #[test]
+    fn declines_bv_head_that_no_constant_interpretation_satisfies() {
+        let mut exec = executor_for(
+            "(set-logic ALL)
+             (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+             (assert (forall ((q (_ BitVec 8))) (= (f q) q)))",
+        );
+        let assertions = exec.ctx.assertions.clone();
+        assert!(
+            exec.try_const_interp_sat_certificate(&assertions, LogicCategory::QfBvLiaIndep)
+                .is_none(),
+            "a non-constant-satisfiable BV universal must never be granted by \
+             the constant-interpretation certificate"
+        );
     }
 
     /// REJECTING DIRECTION — the core of the widening. The `forall` is

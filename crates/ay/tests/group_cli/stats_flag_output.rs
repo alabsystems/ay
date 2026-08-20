@@ -628,12 +628,7 @@ fn test_cli_dimacs_stats_json_exposes_sat_attribution_keys() {
         .env_remove("AY_SAT_PROFILE_ID")
         .env_remove("AY_COMPETITION_JIT_MODE")
         .env_remove("AY_SAT_TRACK")
-        .env_remove("AY_SAT_AI_CLASS")
-        .env_remove("AY_SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE")
-        .env_remove("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION")
-        .env_remove("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW")
-        .env_remove("AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE")
-        .env_remove("AY_BCP_TELEMETRY");
+        .env_remove("AY_SAT_AI_CLASS");
     let output = command
         .output()
         .expect("failed to spawn ay --stats-json on DIMACS fixture");
@@ -838,7 +833,8 @@ fn test_cli_dimacs_stats_json_trail_lookahead_prefetch_env_gate() {
             .env_remove("AY_SAT_TRACK")
             .env_remove("AY_SAT_AI_CLASS");
         if disable_trail_lookahead {
-            command.env("AY_SAT_BCP_DISABLE_TRAIL_LOOKAHEAD_PREFETCH", "1");
+            // B75: the lever is CLI-carried.
+            command.arg("--sat-bcp-disable-trail-lookahead-prefetch");
         }
 
         let output = command
@@ -893,7 +889,8 @@ fn test_cli_dimacs_stats_json_bcp_telemetry_requires_explicit_env() {
             .env_remove("AY_SAT_TRACK")
             .env_remove("AY_SAT_AI_CLASS");
         if telemetry_enabled {
-            command.env("AY_BCP_TELEMETRY", "1");
+            // B75: the lever is CLI-carried.
+            command.arg("--sat-bcp-telemetry");
         }
 
         let output = command

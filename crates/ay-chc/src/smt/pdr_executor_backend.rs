@@ -355,9 +355,46 @@ impl PdrExecutorBackend {
             }
 
             // Check satisfiability.
+            // #cert-accounting item 3: this verdict is consumed only as PDR
+            // search guidance; the portfolio's published `Safe` claim is
+            // re-derived from scratch by `verify_model_impl` (and, where run,
+            // by the checked-replay pass) and reads nothing about how this
+            // sub-query was certified. The declaration changes no gate and no
+            // verdict today — it attributes this channel's certification cost
+            // in `ay_dpll::CertificationAccounting`.
             let status = self
                 .exec
                 .execute(&Command::CheckSat)?
+                // ROLE: Published (fail-safe), declaration WITHDRAWN.
+                //
+                // This called `execute_internal_lemma`, justified by "the
+                // portfolio's published Safe claim is re-derived from scratch by
+                // verify_model_impl". That justification is CIRCULAR:
+                // verify_model_impl's own queries reach the executor through the
+                // same SmtContext lane, so the re-derivation cannot vouch for the
+                // channel it is itself running on. On that path a false UNSAT
+                // becomes a false Safe.
+                //
+                // The declaration was harmless while the role was read only by
+                // accounting. It stopped being harmless when
+                // `active_unsat_query_requires_strict_proof` began consulting the
+                // role (#cert-item-3): an InternalLemma declaration here now
+                // exempts the query from the translated-proof requirement. An
+                // exemption may only rest on an audit that establishes this
+                // channel's verdict never becomes a published claim — which does
+                // not exist. An audit was subsequently completed -- see below.
+                //
+                // ITEM-2 MEASUREMENT (why the audit passed and the change was still
+                // not taken): declaring this channel InternalLemma was tried and
+                // measured on dillig12_m. It captured 60 of 1142 decisions and 6 of
+                // 1019 mints, worth 0.1ms. The other 1013 mints arrive through
+                // SmtContext -- the verifier's OWN lane, which must stay Published.
+                // So the "1000 internal lemmas to compose" the plan assumed do not
+                // exist: the bulk of certification cost is on the channel that
+                // certifies the published claim, and cannot be routed off it. An
+                // exemption carries real soundness surface; 0.1ms does not pay for
+                // it. Published stands on the measurement, not just on the missing
+                // audit -- the audit now exists and passes.
                 .ok_or(PdrBackendError::MissingResult)?;
 
             match status.as_str() {

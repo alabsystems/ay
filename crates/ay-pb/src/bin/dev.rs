@@ -34,7 +34,7 @@ USAGE:
       [--lp-warmup N] [--lp-cadence N] [--lp-window N] [--lp-max-rows N]
       [--lp-low-margin N] [--lp-exact-margin N] [--no-lp-ceiling]
       [--nbhd-rows] [--sdp-worker FILE]
-  ay-pb-dev probe bnn|bnb|sls|lp|safe-lp|milp|floor INSTANCE
+  ay-pb-dev probe bnn|bnb|sls|card|lp|safe-lp|milp|floor|subfloor INSTANCE
       [--seconds N] [--node-budget N]
   ay-pb-dev certify-unsat FILE... [--limit N] --veripb FILE [--proof-dir DIR]
   ay-pb-dev certify-koops ROOT --limit N [--match TEXT]
@@ -368,6 +368,7 @@ fn probe(args: Vec<String>) -> Result<(), String> {
         "safe-lp" => ProbeEngine::SafeLp,
         "milp" => ProbeEngine::Milp,
         "floor" => ProbeEngine::Floor,
+        "subfloor" => ProbeEngine::SubgradientFloor,
         other => return Err(format!("unknown probe engine {other:?}")),
     };
     let instance = read_opb(Path::new(instance_path))?;

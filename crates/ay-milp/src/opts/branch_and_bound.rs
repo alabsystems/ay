@@ -591,6 +591,16 @@ impl EngineEconomics {
         self
     }
 
+    /// Leaf-drought plunge cadence/arming override (the 80-binary zero-leaves
+    /// fix; journal at `drought_class` in `bab.rs`). `0` kills the lane; `n`
+    /// arms it at node `n` with one dive per `n` pops; unset = the shipped
+    /// constants.
+    #[must_use]
+    pub fn with_drought_dive(mut self, n: usize) -> Self {
+        self.drought_dive = Some(n);
+        self
+    }
+
     /// Pin propagation-conflict learning off/force (B50; unset = auto).
     #[must_use]
     pub fn with_prop_conflict(mut self, force: bool) -> Self {

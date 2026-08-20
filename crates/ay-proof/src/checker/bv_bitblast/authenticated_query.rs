@@ -178,6 +178,127 @@ pub fn authenticate_uf_leaf_bool_bv_unsat_query(
     })
 }
 
+/// Authenticate that the conjunction of `roots` is UNSAT in the
+/// quantifier-free Bool/BV fragment extended by the congruence-free
+/// uninterpreted-leaf abstraction AND by the Bool-ATOM abstraction over
+/// operands whose sort lies outside the finite Bool/BitVec/array universe
+/// (`Int`, `Char`, `Real`, …) (#bitblast-original-clause-authority).
+///
+/// This is a strictly separate entry point from
+/// [`authenticate_uf_leaf_bool_bv_unsat_query`] so that the latter — and the
+/// `CheckedQpfInstanceRefutation` lane that calls it — keeps a bit-identical
+/// accept set. Widening an existing lane to admit queries it previously
+/// refused is exactly what this split avoids.
+///
+/// # Why the abstraction is sound in the refutation direction
+///
+/// Write `Q` for the conjunction of the exact roots and `A` for its lowering.
+/// For any structure `M` and assignment `nu` with `M, nu |= Q`, define a
+/// Bool/BitVec valuation `beta` by `beta(proof_bool_t) :=` the truth value of
+/// `t` under `(M, nu)` and `beta(proof_bv_t) :=` the width-`w` value of `t`.
+/// Every leaf minted here is BOOLEAN and stands for a BOOL-SORTED term, so
+/// that map is the IDENTITY on the two-element Boolean domain and is total.
+/// Every non-leaf constructor the lowerer emits interprets its source operator
+/// exactly (Bool `ite`, BV `ite`, the comparison lowerings, and the
+/// same-width requirement all preserve meaning). By structural induction the
+/// lowering evaluates under `beta` exactly as the source evaluates under
+/// `(M, nu)`, so `SAT(Q)` implies `SAT(A)` and therefore `UNSAT(A)` implies
+/// `UNSAT(Q)`.
+///
+/// No `Int`-specific reasoning is assumed anywhere: ordering (`<=`, `<`) and
+/// arithmetic (`+`, `*`, `div`) are not reserved vocabulary and never reach an
+/// interpreted arm, so `A` asserts nothing about transitivity, totality or
+/// wraparound, and NO bit-vector adder is ever emitted for an integer term.
+/// Congruence between distinct non-finitely-sorted subterms is likewise
+/// forgotten: two syntactically distinct `Int` terms that happen to be
+/// semantically equal sit in different atoms and become independent leaves.
+/// That gives `A` strictly MORE models than `Q`, which in the refutation
+/// direction can only turn a real refutation into a DECLINE — never a
+/// satisfiable query into a refutation. The dangerous direction is MERGING
+/// two terms that are not equal, and it cannot occur: leaves are keyed by
+/// hash-consed `TermId`, so two leaves coincide only when the source terms are
+/// syntactically identical and hence equal in every model. Reflexivity is
+/// forgotten too — `(= i i)` over `Int` becomes a free leaf that `A` may set
+/// false — which is again strictly more models.
+///
+/// Groundness is automatic: `Forall`, `Exists` and `Let` are rejected by the
+/// lowerer's node classification, so `beta` is always well defined.
+///
+/// The converse direction fails closed exactly as in
+/// [`authenticate_uf_leaf_bool_bv_unsat_query`]: a satisfiable abstraction
+/// that minted at least one leaf returns
+/// [`BoolBvUnsatAuthenticationError::UnsupportedFragment`] (a capability
+/// DECLINE), never [`BoolBvUnsatAuthenticationError::Satisfiable`].
+pub fn authenticate_atom_leaf_bool_bv_unsat_query(
+    terms: &TermStore,
+    roots: &[TermId],
+    caller_deadline: Option<Instant>,
+) -> Result<AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError> {
+    if roots.is_empty() {
+        return Err(BoolBvUnsatAuthenticationError::EmptyQuery);
+    }
+    if roots.len() > MAX_PROOF_PRODUCING_TERM_NODES {
+        return Err(BoolBvUnsatAuthenticationError::ResourceLimit {
+            reason: format!(
+                "source query has {} roots, above the bounded proof-producing limit {}",
+                roots.len(),
+                MAX_PROOF_PRODUCING_TERM_NODES
+            ),
+        });
+    }
+    if let Some(&root) = roots.iter().find(|root| root.index() >= terms.len()) {
+        return Err(BoolBvUnsatAuthenticationError::InvalidRoot { root });
+    }
+
+    let (limits, deadline) = proof_producing_limits(caller_deadline);
+    let term_snapshot = terms.snapshot_stamp();
+    let mut lowerer = ProofProducingLowerer::new_with_non_finite_atom_leaves(terms, deadline);
+    let expressions = lowerer.lower_bool_terms(roots).map_err(|reason| {
+        if lowerer.resource_exhausted {
+            BoolBvUnsatAuthenticationError::ResourceLimit { reason }
+        } else {
+            BoolBvUnsatAuthenticationError::UnsupportedFragment { reason }
+        }
+    })?;
+    let used_uninterpreted_leaves = lowerer.used_uninterpreted_leaves;
+    let used_exact_finite_arrays = lowerer.used_exact_finite_arrays;
+    let conjunction = balanced_bool_expr(expressions, true, BvExpr::and)
+        .map_err(|reason| BoolBvUnsatAuthenticationError::Refutation { reason })?;
+    let false_expr = BvExpr::const_val(0, 1);
+    let proof = export_bv_blast_proof_expr_with_limits(&conjunction, &false_expr, &limits)
+        .map_err(|error| match error {
+            BvExprExportError::NoRefutation if used_uninterpreted_leaves => {
+                BoolBvUnsatAuthenticationError::UnsupportedFragment {
+                    reason: "the congruence-free uninterpreted-leaf abstraction is satisfiable, \
+                             which is inconclusive for the exact query"
+                        .to_string(),
+                }
+            }
+            BvExprExportError::NoRefutation => BoolBvUnsatAuthenticationError::Satisfiable,
+            resource @ BvExprExportError::ResourceLimit { .. } => {
+                BoolBvUnsatAuthenticationError::ResourceLimit {
+                    reason: resource.to_string(),
+                }
+            }
+            other => BoolBvUnsatAuthenticationError::Refutation {
+                reason: other.to_string(),
+            },
+        })?;
+    let replay_limits = proof_replay_limits(&limits);
+    proof
+        .validate_with_limits(&replay_limits)
+        .map_err(|error| BoolBvUnsatAuthenticationError::Replay {
+            reason: error.to_string(),
+        })?;
+
+    Ok(AuthenticatedBoolBvUnsatQuery {
+        term_snapshot,
+        roots: roots.into(),
+        used_exact_finite_arrays,
+        used_uninterpreted_leaves,
+    })
+}
+
 struct LoweredAuthenticationRoots {
     expressions: Vec<BvExpr>,
     used_array_congruence: bool,

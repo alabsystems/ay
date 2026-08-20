@@ -1011,4 +1011,28 @@ impl Solver {
         self.watches
             .watch_clause(clause_ref, watched.0, watched.1, is_binary);
     }
+
+    /// Attach a clause's watches into pre-sized regions (exact initial build).
+    ///
+    /// Same binary-flag contract as [`attach_clause_watches`]; only the
+    /// storage path differs.
+    ///
+    /// [`attach_clause_watches`]: Solver::attach_clause_watches
+    pub(super) fn attach_clause_watches_presized(
+        &mut self,
+        clause_ref: ClauseRef,
+        lit0: Literal,
+        lit1: Literal,
+        is_binary: bool,
+    ) {
+        debug_assert_eq!(
+            is_binary,
+            self.arena.len_of(clause_ref.0 as usize) == 2,
+            "BUG: watch binary flag mismatch for clause {} (len {})",
+            clause_ref.0,
+            self.arena.len_of(clause_ref.0 as usize),
+        );
+        self.watches
+            .watch_clause_presized(clause_ref, lit0, lit1, is_binary);
+    }
 }

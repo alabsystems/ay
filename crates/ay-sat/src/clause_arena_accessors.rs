@@ -600,7 +600,11 @@ impl ClauseArena {
     /// actual clause-DB cost by 2x-5x in typical workloads, which delays
     /// reduction and masks growth under memory pressure.
     pub(crate) fn memory_bytes(&self) -> usize {
-        let words_bytes = 24 + self.words.capacity() * 4;
+        // `accounted_words`, not `words.capacity()`: this value drives the
+        // `should_reduce_db` byte trigger, so it is pinned to `Vec`'s doubling
+        // ladder and is unaffected by how much the arena actually reserves.
+        // See the field's doc in `clause_arena.rs`.
+        let words_bytes = 24 + self.accounted_words * 4;
         // hashbrown stores entries as (K, V) tuples (with alignment padding)
         // plus 1 control byte per bucket. (u32, u16) is 8 bytes due to
         // alignment, not 6. The 56 covers the HashMap struct overhead.

@@ -623,11 +623,11 @@ pub(crate) mod weq5_shadow {
         }
     }
 
-    /// Env-gated (`AY_WEQ5_SHADOW_DUMP`) one-line stderr dump of the totals,
+    /// `--weq5-shadow-dump` (B73): one-line stderr dump of the totals,
     /// so a standalone `ay` debug run over a repro reports the differential.
     /// Registered via `atexit`-style `Drop` is overkill; callers invoke it.
     pub(crate) fn maybe_dump() {
-        if std::env::var_os("AY_WEQ5_SHADOW_DUMP").is_none() {
+        if !ay_core::misc_cli_flags().weq5_shadow_dump {
             return;
         }
         let s = snapshot();

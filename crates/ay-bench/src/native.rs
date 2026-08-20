@@ -1932,12 +1932,16 @@ fn run_external_solver(
     }
 }
 
-fn progress_every_from_env() -> usize {
-    std::env::var("--progress-every")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(10)
+/// Progress-log stride for native runs (every Nth benchmark, plus first and
+/// last). RETIRED knob: this read an env var literally named
+/// `--progress-every`, which nothing sets — `ay launch-packet
+/// --progress-every` only echoes `bench_progress_every=` into packet
+/// metadata and never reaches this process — so the value was constant 10.
+/// Kept as a function so the decision site keeps its shape; a future carrier
+/// would be a `NativeRunArgs` field fed by the bench CLI (the lu_enabled
+/// documented-constant pattern).
+fn progress_every() -> usize {
+    10
 }
 
 fn should_log_progress(index: usize, total: usize, every: usize) -> bool {
@@ -3341,7 +3345,7 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
         }
     }
 
-    let progress_every = progress_every_from_env();
+    let progress_every = progress_every();
     let mut reference_campaigns = args
         .reference_solvers
         .iter()

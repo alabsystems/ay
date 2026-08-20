@@ -469,6 +469,60 @@ pub enum TheoryLemmaKind {
     /// leaf, unimplemented operator, or budget exhaustion.
     StringGroundEval,
 
+    /// Ground sequence identity through one shared symbolic anchor: the clause
+    /// is exactly `(cl (not (= x S1)) (= x S2))` (either equality orientation,
+    /// either literal order) where `S1` and `S2` are GROUND sequence terms —
+    /// built only from `seq.empty`, `seq.unit` over constant elements, and
+    /// `seq.++` — whose concat-flattened, empty-dropped normal forms are
+    /// ELEMENTWISE IDENTICAL. `x = S1 ⊢ x = S2` is then the substitution
+    /// instance of the ground identity `S1 = S2`, so the clause is a sequence
+    /// tautology. Validated by `ay-proof` with an independent normalizer
+    /// (fail-closed on any non-ground leaf or unsupported operator), never by
+    /// the solver's own seq engine. Motivated by the seq-direct refutation
+    /// lane closing `a = seq.unit(1) ∧ a ≠ seq.++(seq.empty, seq.unit(1))`
+    /// on a bare trust step, which mandatory certification then demoted to
+    /// `unknown` (deductive-checks's calc_basic Seq equality red, 2026-08-19).
+    ///
+    /// Uses Alethe rule `seq_ground_eval`.
+    SeqGroundEval,
+
+    /// A clause that is a standalone LINEAR-ARITHMETIC tautology: negating
+    /// every literal (flattening or-packed literals conjunctively) yields a
+    /// system of polynomial sign constraints that is INFEASIBLE — decided by
+    /// `ay-proof`'s independent generic-arithmetic refuter (equality-span,
+    /// then Fourier–Motzkin), never by the solver's own arithmetic engine.
+    /// The canonical producer is ite/store clausification after definition
+    /// substitution emitting units like
+    /// `(or (= 42 (select a (+ i 1))) (not (= i (+ i 1))))` — valid because
+    /// `i = i + 1` is arithmetically infeasible, regardless of the other
+    /// disjunct. Needs no pedigree back to an authored assertion: validity is
+    /// intrinsic, exactly like [`Self::BoolTautology`] for the propositional
+    /// case.
+    ///
+    /// Uses Alethe rule `arith_clause_tautology`.
+    ArithClauseTautology,
+
+    /// Term-`ite` branch projection: `(cl C (= (ite C a b) b))` or
+    /// `(cl (not C) (= (ite C a b) a))` — either equality orientation, either
+    /// literal order, or-packed unit accepted. A false condition forces the
+    /// `ite` to its else branch (dually for the negated form), where the
+    /// equality is reflexive; valid for any branch sorts with no theory
+    /// content consulted. Emitted by ite/store clausification as a
+    /// pedigree-free original clause.
+    ///
+    /// Uses Alethe rule `ite_branch_projection`.
+    IteBranchProjection,
+
+    /// Store-equality-guarded read-over-write expansion:
+    /// `(cl (not (= E (store A i v))) (ite (= i j) (= v (select E j))
+    /// (= (select A j) (select E j))))` with equality orientations free.
+    /// Under `E = store A i v` the ROW axiom makes both `ite` branches true
+    /// at their own condition polarity. The shape ite-lowering of
+    /// `select`-over-`store` leaves behind after definition substitution.
+    ///
+    /// Uses Alethe rule `array_guarded_row_expansion`.
+    ArrayGuardedRowExpansion,
+
     /// Regex intersection-emptiness over a SYMBOLIC string term: the clause
     /// carries a group of literals `±(str.in_re t Rᵢ)` over one common term `t`
     /// whose regexes are all ground, and the intersection of the languages the
@@ -686,10 +740,16 @@ pub enum TheoryLemmaKind {
     /// renders as an honest `hole` on the external Alethe wire.
     DatatypeInjective,
 
-    /// Reserved C5b direct-acyclicity vocabulary. Exact typed datatype member
-    /// signatures are available, but strict checking rejects this kind until
-    /// its containment walk is reintroduced iteratively with progress polling
-    /// and conservative work accounting. It renders as an honest Alethe `hole`.
+    /// Direct acyclicity (occurs check): the clause denies an equality whose
+    /// one side is a registered-constructor application properly containing
+    /// the other side through constructor applications only — unsatisfiable
+    /// because datatype values are finite constructor trees. Validated by an
+    /// ITERATIVE bounded containment walk (visited set, hard node budget, no
+    /// recursion) with the datatype registry as constructor identity
+    /// authority; fails closed on occurrences under selectors or
+    /// uninterpreted functions and whenever the registry is absent
+    /// (C5b reintroduction, 2026-08-19). It renders as an honest Alethe
+    /// `hole` on the external wire.
     DatatypeAcyclicDirect,
 
     /// Reserved C5b datatype value-equality vocabulary. Exact constructor and

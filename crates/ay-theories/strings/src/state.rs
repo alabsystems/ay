@@ -273,7 +273,7 @@ impl SolverState {
             _ => {}
         }
 
-        // Closure 4 (`AY_STR_NF=1`, sub-flag 4): eager length-fact
+        // Closure 4 (`--str-nf`, sub-flag 4): eager length-fact
         // registration. A `str.len(t)` application that already EXISTS in the
         // term store (every reduction axiom builds them: `len(sk_pre) = n`,
         // `len(skt) <= m`, ...) is linked to `t`'s EQC right now, instead of

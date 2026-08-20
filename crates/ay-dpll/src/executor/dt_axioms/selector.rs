@@ -11,7 +11,7 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::Symbol;
-use ay_core::{Sort, TermData, TermId, TermStore};
+use ay_core::{Sort, TermData, TermId, TermStore, TheoryLemmaKind};
 
 use super::SelectorList;
 use crate::executor::theories::{array_extensionality_witness, ArrayExtWitnessBinding};
@@ -42,8 +42,15 @@ pub(in crate::executor) const DT_MAX_DEEPENING_DEPTH: usize = 64;
 // Type aliases for datatype axiom generation (fixes clippy::type_complexity)
 /// Constructor application info: (constructor_term, args, selectors)
 type CtorAppInfo = (TermId, Vec<TermId>, SelectorList);
-/// Constructor binding: (constructor_name, args, selectors)
-type CtorBinding = (String, Vec<TermId>, SelectorList);
+/// Constructor binding: (constructor_name, args, selectors, provenance).
+///
+/// `provenance` is `Some((asserted_eq_term, ctor_app_term))` when the binding
+/// comes DIRECTLY from an asserted equality `p = C(args)` (either
+/// orientation) — the pair the proof side needs to DERIVE the collapsed
+/// ground facts this expander emits instead of trusting them. A binding
+/// propagated through the equivalence-class walk carries `None`: the equality
+/// holds only transitively there, so no single asserted premise justifies it.
+type CtorBinding = (String, Vec<TermId>, SelectorList, Option<(TermId, TermId)>);
 /// Constructor args and selectors (for nested resolution)
 type CtorArgsAndSelectors = (Vec<TermId>, SelectorList);
 
@@ -3050,6 +3057,7 @@ impl Executor {
                                                             ctor_name.clone(),
                                                             ctor_args.clone(),
                                                             selector_syms,
+                                                            Some((term, ctor_term)),
                                                         ),
                                                     );
                                                 }
@@ -3090,7 +3098,12 @@ impl Executor {
             for (a, b) in &asserted_equalities {
                 for t in [*a, *b] {
                     if t != term && uf_find(&mut uf_parent, t) == root {
-                        var_to_ctor.entry(t).or_insert_with(|| ctor_info.clone());
+                        var_to_ctor.entry(t).or_insert_with(|| {
+                            let (ctor, args, sels, _) = ctor_info.clone();
+                            // The equality holds only TRANSITIVELY for `t`, so
+                            // no single asserted premise justifies the binding.
+                            (ctor, args, sels, None)
+                        });
                     }
                 }
             }
@@ -3164,7 +3177,7 @@ impl Executor {
         //   (assert (= p (mk-pair x y)))
         //   (assert (not (= (fst p) x)))
         // Where we need `fst(p) = x` to derive a contradiction.
-        for (p, (_ctor_name, args, selectors)) in &var_to_ctor {
+        for (p, (_ctor_name, args, selectors, _provenance)) in &var_to_ctor {
             for (idx, (sel_name, sel_sort)) in selectors.iter().enumerate() {
                 // Check if sel_i(p) appears in the term store
                 if let Some(apps) = selector_apps.get(sel_name) {
@@ -3791,15 +3804,57 @@ impl Executor {
         //
         // Note: We assert is-C(x) directly since the equality is already asserted.
         // This is equivalent to modus ponens on (=> (= x C(args)) (is-C x)).
-        for (p, (ctor_name, _args, _selectors)) in &var_to_ctor {
+        //
+        // Proof side: the collapsed unit used to be recorded as a bare
+        // `Generic` trust lemma, which made every proof consuming it
+        // `proof-trusted`. For a DIRECT binding (provenance carries the
+        // asserted equality) the unit is now DERIVED: an `EufCongruentPred`
+        // tautology `¬(p = C(args)) ∨ ¬is-C(C(args)) ∨ is-C(p)` and a
+        // `DatatypeTesterEval` unit `is-C(C(args))`, resolved against the
+        // `Assume` of the asserted equality — every step strict-checkable.
+        let tester_bindings: Vec<(TermId, String, Option<(TermId, TermId)>)> = var_to_ctor
+            .iter()
+            .map(|(p, (ctor_name, _args, _selectors, provenance))| {
+                (*p, ctor_name.clone(), *provenance)
+            })
+            .collect();
+        for (p, ctor_name, provenance) in tester_bindings {
             let tester_name = format!("is-{ctor_name}");
             let tester_app =
                 self.ctx
                     .terms
-                    .mk_app(Symbol::named(&tester_name), vec![*p], Sort::Bool);
+                    .mk_app(Symbol::named(&tester_name), vec![p], Sort::Bool);
 
             if !base_assertions.contains(&tester_app) && seen.insert(tester_app) {
                 extra.push(tester_app);
+                if self.produce_proofs_enabled() {
+                    if let Some((asserted_eq, ctor_term)) = provenance {
+                        let tester_ctor = self.ctx.terms.mk_app(
+                            Symbol::named(&tester_name),
+                            vec![ctor_term],
+                            Sort::Bool,
+                        );
+                        let not_eq = self.ctx.terms.mk_not_raw(asserted_eq);
+                        let not_tester_ctor = self.ctx.terms.mk_not_raw(tester_ctor);
+                        if let (Some(eq_step), Some(tester_ctor_step)) = (
+                            self.proof_tracker.add_assumption(asserted_eq, None),
+                            self.proof_tracker.add_theory_lemma_with_kind(
+                                vec![tester_ctor],
+                                TheoryLemmaKind::DatatypeTesterEval,
+                            ),
+                        ) {
+                            let _ = self.proof_tracker.add_derived_unit_lemma(
+                                vec![not_eq, not_tester_ctor, tester_app],
+                                TheoryLemmaKind::EufCongruentPred,
+                                &[
+                                    (not_eq, asserted_eq, eq_step),
+                                    (not_tester_ctor, tester_ctor, tester_ctor_step),
+                                ],
+                                tester_app,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -3873,7 +3928,7 @@ impl Executor {
             // p = C(a), q = C(b), p = q → a = b.
             let mut uf_class_ctors: HashMap<TermId, Vec<(&String, &Vec<TermId>)>> =
                 HashMap::default();
-            for (p, (ctor_name, args, _selectors)) in &var_to_ctor {
+            for (p, (ctor_name, args, _selectors, _provenance)) in &var_to_ctor {
                 let rep = uf_find(&mut uf_parent, *p);
                 uf_class_ctors
                     .entry(rep)
@@ -4172,15 +4227,20 @@ impl Executor {
         // Fix: Group var_to_ctor entries by (ctor_name, args). For each group with 2+
         // variables, generate pairwise equality axioms.
         {
-            // Group variables by their constructor binding: (ctor_name, args) -> [var_term]
-            let mut binding_groups: HashMap<(&str, &[TermId]), Vec<TermId>> = HashMap::default();
-            for (p, (ctor_name, args, _selectors)) in &var_to_ctor {
+            // Group variables by their constructor binding:
+            // (ctor_name, args) -> [(var_term, binding provenance)]
+            let mut binding_groups: HashMap<
+                (&str, &[TermId]),
+                Vec<(TermId, Option<(TermId, TermId)>)>,
+            > = HashMap::default();
+            for (p, (ctor_name, args, _selectors, provenance)) in &var_to_ctor {
                 binding_groups
                     .entry((ctor_name.as_str(), args.as_slice()))
                     .or_default()
-                    .push(*p);
+                    .push((*p, *provenance));
             }
 
+            let mut derivations: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
             for (_binding, vars) in &binding_groups {
                 if vars.len() < 2 {
                     continue;
@@ -4189,10 +4249,38 @@ impl Executor {
                 // the same constructor application.
                 for i in 0..vars.len() {
                     for j in (i + 1)..vars.len() {
-                        let eq = self.ctx.terms.mk_eq(vars[i], vars[j]);
+                        let (p, p_prov) = vars[i];
+                        let (q, q_prov) = vars[j];
+                        let eq = self.ctx.terms.mk_eq(p, q);
                         if !base_assertions.contains(&eq) && seen.insert(eq) {
                             extra.push(eq);
+                            // Proof side: for two DIRECT bindings the unit is
+                            // an `EufTransitive` chain `p = C(args) = q`, not a
+                            // trust admission. (Hash-consing guarantees both
+                            // bindings name the SAME constructor-app term.)
+                            if let (Some((p_eq, p_ctor)), Some((q_eq, q_ctor))) = (p_prov, q_prov) {
+                                if p_ctor == q_ctor && p_eq != q_eq {
+                                    derivations.push((eq, p_eq, q_eq, p_ctor));
+                                }
+                            }
                         }
+                    }
+                }
+            }
+            if self.produce_proofs_enabled() {
+                for (eq, p_eq, q_eq, _ctor_term) in derivations {
+                    let not_p_eq = self.ctx.terms.mk_not_raw(p_eq);
+                    let not_q_eq = self.ctx.terms.mk_not_raw(q_eq);
+                    if let (Some(p_step), Some(q_step)) = (
+                        self.proof_tracker.add_assumption(p_eq, None),
+                        self.proof_tracker.add_assumption(q_eq, None),
+                    ) {
+                        let _ = self.proof_tracker.add_derived_unit_lemma(
+                            vec![not_p_eq, not_q_eq, eq],
+                            TheoryLemmaKind::EufTransitive,
+                            &[(not_p_eq, p_eq, p_step), (not_q_eq, q_eq, q_step)],
+                            eq,
+                        );
                     }
                 }
             }

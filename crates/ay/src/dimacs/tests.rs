@@ -31,9 +31,7 @@ use super::{
     CLIQUE_N2_K10_CLAUSE_FINGERPRINT, CLIQUE_N2_K10_EXPECTED_CHECKER_AUDIT_STATS,
     DIMACS_MODEL_LINE_LIMIT, DIMACS_TIMEOUT_EXIT_CODE, PHP_FUNCTIONAL_5_4_CLAUSE_FINGERPRINT,
     SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENABLED_KEY,
-    SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV,
     SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENABLED_KEY,
-    SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV,
     SAT_BCP_LEARNED_18_TAIL_REORDER_CANDIDATES_KEY, SAT_BCP_LEARNED_18_TAIL_REORDER_CHANGED_KEY,
     SAT_BCP_LEARNED_18_TAIL_REORDER_ENABLED_KEY, SAT_BCP_LEARNED_18_TAIL_REORDER_EXERCISED_KEY,
     SAT_BCP_LEARNED_18_TAIL_REORDER_SWAPS_KEY,
@@ -57,11 +55,10 @@ use super::{
     SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_CONFLICT_KEY,
     SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ELIGIBLE_KEY,
     SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV,
     SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_WRITES_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_APPLIED_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_CANDIDATES_KEY,
-    SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENABLED_KEY, SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV,
+    SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENABLED_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_FOUND_TRUE_PREFIX_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_FOUND_TRUE_SUFFIX_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_FOUND_UNASSIGNED_PREFIX_KEY,
@@ -69,10 +66,8 @@ use super::{
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_NO_REPLACEMENT_CONFLICT_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_NO_REPLACEMENT_UNIT_KEY,
     SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_SAVED_SLOTS_KEY, SAT_BCP_LEARNED_1963_IDENTITY_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_IDENTITY_ENV, SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV,
+    SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENABLED_KEY,
     SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_BUDGET_APPLIED_KEY,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_BUDGET_CANDIDATES_KEY,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_BUDGET_SKIPPED_OVER_BUDGET_KEY,
@@ -82,7 +77,6 @@ use super::{
     SAT_BCP_LEARNED_1963_TAIL_REORDER_CHANGED_KEY, SAT_BCP_LEARNED_1963_TAIL_REORDER_ENABLED_KEY,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAPS_KEY,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV,
     SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_LIMIT_KEY,
     SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION_ATTEMPTS_KEY,
     SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION_ENABLED_KEY,
@@ -90,7 +84,6 @@ use super::{
     SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_CONFLICT_KEY,
     SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ELIGIBLE_KEY,
     SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENABLED_KEY,
-    SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV,
     SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_UNIT_KEY,
     SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_WRITES_KEY,
     SAT_BCP_LEARNED_617_TAIL_REORDER_CANDIDATES_KEY, SAT_BCP_LEARNED_617_TAIL_REORDER_CHANGED_KEY,
@@ -101,17 +94,13 @@ use super::{
     SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION_MOVES_KEY,
     SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE_ENABLED_KEY,
     SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENABLED_KEY,
-    SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV,
-    SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENABLED_KEY, SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV,
-    SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_EXERCISED_KEY,
+    SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENABLED_KEY, SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_EXERCISED_KEY,
     SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_REQUESTED_KEY, SAT_BOUNDED_BACKBONE_BACKOFF_TRIGGERS_KEY,
     SAT_BOUNDED_BACKBONE_BINARY_SUPPRESSED_KEY, SAT_BOUNDED_BACKBONE_MS_KEY,
     SAT_BOUNDED_BACKBONE_RUNS_KEY, SAT_BOUNDED_BACKBONE_YIELDS_KEY,
     SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENABLED_KEY,
-    SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, SAT_BVE_LRAT_SCOUT_ROUTE_ENV,
-    SAT_DENSE_CLIQUE_MAB_BRANCH_ENABLED_KEY, SAT_DENSE_CLIQUE_MAB_BRANCH_ENV,
-    SAT_DENSE_CLIQUE_MAB_BRANCH_EXERCISED_KEY, SAT_DENSE_CLIQUE_MAB_BRANCH_EXERCISE_COUNT_KEY,
-    SAT_DENSE_CLIQUE_MAB_BRANCH_REQUESTED_KEY,
+    SAT_DENSE_CLIQUE_MAB_BRANCH_ENABLED_KEY, SAT_DENSE_CLIQUE_MAB_BRANCH_EXERCISED_KEY,
+    SAT_DENSE_CLIQUE_MAB_BRANCH_EXERCISE_COUNT_KEY, SAT_DENSE_CLIQUE_MAB_BRANCH_REQUESTED_KEY,
     SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_AUDIT_BUCKET_ALO_ROWS_KEY,
     SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_AUDIT_BUCKET_MUTEX_ROWS_KEY,
     SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_AUDIT_EXTENSION_ROWS_KEY,
@@ -130,32 +119,30 @@ use super::{
     SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_SOURCE_RAW_LITERALS_KEY,
     SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_SOURCE_ROWS_KEY, SAT_DENSE_CLIQUE_SCOUT_COLORS_KEY,
     SAT_DENSE_CLIQUE_SCOUT_COMPLETE_MULTIPARTITE_KEY, SAT_DENSE_CLIQUE_SCOUT_COMPLETE_MUTEX_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_ENABLED_KEY, SAT_DENSE_CLIQUE_SCOUT_ENV,
-    SAT_DENSE_CLIQUE_SCOUT_EXERCISED_KEY, SAT_DENSE_CLIQUE_SCOUT_EXPECTED_MUTEXES_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_GRAPH_EDGES_KEY, SAT_DENSE_CLIQUE_SCOUT_GRAPH_NON_EDGES_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_MUTEXES_KEY, SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKETS_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKET_MAX_KEY, SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKET_MIN_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_OTHER_CLAUSES_KEY, SAT_DENSE_CLIQUE_SCOUT_PHP_HOLES_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_PHP_PIGEONS_KEY, SAT_DENSE_CLIQUE_SCOUT_PHP_UNSAT_OBLIGATION_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_REJECTION_CODE_KEY, SAT_DENSE_CLIQUE_SCOUT_REQUESTED_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_SUPPORT_CLAUSES_KEY, SAT_DENSE_CLIQUE_SCOUT_SUPPORT_WIDTH_KEY,
-    SAT_DENSE_CLIQUE_SCOUT_VERTICES_KEY, SAT_DENSE_MUTEX_FOCUSED_RESTART_ACTIVE_BINARY_CLAUSES_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_ENABLED_KEY, SAT_DENSE_CLIQUE_SCOUT_EXERCISED_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_EXPECTED_MUTEXES_KEY, SAT_DENSE_CLIQUE_SCOUT_GRAPH_EDGES_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_GRAPH_NON_EDGES_KEY, SAT_DENSE_CLIQUE_SCOUT_MUTEXES_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKETS_KEY, SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKET_MAX_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_NONEDGE_BUCKET_MIN_KEY, SAT_DENSE_CLIQUE_SCOUT_OTHER_CLAUSES_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_PHP_HOLES_KEY, SAT_DENSE_CLIQUE_SCOUT_PHP_PIGEONS_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_PHP_UNSAT_OBLIGATION_KEY, SAT_DENSE_CLIQUE_SCOUT_REJECTION_CODE_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_REQUESTED_KEY, SAT_DENSE_CLIQUE_SCOUT_SUPPORT_CLAUSES_KEY,
+    SAT_DENSE_CLIQUE_SCOUT_SUPPORT_WIDTH_KEY, SAT_DENSE_CLIQUE_SCOUT_VERTICES_KEY,
+    SAT_DENSE_MUTEX_FOCUSED_RESTART_ACTIVE_BINARY_CLAUSES_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_ACTIVE_CLAUSES_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_ACTIVE_VARS_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_COMPUTED_GATE_KEY,
-    SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENABLED_KEY, SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV,
+    SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENABLED_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_REQUESTED_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_UPDATES_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_PREVIOUS_GATE_KEY,
     SAT_DENSE_MUTEX_FOCUSED_RESTART_RUNTIME_CANDIDATE_KEY,
-    SAT_DENSE_MUTEX_FOCUSED_RESTART_RUNTIME_CHECKED_KEY,
-    SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, SAT_FOCUSED_RESTART_GATE_FINAL_KEY,
+    SAT_DENSE_MUTEX_FOCUSED_RESTART_RUNTIME_CHECKED_KEY, SAT_FOCUSED_RESTART_GATE_FINAL_KEY,
     SAT_HARD_TAIL_ROW_ID_ENV, SAT_INPROCESSING_LRAT_CLAMPED_BVE_DUE_ROUNDS_KEY,
     SAT_INPROCESSING_LRAT_CLAMPED_FACTOR_DUE_ROUNDS_KEY,
-    SAT_INPROCESSING_LRAT_PROBE_RESCUE_ROUNDS_KEY, SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV,
+    SAT_INPROCESSING_LRAT_PROBE_RESCUE_ROUNDS_KEY,
     SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENABLED_KEY,
-    SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV,
-    SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENABLED_KEY, SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV,
+    SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENABLED_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_EXTERNAL_CHECKER_VERIFIED_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_LEAN_ADMISSION_ISSUE_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_LEAN_CONSERVATION_ISSUE_KEY,
@@ -165,7 +152,6 @@ use super::{
     SAT_MULTIPLIER_EQUIV_CONSERVATION_RESULT_AUTHORITY_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_ROUTE_ADMITTED_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENABLED_KEY,
-    SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_EXERCISED_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_FAIL_CLOSED_KEY,
     SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_REQUESTED_KEY,
@@ -285,8 +271,10 @@ fn make_clauses_mixed(
 
 #[test]
 fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
+    // B75: the lever is a typed SAT switch; unit tests scope it through the
+    // consumer test seam (the misc_test_override idiom B41 established here).
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -295,19 +283,22 @@ fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
         "dense-mutex focused restart route must be default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        dense_mutex_focused_restart_gate: true,
+        ..Default::default()
+    });
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
         requested_input.dense_mutex_focused_restart_gate_experiment,
-        "truthy DIMACS env should record the dense-mutex focused restart route request"
+        "--sat-dense-mutex-focused-restart-gate should record the focused restart route request"
     );
 }
 
 #[test]
 fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -316,19 +307,22 @@ fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
         "dense-clique MAB branch route must be default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        dense_clique_mab_branch: true,
+        ..Default::default()
+    });
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
         requested_input.dense_clique_mab_branch_experiment,
-        "truthy DIMACS env should record the dense-clique MAB branch route request"
+        "--sat-dense-clique-mab-branch should record the dense-clique MAB branch route request"
     );
 }
 
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BVE_LRAT_SCOUT_ROUTE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
     let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -339,14 +333,17 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
     );
     assert!(
         !input.bve_lrat_scout_route,
-        "Main/LRAT BVE scout route env hook must be default-off"
+        "Main/LRAT BVE scout route switch must be default-off"
     );
 }
 
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bve_lrat_scout_route: true,
+        ..Default::default()
+    });
     let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -356,7 +353,7 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
     );
     assert!(
         official.bve_lrat_scout_route,
-        "truthy DIMACS env should request the official Main/LRAT BVE scout route"
+        "--sat-bve-lrat-scout-route should request the official Main/LRAT BVE scout route"
     );
 
     let non_official = variant_input_for_dimacs_route(
@@ -383,7 +380,7 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
     );
     assert!(
         !internal_lrat_export.bve_lrat_scout_route,
-        "env hook must not enable the route for internal LRAT export without LRAT output"
+        "switch must not enable the route for internal LRAT export without LRAT output"
     );
 
     let aggressive =
@@ -391,14 +388,14 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
     assert_eq!(aggressive.route_profile, VariantRouteProfile::Standard);
     assert!(
         !aggressive.bve_lrat_scout_route,
-        "env hook must not enable the route outside default variant"
+        "switch must not enable the route outside default variant"
     );
 }
 
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
     let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -409,14 +406,17 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off()
     );
     assert!(
         !input.fmla_decompose_lrat_preflight_route,
-        "Main/LRAT Fmla decompose preflight route env hook must be default-off"
+        "Main/LRAT Fmla decompose preflight route switch must be default-off"
     );
 }
 
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        fmla_decompose_lrat_preflight_route: true,
+        ..Default::default()
+    });
     let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -426,7 +426,7 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only
     );
     assert!(
         official.fmla_decompose_lrat_preflight_route,
-        "truthy DIMACS env should request the official Main/LRAT Fmla preflight route"
+        "--sat-fmla-decompose-lrat-preflight-route should request the Main/LRAT preflight route"
     );
 
     let non_official = variant_input_for_dimacs_route(
@@ -453,7 +453,7 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only
     );
     assert!(
         !internal_lrat_export.fmla_decompose_lrat_preflight_route,
-        "env hook must not enable the route for internal LRAT export without LRAT output"
+        "switch must not enable the route for internal LRAT export without LRAT output"
     );
 
     let aggressive =
@@ -461,14 +461,14 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only
     assert_eq!(aggressive.route_profile, VariantRouteProfile::Standard);
     assert!(
         !aggressive.fmla_decompose_lrat_preflight_route,
-        "env hook must not enable the route outside default variant"
+        "switch must not enable the route outside default variant"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -480,12 +480,12 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
     );
 
     // The in-place SEARCH BCP route is default-on (cold.rs), verified
-    // bit-identical to the safe path by `propagation_bcp_unsafe.rs`. Without an
-    // env override it stays on; the route runs in `raw-pointer-bcp` builds (which is
-    // a default feature).
+    // bit-identical to the safe path by `propagation_bcp_unsafe.rs`. Without the
+    // tri-state switch (B75: was env-carried) it stays on; the route runs in
+    // `raw-pointer-bcp` builds (which is a default feature).
     assert!(
         solver.bcp_search_inplace_watch_scan_enabled(),
-        "SEARCH in-place watch scan is default-on without an env override"
+        "SEARCH in-place watch scan is default-on without a switch override"
     );
     assert_eq!(
         solver.bcp_search_inplace_watch_scan_route_enabled(),
@@ -498,7 +498,10 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "0");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_search_inplace_watch_scan: Some(false),
+        ..Default::default()
+    });
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -509,11 +512,11 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
         },
     );
 
-    // Kill-switch: `=0` forces the solver back onto the safe deferred-copy route
-    // off the default-on in-place path, in any build.
+    // Kill-switch: `false` forces the solver back onto the safe deferred-copy
+    // route off the default-on in-place path, in any build.
     assert!(
         !solver.bcp_search_inplace_watch_scan_enabled(),
-        "AY_SAT_BCP_SEARCH_INPLACE_WATCH_SCAN=0 must disable the in-place route"
+        "--sat-bcp-search-inplace-watch-scan false must disable the in-place route"
     );
     assert!(!solver.bcp_search_inplace_watch_scan_route_enabled());
 }
@@ -521,7 +524,10 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_search_inplace_watch_scan: Some(true),
+        ..Default::default()
+    });
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -534,7 +540,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
 
     assert!(
         solver.bcp_search_inplace_watch_scan_enabled(),
-        "truthy env should request the SEARCH in-place watch scan route"
+        "--sat-bcp-search-inplace-watch-scan true should request the in-place route"
     );
     assert_eq!(
         solver.bcp_search_inplace_watch_scan_route_enabled(),
@@ -546,7 +552,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -566,7 +572,10 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_no_replacement_scan_pressure: true,
+        ..Default::default()
+    });
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -579,14 +588,14 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
 
     assert!(
         solver.bcp_learned_no_replacement_scan_pressure_enabled(),
-        "truthy DIMACS env should expose #9297 scan-pressure profiling"
+        "--sat-bcp-learned-no-replacement-scan-pressure should expose #9297 scan-pressure profiling"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -601,7 +610,10 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
         "learned 19-63 identity profiling must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_IDENTITY_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_identity: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -612,15 +624,14 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_identity_profile_enabled(),
-        "truthy DIMACS env should enable learned 19-63 identity profiling"
+        "--sat-bcp-learned-1963-identity should enable learned 19-63 identity profiling"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV);
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -639,7 +650,10 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
         "pressure reduction default-off must not enable identity profiling"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_pressure_reduction: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -650,7 +664,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_pressure_reduction_enabled(),
-        "truthy DIMACS env should enable learned 19-63 pressure reduction"
+        "--sat-bcp-learned-1963-pressure-reduction should enable learned 19-63 pressure reduction"
     );
     assert!(
         solver.bcp_learned_1963_identity_profile_enabled(),
@@ -661,8 +675,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV);
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -681,7 +694,10 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
         "pressure retention default-off must not enable identity profiling"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_pressure_retention: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -692,7 +708,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_pressure_retention_enabled(),
-        "truthy DIMACS env should enable learned 19-63 pressure retention"
+        "--sat-bcp-learned-1963-pressure-retention should enable learned 19-63 pressure retention"
     );
     assert!(
         solver.bcp_learned_1963_identity_profile_enabled(),
@@ -703,7 +719,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -718,7 +734,10 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
         "learned 19-63 used5 FSW reset must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_used5_fsw_saved_pos_reset: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -729,14 +748,14 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_used5_fsw_saved_pos_reset_enabled(),
-        "truthy DIMACS env should enable the used5 FSW reset"
+        "--sat-bcp-learned-1963-used5-fsw-saved-pos-reset should enable the used5 FSW reset"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -751,7 +770,10 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
         "learned 19-63 FSW conflict-only reset must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_fsw_conflict_saved_pos_reset: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -762,14 +784,14 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_fsw_conflict_saved_pos_reset_enabled(),
-        "truthy DIMACS env should enable the FSW conflict-only reset"
+        "--sat-bcp-learned-1963-fsw-conflict-saved-pos-reset should enable the conflict-only reset"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -784,7 +806,10 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
         "learned 19-63 FSW Gent-order skip must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_fsw_gent_skip: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -795,15 +820,14 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
     );
     assert!(
         solver.bcp_learned_1963_fsw_gent_skip_enabled(),
-        "truthy DIMACS env should enable the FSW Gent-order skip"
+        "--sat-bcp-learned-1963-fsw-gent-skip should enable the FSW Gent-order skip"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
     let _lock = lock_env();
-    let _guard =
-        ScopedEnvVar::unset(SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV);
+    let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -818,10 +842,10 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
         "learned 19-63 no-replacement unit blocker-refresh guard must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(
-        SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV,
-        "1",
-    );
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_disable_learned_1963_no_replacement_unit_blocker_refresh: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -832,14 +856,14 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
     );
     assert!(
         solver.bcp_disable_learned_1963_no_replacement_unit_blocker_refresh_enabled(),
-        "truthy DIMACS env should enable the learned 19-63 unit blocker-refresh guard"
+        "the disable switch should enable the learned 19-63 unit blocker-refresh guard"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -855,7 +879,10 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
         "learned 19-63 budgeted tail reorder must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV, "256");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bcp_learned_1963_tail_reorder_swap_budget: Some(256),
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -867,14 +894,14 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
     assert_eq!(
         solver.bcp_learned_1963_tail_reorder_swap_budget(),
         Some(256),
-        "DIMACS env should configure the learned 19-63 tail reorder swap budget"
+        "--sat-bcp-learned-1963-tail-reorder-swap-budget should configure the swap budget"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -889,7 +916,10 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
         "the #9084 yield-productivity rescue must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        inprocessing_yield_productivity_rescue: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -900,29 +930,17 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
     );
     assert!(
         solver.inprocessing_yield_productivity_rescue_enabled(),
-        "truthy DIMACS env should enable the #9084 yield-productivity rescue"
+        "--sat-inprocessing-yield-productivity-rescue should enable the #9084 rescue"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
+    // M2 default flip (2026-08-19): the rescue ships ON; the tri-state
+    // switch's `false` arm is the opt-out.
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
-    let mut solver = SatSolver::new(1);
-    configure_dimacs_solver(
-        &mut solver,
-        stats_output::StatsConfig {
-            human: false,
-            json: false,
-        },
-    );
-    assert!(
-        !solver.lrat_proof_clamp_probe_rescue_enabled(),
-        "LRAT proof-clamp probe rescue must stay default-off"
-    );
-
-    let _g = ScopedEnvVar::set(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -933,14 +951,48 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
     );
     assert!(
         solver.lrat_proof_clamp_probe_rescue_enabled(),
-        "truthy DIMACS env should enable the LRAT proof-clamp probe rescue"
+        "LRAT proof-clamp probe rescue ships default-on (M2)"
+    );
+
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        lrat_proof_clamp_probe_rescue: Some(false),
+        ..Default::default()
+    });
+    let mut solver = SatSolver::new(1);
+    configure_dimacs_solver(
+        &mut solver,
+        stats_output::StatsConfig {
+            human: false,
+            json: false,
+        },
+    );
+    assert!(
+        !solver.lrat_proof_clamp_probe_rescue_enabled(),
+        "--sat-lrat-proof-clamp-probe-rescue false must opt out of the M2 default"
+    );
+
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        lrat_proof_clamp_probe_rescue: Some(true),
+        ..Default::default()
+    });
+    let mut solver = SatSolver::new(1);
+    configure_dimacs_solver(
+        &mut solver,
+        stats_output::StatsConfig {
+            human: false,
+            json: false,
+        },
+    );
+    assert!(
+        solver.lrat_proof_clamp_probe_rescue_enabled(),
+        "--sat-lrat-proof-clamp-probe-rescue true should keep the rescue enabled"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -955,7 +1007,10 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         "the #9084 yield-rescue backbone cooldown must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        yield_rescue_backbone_cooldown: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -966,14 +1021,14 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
     );
     assert!(
         solver.inprocessing_yield_rescue_backbone_cooldown_enabled(),
-        "truthy DIMACS env should enable the #9084 backbone cooldown experiment"
+        "--sat-yield-rescue-backbone-cooldown should enable the #9084 cooldown experiment"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -988,7 +1043,10 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
         "the #9084 bounded-backbone zero-decompose backoff must stay default-off"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        bounded_backbone_zero_decompose_backoff: true,
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -999,14 +1057,14 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
     );
     assert!(
         solver.bounded_backbone_zero_decompose_backoff_enabled(),
-        "truthy DIMACS env should enable the #9084 bounded-only backoff experiment"
+        "--sat-bounded-backbone-zero-decompose-backoff should enable the bounded-only backoff"
     );
 }
 
 #[test]
 fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1018,10 +1076,13 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
     );
     assert!(
         solver.backbone_post_vivify_binary_admission_enabled(),
-        "post-vivify binary admission must stay default-on without env override"
+        "post-vivify binary admission must stay default-on without a switch override"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "0");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        backbone_post_vivify_binary_admission: Some(false),
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1032,10 +1093,13 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
     );
     assert!(
         !solver.backbone_post_vivify_binary_admission_enabled(),
-        "env 0 should restore the legacy post-vivify backbone gate"
+        "--sat-backbone-post-vivify-binary-admission false should restore the legacy gate"
     );
 
-    let _g = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        backbone_post_vivify_binary_admission: Some(true),
+        ..Default::default()
+    });
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1046,7 +1110,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
     );
     assert!(
         solver.backbone_post_vivify_binary_admission_enabled(),
-        "env 1 should keep current post-vivify binary admission behavior"
+        "--sat-backbone-post-vivify-binary-admission true should keep current behavior"
     );
 }
 
@@ -1938,7 +2002,7 @@ fn test_dense_clique_php_route_checker_audit_counts_fail_closed() {
 #[test]
 fn test_dense_clique_scout_stats_are_default_off() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_SCOUT_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -1971,7 +2035,10 @@ fn test_dense_clique_scout_stats_are_default_off() {
 #[test]
 fn test_dense_clique_scout_stats_recover_strict_mutex_surface() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        dense_clique_scout: true,
+        ..Default::default()
+    });
     let content = "\
 p cnf 6 17
 1 2 3 0
@@ -2092,7 +2159,10 @@ p cnf 6 17
 #[test]
 fn test_dense_clique_scout_requested_mixed_formula_fails_closed() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        dense_clique_scout: true,
+        ..Default::default()
+    });
     let content = "\
 p cnf 4 3
 1 2 0
@@ -2131,7 +2201,7 @@ p cnf 4 3
 #[test]
 fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::unset(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -2164,7 +2234,10 @@ fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
 #[test]
 fn test_multiplier_equiv_conservation_scout_requested_fails_closed_without_proof() {
     let _lock = lock_env();
-    let _g = ScopedEnvVar::set(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV, "1");
+    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        multiplier_equiv_conservation_scout: true,
+        ..Default::default()
+    });
     let content = "\
 p cnf 3 3
 -3 1 0

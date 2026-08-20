@@ -293,6 +293,40 @@ impl Executor {
             }
         }
 
+        // (#ground-conflict-decomp) All-negated-equality conflict: no positive
+        // conclusion exists, but the closure merges two DISTINCT integer
+        // numerals (e.g. `s[1]=20 ∧ val=1 ∧ … ⊢ 1=20`). Derive the raw
+        // numeral equality through the proof forest and refute it with a
+        // solver-certified Farkas unit. Bounded: numeral scan over the
+        // already-bounded universe.
+        let mut const_clash: Option<(TermId, TermId)> = None;
+        if found.is_none()
+            && split.pos_eqs.is_empty()
+            && split.neg_preds.is_empty()
+            && split.pos_preds.is_empty()
+            && !split.hyps.is_empty()
+        {
+            let mut numerals: Vec<TermId> = Vec::new();
+            for &term in cc.rep.keys() {
+                if matches!(terms.get(term), TermData::Const(ay_core::Constant::Int(_)))
+                    && !numerals.contains(&term)
+                {
+                    numerals.push(term);
+                }
+            }
+            'clash: for (index, &c1) in numerals.iter().enumerate() {
+                for &c2 in &numerals[index + 1..] {
+                    if cc.find(c1) == cc.find(c2) {
+                        const_clash = Some((c1, c2));
+                        break 'clash;
+                    }
+                }
+            }
+        }
+        if found.is_none() && const_clash.is_none() {
+            return None;
+        }
+
         let mut builder = RecipeBuilder {
             terms: &mut self.ctx.terms,
             cc: &cc,
@@ -300,6 +334,51 @@ impl Executor {
             memo: HashMap::default(),
             used_hyps: Vec::new(),
         };
+        if found.is_none() {
+            let (c1, c2) = const_clash?;
+            let EufJust::Derived(top) = builder.derive(c1, c2, None)? else {
+                // A direct `(not (= c1 c2))` hypothesis needs no derivation
+                // chain; unseen in practice, fail closed.
+                return None;
+            };
+            let eq_term = match &builder.derivs[top] {
+                super::EufDeriv::Cong { eq_term, .. } | super::EufDeriv::Chain { eq_term, .. } => {
+                    *eq_term
+                }
+            };
+            let unit_lit = builder.terms.mk_not_raw(eq_term);
+            let kind = ay_core::TheoryLemmaKind::LiaGeneric;
+            let farkas = Some(
+                crate::executor::proof_farkas::constant_disequality_unit_farkas(
+                    builder.terms,
+                    unit_lit,
+                )?,
+            );
+            let RecipeBuilder {
+                derivs, used_hyps, ..
+            } = builder;
+            let target = match or_term {
+                Some(term) => EufTarget::OrUnit { term },
+                None => {
+                    let extras = lits
+                        .iter()
+                        .copied()
+                        .filter(|literal| !used_hyps.contains(literal))
+                        .collect();
+                    EufTarget::Bare { extras }
+                }
+            };
+            return Some(EufLemmaPlan {
+                derivs,
+                concl: EufConcl::ConstClash {
+                    top,
+                    unit_lit,
+                    farkas: farkas?,
+                    kind,
+                },
+                target,
+            });
+        }
         let (conclusion, conclusion_literals) = match found? {
             Found::Eq(literal, lhs, rhs) => {
                 if lhs == rhs {

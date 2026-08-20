@@ -87,6 +87,10 @@ pub(crate) struct Ic3Solver {
     pub(super) ctg_depth: usize,
     /// Verbose tracing output.
     verbose: bool,
+    /// Optional hard wall-clock deadline. Checked only at solve/block loop
+    /// heads; on expiry `solve()` returns [`Ic3Result::Unknown`] -- never a
+    /// truncated `Safe`/`Unsafe`. `None` = no time bound (previous behavior).
+    deadline: Option<ay_core::time::Instant>,
 }
 
 impl Ic3Solver {
@@ -151,7 +155,28 @@ impl Ic3Solver {
             next_seq_id: 0,
             ctg_depth: 0,
             verbose,
+            deadline: None,
         }
+    }
+
+    /// Attach an optional hard wall-clock deadline (builder style, so existing
+    /// `Ic3Solver::new(..)` call sites are unaffected). On expiry the solver
+    /// returns [`Ic3Result::Unknown`]; it never truncates the search into a
+    /// `Safe`/`Unsafe` verdict.
+    #[must_use]
+    pub(crate) fn with_deadline(mut self, deadline: Option<ay_core::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// True once the configured deadline has passed. Checked only at loop heads
+    /// (see [`Ic3Solver::solve`] and `block_all_bad`), where returning `Unknown`
+    /// cannot corrupt a verdict: `Safe` is only produced after a completed
+    /// `propagate()` fixpoint and `Unsafe` only from a verified Init-reaching cube.
+    #[inline]
+    fn resource_exhausted(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| ay_core::time::Instant::now() >= d)
     }
 
     /// Run the IC3 algorithm to check if any bad state is reachable.
@@ -175,6 +200,12 @@ impl Ic3Solver {
 
         // Main loop: strengthen frames and push frontier.
         loop {
+            // Honor the optional deadline at the loop head -- a safe point where
+            // returning Unknown cannot be mistaken for a Safe/Unsafe verdict.
+            if self.resource_exhausted() {
+                self.collect_domain_bcp_stats();
+                return Ic3Result::Unknown;
+            }
             let k = self.frontier_level();
 
             // Try to find and block all bad cubes at the frontier.
@@ -262,6 +293,9 @@ impl Ic3Solver {
 
         // Find bad cubes in the frontier frame.
         while let Some(bad_cube) = self.get_bad_cube(k) {
+            if self.resource_exhausted() {
+                return BlockResult::Unknown;
+            }
             let seq_id = self.next_seq_id();
             obligations.push(PriorityObligation(Ic3Obligation::new(
                 bad_cube, k, 0, seq_id, None,
@@ -269,6 +303,9 @@ impl Ic3Solver {
 
             // Process obligations in priority order (lowest level first).
             while let Some(PriorityObligation(ob)) = obligations.pop() {
+                if self.resource_exhausted() {
+                    return BlockResult::Unknown;
+                }
                 self.stats.obligations_processed += 1;
 
                 if ob.level == 0 {

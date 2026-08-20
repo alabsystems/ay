@@ -112,7 +112,26 @@ def load_corpus(tier: str, only: list[str] | None, limit: int) -> list[dict]:
             continue
         out.append({"name": name, **e})
     out.sort(key=lambda e: (e.get("cols") or 0, e["name"]))
-    return out[:limit] if limit else out
+    out = out[:limit] if limit else out
+    # A manifest missing the fields this tool selects and checks on is a defect in the
+    # manifest, not an empty result set and not a clean run. Both used to be silent:
+    # an untiered manifest made the documented `--tier gurobi` select nothing, and a
+    # ref_obj-less one made `score` inert while still printing "0 alarms".
+    if not out and tier != "all":
+        present = {e.get("tier") for e in man["instances"].values()}
+        if present == {None}:
+            sys.exit(f"{MANIFEST} carries no 'tier' field, so --tier {tier} selects 0 of "
+                     f"{len(man['instances'])} instances. Rebuild it with "
+                     f"scripts/rebuild_milp_bench.py (or scripts/milp_corpus.py index).")
+        sys.exit(f"--tier {tier} selected 0 of {len(man['instances'])} instances; "
+                 f"tiers present: {sorted(t for t in present if t)}")
+    blind = [e["name"] for e in out if e.get("ref_obj") is None]
+    if blind:
+        print(f"** WARNING ** {len(blind)}/{len(out)} selected instances carry no ref_obj: "
+              f"their PROVED objectives CANNOT be checked and are reported as unchecked, "
+              f"not as passes (e.g. {', '.join(blind[:5])}). Rebuild the manifest.",
+              file=sys.stderr, flush=True)
+    return out
 
 
 def close_enough(a, b, tol: float = REL_TOL) -> bool:
@@ -200,13 +219,28 @@ GAP_BAND = 1e-4
 def score(inst: dict, r: dict, gap_band: float = 0.0) -> dict:
     """Classify the answer against the reference.
 
-    Three outcomes, kept apart on purpose:
+    Four outcomes, kept apart on purpose:
       - agreement (within REL_TOL),
       - ``gap`` — outside REL_TOL but inside the solver's own documented stopping gap,
-      - ``alarm`` — outside both, i.e. a claimed-proved objective that is simply wrong.
+      - ``alarm`` — outside both, i.e. a claimed-proved objective that is simply wrong,
+      - ``unchecked`` — the reference says an optimum EXISTS but the manifest carries no
+        ``ref_obj``, so nothing was verified. That is not agreement and must not be
+        counted as one; it is the manifest that is broken, and it says so.
+
+    A null ``ref_obj`` on an ``=inf=``/``=unbd=`` reference is not a gap — no objective
+    exists to compare — so those are checked by status alone and stay silent, because
+    false alarms are how a soundness signal gets ignored.
     """
+    if r.get("status") not in PROVED:
+        return r
     ref = inst.get("ref_obj")
-    if r.get("status") not in PROVED or ref is None or r.get("obj") is None:
+    if ref is None:
+        if inst.get("ref_status") == "opt":
+            r["unchecked"] = "manifest carries no ref_obj; nothing verified"
+        return r
+    if r.get("obj") is None:
+        if r["status"] == "OPTIMAL":
+            r["unchecked"] = "claimed OPTIMAL with no objective value to check"
         return r
     if close_enough(r["obj"], ref):
         return r
@@ -276,6 +310,8 @@ def cmd_baseline(args) -> int:
         rows.append(r)
         if r.get("alarm"):
             print(f"  ** ALARM ** {i['name']:24s} {r['alarm']}", flush=True)
+        elif r.get("unchecked"):
+            print(f"  ** UNCHECKED ** {i['name']:24s} {r['unchecked']}", flush=True)
         elif r.get("gap_slack"):
             print(f"  [gap]      {i['name']:24s} rel {r['gap_slack']:.3e} "
                   f"(within documented MIPGap)", flush=True)
@@ -283,8 +319,9 @@ def cmd_baseline(args) -> int:
             print(f"  [{n}/{len(insts)}]", flush=True)
     n_alarm = sum(1 for r in rows if r.get("alarm"))
     n_gap = sum(1 for r in rows if r.get("gap_slack"))
+    n_unchecked = sum(1 for r in rows if r.get("unchecked"))
     print(f"proved {sum(1 for r in rows if r['status'] in PROVED)}/{len(rows)}   "
-          f"wrong {n_alarm}   within-gap {n_gap}")
+          f"wrong {n_alarm}   within-gap {n_gap}   unchecked {n_unchecked}")
     payload = {"mode": "baseline", "secs": args.secs, "threads": args.threads,
                "gap_band": GAP_BAND, "rows": rows}
     if args.out:
@@ -325,12 +362,22 @@ def summarize(pf: dict, grb: dict | None) -> None:
         print(f"  gurobi-only vs default : {len(gp_ - dp)}")
         print(f"  gurobi-only vs ORACLE  : {len(gp_ - op)}   <- genuinely missing capability")
         print(f"  ay-only  vs gurobi     : {len(op - gp_)}")
+    unchecked = [(r["name"], a, d["unchecked"]) for r in rows for a, d in r["arms"].items()
+                 if d.get("unchecked")]
     if alarms:
         print(f"\n** {len(alarms)} SOUNDNESS ALARMS **")
         for nm, a, why in alarms[:20]:
             print(f"  {nm:24s} {a:12s} {why}")
     else:
         print("\nsoundness: 0 alarms")
+    # "0 alarms" over unverifiable answers is not a soundness result. Never let the
+    # two read the same.
+    if unchecked:
+        n_i = len({nm for nm, _, _ in unchecked})
+        print(f"** {len(unchecked)} PROVED answers UNCHECKED across {n_i} instances "
+              f"— NOT verified, do not read the alarm count as clean **")
+        for nm, a, why in unchecked[:10]:
+            print(f"  {nm:24s} {a:12s} {why}")
 
 
 def cmd_analyze(args) -> int:
@@ -360,6 +407,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("portfolio")
+    # Consumed by _corpus_dir() at import time; declared so argparse does not reject
+    # the spelling this file's own B20 note tells you to use.
+    p.add_argument("--corpus", help="corpus dir (default ~/ay-bench/milp)")
     p.add_argument("--tier", default="gurobi")
     p.add_argument("--only", nargs="*")
     p.add_argument("--limit", type=int, default=0)
@@ -370,6 +420,7 @@ def main() -> int:
     p.set_defaults(fn=cmd_portfolio)
 
     b = sub.add_parser("baseline")
+    b.add_argument("--corpus", help="corpus dir (default ~/ay-bench/milp)")
     b.add_argument("--tier", default="gurobi")
     b.add_argument("--only", nargs="*")
     b.add_argument("--limit", type=int, default=0)

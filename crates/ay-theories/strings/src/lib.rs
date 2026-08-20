@@ -69,7 +69,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Strings NF-engine increment master switch (`AY_STR_NF=1`, default OFF).
+/// Strings NF-engine increment master switch (`--str-nf`, default OFF).
 ///
 /// Gates the ranked NF-engine closures from
 /// the development design notes:
@@ -89,10 +89,10 @@ pub fn str_nf_enabled() -> bool {
         return true;
     }
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| matches!(std::env::var("AY_STR_NF").ok().as_deref(), Some("1")))
+    *V.get_or_init(|| ay_core::misc_cli_flags().str_nf)
 }
 
-/// Closures that `AY_STR_NF=1` alone must NOT enable, because they are known
+/// Closures that `--str-nf` alone must NOT enable, because they are known
 /// to be UNSOUND on the current tree. Reaching them requires naming them
 /// EXPLICITLY in `--str-nf-closures` (for debugging / repair work only).
 ///
@@ -100,7 +100,7 @@ pub fn str_nf_enabled() -> bool {
 ///   WRONG-UNSAT witness on current main:
 ///   `QF_SLIA/non-incremental__QF_SLIA__20180523-Reynolds__kaluza__sat__small__bettermatch1.readable.smt2`
 ///   (SMT-LIB `kaluza/sat/`; z3 4.16 answers `sat`) returns `unsat` under
-///   `AY_STR_NF=1 --str-nf-closures 5`, and under closure 5 alone. Only ONE
+///   `--str-nf --str-nf-closures 5`, and under closure 5 alone. Only ONE
 ///   string lemma is lowered on that file — a `LengthSplit`, which lowers to
 ///   the tautology `[eq, ¬eq]` and therefore cannot turn a satisfiable clause
 ///   set unsatisfiable. The propositional UNSAT must therefore rest on a
@@ -111,7 +111,7 @@ pub fn str_nf_enabled() -> bool {
 ///   for completeness. Fail closed until the escaping conflict is identified.
 const NF_CLOSURES_REQUIRING_EXPLICIT_OPT_IN: &[u8] = &[5];
 
-/// Per-closure sub-flag for A/B attribution under the `AY_STR_NF=1` master
+/// Per-closure sub-flag for A/B attribution under the `--str-nf` master
 /// switch. `--str-nf-closures 1,3` enables only closures 1 and 3; unset (or
 /// unparsable) enables every closure EXCEPT those in
 /// [`NF_CLOSURES_REQUIRING_EXPLICIT_OPT_IN`]. Always `false` when the master

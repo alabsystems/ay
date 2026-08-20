@@ -200,7 +200,7 @@ impl CoreSolver {
                 }
             }
 
-            // Closure 1 (`AY_STR_NF=1`, sub-flag 1): reduction awareness.
+            // Closure 1 (`--str-nf`, sub-flag 1): reduction awareness.
             //
             // An unresolved string application that has been REDUCED via a
             // DPLL-level reduction lemma (str.at/str.substr/... decomposition)

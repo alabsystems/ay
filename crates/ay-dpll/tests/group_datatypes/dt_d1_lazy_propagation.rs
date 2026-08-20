@@ -205,3 +205,37 @@ fn test_frame_chain_commitment_unsat_and_control() {
     let result = crate::common::solve(sat_smt);
     assert_eq!(result.trim(), "sat", "top(s2) = A is the real model");
 }
+
+/// Certification regression for the selector-through-equality repair
+/// (2026-08-19): the refutation of this exact fixture used to publish
+/// `unknown (incomplete self-check-rejected)` because the propagated
+/// `(= a (top x))` leaf was a trust unit no bridge leg could derive. The
+/// eq-planner's selector-chase leg now composes
+/// projection + congruence + transitivity across the two authored
+/// equalities, so the published UNSAT is internally trust-free.
+#[test]
+#[timeout(60_000)]
+fn test_derived_merge_selector_conflict_certifies_trust_free() {
+    use ay_frontend::parse;
+    let smt = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_DT)
+        (declare-datatypes ((blk 0)) (((A) (B))))
+        (declare-datatypes ((tower 0)) (((stack (top blk) (rest tower)) (empty))))
+        (declare-const x tower)
+        (declare-const y tower)
+        (declare-const a blk)
+        (assert (= x y))
+        (assert (= y (stack a empty)))
+        (assert (not (= (top x) a)))
+        (check-sat)
+    "#;
+    let commands = parse(smt).expect("parse");
+    let mut exec = ay_dpll::Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute");
+    assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+    assert!(
+        !exec.unsat_proof_terminal_trust_detected(),
+        "the selector-through-equality refutation must be internally trust-free"
+    );
+}

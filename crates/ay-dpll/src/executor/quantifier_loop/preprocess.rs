@@ -538,8 +538,23 @@ impl Executor {
         // explicitly tolerates its absence while still rejecting a present
         // provenance bound to different assertions.
         if !self.produce_proofs_enabled() || self.proof_problem_assertion_provenance.is_some() {
+            crate::executor::unsat_cert::probe_cert_reject(|| {
+                format!(
+                    "install_proof_source_provenance DECLINED: tracker={} already_installed={} \
+                     roots={}",
+                    self.produce_proofs_enabled(),
+                    self.proof_problem_assertion_provenance.is_some(),
+                    original_assertions.len()
+                )
+            });
             return;
         }
+        crate::executor::unsat_cert::probe_cert_reject(|| {
+            format!(
+                "install_proof_source_provenance INSTALLED: roots={}",
+                original_assertions.len()
+            )
+        });
         let mut assertion_sources = HashMap::default();
         for &source in original_assertions {
             assertion_sources.insert(source, vec![vec![source]]);
@@ -894,7 +909,7 @@ impl Executor {
             // its current behavior). Purely observational — the replacement
             // itself is byte-identical either way.
             let a = self.ctx.assertions[idx];
-            let recorded_expansion = matches!(
+            let mut recorded_expansion = matches!(
                 self.ctx.terms.get(a),
                 TermData::Forall(..) | TermData::Exists(..)
             )
@@ -908,7 +923,7 @@ impl Executor {
                 recorded_expansion.as_ref().map(|(root, _)| *root),
             );
             if matches!(self.ctx.terms.get(a), TermData::Forall(..)) {
-                if let Some((recorded_ground, instances)) = recorded_expansion {
+                if let Some((recorded_ground, instances)) = recorded_expansion.take() {
                     if recorded_ground == ground {
                         // Normalize each instance with the SIMPLIFYING
                         // constructors (the substitution builds `or`/`and`
@@ -981,6 +996,54 @@ impl Executor {
                                 expanded: ground,
                                 instances: folded_instances,
                             });
+                    }
+                }
+            }
+            // (#finite-exists-skolem-provenance) A TOP-LEVEL positive
+            // single-binder `exists` replaced in place by its exact canonical
+            // finite expansion loses the in-place Skolemization that would
+            // have recorded #skolem-unit-authority provenance — the
+            // consequence-replay producer then has no witness facts, its
+            // same-context probe re-solves a consequence set that no longer
+            // implies the existential, and a genuine UNSAT publishes
+            // `unknown` (the frame-quantifier lane, ay group_quantifiers
+            // frame_quantifier_instance_resolve). Mint the SAME provenance
+            // the in-place route records: a fresh registered Skolem witness
+            // with its `SkolemChoice`, and the exact raw substituted body.
+            // The record never touches the assertion stack — `asserted` is
+            // the raw instance itself — and carries no authority: every
+            // consumer independently replays the substitution, and the
+            // strict `sko_forall`/registered-choice validation re-derives
+            // the chain on any stitched candidate. Gated exactly like the
+            // in-place recording site in `skolemize_existentials`
+            // (proof mode + the #quant-unit-authority kill switch).
+            if matches!(self.ctx.terms.get(a), TermData::Exists(..))
+                && recorded_expansion
+                    .as_ref()
+                    .is_some_and(|(recorded_ground, _)| *recorded_ground == ground)
+                && self.produce_proofs_enabled()
+                && crate::quant_unit_authority::quant_unit_authority_enabled()
+            {
+                let (skolemized, provenance) =
+                    crate::skolemize::skolemize_deep_with_provenance(&mut self.ctx.terms, a, true);
+                if skolemized.is_some() {
+                    if let Some(record) = provenance
+                        .iter()
+                        .find(|record| record.from_exists && record.quantified == a)
+                    {
+                        if !crate::ematching::contains_quantifier(&self.ctx.terms, record.instance)
+                        {
+                            self.skolem_instance_records.push(
+                                crate::executor::SkolemInstanceRecord {
+                                    source: a,
+                                    quantified: a,
+                                    witness: record.witness,
+                                    instance: record.instance,
+                                    asserted: record.instance,
+                                    positive: true,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -2985,6 +3048,111 @@ mod tests {
         assert!(
             exec.quant_expansion_records.is_empty(),
             "existential SAT lineage must not masquerade as forall proof provenance"
+        );
+        assert!(
+            exec.skolem_instance_records.is_empty(),
+            "the no-proof solve must record no Skolem-instance provenance \
+             (#finite-exists-skolem-provenance is proof-mode-gated)"
+        );
+    }
+
+    /// (#finite-exists-skolem-provenance) A finite-expanded TOP-LEVEL positive
+    /// single-binder `exists` must record the same #skolem-unit-authority
+    /// provenance the in-place Skolemization route records, so the
+    /// consequence-replay producer can hand its probe the witness facts and
+    /// derive them with the strict `sko_forall` chain.
+    #[test]
+    fn finite_expanded_top_level_exists_records_skolem_instance_provenance() {
+        let commands = parse(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun P (Int) Bool)
+                (assert (exists ((x Int))
+                    (and (<= 0 x) (<= x 10) (P x))))
+            "#,
+        )
+        .expect("valid bounded existential");
+        let mut exec = Executor::new();
+        exec.set_produce_proofs(true);
+        assert!(exec
+            .execute_all(&commands)
+            .expect("setup commands execute")
+            .is_empty());
+        let original = exec.ctx.assertions[0];
+        let TermData::Exists(vars, body, _) = exec.ctx.terms.get(original).clone() else {
+            panic!("fixture asserts a top-level exists");
+        };
+
+        let _ = exec.process_quantifiers();
+
+        let [record] = exec.skolem_instance_records.as_slice() else {
+            panic!(
+                "finite expansion of a top-level exists must record exactly one \
+                 Skolem-instance provenance entry, got {}",
+                exec.skolem_instance_records.len()
+            );
+        };
+        assert_eq!(record.source, original);
+        assert_eq!(record.quantified, original);
+        assert!(
+            record.positive,
+            "a positive exists records a positive entry"
+        );
+        assert_eq!(
+            record.asserted, record.instance,
+            "the finite-expansion route never rewrites the assertion stack, so \
+             the asserted term is the raw instance itself"
+        );
+        let TermData::Var(witness_name, _) = exec.ctx.terms.get(record.witness).clone() else {
+            panic!("witness must be a plain Skolem constant");
+        };
+        assert!(
+            exec.ctx.terms.is_skolem_symbol(&witness_name),
+            "the minted witness must be registered in the exact Skolem registry"
+        );
+        // The recorded instance is the EXACT substitution the strict checker
+        // re-derives.
+        let mut substitution: HashMap<String, TermId> = HashMap::default();
+        substitution.insert(vars[0].0.clone(), record.witness);
+        let expected = subst_vars(&mut exec.ctx.terms, body, &substitution);
+        assert_eq!(
+            record.instance, expected,
+            "recorded instance must be the exact single-binder substitution"
+        );
+        assert!(!contains_quantifier(&exec.ctx.terms, record.instance));
+    }
+
+    /// GUARD-REMOVAL PROOF (#finite-exists-skolem-provenance kill switch):
+    /// `--no-quant-unit-authority` must suppress the recording exactly like
+    /// the in-place route's recording site.
+    #[test]
+    fn finite_exists_skolem_provenance_respects_the_kill_switch() {
+        let commands = parse(
+            r#"
+                (set-logic UFLIA)
+                (declare-fun P (Int) Bool)
+                (assert (exists ((x Int))
+                    (and (<= 0 x) (<= x 10) (P x))))
+            "#,
+        )
+        .expect("valid bounded existential");
+        let mut exec = Executor::new();
+        exec.set_produce_proofs(true);
+        assert!(exec
+            .execute_all(&commands)
+            .expect("setup commands execute")
+            .is_empty());
+
+        let off = ay_core::MiscCliFlags {
+            no_quant_unit_authority: true,
+            ..Default::default()
+        };
+        let _guard = ay_core::misc_test_override::set(off);
+        let _ = exec.process_quantifiers();
+        assert!(
+            exec.skolem_instance_records.is_empty(),
+            "the umbrella kill switch must suppress the finite-expansion \
+             Skolem-instance recording"
         );
     }
 

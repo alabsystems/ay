@@ -103,11 +103,14 @@ impl Executor {
         {
             return false;
         }
-        if let Some(limit) = self.memory_limit() {
-            let current = crate::memory::current_memory_bytes();
-            if current > 0 && current > limit / 2 {
-                return false;
-            }
+        // The probe's marginal cost is ONE clone of THIS executor's term
+        // universe, so that clone — not the whole-process footprint — is what a
+        // per-solver `:max-memory` may spend half of. See
+        // [`crate::memory::probe_clone_fits`]; `qpf_probe_preflight` charges the
+        // same quantity through the same helper so the two cannot drift.
+        if !crate::memory::probe_clone_fits(self.ctx.terms.true_memory_bytes(), self.memory_limit())
+        {
+            return false;
         }
         self.ctx.terms.true_memory_bytes() <= ay_core::TermStore::per_engine_budget() / 2
     }
@@ -145,5 +148,58 @@ impl Executor {
         probe.begin_public_solve(false);
         probe.bind_unsat_query_assumptions(&[]);
         Some(probe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    /// A per-solver `:max-memory` may not be spent by allocation this solver
+    /// does not own.
+    ///
+    /// Regression pin for the reading that made
+    /// `api::tests::test_solving_controls::
+    /// native_decision_routes_preserve_parsed_publication_controls`
+    /// nondeterministic inside the full `ay-dpll` lib binary: the preflight
+    /// compared the WHOLE-PROCESS physical footprint against `memory_limit /
+    /// 2`, so a process large enough for unrelated reasons declined the probe
+    /// clone and degraded an exact optimization decision to `Unknown`. Measured
+    /// 2026-08-18: 1.87 GB process footprint vs a parsed `:max-memory` of
+    /// 2 GiB, for a probe whose own term store is a few KiB.
+    ///
+    /// The cap below sits ABOVE the live process footprint, so the absolute
+    /// process guard in the same function still passes; only the half-of-cap
+    /// reading distinguishes the two implementations. The assertion is an
+    /// EQUALITY against the uncapped answer rather than a bare `assert!`, so a
+    /// process-wide budget set by some other test in this binary makes the pin
+    /// inert instead of spuriously red — it can only fail when declaring a
+    /// memory cap changes an answer that the cap does not actually constrain.
+    #[test]
+    fn preflight_charges_the_probe_clone_not_unowned_process_memory() {
+        let mut executor = Executor::new();
+        executor.set_memory_limit(None);
+        let uncapped = executor.optimization_probe_preflight();
+
+        let own = executor.ctx.terms.true_memory_bytes();
+        let process = crate::memory::current_memory_bytes();
+        assert!(process > 0, "no live footprint reading on this platform");
+        // 1.5x the live footprint: above the absolute guard (`current > limit`)
+        // and below the old half-of-process guard (`current > limit / 2`).
+        let limit = process.saturating_mul(3) / 2;
+        assert!(
+            own.saturating_mul(2) <= limit,
+            "probe clone ({own} B) must fit in half the declared cap ({limit} B) \
+             for this pin to be about the process reading"
+        );
+
+        executor.set_memory_limit(Some(limit));
+        assert_eq!(
+            executor.optimization_probe_preflight(),
+            uncapped,
+            "declaring a memory cap this solver's own clone fits inside must not \
+             change the preflight answer; the process footprint is not this \
+             solver's to spend"
+        );
     }
 }

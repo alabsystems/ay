@@ -1123,6 +1123,59 @@ fn test_nested_array_unsat_assumption_uses_strict_query_authority() {
     );
 }
 
+/// #dt-array-nested-const-idx — the FINITE half of the nested-array boundary.
+///
+/// `test_nested_array_alia_false_unsat_is_quarantined` above pins the INFINITE
+/// (`Int`-indexed) side: still `unknown`, because the guarded lazy
+/// array+arithmetic combination has no trust-free certificate. This is the
+/// BitVec-indexed twin of the same congruence conflict — two reads of one
+/// nested array at a constant-vs-symbolic index that provably denote the same
+/// datatype cell, whose `p` fields are asserted unequal. z3 4.16.0 refutes it.
+///
+/// It leaves the quarantine through the FIRST authority
+/// `nested_array_unsat_has_current_authority` consults: the reconstructed
+/// full-problem proof passes `check_proof_strict_with_datatypes`. That is the
+/// identical mechanism, and the identical `StrictProof` admission class, that
+/// `test_nested_array_proof_request_uses_strict_full_problem_authority` and its
+/// two neighbours above pin — all three were converted from `unknown` to
+/// `unsat` by the same commit (233ab32da, "fix(arrays): authenticate nested
+/// finite unsat"), which is also the commit that gave the quarantine its
+/// authority ladder. Measured admission for this query at this sha:
+/// `strict=true, independent=false, exact_semantic=false`.
+///
+/// Pin the AUTHORITY, not merely the verdict: a regression that widened the
+/// quarantine gate would still print `unsat` here, and only the admission class
+/// can tell a strict-checked refutation apart from an uncertified leak. Strict
+/// checking is what makes this a trust-free certificate — the strict checker is
+/// the one that rejects `trust` and `hole` steps.
+#[test]
+fn test_nested_finite_array_congruence_uses_strict_proof_authority() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-datatype T ((mk (p (_ BitVec 4)) (q (_ BitVec 4)))))
+        (declare-const R (Array (_ BitVec 4) (Array (_ BitVec 4) T)))
+        (declare-const k (_ BitVec 4))
+        (declare-const i (_ BitVec 4))
+        (declare-const z T)
+        (assert (= z (select (select R k) i)))
+        (assert (= k #x3))
+        (assert (not (= (p (select (select R #x3) i)) (p (select (select R k) i)))))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    assert_eq!(outputs[0], "unsat");
+    assert!(
+        exec.last_command_unsat_was_strictly_verified(),
+        "a nested-array UNSAT may leave the quarantine only on an authority the \
+         quarantine actually checked; the strict full-problem proof is the one \
+         consumed here"
+    );
+}
+
 /// #arr2lia-inflate: the speculative arrays-to-LIA rescue reduction must not
 /// inflate the SHARED term store out of proportion to the input.
 ///

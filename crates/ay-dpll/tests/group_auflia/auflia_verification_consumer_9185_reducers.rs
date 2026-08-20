@@ -25,6 +25,94 @@ fn expect_sat(input: &str, label: &str) {
     assert_eq!(result, SolverOutcome::Sat, "{label}: expected SAT");
 }
 
+/// The strongest SAT pin available from an integration test: AY must answer
+/// `sat`, AY's own fail-closed self-checker (`--self-check`) must CONFIRM that
+/// answer, and the model AY publishes must satisfy the AUTHORED assertions when
+/// replayed through z3.
+///
+/// Use this — never a bare [`expect_sat`] — wherever a pin previously demanded
+/// `unknown` "for want of a materialized and rechecked model". Flipping such a
+/// pin to `expect_sat` alone would trade a fail-closed guard for a weaker one;
+/// this trades it for a stronger one, because it fails on a `sat` that has no
+/// model behind it as well as on a `sat` whose model is wrong.
+///
+/// Replay mechanics: AY's `(get-model)` block is spliced into the replay file
+/// verbatim as `define-fun` commands — ordinary SMT-LIB macro definitions — so
+/// z3 evaluates the authored formula UNDER exactly the interpretation AY
+/// published instead of re-deciding the problem. Any symbol AY omits keeps its
+/// `declare-fun`, so a `sat` here proves AY's published interpretation EXTENDS
+/// to a total model; it can never be rescued by reinterpreting a symbol AY
+/// pinned. `decls` is required to hold one declaration per line so the splice
+/// can drop exactly the ones the model defines.
+///
+/// The replay file is emitted under `(set-logic ALL)` for the same reason the
+/// `arbitrary_seq_quantifier_is_sat_by_constant_interpretation` cross-check
+/// below is: z3 rejects the `(Seq Int)` sort under `AUFLIA` and would answer
+/// `sat` for a vacuously empty problem, which is not a check of anything.
+fn expect_sat_with_model_replayed_through_z3(decls: &str, asserts: &str, label: &str) {
+    let problem = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n");
+    let result = run_executor_smt_with_timeout(&problem, 30).expect("execution should succeed");
+    assert_eq!(result, SolverOutcome::Sat, "{label}: expected SAT");
+
+    // AY's own fail-closed checker must confirm it: in `--self-check` mode a
+    // verdict is emitted only when AY's in-tree checker validates it, so an
+    // unbacked `sat` degrades to `unknown` here.
+    let self_checked = crate::common::solve_selfcheck_vec(&problem);
+    assert_eq!(
+        crate::common::sat_result(&self_checked.join("\n")),
+        Some("sat"),
+        "{label}: AY's own fail-closed self-check must confirm this SAT, not degrade it:\n{self_checked:?}"
+    );
+
+    let with_model = format!("(set-logic AUFLIA)\n{decls}\n{asserts}\n(check-sat)\n(get-model)\n");
+    let output = crate::common::solve(&with_model);
+    let model = output
+        .split_once("(model")
+        .map(|(_, rest)| rest.trim_end().trim_end_matches(')').to_string())
+        .unwrap_or_else(|| panic!("{label}: a certified SAT must publish a model:\n{output}"));
+
+    if !crate::common::check_z3_or_skip() {
+        return;
+    }
+    let defined: Vec<String> = model
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("(define-fun "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !defined.is_empty(),
+        "{label}: the published model defines no symbol:\n{output}"
+    );
+    let kept_decls: String = decls
+        .lines()
+        .filter(|line| {
+            let name = line
+                .trim()
+                .trim_start_matches('(')
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default();
+            !defined.iter().any(|d| d == name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let replay = format!("(set-logic ALL)\n{kept_decls}\n{model}\n{asserts}\n(check-sat)\n");
+    let path = std::env::temp_dir().join(format!(
+        "ay_9185_model_replay_{}_{}.smt2",
+        std::process::id(),
+        label.len()
+    ));
+    std::fs::write(&path, &replay).expect("write replay file");
+    let outcome = crate::common::run_z3_file(&path, 20).expect("run z3");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        outcome,
+        SolverOutcome::Sat,
+        "{label}: AY's published model does not satisfy the authored assertions (z3):\n{replay}"
+    );
+}
+
 fn expect_unknown(input: &str, label: &str) {
     let result = run_executor_smt_with_timeout(input, 30).expect("execution should succeed");
     assert_eq!(result, SolverOutcome::Unknown, "{label}: expected UNKNOWN");
@@ -602,19 +690,46 @@ fn seq_concat_len_definition_direct_contradiction_is_not_sat() {
 
 #[test]
 #[timeout(30_000)]
-fn seq_concat_len_and_bucket_ix_definitions_are_soundly_unknown_without_joint_model() {
-    // Each axiom family is satisfiable, but the mixed bundle has no jointly
-    // materialized and rechecked model. Per-axiom syntax is not SAT authority.
-    expect_unknown(
-        r#"
-(set-logic AUFLIA)
-(declare-sort MyHashMap 0)
+fn seq_concat_len_and_bucket_ix_definitions_are_decided_sat_with_a_replayed_joint_model() {
+    // STALE PIN REFRESHED, on the same terms as the thirteen in the header. The
+    // premise below is obsolete:
+    //
+    //   "Each axiom family is satisfiable, but the mixed bundle has no jointly
+    //    materialized and rechecked model. Per-axiom syntax is not SAT
+    //    authority."
+    //
+    // The premise names a MISSING JOINT MODEL, so a joint model is what retires
+    // it — and there is one. Measured at this sha, AY decides the bundle `sat`
+    // in 7 ms and publishes
+    //
+    //   logic_bucket__ix := λ_ _. 0     seq_len_proxy := 1
+    //   logic_K…__ret_i  := λ_. 0       seq_len       := λ_. 0
+    //
+    // which satisfies both axioms outright: axiom 1 becomes `0 = 0 + 0` for
+    // ANY interpretation of `seq_concat` (hence AY marking it formula-neutral
+    // and omitting it), and axiom 2 becomes `0 = mod(0, 1) = 0`. z3 4.16.0
+    // independently answers `sat` on the authored problem and prints a model of
+    // the same shape.
+    //
+    // Two axiom families over DISJOINT vocabularies were never a joint-model
+    // obstacle; the obstacle was that AY could not exhibit one, and the
+    // constant-interpretation SAT certificate (the same capability this file's
+    // header records) now can. The check below is not the flip the pin was
+    // resisting: it demands the verdict, AY's own fail-closed self-check, AND
+    // the published model replayed against the authored assertions — so it
+    // fails on a `sat` with no model behind it, which is exactly what the old
+    // `expect_unknown` existed to prevent.
+    //
+    // The rejecting-direction siblings (`*_direct_contradiction_is_not_sat`) are
+    // untouched and remain the guard against a wrong SAT.
+    expect_sat_with_model_replayed_through_z3(
+        r#"(declare-sort MyHashMap 0)
 (declare-fun seq_concat ((Seq Int) (Seq Int)) (Seq Int))
 (declare-fun seq_len ((Seq Int)) Int)
 (declare-fun logic_K_P__P_hash__log__placeholder_i__ret_i (Int) Int)
 (declare-fun logic_bucket__ix (MyHashMap Int) Int)
-(declare-fun seq_len_proxy () Int)
-(assert (forall ((lhs (Seq Int)) (rhs (Seq Int)))
+(declare-fun seq_len_proxy () Int)"#,
+        r#"(assert (forall ((lhs (Seq Int)) (rhs (Seq Int)))
     (! (= (seq_len (seq_concat lhs rhs))
           (+ (seq_len lhs) (seq_len rhs)))
        :pattern ((seq_len (seq_concat lhs rhs))))))
@@ -622,9 +737,7 @@ fn seq_concat_len_and_bucket_ix_definitions_are_soundly_unknown_without_joint_mo
     (! (= (logic_bucket__ix self k)
           (mod (logic_K_P__P_hash__log__placeholder_i__ret_i k)
                seq_len_proxy))
-       :pattern ((logic_bucket__ix self k)))))
-(check-sat)
-"#,
+       :pattern ((logic_bucket__ix self k)))))"#,
         "ay#8971/verification-consumer hashmap_list seq concat plus bucket index definitions",
     );
 }

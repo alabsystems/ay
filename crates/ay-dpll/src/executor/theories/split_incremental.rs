@@ -780,9 +780,52 @@ pub(in crate::executor) fn encode_and_add_split_clause(
     ];
     let mut proof_clause = vec![left_atom, right_atom];
     if let Some((diseq_term, is_distinct)) = disequality_guard {
-        if let Some(guard_lit) =
-            split_guard_clause_literal(terms, local_term_to_var, diseq_term, is_distinct)
+        let mut guard_lit_mapped =
+            split_guard_clause_literal(terms, local_term_to_var, diseq_term, is_distinct);
+        // (#ground-conflict-decomp, guard restoration) When the guard atom has
+        // no SAT variable, the historical behavior emitted the 2-literal
+        // branch clause WITHOUT its equality guard — sound only in the
+        // requesting context and NOT standalone-valid, so no theory authority
+        // could ever be recorded and the proof surfaced it as an
+        // uncertifiable Generic clause. Encode the guard's equality atom
+        // (delta-Tseitin: stable vars, only new definitional clauses) so the
+        // emitted clause is the guarded 3-literal integer-split TAUTOLOGY
+        // (`x<=c-1 ∨ x>=c+1 ∨ x=c`). Strictly weaker than the historical
+        // clause, so it can never manufacture a wrong verdict; the theory
+        // refutes a `guard=true` assignment through its ordinary conflict
+        // path. `distinct` guards keep the historical behavior.
+        if guard_lit_mapped.is_none()
+            && !is_distinct
+            && crate::quant_unit_authority::ground_conflict_decomp_enabled()
         {
+            let inner = match terms.get(diseq_term) {
+                TermData::Not(inner) => Some(*inner),
+                TermData::App(sym, args) if sym.name() == "not" && args.len() == 1 => Some(args[0]),
+                _ => None,
+            };
+            if let Some(inner) = inner {
+                if matches!(
+                    terms.get(inner),
+                    TermData::App(sym, args) if sym.name() == "=" && args.len() == 2
+                ) {
+                    let _ = encode_atom_delta(
+                        terms,
+                        solver,
+                        local_term_to_var,
+                        local_var_to_term,
+                        local_next_var,
+                        negations,
+                        inner,
+                    );
+                    guard_lit_mapped = local_term_to_var.get(&inner).map(|&mapped| {
+                        let var = SatVariable::new(mapped);
+                        freeze_var_if_needed(solver, var);
+                        SatLiteral::positive(var)
+                    });
+                }
+            }
+        }
+        if let Some(guard_lit) = guard_lit_mapped {
             clause.push(guard_lit);
             let guard_term = if guard_lit.is_positive() {
                 local_var_to_term

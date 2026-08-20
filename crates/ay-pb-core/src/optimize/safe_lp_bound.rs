@@ -3709,6 +3709,7 @@ mod tests {
     }
 
     mod convergence_contracts;
+    mod replay_crossover;
     #[test]
     fn devex_pivot_row_is_the_ratio_the_update_needs() {
         // The subtle step in `devex_update` is WHICH basis its `rho` belongs to.

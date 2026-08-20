@@ -1077,3 +1077,85 @@ fn selfcheck_accepts_correct_result() {
         "self-check must accept the correct O=(2|y) for ∃x. 2x=y"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Period / instance ceiling (#cooper-period-blowup)
+// ---------------------------------------------------------------------------
+
+/// A large COEFFICIENT — not a written `mod` atom — drives Cooper's period.
+/// `∃v. (1048576·v = x ∧ y ≤ v)` sets m = δ = 2^20, and the two instance
+/// sweeps used to materialise ~2^20 interned terms with no ceiling: 3.07 GB
+/// peak and 8.5 s at the CLI for 142 bytes of SMT, after which the bounded
+/// differential self-check discards the result anyway.
+///
+/// The ceiling must refuse BEFORE allocating. Note which assertion does the
+/// work: `NotSupported` alone does NOT discriminate — with the cap disabled
+/// the self-check refuses this elimination too, so that assertion passes
+/// either way. The INTERNED-TERM assertion is the mutation-discriminating
+/// one, and unlike a wall-clock bound it measures the mechanism the cap
+/// exists to bound and does not depend on host speed.
+#[test]
+fn large_coefficient_period_refuses_without_allocating() {
+    let mut terms = TermStore::new();
+    let x = int_var(&mut terms, "x");
+    let y = int_var(&mut terms, "y");
+    let v = int_var(&mut terms, "v");
+    let big = ci(&mut terms, 1_048_576);
+    let bigv = terms.mk_mul(vec![big, v]);
+    let l1 = terms.mk_eq(bigv, x);
+    let l2 = terms.mk_le(y, v);
+    let body = terms.mk_and(vec![l1, l2]);
+
+    let before = terms.len();
+    let t0 = std::time::Instant::now();
+    let result = eliminate_exists(&mut terms, body, v);
+    let elapsed = t0.elapsed();
+    let interned = terms.len() - before;
+
+    assert!(
+        matches!(result, QeResult::NotSupported),
+        "an over-ceiling period must fail closed, not ship an elimination"
+    );
+
+    // MUTATION GUARD, measured — not assumed. `COOPER_INSTANCE_CAP` bounds
+    // `(1 + |B|) * δ`; δ = 2^20 and |B| = 1 here, so an uncapped run interns
+    // the instance terms plus all their subterms. Measured on this host:
+    //   cap = 16_384 (shipped)    →          0 new terms (refused first)
+    //   cap = i64::MAX (disabled) → 13_631_491 new terms
+    // The 4096 threshold is 3329x under the uncapped count, and the capped
+    // run interns nothing at all, so it is a near-miss in neither direction
+    // and does not depend on how fast the host is. Verified by mutation: with
+    // the cap at `i64::MAX` this is the assertion that fires.
+    assert!(
+        interned < 4096,
+        "refusal must happen before the instance sweeps allocate; \
+         interned {interned} new terms"
+    );
+
+    // Wall-clock backstop, secondary to the count above. Measured uncapped:
+    // 9.1 s in this test and 8.5 s at the CLI — 4.5x and 4.3x over this
+    // bound. NOT "an order of magnitude", which an earlier revision of this
+    // comment claimed off a 23.8 s figure this host does not reproduce.
+    // Kept because it is what a reader reaches for, but the interned-term
+    // assertion above is the one to trust.
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "refusal must happen before the instance sweeps allocate; took {elapsed:?}"
+    );
+}
+
+/// The ceiling must not narrow the ordinary small-period fragment: a genuine
+/// scaled elimination still succeeds and still agrees with brute force.
+#[test]
+fn small_period_still_eliminates_under_ceiling() {
+    let mut terms = TermStore::new();
+    let x = int_var(&mut terms, "x");
+    let y = int_var(&mut terms, "y");
+    let six = ci(&mut terms, 6);
+    let six_x = terms.mk_mul(vec![six, x]);
+    let body = terms.mk_eq(six_x, y);
+    match eliminate_exists(&mut terms, body, x) {
+        QeResult::Eliminated(o) => compare_grid(&terms, &[body], x, o, &[y], 8, 40),
+        QeResult::NotSupported => panic!("δ = 6 is far under the ceiling and must eliminate"),
+    }
+}

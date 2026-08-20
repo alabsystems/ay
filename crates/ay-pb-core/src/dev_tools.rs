@@ -311,6 +311,10 @@ pub enum ProbeEngine {
     SafeLp,
     Milp,
     Floor,
+    /// Paired A/B of the Lagrangian subgradient floor with and without the
+    /// single-row-closure separator, over the SAME preprocessed constraints
+    /// the production consumer (`native_oll::lp_relaxation_floor`) hands it.
+    SubgradientFloor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -348,6 +352,15 @@ pub enum ProbeOutcome {
     Lp {
         base: Option<i128>,
         with_cuts: Option<i128>,
+        /// Ablation twin of `with_cuts` with the single-row-closure separator
+        /// disabled, computed back-to-back in the same process so the pair is
+        /// load-immune. `with_cuts - with_cuts_no_src` is SRC's contribution
+        /// to the simplex cut loop on this instance.
+        with_cuts_no_src: Option<i128>,
+        /// Structured-family / SRC cuts separated during the `with_cuts` run
+        /// (pre-dedup totals over rounds).
+        family_cuts: u32,
+        src_cuts: u32,
     },
     SafeLp {
         bound: Option<i128>,
@@ -358,6 +371,19 @@ pub enum ProbeOutcome {
     },
     Floor {
         certified: Option<i128>,
+    },
+    SubgradientFloor {
+        /// Whether preprocessing simplified the instance (mirroring the
+        /// production consumer) or the original constraints were used.
+        preprocessed: bool,
+        with_src: Option<i128>,
+        without_src: Option<i128>,
+        /// Cuts separated during the `with_src` arm (pre-dedup totals).
+        family_cuts: u32,
+        src_cuts: u32,
+        /// Family cuts separated during the `without_src` arm — the paired
+        /// control for how much of the loop SRC displaces.
+        family_cuts_without_src: u32,
     },
 }
 
@@ -461,20 +487,35 @@ fn run_probe_impl(
             );
             ProbeOutcome::CardDescent { best }
         }
-        ProbeEngine::Lp => ProbeOutcome::Lp {
-            base: crate::optimize::lp_bound::lp_lower_bound_no_cuts(
+        ProbeEngine::Lp => {
+            let base = crate::optimize::lp_bound::lp_lower_bound_no_cuts(
                 objective,
                 &instance.constraints,
                 instance.num_vars,
                 should_stop,
-            ),
-            with_cuts: crate::optimize::lp_bound::lp_lower_bound(
+            );
+            crate::optimize::lp_bound::reset_cut_loop_observation();
+            let with_cuts = crate::optimize::lp_bound::lp_lower_bound(
                 objective,
                 &instance.constraints,
                 instance.num_vars,
                 should_stop,
-            ),
-        },
+            );
+            let observation = crate::optimize::lp_bound::cut_loop_observation();
+            let with_cuts_no_src = crate::optimize::lp_bound::lp_lower_bound_without_src(
+                objective,
+                &instance.constraints,
+                instance.num_vars,
+                should_stop,
+            );
+            ProbeOutcome::Lp {
+                base,
+                with_cuts,
+                with_cuts_no_src,
+                family_cuts: observation.simplex_family_cuts,
+                src_cuts: observation.simplex_src_cuts,
+            }
+        }
         ProbeEngine::SafeLp => {
             let (bound, point) = crate::optimize::safe_lp_bound::safe_lp_bound_and_point(
                 objective,
@@ -511,6 +552,48 @@ fn run_probe_impl(
                 should_stop,
             ),
         },
+        ProbeEngine::SubgradientFloor => {
+            // Mirror the production consumer (`native_oll::lp_relaxation_floor`):
+            // the subgradient tier runs over the PREPROCESSED (strengthened)
+            // constraints. On UNSAT/Interrupted fall back to the originals so
+            // the probe still reports something comparable.
+            let strengthened = match crate::preprocess::preprocess_interruptible(instance, || {
+                should_stop()
+            }) {
+                crate::preprocess::PreprocessResult::Simplified { instance, .. } => Some(instance),
+                _ => None,
+            };
+            let preprocessed = strengthened.is_some();
+            let (constraints, num_vars) = strengthened
+                .as_ref()
+                .map_or((&instance.constraints, instance.num_vars), |simplified| {
+                    (&simplified.constraints, simplified.num_vars)
+                });
+            crate::optimize::lp_bound::reset_cut_loop_observation();
+            let with_src = crate::optimize::lp_bound::lagrangian_dual_floor(
+                objective,
+                constraints,
+                num_vars,
+                should_stop,
+            );
+            let with_observation = crate::optimize::lp_bound::cut_loop_observation();
+            crate::optimize::lp_bound::reset_cut_loop_observation();
+            let without_src = crate::optimize::lp_bound::lagrangian_dual_floor_without_src(
+                objective,
+                constraints,
+                num_vars,
+                should_stop,
+            );
+            let without_observation = crate::optimize::lp_bound::cut_loop_observation();
+            ProbeOutcome::SubgradientFloor {
+                preprocessed,
+                with_src,
+                without_src,
+                family_cuts: with_observation.subgradient_family_cuts,
+                src_cuts: with_observation.subgradient_src_cuts,
+                family_cuts_without_src: without_observation.subgradient_family_cuts,
+            }
+        }
     })
 }
 

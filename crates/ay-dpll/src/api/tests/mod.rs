@@ -43,6 +43,7 @@ mod test_solving_controls;
 mod test_string_bv_bridge;
 mod test_strings;
 mod test_term_inspection;
+mod test_trust_bool_iff_refutation;
 mod test_trust_consumer;
 mod test_trust_wrapping_refutation;
 mod test_try_check_sat;

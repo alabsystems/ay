@@ -1480,7 +1480,12 @@ fn test_executor_qf_abv_indirect_equality_many_constants_unsat_8510() {
 }
 
 #[test]
-#[ntest::timeout(10_000)]
+// HANG GUARD, not a performance assertion. This solve is sub-second in
+// isolation; a 10s bound measured scheduler contention instead, so the test
+// failed only under the full `--test-threads=8` run. The regression it guards
+// is the pre-dispatch finite-extensionality EXPLOSION, which does not finish in
+// any budget, so a generous bound catches it just as well.
+#[ntest::timeout(120_000)]
 fn test_executor_qf_abv_fixpoint_gate_skipped_fc_violation_unsat_8510() {
     // Regression for the old pre-dispatch finite-extensionality explosion.
     //

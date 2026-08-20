@@ -1142,11 +1142,39 @@ fn rational_clearing_lia_conjunction_is_strict_verified() {
 }
 
 /// Comparison normalization must not become proof authority. The solver may
-/// internally rewrite `>=`/`>` into swapped `<=`/`<` terms, but a rebuilt
-/// complementary-literal refutation must still assume the exact authored
-/// conjunction and remain offline-checkable against that obligation.
+/// internally rewrite `>=`/`>` into swapped `<=`/`<` terms, but the exported
+/// refutation must still assume the exact authored conjunction and remain
+/// offline-checkable against that obligation.
+///
+/// PIN CORRECTED (measured 2026-08-17). This used to assert the identity
+///
+/// ```text
+/// proof assumes == solver.executor.proof_original_problem_assertions()
+/// ```
+///
+/// which is neither the contract above nor satisfiable here. Preprocessing
+/// folds this contradictory conjunction to the constant `false` **in place**
+/// in `ctx.assertions`, and no `proof_problem_assertion_provenance` is
+/// recorded on this route, so that accessor returns `[false]` (rendered, not
+/// inferred). The old assertion therefore demanded that the refutation assume
+/// `false` — exactly the misused-`false` premise shape that
+/// `try_rebuild_false_collapse` exists to repair.
+///
+/// The identity was also WEAKER than the prose it accompanied: when that
+/// accessor does return a live root, the root is the ELABORATED
+/// (comparison-normalized) conjunction, so `assume == original` was satisfied
+/// by the very normalized derivative this test names as the defect.
+///
+/// The contract is pinned directly instead: the single premise must PRINT as
+/// the authored source text (`>=`/`>` in the authored orientation), must carry
+/// a complete strict certificate, and must be the term the OFFLINE bundle
+/// re-check authenticates. That rejects the normalized derivative the old
+/// identity accepted.
 #[test]
 fn normalized_complementary_conjunction_uses_authored_bundle_premise() {
+    /// The assertion exactly as the problem file spells it.
+    const AUTHORED: &str = "(and (>= x 0) (not (> x 10)) (> x 10))";
+
     #[allow(deprecated)]
     let mut solver = Solver::new(Logic::QfLia);
     solver.set_produce_proofs(true);
@@ -1160,8 +1188,6 @@ fn normalized_complementary_conjunction_uses_authored_bundle_premise() {
         .expect("comparison-normalization fixture must parse");
 
     assert!(solver.check_sat().is_unsat());
-    let authored = solver.executor.proof_original_problem_assertions();
-    assert_eq!(authored.len(), 1, "fixture has one authored assertion");
 
     let proof = solver
         .last_proof()
@@ -1175,8 +1201,15 @@ fn normalized_complementary_conjunction_uses_authored_bundle_premise() {
         })
         .collect();
     assert_eq!(
-        assumed, authored,
-        "the refutation must assume the authored conjunction, not its normalized derivative"
+        assumed.len(),
+        1,
+        "the fixture's one authored assertion is the refutation's one premise: {assumed:?}"
+    );
+    assert_eq!(
+        render_term_canonical(&solver.executor.ctx.terms, assumed[0]),
+        AUTHORED,
+        "the refutation must assume the authored conjunction, not its \
+         comparison-normalized derivative"
     );
 
     let artifact = solver
@@ -1190,13 +1223,21 @@ fn normalized_complementary_conjunction_uses_authored_bundle_premise() {
         "authored-root refutation must pass strict checking: {:?}",
         artifact.strict_verdict
     );
+    assert!(
+        artifact.alethe.contains(&format!("(assume t0 {AUTHORED})")),
+        "the printed certificate must open on the authored assertion:\n{}",
+        artifact.alethe
+    );
 
     let bundle = solver
         .export_last_unsat_bundle()
         .expect("bundle must be present after UNSAT");
     let recheck = re_check_bundle_strict(&bundle)
         .expect("offline checking must authenticate the authored conjunction");
-    assert_eq!(recheck.assume_terms, authored);
+    assert_eq!(
+        recheck.assume_terms, assumed,
+        "offline re-check must authenticate the same premise the proof assumes"
+    );
 }
 
 /// Regression (#trust slice-bounds gap, second export hole): preprocessing
@@ -2279,11 +2320,20 @@ fn assert_congruence_value_refutation_is_plainly_checked(solver: &Solver) {
     // ...and the steps it accepted are the two primitive rules the `Generic`
     // label was standing in for, not something else. Read the proof IR rather
     // than the printed text.
+    // Either representation is the same checker-validated primitive: the
+    // strict checker routes a `TheoryLemma{EufCongruent}` and a
+    // `Step{rule: EqCongruent}` through the SAME `validate_euf_congruent`
+    // re-derivation. (#ground-conflict-decomp's EUF-leaf const-clash arm
+    // legitimately claims this fused lemma before the authored cascade and
+    // emits the rule-step spelling.)
     assert!(
         proof.steps.iter().any(|step| matches!(
             step,
             ProofStep::TheoryLemma {
                 kind: TheoryLemmaKind::EufCongruent,
+                ..
+            } | ProofStep::Step {
+                rule: ay_core::AletheRule::EqCongruent,
                 ..
             }
         )),
@@ -3180,11 +3230,18 @@ fn datatype_constructor_congruence_closure_is_strict_verified() {
             )
         });
 
+    // Both spellings print `:rule eq_congruent` on the wire; the typed
+    // `TheoryLemmaKind::EufCongruent` form is the STRONGER one — the strict
+    // checker re-derives it with `validate_euf_congruent` rather than trusting
+    // the rule name — and the substitution bridge now prefers it.
     assert!(
         proof.steps.iter().any(|step| matches!(
             step,
             ProofStep::Step {
                 rule: AletheRule::EqCongruent,
+                ..
+            } | ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::EufCongruent,
                 ..
             }
         )),

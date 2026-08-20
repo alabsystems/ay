@@ -59,8 +59,10 @@
 //!
 //! A bad `alpha` therefore yields a weak cut or no cut, never an invalid one —
 //! which is what licenses using floating point to *choose* the cut at all. The
-//! downstream exact-rational Lagrangian ([`crate::optimize::lp_bound`]) then
-//! certifies the bound over originals-plus-cuts with no changes.
+//! downstream exact-rational consumers in [`crate::optimize::lp_bound`] — the
+//! Lagrangian subgradient cut loop, the simplex cut loop behind
+//! `lp_lower_bound`, and the reduced-cost-fixing loop — then certify the bound
+//! over originals-plus-cuts with no changes.
 //!
 //! # Cost control
 //!

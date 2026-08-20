@@ -83,6 +83,19 @@ enum EufConcl {
         pos_lit: TermId,
         prems: Vec<EufJust>,
     },
+    /// (#ground-conflict-decomp) Two DISTINCT integer numerals merged by the
+    /// hypothesis closure — an all-negated-equality conflict with no positive
+    /// conclusion literal. `derivs[top]` derives the raw `(= c1 c2)`; the
+    /// solver-certified Farkas unit `(cl ¬(= c1 c2))` refutes it and the
+    /// resolution leaves exactly the used hypothesis literals. Contributes NO
+    /// conclusion literal to the final clause.
+    ConstClash {
+        top: usize,
+        /// `¬(= c1 c2)` — the certified unit's single literal.
+        unit_lit: TermId,
+        farkas: ay_core::FarkasAnnotation,
+        kind: ay_core::TheoryLemmaKind,
+    },
 }
 
 /// Replacement target.
@@ -556,6 +569,33 @@ impl Executor {
                     &[*neg_lit, *pos_lit],
                 )
             }
+            EufConcl::ConstClash {
+                top,
+                unit_lit,
+                farkas,
+                kind,
+            } => {
+                // (#ground-conflict-decomp) Resolve the derived numeral
+                // equality against its certified Farkas refutation unit.
+                let (chain_id, chain_clause) = emitted[*top].clone();
+                let eq_term = match &plan.derivs[*top] {
+                    EufDeriv::Cong { eq_term, .. } | EufDeriv::Chain { eq_term, .. } => *eq_term,
+                };
+                let unit_id = new_proof.add_step(ay_core::ProofStep::TheoryLemma {
+                    theory: "LIA".to_string(),
+                    clause: vec![*unit_lit],
+                    farkas: Some(farkas.clone()),
+                    kind: *kind,
+                    lia: None,
+                });
+                let clause: Vec<TermId> = chain_clause
+                    .iter()
+                    .copied()
+                    .filter(|&literal| literal != eq_term)
+                    .collect();
+                let id = new_proof.add_resolution(clause.clone(), eq_term, unit_id, chain_id);
+                (id, clause)
+            }
         };
         match &plan.target {
             EufTarget::Bare { extras } => {
@@ -674,13 +714,43 @@ impl Executor {
             }
             plans[idx] = self.plan_euf_lemma_with_budget(clause, &mut planning);
         }
+        if ay_core::misc_cli_flags().trace_cegqi_attr {
+            for (idx, step) in proof.steps.iter().enumerate() {
+                let generic = matches!(
+                    step,
+                    ay_core::ProofStep::TheoryLemma {
+                        kind: ay_core::TheoryLemmaKind::Generic,
+                        ..
+                    } | ay_core::ProofStep::Step {
+                        rule: AletheRule::Trust,
+                        ..
+                    }
+                );
+                if generic {
+                    eprintln!(
+                        "[euf-leaf] step {idx}: reachable={} planned={}",
+                        preflight.reachable[idx],
+                        plans[idx].is_some()
+                    );
+                    if plans[idx].is_none() {
+                        eprintln!("[euf-leaf]   unplanned step = {step:?}");
+                    }
+                }
+            }
+        }
         if plans.iter().all(Option::is_none) {
             return;
         }
         if !self.generic_euf_promotion_surface_is_safe(proof, &plans) {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
+                eprintln!("[euf-leaf] surface audit refused");
+            }
             return;
         }
         if !volume::promotion_output_within(&preflight, &plans, output_limit) {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
+                eprintln!("[euf-leaf] volume bound refused");
+            }
             return;
         }
 
@@ -743,11 +813,15 @@ impl Executor {
         // pass installs the same provenance-checked promotion for real.
         let mut validation = rebuilt.clone();
         self.promote_array_extensionality_axioms(&mut validation);
-        if self
-            .check_proof_strict_derivation_with_datatypes(&validation)
-            .is_ok()
-        {
-            *proof = rebuilt;
+        match self.check_proof_strict_derivation_with_datatypes(&validation) {
+            Ok(_) => {
+                *proof = rebuilt;
+            }
+            Err(error) => {
+                if ay_core::misc_cli_flags().trace_cegqi_attr {
+                    eprintln!("[euf-leaf] atomic strict gate refused: {error}");
+                }
+            }
         }
     }
 }

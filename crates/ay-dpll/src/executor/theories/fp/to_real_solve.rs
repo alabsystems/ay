@@ -501,15 +501,28 @@ impl Executor {
         // Save state
         let saved_assertions =
             std::mem::replace(&mut self.ctx.assertions, rewritten_assertions.to_vec());
-        let saved_logic = self.ctx.logic().map(String::from);
         let saved_model = self.last_model.take();
         let saved_result = self.last_result.take();
         let saved_unknown = self.last_unknown_reason.take();
 
-        // Infer logic for the rewritten (FP-free) assertions
+        // Infer logic for the rewritten (FP-free) assertions.
+        //
+        // BORROWED, not re-set. A plain `set_logic` out and back advances the
+        // context's `source_revision` TWICE, and that counter is half of the
+        // `SourceContextStamp` the mandatory UNSAT gate compares against the
+        // stamp captured when the public query was bound. This lane restores
+        // the logic exactly, so nothing observable changes — but the stamp
+        // never came back, and `authenticate_unsat_query_scope` discarded a
+        // correct refutation with "the public UNSAT source context is no longer
+        // current". Measured on
+        // `group_fp::fp_congruence::uf_over_float32_is_congruent_under_fp_to_real`,
+        // where these two writes were the ONLY revision movement in the whole
+        // solve. The borrow rolls the revision back only when nothing else
+        // moved it, so a genuine source change inside the sub-solve still reads
+        // as stale.
         let features = StaticFeatures::collect(&self.ctx.terms, &self.ctx.assertions);
         let inferred_logic = features.infer_logic().to_string();
-        self.ctx.set_logic(inferred_logic);
+        let logic_borrow = self.ctx.begin_internal_logic_borrow(inferred_logic);
 
         // Solve the rewritten subproblem without registering its temporary
         // roots in the outer session's persistent incremental state.
@@ -528,9 +541,7 @@ impl Executor {
 
         // Restore state
         self.ctx.assertions = saved_assertions;
-        if let Some(logic) = saved_logic {
-            self.ctx.set_logic(logic);
-        }
+        self.ctx.end_internal_logic_borrow(logic_borrow);
         self.last_model = saved_model;
         self.last_result = saved_result;
         self.last_unknown_reason = saved_unknown;

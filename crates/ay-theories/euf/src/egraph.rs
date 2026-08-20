@@ -27,7 +27,7 @@ impl EufSolver<'_> {
     /// 2. Registers function applications with their arguments' parent lists
     /// 3. Populates the congruence table with initial signatures
     pub(crate) fn init_enodes(&mut self) {
-        if std::env::var_os("AY_DEBUG_EUF_INIT").is_some() {
+        if ay_core::misc_cli_flags().debug_euf_init {
             use std::sync::atomic::{AtomicU64, Ordering};
             static INIT_COUNT: AtomicU64 = AtomicU64::new(0);
             let n = INIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -101,7 +101,7 @@ impl EufSolver<'_> {
         self.enodes_init = true;
 
         // #euf-inc-cong-undo threshold diagnostic (measurement-only).
-        if std::env::var_os("AY_EUF_CONG_UNDO_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().euf_cong_undo_debug {
             safe_eprintln!(
                 "[cong-undo] func_apps={} threshold={} active={}",
                 self.func_apps.len(),
@@ -110,7 +110,7 @@ impl EufSolver<'_> {
             );
         }
         // #euf-inc-diseq-undo threshold diagnostic (measurement-only).
-        if std::env::var_os("AY_EUF_DISEQ_UNDO_DEBUG").is_some() {
+        if ay_core::misc_cli_flags().euf_diseq_undo_debug {
             safe_eprintln!(
                 "[diseq-undo] func_apps={} threshold={} active={}",
                 self.func_apps.len(),

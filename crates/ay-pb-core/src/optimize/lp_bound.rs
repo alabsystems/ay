@@ -251,30 +251,58 @@ impl SubgradientSchedule {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Default)]
-struct CutLoopObservation {
-    rounds_with_cuts: u32,
-    target_reached_after_cut: u32,
+/// Test / dev-tools observability of the two cut loops in this module. Every
+/// field is a running per-thread total since the last
+/// [`reset_cut_loop_observation`]; production builds compile none of this.
+#[cfg(any(test, feature = "dev-tools"))]
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct CutLoopObservation {
+    pub(crate) rounds_with_cuts: u32,
+    pub(crate) target_reached_after_cut: u32,
+    /// Cuts separated by the SIMPLEX cut loop's structured families
+    /// (`cutting_planes::separate_cuts`), summed over rounds, pre-dedup.
+    pub(crate) simplex_family_cuts: u32,
+    /// Cuts appended by the SIMPLEX cut loop's single-row-closure separator
+    /// (the separator carries its own cross-round dedup).
+    pub(crate) simplex_src_cuts: u32,
+    /// As the two fields above, for the SUBGRADIENT cut loop in
+    /// [`lagrangian_dual_floor`].
+    pub(crate) subgradient_family_cuts: u32,
+    pub(crate) subgradient_src_cuts: u32,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "dev-tools"))]
 thread_local! {
     static CUT_LOOP_OBSERVATION: std::cell::Cell<CutLoopObservation> =
         const { std::cell::Cell::new(CutLoopObservation {
             rounds_with_cuts: 0,
             target_reached_after_cut: 0,
+            simplex_family_cuts: 0,
+            simplex_src_cuts: 0,
+            subgradient_family_cuts: 0,
+            subgradient_src_cuts: 0,
         }) };
 }
 
-#[cfg(test)]
-fn reset_cut_loop_observation() {
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn reset_cut_loop_observation() {
     CUT_LOOP_OBSERVATION.with(|slot| slot.set(CutLoopObservation::default()));
 }
 
-#[cfg(test)]
-fn cut_loop_observation() -> CutLoopObservation {
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn cut_loop_observation() -> CutLoopObservation {
     CUT_LOOP_OBSERVATION.with(std::cell::Cell::get)
+}
+
+/// Applies one update to the thread's [`CutLoopObservation`]. Call sites carry
+/// their own `#[cfg]` so production builds compile none of this machinery.
+#[cfg(any(test, feature = "dev-tools"))]
+fn observe_cut_loop(update: impl FnOnce(&mut CutLoopObservation)) {
+    CUT_LOOP_OBSERVATION.with(|slot| {
+        let mut observation = slot.get();
+        update(&mut observation);
+        slot.set(observation);
+    });
 }
 
 /// Computes a sound LP-relaxation lower bound for `min objective` subject to
@@ -289,7 +317,21 @@ pub(crate) fn lp_lower_bound(
     num_vars: u32,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<i128> {
-    lp_lower_bound_with_cuts(objective, constraints, num_vars, None, should_stop)
+    lp_lower_bound_with_cuts(objective, constraints, num_vars, None, should_stop, true)
+}
+
+/// Ablation twin of [`lp_lower_bound`] with the single-row-closure separator
+/// compiled out of the cut loop — the paired arm for measuring what SRC
+/// contributes to the simplex floor (`ay-pb-dev probe lp`). Never a
+/// production path.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn lp_lower_bound_without_src(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<i128> {
+    lp_lower_bound_with_cuts(objective, constraints, num_vars, None, should_stop, false)
 }
 
 /// LAGRANGIAN SUBGRADIENT floor — a simplex-free route to the LP bound.
@@ -343,6 +385,32 @@ pub(crate) fn lagrangian_dual_floor(
     num_vars: u32,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<i128> {
+    lagrangian_dual_floor_impl(objective, constraints, num_vars, should_stop, true)
+}
+
+/// Ablation twin of [`lagrangian_dual_floor`] with the single-row-closure
+/// separator disabled — the paired arm for measuring what SRC contributes to
+/// the subgradient floor (`ay-pb-dev probe subfloor`). Never a production path.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn lagrangian_dual_floor_without_src(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<i128> {
+    lagrangian_dual_floor_impl(objective, constraints, num_vars, should_stop, false)
+}
+
+/// Body of [`lagrangian_dual_floor`]. `use_src` exists solely so the dev/test
+/// ablation twin can run the IDENTICAL loop minus the SRC separator; every
+/// production caller passes `true`.
+fn lagrangian_dual_floor_impl(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    should_stop: &dyn Fn() -> bool,
+    use_src: bool,
+) -> Option<i128> {
     let model = LpModel::build(objective, constraints, num_vars)?;
     let solution = model.solve_dual_subgradient(None, SubgradientSchedule::base(), should_stop)?;
     let mut best_bound = solution.solution.bound;
@@ -367,11 +435,15 @@ pub(crate) fn lagrangian_dual_floor(
     // Single-row-closure separator: indexed ONCE (minimal-point enumeration is the
     // expensive part) and reused every round. `None` when no row qualifies, in
     // which case the loop behaves exactly as before.
-    let mut src = crate::optimize::single_row_closure::SingleRowClosure::build(
-        constraints,
-        num_vars,
-        should_stop,
-    );
+    let mut src = if use_src {
+        crate::optimize::single_row_closure::SingleRowClosure::build(
+            constraints,
+            num_vars,
+            should_stop,
+        )
+    } else {
+        None
+    };
     // Cuts already in `working`. Separation runs against the ORIGINAL constraints
     // every round, so a slow-moving fractional point re-derives the same rows over
     // and over; measured on `liu/domset _mw19_19` the loop accumulated 6812 rows of
@@ -389,12 +461,22 @@ pub(crate) fn lagrangian_dual_floor(
         };
         let mut cuts =
             crate::optimize::cutting_planes::separate_cuts(constraints, num_vars, x, should_stop);
+        #[cfg(any(test, feature = "dev-tools"))]
+        observe_cut_loop(|observation| {
+            observation.subgradient_family_cuts += cuts.len() as u32;
+        });
         // SRC cuts separate over the EXACT integer hull of a single row, so they
         // dominate anything the structured families can derive from that row.
         // Every one of them is re-proved valid in exact integer arithmetic inside
         // the separator before it is handed back.
         if let Some(src) = src.as_mut() {
+            #[cfg(any(test, feature = "dev-tools"))]
+            let family_only = cuts.len();
             src.separate(x, should_stop, &mut cuts);
+            #[cfg(any(test, feature = "dev-tools"))]
+            observe_cut_loop(|observation| {
+                observation.subgradient_src_cuts += (cuts.len() - family_only) as u32;
+            });
         }
         cuts.retain(|cut| emitted.insert(cut_key(cut)));
         if cuts.is_empty() {
@@ -489,6 +571,7 @@ pub(crate) fn lp_lower_bound_with_target(
         num_vars,
         early_exit_target,
         should_stop,
+        true,
     )
 }
 
@@ -600,6 +683,7 @@ fn lp_lower_bound_with_cuts(
     num_vars: u32,
     early_exit_target: Option<i128>,
     should_stop: &dyn Fn() -> bool,
+    use_src: bool,
 ) -> Option<i128> {
     // Round 0: the base LP (identical to the pre-cuts behaviour).
     let model = LpModel::build(objective, original_constraints, num_vars)?;
@@ -634,6 +718,17 @@ fn lp_lower_bound_with_cuts(
     let stop_or_deadline = || should_stop() || started.elapsed() >= CUT_LOOP_TIME_BUDGET;
 
     let mut current_primal = primal;
+    // Single-row-closure separator, shared across rounds. Built LAZILY on the
+    // first round that has a fractional point to separate — the minimal-point
+    // enumeration is the (bounded) expensive part, and the loop often exits
+    // before separating at all (stop, no primal, target reached). The inner
+    // `None` means no row qualified, in which case the loop behaves exactly as
+    // it did before this wiring. Soundness is inherited unchanged: every SRC
+    // cut is re-proved in exact integer arithmetic against every minimal point
+    // of its parent row before the separator hands it back, so the augmented
+    // LP stays a relaxation of the same integer program (the doc argument on
+    // this function applies verbatim).
+    let mut src: Option<Option<crate::optimize::single_row_closure::SingleRowClosure>> = None;
     for _ in 0..MAX_CUT_ROUNDS {
         if stop_or_deadline() || added_cuts >= MAX_TOTAL_CUTS {
             break;
@@ -645,20 +740,44 @@ fn lp_lower_bound_with_cuts(
         // feasible region the cuts must be valid for; added cuts are themselves
         // already-valid consequences, so re-separating against them is harmless
         // but unnecessary). We separate over the original set for clarity.
-        let cuts = crate::optimize::cutting_planes::separate_cuts(
+        let mut cuts = crate::optimize::cutting_planes::separate_cuts(
             original_constraints,
             num_vars,
             x,
             &stop_or_deadline,
         );
+        #[cfg(any(test, feature = "dev-tools"))]
+        observe_cut_loop(|observation| {
+            observation.simplex_family_cuts += cuts.len() as u32;
+        });
+        // SRC cuts dominate the structured families row-by-row (exact integer
+        // hull of each parent row). Appended AFTER the families, mirroring the
+        // subgradient loop, so a `take` under MAX_TOTAL_CUTS truncates SRC
+        // last-in rather than starving the families.
+        if use_src {
+            let separator = src.get_or_insert_with(|| {
+                crate::optimize::single_row_closure::SingleRowClosure::build(
+                    original_constraints,
+                    num_vars,
+                    &stop_or_deadline,
+                )
+            });
+            if let Some(separator) = separator.as_mut() {
+                #[cfg(any(test, feature = "dev-tools"))]
+                let family_only = cuts.len();
+                separator.separate(x, &stop_or_deadline, &mut cuts);
+                #[cfg(any(test, feature = "dev-tools"))]
+                observe_cut_loop(|observation| {
+                    observation.simplex_src_cuts += (cuts.len() - family_only) as u32;
+                });
+            }
+        }
         if cuts.is_empty() {
             break; // nothing violated -> LP point is cut-free for these families.
         }
-        #[cfg(test)]
-        CUT_LOOP_OBSERVATION.with(|slot| {
-            let mut observation = slot.get();
+        #[cfg(any(test, feature = "dev-tools"))]
+        observe_cut_loop(|observation| {
             observation.rounds_with_cuts += 1;
-            slot.set(observation);
         });
         let take = cuts.len().min(MAX_TOTAL_CUTS - added_cuts);
         working.extend(cuts.into_iter().take(take));
@@ -682,11 +801,9 @@ fn lp_lower_bound_with_cuts(
         // Same early exit inside the loop: a floor at the target ends the
         // tightening (any further cut round is paid-for but unusable work).
         if early_exit_target.is_some_and(|target| best_bound >= target) {
-            #[cfg(test)]
-            CUT_LOOP_OBSERVATION.with(|slot| {
-                let mut observation = slot.get();
+            #[cfg(any(test, feature = "dev-tools"))]
+            observe_cut_loop(|observation| {
                 observation.target_reached_after_cut += 1;
-                slot.set(observation);
             });
             return Some(best_bound);
         }
@@ -820,6 +937,14 @@ fn solve_with_cuts_for_fixing(
     let started = std::time::Instant::now();
     let stop_or_deadline = || should_stop() || started.elapsed() >= CUT_LOOP_TIME_BUDGET;
 
+    // Single-row-closure separator, exactly as in `lp_lower_bound_with_cuts`
+    // (lazy build, cross-round reuse and dedup). Sound here for the same
+    // reason it is sound there: every SRC cut is exactly re-proved from its
+    // parent row, so the augmented LP is still a relaxation and any
+    // dual-feasible point of it yields valid reduced-cost fixings (the
+    // derivation on `lp_reduced_cost_fixings` already covers "original `>=`
+    // rows plus any added valid cuts").
+    let mut src: Option<Option<crate::optimize::single_row_closure::SingleRowClosure>> = None;
     for _ in 0..MAX_CUT_ROUNDS {
         if stop_or_deadline() || added_cuts >= MAX_TOTAL_CUTS {
             break;
@@ -827,12 +952,24 @@ fn solve_with_cuts_for_fixing(
         let Some(x) = best.1.primal.as_ref() else {
             break;
         };
-        let cuts = crate::optimize::cutting_planes::separate_cuts(
+        let mut cuts = crate::optimize::cutting_planes::separate_cuts(
             original_constraints,
             num_vars,
             x,
             &stop_or_deadline,
         );
+        if let Some(separator) = src
+            .get_or_insert_with(|| {
+                crate::optimize::single_row_closure::SingleRowClosure::build(
+                    original_constraints,
+                    num_vars,
+                    &stop_or_deadline,
+                )
+            })
+            .as_mut()
+        {
+            separator.separate(x, &stop_or_deadline, &mut cuts);
+        }
         if cuts.is_empty() {
             break;
         }
@@ -3006,7 +3143,7 @@ mod tests {
     /// loop's re-solve — and its NEGATIVE CONTROL is the same edit that found it:
     /// compiling out `src.separate` drops both floors by one and fails the test.
     #[test]
-    fn single_row_closure_cuts_lift_the_subgradient_floor_to_the_integer_optimum() {
+    fn single_row_closure_cuts_lift_both_cut_loop_floors_to_the_integer_optimum() {
         fn model(rows: &[(&[(u32, i128)], i128)], n: u32) -> (PbObjective, Vec<PbConstraint>) {
             let obj = PbObjective {
                 terms: (1..=n).map(|v| term(1, lit(v))).collect(),
@@ -3066,6 +3203,43 @@ mod tests {
             assert_eq!(
                 floor, opt,
                 "SRC cuts should close the LP gap on {constraints:?} (optimum {opt})"
+            );
+
+            // WIRING GATE for the SIMPLEX cut loop (`lp_lower_bound_with_cuts`),
+            // the second consumer of the SRC separator. Same fixtures, and the
+            // ablation twin is the LIVE negative control: without SRC the
+            // simplex floor stops one unit short of the optimum on both models
+            // (measured pre-wiring: 3 vs optimum 4, and 7 vs optimum 8), so a
+            // wiring regression fails the `without < with` assertion rather
+            // than silently passing.
+            let with_src = lp_lower_bound(&obj, &constraints, n, &never_stop).expect("floor");
+            let without_src =
+                lp_lower_bound_without_src(&obj, &constraints, n, &never_stop).expect("floor");
+            assert!(
+                with_src <= opt && without_src <= opt,
+                "SOUNDNESS VIOLATION: simplex floor above optimum {opt} on {constraints:?}"
+            );
+            assert_eq!(
+                with_src, opt,
+                "SRC cuts should close the simplex cut-loop gap on {constraints:?}"
+            );
+            assert!(
+                without_src < with_src,
+                "ablation twin no longer discriminates on {constraints:?} \
+                 (without {without_src} vs with {with_src}); replace the fixture"
+            );
+
+            // WIRING GATE for the REDUCED-COST-FIXING cut loop
+            // (`solve_with_cuts_for_fixing`), the third consumer. Its bound
+            // must also reach the optimum on these fixtures; the family cuts
+            // alone provably cannot (the `without_src < with_src` assertion
+            // above is the negative control), so this fails if the SRC
+            // separator is unwired from the fixing loop.
+            let fixing = lp_reduced_cost_fixings(&obj, &constraints, n, opt, &never_stop)
+                .expect("fixing LP should solve");
+            assert_eq!(
+                fixing.lower_bound, opt,
+                "SRC cuts should reach the reduced-cost-fixing loop on {constraints:?}"
             );
         }
     }

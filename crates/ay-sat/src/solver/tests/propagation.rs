@@ -39,6 +39,96 @@ fn test_standard_search_route_rejects_active_domain_in_debug() {
     let _ = solver.search_propagate_standard();
 }
 
+#[test]
+fn test_whole_formula_watch_rebuild_is_exactly_sized() {
+    // End-to-end check that `initialize_watches` takes the two-pass exact
+    // build on a whole-formula rebuild: every region ends up sized to its
+    // literal's watch count, the buffer holds exactly two entries per watched
+    // clause, and nothing was abandoned along the way. The incremental builder
+    // instead relocates each region as it fills, leaving both per-region slack
+    // and abandoned copies (`dead_slots`).
+    let num_vars = 24;
+    let mut solver: Solver = Solver::new(num_vars);
+    // A mix of binary and long clauses so the binary-first partition (and its
+    // two different insert paths) is exercised, and so several literals grow
+    // well past the first capacity step.
+    let mut watched_clauses = 0;
+    for i in 0..num_vars {
+        for j in (i + 1)..num_vars {
+            let a = Literal::positive(Variable(i as u32));
+            let b = Literal::negative(Variable(j as u32));
+            if (i + j) % 3 == 0 {
+                solver.add_clause(vec![a, b]);
+            } else {
+                let c = Literal::positive(Variable(((i + j) % num_vars) as u32));
+                if c != a && c != b {
+                    solver.add_clause(vec![a, b, c]);
+                } else {
+                    solver.add_clause(vec![a, b]);
+                }
+            }
+        }
+    }
+
+    solver.watches.clear();
+    solver.initialize_watches();
+
+    // The formula the arena actually kept (add_clause drops tautologies and
+    // normalises duplicates), which is what the builder walks.
+    for off in solver.arena.indices() {
+        if !solver.arena.is_dead(off) && solver.arena.len_of(off) >= 2 {
+            watched_clauses += 1;
+        }
+    }
+
+    let mut live = 0usize;
+    for li in 0..solver.watches.num_lists() {
+        let lit = Literal(li as u32);
+        let len = solver.watches.len_of(lit);
+        // Not `len`: capacity follows the incremental doubling schedule so
+        // that post-build pushes take the same branch (and so preserve watch
+        // ORDER). What the presized build guarantees is no ABANDONED region,
+        // asserted via dead_slots below.
+        let cap = solver.watches.capacity_of(lit);
+        let want = match len {
+            0 => 0,
+            1 | 2 => 2,
+            n => n.next_power_of_two(),
+        };
+        assert_eq!(
+            cap, want,
+            "literal {li} region must carry exactly the schedule capacity"
+        );
+        live += len;
+    }
+    assert_eq!(
+        live,
+        2 * watched_clauses,
+        "every clause of length >= 2 contributes exactly two watches"
+    );
+    // The buffer holds the schedule capacity of each region (never an
+    // abandoned one), so it is the sum of the per-literal round-ups — not the
+    // raw live count. dead_slots == 0 below is the no-abandonment property.
+    let want_slots: usize = (0..solver.watches.num_lists())
+        .map(|li| match solver.watches.len_of(Literal(li as u32)) {
+            0 => 0,
+            1 | 2 => 2,
+            n => n.next_power_of_two(),
+        })
+        .sum();
+    assert_eq!(
+        solver.watches.buffer_slots(),
+        want_slots,
+        "the unified buffer must hold exactly the reserved regions"
+    );
+    assert_eq!(
+        solver.watches.dead_slots(),
+        0,
+        "the exact build must not abandon any region"
+    );
+    assert_watch_invariant_for_all_active_clauses(&solver, "exact whole-formula watch rebuild");
+}
+
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "bucket_queue_active")]

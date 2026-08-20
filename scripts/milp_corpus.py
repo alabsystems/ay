@@ -218,6 +218,21 @@ def scan_mps(path: pathlib.Path) -> dict:
     return {"rows": rows, "cols": cols, "nnz": nnz, "ints": ints, "bins": bins}
 
 
+def tier_of(info: dict) -> str:
+    """Tier from measured shape. THE definition — `rebuild_milp_bench.py` imports it.
+
+    Two producers write this manifest, and a manifest whose `tier` means different
+    things depending on which one built it is worse than one with no tier at all.
+    """
+    if "error" in info:
+        return "large"
+    if info["cols"] <= GUROBI_CAP_COLS and info["rows"] <= GUROBI_CAP_ROWS:
+        return "gurobi"
+    if info["cols"] <= 20000 and info["rows"] <= 20000:
+        return "mid"
+    return "large"
+
+
 def load_solu() -> dict[str, dict]:
     p = META / "miplib2017-v27.solu"
     if not p.exists():
@@ -252,15 +267,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         for i, (name, p, info) in enumerate(ex.map(one, files)):
             ref = solu.get(name, {})
-            tier = "large"
-            if "error" not in info:
-                if info["cols"] <= GUROBI_CAP_COLS and info["rows"] <= GUROBI_CAP_ROWS:
-                    tier = "gurobi"
-                elif info["cols"] <= 20000 and info["rows"] <= 20000:
-                    tier = "mid"
             entries[name] = {
                 "file": str(p),
-                "tier": tier,
+                "tier": tier_of(info),
                 "ref_status": ref.get("status"),
                 "ref_obj": ref.get("obj"),
                 **info,

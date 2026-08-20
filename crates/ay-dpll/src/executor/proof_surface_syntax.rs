@@ -32,6 +32,26 @@ pub(super) fn strip_frontend_annotations(term: &FrontendTerm) -> &FrontendTerm {
 /// Bound canonical DAG work performed while collecting one source's surface
 /// overrides. Quantified roots search the canonical body once per binding,
 /// so that multiplicity is charged before `find_bound_var` runs.
+///
+/// The bound must mirror the collector's actual descent
+/// (`collect_surface_term_overrides_prechecked`): the collector unwraps `not`
+/// shells before it reaches a quantified root, so the bound unwraps a
+/// `(not (forall ...))` shell too. Estimating the raw root instead
+/// misreported every authored negated universal GOAL — the shape of EVERY
+/// skolemized proof obligation — as unboundable work (`canonical_term_work`
+/// fails closed on interior binders), and the surface-override gates then
+/// poisoned an otherwise strict-checkable presentation down to a bare trust
+/// step (#forall-goal-boundary).
+///
+/// DELIBERATELY `forall`-only under the shell: the collector's productive
+/// binder-recovery descent exists only for `Forall` bodies, and a
+/// `(not (exists ...))` root's assertion is rewritten by finite expansion
+/// with no proof-side derivation yet — un-poisoning that shape today merely
+/// converts a dischargeable trust-kind rejection into an undischargeable
+/// assume-scope rejection (measured: `check_sat_after_apply_qe_light_...`
+/// and `qe_selfcheck_window_cap` regressed from `unsat` to `unknown`).
+/// Genuinely nested quantifiers (a binder anywhere below the unwrapped
+/// root's body) still return `None` and keep the fail-closed veto.
 pub(super) fn surface_override_collection_work(
     terms: &ay_core::TermStore,
     canonical: TermId,
@@ -41,6 +61,10 @@ pub(super) fn surface_override_collection_work(
         TermData::Forall(bindings, body, _) | TermData::Exists(bindings, body, _) => {
             (*body, bindings.len().checked_add(2)?)
         }
+        TermData::Not(inner) => match terms.get(*inner) {
+            TermData::Forall(bindings, body, _) => (*body, bindings.len().checked_add(3)?),
+            _ => (canonical, 2),
+        },
         _ => (canonical, 2),
     };
     super::proof_trust_surgery_provenance::canonical_term_work(terms, root)?

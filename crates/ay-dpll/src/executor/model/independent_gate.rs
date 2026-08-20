@@ -4283,6 +4283,23 @@ impl Executor {
             );
             return result;
         }
+        // FINITE-SORT (FP) CERTIFICATE PRODUCER (#inc-fp-no-complete-lane).
+        //
+        // A conjunctive-position `exists` over `FloatingPoint` binders is
+        // Skolemized by the quantifier loop, so it is neither uninstantiated
+        // nor unhandled and `try_mbqi_refinement` — and with it the finite-sort
+        // lane — is never reached. The ground `Sat` arrives here instead, where
+        // the leaf cannot be evaluated against a partially-pinned model and the
+        // gate fails closed. Try to ESTABLISH the certificate rather than only
+        // consult one: the lane discharges each authored leaf with checked
+        // ground solves (Skolemization for an existential, a pinned refutation
+        // of the negation for a universal) and installs the same full-domain
+        // authority the consult below reads. It mutates no assertions and runs
+        // no outer re-solve, and its own sub-solves are quantifier-free so they
+        // return from this gate immediately.
+        if !self.bv_quantifier_full_domain_proof {
+            self.try_finite_model_sat_certificate();
+        }
         // A BV quantifier full-domain proof is equally authoritative: every
         // binder value was covered either by exact finite-domain expansion,
         // exhaustive BV-MBQI enumeration, or a symbolic entailment refutation.
@@ -6686,7 +6703,7 @@ impl Executor {
     /// free constant leaf whose independent-gate model value is representable
     /// as a closed term. `total` iff EVERY free symbol of the conjunct was
     /// pinned exactly — no arity>0 uninterpreted function, no unrepresentable
-    /// value (datatype, sequence, FP, algebraic real), nothing the evaluator
+    /// value (datatype, sequence, algebraic real), nothing the evaluator
     /// left unevaluable. Uninterpreted-sort element values pin to the shared
     /// per-token element constants in `elems`. Fill-only: never fabricates a
     /// value (an unpinnable leaf is left FREE, which can only weaken a
@@ -6752,9 +6769,21 @@ impl Executor {
         for (leaf, mv, sort) in leaf_values {
             match model_value_to_pin_term(&mut self.ctx.terms, &mv, &sort, elems) {
                 Some(value_term) => {
+                    if ay_core::misc_cli_flags().debug_qmg {
+                        safe_eprintln!(
+                            "QMG leafpin: {} := {}",
+                            self.format_term(leaf),
+                            self.format_term(value_term)
+                        );
+                    }
                     equalities.push(self.ctx.terms.mk_eq(leaf, value_term));
                 }
-                None => total = false,
+                None => {
+                    if ay_core::misc_cli_flags().debug_qmg {
+                        safe_eprintln!("QMG leafpin-FAILED: {}", self.format_term(leaf));
+                    }
+                    total = false;
+                }
             }
         }
         QuantifiedGatePins { equalities, total }
@@ -7637,11 +7666,100 @@ fn quantified_gate_default_value_term(
     }
 }
 
+/// Mint the SMT-LIB `(fp <sign> <exponent> <significand>)` literal denoting
+/// `mv` at `sort`, or `None` when the bits cannot be reproduced EXACTLY.
+///
+/// A pin is an equality conjoined to the nested obligation, so a literal that
+/// denotes anything other than the model's value manufactures a false
+/// confirmation. Two properties make that impossible here rather than merely
+/// unlikely:
+///
+/// - the format is taken from the LEAF'S SORT and the value must already carry
+///   the same one, so a `Float32` value can never be pinned onto a `Float64`
+///   leaf; and
+/// - the three fields are round-tripped back through the gate evaluator's own
+///   [`ay_model_check::fp::from_field_bitvectors`] and every bit compared, so a
+///   field that does not fit its width — or a format outside the evaluator's
+///   exact envelope, notably the eb=15/sb=113 formats whose 112 stored bits do
+///   not fit the value's `u64` — fails closed instead of being masked into a
+///   plausible neighbour.
+///
+/// The literal is bit-level, so `+zero` and `-zero` stay DISTINCT (they differ
+/// only in the sign field) and a NaN keeps the payload the model carried. NaN
+/// payloads are not observable through SMT-LIB's FloatingPoint equality — the
+/// sort has a single NaN — so pinning `leaf = (fp #b0 #b1..1 #b1 0..0)` states
+/// exactly "leaf is NaN", which is exactly what the model value says; the
+/// evaluator treats the one operator that could see a payload
+/// (`fp.to_ieee_bv`) as underspecified for NaN already.
+fn fp_model_value_to_literal(
+    terms: &mut TermStore,
+    mv: &ModelValue,
+    sort: &Sort,
+) -> Option<TermId> {
+    let (
+        &ModelValue::FloatingPoint {
+            sign,
+            exponent,
+            significand,
+            exponent_bits,
+            significand_bits,
+        },
+        &Sort::FloatingPoint(eb, sb),
+    ) = (mv, sort)
+    else {
+        return None;
+    };
+    if exponent_bits != eb || significand_bits != sb {
+        return None;
+    }
+    let stored_bits = sb.checked_sub(1)?;
+    if stored_bits == 0 {
+        return None;
+    }
+    let fields = [
+        ModelValue::BitVec {
+            width: 1,
+            value: num_bigint::BigInt::from(u8::from(sign)),
+        },
+        ModelValue::BitVec {
+            width: eb,
+            value: num_bigint::BigInt::from(exponent),
+        },
+        ModelValue::BitVec {
+            width: stored_bits,
+            value: num_bigint::BigInt::from(significand),
+        },
+    ];
+    // Round-trip: the literal these three fields spell must be bit-identical
+    // to the value being pinned, as judged by the evaluator that will read it
+    // back. Any width overflow, out-of-range field or unsupported format
+    // surfaces here as a mismatch or an error, and fails closed.
+    match ay_model_check::fp::from_field_bitvectors(&fields) {
+        Ok(ModelValue::FloatingPoint {
+            sign: rs,
+            exponent: re,
+            significand: rm,
+            exponent_bits: reb,
+            significand_bits: rsb,
+        }) if (rs, re, rm, reb, rsb) == (sign, exponent, significand, eb, sb) => {}
+        _ => return None,
+    }
+    let args: Vec<TermId> = [
+        (u64::from(sign), 1u32),
+        (exponent, eb),
+        (significand, stored_bits),
+    ]
+    .into_iter()
+    .map(|(v, w)| terms.mk_bitvec(num_bigint::BigInt::from(v), w))
+    .collect();
+    Some(terms.mk_app(Symbol::named("fp"), args, sort.clone()))
+}
+
 /// Convert an independent-gate [`ModelValue`] into a closed term of `sort`,
 /// for use in a model-pin equality or a reconstructed interpretation row.
 /// Uninterpreted-sort elements map to the shared per-token constants in
 /// `elems`. `None` for values the term language cannot express exactly
-/// (datatypes, sequences, FP) — the caller then leaves the leaf FREE and
+/// (datatypes, sequences) — the caller then leaves the leaf FREE and
 /// clears `total`, which can only weaken a confirm into a fail-close
 /// (#no-fabricated-model-values).
 fn model_value_to_pin_term(
@@ -7659,7 +7777,47 @@ fn model_value_to_pin_term(
         (ModelValue::Real(r), Sort::Int) if r.is_integer() => Some(terms.mk_int(r.to_integer())),
         (ModelValue::Real(r), _) => Some(terms.mk_rational(r.clone())),
         (ModelValue::BitVec { width, value }, _) => Some(terms.mk_bitvec(value.clone(), *width)),
+        (ModelValue::FloatingPoint { .. }, Sort::FloatingPoint(_, _)) => {
+            fp_model_value_to_literal(terms, mv, sort)
+        }
         (ModelValue::Str(s), Sort::String) => Some(terms.mk_string(s.clone())),
+        // `RoundingMode` wears `Sort::Uninterpreted` (sorts.rs: it is a
+        // BUILTIN sort that is never `declare-sort`ed) but its carrier is the
+        // five FIXED modes, not an opaque universe.
+        //
+        // DEFENSIVE, not a hole this change opened — review corrected the
+        // original rationale. For a LITERAL mode leaf the pre-diff pin was
+        // already `(= RNE @elem0)`, and `RNE` is interpreted in the nested
+        // solve (theories/fp/congruence.rs), so `@elem0` was forced; there was
+        // no freedom to exploit. Real freedom needs a DECLARED RoundingMode
+        // constant, and the measured corpus contains zero occurrences of the
+        // sort name. Two residuals stay open and are NOT closed here:
+        //   - `qmg_row_val_to_term` still routes a RoundingMode-valued UF row
+        //     through `elems.term_for`, so a UF RETURNING a mode still hands
+        //     the nested solve an opaque element;
+        //   - exact FP pins are new surface for operators SMT-LIB leaves
+        //     underspecified (fp.to_ieee_bv of NaN, fp.min/fp.max of +/-0):
+        //     the nested solve may pick a different value than the emitted
+        //     model adopted. Unexercised by the measured corpus (zero
+        //     occurrences) and 800 targeted fuzz instances found nothing.
+        // Minting a gate element
+        // constant for it — what the generic arm below does — would hand the
+        // nested solve a FREE rounding mode and let it confirm with `RTZ` a
+        // model that says `RNE`. Mint the literal itself instead, under the
+        // short spelling the elaborator interns (term.rs) so the FP solver's
+        // name match sees the same term, and fail closed on a token that does
+        // not name a mode.
+        (ModelValue::Uninterpreted(token), Sort::Uninterpreted(name)) if name == "RoundingMode" => {
+            let short = match token.as_str() {
+                "RNE" | "roundNearestTiesToEven" => "RNE",
+                "RNA" | "roundNearestTiesToAway" => "RNA",
+                "RTP" | "roundTowardPositive" => "RTP",
+                "RTN" | "roundTowardNegative" => "RTN",
+                "RTZ" | "roundTowardZero" => "RTZ",
+                _ => return None,
+            };
+            Some(terms.mk_app(Symbol::named(short), [], sort.clone()))
+        }
         (ModelValue::Uninterpreted(token), Sort::Uninterpreted(_)) => {
             Some(elems.term_for(terms, token, sort.clone()))
         }
@@ -10365,6 +10523,210 @@ mod tests {
             SolveResult::Unknown,
             "an unwitnessable ∀∃ must never be confirmed by the witness route"
         );
+    }
+
+    fn fp_value(sign: bool, exponent: u64, significand: u64, eb: u32, sb: u32) -> ModelValue {
+        ModelValue::FloatingPoint {
+            sign,
+            exponent,
+            significand,
+            exponent_bits: eb,
+            significand_bits: sb,
+        }
+    }
+
+    /// The minted literal must READ BACK as exactly the value it pins — that
+    /// round trip is the whole reason a wrong pin cannot manufacture a
+    /// confirmation. Checked on the classes whose bits differ only in ways an
+    /// approximate conversion would erase.
+    #[test]
+    fn fp_pin_literal_round_trips_bit_for_bit() {
+        let mut terms = TermStore::new();
+        let sort = Sort::FloatingPoint(8, 24);
+        for mv in [
+            fp_value(false, 0, 0, 8, 24),         // +zero
+            fp_value(true, 0, 0, 8, 24),          // -zero
+            fp_value(false, 127, 0, 8, 24),       // 1.0
+            fp_value(true, 0, 1, 8, 24),          // -smallest subnormal
+            fp_value(false, 255, 0, 8, 24),       // +oo
+            fp_value(true, 255, 0, 8, 24),        // -oo
+            fp_value(false, 255, 1 << 22, 8, 24), // quiet NaN
+            fp_value(true, 255, 0x2b, 8, 24),     // NaN, sign + payload set
+        ] {
+            let term =
+                fp_model_value_to_literal(&mut terms, &mv, &sort).expect("Float32 value is exact");
+            let TermData::App(sym, args) = terms.get(term).clone() else {
+                panic!("expected an `fp` application");
+            };
+            assert_eq!(sym.name(), "fp");
+            let fields: Vec<ModelValue> = args
+                .iter()
+                .map(|&a| match terms.get(a) {
+                    TermData::Const(ay_core::term::Constant::BitVec { value, width }) => {
+                        ModelValue::BitVec {
+                            width: *width,
+                            value: value.clone(),
+                        }
+                    }
+                    other => panic!("expected a bitvector field, got {other:?}"),
+                })
+                .collect();
+            let back = ay_model_check::fp::from_field_bitvectors(&fields)
+                .expect("the minted fields must re-read");
+            let (ModelValue::FloatingPoint { .. }, ModelValue::FloatingPoint { .. }) = (&mv, &back)
+            else {
+                panic!("round trip changed the value kind");
+            };
+            let key = |v: &ModelValue| match v {
+                ModelValue::FloatingPoint {
+                    sign,
+                    exponent,
+                    significand,
+                    exponent_bits,
+                    significand_bits,
+                } => (
+                    *sign,
+                    *exponent,
+                    *significand,
+                    *exponent_bits,
+                    *significand_bits,
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(key(&mv), key(&back), "minted literal is not the same value");
+        }
+        // +0 and -0 must not collapse onto one term.
+        let pos = fp_model_value_to_literal(&mut terms, &fp_value(false, 0, 0, 8, 24), &sort);
+        let neg = fp_model_value_to_literal(&mut terms, &fp_value(true, 0, 0, 8, 24), &sort);
+        assert_ne!(pos, neg, "+zero and -zero must pin to DISTINCT literals");
+    }
+
+    /// Everything the arm cannot mint bit-exactly must return `None`, which
+    /// leaves the leaf free and clears `total` — today's fail-closed
+    /// behaviour, never a plausible neighbouring value.
+    #[test]
+    fn fp_pin_literal_fails_closed_off_format() {
+        let mut terms = TermStore::new();
+        // Value's format disagrees with the leaf's sort.
+        assert!(fp_model_value_to_literal(
+            &mut terms,
+            &fp_value(false, 0, 0, 11, 53),
+            &Sort::FloatingPoint(8, 24)
+        )
+        .is_none());
+        // Exponent field wider than its declared width.
+        assert!(fp_model_value_to_literal(
+            &mut terms,
+            &fp_value(false, 256, 0, 8, 24),
+            &Sort::FloatingPoint(8, 24)
+        )
+        .is_none());
+        // Significand field wider than its declared width.
+        assert!(fp_model_value_to_literal(
+            &mut terms,
+            &fp_value(false, 0, 1 << 23, 8, 24),
+            &Sort::FloatingPoint(8, 24)
+        )
+        .is_none());
+        // Float128: 112 stored bits do not fit the value's u64, so the
+        // evaluator's exact envelope refuses the format outright.
+        assert!(fp_model_value_to_literal(
+            &mut terms,
+            &fp_value(false, 0, 0, 15, 113),
+            &Sort::FloatingPoint(15, 113)
+        )
+        .is_none());
+        // Not a floating-point value at all.
+        assert!(fp_model_value_to_literal(
+            &mut terms,
+            &ModelValue::Bool(true),
+            &Sort::FloatingPoint(8, 24)
+        )
+        .is_none());
+    }
+
+    /// THE BARRIER FOR THE LOAD-BEARING ARM. Review found that reverting the
+    /// `ModelValue::FloatingPoint` arm of `model_value_to_pin_term` to `None`
+    /// — undoing every one of the ~490 verdicts this change publishes — left
+    /// the whole suite green, because the two FP tests call
+    /// `fp_model_value_to_literal` DIRECTLY and never reach the dispatcher.
+    /// This test enters through `model_value_to_pin_term`, so a no-op arm
+    /// fails it.
+    ///
+    /// The property that matters is not merely "returns Some": it is that the
+    /// pin is a CLOSED FP LITERAL the nested solve cannot reinterpret. An
+    /// opaque element would let the solve pick a different float and confirm a
+    /// model that says something else — which is how a wrong `sat` would be
+    /// manufactured here.
+    #[test]
+    fn fp_leaf_pins_through_the_dispatcher_to_a_closed_literal() {
+        let mut terms = TermStore::new();
+        let mut elems = QuantifiedGateElements::default();
+        let sort = Sort::FloatingPoint(8, 24);
+        // +0.0f32: sign 0, exponent 0x00, significand 0.
+        let value = ModelValue::FloatingPoint {
+            sign: false,
+            exponent: 0,
+            significand: 0,
+            exponent_bits: 8,
+            significand_bits: 24,
+        };
+        let term = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems)
+            .expect("an FP model value must pin through the dispatcher");
+        // It must NOT be an opaque uninterpreted element.
+        assert!(
+            elems.by_token.is_empty(),
+            "an FP leaf must pin to a literal, never mint an opaque gate element"
+        );
+        // And the pinned term must be closed: no free variables to reinterpret.
+        let mut stack = vec![term];
+        while let Some(t) = stack.pop() {
+            match terms.get(t).clone() {
+                TermData::Var(..) => panic!("FP pin must be closed, found a variable"),
+                TermData::App(_, args) => stack.extend(args),
+                _ => {}
+            }
+        }
+    }
+
+    /// A `RoundingMode` leaf must pin to the MODE, not to an opaque gate
+    /// element the nested solve is free to reinterpret.
+    #[test]
+    fn rounding_mode_pins_to_the_literal_not_an_opaque_element() {
+        let mut terms = TermStore::new();
+        let mut elems = QuantifiedGateElements::default();
+        let sort = Sort::Uninterpreted("RoundingMode".to_string());
+        for (token, short) in [
+            ("roundNearestTiesToEven", "RNE"),
+            ("RNE", "RNE"),
+            ("roundTowardZero", "RTZ"),
+            ("RTP", "RTP"),
+        ] {
+            let term = model_value_to_pin_term(
+                &mut terms,
+                &ModelValue::Uninterpreted(token.to_string()),
+                &sort,
+                &mut elems,
+            )
+            .expect("a named rounding mode is exactly expressible");
+            let TermData::App(sym, args) = terms.get(term).clone() else {
+                panic!("expected a nullary rounding-mode application");
+            };
+            assert_eq!(sym.name(), short);
+            assert!(args.is_empty());
+        }
+        assert!(
+            elems.by_token.is_empty(),
+            "no opaque element constant may be minted for a rounding mode"
+        );
+        // A token that names no mode fails closed rather than inventing one.
+        assert!(model_value_to_pin_term(
+            &mut terms,
+            &ModelValue::Uninterpreted("@RoundingMode!0".to_string()),
+            &sort,
+            &mut elems,
+        )
+        .is_none());
     }
 }
 

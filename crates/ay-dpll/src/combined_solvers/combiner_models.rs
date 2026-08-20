@@ -690,6 +690,29 @@ impl TheoryCombiner<'_> {
                     .get(&source)
                     .copied()
                     .and_then(|term| constant_atom(self.terms, term).map(|value| (value, term)));
+                // #A1 stale-pin guard (sibling of the stale-diseq move guard):
+                // a class constant CONTRADICTED by the row's own FINAL
+                // arithmetic value is stale candidate state — an internal
+                // solve-time pin atom (`(= (select ..) c)`) the reconciliation
+                // fixpoints have already overridden — not semantic evidence
+                // about the model being extracted. Counting it as a hard pin
+                // conflict-marks the table and discards the whole model,
+                // degrading genuine `sat` to unknown. Dropping it here only
+                // widens what the congruence repair may ATTEMPT; the strict +
+                // independent validation gates still decide acceptance
+                // fail-closed, so an authored pin the final valuation really
+                // violates still ends in rejection, never a false SAT.
+                let final_value_str = matches!(result_sort, Sort::Int)
+                    .then(|| {
+                        int_value
+                            .as_ref()
+                            .map(crate::executor_format::format_bigint)
+                    })
+                    .flatten();
+                let stale_pin_filter = |pin: &(String, TermId)| match &final_value_str {
+                    Some(final_value) => pin.0 == *final_value,
+                    None => true,
+                };
                 collisions
                     .entry((table_name.clone(), key))
                     .or_default()
@@ -699,7 +722,9 @@ impl TheoryCombiner<'_> {
                         source,
                         result_sort,
                         value,
-                        hard_constant: class_int_constant.or(mapped_constant),
+                        hard_constant: class_int_constant
+                            .or(mapped_constant)
+                            .filter(stale_pin_filter),
                         hard_bool: hard_bool_pins.get(&source).copied(),
                         literal_arg_count,
                     });

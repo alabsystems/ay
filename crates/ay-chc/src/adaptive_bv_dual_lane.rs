@@ -3777,7 +3777,7 @@ fn try_reve_accumulator_invariant(
     let sample_budget = (budget / 3).min(Duration::from_secs(8));
     let states = sample_states_i2(problem, sample_budget);
 
-    let dbg = std::env::var("REVE_DEBUG").is_ok();
+    let dbg = ay_core::misc_cli_flags().reve_debug;
     let mut invs: FxHashMap<PredicateId, Vec<ReveCand>> = FxHashMap::default();
     for &pid in &non_nullary {
         let pred = problem.get_predicate(pid)?;

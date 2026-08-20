@@ -42,9 +42,10 @@ fn guard_factorization_enabled_after_solve() {
 }
 
 /// Verify the SCC-decompose default on the DIMACS route: ON via the
-/// route-aware AUTO probe since 2026-07-10 (wf_55735963; kill-switch
-/// --sat-no-subst-auto — asserted hermetically when set, same tolerant
-/// pattern as the --sat-no-bve-sparse tests in variant.rs).
+/// route-aware AUTO probe since 2026-07-10 (wf_55735963). B34: the
+/// kill-switch (--sat-no-subst-auto) is CLI-owned (sat_ab_switches — never
+/// installed in this test process), so the default arm is unconditional,
+/// same as the dimacs_tests.rs subst-auto assertions.
 #[test]
 #[timeout(5_000)]
 fn guard_decompose_default_after_solve() {
@@ -52,17 +53,11 @@ fn guard_decompose_default_after_solve() {
     let cnf = "p cnf 4 4\n1 2 0\n-1 3 0\n-3 4 0\n-4 -2 0\n";
     let formula = parse_dimacs(cnf).expect("parse");
     let mut solver = formula.into_solver();
-    match std::env::var("--sat-no-subst-auto").ok().as_deref() {
-        None | Some("1") => assert!(
-            solver.inprocessing_feature_profile().decompose,
-            "DIMACS default enables decompose eligibility (AUTO default-ON, \
-             probe-gated; wf_55735963)"
-        ),
-        Some(_) => assert!(
-            !solver.inprocessing_feature_profile().decompose,
-            "kill-switch (--sat-no-subst-auto) restores decompose-off"
-        ),
-    }
+    assert!(
+        solver.inprocessing_feature_profile().decompose,
+        "DIMACS default enables decompose eligibility (AUTO default-ON, \
+         probe-gated; wf_55735963)"
+    );
     let result = solver.solve().into_inner();
 
     assert!(

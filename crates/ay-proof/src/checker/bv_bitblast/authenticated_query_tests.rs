@@ -255,3 +255,182 @@ fn default_entry_point_still_rejects_uninterpreted_applications() {
         .expect_err("the exact entry point must not abstract applications");
     assert!(error.is_unsupported_fragment());
 }
+
+// ---------------------------------------------------------------------------
+// Bool-ATOM abstraction over non-finitely-sorted operands
+// (`authenticate_atom_leaf_bool_bv_unsat_query`).
+// ---------------------------------------------------------------------------
+
+/// `(= i 0)` over `Int` next to a self-contained BitVec contradiction. The
+/// integer atom becomes ONE free Boolean leaf, the BitVec half still refutes,
+/// and the query is authenticated. This is the shape the mixed BV+Int
+/// obligations reach, and it is `Err(UnsupportedFragment)` on both older entry
+/// points.
+#[test]
+fn atom_leaf_query_authenticates_int_atom_beside_bv_contradiction() {
+    let mut terms = TermStore::new();
+    let integer = terms.mk_var("atom_leaf_int", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let int_atom = terms.mk_app(Symbol::named("="), [integer, zero], Sort::Bool);
+    let value = terms.mk_var("atom_leaf_bv", Sort::bitvec(4));
+    let reflexive = terms.mk_app(Symbol::named("="), [value, value], Sort::Bool);
+    let bv_contradiction = terms.mk_not_raw(reflexive);
+
+    let roots = vec![int_atom, bv_contradiction];
+    let evidence = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &roots, None)
+        .expect("the BitVec half refutes while the integer atom is a free Boolean leaf");
+    assert!(evidence.is_current_for(&terms, &roots));
+    assert!(evidence.used_uninterpreted_leaves());
+
+    let mut reordered = roots.clone();
+    reordered.swap(0, 1);
+    assert!(!evidence.is_current_for(&terms, &reordered));
+
+    let _late_term = terms.mk_var("atom_leaf_late", Sort::Bool);
+    assert!(!evidence.term_snapshot_is_current(&terms));
+    assert!(!evidence.is_current_for(&terms, &roots));
+}
+
+/// THE CARDINAL NARROWNESS PIN. `n` pairwise-distinct integers are satisfiable
+/// over the integers for every `n` (take `0, 1, …, n-1`), so this query must
+/// DECLINE. Modelling each `Int` term as a width-`w` bit-vector leaf instead
+/// would refute it by pigeonhole for `n > 2^w` — and the counterexample is
+/// parametric in `w`, so NO finite width is sound. This test fails the moment
+/// anyone mints a non-Boolean leaf for a non-finitely-sorted term.
+#[test]
+fn atom_leaf_query_never_refutes_pairwise_distinct_integers() {
+    for count in 2..=5_usize {
+        let mut terms = TermStore::new();
+        let integers: Vec<_> = (0..count)
+            .map(|index| terms.mk_var(&format!("atom_leaf_distinct_{index}"), Sort::Int))
+            .collect();
+        let mut roots = Vec::new();
+        for (lhs_index, &lhs) in integers.iter().enumerate() {
+            for &rhs in &integers[lhs_index + 1..] {
+                let equal = terms.mk_app(Symbol::named("="), [lhs, rhs], Sort::Bool);
+                roots.push(terms.mk_not_raw(equal));
+            }
+        }
+
+        let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &roots, None)
+            .expect_err("{count} pairwise-distinct integers are satisfiable over Z");
+        assert!(
+            error.is_unsupported_fragment(),
+            "pairwise-distinct integers must DECLINE at n={count}, got: {error}"
+        );
+        assert!(
+            !matches!(error, BoolBvUnsatAuthenticationError::Satisfiable),
+            "a satisfiable atom abstraction is not evidence about the exact query"
+        );
+    }
+}
+
+/// FAIL-CLOSED PIN: a satisfiable abstraction that minted at least one leaf
+/// must DECLINE, never report `Satisfiable`. Congruence — including
+/// REFLEXIVITY — is deliberately forgotten, so `¬(= i i)` over `Int` has a
+/// free-leaf model even though the exact query is unsatisfiable. Declining is
+/// the correct, strictly-weaker answer; claiming `Satisfiable` would be a veto
+/// on a theorem.
+#[test]
+fn atom_leaf_query_declines_satisfiable_int_abstraction_without_sat_claim() {
+    let mut terms = TermStore::new();
+    let integer = terms.mk_var("atom_leaf_reflexive", Sort::Int);
+    let reflexive = terms.mk_app(Symbol::named("="), [integer, integer], Sort::Bool);
+    let root = terms.mk_not_raw(reflexive);
+    let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &[root], None)
+        .expect_err("the congruence-free atom abstraction cannot refute reflexivity");
+    assert!(
+        error.is_unsupported_fragment(),
+        "a satisfiable atom abstraction must decline, got: {error}"
+    );
+    assert!(
+        !matches!(error, BoolBvUnsatAuthenticationError::Satisfiable),
+        "a satisfiable abstraction is not evidence the exact query is satisfiable"
+    );
+}
+
+/// The trigger is the operand SORT FAMILY, never "lowering the operand
+/// failed". `bvudiv` is reserved BitVec vocabulary with BitVec-sorted
+/// operands, so it must keep declining with the operator named even under the
+/// atom abstraction. Rewriting the trigger as "any lowering error" flips this.
+#[test]
+fn atom_leaf_query_never_abstracts_reserved_bv_operators() {
+    let mut terms = TermStore::new();
+    let lhs = terms.mk_var("atom_udiv_lhs", Sort::bitvec(8));
+    let rhs = terms.mk_var("atom_udiv_rhs", Sort::bitvec(8));
+    let quotient = terms.mk_app(Symbol::named("bvudiv"), [lhs, rhs], Sort::bitvec(8));
+    let equal = terms.mk_app(Symbol::named("="), [quotient, quotient], Sort::Bool);
+    let root = terms.mk_not_raw(equal);
+    let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &[root], None)
+        .expect_err("`bvudiv` is reserved theory vocabulary, not a free function");
+    assert!(error.is_unsupported_fragment());
+    assert!(
+        error.to_string().contains("bvudiv"),
+        "the reserved operator must be the decline reason, got: {error}"
+    );
+}
+
+/// The internal BitVec width ceiling must NOT become route-aroundable by
+/// wrapping the too-wide term in `=`. A `BitVec` above the ceiling is a BOUND
+/// failure inside an interpreted sort family, not a non-finite sort, so the
+/// atom abstraction must not absorb it.
+#[test]
+fn atom_leaf_query_still_declines_width_above_internal_ceiling() {
+    const WIDTH: u32 = MAX_PROOF_PRODUCING_INTERNAL_BV_WIDTH + 1;
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("atom_too_wide", Sort::bitvec(WIDTH));
+    let reflexive = terms.mk_app(Symbol::named("="), [value, value], Sort::Bool);
+    let contradiction = terms.mk_not_raw(reflexive);
+    let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &[contradiction], None)
+        .expect_err("widths above the internal source-checker ceiling must decline");
+    assert!(error.is_unsupported_fragment());
+    assert!(
+        !error.to_string().contains("unsupported source sort"),
+        "the decline must stay the width-range diagnosis, got: {error}"
+    );
+}
+
+/// A pure Bool/BV query that never needed a leaf keeps the exact
+/// `Satisfiable` verdict on the atom entry point too.
+#[test]
+fn atom_leaf_query_preserves_exact_satisfiable_verdict_without_leaves() {
+    let mut terms = TermStore::new();
+    let roots = signed_add_safety_query(&mut terms, 1, 1);
+    let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &roots, None)
+        .expect_err("a safe concrete addition is satisfiable");
+    assert!(matches!(error, BoolBvUnsatAuthenticationError::Satisfiable));
+}
+
+/// GUARD-REMOVAL PROOF, both directions. The pre-existing entry points must
+/// still REJECT the exact query the new one now authenticates: the exact lane
+/// because it abstracts nothing, and the UF-leaf lane because reserved `=`
+/// over `Int` still descends into its operands there. The second assertion is
+/// what keeps the `CheckedQpfInstanceRefutation` lane's accept set
+/// bit-identical — deleting the `non_finite_atom_leaves` flag and reusing the
+/// shared lowerer would widen an existing lane, and this test fails.
+#[test]
+fn older_entry_points_still_reject_the_atom_abstracted_query() {
+    let mut terms = TermStore::new();
+    let integer = terms.mk_var("atom_guard_int", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let int_atom = terms.mk_app(Symbol::named("="), [integer, zero], Sort::Bool);
+    let value = terms.mk_var("atom_guard_bv", Sort::bitvec(4));
+    let reflexive = terms.mk_app(Symbol::named("="), [value, value], Sort::Bool);
+    let roots = vec![int_atom, terms.mk_not_raw(reflexive)];
+
+    let exact = authenticate_bool_bv_unsat_query(&terms, &roots, None)
+        .expect_err("the exact entry point must not abstract an integer atom");
+    assert!(exact.is_unsupported_fragment());
+    assert!(
+        exact.to_string().contains("unsupported source sort Int"),
+        "the exact lane must still name the Int sort, got: {exact}"
+    );
+
+    let uf_leaf = super::authenticate_uf_leaf_bool_bv_unsat_query(&terms, &roots, None)
+        .expect_err("the UF-leaf entry point must keep its pre-existing accept set");
+    assert!(uf_leaf.is_unsupported_fragment());
+    assert!(
+        uf_leaf.to_string().contains("unsupported source sort Int"),
+        "the UF-leaf lane must still name the Int sort, got: {uf_leaf}"
+    );
+}

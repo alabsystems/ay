@@ -1,14 +1,8 @@
-error[E0603]: enum `WorkerMsg` is private
- --> tests/ui/primal_sender_cannot_send_done.rs:7:23
+error[E0432]: unresolved import `ay_pb::portfolio::WorkerMsg`
+ --> tests/ui/primal_sender_cannot_send_done.rs:7:5
   |
 7 | use ay_pb::portfolio::WorkerMsg;
-  |                       ^^^^^^^^^ private enum
-  |
-note: the enum `WorkerMsg` is defined here
- --> src/portfolio.rs
-  |
-  | enum WorkerMsg {
-  | ^^^^^^^^^^^^^^
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `WorkerMsg` in `portfolio`
 
 error[E0599]: no method named `send_done` found for reference `&PrimalSender` in the current scope
   --> tests/ui/primal_sender_cannot_send_done.rs:12:20

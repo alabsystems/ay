@@ -5,6 +5,7 @@
 use super::*;
 use ay_core::{Proof, Sort, Symbol, TheoryLemmaKind};
 use num_bigint::BigInt;
+use num_rational::BigRational;
 
 fn int_var(terms: &mut TermStore, name: &str) -> TermId {
     terms.mk_var(name, Sort::Int)
@@ -367,9 +368,62 @@ fn rejects_without_disequality() {
         .expect_err("no disequality conjunct means nothing is refuted");
 }
 
-/// Order constraints alone must never suffice: `x > 0` does not refute
-/// `x >= 0`. This pins the "ignoring inequalities is conservative" claim —
-/// the rule must decline rather than infer from them.
+/// The shared `Generic` entry point offers ONE normalization of the negated
+/// clause to BOTH arithmetic lanes.
+///
+/// * An identity refutation is taken by the equality-span fast path — which is
+///   the only lane that can see it, since it has no order conjunct at all.
+/// * An order refutation is taken by the Fourier–Motzkin lane — which the span
+///   rule declines by construction, as the companion assertion pins.
+/// * A negation with a rational model is still refused by both.
+#[test]
+fn shared_entry_point_serves_both_arithmetic_lanes() {
+    let mut terms = TermStore::new();
+
+    // Lane 1 (span): 2x = 0 entails x = 0.
+    let x = terms.mk_var("shared_lane_x", Sort::Int);
+    let y = terms.mk_var("shared_lane_y", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let one = terms.mk_int(1.into());
+    let two = terms.mk_int(2.into());
+    let two_x = terms.mk_mul(vec![two, x]);
+    let premise = terms.mk_eq(two_x, zero);
+    let goal = terms.mk_eq(x, zero);
+    let identity_clause = vec![terms.mk_not_raw(premise), goal];
+
+    // Lane 2 (Fourier–Motzkin): x <= y and y <= x force x = y.
+    let xy = terms.mk_le(x, y);
+    let yx = terms.mk_le(y, x);
+    let equal = terms.mk_eq(x, y);
+    let order_clause = vec![terms.mk_not_raw(xy), terms.mk_not_raw(yx), equal];
+
+    // Neither lane: 0 < x < 1 has the rational model x = 1/2.
+    let positive = terms.mk_gt(x, zero);
+    let below_one = terms.mk_lt(x, one);
+    let satisfiable_clause = vec![terms.mk_not_raw(positive), terms.mk_not_raw(below_one)];
+
+    let decide = |clause: &[TermId]| {
+        let mut unbounded = |_: usize, _: usize| true;
+        validate_generic_arithmetic_refutation_with_progress(
+            &terms,
+            ProofId(0),
+            clause,
+            &mut unbounded,
+        )
+    };
+    decide(&identity_clause).expect("the equality-span fast path must take the identity");
+    decide(&order_clause).expect("the Fourier-Motzkin lane must take the order refutation");
+    decide(&satisfiable_clause)
+        .expect_err("a negation with a rational model must be refused by both lanes");
+
+    validate_linear_ideal_refutation(&terms, ProofId(0), &order_clause)
+        .expect_err("the span rule alone has no order content");
+}
+
+/// Order constraints alone must never suffice FOR THIS RULE: the span rule
+/// decides equalities and declines `x > 0` versus `x < 0`. (The shared entry
+/// point above then hands exactly this shape to the Fourier–Motzkin lane, which
+/// does refute it — the split of labour, not a soundness boundary.)
 #[test]
 fn rejects_order_only_conflict() {
     let mut terms = TermStore::new();
@@ -380,4 +434,99 @@ fn rejects_order_only_conflict() {
     let clause = vec![terms.mk_not_raw(gt), terms.mk_not_raw(lt)];
     validate_linear_ideal_refutation(&terms, ProofId(0), &clause)
         .expect_err("this rule decides equalities only; order conflicts belong to Farkas");
+}
+
+// ---------------------------------------------------------------------------
+// `recognize_arith_clause_tautology` — or-packed and to_real coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recognizes_or_packed_lia_tautology_unit() {
+    // `(or (= 42 s) (not (= i (+ i 1))))` — valid because `i = i + 1` is
+    // infeasible; `s` stays an opaque leaf. The QF_AUFLIRA ROW-envelope shape.
+    let mut terms = TermStore::new();
+    let i = int_var(&mut terms, "i");
+    let s = int_var(&mut terms, "s");
+    let one = int_const(&mut terms, 1);
+    let forty_two = int_const(&mut terms, 42);
+    let i_plus_1 = terms.mk_app(Symbol::named("+"), vec![i, one], Sort::Int);
+    let bad_eq = terms.mk_app(Symbol::named("="), vec![i, i_plus_1], Sort::Bool);
+    let not_bad = terms.mk_not(bad_eq);
+    let sel_eq = terms.mk_app(Symbol::named("="), vec![forty_two, s], Sort::Bool);
+    let unit = terms.mk_app(Symbol::named("or"), vec![sel_eq, not_bad], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[unit]));
+}
+
+#[test]
+fn rejects_satisfiable_or_packed_unit() {
+    // `(or (= 42 s) (not (= i 1)))` is falsifiable (`s = 0, i = 1`).
+    let mut terms = TermStore::new();
+    let i = int_var(&mut terms, "i");
+    let s = int_var(&mut terms, "s");
+    let one = int_const(&mut terms, 1);
+    let forty_two = int_const(&mut terms, 42);
+    let i_eq_one = terms.mk_app(Symbol::named("="), vec![i, one], Sort::Bool);
+    let not_eq = terms.mk_not(i_eq_one);
+    let sel_eq = terms.mk_app(Symbol::named("="), vec![forty_two, s], Sort::Bool);
+    let unit = terms.mk_app(Symbol::named("or"), vec![sel_eq, not_eq], Sort::Bool);
+    assert!(!recognize_arith_clause_tautology(&terms, &[unit]));
+}
+
+#[test]
+fn to_real_embedding_links_int_and_real_sides() {
+    // `¬(3/2 < r) ∨ ¬(r = to_real x) ∨ ¬(x <= 1)` — the QF_AUFLIRA cross-sort
+    // gate conflict. Valid only if `to_real x` is read as `x`; an opaque leaf
+    // loses the link and the clause would be wrongly refused.
+    let mut terms = TermStore::new();
+    let x = int_var(&mut terms, "x");
+    let r = terms.mk_var("r", Sort::Real);
+    let three_halves = terms.mk_rational(BigRational::new(BigInt::from(3), BigInt::from(2)));
+    let one = int_const(&mut terms, 1);
+    let to_real_x = terms.mk_app(Symbol::named("to_real"), vec![x], Sort::Real);
+    let lt = terms.mk_app(Symbol::named("<"), vec![three_halves, r], Sort::Bool);
+    let eq = terms.mk_app(Symbol::named("="), vec![r, to_real_x], Sort::Bool);
+    let le = terms.mk_app(Symbol::named("<="), vec![x, one], Sort::Bool);
+    let clause = [terms.mk_not(lt), terms.mk_not(eq), terms.mk_not(le)];
+    assert!(recognize_arith_clause_tautology(&terms, &clause));
+}
+
+#[test]
+fn bv2nat_of_constant_folds_exactly() {
+    // `(<= (bv2nat #b0...0) 18446744073709551615)` — the ground Seq index
+    // bound unit; valid because bv2nat folds to 0.
+    let mut terms = TermStore::new();
+    let zero64 = terms.mk_bitvec(BigInt::from(0), 64);
+    let bv2nat = terms.mk_app(Symbol::named("bv2nat"), vec![zero64], Sort::Int);
+    let max = int_const(&mut terms, i64::MAX); // any positive bound works
+    let le = terms.mk_app(Symbol::named("<="), vec![bv2nat, max], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[le]));
+
+    // The symbolic argument stays opaque: `(<= (bv2nat x) N)` alone is NOT
+    // recognized (no range side-constraints are added).
+    let x = terms.mk_var("x", Sort::BitVec(ay_core::BitVecSort { width: 64 }));
+    let sym = terms.mk_app(Symbol::named("bv2nat"), vec![x], Sort::Int);
+    let le_sym = terms.mk_app(Symbol::named("<="), vec![sym, max], Sort::Bool);
+    assert!(!recognize_arith_clause_tautology(&terms, &[le_sym]));
+}
+
+#[test]
+fn bv2nat_symbolic_width_bound_is_a_tautology() {
+    // `(<= (bv2nat sk) 18446744073709551615)` over SYMBOLIC 64-bit `sk`:
+    // valid by the operator's range, carried by the entailed side-bounds.
+    let mut terms = TermStore::new();
+    let sk = terms.mk_var("sk", Sort::BitVec(ay_core::BitVecSort { width: 64 }));
+    let bv2nat = terms.mk_app(Symbol::named("bv2nat"), vec![sk], Sort::Int);
+    let max = terms.mk_int(BigInt::from(u64::MAX));
+    let le = terms.mk_app(Symbol::named("<="), vec![bv2nat, max], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[le]));
+
+    // Nonnegativity too.
+    let zero = int_const(&mut terms, 0);
+    let ge = terms.mk_app(Symbol::named("<="), vec![zero, bv2nat], Sort::Bool);
+    assert!(recognize_arith_clause_tautology(&terms, &[ge]));
+
+    // But a TIGHTER bound is not entailed: `(<= (bv2nat sk) 5)` must reject.
+    let five = int_const(&mut terms, 5);
+    let tight = terms.mk_app(Symbol::named("<="), vec![bv2nat, five], Sort::Bool);
+    assert!(!recognize_arith_clause_tautology(&terms, &[tight]));
 }

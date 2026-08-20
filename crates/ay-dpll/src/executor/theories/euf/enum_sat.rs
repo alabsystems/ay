@@ -240,6 +240,41 @@ impl Executor {
             solver.set_random_seed(seed);
         }
 
+        // Size the clause arena from the encoding, not from the variable count.
+        //
+        // `SatSolver::new` has only `total_vars` to go on and pre-sizes the
+        // arena at `num_vars * 4` clauses of 3 literals each. This lane's eager
+        // lowering routinely blows past that by two orders of magnitude
+        // (vlsat3_b99: 51,893,377 clauses over 563,839 variables, i.e. 23x the
+        // guess), and the arena then climbs there by DOUBLING — finishing one
+        // doubling past what it needed and holding hundreds of megabytes of
+        // mapped, never-written slack. That slack is invisible in RSS but is
+        // charged in full against `--memory`, and on vlsat3_b99 it was the
+        // difference between answering and a memout.
+        //
+        // The count comes from running the emitter itself over a counting sink,
+        // so it cannot drift from what is emitted. It is an upper bound (the
+        // solver still drops duplicate literals, tautologies, and root-satisfied
+        // clauses), which is the safe side for a reservation; the arena grows
+        // normally if it is ever low.
+        let mut planned_clauses = 0usize;
+        let mut planned_literals = 0usize;
+        for clause in tseitin.all_clauses() {
+            planned_clauses += 1;
+            planned_literals += clause.literals().len();
+        }
+        let (extra_clauses, extra_literals) = count_enum_clauses(&scan, &plan, &tseitin);
+        planned_clauses += extra_clauses;
+        planned_literals += extra_literals;
+        solver.reserve_clause_capacity(planned_clauses, planned_literals);
+        if ay_core::misc_cli_flags().phase_trace {
+            eprintln!(
+                "c phase-trace enum-sat-lane reserve clauses={planned_clauses} \
+                 literals={planned_literals} arena_mb={:.1}",
+                (planned_clauses * 3 + planned_literals) as f64 * 4.0 / (1024.0 * 1024.0),
+            );
+        }
+
         // Skeleton clauses.
         let mut buf: Vec<Literal> = Vec::with_capacity(16);
         for clause in tseitin.all_clauses() {
@@ -249,7 +284,7 @@ impl Executor {
         }
 
         // Channeling + domain clauses.
-        emit_enum_clauses(&scan, &plan, &tseitin, &mut solver);
+        emit_enum_clauses(&scan, &plan, &tseitin, &mut EmitSink::Solver(&mut solver));
 
         self.last_statistics
             .set_int("enum_sat.rows", scan.rows.len() as u64);
@@ -846,15 +881,83 @@ fn neg(v: u32) -> Literal {
     Literal::negative(Variable::new(v))
 }
 
+/// Where `emit_enum_clauses` sends the CNF it builds.
+///
+/// The lane runs the emitter twice: once into `Count`, to learn the exact
+/// shape of the encoding it is about to build, and once into `Solver`, to
+/// build it. Running the *same* code both times is the whole point — a
+/// size formula written alongside the emitter is exactly the thing that drifts
+/// out of sync with it (`estimate_extra_clauses` is such a formula, and its
+/// own doc says it is approximate; it stays a budget gate, not a size).
+enum EmitSink<'s> {
+    Solver(&'s mut SatSolver),
+    /// Upper bound on what the solver will store: clause count and total
+    /// literal count as emitted, before the solver's own normalization drops
+    /// duplicate literals, tautologies, and root-satisfied clauses. An upper
+    /// bound is the right side to err on for a reservation.
+    Count {
+        clauses: usize,
+        literals: usize,
+    },
+}
+
+impl EmitSink<'_> {
+    /// Mirrors `Solver::add_clause_reusing_buffer`, including that it leaves
+    /// the buffer empty — every caller refills it before the next use, but
+    /// matching the real sink keeps the two passes indistinguishable.
+    fn add_clause_reusing_buffer(&mut self, lits: &mut Vec<Literal>) {
+        match self {
+            EmitSink::Solver(solver) => {
+                solver.add_clause_reusing_buffer(lits);
+            }
+            EmitSink::Count { clauses, literals } => {
+                *clauses += 1;
+                *literals += lits.len();
+                lits.clear();
+            }
+        }
+    }
+
+    fn add_clause(&mut self, lits: Vec<Literal>) {
+        match self {
+            EmitSink::Solver(solver) => {
+                solver.add_clause(lits);
+            }
+            EmitSink::Count { clauses, literals } => {
+                *clauses += 1;
+                *literals += lits.len();
+            }
+        }
+    }
+}
+
+/// Run the emitter into a counter to get the exact clause/literal shape of
+/// this lane's encoding, without emitting anything.
+fn count_enum_clauses(
+    scan: &EnumSatScan,
+    plan: &EnumVarPlan,
+    tseitin: &Tseitin<'_>,
+) -> (usize, usize) {
+    let mut sink = EmitSink::Count {
+        clauses: 0,
+        literals: 0,
+    };
+    emit_enum_clauses(scan, plan, tseitin, &mut sink);
+    match sink {
+        EmitSink::Count { clauses, literals } => (clauses, literals),
+        EmitSink::Solver(_) => unreachable!("counting sink cannot become a solver sink"),
+    }
+}
+
 /// Emit the domain (exactly-one) and channeling clauses.
 fn emit_enum_clauses(
     scan: &EnumSatScan,
     plan: &EnumVarPlan,
     tseitin: &Tseitin<'_>,
-    solver: &mut SatSolver,
+    solver: &mut EmitSink<'_>,
 ) {
     let mut buf: Vec<Literal> = Vec::with_capacity(16);
-    let clause = |solver: &mut SatSolver, buf: &mut Vec<Literal>, lits: &[Literal]| {
+    let clause = |solver: &mut EmitSink<'_>, buf: &mut Vec<Literal>, lits: &[Literal]| {
         buf.clear();
         buf.extend_from_slice(lits);
         solver.add_clause_reusing_buffer(buf);
@@ -944,14 +1047,14 @@ fn emit_enum_clauses(
 fn emit_eq_atom(
     scan: &EnumSatScan,
     plan: &EnumVarPlan,
-    solver: &mut SatSolver,
+    solver: &mut EmitSink<'_>,
     buf: &mut Vec<Literal>,
     atom: &EnumAtom,
     a: EnumOperand,
     b: EnumOperand,
     tvar: Option<u32>,
 ) {
-    let clause = |solver: &mut SatSolver, buf: &mut Vec<Literal>, lits: &[Literal]| {
+    let clause = |solver: &mut EmitSink<'_>, buf: &mut Vec<Literal>, lits: &[Literal]| {
         buf.clear();
         buf.extend_from_slice(lits);
         solver.add_clause_reusing_buffer(buf);
@@ -1028,13 +1131,13 @@ fn emit_eq_atom(
 fn emit_distinct_atom(
     scan: &EnumSatScan,
     plan: &EnumVarPlan,
-    solver: &mut SatSolver,
+    solver: &mut EmitSink<'_>,
     buf: &mut Vec<Literal>,
     atom: &EnumAtom,
     ops: &[EnumOperand],
     tvar: Option<u32>,
 ) {
-    let clause = |solver: &mut SatSolver, buf: &mut Vec<Literal>, lits: &[Literal]| {
+    let clause = |solver: &mut EmitSink<'_>, buf: &mut Vec<Literal>, lits: &[Literal]| {
         buf.clear();
         buf.extend_from_slice(lits);
         solver.add_clause_reusing_buffer(buf);

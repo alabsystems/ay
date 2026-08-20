@@ -1201,9 +1201,12 @@ fn c5b_kinds_remain_inert_with_both_registries() {
     let dt_decls = pair_datatype();
     let ctor_selectors = pair_selectors();
 
+    // `DatatypeAcyclicDirect` was PROMOTED out of the inert set on
+    // 2026-08-19 (real validator: iterative bounded constructor-containment
+    // walk); it is covered by its own shape tests plus the engaged-but-
+    // fail-closed assertion below the loop.
     for kind in [
         TheoryLemmaKind::DatatypeInjective,
-        TheoryLemmaKind::DatatypeAcyclicDirect,
         TheoryLemmaKind::DatatypeValueEqCongruence,
     ] {
         let step = ProofStep::TheoryLemma {
@@ -1237,4 +1240,57 @@ fn c5b_kinds_remain_inert_with_both_registries() {
             }
         );
     }
+
+    // The promoted acyclicity kind is ENGAGED with both registries: an empty
+    // clause is now refused by the VALIDATOR (InvalidTheoryLemma), not by the
+    // unsupported-kind gate — and without the registry it still fails closed
+    // as unsupported.
+    let step = ProofStep::TheoryLemma {
+        theory: "DT".to_string(),
+        clause: Vec::new(),
+        farkas: None,
+        kind: TheoryLemmaKind::DatatypeAcyclicDirect,
+        lia: None,
+    };
+    let mut derived = Vec::new();
+    let engaged = validate_step_with_datatypes(
+        &terms,
+        &mut derived,
+        ProofId(0),
+        &step,
+        true,
+        Some(&dt_decls),
+        Some(&ctor_selectors),
+        Some(&[]),
+        None,
+        None,
+        None,
+    )
+    .expect_err("empty acyclicity clause must be rejected by the validator");
+    assert!(
+        matches!(engaged, ProofCheckError::InvalidTheoryLemma { .. }),
+        "promoted kind must reach its validator with both registries: {engaged:?}"
+    );
+    let mut derived = Vec::new();
+    let unauthorized = validate_step_with_datatypes(
+        &terms,
+        &mut derived,
+        ProofId(0),
+        &step,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect_err("acyclicity without the registry must fail closed");
+    assert!(
+        matches!(
+            unauthorized,
+            ProofCheckError::UnsupportedTheoryLemmaKind { .. }
+        ),
+        "registry-free acyclicity must stay unsupported: {unauthorized:?}"
+    );
 }

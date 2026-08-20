@@ -116,7 +116,7 @@ impl StrictCheckMeter {
     }
 }
 
-/// Print the refusing limb's exact numbers under `AY_PROBE_STRICT_CHECK`.
+/// Print the refusing limb's exact numbers under `--probe-strict-check`.
 ///
 /// The limb IDENTITY now reaches callers as a distinct error variant
 /// ([`StrictCheckRefusal`] -> `ProofCheckError::Cancelled` vs

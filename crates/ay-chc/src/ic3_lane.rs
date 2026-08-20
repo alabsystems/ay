@@ -100,9 +100,9 @@ fn blast_width(w: u32) -> usize {
 ///
 /// The result is UNTRUSTED — the caller re-validates it via the word-level
 /// validator. See the module docs.
-pub fn try_prove_chc_loop(problem: &ChcProblem, _timeout: Duration) -> Option<InvariantModel> {
-    let dbg = std::env::var_os("TRUST_IC3_LANE_DEBUG").is_some();
-    if let Some(path) = std::env::var_os("TRUST_IC3_LANE_DUMP") {
+pub fn try_prove_chc_loop(problem: &ChcProblem, timeout: Duration) -> Option<InvariantModel> {
+    let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
+    if let Some(path) = ay_core::misc_cli_flags().ic3_lane_dump.as_deref() {
         use std::io::Write as _;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -133,7 +133,12 @@ pub fn try_prove_chc_loop(problem: &ChcProblem, _timeout: Duration) -> Option<In
         latches,
         orig_header,
     } = low?;
-    let mut solver = Ic3Solver::new(ts, false);
+    // Honor the caller's timeout: convert it to an absolute deadline the IC3
+    // engine checks at its loop heads. On expiry solve() returns Unknown, which
+    // the `_ => None` arm below maps to "no candidate" -- sound (a resource-out
+    // can never fabricate a proof), and no longer an unbounded spin.
+    let deadline = ay_core::time::Instant::now() + timeout;
+    let mut solver = Ic3Solver::new(ts, false).with_deadline(Some(deadline));
     let res = solver.solve();
     let safe = matches!(res, Ic3Result::Safe { .. });
     if dbg {
@@ -168,7 +173,7 @@ pub fn try_prove_chc_loop(problem: &ChcProblem, _timeout: Duration) -> Option<In
                         header,
                         &interp.vars,
                         &interp.formula,
-                        _timeout,
+                        timeout,
                     );
                     if dbg {
                         eprintln!(
@@ -234,7 +239,7 @@ fn lift_header_to_full_model(
     h_formula: &ChcExpr,
     _timeout: Duration,
 ) -> Option<InvariantModel> {
-    let dbg = std::env::var_os("TRUST_IC3_LANE_DEBUG").is_some();
+    let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     if dbg {
         eprintln!(
             "IC3_LIFT: ===== begin lift, header pred#{} =====",
@@ -460,7 +465,7 @@ fn edge_image(
     tparams: &[ChcVar],
     interps: &HashMap<PredicateId, (Vec<ChcVar>, ChcExpr)>,
 ) -> Option<ChcExpr> {
-    let dbg = std::env::var_os("TRUST_IC3_LANE_DEBUG").is_some();
+    let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     if headargs.len() != tparams.len() {
         if dbg {
             eprintln!(
@@ -1053,7 +1058,7 @@ fn sort_width(sort: &ChcSort) -> Option<usize> {
 fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
     // (a) LINEARIZE: collapse a multi-block CFG to a single recursive predicate.
     // A single-predicate problem is already in the driven form.
-    let dbg = std::env::var_os("TRUST_IC3_LANE_DEBUG").is_some();
+    let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
     let linearized;
     let mut orig_header: Option<PredicateId> = None;
     let problem: &ChcProblem = if problem.predicates().len() > 1 {
@@ -1423,12 +1428,12 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
         }
         return None;
     }
-    // `TRUST_IC3_LANE_NOSLICE` disables the slice (A/B measurement only; the slice
-    // is always sound — see the contract above).
-    let slice = std::env::var_os("TRUST_IC3_LANE_NOSLICE").is_none()
+    // `--ic3-lane-noslice` (B74) disables the slice (A/B measurement only; the
+    // slice is always sound — see the contract above).
+    let slice = !ay_core::misc_cli_flags().ic3_lane_noslice
         && !coi_idx.is_empty()
         && coi_idx.len() < total_latches;
-    if std::env::var_os("TRUST_IC3_LANE_DEBUG").is_some() {
+    if ay_core::misc_cli_flags().ic3_lane_debug {
         eprintln!(
             "IC3_LANE: coi_slice latches {}->{} (sliced={slice})",
             total_latches,

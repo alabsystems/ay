@@ -202,7 +202,7 @@ fn regexes_default_empty_so_flags_off_checks_are_noops() {
 }
 
 // ---------------------------------------------------------------------------
-// NF-engine closure 6 (`AY_STR_NF=1`): hard `(not (str.contains v c))`.
+// NF-engine closure 6 (`--str-nf`): hard `(not (str.contains v c))`.
 // ---------------------------------------------------------------------------
 
 #[test]

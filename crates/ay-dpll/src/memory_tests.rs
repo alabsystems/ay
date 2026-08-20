@@ -61,3 +61,20 @@ fn peak_rss_is_the_conservative_fallback_when_live_measurement_fails() {
     assert_eq!(current, 2 * 1024 * 1024 * 1024);
     assert!(memory_exceeded_at(Some(128 * 1024 * 1024), current));
 }
+
+#[test]
+fn probe_clone_budget_charges_the_clone_not_the_process() {
+    let cap = 2 * 1024 * 1024 * 1024_usize; // a parsed `:max-memory 2048`
+    let own = 64 * 1024_usize; // this solver's whole term universe
+
+    // A probe whose own clone is KiB fits, however large the surrounding
+    // process is — the process footprint is not an input at all.
+    assert!(probe_clone_fits(own, Some(cap)));
+    // No declared cap: nothing to charge against.
+    assert!(probe_clone_fits(own, None));
+
+    // Still fail-closed: a clone above half the declared cap is refused, and
+    // the boundary itself is inclusive.
+    assert!(probe_clone_fits(cap / 2, Some(cap)));
+    assert!(!probe_clone_fits(cap / 2 + 1, Some(cap)));
+}

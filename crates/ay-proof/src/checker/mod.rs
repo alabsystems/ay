@@ -28,9 +28,10 @@ mod boolean_negation;
 mod bv_bitblast;
 mod bv_lia_query;
 pub use bv_bitblast::{
-    authenticate_bool_bv_unsat_query, authenticate_uf_leaf_bool_bv_unsat_query,
-    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
-    recognize_bv_ground_evaluate, AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
+    authenticate_uf_leaf_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
+    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
     MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF,
     MAX_EXPENSIVE_BV_WORK_PER_LEMMA, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
     MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
@@ -45,10 +46,10 @@ mod clausification;
 mod datatype_axiom;
 pub(crate) use datatype_axiom::validate_datatype_signature_context;
 pub use datatype_axiom::{
-    recognize_datatype_constructor_reconstruct, recognize_datatype_distinct,
-    recognize_datatype_exhaustive, recognize_datatype_selector_project,
-    recognize_datatype_tester_eval, recognize_datatype_tester_eval_with_selectors,
-    DatatypeMemberSignature,
+    recognize_datatype_acyclic_direct, recognize_datatype_constructor_reconstruct,
+    recognize_datatype_distinct, recognize_datatype_exhaustive,
+    recognize_datatype_selector_project, recognize_datatype_tester_eval,
+    recognize_datatype_tester_eval_with_selectors, DatatypeMemberSignature,
 };
 mod euf;
 pub use euf::{
@@ -58,7 +59,11 @@ pub use euf::{
 mod euf_step_rules;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
+mod ite_branch;
+mod nia_fourier_motzkin;
+pub use ite_branch::{recognize_array_guarded_row_expansion, recognize_ite_branch_projection};
 mod nia_linear_ideal;
+pub use nia_linear_ideal::recognize_arith_clause_tautology;
 mod nra_interval;
 mod nra_poly;
 mod nra_univariate;
@@ -74,6 +79,8 @@ pub use regex_length::{recognize_regex_length_lower_bound, regex_min_length};
 mod rounding_mode;
 mod seq_extensional_companion;
 pub use seq_extensional_companion::recognize as recognize_seq_extensional_companion_contradiction;
+mod seq_ground;
+pub use seq_ground::recognize_seq_ground_eval;
 #[path = "set_axiom.rs"]
 mod set_axiom;
 #[path = "set_card_chain.rs"]
@@ -83,6 +90,7 @@ mod subset_axiom;
 pub use rounding_mode::recognize_rounding_mode_domain;
 pub(crate) use set_axiom::EmptySetRegistry;
 pub use set_card_chain::recognize_set_card_chain_recurrence;
+pub use string_ground::clause_mentions_string_or_regex;
 pub use string_ground::recognize_string_ground_eval;
 pub(crate) use string_ground::{
     STRING_CHAR_ALLOCATION_LIMIT, STRING_EVAL_WORK_LIMIT, STRING_NUMERIC_BIT_ALLOCATION_LIMIT,
@@ -96,6 +104,7 @@ pub use fp_bounded::{
 mod fp_forward_error;
 pub use fp_forward_error::recognize_fp_forward_error;
 mod fp_ground;
+pub use fp_ground::clause_mentions_floating_point;
 pub use fp_ground::recognize_fp_ground_eval;
 pub(crate) use fp_ground::FP_GROUND_WORK_LIMIT;
 mod fp_to_bv;
@@ -741,10 +750,25 @@ fn validate_alethe_step(
         match &mut trust_collector {
             Some(collector) => collector.push((step_id, clause.to_vec())),
             None => {
+                // Same triage disclosure as `GENERIC lemma declined` below:
+                // the typed error names only the step id, but the CLAUSE the
+                // trust step asserts is the one fact a strict-decline triage
+                // needs to route the fix (missing repair lane vs producer
+                // defect). Gated on the typed `--debug-cert` carrier.
+                if ay_core::misc_cli_flags().debug_cert {
+                    let rendered: Vec<String> = clause
+                        .iter()
+                        .map(|&t| crate::format_term_alethe(terms, t))
+                        .collect();
+                    ay_core::safe_eprintln!(
+                        "c !! TRUST step rejected at {step_id:?} rule={rule:?} clause=[{}]",
+                        rendered.join(" | ")
+                    );
+                }
                 return Err(match rule {
                     AletheRule::Hole => ProofCheckError::HoleStep { step: step_id },
                     _ => ProofCheckError::TrustStep { step: step_id },
-                })
+                });
             }
         }
     }
@@ -1077,6 +1101,32 @@ fn validate_theory_lemma(
             TheoryLemmaKind::StringGroundEval => {
                 string_ground::validate_string_ground_eval(terms, step_id, clause)?;
             }
+            // Ground sequence identity through one shared symbolic anchor:
+            // `(cl ¬(= x S1) (= x S2))` with S1/S2 ground seq terms whose
+            // concat-flattened, empty-dropped normal forms are elementwise
+            // identical — validated by an INDEPENDENT normalizer, fail-closed
+            // on any non-ground leaf or unsupported operator.
+            TheoryLemmaKind::SeqGroundEval => {
+                seq_ground::validate_seq_ground_eval(terms, step_id, clause)?;
+            }
+            // Standalone linear-arithmetic clause tautology: the negated
+            // clause (or-packed literals flattened conjunctively) is an
+            // INFEASIBLE constraint system, re-derived by the independent
+            // generic-arithmetic refuter. Intrinsically valid — no pedigree
+            // needed — exactly like `BoolTautology` propositionally.
+            TheoryLemmaKind::ArithClauseTautology => {
+                nia_linear_ideal::validate_generic_arithmetic_refutation_with_progress(
+                    terms, step_id, clause, progress,
+                )?;
+            }
+            // Term-ite branch projection / guarded ROW expansion: intrinsic
+            // clausification tautologies, validated purely structurally.
+            TheoryLemmaKind::IteBranchProjection => {
+                ite_branch::validate_ite_branch_projection(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::ArrayGuardedRowExpansion => {
+                ite_branch::validate_array_guarded_row_expansion(terms, step_id, clause)?;
+            }
             // Regex intersection-emptiness over a SYMBOLIC subject (#regex-cert):
             // the clause carries a `str.in_re` literal group over one common
             // term whose jointly-denied intersection is EMPTY, so no value of
@@ -1145,6 +1195,27 @@ fn validate_theory_lemma(
                     });
                 }
             },
+            // Direct acyclicity (occurs check), C5b reintroduced: a denied
+            // equality whose one side is a registered-constructor application
+            // properly containing the other side through constructor
+            // applications only. Iterative bounded walk; the registry is the
+            // constructor identity authority, so without it the kind fails
+            // closed exactly like its siblings.
+            TheoryLemmaKind::DatatypeAcyclicDirect => {
+                match (dt_decls, datatype_member_signatures) {
+                    (Some(decls), Some(_)) => {
+                        datatype_axiom::validate_datatype_acyclic_direct(
+                            terms, step_id, clause, decls,
+                        )?;
+                    }
+                    _ => {
+                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
+                            step: step_id,
+                            kind,
+                        });
+                    }
+                }
+            }
             // Finite-enum pigeonhole. Same fail-closed contract as the sibling
             // above: without the datatype registry the checker cannot establish
             // the constructor count or the nullarity the argument rests on, so
@@ -1278,8 +1349,16 @@ fn validate_theory_lemma(
                 // itself — the lemma carries no payload to forge — and any other
                 // outcome falls through to the pre-existing fail-closed handling
                 // below, so nothing that used to be rejected becomes trusted.
+                //
+                // Two rules share ONE normalization of the negated clause: the
+                // equality-SPAN fast path (polynomial identities, where the
+                // nonlinear monomials cancel) and, when that declines, the
+                // ORDER lane — Fourier-Motzkin elimination over the same
+                // monomial-abstracted constraints, which reaches the `<`/`<=`
+                // conflicts the span rule ignores by construction
+                // (antisymmetry, transitivity, scaled bound contradictions).
                 if other.is_trust() {
-                    match nia_linear_ideal::validate_linear_ideal_refutation_with_progress(
+                    match nia_linear_ideal::validate_generic_arithmetic_refutation_with_progress(
                         terms, step_id, clause, progress,
                     ) {
                         Ok(()) => {
@@ -1302,6 +1381,28 @@ fn validate_theory_lemma(
                 match (other.is_trust(), trust_collector) {
                     (true, Some(collector)) => collector.push((step_id, clause.to_vec())),
                     _ => {
+                        // The SHAPE of the lemma no Generic lane could decide is
+                        // the one fact a strict-decline triage needs, and it was
+                        // unobservable: `UnsupportedTheoryLemmaKind` names the
+                        // step and the kind, never the clause. Without it a
+                        // triage cannot tell a CHECKER gap (the clause is a
+                        // standalone theory tautology nothing validates) from a
+                        // PRODUCER defect (the clause is a propagation valid
+                        // only under the other assertions, which must never be
+                        // admitted). Gated on the existing typed `--debug-cert`
+                        // carrier, reachable in-process through
+                        // `ay_core::set_global_misc_cli_flags_with`.
+                        if ay_core::misc_cli_flags().debug_cert {
+                            let rendered: Vec<String> = clause
+                                .iter()
+                                .map(|&t| crate::format_term_alethe(terms, t))
+                                .collect();
+                            ay_core::safe_eprintln!(
+                                "c !! GENERIC lemma declined at {step_id:?} kind={other:?} \
+                                 clause=[{}]",
+                                rendered.join(" | ")
+                            );
+                        }
                         return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
                             step: step_id,
                             kind: other,

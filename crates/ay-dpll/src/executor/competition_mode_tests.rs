@@ -360,6 +360,128 @@ fn shed_mode_every_unsat_family_admits_competition_raw() {
     }
 }
 
+/// A quantified AUFLIA refutation that routes through a PREPROCESSED-window
+/// theory transaction (`with_deferred_postprocessing`), minimized from the
+/// SMT-LIB SingleQuery instance
+/// `non-incremental/AUFLIA/20170829-Rodin/smt5528103774414173689.smt2`.
+///
+/// The `forall` over the uninterpreted sort forces the combined AUFLIA route,
+/// which swaps a preprocessed assertion window in; the `0 <= c <= 0 /\ c != 0`
+/// bound clash is what refutes.
+const QUANTIFIED_PREPROCESSING_WINDOW_UNSAT: &str = r"
+    (set-logic AUFLIA)
+    (declare-sort Color 0)
+    (declare-fun c () Int)
+    (declare-fun green () Color)
+    (declare-fun red () Color)
+    (assert (forall ((x Color)) (or (= x green) (= x red))))
+    (assert (<= 0 c))
+    (assert (<= c 0))
+    (assert (not (= c 0)))
+    (check-sat)
+    ";
+
+/// RIGOR MONOTONICITY (#rigor-fast-monotone): `--rigor fast` (competition
+/// shedding) does strictly LESS checking than `--rigor standard`, so it may
+/// never LOSE a verdict standard publishes.
+///
+/// It did. `with_deferred_postprocessing` installs a provenance describing its
+/// PREPROCESSED window and, on UNSAT only, deliberately skips the restore so
+/// the certification lanes can consume it. That is sound under standard rigor
+/// because an outer public-query provenance exists and
+/// `preserving_authority_from` re-roots the record onto the authored epoch.
+/// Under shedding `begin_public_solve` installs no outer provenance at all, so
+/// the re-rooting is the identity and what survived named the PREPROCESSED
+/// window — a present-but-mismatched provenance that
+/// `authenticate_unsat_query_scope` hard-fails, degrading the raw lane to
+/// `unknown`. Measured on the SMT-LIB SingleQuery Equality_LinearArith
+/// selection: 15 of 120 declared-unsat AUFLIA instances were lost this way,
+/// on the competition posture, on every quantified division.
+///
+/// The mismatch check is NOT relaxed — present-but-mismatched provenance stays
+/// a hard error under both policies. The transaction simply stops leaving the
+/// record behind when no lane can consume it
+/// (`theory_window_provenance_survives_unsat`).
+#[test]
+fn shed_mode_is_monotone_against_certified_on_preprocessing_window_unsat() {
+    // `--rigor standard`: certified default, no competition switch.
+    let mut standard = Executor::new();
+    let standard_outputs = run(&mut standard, QUANTIFIED_PREPROCESSING_WINDOW_UNSAT);
+    let standard_verdict = standard_outputs.last().map(String::as_str);
+    assert_eq!(
+        standard_verdict,
+        Some("unsat"),
+        "the fixture must still be a certified refutation, else this test \
+         proves nothing about monotonicity"
+    );
+
+    // `--rigor fast`: `set_competition_mode(true)` is exactly what the CLI
+    // level does (`CliAssuranceLevel::Fast` == the former `--competition`).
+    let mut fast = Executor::new();
+    fast.set_competition_mode(true);
+    assert!(fast.competition_shedding_active());
+    let fast_outputs = run(&mut fast, QUANTIFIED_PREPROCESSING_WINDOW_UNSAT);
+
+    assert_eq!(
+        fast_outputs.last().map(String::as_str),
+        standard_verdict,
+        "rigor must be MONOTONE: `fast` does less checking than `standard`, \
+         so it can never lose a verdict `standard` publishes"
+    );
+    assert_eq!(
+        fast.last_command_unsat_admission,
+        Some(CommandUnsatAdmission::CompetitionRaw),
+        "the shed-mode verdict must publish through the B3 raw admission lane"
+    );
+}
+
+/// The mechanism behind the monotonicity failure, pinned directly: after a
+/// shed-mode public solve NO proof-source provenance may be left installed.
+///
+/// Absence is the documented shed-mode norm the B3 raw lane authenticates
+/// (`authenticate_unsat_query_scope` runs with `require_proof_provenance =
+/// false`). Any record surviving a preprocessed-window theory transaction is
+/// bound to that window rather than to `epoch.assertions`, so its mere
+/// presence is what fails the scope check. Asserting the verdict alone would
+/// not catch a future transaction re-introducing the same leftover on a route
+/// this fixture does not take.
+#[test]
+fn shed_mode_public_solve_leaves_no_proof_source_provenance() {
+    for (family, script) in [
+        (
+            "quantified AUFLIA preprocessing window",
+            QUANTIFIED_PREPROCESSING_WINDOW_UNSAT,
+        ),
+        (
+            "LIA preprocessing window",
+            r"
+            (set-logic QF_LIA)
+            (declare-const x Int)
+            (declare-const y Int)
+            (assert (= y (+ x x)))
+            (assert (< x 0))
+            (assert (> x 0))
+            (check-sat)
+            ",
+        ),
+    ] {
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        let outputs = run(&mut exec, script);
+        assert_eq!(
+            outputs.last().map(String::as_str),
+            Some("unsat"),
+            "{family}: fixture must refute under shedding"
+        );
+        assert!(
+            !exec.has_proof_problem_assertion_provenance(),
+            "{family}: a shed-mode solve builds no proof, so it must leave no \
+             proof-source provenance — a surviving record is bound to a \
+             preprocessed window and fails the raw lane's scope check"
+        );
+    }
+}
+
 /// #proof-capability B3 unreachability invariant: with ANY proof demand in
 /// scope — or without competition mode at all — the raw lane is dead code.
 /// Each demand row runs TWIN executors, competition+demand vs demand-only,

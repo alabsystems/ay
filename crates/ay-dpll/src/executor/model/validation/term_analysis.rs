@@ -1988,6 +1988,32 @@ impl Executor {
         })
     }
 
+    /// Reserved `__ay_*` leaves that are ORDINARY model-valued arithmetic
+    /// values rather than opaque internal Skolems (#internal-arith-witness).
+    ///
+    /// Same rationale as the `#reserved-div-witness` exception below, and the
+    /// same fail-closed direction: validating these is STRICTLY STRONGER than
+    /// skipping them. A missing model value now fails validation instead of
+    /// silently removing the assertion from validation coverage — and because
+    /// `precompute_term_flags` propagates `TERM_FLAG_INTERNAL` from children to
+    /// parents, ONE such leaf marks its entire top-level assertion internal.
+    /// When every assertion of a (sub-)solve is marked that way, `checked == 0`
+    /// and the `no_verification_evidence` guard degrades a decided verdict to
+    /// Unknown without ever running a check.
+    ///
+    ///  * `__ay_ce_*` — CEGQI counterexample instantiation variables. The
+    ///    counterexample sub-solve's assertions are the negated quantifier body
+    ///    at these variables, so ALL of them mention one.
+    ///  * `__ay_constinterp!*` — constant-interpretation witnesses, which carry
+    ///    a concrete arithmetic value in the model.
+    ///
+    /// Restricted to arithmetic sorts: these are value leaves, not the opaque
+    /// uninterpreted/array/datatype witnesses the internal flag exists to hide.
+    fn is_model_valued_arith_witness(name: &str, sort: &Sort) -> bool {
+        matches!(sort, Sort::Int | Sort::Real)
+            && (name.starts_with("__ay_ce_") || name.starts_with("__ay_constinterp"))
+    }
+
     /// Precompute term classification flags for all terms in a single O(T) pass.
     ///
     /// Because TermIds are allocated sequentially and children always have lower
@@ -2007,7 +2033,10 @@ impl Executor {
                 TermData::App(sym, args) => {
                     let name = sym.name();
                     // Internal symbol check
-                    if name.starts_with("__ay_") && !self.is_live_private_binding_identity(name) {
+                    if name.starts_with("__ay_")
+                        && !Self::is_model_valued_arith_witness(name, self.ctx.terms.sort(tid))
+                        && !self.is_live_private_binding_identity(name)
+                    {
                         f |= TERM_FLAG_INTERNAL;
                     }
                     // Array term check
@@ -2109,6 +2138,7 @@ impl Executor {
                         && !name.starts_with("__ay_eqdv")
                         && !name.starts_with("__ay_soft_")
                         && !is_model_valued_div_witness
+                        && !Self::is_model_valued_arith_witness(name, self.ctx.terms.sort(tid))
                         && !self.is_live_private_binding_identity(name)
                     {
                         f |= TERM_FLAG_INTERNAL;
@@ -2301,5 +2331,58 @@ impl Executor {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod internal_arith_witness_tests {
+    use super::*;
+
+    /// Pins `#internal-arith-witness` (the classification, in both directions).
+    ///
+    /// `precompute_term_flags` propagates `TERM_FLAG_INTERNAL` from children to
+    /// parents, so ONE mis-classified leaf marks its whole top-level assertion
+    /// internal; when that holds for every assertion of a sub-solve,
+    /// `no_verification_evidence` degrades a decided verdict to Unknown WITHOUT
+    /// running a single check. Measured across the `ay-dpll` suite at
+    /// `dd514ed7a`, treating these two families as opaque cost **734 of the 837**
+    /// `SmtCircularSatFallback` declines — i.e. 88% of that whole class was the
+    /// checker refusing to look, not the model being unverifiable.
+    #[test]
+    fn ce_and_constinterp_arith_leaves_are_validated_not_skipped() {
+        for name in ["__ay_ce_n_6!10", "__ay_ce_y_0!2", "__ay_constinterp!k_3_45"] {
+            for sort in [Sort::Int, Sort::Real] {
+                assert!(
+                    Executor::is_model_valued_arith_witness(name, &sort),
+                    "{name}:{sort:?} carries a concrete arithmetic model value"
+                );
+            }
+        }
+    }
+
+    /// The negative half, which is what keeps this fail-closed: the carve-out is
+    /// for VALUE leaves only. A non-arithmetic sort has no model value to check,
+    /// so it must stay opaque rather than be handed to the evaluator; and no
+    /// other `__ay_*` family is admitted by prefix accident.
+    #[test]
+    fn the_carve_out_is_confined_to_arithmetic_value_leaves() {
+        for sort in [Sort::Bool, Sort::String, Sort::RegLan] {
+            assert!(
+                !Executor::is_model_valued_arith_witness("__ay_ce_p_0!1", &sort),
+                "a non-arithmetic {sort:?} witness has no value to validate"
+            );
+        }
+        for name in [
+            "__ay_skolem_x",
+            "__ay_ext_witness_0",
+            "__ay_storeidx!3",
+            "__ay_ce",
+            "__ay_constinter",
+        ] {
+            assert!(
+                !Executor::is_model_valued_arith_witness(name, &Sort::Int),
+                "{name} is not a CEGQI/constant-interpretation value leaf"
+            );
+        }
     }
 }

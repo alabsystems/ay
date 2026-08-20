@@ -102,6 +102,10 @@ fn main() {
         });
     if flags.has("iter-ledger") {
         ITER_LEDGER.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The library-side accumulation gate (B38 follow-up): without this the
+        // flag printed an empty ledger, because nothing ever turned the
+        // per-phase counters on.
+        ay_milp::enable_iter_ledger();
     }
     let mut args = flags.positional.iter().cloned();
     let Some(path) = args.next() else {
@@ -363,11 +367,19 @@ fn main() {
             return;
         }
     };
-    // The 4th positional arg seeds a reference incumbent (`name value` lines).
-    // Advice is exactly re-checked before belief, so a bad file cannot corrupt
-    // a verdict; it isolates primal quality from enumeration cost.
+    // The 3rd PARSED positional seeds a reference incumbent (`name value`
+    // lines). Advice is exactly re-checked before belief, so a bad file cannot
+    // corrupt a verdict; it isolates primal quality from enumeration cost.
     // B13 replaced the former AY_MILP_SEED_SOL environment arm.
-    if let Some(seedf) = std::env::args().nth(4) {
+    //
+    // This used to read RAW `std::env::args().nth(4)`, bypassing the flags
+    // parser the file's own header installs — so any invocation carrying two or
+    // more engine flags fed a flag token (or its value) to `read_to_string` and
+    // PANICKED with "read seed solution". Every flag-based A/B on this harness
+    // had to pad positionals to dodge it (an audit found an `empty.seed` doing
+    // exactly that). Reading the parsed positional makes flags and the seed
+    // composable, which is the whole point of the shared engine CLI.
+    if let Some(seedf) = args.next() {
         let text = std::fs::read_to_string(&seedf).expect("read seed solution");
         let index: std::collections::HashMap<&str, usize> = p
             .col_names

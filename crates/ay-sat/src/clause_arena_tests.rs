@@ -703,3 +703,89 @@ fn test_live_indices_excludes_garbage_kept_husks() {
     // Husk literal data is intact (reason-pointer contract).
     assert_eq!(arena.literals(off1), &[lit(3), lit(4)]);
 }
+
+/// The clause-DB byte heuristic must not notice the growth policy.
+///
+/// `memory_bytes()` bills `accounted_words`, which is maintained on `Vec`'s
+/// own amortized rule (`max(2*cap, len+extra)`, floored at
+/// `MIN_NON_ZERO_CAP`) rather than on what the arena really reserves. Below
+/// `BOUNDED_GROWTH_THRESHOLD_WORDS` the arena still grows through
+/// `Vec::reserve`, so the two must agree EXACTLY — which is the check that
+/// pins the model to the real ladder. Above the threshold, and after an
+/// explicit `reserve_clauses`, the real capacity diverges by design and the
+/// accounting stays where the heuristic has always been.
+#[test]
+fn test_accounted_words_tracks_vec_growth_ladder_exactly() {
+    let mut arena = ClauseArena::new();
+    assert_eq!(arena.accounted_words, arena.words.capacity());
+    for i in 0..2000u32 {
+        let a = lit(i as i32 + 1);
+        let b = lit(-((i as i32 % 97) + 1));
+        let c = lit((i as i32 % 31) + 1);
+        arena.add(&[a, b, c], i % 3 == 0);
+        assert!(
+            arena.words.capacity() < BOUNDED_GROWTH_THRESHOLD_WORDS,
+            "test must stay in the Vec-growth regime"
+        );
+        assert_eq!(
+            arena.accounted_words,
+            arena.words.capacity(),
+            "accounting ladder diverged from Vec's capacity after {i} clauses"
+        );
+    }
+}
+
+/// An explicit reservation buys real capacity without moving the heuristic.
+#[test]
+fn large_arena_growth_is_bounded_not_doubled() {
+    // THE BARRIER REVIEW FOUND MISSING. Deleting the bounded-growth branch in
+    // `ClauseArena::reserve_words` and falling back to `Vec::reserve` was
+    // undetected by the entire suite (3090 passed either way), even though on
+    // vlsat3_b99 that is the difference between reserving ~1.65 GB and ~1.0 GB.
+    //
+    // A capacity assertion is the only thing that can catch it: `Vec::reserve`
+    // doubles (cap -> 2*cap) while the bounded path grows by a quarter
+    // (cap -> cap + cap/4). Past BOUNDED_GROWTH_THRESHOLD_WORDS those differ by
+    // hundreds of megabytes, which is exactly the regime this fix exists for.
+    let mut arena = ClauseArena::new();
+    let threshold = BOUNDED_GROWTH_THRESHOLD_WORDS;
+    arena.words.reserve_exact(threshold + 1024);
+    arena.words.resize(threshold + 1024, 0);
+    let cap_before = arena.words.capacity();
+    assert!(
+        cap_before >= threshold,
+        "precondition: the arena must be past the bounded-growth threshold"
+    );
+
+    // Ask for one word more than the spare capacity, forcing a grow.
+    let spare = cap_before - arena.words.len();
+    arena.reserve_words(spare + 1);
+
+    let cap_after = arena.words.capacity();
+    assert!(
+        cap_after >= arena.words.len() + spare + 1,
+        "the reservation must actually cover the request"
+    );
+    assert!(
+        cap_after < cap_before * 2,
+        "large-arena growth must be bounded (cap + cap/4), not doubled: \
+         {cap_before} -> {cap_after}. Falling back to `Vec::reserve` here costs \
+         ~650 MB on a 51.9M-clause instance and no other test notices."
+    );
+}
+
+#[test]
+fn test_reserve_clauses_does_not_move_the_memory_heuristic() {
+    let mut arena = ClauseArena::new();
+    arena.add(&[lit(1), lit(-2)], false);
+    let billed_before = arena.memory_bytes();
+    let accounted_before = arena.accounted_words;
+
+    arena.reserve_clauses(100_000, 300_000);
+    assert!(
+        arena.words.capacity() >= 100_000 * HEADER_WORDS + 300_000,
+        "reservation must actually be made"
+    );
+    assert_eq!(arena.accounted_words, accounted_before);
+    assert_eq!(arena.memory_bytes(), billed_before);
+}

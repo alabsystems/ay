@@ -19,11 +19,6 @@ impl Executor {
             self.last_proof_term_overrides = Some(term_overrides);
         }
         let extended_assertions = self.proof_exportable_assertions(rewrites);
-        Self::demote_auxiliary_non_problem_assumptions(
-            proof,
-            &extended_assertions,
-            aux_assume_steps,
-        );
         // Conjunct assumes introduced by top-level and-flattening are DERIVED
         // from their asserted conjunction before demotion can turn them into
         // unverified `trust` steps and fail-close the strict checker.
@@ -35,6 +30,41 @@ impl Executor {
         // Replay propagation rewrites before demotion; a missing or invalid
         // record still falls through to the existing fail-closed path.
         self.derive_propagated_value_assumptions(proof, &extended_assertions);
+        // #4751 `_mod_q` class — the auxiliary demotion runs AFTER the two
+        // derivation lanes, not before them.
+        //
+        // Both orders demote exactly the same assumes; what the original order
+        // changed was whether the lanes ever SAW an auxiliary assume. Running
+        // first, `demote_auxiliary_non_problem_assumptions` had already turned
+        // every `_mod_q`/`_div_q`/`_divmod_q`-mentioning assume into a
+        // premiseless `trust` Step, so `derive_propagated_value_assumptions`
+        // found no `Assume` to plan from and the whole class was unreachable
+        // by construction — measured on `dillig12_m` as 100% of the surviving
+        // `_mod_q_*` rejections.
+        //
+        // Deriving such an assume is NOT the thing #6759 excluded. That change
+        // narrowed the ASSUME whitelist so a preprocessing temporary can never
+        // be presented as though the user had authored it; a derivation makes
+        // no such claim — it discharges the temporary from authored roots
+        // through steps the UNTOUCHED strict checker re-derives, and declines
+        // (leaving today's demotion) on any mismatch. Anything the lanes do
+        // not derive is still an `Assume` here and is demoted exactly as
+        // before.
+        //
+        // The index set is RECOMPUTED because both lanes splice steps into the
+        // proof, which invalidates the caller's positional set. It is a pure
+        // function of the proof, and is skipped entirely when the caller found
+        // no auxiliary assume to begin with, so the no-aux fast path pays
+        // nothing.
+        if !aux_assume_steps.is_empty() {
+            let aux_after_derivation =
+                Self::collect_assume_steps_with_aux_mod_div_vars(&self.ctx.terms, proof);
+            Self::demote_auxiliary_non_problem_assumptions(
+                proof,
+                &extended_assertions,
+                &aux_after_derivation,
+            );
+        }
         Self::demote_non_problem_assumptions(proof, &extended_assertions);
         // Last resort: rebuild from the original assertions only. Failure keeps
         // the existing proof unchanged.

@@ -55,6 +55,31 @@
 //! back as authored — never the normalized re-elaboration, which is how the
 //! folded constant got in. An unsound query cannot survive: the validator's own
 //! interpreter answers `Satisfiable` and the candidate is discarded.
+//!
+//! ## The premise-scope gate, and why the strict checker is not it
+//!
+//! Printing back as authored is NOT the same property as being one of the
+//! premises the Alethe exporter is handed. `alethe_printer`'s
+//! `NonProblemAssume` — "preprocessing results must be derived, never silently
+//! promoted to authored input" — tests exact `TermId` membership in the
+//! exporter's premise set (`validate_reachable_assumes_in_problem_scope`), and
+//! a raw re-intern the premise scope has not admitted fails it however
+//! faithfully it prints.
+//!
+//! The strict checker cannot stand in for that test, because its premise set is
+//! a strict SUPERSET of the exporter's:
+//! `complete_problem_assertions_for_strict_proof` is
+//! `proof_export_scope_assertions()` PLUS `self_check_authored_assertions` PLUS
+//! `declared_obligation_extension()`. A root admitted only by one of those two
+//! extensions passes `check_proof_strict_with_datatypes` and is then refused at
+//! export — the one outcome strictly worse than the hole this promoter
+//! replaces. So the promoter runs the EXPORTER'S OWN check against the
+//! EXPORTER'S OWN set before it commits, and declines the whole recovery
+//! otherwise.
+//!
+//! NO NEW AUTHORITY, matching `respell_certified_proof_over_authored_surface`:
+//! this pass never calls `record_rebuilt_authored_proof_premise`, so it cannot
+//! widen the premise scope by one term to make its own `assume` admissible.
 
 use super::*;
 
@@ -86,11 +111,17 @@ impl Executor {
         if roots.try_reserve_exact(parsed.len()).is_err() {
             return false;
         }
+        // (1b) PREMISE SCOPE. Only a term the exporter's own premise set already
+        // admits may become an `assume`. A root the scope has not admitted is
+        // not a candidate premise at all — dropping it only shrinks the question
+        // asked below, exactly like a root that will not re-intern, which is the
+        // safe direction. This pass adds nothing to the scope; it only reads it.
+        let scope = self.proof_export_scope_assertions();
         for assertion in &parsed {
             let Some(root) = self.raw_intern_surface(assertion) else {
                 continue;
             };
-            if matches!(self.ctx.terms.sort(root), Sort::Bool) {
+            if matches!(self.ctx.terms.sort(root), Sort::Bool) && scope.contains(&root) {
                 roots.push((root, assertion));
             }
         }
@@ -127,6 +158,14 @@ impl Executor {
         let Some(selected) = refuted else {
             return false;
         };
+        // (2c) The gate the brief names, stated where the promotion decision is
+        // made: every root that will become `(assume h_i A_i)` must be a member
+        // of the premise scope. One failure declines the WHOLE recovery — a
+        // partial refutation over a subset of the roots is a different (and
+        // unproven) claim, so there is nothing to fall back to.
+        if selected.iter().any(|&(root, _)| !scope.contains(&root)) {
+            return false;
+        }
 
         // (2b) Only the premises that will actually become `assume` leaves have
         // to round-trip. Rendering each through the SAME override-aware printer
@@ -192,12 +231,21 @@ impl Executor {
             );
         }
 
-        // (4) Commit only what the UNCHANGED strict checker accepts whole.
+        // (4) Commit only what the UNCHANGED strict checker accepts whole, AND
+        // what the exporter's own authority check accepts against the exporter's
+        // own premise set. Candidate construction interned raw negations, so the
+        // scope is recomputed here rather than reused: the committed proof is
+        // judged against the set as it stands at commit time.
         if !residual.is_empty()
             || !Self::proof_derives_empty_clause(&candidate)
             || !self
                 .check_proof_strict_with_datatypes(&candidate)
                 .is_ok_and(|quality| quality.is_complete())
+            || ay_proof::validate_reachable_assumes_in_problem_scope(
+                &candidate,
+                &self.proof_export_scope_assertions(),
+            )
+            .is_err()
         {
             return false;
         }
@@ -208,7 +256,25 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use ay_core::{AletheRule, Proof, TheoryLemmaKind};
+    use ay_core::{AletheRule, Proof, ProofStep, TermId, TheoryLemmaKind};
+
+    /// The exact three-step shape the promoter commits for one root.
+    fn candidate(root: TermId, negated: TermId) -> Proof {
+        let mut proof = Proof::new();
+        let assume_id = proof.add_assume(root, None);
+        let lemma = proof.add_theory_lemma_with_kind(
+            "BV/LIA",
+            vec![negated],
+            TheoryLemmaKind::BvLiaTautology,
+        );
+        proof.add_rule_step(
+            AletheRule::ThResolution,
+            Vec::new(),
+            vec![lemma, assume_id],
+            Vec::new(),
+        );
+        proof
+    }
 
     /// FALSIFY-ONCE for step (4). The promoter's whole soundness argument is
     /// that `BvLiaTautology` is re-derived by the strict checker rather than
@@ -244,24 +310,6 @@ mod tests {
         let not_satisfiable = executor.ctx.terms.mk_not_raw(satisfiable);
         let not_refutable = executor.ctx.terms.mk_not_raw(refutable);
 
-        // The exact three-step shape the promoter commits, one root each.
-        let candidate = |root, negated| {
-            let mut proof = Proof::new();
-            let assume_id = proof.add_assume(root, None);
-            let lemma = proof.add_theory_lemma_with_kind(
-                "BV/LIA",
-                vec![negated],
-                TheoryLemmaKind::BvLiaTautology,
-            );
-            proof.add_rule_step(
-                AletheRule::ThResolution,
-                Vec::new(),
-                vec![lemma, assume_id],
-                Vec::new(),
-            );
-            proof
-        };
-
         let honest =
             executor.check_proof_strict_with_datatypes(&candidate(refutable, not_refutable));
         assert!(
@@ -276,6 +324,125 @@ mod tests {
             planted.is_err(),
             "a BvLiaTautology claiming a SATISFIABLE root is unsound; the strict \
              checker re-derives the query itself and must reject it"
+        );
+    }
+
+    /// FALSIFY-ONCE for the premise-scope gate, reporting BOTH observed states.
+    ///
+    /// The gate's whole claim is that the STRICT CHECKER IS NOT THE EXPORTER.
+    /// `complete_problem_assertions_for_strict_proof` is
+    /// `proof_export_scope_assertions()` plus `self_check_authored_assertions`
+    /// plus `declared_obligation_extension()`, so a root admitted by only one
+    /// of those extensions passes `check_proof_strict_with_datatypes` and is
+    /// then refused by `alethe_printer` as a `NonProblemAssume`. Before the
+    /// gate, the promoter committed exactly that proof: internally certified,
+    /// externally unexportable — the one outcome strictly worse than the hole
+    /// it replaces.
+    ///
+    /// The violation is PLANTED by moving the grant out of the export scope and
+    /// into the strict-only extension, which changes nothing else about the
+    /// query. Both states are asserted:
+    ///
+    /// * ADMITTED — the grant in the export scope: the promoter COMMITS, and
+    ///   the exporter's own authority check accepts the committed proof.
+    /// * PLANTED  — the same grant strict-only: the strict checker STILL
+    ///   accepts the byte-identical candidate (so the strict checker demonstrably
+    ///   is not what stops it), the exporter's own check REJECTS it, and the
+    ///   promoter DECLINES, leaving the caller's proof untouched.
+    #[test]
+    fn a_root_only_the_strict_scope_admits_declines_the_promoter() {
+        let commands =
+            ay_frontend::parse("(set-logic QF_LIA)\n(assert (or (< 2 0) (>= 2 32)))\n(check-sat)")
+                .expect("fixture must parse");
+        let mut executor = crate::Executor::new();
+        executor.set_produce_proofs(true);
+        executor
+            .execute_all(&commands)
+            .expect("fixture must elaborate");
+
+        let parsed: Vec<_> = executor.ctx.assertions_parsed().to_vec();
+        assert_eq!(parsed.len(), 1, "fixture precondition: one authored root");
+        let root = executor
+            .raw_intern_surface(&parsed[0])
+            .expect("the authored root must re-intern");
+        assert!(
+            !executor.ctx.assertions.contains(&root),
+            "fixture precondition: the fold overwrote the authored slot, so the \
+             raw re-intern is reachable only through the recorded premise grant"
+        );
+
+        // ---- ADMITTED: the grant is in the export scope. -------------------
+        assert!(
+            executor.proof_export_scope_assertions().contains(&root),
+            "fixture precondition: the export scope must already admit the raw \
+             re-intern, or the ADMITTED half of this test proves nothing"
+        );
+        let mut admitted = Proof::new();
+        admitted.add_rule_step(AletheRule::Hole, Vec::new(), Vec::new(), Vec::new());
+        assert!(
+            executor.replace_with_exact_authored_bv_lia_refutation(&mut admitted),
+            "ADMITTED: an authored root the export scope admits must still be \
+             promoted; the gate may not cost a recovery that works"
+        );
+        assert!(
+            ay_proof::validate_reachable_assumes_in_problem_scope(
+                &admitted,
+                &executor.proof_export_scope_assertions(),
+            )
+            .is_ok(),
+            "ADMITTED: the committed proof must satisfy the exporter's own \
+             authority check"
+        );
+
+        // ---- PLANTED: the same grant, strict-only. --------------------------
+        // Nothing about the query changes; only WHICH premise set holds the
+        // grant. `self_check_authored_assertions` feeds
+        // `complete_problem_assertions_for_strict_proof` and NOT
+        // `proof_export_scope_assertions`.
+        executor.last_proof_rebuild_originals.clear();
+        executor.self_check_authored_assertions = Some(vec![root]);
+        assert!(
+            !executor.proof_export_scope_assertions().contains(&root),
+            "planted precondition: the export scope must no longer admit the root"
+        );
+
+        let negated = executor.ctx.terms.mk_not_raw(root);
+        let planted = candidate(root, negated);
+        assert!(
+            executor
+                .check_proof_strict_with_datatypes(&planted)
+                .is_ok_and(|quality| quality.is_complete()),
+            "PLANTED: the strict checker must still ACCEPT the byte-identical \
+             candidate — that is the whole point: it is not the gate"
+        );
+        assert!(
+            ay_proof::validate_reachable_assumes_in_problem_scope(
+                &planted,
+                &executor.proof_export_scope_assertions(),
+            )
+            .is_err(),
+            "PLANTED: the exporter's own authority check must refuse it, or the \
+             planted state does not model the defect"
+        );
+
+        let mut untouched = Proof::new();
+        untouched.add_rule_step(AletheRule::Hole, Vec::new(), Vec::new(), Vec::new());
+        assert!(
+            !executor.replace_with_exact_authored_bv_lia_refutation(&mut untouched),
+            "PLANTED: the promoter must DECLINE a root the exporter's premise \
+             set has not admitted, not publish an unexportable proof"
+        );
+        assert!(
+            matches!(
+                untouched.steps.as_slice(),
+                [ProofStep::Step {
+                    rule: AletheRule::Hole,
+                    ..
+                }]
+            ),
+            "PLANTED: a declined recovery must leave the erasure exactly as it \
+             was, got {:?}",
+            untouched.steps
         );
     }
 }

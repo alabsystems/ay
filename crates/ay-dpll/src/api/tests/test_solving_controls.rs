@@ -22,7 +22,16 @@ fn test_timeout_setting() {
 
 #[test]
 fn native_decision_routes_preserve_parsed_publication_controls() {
-    const PARSED_MEMORY_MIB: usize = 2_048;
+    // A SENTINEL limit, not a resource assertion. This test checks that parsed
+    // `:timeout`/`:max-memory` controls are PRESERVED across the native decision
+    // routes; it does not test that the memory limit fires. A 2 GiB cap made the
+    // test load-dependent: under `--test-threads=8` the PROCESS footprint
+    // exceeds the cap, the limit trips, the solve degrades to unknown, and the
+    // `is_sat` assertion below fails — which is exactly why this passed in
+    // isolation and failed only in the full run. The value must stay
+    // unreachable by the test process while remaining precisely what the
+    // preservation assertions compare against.
+    const PARSED_MEMORY_MIB: usize = 262_144;
     const PARSED_MEMORY_BYTES: usize = PARSED_MEMORY_MIB * 1024 * 1024;
     let options =
         format!("(set-option :timeout 60000) (set-option :max-memory {PARSED_MEMORY_MIB})");
@@ -37,7 +46,13 @@ fn native_decision_routes_preserve_parsed_publication_controls() {
         solver.check_sat_assuming(&[truth]),
         solver.check_sat_interruptible(|| false),
     ] {
-        assert!(result.is_sat(), "unexpected native result: {result}");
+        assert!(
+            result.is_sat(),
+            "unexpected native result: {result} (unknown_reason {:?}); \
+             process footprint {} B vs parsed :max-memory {PARSED_MEMORY_BYTES} B",
+            solver.unknown_reason(),
+            crate::memory::current_memory_bytes(),
+        );
         assert_eq!(solver.executor.timeout(), Some(Duration::from_mins(1)));
         assert_eq!(solver.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
         assert_eq!(solver.executor.current_solve_deadline(), None);
@@ -57,7 +72,33 @@ fn native_decision_routes_preserve_parsed_publication_controls() {
     optimizer.maximize(x);
 
     let result = optimizer.optimize_check();
-    assert!(result.is_sat(), "unexpected optimize result: {result}");
+    // Diagnostic only — the assertion is unchanged. This row was measurably
+    // NONDETERMINISTIC inside the full lib binary (2026-08-17, sha dd514ed7a:
+    // red in one 6813-test run and green in the next, same binary, same
+    // machine, no code change; again 2026-08-18 at 2b25d5a79 with a 1.87 GB
+    // footprint printed below), while it passed 3/3 in isolation. The cause is
+    // FIXED: `optimization_probe_preflight` used to refuse the probe clone once
+    // `crate::memory::current_memory_bytes()` (whole-process physical
+    // footprint) exceeded `memory_limit / 2`, spending a per-solver
+    // `:max-memory` on allocation this solver does not own. It now charges the
+    // clone itself, pinned by
+    // `executor::optimization::exact_probe::tests::
+    // preflight_charges_the_probe_clone_not_unowned_process_memory`.
+    //
+    // One PROCESS-WIDE input remains reachable and is deliberately still
+    // printed: the probe carries a 2s wall budget
+    // (`OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS`), so a machine loaded enough to
+    // stretch a 2s budget can still decline. Print both inputs so the next
+    // failure is bucketed from the log instead of re-derived.
+    assert!(
+        result.is_sat(),
+        "unexpected optimize result: {result} (unknown_reason {:?}); \
+         process footprint {} B vs parsed :max-memory {PARSED_MEMORY_BYTES} B \
+         (the preflight no longer reads the process footprint; suspect the 2s \
+         probe wall budget under machine load)",
+        optimizer.unknown_reason(),
+        crate::memory::current_memory_bytes(),
+    );
     assert_eq!(optimizer.executor.timeout(), Some(Duration::from_mins(1)));
     assert_eq!(optimizer.executor.memory_limit(), Some(PARSED_MEMORY_BYTES));
     assert_eq!(optimizer.executor.current_solve_deadline(), None);

@@ -800,6 +800,25 @@ pub(crate) fn extract_constraints(
                     pending.push((arg, true));
                 }
             }
+            // The DUAL: a disjunction under negation is conjunctive
+            // (`not (or a b)` asserts `not a` and `not b`), so an or-PACKED
+            // clause literal stays inside the fragment. An asserted `or` is
+            // genuinely disjunctive and still refuses.
+            TermData::App(Symbol::Named(name), args) if name == "or" => {
+                if asserted {
+                    return Err(
+                        "asserted disjunction is disjunctive; out of the conjunctive fragment"
+                            .to_string(),
+                    );
+                }
+                meter.charge_nodes(args.len())?;
+                pending
+                    .try_reserve(args.len())
+                    .map_err(|_| "nra pending-disjunction allocation refused".to_string())?;
+                for &arg in args.iter().rev() {
+                    pending.push((arg, false));
+                }
+            }
             TermData::App(Symbol::Named(name), args)
                 if args.len() == 2 && matches!(name.as_str(), "<" | "<=" | ">" | ">=" | "=") =>
             {
@@ -829,6 +848,56 @@ pub(crate) fn extract_constraints(
     for c in &constraints {
         c.poly.collect_vars(&mut vars, meter)?;
     }
+
+    // ENTAILED range bounds for `bv2nat` opaque leaves: `0 <= bv2nat(x)` and
+    // `bv2nat(x) <= 2^w - 1` hold in EVERY model by the operator's
+    // definition, so adjoining them to the negated-clause system preserves
+    // soundness of the infeasibility check while making width-bound
+    // tautologies (`(<= (bv2nat sk) 2^64-1)`, the symbolic Seq index bound)
+    // decidable. Added only for leaves that actually survived into the
+    // constraint system, so the pass costs nothing when no `bv2nat` occurs.
+    let mut range_constraints: Vec<Constraint> = Vec::new();
+    for &var in &vars {
+        let TermData::App(Symbol::Named(name), args) = terms.get(var) else {
+            continue;
+        };
+        if name != "bv2nat" || args.len() != 1 {
+            continue;
+        }
+        let Sort::BitVec(bv) = terms.sort(args[0]) else {
+            continue;
+        };
+        if u64::from(bv.width) > u64::try_from(MAX_POLY_COEFF_BITS).unwrap_or(u64::MAX) {
+            continue;
+        }
+        meter.charge_ops(bit_scaled(2, u64::from(bv.width)))?;
+        meter.charge_monomials(4)?;
+        // `-leaf <= 0`  (leaf >= 0)
+        let mut nonneg = MPoly::var(var);
+        nonneg = nonneg.neg(meter)?;
+        range_constraints
+            .try_reserve(2)
+            .map_err(|_| "nra bv2nat range-constraint allocation refused".to_string())?;
+        range_constraints.push(Constraint {
+            poly: nonneg,
+            rel: Rel::Le,
+        });
+        // `leaf - (2^w - 1) <= 0`
+        let mut upper = MPoly::var(var);
+        let bound = (BigInt::one() << bv.width) - BigInt::one();
+        ensure_coeff_width(&BigRational::from(bound.clone()))?;
+        upper.sub_assign_from(&MPoly::constant(BigRational::from(bound)), meter)?;
+        range_constraints.push(Constraint {
+            poly: upper,
+            rel: Rel::Le,
+        });
+    }
+    let mut constraints = constraints;
+    constraints
+        .try_reserve(range_constraints.len())
+        .map_err(|_| "nra bv2nat range-constraint allocation refused".to_string())?;
+    constraints.extend(range_constraints);
+
     Ok(Extraction {
         constraints,
         vars,
@@ -954,6 +1023,48 @@ fn parse_poly_uncached(
             if name == "/" && args.len() == 2 && matches!(terms.sort(t), Sort::Real) =>
         {
             parse_real_division(terms, t, args, memo, meter, depth)
+        }
+        // `(bv2nat c)` over a CONSTANT bitvector is exact constant folding:
+        // the unsigned reading of the bit pattern, always in `[0, 2^w)`. A
+        // symbolic argument stays an opaque leaf below (the width bound would
+        // need side-constraint plumbing; fold only what is exact). Motivated
+        // by the ground index-bound units deductive-checks's Seq encoding asserts
+        // (`(<= (bv2nat #b0..0) 2^64-1)`), which otherwise have no authority.
+        TermData::App(Symbol::Named(name), args)
+            if name == "bv2nat" && args.len() == 1 && matches!(terms.sort(t), Sort::Int) =>
+        {
+            if let TermData::Const(Constant::BitVec { value, .. }) = terms.get(args[0]) {
+                let bits = value.bits().saturating_add(1);
+                if bits > MAX_POLY_COEFF_BITS {
+                    return Err(format!(
+                        "nra polynomial coefficient exceeds cap {MAX_POLY_COEFF_BITS} bits"
+                    ));
+                }
+                meter.charge_ops(bit_scaled(1, bits))?;
+                meter.charge_monomials(1)?;
+                Ok(MPoly::constant(BigRational::from(value.clone())))
+            } else {
+                meter.charge_monomials(1)?;
+                Ok(MPoly::var(t))
+            }
+        }
+        TermData::App(Symbol::Named(name), args)
+            if name == "to_real" && args.len() == 1 && matches!(terms.sort(t), Sort::Real) =>
+        {
+            // `to_real` is the Int -> Real injection: in EVERY model the value
+            // of `(to_real x)` equals the value of `x` read as a real, so the
+            // embedded polynomial IS the argument's polynomial — an exact
+            // translation, not an abstraction. Leaving it opaque instead
+            // severs the one link a mixed Int/Real Farkas conflict runs
+            // through (`x <= 1 ∧ r = to_real x ∧ r > 3/2`, the QF_AUFLIRA
+            // cross-sort gate shape) and the refutation becomes undecidable
+            // here for no semantic reason. Int-sorted argument only; the
+            // relaxation of Int variables to reals downstream is the usual
+            // sound direction for infeasibility.
+            if *terms.sort(args[0]) != Sort::Int {
+                return Err("ill-sorted to_real embedding".to_string());
+            }
+            parse_poly(terms, args[0], memo, meter, depth + 1)
         }
         TermData::App(_, _) if matches!(terms.sort(t), Sort::Int | Sort::Real) => {
             // Opaque leaf: fresh variable keyed by this TermId.

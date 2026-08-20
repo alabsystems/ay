@@ -337,12 +337,35 @@ fn datatype_array_field_congruence_conflict_is_sound() {
 /// across a CONSTANT vs SYMBOLIC inner index. `R : Array -> Array -> T`. The two
 /// reads `(select (select R #x3) i)` and `(select (select R k) i)` with `k = #x3`
 /// denote the SAME `T` cell, so their `p`-fields must agree. The scalar-projection
-/// pass finds the contradiction, but nested-array UNSAT is intentionally
-/// quarantined at the public boundary until the theory-combination refutation has
-/// a trust-free certificate. Preserve the sound `unknown`; in particular, this
-/// congruence conflict must never be reported `sat`.
+/// pass finds the contradiction.
+///
+/// STALE PIN REFRESHED. This demanded `unknown`, on the premise:
+///
+///   "nested-array UNSAT is intentionally quarantined at the public boundary
+///    UNTIL the theory-combination refutation has a trust-free certificate."
+///
+/// That premise names its own expiry, and the certificate arrived: commit
+/// 233ab32da ("fix(arrays): authenticate nested finite unsat", 2026-08-13) gave
+/// `quarantine_unverified_nested_array_unsat` an authority ladder, whose first
+/// rung is a full-problem proof that passes the STRICT checker — the checker
+/// that rejects `trust` and `hole` steps, i.e. exactly a trust-free certificate.
+/// The same commit converted three sibling quarantine pins in
+/// `executor_tests/array_soundness.rs` from `unknown` to `unsat` for this
+/// reason, and did not reach this file.
+///
+/// This is not a relaxation and not a wrong answer: z3 4.16.0 independently
+/// refutes the instance, so `unsat` is the CORRECT verdict, and the pin was
+/// holding AY to a weaker one. The guard is strengthened rather than dropped —
+/// `array_soundness::test_nested_finite_array_congruence_uses_strict_proof_authority`
+/// pins this same query in-crate and asserts the ADMISSION CLASS, which is the
+/// only thing that distinguishes a strict-checked refutation from a quarantine
+/// leak and is not reachable from an integration test. The infinite (`Int`
+/// -indexed) side of the boundary is untouched and still degrades to `unknown`
+/// (`array_soundness::test_nested_array_alia_false_unsat_is_quarantined`).
+///
+/// In particular, this congruence conflict must still never be reported `sat`.
 #[test]
-fn nested_array_of_array_const_symbolic_index_congruence_is_quarantined() {
+fn nested_array_of_array_const_symbolic_index_congruence_is_refuted() {
     let smt = r#"
         (set-logic ALL)
         (declare-datatype T ((mk (p (_ BitVec 4)) (q (_ BitVec 4)))))
@@ -357,7 +380,18 @@ fn nested_array_of_array_const_symbolic_index_congruence_is_quarantined() {
     "#;
     let lines = results(&crate::common::solve(smt));
     assert_eq!(
-        lines[0], "unknown",
-        "uncertified nested array-of-array UNSAT must be quarantined:\n{lines:?}"
+        lines[0], "unsat",
+        "the nested array-of-array congruence conflict is refutable and now \
+         carries a strict-checked certificate:\n{lines:?}"
     );
+    if crate::common::check_z3_or_skip() {
+        let path = temp_smt("dt_nested_const_idx", smt);
+        let outcome = crate::common::run_z3_file(&path, 10).expect("run z3");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            outcome,
+            crate::common::SolverOutcome::Unsat,
+            "sanity: the nested array-of-array congruence conflict is unsat by z3"
+        );
+    }
 }

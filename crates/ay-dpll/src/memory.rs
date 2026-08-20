@@ -43,6 +43,32 @@ fn memory_exceeded_at(limit: Option<usize>, current: usize) -> bool {
     limit.is_some_and(|limit| current > 0 && current > limit)
 }
 
+/// Whether a disposable probe that CLONES `own_bytes` of solver-owned state may
+/// run under a declared per-solver memory `limit`.
+///
+/// The quantity charged is the CLONE's own cost, never the whole-process
+/// footprint. `:max-memory` is a per-solver control; reading
+/// [`current_memory_bytes`] here would let allocation this solver does not own
+/// — a sibling solver in the same process, or simply a large embedding — decide
+/// its verdict, turning an exact decision into `Unknown` with no input
+/// difference. Measured 2026-08-18 on the `ay-dpll` lib binary: a 1.83 GB
+/// process footprint declined a probe whose own term store is a few KiB,
+/// against a parsed `:max-memory` of 2 GiB, and the same query passed in
+/// isolation.
+///
+/// Half of the cap is the budget because the probe DOUBLES the solver's own
+/// term universe. Callers keep their absolute process guards
+/// (`memory_exceeded`, `ay_sys::process_memory_exceeded_at_percent`); this is
+/// only the marginal-cost half, and it is still fail-closed — a clone that
+/// would spend more than half the declared cap is refused.
+#[inline]
+pub(crate) fn probe_clone_fits(own_bytes: usize, limit: Option<usize>) -> bool {
+    match limit {
+        None => true,
+        Some(limit) => own_bytes <= limit / 2,
+    }
+}
+
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;

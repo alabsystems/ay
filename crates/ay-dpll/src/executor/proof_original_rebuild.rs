@@ -1721,6 +1721,9 @@ impl Executor {
         }
         *proof = new_proof;
         self.last_proof_term_overrides = Some(overrides);
+        if ay_core::misc_cli_flags().debug_cert {
+            ay_core::safe_eprintln!("c !! substitution-bridge SUCCEEDED (override path)");
+        }
         true
     }
 
@@ -3243,13 +3246,111 @@ impl Executor {
         if defective.is_empty() {
             return false;
         }
+        if ay_core::misc_cli_flags().debug_cert {
+            ay_core::safe_eprintln!(
+                "c !! substitution-bridge entered: {} defective leaf(s)",
+                defective.len()
+            );
+        }
 
         // (2) Plan a congruence bridge for each defective leaf. Planning is
         // pure w.r.t. the proof (it only interns the equality/lemma terms the
         // emission will need), so a failure costs nothing.
         let mut plans: Vec<BridgePlan> = Vec::with_capacity(defective.len());
+        // A defective leaf that is a STANDALONE checkable tautology needs no
+        // bridge from an authored source at all — validity is intrinsic. The
+        // canonical instance is definition substitution rewriting an
+        // ite/store clausification unit into
+        // `(or (= 42 (select a (+ i 1))) (not (= i (+ i 1))))`, which no
+        // congruence bridge can reach (there is no single authored source)
+        // but the arithmetic refuter re-derives outright. Both recognizers
+        // ARE their strict validators, and the whole-proof gate below
+        // re-checks every emitted lemma, so nothing unproven is admitted.
+        let mut tautology_leaves: Vec<(TermId, TheoryLemmaKind)> = Vec::new();
         for &goal in &defective {
+            if ay_proof::recognize_bool_tautology(&self.ctx.terms, &[goal]) {
+                tautology_leaves.push((goal, TheoryLemmaKind::BoolTautology));
+            } else if ay_proof::recognize_arith_clause_tautology(&self.ctx.terms, &[goal]) {
+                tautology_leaves.push((goal, TheoryLemmaKind::ArithClauseTautology));
+            } else if ay_proof::recognize_euf_transitive(&self.ctx.terms, &[goal]) {
+                // Or-packed EUF transitivity chain (the validator flattens the
+                // packed unit): `¬(a=b) ∨ ¬(c=a) ∨ (c=b)` — intrinsically
+                // valid, produced by congruence-closure explanation recording.
+                tautology_leaves.push((goal, TheoryLemmaKind::EufTransitive));
+            } else if ay_proof::recognize_euf_congruent(&self.ctx.terms, &[goal]) {
+                // Its congruence sibling: `¬(a=b) ∨ (f a c) = (f b c)` — the
+                // extensionality-instance shape array preprocessing emits.
+                tautology_leaves.push((goal, TheoryLemmaKind::EufCongruent));
+            } else if ay_proof::recognize_ite_branch_projection(&self.ctx.terms, &[goal]) {
+                tautology_leaves.push((goal, TheoryLemmaKind::IteBranchProjection));
+            } else if ay_proof::recognize_array_guarded_row_expansion(&self.ctx.terms, &[goal]) {
+                tautology_leaves.push((goal, TheoryLemmaKind::ArrayGuardedRowExpansion));
+            } else if {
+                let decls = self.datatype_decls_for_strict_proof();
+                let selectors = self.ctor_selector_decls_for_strict_proof();
+                !decls.is_empty()
+                    && ay_proof::recognize_datatype_tester_eval_with_selectors(
+                        &self.ctx.terms,
+                        &[goal],
+                        &decls,
+                        &selectors,
+                    )
+            } {
+                // Tester evaluation over a constructor application
+                // (`((_ is B) B)`), registry-validated.
+                tautology_leaves.push((goal, TheoryLemmaKind::DatatypeTesterEval));
+            } else if ay_proof::recognize_array_finite_select_expansion(&self.ctx.terms, &[goal]) {
+                // The Bool/finite-carrier symbolic-select expansion axiom the
+                // array solver injects (`(ite p (= (select A true) (select A p))
+                // (= (select A false) (select A p)))`) — an intrinsic
+                // array-theory tautology whose exhaustiveness the typed
+                // validator re-derives point by point.
+                tautology_leaves.push((goal, TheoryLemmaKind::ArrayFiniteSelectExpansion));
+            }
+        }
+        // A POSITIVE-EQUALITY leaf may be derivable outright by the equality
+        // planner (refl / authored / symm / cong / trans-through-definition /
+        // ground-eval / selector-chase legs), with no predicate-congruence
+        // bridge from a single source at all. The datatype selector
+        // propagation leaf `(= a (top x))` under `x ~ y ~ stack(a, empty)`
+        // is the canonical case: its derivation is projection + congruence +
+        // transitivity across TWO authored equalities.
+        let mut eq_planned_leaves: Vec<(TermId, EqPlan)> = Vec::new();
+        // DERIVED TESTER facts: `((_ is C) t)` (either polarity) where `t` is
+        // derivably equal to a candidate `k` on which the same-polarity
+        // tester fact is a registry-validated `DatatypeTesterEval` tautology
+        // (`is-stack(s1)` under `s1 ~ s0 ~ stack(..)`). Assembled below as
+        // eq_congruent_pred over the unary tester predicate, resolved with
+        // the eq-plan unit and the tester-eval lemma.
+        let mut tester_leaves: Vec<DerivedTesterLeaf> = Vec::new();
+        for &goal in &defective {
+            if tautology_leaves.iter().any(|&(term, _)| term == goal) {
+                continue;
+            }
+            if let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(goal) {
+                if name == "=" && args.len() == 2 {
+                    let (lhs, rhs) = (args[0], args[1]);
+                    let mut budget = EQ_PLAN_BUDGET;
+                    if let Some(plan) = self.plan_eq(lhs, rhs, &original_terms, 0, &mut budget) {
+                        eq_planned_leaves.push((goal, plan));
+                        continue;
+                    }
+                }
+            }
+            if let Some(leaf) = self.plan_derived_tester_leaf(goal, &original_terms) {
+                tester_leaves.push(leaf);
+                continue;
+            }
             let Some(plan) = self.plan_substitution_bridge(goal, &original_terms) else {
+                // Which leaf the repair gave up on is the one fact a
+                // strict-decline triage needs (same disclosure rationale as
+                // `TRUST step rejected` in the checker). Typed carrier only.
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "c !! substitution-bridge plan FAILED for defective leaf {goal:?}: {}",
+                        ay_proof::render_term_canonical(&self.ctx.terms, goal)
+                    );
+                }
                 return false;
             };
             plans.push(plan);
@@ -3280,8 +3381,30 @@ impl Executor {
                 kid.collect_assumed(&mut needed);
             }
         }
+        for (_, plan) in &eq_planned_leaves {
+            let mut assumed = Vec::new();
+            plan.collect_assumed(&mut assumed);
+            for term in assumed {
+                push_needed(term, &mut needed);
+            }
+        }
+        for leaf in &tester_leaves {
+            let mut assumed = Vec::new();
+            leaf.eq_plan.collect_assumed(&mut assumed);
+            for term in assumed {
+                push_needed(term, &mut needed);
+            }
+        }
         // Every assumed term must genuinely be an original premise.
         if needed.iter().any(|t| !original_terms.contains(t)) {
+            if ay_core::misc_cli_flags().debug_cert {
+                for t in needed.iter().filter(|t| !original_terms.contains(t)) {
+                    ay_core::safe_eprintln!(
+                        "c !! substitution-bridge refused: needed premise is not authored: {}",
+                        ay_proof::render_term_canonical(&self.ctx.terms, *t)
+                    );
+                }
+            }
             return false;
         }
 
@@ -3479,6 +3602,50 @@ impl Executor {
         }
 
         let mut bridge_unit: HashMap<TermId, ProofId> = HashMap::default();
+        for &(term, kind) in &tautology_leaves {
+            let theory = match kind {
+                TheoryLemmaKind::ArithClauseTautology => "arith",
+                TheoryLemmaKind::ArrayFiniteSelectExpansion
+                | TheoryLemmaKind::ArrayGuardedRowExpansion => "array",
+                TheoryLemmaKind::EufTransitive | TheoryLemmaKind::EufCongruent => "EUF",
+                TheoryLemmaKind::DatatypeTesterEval => "DT",
+                TheoryLemmaKind::IteBranchProjection => "ite",
+                _ => "bool",
+            };
+            let unit = new_proof.add_step(ProofStep::TheoryLemma {
+                theory: theory.to_string(),
+                clause: vec![term],
+                farkas: None,
+                kind,
+                lia: None,
+            });
+            bridge_unit.insert(term, unit);
+        }
+        for (term, plan) in &eq_planned_leaves {
+            let Some(unit) = Self::emit_eq_plan(&mut new_proof, plan, &assume_ids) else {
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "c !! substitution-bridge refused: eq-plan emission failed for {}",
+                        ay_proof::render_term_canonical(&self.ctx.terms, *term)
+                    );
+                }
+                return false;
+            };
+            bridge_unit.insert(*term, unit);
+        }
+        for leaf in &tester_leaves {
+            let Some(unit) = self.emit_derived_tester_leaf(&mut new_proof, leaf, &assume_ids)
+            else {
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "c !! substitution-bridge refused: derived-tester emission failed for {}",
+                        ay_proof::render_term_canonical(&self.ctx.terms, leaf.goal)
+                    );
+                }
+                return false;
+            };
+            bridge_unit.insert(leaf.goal, unit);
+        }
         for plan in &plans {
             let Some(unit) = Self::emit_substitution_bridge(
                 &mut self.ctx.terms,
@@ -3569,30 +3736,55 @@ impl Executor {
         // every step this pass emits, must validate strictly, and the rebuilt
         // proof must not introduce a trust obligation the original did not
         // already carry.
-        let before = ay_proof::check_proof_collecting_trust(proof, &self.ctx.terms)
-            .ok()
-            .map(|collected| {
-                collected
-                    .into_iter()
-                    .map(|(_, clause)| clause)
-                    .collect::<Vec<_>>()
-            });
-        let after: Vec<Vec<TermId>> =
-            match ay_proof::check_proof_collecting_trust(&new_proof, &self.ctx.terms) {
-                Ok(collected) => collected.into_iter().map(|(_, clause)| clause).collect(),
-                Err(_) => return false,
-            };
+        // The gate runs with the executor's own datatype context when the
+        // exact member signatures exist: the selector-chase leg emits
+        // registry-gated `DatatypeSelectorProject` lemmas which the plain
+        // context-free checker rejects fail-closed by design. Problems with
+        // no datatypes carry empty registries and behave exactly as before.
+        let decls = self.datatype_decls_for_strict_proof();
+        let selectors = self.ctor_selector_decls_for_strict_proof();
+        let member_signatures = self.datatype_member_signatures_for_strict_proof();
+        let gate = |target: &Proof| -> Result<Vec<Vec<TermId>>, ()> {
+            let collected = match member_signatures.as_ref() {
+                Some(signatures) => ay_proof::check_proof_collecting_trust_with_typed_context(
+                    target,
+                    &self.ctx.terms,
+                    (!decls.is_empty()).then_some(decls.as_slice()),
+                    (!selectors.is_empty()).then_some(selectors.as_slice()),
+                    signatures.as_slice(),
+                    None,
+                ),
+                None => ay_proof::check_proof_collecting_trust(target, &self.ctx.terms),
+            }
+            .map_err(|_| ())?;
+            Ok(collected.into_iter().map(|(_, clause)| clause).collect())
+        };
+        let before = gate(proof).ok();
+        let after: Vec<Vec<TermId>> = match gate(&new_proof) {
+            Ok(collected) => collected,
+            Err(()) => return false,
+        };
         let Some(before) = before else {
             // The original did not even pass deferred-trust validation; this
             // pass is not the one to reason about what it was doing.
             return false;
         };
         if after.len() > before.len() || after.iter().any(|clause| !before.contains(clause)) {
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "c !! substitution-bridge refused: rebuilt proof defers {} clause(s), original {}",
+                    after.len(),
+                    before.len()
+                );
+            }
             return false;
         }
 
         if self_contained_surface {
             *proof = new_proof;
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!("c !! substitution-bridge SUCCEEDED (self-contained path)");
+            }
             for raw in raw_authored_to_record {
                 self.record_rebuilt_authored_proof_premise(raw);
             }
@@ -3603,6 +3795,11 @@ impl Executor {
             return true;
         }
         if !surface_override_roots_have_bounded_work(&self.ctx.terms, needed.iter().copied()) {
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "c !! substitution-bridge refused: override roots exceed bounded work"
+                );
+            }
             return false;
         }
         if self
@@ -3610,6 +3807,11 @@ impl Executor {
             .as_ref()
             .is_some_and(|overrides| !surface_override_map_is_bounded(overrides))
         {
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "c !! substitution-bridge refused: unbounded surface-override map"
+                );
+            }
             return false;
         }
         let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
@@ -3651,6 +3853,12 @@ impl Executor {
             if !collect_surface_term_overrides(&mut self.ctx, term, &parsed, &mut overrides)
                 || !surface_override_map_is_bounded(&overrides)
             {
+                if ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "c !! substitution-bridge refused: surface override collection failed for {}",
+                        ay_proof::render_term_canonical(&self.ctx.terms, term)
+                    );
+                }
                 return false;
             }
         }
@@ -3775,8 +3983,53 @@ impl Executor {
         }
         let src_args = src_args.clone();
         let mut kids: Vec<EqPlan> = Vec::with_capacity(src_args.len());
+        let mut effective_src_atom = src_atom;
+        let mut source_via_symm = false;
+        let mut direct_failed = false;
         for (&a, &b) in src_args.iter().zip(goal_args.iter()) {
-            kids.push(self.plan_eq(a, b, original_terms, 0, budget)?);
+            match self.plan_eq(a, b, original_terms, 0, budget) {
+                Some(kid) => kids.push(kid),
+                None => {
+                    direct_failed = true;
+                    break;
+                }
+            }
+        }
+        if direct_failed {
+            // Symmetric retry, POSITIVE binary `=` leaves only. Preprocessing
+            // substitution can reorient an authored equality (`(= S 42)`
+            // recorded as `(= 42 S')`), and positional pairing then asks for
+            // `S = 42` — underivable — instead of the two argument equalities
+            // that actually hold. Pair against the SWAPPED source arguments
+            // and run the congruence from `(= b a)`, which the emitter first
+            // derives from the authored assume by one strict `symm` step. The
+            // negated case would need `not_symm`, which this pass does not
+            // model; it stays fail-closed.
+            if goal_negated
+                || src_args.len() != 2
+                || !matches!(&goal_sym, Symbol::Named(name) if name == "=")
+            {
+                return None;
+            }
+            kids.clear();
+            for (&a, &b) in [src_args[1], src_args[0]].iter().zip(goal_args.iter()) {
+                kids.push(self.plan_eq(a, b, original_terms, 0, budget)?);
+            }
+            let swapped =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [src_args[1], src_args[0]], Sort::Bool);
+            // `mk_app` raw-interns, but a folding surprise would break the
+            // rigid `symm`/`eq_congruent_pred` shapes; fail closed on one.
+            if !matches!(
+                self.ctx.terms.get(swapped),
+                TermData::App(Symbol::Named(name), args)
+                    if name == "=" && args.as_slice() == [src_args[1], src_args[0]]
+            ) {
+                return None;
+            }
+            effective_src_atom = swapped;
+            source_via_symm = true;
         }
         // `eq_congruent_pred ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) ¬P(a..) P(b..))`.
         // For a NEGATED leaf the roles swap: the derivation runs from the
@@ -3787,16 +4040,17 @@ impl Executor {
         let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
         if goal_negated {
             lemma.push(self.ctx.terms.mk_not_raw(goal_atom));
-            lemma.push(src_atom);
+            lemma.push(effective_src_atom);
         } else {
-            lemma.push(self.ctx.terms.mk_not_raw(src_atom));
+            lemma.push(self.ctx.terms.mk_not_raw(effective_src_atom));
             lemma.push(goal_atom);
         }
         Some(BridgePlan {
             goal,
             goal_negated,
             source,
-            source_atom: src_atom,
+            source_atom: effective_src_atom,
+            source_via_symm,
             lemma,
             kids,
         })
@@ -3898,6 +4152,43 @@ impl Executor {
         {
             return Some(plan);
         }
+        // Ground SEQUENCE identity: elaboration folds `seq.++`/`seq.empty`
+        // trees (e.g. `(seq.++ seq.empty (seq.unit 1))` → `(seq.unit 1)`), so
+        // the authored side and the solver-visible side of an assertion cease
+        // to be syntactically linked and pure EUF congruence cannot cross the
+        // gap — the assume was then provenance-demoted to a trust unit and
+        // mandatory certification demoted a correct seq `unsat` to `unknown`
+        // (deductive-checks calc_basic, 2026-08-19). The recognizer IS the strict
+        // validator (`SeqGroundEval` shape B), so this leg is exactly as
+        // fail-closed as the BV `evaluate` leg above.
+        if ay_proof::recognize_seq_ground_eval(&self.ctx.terms, &[eq]) {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::SeqGroundEvaluate,
+            });
+        }
+        // DIRECT datatype selector projection: the goal equality itself is
+        // `(= (sel (C ..)) arg_i)` (either orientation) — a registry-gated
+        // datatype tautology (`(= B (top (stack B ..)))`, the ground-tower
+        // leaves). Registry fetch is gated on a cheap selector-application
+        // shape probe so non-datatype problems never pay for it.
+        if self.eq_sides_have_selector_application(a, b) {
+            let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+            if !ctor_selectors.is_empty()
+                && ay_proof::recognize_datatype_selector_project(
+                    &self.ctx.terms,
+                    &[eq],
+                    &ctor_selectors,
+                )
+            {
+                return Some(EqPlan {
+                    eq,
+                    neg_eq,
+                    kind: EqPlanKind::DatatypeSelectorProjectEval,
+                });
+            }
+        }
         // Congruence: `a` and `b` are the same function applied to pairwise
         // derivably-equal arguments.
         let congruence = (|| {
@@ -3935,7 +4226,477 @@ impl Executor {
         // would be searching for a way to make the substituted form match
         // something, which is exactly the direction that could launder a
         // formula the problem never asserted.
-        self.plan_eq_via_definition(a, b, eq, neg_eq, original_terms, depth, budget)
+        if let Some(plan) =
+            self.plan_eq_via_definition(a, b, eq, neg_eq, original_terms, depth, budget)
+        {
+            return Some(plan);
+        }
+
+        if let Some(plan) = self.plan_eq_via_constructor_injectivity(
+            a,
+            b,
+            eq,
+            neg_eq,
+            original_terms,
+            depth,
+            budget,
+        ) {
+            return Some(plan);
+        }
+
+        // SELECTOR CHASE: `(= a (sel u))` (either orientation) where `u` is
+        // derivably equal to a registered constructor application `C(..)`
+        // owning `sel`. Datatype selector propagation records exactly this
+        // shape as a trust unit — `x ~ stack(a, empty)` forcing
+        // `(= a (top x))` — and no purely syntactic leg can cross it: the
+        // projection is a THEORY fact. Compose
+        //   a = sel(C(..))   [DatatypeSelectorProject, registry-validated]
+        //   sel(C(..)) = sel(u)   [cong over `sel` from plan_eq(C(..), u)]
+        // via trans. Candidate constructor terms are drawn from the authored
+        // assertion sides only (the same non-laundering rule as the
+        // definition leg above), and the projection clause is verified by
+        // the strict validator's own recognizer at plan time.
+        self.plan_eq_via_selector_chase(a, b, eq, neg_eq, original_terms, depth, budget)
+    }
+
+    /// Plan a [`DerivedTesterLeaf`]; see the collection-site comment.
+    fn plan_derived_tester_leaf(
+        &mut self,
+        goal: TermId,
+        original_terms: &[TermId],
+    ) -> Option<DerivedTesterLeaf> {
+        let decls = self.datatype_decls_for_strict_proof();
+        let selectors = self.ctor_selector_decls_for_strict_proof();
+        if decls.is_empty() {
+            return None;
+        }
+        let (subject_atom, negated) = strip_not_polarity(&self.ctx.terms, goal);
+        let TermData::App(tester_symbol, tester_args) = self.ctx.terms.get(subject_atom) else {
+            return None;
+        };
+        if tester_args.len() != 1 {
+            return None;
+        }
+        let (tester_symbol, subject) = (tester_symbol.clone(), tester_args[0]);
+        // Candidates: authored equality sides, same sort as the subject.
+        let mut candidates: Vec<TermId> = Vec::new();
+        for &original in original_terms {
+            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
+                continue;
+            };
+            if name != "=" || args.len() != 2 {
+                continue;
+            }
+            for &side in args.as_slice() {
+                if side != subject
+                    && self.ctx.terms.sort(side) == self.ctx.terms.sort(subject)
+                    && !candidates.contains(&side)
+                {
+                    candidates.push(side);
+                }
+            }
+        }
+        for candidate in candidates {
+            let sort = self.ctx.terms.sort(subject_atom).clone();
+            let candidate_atom = self
+                .ctx
+                .terms
+                .mk_app(tester_symbol.clone(), [candidate], sort);
+            let tester_clause = if negated {
+                self.ctx.terms.mk_not_raw(candidate_atom)
+            } else {
+                candidate_atom
+            };
+            // The same-polarity tester fact on the candidate must be a
+            // registry-validated tautology (the recognizer IS the strict
+            // validator with the same registries).
+            if !ay_proof::recognize_datatype_tester_eval_with_selectors(
+                &self.ctx.terms,
+                &[tester_clause],
+                &decls,
+                &selectors,
+            ) {
+                continue;
+            }
+            let mut budget = EQ_PLAN_BUDGET;
+            let Some(eq_plan) = self.plan_eq(candidate, subject, original_terms, 0, &mut budget)
+            else {
+                continue;
+            };
+            return Some(DerivedTesterLeaf {
+                goal,
+                negated,
+                subject_atom,
+                candidate_atom,
+                tester_clause,
+                eq_plan,
+            });
+        }
+        None
+    }
+
+    /// Emit a planned [`DerivedTesterLeaf`], returning the unit `(cl goal)`:
+    ///
+    /// ```text
+    /// eq_congruent_pred ⊢ (cl ¬(= k t) ¬P(k) P(t))     [pos]  (dually for neg)
+    ///   ⊗ (cl (= k t))    [the eq plan]
+    ///   ⊗ (cl P(k))       [DatatypeTesterEval lemma]
+    ///   = (cl P(t))
+    /// ```
+    fn emit_derived_tester_leaf(
+        &mut self,
+        proof: &mut Proof,
+        leaf: &DerivedTesterLeaf,
+        assume_ids: &HashMap<TermId, ProofId>,
+    ) -> Option<ProofId> {
+        let eq_unit = Self::emit_eq_plan(proof, &leaf.eq_plan, assume_ids)?;
+        let tester_unit = proof.add_step(ProofStep::TheoryLemma {
+            theory: "DT".to_string(),
+            clause: vec![leaf.tester_clause],
+            farkas: None,
+            kind: TheoryLemmaKind::DatatypeTesterEval,
+            lia: None,
+        });
+        let not_eq = leaf.eq_plan.neg_eq;
+        // For a NEGATED goal the roles swap (same convention as the source
+        // bridges): the derivation runs from `(not P(k))` to `(not P(t))`,
+        // which is the same eq_congruent_pred with `P(t)` in the negated slot.
+        let (lemma, tester_pivot) = if leaf.negated {
+            (
+                vec![
+                    not_eq,
+                    self.ctx.terms.mk_not_raw(leaf.subject_atom),
+                    leaf.candidate_atom,
+                ],
+                leaf.candidate_atom,
+            )
+        } else {
+            (
+                vec![
+                    not_eq,
+                    self.ctx.terms.mk_not_raw(leaf.candidate_atom),
+                    leaf.subject_atom,
+                ],
+                leaf.candidate_atom,
+            )
+        };
+        let lemma_step = proof.add_step(ProofStep::TheoryLemma {
+            theory: "EUF".to_string(),
+            clause: lemma.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::EufCongruentPred,
+            lia: None,
+        });
+        // Resolve away the equality premise.
+        let after_eq: Vec<TermId> = lemma.iter().copied().filter(|&l| l != not_eq).collect();
+        let step_eq = proof.add_resolution(after_eq.clone(), leaf.eq_plan.eq, lemma_step, eq_unit);
+        // Resolve away the candidate tester literal against the lemma unit.
+        let goal_lit = if leaf.negated {
+            self.ctx.terms.mk_not_raw(leaf.subject_atom)
+        } else {
+            leaf.subject_atom
+        };
+        let final_clause = vec![goal_lit];
+        // Resolution operand order follows the checker's convention: the
+        // clause holding the NEGATED pivot comes first. Positive goals leave
+        // `¬P(k)` in the congruence residue; negated goals leave `P(k)` there
+        // and the negation in the tester-eval unit.
+        let step_final = if leaf.negated {
+            proof.add_resolution(final_clause.clone(), tester_pivot, tester_unit, step_eq)
+        } else {
+            proof.add_resolution(final_clause.clone(), tester_pivot, step_eq, tester_unit)
+        };
+        (final_clause == vec![leaf.goal]).then_some(step_final)
+    }
+
+    /// Cheap shape probe: is either equality side a unary application whose
+
+    /// head COULD be a selector? Gates the registry fetch in `plan_eq`'s
+    /// direct-projection leg.
+    fn eq_sides_have_selector_application(&self, a: TermId, b: TermId) -> bool {
+        [a, b].iter().any(|&side| {
+            matches!(
+                self.ctx.terms.get(side),
+                TermData::App(Symbol::Named(_), args) if args.len() == 1
+            )
+        })
+    }
+
+    /// Constructor injectivity through selectors: goal `(= x y)` where some
+    /// pair of same-constructor applications `C(.., x, ..)` / `C(.., y, ..)`
+    /// (same argument position, drawn from authored equality sides) is itself
+    /// derivably equal. Then, with `sel_i` the registered position-`i`
+    /// selector,
+    ///   x = sel_i(C(..x..))          [projection]
+    ///     = sel_i(C(..y..))          [cong over sel_i from the planned pair]
+    ///     = y                        [projection]
+    /// — every leaf registry-validated, no injectivity axiom needed. This is
+    /// how a proof leaf like `(= (stack B ..) (stack C ..))` obtained from
+    /// `stack(A, X) ~chain~ stack(A, Y)` becomes derivable.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_eq_via_constructor_injectivity(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        eq: TermId,
+        neg_eq: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<EqPlan> {
+        let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+        if ctor_selectors.is_empty() {
+            return None;
+        }
+        // Constructor applications among authored equality sides that carry
+        // `a` (resp. `b`) as a direct argument.
+        let mut holders_a: Vec<(TermId, String, usize)> = Vec::new();
+        let mut holders_b: Vec<(TermId, String, usize)> = Vec::new();
+        for &original in original_terms {
+            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
+                continue;
+            };
+            if name != "=" || args.len() != 2 {
+                continue;
+            }
+            for &side in args.clone().as_slice() {
+                let TermData::App(Symbol::Named(head), head_args) = self.ctx.terms.get(side) else {
+                    continue;
+                };
+                let head = head.clone();
+                if !ctor_selectors.iter().any(|(ctor, _)| ctor == &head) {
+                    continue;
+                }
+                for (index, &argument) in head_args.clone().iter().enumerate() {
+                    if argument == a && !holders_a.iter().any(|&(t, _, _)| t == side) {
+                        holders_a.push((side, head.clone(), index));
+                    }
+                    if argument == b && !holders_b.iter().any(|&(t, _, _)| t == side) {
+                        holders_b.push((side, head.clone(), index));
+                    }
+                }
+            }
+        }
+        for &(pa, ref ctor_a, index_a) in &holders_a {
+            for &(pb, ref ctor_b, index_b) in &holders_b {
+                if ctor_a != ctor_b || index_a != index_b || pa == pb {
+                    continue;
+                }
+                let Some((_, selectors)) = ctor_selectors.iter().find(|(ctor, _)| ctor == ctor_a)
+                else {
+                    continue;
+                };
+                let Some(selector) = selectors.get(index_a) else {
+                    continue;
+                };
+                // Projections at both ends, recognizer-verified.
+                let sort_a = self.ctx.terms.sort(a).clone();
+                let sel_pa =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named(selector.clone()), [pa], sort_a.clone());
+                let sel_pb = self
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named(selector.clone()), [pb], sort_a);
+                let proj_a = self
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [a, sel_pa], Sort::Bool);
+                let proj_b = self
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [sel_pb, b], Sort::Bool);
+                if !ay_proof::recognize_datatype_selector_project(
+                    &self.ctx.terms,
+                    &[proj_a],
+                    &ctor_selectors,
+                ) || !ay_proof::recognize_datatype_selector_project(
+                    &self.ctx.terms,
+                    &[proj_b],
+                    &ctor_selectors,
+                ) {
+                    continue;
+                }
+                // The constructor-application pair must itself be derivable.
+                let pair_kid = self.plan_eq(pa, pb, original_terms, depth + 1, budget)?;
+                let cong_eq =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named("="), [sel_pa, sel_pb], Sort::Bool);
+                let cong = EqPlan {
+                    eq: cong_eq,
+                    neg_eq: self.ctx.terms.mk_not_raw(cong_eq),
+                    kind: EqPlanKind::Cong {
+                        lemma: vec![pair_kid.neg_eq, cong_eq],
+                        kids: vec![pair_kid],
+                    },
+                };
+                let left = EqPlan {
+                    eq: proj_a,
+                    neg_eq: self.ctx.terms.mk_not_raw(proj_a),
+                    kind: EqPlanKind::DatatypeSelectorProjectEval,
+                };
+                let right_tail = EqPlan {
+                    eq: proj_b,
+                    neg_eq: self.ctx.terms.mk_not_raw(proj_b),
+                    kind: EqPlanKind::DatatypeSelectorProjectEval,
+                };
+                let mid_eq = self
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [sel_pa, b], Sort::Bool);
+                let mid = EqPlan {
+                    eq: mid_eq,
+                    neg_eq: self.ctx.terms.mk_not_raw(mid_eq),
+                    kind: EqPlanKind::Trans {
+                        left: Box::new(cong),
+                        right: Box::new(right_tail),
+                    },
+                };
+                return Some(EqPlan {
+                    eq,
+                    neg_eq,
+                    kind: EqPlanKind::Trans {
+                        left: Box::new(left),
+                        right: Box::new(mid),
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    /// The selector-chase leg of [`Self::plan_eq`]; see the call site.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_eq_via_selector_chase(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        eq: TermId,
+        neg_eq: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<EqPlan> {
+        let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+        if ctor_selectors.is_empty() {
+            return None;
+        }
+        // Which side is the selector application? Try both orientations.
+        for (target, sel_app) in [(a, b), (b, a)] {
+            let TermData::App(Symbol::Named(sel_name), sel_args) = self.ctx.terms.get(sel_app)
+            else {
+                continue;
+            };
+            if sel_args.len() != 1 {
+                continue;
+            }
+            let sel_name = sel_name.clone();
+            let subject = sel_args[0];
+            if !ctor_selectors
+                .iter()
+                .any(|(_, selectors)| selectors.iter().any(|s| s == &sel_name))
+            {
+                continue;
+            }
+            // Candidate constructor terms: authored assertion equality sides.
+            let mut candidates: Vec<TermId> = Vec::new();
+            for &original in original_terms {
+                let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
+                    continue;
+                };
+                if name != "=" || args.len() != 2 {
+                    continue;
+                }
+                for &side in args.as_slice() {
+                    if side != subject && !candidates.contains(&side) {
+                        candidates.push(side);
+                    }
+                }
+            }
+            for candidate in candidates {
+                if self.ctx.terms.sort(candidate) != self.ctx.terms.sort(subject) {
+                    continue;
+                }
+                // The projection clause the strict validator must accept:
+                // `(= target (sel candidate))` in the goal's own orientation,
+                // recognizer-verified (fail-closed on shape or registry).
+                let projected = self.ctx.terms.mk_app(
+                    Symbol::named(sel_name.clone()),
+                    [candidate],
+                    self.ctx.terms.sort(sel_app).clone(),
+                );
+                let projection_eq =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named("="), [target, projected], Sort::Bool);
+                if !ay_proof::recognize_datatype_selector_project(
+                    &self.ctx.terms,
+                    &[projection_eq],
+                    &ctor_selectors,
+                ) {
+                    continue;
+                }
+                // `sel(candidate) = sel(subject)` by congruence over `sel`.
+                let cong_kid =
+                    self.plan_eq(candidate, subject, original_terms, depth + 1, budget)?;
+                let cong_eq =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named("="), [projected, sel_app], Sort::Bool);
+                // `eq_congruent ⊢ (cl ¬(= x y) (= (sel x) (sel y)))`.
+                let cong_lemma = vec![cong_kid.neg_eq];
+                // Assemble `(= target sel_app)`; flip to the requested
+                // orientation with the trans machinery's own handling by
+                // planning in the goal's orientation directly.
+                let left = EqPlan {
+                    eq: projection_eq,
+                    neg_eq: self.ctx.terms.mk_not_raw(projection_eq),
+                    kind: EqPlanKind::DatatypeSelectorProjectEval,
+                };
+                let right = EqPlan {
+                    eq: cong_eq,
+                    neg_eq: self.ctx.terms.mk_not_raw(cong_eq),
+                    kind: EqPlanKind::Cong {
+                        lemma: {
+                            let mut lemma = cong_lemma;
+                            lemma.push(cong_eq);
+                            lemma
+                        },
+                        kids: vec![cong_kid],
+                    },
+                };
+                let assembled_eq =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named("="), [target, sel_app], Sort::Bool);
+                let assembled = EqPlan {
+                    eq: assembled_eq,
+                    neg_eq: self.ctx.terms.mk_not_raw(assembled_eq),
+                    kind: EqPlanKind::Trans {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    },
+                };
+                if assembled_eq == eq {
+                    return Some(EqPlan {
+                        eq,
+                        neg_eq,
+                        kind: assembled.kind,
+                    });
+                }
+                // Goal is the flipped orientation `(= sel_app target)`.
+                return Some(EqPlan {
+                    eq,
+                    neg_eq,
+                    kind: EqPlanKind::SymmOfPlan {
+                        inner: Box::new(assembled),
+                    },
+                });
+            }
+        }
+        None
     }
 
     /// Plan a certified equality from a symbolic binary `concat` to its folded
@@ -4212,6 +4973,14 @@ impl Executor {
             current = proof.add_resolution(resolvent.clone(), *eq, current, *unit);
             clause = resolvent;
         }
+        // A kid whose equality IS the source assertion shares its `neg_eq`
+        // with the source literal, so the kid resolution above already
+        // eliminated both copies and the clause is the unit goal. A further
+        // resolution against the source assume would have no pivot literal
+        // left and be rejected by the checker; the derivation is complete.
+        if clause.as_slice() == [plan.goal] {
+            return Some(current);
+        }
         // Resolve the asserted predicate away, leaving the unit `(cl goal)`.
         let (source_lit, pivot) = if plan.goal_negated {
             (plan.source_atom, plan.source_atom)
@@ -4227,7 +4996,19 @@ impl Executor {
             return None;
         }
         let &source_assume = assume_ids.get(&plan.source)?;
-        Some(proof.add_resolution(resolvent, pivot, current, source_assume))
+        let source_step = if plan.source_via_symm {
+            // `symm`: unit `(cl (= b a))` from the authored `(cl (= a b))`.
+            // Only planned for positive leaves, so the assume IS the equality.
+            proof.add_rule_step(
+                AletheRule::Symm,
+                vec![plan.source_atom],
+                vec![source_assume],
+                Vec::new(),
+            )
+        } else {
+            source_assume
+        };
+        Some(proof.add_resolution(resolvent, pivot, current, source_step))
     }
 
     /// Emit a planned equality derivation, returning the id of the unit
@@ -4241,9 +5022,28 @@ impl Executor {
             EqPlanKind::Refl => {
                 Some(proof.add_rule_step(AletheRule::Refl, vec![plan.eq], Vec::new(), Vec::new()))
             }
-            EqPlanKind::Assumed => assume_ids.get(&plan.eq).copied(),
+            EqPlanKind::Assumed => {
+                let unit = assume_ids.get(&plan.eq).copied();
+                if unit.is_none() && ay_core::misc_cli_flags().debug_cert {
+                    ay_core::safe_eprintln!(
+                        "c !! emit_eq_plan: Assumed eq {:?} has no assume id",
+                        plan.eq
+                    );
+                }
+                unit
+            }
             EqPlanKind::Symm { assumed } => {
-                let &premise = assume_ids.get(assumed)?;
+                let premise = match assume_ids.get(assumed) {
+                    Some(&id) => id,
+                    None => {
+                        if ay_core::misc_cli_flags().debug_cert {
+                            ay_core::safe_eprintln!(
+                                "c !! emit_eq_plan: Symm premise {assumed:?} has no assume id"
+                            );
+                        }
+                        return None;
+                    }
+                };
                 Some(proof.add_rule_step(
                     AletheRule::Symm,
                     vec![plan.eq],
@@ -4257,6 +5057,31 @@ impl Executor {
                 Vec::new(),
                 Vec::new(),
             )),
+            EqPlanKind::SeqGroundEvaluate => Some(proof.add_step(ProofStep::TheoryLemma {
+                theory: "seq".to_string(),
+                clause: vec![plan.eq],
+                farkas: None,
+                kind: TheoryLemmaKind::SeqGroundEval,
+                lia: None,
+            })),
+            EqPlanKind::DatatypeSelectorProjectEval => {
+                Some(proof.add_step(ProofStep::TheoryLemma {
+                    theory: "DT".to_string(),
+                    clause: vec![plan.eq],
+                    farkas: None,
+                    kind: TheoryLemmaKind::DatatypeSelectorProject,
+                    lia: None,
+                }))
+            }
+            EqPlanKind::SymmOfPlan { inner } => {
+                let premise = Self::emit_eq_plan(proof, inner, assume_ids)?;
+                Some(proof.add_rule_step(
+                    AletheRule::Symm,
+                    vec![plan.eq],
+                    vec![premise],
+                    Vec::new(),
+                ))
+            }
             EqPlanKind::Cong { lemma, kids } => {
                 let mut kid_units: Vec<(TermId, TermId, ProofId)> = Vec::with_capacity(kids.len());
                 for kid in kids {
@@ -4275,12 +5100,23 @@ impl Executor {
                     let resolvent: Vec<TermId> =
                         clause.iter().copied().filter(|&l| l != *kid_neg).collect();
                     if resolvent.len() == clause.len() {
+                        if ay_core::misc_cli_flags().debug_cert {
+                            ay_core::safe_eprintln!(
+                                "c !! emit_eq_plan: Cong kid neg_eq {kid_neg:?} absent from lemma {clause:?}"
+                            );
+                        }
                         return None;
                     }
                     current = proof.add_resolution(resolvent.clone(), *kid_eq, current, *unit);
                     clause = resolvent;
                 }
                 if clause.len() != 1 || clause[0] != plan.eq {
+                    if ay_core::misc_cli_flags().debug_cert {
+                        ay_core::safe_eprintln!(
+                            "c !! emit_eq_plan: Cong residue {clause:?} != goal {:?}",
+                            plan.eq
+                        );
+                    }
                     return None;
                 }
                 Some(current)
@@ -4313,6 +5149,23 @@ fn strip_not_polarity(terms: &TermStore, mut lit: TermId) -> (TermId, bool) {
     (lit, negated)
 }
 
+/// A derived tester leaf: `((_ is C) t)` (either polarity) justified by the
+/// same-polarity registry-validated tester fact on a derivably-equal `k`.
+struct DerivedTesterLeaf {
+    /// The defective leaf exactly as the proof states it.
+    goal: TermId,
+    /// True when `goal` is `(not ((_ is C) t))`.
+    negated: bool,
+    /// The tester ATOM on the subject: `((_ is C) t)`.
+    subject_atom: TermId,
+    /// The tester ATOM on the candidate: `((_ is C) k)`.
+    candidate_atom: TermId,
+    /// The tester-eval LEMMA clause: `[((_ is C) k)]` or `[(not ((_ is C) k))]`.
+    tester_clause: TermId,
+    /// Derivation of `(= k t)`.
+    eq_plan: EqPlan,
+}
+
 /// A planned derivation of `(= a b)` from the original problem assertions.
 ///
 /// `eq` is the goal equality and `neg_eq` its negation — both interned during
@@ -4333,6 +5186,19 @@ enum EqPlanKind {
     Symm { assumed: TermId },
     /// Closed concat evaluation accepted by the strict `evaluate` recognizer.
     BvGroundEvaluate,
+    /// Ground sequence identity (`seq.empty`/`seq.unit`-of-constant/`seq.++`
+    /// on both sides, elementwise-identical normal forms) accepted by the
+    /// strict `SeqGroundEval` recognizer. Covers elaboration-folded seq
+    /// concats the same way `BvGroundEvaluate` covers folded BV concats.
+    SeqGroundEvaluate,
+    /// Datatype selector projection `(= t (sel C(..t..)))` accepted by the
+    /// registry-gated `DatatypeSelectorProject` recognizer at plan time.
+    /// Emitted as the corresponding theory lemma; the whole-proof gate
+    /// re-validates it with the executor's own registries.
+    DatatypeSelectorProjectEval,
+    /// The flipped orientation of a fully planned equality: emit `inner`'s
+    /// unit `(cl (= a b))`, then one strict `symm` step to `(cl (= b a))`.
+    SymmOfPlan { inner: Box<EqPlan> },
     /// `eq_congruent` over a shared function symbol.
     Cong {
         lemma: Vec<TermId>,
@@ -4349,7 +5215,11 @@ enum EqPlanKind {
 impl EqPlan {
     fn collect_assumed(&self, out: &mut Vec<TermId>) {
         match &self.kind {
-            EqPlanKind::Refl | EqPlanKind::BvGroundEvaluate => {}
+            EqPlanKind::Refl
+            | EqPlanKind::BvGroundEvaluate
+            | EqPlanKind::SeqGroundEvaluate
+            | EqPlanKind::DatatypeSelectorProjectEval => {}
+            EqPlanKind::SymmOfPlan { inner } => inner.collect_assumed(out),
             EqPlanKind::Assumed => {
                 if !out.contains(&self.eq) {
                     out.push(self.eq);
@@ -4374,7 +5244,10 @@ impl EqPlan {
 
     fn uses_ground_evaluate(&self) -> bool {
         match &self.kind {
-            EqPlanKind::BvGroundEvaluate => true,
+            EqPlanKind::BvGroundEvaluate
+            | EqPlanKind::SeqGroundEvaluate
+            | EqPlanKind::DatatypeSelectorProjectEval => true,
+            EqPlanKind::SymmOfPlan { inner } => inner.uses_ground_evaluate(),
             EqPlanKind::Cong { kids, .. } => kids.iter().any(Self::uses_ground_evaluate),
             EqPlanKind::Trans { left, right } => {
                 left.uses_ground_evaluate() || right.uses_ground_evaluate()
@@ -4393,8 +5266,12 @@ struct BridgePlan {
     goal_negated: bool,
     /// The authored assertion the leaf came from (same polarity as `goal`).
     source: TermId,
-    /// `source` with its `not` wrapper stripped.
+    /// `source` with its `not` wrapper stripped — or, when
+    /// `source_via_symm` is set, the SWAPPED orientation of that equality.
     source_atom: TermId,
+    /// Derive `source_atom` from the authored assume by one strict `symm`
+    /// step before the final resolution (positive binary `=` sources only).
+    source_via_symm: bool,
     /// The `eq_congruent_pred` clause.
     lemma: Vec<TermId>,
     /// Per-argument equality derivations, aligned with the predicate's args.

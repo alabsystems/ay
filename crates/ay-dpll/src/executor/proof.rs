@@ -46,6 +46,7 @@ mod finite_enum_surface;
 #[cfg(test)]
 mod finite_enum_tests;
 mod generic_promotion;
+mod ite_guard_promotion;
 mod lane_policy;
 mod lifecycle;
 mod reconstruction_fallbacks;
@@ -517,7 +518,11 @@ impl Executor {
         // so the proof carries no trust step here. Fail-safe: only fires on the
         // recognized unary-congruence-over-chain shape, reproduces the original
         // clause exactly, and leaves any other lemma untouched.
-        Self::split_euf_congruence_lemmas(&mut self.ctx.terms, &mut proof);
+        Self::split_euf_congruence_lemmas(
+            &mut self.ctx.terms,
+            &mut proof,
+            &self.ground_conflict_decomp_meters,
+        );
 
         // General certified EUF-leaf promotion. Unlike the all-or-nothing
         // original-assertion surgery, this replaces only individually
@@ -530,6 +535,22 @@ impl Executor {
         // Authenticated array-extensionality leaves are deferred: the EUF pass
         // promotes them only on its strict-check clone, while the real proof's
         // final extensionality pass below remains after every surgery.
+        // Boolean-ITE guard-clause rebuild (#ite-guard-promotion): an
+        // asserted Shannon-lifted `(ite c A B)` — the recorded update-axiom
+        // instance shape the consequence-replay probe re-solves — is
+        // clausified into the two guard clauses, whose assumes the demotion
+        // pass exported as premiseless `trust` steps. Re-derive each
+        // recognized guard clause from its authored root with
+        // `ite1`/`ite2`/`eq_symmetric` steps the strict checker re-validates;
+        // each chain is strict-checked in isolation before it may replace its
+        // leaf, and a declined chain leaves the `trust` step byte-identical.
+        // MUST run before `promote_certified_generic_euf_leaves`: that pass's
+        // whole-proof atomic gate reverts while these trust leaves remain,
+        // and this pass's output is what lets it commit. This is what lets
+        // the same-context probe certify the frame-quantifier refutations
+        // (#mbqi-completeness Q2).
+        self.promote_shannon_ite_guard_trust_leaves(&mut proof);
+
         self.promote_certified_generic_euf_leaves(&mut proof);
 
         // Shadowed-store equality expansion: the eager array fixpoint uses the
@@ -2057,13 +2078,20 @@ impl Executor {
     /// The proof is rebuilt sequentially with an old→new `ProofId` remap (ids are
     /// positional — `ProofId(i) == steps[i]`); proofs containing subproof
     /// `Anchor`s (whose `end_step` is a forward reference) are skipped wholesale.
-    fn split_euf_congruence_lemmas(terms: &mut TermStore, proof: &mut Proof) {
+    fn split_euf_congruence_lemmas(
+        terms: &mut TermStore,
+        proof: &mut Proof,
+        decomp_meters: &crate::executor::GroundConflictDecompMeters,
+    ) {
         // Anchors carry forward references the in-order remap cannot resolve.
         if proof
             .steps
             .iter()
             .any(|s| matches!(s, ProofStep::Anchor { .. }))
         {
+            if ay_core::misc_cli_flags().trace_cegqi_attr {
+                eprintln!("[ground-decomp] pass skipped: proof contains anchors");
+            }
             return;
         }
         let has_trust = proof
@@ -2262,6 +2290,82 @@ impl Executor {
                         remap.push(r2_id);
                         changed = true;
                         continue;
+                    }
+
+                    // (#ground-conflict-decomp) The two general decomposition
+                    // arms, tried only after every specific planner above
+                    // declined. Both re-derive the byte-identical clause (as a
+                    // literal set) from checker-validated steps; any mismatch
+                    // truncates the emitted steps and falls through to the
+                    // untouched trust lemma. Kill switch:
+                    // `--no-ground-conflict-decomp`.
+                    if crate::quant_unit_authority::ground_conflict_decomp_enabled() {
+                        decomp_meters
+                            .attempted
+                            .set(decomp_meters.attempted.get().saturating_add(1));
+                        let mut applied = false;
+
+                        // Arm 1: EUF chain (optionally one congruence lift)
+                        // deriving an equality that a solver-checked Farkas
+                        // bridge refutes against the clause's single
+                        // arithmetic literal; unused premise literals are
+                        // weakened back in (e.g. the fused array-frame
+                        // conflict `¬(10=snew[0]) ∨ ¬(snew[sk]<0) ∨ ¬(0=sk) ∨
+                        // ¬(s[0]=10) ∨ ¬(snew[0]=s[0])`).
+                        if let Some(plan) = plan_euf_chain_farkas_bridge(terms, clause) {
+                            let mark = new_steps.len();
+                            let (id, out_clause) =
+                                emit_euf_chain_farkas_bridge(terms, &mut new_steps, &plan);
+                            if clauses_match_as_sets_local(&out_clause, clause) {
+                                remap.push(id);
+                                changed = true;
+                                applied = true;
+                            } else {
+                                new_steps.truncate(mark);
+                            }
+                        }
+
+                        // Arm 2: array read-over-write under an array
+                        // equality, or-packed or flat: rebuild as an
+                        // `ArrayRowChain` lemma carrying the explicit
+                        // `(= read_index store_index)` skip guards, one
+                        // Farkas unit per guard, resolutions, and the
+                        // or-rebuild (e.g. the v11 RoW instance
+                        // `(or ¬(= b (store a 3 9)) (= b[1] a[1]))`).
+                        if !applied {
+                            if let Some(plan) = plan_array_row_chain_under_eq(terms, clause) {
+                                let mark = new_steps.len();
+                                if let Some((id, out_clause)) =
+                                    emit_array_row_chain_under_eq(terms, &mut new_steps, &plan)
+                                {
+                                    if clauses_match_as_sets_local(&out_clause, clause) {
+                                        remap.push(id);
+                                        changed = true;
+                                        applied = true;
+                                    } else {
+                                        new_steps.truncate(mark);
+                                    }
+                                } else {
+                                    new_steps.truncate(mark);
+                                }
+                            }
+                        }
+
+                        if applied {
+                            decomp_meters
+                                .applied
+                                .set(decomp_meters.applied.get().saturating_add(1));
+                            if ay_core::misc_cli_flags().trace_cegqi_attr {
+                                eprintln!("[ground-decomp] APPLIED");
+                            }
+                            continue;
+                        }
+                        if ay_core::misc_cli_flags().trace_cegqi_attr {
+                            eprintln!("[ground-decomp] declined");
+                        }
+                        decomp_meters
+                            .declined
+                            .set(decomp_meters.declined.get().saturating_add(1));
                     }
                 }
             }
@@ -7102,6 +7206,653 @@ fn plan_euf_lia_value_conflict(terms: &mut TermStore, clause: &[TermId]) -> Opti
         }
     }
     None
+}
+
+/// A plan for the general EUF-chain + arithmetic-bridge conflict split
+/// (#ground-conflict-decomp, arm 1).
+///
+/// The fused Generic clause carries 1–3 arithmetic comparison literals (either
+/// polarity) and otherwise only NEGATED equalities (undirected chain edges).
+/// The equalities entail `p = q` — for one arithmetic-atom side `p` and some
+/// clause term `q` — through at most ONE congruence lift plus a transitive
+/// chain (or a single direct edge), and that equality refutes the arithmetic
+/// literals jointly with a solver-synthesized, independently re-verified
+/// Farkas certificate (uninterpreted atoms opaque). Premises the derivation
+/// does not consume are restored with an explicit `weakening` step,
+/// reproducing the original clause as a literal set.
+struct EufChainFarkasBridgePlan {
+    /// The single direct edge literal joining the bridge (no `eq_transitive`
+    /// or congruence step needed); exclusive with the fields below.
+    direct_edge: Option<TermId>,
+    /// Per-position `(Aᵢ, Bᵢ, chain)` plans for the congruence `p = u`
+    /// (empty ⇒ `p` participates in the equality graph directly).
+    cong_plans: Vec<(TermId, TermId, Vec<TermId>)>,
+    /// `(= p u)` — meaningful iff `cong_plans` is non-empty.
+    cong_eq: TermId,
+    /// `¬(= p u)`.
+    cong_neg: TermId,
+    /// Premise literals of the transitive chain from `u` (or `p`) to `q`;
+    /// empty ⇒ `q == u` and `derived_eq == cong_eq`.
+    chain_lits: Vec<TermId>,
+    /// `(= p q)` — the equality the bridge refutes.
+    derived_eq: TermId,
+    /// `¬(= p q)`.
+    derived_neg: TermId,
+    /// `(cl ¬(= p q) <arith literals>)` with its certificate.
+    la_clause: Vec<TermId>,
+    la_farkas: FarkasAnnotation,
+    la_kind: TheoryLemmaKind,
+    /// Original literals the derivation did not consume (weakened back in).
+    extras: Vec<TermId>,
+}
+
+/// Literal budget for the two #ground-conflict-decomp planners.
+const MAX_GROUND_CONFLICT_DECOMP_LITERALS: usize = 16;
+/// Candidate (start, sibling, value) probes for arm 1, per clause.
+const MAX_GROUND_CONFLICT_BRIDGE_PROBES: usize = 64;
+/// Maximum arithmetic literals joined into one Farkas bridge.
+const MAX_GROUND_CONFLICT_BRIDGE_RELS: usize = 3;
+
+/// Plan the EUF-chain + Farkas-bridge split. `None` (→ fall back to the
+/// trust lemma) unless the exact shape above is recognized AND the bridge
+/// clause is certified by the real LRA solver.
+fn plan_euf_chain_farkas_bridge(
+    terms: &mut TermStore,
+    clause: &[TermId],
+) -> Option<EufChainFarkasBridgePlan> {
+    if clause.len() < 3 || clause.len() > MAX_GROUND_CONFLICT_DECOMP_LITERALS {
+        return None;
+    }
+    // Duplicate literals would break the set-resolution bookkeeping.
+    for (index, &lit) in clause.iter().enumerate() {
+        if clause[index + 1..].contains(&lit) {
+            return None;
+        }
+    }
+    // Partition: negated equalities are chain edges; arithmetic comparisons
+    // (either polarity) join the Farkas bridge; anything else declines.
+    let mut rel_lits: Vec<TermId> = Vec::new();
+    let mut rel_sides: Vec<TermId> = Vec::new();
+    let mut edges: Vec<(TermId, TermId, TermId)> = Vec::new();
+    for &lit in clause {
+        let (inner, neg) = strip_not_local(terms, lit);
+        if neg {
+            if let Some((a, b)) = decode_eq_local(terms, inner) {
+                edges.push((a, b, lit));
+                continue;
+            }
+        }
+        if is_arith_cmp(terms, inner) {
+            if rel_lits.len() >= MAX_GROUND_CONFLICT_BRIDGE_RELS {
+                return None;
+            }
+            rel_lits.push(lit);
+            if let Some((_, args)) = as_app_local(terms, inner) {
+                for &side in &args {
+                    if !rel_sides.contains(&side) {
+                        rel_sides.push(side);
+                    }
+                }
+            }
+            continue;
+        }
+        return None;
+    }
+    if rel_lits.is_empty() || edges.len() < 2 {
+        // The specific 3-literal planners above and the EUF-leaf promotion
+        // pass cover the smaller/relation-free shapes.
+        return None;
+    }
+
+    let mut endpoints: Vec<TermId> = Vec::new();
+    for &(a, b, _) in &edges {
+        if !endpoints.contains(&a) {
+            endpoints.push(a);
+        }
+        if !endpoints.contains(&b) {
+            endpoints.push(b);
+        }
+    }
+    // Candidate targets: chain endpoints plus the arithmetic-atom sides.
+    let mut targets: Vec<TermId> = endpoints.clone();
+    for &side in &rel_sides {
+        if !targets.contains(&side) {
+            targets.push(side);
+        }
+    }
+
+    let mut probes = MAX_GROUND_CONFLICT_BRIDGE_PROBES;
+    for &p in &rel_sides {
+        // Case A: `p` participates in the equality graph directly.
+        if endpoints.contains(&p) {
+            for &q in &targets {
+                if q == p {
+                    continue;
+                }
+                probes = probes.checked_sub(1)?;
+                let Some(path) = euf_chain_path(&edges, p, q) else {
+                    continue;
+                };
+                if path.len() == 1 {
+                    // The single edge literal itself joins the bridge; no
+                    // `eq_transitive` step is needed (a 1-edge chain is a
+                    // degenerate clause the checker rejects).
+                    if let Some(plan) = finish_chain_bridge_plan(
+                        terms,
+                        clause,
+                        &rel_lits,
+                        BridgeHead::Edge(path[0]),
+                    ) {
+                        return Some(plan);
+                    }
+                    continue;
+                }
+                if let Some(plan) = finish_chain_bridge_plan(
+                    terms,
+                    clause,
+                    &rel_lits,
+                    BridgeHead::Derived {
+                        p,
+                        q,
+                        cong_plans: Vec::new(),
+                        u: p,
+                        chain_lits: path,
+                    },
+                ) {
+                    return Some(plan);
+                }
+            }
+        }
+        // Case B: one congruence lift `p = u` over a same-symbol application
+        // among the edge endpoints, then a chain from `u` to a target.
+        let Some((p_sym, p_args)) = as_app_local(terms, p) else {
+            continue;
+        };
+        if p_args.is_empty() {
+            continue;
+        }
+        for &u in &endpoints {
+            if u == p {
+                continue;
+            }
+            let Some((u_sym, u_args)) = as_app_local(terms, u) else {
+                continue;
+            };
+            if u_sym != p_sym || u_args.len() != p_args.len() {
+                continue;
+            }
+            let mut cong_plans: Vec<(TermId, TermId, Vec<TermId>)> =
+                Vec::with_capacity(p_args.len());
+            let mut positions_ok = true;
+            for (&ai, &bi) in p_args.iter().zip(u_args.iter()) {
+                if ai == bi {
+                    cong_plans.push((ai, bi, Vec::new()));
+                    continue;
+                }
+                match euf_chain_path(&edges, ai, bi) {
+                    Some(path) => cong_plans.push((ai, bi, path)),
+                    None => {
+                        positions_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !positions_ok || cong_plans.iter().all(|(_, _, chain)| chain.is_empty()) {
+                continue;
+            }
+            // `u` itself, then every other target reachable from `u`.
+            for &q in std::iter::once(&u).chain(targets.iter()) {
+                if q == p {
+                    continue;
+                }
+                probes = probes.checked_sub(1)?;
+                let path = if q == u {
+                    Vec::new()
+                } else {
+                    match euf_chain_path(&edges, u, q) {
+                        Some(path) => path,
+                        None => continue,
+                    }
+                };
+                if let Some(plan) = finish_chain_bridge_plan(
+                    terms,
+                    clause,
+                    &rel_lits,
+                    BridgeHead::Derived {
+                        p,
+                        q,
+                        cong_plans: cong_plans.clone(),
+                        u,
+                        chain_lits: path,
+                    },
+                ) {
+                    return Some(plan);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// How the equality joining arm 1's Farkas bridge is established.
+enum BridgeHead {
+    /// A single original edge literal joins the bridge directly.
+    Edge(TermId),
+    /// A derived equality `(= p q)` via congruence lift and/or chain.
+    Derived {
+        p: TermId,
+        q: TermId,
+        cong_plans: Vec<(TermId, TermId, Vec<TermId>)>,
+        u: TermId,
+        chain_lits: Vec<TermId>,
+    },
+}
+
+/// Certify one candidate bridge and assemble the plan. Fail-closed: a failed
+/// Farkas reconstruction or a constant-fold surprise declines.
+fn finish_chain_bridge_plan(
+    terms: &mut TermStore,
+    clause: &[TermId],
+    rel_lits: &[TermId],
+    head: BridgeHead,
+) -> Option<EufChainFarkasBridgePlan> {
+    let (direct_edge, cong_plans, cong_eq, cong_neg, chain_lits, derived_eq, derived_neg) =
+        match head {
+            BridgeHead::Edge(edge_lit) => {
+                let placeholder = rel_lits[0];
+                (
+                    Some(edge_lit),
+                    Vec::new(),
+                    placeholder,
+                    placeholder,
+                    Vec::new(),
+                    placeholder,
+                    placeholder,
+                )
+            }
+            BridgeHead::Derived {
+                p,
+                q,
+                cong_plans,
+                u,
+                chain_lits,
+            } => {
+                let lifted = !cong_plans.is_empty();
+                let cong_eq = if lifted {
+                    let eq = terms.mk_eq(p, u);
+                    // Fail-closed on constant-fold surprises.
+                    let _ = decode_eq_local(terms, eq)?;
+                    eq
+                } else {
+                    rel_lits[0]
+                };
+                let cong_neg = if lifted {
+                    terms.mk_not(cong_eq)
+                } else {
+                    rel_lits[0]
+                };
+                let (derived_eq, derived_neg) = if lifted && q == u {
+                    (cong_eq, cong_neg)
+                } else {
+                    let eq = terms.mk_eq(p, q);
+                    let _ = decode_eq_local(terms, eq)?;
+                    (eq, terms.mk_not(eq))
+                };
+                if !lifted && chain_lits.is_empty() {
+                    return None;
+                }
+                (
+                    None,
+                    cong_plans,
+                    cong_eq,
+                    cong_neg,
+                    chain_lits,
+                    derived_eq,
+                    derived_neg,
+                )
+            }
+        };
+    let mut la_clause: Vec<TermId> = Vec::with_capacity(rel_lits.len() + 1);
+    match direct_edge {
+        Some(edge_lit) => la_clause.push(edge_lit),
+        None => la_clause.push(derived_neg),
+    }
+    la_clause.extend(rel_lits.iter().copied());
+    let mut la_farkas = None;
+    let mut la_kind = TheoryLemmaKind::LiaGeneric;
+    if !super::proof_farkas::try_lra_farkas_reconstruction(
+        terms,
+        &la_clause,
+        &mut la_farkas,
+        &mut la_kind,
+    ) {
+        return None;
+    }
+
+    // Original literals consumed by the derivation; the rest are weakened
+    // back in so the final clause is the original as a literal set.
+    let mut consumed: Vec<TermId> = rel_lits.to_vec();
+    if let Some(edge_lit) = direct_edge {
+        consumed.push(edge_lit);
+    }
+    for (_, _, chain) in &cong_plans {
+        for &lit in chain {
+            if !consumed.contains(&lit) {
+                consumed.push(lit);
+            }
+        }
+    }
+    for &lit in &chain_lits {
+        if !consumed.contains(&lit) {
+            consumed.push(lit);
+        }
+    }
+    let extras: Vec<TermId> = clause
+        .iter()
+        .copied()
+        .filter(|lit| !consumed.contains(lit))
+        .collect();
+    Some(EufChainFarkasBridgePlan {
+        direct_edge,
+        cong_plans,
+        cong_eq,
+        cong_neg,
+        chain_lits,
+        derived_eq,
+        derived_neg,
+        la_clause,
+        la_farkas: la_farkas?,
+        la_kind,
+        extras,
+    })
+}
+
+/// Emit the planned EUF-chain + Farkas-bridge derivation. Returns the final
+/// step id and clause (the original as a literal set when the plan is sound;
+/// the caller verifies and reverts otherwise).
+fn emit_euf_chain_farkas_bridge(
+    terms: &mut TermStore,
+    new_steps: &mut Vec<ProofStep>,
+    plan: &EufChainFarkasBridgePlan,
+) -> (ProofId, Vec<TermId>) {
+    let lifted = !plan.cong_plans.is_empty();
+    // C: the congruence derivation `(cl <premise ¬eqs> (= s u))`.
+    let cong = lifted.then(|| {
+        emit_congruence_split_steps(terms, new_steps, &plan.cong_plans, plan.cong_eq, true)
+    });
+    // T: the transitive chain `(cl [¬(= s u)] <chain ¬eqs> (= s v))`.
+    let chain = (!plan.chain_lits.is_empty()).then(|| {
+        let mut t_clause = Vec::with_capacity(plan.chain_lits.len() + 2);
+        if lifted {
+            t_clause.push(plan.cong_neg);
+        }
+        t_clause.extend(plan.chain_lits.iter().copied());
+        t_clause.push(plan.derived_eq);
+        let t_id = push_proof_step_local(
+            new_steps,
+            ProofStep::Step {
+                rule: AletheRule::EqTransitive,
+                clause: t_clause.clone(),
+                premises: Vec::new(),
+                args: Vec::new(),
+            },
+        );
+        (t_id, t_clause)
+    });
+    // L: the certified arithmetic bridge.
+    let l_id = push_proof_step_local(
+        new_steps,
+        ProofStep::TheoryLemma {
+            theory: "LIA".to_string(),
+            clause: plan.la_clause.clone(),
+            farkas: Some(plan.la_farkas.clone()),
+            kind: plan.la_kind,
+            lia: None,
+        },
+    );
+    let mut cur_id = l_id;
+    let mut cur_clause = plan.la_clause.clone();
+    if let Some((t_id, t_clause)) = chain {
+        (cur_id, cur_clause) = push_th_resolution_local(
+            new_steps,
+            cur_id,
+            &cur_clause,
+            t_id,
+            &t_clause,
+            plan.derived_eq,
+            plan.derived_neg,
+        );
+    }
+    if let Some((c_id, c_clause)) = cong {
+        (cur_id, cur_clause) = push_th_resolution_local(
+            new_steps,
+            cur_id,
+            &cur_clause,
+            c_id,
+            &c_clause,
+            plan.cong_eq,
+            plan.cong_neg,
+        );
+    }
+    if !plan.extras.is_empty() {
+        let mut weakened = cur_clause.clone();
+        weakened.extend(plan.extras.iter().copied());
+        let w_id = push_proof_step_local(
+            new_steps,
+            ProofStep::Step {
+                rule: AletheRule::Weakening,
+                clause: weakened.clone(),
+                premises: vec![cur_id],
+                args: Vec::new(),
+            },
+        );
+        cur_id = w_id;
+        cur_clause = weakened;
+    }
+    (cur_id, cur_clause)
+}
+
+/// A plan for the array read-over-write-under-equality split
+/// (#ground-conflict-decomp, arm 2).
+///
+/// The Generic lemma is `¬(= L R) ∨ (= (select X x) (select Y x))` — flat or
+/// packed as one `or` unit — where one/both of `L`, `R` carry store chains,
+/// `x` is an integer numeral, and every store index is a DISTINCT integer
+/// numeral. The strict-checkable `ArrayRowChain` schema requires the
+/// positive `(= x i)` guard per skipped store; each guard is refuted by a
+/// solver-certified Farkas unit and resolved away, re-deriving the original.
+struct RowChainUnderEqPlan {
+    /// The packed `or` unit term (`None` for a flat two-literal clause).
+    packed_or: Option<TermId>,
+    /// The two flat literals in original order.
+    flat: Vec<TermId>,
+    /// `¬(= L R)`.
+    not_eq_lit: TermId,
+    /// `(= (select X x) (select Y x))`.
+    pos_eq_lit: TermId,
+    /// Raw `(= x i)` guard literals, deduplicated, one per skipped index.
+    guards: Vec<TermId>,
+}
+
+/// Maximum store-chain guards arm 2 will certify for one lemma.
+const MAX_ROW_CHAIN_DECOMP_GUARDS: usize = 4;
+
+/// Recognize the RoW-under-equality shape. `None` (→ fall back) otherwise.
+fn plan_array_row_chain_under_eq(
+    terms: &mut TermStore,
+    clause: &[TermId],
+) -> Option<RowChainUnderEqPlan> {
+    let (flat, packed_or) = match clause {
+        [single] => match terms.get(*single) {
+            TermData::App(Symbol::Named(op), disjuncts) if op == "or" && disjuncts.len() == 2 => {
+                (disjuncts.clone(), Some(*single))
+            }
+            _ => return None,
+        },
+        [_, _] => (clause.to_vec(), None),
+        _ => return None,
+    };
+    if flat[0] == flat[1] {
+        return None;
+    }
+    let mut not_eq: Option<(TermId, TermId, TermId)> = None;
+    let mut pos_eq: Option<(TermId, TermId, TermId)> = None;
+    for &lit in &flat {
+        let (inner, neg) = strip_not_local(terms, lit);
+        let (lhs, rhs) = decode_eq_local(terms, inner)?;
+        if neg {
+            if !matches!(terms.sort(lhs), Sort::Array(_)) || not_eq.is_some() {
+                return None;
+            }
+            not_eq = Some((lit, lhs, rhs));
+        } else {
+            if pos_eq.is_some() {
+                return None;
+            }
+            pos_eq = Some((lit, lhs, rhs));
+        }
+    }
+    let (not_eq_lit, l, r) = not_eq?;
+    let (pos_eq_lit, u, w) = pos_eq?;
+    let (u_array, u_index) = select_parts_local(terms, u)?;
+    let (w_array, w_index) = select_parts_local(terms, w)?;
+    if u_index != w_index || !is_int_const_local(terms, u_index) {
+        return None;
+    }
+    let x = u_index;
+
+    // Peel each side's store chain to its base, collecting store indices.
+    let peel = |mut array: TermId, indices: &mut Vec<TermId>| -> TermId {
+        while let Some((base, index, _)) = store_parts_local(terms, array) {
+            indices.push(index);
+            array = base;
+        }
+        array
+    };
+    let mut l_indices = Vec::new();
+    let l_base = peel(l, &mut l_indices);
+    let mut r_indices = Vec::new();
+    let r_base = peel(r, &mut r_indices);
+    if l_indices.is_empty() && r_indices.is_empty() {
+        return None;
+    }
+    // The two reads must cover the two SIDES cross-wise: each read array is
+    // one side's outer store or its exact base (the validator's (B) schema).
+    let matches_left = |read: TermId| read == l || read == l_base;
+    let matches_right = |read: TermId| read == r || read == r_base;
+    if !((matches_left(u_array) && matches_right(w_array))
+        || (matches_left(w_array) && matches_right(u_array)))
+    {
+        return None;
+    }
+    // Every store index must be a numeral distinct from the read index so the
+    // guard unit `¬(= x i)` is Farkas-certifiable (numerals are hash-consed,
+    // so TermId inequality is value inequality).
+    let mut guards: Vec<TermId> = Vec::new();
+    for &index in l_indices.iter().chain(r_indices.iter()) {
+        if index == x || !is_int_const_local(terms, index) {
+            return None;
+        }
+        // `mk_eq` folds distinct-numeral equalities to `false`; the guard
+        // must stay a raw equality application for the RowChain schema and
+        // the resolution pivot.
+        let raw_guard = terms.mk_app(Symbol::named("="), [x, index], Sort::Bool);
+        if !guards.contains(&raw_guard) {
+            guards.push(raw_guard);
+        }
+    }
+    if guards.is_empty() || guards.len() > MAX_ROW_CHAIN_DECOMP_GUARDS {
+        return None;
+    }
+    Some(RowChainUnderEqPlan {
+        packed_or,
+        flat,
+        not_eq_lit,
+        pos_eq_lit,
+        guards,
+    })
+}
+
+/// Emit the planned RoW-under-equality derivation: the guarded
+/// `ArrayRowChain` lemma, one certified Farkas unit per guard, the
+/// resolutions, and the or-rebuild for a packed unit. Returns `None` when a
+/// guard's Farkas reconstruction fails (caller truncates and falls back).
+fn emit_array_row_chain_under_eq(
+    terms: &mut TermStore,
+    new_steps: &mut Vec<ProofStep>,
+    plan: &RowChainUnderEqPlan,
+) -> Option<(ProofId, Vec<TermId>)> {
+    let mut lemma_clause = Vec::with_capacity(plan.guards.len() + 2);
+    lemma_clause.push(plan.not_eq_lit);
+    lemma_clause.extend(plan.guards.iter().copied());
+    lemma_clause.push(plan.pos_eq_lit);
+    let row_id = push_proof_step_local(
+        new_steps,
+        ProofStep::TheoryLemma {
+            theory: "array".to_string(),
+            clause: lemma_clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::ArrayRowChain,
+            lia: None,
+        },
+    );
+    let mut cur_id = row_id;
+    let mut cur_clause = lemma_clause;
+    for &guard in &plan.guards {
+        let not_guard = terms.mk_not_raw(guard);
+        let unit_clause = vec![not_guard];
+        let kind = TheoryLemmaKind::LiaGeneric;
+        let farkas = Some(super::proof_farkas::constant_disequality_unit_farkas(
+            terms, not_guard,
+        )?);
+        let unit_id = push_proof_step_local(
+            new_steps,
+            ProofStep::TheoryLemma {
+                theory: "LIA".to_string(),
+                clause: unit_clause.clone(),
+                farkas,
+                kind,
+                lia: None,
+            },
+        );
+        (cur_id, cur_clause) = push_th_resolution_local(
+            new_steps,
+            unit_id,
+            &unit_clause,
+            cur_id,
+            &cur_clause,
+            guard,
+            not_guard,
+        );
+    }
+    if let Some(or_term) = plan.packed_or {
+        // Rebuild the packed unit exactly like the shadowed-store emitter:
+        // `or_neg` supplies `(or D) OR (not d)` per disjunct; resolving all
+        // `d` leaves `(or D)`.
+        for &disjunct in &plan.flat {
+            let negated_disjunct = terms.mk_not_raw(disjunct);
+            let or_neg_clause = vec![or_term, negated_disjunct];
+            let or_neg_id = push_proof_step_local(
+                new_steps,
+                ProofStep::Step {
+                    rule: AletheRule::OrNeg,
+                    clause: or_neg_clause.clone(),
+                    premises: Vec::new(),
+                    args: Vec::new(),
+                },
+            );
+            (cur_id, cur_clause) = push_th_resolution_local(
+                new_steps,
+                cur_id,
+                &cur_clause,
+                or_neg_id,
+                &or_neg_clause,
+                negated_disjunct,
+                disjunct,
+            );
+        }
+    }
+    Some((cur_id, cur_clause))
 }
 
 /// Return the premise literals on a simple path `x`→`y` over the undirected

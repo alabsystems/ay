@@ -245,6 +245,13 @@ impl EufLemmaPlan {
             EufConcl::Pred { prems, .. } => {
                 taut_volume(prems, 2, &emitted_lengths, &mut refls, &mut total)?
             }
+            EufConcl::ConstClash { top, .. } => {
+                // The certified Farkas unit (1 literal) plus the resolvent
+                // (the chain clause minus its concluding equality).
+                let width = emitted_lengths.get(*top)?.saturating_sub(1);
+                spend(&mut total, width.checked_add(2)?)?;
+                width
+            }
         };
         match &self.target {
             EufTarget::Bare { extras } if !extras.is_empty() => {

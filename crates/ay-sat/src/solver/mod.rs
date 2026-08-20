@@ -54,7 +54,7 @@ use crate::transred::TransRed;
 use crate::vivify::{VivifyStats, VivifyTier};
 use crate::vsids::VSIDS;
 use crate::walk::Random;
-use crate::watched::{ClauseRef, WatchList, WatchedLists, Watcher, BINARY_FLAG};
+use crate::watched::{ClauseRef, ExactWatchPlan, WatchList, WatchedLists, Watcher, BINARY_FLAG};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

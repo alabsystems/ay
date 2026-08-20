@@ -1117,6 +1117,25 @@ enum NominalSortSurface {
     },
 }
 
+/// The put-it-back token from [`Context::begin_internal_logic_borrow`].
+///
+/// Opaque and field-private on purpose: only the paired begin/end methods may
+/// construct or read one, so no caller can fabricate a revision to roll back
+/// to. It is deliberately NOT `Drop`-based — an internal sub-solve wants the
+/// restore to be an explicit, greppable line in the lane that borrowed.
+#[derive(Debug)]
+#[must_use = "the borrowed logic slot must be put back"]
+pub struct InternalLogicBorrow {
+    /// The logic in effect before the borrow, restored verbatim.
+    saved_logic: Option<String>,
+    /// The source revision before the borrow's own outbound write.
+    saved_revision: u64,
+    /// The source revision immediately after that outbound write. If the live
+    /// revision has moved past this, something other than the borrow changed
+    /// the source context and `saved_revision` must NOT be restored.
+    entry_revision: u64,
+}
+
 /// Elaboration context
 // Trust: `Clone` lets an independent UNSAT re-discharge rebuild a fresh `Executor`
 // over a COPY of the full solving context (terms, assertions, logic, options) — the
@@ -1802,6 +1821,74 @@ impl Context {
         if self.logic.as_ref() != Some(&logic) {
             self.logic = Some(logic);
             self.advance_source_revision();
+        }
+    }
+
+    /// Retarget the logic slot for an INTERNAL sub-solve, returning the token
+    /// that puts it back.
+    ///
+    /// WHY THIS EXISTS. `source_revision` is the second half of
+    /// [`SourceContextStamp`], and the mandatory UNSAT gate
+    /// (`Executor::authenticate_unsat_query_scope`) rejects a refutation whose
+    /// stamp no longer equals the one captured when the public query was bound
+    /// — "the public UNSAT source context is no longer current". That test is
+    /// meant to catch the source/declaration scope CHANGING under a bound
+    /// query.
+    ///
+    /// An internal lane that borrows the logic slot and puts it back changes
+    /// nothing observable, yet `set_logic` A -> B -> A advances the revision
+    /// TWICE, so the stamp never returns to its captured value. Measured on
+    /// `group_fp::fp_congruence::uf_over_float32_is_congruent_under_fp_to_real`:
+    /// the `fp.to_real` two-phase lane
+    /// (`Executor::solve_rewritten_mixed_subproblem`) infers a logic for its
+    /// FP-free subproblem and restores the caller's on exit; revisions 6 and 7
+    /// are those two writes and nothing else, and the correct `unsat` was
+    /// discarded as stale. The context that decided the query is byte-for-byte
+    /// the context that was bound.
+    ///
+    /// FAIL-CLOSED BY CONSTRUCTION. The revision is rolled back ONLY when this
+    /// borrow's own two writes are the only ones that happened: the token
+    /// records the revision immediately after the outbound write, and
+    /// [`Self::end_internal_logic_borrow`] restores the saved revision only if
+    /// the live revision still equals it. Any declaration, assertion-scope
+    /// change, push/pop, or option write inside the borrow advances it past
+    /// that mark, and then the revision is left advanced and the query
+    /// correctly reads as stale. So this can never hide a real source change —
+    /// it can only stop counting a no-op.
+    #[must_use = "the borrow must be ended with `end_internal_logic_borrow`"]
+    pub fn begin_internal_logic_borrow(&mut self, logic: String) -> InternalLogicBorrow {
+        let saved_logic = self.logic.clone();
+        let saved_revision = self.source_revision;
+        self.set_logic(logic);
+        InternalLogicBorrow {
+            saved_logic,
+            saved_revision,
+            entry_revision: self.source_revision,
+        }
+    }
+
+    /// Put back the logic (and, when nothing else moved, the source revision)
+    /// captured by [`Self::begin_internal_logic_borrow`].
+    pub fn end_internal_logic_borrow(&mut self, borrow: InternalLogicBorrow) {
+        let InternalLogicBorrow {
+            saved_logic,
+            saved_revision,
+            entry_revision,
+        } = borrow;
+        // Only this borrow's outbound write may have moved the revision. If
+        // anything else did, the source context genuinely changed and the
+        // rollback below is withheld.
+        let untouched = self.source_revision == entry_revision;
+        match saved_logic {
+            Some(logic) => self.set_logic(logic),
+            // The caller had no logic at all. `set_logic` cannot express that,
+            // and clearing it is not this borrow's business — leave the
+            // inferred logic in place and, because the context DID observably
+            // change, keep the advanced revision.
+            None => return,
+        }
+        if untouched {
+            self.source_revision = saved_revision;
         }
     }
 

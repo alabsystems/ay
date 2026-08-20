@@ -25,6 +25,14 @@ import argparse, gzip, hashlib, json, os, sys, urllib.request
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+# The manifest schema is `milp_corpus.py`'s, and its consumers select and check on
+# fields this script used to drop: `scripts/milp_portfolio.py --tier gurobi` (its
+# DOCUMENTED default) selected nothing from an untiered manifest, and its soundness
+# alarm compares against `ref_obj`, so a manifest without one made the alarm inert
+# and silent. Shape and tier come from the same code that built the original.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from milp_corpus import scan_mps, tier_of  # noqa: E402
+
 INSTANCE_URL = "https://miplib.zib.de/WebData/instances/{name}.mps.gz"
 SOLU_URL = "https://miplib.zib.de/downloads/miplib2017-v27.solu"
 SOLU_NAME = "miplib2017-v27.solu"
@@ -197,11 +205,23 @@ def fetch(url: str, dest: Path, timeout: int = 300) -> None:
 
 
 def parse_solu(path: Path) -> dict:
+    """name -> (status token, reference objective or None).
+
+    The objective is the third field. Every `=opt=` entry in miplib2017-v27.solu
+    carries one (774/774); `=inf=`, `=unbd=` and `=unkn=` carry none and none
+    exists to carry, so a null `ref_obj` there is the truth, not a gap.
+    """
     out = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         f = raw.split()
         if len(f) >= 2 and f[0].startswith("="):
-            out[f[1]] = f[0]
+            val = None
+            if len(f) > 2:
+                try:
+                    val = float(f[2])
+                except ValueError:
+                    val = None
+            out[f[1]] = (f[0], val)
     return out
 
 
@@ -244,7 +264,7 @@ def main() -> int:
 
     instances, rejected = {}, []
     for name in NAMES:
-        token = solu.get(name)
+        token, ref_obj = solu.get(name, (None, None))
         if token not in TERMINAL:
             rejected.append((name, "non-terminal .solu status %r" % token))
             continue
@@ -261,12 +281,19 @@ def main() -> int:
         except Exception as exc:                      # noqa: BLE001
             rejected.append((name, "gunzip: " + str(exc)[:40]))
             continue
+        info = scan_mps(p)
+        if "error" in info:
+            rejected.append((name, "scan_mps: " + str(info["error"])[:40]))
+            continue
         blob = p.read_bytes()
         instances[name] = {
             "file": str(p),
+            "tier": tier_of(info),
             "ref_status": TERMINAL[token],
+            "ref_obj": ref_obj,
             "sha256": hashlib.sha256(blob).hexdigest(),
             "size_bytes": len(blob),
+            **info,
         }
 
     manifest = {
@@ -285,7 +312,12 @@ def main() -> int:
     }
     (root / "manifest.json").write_text(
         json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
-    print("manifest instances:", len(instances))
+    tiers: dict = {}
+    for e in instances.values():
+        tiers[e["tier"]] = tiers.get(e["tier"], 0) + 1
+    n_obj = sum(1 for e in instances.values() if e["ref_obj"] is not None)
+    print("manifest instances: %d  tiers=%s  with ref_obj: %d/%d"
+          % (len(instances), tiers, n_obj, len(instances)))
     for n, why in rejected:
         print("  excluded %-24s %s" % (n, why))
     return 1 if failed else 0

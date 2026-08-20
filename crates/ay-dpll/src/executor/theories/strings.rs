@@ -841,7 +841,7 @@ impl Executor {
                     }
                     last_lemma = Some(lemma.clone());
 
-                    // Strings NF-engine closure 3 (`AY_STR_NF=1`): drain the
+                    // Strings NF-engine closure 3 (`--str-nf`): drain the
                     // lemmas queued behind this one so the whole batch is
                     // lowered in ONE iteration. Empty with the closure off.
                     let extra_lemmas =

@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::proof::ProofStep;
-use crate::propagation::{Lit, PropResult};
+use crate::propagation::{Lit, PbPropagator, PropResult};
 use crate::types::{PbConstraint, PbObjective};
 
 impl PbCdclSolver {
@@ -593,5 +593,223 @@ impl PbCdclSolver {
         if start < end {
             self.active_optimization_bound_range = Some((start, end));
         }
+    }
+
+    /// Replays VeriPB's own check for the `rup >= 1 ;` step that closes an
+    /// optimality proof: does unit propagation from the empty assignment reach a
+    /// conflict on the constraint database VeriPB will hold at that point?
+    ///
+    /// That database is the imported input rows (`f N ;`) plus the
+    /// objective-improving row `objective <= optimum - 1` that VeriPB derives
+    /// from the `soli` step — the intermediate search steps are suppressed in
+    /// optimization mode ([`PbCdclSolver::suppress_optimization_intermediate_proof_steps`]),
+    /// so nothing else is in it. This method rebuilds exactly that set in a
+    /// *fresh* propagator (never the solver's own, which also holds learned
+    /// lemmas VeriPB has never seen and which would make the replay stronger
+    /// than the checker) and propagates to fixpoint.
+    ///
+    /// Deliberately conservative, since a wrong `true` here is a proof VeriPB
+    /// rejects:
+    ///
+    /// * the whole input formula must have been linear
+    ///   ([`PbCdclSolver::proof_input_rows_are_linear`]), because the rows in
+    ///   `self.constraints` are already normalized and a product term dropped by
+    ///   that normalization would leave a row strictly stronger than the one
+    ///   VeriPB imported;
+    /// * a row whose magnitudes could saturate the normalizer's arithmetic is
+    ///   skipped;
+    /// * the objective must be linear, and the improving row must be a real
+    ///   (non-trivial) constraint;
+    /// * running out of the propagation budget answers `false`.
+    ///
+    /// Dropping rows only ever weakens propagation, and propagation is monotone:
+    /// a conflict found from a subset of VeriPB's database is a conflict VeriPB
+    /// finds too. Answering `false` only ever makes the caller
+    /// ([`PbCdclSolver::conclude_opt_proof`]) fail closed onto the certified
+    /// OPT-LIN route, so every error direction is the safe one.
+    pub(super) fn objective_improvement_unit_propagates_to_conflict(
+        &self,
+        objective: &PbObjective,
+        optimum: i128,
+    ) -> bool {
+        if !self.proof_input_rows_are_linear {
+            return false;
+        }
+        if !objective.terms.iter().all(|term| term.lits.len() == 1) {
+            return false;
+        }
+        let Some(improvement_row) = build_upper_bound_constraint(objective, optimum) else {
+            return false;
+        };
+        if !is_replayable_linear_row(&improvement_row) {
+            return false;
+        }
+
+        let mut propagator = PbPropagator::new();
+        for constraint in self
+            .constraints
+            .iter()
+            .take(self.proof_input_constraint_count)
+            .filter(|constraint| is_replayable_linear_row(constraint))
+        {
+            propagator.add_from_pb_constraint(constraint);
+        }
+        if propagator
+            .add_from_pb_constraint(&improvement_row)
+            .is_none()
+        {
+            // Trivially satisfied improving row: it cannot participate in a
+            // conflict, and the input rows alone are satisfiable (we have an
+            // incumbent), so there is nothing to find.
+            return false;
+        }
+
+        propagation_reaches_conflict(&mut propagator)
+    }
+}
+
+/// Work budget, in constraint visits, for the RUP replay
+/// ([`PbCdclSolver::objective_improvement_unit_propagates_to_conflict`]).
+/// Running out answers "no conflict", which only ever makes the caller fail
+/// closed.
+const RUP_REPLAY_WORK_BUDGET: u64 = 50_000_000;
+
+/// Whether `constraint` can be handed to the linear propagator for the RUP
+/// replay without changing its meaning.
+///
+/// Rejects non-linear (product) terms — the normalizer silently *drops* those,
+/// which strengthens a `>=` row and could manufacture a conflict VeriPB does not
+/// see — and magnitudes large enough for the normalizer's saturating degree
+/// arithmetic to lose information.
+fn is_replayable_linear_row(constraint: &PbConstraint) -> bool {
+    let mut magnitude: i128 = constraint.rhs.checked_abs().unwrap_or(i128::MAX);
+    for term in &constraint.terms {
+        if term.lits.len() != 1 {
+            return false;
+        }
+        let Some(coeff_magnitude) = term.coeff.checked_abs() else {
+            return false;
+        };
+        let Some(next) = magnitude.checked_add(coeff_magnitude) else {
+            return false;
+        };
+        magnitude = next;
+    }
+    true
+}
+
+/// Propagates `propagator` to fixpoint from its current (empty) assignment and
+/// reports whether a conflict is reached.
+///
+/// Uses [`PbPropagator::propagate`], the full-scan form documented as the one
+/// that finds *all* implications, and re-scans after every assignment until a
+/// complete pass is quiet. The solver's own `propagate_all` is the faster
+/// event-driven form, but an event-driven pass may stop short of the fixpoint —
+/// harmless for search (it just means more decisions) and not harmless here,
+/// where a missed implication turns a genuinely checkable `rup >= 1 ;` into an
+/// unnecessary fail-closed UNKNOWN.
+///
+/// The scan is charged against [`RUP_REPLAY_WORK_BUDGET`]; exhausting it reports
+/// "no conflict", the fail-closed answer.
+fn propagation_reaches_conflict(propagator: &mut PbPropagator) -> bool {
+    let mut budget = RUP_REPLAY_WORK_BUDGET;
+
+    loop {
+        let scan_cost = propagator.num_constraints() as u64;
+        let Some(remaining) = budget.checked_sub(scan_cost.max(1)) else {
+            return false;
+        };
+        budget = remaining;
+
+        match propagator.propagate() {
+            PropResult::Conflict(_, _) => return true,
+            PropResult::Interrupted | PropResult::Ok => return false,
+            PropResult::Propagated(lit, _, _) => match propagator.assign_literal(lit, 0) {
+                PropResult::Conflict(_, _) => return true,
+                PropResult::Interrupted => return false,
+                // Any further implication this assignment triggered is re-found
+                // by the next full scan; nothing is lost by ignoring it here.
+                PropResult::Ok | PropResult::Propagated(_, _, _) => {}
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod rup_replay_tests {
+    use super::{is_replayable_linear_row, propagation_reaches_conflict};
+    use crate::propagation::PbPropagator;
+    use crate::types::{PbConstraint, PbLit, PbRel, PbTerm};
+
+    fn lit(var: u32) -> PbLit {
+        PbLit {
+            var,
+            negated: false,
+        }
+    }
+
+    fn row(terms: Vec<PbTerm>, rhs: i128) -> PbConstraint {
+        PbConstraint {
+            terms,
+            rel: PbRel::Ge,
+            rhs,
+        }
+    }
+
+    fn term(coeff: i128, var: u32) -> PbTerm {
+        PbTerm {
+            coeff,
+            lits: vec![lit(var)],
+        }
+    }
+
+    #[test]
+    fn immediately_conflicting_row_is_a_conflict() {
+        // -x1 - x2 >= 1 can never hold: negative slack under the empty
+        // assignment, exactly the shape an objective-improving row takes when the
+        // objective cannot go below its optimum on the cube alone.
+        let mut propagator = PbPropagator::new();
+        propagator.add_from_pb_constraint(&row(vec![term(-1, 1), term(-1, 2)], 1));
+        assert!(propagation_reaches_conflict(&mut propagator));
+    }
+
+    #[test]
+    fn propagation_chain_reaches_conflict() {
+        // x1 + x2 >= 2 forces both true; -x1 - x2 >= -1 (i.e. x1 + x2 <= 1) then
+        // conflicts. Needs real propagation, not just a slack check on one row.
+        let mut propagator = PbPropagator::new();
+        propagator.add_from_pb_constraint(&row(vec![term(1, 1), term(1, 2)], 2));
+        propagator.add_from_pb_constraint(&row(vec![term(-1, 1), term(-1, 2)], -1));
+        assert!(propagation_reaches_conflict(&mut propagator));
+    }
+
+    #[test]
+    fn satisfiable_database_has_no_conflict() {
+        // x1 + x2 >= 1 with x1 + x2 <= 1: satisfiable and propagation-free.
+        let mut propagator = PbPropagator::new();
+        propagator.add_from_pb_constraint(&row(vec![term(1, 1), term(1, 2)], 1));
+        propagator.add_from_pb_constraint(&row(vec![term(-1, 1), term(-1, 2)], -1));
+        assert!(!propagation_reaches_conflict(&mut propagator));
+    }
+
+    #[test]
+    fn non_linear_and_oversized_rows_are_not_replayable() {
+        let non_linear = PbConstraint {
+            terms: vec![PbTerm {
+                coeff: 1,
+                lits: vec![lit(1), lit(2)],
+            }],
+            rel: PbRel::Ge,
+            rhs: 1,
+        };
+        assert!(!is_replayable_linear_row(&non_linear));
+
+        let oversized = row(vec![term(i128::MAX, 1), term(i128::MAX, 2)], 1);
+        assert!(!is_replayable_linear_row(&oversized));
+
+        assert!(is_replayable_linear_row(&row(
+            vec![term(3, 1), term(-2, 2)],
+            1
+        )));
     }
 }

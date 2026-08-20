@@ -72,7 +72,9 @@ pub use bab::{
     // W0 measurement: root dual bound before/after the cut loop, no branching.
     diag_root_closure,
     // P0 instrument: nodes-to-proof, the load-invariant search metric.
+    drought_dives_launched,
     nodes_explored,
+    reset_drought_dives,
     reset_nodes_explored,
     BumpLuDiff,
     // STAGE-0 COLD-CLONE READINESS PoC (inert to the serial path; see bab.rs):
@@ -223,6 +225,7 @@ pub use session::{
     MAX_TARGET_FSB_PREFIX_CANDIDATES,
 };
 pub use simplex::{
-    iter_ledger_line, px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line,
+    enable_iter_ledger, iter_ledger_line, px_profile_line, rt_profile_line, sb_profile_line,
+    upd_profile_line,
 };
 pub use tree_cert::{MilpInfeasibilityCertificate, TreeNode};

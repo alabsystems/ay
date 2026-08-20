@@ -3111,6 +3111,17 @@ const PARALLEL_SHED_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// instantly shed every worker).
 const PARALLEL_SHED_COOLDOWN: Duration = Duration::from_millis(500);
 
+/// ACTIVE-IMPROVER PROTECTION window for the shed pick (see
+/// [`WorkerStopControls::shed_lowest_priority`]): a worker that improved the
+/// coordinator-verified global incumbent within this window is SKIPPED (not
+/// vetoed) by the reverse-order shed. Sized from the measured improvement
+/// cadence of the tail-SLS descent on `minisat15_4_4_4_mh_ic` (steps land
+/// every 0.3–3.6 s; the whole descent finishes by ~11 s): 10 s covers an
+/// actively-improving arm through its descent while guaranteeing a stale
+/// author becomes sheddable again well before the shed sequence must reach
+/// the complete baselines.
+const PARALLEL_SHED_IMPROVER_PROTECT_WINDOW: Duration = Duration::from_secs(10);
+
 /// Hard-deadline grace for the parallel optimization coordinator: how long
 /// past the caller's timeout the collector keeps draining worker messages
 /// before force-returning the best verified incumbent. Small on purpose — a
@@ -4297,8 +4308,12 @@ fn is_definitive_optimization(solution: &PbSolution) -> bool {
 
 /// A message from a worker thread to the coordinator.
 enum WorkerMsg {
-    /// A feasible optimization incumbent (objective value + model).
-    Improvement(i128, Vec<bool>),
+    /// A feasible optimization incumbent (sending worker's label + objective
+    /// value + model). The label exists for the coordinator's shed-protection
+    /// bookkeeping ONLY (see [`collect_optimization_result`]): it never
+    /// licenses a verdict, and the incumbent is still re-verified by
+    /// `sanitize_optimization_incumbent` before anything trusts it.
+    Improvement(&'static str, i128, Vec<bool>),
     /// The worker finished with a (possibly non-definitive) result. `label`
     /// identifies the strategy and is used for the disagreement debug check.
     Done {
@@ -4349,7 +4364,9 @@ mod primal_channel {
         /// before trusting it — the same already-verdict-free message the
         /// complete workers stream.
         pub fn send_improvement(&self, obj_value: i128, model: Vec<bool>) {
-            let _ = self.tx.send(WorkerMsg::Improvement(obj_value, model));
+            let _ = self
+                .tx
+                .send(WorkerMsg::Improvement(self.label, obj_value, model));
         }
 
         /// Signals verdict-free completion (`WorkerMsg::Finished`), CONSUMING
@@ -4806,7 +4823,7 @@ fn collect_decision_result(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
-            WorkerMsg::Improvement(_, _) => {}
+            WorkerMsg::Improvement(_, _, _) => {}
             WorkerMsg::Finished { label } => {
                 // Decision workers are all COMPLETE engines and always send
                 // `Done`; a verdict-free `Finished` cannot arrive here. Count
@@ -5066,6 +5083,7 @@ fn run_parallel_optimization_traced_with_upgrade(
         on_improve,
         shared_bounds.as_ref(),
         &mut backfill,
+        &mut ShedPolicy::new(Instant::now()),
     );
     controls.stop_all();
     let spawned_labels = controls.labels();
@@ -5120,7 +5138,8 @@ fn spawn_optimization_worker_spec(
                 // Forward this worker's feasible incumbents to the coordinator,
                 // which re-verifies them before trusting any of them.
                 let mut on_improve = |obj_value: i128, model: &[bool]| {
-                    let _ = tx_improve.send(WorkerMsg::Improvement(obj_value, model.to_vec()));
+                    let _ =
+                        tx_improve.send(WorkerMsg::Improvement(label, obj_value, model.to_vec()));
                 };
                 let solution = run(
                     worker_instance.as_ref(),
@@ -5437,6 +5456,15 @@ impl WorkerStopControls {
         }
     }
 
+    /// Index of the worker labeled `label`, when it is still active. Labels
+    /// are unique per spawn set (each spec is pushed at most once).
+    fn active_index_of(&self, label: &str) -> Option<usize> {
+        self.workers
+            .iter()
+            .position(|(l, _)| *l == label)
+            .filter(|&idx| !self.inactive[idx])
+    }
+
     /// GRACEFUL MEMORY SHEDDING: stops the lowest-priority still-active
     /// worker (reverse spec order — the primal arms die before the complete
     /// baselines) and returns its label. Never stops index 0 (the P1
@@ -5444,8 +5472,21 @@ impl WorkerStopControls {
     /// aborts the process; under sustained pressure repeated calls shed
     /// progressively down to the baseline alone, after which the per-worker
     /// 95% reactive watermark remains the last resort.
-    fn shed_lowest_priority(&mut self) -> Option<&'static str> {
-        let idx = next_worker_to_shed(&self.inactive)?;
+    ///
+    /// `protect` (the ACTIVE-IMPROVER PROTECTION, measured 2026-08-18 on
+    /// `minisat15_4_4_4_mh_ic`): the index of the worker that most recently
+    /// improved the coordinator-verified global incumbent, skipped by the
+    /// reverse-order pick unless it is the ONLY sheddable worker left. On
+    /// instances big enough to sit at the shed threshold within seconds
+    /// (9.7k vars / 21k rows under the default govern budget), the reverse
+    /// order otherwise kills the one arm actively driving the primal while
+    /// keeping idle memory-heavy engines — the measured -457,891 primal loss
+    /// on minisat15. Protection is a SKIP, never a veto: some worker is still
+    /// shed on every call while more than one candidate remains, so memory
+    /// relief is preserved, and the caller time-bounds the protection so a
+    /// stale improver becomes sheddable again.
+    fn shed_lowest_priority(&mut self, protect: Option<usize>) -> Option<&'static str> {
+        let idx = next_worker_to_shed(&self.inactive, protect)?;
         self.inactive[idx] = true;
         self.workers[idx].1.store(true, Ordering::Relaxed);
         Some(self.workers[idx].0)
@@ -5455,12 +5496,111 @@ impl WorkerStopControls {
 /// Pure shed-order core (unit-testable): the index of the next worker to stop
 /// under memory pressure — the LAST (lowest-priority) still-active worker —
 /// or `None` when only the P1 sequential baseline (index 0, never shed)
-/// remains.
-fn next_worker_to_shed(inactive: &[bool]) -> Option<usize> {
-    inactive
-        .iter()
-        .rposition(|&gone| !gone)
-        .filter(|&idx| idx > 0)
+/// remains. A `protect`ed index (the active improver; see
+/// [`WorkerStopControls::shed_lowest_priority`]) is skipped unless it is the
+/// only sheddable candidate.
+fn next_worker_to_shed(inactive: &[bool], protect: Option<usize>) -> Option<usize> {
+    let candidate = |skip_protected: bool| {
+        inactive
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(idx, &gone)| !gone && idx > 0 && !(skip_protected && protect == Some(idx)))
+            .map(|(idx, _)| idx)
+    };
+    candidate(true).or_else(|| candidate(false))
+}
+
+/// GRACEFUL MEMORY SHEDDING policy state for the parallel optimization
+/// coordinator, EXTRACTED from `collect_optimization_result`'s poll loop so
+/// the whole shed decision — poll-interval gate, cooldown, pressure signal,
+/// ACTIVE-IMPROVER PROTECTION window, and the reverse-order pick — is one
+/// deterministic step drivable from tests with a scripted clock and a
+/// scripted pressure signal (no real memory pressure, no sleeps, no
+/// dependence on thread scheduling). The production poll loop calls
+/// [`Self::step`] with `Instant::now()` and the live
+/// [`parallel_shed_memory_pressured`] probe; the mechanism harness in
+/// `portfolio/tests.rs` calls it with fabricated instants and `|| true`.
+///
+/// SOUNDNESS POSTURE: this policy only ever STOPS workers (via
+/// [`WorkerStopControls::shed_lowest_priority`]). Nothing here can license a
+/// verdict — [`Self::note_verified_improvement`] is bookkeeping recorded
+/// AFTER the coordinator's `sanitize_optimization_incumbent` gate, and its
+/// only consumer is the shed pick.
+struct ShedPolicy {
+    /// Rate limit for the (syscall-backed) pressure probe: `step` is a no-op
+    /// until this instant, and each probing step re-arms it.
+    next_pressure_poll: Instant,
+    /// Rate limit between sheds, armed only when a shed actually happens, so
+    /// a stopped worker has time to actually free its state before the next
+    /// pick (otherwise one pressure spike would instantly shed everyone).
+    shed_cooldown_until: Instant,
+    /// ACTIVE-IMPROVER PROTECTION: the label and time of the last
+    /// coordinator-VERIFIED global-incumbent improvement. Consulted only by
+    /// the shed pick in [`Self::step`]; licenses nothing else.
+    last_improver: Option<(&'static str, Instant)>,
+}
+
+impl ShedPolicy {
+    /// Fresh policy for one parallel collection: first pressure probe one
+    /// poll interval out, no shed cooldown pending, no improver on record.
+    fn new(now: Instant) -> Self {
+        Self {
+            next_pressure_poll: now + PARALLEL_SHED_POLL_INTERVAL,
+            shed_cooldown_until: now,
+            last_improver: None,
+        }
+    }
+
+    /// Records that the worker labeled `label` authored the current VERIFIED
+    /// global incumbent at `now`. Call sites are gated on the coordinator's
+    /// `sanitize_optimization_incumbent` re-verification AND on the incumbent
+    /// actually improving the pool — an unverified (or non-improving) report
+    /// must never reach this method, so a worker cannot buy shed protection
+    /// with a bogus incumbent.
+    fn note_verified_improvement(&mut self, label: &'static str, now: Instant) {
+        self.last_improver = Some((label, now));
+    }
+
+    /// ONE deterministic shed-policy step at time `now`; returns the shed
+    /// worker's label when this step stopped one.
+    ///
+    /// Gate order (exactly the old inline poll-loop logic):
+    /// 1. POLL INTERVAL: before `next_pressure_poll`, do nothing (this also
+    ///    rate-limits the `pressured` probe, which is only invoked past this
+    ///    gate — it can be a syscall in production);
+    /// 2. COOLDOWN + PRESSURE: within the post-shed cooldown, or with the
+    ///    pressure signal quiet, do nothing;
+    /// 3. ACTIVE-IMPROVER PROTECTION: resolve `last_improver` to a live
+    ///    worker index IFF its improvement is younger than
+    ///    [`PARALLEL_SHED_IMPROVER_PROTECT_WINDOW`] (a finished/shed improver
+    ///    resolves to `None` via `active_index_of` — protection can never
+    ///    dangle onto a reused slot, including backfill-grown `controls`);
+    /// 4. SHED: reverse-priority pick skipping the protected index unless it
+    ///    is the only sheddable candidate (skip, never veto — while more than
+    ///    one candidate remains, SOME worker is stopped on every pressured
+    ///    step, so memory relief is never sacrificed), then arm the cooldown.
+    fn step(
+        &mut self,
+        now: Instant,
+        pressured: impl FnOnce() -> bool,
+        controls: &mut WorkerStopControls,
+    ) -> Option<&'static str> {
+        if now < self.next_pressure_poll {
+            return None;
+        }
+        self.next_pressure_poll = now + PARALLEL_SHED_POLL_INTERVAL;
+        if now < self.shed_cooldown_until || !pressured() {
+            return None;
+        }
+        let protect = self
+            .last_improver
+            .filter(|&(_, at)| now.duration_since(at) < PARALLEL_SHED_IMPROVER_PROTECT_WINDOW)
+            .and_then(|(label, _)| controls.active_index_of(label));
+        let shed = controls.shed_lowest_priority(protect)?;
+        self.shed_cooldown_until = now + PARALLEL_SHED_COOLDOWN;
+        Some(shed)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5475,6 +5615,7 @@ fn collect_optimization_result(
     on_improve: &mut dyn FnMut(i128, &[bool]),
     shared_bounds: &SharedBounds,
     backfill: &mut OptimizationBackfill,
+    shed_policy: &mut ShedPolicy,
 ) -> PbSolution {
     // HARD COLLECTION DEADLINE: the caller's timeout plus a small grace. A
     // worker that ignores its stop flag through a long allocation/solve step
@@ -5488,8 +5629,6 @@ fn collect_optimization_result(
     let mut definitive: Option<PbSolution> = None;
     let mut best_incumbent: Option<(Vec<bool>, i128)> = None;
     let mut finished = 0usize;
-    let mut next_pressure_poll = Instant::now() + PARALLEL_SHED_POLL_INTERVAL;
-    let mut shed_cooldown_until = Instant::now();
 
     // LIVE spawned count: freed-slot backfill grows `controls` mid-collection,
     // and every spawned worker (up-front or backfilled) sends exactly one
@@ -5509,25 +5648,23 @@ fn collect_optimization_result(
         // estimates; the aggregate search-time growth of the engines' learnt
         // DBs / CNF state can still approach the limit. At the SHED threshold
         // stop the lowest-priority workers first (reverse spec order, never
-        // the P1 baseline), rate-limited so a stopped worker has time to
-        // actually free its state; the per-worker 95% reactive watermark
-        // remains the last resort.
-        if now >= next_pressure_poll {
-            next_pressure_poll = now + PARALLEL_SHED_POLL_INTERVAL;
-            if now >= shed_cooldown_until
-                && parallel_shed_memory_pressured()
-                && controls.shed_lowest_priority().is_some()
-            {
-                // A shed means memory got tight enough to kill a worker:
-                // PERMANENTLY stop refilling freed slots (fail-closed —
-                // shed-then-backfill flapping would defeat the shed). The
-                // shed order itself already accounts for backfilled workers:
-                // they registered after (= lower priority than) every
-                // up-front worker, so `next_worker_to_shed`'s reverse-order
-                // pick kills them first.
-                backfill.disable();
-                shed_cooldown_until = now + PARALLEL_SHED_COOLDOWN;
-            }
+        // the P1 baseline, skipping the time-bounded ACTIVE improver),
+        // rate-limited so a stopped worker has time to actually free its
+        // state; the per-worker 95% reactive watermark remains the last
+        // resort. The whole decision lives in [`ShedPolicy::step`] (extracted
+        // so the mechanism harness can drive it deterministically).
+        if shed_policy
+            .step(now, parallel_shed_memory_pressured, controls)
+            .is_some()
+        {
+            // A shed means memory got tight enough to kill a worker:
+            // PERMANENTLY stop refilling freed slots (fail-closed —
+            // shed-then-backfill flapping would defeat the shed). The
+            // shed order itself already accounts for backfilled workers:
+            // they registered after (= lower priority than) every
+            // up-front worker, so `next_worker_to_shed`'s reverse-order
+            // pick kills them first.
+            backfill.disable();
         }
         let msg = match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(msg) => msg,
@@ -5553,7 +5690,7 @@ fn collect_optimization_result(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match msg {
-            WorkerMsg::Improvement(obj_value, model) => {
+            WorkerMsg::Improvement(worker_label, obj_value, model) => {
                 // Re-verify every reported incumbent against the original PB
                 // constraints before trusting/propagating it (soundness gate).
                 if let Some((assignment, actual_obj)) =
@@ -5569,6 +5706,11 @@ fn collect_optimization_result(
                         on_improve,
                     );
                     if improved {
+                        // Shed-protection bookkeeping: this worker authored
+                        // the current verified global incumbent. Reached ONLY
+                        // through the sanitize gate above — an unverified
+                        // report can never buy protection.
+                        shed_policy.note_verified_improvement(worker_label, Instant::now());
                         // DOWN-CHANNEL PUBLISH (design §2.7): the coordinator
                         // — the bus's only writer — publishes the VERIFIED
                         // (value, model) pair AFTER the sanitize gate above.

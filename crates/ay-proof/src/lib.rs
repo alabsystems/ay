@@ -88,11 +88,17 @@ pub use bv_blast_solver::{
     SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
+pub use checker::clause_mentions_floating_point;
+pub use checker::clause_mentions_string_or_regex;
+pub use checker::recognize_arith_clause_tautology;
+pub use checker::recognize_array_guarded_row_expansion;
+pub use checker::recognize_datatype_acyclic_direct;
 pub use checker::recognize_euf_congruent;
 pub use checker::recognize_euf_congruent_pred;
 pub use checker::recognize_euf_reflexive;
 pub use checker::recognize_euf_transitive;
 pub use checker::recognize_ground_evaluate;
+pub use checker::recognize_ite_branch_projection;
 pub use checker::recognize_ite_same;
 pub use checker::recognize_nra_interval_unsat;
 pub use checker::recognize_nra_univariate_unsat;
@@ -101,6 +107,7 @@ pub use checker::recognize_regex_intersect_empty;
 pub use checker::recognize_regex_length_lower_bound;
 pub use checker::recognize_rounding_mode_domain;
 pub use checker::recognize_seq_extensional_companion_contradiction;
+pub use checker::recognize_seq_ground_eval;
 pub use checker::recognize_string_concat_cancellation;
 pub use checker::recognize_string_containment_identity;
 pub use checker::recognize_string_ground_eval;
@@ -108,9 +115,10 @@ pub use checker::recognize_string_ground_factor_conflict;
 pub use checker::recognize_string_length_lemma;
 pub use checker::regex_min_length;
 pub use checker::{
-    authenticate_bool_bv_unsat_query, authenticate_uf_leaf_bool_bv_unsat_query,
-    bv_bitblast_requires_proof_producer, recognize_bool_tautology, recognize_bv_bitblast,
-    recognize_bv_ground_evaluate, AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
+    authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
+    authenticate_uf_leaf_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
+    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+    AuthenticatedBoolBvUnsatQuery, BoolBvUnsatAuthenticationError,
     MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
     MAX_PROOF_PRODUCING_BV_LEMMAS_PER_PROOF, MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA,
 };

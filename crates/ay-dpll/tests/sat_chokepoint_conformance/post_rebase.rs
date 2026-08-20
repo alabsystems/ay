@@ -3,7 +3,10 @@
 
 use std::path::PathBuf;
 
-use super::{is_chokepoint_source_fixture, normalize_whitespace, read, rust_sources_below};
+use super::{
+    code_without_comments, is_chokepoint_source_fixture, normalize_whitespace, read,
+    rust_sources_below,
+};
 
 pub(super) fn assert_command_boundary(executor_normalized: &str) {
     // `NativeMaxSmtTextContinuation` is an admitting boundary. Native
@@ -138,8 +141,12 @@ pub(super) fn assert_authored_entrypoint_allowlist() {
         if is_chokepoint_source_fixture(relative.as_ref()) {
             continue;
         }
-        let text = std::fs::read_to_string(&source)
+        let raw = std::fs::read_to_string(&source)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", source.display()));
+        // Audit CODE. A doc comment naming an entrypoint is not a callsite —
+        // `executor/query_role.rs` links `Executor::execute_authored` purely to
+        // explain why that entrypoint is a method rather than a command.
+        let text = code_without_comments(&raw);
         if !text.contains("solve_authored_plain_hard_query")
             && !text.contains("solve_interruptible_authored_plain_hard_query")
             && !text.contains("execute_authored")

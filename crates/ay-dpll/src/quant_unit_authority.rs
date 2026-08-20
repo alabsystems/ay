@@ -14,7 +14,12 @@
 //!     `simplify_vacuous_quantifiers`, which then falls back to the baseline
 //!     conservative `quantified_proof_translation_incomplete` marker),
 //!   - `SkolemInstanceRecord` provenance recording in
-//!     `skolemize_existentials`,
+//!     `skolemize_existentials` AND at the finite-expansion route's
+//!     recording site in `expand_finite_domains`
+//!     (#finite-exists-skolem-provenance),
+//!   - the Boolean-ITE guard-clause trust-leaf rebuild
+//!     (`promote_shannon_ite_guard_trust_leaves`,
+//!     #ite-guard-promotion),
 //!   - (P3b) `BvMbqiFalseInstanceRecord` provenance recording at the
 //!     `try_bv_mbqi_refinement` push site
 //!     (#bv-mbqi-false-instance-authority),
@@ -107,6 +112,19 @@ pub(crate) fn quant_unit_authority_enabled() -> bool {
 /// byte-for-byte. UNSAT-only: this switch never gates a SAT grant.
 pub(crate) fn consequence_replay_enabled() -> bool {
     !ay_core::misc_cli_flags().no_consequence_replay
+}
+
+/// Kill switch for the ground-conflict decomposition arms of the proof
+/// builder (#ground-conflict-decomp): the general EUF-chain + Farkas-bridge
+/// split of a fused ground Generic conflict, and the array read-over-write
+/// chain-under-equality split (both in `split_euf_congruence_lemmas`'s
+/// trust-lemma cascade). Default ON; `--no-ground-conflict-decomp` disables
+/// both arms, leaving each Generic lemma byte-identical for the unchanged
+/// fail-closed strict gate. UNSAT-only producer surgery: neither arm can
+/// produce or influence a SAT grant, and every emitted step is re-validated
+/// by the untouched strict checker.
+pub(crate) fn ground_conflict_decomp_enabled() -> bool {
+    !ay_core::misc_cli_flags().no_ground_conflict_decomp
 }
 
 /// Staged `quantified_proof_translation_incomplete` narrowing, DEFAULT OFF.

@@ -360,3 +360,16 @@ impl Default for FiniteArrayExpansionLedger {
         Self::new()
     }
 }
+
+/// Exact meters for the ground-conflict decomposition arms
+/// (#ground-conflict-decomp). `attempted` counts trust lemmas the two new
+/// planners inspected, `applied` counts lemmas replaced by a checkable
+/// derivation, `declined` counts inspected lemmas the planners refused
+/// (shape mismatch, Farkas failure, or budget). Cumulative within one
+/// executor; published under `proof.ground_conflict_decomp_*` (`--stats`).
+#[derive(Debug, Default)]
+pub(crate) struct GroundConflictDecompMeters {
+    pub(crate) attempted: std::cell::Cell<u64>,
+    pub(crate) applied: std::cell::Cell<u64>,
+    pub(crate) declined: std::cell::Cell<u64>,
+}

@@ -130,10 +130,28 @@ pub(in crate::executor) fn create_disequality_split_atoms(
         let ge_bound = terms.mk_int(&excluded + num_bigint::BigInt::from(1));
         let le = terms.mk_le(split.variable, le_bound);
         let ge = terms.mk_ge(split.variable, ge_bound);
+        // (#ground-conflict-decomp, guard restoration) A request with NO
+        // disequality term historically emitted the guard-less 2-literal
+        // branch clause `x<=c-1 ∨ x>=c+1` — sound only in the requesting
+        // context, NOT standalone-valid, so no theory authority was ever
+        // recorded and the proof surfaced it as an uncertifiable Generic
+        // clause. Synthesize the guard `¬(= x c)` so the emitted clause is
+        // the guarded 3-literal integer-split TAUTOLOGY the typed
+        // `ArithDisequalitySplit` validator independently re-derives. The
+        // weaker clause can never manufacture a wrong verdict; a `x=c`
+        // assignment is refuted by the theory's ordinary conflict path.
+        let disequality_term = split.disequality_term.or_else(|| {
+            if !crate::quant_unit_authority::ground_conflict_decomp_enabled() {
+                return None;
+            }
+            let excluded_term = terms.mk_int(excluded.clone());
+            let equality = terms.mk_eq(split.variable, excluded_term);
+            Some(terms.mk_not(equality))
+        });
         DisequalitySplitAtoms::IntExact {
             le,
             ge,
-            disequality_term: split.disequality_term,
+            disequality_term,
             is_distinct: split.is_distinct,
         }
     } else {

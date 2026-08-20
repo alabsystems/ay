@@ -103,6 +103,67 @@ impl Executor {
         }
     }
 
+    /// One satisfying assignment's concrete values for `targets`, or `None`.
+    ///
+    /// NO AUTHORITY CROSSES THIS BOUNDARY, BY CONSTRUCTION. Unlike
+    /// [`Self::checked_isolated_solve`], this probe returns no
+    /// `CheckedGroundKind` and no sealed scope — only plain `EvalValue` data.
+    /// It is deliberately usable ONLY where a wrong answer is harmless.
+    ///
+    /// Its sole caller is the finite-sort model-refinement lane
+    /// (`executor/finite_model_mbqi.rs`), which turns each returned value into
+    /// a ground INSTANCE `body[x := v]` of a conjunctive-position `forall`.
+    /// `forall x. body |= body[x := v]` holds for EVERY ground `v`, so an
+    /// instance built from a stale, arbitrary, or outright wrong value is still
+    /// a sound logical consequence of an asserted universal: the worst a bad
+    /// witness can do is waste a refinement round. That is why this probe may
+    /// read the nested model directly while the SAT/UNSAT decisions of the same
+    /// lane must go through `checked_ground_solve`.
+    ///
+    /// Quantified assertions are refused: a nested quantifier would make the
+    /// probe's own verdict a quantifier problem rather than the bit-blastable
+    /// counterexample search this is for.
+    pub(in crate::executor) fn probe_finite_witness_values(
+        &mut self,
+        assertions: Vec<TermId>,
+        targets: &[TermId],
+        budget_ms: u64,
+    ) -> Option<Vec<crate::executor::model::EvalValue>> {
+        if targets.is_empty() || self.should_abort_theory_loop() || !self.qpf_probe_preflight() {
+            return None;
+        }
+        if assertions
+            .iter()
+            .any(|&term| contains_quantifier(&self.ctx.terms, term))
+        {
+            return None;
+        }
+        let mut probe_ctx = self.ctx.clone();
+        if probe_ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .is_err()
+        {
+            return None;
+        }
+        self.install_isolated_probe_roots(&mut probe_ctx, &assertions);
+        let mut probe = self.qpf_probe_executor(probe_ctx, budget_ms);
+        probe.original_problem_had_quantifiers = false;
+        probe.incremental_mode = false;
+        probe.begin_public_solve(false);
+        probe.bind_unsat_query_assumptions(&[]);
+        let values = match probe.check_sat() {
+            Ok(SolveResult::Sat) => probe.last_model.as_ref().map(|model| {
+                targets
+                    .iter()
+                    .map(|&target| probe.evaluate_term(model, target))
+                    .collect::<Vec<_>>()
+            }),
+            _ => None,
+        };
+        drop(probe);
+        values
+    }
+
     /// Shared isolation/certification transaction for the public ground probe
     /// and this module's quantified-UNSAT theorem probes.
     pub(super) fn checked_isolated_solve(

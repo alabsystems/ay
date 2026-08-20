@@ -13,10 +13,14 @@ mod common;
 mod auflia_gate_select_model_a1;
 #[path = "group_executor/construction_stats_6364.rs"]
 mod construction_stats_6364;
+#[path = "group_executor/dt_derived_unit_lemmas_certified.rs"]
+mod dt_derived_unit_lemmas_certified;
 #[path = "group_executor/eager_batch_signal_6503.rs"]
 mod eager_batch_signal_6503;
 #[path = "group_executor/empty_assertions_gap_a_7912.rs"]
 mod empty_assertions_gap_a_7912;
+#[path = "group_executor/executor_array_row_case_split_certified.rs"]
+mod executor_array_row_case_split_certified;
 #[path = "group_executor/executor_eq_diamond20.rs"]
 mod executor_eq_diamond20;
 #[path = "group_executor/executor_regression_1708_order_dependent.rs"]

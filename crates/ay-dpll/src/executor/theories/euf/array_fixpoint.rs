@@ -672,8 +672,25 @@ impl Executor {
                 if alias != array || !self.terms_match(index, store_index) {
                     continue;
                 }
+                // The positive arm may conclude only from PROVABLE disequality:
+                // two distinct concrete constants. Syntactic mismatch is not
+                // semantic disequality — with `v = y`, `w = 3`, and `y = 3`
+                // asserted beside the store, the conjunction is satisfiable,
+                // yet the pre-fix arm refuted it here (proof-free, so the
+                // mandatory certification funnel rejected the certificate and
+                // paid a full re-solve to recover). The negative arm keeps
+                // syntactic identity: identical terms ARE semantically equal,
+                // so `select(a, i) != v` against `store(_, i, v)` is a real
+                // conflict.
+                let values_provably_distinct = matches!(
+                    (
+                        self.ctx.terms.get(value),
+                        self.ctx.terms.get(store_value)
+                    ),
+                    (TermData::Const(lhs), TermData::Const(rhs)) if lhs != rhs
+                );
                 let values_match = self.terms_match(value, store_value);
-                if (positive && !values_match) || (!positive && values_match) {
+                if (positive && values_provably_distinct) || (!positive && values_match) {
                     return true;
                 }
             }

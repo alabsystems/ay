@@ -24,6 +24,9 @@ use crate::bv_proof_check::{check_bv_assertions_unsat, check_bv_clause, BvStepVe
 mod bv_lia_source_replay;
 use bv_lia_source_replay::discharge_source_bv_lia;
 
+mod bv_int_bridge_schema;
+use bv_int_bridge_schema::discharge_bv_int_bridge_schema;
+
 /// Exported strict-verification verdict for an UNSAT proof artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -432,6 +435,31 @@ pub(crate) fn discharge_trust_clause(
     }
 
     if discharge_source_bv_lia(terms, clause, assertions) {
+        return Some(());
+    }
+
+    // CLOSED-FORM BV<->Int BRIDGE SCHEMAS (#unsat-cert-bridge-schema).
+    //
+    // An ADDITIONAL non-solving authenticator, not a relaxation of anything
+    // above: it structurally re-derives the two bridge lemma schemas the
+    // BV/LIA bridge feeds the arithmetic solver (the `bvadd`/`bvsub` modular
+    // residue disjunction, and the `bvult`/`bvule` unsigned order fact) from
+    // widths and constants READ OUT OF THE TERM STORE AND CHECKED. Anything it
+    // does not recognise declines and the lanes below still run.
+    //
+    // WHY IT IS NEEDED. `discharge_source_bv_lia` authenticates these only by
+    // ENUMERATING the finite assignment space, so it declines at every width
+    // above 8 ("finite assignment space exceeds 65536" / "a free 64-bit BV
+    // variable exceeds finite enumeration"). Every remaining route is a nested
+    // solve, and a nested solve cannot discharge its own trust steps (the
+    // depth-0 guard in `discharge_trust_steps_for_certification`), so the whole
+    // family fell through to the wall-clock-budgeted whole-problem re-solve —
+    // publishing a correct UNSAT as `unsat` or `unknown` depending on machine
+    // load. Measured on the deductive-checks `i = i + 1usize` loop-counter obligation:
+    // stage (3) accepted 0 times, stage (4) 28, and the depth guard rejected
+    // 36. See `bv_int_bridge_schema` for the derivations and the narrowness
+    // pins.
+    if discharge_bv_int_bridge_schema(terms, clause, assertions) {
         return Some(());
     }
     let mut arena = terms.clone();

@@ -22,6 +22,46 @@ pub(super) fn opaque_arith_farkas_valid(
     conflict: &[TheoryLit],
     farkas: &FarkasAnnotation,
 ) -> bool {
+    opaque_arith_farkas_valid_memo(&mut LinearFarkasVerdict::new(), terms, conflict, farkas)
+}
+
+/// One-shot memo for the LINEAR Farkas verification of a FIXED
+/// `(terms, conflict, farkas)` triple.
+///
+/// `classify_arith_conflict_kind` reaches that verification through three
+/// different eligibility gates, and every one of them calls it with the same
+/// three arguments — so a conflict that fails the first gate pays for the same
+/// exponential orientation search up to three times. The gates genuinely
+/// differ (which conflicts they will even consider), the verification does not,
+/// so caching its result across one classification is behaviour-identical.
+pub(super) struct LinearFarkasVerdict(Option<bool>);
+
+impl LinearFarkasVerdict {
+    pub(super) fn new() -> Self {
+        Self(None)
+    }
+
+    pub(super) fn verified_linear(
+        &mut self,
+        terms: &TermStore,
+        conflict: &[TheoryLit],
+        farkas: &FarkasAnnotation,
+    ) -> bool {
+        *self.0.get_or_insert_with(|| {
+            ay_core::proof_validation::verify_farkas_conflict_lits_linear(terms, conflict, farkas)
+                .is_ok()
+        })
+    }
+}
+
+/// [`opaque_arith_farkas_valid`] sharing one [`LinearFarkasVerdict`] across the
+/// several gates a single classification consults.
+pub(super) fn opaque_arith_farkas_valid_memo(
+    verdict: &mut LinearFarkasVerdict,
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+) -> bool {
     if conflict.is_empty() {
         return false;
     }
@@ -52,7 +92,7 @@ pub(super) fn opaque_arith_farkas_valid(
     }
     // LINEAR-only verification: no congruence-closure merging of opaque
     // terms, matching exactly what external `la_generic` checkers can check.
-    ay_core::proof_validation::verify_farkas_conflict_lits_linear(terms, conflict, farkas).is_ok()
+    verdict.verified_linear(terms, conflict, farkas)
 }
 
 /// Whether an equality-bearing conflict is an exact, externally replayable
@@ -66,7 +106,8 @@ pub(super) fn opaque_arith_farkas_valid(
 /// [`opaque_arith_farkas_valid`]: in particular, a repeated nonlinear product
 /// must not gain `la_generic` authority merely because the internal verifier
 /// can conservatively regard that product as one opaque atom.
-pub(super) fn linear_equality_arith_farkas_valid(
+pub(super) fn linear_equality_arith_farkas_valid_memo(
+    verdict: &mut LinearFarkasVerdict,
     terms: &TermStore,
     conflict: &[TheoryLit],
     farkas: &FarkasAnnotation,
@@ -98,7 +139,9 @@ pub(super) fn linear_equality_arith_farkas_valid(
                 _ => false,
             }
         });
-    eligible && has_asserted_equality && opaque_arith_farkas_valid(terms, conflict, farkas)
+    eligible
+        && has_asserted_equality
+        && opaque_arith_farkas_valid_memo(verdict, terms, conflict, farkas)
 }
 
 #[cfg(test)]

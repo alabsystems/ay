@@ -464,6 +464,285 @@ impl Executor {
                 }
             }
         }
+
+        self.replace_with_exact_authored_congruence_arithmetic_refutation(proof, &authored);
+    }
+
+    /// ARM E — the congruence-derived equality is refuted by ARITHMETIC, not by
+    /// a disequality (#trust-count→0, the Nelson-Oppen EUF+LA gate family).
+    ///
+    /// ```text
+    /// (assert (= x y))
+    /// (assert (> (f x) 0.0))
+    /// (assert (< (f y) 0.0))
+    /// ```
+    ///
+    /// is `unsat` and AY decides it, but the refutation is a COMBINED conflict:
+    /// the clause the theory loop materializes mixes the EUF congruence premise
+    /// with two arithmetic bounds. `infer_theory_lemma_kind_in_caller_order`
+    /// has no closed-theory recognizer for that mixture — it is neither
+    /// pure-EUF (so `infer_euf_lemma_from_clause` declines) nor Farkas-pure in
+    /// the caller's literal order — so the lemma is recorded `Generic`, and
+    /// `check_proof` has no strict validator for a `Generic` theory lemma:
+    ///
+    /// ```text
+    /// computed UNSAT rejected by mandatory strict certification: strict UNSAT
+    /// proof validation failed: step t2 uses unsupported theory lemma kind
+    /// Generic in strict mode
+    /// ```
+    ///
+    /// These queries also set `:produce-proofs`, so
+    /// [`Self::strict_unsat_presentation_required`] is true and BOTH the
+    /// independent exact-semantic lanes and `discharge_trust_steps_for_certification`
+    /// are excluded by design — the caller asked for that artifact. The only
+    /// remedy is to emit a refutation the strict checker accepts, which is what
+    /// this arm does: SPLIT the combined conflict into its two checkable halves.
+    ///
+    /// ```text
+    /// (assume h0 (= x y))
+    /// (assume h1 (> (f x) 0.0))
+    /// (assume h2 (< (f y) 0.0))
+    /// (step t0 (cl (not (= x y)) (= (f x) (f y)))          :rule eq_congruent)
+    /// (step t1 (cl (= (f x) (f y)))                        :rule resolution)
+    /// (step t2 (cl (not (= (f x) (f y)))
+    ///              (not (> (f x) 0.0)) (not (< (f y) 0.0))) :rule la_generic)
+    /// (step t3 (cl)                                         :rule resolution)
+    /// ```
+    ///
+    /// Nothing is trusted. The congruence half is re-derived by `ay-proof`'s
+    /// `EufCongruent` validator (one negated-equality premise per argument
+    /// position, each connecting that position's two arguments); the arithmetic
+    /// half is a positional Farkas certificate that
+    /// `try_lra_farkas_reconstruction` PRODUCES from an independent LRA solve
+    /// and then re-verifies against this exact clause, and that the strict
+    /// checker's own `LraFarkas`/`LiaGeneric` validator re-checks a third time.
+    /// The uninterpreted applications enter the arithmetic reasoning as opaque
+    /// terms, which is exactly the Nelson-Oppen interface literal.
+    ///
+    /// [`Self::derive_congruence_unit`] (not the exact-authored sibling) supplies
+    /// the argument premises, so the two-hop authored chain `(= a b)`, `(= b c)`
+    /// reaches `(= (f a) (f c))` through the checked `EqTransitive` lane.
+    ///
+    /// Fail-closed like every other cascade member: it runs only on a proof the
+    /// strict checker already rejects, assumes only exact authored roots, and
+    /// the rebuilt candidate must derive the empty clause and pass
+    /// `check_proof_strict_with_datatypes` before it replaces anything. Every
+    /// bound below is a work bound — declining leaves the verdict exactly as it
+    /// is today (`unknown`).
+    fn replace_with_exact_authored_congruence_arithmetic_refutation(
+        &mut self,
+        proof: &mut Proof,
+        authored: &[TermId],
+    ) {
+        /// Authored arithmetic literals admitted as Farkas rows.
+        const MAX_ARITH_ROOTS: usize = 12;
+        /// Largest arithmetic premise set tried per congruence pair.
+        const MAX_ARITH_SUBSET: u32 = 3;
+        /// Congruent application pairs examined.
+        const MAX_CONGRUENCE_PAIRS: usize = 64;
+        /// Farkas reconstructions attempted across the whole arm.
+        const MAX_FARKAS_PROBES: usize = 512;
+
+        if self.check_proof_strict_with_datatypes(proof).is_ok() {
+            return;
+        }
+
+        fn arithmetic_literal(terms: &TermStore, root: TermId) -> bool {
+            let atom = match terms.get(root) {
+                TermData::Not(inner) => *inner,
+                _ => root,
+            };
+            let TermData::App(Symbol::Named(operator), args) = terms.get(atom) else {
+                return false;
+            };
+            args.len() == 2
+                && matches!(operator.as_str(), "=" | "<" | "<=" | ">" | ">=")
+                && terms.sort(args[0]) == terms.sort(args[1])
+                && matches!(terms.sort(args[0]), Sort::Int | Sort::Real)
+        }
+
+        /// Numeric-sorted applications of a NON-reserved symbol: the terms an
+        /// arithmetic literal can only relate through the EUF interface.
+        fn collect_opaque_applications(
+            terms: &TermStore,
+            term: TermId,
+            depth: u32,
+            out: &mut Vec<TermId>,
+        ) {
+            /// Work bound on the operand walk.
+            const MAX_OPERAND_DEPTH: u32 = 8;
+
+            if depth > MAX_OPERAND_DEPTH {
+                return;
+            }
+            match terms.get(term) {
+                TermData::Not(inner) => {
+                    collect_opaque_applications(terms, *inner, depth + 1, out);
+                }
+                TermData::App(symbol, args) => {
+                    if !args.is_empty()
+                        && matches!(terms.sort(term), Sort::Int | Sort::Real)
+                        && !ay_frontend::is_reserved_symbol(symbol.name())
+                    {
+                        out.push(term);
+                    }
+                    let args = args.clone();
+                    for arg in args {
+                        collect_opaque_applications(terms, arg, depth + 1, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let arithmetic_roots: Vec<TermId> = authored
+            .iter()
+            .copied()
+            .filter(|&root| arithmetic_literal(&self.ctx.terms, root))
+            .collect();
+        if arithmetic_roots.len() < 2 || arithmetic_roots.len() > MAX_ARITH_ROOTS {
+            return;
+        }
+        let authored_equalities: Vec<(TermId, TermId, TermId)> = authored
+            .iter()
+            .filter_map(|&root| {
+                decode_eq_local(&self.ctx.terms, root).map(|(lhs, rhs)| (root, lhs, rhs))
+            })
+            .collect();
+        if authored_equalities.is_empty() {
+            return;
+        }
+
+        let mut applications: Vec<TermId> = Vec::new();
+        for &root in &arithmetic_roots {
+            collect_opaque_applications(&self.ctx.terms, root, 0, &mut applications);
+        }
+        applications.sort_unstable_by_key(|term| term.0);
+        applications.dedup();
+
+        let Some(subset_limit) = 1_u64.checked_shl(arithmetic_roots.len() as u32) else {
+            return;
+        };
+        let mut pairs = 0_usize;
+        let mut probes = 0_usize;
+        for (left_index, &left_app) in applications.iter().enumerate() {
+            for &right_app in applications.iter().skip(left_index + 1) {
+                // Borrow-only pre-filter; every schema decision below belongs to
+                // the checker's validators.
+                if !Self::is_distinct_same_symbol_application(&self.ctx.terms, left_app, right_app)
+                {
+                    continue;
+                }
+                pairs += 1;
+                if pairs > MAX_CONGRUENCE_PAIRS {
+                    return;
+                }
+                let congruence_equality =
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named("="), [left_app, right_app], Sort::Bool);
+                let congruence_negated = self.ctx.terms.mk_not_raw(congruence_equality);
+
+                for cardinality in 1..=MAX_ARITH_SUBSET {
+                    for mask in 1_u64..subset_limit {
+                        if mask.count_ones() != cardinality {
+                            continue;
+                        }
+                        let selected: Vec<TermId> = arithmetic_roots
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, &root)| {
+                                ((mask & (1_u64 << index)) != 0).then_some(root)
+                            })
+                            .collect();
+                        let mut clause = Vec::with_capacity(selected.len() + 1);
+                        clause.push(congruence_negated);
+                        for &root in &selected {
+                            clause.push(self.ctx.terms.mk_not_raw(root));
+                        }
+                        // A repeated literal would leave a residual the
+                        // discharge loop below cannot remove.
+                        let mut distinct = clause.clone();
+                        distinct.sort_unstable_by_key(|term| term.0);
+                        distinct.dedup();
+                        if distinct.len() != clause.len() {
+                            continue;
+                        }
+
+                        probes += 1;
+                        if probes > MAX_FARKAS_PROBES {
+                            return;
+                        }
+                        let mut farkas = None;
+                        let mut inferred = TheoryLemmaKind::Generic;
+                        if !crate::executor::proof_farkas::try_lra_farkas_reconstruction(
+                            &self.ctx.terms,
+                            &clause,
+                            &mut farkas,
+                            &mut inferred,
+                        ) {
+                            continue;
+                        }
+                        let Some(farkas) = farkas else {
+                            continue;
+                        };
+                        if inferred.is_trust() {
+                            continue;
+                        }
+
+                        let mut candidate = Proof::new();
+                        let Some(congruence) = self.derive_congruence_unit(
+                            &mut candidate,
+                            left_app,
+                            right_app,
+                            &authored_equalities,
+                        ) else {
+                            // No authored argument evidence connects this pair;
+                            // no arithmetic subset can rescue it.
+                            break;
+                        };
+                        if congruence.literal != congruence_equality {
+                            break;
+                        }
+                        let mut remaining = clause.clone();
+                        let lemma = candidate
+                            .add_theory_lemma_with_farkas_and_kind("LRA", clause, farkas, inferred);
+                        let supports: Vec<(TermId, ProofId)> =
+                            std::iter::once((congruence_equality, congruence.step))
+                                .chain(
+                                    selected
+                                        .iter()
+                                        .map(|&root| (root, candidate.add_assume(root, None))),
+                                )
+                                .collect();
+                        let mut chain = lemma;
+                        let mut discharged = true;
+                        for (equality, support) in supports {
+                            let negated = self.ctx.terms.mk_not_raw(equality);
+                            let Some(position) =
+                                remaining.iter().position(|&literal| literal == negated)
+                            else {
+                                discharged = false;
+                                break;
+                            };
+                            let _ = remaining.remove(position);
+                            chain = candidate.add_resolution(
+                                remaining.clone(),
+                                equality,
+                                chain,
+                                support,
+                            );
+                        }
+                        if !discharged || !remaining.is_empty() {
+                            continue;
+                        }
+                        if self.commit_if_strictly_checked(proof, candidate, authored) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

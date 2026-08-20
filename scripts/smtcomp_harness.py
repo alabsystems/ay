@@ -1195,6 +1195,11 @@ class ExecResult:
     stdout_truncated: bool = False
     spawn_error: str = ""
     memout: bool = False  # the envelope backstop killed it (a legitimate outcome)
+    # Peak RSS the backstop sampler observed, MB. Recorded so a banked run can be
+    # AUDITED for envelope compliance after the fact — see the 2026-08-17 finding
+    # that a solved instance in the SQ QF_Datatypes win needed 9,477 MB under a
+    # declared 6,954 MB envelope, which no banked row could have revealed.
+    peak_rss_mb: float | None = None
 
 
 class _NonReapingProcessView:
@@ -1365,6 +1370,7 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
             timed_out=(killed or wall > timeout_s) and not memout,
             stdout_truncated=out_total[0] > len(out_buf),
             memout=memout,
+            peak_rss_mb=getattr(guard, "peak_rss_mb", None),
         )
     finally:
         if proc is not None:
@@ -1789,6 +1795,7 @@ def run_one(sol: Solver, inst: Instance, track: str, timeout_s: int,
             "run_identity": run_identity,
             "run_cache_key": identity_key(run_identity),
             "memout": res.memout,
+            "peak_rss_mb": res.peak_rss_mb,
             "stderr_tail": res.stderr_tail if (res.spawn_error or res.exit_code not in (0,)) else "",
         }
         if res.spawn_error:
@@ -2061,7 +2068,8 @@ def _run_validator(vsol: Solver, logic: str, reduced: Path, timeout_s: int,
     ans = parse_answer_sq(res.stdout.decode("utf-8", errors="replace"))
     out = {"answer": ans, "wall_sec": round(res.wall_sec, 3),
            "cpu_sec": round(res.cpu_sec, 3) if res.cpu_sec is not None else None,
-           "memlimit_mb": memlimit_mb, "memout": res.memout}
+           "memlimit_mb": memlimit_mb, "memout": res.memout,
+           "peak_rss_mb": res.peak_rss_mb}
     if res.timed_out:
         out["timed_out"] = True
     if res.spawn_error:

@@ -118,7 +118,14 @@ impl Executor {
         // recovery and validation against the user-visible formula.
         self.ctx.assertions = original_assertions;
         self.set_counterexample_style(saved_style);
-        if !matches!(result, Ok(ref r) if r.is_unsat()) {
+        // The preprocessed-window provenance outlives an UNSAT only where a
+        // certification / export lane consumes it; under competition shedding
+        // it would survive as a record bound to the PREPROCESSED window and
+        // fail the B3 raw lane's present-but-mismatched check. See
+        // `theory_window_provenance_survives_unsat`.
+        if !matches!(result, Ok(ref r) if r.is_unsat())
+            || !self.theory_window_provenance_survives_unsat()
+        {
             self.proof_problem_assertion_provenance = saved_proof_provenance;
         }
 
@@ -887,7 +894,11 @@ impl Executor {
 
         self.ctx.assertions = original_assertions;
         self.set_counterexample_style(saved_style);
-        if !matches!(result, Ok(ref r) if r.is_unsat()) {
+        // Same shedding carve-out as `solve_lia_incremental` above; see
+        // `theory_window_provenance_survives_unsat`.
+        if !matches!(result, Ok(ref r) if r.is_unsat())
+            || !self.theory_window_provenance_survives_unsat()
+        {
             self.proof_problem_assertion_provenance = saved_proof_provenance;
         }
 

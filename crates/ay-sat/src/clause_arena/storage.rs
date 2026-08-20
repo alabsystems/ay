@@ -256,7 +256,11 @@ impl ClauseArena {
             }
         }
 
+        // Compaction rebuilds `words` through `Vec`'s own growth in every
+        // build, so the heuristic ladder simply re-seeds from the real
+        // capacity here (see `accounted_words`).
         self.words = new_words;
+        self.accounted_words = self.words.capacity();
         self.num_clauses = new_clause_count;
         self.active_count = new_active_count;
         self.irredundant_count = new_irredundant;
@@ -401,7 +405,11 @@ impl ClauseArena {
             pos += HEADER_WORDS + alloc_len;
         }
 
+        // Compaction rebuilds `words` through `Vec`'s own growth in every
+        // build, so the heuristic ladder simply re-seeds from the real
+        // capacity here (see `accounted_words`).
         self.words = new_words;
+        self.accounted_words = self.words.capacity();
         self.num_clauses = new_clause_count;
         self.active_count = new_active_count;
         self.irredundant_count = new_irredundant;

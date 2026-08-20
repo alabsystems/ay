@@ -83,6 +83,18 @@ const MAX_SEED_WORK: usize = 4_096;
 /// Conjunction-nesting depth bound for the recursive `and_pos` flattening.
 const MAX_SEED_DEPTH: usize = 16;
 
+/// Cap on the clauses one `(or …)`-of-conjunctions distribution may emit — the
+/// size of the cross-product of per-disjunct conjunct choices. The deductive-checks
+/// panic-freedom shape is `2 × 2 = 4`; anything past this bound is left to the
+/// fail-closed trust fallback rather than blown up into a costly database
+/// (seeding a SUBSET of the authorized consequences is always sound, so an
+/// over-budget disjunction simply seeds nothing).
+const MAX_OR_DISTRIBUTION_CLAUSES: usize = 32;
+
+/// Cap on the conjuncts of a single conjunctive disjunct considered for that
+/// distribution.
+const MAX_OR_DISTRIBUTION_CHOICES: usize = 8;
+
 /// A propositional atom usable in the seeded clause database: a Boolean-var
 /// atom, or a binary `</<=/>/>=/=` comparison whose BOTH operands are `ite`-free.
 /// Returns `(atom, value)` with `value = false` for a single leading `not`.

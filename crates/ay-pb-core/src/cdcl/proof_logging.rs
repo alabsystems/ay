@@ -188,12 +188,14 @@ impl PbCdclSolver {
     /// already contradictory by unit propagation.
     ///
     /// ONLY call this where that claim is actually derivable: after a real
-    /// refutation (UNSAT), or where a single database row is conflicting under
-    /// the empty assignment. VeriPB re-checks it and rejects the whole proof
-    /// otherwise. In particular it must NOT be used to paper over a
-    /// non-derivable objective lower bound — see [`Self::conclude_opt_proof`],
-    /// which fails closed with [`ProofError::UnprovableOptimizationLowerBound`]
-    /// instead.
+    /// refutation (UNSAT), or where unit propagation over the database VeriPB
+    /// holds already reaches a conflict. VeriPB re-checks it and rejects the
+    /// whole proof otherwise. In particular it must NOT be used to paper over a
+    /// non-derivable objective lower bound: [`Self::conclude_opt_proof`] may
+    /// reach this step on the optimality path, but only behind
+    /// [`PbCdclSolver::objective_improvement_unit_propagates_to_conflict`],
+    /// which replays that check first and otherwise fails closed with
+    /// [`ProofError::UnprovableOptimizationLowerBound`].
     fn log_contradiction_proof_step(&mut self) -> Option<ConstraintId> {
         self.log_proof_step(ProofStep::Rup(format_constraint(&[], 1)))
     }
@@ -320,20 +322,41 @@ impl PbCdclSolver {
                     return;
                 }
                 ObjectiveFloorCutOutcome::Inexpressible => {
-                    // Fail closed. The structural cutting-planes lower bound could not be
-                    // built (the objective floor is not a positive combination of input
-                    // rows — e.g. it needs a divide-by-k rounding cut or genuine search).
-                    // Emitting `rup >= 1 ;` here would assert the empty clause is derivable
-                    // by reverse unit propagation, but the learned clauses that actually
-                    // justify it were SUPPRESSED during the optimization re-solves
+                    // The structural cutting-planes lower bound could not be built (the
+                    // objective floor is not a positive combination of input rows — e.g.
+                    // it needs a divide-by-k rounding cut or genuine search).
+                    //
+                    // Emitting `rup >= 1 ;` UNCONDITIONALLY here would be a lie: it
+                    // asserts the empty clause is derivable by reverse unit propagation,
+                    // but the learned clauses that usually justify it were SUPPRESSED
+                    // during the optimization re-solves
                     // (suppress_optimization_intermediate_proof_steps), so VeriPB rejects
-                    // it: "The constraint is not implied by reverse unit propagation (RUP)".
-                    // Void this native proof and signal the caller (via conclude_proof's
-                    // Err / opt_lower_bound_deferred) to route to the certified OPT-LIN
-                    // fallback, which re-derives the bound from a real augmented-instance
-                    // refutation whose RUP steps VeriPB accepts.
-                    self.store_proof_error(ProofError::UnprovableOptimizationLowerBound);
-                    return;
+                    // it — "The constraint is not implied by reverse unit propagation
+                    // (RUP)" — and with it the whole proof.
+                    //
+                    // It is not always a lie, though. Replay VeriPB's own RUP check
+                    // against the exact database it holds at this point (the imported
+                    // input rows plus the objective-improving row it derives from `soli`);
+                    // when unit propagation alone already reaches a conflict there, the
+                    // step is genuinely checkable and the native proof stands. The replay
+                    // is conservative in the fail-closed direction, so a `false` here only
+                    // costs us the cheap route.
+                    if self.objective_improvement_unit_propagates_to_conflict(objective, optimum) {
+                        match self.log_contradiction_proof_step() {
+                            Some(contradiction_id) => contradiction_id,
+                            // The step failed to emit: the error is already stored and the
+                            // writer nulled (fail closed).
+                            None => return,
+                        }
+                    } else {
+                        // Fail closed. Void this native proof and signal the caller (via
+                        // conclude_proof's Err / opt_lower_bound_deferred) to route to the
+                        // certified OPT-LIN fallback, which re-derives the bound from a
+                        // real augmented-instance refutation whose RUP steps VeriPB
+                        // accepts.
+                        self.store_proof_error(ProofError::UnprovableOptimizationLowerBound);
+                        return;
+                    }
                 }
             };
 

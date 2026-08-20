@@ -1204,6 +1204,28 @@ impl Executor {
             } else {
                 let _ = self.add_finite_index_array_closure();
             }
+            // Companion COMPLETENESS pass (Bool-arg congruence over array
+            // reads). `purify_bool_args` replaces a compound Bool UF argument
+            // with a fresh `boolarg` proxy, so on an array-carrying route the
+            // proxy for `(select s1 5)` is never tied to the `true` constant
+            // that the sibling application `(g true)` uses, and the EUF
+            // truth-value merge never fires. Measured at 5dab36e6:
+            //   (declare-fun g (Bool) Bool)
+            //   (declare-const s1 (Array Int Bool))
+            //   (assert (= (g true) false)) (assert (select s1 5))
+            //   (assert (g (select s1 5))) (check-sat)
+            // answered `unknown`; z3 4.16.0 answers `unsat`. The identical
+            // shape with an Int-element array answers `unsat` here, because
+            // the Int read reaches EUF as an ordinary term.
+            //
+            // `solve_euf` already injects exactly this lemma family on the
+            // pure-EUF route; emit it eagerly here too so the combined
+            // array+LIA/ALL dispatches (which never reach that call) get it.
+            // Sound — each clause is an instance of the congruence axiom, so
+            // no sat/unsat verdict can flip. Scoped to arrays and to
+            // NON-incremental solves (inside the helper), so the measured
+            // incremental CLEARSY completeness collapse cannot recur.
+            self.inject_bool_arg_congruence_lemmas(true);
         }
 
         self.set_active_solve_phase("solver-dispatch", format!("theory:{category:?}"));

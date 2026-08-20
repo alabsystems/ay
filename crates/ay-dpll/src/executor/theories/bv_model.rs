@@ -1118,10 +1118,100 @@ impl Executor {
             &mut array_values,
         );
 
+        // #8512-nested-def: an array variable whose ONLY definition is a
+        // store-chain / const-array equality nested inside `or`/`ite`/`not`
+        // cannot adopt that definition — a conditional equality is not
+        // unconditionally asserted, so applying it would fabricate a value.
+        // But the select-derived interpretation we DO have for such a variable
+        // is knowingly PARTIAL (the defining stores were never scanned), and
+        // publishing it as a total array makes every missing index read back as
+        // the array's `default`. That is a positive claim, not "unknown", so a
+        // store-chain equality over a missing index evaluates FALSE and the
+        // independent gate reports a MODEL VIOLATION for a model that is merely
+        // incomplete — fail-closing a correct `sat` to `unknown`.
+        //
+        // Declare the interpretation partial instead. `ArrayModel::read_conflicted`
+        // is the established channel (`array_from_model` refuses a listed term as
+        // evidence for a total array and the leaf becomes unevaluable), so the
+        // gate reports an honest coverage gap rather than a false violation.
+        let read_conflicted =
+            Self::array_vars_defined_only_under_nested_equality(terms, assertions);
+
         ArrayModel {
             array_values,
+            read_conflicted,
             ..Default::default()
         }
+    }
+
+    /// Array variables that appear in a store-chain / const-array defining
+    /// equality ONLY at a nested (non-top-level, non-top-level-`and`) position.
+    ///
+    /// `propagate_definitional_array_equalities` scans top-level `=` assertions
+    /// only, so these variables never receive their authoritative interpretation
+    /// and keep a partial select-derived one. Listing them as read-conflicted is
+    /// the sound response: it withholds totality without inventing a value.
+    fn array_vars_defined_only_under_nested_equality(
+        terms: &TermStore,
+        assertions: &[TermId],
+    ) -> HashSet<TermId> {
+        fn is_array_ground_def(terms: &TermStore, t: TermId) -> bool {
+            matches!(terms.get(t), TermData::App(sym, _)
+                if sym.name() == "store" || sym.name() == "const-array")
+        }
+        // Definitions reachable unconditionally: top level, or a conjunct of a
+        // top-level `and`. These ARE applied elsewhere, so exclude them.
+        let mut unconditional: HashSet<TermId> = HashSet::default();
+        let mut top: Vec<TermId> = assertions.to_vec();
+        while let Some(t) = top.pop() {
+            match terms.get(t) {
+                TermData::App(sym, args) if sym.name() == "and" => top.extend(args.iter().copied()),
+                TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
+                    for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
+                        if matches!(terms.get(a), TermData::Var(_, _))
+                            && matches!(terms.sort(a), Sort::Array(_))
+                            && is_array_ground_def(terms, b)
+                        {
+                            unconditional.insert(a);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Every array-var store-chain definition anywhere in the formula.
+        let mut nested: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = assertions.to_vec();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            match terms.get(t) {
+                TermData::App(sym, args) => {
+                    if sym.name() == "=" && args.len() == 2 {
+                        for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
+                            if matches!(terms.get(a), TermData::Var(_, _))
+                                && matches!(terms.sort(a), Sort::Array(_))
+                                && is_array_ground_def(terms, b)
+                                && !unconditional.contains(&a)
+                            {
+                                nested.insert(a);
+                            }
+                        }
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, x, y) => {
+                    stack.push(*c);
+                    stack.push(*x);
+                    stack.push(*y);
+                }
+                _ => {}
+            }
+        }
+        nested
     }
 
     /// Overwrite array-variable interpretations with the authoritative

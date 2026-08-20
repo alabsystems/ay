@@ -1375,85 +1375,132 @@ impl Solver {
         self.dirty_watch_list.clear();
 
         let start_offset = incremental_boundary.unwrap_or(0);
-        // Watch-init offsets collect as u32, not usize (B1: the
-        // AY_AB_GIANT_MEM kill-switch and its usize path are deleted; this is
-        // now the only path). On the SC2025 giants (157M/315M clauses) the
-        // usize collect was a 1.26GB/2.5GB transient landing exactly at the
-        // peak-RSS moment.
-        //
-        // #9670: the u32 narrowing below is lossless ONLY because
+        // #9670: clause offsets narrow to u32 losslessly ONLY because
         // ClauseArena::add fail-stops on (end as u64) <= MAX_ARENA_WORDS and
         // MAX_ARENA_WORDS == u32::MAX. Widening the arena to 64-bit offsets
-        // without widening this collect silently truncates BCP offsets.
+        // without widening ClauseRef silently truncates BCP offsets.
         const _: () = assert!(crate::arena_limits::MAX_ARENA_WORDS <= u32::MAX as u64);
-        let narrow_offsets: Vec<u32> = self
-            .arena
-            .indices_from(start_offset)
-            .map(|i| i as u32)
-            .collect();
-        for i in narrow_offsets.into_iter().map(|i| i as usize) {
-            let off = i;
-            let clause_ref = ClauseRef(i as u32);
-            // #8496: Skip dead clauses (garbage-bit or pending-garbage).
-            // arena.indices_from() yields ALL clause offsets including dead
-            // ones. len_of() returns the original lit_len even for clauses
-            // marked pending-garbage (PENDING_GARBAGE_BIT set, lit_len > 0).
-            // Without this check, pending-garbage clauses containing
-            // eliminated variables would be watched, causing stale variable
-            // references during BCP or false UNSAT in release builds.
-            if self.arena.is_dead(off) {
-                continue;
-            }
-            let clause_len = self.arena.len_of(off);
-            // Catch eliminated variables in active clauses during watch init.
-            #[cfg(debug_assertions)]
-            if clause_len >= 2 {
-                for j in 0..clause_len {
-                    let lit = self.arena.literal(off, j);
-                    debug_assert!(
-                        !self.var_lifecycle.is_removed(lit.variable().index()),
-                        "BUG: initialize_watches: active clause {off} (len={clause_len}, \
-                         learned={}) contains eliminated variable {} at position {j}",
-                        self.arena.is_learned(off),
-                        lit.variable().index(),
-                    );
+
+        if self.watches.is_unbuilt() {
+            // Whole-formula rebuild: the clause set is fully known, so every
+            // region is sized exactly in one shot (see below).
+            self.initialize_watches_exact(start_offset);
+        } else {
+            // Incremental attach onto already-populated regions (case b in
+            // reset_search_state): the existing capacities are mid-schedule, so
+            // exact sizing cannot be computed from the new clauses alone.
+            // Amortised growth stays.
+            let mut pos = start_offset;
+            while let Some((off, next_pos)) = self.arena.walk_step(pos) {
+                pos = next_pos;
+                if let Some((watched, is_binary)) = self.initial_watch_pair(off) {
+                    self.attach_clause_watches(ClauseRef(off as u32), watched, is_binary);
                 }
-            }
-            if clause_len >= 2 {
-                let lit0 = self.arena.literal(off, 0);
-                let mut lit1 = self.arena.literal(off, 1);
-                // Guard: if the first two literals are identical, scan for a
-                // distinct literal to watch (#6506). Duplicate literals can
-                // enter the arena via theory propagation or inprocessing paths
-                // that skip clause normalization. The 2WL scheme requires
-                // distinct watch pointers so we must find a non-duplicate pair.
-                if lit0 == lit1 {
-                    let mut found = false;
-                    for j in 2..clause_len {
-                        let candidate = self.arena.literal(off, j);
-                        if candidate != lit0 {
-                            // Swap candidate into position 1 in the arena
-                            self.arena.swap_literals(off, 1, j);
-                            lit1 = candidate;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        // All literals are identical — clause is effectively
-                        // unit. Skip watch attachment (unit handled elsewhere).
-                        continue;
-                    }
-                }
-                let mut watched = [lit0, lit1];
-                let watched = self
-                    .prepare_watched_literals(&mut watched, WatchOrderPolicy::Preserve)
-                    .expect("initialize_watches requires clauses with len >= 2");
-                self.attach_clause_watches(clause_ref, watched, clause_len == 2);
             }
         }
         // Binary-first invariant is maintained incrementally on insert.
         self.watches.debug_assert_binary_first();
+    }
+
+    /// Build every watch region at its exact size in two passes.
+    ///
+    /// Pass 1 counts the watches each literal will receive; the layout is then
+    /// computed from those counts; pass 2 fills the regions in place. The
+    /// incremental builder instead relocates a literal's region to the end of
+    /// the buffer whenever it fills up, doubling the capacity and ABANDONING
+    /// the old copy (tallied in `dead_slots`). On the 51.9M-clause DtAx
+    /// lowering of vlsat3_b99 — 103.8M watch entries, an 830MB live floor —
+    /// that cost 1,953MB of peak RSS (9,006MB -> 7,053MB, medians of three
+    /// runs) and put the instance outside the competition memory envelope.
+    ///
+    /// Both passes walk the arena with the same cursor and derive the same
+    /// watch pair per clause, so pass 2 pushes exactly what pass 1 counted.
+    fn initialize_watches_exact(&mut self, start_offset: usize) {
+        let mut plan = ExactWatchPlan::new(self.watches.num_lists());
+        let mut pos = start_offset;
+        while let Some((off, next_pos)) = self.arena.walk_step(pos) {
+            pos = next_pos;
+            if let Some(((lit0, lit1), _)) = self.initial_watch_pair(off) {
+                plan.count_watch(lit0);
+                plan.count_watch(lit1);
+            }
+        }
+        self.watches.apply_exact_layout(&plan);
+        drop(plan);
+
+        let mut pos = start_offset;
+        while let Some((off, next_pos)) = self.arena.walk_step(pos) {
+            pos = next_pos;
+            if let Some(((lit0, lit1), is_binary)) = self.initial_watch_pair(off) {
+                self.attach_clause_watches_presized(ClauseRef(off as u32), lit0, lit1, is_binary);
+            }
+        }
+    }
+
+    /// The watch pair a whole-formula build attaches for clause at `off`, or
+    /// `None` when the clause takes no watches.
+    ///
+    /// Deterministic and idempotent: calling it twice on the same clause (pass
+    /// 1 then pass 2) yields the same pair. The only mutation is the duplicate
+    /// guard's `swap_literals`, which is a no-op the second time round because
+    /// position 1 then already holds a distinct literal.
+    fn initial_watch_pair(&mut self, off: usize) -> Option<((Literal, Literal), bool)> {
+        // #8496: Skip dead clauses (garbage-bit or pending-garbage).
+        // The arena walk yields ALL clause offsets including dead ones.
+        // len_of() returns the original lit_len even for clauses marked
+        // pending-garbage (PENDING_GARBAGE_BIT set, lit_len > 0). Without this
+        // check, pending-garbage clauses containing eliminated variables would
+        // be watched, causing stale variable references during BCP or false
+        // UNSAT in release builds.
+        if self.arena.is_dead(off) {
+            return None;
+        }
+        let clause_len = self.arena.len_of(off);
+        if clause_len < 2 {
+            return None;
+        }
+        // Catch eliminated variables in active clauses during watch init.
+        #[cfg(debug_assertions)]
+        for j in 0..clause_len {
+            let lit = self.arena.literal(off, j);
+            debug_assert!(
+                !self.var_lifecycle.is_removed(lit.variable().index()),
+                "BUG: initialize_watches: active clause {off} (len={clause_len}, \
+                 learned={}) contains eliminated variable {} at position {j}",
+                self.arena.is_learned(off),
+                lit.variable().index(),
+            );
+        }
+        let lit0 = self.arena.literal(off, 0);
+        let mut lit1 = self.arena.literal(off, 1);
+        // Guard: if the first two literals are identical, scan for a distinct
+        // literal to watch (#6506). Duplicate literals can enter the arena via
+        // theory propagation or inprocessing paths that skip clause
+        // normalization. The 2WL scheme requires distinct watch pointers so we
+        // must find a non-duplicate pair.
+        if lit0 == lit1 {
+            let mut found = false;
+            for j in 2..clause_len {
+                let candidate = self.arena.literal(off, j);
+                if candidate != lit0 {
+                    // Swap candidate into position 1 in the arena
+                    self.arena.swap_literals(off, 1, j);
+                    lit1 = candidate;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // All literals are identical — clause is effectively unit.
+                // Skip watch attachment (unit handled elsewhere).
+                return None;
+            }
+        }
+        let mut watched = [lit0, lit1];
+        let watched = self
+            .prepare_watched_literals(&mut watched, WatchOrderPolicy::Preserve)
+            .expect("initialize_watches requires clauses with len >= 2");
+        Some((watched, clause_len == 2))
     }
 
     /// Propagate unit clauses using 2-watched literals.

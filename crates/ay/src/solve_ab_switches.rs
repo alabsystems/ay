@@ -271,7 +271,11 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_skolem_witness_sat: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
+    no_singleton_carrier_mint: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_consequence_replay: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    no_ground_conflict_decomp: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     vacuous_marker_narrow: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -380,9 +384,153 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     uflia_arith_decisions: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
+    lra_float_layer: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    str_nf: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    debug_euf_init: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    euf_cong_undo_debug: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    euf_diseq_undo_debug: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    probe_prescreen: bool,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "MODE"
+    )]
+    lia_probe_qx: Option<String>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    probe_stats: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    debug_fixed_eqs: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    algebraic_stats: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    debug_arr_extract: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    weq5_shadow_dump: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    ic3_lane_debug: bool,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "PATH"
+    )]
+    ic3_lane_dump: Option<String>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    ic3_lane_noslice: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    reve_debug: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
+    max_propagate_rounds: Option<u64>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    lra_cond_trail: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_deterministic_inproc: Option<bool>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_congruence_parity_trust: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_telemetry: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_lean: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_disable_trail_lookahead_prefetch: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_advance_saved_pos: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_false_saved_pos_reset: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_true_tail_relocation: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_618_true_tail_relocation: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_617_tail_reorder: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_18_tail_reorder: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_tail_reorder: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bve_occ_delta_validation: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bve_occ_saved_state_reuse: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_dense_mutex_focused_restart_gate: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_dense_clique_mab_branch: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bve_lrat_scout_route: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_fmla_decompose_lrat_preflight_route: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_dense_clique_scout: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_multiplier_equiv_conservation_scout: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_used5_fsw_saved_pos_reset: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_fsw_conflict_saved_pos_reset: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_no_replacement_saved_pos_update: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_fsw_gent_skip: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_no_replacement_scan_pressure: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_identity: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_pressure_reduction: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_pressure_retention: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_disable_learned_1963_no_replacement_unit_blocker_refresh: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_inprocessing_yield_productivity_rescue: bool,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_lrat_proof_clamp_probe_rescue: Option<bool>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_yield_rescue_backbone_cooldown: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bounded_backbone_zero_decompose_backoff: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_blocker_cert_shadow: bool,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_bcp_search_inplace_watch_scan: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_backbone_post_vivify_binary_admission: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_finalize_rescue: Option<bool>,
+    #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
+    sat_bcp_learned_1963_tail_reorder_swap_budget: Option<u64>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_blocker_cert_elision: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_bcp_learned_1963_blocker_cert_false_reject_demote: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    sat_dense_clique_php_proof_route: bool,
 
     /// Force the banded additive BVE fast-elim on (overrides the band auto
     /// decision; B36).
@@ -476,6 +624,8 @@ pub(super) struct SolveAbSwitches {
     dpll_no_abvfp_flatten: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     dpll_no_closed_sentence_cert: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    dpll_no_closed_sentence_unsat_cert: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     dpll_no_dt_uflia: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -787,7 +937,9 @@ impl SolveArgs {
             keep_alethe_artifacts: self.ab_switches.keep_alethe_artifacts,
             no_quant_unit_authority: self.ab_switches.no_quant_unit_authority,
             no_skolem_witness_sat: self.ab_switches.no_skolem_witness_sat,
+            no_singleton_carrier_mint: self.ab_switches.no_singleton_carrier_mint,
             no_consequence_replay: self.ab_switches.no_consequence_replay,
+            no_ground_conflict_decomp: self.ab_switches.no_ground_conflict_decomp,
             vacuous_marker_narrow: self.ab_switches.vacuous_marker_narrow,
             proj_axiom_budget: self.ab_switches.proj_axiom_budget,
             uflia_witness_complete: self.ab_switches.uflia_witness_complete,
@@ -841,6 +993,24 @@ impl SolveArgs {
             ab_maxsat_kick_gap_abs: self.ab_switches.ab_maxsat_kick_gap_abs,
             ab_maxsat_descent_kick_scale: self.ab_switches.ab_maxsat_descent_kick_scale,
             uflia_arith_decisions: self.ab_switches.uflia_arith_decisions,
+            lra_float_layer: self.ab_switches.lra_float_layer,
+            str_nf: self.ab_switches.str_nf,
+            debug_euf_init: self.ab_switches.debug_euf_init,
+            euf_cong_undo_debug: self.ab_switches.euf_cong_undo_debug,
+            euf_diseq_undo_debug: self.ab_switches.euf_diseq_undo_debug,
+            probe_prescreen: self.ab_switches.probe_prescreen,
+            lia_probe_qx: self.ab_switches.lia_probe_qx.clone(),
+            probe_stats: self.ab_switches.probe_stats,
+            debug_fixed_eqs: self.ab_switches.debug_fixed_eqs,
+            algebraic_stats: self.ab_switches.algebraic_stats,
+            debug_arr_extract: self.ab_switches.debug_arr_extract,
+            weq5_shadow_dump: self.ab_switches.weq5_shadow_dump,
+            ic3_lane_debug: self.ab_switches.ic3_lane_debug,
+            ic3_lane_dump: self.ab_switches.ic3_lane_dump.clone(),
+            ic3_lane_noslice: self.ab_switches.ic3_lane_noslice,
+            reve_debug: self.ab_switches.reve_debug,
+            max_propagate_rounds: self.ab_switches.max_propagate_rounds,
+            lra_cond_trail: self.ab_switches.lra_cond_trail,
         };
         let _ = ay_core::set_global_misc_cli_flags(flags);
     }
@@ -882,6 +1052,52 @@ impl SolveArgs {
             bve_sparse_max_density: f.sat_bve_sparse_max_density,
             deterministic_inproc: f.sat_deterministic_inproc,
             congruence_parity_trust: f.sat_congruence_parity_trust,
+            bcp_telemetry: f.sat_bcp_telemetry,
+            bcp_lean: f.sat_bcp_lean,
+            bcp_disable_trail_lookahead_prefetch: f.sat_bcp_disable_trail_lookahead_prefetch,
+            bcp_advance_saved_pos: f.sat_bcp_advance_saved_pos,
+            bcp_learned_1963_false_saved_pos_reset: f.sat_bcp_learned_1963_false_saved_pos_reset,
+            bcp_learned_1963_true_tail_relocation: f.sat_bcp_learned_1963_true_tail_relocation,
+            bcp_learned_618_true_tail_relocation: f.sat_bcp_learned_618_true_tail_relocation,
+            bcp_learned_617_tail_reorder: f.sat_bcp_learned_617_tail_reorder,
+            bcp_learned_18_tail_reorder: f.sat_bcp_learned_18_tail_reorder,
+            bcp_learned_1963_tail_reorder: f.sat_bcp_learned_1963_tail_reorder,
+            bve_occ_delta_validation: f.sat_bve_occ_delta_validation,
+            bve_occ_saved_state_reuse: f.sat_bve_occ_saved_state_reuse,
+            dense_mutex_focused_restart_gate: f.sat_dense_mutex_focused_restart_gate,
+            dense_clique_mab_branch: f.sat_dense_clique_mab_branch,
+            bve_lrat_scout_route: f.sat_bve_lrat_scout_route,
+            fmla_decompose_lrat_preflight_route: f.sat_fmla_decompose_lrat_preflight_route,
+            dense_clique_scout: f.sat_dense_clique_scout,
+            multiplier_equiv_conservation_scout: f.sat_multiplier_equiv_conservation_scout,
+            bcp_learned_1963_used5_fsw_saved_pos_reset: f
+                .sat_bcp_learned_1963_used5_fsw_saved_pos_reset,
+            bcp_learned_1963_fsw_conflict_saved_pos_reset: f
+                .sat_bcp_learned_1963_fsw_conflict_saved_pos_reset,
+            bcp_learned_no_replacement_saved_pos_update: f
+                .sat_bcp_learned_no_replacement_saved_pos_update,
+            bcp_learned_1963_fsw_gent_skip: f.sat_bcp_learned_1963_fsw_gent_skip,
+            bcp_learned_no_replacement_scan_pressure: f
+                .sat_bcp_learned_no_replacement_scan_pressure,
+            bcp_learned_1963_identity: f.sat_bcp_learned_1963_identity,
+            bcp_learned_1963_pressure_reduction: f.sat_bcp_learned_1963_pressure_reduction,
+            bcp_learned_1963_pressure_retention: f.sat_bcp_learned_1963_pressure_retention,
+            bcp_disable_learned_1963_no_replacement_unit_blocker_refresh: f
+                .sat_bcp_disable_learned_1963_no_replacement_unit_blocker_refresh,
+            inprocessing_yield_productivity_rescue: f.sat_inprocessing_yield_productivity_rescue,
+            lrat_proof_clamp_probe_rescue: f.sat_lrat_proof_clamp_probe_rescue,
+            yield_rescue_backbone_cooldown: f.sat_yield_rescue_backbone_cooldown,
+            bounded_backbone_zero_decompose_backoff: f.sat_bounded_backbone_zero_decompose_backoff,
+            bcp_learned_1963_blocker_cert_shadow: f.sat_bcp_learned_1963_blocker_cert_shadow,
+            bcp_search_inplace_watch_scan: f.sat_bcp_search_inplace_watch_scan,
+            backbone_post_vivify_binary_admission: f.sat_backbone_post_vivify_binary_admission,
+            finalize_rescue: f.sat_finalize_rescue,
+            bcp_learned_1963_tail_reorder_swap_budget: f
+                .sat_bcp_learned_1963_tail_reorder_swap_budget,
+            bcp_learned_1963_blocker_cert_elision: f.sat_bcp_learned_1963_blocker_cert_elision,
+            bcp_learned_1963_blocker_cert_false_reject_demote: f
+                .sat_bcp_learned_1963_blocker_cert_false_reject_demote,
+            dense_clique_php_proof_route: f.sat_dense_clique_php_proof_route,
         };
         if switches != ay_core::SatAbSwitches::default() {
             let _ = ay_core::set_global_sat_ab_switches(switches);
@@ -921,6 +1137,7 @@ impl SolveArgs {
             no_const_interp_cert: self.ab_switches.no_const_interp_cert,
             no_abvfp_flatten: self.ab_switches.dpll_no_abvfp_flatten,
             no_closed_sentence_cert: self.ab_switches.dpll_no_closed_sentence_cert,
+            no_closed_sentence_unsat_cert: self.ab_switches.dpll_no_closed_sentence_unsat_cert,
             no_dt_uflia: self.ab_switches.dpll_no_dt_uflia,
             no_dt_d1: self.ab_switches.dpll_no_dt_d1,
             no_euf_lnh: self.ab_switches.dpll_no_euf_lnh,

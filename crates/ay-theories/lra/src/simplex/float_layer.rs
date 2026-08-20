@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Float-pivot layer (`AY_LRA_FLOAT_LAYER`, default OFF) — increment 1.
+//! Float-pivot layer (`--lra-float-layer`, default OFF) — increment 1.
 //!
 //! The f64 shadow simplex (`float_find_basis`) proposes a candidate basis `B*`.
 //! This module CERTIFIES that basis exactly in `O(one basis solve)`, not
@@ -34,10 +34,9 @@ use crate::rational::Rational;
 use crate::types::{self, BoundType, InfRational};
 use crate::LraSolver;
 
-/// `AY_LRA_FLOAT_LAYER` gate — DEFAULT OFF (opt in with any non-empty, non-"0").
+/// `--lra-float-layer` gate (B73) — DEFAULT OFF.
 pub(crate) fn float_layer_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("AY_LRA_FLOAT_LAYER").is_ok_and(|v| v != "0" && !v.is_empty()))
+    ay_core::misc_cli_flags().lra_float_layer
 }
 
 /// Minimum tableau row count for the float layer to engage. Below this the f64
@@ -641,7 +640,7 @@ impl LraSolver {
     /// Build a Farkas conflict from an EXPLICIT reduced row + a KNOWN violated
     /// bound, without consulting `self.rows` or `self.vars[bstar].value`.
     ///
-    /// Used only by the float-pivot UNSAT path (`AY_LRA_FLOAT_LAYER`). Every
+    /// Used only by the float-pivot UNSAT path (`--lra-float-layer`). Every
     /// variable in `coeffs` is non-basic in the candidate basis `B*` by
     /// construction, so — unlike `build_conflict_with_farkas`, which filters on
     /// the B0 `VarStatus` — no status filtering is applied. The genuineness of

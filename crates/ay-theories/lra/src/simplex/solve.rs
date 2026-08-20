@@ -75,7 +75,7 @@ impl LraSolver {
         let scale_iters = (self.rows.len() + self.vars.len()) * 200;
         let max_iters = std::cmp::min(base_iters + scale_iters, 10_000_000);
 
-        // Float-pivot layer (AY_LRA_FLOAT_LAYER, default OFF). A pure heuristic
+        // Float-pivot layer (--lra-float-layer, default OFF). A pure heuristic
         // f64 basis oracle proposes a candidate basis that we certify EXACTLY in
         // O(one basis solve); on any imprecision it returns None and we fall
         // through to the unchanged exact simplex below. Only reached on the

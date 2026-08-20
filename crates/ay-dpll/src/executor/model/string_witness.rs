@@ -183,7 +183,7 @@ impl Executor {
             let TermData::App(sym, args) = self.ctx.terms.get(tid) else {
                 continue;
             };
-            // NF-engine closure 6 (`AY_STR_NF=1`): `str.contains(var, w)` with
+            // NF-engine closure 6 (`--str-nf`): `str.contains(var, w)` with
             // a CONSTANT needle is EXACTLY a membership in `Σ* w Σ*` (see
             // `contains_constraint`), so it belongs in this harvest on the same
             // terms as `str.in_re` — in BOTH polarities. Without it the witness

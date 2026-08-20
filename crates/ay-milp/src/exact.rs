@@ -108,6 +108,210 @@ enum Dir {
     Down,
 }
 
+/// Which structural columns start at their UPPER bound instead of the default
+/// lower one — the exact rim's port of the f64 simplex's upper crash
+/// (`ay_pb_core::optimize::safe_lp_bound::crash_at_upper`, `cb11447d8`).
+///
+/// WHY: the default start puts every structural on its lower bound, so on a
+/// COVERING model (`a_rj > 0`, row lower bound `b_r > 0`, no row upper bound)
+/// all `m` logical variables start BELOW their bound and [`ExactLp::make_feasible`]
+/// has to walk every one of them out, one exact pivot each — and each pivot
+/// substitutes the entering column into every other row, so the tableau fills in
+/// and the rationals lengthen as it goes. MEASURED on `mw19_19` (467x466, HiGHS
+/// milliseconds): 466 of 466 logicals violated at the start, 951 Phase I pivots
+/// in 60s and still not feasible. Starting those columns at their upper bound
+/// instead satisfies every row outright: same instance, 0 Phase I pivots, 4.3µs.
+///
+/// The decision is per column, on the single move `x_j: lower -> upper`
+/// evaluated against the default point — `act_r` is row `r`'s activity there,
+/// `span_j = ub_j - lb_j`, `delta = a_rj * span_j`:
+///
+/// * `gain` — violation the move actually removes, capped per row by what that
+///   row is short (`max(0, lb_r - act_r)`) or over (`max(0, act_r - ub_r)`);
+///   overshooting a satisfied row buys nothing;
+/// * `harm` — violation it can create, charged IN FULL (`|delta|`) against the
+///   row's opposite bound whenever that bound is finite, whatever slack the row
+///   actually has.
+///
+/// Crash at upper iff `gain > harm` with a finite, positive span. Covering rows
+/// give `gain > 0 = harm` (no finite row upper bound to charge), so every column
+/// crashes; packing rows give `0 = gain < harm`, so none does. A row with BOTH
+/// bounds finite charges at least as much harm as it credits gain, so
+/// equality/ranged shapes — set partitioning above all — can never tip a column
+/// and reproduce the old all-at-lower start term for term. Mixed models get the
+/// per-column verdict, and Phase I repairs whatever the estimate got wrong.
+///
+/// NOT shape-gated: the per-column rule self-gates (a covering test is exactly
+/// what `gain > harm` is), and a "does this model look like covering"
+/// precondition would be a second, weaker copy of it that mixed models would
+/// fall through.
+///
+/// WHY THE FULL HARM CHARGE IS THE LOAD-BEARING CHOICE: charging `|delta|`
+/// against any finite opposite bound means a column can only tip when EVERY row
+/// it raises is unbounded above and every row it lowers is unbounded below. So
+/// a crashed column cannot increase any row's violation — and two crashed
+/// columns cannot fight over a row either, since a row that one raises and
+/// another lowers would need both `ub_r = +inf` and `lb_r = -inf`, which leaves
+/// it unviolatable. The crashed start is therefore never worse than the
+/// all-at-lower one, by construction rather than by measurement. The weaker
+/// "harm = slack actually eaten" reading has no such property: it tips whole
+/// set-partitioning models (`a_rj = 1`, `lb_r = ub_r = 1`) on the grounds that
+/// the first unit of slack is free.
+///
+/// [`start_is_better`] then enforces the same property numerically before the
+/// mask is adopted, and adds the one thing the algebra does not: a start that
+/// is ALREADY feasible is left alone (nothing to gain, and a different starting
+/// vertex on a degenerate LP is a different optimal vertex downstream).
+///
+/// EXACTNESS: this is a heuristic read of the model's `f64` view, and it moves
+/// the STARTING POINT only — to a bound already held exactly in `upper`. No
+/// verdict, Farkas certificate or multiplier depends on it; a wrong guess costs
+/// pivots, never soundness. `f64` is therefore the right arithmetic here: two
+/// cheap passes over the matrix rather than rational ones, on a construction
+/// path that is already seconds on a 1.85M-nnz model.
+fn upper_crash_mask(model: &Model, deadline: Option<Instant>) -> Option<Vec<bool>> {
+    let n = model.num_cols();
+    let m = model.num_rows();
+    // The default (all-at-lower) start and each column's crash span, in f64.
+    // A column with an infinite or empty span is not a candidate: its default
+    // start is already the only finite bound it has, or it has none.
+    let mut start = vec![0.0f64; n];
+    let mut span = vec![0.0f64; n];
+    for j in 0..n {
+        let (lb, ub) = model.col_bounds(Col(j as u32));
+        start[j] = if lb.is_finite() {
+            lb
+        } else if ub.is_finite() {
+            ub
+        } else {
+            0.0
+        };
+        if lb.is_finite() && ub.is_finite() && ub > lb {
+            span[j] = ub - lb;
+        }
+    }
+    let mut gain = vec![0.0f64; n];
+    let mut harm = vec![0.0f64; n];
+    for r in 0..m {
+        if r % 64 == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return None;
+        }
+        let (coeffs, lb, ub) = model.row(Row(r as u32));
+        let mut act = 0.0f64;
+        for &(c, a) in coeffs {
+            act += a * start[c as usize];
+        }
+        let short = if lb.is_finite() {
+            (lb - act).max(0.0)
+        } else {
+            0.0
+        };
+        let over = if ub.is_finite() {
+            (act - ub).max(0.0)
+        } else {
+            0.0
+        };
+        for &(c, a) in coeffs {
+            let j = c as usize;
+            let delta = a * span[j];
+            if delta > 0.0 {
+                gain[j] += delta.min(short);
+                if ub.is_finite() {
+                    harm[j] += delta;
+                }
+            } else if delta < 0.0 {
+                gain[j] += (-delta).min(over);
+                if lb.is_finite() {
+                    harm[j] += -delta;
+                }
+            }
+        }
+    }
+    let mask: Vec<bool> = (0..n)
+        .map(|j| span[j] > 0.0 && gain[j].is_finite() && harm[j].is_finite() && gain[j] > harm[j])
+        .collect();
+    if !start_is_better(model, &mask, &start, &span, deadline)? {
+        return Some(vec![false; n]);
+    }
+    Some(mask)
+}
+
+/// Does the crashed start leave the logicals in better shape than the
+/// all-at-lower one? The DOMINANCE GUARD on [`upper_crash_mask`]: adopt the
+/// mask only where it demonstrably helps, so no model can be handed a worse
+/// start than the one it has today.
+///
+/// "Better" is measured the way Phase I pays for it — first on the NUMBER of
+/// logicals outside their bounds (each one costs at least one exact repair
+/// pivot, and each pivot substitutes into every row), then, on a tie, on total
+/// violation. A tie in both keeps the old start: an equally-violated but
+/// radically different starting vertex is a change with no case for it.
+///
+/// A non-finite activity anywhere (an overflowing `f64` dot product) declines
+/// the crash outright — the estimate cannot be trusted on numbers it cannot
+/// represent, and declining costs only the old behaviour.
+///
+/// This is a BELT, not the proof: the full harm charge in [`upper_crash_mask`]
+/// already makes a crashed column unable to raise any row's violation, and a
+/// non-empty mask means some row's shortfall strictly falls, so the guard
+/// passes whenever it is consulted. It is kept because it costs one `f64` pass
+/// on a rational construction path, it is what catches a rounding-tipped column
+/// or a future weakening of the rule, and it states the invariant a reader
+/// would otherwise have to re-derive.
+fn start_is_better(
+    model: &Model,
+    mask: &[bool],
+    start: &[f64],
+    span: &[f64],
+    deadline: Option<Instant>,
+) -> Option<bool> {
+    if !mask.iter().any(|&on| on) {
+        return Some(false);
+    }
+    let (mut count_lower, mut count_crash) = (0usize, 0usize);
+    let (mut viol_lower, mut viol_crash) = (0.0f64, 0.0f64);
+    for r in 0..model.num_rows() {
+        if r % 64 == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
+            return None;
+        }
+        let (coeffs, lb, ub) = model.row(Row(r as u32));
+        let mut act_lower = 0.0f64;
+        let mut act_crash = 0.0f64;
+        for &(c, a) in coeffs {
+            let j = c as usize;
+            act_lower += a * start[j];
+            act_crash += a * if mask[j] {
+                start[j] + span[j]
+            } else {
+                start[j]
+            };
+        }
+        if !act_lower.is_finite() || !act_crash.is_finite() {
+            return Some(false);
+        }
+        for (act, count, viol) in [
+            (act_lower, &mut count_lower, &mut viol_lower),
+            (act_crash, &mut count_crash, &mut viol_crash),
+        ] {
+            let short = if lb.is_finite() {
+                (lb - act).max(0.0)
+            } else {
+                0.0
+            };
+            let over = if ub.is_finite() {
+                (act - ub).max(0.0)
+            } else {
+                0.0
+            };
+            if short > 0.0 || over > 0.0 {
+                *count += 1;
+                *viol += short + over;
+            }
+        }
+    }
+    Some(count_crash < count_lower || (count_crash == count_lower && viol_crash < viol_lower))
+}
+
 impl ExactLp {
     /// Build from a model, relaxing integrality (binary columns become their
     /// `[lb, ub]` boxes). Model must be validated. An `Infeasible` verdict
@@ -146,6 +350,19 @@ impl ExactLp {
             lower.push(lb);
             upper.push(ub);
             values.push(v);
+        }
+        // Upper-bound crash (see [`upper_crash_mask`]): choose each structural's
+        // starting bound BEFORE the rows are built, so the exact activity pass
+        // below lands on the crashed point directly and no second rational pass
+        // over the matrix is needed. Nonbasics still sit on a bound, which is
+        // what `make_feasible`'s termination argument requires.
+        let crash = upper_crash_mask(model, deadline)?;
+        for (j, at_upper) in crash.iter().enumerate() {
+            if *at_upper {
+                if let Some(ub) = &upper[j] {
+                    values[j] = ub.clone();
+                }
+            }
         }
         let mut rows = Vec::with_capacity(m);
         for r in 0..m {
@@ -637,5 +854,131 @@ fn signed(magnitude: &Rational, dir: Dir) -> Rational {
     match dir {
         Dir::Up => magnitude.clone(),
         Dir::Down => -magnitude.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget() -> Budget {
+        Budget {
+            deadline: None,
+            max_iters: 10_000,
+        }
+    }
+
+    /// No logical starts outside its bounds ⇔ `make_feasible` returns without
+    /// pivoting once.
+    fn phase_one_is_empty(lp: &ExactLp) -> bool {
+        lp.rows
+            .iter()
+            .all(|row| !lp.below_lower(row.basic as usize) && !lp.above_upper(row.basic as usize))
+    }
+
+    fn unit_objective(n: u32) -> Vec<(u32, Rational)> {
+        (0..n).map(|j| (j, Rational::new(1, 1))).collect()
+    }
+
+    /// COVERING — the class the crash exists for: every column tips to its
+    /// upper bound, which leaves Phase I with nothing to repair, and the
+    /// optimum is unchanged by the different starting point.
+    #[test]
+    fn covering_columns_crash_and_leave_phase_one_empty() {
+        let mut m = Model::new();
+        let x = m.add_col(0.0, 1.0);
+        let y = m.add_col(0.0, 1.0);
+        let z = m.add_col(0.0, 1.0);
+        m.add_row(1.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
+        m.add_row(1.0, f64::INFINITY, &[(y, 1.0), (z, 1.0)]);
+        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![true, true, true]);
+        let mut lp = ExactLp::new(&m);
+        assert!(phase_one_is_empty(&lp));
+        // min x+y+z over that cover is 1 (y = 1), crash or no crash.
+        let LpOptimum::Optimal { value, .. } = lp.minimize(&unit_objective(3), &budget()) else {
+            panic!("covering LP must be optimal");
+        };
+        assert_eq!(value, BigRational::from_integer(1.into()));
+    }
+
+    /// PACKING — `gain` is 0 and `harm` is not, so nothing tips and the start
+    /// is the historical all-at-lower one.
+    #[test]
+    fn packing_columns_do_not_crash() {
+        let mut m = Model::new();
+        let x = m.add_col(0.0, 1.0);
+        let y = m.add_col(0.0, 1.0);
+        m.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
+        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![false, false]);
+        let lp = ExactLp::new(&m);
+        assert!(lp.values[..2].iter().all(Rational::is_zero));
+    }
+
+    /// SET PARTITIONING — a row with both bounds finite charges at least as
+    /// much harm as it credits gain, so an equality model can never tip a
+    /// column. This is what keeps `air03`/`nw04`-shaped models on their old
+    /// start.
+    #[test]
+    fn equality_rows_never_crash() {
+        let mut m = Model::new();
+        let x = m.add_col(0.0, 1.0);
+        let y = m.add_col(0.0, 1.0);
+        let z = m.add_col(0.0, 1.0);
+        m.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
+        m.add_row(1.0, 1.0, &[(y, 1.0), (z, 1.0)]);
+        assert_eq!(
+            upper_crash_mask(&m, None).unwrap(),
+            vec![false, false, false]
+        );
+    }
+
+    /// A start that is already feasible is left alone: with nothing short,
+    /// nothing has anything to gain, so no column tips and the starting vertex
+    /// — which is what a degenerate LP's reported optimum hangs on — does not
+    /// move.
+    #[test]
+    fn a_feasible_start_is_not_disturbed() {
+        let mut m = Model::new();
+        let x = m.add_col(0.0, 1.0);
+        let y = m.add_col(0.0, 1.0);
+        // Covering-shaped (no finite row upper bound) but satisfied at x=y=0.
+        m.add_row(0.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
+        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![false, false]);
+        let lp = ExactLp::new(&m);
+        assert!(lp.values[..2].iter().all(Rational::is_zero));
+    }
+
+    /// An unbounded column has no upper bound to crash to; a fixed column has
+    /// nowhere to move. Neither is a candidate.
+    #[test]
+    fn infinite_and_empty_spans_are_not_candidates() {
+        let mut m = Model::new();
+        let free = m.add_col(0.0, f64::INFINITY);
+        let fixed = m.add_col(1.0, 1.0);
+        let boxed = m.add_col(0.0, 1.0);
+        m.add_row(
+            5.0,
+            f64::INFINITY,
+            &[(free, 1.0), (fixed, 1.0), (boxed, 1.0)],
+        );
+        assert_eq!(
+            upper_crash_mask(&m, None).unwrap(),
+            vec![false, false, true]
+        );
+    }
+
+    /// The crash is a STARTING POINT, not a verdict: an infeasible covering
+    /// model is still refuted, with the same exact answer either way.
+    #[test]
+    fn crash_does_not_change_an_infeasible_verdict() {
+        let mut m = Model::new();
+        let x = m.add_col(0.0, 1.0);
+        m.add_row(2.0, f64::INFINITY, &[(x, 1.0)]);
+        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![true]);
+        let mut lp = ExactLp::new(&m);
+        assert!(matches!(
+            lp.make_feasible(&budget()),
+            LpFeasibility::Infeasible(_)
+        ));
     }
 }

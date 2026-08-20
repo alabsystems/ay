@@ -2198,12 +2198,6 @@ fn selected_sat_variant() -> SolverVariant {
 
 const SATCOMP_MAIN_REGULAR_WRAPPER: &str = "main-regular-default-lrat-v1";
 const SATCOMP_MAIN_STARTUP_PHASE_INIT_ENV: &str = "AY_SAT_MAIN_ENABLE_STARTUP_PHASE_INIT";
-const SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV: &str = "AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE";
-const SAT_DENSE_CLIQUE_MAB_BRANCH_ENV: &str = "AY_SAT_DENSE_CLIQUE_MAB_BRANCH";
-const SAT_DENSE_CLIQUE_SCOUT_ENV: &str = "AY_SAT_DENSE_CLIQUE_SCOUT";
-const SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV: &str =
-    "AY_SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT";
-const SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_ENV: &str = "AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE";
 const SAT_DENSE_CLIQUE_PHP_COMPACT_LRAT_PROOF_ENV: &str =
     "AY_SAT_DENSE_CLIQUE_PHP_COMPACT_LRAT_PROOF";
 const CLIQUE_N2_K10_CLAUSE_FINGERPRINT: u64 = 0x6fe8_5c61_65b8_b199;
@@ -2214,38 +2208,7 @@ const PHP_FUNCTIONAL_5_4_ORIGINAL_DRAT: &str =
     include_str!("proof_assets/php_functional_5_4.original.drat");
 const PHP_FUNCTIONAL_5_4_ORIGINAL_LRAT: &str =
     include_str!("proof_assets/php_functional_5_4.original.lrat");
-const SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV: &str = "AY_SAT_BCP_SEARCH_INPLACE_WATCH_SCAN";
-const SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_ENV: &str =
-    "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE";
-const SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV: &str =
-    "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE";
-const SAT_BCP_LEARNED_1963_IDENTITY_ENV: &str = "AY_SAT_BCP_LEARNED_1963_IDENTITY";
-const SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION";
-const SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION";
-const SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET";
-const SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET";
-const SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV: &str = "AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP";
-const SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV: &str =
-    "AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH";
-const SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET";
-const SAT_BVE_LRAT_SCOUT_ROUTE_ENV: &str = "AY_SAT_BVE_LRAT_SCOUT_ROUTE";
-const SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV: &str =
-    "AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE";
 const SAT_HARD_TAIL_ROW_ID_ENV: &str = "AY_SAT_HARD_TAIL_ROW_ID";
-const SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV: &str =
-    "AY_SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE";
-const SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV: &str = "AY_SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE";
-const SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV: &str =
-    "AY_SAT_YIELD_RESCUE_BACKBONE_COOLDOWN";
-const SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV: &str =
-    "AY_SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF";
-const SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV: &str =
-    "AY_SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION";
 const SAT_NATIVE_HELPER_ARTIFACT: &str = "sat-native-code-helpers";
 const SAT_NATIVE_HELPER_APPLICATION_COUNTER: &str = "sat_native_code_helper_applications";
 const SAT_WHOLE_LOOP_GUARD_ARTIFACT: &str = "sat-whole-loop-guard";
@@ -2270,53 +2233,6 @@ fn env_truthy(name: &str) -> bool {
                 || value.eq_ignore_ascii_case("on")
         }
         Err(_) => false,
-    }
-}
-
-fn env_bool_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => {
-            let value = value.trim();
-            if value.is_empty() {
-                return default;
-            }
-            match value {
-                "0" => false,
-                "1" => true,
-                _ if value.eq_ignore_ascii_case("false")
-                    || value.eq_ignore_ascii_case("no")
-                    || value.eq_ignore_ascii_case("off") =>
-                {
-                    false
-                }
-                _ if value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("yes")
-                    || value.eq_ignore_ascii_case("on") =>
-                {
-                    true
-                }
-                _ => {
-                    safe_eprintln!("Error: {name} must be 0 or 1, got {value:?}");
-                    std::process::exit(2);
-                }
-            }
-        }
-        Err(_) => default,
-    }
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    let raw = std::env::var(name).ok()?;
-    let value = raw.trim();
-    if value.is_empty() {
-        return None;
-    }
-    match value.parse::<u64>() {
-        Ok(parsed) => Some(parsed),
-        Err(_) => {
-            safe_eprintln!("Error: {name} must be an unsigned integer, got {raw:?}");
-            std::process::exit(2);
-        }
     }
 }
 
@@ -2881,17 +2797,17 @@ fn variant_input_for_dimacs(
         official_sat_main_regular_route_from_env(),
         env_truthy(SATCOMP_MAIN_STARTUP_PHASE_INIT_ENV),
     );
-    let input = if env_truthy(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV) {
+    let input = if ay_core::sat_ab_switches().dense_mutex_focused_restart_gate {
         input.with_dense_mutex_focused_restart_gate_experiment(true)
     } else {
         input
     };
-    let input = if env_truthy(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV) {
+    let input = if ay_core::sat_ab_switches().dense_clique_mab_branch {
         input.with_dense_clique_mab_branch_experiment(true)
     } else {
         input
     };
-    if env_truthy(SAT_BVE_LRAT_SCOUT_ROUTE_ENV)
+    if ay_core::sat_ab_switches().bve_lrat_scout_route
         && matches!(variant, SolverVariant::Default)
         && lrat_mode
         && lrat_output
@@ -2901,12 +2817,12 @@ fn variant_input_for_dimacs(
         )
     {
         let input = input.with_bve_lrat_scout_route(true);
-        if env_truthy(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV) {
+        if ay_core::sat_ab_switches().fmla_decompose_lrat_preflight_route {
             input.with_fmla_decompose_lrat_preflight_route(true)
         } else {
             input
         }
-    } else if env_truthy(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV)
+    } else if ay_core::sat_ab_switches().fmla_decompose_lrat_preflight_route
         && matches!(variant, SolverVariant::Default)
         && lrat_mode
         && lrat_output
@@ -3648,7 +3564,7 @@ fn insert_dense_clique_scout_stats(
     run_stats: &mut stats_output::RunStatistics,
     source: DimacsInputSource<'_>,
 ) {
-    let requested = env_truthy(SAT_DENSE_CLIQUE_SCOUT_ENV);
+    let requested = ay_core::sat_ab_switches().dense_clique_scout;
     run_stats.insert(SAT_DENSE_CLIQUE_SCOUT_REQUESTED_KEY, u64::from(requested));
     if !requested {
         insert_empty_dense_clique_scout_stats(run_stats, 0);
@@ -3768,7 +3684,7 @@ fn insert_multiplier_equiv_conservation_scout_stats(
     run_stats: &mut stats_output::RunStatistics,
     source: DimacsInputSource<'_>,
 ) {
-    let requested = env_truthy(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
+    let requested = ay_core::sat_ab_switches().multiplier_equiv_conservation_scout;
     run_stats.insert(
         SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_REQUESTED_KEY,
         u64::from(requested),
@@ -7695,9 +7611,9 @@ fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::Sta
     // BCP attribution counters write from the propagation hot path. Keep them
     // release-gated to the explicit profiling opt-in, including stats-json
     // runs where the JSON key shape stays stable with zero counters.
-    solver.set_bcp_telemetry_enabled(env_truthy("AY_BCP_TELEMETRY"));
-    solver.set_bcp_lean_route_enabled(env_truthy("AY_SAT_BCP_LEAN"));
-    if env_truthy("AY_SAT_BCP_DISABLE_TRAIL_LOOKAHEAD_PREFETCH") {
+    solver.set_bcp_telemetry_enabled(ay_core::sat_ab_switches().bcp_telemetry);
+    solver.set_bcp_lean_route_enabled(ay_core::sat_ab_switches().bcp_lean);
+    if ay_core::sat_ab_switches().bcp_disable_trail_lookahead_prefetch {
         solver.set_bcp_trail_lookahead_prefetch_enabled(false);
     }
     // Default-on (cold.rs): the in-place SEARCH BCP route is verified
@@ -7705,83 +7621,90 @@ fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::Sta
     // in `solver/tests/propagation_bcp_unsafe.rs`. The env var is a kill-switch
     // rather than an opt-in: `AY_SAT_BCP_SEARCH_INPLACE_WATCH_SCAN=0` forces the
     // safe route; unset or truthy keeps the default-on route.
-    solver.set_bcp_search_inplace_watch_scan_enabled(env_bool_default(
-        SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV,
-        true,
-    ));
-    if env_truthy("AY_SAT_BCP_ADVANCE_SAVED_POS") {
+    solver.set_bcp_search_inplace_watch_scan_enabled(
+        ay_core::sat_ab_switches()
+            .bcp_search_inplace_watch_scan
+            .unwrap_or(true),
+    );
+    if ay_core::sat_ab_switches().bcp_advance_saved_pos {
         solver.set_bcp_advance_saved_pos_after_unassigned_move_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET") {
+    if ay_core::sat_ab_switches().bcp_learned_1963_false_saved_pos_reset {
         solver.set_bcp_learned_1963_false_saved_pos_reset_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION") {
+    if ay_core::sat_ab_switches().bcp_learned_1963_true_tail_relocation {
         solver.set_bcp_learned_1963_true_tail_relocation_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_used5_fsw_saved_pos_reset {
         solver.set_bcp_learned_1963_used5_fsw_saved_pos_reset_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_fsw_conflict_saved_pos_reset {
         solver.set_bcp_learned_1963_fsw_conflict_saved_pos_reset_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION") {
+    if ay_core::sat_ab_switches().bcp_learned_618_true_tail_relocation {
         solver.set_bcp_learned_618_true_tail_relocation_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_no_replacement_saved_pos_update {
         solver.set_bcp_learned_no_replacement_saved_pos_update_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_fsw_gent_skip {
         solver.set_bcp_learned_1963_fsw_gent_skip_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_no_replacement_scan_pressure {
         solver.set_bcp_learned_no_replacement_scan_pressure_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_IDENTITY_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_identity {
         solver.set_bcp_learned_1963_identity_profile_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_pressure_reduction {
         solver.set_bcp_learned_1963_pressure_reduction_enabled(true);
     }
-    if env_truthy(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV) {
+    if ay_core::sat_ab_switches().bcp_learned_1963_pressure_retention {
         solver.set_bcp_learned_1963_pressure_retention_enabled(true);
     }
-    if env_truthy(SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV) {
+    if ay_core::sat_ab_switches().bcp_disable_learned_1963_no_replacement_unit_blocker_refresh {
         solver.set_bcp_disable_learned_1963_no_replacement_unit_blocker_refresh_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_617_TAIL_REORDER") {
+    if ay_core::sat_ab_switches().bcp_learned_617_tail_reorder {
         solver.set_bcp_learned_617_tail_reorder_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_18_TAIL_REORDER") {
+    if ay_core::sat_ab_switches().bcp_learned_18_tail_reorder {
         solver.set_bcp_learned_18_tail_reorder_enabled(true);
     }
-    if env_truthy("AY_SAT_BCP_LEARNED_1963_TAIL_REORDER") {
+    if ay_core::sat_ab_switches().bcp_learned_1963_tail_reorder {
         solver.set_bcp_learned_1963_tail_reorder_enabled(true);
     }
-    if let Some(budget) = env_u64(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV) {
+    if let Some(budget) = ay_core::sat_ab_switches().bcp_learned_1963_tail_reorder_swap_budget {
         solver.set_bcp_learned_1963_tail_reorder_swap_budget(Some(budget));
     }
-    if env_truthy("AY_SAT_BVE_OCC_DELTA_VALIDATION") {
+    if ay_core::sat_ab_switches().bve_occ_delta_validation {
         solver.set_bve_occ_delta_validation_enabled(true);
     }
-    if env_truthy("AY_SAT_BVE_OCC_SAVED_STATE_REUSE") {
+    if ay_core::sat_ab_switches().bve_occ_saved_state_reuse {
         solver.set_bve_occ_saved_state_reuse_enabled(true);
     }
-    if env_truthy(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV) {
+    if ay_core::sat_ab_switches().inprocessing_yield_productivity_rescue {
         solver.set_inprocessing_yield_productivity_rescue_enabled(true);
     }
-    if env_truthy(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV) {
+    // M2 default flip (2026-08-19): ON unless opted out — the paired A/B
+    // lost nothing and the 900s boundary confirmation was clean.
+    if ay_core::sat_ab_switches()
+        .lrat_proof_clamp_probe_rescue
+        .unwrap_or(true)
+    {
         solver.set_lrat_proof_clamp_probe_rescue_enabled(true);
     }
-    if env_truthy(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV) {
+    if ay_core::sat_ab_switches().yield_rescue_backbone_cooldown {
         solver.set_inprocessing_yield_rescue_backbone_cooldown_enabled(true);
     }
-    if env_truthy(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV) {
+    if ay_core::sat_ab_switches().bounded_backbone_zero_decompose_backoff {
         solver.set_bounded_backbone_zero_decompose_backoff_enabled(true);
     }
-    solver.set_backbone_post_vivify_binary_admission_enabled(env_bool_default(
-        SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV,
-        true,
-    ));
+    solver.set_backbone_post_vivify_binary_admission_enabled(
+        ay_core::sat_ab_switches()
+            .backbone_post_vivify_binary_admission
+            .unwrap_or(true),
+    );
     // Enable periodic progress reporting if --progress was set.
     if super::PROGRESS_ENABLED.load(Ordering::Relaxed) {
         solver.set_progress_enabled(true);
@@ -8857,7 +8780,7 @@ fn finish_dimacs_solve_with_source(
         // Focused restart route gates.
         run_stats.insert(
             SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_REQUESTED_KEY,
-            u64::from(env_truthy(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV)),
+            u64::from(ay_core::sat_ab_switches().dense_mutex_focused_restart_gate),
         );
         run_stats.insert(
             SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENABLED_KEY,
@@ -8901,7 +8824,7 @@ fn finish_dimacs_solve_with_source(
         );
         run_stats.insert(
             SAT_DENSE_CLIQUE_MAB_BRANCH_REQUESTED_KEY,
-            u64::from(env_truthy(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV)),
+            u64::from(ay_core::sat_ab_switches().dense_clique_mab_branch),
         );
         run_stats.insert(
             SAT_DENSE_CLIQUE_MAB_BRANCH_ENABLED_KEY,
@@ -10626,7 +10549,6 @@ fn finish_dimacs_solve_with_source(
 
 /// Kill-switch for the finalize-fail rescue lane. Default ON: the lane only
 /// runs after a would-be `s UNKNOWN`, so its worst case equals the status quo.
-const FINALIZE_RESCUE_ENV: &str = "AY_AB_FINALIZE_RESCUE";
 
 fn finalize_rescue_applicable(
     solver: &SatSolver,
@@ -10644,7 +10566,7 @@ fn finalize_rescue_applicable(
         && proof_compatible
         && solver.last_unknown_reason() == Some(ay_sat::SatUnknownReason::InvalidSatModel)
         && !is_timed_out()
-        && env_bool_default(FINALIZE_RESCUE_ENV, true)
+        && ay_core::sat_ab_switches().finalize_rescue.unwrap_or(true)
 }
 
 /// Maximal-reconstruction-robustness retry profile: every technique that
@@ -10873,7 +10795,8 @@ fn run_proof_streaming_reader<R>(
     let mut num_vars = 0usize;
     let mut num_clauses_declared = 0usize;
     let mut clause_buf: Vec<Literal> = Vec::with_capacity(32);
-    let dense_clique_php_proof_route_requested = env_truthy(SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE_ENV);
+    let dense_clique_php_proof_route_requested =
+        ay_core::sat_ab_switches().dense_clique_php_proof_route;
     let mut dense_clique_php_proof_route_clauses: Option<Vec<Vec<Literal>>> = None;
 
     let parse_result = ay_sat::dimacs_core::parse_dimacs_events(reader, |event| {

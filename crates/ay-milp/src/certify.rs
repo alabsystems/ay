@@ -1106,6 +1106,37 @@ pub(crate) fn certify_model_basis_with_deadline(
     at: &[NbBound],
     deadline: Option<std::time::Instant>,
 ) -> Option<CertifiedOptimum> {
+    certify_model_basis_within(model, basis, at, deadline, MAX_EXACT_BASIS_ROWS)
+}
+
+/// [`certify_model_basis_with_deadline`] with the row cap named by the caller.
+///
+/// WHY THE CAP IS A PARAMETER. [`MAX_EXACT_BASIS_ROWS`] is a COST guess, not a
+/// soundness rule: it is the point above which exact basis replay stopped being
+/// worth it COMPARED WITH RE-SOLVING ON THE EXACT RIM. Nothing below this line
+/// changes meaning with `m` — every check is exact, and every failure of every
+/// kind is a decline. The all-continuous lane ([`crate::BabSession`]'s
+/// `MilpLane::Exact`) has no rim to lose to: the rim is precisely what cannot
+/// solve those models. So it names its own, larger cap and lets the DEADLINE be
+/// the cost control, which is what the polling in every loop below — and inside
+/// [`solve_sparse`]'s elimination and back-substitution — is for. Existing
+/// callers keep the historical constant and are bit-for-bit unaffected.
+///
+/// The two basis systems are eliminated SPARSELY ([`solve_sparse`], full
+/// Markowitz), not densely. Exact arithmetic makes any nonzero pivot correct, so
+/// the two eliminations return the same rationals; what differs is that a dense
+/// `m x m` `BigRational` matrix is unallocatable at the sizes this lane must
+/// reach (a 12,650-row `hexgrid` basis is 160M entries) while its sparse form is
+/// a few nonzeros per row.
+pub(crate) fn certify_model_basis_within(
+    model: &Model,
+    basis: &[usize],
+    at: &[NbBound],
+    deadline: Option<std::time::Instant>,
+    max_rows: usize,
+) -> Option<CertifiedOptimum> {
+    use std::collections::HashMap;
+
     const INDEX_DEADLINE_STRIDE: usize = 256;
     const ROW_DEADLINE_STRIDE: usize = 64;
 
@@ -1114,7 +1145,7 @@ pub(crate) fn certify_model_basis_with_deadline(
     let n = model.num_cols();
     let m = model.num_rows();
     let cols = n.checked_add(m)?;
-    if m > MAX_EXACT_BASIS_ROWS || basis.len() != m || at.len() != cols || expired() {
+    if m > max_rows || basis.len() != m || at.len() != cols || expired() {
         return None;
     }
 
@@ -1200,7 +1231,10 @@ pub(crate) fn certify_model_basis_with_deadline(
     // Build B and `-N x_N` directly from the model's true matrix. The
     // computational matrix is M=[A|-I], so a nonbasic logical contributes its
     // value positively to the right-hand side.
-    let mut bmat = vec![vec![BigRational::zero(); m]; m];
+    // `B` by model row and `Bᵀ` by basis position are accumulated TOGETHER, so
+    // the transpose costs no second pass and no second `m x m` allocation.
+    let mut bmat: Vec<HashMap<usize, BigRational>> = vec![HashMap::new(); m];
+    let mut transpose: Vec<HashMap<usize, BigRational>> = vec![HashMap::new(); m];
     let mut rhs = vec![BigRational::zero(); m];
     for row in 0..m {
         if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
@@ -1213,36 +1247,45 @@ pub(crate) fn certify_model_basis_with_deadline(
             }
             let coefficient = model.row_coeff_exact(row, column, rounded);
             if let Some(position) = basis_position[column as usize] {
-                bmat[row][position] = coefficient;
+                // Insert, not add: a repeated entry overwrites exactly as the
+                // dense `bmat[row][position] = coefficient` it replaces did.
+                transpose[position].insert(row, coefficient.clone());
+                bmat[row].insert(position, coefficient);
             } else if !z[column as usize].is_zero() {
                 rhs[row] -= coefficient * &z[column as usize];
             }
         }
         let logical = n + row;
         if let Some(position) = basis_position[logical] {
-            bmat[row][position] = -BigRational::from_integer(1.into());
+            let minus_one = -BigRational::from_integer(1.into());
+            transpose[position].insert(row, minus_one.clone());
+            bmat[row].insert(position, minus_one);
         } else if !z[logical].is_zero() {
             rhs[row] += &z[logical];
         }
     }
-
-    // Solve both exact basis systems.  The float solution/duals are not read:
-    // only the combinatorial basis survives into this proof lane.
-    let mut transpose = vec![vec![BigRational::zero(); m]; m];
+    // AN EXACT ZERO IS NOT A NONZERO. The dense form carried zeros harmlessly;
+    // a sparse row must not, because `solve_sparse` reads its keys as the
+    // candidate pivot set and a zero pivot would divide by zero. A side-store
+    // coefficient whose rounded proxy is nonzero can be exactly zero (that is
+    // what `true_singular_basis_declines` is about), so this is load-bearing,
+    // and dropping it also keeps the Markowitz counts honest.
     for row in 0..m {
         if row.is_multiple_of(ROW_DEADLINE_STRIDE) && expired() {
             return None;
         }
-        for column in 0..m {
-            transpose[column][row] = bmat[row][column].clone();
-        }
+        bmat[row].retain(|_, value| !value.is_zero());
+        transpose[row].retain(|_, value| !value.is_zero());
     }
+
+    // Solve both exact basis systems.  The float solution/duals are not read:
+    // only the combinatorial basis survives into this proof lane.
     let basic_cost: Vec<BigRational> = basis
         .iter()
         .map(|&column| minimize_cost[column].clone())
         .collect();
-    let basic_values = solve_dense_by(bmat, rhs, deadline)?;
-    let row_duals = solve_dense_by(transpose, basic_cost, deadline)?;
+    let basic_values = solve_sparse(bmat, rhs, deadline)?;
+    let row_duals = solve_sparse(transpose, basic_cost, deadline)?;
     for (position, &column) in basis.iter().enumerate() {
         z[column] = basic_values[position].clone();
     }
@@ -1603,6 +1646,64 @@ mod true_model_basis_tests {
             Some(std::time::Instant::now()),
         )
         .is_none());
+    }
+
+    /// A covering LP above [`MAX_EXACT_BASIS_ROWS`]: the historical entry
+    /// declines on the cap alone, the capped entry certifies the same basis
+    /// exactly. This is all the all-continuous float-first lane needed — no
+    /// soundness check is skipped, only a cost guess that assumed a rim
+    /// fallback existed.
+    #[test]
+    fn a_caller_named_cap_admits_a_basis_the_default_cap_refuses() {
+        // min sum x_j  s.t.  x_j + x_{j+1} >= 1 (cyclically), 0 <= x_j <= 1.
+        // ODD length: an even cycle's circulant is singular, and a singular
+        // basis would decline for the wrong reason.
+        let m = MAX_EXACT_BASIS_ROWS + 9;
+        assert_eq!(m % 2, 1);
+        let mut model = Model::new();
+        let cols: Vec<Col> = (0..m).map(|_| model.add_col(0.0, 1.0)).collect();
+        for j in 0..m {
+            model.add_row(
+                1.0,
+                f64::INFINITY,
+                &[(cols[j], 1.0), (cols[(j + 1) % m], 1.0)],
+            );
+        }
+        let objective: Vec<(Col, f64)> = cols.iter().map(|&c| (c, 1.0)).collect();
+        model.set_objective(&objective, Sense::Minimize);
+        // x_j = 1/2 everywhere is the odd cycle's optimal vertex: every
+        // structural column is basic, every logical rests at its lower bound.
+        let basis: Vec<usize> = (0..m).collect();
+        let mut at = vec![NbBound::Lower; 2 * m];
+        for slot in at.iter_mut().take(m) {
+            *slot = NbBound::Zero; // basic: never read
+        }
+
+        assert!(
+            certify_model_basis_with_deadline(&model, &basis, &at, None).is_none(),
+            "the historical entry is capped at MAX_EXACT_BASIS_ROWS and must still decline"
+        );
+        let proven = certify_model_basis_within(&model, &basis, &at, None, m)
+            .expect("the same basis is exactly optimal");
+        assert_eq!(
+            proven.value,
+            BigRational::new((m as i64).into(), 2.into()),
+            "m columns at one half"
+        );
+        assert!(proven.cert.verify(&model).is_ok());
+    }
+
+    /// A cap of `m` admits an `m`-row model and a cap of `m - 1` does not: the
+    /// parameter is the only gate that moved.
+    #[test]
+    fn the_cap_parameter_is_the_only_gate_that_moved() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.set_objective(&[(x, 1.0)], Sense::Minimize);
+        model.add_row(0.0, f64::INFINITY, &[(x, 1.0)]);
+        let at = [NbBound::Lower, NbBound::Lower];
+        assert!(certify_model_basis_within(&model, &[1], &at, None, 1).is_some());
+        assert!(certify_model_basis_within(&model, &[1], &at, None, 0).is_none());
     }
 }
 

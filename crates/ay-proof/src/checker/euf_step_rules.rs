@@ -322,6 +322,7 @@ pub(crate) fn validate_cong(
     enum CongruenceHead {
         App(Symbol),
         Ite,
+        Not,
     }
     let application = |term| match terms.get(term) {
         TermData::App(sym, args) => Some((CongruenceHead::App(sym.clone()), args.clone())),
@@ -331,6 +332,12 @@ pub(crate) fn validate_cong(
             CongruenceHead::Ite,
             vec![*condition, *then_branch, *else_branch],
         )),
+        // `not` is likewise a dedicated TermData node rather than an App, and
+        // is an ordinary UNARY function for congruence: `a = b` entails
+        // `(not a) = (not b)`. Admitting it does not widen what `cong` proves
+        // — every argument pair is still discharged by a premise equality
+        // below, exactly as for App and Ite heads.
+        TermData::Not(inner) => Some((CongruenceHead::Not, vec![*inner])),
         _ => None,
     };
     let (f_sym, f_args) = match application(conc_lhs) {

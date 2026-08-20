@@ -215,16 +215,15 @@ impl TwoClubRuntime {
         }
         #[cfg(not(test))]
         {
+            // B74: carried by the typed switch set (`--pb-two-club-*`).
+            let switches = crate::ab_switches::get();
             Self {
-                max_nodes: std::env::var("TWO_CLUB_MAX_NODES")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(MAX_NODES),
+                max_nodes: switches.two_club_max_nodes.unwrap_or(MAX_NODES),
                 branch_rule: ViolatingBranchRule::from_selector(
-                    std::env::var_os("TWO_CLUB_BRANCH").as_deref(),
+                    switches.two_club_branch.map(std::ffi::OsStr::new),
                 ),
-                trace: std::env::var_os("TWO_CLUB_TRACE").is_some(),
-                dump_frontier: std::env::var_os("TWO_CLUB_DUMP_FRONTIER").is_some(),
+                trace: switches.two_club_trace,
+                dump_frontier: switches.two_club_dump_frontier,
                 // The certificate verifier is an explicit developer-tool
                 // dependency, not a process-global production solver knob.
                 sdp_worker: None,

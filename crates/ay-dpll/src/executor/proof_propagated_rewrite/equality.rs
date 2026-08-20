@@ -41,12 +41,27 @@ impl PropagationChainPlanner<'_> {
         // Direct substitution first (mirrors `rewrite`).
         if let Some(&(value, source, entry_stamp)) = cx.entry_by_expr.get(&t) {
             if entry_stamp <= stamp {
+                // A unit-propagation entry (#4751) is licensed by a bare unit
+                // asserting `t`'s COMPLEMENT, not by a defining equality
+                // `(= t false)`, so the source term is NOT the equality this
+                // arm's contract returns. Derive that equality explicitly;
+                // any other shape falls through to the unchanged path.
+                if let Some(res) = self.plan_unit_literal_false_eq(cx, t, value, source) {
+                    return Some(res);
+                }
+                // …and if that bridge does not apply, a `false`-valued entry
+                // whose source is not the `(= t false)` defining equality has
+                // NO license this arm can spell. Handing the source back as
+                // `eq_term` would emit an `equiv_pos` step over a non-equality
+                // — rejected by the strict checker, but better declined here.
+                // Inert for every equality-harvesting producer, whose sources
+                // are `(= expr value)` by construction.
+                if value == self.terms.false_term() && !self.is_defining_equality(source, t, value)
+                {
+                    return None;
+                }
                 let id = self.plan_derive_clause(cx, source)?;
-                return Some(EqRes::Changed {
-                    to: value,
-                    eq_term: source,
-                    id,
-                });
+                return self.plan_compose_entry_value(cx, t, value, source, id, stamp);
             }
         }
         match self.terms.get(t).clone() {
@@ -55,10 +70,39 @@ impl PropagationChainPlanner<'_> {
             TermData::Let(_, _) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {
                 Some(EqRes::Unchanged)
             }
-            // Slice 1 replays Not/Ite only when their children are untouched.
+            // A rewritten `not` child is replayed as a unary congruence
+            // (#4751). Declining here was the sole reason a substituted CHC
+            // transition relation could not be bridged back to its authored
+            // root, which demoted the assume to a premiseless `trust` and
+            // cost the whole refutation its strict presentation.
             TermData::Not(inner) => match self.plan_derive_eq(cx, inner, stamp)? {
                 EqRes::Unchanged => Some(EqRes::Unchanged),
-                EqRes::Changed { .. } => None,
+                EqRes::Changed { to, id, .. } => {
+                    cx.spend(1)?;
+                    let rebuilt = self.terms.mk_not(to);
+                    // `mk_not` may fold (double negation, a constant child).
+                    // The congruence conclusion is then NOT `(not to)`, so
+                    // this slice declines rather than emit a step the strict
+                    // checker would have to take on faith.
+                    match self.terms.get(rebuilt) {
+                        TermData::Not(rebuilt_inner) if *rebuilt_inner == to => {}
+                        _ => return None,
+                    }
+                    let eq_term = self
+                        .terms
+                        .mk_app(Symbol::named("="), [t, rebuilt], Sort::Bool);
+                    let cong_id = cx.chain.add_rule_step(
+                        AletheRule::Cong,
+                        vec![eq_term],
+                        vec![id],
+                        Vec::new(),
+                    );
+                    Some(EqRes::Changed {
+                        to: rebuilt,
+                        eq_term,
+                        id: cong_id,
+                    })
+                }
             },
             TermData::Ite(condition, then_branch, else_branch) => {
                 let unchanged = [condition, then_branch, else_branch].into_iter().try_fold(
@@ -74,6 +118,160 @@ impl PropagationChainPlanner<'_> {
             // Future TermData variants: fail the plan (fail-closed).
             _ => None,
         }
+    }
+
+    /// Compose an entry's replacement with the entries that license ITS
+    /// subterms (#4751 `_mod_q` class).
+    ///
+    /// `VariableSubstitution::substitute_term` applies the pass's map to
+    /// FIXPOINT, so a replacement can itself mention a substituted variable:
+    /// the CHC Euclidean decomposition `(= x (+ (* k q) r))` yields the entry
+    /// `x |-> (+ (* k q) r)` while the pass, seeing `r |-> 0` as well,
+    /// actually writes `(* k q)`. Returning the entry's replacement verbatim
+    /// therefore reconstructed a term the pass never produced, and the record
+    /// bridge declined on the mismatch — measured on `dillig12_m` as the
+    /// dominant decline (`to=(<= -1 (+ (+ (* _mod_q_0 2) _mod_r_1) -1))` for a
+    /// recorded `after=(<= -1 (+ (* _mod_q_0 2) -1))`).
+    ///
+    /// Replay the replacement and, when it changes, chain the two equalities
+    /// with `trans`. `trans` is validated by an UNDIRECTED path search
+    /// (`euf_step_rules::validate_trans`), so the licensing equality's
+    /// orientation — `(= t value)` or `(= value t)` — does not matter, but the
+    /// conclusion must still be the exact `(= t to)` node, which is verified
+    /// structurally because `mk_app` may fold. Any decline leaves the caller
+    /// with today's fail-closed behaviour.
+    fn plan_compose_entry_value(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        t: TermId,
+        value: TermId,
+        source: TermId,
+        source_id: ProofId,
+        stamp: u32,
+    ) -> Option<EqRes> {
+        let unchanged = || {
+            Some(EqRes::Changed {
+                to: value,
+                eq_term: source,
+                id: source_id,
+            })
+        };
+        // Every leg falls back to the UNCOMPOSED result, never to `None`:
+        // this arm must be purely additive, or a plan that succeeds today
+        // could start declining.
+        let Some(EqRes::Changed {
+            to, id: inner_id, ..
+        }) = self.plan_derive_eq(cx, value, stamp)
+        else {
+            return unchanged();
+        };
+        // A composed value that lands back on `t` (or on `value`) gives
+        // `trans` no two-edge path to validate.
+        if to == t || to == value {
+            return unchanged();
+        }
+        if cx.spend(1).is_none() {
+            return unchanged();
+        }
+        let final_eq = self.terms.mk_app(Symbol::named("="), [t, to], Sort::Bool);
+        match self.terms.get(final_eq) {
+            TermData::App(symbol, args) if symbol.name() == "=" && args.as_slice() == [t, to] => {}
+            _ => return unchanged(),
+        }
+        let final_id = cx.chain.add_rule_step(
+            AletheRule::Trans,
+            vec![final_eq],
+            vec![source_id, inner_id],
+            Vec::new(),
+        );
+        Some(EqRes::Changed {
+            to,
+            eq_term: final_eq,
+            id: final_id,
+        })
+    }
+
+    /// Whether `source` is spelled `(= expr value)` or `(= value expr)` — the
+    /// shape [`PropagateValues::extract_value_equality`] harvests entries
+    /// from, and therefore the shape the entry arm may return as its
+    /// `eq_term`.
+    fn is_defining_equality(&self, source: TermId, expr: TermId, value: TermId) -> bool {
+        match self.terms.get(source) {
+            TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2 => {
+                (args[0] == expr && args[1] == value) || (args[0] == value && args[1] == expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Derive `(cl (= t false))` from a unit asserting `t`'s complement
+    /// (#4751 — top-level unit propagation).
+    ///
+    /// `PropagateValues` harvests `expr ↦ value` from a defining EQUALITY, so
+    /// [`Self::plan_derive_eq_inner`] may hand that source term straight back
+    /// as the licensing equality. Unit propagation instead deletes a disjunct
+    /// `t` because a bare unit `u` asserting `t`'s complement is on the stack,
+    /// so the equality has to be BUILT:
+    ///
+    /// ```text
+    ///   (cl (= t false) t false)      :rule equiv_neg2
+    ///   (cl (= t false) false)        resolve with (cl u) on t's atom
+    ///   (cl (not false))              :rule false
+    ///   (cl (= t false))              resolve on false
+    /// ```
+    ///
+    /// Every step is re-derived by the UNTOUCHED strict checker, and the
+    /// licensing unit itself must be derivable from authored roots
+    /// (`plan_derive_clause`). Returns `None` — leaving the caller's existing
+    /// behaviour byte-identical — unless the value really is literal `false`
+    /// and `source` really is the literal complement of `t`.
+    fn plan_unit_literal_false_eq(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        t: TermId,
+        value: TermId,
+        source: TermId,
+    ) -> Option<EqRes> {
+        let false_term = self.terms.false_term();
+        if value != false_term || t == false_term || t == source {
+            return None;
+        }
+        let complementary = match self.terms.get(t) {
+            TermData::Not(inner) => *inner == source,
+            _ => matches!(self.terms.get(source), TermData::Not(inner) if *inner == t),
+        };
+        if !complementary {
+            return None;
+        }
+        cx.spend(4)?;
+        let source_id = self.plan_derive_clause(cx, source)?;
+        let eq_term = self
+            .terms
+            .mk_app(Symbol::named("="), [t, false_term], Sort::Bool);
+        let taut = cx.chain.add_rule_step(
+            AletheRule::EquivNeg2,
+            vec![eq_term, t, false_term],
+            Vec::new(),
+            Vec::new(),
+        );
+        let after_unit = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![eq_term, false_term],
+            vec![taut, source_id],
+            Vec::new(),
+        );
+        let false_taut = self.plan_false_taut(cx);
+        let id = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![eq_term],
+            vec![after_unit, false_taut],
+            Vec::new(),
+        );
+        Some(EqRes::Changed {
+            to: false_term,
+            eq_term,
+            id,
+        })
     }
 
     fn plan_derive_app_eq(
@@ -102,10 +300,10 @@ impl PropagationChainPlanner<'_> {
                 EqRes::Changed { to, .. } => *to,
             })
             .collect::<Vec<_>>();
-        let folded =
+        let mut folded =
             PropagateValues::fold_rebuild(self.terms, symbol.clone(), term, new_args.clone());
         // Mirror `rewrite`'s post-fold map lookup.
-        let tail = cx
+        let mut tail = cx
             .entry_by_expr
             .get(&folded)
             .copied()
@@ -113,8 +311,50 @@ impl PropagationChainPlanner<'_> {
         if tail.map_or(folded, |(value, _, _)| value) == term {
             return Some(EqRes::Unchanged);
         }
-        let (eq_term, id) =
-            self.plan_fold_bridge(cx, term, folded, &symbol, &args, &new_args, &child_results)?;
+        let mut bridge =
+            self.plan_fold_bridge(cx, term, folded, &symbol, &args, &new_args, &child_results);
+        if bridge.is_none() {
+            // Producer-model fallback (#4751). `fold_rebuild` models the
+            // `PropagateValues` pass, which rebuilds boolean connectives
+            // through `mk_and`/`mk_or` and therefore DROPS unit conjuncts:
+            // an 8-ary `and` whose two substituted atoms folded to `true`
+            // comes back 6-ary. `VariableSubstitution` rebuilds the same node
+            // structurally and keeps all 8, so the folding model cannot
+            // reconstruct the term that pass actually produced. Retry with
+            // the structural rebuild.
+            //
+            // This cannot admit anything: the retry only supplies a different
+            // CANDIDATE target, and it still has to be reached by a
+            // congruence whose every argument pair is discharged by a derived
+            // child equality, then still has to equal the recorded `after` at
+            // the bridge, then still has to survive the strict checker. A
+            // wrong candidate simply declines, exactly as before.
+            let sort = self.terms.sort(term).clone();
+            let structural = self.terms.mk_app(symbol.clone(), new_args.clone(), sort);
+            if structural != folded {
+                let retry_tail = cx
+                    .entry_by_expr
+                    .get(&structural)
+                    .copied()
+                    .filter(|&(_, _, entry_stamp)| entry_stamp <= stamp);
+                if retry_tail.map_or(structural, |(value, _, _)| value) != term {
+                    bridge = self.plan_fold_bridge(
+                        cx,
+                        term,
+                        structural,
+                        &symbol,
+                        &args,
+                        &new_args,
+                        &child_results,
+                    );
+                    if bridge.is_some() {
+                        folded = structural;
+                        tail = retry_tail;
+                    }
+                }
+            }
+        }
+        let (eq_term, id) = bridge?;
         let Some((value, source, _)) = tail else {
             return Some(EqRes::Changed {
                 to: folded,
@@ -163,9 +403,31 @@ impl PropagationChainPlanner<'_> {
                 child_results,
             ),
             FoldShape::Collapsing => self
-                .plan_collapsing_fold(cx, term, folded, symbol, args, new_args, child_results)
+                .plan_linear_identity_fold(cx, term, folded, symbol, args, new_args, child_results)
+                .or_else(|| {
+                    self.plan_collapsing_fold(
+                        cx,
+                        term,
+                        folded,
+                        symbol,
+                        args,
+                        new_args,
+                        child_results,
+                    )
+                })
                 .or_else(|| {
                     self.plan_bool_eq_const_fold(
+                        cx,
+                        term,
+                        folded,
+                        symbol,
+                        args,
+                        new_args,
+                        child_results,
+                    )
+                })
+                .or_else(|| {
+                    self.plan_arith_normalization_fold(
                         cx,
                         term,
                         folded,
@@ -294,6 +556,107 @@ impl PropagationChainPlanner<'_> {
         Some((term_to_folded, transitivity))
     }
 
+    /// Arithmetic-identity collapsing fold (#4751 `_mod_q` class).
+    ///
+    /// [`Self::plan_collapsing_fold`] closes a fold only when EVERY rebuilt
+    /// argument is a constant, because its bridge is a ground `evaluate`. The
+    /// substitution folds this class needs are not ground: replacing the
+    /// dividend of a Euclidean decomposition turns `(+ x -1)` into
+    /// `(+ (+ (* q 2) 0) -1)`, which the term store rebuilds as
+    /// `(+ (* q 2) -1)` — an ADDITIVE-IDENTITY/flattening fold over a term
+    /// that still mentions `q`.
+    ///
+    /// Bridge it with the checker's own linear-identity theorem:
+    ///
+    /// ```text
+    ///   cong             (= term rebuilt)     premises: the child equalities
+    ///   lia_generic      (= rebuilt folded)   LiaAnnotation::LinearIdentity
+    ///   trans            (= term folded)
+    /// ```
+    ///
+    /// SOUNDNESS. The middle step is admitted ONLY when
+    /// `ay_core::proof_validation::recognize_lia_linear_identity` accepts it,
+    /// which is the exact inverse of the `validate_linear_identity` the strict
+    /// checker runs: `rebuilt - folded` must reduce to the identically-zero
+    /// INTEGER linear form, so the equality holds in every model. A nonlinear
+    /// or Real-tainted subterm only PREVENTS recognition (the normalizer
+    /// treats it as an opaque atom and any residual coefficient fails the
+    /// zero test), so this can never accept a non-identity. `cong` and `trans`
+    /// are unchanged rules with every premise discharged, and the whole chain
+    /// is replayed by the UNTOUCHED strict checker before the proof is
+    /// accepted. Every guard below fails CLOSED to today's demotion.
+    fn plan_linear_identity_fold(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        term: TermId,
+        folded: TermId,
+        symbol: &Symbol,
+        args: &[TermId],
+        new_args: &[TermId],
+        child_results: &[EqRes],
+    ) -> Option<(TermId, ProofId)> {
+        let sort = self.terms.sort(term).clone();
+        if !matches!(sort, Sort::Int) || !matches!(self.terms.sort(folded), Sort::Int) {
+            return None;
+        }
+        cx.spend(2)?;
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, sort);
+        if rebuilt == term || rebuilt == folded {
+            return None;
+        }
+        // `mk_app` may normalize; the congruence conclusion must name the
+        // node the premises actually build.
+        match self.terms.get(rebuilt) {
+            TermData::App(rebuilt_symbol, rebuilt_args)
+                if rebuilt_symbol == symbol && rebuilt_args.as_slice() == new_args => {}
+            _ => return None,
+        }
+        let identity = self
+            .terms
+            .mk_app(Symbol::named("="), [rebuilt, folded], Sort::Bool);
+        match self.terms.get(identity) {
+            TermData::App(identity_symbol, identity_args)
+                if identity_symbol.name() == "="
+                    && identity_args.as_slice() == [rebuilt, folded] => {}
+            _ => return None,
+        }
+        if !ay_core::proof_validation::recognize_lia_linear_identity(self.terms, &[identity]) {
+            return None;
+        }
+        let premises = Self::congruence_premises(args, child_results, new_args)?;
+        let term_to_rebuilt = self
+            .terms
+            .mk_app(Symbol::named("="), [term, rebuilt], Sort::Bool);
+        let congruence = cx.chain.add_rule_step(
+            AletheRule::Cong,
+            vec![term_to_rebuilt],
+            premises,
+            Vec::new(),
+        );
+        let lemma = cx.chain.add_step(ProofStep::TheoryLemma {
+            theory: "LIA".to_string(),
+            clause: vec![identity],
+            // The strict checker validates through the `LinearIdentity`
+            // annotation; the Alethe printer additionally wants one Farkas
+            // coefficient per literal to render `lia_generic` (#8821).
+            farkas: Some(ay_core::FarkasAnnotation::new(vec![
+                num_rational::Rational64::from(1),
+            ])),
+            kind: TheoryLemmaKind::LiaGeneric,
+            lia: Some(ay_core::LiaAnnotation::LinearIdentity),
+        });
+        let term_to_folded = self
+            .terms
+            .mk_app(Symbol::named("="), [term, folded], Sort::Bool);
+        let transitivity = cx.chain.add_rule_step(
+            AletheRule::Trans,
+            vec![term_to_folded],
+            vec![congruence, lemma],
+            Vec::new(),
+        );
+        Some((term_to_folded, transitivity))
+    }
+
     fn plan_collapsing_fold(
         &mut self,
         cx: &mut PlanCx<'_>,
@@ -417,6 +780,108 @@ impl PropagationChainPlanner<'_> {
             Vec::new(),
         );
         Some((term_to_folded, transitivity))
+    }
+
+    /// Arithmetic-normalization bridge (#4751).
+    ///
+    /// `VariableSubstitution` rebuilds arithmetic nodes through the CANONICAL
+    /// constructors (`mk_add`/`mk_sub`/`mk_mul`), which re-associate,
+    /// distribute and collect like terms. Congruence alone reaches only the
+    /// RAW rebuild, so the two spellings diverge and the chain cannot reach
+    /// the recorded `after`. Measured on the dillig12_m CHC benchmark:
+    /// substituting `A := B` in `(+ A B)` gives raw `(+ B B)` where the pass
+    /// stores `(* B 2)`, and `C := (+ A 2)` in `(* C -2)` gives raw
+    /// `(* (+ A 2) -2)` where the pass stores `(+ (* A -2) -4)`.
+    ///
+    /// Neither shape is expressible as substitution-plus-constant-fold, so
+    /// this slice bridges the two spellings with ONE rule the strict checker
+    /// ALREADY validates independently: an `LraFarkas` theory lemma
+    /// `(cl (= raw canonical))` carrying the unit coefficient. The checker's
+    /// Farkas validator linearizes both sides ITSELF and accepts only when
+    /// the single disequality row cancels to a contradiction in both
+    /// orientations - that is, only when the two terms are the SAME linear
+    /// polynomial. It rejects `(= (+ B B) (* B 3))`, `(= (+ B C) (* B 2))`
+    /// and every non-linear pair, so no identity is taken on trust and no
+    /// checker rule is added or widened.
+    ///
+    /// Fail-closed: the SAME public validator runs at PLAN time on the exact
+    /// literal about to be emitted, so a pair the checker would reject
+    /// declines here and the assume keeps today's demotion behaviour rather
+    /// than splicing a step that would fail the whole presentation.
+    fn plan_arith_normalization_fold(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        term: TermId,
+        folded: TermId,
+        symbol: &Symbol,
+        args: &[TermId],
+        new_args: &[TermId],
+        child_results: &[EqRes],
+    ) -> Option<(TermId, ProofId)> {
+        // Only the arithmetic constructors renormalize; every other head
+        // rebuilds structurally and is already covered by the shape arms.
+        if !matches!(symbol.name(), "+" | "-" | "*") {
+            return None;
+        }
+        let sort = self.terms.sort(term).clone();
+        if !matches!(sort, Sort::Int | Sort::Real) {
+            return None;
+        }
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, sort.clone());
+        if rebuilt == term || rebuilt == folded {
+            return None;
+        }
+        let premises = Self::congruence_premises(args, child_results, new_args)?;
+        let rebuilt_to_folded =
+            self.terms
+                .mk_app(Symbol::named("="), [rebuilt, folded], Sort::Bool);
+        if !Self::linear_identity_holds(self.terms, rebuilt_to_folded) {
+            return None;
+        }
+        cx.spend(3)?;
+        let term_to_rebuilt = self
+            .terms
+            .mk_app(Symbol::named("="), [term, rebuilt], Sort::Bool);
+        let congruence = cx.chain.add_rule_step(
+            AletheRule::Cong,
+            vec![term_to_rebuilt],
+            premises,
+            Vec::new(),
+        );
+        let theory = if sort == Sort::Int { "LIA" } else { "LRA" };
+        let normalization = cx.chain.add_theory_lemma_with_farkas_and_kind(
+            theory,
+            vec![rebuilt_to_folded],
+            ay_core::FarkasAnnotation::from_ints(&[1]),
+            TheoryLemmaKind::LraFarkas,
+        );
+        let term_to_folded = self
+            .terms
+            .mk_app(Symbol::named("="), [term, folded], Sort::Bool);
+        let transitivity = cx.chain.add_rule_step(
+            AletheRule::Trans,
+            vec![term_to_folded],
+            vec![congruence, normalization],
+            Vec::new(),
+        );
+        Some((term_to_folded, transitivity))
+    }
+
+    /// Whether the strict checker's own Farkas validator proves the unit
+    /// clause `(cl equality)` from the unit coefficient - i.e. whether the
+    /// equality's two sides are the same linear polynomial.
+    ///
+    /// This is the EXACT call `lra_farkas`'s strict validator makes for a
+    /// single-disequality row (`verify_farkas_conflict_lits_full`), so a plan
+    /// accepted here is accepted there and a plan rejected here would have
+    /// been rejected there.
+    pub(super) fn linear_identity_holds(terms: &TermStore, equality: TermId) -> bool {
+        ay_core::proof_validation::verify_farkas_conflict_lits_full(
+            terms,
+            &[ay_core::TheoryLit::new(equality, false)],
+            &ay_core::FarkasAnnotation::from_ints(&[1]),
+        )
+        .is_ok()
     }
 
     /// `(cl (= R folded))` where `R` is the raw spelling `(= x true|false)`

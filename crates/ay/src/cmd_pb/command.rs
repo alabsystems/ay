@@ -46,6 +46,18 @@ pub(crate) struct PbAbSwitchesCli {
     /// omit for the auto default (B57).
     #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
     pb_parallel: Option<u16>,
+    /// Two-club node cap override (B74).
+    #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
+    pb_two_club_max_nodes: Option<u64>,
+    /// Two-club branch-rule selector (B74).
+    #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
+    pb_two_club_branch: Option<String>,
+    /// Two-club search tracing (B74).
+    #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
+    pb_two_club_trace: bool,
+    /// Two-club frontier dump (B74).
+    #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
+    pb_two_club_dump_frontier: bool,
 }
 
 impl PbAbSwitchesCli {
@@ -68,6 +80,13 @@ impl PbAbSwitchesCli {
             symmetry_arm: !self.no_pb_symmetry_arm,
             wcsp_edac: self.pb_wcsp_edac,
             parallel_workers: self.pb_parallel,
+            two_club_max_nodes: self.pb_two_club_max_nodes,
+            two_club_branch: self
+                .pb_two_club_branch
+                .clone()
+                .map(|s| &*Box::leak(s.into_boxed_str())),
+            two_club_trace: self.pb_two_club_trace,
+            two_club_dump_frontier: self.pb_two_club_dump_frontier,
         }
     }
 }
@@ -187,6 +206,10 @@ mod tests {
                 symmetry_arm: false,
                 wcsp_edac: false,
                 parallel_workers: None,
+                two_club_max_nodes: None,
+                two_club_branch: None,
+                two_club_trace: false,
+                two_club_dump_frontier: false,
             }
         );
     }

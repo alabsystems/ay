@@ -1467,6 +1467,45 @@ enum SemanticChargeClass {
     /// the whole envelope for a step that performs a few hundred integer
     /// comparisons.
     UnorderedClauseMatch,
+    /// A TRUST-KIND theory lemma (`TheoryLemmaKind::is_trust()`, today exactly
+    /// `Generic`), whose strict route has NO unmodelled cost at all.
+    ///
+    /// The route is, in order:
+    ///
+    ///  1. `nia_linear_ideal::validate_linear_ideal_refutation_with_progress`,
+    ///     which builds its `WorkMeter` with `with_progress(progress)` and
+    ///     debits every rational op, monomial, DAG node and container slot
+    ///     through THIS SAME callback — and is additionally capped by that
+    ///     meter's own `MAX_BIGRATIONAL_OPS` / `MAX_TOTAL_MONOMIALS` /
+    ///     `MAX_DAG_NODES`, so it fails closed on its own;
+    ///  2. otherwise an O(clause_len) clone into the deferred-trust collector,
+    ///     or an O(1) `UnsupportedTheoryLemmaKind` rejection.
+    ///
+    /// `private_validator_charge` already says this — it returns `(0, 0)` for
+    /// `Generic` with the note that the validator "debits its actual rational,
+    /// DAG, and worst-case structural monomial work through the borrowed
+    /// progress callback". But `semantic_validator_charge` then takes
+    /// `base_work.max(private.0)`, so the `General` `work * unfolded_work`
+    /// product was applied anyway and the `(0, 0)` had no effect.
+    ///
+    /// That double-charge is a live verdict loss, not a theoretical one.
+    /// Measured on `array_interface_read_prune::forced_equal_read_distinct_
+    /// arrays_remain_unsat` (QF_AX, 48 arrays read at one shared index): ONE
+    /// `Generic` lemma with `payload(work = 47_284, unfolded_work = 9_030)`
+    /// precharges `47_284 * 9_030 = 426_974_520` against a 350_000_000
+    /// envelope — 1.22x the WHOLE envelope in a single charge, with 80_628
+    /// consumed. The strict check therefore returned `ResourceLimit`, which is
+    /// NOT a trust-kind rejection, so `discharge_trust_steps_for_certification`
+    /// was never entered and a correct `unsat` published as `unknown`. With the
+    /// charge modelled, the same proof reaches the funnel as
+    /// `UnsupportedTheoryLemmaKind { Generic }` and the deferred-trust lane
+    /// discharges it.
+    ///
+    /// Note the payload shape: `work` (47_284 DAG nodes) EXCEEDS
+    /// `unfolded_work` (9_030) here, so this is not even the usual
+    /// sharing-squared story — the product is simply unrelated to anything the
+    /// validator does.
+    TrustKindProgressMetered,
 }
 
 /// Constant factor over the array clause schemas' quadratic term.
@@ -1828,11 +1867,16 @@ fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> Semantic
     if matches!(
         step,
         ProofStep::Step {
-            rule: AletheRule::Or,
+            rule: AletheRule::Or | AletheRule::OrPos(_),
             ..
         }
     ) {
         return SemanticChargeClass::UnorderedClauseMatch;
+    }
+    // Placed LAST so every kind with its own modelled route above keeps it;
+    // only the trust-kind fallthrough reaches here.
+    if matches!(step, ProofStep::TheoryLemma { kind, .. } if kind.is_trust()) {
+        return SemanticChargeClass::TrustKindProgressMetered;
     }
     SemanticChargeClass::General
 }
@@ -1892,6 +1936,23 @@ fn strict_semantic_charge(
             ..
         }
     ) {
+        Ok((0, 0))
+    } else if matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::Hole | AletheRule::Trust,
+            ..
+        }
+    ) {
+        // A hole/trust step has NO semantic validator to reserve for: the
+        // strict checker rejects it in O(1) with the typed
+        // `HoleStep`/`TrustStep` refusal, and the non-strict lanes skip it.
+        // Billing the General tree-unfolded estimate here charged a single
+        // 1000-literal hole 285M+ work — exhausting the whole envelope and
+        // masking the TYPED refusal (`ResourceLimit` instead of `HoleStep`),
+        // which starves every downstream repair lane keyed on that reason.
+        // The structural per-step charge in `strict_step_charge` still
+        // applies, so an adversarial million-hole document remains bounded.
         Ok((0, 0))
     } else {
         semantic_validator_charge(step, semantic_payload, semantic_class)

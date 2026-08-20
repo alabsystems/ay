@@ -141,6 +141,7 @@ impl Knob {
                 Self::AutoMargin => "auto-margin",
                 Self::ImplLane => "impl-lane",
                 Self::ImplArm => "impl-arm",
+                Self::DroughtDive => "drought-dive",
                 Self::PropConflict => "prop-conflict",
                 Self::LbConflict => "lb-conflict",
                 Self::LbArm => "lb-arm",
@@ -251,7 +252,7 @@ impl Knob {
         }
     }
 
-    pub(super) const ALL: [Knob; 224] = [
+    pub(super) const ALL: [Knob; 225] = [
         Self::GmiRounds,
         Self::RootCutsPerRound,
         Self::RootProbe,
@@ -403,6 +404,7 @@ impl Knob {
         Self::AutoMargin,
         Self::ImplLane,
         Self::ImplArm,
+        Self::DroughtDive,
         Self::PropConflict,
         Self::LbConflict,
         Self::LbArm,

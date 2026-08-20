@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use crate::kani_compat::{det_hash_set_new, det_hash_set_with_capacity, DetHashSet};
 
 mod sat_ab_switches;
+#[doc(hidden)]
+pub use sat_ab_switches::consumer_test_override as sat_ab_test_override;
 pub use sat_ab_switches::{sat_ab_switches, set_global_sat_ab_switches, SatAbSwitches};
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1131,12 @@ pub struct MiscCliFlags {
     pub no_quant_unit_authority: bool,
     /// `--no-consequence-replay` — disable authored consequence replay (B66).
     pub no_consequence_replay: bool,
+    /// `--no-ground-conflict-decomp` — disable the ground-conflict
+    /// decomposition arms of the proof builder (#ground-conflict-decomp):
+    /// the EUF-chain + Farkas-bridge split, and the array read-over-write
+    /// chain-under-equality split. UNSAT-only producer surgery; disabling
+    /// restores the baseline Generic/trust lemmas byte-for-byte.
+    pub no_ground_conflict_decomp: bool,
     /// `--vacuous-marker-narrow` — staged marker narrowing (B66).
     pub vacuous_marker_narrow: bool,
     /// `--proj-axiom-budget <n>` — projection axiom cap (default 50000; B66).
@@ -1239,6 +1247,48 @@ pub struct MiscCliFlags {
     /// `--no-skolem-witness-sat` — kill switch for the skolem-witness SAT
     /// confirmation arm in quantifier restore (#skolem-witness-sat).
     pub no_skolem_witness_sat: bool,
+    /// `--no-singleton-carrier-mint` — kill switch for the empty-universe
+    /// singleton carrier mint in the EPR singleton SAT chain
+    /// (#eu-carrier-mint).
+    pub no_singleton_carrier_mint: bool,
+    /// `--lra-float-layer` (B73): opt in to the LRA float pre-solve layer.
+    pub lra_float_layer: bool,
+    /// `--str-nf` (B73): string-theory normal-form debug gate.
+    pub str_nf: bool,
+    /// `--debug-euf-init` (B73): EUF e-graph construction tracing.
+    pub debug_euf_init: bool,
+    /// `--euf-cong-undo-debug` (B73): EUF congruence-undo tracing.
+    pub euf_cong_undo_debug: bool,
+    /// `--euf-diseq-undo-debug` (B73): EUF disequality-undo tracing.
+    pub euf_diseq_undo_debug: bool,
+    /// `--probe-prescreen` (B73): arm the LIA probe batch prescreen.
+    pub probe_prescreen: bool,
+    /// `--lia-probe-qx` (B73): probe minimization mode
+    /// (`quickxplain` | `gallop`; default scan).
+    pub lia_probe_qx: Option<String>,
+    /// `--probe-stats` (B73): LIA probe statistics to stderr.
+    pub probe_stats: bool,
+    /// `--debug-fixed-eqs` (B73): LIA fixed-equality tracing.
+    pub debug_fixed_eqs: bool,
+    /// `--algebraic-stats` (B73): Nelson-Oppen algebraic statistics.
+    pub algebraic_stats: bool,
+    /// `--debug-arr-extract` (B73): array model extraction tracing.
+    pub debug_arr_extract: bool,
+    /// `--weq5-shadow-dump` (B73): weak-equivalence shadow differential dump.
+    pub weq5_shadow_dump: bool,
+    /// `--ic3-lane-debug` (B74): TRUST ic3-lane stderr tracing.
+    pub ic3_lane_debug: bool,
+    /// `--ic3-lane-dump` (B74): append ic3-lane traffic to this path.
+    pub ic3_lane_dump: Option<String>,
+    /// `--ic3-lane-noslice` (B74): disable the COI slice (A/B; slice is sound).
+    pub ic3_lane_noslice: bool,
+    /// `--reve-debug` (B74): REVE invariant-sampling stderr tracing.
+    pub reve_debug: bool,
+    /// `--max-propagate-rounds` (B74): research override for the extension
+    /// propagate spin guard (default 50M; a genuine solve never reaches it).
+    pub max_propagate_rounds: Option<u64>,
+    /// `--lra-cond-trail` (B75): experimental LRA conditional bound trail.
+    pub lra_cond_trail: bool,
 }
 
 /// Global miscellaneous CLI flags, initialized once per process.
@@ -1286,10 +1336,9 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         chc_checked_replay_secs: None,
         xor_allow_large: false,
         xor_allow_residual: false,
-        // Diagnostic trace, not an A/B lane: keeps its env read like
-        // AY_DUMP_*/AY_TRACE_* — the development design notes direct users to AY_PHASE_TRACE=1
-        // for the certification funnel's decline reasons.
-        phase_trace: std::env::var_os("AY_PHASE_TRACE").is_some(),
+        // B74: --phase-trace is the carrier; the env fallback (added against
+        // a family pattern B72 deleted) is retired with the rest of it.
+        phase_trace: false,
         debug_cert: false,
         debug_qmg: false,
         model_reject_dump: false,
@@ -1340,7 +1389,8 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         lia_instrument: false,
         probe_stats_every: None,
         str_nf_closures: None,
-        trace_cegqi_attr: std::env::var_os("AY_TRACE_CEGQI_ATTR").is_some(),
+        // B74: --trace-cegqi-attr is the carrier; env fallback retired.
+        trace_cegqi_attr: false,
         debug_read_pin: false,
         f1_diag: false,
         census_trace: false,
@@ -1366,11 +1416,9 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         qfax_combiner_route: false,
         qfax_cegar: false,
         qfax_lanes_debug: false,
-        // Diagnostic probe, not an A/B lane: keeps its env read like the
-        // AY_DUMP_*/AY_TRACE_* family. The strict-check meter's own docs
-        // direct users to AY_PROBE_STRICT_CHECK for the refusing limb's
-        // numbers; without this read the probe is unreachable from a test run.
-        probe_strict_check: std::env::var_os("AY_PROBE_STRICT_CHECK").is_some(),
+        // B74: --probe-strict-check is the carrier; env fallback retired
+        // (test runs install the typed carrier via `misc_test_override`).
+        probe_strict_check: false,
         probe_cert_reject: false,
         uflia_witness_debug: false,
         pb_sym_debug: false,
@@ -1385,6 +1433,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         keep_alethe_artifacts: false,
         no_quant_unit_authority: false,
         no_consequence_replay: false,
+        no_ground_conflict_decomp: false,
         vacuous_marker_narrow: false,
         proj_axiom_budget: None,
         uflia_witness_complete: false,
@@ -1440,6 +1489,28 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         // B72: --uflia-arith-decisions is the carrier; no env fallback.
         uflia_arith_decisions: false,
         no_skolem_witness_sat: false,
+        no_singleton_carrier_mint: false,
+        // B73: the theory-crate diagnostics are CLI-carried; no env fallbacks.
+        lra_float_layer: false,
+        str_nf: false,
+        debug_euf_init: false,
+        euf_cong_undo_debug: false,
+        euf_diseq_undo_debug: false,
+        probe_prescreen: false,
+        lia_probe_qx: None,
+        probe_stats: false,
+        debug_fixed_eqs: false,
+        algebraic_stats: false,
+        debug_arr_extract: false,
+        weq5_shadow_dump: false,
+        // B74: the chc/dpll research diagnostics are CLI-carried.
+        ic3_lane_debug: false,
+        ic3_lane_dump: None,
+        ic3_lane_noslice: false,
+        reve_debug: false,
+        max_propagate_rounds: None,
+        // B75: --lra-cond-trail is the carrier; no env fallback.
+        lra_cond_trail: false,
     }
 }
 
@@ -1494,12 +1565,94 @@ pub fn set_global_misc_cli_flags(flags: MiscCliFlags) -> Result<(), MiscCliFlags
     GLOBAL_MISC_CLI_FLAGS.set(flags)
 }
 
+/// The flag set [`misc_cli_flags`] would install on first use, with `configure`
+/// applied on top. Pure: installs nothing.
+///
+/// This exists because `MiscCliFlags` has ~120 fields and no `Default`, so a
+/// consumer outside this crate cannot in practice build one to hand to
+/// [`set_global_misc_cli_flags`] — the setter was public but unusable.
+#[must_use]
+pub fn misc_cli_flags_with(configure: impl FnOnce(&mut MiscCliFlags)) -> MiscCliFlags {
+    let mut flags = init_misc_cli_flags_from_env();
+    configure(&mut flags);
+    flags
+}
+
+/// Install a diagnostic configuration process-wide from a Rust-API consumer.
+///
+/// # Why this exists (the measurement gap)
+///
+/// The diagnostic carriers — `probe_cert_reject`, `phase_trace`, `debug_cert`,
+/// `trace_cegqi_attr`, the `--f1-diag` family — were migrated to typed
+/// `MiscCliFlags` and `init_misc_cli_flags_from_env` deliberately keeps no
+/// `AY_*` fallback for them. That is right for a CLI, and it is not to be
+/// undone by re-adding an environment read.
+///
+/// But it left every *library* consumer with no supported way to turn a channel
+/// on at all:
+///
+///  * the Rust API and the integration-test binaries never parse a CLI, so a
+///    strict-certification refusal records its reason and is never printed;
+///  * downstream embedders (`deductive-checks`) surface only the opaque
+///    `(incomplete self-check-rejected)` reason code and cannot ask which gate
+///    refused, or on which Alethe rule/step/clause;
+///  * the only seam was [`misc_test_override`], which is **thread-local** — it
+///    cannot instrument a solve that runs on a worker thread, and cannot be
+///    applied to a whole test binary.
+///
+/// This is that seam: process-wide, typed, no environment variable, and
+/// therefore no new entry in the exact-set environment-flag audit.
+///
+/// # Authority
+///
+/// Exactly [`set_global_misc_cli_flags`]'s — no more, no less. It is *not*
+/// restricted to diagnostic fields, because `MiscCliFlags` draws no such line;
+/// callers get the same first-writer-wins global the CLI writes. Returns
+/// `false` if the flags were already initialized (the CLI already parsed its
+/// arguments, or an earlier caller installed a set, or something already called
+/// [`misc_cli_flags`]), in which case nothing was changed.
+pub fn set_global_misc_cli_flags_with(configure: impl FnOnce(&mut MiscCliFlags)) -> bool {
+    set_global_misc_cli_flags(misc_cli_flags_with(configure)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
 
     include!("debug_channel/tests.rs");
+
+    /// The consumer-facing half of the measurement gap: a Rust-API caller can
+    /// name a diagnostic channel without naming all ~120 `MiscCliFlags` fields,
+    /// and building the value installs nothing.
+    #[test]
+    fn misc_cli_flags_with_applies_configuration_and_installs_nothing() {
+        let base = misc_cli_flags_with(|_| {});
+        assert!(
+            !base.probe_cert_reject && !base.phase_trace && !base.debug_cert,
+            "no AY_* fallback may resurrect a retired diagnostic carrier"
+        );
+
+        let tuned = misc_cli_flags_with(|flags| {
+            flags.probe_cert_reject = true;
+            flags.phase_trace = true;
+        });
+        assert!(tuned.probe_cert_reject, "configure must be applied");
+        assert!(tuned.phase_trace, "configure must be applied");
+        assert!(
+            !tuned.debug_cert,
+            "configure must not disturb the fields it did not name"
+        );
+
+        // Purity: building a value must not initialize (or mutate) the global.
+        let before = misc_cli_flags().probe_cert_reject;
+        let _ = misc_cli_flags_with(|flags| flags.probe_cert_reject = true);
+        assert_eq!(
+            misc_cli_flags().probe_cert_reject,
+            before,
+            "misc_cli_flags_with must be pure"
+        );
+    }
 
     #[test]
     #[serial(trace_file_claim)]

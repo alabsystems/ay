@@ -86,6 +86,12 @@ mod array_ext_shadow;
 pub(crate) use array_ext_shadow::ArrayExtShadow;
 mod assumption_solving;
 mod bv_mbqi;
+mod cert_accounting;
+// Re-exported at the crate root as `ay_dpll::CertificationAccounting` so a
+// benchmark harness or CI gate outside this crate can read the counters
+// without `--stats` plumbing. Read-only: the type exposes totals and a
+// diagnostic reset, and nothing in the solver consults it.
+pub use cert_accounting::CertificationAccounting;
 mod check_sat;
 mod check_sat_assuming;
 mod commands;
@@ -95,6 +101,7 @@ pub(crate) mod dl_theory;
 mod dt_axioms;
 mod exact_exists_bounds;
 mod exact_forall_exists;
+mod finite_model_mbqi;
 pub(crate) mod ite_lift;
 pub(crate) mod lean_firewall;
 pub(crate) mod lemma_cache;
@@ -124,6 +131,8 @@ mod qe_prepass;
 mod quantified_sat;
 mod quantifier_loop;
 mod query_authority;
+mod query_role;
+pub(crate) use query_role::QueryPublicationRole;
 mod query_state;
 mod rewrite_const_array_reads;
 mod rm_domain;
@@ -142,9 +151,9 @@ pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
 pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
 pub(crate) use query_state::{
     BvMbqiFalseInstanceRecord, EmatchingProofRecord, FiniteArrayCachedAxiom,
-    FiniteArrayExpansionLedger, FiniteEnumPigeonholeWitness, PrepassReachability,
-    QpfPremiseForcedInstanceRecord, QuantExpansionRecord, SkolemInstanceRecord,
-    SkolemWitnessRecord,
+    FiniteArrayExpansionLedger, FiniteEnumPigeonholeWitness, GroundConflictDecompMeters,
+    PrepassReachability, QpfPremiseForcedInstanceRecord, QuantExpansionRecord,
+    SkolemInstanceRecord, SkolemWitnessRecord,
 };
 pub(crate) use solve_deadline::SolveDeadlineCell;
 pub(crate) use unsat_cert::UnsatCertificate;
@@ -205,7 +214,7 @@ pub struct Executor {
     /// Origin canary for query-authority unit tests.
     #[cfg(test)]
     pub(in crate::executor) last_authored_query_authority_seen: bool,
-    /// Strings NF-engine closure 5 (`AY_STR_NF=1`) bookkeeping: whether EVERY
+    /// Strings NF-engine closure 5 (`--str-nf`) bookkeeping: whether EVERY
     /// string lemma lowered into the SAT solver during the current solve was
     /// of a UNIVERSALLY VALID kind (exact extended-function reduction axioms
     /// over fresh cached skolems, or tautological splits `p ∨ ¬p`).
@@ -576,6 +585,24 @@ pub struct Executor {
     /// check-sat-assuming / reset, and saved+restored across both nested-solve
     /// rollbacks so no record outlives a rolled-back speculative window.
     pub(crate) bv_mbqi_false_instance_records: Vec<BvMbqiFalseInstanceRecord>,
+    /// Generic-MBQI falsifying-instance provenance
+    /// (#mbqi-instance-provenance). Written ONLY at `try_mbqi_refinement`'s
+    /// ground re-solve UNSAT return, with the exact (source quantifier,
+    /// positional binder values, folded instance) triples accumulated across
+    /// the refinement rounds of that one call. Records are HINTS with no
+    /// authority: the consequence-replay consumer re-derives the exact
+    /// structural instance (`exact_forall_instance`) and the strict
+    /// `forall_inst` validator re-replays the substitution on the stitched
+    /// candidate, so a wrong record can only decline a translation. Consumed
+    /// (taken) immediately by `try_skipped_quantifier_mbqi_refinement`;
+    /// cleared per check-sat alongside `ematching_proof_records`.
+    pub(crate) mbqi_refinement_instance_records:
+        Vec<crate::ematching::ForallInstantiationProvenance>,
+    /// Exact meters for the ground-conflict decomposition arms
+    /// (#ground-conflict-decomp), published into `last_statistics` by
+    /// `publish_strict_check_counters` (`--stats`). Cumulative within this
+    /// executor.
+    pub(crate) ground_conflict_decomp_meters: GroundConflictDecompMeters,
     /// qpf premise-forced instance provenance (#ppp-c7, L2). Recorded at the
     /// exact re-solve push site in `premise_forced_binder_refutation`.
     /// Lifecycle mirrors `bv_mbqi_false_instance_records` exactly: cleared
@@ -630,6 +657,24 @@ pub struct Executor {
     /// bound labelled "submitted", not a claim every step was individually
     /// accepted). Dumped as `proof.strict_check_steps_validated`.
     pub(in crate::executor) strict_check_steps_validated: Cell<u64>,
+    /// #cert-accounting item 3: the DECLARED consumer of the decision query
+    /// currently executing on this executor.
+    ///
+    /// Set only by the typed `execute_internal_lemma`/`execute_all_internal_lemma`
+    /// entrypoints, which save and restore the previous value around the call,
+    /// so the declaration is scoped to exactly the command the caller declared
+    /// it for. Unreachable from parsed SMT-LIB text.
+    ///
+    /// READ BY EXACTLY ONE CONSUMER: `cert_accounting`. It selects no lane,
+    /// relaxes no gate, and changes no verdict — see `query_role.rs` for why
+    /// the declaration deliberately lands ahead of any policy that keys on it.
+    /// `Cell` because the accounting hooks run under `&self`.
+    pub(in crate::executor) query_publication_role: Cell<QueryPublicationRole>,
+    /// Re-entrancy depth of command-boundary decision commands on THIS
+    /// executor, so `cert_accounting`'s wall-clock decision timer measures the
+    /// outermost command once instead of summing nested probe solves into it.
+    /// Diagnostic bookkeeping only.
+    pub(in crate::executor) decision_command_depth: Cell<u32>,
     /// Reason for last Unknown result (for get-info :reason-unknown)
     last_unknown_reason: Option<UnknownReason>,
     /// The quantifier classification ended `Unknown` at the MBQI-UNSAFE PARTIAL
@@ -1832,6 +1877,51 @@ impl Executor {
         })
     }
 
+    /// Execute one command whose verdict this caller consumes ONLY as internal
+    /// search guidance — the caller's own published claim is certified by
+    /// separate obligations it re-derives itself.
+    ///
+    /// # This does not weaken certification
+    ///
+    /// The command runs through [`Self::execute`]'s exact routing, boundary,
+    /// gates, and publication funnel: an UNSAT returned here carries the same
+    /// mandatory certification as one returned by [`Self::execute`], and the
+    /// bytes of the verdict are identical. The declaration is consumed by the
+    /// certification COST ACCOUNTING (`cert_accounting`) and by nothing else,
+    /// so this entrypoint currently buys attribution, not speed.
+    ///
+    /// It is a typed method rather than a `Command` or a `(set-option ...)`
+    /// deliberately: a role reachable from parsed text would let a user's own
+    /// `.smt2` file label its top-level `(check-sat)` as internal. That is
+    /// irrelevant while the role only counts, and load-bearing the moment any
+    /// policy keys on it — so the shape is fixed now, before the policy exists.
+    ///
+    /// The previous role is restored on return. A panic mid-command leaves the
+    /// declaration set, exactly as a panic leaves the sibling publication
+    /// deadline installed in `execute_stack_guarded`; both are diagnostic
+    /// state on an executor that is already in an unrecoverable condition.
+    #[must_use = "command results must be checked — errors indicate parse/solve failures"]
+    pub fn execute_internal_lemma(&mut self, cmd: &Command) -> Result<Option<String>> {
+        let previous = self
+            .query_publication_role
+            .replace(QueryPublicationRole::InternalLemma);
+        let result = self.execute(cmd);
+        self.query_publication_role.set(previous);
+        result
+    }
+
+    /// [`Self::execute_all`] under one internal-lemma declaration covering the
+    /// whole command sequence. See [`Self::execute_internal_lemma`].
+    #[must_use = "command results must be checked — errors indicate parse/solve failures"]
+    pub fn execute_all_internal_lemma(&mut self, commands: &[Command]) -> Result<Vec<String>> {
+        let previous = self
+            .query_publication_role
+            .replace(QueryPublicationRole::InternalLemma);
+        let result = self.execute_all(commands);
+        self.query_publication_role.set(previous);
+        result
+    }
+
     /// Body of [`Executor::execute`] — only called through the stack guard
     /// above so its (large, low-opt) frame lands on the grown segment.
     fn execute_stack_guarded(
@@ -1844,11 +1934,26 @@ impl Executor {
         // absolute deadline across the complete command so certification and
         // any nested trust re-confirmation consume the caller's ORIGINAL
         // timeout rather than receiving a renewed timeout (or no deadline).
-        let publication_deadline = matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_))
-            .then(|| self.install_command_publication_deadline());
+        let is_decision_command = matches!(cmd, Command::CheckSat | Command::CheckSatAssuming(_));
+        // #cert-accounting item 6: wall time of the OUTERMOST decision command
+        // on this executor, so a nested probe solve entering here again cannot
+        // sum its enclosing command's time into the total a second time.
+        // Diagnostic bookkeeping — no gate, lane, or verdict reads it.
+        let outermost_decision_command =
+            is_decision_command && self.decision_command_depth.get() == 0;
+        if outermost_decision_command {
+            self.decision_command_depth.set(1);
+        }
+        let decision_timer = outermost_decision_command.then(cert_accounting::DecisionTimer::start);
+        let publication_deadline =
+            is_decision_command.then(|| self.install_command_publication_deadline());
         let result = self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
         if let Some(previous_deadline) = publication_deadline {
             self.restore_timeout_deadline_after_call(previous_deadline);
+        }
+        drop(decision_timer);
+        if outermost_decision_command {
+            self.decision_command_depth.set(0);
         }
         result
     }

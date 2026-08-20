@@ -122,6 +122,85 @@ impl Executor {
             .set_int("proof.strict_check_invocations", invocations);
         self.last_statistics
             .set_int("proof.strict_check_steps_validated", steps);
+        // (#ground-conflict-decomp) Exact meters for the two decomposition
+        // arms: attempted = applied + declined, per inspected trust lemma.
+        self.last_statistics.set_int(
+            "proof.ground_conflict_decomp_attempted",
+            self.ground_conflict_decomp_meters.attempted.get(),
+        );
+        self.last_statistics.set_int(
+            "proof.ground_conflict_decomp_applied",
+            self.ground_conflict_decomp_meters.applied.get(),
+        );
+        self.last_statistics.set_int(
+            "proof.ground_conflict_decomp_declined",
+            self.ground_conflict_decomp_meters.declined.get(),
+        );
+        self.publish_certification_accounting();
+    }
+
+    /// #cert-accounting item 6: dump the certification cost counters into
+    /// `last_statistics` alongside the strict-check attribution above.
+    ///
+    /// These are PROCESS-CUMULATIVE totals, not per-query ones — see
+    /// `executor::cert_accounting` for why the accumulator has to outlive the
+    /// `Executor` (the CHC portfolio builds a fresh one per sub-query, and the
+    /// two corroboration re-solves inside a mint each build another). For a
+    /// single-query CLI run the distinction is vacuous and `--stats` reads as
+    /// "what this query cost"; for a portfolio run it reads as "what the run
+    /// cost", which is the question that was actually being asked.
+    ///
+    /// Write-only: no gate, lane, or verdict reads any of these values.
+    pub(in crate::executor) fn publish_certification_accounting(&mut self) {
+        let accounting = crate::executor::CertificationAccounting::snapshot();
+        for (key, value) in [
+            ("cert.decisions", accounting.decisions),
+            (
+                "cert.decisions_internal_lemma",
+                accounting.decisions_internal_lemma,
+            ),
+            (
+                "cert.decisions_proof_tracked",
+                accounting.decisions_proof_tracked,
+            ),
+            (
+                "cert.decisions_proof_tracked_internal_lemma",
+                accounting.decisions_proof_tracked_internal_lemma,
+            ),
+            ("cert.decision_nanos", accounting.decision_nanos),
+            ("cert.proof_steps_recorded", accounting.proof_steps_recorded),
+            ("cert.mints", accounting.mints),
+            ("cert.mint_nanos", accounting.mint_nanos),
+            ("cert.mints_internal_lemma", accounting.mints_internal_lemma),
+            (
+                "cert.mint_nanos_internal_lemma",
+                accounting.mint_nanos_internal_lemma,
+            ),
+            (
+                "cert.nested_corroboration_solves",
+                accounting.nested_corroboration_solves,
+            ),
+            (
+                "cert.nested_corroboration_nanos",
+                accounting.nested_corroboration_nanos,
+            ),
+            ("cert.raw_admissions", accounting.raw_admissions),
+            (
+                "cert.publication_rejections",
+                accounting.publication_rejections,
+            ),
+        ] {
+            self.last_statistics.set_int(key, value);
+        }
+        // Per-EXECUTOR, unlike the totals above: the role declared for the
+        // decision whose publication funnel is running right now. This is the
+        // only certification statistic that is local to this executor, and it
+        // is what makes the declaration observable (and testable) without
+        // reading process-global counters that a parallel test runner shares.
+        self.last_statistics.set_string(
+            "cert.decision_role",
+            self.query_publication_role.get().label(),
+        );
     }
 
     /// Datatype constructor registry for strict proof validation:

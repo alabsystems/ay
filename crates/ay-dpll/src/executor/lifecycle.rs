@@ -146,6 +146,11 @@ impl Executor {
         self.last_unsat_proof_reconstruction_suppressed = false;
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
+        if self.proof_problem_assertion_provenance.is_some() {
+            super::unsat_cert::probe_cert_reject(|| {
+                "proof-source provenance CLEARED by invalidate_last_check_result".to_string()
+            });
+        }
         self.proof_problem_assertion_provenance = None;
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
@@ -467,6 +472,14 @@ impl Executor {
         // optimization/probe solves then inherit those roots rather than
         // recapturing their generated working set as authored input.
         self.install_proof_source_provenance(&authored_assertions);
+        super::unsat_cert::probe_cert_reject(|| {
+            format!(
+                "begin_public_solve: tracker={} provenance={} authored_roots={}",
+                self.produce_proofs_enabled(),
+                self.proof_problem_assertion_provenance.is_some(),
+                authored_assertions.len()
+            )
+        });
         // #proof-capability B1 mis-plumbing canary: a competition-mode
         // executor with no proof demand must leave this public solve with the
         // tracker OFF — if a future edit re-enables it unconditionally above
@@ -498,10 +511,20 @@ impl Executor {
     /// pre-solve rebind; the epoch method refuses it once assumptions are bound.
     pub(crate) fn bind_materialized_public_query(&mut self) {
         let assertions = self.ctx.assertions.clone();
+        let had = self.proof_problem_assertion_provenance.is_some();
         self.proof_problem_assertion_provenance = None;
-        if self.rebind_unsat_query_epoch_assertions(&assertions) {
+        let rebound = self.rebind_unsat_query_epoch_assertions(&assertions);
+        if rebound {
             self.install_proof_source_provenance(&assertions);
         }
+        super::unsat_cert::probe_cert_reject(|| {
+            format!(
+                "bind_materialized_public_query: had_provenance={had} rebound={rebound} \
+                 provenance={} epoch={}",
+                self.proof_problem_assertion_provenance.is_some(),
+                self.unsat_query_epoch.is_some()
+            )
+        });
     }
 
     /// Native API assertions bypass `Command::Assert`, so they must manually
@@ -604,6 +627,8 @@ impl Executor {
             skolem_instance_records: Vec::new(),
             skolem_witness_records: Vec::new(),
             bv_mbqi_false_instance_records: Vec::new(),
+            mbqi_refinement_instance_records: Vec::new(),
+            ground_conflict_decomp_meters: Default::default(),
             qpf_premise_forced_instance_records: Vec::new(),
             propagated_value_provenance: Default::default(),
             last_proof_rebuild_originals: Vec::new(),
@@ -611,6 +636,8 @@ impl Executor {
             last_proof_quality: None,
             strict_check_invocations: Cell::new(0),
             strict_check_steps_validated: Cell::new(0),
+            query_publication_role: Cell::new(QueryPublicationRole::default()),
+            decision_command_depth: Cell::new(0),
             last_unknown_reason: None,
             unsafe_partial_quantifier_unknown: false,
             last_unknown_origin: None,
@@ -961,6 +988,43 @@ impl Executor {
             && !self.is_producing_proofs()
             && !self.strict_proofs_enabled()
             && !self.self_check
+    }
+
+    /// Whether an inner theory transaction that swaps a PREPROCESSED assertion
+    /// window in may leave its window provenance installed after refuting.
+    ///
+    /// Those transactions (`with_deferred_postprocessing`, the LIA/NIA
+    /// preprocessing windows) install
+    /// `ProofProblemAssertionProvenance::from_sources(window_roots, …)
+    /// .preserving_authority_from(outer)` and, on UNSAT only, deliberately skip
+    /// the restore so the certification and export lanes can map the window's
+    /// premises back to the authored roots.
+    ///
+    /// That retention is sound exactly because an OUTER provenance exists to be
+    /// preserved: `preserving_authority_from(Some(outer))` rewrites
+    /// `original_problem_assertions` to the authored epoch vector, so what
+    /// survives still names the authored query. Under competition shedding
+    /// (#proof-capability B1) `begin_public_solve` installs no public-query
+    /// provenance at all (`install_proof_source_provenance` self-gates on
+    /// `produce_proofs_enabled`), so the outer is `None`,
+    /// `preserving_authority_from` is the identity, and what survives is bound
+    /// to the PREPROCESSED window — never to `epoch.assertions`.
+    ///
+    /// The B3 raw lane then sees a PRESENT-but-mismatched provenance and
+    /// hard-fails (`authenticate_unsat_query_scope`), losing a verdict that
+    /// `--rigor standard` publishes with a full checked certificate. Measured
+    /// before this predicate existed: 15 of 120 declared-unsat AUFLIA
+    /// SingleQuery instances answered `unsat` at `--rigor standard` and
+    /// `unknown` at `--rigor fast`, which is the competition posture.
+    ///
+    /// So: retain only when a proof consumer can exist. Under shedding restore
+    /// the pre-transaction value — `None` by construction — which is the
+    /// documented shed-mode norm the raw lane already authenticates. The
+    /// present-but-mismatched check itself is NOT relaxed; it stays a hard
+    /// error under both policies, and this only stops manufacturing the stale
+    /// record that made it fire.
+    pub(in crate::executor) fn theory_window_provenance_survives_unsat(&self) -> bool {
+        !self.competition_shedding_active()
     }
 
     /// Whether the last `check_sat` produced a pure-QF_BV UNSAT under

@@ -65,6 +65,43 @@ impl Executor {
                         .mk_app(Symbol::named(head), raw_arguments, sort),
                 )
             }
+            // Qualified identifier `((as <id> <sort>) arg..)` — the shape every
+            // sort-polymorphic nullary constant takes (`(as seq.empty (Seq
+            // Int))`, `(as const (Array ..))`). Without this arm the whole
+            // enclosing assertion lost its raw re-intern (the
+            // #raw-intern-head-cliff failure mode one level down), which
+            // denied the substitution-bridge repair to any SEQ assertion
+            // written with an explicit empty — the deductive-checks calc_basic class.
+            // Elaboration is the identity authority for the qualified head
+            // (it resolves the sort ascription); arguments are still rebuilt
+            // raw, so this grants exactly the same authority as the `App` arm.
+            FrontendTerm::QualifiedApp(_, _, arguments) => {
+                let elaborated = self.ctx.elaborate_surface_subterm(stripped)?;
+                if arguments.is_empty() {
+                    // A nullary qualified constant IS its canonical form; the
+                    // ascription only selected the sort.
+                    return Some(elaborated);
+                }
+                let ay_core::term::TermData::App(symbol, _) = self.ctx.terms.get(elaborated) else {
+                    return None;
+                };
+                let symbol = symbol.clone();
+                let raw_arguments = arguments
+                    .iter()
+                    .map(|argument| self.raw_intern_surface_prechecked(argument))
+                    .collect::<Option<Vec<TermId>>>()?;
+                let sort = self.ctx.terms.sort(elaborated).clone();
+                let rebuilt = self
+                    .ctx
+                    .terms
+                    .mk_app(symbol.clone(), raw_arguments.clone(), sort);
+                matches!(
+                    self.ctx.terms.get(rebuilt),
+                    ay_core::term::TermData::App(rebuilt_symbol, rebuilt_args)
+                        if *rebuilt_symbol == symbol && rebuilt_args.as_slice() == raw_arguments
+                )
+                .then_some(rebuilt)
+            }
             FrontendTerm::IndexedApp(name, indices, arguments) => {
                 let elaborated = self.ctx.elaborate_surface_subterm(stripped)?;
                 // SMT-LIB datatype tester `((_ is C) t)`. Its index is a

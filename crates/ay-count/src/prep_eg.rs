@@ -589,7 +589,10 @@ pub fn independent_support(
             removed += 1;
         }
     }
-    if std::env::var_os("--count-debug").is_some() {
+    // B59: `--count-debug` is CLI-owned (misc_cli_flags), same seam as every
+    // other diagnostic in this crate — the literal env::var_os read of the
+    // flag name was dead (nothing sets an env var named "--count-debug").
+    if ay_core::misc_cli_flags().count_debug {
         eprintln!("c o [debug] indep support: removed {removed} of {k} candidates");
     }
     // Accept only a SUBSTANTIAL support reduction: the one corpus win

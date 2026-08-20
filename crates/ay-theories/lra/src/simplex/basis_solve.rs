@@ -6,7 +6,7 @@
 //! **fraction-free Bareiss** (integer-preserving Gaussian elimination).
 //!
 //! This is the exact-certification kernel of the float-pivot layer
-//! (`AY_LRA_FLOAT_LAYER`). The f64 shadow simplex chooses a candidate basis
+//! (`--lra-float-layer`). The f64 shadow simplex chooses a candidate basis
 //! `B*`; this module solves the ORIGINAL small-coefficient slack-definition
 //! system restricted to `B*` in **one** dense elimination — cost `O(m^3)` exact
 //! ops decoupled from the pivot count `P`, unlike replaying `P` exact

@@ -103,7 +103,7 @@ pub trait TheorySolver {
 
     /// Drain ADDITIONAL pending string lemmas queued behind a
     /// `TheoryResult::NeedStringLemma` (strings NF-engine closure 3,
-    /// `AY_STR_NF=1`).
+    /// `--str-nf`).
     ///
     /// When a string theory discovers several independent lemma requests in
     /// one check round (multiple buffered NF splits, multiple blocked

@@ -123,12 +123,20 @@ const REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES: usize = 4;
 const REDUCED_LIA_ARRAY_ROUTE_MAX_PREDICATES: usize = 12;
 const REDUCED_LIA_ARRAY_ROUTE_MAX_CLAUSES: usize = 16;
 const REDUCED_LIA_ARRAY_ROUTE_MAX_ARITY: usize = 64;
-const REDUCED_LIA_ARRAY_ROUTE_BUDGET: Duration = Duration::from_secs(3);
+// 3s -> 5s and the validation reserve 750ms -> 2500ms (2026-08-17): the
+// stripFullBoth_arr original-clause strict validation measures ~2-3s on a
+// Grace (Neoverse) debug build once the mandatory certification actually
+// CHECKS its ~25 AUFLIA Farkas lemmas instead of vetoing on the old phantom
+// byte pre-charge; 750ms was calibrated on an M-series box where the same
+// validation fits. The route stays fail-closed and outer-deadline bounded
+// (`min` with the caller's deadline), so the only cost is a later
+// fall-through on problems this route cannot decide.
+const REDUCED_LIA_ARRAY_ROUTE_BUDGET: Duration = Duration::from_secs(5);
 const REDUCED_LIA_ARRAY_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(750);
 const REDUCED_LIA_ARRAY_INTERVAL_BUDGET: Duration = Duration::from_millis(500);
 const REDUCED_LIA_ARRAY_BMC_BUDGET: Duration = Duration::from_millis(1500);
 const REDUCED_LIA_ARRAY_BMC_MAX_DEPTH: usize = 16;
-const REDUCED_LIA_ARRAY_VALIDATION_RESERVE: Duration = Duration::from_millis(750);
+const REDUCED_LIA_ARRAY_VALIDATION_RESERVE: Duration = Duration::from_millis(2500);
 const REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE: Duration = Duration::from_millis(250);
 const REAL_LRA_PROMOTION_ENV: &str = "AY_CHC_ENABLE_REAL_LRA_PROMOTION";
 
@@ -2695,6 +2703,7 @@ impl AdaptivePortfolio {
                 .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
             let original_validation =
                 self.validate_lia_farkas_safe_model_on_original(&translated, validation_budget);
+
             self.decision_log.log_decision_with_details(
                 DecisionEntry {
                     stage: "reduced_lia_array_top_model",

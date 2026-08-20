@@ -93,6 +93,20 @@ pub(in crate::executor) struct ProvenanceSurfaceAudit {
 }
 
 impl ProvenanceSurfaceAudit {
+    /// Whether any bounded collection overflowed; an overflowed audit must
+    /// fail closed in every consumer.
+    pub(in crate::executor) fn is_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Whether `term` participates in a RIGID printed role (registered via
+    /// [`Self::protect_rigid_operand`]/[`Self::protect_rigid_root`]): its
+    /// exact canonical rendering is load-bearing for a positional Alethe rule,
+    /// so no retained spelling may reach it.
+    pub(in crate::executor) fn is_rigid(&self, term: TermId) -> bool {
+        self.rigid.contains(&term)
+    }
+
     pub(in crate::executor) fn active_map_is_bounded(
         &self,
         active: &HashMap<TermId, String>,

@@ -378,6 +378,10 @@ pub(crate) enum Knob {
     ImplLane,
     /// Implication-lane arming node override (default: the mixed-lever arm).
     ImplArm,
+    /// Leaf-drought plunge cadence/arming override (the 80-binary zero-leaves
+    /// fix): `0` kills the lane, `n` arms it at node `n` with a dive every `n`
+    /// pops; unset = the shipped `DROUGHT_ARM_NODES`/`DROUGHT_DIVE_EVERY`.
+    DroughtDive,
     /// Propagation-conflict learning: `false` = off, `true` = force, unset =
     /// the implication/feasibility class auto.
     PropConflict,

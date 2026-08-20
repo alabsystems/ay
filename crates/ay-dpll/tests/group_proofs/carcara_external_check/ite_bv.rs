@@ -295,49 +295,107 @@ fn test_carcara_trust_free_qf_bv_idempotent_gate_bitblast() {
     let Some(carcara) = require_carcara_or_skip() else {
         return;
     };
-    for (label, operator, blast_rule, simplify_rule) in [
-        (
-            "trust_free_qf_bv_bvand_idempotent",
-            "bvand",
-            ":rule bitblast_and",
-            ":rule and_simplify",
-        ),
-        (
-            "trust_free_qf_bv_bvor_idempotent",
-            "bvor",
-            ":rule bitblast_or",
-            ":rule or_simplify",
-        ),
+    for (operator, blast_rule, simplify_rule) in [
+        ("bvand", ":rule bitblast_and", ":rule and_simplify"),
+        ("bvor", ":rule bitblast_or", ":rule or_simplify"),
     ] {
-        let problem = format!(
-            "(set-logic QF_BV)\n\
-             (declare-const x (_ BitVec 8))\n\
-             (assert (not (= ({operator} x x) x)))\n\
-             (check-sat)\n"
-        );
-        let proof = solve_unsat_and_get_proof(&problem, label);
-        assert!(
-            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
-            "{label}: bit-blast identity proof must not contain unchecked rules:\n{proof}"
-        );
-        assert!(
-            !proof.contains(":rule bv_bitblast"),
-            "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
-        );
-        for expected in [blast_rule, ":rule bitblast_var", simplify_rule] {
+        // The lowering is per-BIT, so the width is the load-bearing axis: 8 is
+        // the historical case, 32 is the width code-generator guard
+        // obligations actually arrive at, and 64 is the printer's
+        // `MAX_BITBLAST_LOWERING_WIDTH` boundary itself.
+        for width in [8u32, 32, 64] {
+            let label = format!("trust_free_qf_bv_{operator}_idempotent_w{width}");
+            let label = label.as_str();
+            let declarations = format!("(declare-const x (_ BitVec {width}))\n");
+            let problem = format!(
+                "(set-logic QF_BV)\n\
+                 {declarations}\
+                 (assert (not (= ({operator} x x) x)))\n\
+                 (check-sat)\n"
+            );
+            let proof = solve_unsat_and_get_proof(&problem, label);
             assert!(
-                proof.contains(expected),
-                "{label}: identity must be derived through Carcara's per-operator \
-                 bit-blasting, missing {expected}:\n{proof}"
+                !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+                "{label}: bit-blast identity proof must not contain unchecked rules:\n{proof}"
+            );
+            assert!(
+                !proof.contains(":rule bv_bitblast"),
+                "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+            );
+            for expected in [blast_rule, ":rule bitblast_var", simplify_rule] {
+                assert!(
+                    proof.contains(expected),
+                    "{label}: identity must be derived through Carcara's per-operator \
+                     bit-blasting, missing {expected}:\n{proof}"
+                );
+            }
+            let scope = published_assumption_scope(&declarations, &proof);
+            assert!(
+                run_carcara_trust_free(&carcara, label, &scope, &proof),
+                "{label}: per-operator bit-blast derivation must be verified by Carcara \
+                 without allowed trust"
             );
         }
-        let scope = published_assumption_scope("(declare-const x (_ BitVec 8))\n", &proof);
+    }
+}
+
+/// The idempotent gate NESTED BELOW A CONGRUENCE SPINE, which is the shape a
+/// verified code generator's division-guard obligations actually produce:
+///
+/// ```text
+/// (= (ite (= t #b0..0) #b1 #b0) (ite (= (bvand t t) #b0..0) #b1 #b0))
+/// ```
+///
+/// The gate sits two levels below the equated `ite`s, so the printer's
+/// top-level idempotency lowering cannot see it. Unless the rewrite spine is
+/// decomposed — small `(= t (bvand t t))` crux, then `cong` up through the `=`
+/// and the `ite` — AY mints ONE coarse lemma over the whole `ite` equality that
+/// it can DECIDE but not TYPESET, and the document goes out with an honest
+/// `hole`. This is the family the 32-bit reproducer above is extracted from,
+/// so it is pinned at the width the code generator emits.
+#[test]
+#[timeout(120_000)]
+fn test_carcara_trust_free_qf_bv_idempotent_gate_below_ite_congruence() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "trust_free_qf_bv_idempotent_gate_below_ite";
+    let declarations = "(declare-const lhs (_ BitVec 32))\n";
+    let problem = format!(
+        "(set-logic QF_BV)\n\
+         {declarations}\
+         (assert (not (= (ite (= lhs (_ bv0 32)) (_ bv1 1) (_ bv0 1)) \
+         (ite (= (bvand lhs lhs) (_ bv0 32)) (_ bv1 1) (_ bv0 1)))))\n\
+         (check-sat)\n"
+    );
+    let proof = solve_unsat_and_get_proof(&problem, label);
+    assert!(
+        !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+        "{label}: the guard obligation must not go out with an unchecked step:\n{proof}"
+    );
+    assert!(
+        !proof.contains(":rule bv_bitblast"),
+        "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+    );
+    // The crux must be lowered per bit AND lifted by congruence — a document
+    // carrying only one of the two would not be this shape.
+    for expected in [
+        ":rule bitblast_and",
+        ":rule bitblast_var",
+        ":rule and_simplify",
+        ":rule cong",
+    ] {
         assert!(
-            run_carcara_trust_free(&carcara, label, &scope, &proof),
-            "{label}: per-operator bit-blast derivation must be verified by Carcara \
-             without allowed trust"
+            proof.contains(expected),
+            "{label}: nested gate must be discharged by a per-bit lowering lifted \
+             through congruence, missing {expected}:\n{proof}"
         );
     }
+    let scope = published_assumption_scope(declarations, &proof);
+    assert!(
+        run_carcara_trust_free(&carcara, label, &scope, &proof),
+        "{label}: the lifted derivation must be verified by Carcara without allowed trust"
+    );
 }
 
 /// The NESTED per-operator case. A Carcara `bitblast_*` rule relates exactly
@@ -378,6 +436,187 @@ fn test_carcara_trust_free_qf_bv_double_negation_bitblast() {
         run_carcara_trust_free(&carcara, label, &scope, &proof),
         "{label}: nested bit-blast derivation must be verified by Carcara without \
          allowed trust"
+    );
+}
+
+/// The rule of every SUB-STEP of the crux derivation, in emission order.
+///
+/// The printer names the crux's sub-steps after their parent step with a dotted
+/// suffix (`t1.pa`, `t1.f1`, ...), so a dot in the step id is exactly the
+/// "belongs to the lowered crux" marker; the surrounding `assume`/spine steps
+/// carry plain ids and are skipped. Returning the rules IN ORDER is the point:
+/// it lets a test pin the derivation's shape, not merely which rules appear.
+fn crux_step_rules(proof: &str) -> Vec<String> {
+    let mut rules = Vec::new();
+    for chunk in proof.split("(step ").skip(1) {
+        let Some(id) = chunk.split_whitespace().next() else {
+            continue;
+        };
+        if !id.contains('.') {
+            continue;
+        }
+        // Take this step's OWN rule: stop at the next step so a malformed or
+        // rule-less chunk can never borrow its successor's rule name.
+        let body = chunk.split("(step ").next().unwrap_or(chunk);
+        if let Some(rule) = body.split(":rule ").nth(1) {
+            let rule: String = rule
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !rule.is_empty() {
+                rules.push(rule);
+            }
+        }
+    }
+    rules
+}
+
+/// The UNSIGNED COMPARISON DUALITY below a congruence spine — the shape a
+/// verified code generator's BOUNDS and SHIFT-RANGE guard obligations produce,
+/// one guard over from the division-guard idempotency shape above:
+///
+/// ```text
+/// (= (ite (bvuge lhs rhs) #b1 #b0) (ite (not (bvult lhs rhs)) #b1 #b0))
+/// ```
+///
+/// The INTENDED trap set is spelled with the `bvuge` primitive; the EMITTED x86
+/// `AE` condition code is the negation of the carry flag, i.e. `(not (bvult lhs
+/// rhs))`. Carcara has NO `bitblast_*` rule whose conclusion carries `bvuge`, so
+/// unlike every other lowering in this file the identity is reconstructed
+/// through the PSEUDO-BOOLEAN family plus two checked `la_generic` clauses.
+///
+/// The structural assertions run unconditionally — carcara is optional here and
+/// `require_carcara_or_skip` would silently skip the whole test on a box without
+/// it, which is exactly how a regression to `hole` would go unnoticed.
+#[test]
+#[timeout(180_000)]
+fn test_qf_bv_unsigned_compare_duality_below_ite_congruence() {
+    let carcara = find_carcara();
+    for (operator, dual, non_strict_rule, strict_rule) in [
+        ("bvuge", "bvult", ":rule pbblast_bvuge", ":rule pbblast_bvult"),
+        ("bvule", "bvugt", ":rule pbblast_bvule", ":rule pbblast_bvugt"),
+    ] {
+        // The three widths `run_guard_carrier_canary` actually requests.
+        for width in [8u32, 32, 64] {
+            let label = format!("unsigned_compare_duality_{operator}_w{width}");
+            let label = label.as_str();
+            let declarations = format!(
+                "(declare-const lhs (_ BitVec {width}))\n\
+                 (declare-const rhs (_ BitVec {width}))\n"
+            );
+            let problem = format!(
+                "(set-logic QF_BV)\n\
+                 {declarations}\
+                 (assert (not (= (ite ({operator} lhs rhs) (_ bv1 1) (_ bv0 1)) \
+                 (ite (not ({dual} lhs rhs)) (_ bv1 1) (_ bv0 1)))))\n\
+                 (check-sat)\n"
+            );
+            let proof = solve_unsat_and_get_proof(&problem, label);
+            assert!(
+                !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+                "{label}: the guard obligation must not go out with an unchecked step:\n{proof}"
+            );
+            assert!(
+                !proof.contains(":rule bv_bitblast"),
+                "{label}: AY's private coarse rule name must never reach the wire:\n{proof}"
+            );
+            // The crux must be pseudo-Boolean-blasted on BOTH sides, bridged by
+            // checked linear arithmetic, and lifted through the `ite` spine — a
+            // document carrying only some of those would not be this derivation.
+            for expected in [
+                non_strict_rule,
+                strict_rule,
+                ":rule la_generic",
+                ":rule equiv_neg1",
+                ":rule equiv_neg2",
+                ":rule not_not",
+                ":rule cong",
+            ] {
+                assert!(
+                    proof.contains(expected),
+                    "{label}: missing {expected} in the duality derivation:\n{proof}"
+                );
+            }
+            // PIN THE EXACT STEP SEQUENCE, not merely the set of rules used.
+            // Presence alone would still pass if the steps were reordered, if a
+            // step were duplicated, or if extra inferences crept in — none of
+            // which is the derivation that was machine-checked. The sequence is
+            // WIDTH-INVARIANT by construction: only the pseudo-Boolean sums grow
+            // with the width, never the shape of the argument, so the identical
+            // expectation is asserted at 8, 32 and 64.
+            let emitted = crux_step_rules(&proof);
+            let expected_sequence = [
+                non_strict_rule.trim_start_matches(":rule "),
+                strict_rule.trim_start_matches(":rule "),
+                "la_generic",
+                "la_generic",
+                "equiv_neg1",
+                "equiv_neg2",
+                "resolution",
+                "resolution",
+                "resolution",
+                "not_not",
+                "resolution",
+                "resolution",
+                "cong",
+                "symm",
+                "trans",
+            ];
+            assert_eq!(
+                emitted, expected_sequence,
+                "{label}: the emitted crux derivation must be exactly the \
+                 machine-checked step sequence, in order:\n{proof}"
+            );
+            let Some(carcara) = carcara.as_ref() else {
+                continue;
+            };
+            let scope = published_assumption_scope(&declarations, &proof);
+            assert!(
+                run_carcara_trust_free(carcara, label, &scope, &proof),
+                "{label}: the lifted derivation must be verified by Carcara without \
+                 allowed trust"
+            );
+        }
+    }
+}
+
+/// LOCK-STEP regression: the SIGNED duality `(bvsge a b) = (not (bvslt a b))` is
+/// just as TRUE as the unsigned one, and AY decides it, but Carcara's
+/// pseudo-Boolean rules for signed comparisons carry an extra negative-weight
+/// sign summand — a DIFFERENT derivation this printer does not emit. The leaf
+/// table must therefore decline it, leaving an honest `hole` that keeps the
+/// document structurally checkable, rather than a step named after an inference
+/// the printed text does not license.
+#[test]
+#[timeout(120_000)]
+fn test_signed_compare_duality_remains_an_honest_hole() {
+    let label = "signed_compare_duality_honest_hole";
+    let declarations = "(declare-const lhs (_ BitVec 32))\n\
+                        (declare-const rhs (_ BitVec 32))\n";
+    let problem = format!(
+        "(set-logic QF_BV)\n\
+         {declarations}\
+         (assert (not (= (ite (bvsge lhs rhs) (_ bv1 1) (_ bv0 1)) \
+         (ite (not (bvslt lhs rhs)) (_ bv1 1) (_ bv0 1)))))\n\
+         (check-sat)\n"
+    );
+    let proof = solve_unsat_and_get_proof(&problem, label);
+    assert!(
+        !proof.contains(":rule pbblast_"),
+        "{label}: the unsigned lowering must not fire on a signed comparison:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule hole"),
+        "{label}: the uncovered identity must stay an honest hole:\n{proof}"
+    );
+    let Some(carcara) = find_carcara() else {
+        return;
+    };
+    let scope = published_assumption_scope(declarations, &proof);
+    assert!(
+        run_carcara(&carcara, label, &scope, &proof),
+        "{label}: an honest hole must leave the rest of the document checkable, \
+         never make it invalid"
     );
 }
 

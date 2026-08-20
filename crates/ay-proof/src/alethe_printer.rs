@@ -430,8 +430,13 @@ impl<'a> AlethePrinter<'a> {
             };
             debug_assert_eq!(eq, "=");
             let (quantified, instance) = (equality_args[0], equality_args[1]);
-            let TermData::Forall(bindings, body, _) = self.terms.get(quantified) else {
-                unreachable!("strict Skolem validation fixed the source shape")
+            // The strict validator admits BOTH readings: `sko_forall` over a
+            // `forall` source and `sko_ex` over a registered positive
+            // `exists` source. The exists choice binds the UNNEGATED body.
+            let (bindings, body, source_is_exists) = match self.terms.get(quantified) {
+                TermData::Forall(bindings, body, _) => (bindings, body, false),
+                TermData::Exists(bindings, body, _) => (bindings, body, true),
+                _ => unreachable!("strict Skolem validation fixed the source shape"),
             };
             let [(binder, binder_sort)] = bindings.as_slice() else {
                 unreachable!("strict Skolem validation fixed the binder arity")
@@ -442,7 +447,11 @@ impl<'a> AlethePrinter<'a> {
 
             let (binder_token, body_surface) =
                 self.skolem_surface_binder_and_body(quantified, *body, binder);
-            let choice = format!("(choice (({binder_token} {binder_sort})) (not {body_surface}))");
+            let choice = if source_is_exists {
+                format!("(choice (({binder_token} {binder_sort})) {body_surface})")
+            } else {
+                format!("(choice (({binder_token} {binder_sort})) (not {body_surface}))")
+            };
             let instance_surface = substitute_smt_symbol(&body_surface, &binder_token, &choice);
 
             self.insert_skolem_override(id, *witness, choice.clone())?;
@@ -1821,8 +1830,12 @@ impl<'a> AlethePrinter<'a> {
             unreachable!("validated Skolem equality")
         };
         let (quantified, instance) = (equality_args[0], equality_args[1]);
-        let TermData::Forall(bindings, body, _) = self.terms.get(quantified) else {
-            unreachable!("validated Skolem source")
+        // Both validator-admitted readings: `sko_forall` (forall source) and
+        // `sko_ex` (registered positive exists source).
+        let (bindings, body, rule) = match self.terms.get(quantified) {
+            TermData::Forall(bindings, body, _) => (bindings, body, "sko_forall"),
+            TermData::Exists(bindings, body, _) => (bindings, body, "sko_ex"),
+            _ => unreachable!("validated Skolem source"),
         };
         let [(binder, binder_sort)] = bindings.as_slice() else {
             unreachable!("validated Skolem binder")
@@ -1842,7 +1855,7 @@ impl<'a> AlethePrinter<'a> {
         Ok(format!(
             "(anchor :step {id} :args ((:= ({binder} {binder_sort}) {choice})))\n\
              (step {id}.t1 (cl (= {body} {instance})) :rule refl)\n\
-             (step {id} (cl (= {quantified} {instance})) :rule sko_forall)"
+             (step {id} (cl (= {quantified} {instance})) :rule {rule})"
         ))
     }
 
@@ -2219,6 +2232,9 @@ impl<'a> AlethePrinter<'a> {
             if let Some(text) = self.format_bv_double_negation_bitblast(id, clause) {
                 return Ok(text);
             }
+            if let Some(text) = self.format_bv_unsigned_compare_duality(id, clause) {
+                return Ok(text);
+            }
         }
         // Lower the internal conservative-extension certificate to Carcara's
         // `arrays_ext` shape (fresh witness rendered as the exact epsilon
@@ -2392,6 +2408,15 @@ impl<'a> AlethePrinter<'a> {
         if wire == ay_core::UNPROVED_STEP_RULE {
             if let Some(text) = Self::lower_ground_bv_disequality(id, &clause_str) {
                 return Ok(text);
+            }
+            // WHICH internal kind was downgraded to the wire hole is the one
+            // fact a holey-certificate triage needs, and the document does not
+            // carry it (the honest wire name is `hole` for every such kind).
+            // Same typed-carrier disclosure as the checker's decline prints.
+            if ay_core::misc_cli_flags().debug_cert {
+                ay_core::safe_eprintln!(
+                    "c !! wire downgrade at {id:?}: kind {kind:?} prints as hole"
+                );
             }
         }
         Ok(format!("(step {id} {clause_str} :rule {wire})"))
@@ -2947,6 +2972,264 @@ impl<'a> AlethePrinter<'a> {
             );
         }
         Some(output)
+    }
+
+    /// A NON-STRICT unsigned comparison -> the Carcara pseudo-Boolean rule for
+    /// it, its exact STRICT dual operator, the pseudo-Boolean rule for that
+    /// dual, and whether the non-strict side's pseudo-Boolean difference is
+    /// taken in the SWAPPED operand order.
+    ///
+    /// Read off Carcara's `checker/rules/pb_blasting.rs` conclusions directly:
+    ///
+    /// ```text
+    /// pbblast_bvuge : (= (bvuge x y) (>= (- Sx Sy) 0))
+    /// pbblast_bvult : (= (bvult x y) (>= (- Sy Sx) 1))
+    /// pbblast_bvule : (= (bvule x y) (>= (- Sy Sx) 0))
+    /// pbblast_bvugt : (= (bvugt x y) (>= (- Sx Sy) 1))
+    /// ```
+    ///
+    /// So for `bvuge` the non-strict difference is `Sx - Sy` (`swapped =
+    /// false`) and its dual's is the reverse; for `bvule` it is `Sy - Sx`
+    /// (`swapped = true`) and its dual's is the reverse. In BOTH rows the pair
+    /// is `A = (>= D 0)` against `B = (>= -D 1)` for one difference `D`, which
+    /// is what makes one derivation cover both.
+    ///
+    /// This table is exactly `ay_dpll`'s `unsigned_strict_dual` and must stay in
+    /// lock-step with it. SIGNED comparisons are excluded from both for the same
+    /// reason: `pbblast_bvsge`/`pbblast_bvslt` carry an extra negative-weight
+    /// sign summand, so they are a different derivation needing their own
+    /// machine-checked witness.
+    fn decode_unsigned_compare_duality(
+        op: &str,
+    ) -> Option<(&'static str, &'static str, &'static str, bool)> {
+        match op {
+            "bvuge" => Some(("pbblast_bvuge", "bvult", "pbblast_bvult", false)),
+            "bvule" => Some(("pbblast_bvule", "bvugt", "pbblast_bvugt", true)),
+            _ => None,
+        }
+    }
+
+    /// The pseudo-Boolean value sum Carcara's `check_pbblast_sum` expects for a
+    /// width-`width` bit-vector printed as `bitvector`:
+    /// `(+ ((_ @int_of 0) v) (* 2 ((_ @int_of 1) v)) ... (* 2^(w-1) ((_ @int_of w-1) v)))`.
+    ///
+    /// The i-th summand must carry coefficient exactly `2^i` and index exactly
+    /// `i`, and the i==0 coefficient may be — and here is — omitted. At width 1
+    /// the sum is the bare summand: `split_summation` takes a non-`+` term as a
+    /// one-element sum, and a one-argument `(+ x)` is not well-formed SMT-LIB.
+    fn pbblast_value_sum(bitvector: &str, width: u32) -> String {
+        let summands: Vec<String> = (0..width)
+            .map(|index| {
+                let projection = format!("((_ @int_of {index}) {bitvector})");
+                if index == 0 {
+                    projection
+                } else {
+                    format!("(* {} {projection})", 1_u128 << index)
+                }
+            })
+            .collect();
+        if let [only] = summands.as_slice() {
+            return only.clone();
+        }
+        format!("(+ {})", summands.join(" "))
+    }
+
+    /// Lower the unsigned comparison DUALITY `(bvuge a b) = (not (bvult a b))`
+    /// (and its `bvule`/`bvugt` mirror) to Carcara's pseudo-Boolean blasting
+    /// plus checked linear arithmetic.
+    ///
+    /// This is the guard-carrier shape a verified code generator's BOUNDS and
+    /// SHIFT-RANGE obligations produce: the INTENDED trap set is spelled with
+    /// the `bvuge` primitive while the EMITTED x86 `AE` condition code is the
+    /// negation of the carry flag, i.e. `(not (bvult a b))`.
+    ///
+    /// WHY NOT THE `bitblast_*` SUITE, which every other lowering here uses.
+    /// Carcara's bit-blasting family has `bitblast_ult` but NO rule whose
+    /// conclusion carries `bvuge`, and the bit-level residue of the identity is
+    /// not one any `*_simplify` rule discharges. The pseudo-Boolean family does
+    /// have both directions, so the identity is reconstructible there instead.
+    ///
+    /// SUBSET ARGUMENT, rule by rule, for the shape this function accepts. Write
+    /// `Sx`/`Sy` for the two `pbblast_value_sum`s, `D` for the non-strict side's
+    /// difference, `A = (>= D 0)` and `B = (>= (- D) 1)`.
+    ///
+    /// * `pbblast_bvuge` / `pbblast_bvule` / `pbblast_bvult` / `pbblast_bvugt`
+    ///   (`checker/rules/pb_blasting.rs`) each match exactly the conclusion
+    ///   quoted in [`Self::decode_unsigned_compare_duality`] and then re-check
+    ///   every summand's coefficient (`2^i`), index (`i`) and bit-vector
+    ///   against the operand's own sort. Both sums are printed at the operand's
+    ///   FULL width from that same sort, so they are in the strictest sub-case
+    ///   of what the rule admits.
+    /// * `la_generic` is a Farkas check with real arithmetic over the printed
+    ///   linear forms. The two clauses are the two halves of `A <-> ~B`, and
+    ///   both need integer strengthening, which Carcara applies because
+    ///   `@int_of` is Int-sorted: `(cl (not A) (not B))` negates to `D >= 0` and
+    ///   `-D >= 1`, summing to `0 >= 1`; `(cl A B)` negates to `D < 0` and
+    ///   `-D < 1`, strengthened to `D <= -1` and `-D <= 0`, summing to
+    ///   `0 <= -1`. Both are contradictory, so both clauses are valid — and a
+    ///   wrong threshold or a wrong operand order makes the sum NON-contradictory
+    ///   and Carcara rejects the step.
+    /// * `equiv_neg1` / `equiv_neg2` / `not_not` / `resolution` are the
+    ///   propositional bridge from those two clauses to the single equivalence
+    ///   `(= A (not B))`; every one is premise-checked.
+    /// * `cong`, `trans`, `symm` are premise-checked congruence closure.
+    ///
+    /// Every step is therefore one Carcara re-derives from the printed text
+    /// alone. Nothing here asserts the identity — and nothing here AUTHORIZES
+    /// it either: the clause reached this printer only because
+    /// `checker::bv_bitblast`'s independent bit-blast/LRAT recognizer already
+    /// decided it, so a false pair is refused there before it is ever typeset.
+    ///
+    /// NEGATIVE DIRECTION. `(= (bvugt a b) (not (bvult a b)))` (a FALSE pair:
+    /// the two differ exactly when `a == b`), a mismatched operand order
+    /// (`(= (bvuge a b) (not (bvult b a)))`), a signed comparison, a non-unit
+    /// clause, an over-cap or zero width, and any surface override that breaks
+    /// the printed operand identity all return `None` and keep the honest
+    /// `hole`.
+    fn format_bv_unsigned_compare_duality(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let [equality] = clause else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*equality) else {
+            return None;
+        };
+        if eq != "=" || equality_args.len() != 2 {
+            return None;
+        }
+        let (left, right) = (equality_args[0], equality_args[1]);
+        // Exactly one side is the non-strict comparison and the other is the
+        // negation of its strict dual. `reversed` records the printed
+        // orientation so the final step reproduces the clause byte-for-byte.
+        let (non_strict, negated_strict, reversed) =
+            match Self::decode_unsigned_compare_operands(self.terms, left, right) {
+                Some(()) => (left, right, false),
+                None => match Self::decode_unsigned_compare_operands(self.terms, right, left) {
+                    Some(()) => (right, left, true),
+                    None => return None,
+                },
+            };
+        let TermData::App(Symbol::Named(operator), comparison_args) = self.terms.get(non_strict)
+        else {
+            return None;
+        };
+        let (non_strict_rule, strict_operator, strict_rule, swapped) =
+            Self::decode_unsigned_compare_duality(operator.as_str())?;
+        let [first_operand, _] = comparison_args.as_slice() else {
+            return None;
+        };
+        let Sort::BitVec(bits) = self.terms.sort(*first_operand) else {
+            return None;
+        };
+        let width = bits.width;
+        if width == 0 || width > Self::MAX_BITBLAST_LOWERING_WIDTH {
+            return None;
+        }
+
+        // Gate on the printed bytes: a surface override may re-spell either
+        // side, and the derivation is only sound while the two comparisons name
+        // the SAME two operands in the SAME order in the PRINTED text.
+        let printed_non_strict = self.format_term(non_strict);
+        let printed_negated = self.format_term(negated_strict);
+        let printed_equality = self.format_term(*equality);
+        let oriented_equality = if reversed {
+            format!("(= {printed_negated} {printed_non_strict})")
+        } else {
+            format!("(= {printed_non_strict} {printed_negated})")
+        };
+        if printed_equality != oriented_equality {
+            return None;
+        }
+        let [printed_strict] =
+            <[String; 1]>::try_from(split_application(&printed_negated, "not")?).ok()?;
+        let [x, y] =
+            <[String; 2]>::try_from(split_application(&printed_non_strict, operator.as_str())?)
+                .ok()?;
+        let strict_operands =
+            <[String; 2]>::try_from(split_application(&printed_strict, strict_operator)?).ok()?;
+        if strict_operands != [x.clone(), y.clone()] {
+            return None;
+        }
+
+        let x_sum = Self::pbblast_value_sum(&x, width);
+        let y_sum = Self::pbblast_value_sum(&y, width);
+        // `A` is the non-strict side's pseudo-Boolean constraint and `B` its
+        // dual's; by the table they always take the difference in OPPOSITE
+        // orders, which is exactly what makes `A <-> (not B)` hold.
+        let (a_left, a_right) = if swapped {
+            (&y_sum, &x_sum)
+        } else {
+            (&x_sum, &y_sum)
+        };
+        let constraint_a = format!("(>= (- {a_left} {a_right}) 0)");
+        let constraint_b = format!("(>= (- {a_right} {a_left}) 1)");
+        let equivalence = format!("(= {constraint_a} (not {constraint_b}))");
+        let forward_equality = format!("(= {printed_non_strict} {printed_negated})");
+
+        let mut output = format!(
+            "(step {id}.pa (cl (= {printed_non_strict} {constraint_a})) :rule {non_strict_rule})\n\
+             (step {id}.pb (cl (= {printed_strict} {constraint_b})) :rule {strict_rule})\n\
+             (step {id}.f1 (cl (not {constraint_a}) (not {constraint_b})) :rule la_generic :args (1 1))\n\
+             (step {id}.f2 (cl {constraint_a} {constraint_b}) :rule la_generic :args (1 1))\n\
+             (step {id}.n1 (cl {equivalence} (not {constraint_a}) (not (not {constraint_b}))) :rule equiv_neg1)\n\
+             (step {id}.n2 (cl {equivalence} {constraint_a} (not {constraint_b})) :rule equiv_neg2)\n\
+             (step {id}.r1 (cl {equivalence} (not {constraint_b})) :rule resolution :premises ({id}.n2 {id}.f1))\n\
+             (step {id}.r2 (cl {equivalence} (not (not {constraint_b})) {constraint_b}) :rule resolution :premises ({id}.n1 {id}.f2))\n\
+             (step {id}.r3 (cl {equivalence} (not (not {constraint_b}))) :rule resolution :premises ({id}.r2 {id}.r1))\n\
+             (step {id}.nn (cl (not (not (not {constraint_b}))) {constraint_b}) :rule not_not)\n\
+             (step {id}.r4 (cl {equivalence} {constraint_b}) :rule resolution :premises ({id}.r3 {id}.nn))\n\
+             (step {id}.eq (cl {equivalence}) :rule resolution :premises ({id}.r4 {id}.r1))\n\
+             (step {id}.cb (cl (= {printed_negated} (not {constraint_b}))) :rule cong :premises ({id}.pb))\n\
+             (step {id}.cbs (cl (= (not {constraint_b}) {printed_negated})) :rule symm :premises ({id}.cb))\n\
+             (step {id}.lhs (cl (= {printed_non_strict} (not {constraint_b}))) :rule trans :premises ({id}.pa {id}.eq))"
+        );
+        if reversed {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id}.fwd (cl {forward_equality}) :rule trans :premises ({id}.lhs {id}.cbs))\n\
+                     (step {id} (cl {oriented_equality}) :rule symm :premises ({id}.fwd))"
+                ),
+            );
+        } else {
+            let _ = std::fmt::Write::write_fmt(
+                &mut output,
+                format_args!(
+                    "\n(step {id} (cl {forward_equality}) :rule trans :premises ({id}.lhs {id}.cbs))"
+                ),
+            );
+        }
+        Some(output)
+    }
+
+    /// Does `non_strict` hold an unsigned non-strict comparison whose exact
+    /// negated strict dual, over the SAME operands in the SAME order, is
+    /// `negated_strict`? Mirrors `ay_dpll`'s `is_unsigned_compare_duality_of`.
+    fn decode_unsigned_compare_operands(
+        terms: &TermStore,
+        non_strict: TermId,
+        negated_strict: TermId,
+    ) -> Option<()> {
+        let TermData::App(Symbol::Named(operator), comparison_args) = terms.get(non_strict) else {
+            return None;
+        };
+        let (_, strict_operator, _, _) = Self::decode_unsigned_compare_duality(operator.as_str())?;
+        let [x, y] = comparison_args.as_slice() else {
+            return None;
+        };
+        let (x, y) = (*x, *y);
+        let inner = match terms.get(negated_strict) {
+            TermData::Not(inner) => *inner,
+            TermData::App(Symbol::Named(name), args) if name == "not" && args.len() == 1 => args[0],
+            _ => return None,
+        };
+        let TermData::App(Symbol::Named(inner_operator), inner_args) = terms.get(inner) else {
+            return None;
+        };
+        (inner_operator.as_str() == strict_operator
+            && inner_args.as_slice() == [x, y]
+            && matches!(terms.sort(x), Sort::BitVec(_))
+            && terms.sort(x) == terms.sort(y))
+        .then_some(())
     }
 
     /// `(bvnot t)` -> `t`.

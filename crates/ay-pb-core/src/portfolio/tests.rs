@@ -2612,7 +2612,8 @@ fn test_primal_sender_streams_improvements_and_finishes_verdict_free() {
     sender.finish();
 
     match rx.recv().expect("improvement should arrive") {
-        WorkerMsg::Improvement(obj_value, model) => {
+        WorkerMsg::Improvement(label, obj_value, model) => {
+            assert_eq!(label, "sls-primal-opt");
             assert_eq!(obj_value, 1);
             assert_eq!(model, vec![true, false]);
         }
@@ -2638,6 +2639,28 @@ fn collect_injected(
     objective: &PbObjective,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> PbSolution {
+    collect_injected_with_policy(
+        msgs,
+        labels,
+        instance,
+        objective,
+        on_improve,
+        &mut ShedPolicy::new(Instant::now()),
+    )
+}
+
+/// [`collect_injected`] with a caller-owned [`ShedPolicy`], so mechanism
+/// tests can inspect the policy state (`last_improver`) the REAL coordinator
+/// message-handling left behind — in particular that the sanitize gate, not
+/// the message label, decides whether an `Improvement` buys shed protection.
+fn collect_injected_with_policy(
+    msgs: Vec<WorkerMsg>,
+    labels: &[&'static str],
+    instance: &PbInstance,
+    objective: &PbObjective,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+    shed_policy: &mut ShedPolicy,
+) -> PbSolution {
     let (tx, rx) = mpsc::channel();
     for msg in msgs {
         tx.send(msg).expect("send should succeed");
@@ -2659,6 +2682,7 @@ fn collect_injected(
         on_improve,
         &SharedBounds::new(),
         &mut OptimizationBackfill::none(),
+        shed_policy,
     )
 }
 
@@ -2692,6 +2716,7 @@ fn test_coordinator_counts_verdict_free_finished_toward_completion() {
         &mut on_improve,
         &SharedBounds::new(),
         &mut OptimizationBackfill::none(),
+        &mut ShedPolicy::new(Instant::now()),
     );
 
     assert_eq!(outcome.status, PbStatus::Satisfiable);
@@ -2783,7 +2808,7 @@ fn test_coordinator_refuses_unsat_contradicted_by_verified_incumbent() {
     let mut improvements: Vec<(i128, Vec<bool>)> = Vec::new();
     let outcome = collect_injected(
         vec![
-            WorkerMsg::Improvement(9, vec![true, false, false]),
+            WorkerMsg::Improvement("sat-oll-opt", 9, vec![true, false, false]),
             WorkerMsg::Done {
                 label: "sat-oll-opt",
                 solution: PbSolution {
@@ -2814,7 +2839,7 @@ fn test_coordinator_refuses_optimum_worse_than_verified_incumbent() {
     let objective = instance.objective.clone().expect("fixture has objective");
     let outcome = collect_injected(
         vec![
-            WorkerMsg::Improvement(9, vec![true, false, false]),
+            WorkerMsg::Improvement("sat-oll-opt", 9, vec![true, false, false]),
             WorkerMsg::Done {
                 label: "sat-oll-opt",
                 solution: PbSolution {
@@ -2845,7 +2870,7 @@ fn test_coordinator_adopts_consistent_better_optimum() {
     let mut improvements: Vec<(i128, Vec<bool>)> = Vec::new();
     let outcome = collect_injected(
         vec![
-            WorkerMsg::Improvement(9, vec![true, false, false]),
+            WorkerMsg::Improvement("sat-oll-opt", 9, vec![true, false, false]),
             WorkerMsg::Done {
                 label: "sat-oll-opt",
                 solution: PbSolution {
@@ -2881,7 +2906,7 @@ fn test_coordinator_refuses_unverifiable_optimum_claims() {
     let objective = instance.objective.clone().expect("fixture has objective");
     let infeasible = collect_injected(
         vec![
-            WorkerMsg::Improvement(9, vec![true, false, false]),
+            WorkerMsg::Improvement("sat-oll-opt", 9, vec![true, false, false]),
             WorkerMsg::Done {
                 label: "sat-binary-search-opt",
                 solution: PbSolution {
@@ -2902,7 +2927,7 @@ fn test_coordinator_refuses_unverifiable_optimum_claims() {
 
     let absent_objective = collect_injected(
         vec![
-            WorkerMsg::Improvement(9, vec![true, false, false]),
+            WorkerMsg::Improvement("sat-oll-opt", 9, vec![true, false, false]),
             WorkerMsg::Done {
                 label: "sat-binary-search-opt",
                 solution: PbSolution {
@@ -2934,12 +2959,34 @@ fn test_memory_shed_order_reverse_priority_never_baseline() {
     // and refuse index 0.
     let mut inactive = vec![false; 5];
     let mut order = Vec::new();
-    while let Some(idx) = next_worker_to_shed(&inactive) {
+    while let Some(idx) = next_worker_to_shed(&inactive, None) {
         inactive[idx] = true;
         order.push(idx);
     }
     assert_eq!(order, vec![4, 3, 2, 1]);
-    assert_eq!(next_worker_to_shed(&[false]), None, "sole baseline stays");
+    assert_eq!(
+        next_worker_to_shed(&[false], None),
+        None,
+        "sole baseline stays"
+    );
+
+    // ACTIVE-IMPROVER PROTECTION: a protected index is skipped by the
+    // reverse-order pick...
+    assert_eq!(next_worker_to_shed(&[false; 5], Some(4)), Some(3));
+    // ...intermediate protection skips in place...
+    assert_eq!(
+        next_worker_to_shed(&[false, false, false, true, true], Some(2)),
+        Some(1)
+    );
+    // ...but protection is a SKIP, never a veto: the only sheddable worker
+    // is still shed (memory relief cannot be starved)...
+    assert_eq!(
+        next_worker_to_shed(&[false, true, true, false, true], Some(3)),
+        Some(3)
+    );
+    // ...and protecting the never-shed baseline changes nothing.
+    assert_eq!(next_worker_to_shed(&[false, false], Some(0)), Some(1));
+    assert_eq!(next_worker_to_shed(&[false, true], Some(0)), None);
 
     // Controls wiring: shedding raises exactly the victim's stop flag, skips
     // workers that already finished on their own, and a mocked pressure
@@ -2962,7 +3009,7 @@ fn test_memory_shed_order_reverse_priority_never_baseline() {
     let mut shed: Vec<&str> = Vec::new();
     for under_pressure in pressure {
         if under_pressure {
-            if let Some(label) = controls.shed_lowest_priority() {
+            if let Some(label) = controls.shed_lowest_priority(None) {
                 shed.push(label);
             }
         }
@@ -2984,6 +3031,390 @@ fn test_memory_shed_order_reverse_priority_never_baseline() {
     );
 }
 
+/// ACTIVE-IMPROVER PROTECTION wiring (the minisat15 shed race, 2026-08-18):
+/// the shed pick skips the still-active worker that last improved the
+/// verified global incumbent, sheds the next tail arm instead, and falls
+/// back to shedding the protected worker when it is the only candidate left.
+#[test]
+fn test_memory_shed_protects_active_improver() {
+    let mut controls = WorkerStopControls::default();
+    let labels = [
+        "sequential-portfolio-opt",
+        "native-cdcl-opt",
+        "sls-primal-opt",
+        "sls-ddfw-opt",
+    ];
+    let flags: Vec<_> = labels
+        .iter()
+        .map(|label| controls.register(label))
+        .collect();
+
+    // The tail arm `sls-ddfw-opt` authored the current incumbent: the first
+    // shed must skip it and stop `sls-primal-opt` instead.
+    let protect = controls.active_index_of("sls-ddfw-opt");
+    assert_eq!(protect, Some(3));
+    assert_eq!(
+        controls.shed_lowest_priority(protect),
+        Some("sls-primal-opt")
+    );
+    assert!(!flags[3].load(Ordering::Relaxed) && flags[2].load(Ordering::Relaxed));
+
+    // Still protected, next shed takes the complete arm above it.
+    let protect = controls.active_index_of("sls-ddfw-opt");
+    assert_eq!(
+        controls.shed_lowest_priority(protect),
+        Some("native-cdcl-opt")
+    );
+
+    // Now the protected worker is the ONLY sheddable one left (the baseline
+    // is never shed): protection yields — a skip, never a veto.
+    let protect = controls.active_index_of("sls-ddfw-opt");
+    assert_eq!(controls.shed_lowest_priority(protect), Some("sls-ddfw-opt"));
+    assert!(flags[3].load(Ordering::Relaxed));
+    assert!(
+        !flags[0].load(Ordering::Relaxed),
+        "the P1 sequential baseline must never be shed"
+    );
+
+    // A finished worker is no longer an addressable protection target.
+    assert_eq!(controls.active_index_of("sls-ddfw-opt"), None);
+    assert_eq!(
+        controls.active_index_of("sequential-portfolio-opt"),
+        Some(0)
+    );
+}
+
+// =====================================================================
+// MECHANISM HARNESS for the minisat15 shed race (`ShedPolicy`): the whole
+// production shed decision — poll gate, cooldown, pressure signal,
+// ACTIVE-IMPROVER PROTECTION window, reverse-order pick — driven with a
+// SCRIPTED clock and SCRIPTED pressure. No sleeps, no real memory
+// pressure, no dependence on thread scheduling: outcome-level A/Bs on the
+// real instance are swamped by scheduling variance (the tight-memory A/B
+// washed and the generous-memory negative control diverged on identical
+// code), so the causally-proven mechanism is pinned HERE instead.
+// =====================================================================
+
+/// Harness fixture: the minisat15-shaped 4-arm portfolio (P1 baseline +
+/// complete arm + two primal arms, spec priority order) as registered stop
+/// controls plus their stop flags.
+fn shed_harness_controls() -> (WorkerStopControls, Vec<Arc<AtomicBool>>) {
+    let mut controls = WorkerStopControls::default();
+    let flags = [
+        "sequential-portfolio-opt",
+        "native-cdcl-opt",
+        "sls-primal-opt",
+        "sls-ddfw-opt",
+    ]
+    .iter()
+    .map(|label| controls.register(label))
+    .collect();
+    (controls, flags)
+}
+
+/// IMPROVER SURVIVES: a worker that improved the VERIFIED incumbent within
+/// the protection window is skipped by the pressure shed — the pick stops
+/// the lowest-priority worker that is NOT the improver, and the improver's
+/// stop flag stays down. Pinned for BOTH improver positions: the tail arm
+/// (the default reverse-order victim — the minisat15 mechanism itself) and
+/// a mid-priority arm.
+#[test]
+fn shed_mechanism_improver_survives_within_window() {
+    // Improver = the tail arm, i.e. exactly the worker plain reverse order
+    // would kill first.
+    let (mut controls, flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let t_improve = t0 + Duration::from_secs(1);
+    policy.note_verified_improvement("sls-ddfw-opt", t_improve);
+    // Pressure fires 2 s after the improvement — inside the 10 s window.
+    let t_shed = t_improve + Duration::from_secs(2);
+    assert_eq!(
+        policy.step(t_shed, || true, &mut controls),
+        Some("sls-primal-opt"),
+        "the shed must stop the lowest-priority worker that is NOT the improver"
+    );
+    assert!(
+        !flags[3].load(Ordering::Relaxed),
+        "the active improver must survive the shed"
+    );
+    assert!(flags[2].load(Ordering::Relaxed));
+    assert!(
+        !flags[0].load(Ordering::Relaxed),
+        "the P1 sequential baseline must never be shed"
+    );
+
+    // Improver = a mid-priority arm: it survives while the plain tail victim
+    // is shed.
+    let (mut controls, flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let t_improve = t0 + Duration::from_secs(1);
+    policy.note_verified_improvement("sls-primal-opt", t_improve);
+    let t_shed = t_improve + Duration::from_secs(2);
+    assert_eq!(
+        policy.step(t_shed, || true, &mut controls),
+        Some("sls-ddfw-opt")
+    );
+    assert!(!flags[2].load(Ordering::Relaxed) && flags[3].load(Ordering::Relaxed));
+    assert!(!flags[0].load(Ordering::Relaxed));
+}
+
+/// WINDOW EXPIRES: once the improvement is older than
+/// `PARALLEL_SHED_IMPROVER_PROTECT_WINDOW`, the plain reverse-order pick
+/// applies again — the stale improver is the first victim. The boundary is
+/// strict (`<`): protection has ALREADY lapsed at exactly the window.
+#[test]
+fn shed_mechanism_protection_lapses_after_window() {
+    // Strictly past the window.
+    let (mut controls, flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let t_improve = t0 + Duration::from_secs(1);
+    policy.note_verified_improvement("sls-ddfw-opt", t_improve);
+    let t_shed = t_improve + PARALLEL_SHED_IMPROVER_PROTECT_WINDOW + Duration::from_secs(1);
+    assert_eq!(
+        policy.step(t_shed, || true, &mut controls),
+        Some("sls-ddfw-opt"),
+        "a stale improver must be sheddable again (plain reverse order)"
+    );
+    assert!(flags[3].load(Ordering::Relaxed));
+
+    // Exactly at the window: `duration_since == window` is not `< window`.
+    let (mut controls, _flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let t_improve = t0 + Duration::from_secs(1);
+    policy.note_verified_improvement("sls-ddfw-opt", t_improve);
+    assert_eq!(
+        policy.step(
+            t_improve + PARALLEL_SHED_IMPROVER_PROTECT_WINDOW,
+            || true,
+            &mut controls
+        ),
+        Some("sls-ddfw-opt")
+    );
+}
+
+/// SKIP NOT VETO: when the protected improver is the ONLY sheddable worker
+/// left, it IS shed — memory relief is never sacrificed to protection. And
+/// with the baseline alone remaining, the step yields nothing, forever
+/// (P1 NEVER SHED).
+#[test]
+fn shed_mechanism_protection_is_skip_not_veto() {
+    let mut controls = WorkerStopControls::default();
+    let p1_flag = controls.register("sequential-portfolio-opt");
+    let tail_flag = controls.register("sls-ddfw-opt");
+
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let t_improve = t0 + Duration::from_secs(1);
+    policy.note_verified_improvement("sls-ddfw-opt", t_improve);
+    // Freshly protected AND the only sheddable candidate: shed anyway.
+    let t_shed = t_improve + Duration::from_millis(200);
+    assert_eq!(
+        policy.step(t_shed, || true, &mut controls),
+        Some("sls-ddfw-opt"),
+        "protection is a skip, never a veto: the only candidate is shed"
+    );
+    assert!(tail_flag.load(Ordering::Relaxed));
+
+    // Only the P1 baseline remains: sustained pressure sheds nothing, ever.
+    for secs in [2u64, 3, 4] {
+        assert_eq!(
+            policy.step(t0 + Duration::from_secs(secs), || true, &mut controls),
+            None,
+            "the P1 baseline must never be shed"
+        );
+    }
+    assert!(!p1_flag.load(Ordering::Relaxed));
+}
+
+/// UNVERIFIED DOES NOT PROTECT (the 'label licenses nothing' claim), pinned
+/// against the REAL coordinator message path: an `Improvement` whose model
+/// FAILS `sanitize_optimization_incumbent` must leave `last_improver`
+/// untouched — a worker cannot buy shed protection with a bogus incumbent.
+/// Positive control: the same path with a VERIFIED improving incumbent
+/// records the sender. And a verified but NON-IMPROVING duplicate does not
+/// steal protection from the actual improver.
+#[test]
+fn shed_mechanism_unverified_improvement_buys_no_protection() {
+    let instance = reconcile_instance();
+    let objective = instance.objective.clone().expect("fixture has objective");
+
+    // BOGUS incumbent: all-false violates x1 + x2 + x3 >= 1 (claimed obj 0
+    // would even meet any floor — the sanitize gate alone must reject it).
+    let mut policy = ShedPolicy::new(Instant::now());
+    let outcome = collect_injected_with_policy(
+        vec![
+            WorkerMsg::Improvement("sls-ddfw-opt", 0, vec![false, false, false]),
+            WorkerMsg::Finished {
+                label: "sls-ddfw-opt",
+            },
+        ],
+        &["sls-ddfw-opt"],
+        &instance,
+        &objective,
+        &mut |_, _| {},
+        &mut policy,
+    );
+    assert_eq!(
+        outcome.status,
+        PbStatus::Unknown,
+        "the bogus incumbent must not survive the sanitize gate"
+    );
+    assert!(
+        policy.last_improver.is_none(),
+        "an incumbent that fails coordinator re-verification must not buy \
+         shed protection (the label licenses nothing)"
+    );
+
+    // POSITIVE CONTROL: the identical path with a feasible incumbent records
+    // the sending worker as the protected improver.
+    let mut policy = ShedPolicy::new(Instant::now());
+    let outcome = collect_injected_with_policy(
+        vec![
+            WorkerMsg::Improvement("sls-ddfw-opt", 9, vec![true, false, false]),
+            WorkerMsg::Finished {
+                label: "sls-ddfw-opt",
+            },
+        ],
+        &["sls-ddfw-opt"],
+        &instance,
+        &objective,
+        &mut |_, _| {},
+        &mut policy,
+    );
+    assert_eq!(outcome.status, PbStatus::Satisfiable);
+    assert_eq!(
+        policy.last_improver.map(|(label, _)| label),
+        Some("sls-ddfw-opt"),
+        "a verified improvement must record its author for shed protection"
+    );
+
+    // NON-IMPROVING duplicate: a verified report that does not beat the pool
+    // (9 again, then a strictly worse 10) leaves the original author
+    // protected — protection cannot be stolen by a me-too report.
+    let mut policy = ShedPolicy::new(Instant::now());
+    let _ = collect_injected_with_policy(
+        vec![
+            WorkerMsg::Improvement("sls-ddfw-opt", 9, vec![true, false, false]),
+            WorkerMsg::Improvement("sls-primal-opt", 9, vec![true, false, false]),
+            WorkerMsg::Improvement("sls-primal-opt", 10, vec![false, false, true]),
+            WorkerMsg::Finished {
+                label: "sls-ddfw-opt",
+            },
+            WorkerMsg::Finished {
+                label: "sls-primal-opt",
+            },
+        ],
+        &["sls-ddfw-opt", "sls-primal-opt"],
+        &instance,
+        &objective,
+        &mut |_, _| {},
+        &mut policy,
+    );
+    assert_eq!(
+        policy.last_improver.map(|(label, _)| label),
+        Some("sls-ddfw-opt"),
+        "only a strict improvement moves the protected-improver record"
+    );
+}
+
+/// SHED SEQUENCE TERMINATES: under sustained scripted pressure the policy
+/// drains every worker but the P1 baseline in finitely many steps — even in
+/// the worst case where the protected improver refreshes its protection
+/// before EVERY step — and then yields `None` forever. Protection only
+/// reorders the drain (the improver goes last); it never extends it.
+#[test]
+fn shed_mechanism_sustained_pressure_drains_to_baseline() {
+    // Worst case: the tail improver re-improves before every pressure poll.
+    let (mut controls, flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let mut now = t0;
+    let mut shed_order: Vec<&str> = Vec::new();
+    let mut steps = 0usize;
+    while steps < 100 {
+        steps += 1;
+        // 1 s per step clears both the poll interval (100 ms) and the
+        // post-shed cooldown (500 ms) — scripted time, no sleeping.
+        now += Duration::from_secs(1);
+        policy.note_verified_improvement("sls-ddfw-opt", now);
+        match policy.step(now, || true, &mut controls) {
+            Some(label) => shed_order.push(label),
+            None => break,
+        }
+    }
+    assert_eq!(
+        shed_order,
+        vec!["sls-primal-opt", "native-cdcl-opt", "sls-ddfw-opt"],
+        "protection reorders the drain (improver last), never blocks it"
+    );
+    assert_eq!(steps, 4, "3 sheds + the terminating None, no more");
+    assert_eq!(controls.active(), 1, "only the P1 baseline survives");
+    assert!(!flags[0].load(Ordering::Relaxed));
+    // Steady state: further pressured steps stay `None`.
+    now += Duration::from_secs(1);
+    policy.note_verified_improvement("sls-ddfw-opt", now);
+    assert_eq!(policy.step(now, || true, &mut controls), None);
+
+    // Control: the same drain WITHOUT protection — plain reverse order,
+    // same length, same terminal state.
+    let (mut controls, _flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+    let mut now = t0;
+    let mut shed_order: Vec<&str> = Vec::new();
+    for _ in 0..100 {
+        now += Duration::from_secs(1);
+        match policy.step(now, || true, &mut controls) {
+            Some(label) => shed_order.push(label),
+            None => break,
+        }
+    }
+    assert_eq!(
+        shed_order,
+        vec!["sls-ddfw-opt", "sls-primal-opt", "native-cdcl-opt"]
+    );
+    assert_eq!(controls.active(), 1);
+}
+
+/// RATE LIMITS survive the extraction: the poll-interval gate defers the
+/// first probe, a shed arms the cooldown (no back-to-back sheds), and a
+/// quiet pressure signal sheds nothing — all on scripted time.
+#[test]
+fn shed_mechanism_poll_and_cooldown_gates() {
+    let (mut controls, _flags) = shed_harness_controls();
+    let t0 = Instant::now();
+    let mut policy = ShedPolicy::new(t0);
+
+    // Before the first poll interval (100 ms): no probe, no shed.
+    assert_eq!(policy.step(t0, || true, &mut controls), None);
+    // Past the poll interval: pressure sheds the tail arm.
+    assert_eq!(
+        policy.step(t0 + Duration::from_millis(150), || true, &mut controls),
+        Some("sls-ddfw-opt")
+    );
+    // 450 ms: past the re-armed poll (250 ms) but inside the 500 ms
+    // post-shed cooldown (until 650 ms) — no shed.
+    assert_eq!(
+        policy.step(t0 + Duration::from_millis(450), || true, &mut controls),
+        None
+    );
+    // 700 ms: cooldown cleared — next reverse-order victim.
+    assert_eq!(
+        policy.step(t0 + Duration::from_millis(700), || true, &mut controls),
+        Some("sls-primal-opt")
+    );
+    // Quiet pressure signal: nothing sheds regardless of candidates.
+    assert_eq!(
+        policy.step(t0 + Duration::from_secs(2), || false, &mut controls),
+        None
+    );
+    assert_eq!(controls.active(), 2, "P1 + the complete arm still active");
+}
+
 /// Hard collection deadline (F7): a straggler worker that ignores its stop
 /// flag past the caller's timeout must not stall the coordinator — it returns
 /// the best VERIFIED streamed incumbent within timeout + grace (workers are
@@ -2999,8 +3430,12 @@ fn test_collector_hard_deadline_returns_streamed_incumbent() {
     // The straggler streams one incumbent, then holds its channel end open
     // well past the deadline (simulating a long uninterruptible solve step).
     std::thread::spawn(move || {
-        tx.send(WorkerMsg::Improvement(9, vec![true, false, false]))
-            .expect("send should succeed");
+        tx.send(WorkerMsg::Improvement(
+            "sequential-portfolio-opt",
+            9,
+            vec![true, false, false],
+        ))
+        .expect("send should succeed");
         std::thread::sleep(Duration::from_secs(20));
         drop(tx);
     });
@@ -3020,6 +3455,7 @@ fn test_collector_hard_deadline_returns_streamed_incumbent() {
         &mut |obj, _| improvements.push(obj),
         &SharedBounds::new(),
         &mut OptimizationBackfill::none(),
+        &mut ShedPolicy::new(Instant::now()),
     );
     let elapsed = start.elapsed();
 
@@ -3135,6 +3571,7 @@ fn test_backfill_spawns_tail_spec_and_collects_planted_incumbent() {
         &mut |obj, _| improvements.push(obj),
         &SharedBounds::new(),
         &mut backfill,
+        &mut ShedPolicy::new(Instant::now()),
     );
 
     assert_eq!(
@@ -3201,6 +3638,7 @@ fn test_collector_reaps_worker_that_dies_without_completion_message() {
         &mut |_, _| {},
         &SharedBounds::new(),
         &mut backfill,
+        &mut ShedPolicy::new(Instant::now()),
     );
     let elapsed = started.elapsed();
     drop(held_tx);
@@ -3449,7 +3887,7 @@ fn test_shed_order_accounts_for_backfilled_workers() {
     );
 
     let mut shed: Vec<&str> = Vec::new();
-    while let Some(label) = controls.shed_lowest_priority() {
+    while let Some(label) = controls.shed_lowest_priority(None) {
         shed.push(label);
     }
     assert_eq!(
@@ -5357,6 +5795,7 @@ fn test_collector_upgrades_primal_incumbent_meeting_sound_floor_to_optimum() {
         &mut |obj, _| improvements.push(obj),
         &bus,
         &mut OptimizationBackfill::none(),
+        &mut ShedPolicy::new(Instant::now()),
     );
 
     assert_eq!(outcome.status, PbStatus::OptimumFound);
@@ -5400,6 +5839,7 @@ fn test_collector_produces_no_upgrade_from_corrupted_bus_slot() {
         &mut |_, _| {},
         &bus,
         &mut OptimizationBackfill::none(),
+        &mut ShedPolicy::new(Instant::now()),
     );
 
     assert_ne!(

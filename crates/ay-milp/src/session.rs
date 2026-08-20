@@ -22,8 +22,8 @@ use num_traits::Zero;
 
 use crate::cert::{BoundSide, CertifiedRow, FarkasCertificate, OptimalityCertificate};
 use crate::certify::{
-    certified_weak_dual_row, certify, certify_model_basis_with_deadline, certify_with_deadline,
-    MAX_EXACT_BASIS_ROWS,
+    certified_weak_dual_row, certify, certify_model_basis_with_deadline,
+    certify_model_basis_within, certify_with_deadline, MAX_EXACT_BASIS_ROWS,
 };
 use crate::error::{MilpError, ModelError};
 use crate::exact::{Budget, ExactLp, LpFeasibility, LpOptimum};
@@ -500,6 +500,94 @@ mod fixed_assignment_tree_warm_mode_tests {
 fn float_lane_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::NoFloat) != Some(true))
+}
+
+/// The share of an all-continuous solve's remaining budget the float-first
+/// start may spend before the exact rim takes over.
+///
+/// The rim is the FALLBACK on this lane, and a fallback that has been starved of
+/// its budget is not one. Half is the smallest split that still leaves the float
+/// search room on the shapes this exists for (`domset_mw19_19`: 9.6s of float
+/// search plus its exact basis adjudication, against a 120s budget) while
+/// leaving the rim at least half of what it has today. A float-first attempt
+/// that overruns its share DECLINES, which is today's behaviour minus the
+/// spent half — never a different verdict.
+const CONTINUOUS_FLOAT_FIRST_SHARE: f64 = 0.5;
+
+/// The row cap for the all-continuous lane's exact basis adjudication.
+///
+/// NOT [`MAX_EXACT_BASIS_ROWS`]: that constant is the point above which exact
+/// basis replay stops being worth it COMPARED WITH RE-SOLVING ON THE EXACT RIM,
+/// and on this lane the rim is the thing that cannot solve the model at all
+/// (`hexgrid_opt_ncols_550`, 12,650 rows: the rim returns `UNKNOWN Timeout`).
+/// The comparison the constant encodes does not apply here, so the DEADLINE —
+/// polled inside every construction loop and inside the sparse elimination and
+/// back-substitution — is the cost control instead. The cap survives only as a
+/// guard against an absurd allocation.
+const CONTINUOUS_FLOAT_FIRST_MAX_ROWS: usize = 1_000_000;
+
+/// FLOAT-FIRST START FOR THE ALL-CONTINUOUS LANE (`MilpLane::Exact`).
+///
+/// WHY THIS EXISTS. A model with no integrality is routed to `MilpLane::Exact`,
+/// which built [`ExactLp`] and asked it for the optimum directly — the float
+/// lane never ran at all. So on exactly the class the exact rim cannot solve
+/// (weighted covering: `a_rj > 0`, finite row lower bounds, no row upper bounds)
+/// the rim was the SOLE authority. MEASURED at this HEAD, `domset_mw19_19`
+/// (466x467): the rim returns `UNKNOWN Timeout` at both 20s and 120s, while the
+/// float lane finds an optimal basis in 9.6s / 13,493 primal iterations. The
+/// BASIS is the thing worth having; the number attached to it is not.
+///
+/// WHAT IS TRUSTED: nothing numeric. [`FloatLp`] contributes a COMBINATORIAL
+/// object — which columns are basic (`cand.basis`), and which bound each other
+/// column rests on (`cand.at`) — and
+/// [`crate::certify::certify_model_basis_within`] rebuilds the matrix, both
+/// sets of bounds, the objective and the sense from the [`Model`]'s own exact
+/// side store, solves `B x_B = -N x_N` and `Bᵀ y = c_B` in exact rationals,
+/// re-derives every row activity and reduced cost from the true matrix, checks
+/// every bound and every reduced-cost sign exactly, and only then hands the
+/// assembled certificate to the independent public checker. No `f64` from the
+/// search reaches the verdict, the point, or the certificate.
+///
+/// FAIL-CLOSED AT EVERY STEP: a float status that is not `Optimal`, a malformed,
+/// duplicated or singular basis, a nonbasic resting on a bound it does not have,
+/// an exactly infeasible basic value, a reduced cost with the wrong sign, an
+/// expired share, or a certificate the public checker rejects all return `None`
+/// — and `None` means the caller runs today's exact rim, unchanged, on the
+/// budget that remains.
+fn continuous_float_first_optimum(
+    model: &Model,
+    objective: &[(u32, f64)],
+    deadline: Option<Instant>,
+) -> Option<Outcome> {
+    if !float_lane_enabled() {
+        return None;
+    }
+    let now = Instant::now();
+    let share = deadline.map(|limit| {
+        now + limit
+            .saturating_duration_since(now)
+            .mul_f64(CONTINUOUS_FLOAT_FIRST_SHARE)
+    });
+    let mut lp = FloatLp::from_model_with_deadline(model, objective, model.sense(), share)?;
+    // The session lane's measured configuration (see `FloatLp::plain_cold`).
+    lp.plain_cold = true;
+    let cand = lp.solve(share);
+    if cand.status != SimplexStatus::Optimal {
+        return None;
+    }
+    // This entry reads NO numeric data back from `lp` — only `basis` and `at`.
+    let proven = certify_model_basis_within(
+        model,
+        &cand.basis,
+        &cand.at,
+        share,
+        CONTINUOUS_FLOAT_FIRST_MAX_ROWS,
+    )?;
+    Some(Outcome::Optimal {
+        value: proven.value + model.obj_offset_exact(),
+        model_values: proven.values,
+        cert: Some(proven.cert),
+    })
 }
 
 /// Build the exact-lane iteration/deadline budget for `model` under `opts`.
@@ -9121,7 +9209,21 @@ impl BabSession {
                     other => other,
                 }
             }
-            MilpLane::Exact => {
+            MilpLane::Exact => 'exact: {
+                // FLOAT-FIRST START (see `continuous_float_first_optimum`): a
+                // combinatorial basis from the float lane, adjudicated entirely
+                // in exact rationals against this model's own data. A decline
+                // costs at most half the budget and falls straight through to
+                // the unchanged exact rim below. Only an objective-bearing
+                // solve takes it — a feasibility solve's verdict is
+                // `Outcome::Feasible`, and an optimum is not that verdict.
+                if has_objective && !expired(&self.opts) {
+                    if let Some(fast) =
+                        continuous_float_first_optimum(&self.model, &objective, self.opts.deadline)
+                    {
+                        break 'exact fast;
+                    }
+                }
                 let budget = budget_for(&self.model, &self.opts);
                 let mut lp = ExactLp::new(&self.model);
                 if has_objective {

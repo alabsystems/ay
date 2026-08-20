@@ -354,5 +354,11 @@ fn infer_dt_lemma_kind(
     if ay_proof::recognize_datatype_distinct(terms, clause, dt.datatypes) {
         return Some(TheoryLemmaKind::DatatypeDistinct);
     }
+    // Direct acyclicity (occurs check): the recognizer IS the strict
+    // validator with the same registries, so acceptance is re-decided
+    // identically at certification.
+    if ay_proof::recognize_datatype_acyclic_direct(terms, clause, dt.datatypes) {
+        return Some(TheoryLemmaKind::DatatypeAcyclicDirect);
+    }
     None
 }

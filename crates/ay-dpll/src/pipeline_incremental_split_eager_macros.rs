@@ -529,7 +529,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L440"));
                                 break 'split_loop Ok(SolveResult::Unknown);
                             }
-                            // Strings NF-engine closure 3 (`AY_STR_NF=1`):
+                            // Strings NF-engine closure 3 (`--str-nf`):
                             // drain any ADDITIONAL lemmas the theory queued
                             // behind this one and lower the whole batch in
                             // THIS iteration instead of one CEGAR round-trip
@@ -1347,7 +1347,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         );
                     }
                     SatResult::Unsat(_) => {
-                        // Strings NF-engine closure 5 (`AY_STR_NF=1`): a
+                        // Strings NF-engine closure 5 (`--str-nf`): a
                         // propositional UNSAT reached after string lemma
                         // clauses were added is a PROOF when every such clause
                         // is universally valid (exact reduction axioms over

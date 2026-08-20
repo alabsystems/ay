@@ -118,6 +118,21 @@ fn normalize_row(constraint: &PbConstraint, num_vars: usize, acc: &mut [i128]) -
 /// Turns the accumulated coefficients into a [`NormRow`]. Split out of
 /// [`normalize_row`] so the accumulator is always zeroed on one path.
 fn collect_normalized(touched: &[u32], acc: &[i128], rhs: i128) -> NormRow {
+    // MONOTONICITY FIRST, triviality second. A negative normalized
+    // coefficient puts the row outside the monotone covering fragment no
+    // matter the rhs: an at-most-one row (`-x1 - x2 >= -1`) or an implication
+    // row (`-x1 + x2 >= 0`) normalizes to `rhs <= 0` yet is NOT trivially
+    // true. The old order dropped such rows as "trivial", leaving the
+    // advisory view a strict relaxation; that stayed SOUND (the first greedy
+    // candidate failed `record`'s original-constraint re-verification and the
+    // arm declined fail-closed) but the decline was accidental and paid for a
+    // full view build + greedy + doomed verification — measured 47ms on
+    // `primes-dimacs-cnf/ii16d2` and 99us on `routing/s4-4-3-1pb`, against
+    // the microsecond structural declines this gate promises. Rejecting here
+    // makes the same verdict structural and O(row).
+    if touched.iter().any(|&var| acc[var as usize] < 0) {
+        return NormRow::Reject;
+    }
     if rhs <= 0 {
         return NormRow::Trivial;
     }
@@ -128,9 +143,7 @@ fn collect_normalized(touched: &[u32], acc: &[i128], rhs: i128) -> NormRow {
     let mut reach: i64 = 0;
     for &var in touched {
         let coeff = acc[var as usize];
-        if coeff < 0 {
-            return NormRow::Reject;
-        }
+        debug_assert!(coeff >= 0, "negative coefficients were rejected above");
         if coeff == 0 {
             continue;
         }

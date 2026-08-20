@@ -332,6 +332,7 @@ fn decide_linear_ideal_refutation(terms: &TermStore, clause: &[TermId]) -> Resul
     decide_linear_ideal_refutation_with_progress(terms, clause, &mut unbounded)
 }
 
+#[cfg(test)]
 pub(crate) fn validate_linear_ideal_refutation_with_progress(
     terms: &TermStore,
     step_id: ProofId,
@@ -350,7 +351,50 @@ pub(crate) fn validate_linear_ideal_refutation_with_progress(
     })
 }
 
-fn decide_linear_ideal_refutation_with_progress(
+/// Validate a `Generic` arithmetic lemma on EITHER arithmetic lane.
+///
+/// The negated clause is normalized ONCE and then offered to two rules:
+///
+/// 1. the equality-span FAST PATH of this module, which decides polynomial
+///    IDENTITY refutations (loop-invariant consecution) and ignores order;
+/// 2. [`super::nia_fourier_motzkin`], which decides the ORDER lane by
+///    exact-rational Fourier–Motzkin elimination over the same constraints.
+///
+/// Sharing one extraction and one [`WorkMeter`] matters: this runs on every
+/// trust-kind theory lemma of every proof, and re-parsing each clause would
+/// double the caller's proof-wide resource charge for the whole `Generic` arm.
+/// Declaration-free recognizer used by proof producers: `true` exactly when
+/// the strict [`crate::checker`] `ArithClauseTautology` arm accepts the
+/// clause (recognizer IS the validator, so classifier and checker cannot
+/// drift). Runs under the validator's own work meter with an unbounded
+/// progress callback.
+#[must_use]
+pub fn recognize_arith_clause_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_generic_arithmetic_refutation_with_progress(terms, ProofId(0), clause, &mut |_, _| {
+        true
+    })
+    .is_ok()
+}
+
+pub(crate) fn validate_generic_arithmetic_refutation_with_progress(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    decide_generic_arithmetic_refutation_with_progress(terms, clause, progress).map_err(|reason| {
+        if reason == WORK_METER_RESOURCE_LIMIT {
+            ProofCheckError::ResourceLimit
+        } else {
+            ProofCheckError::InvalidTheoryLemma {
+                step: step_id,
+                reason: format!("generic_arithmetic_refutation: {reason}"),
+            }
+        }
+    })
+}
+
+fn decide_generic_arithmetic_refutation_with_progress(
     terms: &TermStore,
     clause: &[TermId],
     progress: &mut dyn FnMut(usize, usize) -> bool,
@@ -367,9 +411,46 @@ fn decide_linear_ideal_refutation_with_progress(
         return Ok(());
     }
 
+    match decide_span_refutation(&extraction.constraints, &mut meter, &mut envelope) {
+        Ok(()) => return Ok(()),
+        // A caller-envelope refusal is a resource event, not a verdict: do not
+        // spend more of the same envelope on the second lane.
+        Err(reason) if reason == WORK_METER_RESOURCE_LIMIT => return Err(reason),
+        Err(_) => {}
+    }
+    super::nia_fourier_motzkin::fourier_motzkin_refutes(&extraction.constraints, &mut meter)
+}
+
+#[cfg(test)]
+fn decide_linear_ideal_refutation_with_progress(
+    terms: &TermStore,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), String> {
+    let mut meter = WorkMeter::with_progress(progress);
+    meter.poll()?;
+    let extraction = extract_constraints(terms, clause, &mut meter)?;
+    meter.poll()?;
+    let mut envelope = IdealEnvelope::default();
+    account_extracted_constraints(&extraction.constraints, &mut meter, &mut envelope)?;
+
+    // A conjunct that evaluated to FALSE refutes the negation outright.
+    if extraction.const_refuted {
+        return Ok(());
+    }
+    decide_span_refutation(&extraction.constraints, &mut meter, &mut envelope)
+}
+
+/// The equality-span rule proper: is some disequality polynomial in the
+/// rational span of the equality polynomials?
+fn decide_span_refutation(
+    constraints: &[super::nra_poly::Constraint],
+    meter: &mut WorkMeter<'_>,
+    envelope: &mut IdealEnvelope,
+) -> Result<(), String> {
     let mut equalities: Vec<&MPoly> = Vec::new();
     let mut disequalities: Vec<&MPoly> = Vec::new();
-    for constraint in &extraction.constraints {
+    for constraint in constraints {
         meter.poll()?;
         match constraint.rel {
             Rel::Eq => {
@@ -411,22 +492,18 @@ fn decide_linear_ideal_refutation_with_progress(
     let mut basis = PivotBasis::new();
     for poly in &equalities {
         meter.poll()?;
-        let residual = reduce(poly, &basis, &mut meter, &mut envelope)?;
-        if let Some((lead_ref, coeff_ref)) = envelope.leading_term(&residual, &mut meter)? {
+        let residual = reduce(poly, &basis, meter, envelope)?;
+        if let Some((lead_ref, coeff_ref)) = envelope.leading_term(&residual, meter)? {
             if basis.len() == MAX_BASIS_ROWS {
                 return Err(format!(
                     "linear-ideal basis-row cap {MAX_BASIS_ROWS} exceeded"
                 ));
             }
-            let (lead, coeff) = envelope.clone_leading(lead_ref, coeff_ref, &mut meter)?;
-            envelope.charge_pivot_lookup(basis.len(), &lead, &mut meter)?;
-            let inverse = envelope.reciprocal(&coeff, &mut meter)?;
-            envelope.charge_poly_upper(
-                &residual,
-                &mut meter,
-                "precharging a normalized basis row",
-            )?;
-            let normalized = residual.scale(&inverse, &mut meter)?;
+            let (lead, coeff) = envelope.clone_leading(lead_ref, coeff_ref, meter)?;
+            envelope.charge_pivot_lookup(basis.len(), &lead, meter)?;
+            let inverse = envelope.reciprocal(&coeff, meter)?;
+            envelope.charge_poly_upper(&residual, meter, "precharging a normalized basis row")?;
+            let normalized = residual.scale(&inverse, meter)?;
             if basis.insert(lead, normalized).is_some() {
                 return Err("duplicate pivot survived linear-ideal reduction".to_string());
             }
@@ -436,7 +513,7 @@ fn decide_linear_ideal_refutation_with_progress(
     // `G` is in the span iff it reduces to the zero polynomial.
     for poly in &disequalities {
         meter.poll()?;
-        let residual = reduce(poly, &basis, &mut meter, &mut envelope)?;
+        let residual = reduce(poly, &basis, meter, envelope)?;
         if residual.terms.is_empty() {
             return Ok(());
         }

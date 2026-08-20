@@ -11,61 +11,23 @@
 use super::inprocessing::FactorSkipReason;
 use super::*;
 
-pub(super) const BCP_LEARNED_1963_BLOCKER_CERT_ELISION_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION";
-pub(super) const BCP_LEARNED_1963_BLOCKER_CERT_SHADOW_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW";
-pub(super) const BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE_ENV: &str =
-    "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE";
-
 #[inline]
 pub(super) fn bcp_learned_1963_blocker_cert_elision_env_enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_ELISION_ENV).is_ok_and(|value| value == "1")
-        })
-    }
-
-    #[cfg(test)]
-    {
-        std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_ELISION_ENV).is_ok_and(|value| value == "1")
-    }
+    // B76: `--sat-bcp-learned-1963-blocker-cert-elision` is the carrier
+    // (the official run.sh passes it per profile decision).
+    ay_core::sat_ab_switches().bcp_learned_1963_blocker_cert_elision
 }
 
 #[inline]
 pub(super) fn bcp_learned_1963_blocker_cert_shadow_env_enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_SHADOW_ENV).is_ok_and(|value| value == "1")
-        })
-    }
-
-    #[cfg(test)]
-    {
-        std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_SHADOW_ENV).is_ok_and(|value| value == "1")
-    }
+    // B75: `--sat-bcp-learned-1963-blocker-cert-shadow` is the carrier.
+    ay_core::sat_ab_switches().bcp_learned_1963_blocker_cert_shadow
 }
 
 #[inline]
 pub(super) fn bcp_learned_1963_blocker_cert_false_reject_demote_env_enabled() -> bool {
-    #[cfg(not(test))]
-    {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE_ENV)
-                .is_ok_and(|value| value == "1")
-        })
-    }
-
-    #[cfg(test)]
-    {
-        std::env::var(BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE_ENV)
-            .is_ok_and(|value| value == "1")
-    }
+    // B76: `--sat-bcp-learned-1963-blocker-cert-false-reject-demote` carrier.
+    ay_core::sat_ab_switches().bcp_learned_1963_blocker_cert_false_reject_demote
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

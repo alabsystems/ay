@@ -184,6 +184,18 @@ fn clause_has_true_ground_literal(terms: &TermStore, clause: &[TermId]) -> bool 
         .any(|&lit| eval.eval(lit).and_then(|v| v.as_bool()) == Some(true))
 }
 
+/// The hygiene gate of [`recognize_string_ground_eval`], on its own.
+///
+/// Exported so a caller that classifies MANY sub-clauses of one conflict can
+/// pay for the DAG walk once. It is exact rather than approximate, and it is
+/// MONOTONE in the clause: the terms reachable from a sub-clause are a subset
+/// of those reachable from the clause, so `false` here proves `false` for every
+/// sub-clause, and skipping the recognizer on those sub-clauses cannot change
+/// which lemma kind is inferred.
+pub fn clause_mentions_string_or_regex(terms: &TermStore, clause: &[TermId]) -> bool {
+    mentions_string_or_regex(terms, clause)
+}
+
 fn mentions_string_or_regex(terms: &TermStore, clause: &[TermId]) -> bool {
     let mut stack: Vec<TermId> = clause.to_vec();
     let mut visited: DetHashSet<TermId> = DetHashSet::default();

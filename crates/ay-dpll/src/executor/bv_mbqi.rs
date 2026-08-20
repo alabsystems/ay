@@ -124,6 +124,81 @@ impl CheckedBvFullDomainSatAuthority {
     }
 }
 
+/// Mint full-domain SAT authority for a complete-domain proof produced OUTSIDE
+/// this module, bundling the root-coverage check with the mint so the two can
+/// never be separated at a call site.
+///
+/// The token's meaning is "every quantified obligation in this exact authored
+/// root window was discharged over its binders' COMPLETE domain" — it is not
+/// specific to bitvectors, only named for its first producer. The finite-sort
+/// model-relative lane (`executor/finite_model_mbqi.rs`) establishes exactly
+/// that for `FloatingPoint` binders, by a different but equally complete route:
+/// a checked-UNSAT refutation of the skolemized negation under a pinned
+/// structure covers the whole binder domain the same way this module's
+/// symbolic entailment check does.
+///
+/// [`CheckedBvFullDomainSatAuthority::for_current`] stays private so no sibling
+/// module can mint the token from a raw solver result; this is the only widened
+/// entry point, and it cannot be called without passing the coverage check.
+/// `certified_nodes` are identified by their QUANTIFIER NODE, so a universal
+/// authored as `(not (exists ...))` is named by its `Exists` node — the term
+/// that actually occurs in the authored root window the publication gates
+/// check. (`authority_roots_exactly_cover_bv_foralls` additionally demands each
+/// certified node BE a `Forall`, which only a lane working on the rewritten
+/// form can satisfy.)
+pub(in crate::executor) fn checked_full_domain_sat_authority(
+    executor: &Executor,
+    authority_roots: &[TermId],
+    certified_nodes: &[TermId],
+) -> Option<CheckedBvFullDomainSatAuthority> {
+    let terms = &executor.ctx.terms;
+    let certified: HashSet<TermId> = certified_nodes.iter().copied().collect();
+    (!authority_roots.is_empty()
+        && !certified_nodes.is_empty()
+        && certified.len() == certified_nodes.len()
+        && quantifier_nodes_in(terms, authority_roots) == certified)
+        .then(|| CheckedBvFullDomainSatAuthority::for_current(executor, authority_roots))
+        .flatten()
+}
+
+/// Every `Forall`/`Exists` node reachable from `roots`.
+///
+/// Shared with the finite-sort lane, which must enumerate exactly the nodes
+/// this coverage check will later look for — deriving them by a second,
+/// independent walk is how they drift apart.
+pub(in crate::executor) fn quantifier_nodes_in(
+    terms: &TermStore,
+    roots: &[TermId],
+) -> HashSet<TermId> {
+    let mut found: HashSet<TermId> = HashSet::default();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut pending = roots.to_vec();
+    while let Some(term) = pending.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        match terms.get(term) {
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
+                found.insert(term);
+                pending.push(*body);
+            }
+            TermData::App(_, args) => pending.extend(args.iter().copied()),
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(condition, then_term, else_term) => {
+                pending.push(*condition);
+                pending.push(*then_term);
+                pending.push(*else_term);
+            }
+            TermData::Let(bindings, body) => {
+                pending.extend(bindings.iter().map(|(_, value)| *value));
+                pending.push(*body);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
 /// Check that the roots bound into a BV authority token contain exactly the
 /// quantified obligations this refinement pass discharged. Ground siblings
 /// are allowed because their SAT/model evidence is checked by the ordinary

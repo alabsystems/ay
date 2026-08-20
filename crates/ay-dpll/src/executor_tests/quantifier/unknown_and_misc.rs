@@ -748,6 +748,111 @@ fn test_cardinality_two_distinct_stays_unsat() {
     assert_eq!(out, "unsat", "cardinality conflict must stay UNSAT");
 }
 
+/// (#eu-carrier-mint) ACCEPTING DIRECTION: a var-equality forall over an EMPTY
+/// uninterpreted universe is SAT in the singleton universe, but the
+/// instantiated body `(= w w)` hash-conses to `true`, so the disposable ground
+/// solve never materializes a carrier element for the synthesized witness and
+/// the exactness check used to decline the transport
+/// ("CERT/empty-universe: checked model transport declined SAT"). The carrier
+/// mint names the sort's sole inhabitant; the UNTOUCHED independent gate must
+/// then confirm the resulting model on its own terms — the assertion below is
+/// the gate's own verdict string, not the lane's claim about itself.
+#[test]
+fn empty_universe_var_equality_singleton_sat_gate_confirmed() {
+    let commands = parse(
+        r#"
+        (set-logic ALL)
+        (declare-sort U 0)
+        (assert (forall ((u U) (v U)) (= u v)))
+        (check-sat)
+    "#,
+    )
+    .expect("script parses");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("script executes");
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "singleton-universe var equality must certify SAT, not decline the transport"
+    );
+    assert_eq!(
+        exec.statistics().get_string("model_check_gate.result"),
+        Some("confirmed-sat"),
+        "the independent gate must confirm the minted-carrier model on its own terms"
+    );
+    assert_eq!(
+        exec.statistics()
+            .get_int("model_completion.singleton_universe_carriers"),
+        Some(1),
+        "exactly the one synthesized witness carrier must have been minted"
+    );
+}
+
+/// (#eu-carrier-mint) KILL SWITCH: `--no-singleton-carrier-mint` disables the
+/// carrier mint and must restore the baseline decline byte-for-byte —
+/// `unknown` with the quantifier-unhandled reason. Deleting the kill-switch
+/// guard in `publish_singleton_universe_uf_tables` makes the OFF half fail;
+/// the ON half re-checks the default grant in the same process.
+#[test]
+fn empty_universe_carrier_mint_kill_switch_restores_baseline() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-sort U 0)
+        (assert (forall ((u U) (v U)) (= u v)))
+        (check-sat)
+    "#;
+
+    let off = ay_core::MiscCliFlags {
+        no_singleton_carrier_mint: true,
+        ..ay_core::MiscCliFlags::default()
+    };
+    let off_guard = ay_core::misc_test_override::set(off);
+    let out_off = check_sat_output(smt);
+    drop(off_guard);
+    assert_eq!(
+        out_off, "unknown",
+        "with the mint killed the chain must restore the baseline decline"
+    );
+
+    let out_on = check_sat_output(smt);
+    assert_eq!(
+        out_on, "sat",
+        "with the mint on (default) the singleton chain must certify SAT"
+    );
+}
+
+/// (#eu-carrier-mint) REJECTING DIRECTION: a universe forced to TWO elements
+/// by an existential must never ride the singleton chain to `sat` — in either
+/// kill-switch mode. (The ground-constant form of this guard is
+/// `test_cardinality_two_distinct_stays_unsat` above; this is the form whose
+/// sort has no ground terms before skolemization.)
+#[test]
+fn empty_universe_exists_forced_two_elements_never_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-sort U 0)
+        (assert (forall ((x U) (y U)) (= x y)))
+        (assert (exists ((u U) (v U)) (distinct u v)))
+        (check-sat)
+    "#;
+    let out = check_sat_output(smt);
+    assert_ne!(
+        out, "sat",
+        "a two-element-forced universe must never take the singleton chain to SAT"
+    );
+
+    let off = ay_core::MiscCliFlags {
+        no_singleton_carrier_mint: true,
+        ..ay_core::MiscCliFlags::default()
+    };
+    let _guard = ay_core::misc_test_override::set(off);
+    let out_off = check_sat_output(smt);
+    assert_ne!(
+        out_off, "sat",
+        "the rejection must not depend on the mint being enabled"
+    );
+}
+
 /// (#p2-default-row) c2: n-ary bare-tuple default-row certificate decides
 /// `∀x,y:Int. p(x,y)` SAT with `p ≡ true` (z3 parity).
 #[test]

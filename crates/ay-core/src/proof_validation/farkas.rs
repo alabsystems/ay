@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use num_bigint::BigInt;
 use num_rational::{BigRational, Rational64};
-use num_traits::{One, Zero};
+use num_traits::{One, Signed, Zero};
 use thiserror::Error;
 
 use crate::{Constant, FarkasAnnotation, Symbol, TermData, TermId, TermStore, TheoryLit};
@@ -154,6 +154,46 @@ impl LinearExpr {
             let should_remove = {
                 let entry = self.coeffs.entry(*var).or_insert_with(BigRational::zero);
                 *entry += scale * coeff;
+                entry.is_zero()
+            };
+            if should_remove {
+                self.coeffs.remove(var);
+            }
+        }
+    }
+
+    /// `self += other`, with the scale already folded into `other`.
+    ///
+    /// Identical to `add_scaled(other, 1)` but without the per-coefficient
+    /// `BigRational` multiplication (a bigint gcd + two divisions each). The
+    /// orientation search adds the SAME λ-scaled row millions of times, so the
+    /// multiplication belongs in the one-time plan build, not the inner loop.
+    fn add_expr(&mut self, other: &Self) {
+        self.constant += &other.constant;
+        for (var, coeff) in &other.coeffs {
+            let should_remove = {
+                let entry = self.coeffs.entry(*var).or_insert_with(BigRational::zero);
+                *entry += coeff;
+                entry.is_zero()
+            };
+            if should_remove {
+                self.coeffs.remove(var);
+            }
+        }
+    }
+
+    /// Exact inverse of [`LinearExpr::add_expr`].
+    ///
+    /// `coeffs` is canonical — a key is present exactly when its running total
+    /// is non-zero — so `add_expr(e)` followed by `sub_expr(e)` restores both
+    /// the map and the constant bit-for-bit. That is what lets the orientation
+    /// search backtrack in place instead of cloning the accumulator per node.
+    fn sub_expr(&mut self, other: &Self) {
+        self.constant -= &other.constant;
+        for (var, coeff) in &other.coeffs {
+            let should_remove = {
+                let entry = self.coeffs.entry(*var).or_insert_with(BigRational::zero);
+                *entry -= coeff;
                 entry.is_zero()
             };
             if should_remove {
@@ -660,37 +700,45 @@ fn farkas_combination_contradicts(
         .try_fold(1u64, u64::checked_mul)
         .unwrap_or(u64::MAX);
 
+    // Both paths below consume the SAME plan: every `λ·e` product is computed
+    // once here rather than once per combination, and the single-orientation
+    // literals are summed once into `plan.base` (#8404 perf — see `ScaledPlan`).
+    let plan = build_scaled_plan(alternatives, lambdas);
+
     if search_space <= 1024 {
-        if search(0, alternatives, lambdas, &LinearExpr::zero(), false) {
+        let mut acc = plan.base.clone();
+        if search_plan(&plan, 0, &mut acc, plan.base_strict, &mut None) {
             return true;
         }
     } else {
         // Too many combinations — try only the first alternative for each
         // literal (fast path).  If that succeeds, accept the certificate.
-        let mut sum = LinearExpr::zero();
-        let mut strict = false;
-        for (alts, lambda) in alternatives.iter().zip(lambdas.iter()) {
-            let alt = &alts[0];
-            sum.add_scaled(&alt.expr, lambda);
-            strict = strict || (!lambda.is_zero() && alt.strict);
+        let mut sum = plan.base.clone();
+        let mut strict = plan.base_strict;
+        for branch in &plan.branches {
+            sum.add_expr(&branch.scaled[0]);
+            strict = strict || branch.strict[0];
         }
         if is_contradiction(&sum, strict) {
             return true;
         }
-        // Try the second alternative for each equality literal one at a time
-        for i in 0..alternatives.len() {
-            if alternatives[i].len() <= 1 {
-                continue;
-            }
-            let mut sum2 = LinearExpr::zero();
-            let mut strict2 = false;
-            for (j, (alts, lambda)) in alternatives.iter().zip(lambdas.iter()).enumerate() {
-                let alt_idx = if j == i { 1 } else { 0 };
-                let alt = &alts[alt_idx.min(alts.len() - 1)];
-                sum2.add_scaled(&alt.expr, lambda);
-                strict2 = strict2 || (!lambda.is_zero() && alt.strict);
-            }
-            if is_contradiction(&sum2, strict2) {
+        // Try the second alternative for each equality literal one at a time.
+        // `sum` already holds the all-first combination, so each variant is one
+        // row swapped out and one swapped in — not a rebuild from scratch.
+        for flipped in 0..plan.branches.len() {
+            let branch = &plan.branches[flipped];
+            sum.sub_expr(&branch.scaled[0]);
+            sum.add_expr(&branch.scaled[1]);
+            let strict2 = plan.base_strict
+                || plan
+                    .branches
+                    .iter()
+                    .enumerate()
+                    .any(|(i, b)| b.strict[usize::from(i == flipped)]);
+            let hit = is_contradiction(&sum, strict2);
+            sum.sub_expr(&branch.scaled[1]);
+            sum.add_expr(&branch.scaled[0]);
+            if hit {
                 return true;
             }
         }
@@ -1026,72 +1074,222 @@ fn is_contradiction(sum: &LinearExpr, strict: bool) -> bool {
     }
 }
 
-fn search(
+/// One orientation-branching position of a [`ScaledPlan`].
+///
+/// Only literals that genuinely offer more than one normalized form (an
+/// equality's two orientations, a disequality's two strict branches) become a
+/// branch; everything else is folded into [`ScaledPlan::base`] once.
+struct ScaledBranch {
+    /// Position in the original `alternatives`/`lambdas` vectors, so
+    /// `search_recording_choice` can report the choice at the right index.
     idx: usize,
+    /// `λ·e` for each candidate, in the original candidate order.
+    scaled: Vec<LinearExpr>,
+    /// `λ != 0 && alt.strict` for each candidate.
+    strict: Vec<bool>,
+}
+
+/// The orientation search, pre-scaled and pre-folded (#8404 perf).
+///
+/// The naive formulation walks all `alternatives.len()` positions recursively,
+/// cloning the accumulator and running one `BigRational` multiplication per
+/// coefficient at every node. On a conflict with `n` literals of which `k` are
+/// orientation-bearing that is `Θ(2^k · (n − k))` clones and multiplications,
+/// and it was measured at ~80 % of total solver time on the `#8404` Seq-dense
+/// `ghost_vec` benchmark — every recorded theory conflict pays it.
+///
+/// Nothing about the search *space* changes here. The same combinations are
+/// enumerated in the same order; only the arithmetic is hoisted:
+///
+/// * every `λ·e` product is computed ONCE at plan-build time rather than once
+///   per visit of the subtree beneath it, and
+/// * the `n − k` single-candidate positions contribute a fixed sum, so they are
+///   summed once into `base` instead of forming a clone-per-node chain under
+///   every one of the `2^k` leaves.
+///
+/// Both rewrites are exact: `BigRational` addition is associative and
+/// commutative, `LinearExpr::coeffs` is canonical (present iff non-zero), and
+/// the strict flag is an OR — so reassociating the sum cannot change any
+/// leaf's [`is_contradiction`] verdict. Branches are kept in ascending position
+/// order with candidates in ascending index order, which preserves the
+/// lexicographic enumeration `search_recording_choice` depends on.
+struct ScaledPlan {
+    /// `Σ λᵢ·eᵢ` over every position with exactly one candidate.
+    base: LinearExpr,
+    /// The strict flag contributed by those same positions.
+    base_strict: bool,
+    /// The multi-candidate positions, ascending by `idx`.
+    branches: Vec<ScaledBranch>,
+    /// `remaining[d][v]` is the largest absolute coefficient the branches at
+    /// depth `d..` can still contribute to variable `v`; `v` absent means zero.
+    /// Length is `branches.len() + 1`, so `remaining[branches.len()]` is empty.
+    ///
+    /// This is what makes the search sublinear in the leaf count on the
+    /// conflicts that dominate runtime. `is_contradiction` demands that EVERY
+    /// variable coefficient cancel, and a partial sum's coefficient for `v` can
+    /// only move by at most `remaining[d][v]` over the rest of the walk — so
+    /// once `|acc[v]| > remaining[d][v]`, no completion of this prefix can
+    /// contradict and the entire subtree is dead. The common case is decided at
+    /// depth 0: an all-ones certificate guessed against a wide conflict usually
+    /// leaves `base` carrying variables no orientation choice even mentions, and
+    /// the search returns without visiting a single leaf.
+    ///
+    /// The prune is exact, not heuristic — it removes only subtrees in which
+    /// every leaf provably fails `is_contradiction` — so the accept/reject
+    /// verdict and the recorded orientation choice are unchanged.
+    remaining: Vec<BTreeMap<TermId, BigRational>>,
+}
+
+fn build_scaled_plan(
     alternatives: &[Vec<NormalizedConstraint>],
     lambdas: &[BigRational],
-    acc: &LinearExpr,
-    strict_acc: bool,
-) -> bool {
-    if idx == alternatives.len() {
-        return is_contradiction(acc, strict_acc);
+) -> ScaledPlan {
+    let mut base = LinearExpr::zero();
+    let mut base_strict = false;
+    let mut branches = Vec::new();
+
+    for (idx, (alts, lambda)) in alternatives.iter().zip(lambdas.iter()).enumerate() {
+        // A zero multiplier contributes nothing, so its orientation is not a
+        // real choice — pin it to the first alternative exactly as the
+        // node-at-a-time search did.
+        let candidates: &[NormalizedConstraint] = if lambda.is_zero() { &alts[0..1] } else { alts };
+
+        if candidates.len() <= 1 {
+            let alt = &candidates[0];
+            base.add_scaled(&alt.expr, lambda);
+            base_strict = base_strict || (!lambda.is_zero() && alt.strict);
+            continue;
+        }
+
+        let mut scaled = Vec::with_capacity(candidates.len());
+        let mut strict = Vec::with_capacity(candidates.len());
+        for alt in candidates {
+            let mut row = LinearExpr::zero();
+            row.add_scaled(&alt.expr, lambda);
+            scaled.push(row);
+            strict.push(!lambda.is_zero() && alt.strict);
+        }
+        branches.push(ScaledBranch {
+            idx,
+            scaled,
+            strict,
+        });
     }
 
-    let lambda = &lambdas[idx];
-    let candidates: &[NormalizedConstraint] = if lambda.is_zero() {
-        &alternatives[idx][0..1]
-    } else {
-        &alternatives[idx]
+    let remaining = build_remaining_bounds(&branches);
+    ScaledPlan {
+        base,
+        base_strict,
+        branches,
+        remaining,
+    }
+}
+
+/// Suffix bounds for [`ScaledPlan::remaining`], built back-to-front so each
+/// depth is the next depth plus this branch's worst-case contribution.
+fn build_remaining_bounds(branches: &[ScaledBranch]) -> Vec<BTreeMap<TermId, BigRational>> {
+    let mut remaining = vec![BTreeMap::new(); branches.len() + 1];
+    for depth in (0..branches.len()).rev() {
+        let mut bounds = remaining[depth + 1].clone();
+        // Worst case over this branch's candidates, per variable.
+        let mut worst: BTreeMap<TermId, BigRational> = BTreeMap::new();
+        for row in &branches[depth].scaled {
+            for (var, coeff) in &row.coeffs {
+                let magnitude = coeff.abs();
+                match worst.get_mut(var) {
+                    Some(current) if *current >= magnitude => {}
+                    Some(current) => *current = magnitude,
+                    None => {
+                        worst.insert(*var, magnitude);
+                    }
+                }
+            }
+        }
+        for (var, magnitude) in worst {
+            *bounds.entry(var).or_insert_with(BigRational::zero) += magnitude;
+        }
+        remaining[depth] = bounds;
+    }
+    remaining
+}
+
+/// Whether any completion of `acc` from depth `depth` could still cancel every
+/// variable. `false` means the whole subtree is provably contradiction-free.
+fn subtree_can_cancel(acc: &LinearExpr, bounds: &BTreeMap<TermId, BigRational>) -> bool {
+    acc.coeffs
+        .iter()
+        .all(|(var, coeff)| bounds.get(var).is_some_and(|bound| coeff.abs() <= *bound))
+}
+
+/// Depth-first walk over the branching positions of `plan`, accumulating in
+/// place and undoing on the way out (see [`LinearExpr::sub_expr`]).
+///
+/// When `choice` is `Some`, the alternative index taken at each branch is
+/// recorded at that branch's ORIGINAL position; single-candidate positions keep
+/// the caller's zero initialization, which is the index they would have been
+/// assigned anyway.
+fn search_plan(
+    plan: &ScaledPlan,
+    depth: usize,
+    acc: &mut LinearExpr,
+    strict_acc: bool,
+    choice: &mut Option<&mut [usize]>,
+) -> bool {
+    // Exact subtree prune (see `ScaledPlan::remaining`). At the leaf the bound
+    // map is empty, so this reduces to `is_contradiction`'s own
+    // "every coefficient eliminated" requirement.
+    if !subtree_can_cancel(acc, &plan.remaining[depth]) {
+        return false;
+    }
+
+    let Some(branch) = plan.branches.get(depth) else {
+        return is_contradiction(acc, strict_acc);
     };
 
-    for alt in candidates {
-        let mut next = acc.clone();
-        next.add_scaled(&alt.expr, lambda);
-        let next_strict = strict_acc || (!lambda.is_zero() && alt.strict);
-        if search(idx + 1, alternatives, lambdas, &next, next_strict) {
+    for (alt_idx, scaled) in branch.scaled.iter().enumerate() {
+        acc.add_expr(scaled);
+        if let Some(choice) = choice.as_deref_mut() {
+            choice[branch.idx] = alt_idx;
+        }
+        let hit = search_plan(
+            plan,
+            depth + 1,
+            acc,
+            strict_acc || branch.strict[alt_idx],
+            choice,
+        );
+        acc.sub_expr(scaled);
+        if hit {
             return true;
         }
+    }
+    if let Some(choice) = choice.as_deref_mut() {
+        choice[branch.idx] = 0;
     }
 
     false
 }
 
-/// Like [`search`], but records which alternative index was chosen for each
+/// Like [`search_plan`], but records which alternative index was chosen for each
 /// literal in `choice` when a contradicting combination is found. Alternatives
 /// are explored first-alternative-first, so when the all-first combination
 /// already contradicts, `choice` stays all-zero (deterministic, and keeps
-/// pure-inequality certificates byte-identical downstream).
+/// pure-inequality certificates byte-identical downstream). `choice` must be
+/// zero-initialized and as long as `alternatives`.
 fn search_recording_choice(
-    idx: usize,
     alternatives: &[Vec<NormalizedConstraint>],
     lambdas: &[BigRational],
-    acc: &LinearExpr,
-    strict_acc: bool,
     choice: &mut [usize],
 ) -> bool {
-    if idx == alternatives.len() {
-        return is_contradiction(acc, strict_acc);
-    }
-
-    let lambda = &lambdas[idx];
-    let candidates: &[NormalizedConstraint] = if lambda.is_zero() {
-        &alternatives[idx][0..1]
-    } else {
-        &alternatives[idx]
-    };
-
-    for (alt_idx, alt) in candidates.iter().enumerate() {
-        let mut next = acc.clone();
-        next.add_scaled(&alt.expr, lambda);
-        let next_strict = strict_acc || (!lambda.is_zero() && alt.strict);
-        choice[idx] = alt_idx;
-        if search_recording_choice(idx + 1, alternatives, lambdas, &next, next_strict, choice) {
-            return true;
-        }
-    }
-    choice[idx] = 0;
-
-    false
+    let plan = build_scaled_plan(alternatives, lambdas);
+    let mut acc = plan.base.clone();
+    search_plan(
+        &plan,
+        0,
+        &mut acc,
+        plan.base_strict,
+        &mut Some(&mut choice[..]),
+    )
 }
 
 /// Resolve the SIGNED Alethe `la_generic` coefficients for a Farkas
@@ -1164,14 +1362,7 @@ pub fn resolve_equality_coefficient_signs(
     }
 
     let mut choice = vec![0usize; alternatives.len()];
-    if !search_recording_choice(
-        0,
-        &alternatives,
-        &lambdas,
-        &LinearExpr::zero(),
-        false,
-        &mut choice,
-    ) {
+    if !search_recording_choice(&alternatives, &lambdas, &mut choice) {
         return None;
     }
 

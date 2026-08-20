@@ -7741,3 +7741,59 @@ fn conflict_capped_assumption_solve_never_reports_a_bogus_core() {
         "no capped call ever returned a core — the caps bound too hard to test the contract"
     );
 }
+
+#[test]
+fn test_checkable_rup_optimality_proof_concludes_instead_of_deferring() {
+    // The mirror image of
+    // `test_undecidable_lower_bound_opt_proof_defers_without_conclusion`.
+    //
+    // `try_log_objective_lower_bound_cut_proof` short-circuits to Inexpressible
+    // whenever `optimum <= 0`, so before the RUP replay EVERY optimum-0 instance
+    // fell through to the fail-closed path and paid for the certified OPT-LIN
+    // re-derivation — even though its `rup >= 1 ;` step is trivially checkable:
+    // the improving row `x1 + x2 <= -1` has negative slack under the empty
+    // assignment (both coefficients are non-negative and the variables are
+    // boolean), so unit propagation refutes it on the input rows alone.
+    //
+    // `~x1 + ~x2 >= 1` is satisfied by all-false, which is also the optimum, so
+    // the true optimum is 0.
+    let objective = objective(vec![linear_term(1, lit(1)), linear_term(1, lit(2))]);
+    let instance = PbInstance {
+        num_vars: 2,
+        num_constraints: 1,
+        constraints: vec![ge_constraint(
+            vec![linear_term(1, not(1)), linear_term(1, not(2))],
+            1,
+        )],
+        objective: Some(objective.clone()),
+    };
+    let buf = SharedBuf::new();
+    let mut solver = PbCdclSolver::with_proof_writer(&instance, buf.clone())
+        .expect("proof writer creation must succeed");
+
+    let result = solver.solve_optimize(&objective, None);
+    assert!(
+        matches!(result, PbCdclResult::Optimal(_, 0)),
+        "at-most-one-true should solve to optimum 0, got {result:?}"
+    );
+    assert!(
+        !solver.opt_lower_bound_deferred(),
+        "a checkable RUP bound must NOT defer to the certified OPT-LIN fallback"
+    );
+
+    solver
+        .conclude_proof()
+        .expect("a checkable optimality proof must conclude");
+
+    let proof = buf.as_string();
+    assert!(
+        proof.lines().any(|line| line == "rup >= 1 ;"),
+        "the checked RUP route must emit its empty-clause step: {proof}"
+    );
+    assert!(
+        proof
+            .lines()
+            .any(|line| line.starts_with("conclusion BOUNDS")),
+        "a concluded optimality proof must claim its bounds: {proof}"
+    );
+}

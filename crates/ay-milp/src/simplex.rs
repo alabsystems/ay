@@ -807,7 +807,7 @@ fn ledger_phase_is_heuristic(p: usize) -> bool {
 /// included.
 ///
 /// ZERO COST WHEN OFF. Both constructors return `None` unless
-/// `--iter-ledger` is set, so the default path pays one `OnceLock` bool
+/// `--iter-ledger` is set, so the default path pays one relaxed atomic bool
 /// load per scope entry (NOT per iteration) and never writes the thread-local.
 pub(crate) struct PhaseScope(usize);
 impl PhaseScope {
@@ -1386,11 +1386,26 @@ fn iter_profile_enabled() -> bool {
 }
 /// Per-phase ITERATION LEDGER (`--iter-ledger`). See `iter_ledger_line`.
 /// Read once per SCOPE ENTRY and once per dual/primal WALK — never inside a
-/// pivot loop, so the default path pays a `OnceLock` load a few times per solve
-/// and nothing per iteration.
+/// pivot loop, so the default path pays a relaxed atomic load a few times per
+/// solve and nothing per iteration.
+///
+/// Process-global like the phase counters it gates, and enabled by
+/// [`enable_iter_ledger`] at driver CLI parse — deliberately NOT a
+/// caller-layer knob: the ledger must also cover the root-closure and
+/// LP-only diagnostic paths, which run outside any active solve profile
+/// (B38 left this reading an env name nothing sets, so the flag printed an
+/// empty ledger).
+static ITER_LEDGER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn on the per-phase iteration ledger for this process (`--iter-ledger`
+/// in the drivers). Call before solving; the counters accumulate from here on
+/// and [`iter_ledger_line`] reports them.
+pub fn enable_iter_ledger() {
+    ITER_LEDGER_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn iter_ledger_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("--iter-ledger").is_some())
+    ITER_LEDGER_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 /// BREAKPOINT-SORT INTEGER-KEY comparator (`AY_MILP_NO_RT_BITS_KEY` kills it).
 /// The dual long-step (BFRT) select phase sorts `self.bp: Vec<(f64,u32)>` by the
@@ -1548,9 +1563,16 @@ fn churn_band_factor() -> f64 {
     // WALK-CHANGING-if-touched value (re-cert on any change).
     0.5
 }
+/// Historical force-everywhere lever for the LU / Forrest-Tomlin engine.
+/// RETIRED: the LU engine auto-engages by shape (`warm_lu_enabled` &&
+/// `wide_tall`/`tall_lu`, plus the node/cold-root LU knobs), and the force
+/// lever's producer never survived the B38 CLI migration — the read here was
+/// an env name nothing sets, i.e. constant `false`. Kept as a function so
+/// the six decision sites keep their shape; a future measurement arm can
+/// force LU everywhere again by editing this constant or adding a typed
+/// carrier (the phase-2 flag table's "keep-override-only" verdict).
 fn lu_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("--lu").is_some())
+    false
 }
 
 /// Kill switch for CROSS-SOLVE ETA REUSE (see `warm_start`): `AY_MILP_NO_ETA_REUSE`

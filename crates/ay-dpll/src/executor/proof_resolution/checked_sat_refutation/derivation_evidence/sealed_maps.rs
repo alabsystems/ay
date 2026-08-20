@@ -107,6 +107,21 @@ pub(in super::super) fn sealed_fragment_derivation_maps(
             record.asserted,
         ));
     }
+    // (#mbqi-sidecar-instance) The generic MBQI refinement's pushed
+    // falsifying instances, recorded at the push site with the exact
+    // structural substitution (the P3b `bv_mbqi_false_instance_records`
+    // pattern, minus the false-fold bridge: the pushed term IS the exact
+    // instance). Hints only — `CheckedInstanceDerivation::seal` replays the
+    // substitution and stamps epoch/entry identity, so a wrong or stale
+    // record can only decline.
+    for record in &executor.mbqi_refinement_instance_records {
+        candidates.push((
+            record.quantifier,
+            record.binding.clone(),
+            record.instance,
+            record.instance,
+        ));
+    }
     for (quantifier, values, instance, asserted) in
         candidates.into_iter().take(MAX_SEALED_DERIVATIONS)
     {

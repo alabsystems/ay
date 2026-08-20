@@ -74,6 +74,9 @@ pub struct TheoryDisableFlags {
     pub no_abvfp_flatten: bool,
     /// `--dpll-no-closed-sentence-cert`
     pub no_closed_sentence_cert: bool,
+    /// `--dpll-no-closed-sentence-unsat-cert` — kill switch for the
+    /// symmetric UNSAT arm of the closed-sentence certificate (U2).
+    pub no_closed_sentence_unsat_cert: bool,
     /// `--dpll-no-dt-uflia`
     pub no_dt_uflia: bool,
     /// `--dpll-no-dt-d1`

@@ -67,12 +67,6 @@ pub struct Knob {
 /// Every `AY_*` name the ay-theories crates read.
 pub const KNOBS: &[Knob] = &[
     Knob {
-        name: "AY_ALGEBRAIC_STATS",
-        crate_name: "lia",
-        bucket: Bucket::Diagnostic,
-        read_sites: 1,
-    },
-    Knob {
         name: "AY_BENCH_LOOP_B_ITERS",
         crate_name: "lia",
         bucket: Bucket::Tuning,
@@ -85,75 +79,9 @@ pub const KNOBS: &[Knob] = &[
         read_sites: 1,
     },
     Knob {
-        name: "AY_DEBUG_ARR_EXTRACT",
-        crate_name: "arrays",
-        bucket: Bucket::Diagnostic,
-        read_sites: 3,
-    },
-    Knob {
-        name: "AY_DEBUG_EUF_INIT",
-        crate_name: "euf",
-        bucket: Bucket::Diagnostic,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_DEBUG_FIXED_EQS",
-        crate_name: "lia",
-        bucket: Bucket::Diagnostic,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_EUF_CONG_UNDO_DEBUG",
-        crate_name: "euf",
-        bucket: Bucket::Diagnostic,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_EUF_DISEQ_UNDO_DEBUG",
-        crate_name: "euf",
-        bucket: Bucket::Diagnostic,
-        read_sites: 1,
-    },
-    Knob {
         name: "AY_LIA_HOT_LOOP_ITERS",
         crate_name: "lia",
         bucket: Bucket::Tuning,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_LIA_PROBE_QX",
-        crate_name: "lia",
-        bucket: Bucket::Tuning,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_LRA_FLOAT_LAYER",
-        crate_name: "lra",
-        bucket: Bucket::Tuning,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_PROBE_PRESCREEN",
-        crate_name: "lia",
-        bucket: Bucket::Tuning,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_PROBE_STATS",
-        crate_name: "lia",
-        bucket: Bucket::Diagnostic,
-        read_sites: 5,
-    },
-    Knob {
-        name: "AY_STR_NF",
-        crate_name: "strings",
-        bucket: Bucket::Tuning,
-        read_sites: 1,
-    },
-    Knob {
-        name: "AY_WEQ5_SHADOW_DUMP",
-        crate_name: "arrays",
-        bucket: Bucket::Diagnostic,
         read_sites: 1,
     },
 ];

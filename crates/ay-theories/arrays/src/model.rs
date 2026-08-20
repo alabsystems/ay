@@ -59,7 +59,7 @@ impl ArraySolver<'_> {
             while let Some(&(base, idx, val)) = self.store_cache.get(&current) {
                 let idx_str = term_values.get(&idx).cloned().unwrap_or_default();
                 let val_str = term_values.get(&val).cloned().unwrap_or_default();
-                if std::env::var_os("AY_DEBUG_ARR_EXTRACT").is_some() {
+                if ay_core::misc_cli_flags().debug_arr_extract {
                     eprintln!(
                         "[arr-extract] arr={} chain: base={} idx={}({idx_str}) val={}({val_str}) val_data={:?}",
                         arr_term.0, base.0, idx.0, val.0,
@@ -182,7 +182,7 @@ impl ArraySolver<'_> {
                 }
                 base = inner_base;
             }
-            if std::env::var_os("AY_DEBUG_ARR_EXTRACT").is_some() {
+            if ay_core::misc_cli_flags().debug_arr_extract {
                 eprintln!(
                     "[arr-extract] select: sel={}({:?}) arr={} base={} idx={}({:?}) reaches_base={}",
                     select_term.0,
@@ -284,7 +284,7 @@ impl ArraySolver<'_> {
             self.fill_missing_array_defaults(&mut model);
         }
 
-        if std::env::var_os("AY_DEBUG_ARR_EXTRACT").is_some() {
+        if ay_core::misc_cli_flags().debug_arr_extract {
             let mut rows: Vec<_> = model.array_values.iter().collect();
             rows.sort_by_key(|(t, _)| t.0);
             for (t, i) in rows {

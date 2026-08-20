@@ -81,6 +81,14 @@ pub mod ab_switches {
         /// `None` = the shipped default (parallel ON, auto/NBCORE-sized),
         /// `Some(0)` = force the sequential path, `Some(n)` = n workers.
         pub parallel_workers: Option<u16>,
+        /// Two-club node cap override (B74; `--pb-two-club-max-nodes`).
+        pub two_club_max_nodes: Option<u64>,
+        /// Two-club branch-rule selector (B74; `--pb-two-club-branch`).
+        pub two_club_branch: Option<&'static str>,
+        /// Two-club search tracing (B74; `--pb-two-club-trace`).
+        pub two_club_trace: bool,
+        /// Two-club frontier dump (B74; `--pb-two-club-dump-frontier`).
+        pub two_club_dump_frontier: bool,
     }
 
     impl Default for PbAbSwitches {
@@ -99,6 +107,10 @@ pub mod ab_switches {
                 symmetry_arm: true,
                 wcsp_edac: false,
                 parallel_workers: None,
+                two_club_max_nodes: None,
+                two_club_branch: None,
+                two_club_trace: false,
+                two_club_dump_frontier: false,
             }
         }
     }

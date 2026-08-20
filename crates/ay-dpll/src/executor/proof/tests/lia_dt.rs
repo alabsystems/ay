@@ -428,16 +428,16 @@ fn test_dt_emitted_exhaustive_and_reconstruct_axioms_match_their_validators() {
 }
 
 #[test]
-fn test_qf_dt_mined_acyclicity_units_stay_generic_and_fail_strict_check() {
+fn test_qf_dt_mined_acyclicity_units_promote_and_pass_strict_check() {
     // Case-split structural cycles: every disjunct equates `(cons k x)` with
     // `(cons k (cons k x))`, which the frontend's constructor-injectivity
     // decomposition folds to the direct cycle `(= x (cons k x))`. Nine two-way
     // case splits push the occurs-check fast path past its documented
     // 256-combination cross-product bound, so the refutation runs through the
-    // mined `#dt-acyclic-case-split` units at the SAT layer. With that
-    // promotion lane disabled, a surviving mined unit must remain explicit
-    // `Generic` trust and the datatype-aware strict checker must reject the
-    // proof rather than publishing an unsupported typed lemma.
+    // mined `#dt-acyclic-case-split` units at the SAT layer. PROMOTED
+    // 2026-08-19: the units now classify to the validated
+    // `DatatypeAcyclicDirect` kind and the datatype-aware strict checker
+    // accepts the proof outright.
     let mut input = String::from(
         r#"
         (set-option :produce-proofs true)
@@ -460,26 +460,36 @@ fn test_qf_dt_mined_acyclicity_units_stay_generic_and_fail_strict_check() {
     let result = exec.solve_dt().expect("solve_dt must not error");
     assert!(result.is_unsat(), "the case-split cycles must be UNSAT");
     let proof = exec.last_proof.clone().expect("proof after UNSAT");
+    // PROMOTED (2026-08-19): `DatatypeAcyclicDirect` is now a real validated
+    // rule (iterative bounded constructor-containment walk), so the mined
+    // cycle-breaking units classify to the typed kind instead of remaining
+    // explicit Generic trust — the state the old pins existed to detect.
     assert!(
         proof.steps.iter().any(|step| matches!(
-            step,
-            ProofStep::TheoryLemma {
-                kind: TheoryLemmaKind::Generic,
-                ..
-            }
-        )),
-        "the mined cycle-breaking units must remain explicit Generic trust"
-    );
-    assert!(
-        !proof.steps.iter().any(|step| matches!(
             step,
             ProofStep::TheoryLemma {
                 kind: TheoryLemmaKind::DatatypeAcyclicDirect,
                 ..
             }
         )),
-        "the disabled acyclicity promotion must not mint DatatypeAcyclicDirect"
+        "the mined cycle-breaking units must promote to DatatypeAcyclicDirect"
     );
-    assert!(!ay_proof::terminal_trust_report(&proof).is_trust_free());
-    assert!(exec.check_proof_strict_with_datatypes(&proof).is_err());
+    assert!(
+        !proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::Generic,
+                ..
+            }
+        )),
+        "no mined unit may remain Generic once the typed kind exists"
+    );
+    assert!(
+        ay_proof::terminal_trust_report(&proof).is_trust_free(),
+        "the promoted refutation must be trust-free"
+    );
+    assert!(
+        exec.check_proof_strict_with_datatypes(&proof).is_ok(),
+        "the datatype-aware strict checker must accept the promoted proof"
+    );
 }

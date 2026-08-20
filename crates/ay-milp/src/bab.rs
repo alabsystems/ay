@@ -610,6 +610,43 @@ fn strong_branch_effort(n_ints: usize, lp_rows: usize, lp_cols: usize) -> (u32, 
     // the widest measured-paying full-probe LP, half the narrowest measured-losing one.
     let (rel, cands, tot) = if lp_cols >= 4096 && lp_rows < PROBE_FULL_ROWS {
         (8, 24, total.unwrap_or(0))
+    } else if lp_rows <= TINY_ROW_SB_ROWS && n_ints >= 55 {
+        // TINY-ROW HIGH-RELIABILITY TIER (2026-08 mas76 SB campaign). On a 12-row LP a
+        // probe pair is 1-2 node LPs, so reliability — not wall clock — is the only
+        // budget that matters, and the measured response is large: mas76 (12 x 151)
+        // descends from 491,052 nodes to a rel>=64 plateau of ~273-294k, best 273,256
+        // at rel=72 with the total uncapped (-44.4%; 27,699 pairs = ~0.6s of probes).
+        // CANDS is dead on this class (24/48/151 give byte-identical trees — the
+        // fractional-candidate list never exceeds 24) and TOTAL alone is a no-op (at
+        // rel=8 the retirement rule stops probing at 513 of the 600 pairs), so rel is
+        // the live axis; it needs total >= ~30k to breathe (rel=64: total 600 ->
+        // 403,364 nodes, 10,000 -> 286,002, 100,000 -> 280,822). The rel surface is a
+        // plateau, not a point (64 -> 280,822; 72 -> 273,256; 80 -> 277,328, with
+        // non-monotone dips at 12 and 56) — 72 ships because it is the measured best.
+        // The shipped tier lands 273,252, not the sweep's 273,256: the sweep's knob
+        // arm also forced rel on non-tier sub-solve calls — a 4-node wash.
+        //
+        // THE BOUNDARY IS ONE ROW WIDE, AND THAT IS MEASURED, NOT CHOSEN. mas74 — the
+        // same family, 13 rows — is hurt by EVERY raised rel (rel=16 +95%, rel=32
+        // +14%, rel=72 +109% nodes), and even rel=8 with the total merely uncapped
+        // consumes 88 extra pairs and DOUBLES its tree (2.96M -> 6.17M): the family
+        // sits in a performance-variability regime where the shipped 600-pair cap is
+        // a lottery ticket mas74 happens to hold, so the tier must not touch it.
+        // Further out every raised-rel arm loses or washes (gt2 29 rows: 2.3x nodes;
+        // pk1 45 rows: +1.9%; misc07 212 rows: -21% nodes but +16% wall), so the
+        // tier stops at the last measured-profitable row count: <= 12. n_ints >= 55
+        // keeps the sub-55 small-int fast path (whose tiny trees never amortise
+        // probes) out of this unmeasured corner.
+        //
+        // AUDIT NOTE — `lp_rows` here is the row count AT TREE START, which INCLUDES
+        // adopted root-cut rows, so the effective gate is "<= 12 rows AFTER root-cut
+        // adoption". mas76 qualifies only because it adopts zero root cuts (cut round
+        // 0: rows=12, pool=0); a synthetic 12-row/60-binary covering instance adopts
+        // 9 cuts, enters the tree at 21 rows, and the tier stays inert (byte-identical
+        // 2,714 nodes both arms; forcing rel=72/total=100k there via knobs gives
+        // 2,580 — mildly better, no blowup). Strictly narrower than the raw-row
+        // reading, which shrinks in-the-wild exposure further.
+        (72, 24, total.unwrap_or(100_000))
     } else if n_ints >= 55 {
         (8, 24, total.unwrap_or(600))
     } else if n_ints >= 48 {
@@ -679,9 +716,45 @@ fn strong_branch_effort(n_ints: usize, lp_rows: usize, lp_cols: usize) -> (u32, 
 /// until it lands (leaves stayed at ZERO — which is the real mystery, since eighty pins on
 /// eighty binaries MUST be a leaf).
 ///
-/// So the next person starts here: **why does an 80-binary search never reach an integral
-/// node?** That is a bug or a blind spot, not a tuning problem, and it is worth more than
-/// any amount of bound strengthening.
+/// RESOLVED (2026-08-17) — the syllogism was sound; its PREMISE was never established:
+/// no lane of this search ever CONSTRUCTED a node with eighty pins. Measured with the
+/// trace depth-fate census (`DEPTH_CENSUS`; 80x60 s2026, 30s): 25,003 main-tree pops,
+/// 24,981 still open, 9 bound prunes, 0 infeasible, 0 leaves, max depth 45 of 80 — the
+/// tree fathoms NOTHING, so every pop parks a sibling and the flood is total. Three
+/// mechanisms, each named:
+///
+///  1. Best-bound parks BOTH children at every branch (`push_children`'s heap arm), and
+///     the "granule tie-break IS the plunge" device (`Node::cmp`'s depth tie-break) only
+///     chains while the child's rounded bound stays inside the parent's granule. On this
+///     dense mixed-sign ladder nearly every branch moves the bound a granule, so the
+///     frontier drains granule by granule, breadth-first, gaining a few DEPTH levels per
+///     granule — depth 80 is beyond any budget (~1M nodes reached depth 57).
+///  2. Every lane built to break exactly this starvation is class-gated OFF here: the
+///     dive-stack plunge is qiu/mas74-only (`plunge_class`), the measured-plateau DFS
+///     drain is mixed-model-only (`mixed_model_gate` — this model is pure binary), the
+///     market-split and general-integer DFS shapes do not match, and the node-dive
+///     heuristic lane retires the moment ANY incumbent exists.
+///  3. The primal restart clears `stack` AND `dive` on the wide-gap ladder, so even the
+///     depth the granule drain does accumulate is periodically forfeited — the likely
+///     reason the historical every-3,000-nodes plunge stayed at zero: whatever it built,
+///     the next restart could discard mid-descent.
+///
+/// The fix is the LEAF-DROUGHT PLUNGE (`drought_class`): while the main tree is measured
+/// leaf-starved, the node best-bound just chose dives single-path to a fathom on a
+/// bounded cadence, and the restart may not decapitate an in-flight dive.
+///
+/// WHAT THE LANE ACTUALLY PRODUCES, measured: registered `leaves` stay rare on this
+/// class even under full DFS (~2 per 87k nodes) because an integral relaxation must
+/// STRICTLY beat the incumbent to survive to the leaf check, and the in-tree finishers
+/// (RINS, round-and-repair) adopt each dive path's completion first — rounding a
+/// nearly-pinned relaxation IS the completion. The dive's product is the DEEP FACE it
+/// hands them: with root heuristics quieted, the same first in-tree RINS site (node
+/// 4,096) lands 258 from a dive face vs 229 from the breadth flood (stable over 3
+/// paired reps); with the full default stack, 30s on 80x60 s2026 goes 267 -> 268 with
+/// the whole chain 249->258->261->267->268 arriving by node 37.5k (~3.2s) where the
+/// baseline sat flat until its RINS lottery at ~node 20k, and the dual bound improved
+/// 287 -> 286. 268 beats the best HiGHS reference this journal records (267).
+/// Regression: `tests/leaf_drought.rs` pins the paired dive-face differential.
 ///
 /// How many nodes best-bound may leave OPEN before it must behave like depth-first.
 ///
@@ -697,6 +770,19 @@ fn strong_branch_effort(n_ints: usize, lp_rows: usize, lp_cols: usize) -> (u32, 
 /// warm-start basis (~1 KB, shared between siblings), not the box — which is the next thing
 /// to attack if the frontier ever needs to grow again.
 const MAX_OPEN: usize = 1_000_000;
+
+/// LEAF-DROUGHT PLUNGE arming node (journal at `drought_class` in
+/// `solve_milp_in`). Late enough that every home-corpus tree that fathoms
+/// normally has finished or landed leaves well below it (misc07's whole proof
+/// is ~5-9k nodes, mod010 2.4k, blend2 3.9k, air05 ~100, air03 3), early
+/// enough to matter inside a 30s dense-ladder budget (~25k nodes).
+const DROUGHT_ARM_NODES: usize = 16_384;
+/// One drought dive per this many pops while the leaf rate sits below
+/// `1/DROUGHT_DIVE_EVERY` — the cadence of the historical "plunge every 3,000
+/// nodes" experiment, now with the dive actually surviving to a fathom. A dive
+/// is at most ~80 pops on the class, so the lane's worst-case node overhead is
+/// a few percent.
+const DROUGHT_DIVE_EVERY: usize = 3_000;
 
 /// Node budget — a runaway backstop, not a quality knob.
 ///
@@ -4324,6 +4410,21 @@ static EMPTY_BY_DEPTH: [std::sync::atomic::AtomicUsize; 3] = [
     std::sync::atomic::AtomicUsize::new(0),
 ];
 
+/// DEPTH-FATE CENSUS (trace-only diagnostics, zero cost off-trace): per-depth pop
+/// and fate counts for the leaf-starvation hunt (the 80-binary zero-leaves study).
+/// Index saturates at 127. Fates: 0=pop, 1=exact-empty (infeasible), 2=bound prune
+/// (inherited, post-LP, or cutoff), 3=integral leaf.
+static DEPTH_CENSUS: [[std::sync::atomic::AtomicUsize; 128]; 4] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    [[Z; 128], [Z; 128], [Z; 128], [Z; 128]]
+};
+
+fn depth_census(fate: usize, depth: u32) {
+    DEPTH_CENSUS[fate][(depth as usize).min(127)]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Total structural nonzeros — the scale factor for every O(nnz) heuristic cache below.
 fn model_nnz(model: &Model) -> usize {
     model.rows.iter().map(|r| r.coeffs.len()).sum()
@@ -6866,13 +6967,13 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     const TINY_GMI_COLS_PLUS_ROWS: usize = 64;
     const TINY_GMI_ROUNDS: usize = 2;
     let tiny = model.num_cols() + model.num_rows() <= TINY_GMI_COLS_PLUS_ROWS
-        && std::env::var_os("--gmi-rounds").is_none();
+        && crate::cuts::gmi_rounds_env().is_none();
     // GENERAL-INTEGER EXTENSION GATE (see GI_MIN_GENERAL_INTS / `wants_gi_extension`): a non-tiny
     // model with many general-integer columns is the regime where more full GMI/MIR rounds pay,
     // unlike the dense-binary base the 2-round default protects. An explicit `--gmi-rounds`
     // still means exactly what it says; `AY_MILP_NO_GI_EXT` is the A/B kill switch.
     let gi_ext = !in_rens()
-        && std::env::var_os("--gmi-rounds").is_none()
+        && crate::cuts::gmi_rounds_env().is_none()
         && !crate::tune::on(crate::tune::Knob::NoGiExt)
         && wants_gi_extension(&model);
     // SMALL SYMMETRIC BOTTLENECK (see `wants_bottleneck_extension`): the one
@@ -6884,7 +6985,7 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     // corpus is byte-identical. `AY_MILP_NO_BOTTLENECK_EXT` is the kill switch.
     const BOTTLENECK_GMI_ROUNDS: usize = 18;
     let bottleneck_ext = !in_rens()
-        && std::env::var_os("--gmi-rounds").is_none()
+        && crate::cuts::gmi_rounds_env().is_none()
         && !crate::tune::on(crate::tune::Knob::NoBottleneckExt)
         && wants_bottleneck_extension(&model);
     let base_rounds = if in_rens() {
@@ -11283,6 +11384,28 @@ pub fn reset_nodes_explored() {
     NODES_EXPLORED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Leaf-drought plunge launches since process start (see `drought_class`).
+/// Same shape and caveats as [`nodes_explored`]: a process-wide observability
+/// counter whose ONLY consumers are diagnostics and the regression test that
+/// pins the drought lane's MECHANISM (dives launched, gate obeyed) rather than
+/// an incumbent-value differential — the differential drifted with dependency
+/// behavior while the mechanism observable does not.
+pub(crate) static DROUGHT_DIVES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Drought-dive launches since process start (or the last reset).
+#[doc(hidden)]
+#[must_use]
+pub fn drought_dives_launched() -> u64 {
+    DROUGHT_DIVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zero the drought-dive counter — for paired in-process arms.
+#[doc(hidden)]
+pub fn reset_drought_dives() {
+    DROUGHT_DIVES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// W4 root probing: the most binaries one pass may probe (each costs up to two exact
 /// propagations). See `root_probe_wanted` for the gate this sits behind.
 const ROOT_PROBE_CAP: usize = 64;
@@ -11336,7 +11459,7 @@ fn root_probe_wanted(model: &Model, mode: &SearchMode) -> bool {
     if mode.cheap || mode.depth > 0 {
         return false;
     }
-    if std::env::var_os("--root-probe").is_none() {
+    if !crate::tune::on(crate::tune::Knob::RootProbe) {
         return false;
     }
     if crate::tune::caller_flag(crate::tune::Knob::RootProbeAll) == Some(true) {
@@ -11602,6 +11725,25 @@ const SB_MIN_WORK: u64 = 20_000;
 /// tuned on sits well below (mas76 12 rows ... rout 291), the two probe-priced
 /// walls sit above (air05 426, qnet1 503).
 const PROBE_FULL_ROWS: usize = 300;
+
+/// TINY-ROW tier boundary (see the tier in `strong_branch_effort`): the last row
+/// count where high-reliability probing is measured to PAY. mas76 (12 rows) takes
+/// -44.4% nodes from rel=72; mas74 (13 rows, same family) takes +109% from the
+/// same setting and +108% from merely uncapping the total at rel=8. One row apart,
+/// opposite signs — the boundary is an instance-level fact, not a regime edge, so
+/// it sits exactly on the measured-profitable side and no wider.
+const TINY_ROW_SB_ROWS: usize = 12;
+
+/// TALL PURE-BINARY sustain boundary (see the arming site near the sustained
+/// probing setup): the lowest LP row count where default-arming sustained SB on
+/// a pure-binary model is measured to PAY. Winners at 176/212/755 rows (p0548
+/// -29.7%, misc07 -24.7% wall-flat, p2756 DNF->OPTIMAL at >=16x wall); every
+/// measured loser is a short exhauster (6-45 rows, +1.2% to +118.9%); the
+/// 46-175 band is unmeasured-or-censored and stays out. Sits at the last
+/// measured-profitable row count, the [`TINY_ROW_SB_ROWS`] idiom. Note the row
+/// count at the gate INCLUDES adopted root-cut rows — winners can only gain
+/// rows from cuts, so the boundary is stable in the profitable direction.
+const TALL_PURE_BINARY_SUSTAIN_ROWS: usize = 176;
 
 /// TALL-LP regime: the most dual pivots one probe may spend. 25 is measured on
 /// qnet1, and MORE only climbs back toward the old wall (MIR-ext-ON sweep:
@@ -20963,11 +21105,11 @@ fn solve_milp_advised_with_prefix(
         eprintln!("seed-solution-file: seeded incumbent accepted (min-frame {min_v})");
         Some((pt, min_v))
     });
-    // MEASUREMENT LEVER (env-gated, default off): force depth-first node selection
+    // MEASUREMENT LEVER (`--dfs`, default off): force depth-first node selection
     // on the user's solve, to A/B the enumeration profile on deep pure-integer
-    // trees (pk1-class). Never fires without the env var.
+    // trees (pk1-class). Never fires without the flag.
     let full = SearchMode {
-        dfs: std::env::var_os("--dfs").is_some(),
+        dfs: crate::tune::on(crate::tune::Knob::Dfs),
         // Every nonempty prefix path promises ONE literal complete partition
         // prepared from ONE root. Symmetry reduction is exhaustive only up to
         // an automorphism and poisons literal tree capture; if serial prefix
@@ -21490,10 +21632,10 @@ pub(crate) fn solve_milp_seeded(
     if seed.is_none() {
         return solve_milp_advised(model, opts, branch_hints, root_probe_shortlist);
     }
-    // Same measurement lever as `solve_milp` (env-gated, default off): the seeded
+    // Same measurement lever as `solve_milp` (`--dfs`, default off): the seeded
     // solve must run the same profile as the unseeded one, or A/Bs lie.
     let full = SearchMode {
-        dfs: std::env::var_os("--dfs").is_some(),
+        dfs: crate::tune::on(crate::tune::Knob::Dfs),
         ..SearchMode::FULL
     };
     solve_milp_in(
@@ -25275,13 +25417,60 @@ fn solve_milp_in_impl(
     // total is 0: probes were measured to starve the tree outright there — nw04).
     // `--sb-total` still pins an explicit total; `--sb-sustain` restores
     // the counted budget on the mixed gate for A/B.
+    //
+    // TALL PURE-BINARY SUSTAIN (2026-08-19, misc07-lead witness campaign). The
+    // counted 600-pair total also starves a second class the mixed gate's
+    // materiality test excludes: PURE-binary models with tall LPs, where the
+    // budget exhausts at tree start and every later-fractional column is scored
+    // off the global average forever. Witnesses, all measured against defaults
+    // with the flag as the arm (node counts deterministic unless noted):
+    //   misc07 (212 rows, 0/259 nonbin): -24.7% nodes WALL-FLAT (5-run
+    //     solo-serial medians 8,103 -> 6,101, bands non-overlapping — the
+    //     instance is wall-clock-nondeterministic), independently audited;
+    //   p0548  (176 rows, 0/548): 3,385 (nondet band 3,093-3,403) -> 2,380
+    //     five-times-flat — the sustain arm DETERMINIZES it — wall improves;
+    //   p2756  (755 rows, 0/2756): DNF at 300s x3 (incumbent parked at 3127)
+    //     -> OPTIMAL 3124 in 17-19s x3, ~85k nodes. Not a node shave: an
+    //     unsolved-to-solved flip at >=16x wall.
+    // The boundary is MEASURED, in the tiny-row tier's idiom: every loser is a
+    // SHORT budget-exhauster — enigma 21 rows +118.9%, mas74 13 rows +70.9%,
+    // p0033 16 rows +5.2%, mod008 6 rows +1.2% — the same
+    // branching-decision-variance regime the sustained experiment falsified
+    // work-share protection for, so the gate stops at the last
+    // measured-profitable row count (p0548's 176). Between the losers' 45 and
+    // 176 the two probes ran censored with no separation either way (l152lav
+    // 97 rows, harp2 112: both DNF both arms at 300s) and stay OUT. Where the
+    // counted budget never exhausts, arming is a receipted strict no-op
+    // (bit-identical SB censuses: p0282, misc03, lseu, stein27/45), so the
+    // static shape gate is safe on the whole measured class. pk1's DFS engine
+    // keeps its exclusion via !mode.dfs; the wide-short zero-probe regime via
+    // sb_total > 0.
+    let sustain_tall_pure_binary = !mode.dfs
+        && lp.rows() >= TALL_PURE_BINARY_SUSTAIN_ROWS
+        && (0..model.num_cols()).all(|j| matches!(model.col_kind(Col(j as u32)), ColKind::Binary));
     let sb_sustained = !mode.cheap
         && sb_total > 0
-        && std::env::var_os("--sb-total").is_none()
-        && crate::tune::caller_flag(crate::tune::Knob::SbSustain).unwrap_or(lever_default);
+        && crate::tune::count_opt(crate::tune::Knob::SbTotal).is_none()
+        && crate::tune::caller_flag(crate::tune::Knob::SbSustain)
+            .unwrap_or(lever_default || sustain_tall_pure_binary);
     // The unbounded budget arms with the other levers (see MIXED_LEVER_ARM_NODES,
     // applied at the pop loop): until then the tuned 600-pair cap stands.
     let sb_sustained_armed_budget = sb_sustained;
+    // EXPERIMENT INSTRUMENT (sb_sustained mechanism study, trace-only): receipt the
+    // SB configuration and the mixed-gate census this solve actually took.
+    if trace {
+        let n = model.num_cols();
+        let nb = (0..n)
+            .filter(|&j| !matches!(model.col_kind(Col(j as u32)), ColKind::Binary))
+            .count();
+        eprintln!(
+            "--trace sb-config rel={reliability} cands={sb_candidates} total={sb_total} \
+             sustained={sb_sustained} mixed_gate={} nonbin={nb}/{n} cheap={} dfs={}",
+            mixed_model_gate(model),
+            mode.cheap,
+            mode.dfs,
+        );
+    }
     // MEASURED-PLATEAU DFS DRAIN (mixed-model lever 3, 2026-07-17). Best-first parks a
     // sibling at every branch, so on a bound PLATEAU — a face the LP bound cannot climb
     // out of, noswot's signature (-43 frozen for the whole 60s wall, open set 104k+ =
@@ -25333,6 +25522,42 @@ fn solve_milp_in_impl(
             "mas74-class"
         };
         eprintln!("--trace plunge armed ({cls}): shallow cap={plunge_cap} nodes");
+    }
+    // LEAF-DROUGHT PLUNGE CLASS (the 80-binary zero-leaves resolution; journal at
+    // the OPEN PROBLEM note above `MAX_OPEN`). The dense pure-binary ladder with
+    // an integral objective granule is the class whose "the granule tie-break IS
+    // the plunge" assumption is measured FALSE: nearly every branch moves the
+    // granule-rounded bound, so best-bound parks both children forever and the
+    // frontier drains granule by granule, breadth-first (80x60 s2026, 30s traced:
+    // 25,003 pops, 24,981 still open, 9 prunes, 0 infeasible, 0 leaves, max
+    // depth 45 of 80 — the tree fathoms NOTHING, and the "eighty pins MUST be a
+    // leaf" syllogism fails at its premise because no lane ever CONSTRUCTS a
+    // node with eighty pins). Scope: no general-integer columns (gt2/flugpl keep
+    // their gi/best-bound engines), an objective granule (mas74/mas76/qiu/rout/
+    // blend2/qnet1 have none and are byte-identical), the user's main tree only.
+    // While the tree is measured leaf-starved — under one integral leaf per
+    // `DROUGHT_DIVE_EVERY` pops — the node best-bound just chose dives
+    // single-path to a fathom (the `plunge` dispatch: LP-preferred child rides
+    // the LIFO dive stack, the sibling parks on the heap, so best-bound still
+    // governs the frontier and the dual bound). Node ORDER only: no bound,
+    // verdict, or certificate is touched. `--drought-dive 0` kills the lane;
+    // `--drought-dive n` arms at node `n` with one dive per `n` pops.
+    let (drought_arm, drought_every) = match crate::tune::count_opt(crate::tune::Knob::DroughtDive)
+    {
+        Some(0) => (usize::MAX, usize::MAX),
+        Some(n) => (n, n),
+        None => (DROUGHT_ARM_NODES, DROUGHT_DIVE_EVERY),
+    };
+    let drought_class = !mode.cheap
+        && !mode.dfs
+        && drought_arm != usize::MAX
+        && obj_gran.is_some()
+        && (0..model.num_cols())
+            .all(|j| !matches!(model.col_kind(Col(j as u32)), ColKind::Integer));
+    // The node count at which the next drought dive may launch.
+    let mut next_drought_dive: usize = drought_arm;
+    if trace && drought_class {
+        eprintln!("--trace drought-dive armed: arm={drought_arm} nodes, cadence={drought_every}");
     }
     // Per-column probe-ATTEMPT retirement for the sustained regime. `reliable()` counts
     // RECORDED observations, and a probe records nothing when its child is infeasible
@@ -25908,6 +26133,9 @@ fn solve_milp_in_impl(
         crate::acensus::mark(2);
         nodes += 1;
         NODES_EXPLORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if trace && mode.depth == 0 && !mode.cheap {
+            depth_census(0, node.depth);
+        }
         // HYBRID CUTOFF SIGNAL, denominator half: this node exists because some
         // branch on (`bj`, side) created it, and it has now been popped. The
         // numerator is the complement of `HybridHist::branched`, stamped inside
@@ -25924,6 +26152,30 @@ fn solve_milp_in_impl(
         // engaged). Off-class this is always false, so `push_children` takes the
         // byte-identical best-bound/DFS path.
         let plunge = plunge_class && incumbent.is_some() && nodes <= plunge_cap && !plateau_dfs;
+        // LEAF-DROUGHT PLUNGE dispatch (see `drought_class`): launch a dive from
+        // this best-bound pick on cadence while the tree is leaf-starved, and
+        // KEEP an in-flight dive running until it fathoms. The continuation
+        // signal is `!from_heap` — the popped node came off the LIFO dive stack,
+        // which in this class only ever holds the current dive path (best-bound
+        // mode routes everything else to the heap; the MAX_OPEN overflow route
+        // takes the full-DFS arm in `push_children` before `plunge` is read).
+        let drought_now = drought_class
+            && from_heap
+            && incumbent.is_some()
+            && !plateau_dfs
+            && nodes >= next_drought_dive
+            && leaves.saturating_mul(drought_every) < nodes;
+        if drought_now {
+            next_drought_dive = nodes + drought_every;
+            DROUGHT_DIVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if trace {
+                eprintln!(
+                    "--trace drought-dive launch at nodes={nodes} d={} leaves={leaves}",
+                    node.depth
+                );
+            }
+        }
+        let plunge = plunge || (drought_class && (drought_now || !from_heap));
         // #vsids: classic activity decay (+ rescale on overflow), periodic + cheap.
         if vsids_on && !vsids.is_empty() && nodes.is_multiple_of(128) {
             for a in vsids.iter_mut() {
@@ -26608,6 +26860,9 @@ fn solve_milp_in_impl(
         if let (Some(b), Some((_, best))) = (&node.bound, &incumbent) {
             if b >= best {
                 pruned += 1;
+                if trace && mode.depth == 0 && !mode.cheap {
+                    depth_census(2, node.depth);
+                }
                 continue;
             }
         }
@@ -26887,6 +27142,9 @@ fn solve_milp_in_impl(
                 }
                 pruned += 1;
                 cutoff_pruned += 1;
+                if trace && mode.depth == 0 && !mode.cheap {
+                    depth_census(2, node.depth);
+                }
                 continue;
             }
             // Did not confirm: fall back to the true solve (cutoff already consumed).
@@ -27560,6 +27818,9 @@ fn solve_milp_in_impl(
                 if trace {
                     EMPTY_BY_DEPTH[usize::from(node.depth > 8) + usize::from(node.depth > 16)]
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if mode.depth == 0 && !mode.cheap {
+                        depth_census(1, node.depth);
+                    }
                 }
                 // ⚠ A NO-GOOD MUST NAME EVERY BOUND ITS PROOF LEANED ON.
                 //
@@ -27993,6 +28254,9 @@ fn solve_milp_in_impl(
                 }
                 lb_learn_here!(best, lb_rc_ok);
                 pruned += 1;
+                if trace && mode.depth == 0 && !mode.cheap {
+                    depth_census(2, node.depth);
+                }
                 continue; // exactly proven: nothing here beats the incumbent
             }
         }
@@ -28810,10 +29074,10 @@ fn solve_milp_in_impl(
                     && (nodes as f64 / solve_start.elapsed().as_secs_f64().max(0.1)) * 1.2
                         < (rins_cadence / 8) as f64;
                 // The dry-ball memo (see `dry_ball`). The arm/radius preview mirrors
-                // rins()'s default ladder selection; an env-pinned variant
+                // rins()'s default ladder selection; a flag-pinned variant
                 // (`--rins`) bypasses the ladder, so the memo stands down.
                 #[allow(clippy::cast_precision_loss)]
-                let ball_radius = if std::env::var_os("--rins").is_none() {
+                let ball_radius = if crate::tune::count_opt(crate::tune::Knob::Rins).is_none() {
                     let cycle = (rins_stall / 7) as f64;
                     match rins_stall % 7 {
                         4 => Some(12.0 + 4.0 * cycle),
@@ -29145,6 +29409,16 @@ fn solve_milp_in_impl(
                     // A restart discards the explored frontier — on an engaged
                     // plateau drain that frontier IS the proof's progress (lever 3).
                     && !plateau_dfs
+                    // …and it clears BOTH open containers, so an in-flight
+                    // drought dive (the dive stack's current path — see
+                    // `drought_class`) would be decapitated mid-descent and its
+                    // face lost to the very pulls this restart exists to feed.
+                    // A dive fathoms within ~80 pops; the next RINS site
+                    // restarts as before. Scoped to the drought class:
+                    // out-of-class models can hold leftover dive entries (a
+                    // disengaged plateau drain), and their restart behavior
+                    // must stay byte-identical.
+                    && !(drought_class && !dive.is_empty())
                 {
                     restart_inc = incumbent.as_ref().map(|(_, v)| v.clone());
                     let mut floor: Option<BigRational> = incumbent.as_ref().map(|(_, v)| v.clone());
@@ -30197,6 +30471,9 @@ fn solve_milp_in_impl(
             // MILP solution — but only once it is re-derived exactly. The float
             // point is not the witness; the exact replay of its basis is.
             leaves += 1;
+            if trace && mode.depth == 0 && !mode.cheap {
+                depth_census(3, node.depth);
+            }
             // #p2-finalize-reserve leaf pull-back (see the widen before the loop):
             // this tree is no longer leaf-starved, so finalize now has real per-leaf
             // work. Reinstate the search deadline so that budget is protected — but sized
@@ -31172,6 +31449,24 @@ fn solve_milp_in_impl(
             EMPTY_BY_DEPTH[1].load(Relaxed),
             EMPTY_BY_DEPTH[2].load(Relaxed)
         );
+        {
+            // DEPTH-FATE CENSUS dump: one line per depth with any traffic.
+            // pops/infeasible/bound-pruned/leaves; process-cumulative.
+            let mut parts: Vec<String> = Vec::new();
+            for d in 0..128 {
+                let p = DEPTH_CENSUS[0][d].load(Relaxed);
+                let i = DEPTH_CENSUS[1][d].load(Relaxed);
+                let b = DEPTH_CENSUS[2][d].load(Relaxed);
+                let l = DEPTH_CENSUS[3][d].load(Relaxed);
+                if p + i + b + l > 0 {
+                    parts.push(format!("{d}:{p}/{i}/{b}/{l}"));
+                }
+            }
+            eprintln!(
+                "--trace depth-census (d:pop/inf/bnd/leaf) {}",
+                parts.join(" ")
+            );
+        }
         eprintln!(
             "--trace TIME simplex={:.2}s exact_bound={:.2}s farkas={:.2}s strongbranch={:.2}s rim={:.2}s",
             t_simplex.as_secs_f64(),
@@ -34242,9 +34537,14 @@ mod tests {
 
     /// `--rins-every` must actually override the RINS cadence base — it was once written
     /// but left unwired (every call site read the `RINS_EVERY` const directly). The whole
-    /// override contract lives in `rins_every()`: parseable positive values win, junk and zero
-    /// (which would divide-by-zero the round counter) fall back to the tuned const. No other
-    /// test in this binary touches this env var, so set/remove here cannot race a reader.
+    /// override contract lives in `rins_every()`: positive counts win, zero (which would
+    /// divide-by-zero the round counter) falls back to the tuned const. The override rides
+    /// the CALLER-LAYER knob (`--rins-every` via `EngineEconomics::with_rins_every`) — the
+    /// former environment arm for this knob was retired by B39b, and a doc here that kept
+    /// saying "env var" sent a measurement harness down the dead path (audit, 2026-08-18).
+    /// (The retired name is spelled out in the census history, not here: the env-ledger
+    /// test greps SOURCE for the prefix, and a prose mention would re-register it.)
+    /// The caller-layer activation below is scoped, so this test cannot race a reader.
     #[test]
     fn rins_every_env_override() {
         assert_eq!(rins_every(), RINS_EVERY);

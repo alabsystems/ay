@@ -203,6 +203,254 @@ impl Executor {
         self.merge_propagation_records(records);
     }
 
+    /// Mint `PropagateValues`-shaped provenance for the QF_LIA
+    /// `VariableSubstitution` round (#4751).
+    ///
+    /// That pass rewrites assertions IN PLACE exactly like `PropagateValues`
+    /// — its own call site notes it "detaches the reconstructed proof's
+    /// leaves from the original assertions and forces Trust-step fallbacks"
+    /// — but, unlike the BV and AUFLIA routes, it minted no records, so
+    /// [`Self::derive_propagated_value_assumptions`] declined at its first
+    /// guard and `demote_non_problem_assumptions` stamped the rewritten
+    /// assume as a premiseless `trust`. Measured on the `dillig12_m` CHC
+    /// benchmark: the depth-0 SingleLoop transition relation is substituted
+    /// under its own init units (`v0 |-> 0`, `v1 |-> 0`) and constant-folded,
+    /// so the proof assumes a term the authored stack does not contain.
+    ///
+    /// The records are HINTS ONLY, on the module's existing contract: the
+    /// replay re-derives every step from the licensing defining equalities
+    /// and declines on any mismatch. Fail-closed on each leg — a
+    /// substitution with no recorded source assertion, or a replacement with
+    /// no structurally-verified licensing equality, withholds the WHOLE run
+    /// rather than seed a partial licensing environment, matching the
+    /// over-cap policy in [`Self::merge_propagation_records`].
+    ///
+    /// #4751 `_mod_q` class — why a NON-CONSTANT replacement is admitted.
+    /// The original leg demanded `TermData::Const(_)`, which withheld the
+    /// whole run on the CHC route: `ChcExpr::eliminate_mod` asserts the
+    /// Euclidean decomposition `(= x (+ (* k q) r))`, and substituting its
+    /// dividend replaces `x` by a SUM, not a constant. Measured at the
+    /// demotion site on `dillig12_m`, every `_mod_q_*` assume carried
+    /// `rec=false` — i.e. no record at all — for exactly this reason.
+    ///
+    /// Constness was never what made the entry sound. The replay's entry arm
+    /// (`plan_derive_eq_inner`) hands the entry's `source_assertion` back as
+    /// the licensing EQUALITY and discharges it with `plan_derive_clause`, so
+    /// what it actually needs is that the source really is spelled
+    /// `(= expr value)` (either orientation). That is now checked
+    /// STRUCTURALLY here for non-constant replacements — strictly more
+    /// evidence than the constant leg ever required, and still only a hint:
+    /// every emitted step is re-derived by the UNTOUCHED strict checker, and
+    /// the reconstructed term must equal the recorded `after` before the
+    /// bridge is taken.
+    pub(in crate::executor) fn extend_propagated_value_provenance_from_var_subst(
+        &mut self,
+        before: &[TermId],
+        after: &[TermId],
+        var_subst: &crate::preprocess::VariableSubstitution,
+    ) {
+        if !crate::quant_unit_authority::quant_unit_authority_enabled() {
+            return;
+        }
+        // A length mismatch means the caller re-shaped the stack between the
+        // snapshots, so `before[i] -> after[i]` is not a rewrite pair.
+        if before.len() != after.len() {
+            return;
+        }
+        let substitutions = var_subst.substitutions();
+        if substitutions.is_empty() {
+            return;
+        }
+        let sources = var_subst.substitution_sources();
+
+        // Entries are harvested at the same stamp as the rewrites they
+        // license: "entries harvested in call k license rewrites of call
+        // >= k", and this is a single `apply` round.
+        let mut entries = Vec::with_capacity(substitutions.len());
+        for (&expr, &value) in substitutions {
+            let Some(&source_assertion) = sources.get(&expr) else {
+                return;
+            };
+            // A LITERAL-CONSTANT replacement is the `PropagateValues` shape
+            // this store was minted for; the replay's entry arm reads the
+            // recorded `source_assertion` as the licensing equality directly.
+            //
+            // A NON-CONSTANT replacement is the DOMINANT QF_LIA shape and was
+            // withheld outright by the first cut of this mint (#4751 measured
+            // on dillig12_m: every substitution of every minting round is
+            // non-constant, so the store stayed empty and every rewritten
+            // assume demoted to `trust`). Admit it, but only when the recorded
+            // source is spelled EXACTLY `(= expr value)` / `(= value expr)` --
+            // that is precisely the claim the entry arm makes when it hands
+            // `source` back as the licensing equality. `find_substitution`
+            // also harvests from `ite`-encoded equalities, whose source term
+            // is NOT that equality; those still withhold the WHOLE run rather
+            // than seed an entry the replay would spell as an `equiv_pos` over
+            // a non-equality (the live defect a95cec3469's negative test
+            // found, there guarded only for `value == false`).
+            //
+            // Nothing else changes: records stay HINTS, every emitted step is
+            // re-derived by the untouched strict checker, and a chain that
+            // cannot reach the recorded `after` still declines to today's
+            // demotion. The constant leg is untouched, so the existing
+            // derivations are byte-identical.
+            if !matches!(self.ctx.terms.get(value), ay_core::TermData::Const(_))
+                && !Self::is_recorded_defining_equality(
+                    &self.ctx.terms,
+                    source_assertion,
+                    expr,
+                    value,
+                )
+            {
+                return;
+            }
+            entries.push(crate::preprocess::PropagatedEntrySource {
+                expr,
+                value,
+                source_assertion,
+                stamp: 1,
+            });
+        }
+
+        let rewrites: Vec<crate::preprocess::PropagatedRewriteRecord> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(before, after)| before != after)
+            .map(
+                |(&before, &after)| crate::preprocess::PropagatedRewriteRecord {
+                    before,
+                    after,
+                    stamp: 1,
+                },
+            )
+            .collect();
+        if rewrites.is_empty() {
+            return;
+        }
+
+        self.merge_propagation_records(PropagationRecords { rewrites, entries });
+    }
+
+    /// Whether `source` is spelled `(= expr value)` or `(= value expr)` — the
+    /// only shape the replay's entry arm may hand back as its licensing
+    /// equality. Mirrors the consumer-side `is_defining_equality` check in
+    /// `proof_propagated_rewrite::equality`, applied at MINT time so a
+    /// non-constant replacement can never seed an entry the consumer would
+    /// have to take on faith.
+    fn source_is_defining_equality(
+        terms: &TermStore,
+        source: TermId,
+        expr: TermId,
+        value: TermId,
+    ) -> bool {
+        match terms.get(source) {
+            TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2 => {
+                (args[0] == expr && args[1] == value) || (args[0] == value && args[1] == expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// Mint `PropagateValues`-shaped provenance for the top-level
+    /// UNIT-PROPAGATION round in `preprocess_lia_artifacts` (#4751).
+    ///
+    /// That pass deletes falsified disjuncts and stores `assertions[i] =
+    /// (or kept…)` IN PLACE, exactly like `PropagateValues` and
+    /// `VariableSubstitution`, but minted no records — so
+    /// [`Self::derive_propagated_value_assumptions`] never saw the rewrite
+    /// and `demote_non_problem_assumptions` stamped the reduced `or` a
+    /// premiseless `trust`. The designed replay
+    /// (`plan_or_elimination_bridge`) is exactly the right mechanism: it
+    /// clausifies the authored `or`, drives every deleted disjunct to
+    /// `false`, and resolves the survivors.
+    ///
+    /// The difference from `PropagateValues` is the LICENSE: unit
+    /// propagation deletes `dj` because a bare unit asserting `dj`'s
+    /// COMPLEMENT is on the stack, not because a defining equality
+    /// `(= dj false)` is. The entries therefore carry that unit as their
+    /// `source_assertion`, and the planner bridges it to the equality with
+    /// an `equiv_neg2` tautology (see `plan_unit_literal_false_eq`). The c7
+    /// sealing lane re-derives entries through
+    /// `PropagateValues::extract_value_equality` and so simply DROPS these
+    /// (fail-closed), leaving that channel unchanged.
+    ///
+    /// Records are HINTS ONLY on the module's existing contract: the replay
+    /// re-derives every step and declines on any mismatch. Fail-closed per
+    /// leg — a deletion whose recorded unit is not the literal complement of
+    /// the deleted disjunct withholds the WHOLE run rather than seed a
+    /// partial licensing environment.
+    pub(in crate::executor) fn extend_propagated_value_provenance_from_unit_prop(
+        &mut self,
+        before: &[TermId],
+        after: &[TermId],
+        deletions: &[(TermId, TermId)],
+    ) {
+        if !crate::quant_unit_authority::quant_unit_authority_enabled() {
+            return;
+        }
+        // A length mismatch means the caller re-shaped the stack between the
+        // snapshots, so `before[i] -> after[i]` is not a rewrite pair.
+        if before.len() != after.len() || deletions.is_empty() {
+            return;
+        }
+        let false_term = self.ctx.terms.mk_bool(false);
+        let mut entries = Vec::with_capacity(deletions.len());
+        for &(disjunct, unit) in deletions {
+            // The recorded unit must assert exactly the complement of the
+            // deleted disjunct; anything else is not a license this replay
+            // can spell, so withhold the run.
+            let complementary = match self.ctx.terms.get(disjunct) {
+                TermData::Not(inner) => *inner == unit,
+                _ => matches!(self.ctx.terms.get(unit), TermData::Not(inner) if *inner == disjunct),
+            };
+            if !complementary {
+                return;
+            }
+            entries.push(crate::preprocess::PropagatedEntrySource {
+                expr: disjunct,
+                value: false_term,
+                source_assertion: unit,
+                stamp: 1,
+            });
+        }
+
+        let rewrites: Vec<crate::preprocess::PropagatedRewriteRecord> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(before, after)| before != after)
+            .map(
+                |(&before, &after)| crate::preprocess::PropagatedRewriteRecord {
+                    before,
+                    after,
+                    stamp: 1,
+                },
+            )
+            .collect();
+        if rewrites.is_empty() {
+            return;
+        }
+
+        self.merge_propagation_records(PropagationRecords { rewrites, entries });
+    }
+
+    /// Whether `source` is spelled exactly `(= expr value)` or
+    /// `(= value expr)` -- the licensing shape the propagation replay's entry
+    /// arm assumes when it returns `source` as the equality between `expr`
+    /// and `value`.
+    fn is_recorded_defining_equality(
+        terms: &TermStore,
+        source: TermId,
+        expr: TermId,
+        value: TermId,
+    ) -> bool {
+        match terms.get(source) {
+            TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2 => {
+                (args[0] == expr && args[1] == value) || (args[0] == value && args[1] == expr)
+            }
+            _ => false,
+        }
+    }
+
     fn merge_propagation_records(&mut self, records: PropagationRecords) {
         let store = &mut self.propagated_value_provenance;
         let offset = store

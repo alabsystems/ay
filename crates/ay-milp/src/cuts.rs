@@ -1710,10 +1710,17 @@ pub(crate) const MAX_GMI_ROUNDS: usize = 2;
 /// generator, where more cuts are decisively worse; a real model may want quite different ones,
 /// and that is a question to settle with the corpus rather than a guess.
 pub(crate) fn gmi_rounds() -> usize {
-    std::env::var("--gmi-rounds")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_GMI_ROUNDS)
+    gmi_rounds_env().unwrap_or(MAX_GMI_ROUNDS)
+}
+
+/// The ONE read of the `--gmi-rounds` override. B38 follow-up: the flag
+/// arrives as a caller-layer knob (`engine_cli` -> `EngineEconomics::
+/// with_gmi_rounds` -> `opts::profile`), exactly like `cuts_per_round_env`
+/// below. Presence is meaningful on its own — the tiny/GI-extension/
+/// bottleneck round overrides in `bab::add_root_cuts` stand down when an
+/// explicit round count is given — so the `Option` is exposed.
+pub(crate) fn gmi_rounds_env() -> Option<usize> {
+    crate::tune::count_opt(crate::tune::Knob::GmiRounds)
 }
 
 /// The ONE read of `--cuts-per-round`. Every budget below funnels through here so the
@@ -1857,10 +1864,12 @@ pub(crate) fn root_cuts_per_round() -> usize {
 }
 
 fn root_cuts_per_round_env() -> Option<usize> {
-    std::env::var("--root-cuts-per-round")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or_else(cuts_per_round_env)
+    // B38 follow-up: the flag arrives as a caller-layer knob
+    // (`engine_cli` -> `EngineEconomics::with_root_cuts_per_round` ->
+    // `opts::profile`), exactly like `cuts_per_round_env` above. The
+    // historical node knob still overrides both budgets, so every
+    // measurement taken through it keeps its meaning.
+    crate::tune::count_opt(crate::tune::Knob::RootCutsPerRound).or_else(cuts_per_round_env)
 }
 
 /// The root loop's per-round budget under the same shape gate as
@@ -11861,10 +11870,10 @@ mod lnp_tests {
             cand.status,
             t0.elapsed().as_secs_f64()
         );
-        let budget: usize = std::env::var("--lnp-budget")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4);
+        // B38 follow-up: same caller-layer knob as `lnp_budget` above; the
+        // probe keeps its own "unset means 4" default rather than the
+        // family's "unset disables" gate.
+        let budget: usize = crate::tune::count_opt(crate::tune::Knob::LnpBudget).unwrap_or(4);
         let t1 = std::time::Instant::now();
         let cuts = separate_lift_project(
             m,

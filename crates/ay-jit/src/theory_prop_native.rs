@@ -156,7 +156,7 @@ impl NativeVarPropagator {
 ///
 /// Returns `Some((code, atom_indices))` on success; `atom_indices` maps
 /// bitmap positions to the caller's atom indices.
-fn emit_native_propagator_code(prop: &VarPropagator) -> Option<(Vec<u8>, Vec<u32>)> {
+pub(crate) fn emit_native_propagator_code(prop: &VarPropagator) -> Option<(Vec<u8>, Vec<u32>)> {
     let total = prop.upper_atoms.len() + prop.lower_atoms.len();
     if total == 0 || total > MAX_NATIVE_ATOMS {
         return None;
@@ -1676,11 +1676,19 @@ fn emit_set_bit_x64(asm: &mut TheoryAsmX64, result_reg: u8, bit_pos: u32) {
 ///
 /// Returns the number of variables successfully compiled to native code.
 pub fn compile_native_propagators(
-    jit: &crate::theory_prop::TheoryPropJit,
+    jit: &mut crate::theory_prop::TheoryPropJit,
 ) -> (Vec<Option<NativeVarPropagator>>, u32) {
-    let props = jit.propagators();
-    let mut native_props: Vec<Option<NativeVarPropagator>> = Vec::with_capacity(props.len());
-    native_props.resize_with(props.len(), || None);
+    // Resolve every slot's machine code FIRST, reusing the bytes emitted for an
+    // identical table on a previous rebuild. Registering one new atom
+    // invalidates the whole JIT, and a hot instance then re-emits code for
+    // EVERY variable — quadratic in the number of atom registrations, and the
+    // dominant cost of the quantifier-instantiation loop in
+    // `recovered_array_false_unsat`. `emit_native_propagator_code` is a pure
+    // function of the table, so an unchanged table's bytes are still exactly
+    // right; only the (cheap) blob assembly and the single mapping are redone.
+    let codes = jit.resolve_native_code();
+    let mut native_props: Vec<Option<NativeVarPropagator>> = Vec::with_capacity(codes.len());
+    native_props.resize_with(codes.len(), || None);
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -1699,18 +1707,16 @@ pub fn compile_native_propagators(
         let mut blob: Vec<u8> = Vec::new();
         let mut pending: Vec<PendingFn> = Vec::new();
 
-        for (slot, prop_opt) in props.iter().enumerate() {
-            let Some(prop) = prop_opt else { continue };
-            let Some((code, atom_indices)) = emit_native_propagator_code(prop) else {
-                continue;
-            };
+        for (slot, code) in codes.iter().enumerate() {
+            let Some(code) = code else { continue };
+            let (code, atom_indices) = code.as_ref();
             pad_to_fn_align(&mut blob);
             pending.push(PendingFn {
                 slot,
                 offset: blob.len(),
-                atom_indices,
+                atom_indices: atom_indices.clone(),
             });
-            blob.extend_from_slice(&code);
+            blob.extend_from_slice(code);
         }
 
         if pending.is_empty() {

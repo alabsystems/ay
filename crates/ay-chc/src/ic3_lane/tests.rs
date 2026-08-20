@@ -121,6 +121,25 @@ fn count_parity_loop_back_translates_to_candidate() {
     );
 }
 
+#[test]
+fn count_parity_loop_zero_timeout_returns_none_promptly() {
+    // The previously-ignored timeout is now honored: a zero/expired budget makes
+    // IC3 stop at its first loop head and return Unknown, which the lane maps to
+    // "no candidate" (None) -- sound, and no longer an unbounded spin. Contrast
+    // count_parity_loop_back_translates_to_candidate, which proves Safe at 5s.
+    let problem = count_parity_problem(1);
+    let start = std::time::Instant::now();
+    let res = try_prove_chc_loop(&problem, Duration::from_nanos(0));
+    assert!(
+        res.is_none(),
+        "an expired timeout must yield no candidate, not a proof"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "the deadline must be honored promptly, not spun through"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Real-shaped lowering: a multi-block BitVec(64) CFG (one relation per basic
 // block) for the count-parity loop, mirroring the targo-lowered shape (7

@@ -63,6 +63,59 @@ mod verification;
 /// scan footprint between reduce/arena-GC passes.
 const WATCH_DEFRAG_DEAD_SLOT_DIVISOR: usize = 8;
 
+/// Buffer size (in 8-byte entries) above which the unified watch buffer stops
+/// using `Vec`'s doubling policy for its own capacity.
+///
+/// 4Mi entries is 32 MB. Below that a doubling wastes at most 32 MB, which no
+/// memory envelope cares about and which is cheaper to waste than to copy —
+/// so everything under this threshold keeps the stock `Vec` policy EXACTLY,
+/// including the capacity `heap_bytes()` reports to the clause-DB byte-limit
+/// reduction trigger. The bounded policies below therefore cannot perturb any
+/// instance whose watch buffer stays under 32 MB.
+const WATCH_BUF_LARGE_ENTRIES: usize = 1 << 22;
+
+/// Relocation headroom left past the exact plan, as a fraction of the plan.
+///
+/// [`apply_exact_layout`] ends with `len == capacity` on `buf_entries`: the
+/// plan IS the allocation. The first post-build [`grow_and_push`] therefore
+/// calls `Vec::reserve` on a FULL vector, which takes Rust's amortised path
+/// (`cap = max(2 * cap, needed)`) and DOUBLES the buffer to admit a handful of
+/// relocations. Measured on the 51.9M-clause DtAx lowering of vlsat3_b99: the
+/// buffer ends only 170,938 entries (1.3 MB) past the exact plan, yet capacity
+/// had gone from 151,256,006 to 302,512,012 entries — 1,153 MB of
+/// mapped-but-never-written slack. That slack is invisible in RSS and charged
+/// in FULL against `--memory`, which trips on counting-allocator live bytes /
+/// `phys_footprint`, not RSS.
+///
+/// 1/64 of the plan covers that measured overshoot ~13x over while costing
+/// 1.6% of the plan. The headroom is uninitialised CAPACITY — `len` is still
+/// exactly the plan — so it changes no offset, no region, and no watch order.
+///
+/// [`apply_exact_layout`]: WatchedLists::apply_exact_layout
+/// [`grow_and_push`]: WatchedLists::grow_and_push
+const WATCH_BUF_EXACT_BUILD_HEADROOM_DIVISOR: usize = 64;
+
+/// Growth step for a large unified watch buffer, as a fraction of capacity.
+///
+/// The point is to stay geometric — so growth is still amortised O(1) — without
+/// doubling, which on a 151M-entry buffer strands a full gigabyte of untouched
+/// capacity to buy headroom the solve never uses (measured on vlsat3_b99:
+/// 2,308 MB allocated against 1,155 MB used).
+///
+/// Sized relative to [`WATCH_DEFRAG_DEAD_SLOT_DIVISOR`], but do NOT read that as
+/// "one step per defrag cycle". Review measured the real relationship and it is
+/// coarser: `grow_and_push` appends `old_len * 2` entries while adding only
+/// `old_len` dead ones, so a cycle reaches the `dead_slots > len / 8` trigger
+/// after appending about `len / 4` — roughly two growth steps, not one. And
+/// `shrink_capacity` is not polled on the push path at all (it runs from
+/// `arena_gc` and `shrink_lists`), so nothing here bounds the number of
+/// reallocations between those boundaries.
+///
+/// What the constant does guarantee is the property that matters: growth is
+/// always at least 1.125x (when `additional > cap / 8`, the target exceeds
+/// `1.125 * cap`), so there is no quadratic path.
+const WATCH_BUF_GROWTH_STEP_DIVISOR: usize = 8;
+
 /// Index of a clause in the clause database
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(kani, derive(kani::Arbitrary))]
@@ -477,6 +530,43 @@ impl WatchList {
     }
 }
 
+// ─── Exact-size initial watch construction ──────────────────────────
+
+/// Per-literal watch counts gathered by pass 1 of the exact initial build.
+///
+/// The full clause set is known before watches are attached, so every
+/// literal's region size is computable exactly. Pass 1 fills this table;
+/// [`WatchedLists::apply_exact_layout`] turns it into a one-shot layout with
+/// zero slack, and pass 2 fills the regions in place — no `grow_and_push`,
+/// no relocation, no abandoned regions.
+#[derive(Debug, Default)]
+pub(crate) struct ExactWatchPlan {
+    /// Number of watches the build will attach to each literal index.
+    counts: Vec<u32>,
+}
+
+impl ExactWatchPlan {
+    /// Start a plan sized for `num_lits` literal indices (it grows on demand).
+    pub(crate) fn new(num_lits: usize) -> Self {
+        Self {
+            counts: vec![0; num_lits],
+        }
+    }
+
+    /// Record one watch for `lit` (pass 1).
+    #[inline]
+    pub(crate) fn count_watch(&mut self, lit: Literal) {
+        let li = lit.index();
+        if li >= self.counts.len() {
+            self.counts.resize(li + 1, 0);
+        }
+        // Overflow-checks are on in release: a literal watched more than
+        // `u32::MAX` times fails loudly rather than wrapping into a
+        // too-small region.
+        self.counts[li] += 1;
+    }
+}
+
 // ─── Per-literal metadata into the unified buffer ───────────────────
 
 /// Metadata for a single literal's region in the unified watch buffer.
@@ -729,7 +819,10 @@ impl WatchedLists {
         let len = m.len as usize;
         // SAFETY: `start` is derived from `meta[lit.index()].offset`, which is
         // only set by `grow_and_push`, `restore_from_deferred`,
-        // `restore_from_deferred_with_bc`, and `defragment`. All paths ensure
+        // `restore_from_deferred_with_bc`, `defragment`, and
+        // `apply_exact_layout` (the one-shot presized build, which assigns
+        // prefix-sum offsets over a buffer resized to their total, so the
+        // bound below holds there by construction). All paths ensure
         // `start + capacity <= buf_entries.len()` (the buffer is always
         // resized/pushed to hold the full region), and `len <= capacity`,
         // so `start + len <= buf_entries.len()`. Therefore `.add(start)`
@@ -884,6 +977,47 @@ impl WatchedLists {
         }
     }
 
+    /// Reserve room for `additional` more entries with a BOUNDED growth step.
+    ///
+    /// Every relocating path (`grow_and_push`, the three
+    /// `restore_from_deferred*` overflow paths) appends a fresh region at the
+    /// end of `buf_entries` and must first make room for it. `Vec::reserve`
+    /// answers that with `cap = max(2 * cap, needed)`, which is the right
+    /// policy for a vector filled from empty and the wrong one here once the
+    /// buffer is large: after [`apply_exact_layout`] the buffer already holds
+    /// its planned size, and the relocations that follow are rare and small,
+    /// so doubling multiplies the solver's single largest allocation to admit
+    /// kilobytes. On vlsat3_b99 that cost 1,153 MB of never-written capacity
+    /// — enough to decide whether the instance fits its memory envelope.
+    ///
+    /// Below [`WATCH_BUF_LARGE_ENTRIES`] this defers to `Vec::reserve`
+    /// unchanged, so small and medium instances keep byte-identical capacity
+    /// (and hence a byte-identical [`heap_bytes`], which feeds the clause-DB
+    /// byte-limit reduction trigger). Above it, capacity grows by
+    /// `cap / WATCH_BUF_GROWTH_STEP_DIVISOR` per step, still geometric — so
+    /// still amortised O(1) per entry — but with a step sized to one
+    /// defragmentation cycle instead of a whole extra buffer.
+    ///
+    /// [`apply_exact_layout`]: WatchedLists::apply_exact_layout
+    /// [`heap_bytes`]: WatchedLists::heap_bytes
+    #[inline]
+    fn reserve_entries(&mut self, additional: usize) {
+        let cap = self.buf_entries.capacity();
+        let len = self.buf_entries.len();
+        let needed = len + additional;
+        if needed <= cap {
+            // The common case once the exact build leaves headroom: no
+            // allocation, no relocation, no copy.
+            return;
+        }
+        if cap < WATCH_BUF_LARGE_ENTRIES {
+            self.buf_entries.reserve(additional);
+            return;
+        }
+        let target = needed.max(cap + cap / WATCH_BUF_GROWTH_STEP_DIVISOR);
+        self.buf_entries.reserve_exact(target - len);
+    }
+
     /// Grow a literal's region (allocate at end of the buffer) and push one
     /// packed entry.
     ///
@@ -900,7 +1034,7 @@ impl WatchedLists {
         let is_binary = entry_is_binary(entry);
 
         // Allocate new region at the end of the buffer.
-        self.buf_entries.reserve(new_capacity);
+        self.reserve_entries(new_capacity);
 
         if is_binary {
             // Bulk-copy the existing binary prefix, insert the new binary
@@ -934,6 +1068,226 @@ impl WatchedLists {
             capacity: new_capacity as u32,
             binary_count: (old_bc + usize::from(is_binary)) as u32,
         };
+    }
+
+    // ─── Exact-size one-shot build (pass 2) ─────────────────────────
+
+    /// True when no watch entries are stored — the state after [`clear`] and
+    /// the precondition of the exact-size build.
+    ///
+    /// [`clear`]: WatchedLists::clear
+    #[inline]
+    pub(crate) fn is_unbuilt(&self) -> bool {
+        self.buf_entries.is_empty()
+    }
+
+    /// Would the incremental builder have relocated a region of this length?
+    ///
+    /// [`grow_and_push`] runs exactly when `len == capacity`, and the capacity
+    /// schedule for a region grown from empty is `0 → 2 → 4 → 8 → …` (see
+    /// `new_capacity` there). Walking that schedule, the relocation lengths are
+    /// `{0} ∪ {2, 4, 8, 16, …}`: at `len == 1` the capacity is already 2, so
+    /// the one power of two that is NOT a growth step is 1.
+    ///
+    /// This is needed because the two insert paths order the long suffix
+    /// DIFFERENTLY on a binary insert (rotation vs shift, see
+    /// [`push_entry_presized`]). Reproducing the search exactly therefore means
+    /// reproducing which path each push would have taken.
+    ///
+    /// [`grow_and_push`]: WatchedLists::grow_and_push
+    /// [`push_entry_presized`]: WatchedLists::push_entry_presized
+    #[inline]
+    fn is_growth_step(len: usize) -> bool {
+        len == 0 || (len != 1 && len.is_power_of_two())
+    }
+
+    /// The capacity the incremental builder would hold after `count` pushes.
+    ///
+    /// `grow_and_push` doubles: 0 -> 2 -> 4 -> 8 ... and never shrinks, so a
+    /// region holding N watches has capacity `max(2, next_power_of_two(N))`
+    /// (N = 0 stays 0: nothing was ever pushed, so nothing was ever reserved).
+    /// Matching it exactly is what keeps post-build `push_entry` branch
+    /// selection — and therefore watch order — identical to the incremental
+    /// path.
+    fn schedule_capacity(count: u32) -> u32 {
+        match count {
+            0 => 0,
+            1 | 2 => 2,
+            n => n.next_power_of_two(),
+        }
+    }
+
+    /// Lay out every literal's region at its exact size from a pass-1 plan.
+    ///
+    /// One allocation, `sum(counts)` slots, regions in literal-index order.
+    /// `capacity == count` for every literal: no doubling overshoot, no dead
+    /// slots. Callers must attach exactly the counted watches afterwards with
+    /// [`push_entry_presized`].
+    ///
+    /// [`push_entry_presized`]: WatchedLists::push_entry_presized
+    pub(crate) fn apply_exact_layout(&mut self, plan: &ExactWatchPlan) {
+        assert!(
+            self.is_unbuilt(),
+            "BUG: exact watch layout applied over {} existing entries",
+            self.buf_entries.len()
+        );
+        let num_lits = plan.counts.len();
+        if self.meta.len() < num_lits {
+            Self::assert_lit_index_bound(num_lits);
+            self.meta.resize(num_lits, WatchMeta::default());
+        }
+        // Sized by CAPACITY, not count. `capacity` is schedule-rounded (see
+        // below), and `push_entry`'s in-capacity branch writes at
+        // `start + len` whenever `len < capacity` — so a region reserved at
+        // only `count` slots would let the first post-build push write into
+        // the NEXT region's first slot. Reserving the rounded capacity is what
+        // makes that branch's bound real rather than nominal.
+        let total: usize = plan
+            .counts
+            .iter()
+            .map(|&c| Self::schedule_capacity(c) as usize)
+            .sum();
+        // `WatchMeta::offset` is a u32, so the whole buffer must be u32
+        // addressable. The incremental builder truncates here silently
+        // (`new_offset as u32` in `grow_and_push`); this path refuses.
+        let total_u32 =
+            u32::try_from(total).expect("BUG: watch entries exceed the u32 buffer offset space");
+        let mut next_offset: u32 = 0;
+        for (li, &count) in plan.counts.iter().enumerate() {
+            self.meta[li] = WatchMeta {
+                offset: next_offset,
+                len: 0,
+                // NOT `count`: `capacity` is what selects which `push_entry`
+                // branch every SUBSEQUENT push takes, and the two branches
+                // order a region's long suffix differently (in-capacity
+                // rotates the first long watch to the end; the relocating
+                // path right-shifts). Handing the solve an exact capacity
+                // therefore diverges watch order on the first post-build push
+                // — demonstrated by review on the sequence
+                // [(l,bin),(l,long),(l,long)] + one binary:
+                //   incremental -> [B0, B1, L1, L0]
+                //   exact       -> [B0, B1, L0, L1]
+                // No answer or search count changed on 116 instances, but
+                // watch order steers propagation and this is unproven-safe.
+                // Rounding to the schedule keeps the state bit-identical to
+                // the incremental builder while still removing every
+                // ABANDONED region, which is the dominant term.
+                capacity: Self::schedule_capacity(count),
+                binary_count: 0,
+            };
+            next_offset += Self::schedule_capacity(count);
+        }
+        debug_assert_eq!(next_offset, total_u32);
+        // Regions past the plan hold no watches; the plan covers every literal
+        // the build will touch, so anything beyond it must be an empty region.
+        for m in self.meta[num_lits..].iter_mut() {
+            *m = WatchMeta::default();
+        }
+        // Reserve the plan PLUS a relocation headroom, and reserve it exactly.
+        //
+        // Exactly: `resize`'s amortised growth would round the final size up
+        // to a power-of-two-ish capacity, and there is nothing to amortise
+        // against — the plan IS the final size of the build.
+        //
+        // Plus headroom: without it the build ends at `len == capacity`, and
+        // the first `grow_and_push` of the following BCP hits `Vec::reserve`
+        // on a FULL vector, which doubles the whole buffer to admit the few
+        // relocations the solve actually performs (see
+        // `WATCH_BUF_EXACT_BUILD_HEADROOM_DIVISOR`). The headroom is spare
+        // CAPACITY only — `len` below is still exactly `total` — so every
+        // region offset, region capacity, entry, and watch order is unchanged;
+        // this buys the relocations somewhere to land, nothing else.
+        //
+        // Only above `WATCH_BUF_LARGE_ENTRIES`: under 32 MB a doubling is not
+        // worth a byte of divergence from the stock policy, and `heap_bytes()`
+        // (the clause-DB byte-limit reduction trigger) stays identical there.
+        let reserved = if total >= WATCH_BUF_LARGE_ENTRIES {
+            total + total / WATCH_BUF_EXACT_BUILD_HEADROOM_DIVISOR
+        } else {
+            total
+        };
+        if self.buf_entries.capacity() < reserved {
+            self.buf_entries.reserve_exact(reserved);
+        }
+        self.buf_entries.resize(total, 0);
+        self.dead_slots = 0;
+    }
+
+    /// Push one watch into its pre-sized region (pass 2 of the exact build).
+    ///
+    /// Reproduces [`push_entry`]'s resulting order BIT FOR BIT, which is why
+    /// it branches on [`is_growth_step`]: on a binary insert the in-capacity
+    /// path moves only the FIRST long watch to the end (a rotation of the long
+    /// suffix), whereas the relocating path rebuilds the region as
+    /// `[binaries][new][longs]` (a right shift of the long suffix). The two
+    /// disagree whenever the region holds 2+ long watches, so watch order —
+    /// and hence propagation order — depends on which path each push took.
+    ///
+    /// [`push_entry`]: WatchedLists::push_entry
+    /// [`is_growth_step`]: WatchedLists::is_growth_step
+    pub(crate) fn push_entry_presized(&mut self, lit: Literal, blocker_raw: u32, clause_raw: u64) {
+        let li = lit.index();
+        debug_assert!(
+            li < self.meta.len(),
+            "BUG: exact build pushed to unplanned literal index {li}"
+        );
+        let entry = pack_entry(blocker_raw, clause_raw);
+        let m = self.meta[li];
+        let start = m.offset as usize;
+        let len = m.len as usize;
+        let bc = m.binary_count as usize;
+        assert!(
+            len < m.capacity as usize,
+            "BUG: exact watch region for literal index {li} overflowed \
+             (capacity {}, pass 1 undercounted)",
+            m.capacity
+        );
+        if entry_is_binary(entry) {
+            if bc < len {
+                if Self::is_growth_step(len) {
+                    // Relocating path: shift the long suffix right by one.
+                    self.buf_entries
+                        .copy_within(start + bc..start + len, start + bc + 1);
+                } else {
+                    // In-capacity path: rotate the first long to the end.
+                    self.buf_entries[start + len] = self.buf_entries[start + bc];
+                }
+            }
+            self.buf_entries[start + bc] = entry;
+            self.meta[li].binary_count = (bc + 1) as u32;
+        } else {
+            // Long insert: append at the end, on both paths.
+            self.buf_entries[start + len] = entry;
+        }
+        self.meta[li].len = (len + 1) as u32;
+    }
+
+    /// Set up both watches for a clause during the exact build.
+    ///
+    /// Mirrors [`watch_clause`] but writes into pre-sized regions.
+    ///
+    /// [`watch_clause`]: WatchedLists::watch_clause
+    #[inline]
+    pub(crate) fn watch_clause_presized(
+        &mut self,
+        clause_ref: ClauseRef,
+        lit0: Literal,
+        lit1: Literal,
+        is_binary: bool,
+    ) {
+        let (w0, w1) = if is_binary {
+            (
+                Watcher::binary(clause_ref, lit1),
+                Watcher::binary(clause_ref, lit0),
+            )
+        } else {
+            (
+                Watcher::new(clause_ref, lit1),
+                Watcher::new(clause_ref, lit0),
+            )
+        };
+        self.push_entry_presized(lit0, w0.blocker_raw, w0.clause_raw);
+        self.push_entry_presized(lit1, w1.blocker_raw, w1.clause_raw);
     }
 
     /// Push a Watcher to a literal's watch list.
@@ -1038,7 +1392,7 @@ impl WatchedLists {
             // Need more capacity, no overflow. Allocate at end.
             let new_capacity = total_len.next_power_of_two().max(4);
             let new_offset = self.buf_entries.len();
-            self.buf_entries.reserve(new_capacity);
+            self.reserve_entries(new_capacity);
             self.buf_entries.extend_from_slice(&deferred.entries);
             self.buf_entries.resize(new_offset + new_capacity, 0);
             self.dead_slots += m.capacity as usize;
@@ -1075,7 +1429,7 @@ impl WatchedLists {
             }
             let new_capacity = total_len.next_power_of_two().max(4);
             let new_offset = self.buf_entries.len();
-            self.buf_entries.reserve(new_capacity);
+            self.reserve_entries(new_capacity);
 
             self.buf_entries
                 .extend_from_slice(&deferred.entries[..deferred_bc]);
@@ -1140,7 +1494,7 @@ impl WatchedLists {
             // Need more capacity. Allocate at end.
             let new_capacity = deferred_len.next_power_of_two().max(4);
             let new_offset = self.buf_entries.len();
-            self.buf_entries.reserve(new_capacity);
+            self.reserve_entries(new_capacity);
             self.buf_entries.extend_from_slice(&deferred.entries);
             self.buf_entries.resize(new_offset + new_capacity, 0);
             self.dead_slots += m.capacity as usize;
@@ -1399,6 +1753,18 @@ impl WatchedLists {
     #[cfg(test)]
     pub(crate) fn outer_capacity(&self) -> usize {
         self.meta.capacity()
+    }
+
+    /// Freed-but-unreclaimed slots in the unified buffer (tests).
+    #[cfg(test)]
+    pub(crate) fn dead_slots(&self) -> usize {
+        self.dead_slots
+    }
+
+    /// Slots in the unified buffer, live and reserved alike (tests).
+    #[cfg(test)]
+    pub(crate) fn buffer_slots(&self) -> usize {
+        self.buf_entries.len()
     }
 
     /// Get the length of a watch list (kani proofs only)

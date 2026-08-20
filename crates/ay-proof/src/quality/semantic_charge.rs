@@ -36,9 +36,32 @@ fn class_specific_semantic_charge(
                 )?,
             )
         }
+        SemanticChargeClass::TrustKindProgressMetered => trust_kind_progress_charge(payload)?,
         SemanticChargeClass::General | SemanticChargeClass::ProgressFarkas => return Ok(None),
     };
     Ok(Some(charge))
+}
+
+/// Exact model for [`SemanticChargeClass::TrustKindProgressMetered`].
+///
+/// Everything the route can spend beyond what it debits itself is LINEAR: the
+/// clause sort/shape scan, and at most two `clause.to_vec()` clones (the
+/// deferred-trust collector entry and the derived-clause record). One copy of
+/// `work + unfolded_work` covers all of it with headroom; the polynomial part
+/// of the route is `nia_linear_ideal`, which charges through the same
+/// `progress` callback and is capped by its own `WorkMeter`.
+///
+/// Capped by [`replaced_general_product`] so it is a TIGHTENING at every
+/// payload: no proof that fits a caller's envelope today can stop fitting it.
+/// Bytes are left at the `General`/private model (`payload.bytes`) — the byte
+/// limb was never the binding one for this family, which keeps this a pure
+/// work-side correction.
+fn trust_kind_progress_charge(payload: PayloadStats) -> Result<(usize, usize), ProofCheckError> {
+    let structural = checked_add_usize(payload.work, payload.unfolded_work)?;
+    Ok((
+        structural.min(replaced_general_product(payload, 1)),
+        payload.bytes,
+    ))
 }
 
 /// The `General` product a tightening class replaces, saturated rather than
@@ -121,6 +144,22 @@ fn bounded_assignment_eval_charge(
 /// least one unfolded node), so `clause_len^2 <= unfolded_work^2`; the result is
 /// additionally capped by [`replaced_general_product`], making this a tightening
 /// of the `General` product at every payload.
+///
+/// `AletheRule::OrPos(_)` shares this model exactly. Its validator
+/// ([`crate::checker::boolean::validate_or_pos`]) scans the clause for a
+/// `(not (or ...))` literal, materializes `[not_or] ++ args`, and hands both to
+/// the SAME `clause_matches_unordered` — which returns immediately unless the
+/// two lengths are equal, so its pairwise phase is bounded by `clause_len^2`
+/// just as `Or`'s is. The one linear pass neither model names — reading the
+/// disjunction's argument list — is already paid for by the per-node payload
+/// walk that produced `work`/`unfolded_work` in the first place, which is why
+/// this class deliberately charges the CLAUSE and not the term DAG.
+///
+/// Measured on the `storeinv_t3_np_nf_10` QF_AX canary, one `OrPos(0)` step
+/// with `payload(work = 2_035, unfolded_work = 23_046)` was billed the
+/// `General` product `23_046^2 = 531_118_116` against a 350_000_000 envelope
+/// — 1.5x the WHOLE envelope for a few dozen `TermId` comparisons — and a
+/// correct `unsat` published as `unknown`.
 fn unordered_clause_match_charge(
     step: &ProofStep,
     payload: PayloadStats,
@@ -264,17 +303,57 @@ fn scale_validator_charge(
     ))
 }
 
+/// Name the charge MODEL behind one semantic precharge under
+/// `--probe-strict-check`.
+///
+/// `ProofCheckError::ResourceLimit`'s own doc says the remedy "lives in the
+/// charge model or the envelope constant", but the refusal message reports
+/// only the aggregate totals — so a single quadratic precharge that exceeds
+/// the whole envelope by itself is indistinguishable from a proof that simply
+/// accumulated too much. Printing the class and the payload it was computed
+/// from is what tells those two apart. Diagnostic only; no behaviour depends
+/// on it.
+fn probe_semantic_charge(
+    step: &ProofStep,
+    class: SemanticChargeClass,
+    payload: PayloadStats,
+    charge: (usize, usize),
+) {
+    if !ay_core::misc_cli_flags().probe_strict_check {
+        return;
+    }
+    // Only precharges large enough to matter against a caller envelope are
+    // worth a line; a large proof emits millions of small ones.
+    const PROBE_WORK_FLOOR: usize = 1_000_000;
+    if charge.0 < PROBE_WORK_FLOOR {
+        return;
+    }
+    let what = match step {
+        ProofStep::Step { rule, .. } => format!("rule {rule:?}"),
+        ProofStep::TheoryLemma { kind, .. } => format!("theory lemma {kind:?}"),
+        other => format!("{other:?}"),
+    };
+    eprintln!(
+        "--probe-strict-check: semantic precharge class={class:?} on {what}: work={} bytes={} \
+         from payload(work={}, unfolded_work={}, bytes={})",
+        charge.0, charge.1, payload.work, payload.unfolded_work, payload.bytes
+    );
+}
+
 pub(super) fn semantic_validator_charge(
     step: &ProofStep,
     payload: PayloadStats,
     class: SemanticChargeClass,
 ) -> Result<(usize, usize), ProofCheckError> {
     if let Some(charge) = class_specific_semantic_charge(step, payload, class)? {
+        probe_semantic_charge(step, class, payload, charge);
         return Ok(charge);
     }
     let named = checked_mul_usize(payload.work, payload.unfolded_work)?;
     let paired = checked_mul_usize(payload.unfolded_work, payload.unfolded_work)?;
     let base_work = named.max(paired);
     let private = private_validator_charge(step, payload, base_work, class)?;
-    Ok((base_work.max(private.0), payload.bytes.max(private.1)))
+    let charge = (base_work.max(private.0), payload.bytes.max(private.1));
+    probe_semantic_charge(step, class, payload, charge);
+    Ok(charge)
 }

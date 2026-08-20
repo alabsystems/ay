@@ -13,14 +13,15 @@
 #      obligation and observes a published `sat`, or any test whose failure is
 #      AY's own `[AY SOUNDNESS GATE] caught an INVALID model` banner, may not
 #      appear here at any expiry. Those stay visibly red until fixed.
-#      Four such rows are red as of 2026-08-13 and are deliberately ABSENT
+#      Five such rows are red as of 2026-08-16 and are deliberately ABSENT
 #      from this file — they are listed under "EXPLICITLY NOT QUARANTINED"
 #      below so their omission is auditable rather than accidental.
-#   2. Quarantine is the LAST resort, not a triage convenience. The 132 red
-#      rows in ay-dpll at this commit are overwhelmingly REAL DEFECTS with
+#   2. Quarantine is the LAST resort, not a triage convenience. The 53 red
+#      rows in ay-dpll at 5dab36e65 are overwhelmingly REAL DEFECTS with
 #      identified mechanisms; they are recorded in
 #      the development design notes and left red on purpose.
-#      Only 9 rows are quarantined here.
+#      Only 10 of them are quarantined here, and exactly ONE of those is
+#      environmental.
 #   3. Never weaken an assertion, loosen a bound, or delete a test to retire a
 #      row from this file. Fix the defect, or let the row expire and be
 #      re-reviewed.
@@ -35,9 +36,20 @@
 #   auflia_verification_consumer_ext_eq_7956::
 #       test_quantifier_consumer_ext_eq_tseitin_fails_closed_without_total_model_7956
 
+#   api::tests::test_solving_controls::
+#       native_decision_routes_preserve_parsed_publication_controls
+#       (2026-08-16: passes alone in 0.00 s, so it LOOKS environmental. It is
+#        not. `optimization_probe_preflight` aborts on
+#        `crate::memory::current_memory_bytes()`, which measures the WHOLE
+#        PROCESS, so the fixture's `(set-option :max-memory 2048)` trips at
+#        1 GiB of process footprint and a solver that allocated almost nothing
+#        answers `unknown`. The lib binary peaks at 6.29 GiB RSS. There is no
+#        wall to raise and the test's expectation is correct; quarantining it
+#        as "contention" would bury a real accounting defect.)
+
 schema_version = "0.1.0"
-reviewed_sha = "4c293515e"
-reviewed_on = "2026-08-13"
+reviewed_sha = "5dab36e65"
+reviewed_on = "2026-08-16"
 
 # ---------------------------------------------------------------------------
 # ENVIRONMENTAL — the benchmark fixture is not in the repository at all.
@@ -133,4 +145,53 @@ Restore the three validators with the iterative, progress-polled implementation
 the removal commit demands, then flip the pinning test in
 executor/proof/tests.rs in the SAME commit. Do not route these lemmas around
 the strict checker to retire this row.
+"""
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENTAL — wall-clock contention only. Measured alone-time is 20x under
+# the wall; the row fails only under full-suite parallelism.
+# ---------------------------------------------------------------------------
+
+[[divergences]]
+id = "ay-dpll.qf_abv.2026-08-16.fixpoint-gate-wall-contention"
+binary = "ay_dpll"
+tests = [
+    "executor_tests::bv::qf_abv::test_executor_qf_abv_fixpoint_gate_skipped_fc_violation_unsat_8510",
+]
+status = "active"
+owner = "@ay-perf"
+reviewed_on = "2026-08-16"
+expires_on = "2026-10-15"
+classification = "environmental_wall_clock_contention"
+cause = """
+The row carries `#[ntest::timeout(10_000)]`
+(crates/ay-dpll/src/executor_tests/bv/qf_abv.rs). Measured at 5dab36e65, release
+profile:
+
+  alone  (--exact --test-threads=1)  0.48 s and 0.49 s on two consecutive runs
+  loaded (cargo test -p ay-dpll, 51 binaries, 18 threads)  10 005 ms
+
+That is a 0.05 % overshoot of the wall against a 20x margin when the machine is
+not oversubscribed. The verdict is never wrong: the test asserts `unsat` plus
+three finite-extensionality telemetry pins, and all four hold when the test is
+given the CPU. This is not a soundness defect and not a fail-closed violation —
+it is the scheduler.
+"""
+why_not_fixed_now = """
+There is nothing in the solver to fix. The only two ways to clear it are to
+raise the wall, which is forbidden and would destroy the regression value the
+10 s bound exists to provide, or to stop running 51 binaries at 18 threads on
+one box, which is a harness decision and not a code change.
+"""
+required_action = """
+Re-measure on an un-oversubscribed runner before the expiry. If the alone-time
+has moved materially off 0.5 s, that IS a performance defect and this row must
+be reclassified rather than renewed. Do NOT retire this row by raising the
+`ntest::timeout`.
+"""
+note = """
+This is the ONLY environmental row at this sha. The contention bucket collapsed
+from 52 rows at 06c5208748 to 2 at 5dab36e65, and the second of those two
+(api::tests::test_solving_controls::native_decision_routes_...) is a REAL
+accounting defect that is deliberately NOT quarantined — see the header.
 """

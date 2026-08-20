@@ -31,7 +31,9 @@ use super::exact_checked_add;
 use crate::executor::proof_propagated_rewrite::{
     PlanCx, PropagationChainPlanner, PLAN_NODE_BUDGET,
 };
-use crate::sat_proof_manager::{ExactOriginalProofError, SatProofManager};
+use crate::sat_proof_manager::{
+    ExactOriginalProofError, FragmentInstanceRootDerivation, SatProofManager,
+};
 
 fn propagated_chain_slots(chain: &Proof) -> Result<usize, ResolutionValidationError> {
     let mut slots = 0usize;
@@ -121,7 +123,33 @@ impl SatProofManager<'_> {
         let empty_env = super::types::FragmentPropagationEnvironment::default();
         let env = self.propagation_environment.unwrap_or(&empty_env);
         let instance_roots = self.instance_root_derivations.unwrap_or(&[]);
-        if env.is_empty() && instance_roots.is_empty() {
+        // (#mbqi-sidecar-instance) Extend the plan's instance roots with the
+        // sealed c4 instance derivations: a preprocessing rewrite of a pushed
+        // MBQI/E-matching instance leaves an original unit whose propagation
+        // chain must ROOT in the instance itself (`forall_inst` from the
+        // authored quantifier), not in an authored term. Each entry was
+        // sealed by `CheckedInstanceDerivation::seal` (exact substitution
+        // replay + epoch/entry stamps), the planner still requires the
+        // quantifier to be in the problem set, and every emitted step is
+        // re-derived by the untouched strict premise authenticator — a wrong
+        // root can only fail the plan (fail-closed to
+        // `UnauthenticatedOriginalClause`, exactly as before).
+        let mut augmented_roots: Vec<FragmentInstanceRootDerivation> = instance_roots.to_vec();
+        if let Some(map) = self.instance_derivations {
+            for derivation in map.values() {
+                let root = FragmentInstanceRootDerivation {
+                    quantifier: derivation.quantifier,
+                    values: derivation.values.clone(),
+                    instance: derivation.instance,
+                    survivor: derivation.instance,
+                    refuted_disjuncts: Vec::new(),
+                };
+                if !augmented_roots.contains(&root) {
+                    augmented_roots.push(root);
+                }
+            }
+        }
+        if env.is_empty() && augmented_roots.is_empty() {
             return Ok(None);
         }
         // The whole bounded plan walk is covered before it runs; the exact
@@ -132,7 +160,7 @@ impl SatProofManager<'_> {
             authored_problem_terms,
             &env.record_by_after,
             &env.entry_by_expr,
-            instance_roots,
+            &augmented_roots,
             true,
         );
         let mut planner = PropagationChainPlanner { terms: self.terms };

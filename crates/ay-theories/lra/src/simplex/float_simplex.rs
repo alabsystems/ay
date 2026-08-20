@@ -280,7 +280,7 @@ impl FloatSimplex {
 }
 
 // ===========================================================================
-// Float pivot layer (AY_LRA_FLOAT_LAYER) — heuristic f64 basis oracle.
+// Float pivot layer (--lra-float-layer) — heuristic f64 basis oracle.
 //
 // `float_find_basis` runs a REAL f64 dual-simplex-style feasibility search over
 // a shadow copy of the current reduced tableau and returns a CANDIDATE basis

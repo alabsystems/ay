@@ -181,6 +181,17 @@ impl ProofTracker {
         self.enabled
     }
 
+    /// Number of proof steps currently retained in the ledger.
+    ///
+    /// #cert-accounting item 6: a cheap volume proxy for the recording work a
+    /// solve paid for. Push/pop truncates the ledger, so this is a LOWER
+    /// BOUND on the steps ever constructed. Read only by
+    /// `executor::cert_accounting`; nothing consults it to decide anything.
+    #[must_use]
+    pub(crate) fn recorded_step_count(&self) -> usize {
+        self.proof.steps.len()
+    }
+
     /// Set the theory name for subsequent theory lemmas
     pub(crate) fn set_theory(&mut self, theory: impl Into<String>) {
         self.theory_name = theory.into();
@@ -351,6 +362,68 @@ impl ProofTracker {
                 .or_insert(LemmaKey::new(TheoryLemmaKind::Generic, &[term], None), id);
         }
         Some(id)
+    }
+
+    /// Derive a solver-visible UNIT from a typed guarded tautology resolved
+    /// against already-recorded premise steps, instead of admitting the unit
+    /// as a bare `Generic` trust lemma.
+    ///
+    /// `guarded_clause` is `[¬p_1, .., ¬p_k, unit]` where each `¬p_i` is the
+    /// literal term in clause order and `premises[i] = (¬p_i, p_i, step_i)`
+    /// supplies the positive premise term and the proof step deriving `(cl
+    /// p_i)` (an `Assume` of an asserted root, or a typed unit lemma). The
+    /// guarded clause is recorded under `kind` — a kind the strict checker
+    /// re-derives — and the premises are resolved away in order, leaving
+    /// `(cl unit)`. The final step is indexed under the `Generic`-unit lookup
+    /// so `add_assumption` and the axiom-recording dedup reuse the DERIVATION
+    /// where they previously found (or minted) a trust step.
+    ///
+    /// The DT axiom expander uses this for its modus-ponens-collapsed ground
+    /// facts (same-binding variable equalities, equality-to-tester units):
+    /// asserting the unit is sound, but recording it premiselessly made every
+    /// proof that used it `proof-trusted`, and mandatory certification then
+    /// demoted genuine UNSATs — the verification-consumer extern_spec Option::unwrap red.
+    pub(crate) fn add_derived_unit_lemma(
+        &mut self,
+        guarded_clause: Vec<TermId>,
+        kind: TheoryLemmaKind,
+        premises: &[(TermId, TermId, ProofId)],
+        unit: TermId,
+    ) -> Option<ProofId> {
+        if !self.enabled {
+            return None;
+        }
+        if let Some(id) = self.lemma_map.get(TheoryLemmaKind::Generic, &[unit], None) {
+            return Some(id);
+        }
+        debug_assert_eq!(
+            guarded_clause.len(),
+            premises.len() + 1,
+            "guarded clause must hold one negated literal per premise plus the unit"
+        );
+        debug_assert_eq!(guarded_clause.last(), Some(&unit));
+
+        let lemma_id = self.add_theory_lemma_with_kind(guarded_clause.clone(), kind)?;
+        let mut remaining = guarded_clause;
+        let mut current = lemma_id;
+        for &(neg_literal, premise, premise_step) in premises {
+            let before = remaining.len();
+            remaining.retain(|&lit| lit != neg_literal);
+            debug_assert_eq!(
+                before,
+                remaining.len() + 1,
+                "premise literal must be in clause"
+            );
+            current = self
+                .proof
+                .add_resolution(remaining.clone(), premise, current, premise_step);
+        }
+        debug_assert_eq!(remaining.as_slice(), &[unit]);
+        self.lemma_map.or_insert(
+            LemmaKey::new(TheoryLemmaKind::Generic, &[unit], None),
+            current,
+        );
+        Some(current)
     }
 
     /// Record an arithmetic theory lemma with Farkas coefficients and explicit kind.

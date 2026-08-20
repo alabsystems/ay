@@ -639,7 +639,7 @@ impl TheorySolver for LiaSolver<'_> {
             if lval != rval {
                 continue;
             }
-            if std::env::var_os("AY_DEBUG_FIXED_EQS").is_some() {
+            if ay_core::misc_cli_flags().debug_fixed_eqs {
                 eprintln!(
                     "[fixed-eqs] export {}={} lhs={:?} rhs={:?} ",
                     req.lhs.0,

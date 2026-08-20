@@ -40,6 +40,140 @@ fn rust_sources_below(root: &std::path::Path, output: &mut Vec<PathBuf>) {
     }
 }
 
+/// Blank every comment span, keeping code and string literals verbatim.
+///
+/// The authored-authority allowlist scans source text for entrypoint names. A
+/// comment cannot call anything, so a doc comment that links
+/// [`crate::Executor::execute_authored`] — as
+/// `crates/ay-dpll/src/executor/query_role.rs` does, to explain why the
+/// entrypoint is a method rather than a command — is prose, not a callsite.
+/// Indicting it is the same category error the chokepoint-fixture exclusion
+/// above already rejects: "source-search strings are not executable callsites".
+///
+/// This narrows only what counts as PROSE. String literals (including raw and
+/// byte strings) and char literals are copied verbatim, so a `//` or `/*`
+/// inside one can never open a comment and hide a real call on that line. When
+/// the scanner cannot classify something it keeps the text, i.e. it errs toward
+/// the pre-existing over-strict behaviour rather than toward missing a callsite.
+fn code_without_comments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let at = |index: usize| chars.get(index).copied();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        // Line comment (covers `//`, `///` and `//!`): drop to end of line.
+        if chars[index] == '/' && at(index + 1) == Some('/') {
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        // Block comment; Rust nests them. Newlines are preserved so any later
+        // line-oriented reading of the result keeps its line numbering.
+        if chars[index] == '/' && at(index + 1) == Some('*') {
+            let mut depth = 1usize;
+            index += 2;
+            while index < chars.len() && depth > 0 {
+                if chars[index] == '/' && at(index + 1) == Some('*') {
+                    depth += 1;
+                    index += 2;
+                } else if chars[index] == '*' && at(index + 1) == Some('/') {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    if chars[index] == '\n' {
+                        out.push('\n');
+                    }
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        // Raw string literal: `r"..."`, `r#"..."#`, `br#"..."#`. Copied whole.
+        if let Some(raw_start) = raw_string_open(&chars, index) {
+            let mut hashes = 0usize;
+            while hashes < raw_start - index && chars[raw_start - 1 - hashes] == '#' {
+                hashes += 1;
+            }
+            let prefix = index;
+            index = raw_start + 1;
+            while index < chars.len() {
+                if chars[index] == '"' && (1..=hashes).all(|offset| at(index + offset) == Some('#'))
+                {
+                    index += hashes + 1;
+                    break;
+                }
+                index += 1;
+            }
+            out.extend(&chars[prefix..index.min(chars.len())]);
+            continue;
+        }
+        // Ordinary string literal, escapes respected.
+        if chars[index] == '"' {
+            out.push('"');
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\\' {
+                    out.push('\\');
+                    if let Some(escaped) = at(index + 1) {
+                        out.push(escaped);
+                    }
+                    index += 2;
+                    continue;
+                }
+                out.push(chars[index]);
+                index += 1;
+                if chars[index - 1] == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Char literal, but never a lifetime (`'a` has no closing quote).
+        if chars[index] == '\'' {
+            let closes_at = if at(index + 1) == Some('\\') {
+                (index + 2..chars.len().min(index + 8)).find(|&probe| chars[probe] == '\'')
+            } else if at(index + 2) == Some('\'') {
+                Some(index + 2)
+            } else {
+                None
+            };
+            if let Some(close) = closes_at {
+                out.extend(&chars[index..=close]);
+                index = close + 1;
+                continue;
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// If a raw-string literal opens at `index`, return the position of its `"`.
+fn raw_string_open(chars: &[char], index: usize) -> Option<usize> {
+    let previous_is_ident = index
+        .checked_sub(1)
+        .and_then(|previous| chars.get(previous))
+        .is_some_and(|character| character.is_alphanumeric() || *character == '_');
+    if previous_is_ident {
+        return None;
+    }
+    let mut cursor = index;
+    if chars.get(cursor) == Some(&'b') {
+        cursor += 1;
+    }
+    if chars.get(cursor) != Some(&'r') {
+        return None;
+    }
+    cursor += 1;
+    while chars.get(cursor) == Some(&'#') {
+        cursor += 1;
+    }
+    (chars.get(cursor) == Some(&'"')).then_some(cursor)
+}
+
 fn is_chokepoint_source_fixture(relative: &str) -> bool {
     matches!(
         relative,

@@ -1866,3 +1866,133 @@ fn split_leading_set_logic_falls_back_and_leaves_unrecognized_input_alone() {
         assert_eq!(body, odd, "must be untouched: {odd:?}");
     }
 }
+
+/// #cert-accounting item 3/6: the declared query role reaches ay-dpll and is
+/// attributed there, and declaring it changes no verdict.
+///
+/// This is the wiring test for the CHC side of the accounting. It calls the
+/// adapter helper directly rather than driving a portfolio, so it cannot
+/// become flaky when a scheduling change reroutes which lane a benchmark
+/// happens to take.
+mod query_role_accounting {
+    use super::*;
+    use ay_dpll::CertificationAccounting;
+
+    const UNSAT_SCRIPT: &str = "(set-logic QF_LIA)\n\
+         (declare-const x Int)\n\
+         (assert (> x 5))\n\
+         (assert (< x 3))\n\
+         (check-sat)\n";
+
+    fn run(role: ExecutorQueryRole) -> Vec<String> {
+        let commands = ay_frontend::parse(UNSAT_SCRIPT).expect("fixture parses");
+        execute_commands_via_executor(&commands, role).expect("fixture executes")
+    }
+
+    /// Both roles decide, certify, and publish identically. If this ever
+    /// fails, a policy has started keying on the role and the `Published`
+    /// channels listed in `ExecutorQueryRole`'s doc must be re-audited before
+    /// the change lands.
+    #[test]
+    fn declaring_the_internal_lemma_role_does_not_change_the_verdict() {
+        assert_eq!(
+            run(ExecutorQueryRole::Published),
+            run(ExecutorQueryRole::InternalLemma)
+        );
+        assert_eq!(
+            run(ExecutorQueryRole::InternalLemma)
+                .first()
+                .map(String::as_str),
+            Some("unsat")
+        );
+    }
+
+    /// The internal-lemma channel is attributed, and — the point of the whole
+    /// exercise — it is visibly PAYING certification cost: a search-guidance
+    /// sub-query mints a full UNSAT certificate today. A future stage that
+    /// makes the search channel shed that work turns this assertion around;
+    /// until then the number is the standing measurement of what commit
+    /// 66538b006f added to every CHC sub-query.
+    ///
+    /// Deltas, never absolutes: the counters are process-global and the test
+    /// runner is multi-threaded, so a concurrent solve can only inflate.
+    #[test]
+    fn internal_lemma_sub_queries_are_attributed_and_do_pay_for_certification() {
+        let before = CertificationAccounting::snapshot();
+        let outputs = run(ExecutorQueryRole::InternalLemma);
+        let delta = CertificationAccounting::snapshot().since(before);
+
+        assert_eq!(outputs.first().map(String::as_str), Some("unsat"));
+        assert!(
+            delta.decisions_internal_lemma >= 1,
+            "the CHC search channel's declaration must reach ay-dpll: {delta}"
+        );
+        assert!(
+            delta.mints_internal_lemma >= 1,
+            "a search-guidance sub-query still mints a certificate: {delta}"
+        );
+        assert!(
+            delta.decisions_proof_tracked_internal_lemma >= 1,
+            "a search-guidance sub-query still records proof steps while \
+             solving — the cost the dillig12_m regression is made of: {delta}"
+        );
+    }
+}
+
+/// #cert-accounting item 3: the vetted inventory of internal-lemma
+/// declarations in this crate.
+///
+/// The declaration is inert today, so this list guards a future stage rather
+/// than the present one — but it is exactly the list a reviewer would
+/// otherwise have to rebuild by hand the moment any policy keys on the role.
+/// A channel on which a raw executor `"unsat"` BECOMES the published claim
+/// must never appear here.
+#[test]
+fn internal_lemma_declarations_match_the_vetted_inventory() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found: Vec<String> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("ay-chc src is readable") {
+            let path = entry.expect("directory entry is readable").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file is readable");
+            // Skip the `tests.rs` module this assertion lives in: its own
+            // fixtures legitimately name both roles.
+            if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
+                continue;
+            }
+            let declares = text.contains("execute_internal_lemma")
+                || text.contains("execute_all_internal_lemma")
+                || text.contains("ExecutorQueryRole::InternalLemma");
+            if declares {
+                let relative = path
+                    .strip_prefix(&root)
+                    .expect("enumerated file is below src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                found.push(relative);
+            }
+        }
+    }
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            // The SmtContext executor fallback and the incremental conjunction
+            // check: both feed PDR search only.
+            "smt/executor_adapter/mod.rs".to_string(),
+            // PDR's own executor-backed reachability/blocking queries.
+            "smt/pdr_executor_backend.rs".to_string(),
+            "smt/persistent.rs".to_string(),
+        ],
+        "a new internal-lemma declaration requires an explicit audit of what \
+         backs the published claim on that channel"
+    );
+}

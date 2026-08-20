@@ -4,6 +4,19 @@
 
 use super::*;
 
+/// #lra-inc-engine P1 (`--lra-cond-trail`, EXPERIMENTAL, default OFF): when ON,
+/// `assert_var_bound[_with_reasons]` trails ONLY genuine bound writes (tightenings),
+/// not the non-tightening re-assert flood that `process_check_atoms` re-presents
+/// every check. This makes `pop_inner`'s trail replay O(delta) instead of O(base),
+/// eliminating the scoped-push/pop pop-cost tax. SOUNDNESS: a non-tightening assert
+/// changes no bound state, so its trail entry only ever restored a value to itself
+/// (a no-op) — skipping it restores identically. Core trail path (all LRA/LIA):
+/// gate behind full-suite + adversarial review before any default-on.
+fn cond_trail_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| ay_core::misc_cli_flags().lra_cond_trail)
+}
+
 impl LraSolver {
     /// #8406: Takes `Rational` instead of `BigRational` to avoid heap allocation
     /// on every bound assertion. Callers pass `Rational::zero()` for the common
@@ -258,7 +271,24 @@ impl LraSolver {
             BoundType::Lower => info.lower.clone(),
             BoundType::Upper => info.upper.clone(),
         };
-        self.trail.push((var, bound_type, old_bound));
+        // #lra-inc-engine P1: default pushes unconditionally (`||` short-circuits
+        // on the flag → zero extra work, byte-identical). With --lra-cond-trail
+        // on, skip trailing a non-tightening re-assert (peek mirrors the
+        // should_update logic below) so pop replay is O(delta).
+        if !cond_trail_enabled()
+            || (match bound_type {
+                BoundType::Lower => match &info.lower {
+                    None => true,
+                    Some(e) => bound > e.value || (bound == e.value && strict && !e.strict),
+                },
+                BoundType::Upper => match &info.upper {
+                    None => true,
+                    Some(e) => bound < e.value || (bound == e.value && strict && !e.strict),
+                },
+            })
+        {
+            self.trail.push((var, bound_type, old_bound));
+        }
         // LIA algebraic-detection memo invalidation (`bound_revision`) is
         // decided AFTER the write below, and only when the write touches a
         // TIGHT (lower == upper, non-strict) pair — the only bound state the
@@ -451,7 +481,24 @@ impl LraSolver {
             BoundType::Lower => info.lower.clone(),
             BoundType::Upper => info.upper.clone(),
         };
-        self.trail.push((var, bound_type, old_bound));
+        // #lra-inc-engine P1: default pushes unconditionally (`||` short-circuits
+        // on the flag → zero extra work, byte-identical). With --lra-cond-trail
+        // on, skip trailing a non-tightening re-assert (peek mirrors the
+        // should_update logic below) so pop replay is O(delta).
+        if !cond_trail_enabled()
+            || (match bound_type {
+                BoundType::Lower => match &info.lower {
+                    None => true,
+                    Some(e) => bound > e.value || (bound == e.value && strict && !e.strict),
+                },
+                BoundType::Upper => match &info.upper {
+                    None => true,
+                    Some(e) => bound < e.value || (bound == e.value && strict && !e.strict),
+                },
+            })
+        {
+            self.trail.push((var, bound_type, old_bound));
+        }
         // LIA algebraic-detection memo invalidation (`bound_revision`) is
         // decided AFTER the write below, and only when the write touches a
         // TIGHT (lower == upper, non-strict) pair — the only bound state the

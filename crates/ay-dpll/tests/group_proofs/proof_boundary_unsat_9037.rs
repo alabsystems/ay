@@ -59,13 +59,14 @@ fn qf_s_ground_folded_false_unsat_keeps_proof() {
 /// requires UNSAT. The VERDICT is thus certified by an independent re-solve and
 /// `unsat` publishes.
 ///
-/// THE PROOF IS NOT EXTERNALLY CHECKABLE, and this test still pins that. The
-/// re-solve certifies the CONCLUSION, not the document: the occurs-check step
-/// still prints as `(step t2 (cl (not (= n 0)) (not (= x (cons 0 x)))) :rule
-/// hole)`, so `check_proof_strict` must keep REJECTING it and `--self-check`
-/// answers `unknown` here while default mode answers `unsat`. The
-/// strict-rejection assertion below is what fires if AY ever gains a real
-/// occurs-check proof rule, demanding this test be promoted.
+/// PROMOTED (2026-08-19): the occurs check is now the typed, strictly
+/// validated `DatatypeAcyclicDirect` rule, so the INTERNAL refutation is
+/// trust-free and certification no longer needs the re-solve fallback. Two
+/// boundaries deliberately unchanged and still pinned below: the
+/// registry-free strict check keeps rejecting (no constructor authority —
+/// fail-closed like every datatype kind), and the EXTERNAL wire still prints
+/// an honest `hole` (carcara has no datatype acyclicity rule), so
+/// `:check-proofs-strict` continues to withhold on the wire gap.
 #[test]
 fn dt_occurs_check_publishes_uncheckable_certificate() {
     let smt = r#"
@@ -94,17 +95,32 @@ fn dt_occurs_check_publishes_uncheckable_certificate() {
         "get-proof must succeed after certified publication: {outputs:?}"
     );
 
-    // SOUNDNESS GUARD: the occurs check has no strict Alethe rule, so the
-    // document must stay honestly unproved — never dressed up as checkable.
+    // PROMOTED (2026-08-19): AY gained the real occurs-check rule this
+    // test's original strict-rejection guard existed to detect —
+    // `TheoryLemmaKind::DatatypeAcyclicDirect`, an iterative bounded
+    // constructor-containment walk with the datatype registry as constructor
+    // identity authority. The internal refutation is now TRUST-FREE.
+    assert!(
+        !exec.unsat_proof_terminal_trust_detected(),
+        "the occurs-check refutation must be internally trust-free now that \
+         DatatypeAcyclicDirect is a real validated rule"
+    );
+
+    // FAIL-CLOSED GUARD: without the datatype registry the checker has no
+    // constructor authority, so the REGISTRY-FREE strict check must keep
+    // rejecting rather than accept a datatype claim it cannot authenticate.
     let strict = ay_proof::check_proof_strict(proof, exec.terms());
     assert!(
         strict.is_err(),
-        "datatype occurs-check has no strict certificate; the checker must not \
-         accept a fabricated one: {strict:?}"
+        "registry-free strict check must stay fail-closed on datatype \
+         acyclicity: {strict:?}"
     );
+
+    // The EXTERNAL wire has no carcara acyclicity rule: the document stays
+    // honestly holey, never dressed up as externally checkable.
     let alethe = outputs.get(1).expect("get-proof output");
     assert!(
         alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the uncheckable gap must be disclosed as an unproved step:\n{alethe}"
+        "the external wire gap must be disclosed as an unproved step:\n{alethe}"
     );
 }

@@ -939,3 +939,55 @@ fn frozen_reachable_terms_detect_suffix_rollback() {
 
     assert!(!context.projection_bindings_still_current(&checked, &[root]));
 }
+
+/// An internal sub-solve that borrows the logic slot and puts it back must
+/// leave the source-context stamp EQUAL to the one captured before it.
+///
+/// Regression for the `fp.to_real` two-phase lane
+/// (`Executor::solve_rewritten_mixed_subproblem`), which inferred a logic for
+/// its FP-free subproblem and restored the caller's on exit. With two plain
+/// `set_logic` calls the revision advanced twice, so the stamp never returned
+/// and `Executor::authenticate_unsat_query_scope` discarded a correct UNSAT as
+/// "the public UNSAT source context is no longer current".
+#[test]
+fn internal_logic_borrow_restores_the_source_context_stamp() {
+    let mut context = elaborate("(set-logic QF_UFLRA)\n(declare-fun f (Real) Real)");
+    let bound = context.source_context_stamp();
+
+    let borrow = context.begin_internal_logic_borrow("QF_LRA".to_string());
+    assert!(
+        context.source_context_stamp() != bound,
+        "the borrow must be observable WHILE it is held; otherwise this test \
+         would pass on a `set_logic` that silently did nothing"
+    );
+    context.end_internal_logic_borrow(borrow);
+
+    assert!(
+        context.source_context_stamp() == bound,
+        "an exactly-restoring internal borrow changes nothing observable, so \
+         the stamp the mandatory UNSAT gate compares must come back"
+    );
+    assert_eq!(context.logic(), Some("QF_UFLRA"));
+}
+
+/// FAIL-CLOSED HALF, and the reason the rollback is safe: a declaration made
+/// INSIDE the borrow is a genuine source-context change, so the stamp must NOT
+/// be rolled back over it.
+#[test]
+fn internal_logic_borrow_does_not_roll_back_over_a_real_source_change() {
+    let mut context = elaborate("(set-logic QF_UFLRA)\n(declare-fun f (Real) Real)");
+    let bound = context.source_context_stamp();
+
+    let borrow = context.begin_internal_logic_borrow("QF_LRA".to_string());
+    context
+        .process_command(&parse("(declare-fun g (Real) Real)").expect("parse")[0])
+        .expect("declare inside the borrow");
+    context.end_internal_logic_borrow(borrow);
+
+    assert!(
+        context.source_context_stamp() != bound,
+        "a declaration inside the borrow really did change the source scope; \
+         rolling the revision back over it would let a stale query certify"
+    );
+    assert_eq!(context.logic(), Some("QF_UFLRA"));
+}

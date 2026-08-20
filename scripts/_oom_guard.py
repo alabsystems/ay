@@ -1020,6 +1020,16 @@ class _RssWatchdog:
         self.armed = False
         self.breached = False
         self.breach_time_ns = None
+        # Peak RSS the sampler actually observed, in MB (None if never sampled).
+        #
+        # Without this, NO banked run is auditable for envelope compliance. That
+        # is not hypothetical: the SQ QF_Datatypes win of 2026-08-01 recorded
+        # memlimit_mb 6954 and a SIGKILL watchdog, yet one of its solved
+        # instances needs 9,477 MB — verified 2026-08-17 with /usr/bin/time -l.
+        # Nothing in the banked rows could have revealed that, because peak RSS
+        # was sampled and then thrown away. The sampler is already walking the
+        # process group every poll; keeping the maximum is free.
+        self.peak_rss_mb = None
         self._proc = proc
         self._pgid = pgid
         self._kill_mb = kill_mb
@@ -1092,6 +1102,8 @@ class _RssWatchdog:
                           file=sys.stderr, flush=True)
                 else:
                     unknown = 0
+                    if self.peak_rss_mb is None or rss > self.peak_rss_mb:
+                        self.peak_rss_mb = rss
                     if rss <= self._kill_mb:
                         continue
                     if not self._retain_authenticated_group():

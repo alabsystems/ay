@@ -884,6 +884,96 @@ fn clause_trace_level0_multiliteral_conflict_is_positive_rup() {
     assert_eq!(validated.dag().empty_clause_id, 5);
 }
 
+/// End-to-end: the solver's OWN emitted refutation, run through the real
+/// independent positive-RUP validator.
+///
+/// First-UIP analysis records only the conflict-analysis antecedents of a
+/// learned row. Those antecedents are unit only under assignments the row
+/// itself no longer mentions — chiefly the root-level reason clauses their
+/// literals propagate through — so the recorded chain alone is frequently NOT
+/// a RUP derivation of the row it claims. Replaying the producer's claim
+/// verbatim therefore rejects genuine refutations, which is what made a real
+/// bit-blasted overflow obligation fail strict certification: the checked-SAT
+/// sidecar refused the emitter's own chain and the UNSAT verdict was withheld.
+///
+/// The converter must independently reconstruct each row's chain from the
+/// exact prior canonical database. This drives the ordinary CDCL lane on a
+/// pigeonhole instance and requires (a) that the emitter's own trace passes the
+/// real replay, and (b) that reconstruction demonstrably widened at least one
+/// row — without (b) the test would still pass if reconstruction were removed.
+#[test]
+fn clause_trace_learned_rows_omitting_root_antecedents_are_reconstructed() {
+    // PHP(5 pigeons, 4 holes): UNSAT, small, and dense enough that first-UIP
+    // learning produces rows whose recorded antecedents are unit only under
+    // the root-level assignment.
+    const HOLES: usize = 4;
+    const PIGEONS: usize = HOLES + 1;
+    let num_vars = PIGEONS * HOLES;
+    let var = |pigeon: usize, hole: usize| Variable((pigeon * HOLES + hole) as u32);
+
+    let mut clauses: Vec<Vec<Literal>> = Vec::new();
+    for pigeon in 0..PIGEONS {
+        clauses.push(
+            (0..HOLES)
+                .map(|hole| Literal::positive(var(pigeon, hole)))
+                .collect(),
+        );
+    }
+    for hole in 0..HOLES {
+        for first in 0..PIGEONS {
+            for second in (first + 1)..PIGEONS {
+                clauses.push(vec![
+                    Literal::negative(var(first, hole)),
+                    Literal::negative(var(second, hole)),
+                ]);
+            }
+        }
+    }
+
+    let mut solver = Solver::new(num_vars);
+    solver.enable_clause_trace();
+    for clause in &clauses {
+        assert!(solver.add_clause(clause.clone()));
+    }
+    assert!(solver.solve().into_inner().is_unsat());
+
+    let trace = solver.take_clause_trace().expect("clause trace enabled");
+    let recorded_widths: Vec<usize> = trace
+        .entries()
+        .iter()
+        .filter(|entry| !entry.is_original)
+        .map(|entry| entry.resolution_hints.len())
+        .collect();
+    assert!(
+        !recorded_widths.is_empty(),
+        "the refutation must learn rows"
+    );
+
+    let validated = crate::validate_clause_trace_resolution(
+        &trace,
+        num_vars,
+        &crate::ResolutionValidationLimits::unbounded(),
+    )
+    .expect("the emitter's own refutation must pass independent positive-RUP replay");
+
+    let validated_widths: Vec<usize> = validated
+        .dag()
+        .derived
+        .iter()
+        .map(|step| step.rup_hints.len())
+        .collect();
+    let widened = recorded_widths
+        .iter()
+        .zip(validated_widths.iter())
+        .filter(|(recorded, replayed)| replayed > recorded)
+        .count();
+    assert!(
+        widened > 0,
+        "independent reconstruction must have supplied antecedents the producer \
+         omitted; recorded={recorded_widths:?} validated={validated_widths:?}"
+    );
+}
+
 #[test]
 fn clause_trace_level0_conflict_missing_id_fails_closed() {
     let mut solver = Solver::new(3);

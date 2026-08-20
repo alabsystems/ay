@@ -195,6 +195,67 @@ fn test_default_limit_floors_never_exceed_detected_ceiling() {
     assert_eq!(default_embedded_memory_limit_from(0), 0);
 }
 
+/// Concurrency-aware unarmed default: a single tenant is byte-for-byte the old
+/// figure; multiple peers split AVAILABLE memory instead of each claiming 85% of
+/// TOTAL RAM (the 2026-08-11 panic mechanism).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn test_standalone_limit_from_parts_divides_only_under_concurrency() {
+    let gb = 1024 * 1024 * 1024;
+    // conc <= 1 is the sole-tenant path: identical to the flat figure for any phys.
+    for &phys in &[gb, 3 * gb, 20 * gb, 128 * gb] {
+        assert_eq!(
+            default_standalone_memory_limit_from_parts(phys, phys, 1),
+            default_standalone_memory_limit_from(phys),
+            "conc=1 must equal the sole-tenant figure (phys={phys})"
+        );
+        assert_eq!(
+            default_standalone_memory_limit_from_parts(phys, phys, 0),
+            default_standalone_memory_limit_from(phys),
+            "conc=0 is treated as sole-tenant"
+        );
+    }
+    // 128 GiB box, ~96 GiB available, 16 peers: each gets (0.75*96)/16 = 4.5 GiB,
+    // NOT 108 GiB. This is the fix — the sum (72 GiB) stays under available.
+    let avail = 96 * gb;
+    let phys = 128 * gb;
+    let per = default_standalone_memory_limit_from_parts(avail, phys, 16);
+    assert_eq!(per, (avail * 3 / 4) / 16);
+    assert!(
+        per * 16 <= avail,
+        "16 peers must not over-commit available memory"
+    );
+    // The split never RAISES a single process above the sole-tenant cap.
+    assert!(
+        default_standalone_memory_limit_from_parts(avail, phys, 2)
+            <= default_standalone_memory_limit_from(phys),
+        "the per-process ceiling is capped at the sole-tenant figure"
+    );
+    // 2 GiB floor: many peers on a small box still get a workable floor, not 0.
+    let small = 4 * gb;
+    assert_eq!(
+        default_standalone_memory_limit_from_parts(small, small, 64),
+        (2 * gb).min(small)
+    );
+    // Total detection failure disables the limit.
+    assert_eq!(default_standalone_memory_limit_from_parts(0, 0, 8), 0);
+}
+
+/// Concurrency detection precedence: explicit override wins; a test harness maps
+/// to the CPU count; everything absent is sole-tenant; pathological values clamp.
+#[test]
+fn test_detected_concurrency_precedence_and_clamp() {
+    // Explicit override wins over everything, clamped to 2x parallelism.
+    assert_eq!(detected_concurrency_from(Some(4), true, 8), 4);
+    assert_eq!(detected_concurrency_from(Some(1000), false, 8), 16);
+    // Test harness with no override assumes one peer per logical CPU.
+    assert_eq!(detected_concurrency_from(None, true, 8), 8);
+    // No harness, no override => sole tenant.
+    assert_eq!(detected_concurrency_from(None, false, 8), 1);
+    // Degenerate parallelism is treated as 1.
+    assert_eq!(detected_concurrency_from(None, true, 0), 1);
+}
+
 /// THE property: the cooperative limit must sit strictly below the kernel's.
 ///
 /// A cooperative ceiling above the kernel cap is worse than none — every

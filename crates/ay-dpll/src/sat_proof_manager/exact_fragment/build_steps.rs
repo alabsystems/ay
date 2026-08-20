@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId};
+use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TheoryLemmaKind};
 use ay_sat::ResolutionValidationError;
 
 use super::types::OrFoldUnitPlan;
@@ -245,6 +245,118 @@ impl SatProofManager<'_> {
                 )? {
                     return Ok(step);
                 }
+                // Last resort before refusal: a packed clausification unit
+                // whose flattened disjuncts contain a complementary pair (or
+                // one of the `and_pos`/`or_neg` gate shapes) is a
+                // propositional TAUTOLOGY — true regardless of provenance, so
+                // it needs no pedigree back to an authored assertion at all.
+                // The canonical producer is ite/store clausification emitting
+                // `(or (or .. P) (not P))` unannotated (the QF_AUFLIRA ROW
+                // envelope red, 2026-08-19). The recognizer IS the strict
+                // validator for `BoolTautology`, so the whole-proof re-check
+                // re-derives exactly what is admitted here; a wrong guess
+                // fails authentication exactly like today's refusal. Placed
+                // after every pedigree lane so it only ever runs on units
+                // that would otherwise hard-fail.
+                if ay_proof::recognize_bool_tautology(self.terms, &[*unit]) {
+                    let (work, bytes) = Self::unit_chain_charge(1, 1)?;
+                    progress(work, bytes)?;
+                    return Ok(proof.add_step(ProofStep::TheoryLemma {
+                        theory: "bool".to_owned(),
+                        clause: vec![*unit],
+                        farkas: None,
+                        kind: TheoryLemmaKind::BoolTautology,
+                        lia: None,
+                    }));
+                }
+                // Its arithmetic sibling: the negated unit (or-packed
+                // literals flattened conjunctively) is an infeasible linear
+                // system — again intrinsically valid, no pedigree needed.
+                if ay_proof::recognize_arith_clause_tautology(self.terms, &[*unit]) {
+                    let (work, bytes) = Self::unit_chain_charge(1, 1)?;
+                    progress(work, bytes)?;
+                    return Ok(proof.add_step(ProofStep::TheoryLemma {
+                        theory: "arith".to_owned(),
+                        clause: vec![*unit],
+                        farkas: None,
+                        kind: TheoryLemmaKind::ArithClauseTautology,
+                        lia: None,
+                    }));
+                }
+                // Term-ite branch projection and guarded ROW expansion: the
+                // pedigree-free shapes ite/store clausification emits.
+                if ay_proof::recognize_ite_branch_projection(self.terms, &[*unit]) {
+                    let (work, bytes) = Self::unit_chain_charge(1, 1)?;
+                    progress(work, bytes)?;
+                    return Ok(proof.add_step(ProofStep::TheoryLemma {
+                        theory: "ite".to_owned(),
+                        clause: vec![*unit],
+                        farkas: None,
+                        kind: TheoryLemmaKind::IteBranchProjection,
+                        lia: None,
+                    }));
+                }
+                // Or-packed EUF congruence/transitivity chains — the
+                // extensionality-instance and explanation shapes.
+                if ay_proof::recognize_euf_congruent(self.terms, &[*unit])
+                    || ay_proof::recognize_euf_transitive(self.terms, &[*unit])
+                {
+                    let (work, bytes) = Self::unit_chain_charge(1, 1)?;
+                    progress(work, bytes)?;
+                    let kind = if ay_proof::recognize_euf_congruent(self.terms, &[*unit]) {
+                        TheoryLemmaKind::EufCongruent
+                    } else {
+                        TheoryLemmaKind::EufTransitive
+                    };
+                    return Ok(proof.add_step(ProofStep::TheoryLemma {
+                        theory: "EUF".to_owned(),
+                        clause: vec![*unit],
+                        farkas: None,
+                        kind,
+                        lia: None,
+                    }));
+                }
+                if ay_proof::recognize_array_guarded_row_expansion(self.terms, &[*unit]) {
+                    let (work, bytes) = Self::unit_chain_charge(1, 1)?;
+                    progress(work, bytes)?;
+                    return Ok(proof.add_step(ProofStep::TheoryLemma {
+                        theory: "array".to_owned(),
+                        clause: vec![*unit],
+                        farkas: None,
+                        kind: TheoryLemmaKind::ArrayGuardedRowExpansion,
+                        lia: None,
+                    }));
+                }
+            }
+        }
+        // A NON-UNIT original clause that is a propositional clausification
+        // tautology (`(cl (not (or A B)) A B)` — the or_pos shape emitted as
+        // a plain original clause) needs no pedigree either; same contract as
+        // the unit lanes above, same strict re-validation downstream.
+        if clause.len() >= 2 && ay_proof::recognize_bool_tautology(self.terms, clause) {
+            let (work, bytes) = Self::unit_chain_charge(1, clause.len())?;
+            progress(work, bytes)?;
+            return Ok(proof.add_step(ProofStep::TheoryLemma {
+                theory: "bool".to_owned(),
+                clause: clause.to_vec(),
+                farkas: None,
+                kind: TheoryLemmaKind::BoolTautology,
+                lia: None,
+            }));
+        }
+        // The SHAPE of the clause no authority lane could authenticate is the
+        // one fact a certification-decline triage needs, and the typed error
+        // names only ids. Same rationale as the `GENERIC lemma declined`
+        // disclosure in `ay-proof`'s checker: without the rendered literals a
+        // triage cannot tell a missing authority LANE (the clause is a
+        // preprocessing product with a derivable pedigree) from a producer
+        // defect. Gated on the typed `--probe-cert-reject` carrier.
+        if ay_core::misc_cli_flags().probe_cert_reject {
+            for &lit in clause {
+                ay_core::safe_eprintln!(
+                    "--probe-cert-reject: unauthenticated original clause {clause_id} literal: {}",
+                    ay_proof::render_term_canonical(self.terms, lit)
+                );
             }
         }
         Err(ExactOriginalProofError::UnauthenticatedOriginalClause {

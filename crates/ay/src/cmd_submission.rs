@@ -8789,6 +8789,14 @@ fn smt_incremental_interactive_smoke(root: &Path, command: &str) -> Result<()> {
         .recv_timeout(Duration::from_secs(3))
         .context("SMT incremental wrapper did not answer before EOF")?
         .context("failed to read SMT incremental stdout")?;
+    // End the interactive session by closing stdin BEFORE waiting. The wrapper
+    // runs `ay` as a child (not exec), so killing the wrapper alone orphans a
+    // solver that (a) never exits — its REPL is waiting on the stdin write end
+    // this function still held — and (b) keeps the shared stderr pipe open,
+    // deadlocking `wait_with_output`'s drain (task #22: every `gate smt` run
+    // hung here, success or not). EOF ends the solver, which closes stderr and
+    // lets the wait finish; the kill stays as a belt for a wedged wrapper.
+    drop(stdin);
     let _ = child.kill();
     let output = child
         .wait_with_output()

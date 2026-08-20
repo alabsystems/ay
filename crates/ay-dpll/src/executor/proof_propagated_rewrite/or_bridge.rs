@@ -48,10 +48,18 @@ impl PropagationChainPlanner<'_> {
     }
 
     /// Shape A: `before = (or d1 .. dk)` with all-distinct disjuncts; every
-    /// changed disjunct must replay to literal `false`. Survivors must all
-    /// equal `after`, or — when `after` IS literal `false` — every disjunct
-    /// must be eliminated, the last one through the equivalence bridge so
-    /// the conclusion is exactly `(cl false)`.
+    /// changed disjunct must replay to literal `false`. `after` is then one
+    /// of three shapes, and anything else declines:
+    ///
+    ///  * literal `false` — every disjunct is eliminated, the last one
+    ///    through the equivalence bridge so the conclusion is exactly
+    ///    `(cl false)`;
+    ///  * the single surviving disjunct — the clause IS the conclusion;
+    ///  * `(or survivors…)` — the disjunction is RE-FORMED (#4751). Top-level
+    ///    unit propagation stores `mk_or(kept)`, which sorts and
+    ///    deduplicates, so the survivor SET (not its order) must match, and
+    ///    the surviving clause is folded back into the disjunction by one
+    ///    `or_neg` tautology per survivor plus a resolution.
     pub(super) fn plan_or_elimination_bridge(
         &mut self,
         cx: &mut PlanCx<'_>,
@@ -122,9 +130,34 @@ impl PropagationChainPlanner<'_> {
                 last_eq_id,
             ));
         }
-        if survivors.is_empty() || survivors.iter().any(|&s| s != after) {
+        if survivors.is_empty() {
             return None;
         }
+        // Either the disjunction COLLAPSED to its single survivor (`after` is
+        // that literal) or it was RE-FORMED as `(or survivors…)` (#4751 —
+        // top-level unit propagation stores `mk_or(kept)`, which sorts and
+        // deduplicates, so the survivor SET, not its order, is what must
+        // match). Anything else declines.
+        let reformed = if survivors.len() == 1 && survivors[0] == after {
+            None
+        } else {
+            let TermData::App(Symbol::Named(head), after_args) = self.terms.get(after) else {
+                return None;
+            };
+            if head != "or" {
+                return None;
+            }
+            let after_args = after_args.clone();
+            let mut recorded = after_args.clone();
+            recorded.sort_unstable();
+            let mut replayed = survivors.clone();
+            replayed.sort_unstable();
+            if recorded != replayed {
+                return None;
+            }
+            cx.spend(after_args.len().checked_mul(2)?)?;
+            Some(after_args)
+        };
         let mut clause: Vec<TermId> = disjuncts.clone();
         let mut current = clausified;
         for (dj, eq_term, eq_id) in eliminated {
@@ -134,7 +167,32 @@ impl PropagationChainPlanner<'_> {
                 .chain
                 .add_resolution(clause.clone(), dj, current, not_dj_id);
         }
-        debug_assert_eq!(clause, vec![after]);
+        let Some(after_args) = reformed else {
+            debug_assert_eq!(clause, vec![after]);
+            return Some(current);
+        };
+        // `(cl s1 … sm)` -> `(cl (or s1 … sm))`: one `or_neg` tautology
+        // `(cl after (not si))` per survivor, resolved in turn. Every step is
+        // re-derived by the untouched strict checker.
+        for survivor in after_args {
+            let not_survivor = self.terms.mk_not_raw(survivor);
+            let or_neg = cx.chain.add_rule_step(
+                AletheRule::OrNeg,
+                vec![after, not_survivor],
+                Vec::new(),
+                Vec::new(),
+            );
+            clause.retain(|&lit| lit != survivor);
+            if !clause.contains(&after) {
+                clause.push(after);
+            }
+            current = cx
+                .chain
+                .add_resolution(clause.clone(), survivor, current, or_neg);
+        }
+        if clause != vec![after] {
+            return None;
+        }
         Some(current)
     }
 

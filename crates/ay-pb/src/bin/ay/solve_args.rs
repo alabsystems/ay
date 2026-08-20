@@ -45,6 +45,25 @@ fn parse_solve_args(args: Vec<String>) -> Result<SolveArgs, String> {
             "--proof-tap-legacy" => proof_tap_legacy = true,
             // B56: opt in to the root EDAC/VAC-lite WCSP probe.
             "--pb-wcsp-edac" => switches.wcsp_edac = true,
+            "--pb-two-club-trace" => switches.two_club_trace = true,
+            "--pb-two-club-dump-frontier" => switches.two_club_dump_frontier = true,
+            "--pb-two-club-max-nodes" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--pb-two-club-max-nodes requires a count".to_string())?;
+                let nodes = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --pb-two-club-max-nodes value: {value}"))?;
+                switches.two_club_max_nodes = Some(nodes);
+            }
+            "--pb-two-club-branch" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--pb-two-club-branch requires a selector".to_string())?;
+                switches.two_club_branch = Some(&*Box::leak(value.clone().into_boxed_str()));
+            }
             // B57: parallel worker policy (0 = sequential, N = N workers).
             "--pb-parallel" => {
                 i += 1;

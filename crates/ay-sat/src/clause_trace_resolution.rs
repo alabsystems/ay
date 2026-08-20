@@ -49,6 +49,11 @@ struct TraceShape {
     hints: usize,
     max_row_hints: usize,
     synthesis_scratch_bytes: usize,
+    /// Per-derived-row hint width admitted for independent RUP chain
+    /// reconstruction. A row may retain at most
+    /// `max(recorded_hints, row_hint_budget)` hints. `0` admits only the
+    /// producer's own recorded width, so no reconstruction can widen a row.
+    row_hint_budget: usize,
     source_trace_bytes: usize,
     synthesize_terminal_empty: bool,
 }
@@ -499,6 +504,37 @@ fn planned_mapping_bytes(shape: TraceShape) -> Result<usize, ResolutionValidatio
     )
 }
 
+/// One fully costed candidate plan: the shape plus both preflighted phase
+/// peaks (conversion retains the id map; replay swaps it for the clause
+/// database and assignment/trail scratch).
+#[derive(Clone, Copy, Debug)]
+struct PlannedPeaks {
+    shape: TraceShape,
+    conversion: usize,
+    replay: usize,
+}
+
+/// Retained payload a planned shape converts into: the DAG, the exact original
+/// mapping, the caller-owned extras, and the borrowed source trace.
+fn planned_retained_bytes(
+    shape: TraceShape,
+    additional_retained_bytes: usize,
+) -> Result<usize, ResolutionValidationError> {
+    checked_resource_add(
+        checked_resource_add(
+            checked_resource_add(
+                planned_dag_bytes(shape)?,
+                planned_mapping_bytes(shape)?,
+                ResolutionValidationResource::Bytes,
+            )?,
+            additional_retained_bytes,
+            ResolutionValidationResource::Bytes,
+        )?,
+        shape.source_trace_bytes,
+        ResolutionValidationResource::Bytes,
+    )
+}
+
 fn planned_synthesis_scratch_bytes(
     num_vars: usize,
     max_row_hints: usize,
@@ -595,6 +631,17 @@ fn preflight_trace_shape(
         source_trace_bytes,
         ..TraceShape::default()
     };
+    // Exact worst-case width of an independently reconstructed positive-RUP
+    // chain: a deterministic unit-propagation run records at most one hint per
+    // newly assigned variable plus one final conflicting clause, and can never
+    // name more rows than precede it.
+    let propagation_and_conflict_bound =
+        checked_resource_add(num_vars, 1, ResolutionValidationResource::Hints)?;
+    let reconstruction_row_bound = entries.len().min(propagation_and_conflict_bound);
+    // Running total for the widened plan, in which every derived row retains a
+    // fully reconstructed chain. `None` once it overflows `usize`, which simply
+    // means the widened plan is unavailable.
+    let mut widened_hints: Option<usize> = Some(0);
     let mut has_derived_empty = false;
     for (entry_index, entry) in entries.iter().enumerate() {
         if entry_index % CONTROL_POLL_INTERVAL == 0 {
@@ -635,6 +682,9 @@ fn preflight_trace_shape(
                 meter.limits.max_hints,
             )?;
             shape.max_row_hints = shape.max_row_hints.max(entry.resolution_hints.len());
+            widened_hints = widened_hints.and_then(|total| {
+                total.checked_add(entry.resolution_hints.len().max(reconstruction_row_bound))
+            });
         }
         if entry.clause.len() >= CONTROL_POLL_INTERVAL
             || entry.resolution_hints.len() >= CONTROL_POLL_INTERVAL
@@ -659,9 +709,7 @@ fn preflight_trace_shape(
             ResolutionValidationResource::DerivedSteps,
             meter.limits.max_derived_steps,
         )?;
-        let propagation_and_conflict_bound =
-            checked_resource_add(num_vars, 1, ResolutionValidationResource::Hints)?;
-        let synthesized_hint_bound = entries.len().min(propagation_and_conflict_bound);
+        let synthesized_hint_bound = reconstruction_row_bound;
         shape.hints = add_count(
             shape.hints,
             synthesized_hint_bound,
@@ -669,14 +717,13 @@ fn preflight_trace_shape(
             meter.limits.max_hints,
         )?;
         shape.max_row_hints = shape.max_row_hints.max(synthesized_hint_bound);
+        widened_hints = widened_hints.and_then(|total| total.checked_add(synthesized_hint_bound));
     }
 
     // Reject count/byte envelopes before allocating the namespace map or any
     // duplicate DAG/mapping payload. The two phase peaks are both preflighted:
     // conversion retains the id map, while replay replaces that map with its
     // clause database and assignment/trail scratch.
-    let dag_bytes = planned_dag_bytes(shape)?;
-    let mapping_bytes = planned_mapping_bytes(shape)?;
     // Hash tables reserve spare buckets to preserve their load factor. Budget
     // a checked 2x bucket envelope before allocation; the actual capacity is
     // measured again after `try_reserve`.
@@ -687,38 +734,15 @@ fn preflight_trace_shape(
         HASH_ENTRY_BYTES,
         ResolutionValidationResource::Bytes,
     )?;
-    shape.synthesis_scratch_bytes = if allow_synthesized_terminal {
-        planned_synthesis_scratch_bytes(num_vars, shape.max_row_hints)?
-    } else {
-        0
-    };
-    let conversion_peak = checked_resource_add(
-        checked_resource_add(
-            checked_resource_add(
-                checked_resource_add(
-                    dag_bytes,
-                    mapping_bytes,
-                    ResolutionValidationResource::Bytes,
-                )?,
-                additional_retained_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            shape.source_trace_bytes,
-            ResolutionValidationResource::Bytes,
-        )?,
-        checked_resource_add(
-            namespace_bytes,
-            shape.synthesis_scratch_bytes,
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        conversion_peak,
-        meter.limits.max_bytes,
-    )?;
 
+    // Independent per-row chain reconstruction is what repairs a producer hint
+    // list that names only the conflict-analysis antecedents and omits the
+    // root-level reason clauses those antecedents propagate through. A
+    // reconstructed chain can therefore be wider than the recorded one. Admit
+    // that worst case up front when it fits the configured envelope. When it
+    // does not, keep the narrower recorded-width plan: reconstruction is then
+    // confined to each row's own recorded width, exactly the pre-existing
+    // posture, and no admitted envelope is ever exceeded.
     let replay_database_bytes = namespace_bytes;
     let assignment_bytes = checked_resource_mul(
         num_vars,
@@ -729,27 +753,60 @@ fn preflight_trace_shape(
         )?,
         ResolutionValidationResource::Bytes,
     )?;
-    let replay_peak = checked_resource_add(
-        checked_resource_add(
+    let plan_peaks = |mut planned: TraceShape| -> Result<PlannedPeaks, ResolutionValidationError> {
+        planned.synthesis_scratch_bytes =
+            planned_synthesis_scratch_bytes(num_vars, planned.max_row_hints)?;
+        let retained = planned_retained_bytes(planned, additional_retained_bytes)?;
+        let conversion = checked_resource_add(
             checked_resource_add(
-                checked_resource_add(
-                    checked_resource_add(
-                        dag_bytes,
-                        mapping_bytes,
-                        ResolutionValidationResource::Bytes,
-                    )?,
-                    additional_retained_bytes,
-                    ResolutionValidationResource::Bytes,
-                )?,
-                shape.source_trace_bytes,
+                retained,
+                namespace_bytes,
                 ResolutionValidationResource::Bytes,
             )?,
-            replay_database_bytes,
+            planned.synthesis_scratch_bytes,
             ResolutionValidationResource::Bytes,
-        )?,
-        assignment_bytes,
+        )?;
+        let replay = checked_resource_add(
+            checked_resource_add(
+                retained,
+                replay_database_bytes,
+                ResolutionValidationResource::Bytes,
+            )?,
+            assignment_bytes,
+            ResolutionValidationResource::Bytes,
+        )?;
+        Ok(PlannedPeaks {
+            shape: planned,
+            conversion,
+            replay,
+        })
+    };
+
+    let mut planned = plan_peaks(shape)?;
+    if let Some(widened_total) = widened_hints.filter(|&total| total <= meter.limits.max_hints) {
+        let widened = plan_peaks(TraceShape {
+            hints: widened_total,
+            max_row_hints: shape.max_row_hints.max(reconstruction_row_bound),
+            row_hint_budget: reconstruction_row_bound,
+            ..shape
+        });
+        if let Ok(widened) = widened {
+            if widened.conversion <= meter.limits.max_bytes
+                && widened.replay <= meter.limits.max_bytes
+            {
+                planned = widened;
+            }
+        }
+    }
+    shape = planned.shape;
+    let conversion_peak = planned.conversion;
+    let replay_peak = planned.replay;
+    enforce_resource(
         ResolutionValidationResource::Bytes,
+        conversion_peak,
+        meter.limits.max_bytes,
     )?;
+
     enforce_resource(
         ResolutionValidationResource::Bytes,
         replay_peak,
@@ -1639,9 +1696,18 @@ fn validate_clause_trace_resolution_interruptible_impl(
                 })?;
             canonical_candidates.push(canonical_hint);
         }
-        let synthesized_hints = if unit_premises.is_empty() {
-            None
-        } else {
+        // The producer's recorded antecedents are never authority. Every
+        // derived row is independently rechecked here: first by compacting the
+        // named candidates to a propagation-ordered chain, and, when those
+        // candidates do not derive the row on their own, by reconstructing a
+        // chain from the exact prior canonical database. A recorded chain that
+        // names only the conflict-analysis antecedents — omitting the
+        // root-level reason clauses they propagate through — is repaired by
+        // that reconstruction rather than shipped as an unchecked claim.
+        // Whatever is produced is still replayed by the ordinary independent
+        // DAG validator before acceptance, so this can only ever move a row
+        // from rejected to checked, never from unchecked to trusted.
+        let synthesized_hints = {
             let compacted = compact_rup_hint_candidates(
                 &original_clauses,
                 &derived,
@@ -1661,7 +1727,7 @@ fn validate_clause_trace_resolution_interruptible_impl(
                     entry.clause,
                     &unit_premises,
                     num_vars,
-                    entry.resolution_hints.len(),
+                    entry.resolution_hints.len().max(shape.row_hint_budget),
                     canonical_candidates.capacity(),
                     shape.synthesis_scratch_bytes,
                     &mut meter,
@@ -2149,6 +2215,96 @@ mod tests {
                 limit,
             } if observed == actual as u128 && limit == planned as u128
         ));
+    }
+
+    /// A plain `check-sat` trace whose derived row names only its
+    /// conflict-analysis antecedents, omitting the root-level reason clauses
+    /// those antecedents propagate through.
+    ///
+    /// Ids 3 and 4 alone are not a RUP chain for the empty clause: neither is
+    /// unit under the empty assignment. The row is nonetheless implied by the
+    /// full prior database via 1 and 2. Independent reconstruction must supply
+    /// the omitted root antecedents, and the reconstructed chain must be
+    /// accepted by the ordinary DAG replay — which `convert` runs.
+    fn root_antecedents_omitted_trace() -> ClauseTrace {
+        let mut trace = ClauseTrace::new();
+        trace.add_clause(10, vec![pos(0)], true);
+        trace.add_clause(11, vec![neg(0), neg(1)], true);
+        trace.add_clause(12, vec![pos(1), pos(2)], true);
+        trace.add_clause(13, vec![pos(1), neg(2)], true);
+        trace.add_clause_with_hints(14, Vec::new(), false, vec![12, 13]);
+        trace
+    }
+
+    #[test]
+    fn reconstructs_row_chains_that_omit_root_level_antecedents() {
+        let trace = root_antecedents_omitted_trace();
+        let converted =
+            convert(&trace, 3).expect("the row is RUP from the full prior canonical database");
+
+        let step = converted
+            .dag()
+            .derived
+            .iter()
+            .find(|step| step.id == 5)
+            .expect("the derived empty row");
+        assert!(
+            step.rup_hints.len() > 2,
+            "the recorded two-hint chain must have been widened by reconstruction, got {:?}",
+            step.rup_hints
+        );
+        assert_eq!(
+            step.rup_hints,
+            vec![1, 2, 3, 4],
+            "reconstruction must emit the propagation-ordered chain including the root antecedents"
+        );
+        assert_eq!(converted.dag().empty_clause_id, 5);
+    }
+
+    /// Narrowness pin: reconstruction repairs an incomplete chain for a row the
+    /// database really implies. A row the database does NOT imply must still be
+    /// rejected — reconstruction may never invent a derivation.
+    #[test]
+    fn reconstruction_still_rejects_a_row_the_database_does_not_imply() {
+        let mut unimplied = ClauseTrace::new();
+        unimplied.add_clause(10, vec![pos(0)], true);
+        unimplied.add_clause(11, vec![neg(0), neg(1)], true);
+        // `p1` is false in the model {p0 = true, p1 = false}, so no chain exists.
+        unimplied.add_clause_with_hints(12, vec![pos(1)], false, vec![10, 11]);
+        unimplied.add_clause_with_hints(13, Vec::new(), false, vec![12, 11]);
+        assert!(matches!(
+            convert(&unimplied, 2),
+            Err(ClauseTraceResolutionError::InvalidResolutionDag(
+                ResolutionValidationError::Invalid(ResolutionDagValidateError::NoConflict {
+                    step: 3
+                })
+            ))
+        ));
+    }
+
+    /// The widened plan is admitted before any conversion allocation. When it
+    /// does not fit the configured hint envelope it must be declined outright,
+    /// leaving the narrower recorded-width posture, never silently exceeded.
+    #[test]
+    fn declines_the_widened_plan_that_does_not_fit_the_hint_envelope() {
+        let trace = root_antecedents_omitted_trace();
+        let mut limits = ResolutionValidationLimits::unbounded();
+        // Room for the two recorded hints, but not for a reconstructed chain.
+        limits.max_hints = 2;
+        let error = validate_clause_trace_resolution(&trace, 3, &limits)
+            .expect_err("without a widened budget the omitted antecedents stay omitted");
+        assert!(
+            matches!(
+                error,
+                ClauseTraceResolutionError::InvalidResolutionDag(
+                    ResolutionValidationError::Invalid(
+                        ResolutionDagValidateError::NoConflict { step: 5 }
+                            | ResolutionDagValidateError::HintNotUnit { step: 5, .. }
+                    )
+                )
+            ),
+            "expected a fail-closed replay rejection of the unrepaired row, got {error:?}"
+        );
     }
 
     #[test]

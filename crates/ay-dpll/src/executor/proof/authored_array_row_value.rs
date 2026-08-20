@@ -565,7 +565,21 @@ impl Executor {
                 authored_equalities,
                 current,
             ) else {
-                return false;
+                // The index comparison at `current` is INDETERMINATE — neither
+                // provably equal nor provably distinct. The chain can still
+                // close when BOTH read-over-write branches reach the same
+                // authored-refuted target (the ghost-pair shape:
+                // `a2 = store(a, n, 0)`, `select(a, k) = 0`,
+                // `not (select(a2, k) = 0)` with `k` vs `n` unconstrained).
+                return self.close_authored_array_row_case_split(
+                    proof,
+                    &candidate,
+                    &edges,
+                    authored,
+                    authored_equalities,
+                    read,
+                    current,
+                );
             };
             if visited.contains(&next) {
                 return false;
@@ -804,6 +818,284 @@ impl Executor {
 
             if self.commit_if_strictly_checked(proof, candidate, authored) {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Close an indeterminate-index read-over-write by CASE SPLIT: both ROW
+    /// branches must chain to one authored-refuted target.
+    ///
+    /// For `current = select(A0, k)` with `A0` reaching `store(base, w, v)`
+    /// (directly or through one authored array equality) and `(= w k)`
+    /// underivable in either direction, derive per branch:
+    ///
+    /// - TRUE  (`w = k`): `select(store, k) = v`   and `v = t`;
+    /// - FALSE (`w != k`): `select(store, k) = select(base, k)` and
+    ///   `select(base, k) = t`;
+    ///
+    /// with `t` drawn from an authored disequality against `read`. Each branch
+    /// then resolves through an [`TheoryLemmaKind::EufTransitive`] chain and
+    /// the guarded [`TheoryLemmaKind::ArraySelectStore`] lemma to the unit
+    /// `[not (w = k)]` / `[(w = k)]`, and the two units resolve to the empty
+    /// clause. Nothing is taken on the producer's word: every lemma kind here
+    /// is re-derived by `ay-proof` from its clause alone, and only
+    /// [`Self::commit_if_strictly_checked`] can publish the candidate.
+    #[allow(clippy::too_many_arguments)]
+    fn close_authored_array_row_case_split(
+        &mut self,
+        proof: &mut Proof,
+        chain: &Proof,
+        edges: &[(TermId, ProofId)],
+        authored: &[TermId],
+        authored_equalities: &[(TermId, TermId, TermId)],
+        read: TermId,
+        current: TermId,
+    ) -> bool {
+        /// Work bound on authored-disequality targets per store route.
+        const MAX_SPLIT_TARGETS: usize = 8;
+
+        let Some((array, index)) = select_parts_local(&self.ctx.terms, current) else {
+            return false;
+        };
+        let mut routes: Vec<TermId> = Vec::new();
+        if store_parts_local(&self.ctx.terms, array).is_some() {
+            routes.push(array);
+        }
+        for &(_, lhs, rhs) in authored_equalities {
+            for (alias, store_term) in [(lhs, rhs), (rhs, lhs)] {
+                if alias == array
+                    && alias != store_term
+                    && store_parts_local(&self.ctx.terms, store_term).is_some()
+                    && !routes.contains(&store_term)
+                {
+                    routes.push(store_term);
+                }
+            }
+        }
+
+        // Targets: the other side of an authored disequality against `read`.
+        let mut targets: Vec<TermId> = Vec::new();
+        for &root in authored {
+            let TermData::Not(inner) = self.ctx.terms.get(root).clone() else {
+                continue;
+            };
+            let Some((lhs, rhs)) = decode_eq_local(&self.ctx.terms, inner) else {
+                continue;
+            };
+            let Some(other) = pair_other_side_local(lhs, rhs, read) else {
+                continue;
+            };
+            if !targets.contains(&other) {
+                targets.push(other);
+            }
+            if targets.len() >= MAX_SPLIT_TARGETS {
+                break;
+            }
+        }
+        if targets.is_empty() {
+            return false;
+        }
+
+        for store_term in routes {
+            let Some((base, store_index, store_value)) =
+                store_parts_local(&self.ctx.terms, store_term)
+            else {
+                continue;
+            };
+            let value_sort = self.ctx.terms.sort(current).clone();
+            let store_read = self.ctx.terms.mk_app(
+                Symbol::named("select"),
+                [store_term, index],
+                value_sort.clone(),
+            );
+            let base_read =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("select"), [base, index], value_sort.clone());
+            let split = self
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), [store_index, index], Sort::Bool);
+            let not_split = self.ctx.terms.mk_not_raw(split);
+            let row1_equality =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [store_read, store_value], Sort::Bool);
+            let row2_equality =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [store_read, base_read], Sort::Bool);
+
+            for &target in &targets {
+                let mut candidate = chain.clone();
+                let mut shared_edges = edges.to_vec();
+                if store_read != current {
+                    let Some(lift) = self.derive_congruence_unit(
+                        &mut candidate,
+                        current,
+                        store_read,
+                        authored_equalities,
+                    ) else {
+                        break;
+                    };
+                    shared_edges.push((lift.literal, lift.step));
+                }
+                let Some(conflict) = self.derive_disequality_unit(
+                    &mut candidate,
+                    read,
+                    target,
+                    authored,
+                    authored_equalities,
+                ) else {
+                    continue;
+                };
+                let TermData::Not(conflict_equality) = self.ctx.terms.get(conflict.literal).clone()
+                else {
+                    continue;
+                };
+                // A branch endpoint that IS the target needs no bridge —
+                // and must not get one: the EufTransitive validator rejects
+                // redundant premise equalities.
+                let value_unit = if store_value == target {
+                    None
+                } else {
+                    match self.derive_equality_unit(
+                        &mut candidate,
+                        store_value,
+                        target,
+                        authored_equalities,
+                    ) {
+                        Some(unit) => Some(unit),
+                        None => continue,
+                    }
+                };
+                let base_unit = if base_read == target {
+                    None
+                } else {
+                    match self.derive_equality_unit(
+                        &mut candidate,
+                        base_read,
+                        target,
+                        authored_equalities,
+                    ) {
+                        Some(unit) => Some(unit),
+                        None => continue,
+                    }
+                };
+
+                let row1_lemma = candidate.add_theory_lemma_with_kind(
+                    "array",
+                    vec![not_split, row1_equality],
+                    TheoryLemmaKind::ArraySelectStore { index_eq: true },
+                );
+                let row2_lemma = candidate.add_theory_lemma_with_kind(
+                    "array",
+                    vec![split, row2_equality],
+                    TheoryLemmaKind::ArraySelectStore { index_eq: false },
+                );
+
+                // One branch: transitive chain read = .. = store_read,
+                // store_read = branch_read, branch_read .. = target, refuted
+                // by the authored conflict, discharged down to the bare split
+                // guard unit.
+                let mut branch = |row_equality: TermId,
+                                  row_lemma: ProofId,
+                                  bridge: Option<&DerivedUnit>,
+                                  guard: TermId,
+                                  candidate: &mut Proof|
+                 -> Option<ProofId> {
+                    let mut clause: Vec<TermId> = shared_edges
+                        .iter()
+                        .map(|&(equality, _)| self.ctx.terms.mk_not_raw(equality))
+                        .collect();
+                    clause.push(self.ctx.terms.mk_not_raw(row_equality));
+                    if let Some(bridge) = bridge {
+                        clause.push(self.ctx.terms.mk_not_raw(bridge.literal));
+                    }
+                    clause.push(conflict_equality);
+                    let mut resolved = candidate.add_theory_lemma_with_kind(
+                        "euf",
+                        clause.clone(),
+                        TheoryLemmaKind::EufTransitive,
+                    );
+                    let mut remaining = clause;
+                    for &(equality, support) in &shared_edges {
+                        let negated = self.ctx.terms.mk_not_raw(equality);
+                        let position = remaining.iter().position(|&literal| literal == negated)?;
+                        let _ = remaining.remove(position);
+                        resolved = candidate.add_resolution(
+                            remaining.clone(),
+                            equality,
+                            resolved,
+                            support,
+                        );
+                    }
+                    if let Some(bridge) = bridge {
+                        let negated_bridge = self.ctx.terms.mk_not_raw(bridge.literal);
+                        let position = remaining
+                            .iter()
+                            .position(|&literal| literal == negated_bridge)?;
+                        let _ = remaining.remove(position);
+                        resolved = candidate.add_resolution(
+                            remaining.clone(),
+                            bridge.literal,
+                            resolved,
+                            bridge.step,
+                        );
+                    }
+                    // Discharge the row equality against the guarded lemma:
+                    // [.. not(row_eq) .. conflict_eq] x [guard, row_eq].
+                    let negated_row = self.ctx.terms.mk_not_raw(row_equality);
+                    let position = remaining
+                        .iter()
+                        .position(|&literal| literal == negated_row)?;
+                    let _ = remaining.remove(position);
+                    let mut with_guard = remaining.clone();
+                    with_guard.insert(0, guard);
+                    resolved = candidate.add_resolution(
+                        with_guard.clone(),
+                        row_equality,
+                        resolved,
+                        row_lemma,
+                    );
+                    // Refute the conclusion with the authored conflict.
+                    let position = with_guard
+                        .iter()
+                        .position(|&literal| literal == conflict_equality)?;
+                    let mut guard_only = with_guard;
+                    let _ = guard_only.remove(position);
+                    Some(candidate.add_resolution(
+                        guard_only,
+                        conflict_equality,
+                        conflict.step,
+                        resolved,
+                    ))
+                };
+
+                let Some(true_unit) = branch(
+                    row1_equality,
+                    row1_lemma,
+                    value_unit.as_ref(),
+                    not_split,
+                    &mut candidate,
+                ) else {
+                    continue;
+                };
+                let Some(false_unit) = branch(
+                    row2_equality,
+                    row2_lemma,
+                    base_unit.as_ref(),
+                    split,
+                    &mut candidate,
+                ) else {
+                    continue;
+                };
+                candidate.add_resolution(Vec::new(), split, true_unit, false_unit);
+
+                if self.commit_if_strictly_checked(proof, candidate, authored) {
+                    return true;
+                }
             }
         }
         false

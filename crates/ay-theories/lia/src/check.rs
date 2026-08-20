@@ -621,9 +621,7 @@ impl LiaSolver<'_> {
     /// split above makes that flip safe (no green is lost to a mis-skip).
     fn probe_batch_prescreen_active(&self) -> bool {
         static OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*OVERRIDE
-            .get_or_init(|| std::env::var("AY_PROBE_PRESCREEN").ok().as_deref() == Some("1"))
-        {
+        if !*OVERRIDE.get_or_init(|| ay_core::misc_cli_flags().probe_prescreen) {
             return false;
         }
         PROBE_SCAN_FAIL_STREAK.with(|streak| streak.get() >= PROBE_SCAN_FAIL_STREAK_SWITCH)
@@ -1226,12 +1224,12 @@ pub(crate) enum ProbeQxMode {
     Gallop,
 }
 
-/// Probe minimization strategy for this process (`AY_LIA_PROBE_QX`, one
-/// cached env read). See [`ProbeQxMode`].
+/// Probe minimization strategy for this process (`--lia-probe-qx`, B73,
+/// read once). See [`ProbeQxMode`].
 fn probe_qx_mode() -> ProbeQxMode {
     static MODE: std::sync::OnceLock<ProbeQxMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("AY_LIA_PROBE_QX").ok().as_deref() {
-        Some("1") => ProbeQxMode::Quickxplain,
+    *MODE.get_or_init(|| match ay_core::misc_cli_flags().lia_probe_qx.as_deref() {
+        Some("quickxplain") => ProbeQxMode::Quickxplain,
         Some("gallop") => ProbeQxMode::Gallop,
         _ => ProbeQxMode::Scan,
     })
@@ -1279,7 +1277,7 @@ fn probe_rescue_budget() -> usize {
 fn prescreen_batch_verdict_record(r: &TheoryResult) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+    if !*ENABLED.get_or_init(|| ay_core::misc_cli_flags().probe_stats) {
         return;
     }
     static SAT: AtomicU64 = AtomicU64::new(0);
@@ -1365,7 +1363,7 @@ fn probe_stats_record(checks: u64, success: bool, subset_len: usize) {
     static SUCCESSES: AtomicU64 = AtomicU64::new(0);
     static SUBSET_LEN: AtomicU64 = AtomicU64::new(0);
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+    if !*ENABLED.get_or_init(|| ay_core::misc_cli_flags().probe_stats) {
         return;
     }
     CHECKS.fetch_add(checks, Ordering::Relaxed);
@@ -1400,7 +1398,7 @@ fn probe_stats_record(checks: u64, success: bool, subset_len: usize) {
 fn qx_stats_record(outcome: QxStat, checks: u64, subset_len: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+    if !*ENABLED.get_or_init(|| ay_core::misc_cli_flags().probe_stats) {
         return;
     }
     static PROVED: AtomicU64 = AtomicU64::new(0);
@@ -1457,7 +1455,7 @@ fn probe_scan_big_fail_record(order_len: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static BIG_FAILS: AtomicU64 = AtomicU64::new(0);
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+    if !*ENABLED.get_or_init(|| ay_core::misc_cli_flags().probe_stats) {
         return;
     }
     let n = BIG_FAILS.fetch_add(1, Ordering::Relaxed) + 1;

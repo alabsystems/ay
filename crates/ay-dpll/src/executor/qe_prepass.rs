@@ -90,12 +90,14 @@ use crate::qe::{eliminate_exists, eliminate_exists_real, QeResult};
 /// elimination stays individually self-checked; adoption remains all-or-
 /// nothing quantifier-free) and only these abort constants blocked it. The
 /// real cost bound is the per-elimination `budget.interrupted()` solve-
-/// deadline poll, which is wall-clock-based and unchanged.
+/// deadline poll — but see `Budget::interrupted` below: that poll is BETWEEN
+/// eliminator invocations, so it does not bound work inside one call.
 const MAX_DNF_DISJUNCTS: usize = 512;
 
 /// Hard cap on nodes produced while building the DNF of a single matrix
 /// (#quantprod-g: raised 4096 -> 65536 alongside `MAX_DNF_DISJUNCTS`; the
-/// wall-clock interrupt poll remains the operative bound).
+/// wall-clock interrupt poll is polled between invocations only — see
+/// `Budget::interrupted`).
 const MAX_DNF_NODES: usize = 65536;
 
 /// Hard cap on eliminator invocations (Cooper / LW, each self-checked) per
@@ -104,17 +106,33 @@ const MAX_DNF_NODES: usize = 65536;
 ///
 /// #quantprod-g: raised 64 -> 8192 so a several-hundred-disjunct distributed
 /// matrix (one self-checked elimination per disjunct) completes instead of
-/// exhausting mid-assertion. Each invocation still polls the solve-deadline
-/// interrupt first, so pathological inputs are wall-clock-bounded, not
-/// constant-bounded.
+/// exhausting mid-assertion.
+///
+/// CORRECTION (#cooper-period-blowup): this comment used to claim "each
+/// invocation still polls the solve-deadline interrupt first, so pathological
+/// inputs are wall-clock-bounded". That is false, and it mattered. The poll
+/// happens only BETWEEN eliminator invocations (`Budget::interrupted`, called
+/// from the descent below); a single invocation is not interruptible from the
+/// inside, so one blown-up eliminator call runs to completion no matter what
+/// the deadline says. Cooper's instance sweep was exactly that case — 8.5 s
+/// and 3.07 GB inside ONE call, uninterruptible. The bound on that call now
+/// comes from `qe::cooper::COOPER_INSTANCE_CAP`, which is checked before the
+/// sweeps allocate; this budget bounds only the NUMBER of invocations.
 const MAX_ELIMINATIONS_PER_APPLY: usize = 8192;
 
 /// Per-apply elimination budget, shared across all assertions of one call.
 struct Budget<'a> {
     eliminations: usize,
     /// The executor's solve-interrupt flag (#clusterD divergence backstop):
-    /// polled coarsely — once per eliminator invocation — so an application
-    /// watchdog can always land even if an eliminator's per-call work grows.
+    /// polled coarsely — once per eliminator invocation. That is a real
+    /// limitation, not a safety property: a watchdog CANNOT land while a single
+    /// invocation runs. Measured — before COOPER_INSTANCE_CAP, one `cooper()`
+    /// call ran 8.2s uninterruptibly and could allocate gigabytes, because the
+    /// period sweep polls nothing. An earlier version of this comment claimed
+    /// the watchdog "can always land even if an eliminator's per-call work
+    /// grows"; that is refuted by this crate's own blowup repro. Per-call work
+    /// must therefore be bounded by construction, which is what the instance
+    /// cap does.
     /// An observed interrupt refuses the remaining work (status quo kept for
     /// the untouched assertions), never a partial rewrite.
     interrupt: Option<&'a AtomicBool>,

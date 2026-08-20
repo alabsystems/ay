@@ -277,7 +277,7 @@ impl CoreSolver {
         let Some(lemma) = self.buffered_lemmas.pop() else {
             return NfCheckResult::Ok;
         };
-        // Closure 3 (`AY_STR_NF=1`, sub-flag 3): de-serialized emission.
+        // Closure 3 (`--str-nf`, sub-flag 3): de-serialized emission.
         // Every remaining DISTINCT buffered lemma rides along in the same
         // round instead of costing one CEGAR round-trip each. Each buffered
         // lemma is independently guarded (its own NF explanation), so
