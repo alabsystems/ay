@@ -30,7 +30,7 @@
 //! optimum` pins that the model below really does reduce.
 
 use ay_milp::{BabSession, Col, Model, Outcome, Sense, SolveOpts};
-use ay_test_support::env::{lock_env, ScopedEnvVar};
+use ay_test_support::env::lock_env;
 use num_rational::BigRational;
 use num_traits::ToPrimitive as _;
 use std::time::Duration;

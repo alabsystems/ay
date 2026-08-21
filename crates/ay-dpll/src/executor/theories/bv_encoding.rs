@@ -296,9 +296,14 @@ pub(in crate::executor::theories) fn build_negation_map(
 ///
 /// When `a = b` is asserted and the formula contains BV predicates `(= a c)`
 /// and `(= b c)`, these get independent SAT variables via Tseitin/bitblasting.
-/// This function generates equivalence clauses `(= a c) ↔ (= b c)` at the
-/// SAT level, providing a direct connection that helps the SAT solver propagate
-/// conflicts without traversing the full bit-level encoding chain.
+/// This connects them at the SAT level so conflicts propagate without
+/// traversing the full bit-level chain.
+///
+/// SOUNDNESS (#7892 root cause): `(= a c) ↔ (= b c)` holds only under `a = b`,
+/// yet these clauses go in globally. As a bare equivalence it could outlive the
+/// scope that asserted the hypothesis and cause false UNSAT after `pop`. Every
+/// clause is therefore guarded by `¬(a = b)`. If the bit-blasted hypothesis
+/// literal is unavailable, no congruence clause is emitted.
 ///
 /// Used by both fresh-state and persistent-state phases of the unified BV
 /// pipeline to maintain axiom parity (#5441, #6691 config-driven gating).
@@ -320,7 +325,6 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
 ) -> BvEqCongruenceBatch {
     let mut bv_eq_terms: Vec<(TermId, i32)> = Vec::new();
     let mut seen_terms: HashSet<TermId> = HashSet::default();
-
     for (&term, &bv_lit) in bv_solver.predicate_to_var() {
         if let TermData::App(ref sym, ref args) = terms.get(term) {
             if sym.name() == "=" && args.len() == 2 {
@@ -341,7 +345,6 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
             }
         }
     }
-
     let mut var_eq_index: HashMap<(TermId, TermId), (TermId, i32)> = HashMap::default();
     for (eq_term, eq_lit) in &bv_eq_terms {
         if let TermData::App(_, ref args) = terms.get(*eq_term) {
@@ -349,7 +352,6 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
             var_eq_index.insert((args[1], args[0]), (*eq_term, *eq_lit));
         }
     }
-
     let mut asserted_bv_eqs: Vec<(TermId, TermId)> = Vec::new();
     fn collect_bv_eqs(terms: &TermStore, term: TermId, eqs: &mut Vec<(TermId, TermId)>) {
         match terms.get(term) {
@@ -374,6 +376,9 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
     let mut newly_emitted_pairs = Vec::new();
     let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
     for &(var_a, var_b) in &asserted_bv_eqs {
+        let Some(&(_, hyp_lit)) = var_eq_index.get(&(var_a, var_b)) else {
+            continue;
+        };
         for (eq_term, eq_lit) in &bv_eq_terms {
             if let TermData::App(_, ref eq_args) = terms.get(*eq_term) {
                 let other_c = if eq_args[0] == var_a {
@@ -412,8 +417,8 @@ pub(in crate::executor::theories) fn build_bv_eq_congruence_batch(
                                 continue;
                             }
                         }
-                        clauses.push(CnfClause::binary(-*eq_lit, other_eq_lit));
-                        clauses.push(CnfClause::binary(*eq_lit, -other_eq_lit));
+                        clauses.push(CnfClause::ternary(-hyp_lit, -*eq_lit, other_eq_lit));
+                        clauses.push(CnfClause::ternary(-hyp_lit, *eq_lit, -other_eq_lit));
                         newly_emitted_pairs.push(pair);
                     }
                 }

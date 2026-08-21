@@ -6,6 +6,9 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+#[cfg(test)]
+#[path = "alethe_printer_disequality_split_tests.rs"]
+mod disequality_split_tests;
 #[path = "alethe_printer_eq_transitive.rs"]
 mod eq_transitive;
 mod folded_assume;
@@ -2200,7 +2203,7 @@ impl<'a> AlethePrinter<'a> {
         if matches!(kind, ay_core::TheoryLemmaKind::IntBoundsTautology) {
             return self.format_unit_farkas_clause(id, clause, "integer bounds tautology");
         }
-        if matches!(kind, ay_core::TheoryLemmaKind::ArithDisequalitySplit) {
+        if self.arith_disequality_split_is_exactly_lowerable(kind, clause) {
             return self.format_arith_disequality_split(id, clause);
         }
         // AY's wide BV checker proves binary `bvand` commutativity by building
@@ -2285,18 +2288,39 @@ impl<'a> AlethePrinter<'a> {
         }
 
         let clause_str = self.format_clause(clause);
-        if matches!(kind, ay_core::TheoryLemmaKind::LiaGeneric) {
-            if let Some(text) = self.format_lia_ground_evaluate(id, clause, &clause_str) {
-                return Ok(text);
-            }
+        // One complete-step decision is shared with the publication wire-gap
+        // gate. `lia_generic` is only a checker-recognized placeholder; the
+        // exact clause may instead use checked `evaluate`, or its actual
+        // Farkas certificate may promote it to checked `la_generic`.
+        let wire_rule =
+            crate::promoted_wire_rule(self.terms, kind, clause, farkas, self.term_overrides);
+        if wire_rule == "evaluate" {
+            return Ok(self
+                .format_lia_ground_evaluate(id, clause, &clause_str)
+                .unwrap_or_else(|| {
+                    // The shared decision and formatter use the same ground
+                    // validator and no surface override. Keep even unexpected
+                    // implementation drift fail-closed.
+                    format!(
+                        "(step {id} {clause_str} :rule {})",
+                        ay_core::UNPROVED_STEP_RULE
+                    )
+                }));
         }
         if let Some(farkas) = farkas {
             // WIRE name, not the internal one: a kind the checker does not
             // implement must print as `hole`, never as an unknown rule name
-            // (which makes the whole document `invalid`). The arithmetic kinds
-            // that actually reach here (`LraFarkas`, `LiaGeneric`) are
-            // checkable and pass through unchanged.
-            let rule = kind.alethe_wire_rule();
+            // (which makes the whole document `invalid`). `LraFarkas` passes
+            // through as `la_generic`; `LiaGeneric` reaches that spelling only
+            // through the shared certificate promotion.
+            let rule = wire_rule;
+            // ...and `hole` takes no `:args`, so a kind with coefficients but
+            // no external rule (e.g. `IntBoundLatticeGap`, whose integer
+            // lattice argument Alethe cannot state) drops them rather than
+            // print `hole :args (..)`, which is `invalid`, not `holey`.
+            if rule == ay_core::UNPROVED_STEP_RULE {
+                return Ok(format!("(step {id} {clause_str} :rule {rule})"));
+            }
             // Alethe `la_generic` coefficients are SIGNED: an equality literal
             // used in the `rhs - lhs` orientation must print a negative
             // coefficient, while the internal certificate keeps non-negative
@@ -2439,9 +2463,19 @@ impl<'a> AlethePrinter<'a> {
         let reverse = self.format_term(*not_reverse);
         let equality = self.format_term(*equality);
         let packed = format!("(or {equality} {forward} {reverse})");
+        // `la_disequality` fixes the PACKED order (equality first), while this
+        // kind's strict validator fixes the FLAT order (equality last), and
+        // carcara's `or` is POSITIONAL — measured at this file's `or` arm:
+        // premise `(or a b)` with conclusion `(cl b a)` fails with "expected
+        // terms to be equal". Unpack in the premise's own order and reach the
+        // recorded order with `reordering`, the same adaptation the array
+        // extensionality lowering's `FlatReversed` conclusion uses. Emitting
+        // the permuted `or` directly would make the whole document `invalid`
+        // rather than merely holey.
         Ok(format!(
             "(step {id}.split (cl {packed}) :rule la_disequality)\n\
-             (step {id} (cl {forward} {reverse} {equality}) :rule or :premises ({id}.split))"
+             (step {id}.flat (cl {equality} {forward} {reverse}) :rule or :premises ({id}.split))\n\
+             (step {id} (cl {forward} {reverse} {equality}) :rule reordering :premises ({id}.flat))"
         ))
     }
 
@@ -2486,6 +2520,30 @@ impl<'a> AlethePrinter<'a> {
             "(step {id} {} :rule la_generic :args ({coeffs}))",
             self.format_clause(clause),
         ))
+    }
+
+    /// Whether an `ArithDisequalitySplit` lemma is exactly reconstructible from
+    /// the pinned checker's own primitives.
+    ///
+    /// [`Self::format_arith_disequality_split`] lowers the lemma through the
+    /// GUARD's operands — `(<= lhs rhs)` / `(<= rhs lhs)` — and pairs each with
+    /// a branch. That pairing holds only while the guard and the branches share
+    /// ONE linear form, i.e. the PRIMITIVE `k = 1` guard. The strict checker
+    /// also certifies a guard scaled by a positive integer `k >= 2`, whose
+    /// operands span a wider interval than the branches do: on
+    /// `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1` the sub-step
+    /// `(cl (<= 2q+1 4q+1) (<= 1 q))` reads `q >= 0 ∨ q >= 1`, which is FALSE
+    /// at `q = -1`. Those clauses keep the honest `hole` wire rather than print
+    /// a derivation the printed clause does not license.
+    fn arith_disequality_split_is_exactly_lowerable(
+        &self,
+        kind: &ay_core::TheoryLemmaKind,
+        clause: &[TermId],
+    ) -> bool {
+        matches!(kind, ay_core::TheoryLemmaKind::ArithDisequalitySplit)
+            && ay_core::proof_validation::arith_disequality_split_has_primitive_guard(
+                self.terms, clause,
+            )
     }
 
     fn format_arith_disequality_split(
@@ -4596,6 +4654,43 @@ impl<'a> AlethePrinter<'a> {
         Some(out)
     }
 
+    /// Render a fresh-symbol definitional bound.
+    ///
+    /// Unlike `array_ext_diff_intro`, this step carries a clause that later
+    /// steps resolve against and therefore cannot be demoted to a comment.
+    ///
+    /// There is no Alethe rule for it. Alethe has no notion of a solver
+    /// introducing a symbol and defining it, and the two rules that come
+    /// closest are not it: `la_generic` would claim `(<= d lin)` is a rational
+    /// tautology (it is FALSE at `d = lin + 1`), and `sko_ex` would claim the
+    /// symbol is a `choice` term it is not. So the honest wire rule is `hole`
+    /// — exactly what the premiseless `trust` this replaces already printed,
+    /// which is why the emitted document is unchanged by that lane.
+    ///
+    /// The `:args` MUST be dropped: the pinned carcara build rejects `hole`
+    /// arguments, turning a `holey` document into an `invalid` one. AY's checker
+    /// re-derives the defined symbol from the step, so omitting it loses nothing.
+    fn format_fresh_def_bound(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        crate::checker::validate_fresh_def_bound_for_printer(
+            self.terms, id, clause, premises, args,
+        )
+        .map_err(|err| AlethePrintError::InvalidSurfaceStep {
+            id,
+            reason: err.to_string(),
+        })?;
+        let clause_str = self.format_clause(clause);
+        Ok(format!(
+            "(step {id} {clause_str} :rule {})",
+            ay_core::UNPROVED_STEP_RULE
+        ))
+    }
+
     fn format_generic_step(
         &self,
         id: ProofId,
@@ -4604,6 +4699,9 @@ impl<'a> AlethePrinter<'a> {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<String, AlethePrintError> {
+        if matches!(rule, ay_core::AletheRule::FreshDefBound) {
+            return self.format_fresh_def_bound(id, clause, premises, args);
+        }
         if matches!(rule, ay_core::AletheRule::Symm) {
             return self.format_surface_symm(id, clause, premises, args);
         }

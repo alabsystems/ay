@@ -388,12 +388,39 @@ impl PdrSolver {
             }
         }
 
-        // Inductive subset was tried and doesn't block errors.
-        if is_multi_pred {
-            InductiveSubsetOutcome::Insufficient
-        } else {
-            InductiveSubsetOutcome::Cascade(model)
-        }
+        // Inductive subset was tried and doesn't block errors. Hand the FULL
+        // frame model to the verification cascade — for multi-predicate problems
+        // too, which used to give up here (#4751).
+        //
+        // WHY THE SUBSET FAILING DOES NOT MEAN THERE IS NO PROOF. Everything
+        // above admits lemmas ONE AT A TIME: a candidate enters
+        // `inductive_lemmas` only if it is self-inductive BY ITSELF. But an
+        // inductive invariant is a CONJUNCTION that is inductive AS A WHOLE, and
+        // its conjuncts routinely are not inductive in isolation — each one's
+        // preservation leans on the others. A mutually-inductive family is
+        // therefore rejected lemma-by-lemma and the surviving subset is too weak
+        // to block the errors, which is exactly the state we are in here.
+        //
+        // `dillig12_m_000` is that shape: PDR reaches a post-fixpoint in ~100 ms
+        // with 28 candidates, every one of the 14 that carry the proof is
+        // reported "not self-inductive", the remaining subset does not block the
+        // query, and the whole portfolio then runs out its budget. Giving the
+        // full model to the cascade proves it outright.
+        //
+        // SOUNDNESS. This widens what is ATTEMPTED, never what is ACCEPTED. The
+        // cascade returns `Some` only for a model `verify_model_fast` /
+        // `verify_model_with_budget` has confirmed against the real clauses —
+        // init, consecution over EVERY clause including the cross-predicate
+        // edges, and query blocking. That whole-model check is precisely the
+        // "cross-predicate transition verification that self-inductiveness
+        // doesn't cover" the caller documents needing, so multi-predicate is the
+        // case that wants it most, not least. Per-lemma admission stays exactly
+        // as it was and remains the fast path; this is only the fallback when it
+        // comes up short.
+        //
+        // COST is bounded: the cascade carries its own 2 s budget and re-checks
+        // its deadline between strategies.
+        InductiveSubsetOutcome::Cascade(model)
     }
 
     /// Error-guided lemma discovery (#5425).

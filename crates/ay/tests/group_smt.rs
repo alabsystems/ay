@@ -7,6 +7,9 @@
 #[path = "common/spawn.rs"]
 pub mod spawn;
 
+#[path = "common/smt.rs"]
+mod smt;
+
 #[path = "group_smt/smt_lib_conformance.rs"]
 mod smt_lib_conformance;
 

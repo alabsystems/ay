@@ -516,7 +516,6 @@ impl Solver {
     /// open, measurable question rather than an assumption.
     #[inline(always)]
     pub(super) fn should_prune_conflict_analysis_experiments(&self) -> bool {
-        use std::sync::OnceLock;
         match ay_core::misc_cli_flags().sat_prune_conflict_experiments {
             Some(forced) => forced,
             None => self.cold.sat_comp_main_conflict_pruning,

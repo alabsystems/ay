@@ -12,6 +12,14 @@
 //! This conversion deliberately does **not** assign semantic authority to an
 //! entry merely because [`ClauseTraceEntry::is_original`] is set.  A downstream
 //! SMT proof publisher must separately authenticate every mapped original.
+//!
+//! Recorded chains that omit antecedents (typically the root-level reason
+//! chains conflict analysis never walks) are independently repaired by three
+//! escalating, envelope-metered lanes before replay: candidate compaction, a
+//! rooted repair over a one-time root-propagation fixpoint plus a
+//! literal-keyed occurrence index, and a full-database cone-trimmed
+//! synthesis. Repair only ever widens acceptance — whatever chain is
+//! produced is still replayed by the ordinary independent DAG validator.
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -54,6 +62,16 @@ struct TraceShape {
     /// `max(recorded_hints, row_hint_budget)` hints. `0` admits only the
     /// producer's own recorded width, so no reconstruction can widen a row.
     row_hint_budget: usize,
+    /// Hint-count slack the whole conversion may spend widening individual
+    /// rows past their admitted width: the configured `max_hints` minus the
+    /// recorded total the plan already accounts. Consuming it per retained
+    /// excess hint keeps the running retained total under the configured
+    /// limit even though the widened per-row worst case was not admitted.
+    widening_hint_slack: usize,
+    /// Byte slack between the admitted plan peaks and `max_bytes`, spent in
+    /// lockstep with `widening_hint_slack` (8 bytes per excess hint) so the
+    /// final retained-byte enforcement can never trip on a widened row.
+    widening_byte_slack: usize,
     source_trace_bytes: usize,
     synthesize_terminal_empty: bool,
 }
@@ -539,18 +557,38 @@ fn planned_synthesis_scratch_bytes(
     num_vars: usize,
     max_row_hints: usize,
 ) -> Result<usize, ResolutionValidationError> {
-    synthesis_scratch_bytes_from_capacities(num_vars, max_row_hints, max_row_hints, max_row_hints)
+    synthesis_scratch_bytes_from_capacities(
+        num_vars,
+        max_row_hints,
+        max_row_hints,
+        max_row_hints,
+        num_vars,
+    )
 }
+
+/// Per-variable propagation bookkeeping retained by cone-trimmed chain
+/// reconstruction. Covers both the conversion-scoped root-propagation state
+/// (assignment, reason id, order slot and position, cone marks, per-row
+/// candidate reasons and trails) and the last-resort full-sweep synthesis
+/// scratch (reason id, order slot, cone marker, cone-walk stack). 64 bytes
+/// per variable is a deliberate over-approximation of both together.
+const PROPAGATION_SCRATCH_BYTES_PER_VAR: usize = 64;
 
 fn synthesis_scratch_bytes_from_capacities(
     assignment_capacity: usize,
     candidate_hint_capacity: usize,
     output_hint_capacity: usize,
     recorded_capacity: usize,
+    propagation_scratch_vars: usize,
 ) -> Result<usize, ResolutionValidationError> {
     let assignment = checked_resource_mul(
         assignment_capacity,
         size_of::<Option<bool>>(),
+        ResolutionValidationResource::Bytes,
+    )?;
+    let propagation = checked_resource_mul(
+        propagation_scratch_vars,
+        PROPAGATION_SCRATCH_BYTES_PER_VAR,
         ResolutionValidationResource::Bytes,
     )?;
     let candidates = checked_resource_mul(
@@ -570,251 +608,20 @@ fn synthesis_scratch_bytes_from_capacities(
     )?;
     checked_resource_add(
         checked_resource_add(
-            checked_resource_add(assignment, candidates, ResolutionValidationResource::Bytes)?,
-            checked_resource_add(output_hints, recorded, ResolutionValidationResource::Bytes)?,
+            checked_resource_add(
+                checked_resource_add(assignment, candidates, ResolutionValidationResource::Bytes)?,
+                checked_resource_add(output_hints, recorded, ResolutionValidationResource::Bytes)?,
+                ResolutionValidationResource::Bytes,
+            )?,
+            propagation,
             ResolutionValidationResource::Bytes,
         )?,
-        checked_resource_mul(4, size_of::<Vec<u8>>(), ResolutionValidationResource::Bytes)?,
+        checked_resource_mul(7, size_of::<Vec<u8>>(), ResolutionValidationResource::Bytes)?,
         ResolutionValidationResource::Bytes,
     )
 }
 
-fn preflight_trace_shape(
-    trace: &ClauseTrace,
-    entries: TraceEntries<'_>,
-    num_vars: usize,
-    additional_retained_bytes: usize,
-    allow_synthesized_terminal: bool,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<TraceShape, ResolutionValidationError> {
-    meter.check_controls()?;
-    // Arena model (#A3): the trace retains one metadata vector plus two
-    // shared pools; the retained-capacity census is those three allocations,
-    // not a per-entry heap walk.
-    let mut source_trace_bytes = checked_resource_add(
-        size_of::<ClauseTrace>(),
-        checked_resource_mul(
-            trace.entries_capacity(),
-            ClauseTrace::entry_slot_bytes(),
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    source_trace_bytes = checked_resource_add(
-        source_trace_bytes,
-        checked_resource_mul(
-            trace.lit_pool_capacity(),
-            size_of::<Literal>(),
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    source_trace_bytes = checked_resource_add(
-        source_trace_bytes,
-        checked_resource_mul(
-            trace.hint_pool_capacity(),
-            size_of::<u64>(),
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    source_trace_bytes = checked_resource_add(
-        source_trace_bytes,
-        checked_resource_mul(
-            trace.scope_assumptions_capacity(),
-            size_of::<Literal>(),
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    let mut shape = TraceShape {
-        source_trace_bytes,
-        ..TraceShape::default()
-    };
-    // Exact worst-case width of an independently reconstructed positive-RUP
-    // chain: a deterministic unit-propagation run records at most one hint per
-    // newly assigned variable plus one final conflicting clause, and can never
-    // name more rows than precede it.
-    let propagation_and_conflict_bound =
-        checked_resource_add(num_vars, 1, ResolutionValidationResource::Hints)?;
-    let reconstruction_row_bound = entries.len().min(propagation_and_conflict_bound);
-    // Running total for the widened plan, in which every derived row retains a
-    // fully reconstructed chain. `None` once it overflows `usize`, which simply
-    // means the widened plan is unavailable.
-    let mut widened_hints: Option<usize> = Some(0);
-    let mut has_derived_empty = false;
-    for (entry_index, entry) in entries.iter().enumerate() {
-        if entry_index % CONTROL_POLL_INTERVAL == 0 {
-            meter.check_controls()?;
-        }
-        meter.charge(1)?;
-        if entry.is_original {
-            shape.original_clauses = add_count(
-                shape.original_clauses,
-                1,
-                ResolutionValidationResource::OriginalClauses,
-                meter.limits.max_original_clauses,
-            )?;
-            shape.original_literals = add_count(
-                shape.original_literals,
-                entry.clause.len(),
-                ResolutionValidationResource::OriginalLiterals,
-                meter.limits.max_original_literals,
-            )?;
-        } else {
-            has_derived_empty |= entry.clause.is_empty();
-            shape.derived_steps = add_count(
-                shape.derived_steps,
-                1,
-                ResolutionValidationResource::DerivedSteps,
-                meter.limits.max_derived_steps,
-            )?;
-            shape.derived_literals = add_count(
-                shape.derived_literals,
-                entry.clause.len(),
-                ResolutionValidationResource::DerivedLiterals,
-                meter.limits.max_derived_literals,
-            )?;
-            shape.hints = add_count(
-                shape.hints,
-                entry.resolution_hints.len(),
-                ResolutionValidationResource::Hints,
-                meter.limits.max_hints,
-            )?;
-            shape.max_row_hints = shape.max_row_hints.max(entry.resolution_hints.len());
-            widened_hints = widened_hints.and_then(|total| {
-                total.checked_add(entry.resolution_hints.len().max(reconstruction_row_bound))
-            });
-        }
-        if entry.clause.len() >= CONTROL_POLL_INTERVAL
-            || entry.resolution_hints.len() >= CONTROL_POLL_INTERVAL
-        {
-            meter.check_controls()?;
-        }
-    }
-
-    // An assumption solve can finish from a conflict against a temporary
-    // decision without adding a permanent empty clause to ClauseTrace. The
-    // marker alone is never authority. Under exact fixed unit premises the
-    // converter may reconstruct one terminal positive-RUP step, but its full
-    // worst-case retained shape must be admitted before any conversion
-    // allocation. A deterministic unit-propagation chain uses at most one hint
-    // per newly assigned variable plus one final conflicting clause, and never
-    // more hints than there are preceding clauses.
-    if allow_synthesized_terminal && trace.has_empty_clause() && !has_derived_empty {
-        shape.synthesize_terminal_empty = true;
-        shape.derived_steps = add_count(
-            shape.derived_steps,
-            1,
-            ResolutionValidationResource::DerivedSteps,
-            meter.limits.max_derived_steps,
-        )?;
-        let synthesized_hint_bound = reconstruction_row_bound;
-        shape.hints = add_count(
-            shape.hints,
-            synthesized_hint_bound,
-            ResolutionValidationResource::Hints,
-            meter.limits.max_hints,
-        )?;
-        shape.max_row_hints = shape.max_row_hints.max(synthesized_hint_bound);
-        widened_hints = widened_hints.and_then(|total| total.checked_add(synthesized_hint_bound));
-    }
-
-    // Reject count/byte envelopes before allocating the namespace map or any
-    // duplicate DAG/mapping payload. The two phase peaks are both preflighted:
-    // conversion retains the id map, while replay replaces that map with its
-    // clause database and assignment/trail scratch.
-    // Hash tables reserve spare buckets to preserve their load factor. Budget
-    // a checked 2x bucket envelope before allocation; the actual capacity is
-    // measured again after `try_reserve`.
-    let namespace_bucket_bound =
-        checked_resource_mul(entries.len(), 2, ResolutionValidationResource::Bytes)?;
-    let namespace_bytes = checked_resource_mul(
-        namespace_bucket_bound,
-        HASH_ENTRY_BYTES,
-        ResolutionValidationResource::Bytes,
-    )?;
-
-    // Independent per-row chain reconstruction is what repairs a producer hint
-    // list that names only the conflict-analysis antecedents and omits the
-    // root-level reason clauses those antecedents propagate through. A
-    // reconstructed chain can therefore be wider than the recorded one. Admit
-    // that worst case up front when it fits the configured envelope. When it
-    // does not, keep the narrower recorded-width plan: reconstruction is then
-    // confined to each row's own recorded width, exactly the pre-existing
-    // posture, and no admitted envelope is ever exceeded.
-    let replay_database_bytes = namespace_bytes;
-    let assignment_bytes = checked_resource_mul(
-        num_vars,
-        checked_resource_add(
-            size_of::<Option<bool>>(),
-            size_of::<usize>(),
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    let plan_peaks = |mut planned: TraceShape| -> Result<PlannedPeaks, ResolutionValidationError> {
-        planned.synthesis_scratch_bytes =
-            planned_synthesis_scratch_bytes(num_vars, planned.max_row_hints)?;
-        let retained = planned_retained_bytes(planned, additional_retained_bytes)?;
-        let conversion = checked_resource_add(
-            checked_resource_add(
-                retained,
-                namespace_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            planned.synthesis_scratch_bytes,
-            ResolutionValidationResource::Bytes,
-        )?;
-        let replay = checked_resource_add(
-            checked_resource_add(
-                retained,
-                replay_database_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            assignment_bytes,
-            ResolutionValidationResource::Bytes,
-        )?;
-        Ok(PlannedPeaks {
-            shape: planned,
-            conversion,
-            replay,
-        })
-    };
-
-    let mut planned = plan_peaks(shape)?;
-    if let Some(widened_total) = widened_hints.filter(|&total| total <= meter.limits.max_hints) {
-        let widened = plan_peaks(TraceShape {
-            hints: widened_total,
-            max_row_hints: shape.max_row_hints.max(reconstruction_row_bound),
-            row_hint_budget: reconstruction_row_bound,
-            ..shape
-        });
-        if let Ok(widened) = widened {
-            if widened.conversion <= meter.limits.max_bytes
-                && widened.replay <= meter.limits.max_bytes
-            {
-                planned = widened;
-            }
-        }
-    }
-    shape = planned.shape;
-    let conversion_peak = planned.conversion;
-    let replay_peak = planned.replay;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        conversion_peak,
-        meter.limits.max_bytes,
-    )?;
-
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        replay_peak,
-        meter.limits.max_bytes,
-    )?;
-    meter.check_controls()?;
-    Ok(shape)
-}
+include!("clause_trace_resolution/preflight.rs");
 
 fn reserve_exact<T>(
     values: &mut Vec<T>,
@@ -927,286 +734,11 @@ fn synthesize_terminal_empty_hints(
     .ok_or(ClauseTraceResolutionError::UnitPremisesDoNotRefuteTrace)
 }
 
-/// Reconstruct one deterministic positive-RUP chain from the exact prior
-/// canonical database and authenticated fixed units.
-///
-/// The target is negated into the initial assignment, then prior rows are
-/// scanned in canonical-id order to a unit-propagation fixpoint. Clauses that
-/// are already satisfied (including by fixed premises) are omitted. The
-/// returned ids are therefore each unit, followed by one conflicting id, for
-/// the ordinary independent DAG replay. `max_hints` is the source row's
-/// already-accounted hint length; reconstruction never widens retained proof
-/// payload. `None` means the target was not RUP within that envelope.
-fn synthesize_rup_hints(
-    original_clauses: &[(u64, Vec<Literal>)],
-    derived: &[RupStep],
-    target_clause: &[Literal],
-    fixed_unit_premises: &[Literal],
-    num_vars: usize,
-    max_hints: usize,
-    candidate_hint_capacity: usize,
-    admitted_scratch_bytes: usize,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
-    let mut assign = Vec::new();
-    reserve_exact(
-        &mut assign,
-        num_vars,
-        ResolutionValidationResource::AssignmentScratch,
-        meter,
-    )?;
-    let mut hints = Vec::new();
-    reserve_exact(
-        &mut hints,
-        max_hints,
-        ResolutionValidationResource::Hints,
-        meter,
-    )?;
-    let actual_scratch_bytes = synthesis_scratch_bytes_from_capacities(
-        assign.capacity(),
-        candidate_hint_capacity,
-        hints.capacity(),
-        0,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        actual_scratch_bytes,
-        admitted_scratch_bytes,
-    )?;
-    while assign.len() < num_vars {
-        let chunk = (num_vars - assign.len()).min(CONTROL_POLL_INTERVAL);
-        meter.charge(chunk)?;
-        assign.resize(assign.len() + chunk, None);
-        meter.check_controls()?;
-    }
+include!("clause_trace_resolution/root_propagation.rs");
 
-    for &literal in fixed_unit_premises {
-        meter.charge(1)?;
-        let variable = literal.variable().index();
-        if variable >= num_vars {
-            return Err(ResolutionDagValidateError::VarOutOfRange {
-                clause: 0,
-                var: variable,
-                num_vars,
-            }
-            .into());
-        }
-        let value = literal.is_positive();
-        match assign[variable] {
-            None => assign[variable] = Some(value),
-            Some(existing) if existing == value => {}
-            // The exact premise set refutes itself. The downstream replay has
-            // the same fixed-premise conflict rule, so an empty hint chain is
-            // a complete independently checked terminal derivation.
-            Some(_) => return Ok(Some(hints)),
-        }
-    }
-    for &literal in target_clause {
-        meter.charge(1)?;
-        let variable = literal.variable().index();
-        if variable >= num_vars {
-            return Err(ResolutionDagValidateError::VarOutOfRange {
-                clause: 0,
-                var: variable,
-                num_vars,
-            }
-            .into());
-        }
-        let value = !literal.is_positive();
-        match assign[variable] {
-            None => assign[variable] = Some(value),
-            Some(existing) if existing == value => {}
-            // The target is tautological under the fixed premises. Ordinary
-            // RUP replay detects the same target-negation conflict immediately.
-            Some(_) => return Ok(Some(hints)),
-        }
-    }
+include!("clause_trace_resolution/rooted_repair.rs");
 
-    loop {
-        meter.check_controls()?;
-        let mut propagated = false;
-        let clauses = original_clauses
-            .iter()
-            .map(|(id, clause)| (*id, clause.as_slice()))
-            .chain(derived.iter().map(|step| (step.id, step.clause.as_slice())));
-        for (id, clause) in clauses {
-            match scan_terminal_hint_clause(clause, &assign, meter)? {
-                TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
-                TerminalHintScan::Unit(literal) => {
-                    if hints.len() == max_hints {
-                        return Ok(None);
-                    }
-                    // Unit scans only return an unassigned literal. Recording
-                    // the id before installing it produces the exact ordered
-                    // hint sequence consumed by positive-RUP replay.
-                    hints.push(id);
-                    meter.charge(1)?;
-                    assign[literal.variable().index()] = Some(literal.is_positive());
-                    propagated = true;
-                }
-                TerminalHintScan::Conflict => {
-                    if hints.len() == max_hints {
-                        return Ok(None);
-                    }
-                    hints.push(id);
-                    meter.charge(1)?;
-                    return Ok(Some(hints));
-                }
-            }
-        }
-        if !propagated {
-            return Ok(None);
-        }
-    }
-}
-
-/// Compact the producer's ordered hint candidates into a checked positive-RUP
-/// chain under exact fixed premises.
-///
-/// Candidate ids remain untrusted. Named prior clauses are rescanned to a
-/// deterministic fixpoint under fixed premises plus the negated target:
-/// satisfied, open, and non-unit rows contribute no inference; unit rows are
-/// retained once and propagated; the first conflict completes the chain. A
-/// returned chain is never larger than the source candidate list and is still
-/// replayed by the ordinary independent DAG validator before acceptance.
-fn compact_rup_hint_candidates(
-    original_clauses: &[(u64, Vec<Literal>)],
-    derived: &[RupStep],
-    target_clause: &[Literal],
-    fixed_unit_premises: &[Literal],
-    candidate_hints: &[u64],
-    candidate_hint_capacity: usize,
-    num_vars: usize,
-    admitted_scratch_bytes: usize,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<Option<Vec<u64>>, ResolutionValidationError> {
-    let mut assign = Vec::new();
-    reserve_exact(
-        &mut assign,
-        num_vars,
-        ResolutionValidationResource::AssignmentScratch,
-        meter,
-    )?;
-    while assign.len() < num_vars {
-        let chunk = (num_vars - assign.len()).min(CONTROL_POLL_INTERVAL);
-        meter.charge(chunk)?;
-        assign.resize(assign.len() + chunk, None);
-        meter.check_controls()?;
-    }
-    let mut hints = Vec::new();
-    reserve_exact(
-        &mut hints,
-        candidate_hints.len(),
-        ResolutionValidationResource::Hints,
-        meter,
-    )?;
-    let mut recorded: Vec<u8> = Vec::new();
-    reserve_exact(
-        &mut recorded,
-        candidate_hints.len(),
-        ResolutionValidationResource::AssignmentScratch,
-        meter,
-    )?;
-    for chunk in candidate_hints.chunks(CONTROL_POLL_INTERVAL) {
-        meter.charge(chunk.len())?;
-        recorded.resize(recorded.len() + chunk.len(), 0);
-        meter.check_controls()?;
-    }
-    let actual_scratch_bytes = synthesis_scratch_bytes_from_capacities(
-        assign.capacity(),
-        candidate_hint_capacity,
-        hints.capacity(),
-        recorded.capacity(),
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        actual_scratch_bytes,
-        admitted_scratch_bytes,
-    )?;
-
-    for &literal in fixed_unit_premises {
-        meter.charge(1)?;
-        let variable = literal.variable().index();
-        if variable >= num_vars {
-            return Err(ResolutionDagValidateError::VarOutOfRange {
-                clause: 0,
-                var: variable,
-                num_vars,
-            }
-            .into());
-        }
-        let value = literal.is_positive();
-        match assign[variable] {
-            None => assign[variable] = Some(value),
-            Some(existing) if existing == value => {}
-            Some(_) => return Ok(Some(hints)),
-        }
-    }
-    for &literal in target_clause {
-        meter.charge(1)?;
-        let variable = literal.variable().index();
-        if variable >= num_vars {
-            return Err(ResolutionDagValidateError::VarOutOfRange {
-                clause: 0,
-                var: variable,
-                num_vars,
-            }
-            .into());
-        }
-        let value = !literal.is_positive();
-        match assign[variable] {
-            None => assign[variable] = Some(value),
-            Some(existing) if existing == value => {}
-            Some(_) => return Ok(Some(hints)),
-        }
-    }
-
-    loop {
-        let mut propagated = false;
-        for (candidate_index, &id) in candidate_hints.iter().enumerate() {
-            if candidate_index % CONTROL_POLL_INTERVAL == 0 {
-                meter.check_controls()?;
-            }
-            meter.charge(1)?;
-            if recorded[candidate_index] != 0 {
-                continue;
-            }
-            let canonical_index = id
-                .checked_sub(1)
-                .and_then(|value| usize::try_from(value).ok());
-            let clause = canonical_index.and_then(|index| {
-                if let Some((stored_id, clause)) = original_clauses.get(index) {
-                    (*stored_id == id).then_some(clause.as_slice())
-                } else {
-                    let derived_index = index.checked_sub(original_clauses.len())?;
-                    let step = derived.get(derived_index)?;
-                    (step.id == id).then_some(step.clause.as_slice())
-                }
-            });
-            let Some(clause) = clause else {
-                return Ok(None);
-            };
-            match scan_terminal_hint_clause(clause, &assign, meter)? {
-                TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
-                TerminalHintScan::Unit(literal) => {
-                    hints.push(id);
-                    meter.charge(1)?;
-                    recorded[candidate_index] = 1;
-                    assign[literal.variable().index()] = Some(literal.is_positive());
-                    propagated = true;
-                }
-                TerminalHintScan::Conflict => {
-                    hints.push(id);
-                    meter.charge(1)?;
-                    return Ok(Some(hints));
-                }
-            }
-        }
-        if !propagated {
-            return Ok(None);
-        }
-    }
-}
+include!("clause_trace_resolution/synthesis.rs");
 
 fn retained_mapping_bytes(
     mappings: &[ClauseTraceOriginalMapping],
@@ -1374,479 +906,7 @@ pub fn validate_clause_trace_resolution_with_unit_premises_interruptible(
     })
 }
 
-fn validate_clause_trace_resolution_interruptible_impl(
-    trace: &ClauseTrace,
-    num_vars: usize,
-    fixed_unit_premises: &[Literal],
-    limits: &ResolutionValidationLimits,
-    mut should_stop: impl FnMut() -> bool,
-) -> Result<(ValidatedClauseTraceResolution, Vec<Literal>), ClauseTraceResolutionError> {
-    let mut meter = ConversionMeter::new(limits, &mut should_stop)?;
-    if trace.is_truncated() {
-        return Err(ClauseTraceResolutionError::Truncated);
-    }
-    if trace.proof_work_exhausted() {
-        return Err(ClauseTraceResolutionError::ProofWorkExhausted);
-    }
-
-    let entries = trace.entries();
-    let premise_payload_bytes = checked_resource_mul(
-        fixed_unit_premises.len(),
-        size_of::<Literal>(),
-        ResolutionValidationResource::Bytes,
-    )?;
-    // The caller-owned premise payload and the returned owned copy coexist
-    // throughout conversion and replay.
-    let planned_premise_bytes = checked_resource_add(
-        size_of::<Vec<Literal>>(),
-        checked_resource_mul(
-            premise_payload_bytes,
-            2,
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    let shape = preflight_trace_shape(
-        trace,
-        entries,
-        num_vars,
-        planned_premise_bytes,
-        !fixed_unit_premises.is_empty(),
-        &mut meter,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::OriginalClauses,
-        checked_resource_add(
-            shape.original_clauses,
-            fixed_unit_premises.len(),
-            ResolutionValidationResource::OriginalClauses,
-        )?,
-        limits.max_original_clauses,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::OriginalLiterals,
-        checked_resource_add(
-            shape.original_literals,
-            fixed_unit_premises.len(),
-            ResolutionValidationResource::OriginalLiterals,
-        )?,
-        limits.max_original_literals,
-    )?;
-    for (premise_index, &premise) in fixed_unit_premises.iter().enumerate() {
-        if premise_index % CONTROL_POLL_INTERVAL == 0 {
-            meter.check_controls()?;
-        }
-        meter.charge(1)?;
-        let variable = premise.variable().index();
-        if variable >= num_vars {
-            return Err(ClauseTraceResolutionError::UnitPremiseVariableOutOfRange {
-                premise_index,
-                variable,
-                num_vars,
-            });
-        }
-    }
-    let unit_premises = copy_slice_bounded(
-        fixed_unit_premises,
-        ResolutionValidationResource::OriginalLiterals,
-        &mut meter,
-    )?;
-    let retained_premise_bytes = checked_resource_add(
-        size_of::<Vec<Literal>>(),
-        checked_resource_add(
-            premise_payload_bytes,
-            checked_resource_mul(
-                unit_premises.capacity(),
-                size_of::<Literal>(),
-                ResolutionValidationResource::Bytes,
-            )?,
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        retained_premise_bytes,
-        limits.max_bytes,
-    )?;
-
-    // The complete count/byte preflight above precedes every conversion
-    // allocation. All reserves are fallible and surrounded by cooperative
-    // control checks.
-    let mut entry_states = HashMap::new();
-    meter.check_controls()?;
-    // Hash-table reserve initializes its bucket/control-byte namespace before
-    // any entry insertion. Charge the same conservative 2x capacity bound used
-    // by the byte preflight before entering that allocation.
-    meter.charge(checked_resource_mul(
-        entries.len(),
-        2,
-        ResolutionValidationResource::Work,
-    )?)?;
-    entry_states.try_reserve(entries.len()).map_err(|_| {
-        ResolutionValidationError::AllocationFailed {
-            resource: ResolutionValidationResource::ClauseDatabase,
-        }
-    })?;
-    meter.check_controls()?;
-    for (entry_index, entry) in entries.iter().enumerate() {
-        if entry_index % CONTROL_POLL_INTERVAL == 0 {
-            meter.check_controls()?;
-        }
-        meter.charge(1)?;
-        if entry.id == 0 {
-            return Err(ClauseTraceResolutionError::ZeroClauseId { entry_index });
-        }
-        if let Some(first) = entry_states.insert(
-            entry.id,
-            TraceIdState {
-                trace_index: entry_index,
-                canonical_id: None,
-            },
-        ) {
-            return Err(ClauseTraceResolutionError::DuplicateClauseId {
-                id: entry.id,
-                first_index: first.trace_index,
-                duplicate_index: entry_index,
-            });
-        }
-    }
-
-    let mut terminal_empty_index = None;
-    for (entry_index, entry) in entries.iter().enumerate() {
-        if entry_index % CONTROL_POLL_INTERVAL == 0 {
-            meter.check_controls()?;
-        }
-        meter.charge(1)?;
-        if let Some(empty_entry_index) = terminal_empty_index {
-            return Err(ClauseTraceResolutionError::EntryAfterTerminalEmpty {
-                entry_index,
-                id: entry.id,
-                empty_entry_index,
-            });
-        }
-
-        if entry.is_original {
-            if entry.clause.is_empty() {
-                return Err(ClauseTraceResolutionError::OriginalEmptyClause {
-                    entry_index,
-                    id: entry.id,
-                });
-            }
-            if !entry.resolution_hints.is_empty() {
-                return Err(ClauseTraceResolutionError::OriginalHasHints {
-                    entry_index,
-                    id: entry.id,
-                });
-            }
-            continue;
-        }
-
-        if entry.resolution_hints.is_empty() && unit_premises.is_empty() {
-            return Err(ClauseTraceResolutionError::UnhintedDerivedClause {
-                entry_index,
-                id: entry.id,
-            });
-        }
-        for (hint_index, &hint_id) in entry.resolution_hints.iter().enumerate() {
-            if hint_index % CONTROL_POLL_INTERVAL == 0 {
-                meter.check_controls()?;
-            }
-            meter.charge(1)?;
-            if hint_id == 0 {
-                return Err(ClauseTraceResolutionError::ZeroHint {
-                    entry_index,
-                    entry_id: entry.id,
-                });
-            }
-            let Some(hint_state) = entry_states.get(&hint_id) else {
-                return Err(ClauseTraceResolutionError::UnknownHint {
-                    entry_index,
-                    entry_id: entry.id,
-                    hint_id,
-                });
-            };
-            let hint_entry_index = hint_state.trace_index;
-            if hint_entry_index >= entry_index {
-                return Err(ClauseTraceResolutionError::FutureHint {
-                    entry_index,
-                    entry_id: entry.id,
-                    hint_id,
-                    hint_entry_index,
-                });
-            }
-        }
-
-        if entry.clause.is_empty() {
-            terminal_empty_index = Some(entry_index);
-        }
-    }
-
-    if terminal_empty_index.is_none() && !shape.synthesize_terminal_empty {
-        return if trace.has_empty_clause() {
-            Err(ClauseTraceResolutionError::EmptyMarkerWithoutDerivedEmpty)
-        } else {
-            Err(ClauseTraceResolutionError::NoDerivedEmptyClause)
-        };
-    }
-    if !trace.has_empty_clause() {
-        // Public ClauseTrace mutation keeps this state unreachable, but require
-        // both signals so future constructors cannot weaken the contract.
-        return Err(ClauseTraceResolutionError::NoDerivedEmptyClause);
-    }
-
-    let original_count_u64 = u64::try_from(shape.original_clauses)
-        .map_err(|_| ClauseTraceResolutionError::CanonicalIdOverflow)?;
-    let mut original_clauses = Vec::new();
-    reserve_exact(
-        &mut original_clauses,
-        shape.original_clauses,
-        ResolutionValidationResource::OriginalClauses,
-        &mut meter,
-    )?;
-    let mut original_mappings = Vec::new();
-    reserve_exact(
-        &mut original_mappings,
-        shape.original_clauses,
-        ResolutionValidationResource::OriginalClauses,
-        &mut meter,
-    )?;
-
-    let mut next_canonical_id = 1_u64;
-    for (trace_index, entry) in entries.iter().enumerate() {
-        // Iterator filtering still visits every trace entry. Charge that scan
-        // independently from the selected-entry conversion work below.
-        meter.charge(1)?;
-        if !entry.is_original {
-            continue;
-        }
-        meter.charge(1)?;
-        let canonical_id = next_canonical_id;
-        next_canonical_id = next_canonical_id
-            .checked_add(1)
-            .ok_or(ClauseTraceResolutionError::CanonicalIdOverflow)?;
-        let Some(state) = entry_states.get_mut(&entry.id) else {
-            return Err(ClauseTraceResolutionError::MissingCheckedIdentity {
-                entry_index: trace_index,
-                id: entry.id,
-            });
-        };
-        state.canonical_id = Some(canonical_id);
-        let dag_clause = copy_slice_bounded(
-            entry.clause,
-            ResolutionValidationResource::OriginalLiterals,
-            &mut meter,
-        )?;
-        let mapped_clause = copy_slice_bounded(
-            entry.clause,
-            ResolutionValidationResource::OriginalLiterals,
-            &mut meter,
-        )?;
-        original_clauses.push((canonical_id, dag_clause));
-        original_mappings.push(ClauseTraceOriginalMapping {
-            canonical_id,
-            trace_index,
-            trace_entry: ClauseTraceEntry::new(entry.id, mapped_clause, true, Vec::new()),
-        });
-    }
-
-    let expected_first_derived = original_count_u64
-        .checked_add(1)
-        .ok_or(ClauseTraceResolutionError::CanonicalIdOverflow)?;
-    debug_assert_eq!(next_canonical_id, expected_first_derived);
-    let mut derived = Vec::new();
-    reserve_exact(
-        &mut derived,
-        shape.derived_steps,
-        ResolutionValidationResource::DerivedSteps,
-        &mut meter,
-    )?;
-    let mut empty_clause_id = None;
-    for (entry_index, entry) in entries.iter().enumerate() {
-        // As above, every predicate visit belongs to the shared allowance.
-        meter.charge(1)?;
-        if entry.is_original {
-            continue;
-        }
-        meter.charge(1)?;
-        let canonical_id = next_canonical_id;
-        next_canonical_id = next_canonical_id
-            .checked_add(1)
-            .ok_or(ClauseTraceResolutionError::CanonicalIdOverflow)?;
-
-        let mut canonical_candidates = Vec::new();
-        reserve_exact(
-            &mut canonical_candidates,
-            entry.resolution_hints.len(),
-            ResolutionValidationResource::Hints,
-            &mut meter,
-        )?;
-        for (hint_index, &hint_id) in entry.resolution_hints.iter().enumerate() {
-            if hint_index % CONTROL_POLL_INTERVAL == 0 {
-                meter.check_controls()?;
-            }
-            meter.charge(1)?;
-            let canonical_hint = entry_states
-                .get(&hint_id)
-                .and_then(|state| state.canonical_id)
-                .ok_or(ClauseTraceResolutionError::UnknownHint {
-                    entry_index,
-                    entry_id: entry.id,
-                    hint_id,
-                })?;
-            canonical_candidates.push(canonical_hint);
-        }
-        // The producer's recorded antecedents are never authority. Every
-        // derived row is independently rechecked here: first by compacting the
-        // named candidates to a propagation-ordered chain, and, when those
-        // candidates do not derive the row on their own, by reconstructing a
-        // chain from the exact prior canonical database. A recorded chain that
-        // names only the conflict-analysis antecedents — omitting the
-        // root-level reason clauses they propagate through — is repaired by
-        // that reconstruction rather than shipped as an unchecked claim.
-        // Whatever is produced is still replayed by the ordinary independent
-        // DAG validator before acceptance, so this can only ever move a row
-        // from rejected to checked, never from unchecked to trusted.
-        let synthesized_hints = {
-            let compacted = compact_rup_hint_candidates(
-                &original_clauses,
-                &derived,
-                entry.clause,
-                &unit_premises,
-                &canonical_candidates,
-                canonical_candidates.capacity(),
-                num_vars,
-                shape.synthesis_scratch_bytes,
-                &mut meter,
-            )?;
-            match compacted {
-                some @ Some(_) => some,
-                None => synthesize_rup_hints(
-                    &original_clauses,
-                    &derived,
-                    entry.clause,
-                    &unit_premises,
-                    num_vars,
-                    entry.resolution_hints.len().max(shape.row_hint_budget),
-                    canonical_candidates.capacity(),
-                    shape.synthesis_scratch_bytes,
-                    &mut meter,
-                )?,
-            }
-        };
-        let rup_hints = if let Some(hints) = synthesized_hints {
-            hints
-        } else {
-            canonical_candidates
-        };
-        let Some(state) = entry_states.get_mut(&entry.id) else {
-            return Err(ClauseTraceResolutionError::MissingCheckedIdentity {
-                entry_index,
-                id: entry.id,
-            });
-        };
-        state.canonical_id = Some(canonical_id);
-        if Some(entry_index) == terminal_empty_index {
-            empty_clause_id = Some(canonical_id);
-        }
-        let clause = copy_slice_bounded(
-            entry.clause,
-            ResolutionValidationResource::DerivedLiterals,
-            &mut meter,
-        )?;
-        derived.push(RupStep {
-            id: canonical_id,
-            clause,
-            rup_hints,
-        });
-    }
-
-    if shape.synthesize_terminal_empty {
-        let rup_hints = synthesize_terminal_empty_hints(
-            &original_clauses,
-            &derived,
-            &unit_premises,
-            num_vars,
-            shape.synthesis_scratch_bytes,
-            &mut meter,
-        )?;
-        let canonical_id = next_canonical_id;
-        derived.push(RupStep {
-            id: canonical_id,
-            clause: Vec::new(),
-            rup_hints,
-        });
-        empty_clause_id = Some(canonical_id);
-    }
-
-    let empty_clause_id =
-        empty_clause_id.ok_or(ClauseTraceResolutionError::EmptyMarkerWithoutDerivedEmpty)?;
-    let dag = ResolutionDag {
-        num_vars,
-        original_clauses,
-        derived,
-        empty_clause_id,
-    };
-    let mapping_bytes =
-        retained_mapping_bytes(&original_mappings, original_mappings.capacity(), &mut meter)?;
-    let dag_bytes = retained_dag_bytes(&dag, &mut meter)?;
-    let retained_bytes = checked_resource_add(
-        checked_resource_add(
-            checked_resource_add(
-                dag_bytes,
-                mapping_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            retained_premise_bytes,
-            ResolutionValidationResource::Bytes,
-        )?,
-        shape.source_trace_bytes,
-        ResolutionValidationResource::Bytes,
-    )?;
-    let conversion_bytes = checked_resource_add(
-        retained_bytes,
-        checked_resource_mul(
-            entry_states.capacity(),
-            HASH_ENTRY_BYTES,
-            ResolutionValidationResource::Bytes,
-        )?,
-        ResolutionValidationResource::Bytes,
-    )?;
-    enforce_resource(
-        ResolutionValidationResource::Bytes,
-        conversion_bytes,
-        limits.max_bytes,
-    )?;
-    meter.check_controls()?;
-    drop(entry_states);
-
-    let conversion_work = meter.consumed_work();
-    let validation_work = dag.validate_with_limits_interruptible(
-        limits,
-        unit_premises.as_slice(),
-        checked_resource_add(
-            checked_resource_add(
-                mapping_bytes,
-                shape.source_trace_bytes,
-                ResolutionValidationResource::Bytes,
-            )?,
-            retained_premise_bytes,
-            ResolutionValidationResource::Bytes,
-        )?,
-        conversion_work,
-        &mut should_stop,
-    )?;
-
-    Ok((
-        ValidatedClauseTraceResolution {
-            dag,
-            original_mappings,
-            validation_work,
-            retained_bytes,
-        },
-        unit_premises,
-    ))
-}
+include!("clause_trace_resolution/validation.rs");
 
 #[cfg(test)]
 mod tests {
@@ -2202,7 +1262,7 @@ mod tests {
     fn synthesis_scratch_capacity_growth_exceeds_planned_sub_envelope() {
         let planned = planned_synthesis_scratch_bytes(3, 3).expect("scratch plan");
         let actual =
-            synthesis_scratch_bytes_from_capacities(4, 4, 4, 4).expect("actual-capacity census");
+            synthesis_scratch_bytes_from_capacities(4, 4, 4, 4, 4).expect("actual-capacity census");
         assert!(actual > planned);
 
         let error = enforce_resource(ResolutionValidationResource::Bytes, actual, planned)
@@ -2304,6 +1364,60 @@ mod tests {
                 )
             ),
             "expected a fail-closed replay rejection of the unrepaired row, got {error:?}"
+        );
+    }
+
+    /// Slack-funded widening under the narrow plan: the widened plan's
+    /// worst case (every derived row at full reconstruction width) does not
+    /// fit the hint envelope, but the envelope still has unclaimed room past
+    /// the recorded total. One under-recorded row must widen into that slack
+    /// and the conversion must succeed, with the other row untouched.
+    #[test]
+    fn widens_one_row_into_unclaimed_hint_slack_under_the_narrow_plan() {
+        let mut trace = ClauseTrace::new();
+        trace.add_clause(10, vec![pos(0)], true);
+        trace.add_clause(11, vec![neg(0), pos(1)], true);
+        trace.add_clause(12, vec![neg(1), pos(2)], true);
+        trace.add_clause(13, vec![neg(2)], true);
+        // Records only its conflicting antecedent; the root chain via 10/11
+        // is omitted and must be reconstructed (canonical chain [1, 2, 3]).
+        trace.add_clause_with_hints(20, vec![pos(2)], false, vec![12]);
+        trace.add_clause_with_hints(21, Vec::new(), false, vec![20, 13]);
+
+        let mut limits = ResolutionValidationLimits::unbounded();
+        // Recorded total 3; widened worst case max(1,4) + max(2,4) = 8. Six
+        // declines the widened plan and leaves a slack of exactly 3, of which
+        // the reconstructed row consumes 2.
+        limits.max_hints = 6;
+        let converted = validate_clause_trace_resolution(&trace, 3, &limits)
+            .expect("the under-recorded row widens into the unclaimed hint slack");
+        assert_eq!(converted.dag().derived[0].rup_hints, vec![1, 2, 3]);
+        assert_eq!(converted.dag().derived[1].rup_hints, vec![5, 4]);
+        assert_eq!(converted.dag().empty_clause_id, 6);
+    }
+
+    /// Reconstructed chains are trimmed to the conflict cone: a root unit the
+    /// sweep happens to propagate, but that does not support the conflict,
+    /// must not appear in the retained chain.
+    #[test]
+    fn reconstructed_chain_is_trimmed_to_the_conflict_cone() {
+        let mut trace = ClauseTrace::new();
+        // An unrelated propagating unit, deliberately first in canonical
+        // order so the sweep assigns it before the relevant chain.
+        trace.add_clause(9, vec![pos(3)], true);
+        trace.add_clause(10, vec![pos(0)], true);
+        trace.add_clause(11, vec![neg(0), pos(1)], true);
+        trace.add_clause(12, vec![neg(1), pos(2)], true);
+        trace.add_clause(13, vec![neg(2)], true);
+        trace.add_clause_with_hints(20, vec![pos(2)], false, vec![12]);
+        trace.add_clause_with_hints(21, Vec::new(), false, vec![20, 13]);
+
+        let converted =
+            convert(&trace, 4).expect("the row is RUP from the full prior canonical database");
+        assert_eq!(
+            converted.dag().derived[0].rup_hints,
+            vec![2, 3, 4],
+            "the unrelated unit (canonical id 1) must be trimmed from the chain"
         );
     }
 

@@ -50,6 +50,9 @@ impl Executor {
             return None;
         }
 
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!("CERT/epoch PARKED exec={:p}", self as *const _);
+        }
         Some(ParkedPlainQueryAuthority {
             epoch: self.unsat_query_epoch.take()?,
             provenance: self.proof_problem_assertion_provenance.take()?,
@@ -79,9 +82,20 @@ impl Executor {
             || parked.epoch.declared_extension_objective_entries.is_some()
             || parked.provenance.original_problem_assertions != parked.epoch.assertions
         {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!(
+                    "CERT/epoch cleared: named-core restore DECLINED exec={:p} current={} assertions_match={}",
+                    self as *const _,
+                    parked.epoch.is_current(self),
+                    parked.epoch.assertions == self.ctx.assertions,
+                );
+            }
             return false;
         }
 
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!("CERT/epoch RESTORED exec={:p}", self as *const _);
+        }
         self.unsat_query_epoch = Some(parked.epoch);
         self.proof_problem_assertion_provenance = Some(parked.provenance);
         true

@@ -17,6 +17,7 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
 use ay_milp::{
     nodes_explored, reset_nodes_explored, BabSession, Col, LpSession, Model, Outcome, Sense,
     SolveOpts,
@@ -258,17 +259,25 @@ fn basis_file_arg() -> String {
     "/tmp/ay_root_basis.txt".into()
 }
 
-fn main() {
+fn parse_profile_flags(raw: &[String]) -> Flags {
     // B40b: harness switches ride the shared engine CLI parser
     // (--lu, --prefix-cols i,j, --obbt-cols <file>) instead of env.
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut value_flags: Vec<&str> = ay_milp::engine_cli::VALUE_FLAGS.to_vec();
-    value_flags.push("prefix-cols");
-    value_flags.push("obbt-cols");
-    let flags = ay_milp::engine_cli::Flags::parse(&raw, &value_flags).unwrap_or_else(|e| {
+    let mut value_flags: Vec<&str> = VALUE_FLAGS.to_vec();
+    value_flags.extend(["prefix-cols", "obbt-cols", "basis-file"]);
+    // `--basis-file <path>` is read by `basis_file_arg()` straight off
+    // `env::args()`, but it must ALSO be declared here: strict parsing refuses
+    // an undeclared flag and keeps its value out of `positional`.
+    let mut switch_flags = switch_flags();
+    switch_flags.push("lu");
+    Flags::parse(raw, &value_flags, &switch_flags).unwrap_or_else(|e| {
         eprintln!("usage: milp_profile <file.milp> <seconds> [lp|mip|both] [--flags]: {e}");
         std::process::exit(2);
-    });
+    })
+}
+
+fn main() {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let flags = parse_profile_flags(&raw);
     let mut args = flags.positional.iter().cloned();
     let path = args
         .next()
@@ -283,7 +292,17 @@ fn main() {
     );
 
     let text = std::fs::read_to_string(&path).expect("read .milp");
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+    // Engine flags APPLY here too (same defect `mps_solve` carried: the flags were
+    // parsed for an `apply` that never ran, so `--trace`/knob switches on this
+    // harness were silently inert — R7's vacuous-null trap on the PRODUCTION lane).
+    let opts = ay_milp::engine_cli::apply(
+        &flags,
+        SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs)),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("bad engine flag: {e}");
+        std::process::exit(2);
+    });
 
     if mode == "lp" || mode == "both" {
         // ROOT LP relaxation: integrality dropped so LpSession accepts it. Phase-1

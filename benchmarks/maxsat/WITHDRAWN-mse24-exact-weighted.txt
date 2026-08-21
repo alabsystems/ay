@@ -1,0 +1,39 @@
+# MSE24 exact-weighted: instances present in mse24-exact-weighted.zip (571) but
+# ABSENT from mse24-exact-weighted-fixed.zip (539) -- i.e. withdrawn by organizers.
+# Recorded 2026-08-20 before the source zips were deleted for disk space.
+# The local mse24-exact-weighted/ .xz set was extracted from the UNFIXED zip,
+# so it still contains these       33 instances. Exclude them for official-set comparisons.
+
+
+timetabling_wt-comp07.wcnf
+timetabling_wt-comp09.wcnf
+timetabling_wt-comp10.wcnf
+timetabling_wt-comp14.wcnf
+timetabling_wt-comp16.wcnf
+timetabling_wt-comp19.wcnf
+timetabling_wt-comp21.wcnf
+timetabling_wt-EA12.lp.sm-extracted.wcnf
+timetabling_wt-test4.wcnf
+upgradeability_wt-mancoosi-test-i1000d0u98-2.wcnf
+upgradeability_wt-mancoosi-test-i10d0u98-0.wcnf
+upgradeability_wt-mancoosi-test-i10d0u98-16.wcnf
+upgradeability_wt-mancoosi-test-i10d0u98-9.wcnf
+upgradeability_wt-mancoosi-test-i20d0u98-0.wcnf
+upgradeability_wt-mancoosi-test-i3000d0u98-73.wcnf
+upgradeability_wt-mancoosi-test-i4000d0u98-84.wcnf
+upgradeability_wt-mancoosi-test-i4000d0u98-92.wcnf
+upgradeability_wt-mancoosi-test-i4000d0u98-93.wcnf
+upgradeability_wt-mancoosi-test-i4000d0u98-94.wcnf
+upgradeability_wt-mancoosi-test-i40d0u98-7.wcnf
+upgradeability_wt-rand196_l2.wcnf
+upgradeability_wt-rand30_l1.wcnf
+upgradeability_wt-rand653_l2.wcnf
+upgradeability_wt-rand717_l2.wcnf
+warehouses_wt-cap131.wcsp.wcnf
+warehouses_wt-cap132.wcsp.wcnf
+warehouses_wt-cap71.wcsp.wcnf
+warehouses_wt-cap72.wcsp.wcnf
+warehouses_wt-cap91.wcsp.wcnf
+warehouses_wt-cap92.wcsp.wcnf
+warehouses_wt-warehouse0.wcsp.wcnf
+warehouses_wt-warehouse1.wcsp.wcnf

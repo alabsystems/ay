@@ -104,6 +104,98 @@ impl EufLemmaPlan {
 /// matching the shared audit's alias-scan envelope.
 const MAX_PROMOTION_SURFACE_SCAN: usize = 100_000;
 const MAX_PROMOTION_SURFACE_DEPTH: usize = 256;
+const MAX_PROMOTION_SURFACE_RENDER_WORK: u64 = 8 * 1024 * 1024;
+
+pub(super) struct PreparedSurfaceMap {
+    pub(super) audited: HashMap<ay_core::TermId, String>,
+    pub(super) canonical: HashMap<ay_core::TermId, String>,
+    pub(super) effective: HashMap<ay_core::TermId, String>,
+}
+
+pub(super) fn prepare_surface_map_bounded(
+    terms: &ay_core::TermStore,
+    candidates: &HashMap<ay_core::TermId, String>,
+    effective: &HashMap<ay_core::TermId, String>,
+) -> Option<PreparedSurfaceMap> {
+    let mut canonical_roots: Vec<ay_core::TermId> = candidates.keys().copied().collect();
+    let mut effective_roots = Vec::new();
+    for &term in candidates.keys() {
+        match terms.get(term) {
+            TermData::App(Symbol::Named(operator), sides)
+                if operator == "=" && sides.len() == 2 =>
+            {
+                canonical_roots.extend(sides.iter().copied());
+            }
+            TermData::Not(inner) => effective_roots.push(*inner),
+            _ => {}
+        }
+    }
+    canonical_roots.sort_unstable();
+    canonical_roots.dedup();
+    effective_roots.sort_unstable();
+    effective_roots.dedup();
+    let (effective_rendered, canonical_rendered) =
+        ay_proof::format_terms_alethe_with_overrides_and_canonical_bounded(
+            terms,
+            &effective_roots,
+            effective,
+            &canonical_roots,
+            MAX_PROMOTION_SURFACE_RENDER_WORK,
+        )
+        .ok()?;
+    let mut audited = HashMap::default();
+    for (&term, spelling) in candidates {
+        if canonical_rendered.get(&term)? != spelling {
+            audited.insert(term, spelling.clone());
+        }
+    }
+    Some(PreparedSurfaceMap {
+        audited,
+        canonical: canonical_rendered,
+        effective: effective_rendered,
+    })
+}
+
+pub(super) fn is_exact_equality_swap(
+    terms: &ay_core::TermStore,
+    term: ay_core::TermId,
+    spelling: &str,
+    canonical: &HashMap<ay_core::TermId, String>,
+) -> bool {
+    let TermData::App(Symbol::Named(operator), sides) = terms.get(term) else {
+        return false;
+    };
+    operator == "="
+        && sides.len() == 2
+        && canonical
+            .get(&sides[1])
+            .zip(canonical.get(&sides[0]))
+            .is_some_and(|(right, left)| {
+                spelling
+                    .strip_prefix("(= ")
+                    .and_then(|rest| rest.strip_prefix(right.as_str()))
+                    .and_then(|rest| rest.strip_prefix(' '))
+                    .and_then(|rest| rest.strip_prefix(left.as_str()))
+                    == Some(")")
+            })
+}
+
+pub(super) fn is_exact_compositional_negation(
+    terms: &ay_core::TermStore,
+    term: ay_core::TermId,
+    spelling: &str,
+    rendered_children: &HashMap<ay_core::TermId, String>,
+) -> bool {
+    let TermData::Not(inner) = terms.get(term) else {
+        return false;
+    };
+    rendered_children.get(inner).is_some_and(|inner| {
+        spelling
+            .strip_prefix("(not ")
+            .and_then(|rest| rest.strip_prefix(inner.as_str()))
+            == Some(")")
+    })
+}
 
 /// Collect the full term DAG reachable from every certified `Skolem` step's
 /// clause and arguments (the sko equality: source quantifier, its body, the
@@ -145,7 +237,7 @@ fn skolem_managed_cone(
 
 /// Whether any retained-override key occurs in the DAG of `roots`. Bounded;
 /// overflow counts as an intersection (fail closed).
-fn cone_mentions_key(
+pub(super) fn cone_mentions_key(
     terms: &ay_core::TermStore,
     roots: impl IntoIterator<Item = ay_core::TermId>,
     keys: &HashMap<ay_core::TermId, String>,
@@ -170,6 +262,67 @@ fn cone_mentions_key(
         }
     }
     false
+}
+
+fn emitted_roles_are_compatible(
+    terms: &ay_core::TermStore,
+    audit: &ProvenanceSurfaceAudit,
+    prepared: &PreparedSurfaceMap,
+) -> bool {
+    for (&key, spelling) in &prepared.audited {
+        if audit.is_rigid(key) {
+            return false;
+        }
+        match terms.get(key) {
+            TermData::App(Symbol::Named(op), sides) if op == "=" && sides.len() == 2 => {
+                if !is_exact_equality_swap(terms, key, spelling, &prepared.canonical) {
+                    return false;
+                }
+            }
+            TermData::Not(_) => {
+                if !is_exact_compositional_negation(terms, key, spelling, &prepared.effective) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn copied_roles_are_compatible(
+    terms: &ay_core::TermStore,
+    proof: &Proof,
+    live: &[bool],
+    replaced: &HashSet<usize>,
+    audited: &HashMap<ay_core::TermId, String>,
+) -> bool {
+    let mut work = 0usize;
+    for (index, step) in proof.steps.iter().enumerate() {
+        if !live[index] || replaced.contains(&index) {
+            continue;
+        }
+        let (clause, args) = match step {
+            ProofStep::Assume(_) | ProofStep::Anchor { .. } => continue,
+            ProofStep::Resolution { .. } => continue,
+            ProofStep::Step {
+                rule: AletheRule::Contraction | AletheRule::Weakening,
+                ..
+            } => continue,
+            ProofStep::Step { clause, args, .. } => (clause.as_slice(), args.as_slice()),
+            ProofStep::TheoryLemma { clause, .. } => (clause.as_slice(), &[] as &[_]),
+            _ => return false,
+        };
+        if cone_mentions_key(
+            terms,
+            clause.iter().chain(args).copied(),
+            audited,
+            &mut work,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 impl Executor {
@@ -209,8 +362,9 @@ impl Executor {
     /// - an equality key must be exactly the orientation swap of its
     ///   canonical rendering (`eq_transitive`/`eq_congruent` premises accept
     ///   either orientation; identity was already pruned);
-    /// - a negation key must keep the `(not ...)` shell so printed complement
-    ///   matching in resolutions still holds;
+    /// - a negation key must be the exact `(not <effective-child>)`
+    ///   composition so printed complement matching in resolutions still
+    ///   holds;
     /// - any other key (an opaque literal spelling such as an authored
     ///   `(>= len 0)` for the canonical `(<= 0 len)`) renders consistently at
     ///   every occurrence and participates only in literal-identity roles;
@@ -249,22 +403,27 @@ impl Executor {
             return false;
         }
 
-        // Carve-out 1: prune inert identity overrides (byte-for-byte the
-        // canonical rendering; observationally free either way).
-        let mut audited: HashMap<ay_core::TermId, String> = effective.clone();
-        audited.retain(|&term, spelling| {
-            *spelling != ay_proof::format_term_alethe(&self.ctx.terms, term)
-        });
-        if audited.is_empty() {
-            return true;
-        }
-
         // Carve-out 2: keys whose rendering the printer's checked Skolem
         // substitution machinery owns and re-validates fail-closed at export.
         let Some(cone) = skolem_managed_cone(&self.ctx.terms, proof) else {
             return false;
         };
-        audited.retain(|term, _| !cone.contains(term));
+        let mut candidates = effective.clone();
+        candidates.retain(|term, _| !cone.contains(term));
+        if candidates.is_empty() {
+            return true;
+        }
+
+        // Carve-out 1: prune inert identity overrides (byte-for-byte the
+        // canonical rendering; observationally free either way). Render all
+        // candidate roots, equality sides, and negation children in one
+        // aggregate-bounded batch so neither map width nor shared-deep terms
+        // can reset the work budget per entry.
+        let Some(prepared) = prepare_surface_map_bounded(&self.ctx.terms, &candidates, effective)
+        else {
+            return false;
+        };
+        let audited = &prepared.audited;
         if audited.is_empty() {
             return true;
         }
@@ -286,94 +445,20 @@ impl Executor {
                 )
             })
             .collect();
-        if !live_proof_rendering_is_static(proof, &live, &self.ctx.terms, &audited) {
+        if !live_proof_rendering_is_static(proof, &live, &self.ctx.terms, audited) {
             return false;
         }
 
-        // Copied positional roles: no surviving key may reach the operand
-        // cone of any step whose printed shape is load-bearing.
-        let mut work = 0usize;
-        for (index, step) in proof.steps.iter().enumerate() {
-            if !live[index] || replaced.contains(&index) {
-                continue;
-            }
-            let (clause, args) = match step {
-                ProofStep::Assume(_) | ProofStep::Anchor { .. } => continue,
-                // Pure literal plumbing: printed per-term-consistent literal
-                // identity (plus the negation-shell rule below) suffices.
-                ProofStep::Resolution { .. } => continue,
-                ProofStep::Step {
-                    rule: AletheRule::Contraction | AletheRule::Weakening,
-                    ..
-                } => continue,
-                ProofStep::Step { clause, args, .. } => (clause.as_slice(), args.as_slice()),
-                ProofStep::TheoryLemma { clause, .. } => (clause.as_slice(), &[] as &[_]),
-                _ => return false,
-            };
-            if cone_mentions_key(
-                &self.ctx.terms,
-                clause.iter().chain(args).copied(),
-                &audited,
-                &mut work,
-            ) {
-                return false;
-            }
+        // Copied positional roles cannot retain an override in any
+        // load-bearing operand cone.
+        if !copied_roles_are_compatible(&self.ctx.terms, proof, &live, &replaced, audited) {
+            return false;
         }
 
-        // Emitted-role compatibility for every surviving key.
-        for (&key, spelling) in &audited {
-            if audit.is_rigid(key) {
-                return false;
-            }
-            match self.ctx.terms.get(key) {
-                TermData::App(Symbol::Named(op), sides) if op == "=" && sides.len() == 2 => {
-                    let swapped = format!(
-                        "(= {} {})",
-                        ay_proof::format_term_alethe(&self.ctx.terms, sides[1]),
-                        ay_proof::format_term_alethe(&self.ctx.terms, sides[0]),
-                    );
-                    if *spelling != swapped {
-                        return false;
-                    }
-                }
-                TermData::Not(_) => {
-                    if !spelling.starts_with("(not ") {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        true
+        emitted_roles_are_compatible(&self.ctx.terms, &audit, &prepared)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use ay_core::kani_compat::DetHashMap as HashMap;
-    use ay_core::Sort;
-
-    use super::ProvenanceSurfaceAudit;
-    use crate::executor::Executor;
-
-    #[test]
-    fn standalone_euf_plan_audits_boolean_equality_surface() {
-        let mut executor = Executor::new();
-        let a = executor.ctx.terms.mk_var("late_euf_a", Sort::Int);
-        let b = executor.ctx.terms.mk_var("late_euf_b", Sort::Int);
-        let c = executor.ctx.terms.mk_var("late_euf_c", Sort::Int);
-        let ab = executor.ctx.terms.mk_eq(a, b);
-        let bc = executor.ctx.terms.mk_eq(b, c);
-        let ac = executor.ctx.terms.mk_eq(a, c);
-        let not_ab = executor.ctx.terms.mk_not_raw(ab);
-        let not_bc = executor.ctx.terms.mk_not_raw(bc);
-        let plan = executor
-            .plan_euf_lemma(&[ac, not_ab, not_bc])
-            .expect("transitivity fixture must plan");
-        let mut audit = ProvenanceSurfaceAudit::default();
-        plan.protect_surface_operands(&mut audit, &mut executor.ctx.terms);
-        let mut active = HashMap::default();
-        active.insert(not_ab, "(= (= late_euf_a late_euf_b) false)".to_string());
-        assert!(!audit.validate_effective(&executor.ctx.terms, &active));
-    }
-}
+#[path = "proof_euf_lemma_surface_tests.rs"]
+mod tests;

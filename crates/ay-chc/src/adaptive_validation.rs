@@ -26,6 +26,7 @@ use crate::pdr::{
 };
 use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver};
 use crate::{BmcSolver, ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
+use ay_core::time::Instant;
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -62,6 +63,46 @@ impl AdaptivePortfolio {
     /// Standard validation budget for 1-inductive engines (PDR, TPA, CEGAR).
     /// Matches portfolio's validate_safe budget (#5394).
     const VALIDATION_BUDGET_1INDUCTIVE: Duration = Duration::from_millis(1500);
+
+    /// Share of the REMAINING solve budget granted to final Safe/Unsafe
+    /// validation, and the cap on that share (#4751 cause-4).
+    ///
+    /// A fixed 1.5s gate discards a COMPLETE, already-verified proof whenever
+    /// re-validation over the original problem happens to be slower than the
+    /// constant — on dillig12_m the merged case-split model verifies
+    /// ("Case-split: merged model verified, returning Safe") and is then thrown
+    /// away because the SMT layer returns Unknown on a formula-level `ite` and
+    /// falls back to recursive ITE case-splits, while ~33s of the 60s solve
+    /// budget is still unused. Soundness is unchanged: validation still runs
+    /// and still fails closed; only the wall granted to it scales.
+    const VALIDATION_BUDGET_PERCENT: u32 = 50;
+    const VALIDATION_BUDGET_SCALED_CAP: Duration = Duration::from_secs(20);
+
+    /// Budget for a MANDATORY final validation, scaled by the remaining wall.
+    ///
+    /// Deliberately does NOT use the probe-budget helper: that one collapses its
+    /// floor to ZERO when `remaining < nominal`, which is correct for probes
+    /// sharing a wall but wrong here — this is the last step before a COMPLETE
+    /// proof is either published or thrown away, so it must never get LESS than
+    /// the historical fixed budget. Invariants: result >= `nominal` always, and
+    /// exactly `nominal` when there is no deadline (unbounded runs unchanged).
+    /// Measured on dillig12_m: re-validating the merged case-split model needs
+    /// more than 8.3s (25% of the remaining 33s was NOT enough), while the fixed
+    /// 1.5s discards an already-verified proof outright (#4751 cause-4).
+    pub(crate) fn final_validation_budget(
+        &self,
+        deadline: Option<Instant>,
+        nominal: Duration,
+    ) -> Duration {
+        match self.remaining_budget(deadline) {
+            None => nominal,
+            Some(remaining) => nominal.max(
+                remaining
+                    .mul_f64(f64::from(Self::VALIDATION_BUDGET_PERCENT) / 100.0)
+                    .min(Self::VALIDATION_BUDGET_SCALED_CAP),
+            ),
+        }
+    }
 
     /// Build a fresh verifier for adaptive result validation.
     ///
@@ -486,6 +527,18 @@ impl AdaptivePortfolio {
     }
 
     pub(crate) fn validate_adaptive_result(&self, result: PdrResult) -> PdrResult {
+        self.validate_adaptive_result_with_deadline(result, None)
+    }
+
+    /// Deadline-aware form of [`Self::validate_adaptive_result`].
+    ///
+    /// With `deadline == None` the budgets are exactly the historical fixed
+    /// constants, so unbounded runs are unaffected.
+    pub(crate) fn validate_adaptive_result_with_deadline(
+        &self,
+        result: PdrResult,
+        deadline: Option<Instant>,
+    ) -> PdrResult {
         match result {
             // #8782: Models with convergence_proven=true from the main PDR
             // blocking loop are inductive by the convergence theorem. However,
@@ -497,7 +550,7 @@ impl AdaptivePortfolio {
             PdrResult::Safe(ref model) if model.convergence_proven => {
                 // Extended budget: convergence models are typically from complex
                 // multi-predicate problems where standard 1.5s may be tight.
-                let budget = Duration::from_secs(3);
+                let budget = self.final_validation_budget(deadline, Duration::from_secs(3));
                 self.validate_adaptive_result_with_budget(result, budget)
             }
             // Safe validation is mandatory: direct adaptive Safe results
@@ -509,8 +562,11 @@ impl AdaptivePortfolio {
             // re-check initiation and transition clauses against the original
             // CHC system in a fresh context. If full validation cannot prove
             // those obligations within budget, demote to Unknown.
-            PdrResult::Safe(_) => self
-                .validate_adaptive_result_with_budget(result, Self::VALIDATION_BUDGET_1INDUCTIVE),
+            PdrResult::Safe(_) => {
+                let budget =
+                    self.final_validation_budget(deadline, Self::VALIDATION_BUDGET_1INDUCTIVE);
+                self.validate_adaptive_result_with_budget(result, budget)
+            }
             // Unsafe validation is mandatory for EVERY adaptive Unsafe
             // (inc-9, gate g4). Previously, without `config.validate` /
             // `strict_proofs` the result was DROPPED without any
@@ -519,8 +575,11 @@ impl AdaptivePortfolio {
             // BMC cex replay for witness-free multipred counterexamples) and
             // is accepted ONLY when that verification confirms it — still
             // fail-closed, but no longer blind to genuine refutations.
-            PdrResult::Unsafe(_) => self
-                .validate_adaptive_result_with_budget(result, Self::VALIDATION_BUDGET_1INDUCTIVE),
+            PdrResult::Unsafe(_) => {
+                let budget =
+                    self.final_validation_budget(deadline, Self::VALIDATION_BUDGET_1INDUCTIVE);
+                self.validate_adaptive_result_with_budget(result, budget)
+            }
             PdrResult::Unknown | PdrResult::NotApplicable => PdrResult::Unknown,
         }
     }

@@ -226,6 +226,14 @@ impl TheorySolver for EufSolver<'_> {
         let Some(mark) = self.scopes.pop() else {
             return;
         };
+        // #euf-inc-neg-pop: opt-in delta recording (`--euf-inc-neg-pop`).
+        // While OFF every branch below behaves exactly as it did before — the
+        // dirty sets are cleared and the full negative rescan is armed — so the
+        // flag-off path is byte-identical to baseline.
+        let pop_delta = self.inc_neg_pop_enabled;
+        // Set if this pop hit a state whose delta we cannot certify; forces the
+        // sound full rescan below.
+        let mut pop_delta_hazard = false;
         // Production soundness gate (#8454): if scope mark exceeds trail
         // length, the E-graph state is already corrupted. Clamp to prevent
         // further damage and poison the solver so next check() returns Unknown.
@@ -249,9 +257,28 @@ impl TheorySolver for EufSolver<'_> {
             match prev {
                 Some(v) => {
                     self.assigns.insert(term, v);
+                    // #euf-inc-neg-pop: a RESTORED previous value can add a
+                    // disequality to the index (true -> false) without any
+                    // representative changing, which the delta does not cover.
+                    // `record_assignment` only ever trails `None` (it treats a
+                    // conflicting re-assert as a pending conflict instead of
+                    // overwriting), so this arm is unreachable today; refuse the
+                    // delta rather than rely on that.
+                    pop_delta_hazard = true;
                 }
                 None => {
                     self.assigns.remove(&term);
+                    // #euf-inc-neg-pop: this equality atom just became
+                    // UNASSIGNED, so it is a negative-propagation candidate for
+                    // the first time. The representative delta cannot cover it
+                    // (its classes need not have changed at all), so record the
+                    // atom itself. Same-sort filtering and the index probe are
+                    // done by the scan, exactly as the full pass does them.
+                    if pop_delta {
+                        if let Some((a, b)) = self.decode_eq(term) {
+                            self.neg_pop_retracted.push((term, a, b));
+                        }
+                    }
                 }
             }
         }
@@ -289,6 +316,36 @@ impl TheorySolver for EufSolver<'_> {
                         if (node as usize) < self.enodes.len() {
                             self.enodes[node as usize].root = old_root;
                             self.enodes[node as usize].next = old_next;
+                            // #euf-inc-neg-pop: `old_root` is the representative
+                            // this node is being handed back to, and it is itself
+                            // a post-pop representative: it was a root when the
+                            // record was written, and every later merge that
+                            // absorbed it wrote its own `SetRoot { node: old_root,
+                            // old_root }` record, which this same reverse replay
+                            // undoes (records above this one in the trail were
+                            // already replayed by this or an earlier pop). So the
+                            // set of `old_root`s IS the set of class
+                            // representatives this pop split apart — exactly the
+                            // reps whose `class_eqs` bucket can hold an equality
+                            // atom whose `(min_rep,max_rep)` key changed, and
+                            // exactly the reps under which the replayed
+                            // `DiseqSet`/`DiseqRemove` records rekey the index
+                            // (merge-time rekeying always keys by the ABSORBED
+                            // rep). Verified in debug by
+                            // `debug_assert_neg_dirty_reps_are_roots`, which also
+                            // covers the one way a stale entry can survive here
+                            // (a rep recorded by an earlier pop of the same
+                            // backjump, absorbed since by a merge in an outer
+                            // scope this pop did not unwind).
+                            //
+                            // Recorded in the SPLIT set, not the event set: these
+                            // reps need the direct index probe but must NOT drive
+                            // the cong-neg lookahead, because the baseline
+                            // post-pop pass runs zero lookahead simulations over
+                            // them (see `neg_pop_split_reps`).
+                            if pop_delta {
+                                self.neg_pop_split_reps.insert(old_root);
+                            }
                             // Incremental UF-mirror sync: this node's root was just
                             // restored, so its representative may now differ from
                             // its `uf.parent` mirror entry. Record it so the next
@@ -453,7 +510,121 @@ impl TheorySolver for EufSolver<'_> {
             // which re-derives both live split pairs and surviving conflicts.
             && self.pending_diseq_conflicts.is_empty();
 
-        self.neg_dirty_reps.clear();
+        // #euf-inc-neg-pop: can the next negative scan skip the FULL candidate
+        // pass over `eq_terms` and visit only this pop's deltas?
+        //
+        // What the full pass would find that a delta pass must also find:
+        //  (1) an unassigned equality whose `(min_rep,max_rep)` key CHANGED —
+        //      then one endpoint's representative changed, so that endpoint's
+        //      post-pop rep is one of the replayed `SetRoot.old_root`s recorded
+        //      into `neg_pop_split_reps` above, and the atom sits in that rep's
+        //      `class_eqs` bucket (rebuilt by the positive full scan that always
+        //      runs first in the same `propagate`, since `pos_full_scan_needed`
+        //      is armed just above);
+        //  (2) an unassigned equality whose key is unchanged but whose key
+        //      became a LIVE index key — index keys only appear here by the
+        //      replay's `DiseqSet` (whose key is the pre-merge key, containing
+        //      the ABSORBED rep -> in `neg_pop_split_reps`) or, on the
+        //      from-scratch rebuild branch, by a disequality whose endpoint reps
+        //      changed (same argument as (1)) or whose collapsed pair SPLIT
+        //      (likewise a rep change). A key that DISAPPEARS only removes
+        //      candidates;
+        //  (3) an equality this pop UNASSIGNED — recorded in `neg_pop_retracted`.
+        // Merges asserted after this pop are covered by the existing
+        // `incremental_merge` trigger (it inserts the survivor rep into
+        // `neg_dirty_reps`).
+        //
+        // The two rep sets are consumed together but play different roles: the
+        // pop-split reps get the DIRECT index probe only, while the event set
+        // (`neg_dirty_reps`) additionally drives the cong-neg lookahead — exactly
+        // matching what a baseline post-pop full pass does (see
+        // `neg_pop_split_reps`).
+        //
+        // The cover is anchored at the last COMPLETE candidate pass, so it must
+        // CHAIN. Either this pop's predecessor already handed over a valid delta
+        // that is still pending (`neg_pop_delta_valid` — deep backjumps pop many
+        // levels before a single `propagate`, and `neg_pop_split_reps` /
+        // `neg_pop_retracted` simply accumulate), or no rescan is outstanding at
+        // all (`!neg_full_scan_needed`, i.e. the last scan WAS the complete pass).
+        // Any other state means some earlier event demanded a full pass that has
+        // not happened yet — in particular a preceding pop whose delta we refused
+        // and discarded — and this pop's own delta would not cover it.
+        //
+        // Refused when a full LOOKAHEAD sweep is armed (`neg_full_scan_la_needed`
+        // — only after reset/soft-reset/unwind, never after a plain pop), and
+        // when a disequality is stranded outside the index (`pending_neg_eqs`
+        // non-empty: the next sync would index it under a possibly-unchanged key,
+        // which no delta covers).
+        //
+        // Conditions added when this was rebased onto the adaptive-backoff /
+        // measured-crossover code (#cong-neg-cold, #cong-neg-scan-gate,
+        // #euf-inc-undo-adaptive, #euf-atom-filter), each re-derived against what
+        // the CURRENT post-pop full pass does beyond the delta:
+        //  - `eq_terms_init`: the cover is a statement about the candidate set
+        //    the anchor pass walked. `set_sat_atom_eq_terms` (#euf-atom-filter)
+        //    drops `eq_terms` and `class_eqs` and arms a full pass over the
+        //    NEW candidate set; until `init_eq_terms` has rebuilt it there is
+        //    no set to certify against. (That setter also discards the delta
+        //    state itself, so a delta pending ACROSS the reinstall is refused
+        //    by the chain condition below, not merely by this one.)
+        //  - `!poisoned`: a clamped scope/undo mark (#8454) means the trail the
+        //    delta was read off is not the trail the e-graph was restored from;
+        //    nothing read above can be trusted as a cover.
+        //  - `cong_neg_scan_suspended` (#cong-neg-scan-gate) needs NO condition:
+        //    it advances its re-probe counter once per scan in BOTH the full and
+        //    the incremental scan, and the delta path runs exactly one
+        //    incremental scan in place of exactly one full scan, so the counter
+        //    — and hence the per-scan skip decision — is bit-identical. Likewise
+        //    `cong_neg_ever_fired` / the cold cap only shape the memo's own
+        //    backoff, which both scans call through the same `la_dirty`-gated
+        //    atoms (the split set is denied the lookahead on both paths).
+        //  - the undo-mode latch (`maybe_latch_undo`, #euf-inc-undo-adaptive)
+        //    needs NO condition: it flips only at a `push` with no open scope,
+        //    so every scope this pop unwinds was recorded and replayed in ONE
+        //    mode, and `diseq_incremental_ok` above still decides prebuilt vs.
+        //    rebuild per pop — both restoration branches are handled by the
+        //    consumption site. `diseq_undo_active()` losing its size floor
+        //    (#euf-inc-diseq-undo) only changes WHICH branch is taken, never
+        //    the cover argument.
+        //
+        // A refusal is always safe: it takes the baseline full pass. A wrongly
+        // GRANTED delta costs lost propagation hints — never a wrong verdict —
+        // because `check()` is the conflict authority and the index-restoration
+        // duties below/next-scan are unchanged (see `inc_neg_pop_enabled`).
+        let pop_delta_ok = pop_delta
+            && !pop_delta_hazard
+            && !self.poisoned
+            && self.enodes_init
+            && self.func_apps_init
+            && self.eq_terms_init
+            && self.inc_neg_enabled
+            && self.inc_pos_enabled
+            && !self.neg_full_scan_la_needed
+            && self.pending_neg_eqs.is_empty()
+            && (self.neg_pop_delta_valid || !self.neg_full_scan_needed);
+        self.neg_pop_delta_valid = pop_delta_ok;
+        if !pop_delta_ok {
+            self.neg_dirty_reps.clear();
+            self.neg_pop_split_reps.clear();
+            self.neg_pop_retracted.clear();
+        } else {
+            // #euf-inc-neg-pop parity: baseline `pop` clears `neg_dirty_reps`
+            // UNCONDITIONALLY, so no pre-pop EVENT rep survives a pop with
+            // lookahead rights and the post-pop pass runs ZERO cong-neg
+            // simulations. Carrying them would re-introduce exactly the cost the
+            // baseline pop path deliberately suppresses (and would accumulate
+            // across a deep backjump). Move them to the split set instead: they
+            // keep the cheap DIRECT `diseq_pair_index` probe, but are denied the
+            // lookahead — restoring baseline parity while preserving coverage.
+            for rep in std::mem::take(&mut self.neg_dirty_reps) {
+                self.neg_pop_split_reps.insert(rep);
+            }
+        }
+        // NOTE: `debug_assert_neg_dirty_reps_are_roots` is deliberately NOT called
+        // here. The delta sets accumulate across every pop of one backjump, so a
+        // per-pop O(|set|) walk is O(pops^2) and throttles debug fuzzing; the
+        // invariant is asserted once at the consumption site instead (see
+        // `propagate_disequalities`).
         if diseq_incremental_ok {
             // The undo replay restored `diseq_pair_index` exactly. Keep it, mark
             // it prebuilt so the next full negative scan runs only the candidate
@@ -475,6 +646,32 @@ impl TheorySolver for EufSolver<'_> {
             self.diseq_pair_index.clear();
             self.diseq_keys_by_rep.clear();
             self.pending_diseq_conflicts.clear();
+        }
+        // #euf-inc-neg-pop: `pending_diseq_match_keys` holds index keys a
+        // `sync_diseq_index` inserted that NO negative scan has matched against
+        // `class_eqs` yet (assert-then-pop with no `propagate` in between). The
+        // baseline covers them with its post-pop O(n_eqs) sweep; a delta scan will
+        // not, and the clear below throws them away. Fold their endpoints into the
+        // EVENT set so the delta pass revisits those classes. Both endpoints are
+        // needed (`class_eqs` indexes an atom under both of its endpoint reps),
+        // and a key endpoint was a representative before this pop, so — since a
+        // pop only ever SPLITS classes — it still is one. Sub-classes it split
+        // into are in `neg_pop_split_reps`, so the union stays a cover. These are
+        // event reps (a newly indexed disequality), which the baseline treats as
+        // lookahead-worthy in `sync_diseq_index`.
+        if pop_delta_ok && !self.pending_diseq_match_keys.is_empty() {
+            let keys = std::mem::take(&mut self.pending_diseq_match_keys);
+            for &(key, _) in &keys {
+                // Split set, NOT the event set: `sync_diseq_index` does not treat
+                // these endpoints as lookahead-worthy — it dirties only the
+                // ARGUMENT classes of their application members
+                // (`dirty_app_member_args`), never the endpoints themselves. They
+                // need the direct probe; giving them lookahead diverges from
+                // baseline.
+                self.neg_pop_split_reps.insert(key.0);
+                self.neg_pop_split_reps.insert(key.1);
+            }
+            self.pending_diseq_match_keys = keys;
         }
         self.pending_diseq_match_keys.clear();
         // Incremental UF-mirror sync: the undo replay above restored each
@@ -583,6 +780,12 @@ impl TheorySolver for EufSolver<'_> {
         // #euf-inc-diseq-undo: index cleared — the next full negative scan must
         // rebuild it from scratch, not take the prebuilt skip.
         self.neg_index_prebuilt = false;
+        // #euf-inc-neg-pop: the anchor for the delta cover (the last complete
+        // candidate pass) is gone along with the index — the next scan must be a
+        // full pass.
+        self.neg_pop_delta_valid = false;
+        self.neg_pop_retracted.clear();
+        self.neg_pop_split_reps.clear();
         self.diseq_keys_dirty = false;
         self.diseq_index_base_depth = 0;
         // Incremental UF-mirror sync: E-graph partition was wiped; the mirror
@@ -675,6 +878,12 @@ impl TheorySolver for EufSolver<'_> {
         // #euf-inc-diseq-undo: index cleared — the next full negative scan must
         // rebuild it from scratch, not take the prebuilt skip.
         self.neg_index_prebuilt = false;
+        // #euf-inc-neg-pop: the anchor for the delta cover (the last complete
+        // candidate pass) is gone along with the index — the next scan must be a
+        // full pass.
+        self.neg_pop_delta_valid = false;
+        self.neg_pop_retracted.clear();
+        self.neg_pop_split_reps.clear();
         self.diseq_keys_dirty = false;
         self.diseq_index_base_depth = 0;
         // Incremental UF-mirror sync: E-graph partition was wiped; the mirror
@@ -1238,6 +1447,12 @@ impl EufSolver<'_> {
         // #euf-inc-diseq-undo: index cleared — the next full negative scan must
         // rebuild it from scratch, not take the prebuilt skip.
         self.neg_index_prebuilt = false;
+        // #euf-inc-neg-pop: the anchor for the delta cover (the last complete
+        // candidate pass) is gone along with the index — the next scan must be a
+        // full pass.
+        self.neg_pop_delta_valid = false;
+        self.neg_pop_retracted.clear();
+        self.neg_pop_split_reps.clear();
         self.diseq_keys_dirty = false;
         self.diseq_index_base_depth = 0;
         self.uf_full_sync_needed = true;

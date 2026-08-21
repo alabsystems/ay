@@ -141,6 +141,45 @@ impl EngineEconomics {
         Ok(self)
     }
 
+    /// The configured eager-perturb mode, if the caller set one.
+    ///
+    /// Read directly rather than through [`crate::tune`] by the all-continuous
+    /// float-first lane (`session::continuous_float_first_eager`), which runs
+    /// OUTSIDE any `tune::activate_caller` frame — that lane never installs a
+    /// caller profile, so `tune::count_opt` there reports the compiled default
+    /// no matter what the operator passed, and `--eager-perturb-mode 0` would
+    /// have been a silent no-op as a kill switch.
+    pub(crate) fn eager_perturb_mode(&self) -> Option<usize> {
+        self.eager_perturb
+    }
+
+    /// The float advice lane. Default on; `--no-float` forces every solve down
+    /// the exact rational rim.
+    ///
+    /// This is the A/B switch the float lane's speedup is measured with, and
+    /// the kill switch if it ever misbehaves. It had no carrier at all before
+    /// this: `Knob::NoFloat` was read by `session::float_lane_enabled` and
+    /// written by nothing, so `--no-float` parsed as an unknown bare switch and
+    /// changed nothing — a prior measurement that believed it had turned the
+    /// float lane off had in fact measured the float lane.
+    #[must_use]
+    pub fn with_float_lane(mut self, enabled: bool) -> Self {
+        self.float_lane = Some(enabled);
+        self
+    }
+
+    /// The configured float-lane setting, if the caller set one.
+    ///
+    /// Read directly rather than only through [`crate::tune`] for the same
+    /// reason as [`Self::eager_perturb_mode`] above: the all-continuous lane
+    /// runs OUTSIDE any `tune::activate_caller` frame, so `tune::caller_flag`
+    /// there reports the compiled default whatever the operator passed — and
+    /// the all-continuous covering class is precisely what this switch exists
+    /// to A/B. See `session::float_lane_enabled`.
+    pub(crate) fn float_lane(&self) -> Option<bool> {
+        self.float_lane
+    }
+
     pub fn with_chain_devex(mut self, mode: usize) -> Result<Self, EngineConfigError> {
         if mode > 2 {
             return Err(EngineConfigError::OutOfRange {
@@ -224,6 +263,7 @@ impl EngineEconomics {
                 Knob::EagerPerturbMode,
                 self.eager_perturb.map(Setting::Count),
             ),
+            (Knob::NoFloat, self.float_lane.map(|v| Setting::Flag(!v))),
             (Knob::NoCutoff, self.cutoff_stop.map(|v| Setting::Flag(!v))),
             (Knob::NoNodeLu, self.node_lu.map(|v| Setting::Flag(!v))),
             (Knob::NoTallLu, self.tall_lu.map(|v| Setting::Flag(!v))),
@@ -321,5 +361,41 @@ mod tests {
         for knob in [Knob::NoVub, Knob::FtGrowthTol] {
             assert_eq!(knob.env(), None, "{knob:?} must have no env spelling");
         }
+    }
+
+    /// `--no-float` HAS A CARRIER, ON BOTH ROUTES.
+    ///
+    /// `Knob::NoFloat` used to be read by `session::float_lane_enabled` and
+    /// written by nothing at all, so `--no-float` parsed as an unrecognised
+    /// bare switch and changed no behaviour — and a prior "no-float"
+    /// measurement measured the float path. This pins BOTH halves of the
+    /// repair, because either half alone leaves the flag dead on one lane:
+    /// the `tune` profile entry (branch-and-bound, which installs a caller
+    /// frame) and the direct typed getter (the all-continuous lane, which does
+    /// not).
+    #[test]
+    fn the_no_float_switch_reaches_both_the_profile_and_the_typed_getter() {
+        assert_eq!(
+            EngineEconomics::default().float_lane(),
+            None,
+            "unset by default, so the compiled default still decides"
+        );
+
+        let off = EngineEconomics::default().with_float_lane(false);
+        assert_eq!(off.float_lane(), Some(false));
+        let active = crate::tune::activate_caller(off.profile());
+        assert!(
+            crate::tune::on(Knob::NoFloat),
+            "--no-float must reach the tune layer for the branch-and-bound lane"
+        );
+        drop(active);
+
+        let on = EngineEconomics::default().with_float_lane(true);
+        assert_eq!(on.float_lane(), Some(true));
+        let _active = crate::tune::activate_caller(on.profile());
+        assert!(
+            !crate::tune::on(Knob::NoFloat),
+            "the switch must be honoured in both directions"
+        );
     }
 }

@@ -13,6 +13,8 @@ mod false_proof_array_equality_8675;
 mod ground_witness_backtranslation;
 #[path = "group_soundness/had_sat_no_cube_soundness.rs"]
 mod had_sat_no_cube_soundness;
+#[path = "group_soundness/init_fact_head_args_9312.rs"]
+mod init_fact_head_args_9312;
 #[path = "group_soundness/kind_soundness.rs"]
 mod kind_soundness;
 #[path = "group_soundness/pdkind_soundness.rs"]

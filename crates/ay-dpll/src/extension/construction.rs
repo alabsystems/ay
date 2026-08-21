@@ -332,6 +332,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             ite_deferred_atoms: Vec::new(),
             can_propagate_scan_pos: Cell::new(0),
             verify_memo: None,
+            context_records: None,
             disable_theory_check: cached.disable_theory_check,
             total_bcp_checks: 0,
             total_bcp_conflicts: 0,
@@ -926,6 +927,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             ite_deferred_atoms: Vec::new(),
             can_propagate_scan_pos: Cell::new(0),
             verify_memo: None,
+            context_records: None,
             disable_theory_check: crate::theory_debug_flags::disable_theory_check(),
             total_bcp_checks: 0,
             total_bcp_conflicts: 0,
@@ -1135,6 +1137,17 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
         memo: &'a mut crate::verification::ConflictSemanticVerifyMemo,
     ) -> Self {
         self.verify_memo = Some(memo);
+        self
+    }
+
+    /// Wire the Executor-owned #dt-context-derivation record sink into this
+    /// eager extension. See the `context_records` field doc; `None` (the
+    /// default) keeps the eager path record-free.
+    pub(crate) fn with_context_records(
+        mut self,
+        records: &'a mut crate::executor::DtContextConflictSink,
+    ) -> Self {
+        self.context_records = Some(records);
         self
     }
 

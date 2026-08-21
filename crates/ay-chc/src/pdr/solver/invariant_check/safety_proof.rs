@@ -625,14 +625,6 @@ impl PdrSolver {
                     }
                     return Some(m);
                 }
-                InductiveSubsetOutcome::Insufficient => {
-                    if self.config.verbose {
-                        safe_eprintln!(
-                            "PDR: check_invariants_prove_safety: skipping cascade (multi-predicate, inductive subset insufficient)"
-                        );
-                    }
-                    return None;
-                }
                 InductiveSubsetOutcome::Cascade(m) => {
                     return self.try_model_verification_cascade(m);
                 }

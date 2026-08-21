@@ -140,6 +140,21 @@ pub(crate) fn validate_arith_eq_triangle(
     Ok(())
 }
 
+/// Recognize the exact flat arithmetic equality-triangle clause shape
+/// [`validate_arith_eq_triangle`] accepts: `(not (<= a b)) (not (<= b a))
+/// (= a b)` — the two negated bounds FIRST, in forward-then-reverse order,
+/// with the equality LAST.
+///
+/// Like [`super::recognize_euf_transitive`], recognition IS the strict
+/// validator run on exactly the clause the caller intends to record, so a
+/// producer-side classifier and the checker that must re-validate the step
+/// cannot drift, and the ORDER-SENSITIVITY of this schema is decided on the
+/// recorded order rather than assumed (fail-closed).
+#[must_use]
+pub fn recognize_arith_eq_triangle(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_arith_eq_triangle(terms, ProofId(0), clause).is_ok()
+}
+
 /// Validate one exact equality-adapter implication, `a=b => a<=b` (or its
 /// reverse bound).  The kind cannot authorize an arbitrary arithmetic clause.
 pub(crate) fn validate_arith_eq_implies_bound(
@@ -195,6 +210,58 @@ pub(crate) fn validate_int_bounds_tautology(
             step: step_id,
             reason: "integer split clause does not negate to contradictory exact bounds"
                 .to_string(),
+        })
+    }
+}
+
+/// Validate a [`ay_core::TheoryLemmaKind::IntBoundLatticeGap`] lemma.
+///
+/// Delegates to `ay_core::proof_validation::recognize_int_bound_lattice_gap`,
+/// which re-derives the narrow integer core from the CLAUSE alone: the greatest
+/// lower bound, the least upper bound, and the coefficient `gcd` of one shared
+/// all-`Int` linear form, plus the check that no multiple of that `gcd` lies
+/// between the two bounds. Nothing is taken on the producer's word — the kind
+/// carries no annotation payload — so a forged label on any other clause is
+/// rejected here.
+pub(crate) fn validate_int_bound_lattice_gap(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_int_bound_lattice_gap(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "integer bound-lattice gap: no shared linear form in this ".to_string()
+                + "clause is squeezed by the clause negation into a range "
+                + "without an attainable value",
+        })
+    }
+}
+
+/// Validate a [`ay_core::TheoryLemmaKind::IntCutLatticeGap`] lemma.
+///
+/// Delegates to `ay_core::proof_validation::recognize_int_cut_lattice_gap`,
+/// which re-derives EVERYTHING from the clause alone: the `>=`-oriented rows,
+/// the canonical elimination multipliers for every pair of them, the tightest
+/// bound in each direction on every canonical form, and the coefficient `gcd`
+/// test that no attainable value lies between. Nothing is taken on the
+/// producer's word — the kind carries no annotation payload — so a forged
+/// label on any other clause is rejected here.
+pub(crate) fn validate_int_cut_lattice_gap(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_int_cut_lattice_gap(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "integer cut-lattice gap: no canonical two-row elimination ".to_string()
+                + "in this clause squeezes a derived linear form into a range "
+                + "without an attainable value",
         })
     }
 }

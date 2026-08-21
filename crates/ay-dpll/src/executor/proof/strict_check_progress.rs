@@ -58,6 +58,48 @@ fn executor_stopped(executor: &Executor, should_stop: &impl Fn() -> bool) -> boo
         || ay_sys::process_memory_exceeded()
 }
 
+/// Name which of [`executor_stopped`]'s four signals is currently asserted, for
+/// the cancellation probe.
+///
+/// The hot path deliberately collapses interrupt / deadline / executor-memory /
+/// process-memory into one boolean, so a cancelled strict check used to report
+/// only the disjunction — "interrupt, solve deadline, or memory limit". That is
+/// the whole differential diagnosis, and it was missing: telling those apart
+/// required hand-instrumenting four sites and rebuilding. (The answer, measured
+/// on the model-checker-consumer `dyn_ptr` CHC obligation, was the DEADLINE 233 times out of
+/// 233 — never the interrupt, never either memory guard.)
+///
+/// Re-polls each signal individually rather than threading state out of the hot
+/// path, so it costs nothing unless `--probe-strict-check` is set and a stop has
+/// already been observed. A signal that flipped in between reports as
+/// `none-now`, which is itself worth seeing.
+fn describe_stop_signal(executor: &Executor) -> String {
+    let interrupt = executor.solve_interrupt_is_set();
+    let deadline = executor.solve_deadline_state();
+    let exec_mem = crate::memory::memory_exceeded(executor.memory_limit());
+    let proc_mem = ay_sys::process_memory_exceeded();
+    if !interrupt && !exec_mem && !proc_mem && !deadline.starts_with("expired") {
+        return format!("none-now (deadline={deadline})");
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if interrupt {
+        parts.push("interrupt".to_string());
+    }
+    if deadline.starts_with("expired") {
+        parts.push(format!("deadline {deadline}"));
+    }
+    if exec_mem {
+        parts.push(format!(
+            "executor-memory(limit={:?})",
+            executor.memory_limit()
+        ));
+    }
+    if proc_mem {
+        parts.push("process-memory".to_string());
+    }
+    parts.join(" + ")
+}
+
 impl StrictCheckMeter {
     fn production() -> Self {
         Self::with_limits(MAX_CHECK_WORK, MAX_CHECK_BYTES)
@@ -93,11 +135,19 @@ impl StrictCheckMeter {
         work_delta: usize,
         byte_delta: usize,
         stopped: impl FnOnce() -> bool,
+        describe_stop: impl FnOnce() -> String,
     ) -> bool {
         if stopped() {
             self.refusal.get_or_insert(StrictCheckRefusal::Cancelled);
             probe_strict_check_refusal(|| {
-                "cancelled: interrupt, solve deadline, or memory limit".to_string()
+                format!(
+                    "cancelled: {} (work {} of {}, bytes {} of {})",
+                    describe_stop(),
+                    self.work,
+                    self.max_work,
+                    self.bytes,
+                    self.max_bytes
+                )
             });
             return false;
         }
@@ -167,11 +217,14 @@ pub(super) fn check_with_executor_progress(
         let poll_stop =
             ops == 1 || (work_delta == 0 && byte_delta == 0) || ops % STOP_POLL_INTERVAL == 0;
         if poll_stop {
-            meter.charge_while_running(work_delta, byte_delta, || {
-                executor_stopped(executor, &should_stop)
-            })
+            meter.charge_while_running(
+                work_delta,
+                byte_delta,
+                || executor_stopped(executor, &should_stop),
+                || describe_stop_signal(executor),
+            )
         } else {
-            meter.charge_while_running(work_delta, byte_delta, || false)
+            meter.charge_while_running(work_delta, byte_delta, || false, || "unpolled".to_string())
         }
     };
     let outcome = ay_proof::check_proof_strict_with_typed_context_and_progress(
@@ -222,15 +275,65 @@ mod tests {
     fn control_is_polled_on_every_charge_including_zero_delta() {
         let polls = Cell::new(0usize);
         let mut meter = StrictCheckMeter::with_limits(10, 10);
-        assert!(meter.charge_while_running(1, 1, || {
-            polls.set(polls.get() + 1);
-            false
-        }));
-        assert!(!meter.charge_while_running(0, 0, || {
-            polls.set(polls.get() + 1);
-            true
-        }));
+        assert!(meter.charge_while_running(
+            1,
+            1,
+            || {
+                polls.set(polls.get() + 1);
+                false
+            },
+            || "test".to_string()
+        ));
+        assert!(!meter.charge_while_running(
+            0,
+            0,
+            || {
+                polls.set(polls.get() + 1);
+                true
+            },
+            || "test".to_string()
+        ));
         assert_eq!(polls.get(), 2);
+    }
+
+    /// The cancel limb has to tell interrupt from deadline from memory. It used
+    /// to print the disjunction of all three, so the one question a reader has
+    /// -- WHICH one stopped it -- was the one it would not answer, and
+    /// diagnosing the model-checker-consumer `dyn_ptr` certification gap needed four
+    /// hand-instrumented sites and a rebuild to establish "the deadline, 233
+    /// times out of 233".
+    #[test]
+    fn stop_signal_description_names_the_signal_that_fired() {
+        let mut interrupted = Executor::new();
+        interrupted.set_solve_controls(Some(Arc::new(AtomicBool::new(true))), None);
+        let described = describe_stop_signal(&interrupted);
+        assert!(
+            described.contains("interrupt"),
+            "a raised interrupt must be named, got {described:?}"
+        );
+
+        let mut expired = Executor::new();
+        expired.set_solve_controls(
+            None,
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(50)),
+        );
+        let described = describe_stop_signal(&expired);
+        assert!(
+            described.starts_with("deadline expired by"),
+            "a passed deadline must be named and quantified, got {described:?}"
+        );
+        assert!(
+            !described.contains("interrupt"),
+            "an unset interrupt must not be reported, got {described:?}"
+        );
+
+        // Neither signal set: say so rather than name an innocent one.
+        let quiet = Executor::new();
+        let described = describe_stop_signal(&quiet);
+        assert!(
+            described.starts_with("none-now"),
+            "no live signal must report none-now, got {described:?}"
+        );
     }
 
     #[test]

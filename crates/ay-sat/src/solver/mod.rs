@@ -144,6 +144,35 @@ impl SolverContext for Solver {
     fn activity(&self, var: Variable) -> f64 {
         Self::activity(self, var)
     }
+
+    fn var_reason_side(&self, var: Variable) -> Option<Vec<Literal>> {
+        let index = var.index();
+        if index >= self.var_data.len() || !self.var_is_assigned(index) {
+            return None;
+        }
+        let data = &self.var_data[index];
+        let reason = data.reason;
+        if reason == NO_REASON || data.is_lazy_theory_reason() {
+            return None;
+        }
+        if is_binary_literal_reason(reason) {
+            return Some(vec![Literal(binary_reason_lit(reason))]);
+        }
+        // Guard against stale arena offsets exactly like the provenance
+        // antecedent walk above (#8490).
+        let offset = reason as usize;
+        if !self.arena.is_active(offset) {
+            return None;
+        }
+        let side: Vec<Literal> = self
+            .arena
+            .literals(offset)
+            .iter()
+            .copied()
+            .filter(|lit| lit.variable() != var)
+            .collect();
+        Some(side)
+    }
 }
 
 mod arena_gc;

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ay_test_support::env::{lock_env, ScopedEnvVar};
+use ay_test_support::env::lock_env;
 
 use crate::adaptive::{AdaptiveConfig, AdaptivePortfolio};
 use crate::engine_result::ValidationEvidence;

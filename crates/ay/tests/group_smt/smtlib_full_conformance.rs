@@ -16,84 +16,16 @@
 //! - Numeral and decimal literal formats
 //! - Named assertions and annotation handling
 
-use ntest::timeout;
-use std::io::Write;
-use std::process::{Command, Stdio};
-
-// ---------------------------------------------------------------------------
-// Helper: run AY with SMT-LIB input on stdin
-// ---------------------------------------------------------------------------
-
-struct AYOutput {
-    stdout: String,
-    stderr: String,
-    success: bool,
-}
-
-fn run_ay_stdin(input: &str) -> AYOutput {
-    let ay_path = env!("CARGO_BIN_EXE_ay");
-
-    let mut child = Command::new(ay_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn ay");
-
-    {
-        let stdin = child.stdin.as_mut().expect("stdin must be piped");
-        stdin
-            .write_all(input.as_bytes())
-            .expect("failed to write to ay stdin");
-    }
-
-    let output = child.wait_with_output().expect("failed to wait on ay");
-    AYOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        success: output.status.success(),
-    }
-}
-
-fn first_line(out: &AYOutput) -> &str {
-    out.stdout.lines().next().unwrap_or("").trim()
-}
-
-fn check_sat_results(out: &AYOutput) -> Vec<String> {
-    out.stdout
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            t == "sat" || t == "unsat" || t == "unknown"
-        })
-        .map(|l| l.trim().to_string())
-        .collect()
-}
-
-/// Assert the first check-sat result is exactly `expected`, or "unknown" if `allow_unknown`.
-fn assert_result(out: &AYOutput, expected: &str, allow_unknown: bool, context: &str) {
-    let fl = first_line(out);
-    if allow_unknown && fl == "unknown" {
-        return;
-    }
-    assert!(
-        out.success,
-        "{context}: ay exited with failure\nstdout:\n{}\nstderr:\n{}",
-        out.stdout, out.stderr
-    );
-    assert_eq!(
-        fl, expected,
-        "{context}: expected '{expected}', got '{fl}'\nstdout:\n{}\nstderr:\n{}",
-        out.stdout, out.stderr
-    );
-}
+use crate::smt::{
+    assert_result, check_sat_results, first_line, run_ay_stdin, run_ay_stdin_with_args,
+    UnknownPolicy,
+};
 
 // ===========================================================================
 // Part 1: Sort operations
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_sort_bitvec_various_widths() {
     // Test BitVec sorts of various widths: 1, 8, 16, 32, 64
     for width in &[1, 8, 16, 32, 64] {
@@ -119,7 +51,6 @@ fn test_sort_bitvec_various_widths() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_sort_array_int_int() {
     let out = run_ay_stdin(
         "(set-logic QF_AUFLIA)
@@ -130,11 +61,15 @@ fn test_sort_array_int_int() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "Array Int Int store/select");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "Array Int Int store/select",
+    );
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_sort_array_nested() {
     // Array of arrays: (Array Int (Array Int Int))
     let out = run_ay_stdin(
@@ -147,11 +82,10 @@ fn test_sort_array_nested() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "nested Array sort");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "nested Array sort");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_sort_bool_as_first_class() {
     // Bool is a first-class sort in SMT-LIB
     let out = run_ay_stdin(
@@ -163,11 +97,10 @@ fn test_sort_bool_as_first_class() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "Bool first-class sort");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "Bool first-class sort");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_sort_to_real_to_int_coercion() {
     let out = run_ay_stdin(
         "(set-logic QF_LIRA)
@@ -180,7 +113,7 @@ fn test_sort_to_real_to_int_coercion() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "to_real coercion");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "to_real coercion");
 }
 
 // ===========================================================================
@@ -190,7 +123,6 @@ fn test_sort_to_real_to_int_coercion() {
 // ---- set-info ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_set_info_source() {
     let out = run_ay_stdin(
         "(set-info :source \"test suite\")
@@ -216,7 +148,6 @@ fn test_cmd_set_info_source() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_set_info_status_unsat() {
     let out = run_ay_stdin(
         "(set-info :status unsat)
@@ -239,7 +170,6 @@ fn test_cmd_set_info_status_unsat() {
 // ---- get-assertions ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_get_assertions() {
     let out = run_ay_stdin(
         "(set-option :interactive-mode true)
@@ -263,7 +193,6 @@ fn test_cmd_get_assertions() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_get_assertions_via_produce_assertions_only() {
     // z3 enables (get-assertions) via the SMT-LIB 2.6 `:produce-assertions`
     // option (not the deprecated 2.5 `:interactive-mode`). AY must accept it too,
@@ -298,7 +227,6 @@ fn test_cmd_get_assertions_via_produce_assertions_only() {
 // ---- get-assignment ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_get_assignment() {
     let out = run_ay_stdin(
         "(set-option :produce-assignments true)
@@ -323,7 +251,6 @@ fn test_cmd_get_assignment() {
 // ---- get-option ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_get_option() {
     let out = run_ay_stdin(
         "(set-option :produce-models true)
@@ -347,7 +274,6 @@ fn test_cmd_get_option() {
 // ---- simplify ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_simplify() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -369,7 +295,6 @@ fn test_cmd_simplify() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_simplify_bool() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -392,7 +317,6 @@ fn test_cmd_simplify_bool() {
 // ---- declare-sort ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_declare_sort_arity_zero() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -404,11 +328,10 @@ fn test_cmd_declare_sort_arity_zero() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "declare-sort arity 0");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "declare-sort arity 0");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_declare_sort_used_in_function() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -422,13 +345,17 @@ fn test_cmd_declare_sort_used_in_function() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "declare-sort used in function");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "declare-sort used in function",
+    );
 }
 
 // ---- define-fun-rec ---
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_define_fun_rec() {
     // Use a simple non-recursive definition to test parsing of define-fun-rec.
     // Actual recursive evaluation may time out on complex cases.
@@ -451,7 +378,6 @@ fn test_cmd_define_fun_rec() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_cmd_define_fun_rec_genuine_recursion_evaluates() {
     // Regression (Phase 1 CLI drop-in): a terminating recursive function applied
     // to a concrete argument must EVALUATE, not blow the expansion-depth limit.
@@ -512,7 +438,6 @@ fn test_cmd_define_fun_rec_genuine_recursion_evaluates() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_let_binding_simple() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -522,11 +447,10 @@ fn test_let_binding_simple() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "let binding simple");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "let binding simple");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_let_binding_nested() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -540,11 +464,10 @@ fn test_let_binding_nested() {
 ",
     );
     // (x+1)*2 = 10 => x = 4, should be sat
-    assert_result(&out, "sat", false, "let binding nested");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "let binding nested");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_let_binding_multiple_vars() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -558,7 +481,12 @@ fn test_let_binding_multiple_vars() {
 ",
     );
     // a+b=10, a-b=2 => a=6, b=4, should be sat
-    assert_result(&out, "sat", false, "let binding multiple vars");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "let binding multiple vars",
+    );
 }
 
 // ===========================================================================
@@ -566,7 +494,6 @@ fn test_let_binding_multiple_vars() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_quantifier_forall_trivial_sat() {
     let out = run_ay_stdin(
         "(set-logic LIA)
@@ -575,11 +502,10 @@ fn test_quantifier_forall_trivial_sat() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "forall trivial sat");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "forall trivial sat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_quantifier_forall_trivial_unsat() {
     let out = run_ay_stdin(
         "(set-logic LIA)
@@ -588,11 +514,10 @@ fn test_quantifier_forall_trivial_unsat() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", true, "forall trivial unsat");
+    assert_result(&out, "unsat", UnknownPolicy::Accept, "forall trivial unsat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_quantifier_exists_sat() {
     let out = run_ay_stdin(
         "(set-logic LIA)
@@ -602,11 +527,10 @@ fn test_quantifier_exists_sat() {
 ",
     );
     // x=2 satisfies x*x=4
-    assert_result(&out, "sat", true, "exists sat");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "exists sat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_quantifier_forall_exists_combination() {
     let out = run_ay_stdin(
         "(set-logic LIA)
@@ -616,7 +540,12 @@ fn test_quantifier_forall_exists_combination() {
 ",
     );
     // For all x, y = -x makes x+y=0
-    assert_result(&out, "sat", true, "forall-exists combination");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Accept,
+        "forall-exists combination",
+    );
 }
 
 // ===========================================================================
@@ -624,7 +553,6 @@ fn test_quantifier_forall_exists_combination() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_sequential_check_sat_accumulating() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -658,7 +586,6 @@ fn test_sequential_check_sat_accumulating() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_sequential_check_sat_becomes_unsat() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -690,7 +617,6 @@ fn test_sequential_check_sat_becomes_unsat() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_and() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -701,11 +627,10 @@ fn test_bool_and() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bool and");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bool and");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_or() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -718,11 +643,10 @@ fn test_bool_or() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", false, "bool or unsat");
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "bool or unsat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_xor() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -735,11 +659,10 @@ fn test_bool_xor() {
 ",
     );
     // xor(p,q) and p=q is contradictory
-    assert_result(&out, "unsat", false, "bool xor unsat");
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "bool xor unsat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_implies() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -753,11 +676,10 @@ fn test_bool_implies() {
 ",
     );
     // p => q, p, not q is contradictory
-    assert_result(&out, "unsat", false, "bool implies unsat");
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "bool implies unsat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_ite() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -770,11 +692,10 @@ fn test_bool_ite() {
 ",
     );
     // x = ite(p, 1, 2), x = 1 => p must be true, satisfiable
-    assert_result(&out, "sat", false, "bool ite");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bool ite");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_distinct() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -787,11 +708,10 @@ fn test_bool_distinct() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "distinct 3 values");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "distinct 3 values");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bool_distinct_contradicts_equal() {
     let out = run_ay_stdin(
         "(set-logic QF_UF)
@@ -804,7 +724,12 @@ fn test_bool_distinct_contradicts_equal() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", false, "distinct contradicts equal");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Reject,
+        "distinct contradicts equal",
+    );
 }
 
 // ===========================================================================
@@ -812,7 +737,6 @@ fn test_bool_distinct_contradicts_equal() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_int_zero() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -822,11 +746,10 @@ fn test_literal_int_zero() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "int literal zero");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "int literal zero");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_int_negative() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -836,11 +759,10 @@ fn test_literal_int_negative() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "int literal negative");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "int literal negative");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_real_decimal() {
     let out = run_ay_stdin(
         "(set-logic QF_LRA)
@@ -850,11 +772,10 @@ fn test_literal_real_decimal() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "real decimal literal");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "real decimal literal");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_real_fraction() {
     let out = run_ay_stdin(
         "(set-logic QF_LRA)
@@ -864,11 +785,10 @@ fn test_literal_real_fraction() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "real fraction literal");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "real fraction literal");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_bv_hex() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -878,11 +798,10 @@ fn test_literal_bv_hex() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv hex literal");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv hex literal");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_literal_bv_binary() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -892,7 +811,7 @@ fn test_literal_bv_binary() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv binary literal");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv binary literal");
 }
 
 // ===========================================================================
@@ -900,7 +819,6 @@ fn test_literal_bv_binary() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_named_assertion() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -911,11 +829,10 @@ fn test_named_assertion() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "named assertion");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "named assertion");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_named_assertion_with_pattern() {
     // :pattern is used in quantified formulas
     let out = run_ay_stdin(
@@ -928,7 +845,12 @@ fn test_named_assertion_with_pattern() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", true, "named assertion with pattern");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Accept,
+        "named assertion with pattern",
+    );
 }
 
 // ===========================================================================
@@ -936,27 +858,24 @@ fn test_named_assertion_with_pattern() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_error_unknown_command() {
     let out = run_ay_stdin(
         "(nonexistent-command)
 (exit)
 ",
     );
-    // Should produce an error message (on stderr or stdout), not crash
+    // SMT-LIB uses the regular `unsupported` response for a well-formed but
+    // unknown command. AY also reports the rejected spelling diagnostically.
+    assert!(out.success, "unknown command must not crash");
+    assert_eq!(first_line(&out), "unsupported");
     assert!(
-        out.stderr.contains("error")
-            || out.stderr.contains("Error")
-            || out.stdout.contains("error")
-            || !out.success,
-        "unknown command should produce error\nstdout: {}\nstderr: {}",
-        out.stdout,
+        out.stderr.contains("nonexistent-command"),
+        "diagnostic should identify the rejected command: {}",
         out.stderr
     );
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_error_missing_check_sat_args() {
     // declare-const without sort should error
     let out = run_ay_stdin(
@@ -977,7 +896,6 @@ fn test_error_missing_check_sat_args() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_error_type_mismatch() {
     // Comparing Int and Bool should error
     let out = run_ay_stdin(
@@ -1005,7 +923,6 @@ fn test_error_type_mismatch() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_error_unbalanced_parens() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1027,7 +944,6 @@ fn test_error_unbalanced_parens() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_error_pop_underflow() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1048,7 +964,6 @@ fn test_error_pop_underflow() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_error_undeclared_symbol() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1074,7 +989,6 @@ fn test_error_undeclared_symbol() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_arith_int_abs() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1085,11 +999,10 @@ fn test_arith_int_abs() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "int abs");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "int abs");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_arith_int_div_mod() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1103,11 +1016,10 @@ fn test_arith_int_div_mod() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "int div mod");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "int div mod");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_arith_real_division() {
     let out = run_ay_stdin(
         "(set-logic QF_LRA)
@@ -1117,7 +1029,12 @@ fn test_arith_real_division() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "real division via multiplication");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "real division via multiplication",
+    );
 }
 
 // ===========================================================================
@@ -1125,7 +1042,6 @@ fn test_arith_real_division() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_extract_concat() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1137,11 +1053,10 @@ fn test_bv_extract_concat() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv extract");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv extract");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_concat() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1154,11 +1069,10 @@ fn test_bv_concat() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv concat");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv concat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_arithmetic() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1171,11 +1085,10 @@ fn test_bv_arithmetic() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv arithmetic");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv arithmetic");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_shift() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1186,11 +1099,10 @@ fn test_bv_shift() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv shift left");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv shift left");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_sign_extend() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1201,11 +1113,10 @@ fn test_bv_sign_extend() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv sign_extend");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv sign_extend");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_bv_zero_extend() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1216,7 +1127,7 @@ fn test_bv_zero_extend() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "bv zero_extend");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "bv zero_extend");
 }
 
 // ===========================================================================
@@ -1224,7 +1135,6 @@ fn test_bv_zero_extend() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_logic_switching_via_reset() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1259,7 +1169,6 @@ fn test_logic_switching_via_reset() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_string_concat() {
     let out = run_ay_stdin(
         "(set-logic QF_S)
@@ -1272,11 +1181,10 @@ fn test_string_concat() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "string concat");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "string concat");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_string_contains() {
     let out = run_ay_stdin(
         "(set-logic QF_S)
@@ -1287,11 +1195,10 @@ fn test_string_contains() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "string contains");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "string contains");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_string_length_constraint() {
     let out = run_ay_stdin(
         "(set-logic QF_SLIA)
@@ -1302,7 +1209,7 @@ fn test_string_length_constraint() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", true, "string length + prefix");
+    assert_result(&out, "sat", UnknownPolicy::Accept, "string length + prefix");
 }
 
 // ===========================================================================
@@ -1310,7 +1217,6 @@ fn test_string_length_constraint() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_check_sat_assuming_with_core() {
     let out = run_ay_stdin(
         "(set-option :produce-unsat-cores true)
@@ -1337,7 +1243,6 @@ fn test_check_sat_assuming_with_core() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_trivial_check_sat_no_assertions() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1345,11 +1250,15 @@ fn test_trivial_check_sat_no_assertions() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "trivial check-sat no assertions");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "trivial check-sat no assertions",
+    );
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_trivial_assert_true() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1358,11 +1267,10 @@ fn test_trivial_assert_true() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "assert true");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "assert true");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_trivial_assert_false() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1371,7 +1279,7 @@ fn test_trivial_assert_false() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", false, "assert false");
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "assert false");
 }
 
 // ===========================================================================
@@ -1379,7 +1287,6 @@ fn test_trivial_assert_false() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_multiple_consts_same_sort() {
     let out = run_ay_stdin(
         "(set-logic QF_LIA)
@@ -1398,7 +1305,12 @@ fn test_multiple_consts_same_sort() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "multiple consts same sort");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "multiple consts same sort",
+    );
 }
 
 // ===========================================================================
@@ -1406,7 +1318,6 @@ fn test_multiple_consts_same_sort() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_define_sort_bitvec_alias() {
     let out = run_ay_stdin(
         "(set-logic QF_BV)
@@ -1417,11 +1328,10 @@ fn test_define_sort_bitvec_alias() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "define-sort bv alias");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "define-sort bv alias");
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_define_sort_parameterized_alias() {
     // A parameterized synonym `(define-sort Pair (T) (Array Int T))` must
     // substitute the type parameter and solve like z3 (previously AY errored
@@ -1435,11 +1345,15 @@ fn test_define_sort_parameterized_alias() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "parameterized define-sort");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "parameterized define-sort",
+    );
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_define_sort_parameterized_alias_unsat() {
     // Soundness: a contradiction expressed through the synonym must be `unsat`,
     // never a dropped-constraint `sat`. Nested synonyms + multi-param too.
@@ -1454,11 +1368,15 @@ fn test_define_sort_parameterized_alias_unsat() {
 (exit)
 ",
     );
-    assert_result(&out, "unsat", false, "parameterized define-sort unsat");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Reject,
+        "parameterized define-sort unsat",
+    );
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_define_sort_recursive_terminates() {
     // A self-recursive parameterized synonym is malformed (z3 rejects it as an
     // unknown sort). AY's lazy expansion must NOT infinite-loop — the recursion
@@ -1485,7 +1403,6 @@ fn test_define_sort_recursive_terminates() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_qf_bvfp_model_not_corrupted_by_minimization() {
     // A BV var used only under `(_ to_fp …)` must keep its FP-pinned value in
     // the model — the counterexample minimizer used to shrink it to 0, producing
@@ -1515,7 +1432,6 @@ fn test_qf_bvfp_model_not_corrupted_by_minimization() {
 }
 
 #[test]
-#[timeout(30_000)]
 fn test_string_backslash_is_literal_smtlib26() {
     // SMT-LIB 2.6: `\` is a LITERAL character (no C-style escapes), so
     // `"a\\b"` has FOUR characters. AY used to decode `\\` -> `\` (three
@@ -1546,7 +1462,6 @@ fn test_string_backslash_is_literal_smtlib26() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_comments_semicolon() {
     let out = run_ay_stdin(
         "; This is a comment
@@ -1559,7 +1474,7 @@ fn test_comments_semicolon() {
 (exit)
 ",
     );
-    assert_result(&out, "sat", false, "comments handling");
+    assert_result(&out, "sat", UnknownPolicy::Reject, "comments handling");
 }
 
 // ===========================================================================
@@ -1567,7 +1482,6 @@ fn test_comments_semicolon() {
 // ===========================================================================
 
 #[test]
-#[timeout(30_000)]
 fn test_get_info_all_standard_keywords() {
     // Test several standard SMT-LIB get-info keywords
     for keyword in &[":name", ":version", ":authors"] {
@@ -1587,83 +1501,127 @@ fn test_get_info_all_standard_keywords() {
 // Part 20: Conformance summary covering all test categories
 // ===========================================================================
 
+struct ConformanceCase {
+    expected: &'static str,
+    input: &'static str,
+}
+
+struct ConformanceCategory {
+    name: &'static str,
+    cases: &'static [ConformanceCase],
+}
+
+const BASIC_SORT_CASES: &[ConformanceCase] = &[
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-logic QF_LIA)(declare-const x Int)(assert (= x 1))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-logic QF_LRA)(declare-const x Real)(assert (= x 1.0))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "sat",
+        input:
+            "(set-logic QF_BV)(declare-const x (_ BitVec 8))(assert (= x #xFF))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-logic QF_UF)(declare-const p Bool)(assert p)(check-sat)(exit)",
+    },
+];
+
+const ARRAY_SORT_CASES: &[ConformanceCase] = &[
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-logic QF_AUFLIA)(declare-const a (Array Int Int))(assert (= (select a 0) 1))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "unsat",
+        input: "(set-logic QF_AUFLIA)(declare-const a (Array Int Int))(assert (= (select (store a 0 1) 0) 2))(check-sat)(exit)",
+    },
+];
+
+const COMMAND_CASES: &[ConformanceCase] = &[
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-info :status sat)(set-logic QF_LIA)(declare-const x Int)(assert (= x 1))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "sat",
+        input: "(set-logic QF_LIA)(declare-const x Int)(assert (> x 0))(push 1)(assert (< x 0))(check-sat)(pop 1)(check-sat)(exit)",
+    },
+];
+
+const LET_BINDING_CASES: &[ConformanceCase] = &[ConformanceCase {
+    expected: "sat",
+    input: "(set-logic QF_LIA)(declare-const x Int)(assert (let ((y (+ x 1))) (> y 0)))(check-sat)(exit)",
+}];
+
+const BOOLEAN_CASES: &[ConformanceCase] = &[
+    ConformanceCase {
+        expected: "unsat",
+        input: "(set-logic QF_UF)(declare-const p Bool)(assert (and p (not p)))(check-sat)(exit)",
+    },
+    ConformanceCase {
+        expected: "unsat",
+        input: "(set-logic QF_UF)(declare-const p Bool)(declare-const q Bool)(assert (xor p q))(assert (= p q))(check-sat)(exit)",
+    },
+];
+
+const CONFORMANCE_CATEGORIES: &[ConformanceCategory] = &[
+    ConformanceCategory {
+        name: "Basic Sorts",
+        cases: BASIC_SORT_CASES,
+    },
+    ConformanceCategory {
+        name: "Array Sorts",
+        cases: ARRAY_SORT_CASES,
+    },
+    ConformanceCategory {
+        name: "Commands",
+        cases: COMMAND_CASES,
+    },
+    ConformanceCategory {
+        name: "Let Bindings",
+        cases: LET_BINDING_CASES,
+    },
+    ConformanceCategory {
+        name: "Boolean Ops",
+        cases: BOOLEAN_CASES,
+    },
+];
+
+fn run_conformance_category(category: &ConformanceCategory) -> usize {
+    let mut passed = 0;
+    for case in category.cases {
+        let output = run_ay_stdin(case.input);
+        let results = check_sat_results(&output);
+        let actual = results.last().map(String::as_str).unwrap_or("");
+        assert_eq!(
+            actual,
+            case.expected,
+            "{}: expected {}, got '{actual}' for: {}\nstderr: {}",
+            category.name,
+            case.expected,
+            &case.input[..case.input.len().min(60)],
+            output.stderr
+        );
+        passed += 1;
+    }
+    let rate = 100.0 * (passed as f64 / category.cases.len() as f64);
+    eprintln!(
+        "{:<20} {:>5} {:>5} {:>7.0}%",
+        category.name,
+        category.cases.len(),
+        passed,
+        rate
+    );
+    passed
+}
+
 #[test]
-#[timeout(120_000)]
 fn test_conformance_category_summary() {
-    // Quick summary across categories: sorts, commands, incremental, error handling
-    let categories: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        (
-            "Basic Sorts",
-            vec![
-                (
-                    "sat",
-                    "(set-logic QF_LIA)(declare-const x Int)(assert (= x 1))(check-sat)(exit)",
-                ),
-                (
-                    "sat",
-                    "(set-logic QF_LRA)(declare-const x Real)(assert (= x 1.0))(check-sat)(exit)",
-                ),
-                (
-                    "sat",
-                    "(set-logic QF_BV)(declare-const x (_ BitVec 8))(assert (= x #xFF))(check-sat)(exit)",
-                ),
-                (
-                    "sat",
-                    "(set-logic QF_UF)(declare-const p Bool)(assert p)(check-sat)(exit)",
-                ),
-            ],
-        ),
-        (
-            "Array Sorts",
-            vec![
-                (
-                    "sat",
-                    "(set-logic QF_AUFLIA)(declare-const a (Array Int Int))(assert (= (select a 0) 1))(check-sat)(exit)",
-                ),
-                (
-                    "unsat",
-                    "(set-logic QF_AUFLIA)(declare-const a (Array Int Int))(assert (= (select (store a 0 1) 0) 2))(check-sat)(exit)",
-                ),
-            ],
-        ),
-        (
-            "Commands",
-            vec![
-                (
-                    "sat",
-                    "(set-info :status sat)(set-logic QF_LIA)(declare-const x Int)(assert (= x 1))(check-sat)(exit)",
-                ),
-                (
-                    "sat",
-                    "(set-logic QF_LIA)(declare-const x Int)(assert (> x 0))(push 1)(assert (< x 0))(check-sat)(pop 1)(check-sat)(exit)",
-                ),
-            ],
-        ),
-        (
-            "Let Bindings",
-            vec![(
-                "sat",
-                "(set-logic QF_LIA)(declare-const x Int)(assert (let ((y (+ x 1))) (> y 0)))(check-sat)(exit)",
-            )],
-        ),
-        (
-            "Boolean Ops",
-            vec![
-                (
-                    "unsat",
-                    "(set-logic QF_UF)(declare-const p Bool)(assert (and p (not p)))(check-sat)(exit)",
-                ),
-                (
-                    "unsat",
-                    "(set-logic QF_UF)(declare-const p Bool)(declare-const q Bool)(assert (xor p q))(assert (= p q))(check-sat)(exit)",
-                ),
-            ],
-        ),
-    ];
-
-    let mut grand_total = 0;
-    let mut grand_pass = 0;
-
     eprintln!("\n=== SMT-LIB 2.6 Full Conformance Category Summary ===");
     eprintln!(
         "{:<20} {:>5} {:>5} {:>8}",
@@ -1671,56 +1629,21 @@ fn test_conformance_category_summary() {
     );
     eprintln!("{}", "-".repeat(42));
 
-    for (category, tests) in &categories {
-        let mut total = 0;
-        let mut pass = 0;
-
-        for (expected, input) in tests {
-            let out = run_ay_stdin(input);
-            total += 1;
-            grand_total += 1;
-
-            // For incremental tests with multiple check-sats, check the last result
-            let results = check_sat_results(&out);
-            let last = results.last().map(String::as_str).unwrap_or("");
-
-            if last == *expected || last == "unknown" {
-                pass += 1;
-                grand_pass += 1;
-            } else {
-                eprintln!(
-                    "  {category}: expected {expected}, got '{last}' for: {}",
-                    &input[..input.len().min(60)]
-                );
-            }
-        }
-
-        let rate = if total > 0 {
-            format!("{:.0}%", (f64::from(pass) / f64::from(total)) * 100.0)
-        } else {
-            "N/A".to_string()
-        };
-        eprintln!("{category:<20} {total:>5} {pass:>5} {rate:>8}");
-    }
-
+    let grand_total = CONFORMANCE_CATEGORIES
+        .iter()
+        .map(|category| category.cases.len())
+        .sum::<usize>();
+    let grand_pass = CONFORMANCE_CATEGORIES
+        .iter()
+        .map(run_conformance_category)
+        .sum::<usize>();
     eprintln!("{}", "-".repeat(42));
-    let grand_rate = if grand_total > 0 {
-        format!(
-            "{:.0}%",
-            (f64::from(grand_pass) / f64::from(grand_total)) * 100.0
-        )
-    } else {
-        "N/A".to_string()
-    };
+    let grand_rate = 100.0 * (grand_pass as f64 / grand_total as f64);
     eprintln!(
-        "{:<20} {:>5} {:>5} {:>8}",
+        "{:<20} {:>5} {:>5} {:>7.0}%",
         "TOTAL", grand_total, grand_pass, grand_rate
     );
-
-    assert!(
-        grand_pass > 0,
-        "At least some conformance tests should pass"
-    );
+    assert_eq!(grand_pass, grand_total, "every conformance case must pass");
 }
 
 // ===========================================================================
@@ -1734,7 +1657,6 @@ fn test_conformance_category_summary() {
 /// which maps it to a `true => false` query ⇒ unconditional `unsat`, a wrong
 /// verdict vs z3 (`sat`). `(assert false)` must STILL be `unsat`.
 #[test]
-#[timeout(30_000)]
 fn test_horn_predicate_free_tautology_is_sat() {
     for body in &["true", "(and true true)", "(forall ((x Int)) true)"] {
         let input = format!("(set-logic HORN)\n(assert {body})\n(check-sat)\n");
@@ -1742,13 +1664,13 @@ fn test_horn_predicate_free_tautology_is_sat() {
         assert_result(
             &out,
             "sat",
-            false,
+            UnknownPolicy::Reject,
             &format!("HORN tautology (assert {body})"),
         );
     }
     // Guard: a genuine contradiction stays unsat (must not be over-relaxed).
     let out = run_ay_stdin("(set-logic HORN)\n(assert false)\n(check-sat)\n");
-    assert_result(&out, "unsat", false, "HORN (assert false)");
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "HORN (assert false)");
 }
 
 // ===========================================================================
@@ -1760,33 +1682,13 @@ fn test_horn_predicate_free_tautology_is_sat() {
 /// reader rejects. `--z3-mode` (byte-compatible transcripts) must drop the head;
 /// default mode keeps AY's native form (its own model parsers consume it).
 #[test]
-#[timeout(30_000)]
 fn test_get_model_z3_mode_drops_model_head() {
-    let ay_path = env!("CARGO_BIN_EXE_ay");
     let smt = "(declare-fun x () Int)\n(assert (= x 5))\n(check-sat)\n(get-model)\n";
-
-    let run = |args: &[&str]| -> String {
-        let mut child = Command::new(ay_path)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn ay");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(smt.as_bytes())
-            .expect("write");
-        let o = child.wait_with_output().expect("wait");
-        String::from_utf8_lossy(&o.stdout).to_string()
-    };
 
     // --z3-mode: the model block opens with a bare `(` on its own line, never
     // `(model`. Filter `c ...` provenance comments the harness prints to stderr
     // (they never reach stdout, but be defensive).
-    let z3 = run(&["--z3-mode"]);
+    let z3 = run_ay_stdin_with_args(smt, &["--z3-mode"]).stdout;
     let z3_model_line = z3
         .lines()
         .find(|l| l.trim_start().starts_with('('))
@@ -1807,7 +1709,7 @@ fn test_get_model_z3_mode_drops_model_head() {
     );
 
     // Default mode retains AY's native `(model ...)` form.
-    let native = run(&[]);
+    let native = run_ay_stdin(smt).stdout;
     assert!(
         native.contains("(model"),
         "default mode should keep AY's native `(model` head:\n{native}"
@@ -1825,7 +1727,6 @@ fn test_get_model_z3_mode_drops_model_head() {
 /// full formula). These previously returned `unknown` (no Int/Real Nelson-Oppen
 /// combination). z3 decides all of them.
 #[test]
-#[timeout(30_000)]
 fn test_mixed_int_real_disjoint_split() {
     // Disjoint SAT — the P0 headline (single `(assert (and ...))`), the
     // two-assertion form, and a 2-Int + 2-Real spread.
@@ -1835,7 +1736,7 @@ fn test_mixed_int_real_disjoint_split() {
         "(declare-fun a () Int)(declare-fun b () Int)(declare-fun p () Real)(declare-fun q () Real)\n(assert (and (> a 5) (< b 0) (> p 1.5) (< q 0.0)))\n(check-sat)\n",
     ] {
         let out = run_ay_stdin(f);
-        assert_result(&out, "sat", false, "disjoint mixed Int/Real must be sat");
+        assert_result(&out, "sat", UnknownPolicy::Reject, "disjoint mixed Int/Real must be sat");
     }
 
     // UNSAT via a subset partition (the Int side alone is unsat ⇒ whole unsat).
@@ -1845,7 +1746,7 @@ fn test_mixed_int_real_disjoint_split() {
     assert_result(
         &out,
         "unsat",
-        false,
+        UnknownPolicy::Reject,
         "disjoint mixed Int/Real unsat via subset",
     );
 
@@ -1865,7 +1766,12 @@ fn test_mixed_int_real_disjoint_split() {
     let br = run_ay_stdin(
         "(declare-fun x () Int)\n(declare-fun p () Real)\n(assert (> (to_real x) p))\n(check-sat)\n",
     );
-    assert_result(&br, "sat", true, "to_real-bridged formula stays correct");
+    assert_result(
+        &br,
+        "sat",
+        UnknownPolicy::Accept,
+        "to_real-bridged formula stays correct",
+    );
 }
 
 // ===========================================================================
@@ -1879,7 +1785,6 @@ fn test_mixed_int_real_disjoint_split() {
 /// not stay stuck on `unknown` forever. Regression for the "reset does not clear
 /// session poison" divergence (z3 answers sat here).
 #[test]
-#[timeout(30_000)]
 fn test_reset_clears_error_poison() {
     let input = "(assert (> nonexistent_symbol 0))\n(check-sat)\n(reset)\n\
                  (declare-const a Int)\n(assert (= a 5))\n(check-sat)\n(get-value (a))\n";
@@ -1917,7 +1822,6 @@ fn test_reset_clears_error_poison() {
 /// (#string-predicate-propagation). The lemmas must NOT over-constrain: a lone
 /// prefixof is still `sat`.
 #[test]
-#[timeout(30_000)]
 fn test_string_prefix_suffix_imply_contains() {
     // The gaps that now close (unsat, matching z3).
     for f in &[
@@ -1926,7 +1830,7 @@ fn test_string_prefix_suffix_imply_contains() {
         "(declare-const x String)\n(declare-const p String)\n(assert (str.prefixof p x))\n(assert (not (str.contains x p)))\n(check-sat)\n",
     ] {
         let out = run_ay_stdin(f);
-        assert_result(&out, "unsat", false, "prefix/suffix implies contains refutation");
+        assert_result(&out, "unsat", UnknownPolicy::Reject, "prefix/suffix implies contains refutation");
     }
     // Regression: a lone prefixof/suffixof stays sat (the lemma adds a valid
     // implication; it must not force contains false or over-constrain).
@@ -1936,7 +1840,7 @@ fn test_string_prefix_suffix_imply_contains() {
         "(declare-const x String)\n(assert (str.prefixof \"ab\" x))\n(assert (str.contains x \"ab\"))\n(check-sat)\n",
     ] {
         let out = run_ay_stdin(f);
-        assert_result(&out, "sat", false, "lone prefix/suffix stays sat");
+        assert_result(&out, "sat", UnknownPolicy::Reject, "lone prefix/suffix stays sat");
     }
     // QF_SLIA routing: an Int constraint (`str.len`) routes the instance through
     // the string+LIA combined path, which also gets these lemmas. Still `unsat`.
@@ -1946,7 +1850,7 @@ fn test_string_prefix_suffix_imply_contains() {
     assert_result(
         &out,
         "unsat",
-        false,
+        UnknownPolicy::Reject,
         "prefix ⟹ contains fires in the QF_SLIA path too",
     );
 }
@@ -1956,7 +1860,6 @@ fn test_string_prefix_suffix_imply_contains() {
 /// so `¬contains x s ∧ replace x s t ≠ x` refutes to `unsat` = z3 (was
 /// `unknown`). A replace that genuinely changes the string stays `sat`.
 #[test]
-#[timeout(30_000)]
 fn test_to_real_integrality_bridge() {
     // to_real-integrality rewrites (#to-real-bridge): atoms over the builtin
     // to_real tighten to pure-Int atoms (equivalences), closing the mixed
@@ -2000,7 +1903,7 @@ fn test_to_real_integrality_bridge() {
         ),
     ] {
         let out = run_ay_stdin(&format!("{d}{body}\n(check-sat)\n"));
-        assert_result(&out, expected, false, why);
+        assert_result(&out, expected, UnknownPolicy::Reject, why);
     }
     // A user-declared `to_real` shadows the builtin: rewrites must stand down
     // (fail-closed unknown acceptable; a definitive unsat would fabricate
@@ -2028,23 +1931,43 @@ fn test_recursive_functions_over_datatypes() {
     let out = run_ay_stdin(&format!(
         "{dt}{len}(assert (= (len (cons 1 (cons 2 nil))) 2))\n(check-sat)\n"
     ));
-    assert_result(&out, "sat", false, "ite-based rec len over DT decides");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "ite-based rec len over DT decides",
+    );
     let out = run_ay_stdin(&format!(
         "{dt}{len}(assert (= (len (cons 1 (cons 2 nil))) 3))\n(check-sat)\n"
     ));
-    assert_result(&out, "unsat", false, "wrong len value must be unsat");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Reject,
+        "wrong len value must be unsat",
+    );
     // match-based recursion: needs the match dead-case short-circuit too.
     let mlen =
         "(define-fun-rec mlen ((l L)) Int (match l ((nil 0) ((cons h t) (+ 1 (mlen t))))))\n";
     let out = run_ay_stdin(&format!(
         "{dt}{mlen}(assert (= (mlen (cons 1 (cons 2 nil))) 2))\n(check-sat)\n"
     ));
-    assert_result(&out, "sat", false, "match-based rec len over DT decides");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "match-based rec len over DT decides",
+    );
     // Tester over a nullary constructor folds correctly in both polarities.
     let out = run_ay_stdin(&format!(
         "{dt}(assert (not ((_ is nil) nil)))\n(check-sat)\n"
     ));
-    assert_result(&out, "unsat", false, "not(is-nil nil) is unsat");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Reject,
+        "not(is-nil nil) is unsat",
+    );
     // Shadowing a constructor name with a binder must NOT fold (TermId-exact
     // guard); fail-closed unknown is acceptable, a wrong sat is not.
     let out = run_ay_stdin(&format!(
@@ -2064,11 +1987,21 @@ fn test_string_replace_idempotence() {
     let out = run_ay_stdin(
         "(declare-const x String)\n(assert (not (str.contains x \"a\")))\n(assert (not (= (str.replace x \"a\" \"b\") x)))\n(check-sat)\n",
     );
-    assert_result(&out, "unsat", false, "no-occurrence replace is a no-op");
+    assert_result(
+        &out,
+        "unsat",
+        UnknownPolicy::Reject,
+        "no-occurrence replace is a no-op",
+    );
     // Regression: a replace over a haystack that DOES contain the needle can
     // change the string, so this must stay sat (the lemma is vacuous here).
     let out = run_ay_stdin(
         "(declare-const x String)\n(assert (str.contains x \"a\"))\n(assert (not (= (str.replace x \"a\" \"b\") x)))\n(check-sat)\n",
     );
-    assert_result(&out, "sat", false, "occurring-needle replace can change x");
+    assert_result(
+        &out,
+        "sat",
+        UnknownPolicy::Reject,
+        "occurring-needle replace can change x",
+    );
 }

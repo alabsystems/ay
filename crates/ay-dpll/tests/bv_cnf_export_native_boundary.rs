@@ -6,7 +6,6 @@
 
 use ay_dpll::api::{Logic, Solver, SolverError, Sort, Tactic};
 use ay_dpll::ExecutorError;
-use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 fn assert_artifact_error<T>(result: Result<T, SolverError>, operation: &str) {
     match result {

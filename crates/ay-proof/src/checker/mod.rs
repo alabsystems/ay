@@ -3,6 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
+mod ite_premise;
+pub use ite_premise::assumed_is_authored_bool_ite_consequence;
 mod array_axiom;
 pub(crate) use array_axiom::{
     array_row_chain_printer_terms, array_select_store_printer_terms,
@@ -44,22 +46,29 @@ pub use bv_lia_query::{
 };
 mod clausification;
 mod datatype_axiom;
+mod datatype_ground;
 pub(crate) use datatype_axiom::validate_datatype_signature_context;
 pub use datatype_axiom::{
     recognize_datatype_acyclic_direct, recognize_datatype_constructor_reconstruct,
     recognize_datatype_distinct, recognize_datatype_exhaustive,
     recognize_datatype_selector_project, recognize_datatype_tester_eval,
-    recognize_datatype_tester_eval_with_selectors, DatatypeMemberSignature,
+    recognize_datatype_tester_eval_with_selectors, recognize_datatype_tester_exclusive,
+    recognize_datatype_value_eq_congruence, DatatypeMemberSignature,
 };
+pub use datatype_ground::recognize_datatype_ground_conflict;
 mod euf;
 pub use euf::{
     recognize_euf_congruent, recognize_euf_congruent_pred, recognize_euf_reflexive,
     recognize_euf_transitive,
 };
 mod euf_step_rules;
+mod fresh_def;
+pub use fresh_def::FreshDefRegistry;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
+mod ground_subst;
 mod ite_branch;
+pub use ground_subst::{ground_substitution_image_matches, recognize_ground_equality_substitution};
 mod nia_fourier_motzkin;
 pub use ite_branch::{recognize_array_guarded_row_expansion, recognize_ite_branch_projection};
 mod nia_linear_ideal;
@@ -112,6 +121,7 @@ mod ground_evaluate;
 pub use ground_evaluate::recognize_ground_evaluate;
 pub(crate) use ground_evaluate::validate_ground_evaluate as validate_ground_evaluate_for_printer;
 mod lia;
+pub use lia::recognize_arith_eq_triangle;
 mod lra_farkas;
 pub(crate) use lra_farkas::uses_progress_metered_path as farkas_uses_progress_meter;
 pub(crate) mod quantifier;
@@ -253,6 +263,33 @@ pub enum ProofCheckError {
         rule: String,
         /// Number of premises provided by the step.
         premise_count: usize,
+    },
+    /// A `resolution` / `th_resolution` step carries `:args`, but they are not
+    /// a well-formed Alethe pivot list.
+    ///
+    /// Alethe's argument-directed resolution takes a `(pivot, polarity)` PAIR
+    /// per link, i.e. `2 * (premises - 1)` arguments, with each polarity a
+    /// Boolean constant. carcara 1.1.0 routes any non-empty `:args` to that
+    /// checker and rejects the step outright when the count is wrong
+    /// (`expected 4 arguments, got 1`), so accepting a malformed list here is
+    /// exactly how AY would ship a proof carcara refuses. Distinct from
+    /// [`Self::InvalidResolution`] so the diagnostic names the count carcara
+    /// will demand instead of reporting a pivot search that never ran.
+    #[error(
+        "step {step} uses {rule} with malformed :args \
+         (expected {expected} pivot/polarity terms for {premise_count} premises, got {got})"
+    )]
+    MalformedResolutionArgs {
+        /// Invalid step ID.
+        step: ProofId,
+        /// Rule name (`resolution` or `th_resolution`).
+        rule: String,
+        /// Number of premises the step lists.
+        premise_count: usize,
+        /// Required argument count (`2 * (premise_count - 1)`).
+        expected: usize,
+        /// Argument count actually supplied.
+        got: usize,
     },
     /// The terminal clause-producing step must derive the empty clause.
     #[error("final clause-producing step {step} is not the empty clause")]
@@ -458,6 +495,12 @@ fn check_proof_collecting_trust_with_context_impl(
     // it so `SetCardEmptyByAssertion` fails closed.
     let empty_sets =
         problem_assertions.map(|assertions| EmptySetRegistry::collect(terms, assertions));
+    // Fresh-symbol definitions are built even without a problem assertion set:
+    // the load-bearing freshness test is against the proof's own `assume`
+    // leaves (see `FreshDefRegistry::collect`), and failing closed here would
+    // turn a rescuable `trust` rejection into an unrescuable hard one on the
+    // one caller that passes `None`.
+    let fresh_defs = FreshDefRegistry::collect(proof, terms, problem_assertions)?;
 
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
     let mut collected: Vec<(ProofId, Vec<TermId>)> = Vec::new();
@@ -474,6 +517,7 @@ fn check_proof_collecting_trust_with_context_impl(
             datatype_member_signatures,
             ext_diff.as_ref(),
             empty_sets.as_ref(),
+            Some(&fresh_defs),
             Some(&mut collected),
         )?;
     }
@@ -490,27 +534,38 @@ pub(crate) fn validate_problem_assumptions(
 ) -> Result<(), ProofCheckError> {
     let mut allowed: ay_core::kani_compat::DetHashSet<TermId> =
         problem_assertions.iter().copied().collect();
+    // Boolean-ITE closure members (#ite-expansion-authority): an assume of a
+    // branch implication `(=> c t)` / `(=> (not c) e)` of one of these is an
+    // ENTAILED premise — the executor's `rewrite_assertion_bool_ites` pass
+    // asserts exactly those forms for a top-level Bool ITE. Recognition is
+    // the shared structural matcher in `ite_premise`; it re-derives the
+    // entailment from the SUPPLIED problem terms, so nothing producer-side
+    // is trusted.
+    let mut authored_bool_ites: Vec<(TermId, TermId, TermId)> = Vec::new();
     let mut expanded = ay_core::kani_compat::DetHashSet::default();
     let mut stack = problem_assertions.to_vec();
     while let Some(term) = stack.pop() {
         if !expanded.insert(term) {
             continue;
         }
-        let ay_core::term::TermData::App(ay_core::Symbol::Named(name), args) = terms.get(term)
-        else {
-            continue;
-        };
-        if name != "and" {
-            continue;
-        }
-        for &arg in args {
-            allowed.insert(arg);
-            stack.push(arg);
+        match terms.get(term) {
+            ay_core::term::TermData::Ite(cond, then_term, else_term) => {
+                authored_bool_ites.push((*cond, *then_term, *else_term));
+            }
+            ay_core::term::TermData::App(ay_core::Symbol::Named(name), args) if name == "and" => {
+                for &arg in args {
+                    allowed.insert(arg);
+                    stack.push(arg);
+                }
+            }
+            _ => {}
         }
     }
     for (index, step) in proof.steps.iter().enumerate() {
         if let ProofStep::Assume(term) = step {
-            if !allowed.contains(term) {
+            if !allowed.contains(term)
+                && !assumed_is_authored_bool_ite_consequence(terms, *term, &authored_bool_ites)
+            {
                 return Err(ProofCheckError::UnauthorizedAssumption {
                     step: ProofId(index as u32),
                     term: *term,
@@ -527,6 +582,69 @@ pub(crate) fn validate_problem_assumptions(
 /// Crate-internal re-export of the diff-witness introduction shape check for
 /// the Alethe printer, so a malformed introduction is a typed print error
 /// rather than a silently-rendered comment.
+/// Validate one `fresh_def_bound` step and return the clause it derives.
+///
+/// A `fresh_def_bound` is a DEFINITION, not an inference: it asserts one bound
+/// of `d = lin` for a symbol `d` the problem never mentions. Its clause is NOT
+/// a tautology, so unlike every theory-lemma kind it cannot be certified from
+/// the clause alone; what makes it sound is whole-proof provenance (`d` fresh,
+/// ONE definiens, no introduced symbol inside any definiens, matching sorts),
+/// enforced once in [`FreshDefRegistry::collect`]. Without that registry there
+/// is nothing to check against, so strict mode rejects; non-strict mode admits
+/// the clause exactly as it admits `trust`.
+///
+/// # Errors
+///
+/// Returns [`ProofCheckError::InvalidTheoryLemma`] when strict mode has no
+/// registry, or when the registry declines this step.
+fn validate_fresh_def_bound_step(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    premises: &[ProofId],
+    args: &[TermId],
+    strict: bool,
+    fresh_defs: Option<&FreshDefRegistry>,
+) -> Result<Vec<TermId>, ProofCheckError> {
+    if !strict {
+        return Ok(clause.to_vec());
+    }
+    let registry = fresh_defs.ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: "a fresh-definition bound needs the whole-proof provenance registry this \
+                 checker entry point does not build"
+            .to_string(),
+    })?;
+    registry
+        .validate_bound(terms, step_id, clause, premises, args)
+        .map(|atom| vec![atom])
+}
+
+/// Printer-side shape gate for a `fresh_def_bound` step.
+///
+/// The printer emits this step's CLAUSE, so a malformed step must decline
+/// rather than reach the wire. Only the local shape is decided here; the
+/// whole-proof provenance is the strict checker's job and is not re-run for
+/// printing (the printer never claims the step is proved — it prints `hole`).
+///
+/// # Errors
+///
+/// Returns [`ProofCheckError::InvalidTheoryLemma`] when the step is malformed.
+pub(crate) fn validate_fresh_def_bound_for_printer(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    premises: &[ProofId],
+    args: &[TermId],
+) -> Result<(), ProofCheckError> {
+    ay_core::proof_validation::recognize_fresh_def_bound(terms, clause, premises.len(), args)
+        .map(|_| ())
+        .map_err(|error| ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: error.to_string(),
+        })
+}
+
 pub(crate) fn validate_ext_diff_intro_for_printer(
     terms: &TermStore,
     step_id: ProofId,
@@ -546,246 +664,26 @@ pub(crate) fn validate_array_extensionality_for_provenance(
     array_axiom::validate_array_extensionality(terms, step_id, clause, registry)
 }
 
-pub(crate) fn validate_step(
-    terms: &TermStore,
-    derived_clauses: &mut Vec<Option<Vec<TermId>>>,
-    step_id: ProofId,
-    step: &ProofStep,
-    strict: bool,
-    // When `Some` AND a strict `AletheRule::Trust` step is encountered, the step
-    // is DEFERRED (its clause is collected here and admitted as an axiom) instead
-    // of being rejected. The collected clauses MUST be independently discharged
-    // by the caller; this is never an unconditional accept.
-    trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
-) -> Result<(), ProofCheckError> {
-    validate_step_with_datatypes(
-        terms,
-        derived_clauses,
-        step_id,
-        step,
-        strict,
-        None,
-        None,
-        None,
-        None,
-        None,
-        trust_collector,
-    )
-}
+include!("step_validation.rs");
+include!("theory_lemma_dispatch.rs");
+include!("theory_lemma_dispatch_extended.rs");
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
 
-/// As [`validate_step`], but with the datatype constructor registry threaded in
-/// so strict mode can validate `TheoryLemmaKind::DatatypeDistinct` lemmas.
-///
-/// Runtime datatype terms carry `Sort::Uninterpreted`, so the checker cannot
-/// recover constructor membership from the `TermStore` alone — the executor
-/// supplies the `declare-datatype` declarations explicitly. When `dt_decls` is
-/// `None`, datatype-distinctness lemmas fail closed in strict mode.
-///
-/// `datatype_member_signatures.is_some()` is only a dispatch marker here. The
-/// caller MUST have run [`validate_datatype_signature_context`] over this exact
-/// `TermStore` and exact registry slices first. This covers both datatype
-/// lemmas and finite-array schemas over an enum index. All production callers
-/// satisfy that precondition through the public typed whole-proof entry points;
-/// direct calls are crate-private validator-shape tests and confer no proof
-/// authority.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_step_with_datatypes(
-    terms: &TermStore,
-    derived_clauses: &mut Vec<Option<Vec<TermId>>>,
-    step_id: ProofId,
-    step: &ProofStep,
-    strict: bool,
-    dt_decls: Option<datatype_axiom::DatatypeDecls<'_>>,
-    ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
-    datatype_member_signatures: Option<&[DatatypeMemberSignature]>,
-    // Whole-proof extensionality diff-witness provenance, built once by the
-    // caller from the proof's `array_ext_diff_intro` steps and the PROBLEM's
-    // assertions. `None` (no problem assertion set available) keeps
-    // `TheoryLemmaKind::ArrayExtensionality` fail-closed.
-    ext_diff: Option<&ExtDiffRegistry>,
-    // Problem-derived registry of sets asserted empty; `None` keeps
-    // `SetCardEmptyByAssertion` fail-closed.
-    empty_sets: Option<&EmptySetRegistry>,
-    // Deferred-trust recovery (see [`validate_step`]): when `Some`, a strict
-    // `Trust` step is collected for independent discharge instead of rejected.
-    trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
-) -> Result<(), ProofCheckError> {
-    let mut unbounded = |_: usize, _: usize| true;
-    validate_step_with_datatypes_and_progress(
-        terms,
-        derived_clauses,
-        step_id,
-        step,
-        strict,
-        dt_decls,
-        ctor_selectors,
-        datatype_member_signatures,
-        ext_diff,
-        empty_sets,
-        trust_collector,
-        &mut unbounded,
-    )
-}
+#[cfg(test)]
+#[path = "fresh_def_tests.rs"]
+mod fresh_def_tests;
+// DRIFT-PROOF name-authority lint: every operator spelling a strict validator
+// keys on must be one `ay-frontend` guarantees denotes the native theory
+// operator. See the module docs for the bug class it kills.
+#[cfg(test)]
+#[path = "name_authority_tests.rs"]
+mod name_authority_tests;
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_step_with_datatypes_and_progress(
-    terms: &TermStore,
-    derived_clauses: &mut Vec<Option<Vec<TermId>>>,
-    step_id: ProofId,
-    step: &ProofStep,
-    strict: bool,
-    dt_decls: Option<datatype_axiom::DatatypeDecls<'_>>,
-    ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
-    datatype_member_signatures: Option<&[DatatypeMemberSignature]>,
-    ext_diff: Option<&ExtDiffRegistry>,
-    empty_sets: Option<&EmptySetRegistry>,
-    trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
-    progress: &mut dyn FnMut(usize, usize) -> bool,
-) -> Result<(), ProofCheckError> {
-    debug_assert_eq!(
-        step_id.0 as usize,
-        derived_clauses.len(),
-        "BUG: step_id {} does not match derived_clauses index {}",
-        step_id.0,
-        derived_clauses.len()
-    );
-    match step {
-        ProofStep::Assume(term) => derived_clauses.push(Some(vec![*term])),
-        ProofStep::TheoryLemma {
-            clause,
-            kind,
-            farkas,
-            lia,
-            ..
-        } => validate_theory_lemma(
-            terms,
-            derived_clauses,
-            step_id,
-            clause,
-            farkas.as_ref(),
-            *kind,
-            lia.as_ref(),
-            strict,
-            dt_decls,
-            ctor_selectors,
-            datatype_member_signatures,
-            ext_diff,
-            empty_sets,
-            trust_collector,
-            progress,
-        )?,
-        // An `array_ext_diff_intro` is a DEFINITION, not an inference: it
-        // records that a fresh symbol is the extensionality difference witness
-        // for one array pair. It is validated for shape here and recorded as
-        // producing NO clause (like an `anchor`), so it can never be resolved
-        // against, never seed a RUP check, and never be mistaken for a derived
-        // empty clause. The provenance conditions that make it MEAN anything
-        // (freshness, bound-once) are whole-proof and live in
-        // `ExtDiffRegistry::collect`.
-        ProofStep::Step {
-            rule: AletheRule::ArrayExtDiffIntro,
-            clause,
-            premises,
-            args,
-        } => {
-            let _binding =
-                array_axiom::validate_ext_diff_intro(terms, step_id, clause, premises, args)?;
-            derived_clauses.push(None);
-        }
-        ProofStep::Resolution {
-            clause,
-            pivot,
-            clause1,
-            clause2,
-        } => validate_resolution_step(
-            terms,
-            derived_clauses,
-            step_id,
-            clause,
-            *pivot,
-            *clause1,
-            *clause2,
-        )?,
-        ProofStep::Step {
-            rule,
-            clause,
-            premises,
-            args,
-        } => validate_alethe_step(
-            terms,
-            derived_clauses,
-            step_id,
-            rule,
-            clause,
-            premises,
-            args,
-            strict,
-            trust_collector,
-            progress,
-        )?,
-        ProofStep::Anchor { .. } => derived_clauses.push(None),
-        _ => unreachable!("unexpected ProofStep variant"),
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_alethe_step(
-    terms: &TermStore,
-    derived_clauses: &mut Vec<Option<Vec<TermId>>>,
-    step_id: ProofId,
-    rule: &AletheRule,
-    clause: &[TermId],
-    premises: &[ProofId],
-    args: &[TermId],
-    strict: bool,
-    mut trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
-    progress: &mut dyn FnMut(usize, usize) -> bool,
-) -> Result<(), ProofCheckError> {
-    // `Hole` belongs here alongside `Trust`. AY treats the two as one family:
-    // a hole carries an obligation, not a placeholder. In deferred-trust mode
-    // collect that obligation; plain strict mode keeps it a hard rejection.
-    let deferrable = strict && matches!(rule, AletheRule::Trust | AletheRule::Hole);
-    if deferrable {
-        match &mut trust_collector {
-            Some(collector) => collector.push((step_id, clause.to_vec())),
-            None => {
-                // Same triage disclosure as `GENERIC lemma declined` below:
-                // the typed error names only the step id, but the CLAUSE the
-                // trust step asserts is the one fact a strict-decline triage
-                // needs to route the fix (missing repair lane vs producer
-                // defect). Gated on the typed `--debug-cert` carrier.
-                if ay_core::misc_cli_flags().debug_cert {
-                    let rendered: Vec<String> = clause
-                        .iter()
-                        .map(|&t| crate::format_term_alethe(terms, t))
-                        .collect();
-                    ay_core::safe_eprintln!(
-                        "c !! TRUST step rejected at {step_id:?} rule={rule:?} clause=[{}]",
-                        rendered.join(" | ")
-                    );
-                }
-                return Err(match rule {
-                    AletheRule::Hole => ProofCheckError::HoleStep { step: step_id },
-                    _ => ProofCheckError::TrustStep { step: step_id },
-                });
-            }
-        }
-    }
-    validate_generic_step(
-        terms,
-        derived_clauses,
-        step_id,
-        rule,
-        clause,
-        premises,
-        args,
-        strict,
-        // Only a hole that was collected may skip its own rejection.
-        deferrable && trust_collector.is_some(),
-        progress,
-    )
-}
+#[cfg(test)]
+#[path = "bv_expensive_budget_tests.rs"]
+mod expensive_bv_budget_tests;
 
 #[allow(clippy::too_many_arguments)]
 fn validate_theory_lemma(
@@ -836,580 +734,29 @@ fn validate_theory_lemma(
                 reason: format!("{kind:?} must not carry unrelated Farkas/LIA evidence"),
             });
         }
-        match kind {
-            TheoryLemmaKind::EufTransitive => {
-                validate_euf_transitive(terms, step_id, clause)?;
-            }
-            // Reflexivity is checked by the same routine that backs the
-            // `eq_reflexive` Alethe rule: exactly one literal, a binary
-            // equality, and both sides the SAME term. Nothing about the
-            // conflict that produced it is taken on trust.
-            TheoryLemmaKind::EufReflexive => {
-                boolean_derived::validate_eq_reflexive(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::EufCongruent => {
-                validate_euf_congruent(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::EufCongruentPred => {
-                validate_euf_congruent_pred(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::LraFarkas => {
-                lra_farkas::validate_metered(terms, step_id, clause, farkas, progress)?;
-            }
-            TheoryLemmaKind::LiaGeneric => {
-                lia::validate_metered(terms, step_id, clause, farkas, lia_ann, progress)?;
-            }
-            TheoryLemmaKind::LiaModRange => {
-                ay_core::proof_validation::validate_lia_mod_range(terms, clause).map_err(|e| {
-                    ProofCheckError::InvalidTheoryLemma {
-                        step: step_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-            }
-            TheoryLemmaKind::QuantifierNegatedExistsDual => qdual(terms, step_id, clause)?,
-            TheoryLemmaKind::BvLiaTautology => {
-                bv_lia_query::validate_bv_lia_tautology(
-                    terms,
-                    step_id,
-                    clause,
-                    farkas.is_some(),
-                    lia_ann.is_some(),
-                )?;
-            }
-            TheoryLemmaKind::SeqExtensionalCompanionContradiction => {
-                seq_extensional_companion::validate(terms, step_id, clause)?;
-            }
-            // BV bit-blast lemmas: bounded semantic validation (#8820).
-            // The previous checker accepted any non-empty clause, which let a
-            // forged proof label arbitrary Boolean literals as a bit-blast
-            // lemma. `validate_bv_bitblast` enforces:
-            //  - every literal is Boolean-sorted;
-            //  - the clause mentions at least one bitvector sub-term;
-            //  - for `BvBitBlastGate`, the clause references the declared
-            //    operator (`bvand`, `bvadd`, etc.).
-            // Full proof-bitblaster coverage is still future work (#8071), so
-            // strict mode fails closed for unsupported/too-wide clauses.
-            TheoryLemmaKind::BvBitBlast => {
-                bv_bitblast::validate_bv_bitblast(terms, step_id, clause, None)?;
-            }
-            // Boolean tautology: a propositional clause true under every bounded
-            // assignment (e.g. `(= (not (not p)) p)`). Validated by the same
-            // exhaustive bounded evaluator, without the bit-blast BV-content gate.
-            TheoryLemmaKind::BoolTautology => {
-                bv_bitblast::validate_bool_tautology(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::ArithEqTriangle => {
-                lia::validate_arith_eq_triangle(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::ArithEqImpliesBound => {
-                lia::validate_arith_eq_implies_bound(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::IntBoundsTautology => {
-                lia::validate_int_bounds_tautology(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::ArithDisequalitySplit => {
-                lia::validate_arith_disequality_split(terms, step_id, clause)?;
-            }
-            // If-then-else with identical branches: `(= (ite c x x) x)` — a
-            // syntactic axiom valid for any condition and any sort of x.
-            TheoryLemmaKind::IteSame => {
-                ite_axiom::validate_ite_same(terms, step_id, clause)?;
-            }
-            // Exact bounded decision procedure for formulas whose numeric
-            // terms are pure `ite` trees selecting Int/Real variables.  The
-            // checker enumerates one representative of every total preorder;
-            // anything outside that fragment fails closed.
-            TheoryLemmaKind::OrderIteTautology => {
-                order_ite::validate_order_ite_tautology(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::FpClassification { .. } => {
-                fp_bounded::validate_fp_classification(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::FpRoundingModeDomain => {
-                fp_bounded::validate_fp_rounding_mode_domain(terms, step_id, clause)?;
-            }
-            // Exact IEEE-754 evaluation (`fp_ground`): the clause is TRUE under
-            // every assignment of whatever variables survive its own ground
-            // bindings, decided by an INDEPENDENT correctly-rounded
-            // integer/rational kernel — not by `f64`, and not by the solver's
-            // evaluator. This is a full semantic validation rather than a
-            // schema check; unsupported operators, unbounded variable domains
-            // and budget exhaustion all fail closed.
-            TheoryLemmaKind::FpGroundEval => {
-                fp_ground::validate_fp_ground_eval(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::RoundingModeDomain => {
-                rounding_mode::validate_rounding_mode_domain(terms, step_id, clause)?;
-            }
-            // FP forward-error lemma: the clause is the disjunction of the
-            // NEGATED premises of a rounding-error refutation. The validator
-            // independently re-derives the whole analysis from the clause —
-            // fact mining, RNE/no-overflow side conditions, exact-rational
-            // half-ulp enclosure propagation, mirror-polynomial identity, and
-            // the strict claim contradiction — failing closed on anything
-            // unrecognized.
-            TheoryLemmaKind::FpForwardError => {
-                fp_forward_error::validate_fp_forward_error(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::BvBitBlastGate { gate_type, width } => {
-                bv_bitblast::validate_bv_bitblast(
-                    terms,
-                    step_id,
-                    clause,
-                    Some((gate_type, width)),
-                )?;
-            }
-            // Array theory lemmas: semantic ROW validation (#8820).
-            //
-            // Enforces that read-over-write clauses mention
-            // `(select (store ...) ...)` and that the negative case carries a
-            // disequality between the indices. Extensionality clauses are
-            // handled separately below: their soundness is provenance, not
-            // shape, so they need the `ext_diff` registry.
-            TheoryLemmaKind::ArraySelectStore { index_eq } => {
-                array_axiom::validate_array_select_store(terms, step_id, clause, index_eq)?;
-            }
-            // n-ary store-commutativity and chain read-over-write: exact
-            // schemas with fully-checked side conditions (see array_axiom.rs).
-            TheoryLemmaKind::ArrayStorePermutation => {
-                array_axiom::validate_array_store_permutation(terms, step_id, clause, progress)?;
-            }
-            TheoryLemmaKind::ArrayRowChain => {
-                array_axiom::validate_array_row_chain(terms, step_id, clause, progress)?;
-            }
-            TheoryLemmaKind::ArrayDefaultConst => {
-                array_axiom::validate_array_default_const(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SetCardNonNegative => {
-                set_axiom::validate_set_card_non_negative(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SetCardMemberLowerBound => {
-                set_axiom::validate_set_card_member_lower_bound(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SetCardEmpty => {
-                set_axiom::validate_set_card_empty(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SetCardMemberCount => {
-                set_axiom::validate_set_card_member_count(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SetCardEmptyByAssertion => {
-                set_axiom::validate_set_card_empty_by_assertion(
-                    terms, step_id, clause, empty_sets,
-                )?;
-            }
-            // Definitional set-cardinality recurrence over an EMPTY-ROOTED
-            // store chain. The empty root confines the schema to the finite
-            // fragment and is established by a walk of its own -- the
-            // membership walk short-circuits at the probed index and can
-            // answer without ever seeing the root. See set_card_chain.rs.
-            TheoryLemmaKind::SetCardChainRecurrence => {
-                set_card_chain::validate_set_card_chain_recurrence(terms, step_id, clause)?;
-            }
-            // Collection subset schemas: universally valid, re-derived from
-            // the clause alone (exact operand identity, native array
-            // signature, carrier element sort). See subset_axiom.rs.
-            TheoryLemmaKind::SubsetReflexive => {
-                subset_axiom::validate_subset_reflexive(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::SubsetElementInstance => {
-                subset_axiom::validate_subset_element_instance(terms, step_id, clause)?;
-            }
-            // Transitivity of one collection subset predicate: the chain is
-            // re-derived from the clause, so a triple that does not connect is
-            // refused. See subset_axiom.rs.
-            TheoryLemmaKind::SubsetTransitive => {
-                subset_axiom::validate_subset_transitive(terms, step_id, clause)?;
-            }
-            // One subset atom DECIDED EXACTLY on ground carriers, under the
-            // clause's own ground bindings. This is a full semantic decision
-            // rather than a schema check: an unrecognized carrier, an unbound
-            // operand the decision needs, or a polarity the pointwise decision
-            // contradicts all fail closed. See subset_axiom.rs.
-            TheoryLemmaKind::SubsetGroundEval => {
-                subset_axiom::validate_subset_ground_eval(terms, step_id, clause)?;
-            }
-            // Skolemized extensionality: NOT a tautology, so shape alone can
-            // never license it. Accepted only against the whole-proof
-            // `array_ext_diff_intro` provenance registry; `None` (the caller
-            // had no problem assertion set to check freshness against) fails
-            // closed exactly as this kind always did.
-            TheoryLemmaKind::ArrayExtensionality => {
-                array_axiom::validate_array_extensionality(terms, step_id, clause, ext_diff)?;
-            }
-            // Complete finite-carrier array schemas. Unlike Skolemized
-            // extensionality, these are theory tautologies and need no witness
-            // provenance: the checker independently enumerates the entire
-            // carrier from Bool/BV sorts or authenticated nullary constructors.
-            TheoryLemmaKind::ArrayFiniteExtensionality => {
-                array_finite::validate_array_finite_extensionality(
-                    terms,
-                    step_id,
-                    clause,
-                    dt_decls,
-                    ctor_selectors,
-                    datatype_member_signatures,
-                )?;
-            }
-            TheoryLemmaKind::ArrayFiniteSelectExpansion => {
-                array_finite::validate_array_finite_select_expansion(
-                    terms,
-                    step_id,
-                    clause,
-                    dt_decls,
-                    ctor_selectors,
-                    datatype_member_signatures,
-                )?;
-            }
-            // FP→BV lemmas: fail-closed until semantic lowering exists (#8820).
-            //
-            // Enforces the cheap schema checks first, then rejects because
-            // strict IEEE 754 re-verification against the BV circuit is #8075.
-            TheoryLemmaKind::FpToBv { operation } => {
-                fp_to_bv::validate_fp_to_bv(terms, step_id, clause, operation)?;
-            }
-            // String theory lemmas: fail-closed semantic validation (#8820).
-            //
-            // Length lemmas pass only when statically proven true. Content and
-            // normal-form lemmas reject until full semantic validation exists
-            // (#8074).
-            TheoryLemmaKind::StringLengthAxiom => {
-                string_axiom::validate_string_length_axiom(terms, step_id, clause)?;
-            }
-            // Universally-valid str.len theorem over symbolic subjects
-            // (#selfcert-strlen): the clause carries a certified length identity
-            // (concat-length sum, empty↔zero-length, non-negativity,
-            // constant-length, equal-length congruence, or containment bound).
-            // The INDEPENDENT structural checker re-derives the exact algebraic
-            // identity and fails closed on any near-miss, so the injected length
-            // axioms can carry a checkable rule instead of a bare foreign assume.
-            TheoryLemmaKind::StringLengthLemma => {
-                string_length_identity::validate_string_length_lemma(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::StringContentAxiom => {
-                string_axiom::validate_string_content_axiom(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::StringNormalForm => {
-                string_axiom::validate_string_normal_form(terms, step_id, clause)?;
-            }
-            // Ground string/regex evaluation (#8074 ground fragment): the
-            // clause carries a literal whose leaves are all constants and
-            // which the INDEPENDENT ground evaluator proves TRUE. A clause
-            // with a true literal is a tautology, so this is a full semantic
-            // validation — not a schema check. Fail-closed on anything the
-            // evaluator cannot decide outright.
-            TheoryLemmaKind::StringGroundEval => {
-                string_ground::validate_string_ground_eval(terms, step_id, clause)?;
-            }
-            // Ground sequence identity through one shared symbolic anchor:
-            // `(cl ¬(= x S1) (= x S2))` with S1/S2 ground seq terms whose
-            // concat-flattened, empty-dropped normal forms are elementwise
-            // identical — validated by an INDEPENDENT normalizer, fail-closed
-            // on any non-ground leaf or unsupported operator.
-            TheoryLemmaKind::SeqGroundEval => {
-                seq_ground::validate_seq_ground_eval(terms, step_id, clause)?;
-            }
-            // Standalone linear-arithmetic clause tautology: the negated
-            // clause (or-packed literals flattened conjunctively) is an
-            // INFEASIBLE constraint system, re-derived by the independent
-            // generic-arithmetic refuter. Intrinsically valid — no pedigree
-            // needed — exactly like `BoolTautology` propositionally.
-            TheoryLemmaKind::ArithClauseTautology => {
-                nia_linear_ideal::validate_generic_arithmetic_refutation_with_progress(
-                    terms, step_id, clause, progress,
-                )?;
-            }
-            // Term-ite branch projection / guarded ROW expansion: intrinsic
-            // clausification tautologies, validated purely structurally.
-            TheoryLemmaKind::IteBranchProjection => {
-                ite_branch::validate_ite_branch_projection(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::ArrayGuardedRowExpansion => {
-                ite_branch::validate_array_guarded_row_expansion(terms, step_id, clause)?;
-            }
-            // Regex intersection-emptiness over a SYMBOLIC subject (#regex-cert):
-            // the clause carries a `str.in_re` literal group over one common
-            // term whose jointly-denied intersection is EMPTY, so no value of
-            // the term falsifies the group and the clause is a tautology. The
-            // INDEPENDENT derivative-product checker re-derives the whole
-            // reachability argument — verified total alphabet partition,
-            // closure, non-acceptance — and fails closed on anything it cannot
-            // establish outright.
-            TheoryLemmaKind::RegexIntersectEmpty => {
-                regex_empty::validate_regex_intersect_empty(terms, step_id, clause)?;
-            }
-            // Universally-valid containment/order identity over a SYMBOLIC
-            // subject: self-containment/prefix/suffix, `str.<=` reflexivity,
-            // `str.<` irreflexivity, or an empty-word containment. The
-            // INDEPENDENT structural checker re-derives the exact theorem —
-            // the two positions must hold the SAME term, or the empty-string
-            // constant in the operator's own contained-word position — and
-            // fails closed on every near-miss.
-            TheoryLemmaKind::StringContainmentIdentity => {
-                string_word_identity::validate_string_containment_identity(terms, step_id, clause)?;
-            }
-            // Free-monoid cancellation for `str.++`: `u·w = v·w` forces
-            // `u = v` and `w·u = w·v` forces `u = v`. The INDEPENDENT
-            // structural checker re-derives the shared block and both
-            // residuals from the clause alone; a block that is not
-            // syntactically identical, sits at the wrong end, or does not
-            // leave exactly the conclusion's two sides is rejected.
-            TheoryLemmaKind::StringConcatCancellation => {
-                string_word_identity::validate_string_concat_cancellation(terms, step_id, clause)?;
-            }
-            // A containment refuted by the GROUND blocks it names. The
-            // INDEPENDENT factor scan re-derives the impossibility from the
-            // clause's own constants — a ground block missing from a ground
-            // container, or a ground pattern disagreeing with the container's
-            // ground boundary block — and never reasons about the symbolic
-            // parts.
-            TheoryLemmaKind::StringGroundFactorConflict => {
-                string_word_identity::validate_string_ground_factor_conflict(
-                    terms, step_id, clause,
-                )?;
-            }
-            // A regex membership bounding `str.len` below. The INDEPENDENT
-            // compositional minimum-length computation re-derives the bound
-            // from the ground regex tree and rejects `re.comp`, every
-            // unmodelled operator, a non-ground leaf, a mismatched subject, and
-            // any bound stronger than it can support.
-            TheoryLemmaKind::RegexLengthLowerBound => {
-                regex_length::validate_regex_length_lower_bound(terms, step_id, clause)?;
-            }
-            // Datatype constructor distinctness (#8419 / trust_count→0).
-            //
-            // `(not (= C1(..) C2(..)))` for two distinct constructors of the
-            // same datatype is a tautology of datatype theory. The checker
-            // cannot recover constructor membership from `TermStore` alone
-            // (runtime datatype terms carry `Sort::Uninterpreted`), so the
-            // executor supplies the `declare-datatype` registry. Without it
-            // this kind fails closed rather than assuming distinctness by shape.
-            TheoryLemmaKind::DatatypeDistinct => match (dt_decls, datatype_member_signatures) {
-                (Some(decls), Some(_)) => {
-                    datatype_axiom::validate_datatype_distinct(terms, step_id, clause, decls)?;
-                }
-                _ => {
-                    return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                        step: step_id,
-                        kind,
-                    });
-                }
-            },
-            // Direct acyclicity (occurs check), C5b reintroduced: a denied
-            // equality whose one side is a registered-constructor application
-            // properly containing the other side through constructor
-            // applications only. Iterative bounded walk; the registry is the
-            // constructor identity authority, so without it the kind fails
-            // closed exactly like its siblings.
-            TheoryLemmaKind::DatatypeAcyclicDirect => {
-                match (dt_decls, datatype_member_signatures) {
-                    (Some(decls), Some(_)) => {
-                        datatype_axiom::validate_datatype_acyclic_direct(
-                            terms, step_id, clause, decls,
-                        )?;
-                    }
-                    _ => {
-                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                            step: step_id,
-                            kind,
-                        });
-                    }
-                }
-            }
-            // Finite-enum pigeonhole. Same fail-closed contract as the sibling
-            // above: without the datatype registry the checker cannot establish
-            // the constructor count or the nullarity the argument rests on, so
-            // the kind is rejected rather than assumed.
-            TheoryLemmaKind::DatatypeEnumPigeonhole => {
-                match (dt_decls, datatype_member_signatures) {
-                    (Some(decls), Some(_)) => {
-                        datatype_axiom::validate_datatype_enum_pigeonhole(
-                            terms,
-                            step_id,
-                            clause,
-                            decls,
-                            ctor_selectors,
-                        )?;
-                    }
-                    _ => {
-                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                            step: step_id,
-                            kind,
-                        });
-                    }
-                }
-            }
-            // Datatype selector projection (#trust-count→0).
-            //
-            // `(= (sel_i (C a_0 .. a_n)) a_i)` — reading field `i` of a
-            // constructor application yields argument `i` — is a tautology of
-            // datatype theory exactly when `sel_i` is `C`'s registered field-`i`
-            // selector. The carrier sort is `Sort::Uninterpreted`, so the checker
-            // is given the constructor→selector registry; without it this kind
-            // fails closed rather than assuming the projection by shape.
-            TheoryLemmaKind::DatatypeSelectorProject => {
-                match (ctor_selectors, datatype_member_signatures) {
-                    (Some(selectors), Some(_)) => {
-                        datatype_axiom::validate_datatype_selector_project(
-                            terms, step_id, clause, selectors,
-                        )?;
-                    }
-                    _ => {
-                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                            step: step_id,
-                            kind,
-                        });
-                    }
-                }
-            }
-            // Pure-NRA interval refutation (#nra-cert): the checker's OWN
-            // bounded exact-rational interval propagation re-refutes the
-            // negated clause from the terms alone — no payload, nothing to
-            // forge. Fail-closed on any shape/degree/budget surprise.
-            TheoryLemmaKind::NraIntervalUnsat => {
-                nra_interval::validate_nra_interval_unsat(terms, step_id, clause)?;
-            }
-            // Pure-NRA univariate refutation (#nra-cert): the checker's OWN
-            // exact Sturm-based cell decomposition re-decides the negated
-            // one-variable system, algebraically correct at irrational roots
-            // (the sqrt(2) trap). Fail-closed everywhere.
-            TheoryLemmaKind::NraUnivariateUnsat => {
-                nra_univariate::validate_nra_univariate_unsat(terms, step_id, clause)?;
-            }
-            TheoryLemmaKind::DatatypeTesterEval => match (dt_decls, datatype_member_signatures) {
-                (Some(decls), Some(_)) => {
-                    datatype_axiom::validate_datatype_tester_eval(
-                        terms,
-                        step_id,
-                        clause,
-                        decls,
-                        ctor_selectors,
-                        true,
-                    )?;
-                }
-                _ => {
-                    return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                        step: step_id,
-                        kind,
-                    });
-                }
-            },
-            // Datatype constructor coverage (#trust-count→0, C5).
-            //
-            // `(is-C1 t) ∨ .. ∨ (is-Ck t)` over ALL declared constructors of
-            // `t`'s datatype is a tautology of datatype theory — every value
-            // is built by SOME constructor. The coverage list cannot be
-            // recovered from the `TermStore` (carrier sorts are
-            // `Sort::Uninterpreted`), so the executor supplies the registry;
-            // without it this kind fails closed rather than trusting the
-            // clause to have named every constructor.
-            TheoryLemmaKind::DatatypeExhaustive => match (dt_decls, datatype_member_signatures) {
-                (Some(decls), Some(_)) => {
-                    datatype_axiom::validate_datatype_exhaustive(terms, step_id, clause, decls)?;
-                }
-                _ => {
-                    return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                        step: step_id,
-                        kind,
-                    });
-                }
-            },
-            // Guarded datatype constructor reconstruction (#trust-count→0, C5).
-            //
-            // `(not (is-C t)) ∨ (= t (C (sel_1 t) .. (sel_k t)))` is a
-            // tautology exactly when `sel_1 .. sel_k` is `C`'s FULL declared
-            // selector list in declared field order. Both the constructor
-            // registry (tester authentication, sort matching) and the
-            // constructor→selector registry (field list + order + nullarity)
-            // are required; without either this kind fails closed.
-            TheoryLemmaKind::DatatypeConstructorReconstruct => {
-                match (dt_decls, ctor_selectors, datatype_member_signatures) {
-                    (Some(decls), Some(selectors), Some(_)) => {
-                        datatype_axiom::validate_datatype_constructor_reconstruct(
-                            terms, step_id, clause, decls, selectors,
-                        )?;
-                    }
-                    _ => {
-                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                            step: step_id,
-                            kind,
-                        });
-                    }
-                }
-            }
-            other => {
-                // Retired non-trust kinds, including the inert datatype C5b
-                // tags, intentionally reach the fail-closed rejection below.
-                // Before falling back to deferral/rejection, try to VALIDATE the
-                // lemma outright: an arithmetic conflict whose refutation is a
-                // linear combination of equalities over the monomial basis is
-                // fully checkable here, and that is the dominant `Generic` shape
-                // (loop-invariant consecution, where the nonlinear monomials
-                // cancel). This only ever ACCEPTS what the checker reconstructs
-                // itself — the lemma carries no payload to forge — and any other
-                // outcome falls through to the pre-existing fail-closed handling
-                // below, so nothing that used to be rejected becomes trusted.
-                //
-                // Two rules share ONE normalization of the negated clause: the
-                // equality-SPAN fast path (polynomial identities, where the
-                // nonlinear monomials cancel) and, when that declines, the
-                // ORDER lane — Fourier-Motzkin elimination over the same
-                // monomial-abstracted constraints, which reaches the `<`/`<=`
-                // conflicts the span rule ignores by construction
-                // (antisymmetry, transitivity, scaled bound contradictions).
-                if other.is_trust() {
-                    match nia_linear_ideal::validate_generic_arithmetic_refutation_with_progress(
-                        terms, step_id, clause, progress,
-                    ) {
-                        Ok(()) => {
-                            derived_clauses.push(Some(clause.to_vec()));
-                            return Ok(());
-                        }
-                        Err(ProofCheckError::ResourceLimit) => {
-                            return Err(ProofCheckError::ResourceLimit);
-                        }
-                        Err(_) => {}
-                    }
-                }
-                // A trust-kind (`Generic`) theory lemma has no dedicated strict
-                // validator (e.g. an integer-arithmetic lemma over an `ite` whose
-                // proof is not Farkas-pure, so no typed LIA validator can discharge
-                // it). In DEFERRED-trust mode (collector present) record its clause
-                // for independent re-discharge and fall through to admit it —
-                // exactly like a `Step{rule:Trust}`. In plain strict mode it stays
-                // a hard rejection.
-                match (other.is_trust(), trust_collector) {
-                    (true, Some(collector)) => collector.push((step_id, clause.to_vec())),
-                    _ => {
-                        // The SHAPE of the lemma no Generic lane could decide is
-                        // the one fact a strict-decline triage needs, and it was
-                        // unobservable: `UnsupportedTheoryLemmaKind` names the
-                        // step and the kind, never the clause. Without it a
-                        // triage cannot tell a CHECKER gap (the clause is a
-                        // standalone theory tautology nothing validates) from a
-                        // PRODUCER defect (the clause is a propagation valid
-                        // only under the other assertions, which must never be
-                        // admitted). Gated on the existing typed `--debug-cert`
-                        // carrier, reachable in-process through
-                        // `ay_core::set_global_misc_cli_flags_with`.
-                        if ay_core::misc_cli_flags().debug_cert {
-                            let rendered: Vec<String> = clause
-                                .iter()
-                                .map(|&t| crate::format_term_alethe(terms, t))
-                                .collect();
-                            ay_core::safe_eprintln!(
-                                "c !! GENERIC lemma declined at {step_id:?} kind={other:?} \
-                                 clause=[{}]",
-                                rendered.join(" | ")
-                            );
-                        }
-                        return Err(ProofCheckError::UnsupportedTheoryLemmaKind {
-                            step: step_id,
-                            kind: other,
-                        });
-                    }
-                }
-            }
+        let mut validation = TheoryLemmaValidation {
+            terms,
+            step_id,
+            clause,
+            farkas,
+            lia_ann,
+            dt_decls,
+            ctor_selectors,
+            datatype_member_signatures,
+            ext_diff,
+            empty_sets,
+            progress,
+        };
+        let handled = validate_theory_core(&mut validation, kind)?
+            || validate_theory_numeric_and_fp(&mut validation, kind)?
+            || validate_theory_sets(&mut validation, kind)?
+            || validate_theory_arrays_and_strings(&mut validation, kind)?
+            || validate_theory_ground_and_words(&mut validation, kind)?
+            || validate_theory_datatype_primary(&mut validation, kind)?
+            || validate_theory_nra_and_tester(&mut validation, kind)?
+            || validate_theory_datatype_remaining(&mut validation, kind)?;
+        if !handled {
+            validate_theory_fallback(&mut validation, kind, trust_collector)?;
         }
     }
     derived_clauses.push(Some(clause.to_vec()));
@@ -1696,18 +1043,3 @@ fn premise_clause(
         .as_deref()
         .ok_or(ProofCheckError::PremiseHasNoClause { step, premise })
 }
-
-#[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
-// DRIFT-PROOF name-authority lint: every operator spelling a strict validator
-// keys on must be one `ay-frontend` guarantees denotes the native theory
-// operator. See the module docs for the bug class it kills.
-#[cfg(test)]
-#[path = "name_authority_tests.rs"]
-mod name_authority_tests;
-
-#[cfg(test)]
-#[path = "bv_expensive_budget_tests.rs"]
-mod expensive_bv_budget_tests;

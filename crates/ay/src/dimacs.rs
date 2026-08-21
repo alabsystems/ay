@@ -7603,6 +7603,8 @@ fn verify_unsat_proof_from_source(
     }
 }
 
+include!("dimacs/configure_support.rs");
+
 fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::StatsConfig) {
     // Wire interrupt flag so the solver checks the watchdog directly (#3638).
     if let Some(handle) = INTERRUPT_HANDLE.get() {
@@ -7694,7 +7696,12 @@ fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::Sta
     {
         solver.set_lrat_proof_clamp_probe_rescue_enabled(true);
     }
-    if ay_core::sat_ab_switches().yield_rescue_backbone_cooldown {
+    // M3 default flip (2026-08-19): ON unless opted out — paired A/B lost
+    // nothing; the 900s confirmation held the gain.
+    if ay_core::sat_ab_switches()
+        .yield_rescue_backbone_cooldown
+        .unwrap_or(true)
+    {
         solver.set_inprocessing_yield_rescue_backbone_cooldown_enabled(true);
     }
     if ay_core::sat_ab_switches().bounded_backbone_zero_decompose_backoff {
@@ -7705,28 +7712,7 @@ fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::Sta
             .backbone_post_vivify_binary_admission
             .unwrap_or(true),
     );
-    // Enable periodic progress reporting if --progress was set.
-    if super::PROGRESS_ENABLED.load(Ordering::Relaxed) {
-        solver.set_progress_enabled(true);
-    }
-    // Attach JSONL progress observer if configured (#8155 subtask 7b).
-    if let Some(path) = super::PROGRESS_JSON_PATH.get() {
-        if let Ok(observer) = ay_sat::json_observer::JsonProgressObserver::new_append(path) {
-            solver.set_observer(Some(Box::new(observer)));
-        }
-    }
-    // Apply --disable CLI flags for SAT technique disabling (#8331).
-    // Reads the global populated by run_solve() instead of env vars.
-    if let Some(techniques) = super::DISABLED_SAT_TECHNIQUES.get() {
-        for &technique in techniques {
-            solver.disable_technique(technique);
-        }
-    }
-    // TLA trace setup is done in run_dimacs_from_content for the non-proof solver path.
-    solver.maybe_enable_diagnostic_trace_from_env();
-    solver.maybe_enable_decision_trace_from_env();
-    solver.maybe_enable_replay_trace_from_env();
-    solver.maybe_load_solution_from_env();
+    finish_configure_dimacs_solver(solver);
 }
 
 // Serialize the process-global FMLA proof-out env override: the mutation and its

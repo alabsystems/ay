@@ -2,6 +2,9 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use super::*;
+use serial_test::serial;
+
 #[test]
 fn test_debug_config_empty_by_default() {
     let cfg = DebugConfig::default();
@@ -155,6 +158,69 @@ fn test_claim_trace_file_idempotent() {
 
     claim_trace_file();
     claim_trace_file(); // double claim should not panic or change state
+    assert!(TRACE_FILE_CLAIMED.load(Ordering::Acquire));
+
+    release_trace_file();
+}
+
+/// The consumer-facing half of the measurement gap: a Rust-API caller can
+/// name a diagnostic channel without naming all ~120 `MiscCliFlags` fields,
+/// and building the value installs nothing.
+#[test]
+fn misc_cli_flags_with_applies_configuration_and_installs_nothing() {
+    let base = misc_cli_flags_with(|_| {});
+    assert!(
+        !base.probe_cert_reject && !base.phase_trace && !base.debug_cert,
+        "no AY_* fallback may resurrect a retired diagnostic carrier"
+    );
+
+    let tuned = misc_cli_flags_with(|flags| {
+        flags.probe_cert_reject = true;
+        flags.phase_trace = true;
+    });
+    assert!(tuned.probe_cert_reject, "configure must be applied");
+    assert!(tuned.phase_trace, "configure must be applied");
+    assert!(
+        !tuned.debug_cert,
+        "configure must not disturb the fields it did not name"
+    );
+
+    // Purity: building a value must not initialize (or mutate) the global.
+    let before = misc_cli_flags().probe_cert_reject;
+    let _ = misc_cli_flags_with(|flags| flags.probe_cert_reject = true);
+    assert_eq!(
+        misc_cli_flags().probe_cert_reject,
+        before,
+        "misc_cli_flags_with must be pure"
+    );
+}
+
+#[test]
+#[serial(trace_file_claim)]
+fn test_trace_file_available_false_when_no_env_var() {
+    // In the test environment no trace file is configured,
+    // so trace_file_available() should return false regardless of claim state.
+    release_trace_file();
+    assert!(
+        !trace_file_available(),
+        "trace_file_available should be false when no trace file is configured"
+    );
+}
+
+#[test]
+#[serial(trace_file_claim)]
+fn test_claim_release_cycle() {
+    // Simulate a solver reuse scenario: claim -> solve -> release -> claim again
+    release_trace_file();
+
+    claim_trace_file();
+    assert!(TRACE_FILE_CLAIMED.load(Ordering::Acquire));
+
+    release_trace_file();
+    assert!(!TRACE_FILE_CLAIMED.load(Ordering::Acquire));
+
+    // Second solve can claim again
+    claim_trace_file();
     assert!(TRACE_FILE_CLAIMED.load(Ordering::Acquire));
 
     release_trace_file();

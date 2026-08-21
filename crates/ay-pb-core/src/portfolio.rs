@@ -27,7 +27,6 @@
 //! - Een & Sorensson, "Translating Pseudo-Boolean Constraints into SAT", 2006
 
 use std::collections::BinaryHeap;
-use std::ffi::OsStr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;

@@ -126,7 +126,7 @@ impl Solver {
             if self.arena.is_garbage_any(idx) {
                 continue;
             }
-            let clen = self.arena.len_of(idx);
+            let clen = self.arena.len_of(idx); // See BINARY_CLAUSE_VIVIFICATION.md.
             if clen < 3 {
                 continue;
             }

@@ -154,6 +154,10 @@ impl TheorySolver for NraSolver<'_> {
         self.aux_to_monomial.clear();
         self.compound_factors.clear();
         self.compound_defs_emitted.clear();
+        // The cache describes rows live in `lra`; `lra.reset()` below removes
+        // every such row, so retaining a key would suppress a required row in
+        // the next independent solve.
+        self.linearization_rows.clear();
         self.sign_constraints.clear();
         self.var_sign_constraints.clear();
         self.sign_constraint_trail.clear();

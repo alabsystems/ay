@@ -257,6 +257,10 @@ macro_rules! pipeline_incremental_setup {
         }
 
         let _pis_cnf_to_sat = $crate::cnf_lit_to_sat;
+        // #dt-lazy-axiom-authority: snapshot the query-scoped injected-axiom
+        // registry before the loop borrows `$state` mutably. The map is tiny
+        // (one entry per injected axiom this query).
+        let _pis_injected_axiom_kinds = $self.injected_axiom_theory_kinds.clone();
 
         // #6853: Collect pending activations instead of adding them directly.
         let mut $pending_out: Vec<(SatLiteral, usize)> = Vec::new();
@@ -315,14 +319,31 @@ macro_rules! pipeline_incremental_setup {
             // Global (depth 0) activations MUST use add_clause_global so they
             // survive SMT-level pop operations. Making them scoped causes model
             // validation failures in LRA/EUF incremental push/pop scenarios.
+            let _pis_activation_before = $solver_out.issued_original_clause_id_max();
+            // #dt-lazy-axiom-authority: a solver-INJECTED axiom assertion's
+            // activation unit carries the indexed theory authority its
+            // recognizer established; authored assertions yield None and the
+            // placement is vacuous (ledgers still aligned).
+            let _pis_axiom_theory =
+                _pis_injected_axiom_kinds
+                    .get(&_pis_term)
+                    .map(|&kind| ay_core::TheoryLemmaProof {
+                        clause: vec![_pis_term],
+                        kind,
+                        farkas: None,
+                        lia: None,
+                    });
             if _pis_activation_depth == 0 {
                 $solver_out.add_clause_global(vec![_pis_root]);
             } else {
                 $solver_out.add_clause_at_scope_depth(vec![_pis_root], _pis_activation_depth);
             }
             if $proof_enabled {
-                $crate::pipeline_fns::align_original_clause_authority_ledgers(
+                let _ = $crate::pipeline_fns::place_single_original_clause_authority(
                     &$solver_out,
+                    _pis_activation_before,
+                    None,
+                    _pis_axiom_theory,
                     &mut $state.clausification_proofs,
                     &mut $state.original_clause_theory_proofs,
                 );
@@ -734,45 +755,7 @@ macro_rules! pipeline_export_split_loop_eager_stats {
     };
 }
 
-macro_rules! pipeline_register_proof_context {
-    ($self:expr, $proof_enabled:expr, $tag:expr) => {{
-        let problem_assertions = $self.proof_problem_assertions();
-        pipeline_register_proof_context!(
-            $self,
-            $proof_enabled,
-            $tag,
-            problem_assertions: problem_assertions
-        );
-    }};
-    ($self:expr, $proof_enabled:expr, $tag:expr, problem_assertions: $problem_assertions:expr) => {{
-        pipeline_register_proof_context!(
-            $self,
-            $proof_enabled,
-            $tag,
-            problem_assertions: $problem_assertions,
-            assumptions: &[]
-        );
-    }};
-    ($self:expr, $proof_enabled:expr, $tag:expr,
-     problem_assertions: $problem_assertions:expr, assumptions: $assumptions:expr) => {{
-        // Read disjoint immutable self-fields into a Copy bool / owned Vec
-        // BEFORE taking the &mut proof_tracker borrow (avoids E0502).
-        let __prpc_has_provenance = $self.proof_problem_assertion_provenance.is_some();
-        let __prpc_problem_assertions: Vec<ay_core::TermId> = $problem_assertions;
-        let __prpc_assumptions: &[(ay_core::TermId, ay_core::TermId)] = $assumptions;
-        // &mut $self.proof_tracker and &$self.ctx.assertions are DISJOINT fields,
-        // so this simultaneous borrow is accepted by the borrow checker.
-        $crate::pipeline_fns::register_proof_context(
-            &mut $self.proof_tracker,
-            $proof_enabled,
-            $tag,
-            __prpc_has_provenance,
-            &$self.ctx.assertions,
-            __prpc_problem_assertions,
-            __prpc_assumptions,
-        );
-    }};
-}
+include!("pipeline_setup_macros/register_proof_context.rs");
 
 /// Clone split-local proof ledgers from incremental state (#5814 Packet A).
 ///

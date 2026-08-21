@@ -65,6 +65,7 @@ use crate::opts::SolveOpts;
 use crate::outcome::{Outcome, UnknownReason};
 use crate::simplex::{Candidate, FloatLp, NbBound, SimplexStatus, WarmSolveMode};
 
+mod affine;
 mod hybrid_history;
 mod mas74_class;
 mod pump_iteration_budget;
@@ -6171,8 +6172,8 @@ fn separate_mixing_for_root_shape(
     crate::cuts::separate_mixing(work, x, n_rows, budget)
 }
 
-/// Parse a floating-point tuning knob without allowing NaN, infinities, or a
-/// negative spelling to acquire surprising control-flow semantics.
+/// Parse a finite, nonnegative test setting.
+#[cfg(test)]
 fn finite_nonnegative_setting(raw: Option<&str>, default: f64) -> f64 {
     raw.and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite())
@@ -6762,6 +6763,12 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
         let now = Instant::now();
         now + d.saturating_duration_since(now).mul_f64(share)
     });
+    if trace_cuts() {
+        eprintln!(
+            "--trace cut loop share deadline: {:?} from entry",
+            deadline.map(|d| d.saturating_duration_since(Instant::now()))
+        );
+    }
     let expired = || deadline.is_some_and(|d| Instant::now() >= d);
 
     // A CUT POOL, NOT A CUT LIST. Cuts that stop binding are DROPPED.
@@ -7091,12 +7098,30 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     // extended rounds close a dual gap single-row MIR saturates weak on and the qnet1-class wall
     // regression that keeps it off by default does not occur. The gate excludes every home
     // instance (see `is_mixed_integer_knapsack`), so this is bit-identical on the 16.
-    let mir_ext_rounds_eff =
-        crate::cuts::mir_ext_rounds().max(if crate::cuts::is_mixed_integer_knapsack(&model) {
+    // THE BIG-M INDICATOR SHAPE (W-safenlp-1): computed once for the whole loop. It arms the
+    // aggregated-MIR family per round, the MIR extension, and the wider extension budget below
+    // — see `cuts::is_bigm_indicator` for the shape, the discriminator against fixed-charge,
+    // and the measured closure (0.220 → 2.80 of safenlp_ruarobot_1181_margin's 4.32 root gap).
+    let bigm_shape = crate::cuts::is_bigm_indicator(&model);
+    let mir_ext_rounds_eff = crate::cuts::mir_ext_rounds()
+        .max(if crate::cuts::is_mixed_integer_knapsack(&model) {
             crate::cuts::mik_mir_ext_rounds()
         } else {
             0
+        })
+        .max(if bigm_shape {
+            crate::cuts::bigm_mir_ext_rounds()
+        } else {
+            0
         });
+    // The extension budget the shape earns (see `cuts::bigm_mir_ext_cuts_per_round`): an
+    // extension round's whole cost here is one cheap LP re-solve, and the class's closure
+    // comes from cut VOLUME — 4/round was measured to leave 1.5 of the 2.8 on the table.
+    let mir_ext_budget = if bigm_shape {
+        crate::cuts::bigm_mir_ext_cuts_per_round()
+    } else {
+        crate::cuts::mir_ext_cuts_per_round()
+    };
     let mir_ext_on = base_rounds > 0
         && mir_ext_rounds_eff > 0
         && (0..model.num_cols()).any(|j| !model.col_kind(Col(j as u32)).is_integral());
@@ -7484,7 +7509,7 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
             // Rounds another economy bought keep the tuned base budget; rounds MIR's own extension
             // is buying get the extension budget.
             let mir_budget = if clique_only {
-                crate::cuts::mir_ext_cuts_per_round()
+                mir_ext_budget
             } else {
                 crate::cuts::root_cuts_per_round_for_shape(model.num_rows(), model.num_cols())
             };
@@ -7554,7 +7579,7 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
                         &work,
                         &cand.values,
                         model.num_rows(),
-                        crate::cuts::mir_ext_cuts_per_round(),
+                        mir_ext_budget,
                     )
                 }));
                 // GÜNLÜK–POCHET MIXING -- OPT-IN (`AY_MILP_MIXING=1`), DEFAULT-OFF: measured
@@ -7575,8 +7600,13 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
             // aggregation was written for -- it fires only when the plain family separates
             // NOTHING, and on qnet1 plain MIR never dries up -- so this is the arm that actually
             // measures the aggregation walk. DEFAULT-OFF (`mir_agg_root`), skipped before any
-            // model scan, so the corpus is bit-identical without it.
-            if crate::cuts::mir_agg_root() && !(clique_only && mir_stage2) {
+            // model scan, so the corpus is bit-identical without it — EXCEPT on the big-M
+            // indicator shape (W-safenlp-1), where this family IS the class's closure: the
+            // 3-term big-M rows are its base rows, the wide input equalities its partners,
+            // and the aggregate is the neuron-over-inputs inequality single-row MIR provably
+            // cannot say (the violation screen kills every single-row candidate at this
+            // class's root vertex — measured, 904 of 904).
+            if (crate::cuts::mir_agg_root() || bigm_shape) && !(clique_only && mir_stage2) {
                 fresh.extend(crate::cuts::separate_mir_agg(
                     &work,
                     &cand.values,
@@ -7835,12 +7865,7 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
                 eprintln!("--trace   MIR extension dry at round {round}: aggregated MIR enters");
             }
             fresh.extend(crate::cuts::sep_wall_scope(mir_wall, || {
-                crate::cuts::separate_mir_agg(
-                    &work,
-                    &cand.values,
-                    model.num_rows(),
-                    crate::cuts::mir_ext_cuts_per_round(),
-                )
+                crate::cuts::separate_mir_agg(&work, &cand.values, model.num_rows(), mir_ext_budget)
             }));
             // ...and the mixing family with it -- OPT-IN (`AY_MILP_MIXING=1`), DEFAULT-OFF:
             // measured net-negative on mik (see the every-round site above). The wrapper keeps the
@@ -15846,8 +15871,17 @@ fn rins(
     };
     let trace = crate::debug_flags::milp_debug_flags().trace;
     let t0 = Instant::now();
-    let sub_opts =
+    // The sub-solve's wall cap must reach the OPTS too, not only `sub_mode`: the root cut
+    // loop budgets itself from `opts.effective_deadline` and read `None` here, i.e. an
+    // UNBUDGETED separation loop inside every RINS/ball sub-MIP. Invisible at the default
+    // two-round/four-cut budget (~0.2s); with a raised `--gmi-rounds`/`--root-cuts-per-round`
+    // it ran minutes of exact GMI per sub-MIP and blew the caller's whole time limit
+    // (measured on safenlp_ruarobot_1181_margin: 60s limit, >130s of sub-MIP root cuts).
+    let mut sub_opts =
         SolveOpts::new().with_ft_adoption_solve_latch(sub_model.ft_adoption_solve_latch());
+    if let Some(d) = sub_deadline {
+        sub_opts = sub_opts.with_deadline(d);
+    }
     let out = solve_milp_in(&sub_model, &sub_opts, sub_mode, sub_seed, &[], &[], &[]);
     let _attrib_lt = crate::attrib::LaunchTag::new("cdcl-ball/local-branching");
     if trace {
@@ -16130,8 +16164,11 @@ fn diversified_rins_sweep(
             no_sym: false,
             prefix_workers: 0,
         };
-        let sub_opts =
-            SolveOpts::new().with_ft_adoption_solve_latch(sub_model.ft_adoption_solve_latch());
+        // Same defect as the ball/local-branching site above: the wall cap must reach the
+        // opts too, or every opts-budgeted phase inside the sub-solve runs uncapped.
+        let sub_opts = SolveOpts::new()
+            .with_ft_adoption_solve_latch(sub_model.ft_adoption_solve_latch())
+            .with_deadline(sub_deadline);
         let _attrib_lt = crate::attrib::LaunchTag::new("diversified-rins");
         let out = solve_milp_in(
             &sub_model,
@@ -19477,12 +19514,8 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
     let Some(mut lp) = FloatLp::from_model(model, &objective, sense) else {
         return "diag_float_lp: model cannot be lowered".to_string();
     };
-    // MEASUREMENT KNOB (diag only): `--diag-plain-cold` runs the solve on
-    // the search's own lane (`plain_cold`: classic eta path + triangular
-    // crash) instead of the default cold-LU lane — `diag_float_lp` otherwise
-    // measures a DIFFERENT engine than the in-chain root LP on big-LP shapes
-    // (w5: the LU cold lane is the journaled near-stuck negative; the chain's
-    // classic+crash lane is the one that solves).
+    // `--diag-plain-cold` selects the search's classic-eta/crash lane instead
+    // of the diagnostic's cold-LU lane.
     if crate::tune::caller_flag(crate::tune::Knob::DiagPlainCold) == Some(true) {
         lp.plain_cold = true;
     }
@@ -19508,9 +19541,7 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
     let cand = lp.solve_bounded(&lp.lower, &lp.upper, None, Some(deadline));
     let wall = t.elapsed().as_secs_f64();
     let obj: f64 = (0..lp.n).map(|j| lp.cost[j] * cand.values[j]).sum();
-    // MEASUREMENT KNOB (diag only): dump the fractional LP vertex + row
-    // tightness to derive cuts on hard covering instances. Disabled unless the
-    // documented exact value `--dump-vertex` is present.
+    // `--dump-vertex` emits the fractional LP vertex and row tightness.
     if crate::tune::caller_flag(crate::tune::Knob::DumpVertex) == Some(true) {
         let n = model.num_cols();
         let mut buckets = [0usize; 11];
@@ -19567,6 +19598,12 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
     )
 }
 
+/// Run [`diag_float_lp`] under the caller profile carried by `opts`.
+pub fn diag_float_lp_with(model: &Model, secs: f64, opts: &SolveOpts) -> String {
+    let _tuned = crate::tune::activate_caller(opts.engine().profile());
+    diag_float_lp(model, secs)
+}
+
 /// ROOT CLOSURE — the cut loop's bottom-line quality signal, isolated from the tree.
 ///
 /// This is the W0 metric of the development design notes. Cut
@@ -19589,6 +19626,23 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
 /// A/B beds (each side sees the same input); the presolved one is the one comparable with
 /// another solver's reported root bound.
 pub fn diag_root_closure(model: &Model, secs: f64) -> String {
+    diag_root_closure_with(model, secs, &SolveOpts::new())
+}
+
+/// [`diag_root_closure`] under a caller's own [`SolveOpts`] — the variant the flagged harness
+/// drivers call.
+///
+/// WHY IT EXISTS. The engine knobs resolve through `tune`'s caller layer, which a real solve
+/// installs from `opts.engine().profile()` at its entry point — and this diagnostic never did.
+/// `mps_solve` additionally parsed its engine flags AFTER the `AY_ROOT_CLOSURE` early return, so
+/// a root-closure run with `--root-cuts-per-round 200 --cut-eff-floor 0.0001` measured the
+/// DEFAULT configuration and reported it under the flagged name. That is measurement rule R7's
+/// vacuous null (a lever that cannot fire measures nothing), and it was believed at least once:
+/// the safenlp work item's "bit-identical under bigger budgets" observation was taken on this
+/// path. Installing the profile here makes the diagnostic and the search read the same knobs;
+/// the zero-argument wrapper above pins the historical default-profile behaviour byte-for-byte.
+pub fn diag_root_closure_with(model: &Model, secs: f64, opts: &SolveOpts) -> String {
+    let _tuned = crate::tune::activate_caller(opts.engine().profile());
     let subject = if crate::tune::caller_flag(crate::tune::Knob::RootClosurePresolve) == Some(true)
     {
         match crate::presolve::tighten_bounds(
@@ -19636,7 +19690,7 @@ pub fn diag_root_closure(model: &Model, secs: f64) -> String {
 
     let rows_before = subject.num_rows();
     let t1 = Instant::now();
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+    let opts = opts.clone().with_time_limit(Duration::from_secs_f64(secs));
     let cut_model = add_root_cuts(subject.clone(), &opts);
     let t_cuts = t1.elapsed().as_secs_f64();
     let cuts_added = cut_model.num_rows().saturating_sub(rows_before);
@@ -20837,11 +20891,25 @@ pub(crate) fn solve_milp_shared_binary_prefix(
     )
 }
 
-/// Shared-prefix margin optimization with proof-at-interruption replay.
+/// Margin optimization with proof-at-interruption replay, over an OPTIONAL
+/// shared binary prefix.
 ///
 /// `target` belongs to the original feasibility model. The reframed search's
 /// global bound may only trigger replay against that model.
-pub(crate) fn solve_milp_shared_binary_prefix_with_margin_proof(
+///
+/// # Why `split_cols` may be empty
+///
+/// This entry used to assert a NONEMPTY prefix, because the only caller was
+/// the explicit `check_marked_margin_shared_binary_prefix` API. The prefix and
+/// the proof target are independent, though: everything the target drives —
+/// the finalize reserve (`FinalizeReplayObligation::MarkedMarginPrefix`), the
+/// live preview at the first quiescent boundary, the terminal
+/// `finalize_margin_cover` — keys on `margin_proof_target.is_some()` and never
+/// on the prefix. Tying them together is what left `MarginMode::Auto` unable
+/// to reach the crossing machinery at all: the session's empty-prefix dispatch
+/// silently dropped the target, so `strictly_excludes` and both cover paths
+/// were dead code on the lane every model that arrives as a FILE takes.
+pub(crate) fn solve_milp_margin_proof(
     model: &Model,
     opts: &SolveOpts,
     split_cols: &[Col],
@@ -20850,7 +20918,7 @@ pub(crate) fn solve_milp_shared_binary_prefix_with_margin_proof(
     root_probe_shortlist: &[Col],
     target_fsb_prefix: Option<TargetFsbPrefixRequest<'_>>,
 ) -> Outcome {
-    debug_assert!(!split_cols.is_empty() && split_cols.len() <= 4);
+    debug_assert!(split_cols.len() <= 4);
     solve_milp_advised_with_prefix(
         model,
         opts,
@@ -21118,7 +21186,18 @@ fn solve_milp_advised_with_prefix(
         // symmetry out from the first solve instead. `prefix_workers > 0`
         // preserves the proof-first setting explicitly, while the nonempty
         // predicate adds the serial path; empty-prefix behavior stays false.
-        no_sym: prefix_workers > 0 || !shared_binary_prefix.is_empty(),
+        //
+        // A MARGIN PROOF TARGET carries the identical obligation with or
+        // without a prefix: its whole authority is `finalize_margin_cover`
+        // replaying the literal captured tree against the ORIGINAL model, and
+        // symmetry reduction poisons that capture. Before the empty-prefix
+        // dispatch existed this was implied by the prefix (the only caller had
+        // one); stating it directly is what keeps the new lane's capture alive.
+        // Byte-identical for every pre-existing caller — each already had a
+        // nonempty prefix here.
+        no_sym: prefix_workers > 0
+            || !shared_binary_prefix.is_empty()
+            || margin_proof_target.is_some(),
         prefix_workers,
         ..SearchMode::FULL
     };
@@ -21134,7 +21213,17 @@ fn solve_milp_advised_with_prefix(
         );
     }
     // Detailed capture/reduction contract: see `bab/incoming_feature_history.md`.
+    //
+    // A margin proof target is excluded for the same reason a prefix is: these
+    // reductions answer in a REDUCED frame and fail-close every certificate
+    // that references it (`expand_kernel_outcome`, `expand_dualfix_outcome`),
+    // so a reduction that decides here returns past the margin-proof dispatch
+    // below with the target never consulted. That was harmless while the target
+    // implied a nonempty prefix; with the empty-prefix lane open it would make
+    // the crossing machinery unreachable again, on exactly the models the
+    // reductions like best. Byte-identical for every pre-existing caller.
     if shared_binary_prefix.is_empty()
+        && margin_proof_target.is_none()
         && branch_hints.is_empty()
         && root_probe_shortlist.is_empty()
         && !in_rens()
@@ -21330,17 +21419,10 @@ fn solve_milp_advised_with_prefix(
                 );
             }
         }
-        if reductions_run && dedup_enabled() {
-            if let Some((reduced, map)) = dedup_columns(model) {
-                let outcome = solve_milp_in(&reduced, opts, full, None, &[], &[], &[]);
-                return harvest_tree_cert_by_resolve(
-                    expand_dedup_outcome_certified(outcome, &map, model),
-                    model,
-                    opts,
-                    full,
-                    entry_deadline,
-                );
-            }
+        if let Some(outcome) =
+            affine::solve_aggregation_or_dedup(model, opts, full, reductions_run, entry_deadline)
+        {
+            return outcome;
         }
         // DUAL FIXING BY LOCK COUNTING (`crate::dualfix`). Tried LAST, and it is
         // a different animal from the three above.
@@ -21606,8 +21688,10 @@ pub(crate) fn solve_milp_seeded(
             no_sym: false,
             prefix_workers: 0,
         };
-        let sub_opts =
-            SolveOpts::new().with_ft_adoption_solve_latch(fixed.ft_adoption_solve_latch());
+        // Same defect as the ball/local-branching site: fold the wall cap into the opts.
+        let sub_opts = SolveOpts::new()
+            .with_ft_adoption_solve_latch(fixed.ft_adoption_solve_latch())
+            .with_deadline(repair_deadline);
         match solve_milp_in(&fixed, &sub_opts, sub_mode, None, &[], &[], &[]) {
             Outcome::Optimal { model_values, .. } | Outcome::Feasible { model_values, .. }
                 if model_values.len() == model.num_cols()
@@ -23160,7 +23244,17 @@ fn solve_milp_in_impl(
     // its f64 proxy: marked-margin strictness is a caller-frame statement.
     let model_offset = model.obj_offset_exact();
     // Detailed design and measurements: see `bab/incoming_feature_history.md`.
-    let node_cuts_opted_in = crate::tune::count_opt(crate::tune::Knob::NodeCutSlots).is_some();
+    //
+    // TWO WAYS IN, AND THE SECOND ONE WAS MISSING. `--node-cut-slots <k>` opts
+    // in and sizes the block in one act. `--node-cuts` is the switch whose NAME
+    // says "separate cuts below the root" — it has a builder, a field and a
+    // profile line, and until this read existed `Knob::NodeCuts` was written by
+    // `opts/profile.rs` and read by NOTHING. It was the mirror image of the
+    // reader-without-writer defect `tests/knob_census.rs` gates: a flag that
+    // parses, validates, lowers into the profile and changes no behaviour. It
+    // now means what it says, and takes the structural slot count.
+    let node_cuts_opted_in = crate::tune::count_opt(crate::tune::Knob::NodeCutSlots).is_some()
+        || crate::tune::caller_flag(crate::tune::Knob::NodeCuts) == Some(true);
     let slot_k = if mode.cheap || proof_first_prefix || !node_cuts_opted_in || false {
         0 // proof-first and sub-MIP finders skip optional separation entirely
     } else {
@@ -25114,7 +25208,14 @@ fn solve_milp_in_impl(
                     }
                 }
             }
-            if root_gap_wide {
+            // ...but NOT on the big-M indicator shape (W-safenlp-1's verification economy).
+            // A margin/verification race there is DUAL-BOUND-bound: any incumbent above the
+            // threshold settles nothing, and its root gap is structurally wide (the encoding
+            // puts the LP bound far below every integer point), so this emergency-primal
+            // trigger fired permanently and the ledger billed RINS 43% of ALL simplex
+            // iterations (405k of 937k on safenlp_ruarobot_1181_margin @60s) against a tree
+            // that is the only proof device. The shape keeps the tuned cadence instead.
+            if root_gap_wide && !crate::cuts::is_bigm_indicator(caller_model) {
                 next_rins = 1;
             }
 
@@ -32049,7 +32150,7 @@ mod tests {
     use crate::session::TargetFsbPrefixOpts;
     // The one workspace env choke point: serialized, restore-on-exit (also on
     // panic) process-environment mutation for these tests.
-    use ay_test_support::env::{lock_env, with_env_edits, ScopedEnvVar};
+    use ay_test_support::env::{lock_env, with_env_edits};
 
     mod root_prepared_relaxation_tests;
 
@@ -32083,7 +32184,7 @@ mod tests {
             "pub(crate) fn solve_milp_hinted(",
             "pub(crate) fn solve_milp_advised(",
             "pub(crate) fn solve_milp_shared_binary_prefix(",
-            "pub(crate) fn solve_milp_shared_binary_prefix_with_margin_proof(",
+            "pub(crate) fn solve_milp_margin_proof(",
             "pub(crate) fn solve_milp_shared_binary_prefix_proof_first(",
             "pub(crate) fn solve_milp_seeded(",
         ];
@@ -32173,11 +32274,14 @@ mod tests {
         m
     }
 
+    include!("bab/affine_tests.rs");
+
     /// A rational objective introduced by singleton substitution must never be
     /// optimized through native Bab's rounded `f64` proxy.  The original model
     /// is entirely f64-exact; only the temporary reduced objective contains
     /// 1/10, which is why checking `Model::has_inexact_coeffs()` after postsolve
     /// cannot catch this failure.
+
     #[test]
     fn native_declines_singleton_reduction_with_inexact_objective() {
         let _env_lock = lock_env();
@@ -41393,6 +41497,7 @@ fn prime_env_all() {
     crate::presolve::binary_complement::prime_env();
     crate::presolve::objective_singleton::prime_env();
     crate::presolve::structure::prime_env();
+    crate::presolve::implied_free::prime_env();
     prime_env();
 }
 

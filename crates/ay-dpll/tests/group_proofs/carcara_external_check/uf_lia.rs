@@ -55,6 +55,51 @@ fn test_carcara_trust_free_bv_constant_endpoint_mismatch() {
     }
 }
 
+/// Ground QF_LRA assertions can fold to `false` before the ordinary conflict
+/// proof is built. The repair must recover the exact authored literal without
+/// letting the source-override map re-spell raw proof terms. Comparisons use a
+/// checked one-row Farkas lemma; a true equality uses the primitive
+/// `evaluate` bridge because Alethe cannot encode its disequality complement
+/// as a one-row Farkas certificate.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_qf_lra_ground_false_collapse() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let cases = [
+        (
+            "qf_lra_ground_comparison_false_collapse",
+            "(set-logic QF_LRA)\n\
+             (assert (not (< 0.0 1.0)))\n\
+             (check-sat)\n",
+            ":rule la_generic",
+        ),
+        (
+            "qf_lra_ground_equality_false_collapse",
+            "(set-logic QF_LRA)\n\
+             (assert (not (= (+ 2.0 3.0) 5.0)))\n\
+             (check-sat)\n",
+            ":rule evaluate",
+        ),
+    ];
+    for (label, problem, required_rule) in cases {
+        let proof = solve_unsat_and_get_proof(problem, label);
+        assert!(
+            !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+            "{label}: folded ground-LRA proof must contain no admitted step:\n{proof}",
+        );
+        assert!(
+            proof.contains(required_rule),
+            "{label}: proof must contain {required_rule}:\n{proof}",
+        );
+        assert!(
+            run_carcara_trust_free(&carcara, label, problem, &proof),
+            "{label}: folded ground-LRA proof must pass Carcara without allowed trust",
+        );
+    }
+}
+
 /// The `ay z3-audit` canonical QF_UF transitivity fixture must export a
 /// genuine `eq_transitive` + `th_resolution` derivation that carcara accepts
 /// WITHOUT `--allowed-rules trust`. This is the exact fixture used by the audit

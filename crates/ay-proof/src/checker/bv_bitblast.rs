@@ -2498,7 +2498,7 @@ mod multi_literal_clausification_tautology_tests {
     fn opaque_atom(terms: &mut TermStore, name: &str) -> TermId {
         let x = terms.mk_var(&format!("{name}_x"), Sort::Int);
         let y = terms.mk_var(&format!("{name}_y"), Sort::Int);
-        terms.mk_app(ay_core::Symbol::named("="), vec![x, y], Sort::Bool)
+        terms.mk_app(Symbol::named("="), vec![x, y], Sort::Bool)
     }
 
     #[test]
@@ -2507,7 +2507,7 @@ mod multi_literal_clausification_tautology_tests {
         let mut terms = TermStore::new();
         let a = opaque_atom(&mut terms, "a");
         let b = opaque_atom(&mut terms, "b");
-        let packed = terms.mk_app(ay_core::Symbol::named("or"), vec![a, b], Sort::Bool);
+        let packed = terms.mk_app(Symbol::named("or"), vec![a, b], Sort::Bool);
         let not_packed = terms.mk_not(packed);
         let clause = [not_packed, a, b];
         assert!(recognize_bool_tautology(&terms, &clause));
@@ -2530,7 +2530,7 @@ mod multi_literal_clausification_tautology_tests {
         let mut terms = TermStore::new();
         let a = opaque_atom(&mut terms, "a");
         let b = opaque_atom(&mut terms, "b");
-        let packed = terms.mk_app(ay_core::Symbol::named("or"), vec![a, b], Sort::Bool);
+        let packed = terms.mk_app(Symbol::named("or"), vec![a, b], Sort::Bool);
         let not_packed = terms.mk_not(packed);
         let clause = [not_packed, a];
         assert!(!recognize_bool_tautology(&terms, &clause));

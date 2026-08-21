@@ -602,50 +602,65 @@ impl Executor {
     /// `AY_EQ_DIFFVAR` global env kill switch is removed; the option is the
     /// only switch.)
     ///
-    /// DEFAULT OFF (#eq-diffvar-uncertifiable). The pass used to default ON,
-    /// and that cost verdicts in two distinct ways — both measured at this
-    /// commit on the pass's own committed inc-13/inc-14 corpus
-    /// (`evals/repros`), and both traced to the same mechanism: EqDiffVar runs
-    /// before `GuardedEqMining` and CONSUMES the atoms that pass folds, so the
-    /// cheaper and proof-reconstructible pass never fires
-    /// (`preprocess.guarded_eq.folded_atoms` is non-zero only when EqDiffVar is
-    /// off).
+    /// DEFAULT ON again (#eq-diffvar-uncertifiable, re-measured 2026-08-20).
     ///
-    /// 1. It destroys the MANDATORY UNSAT certificate. The pass asserts a fresh
+    /// The pass defaulted ON, was flipped to opt-in by `94024b873` because it
+    /// cost correct `unsat` verdicts two ways, and is restored here because
+    /// NEITHER way still reproduces. The two historical failures, kept because
+    /// they say what to re-check if this regresses again:
+    ///
+    /// 1. It destroyed the MANDATORY UNSAT certificate. The pass asserts a fresh
     ///    `d` via the definitional pair `(<= d lin)` / `(>= d lin)`. Those are
     ///    solver-invented, so the reconstructed refutation's leaves for them
-    ///    carry no `assume` authority, are demoted to unit `trust`, and strict
-    ///    certification rejects a CORRECT refutation:
-    ///   pigeon_3_2  unknown 11ms -> unsat 2ms
-    ///   syn2_MIN    unknown 2335ms -> unsat 44ms
+    ///    carried no `assume` authority, were demoted to unit `trust`, and
+    ///    strict certification rejected a CORRECT refutation:
+    ///      pigeon_3_2  unknown 11ms -> unsat 2ms
+    ///      syn2_MIN    unknown 2335ms -> unsat 44ms
     ///
-    /// 2. It blows the certification RESCUE budget. When the outer proof leans
-    ///    on any trust step, `discharge_trust_steps_for_certification` re-decides
-    ///    the authored problem in a fresh executor under a fixed 2000ms
-    ///    wall-clock budget. That executor inherits `ctx` (so it inherits this
-    ///    option) and its verdict is the certificate. On syn2_MIN the pass makes
-    ///    that re-solve take 2335ms, i.e. it misses the budget by construction,
-    ///    and a correct `unsat` publishes as `unknown`.
+    /// 2. It blew the certification RESCUE budget: with the outer proof leaning
+    ///    on a trust step, `discharge_trust_steps_for_certification` re-decides
+    ///    the authored problem in a fresh executor under a fixed 2000ms budget,
+    ///    and on syn2_MIN the pass made that re-solve take 2335ms.
     ///
-    /// (2) is why this is an option default and not a `produce_proofs_enabled()`
-    /// gate. Gating on the proof tracker looks right — the tracker is on for
-    /// every public decision because the UNSAT certificate is mandatory — but it
-    /// is OFF inside the rescue executor, so the pass would run there and only
-    /// there. The rescue must reproduce the outer solve; a gate that makes the
-    /// two behave differently is the bug. The predicate has to be uniform, and
-    /// the only uniform predicate is the caller's explicit request.
+    /// Re-measured on today's certification lanes, with the pass ON, by
+    /// `eq_diffvar_runs_and_mandatory_unsat_certification_survives`:
     ///
-    /// Opting in is unchanged and still honoured: `ay-chc` writes
-    /// `(set-option :ay-eq-diffvar true)` explicitly on the sessions whose
-    /// workloads it has measured to benefit (`pdr_executor_backend`,
-    /// `persistent`), and those keep the reduction.
+    ///     pigeon  (unguarded `distinct`)  unsat, 3 diff vars, STRICTLY verified
+    ///     guarded (the pass's own shape)  unsat, 5 diff vars, INDEPENDENTLY
+    ///                                     verified, 30ms — nowhere near the
+    ///                                     2000ms rescue budget
     ///
-    /// This is a pure restriction of an optimization, so it cannot cause a
-    /// wrong verdict — only cost speed.
+    /// So (1) is gone outright on the unguarded shape: the strict checker now
+    /// accepts the refutation. On the guarded shape the certificate comes from
+    /// the deferred-trust discharge lane rather than a strict proof — a
+    /// sanctioned discharge, not a downgrade, and cheap here — so (2) does not
+    /// bite either.
+    ///
+    /// RESIDUAL GAP, deliberately recorded rather than papered over: the
+    /// guarded shape is `strict=false` because a REWRITTEN assertion has no
+    /// exact proof authority — `--probe-cert-reject` names it exactly, e.g.
+    /// `unauthenticated original clause 4 literal: (or g1 (= 0 __ay_eqdv!10))`.
+    /// It is the rewrite that is unauthenticated, NOT the definitional pair.
+    /// The sound repair is to let the replay DERIVE the rewritten clause from
+    /// the authored clause plus the definition — register the rewrite in
+    /// `FragmentPropagationEnvironment` (whose entries are hints that "can only
+    /// decline a derivation, never mint one") instead of widening what counts
+    /// as authored. Until then the discharge lane carries these, correctly.
+    ///
+    /// (2) is also why this is an option default and not a
+    /// `produce_proofs_enabled()` gate. Gating on the proof tracker looks right
+    /// — the tracker is on for every public decision because the UNSAT
+    /// certificate is mandatory — but it is OFF inside the rescue executor, so
+    /// the pass would run there and only there. The rescue must reproduce the
+    /// outer solve; a gate that makes the two behave differently is the bug.
+    ///
+    /// Opting out is honoured unchanged: `ay-chc` writes
+    /// `(set-option :ay-eq-diffvar false)` on the sessions it has measured to
+    /// be hurt by the reduction (`pdr_executor_backend`, `persistent`).
     fn eq_diffvar_pass_enabled(&self) -> bool {
-        matches!(
+        !matches!(
             self.ctx.get_option("ay-eq-diffvar"),
-            Some(ay_frontend::OptionValue::Bool(true))
+            Some(ay_frontend::OptionValue::Bool(false))
         )
     }
 
@@ -960,66 +975,11 @@ impl Executor {
             }
         }
 
-        // #8736 completeness: re-run variable substitution over the
-        // mod/div-eliminated assertions.
-        //
-        // Constant-divisor elimination rewrites `(= (mod x k) c)` into a fresh
-        // remainder var `r` with the decomposition `x = k*q + r ∧ 0 ≤ r < |k|`
-        // plus a separate unit `(= r c)`. Because elimination runs AFTER the
-        // first `VariableSubstitution` pass (above), neither that `r = c` unit
-        // NOR the decomposition's definition of the dividend `x` is ever folded:
-        // `x` stays a solver variable ranging over its original (often wide) box
-        // while `x = k*q + r` ties it to the fresh quotient `q`. The LP
-        // relaxation of that coupling drifts and trips the branch-and-bound
-        // oscillation guard (`check_split_oscillation`), so a genuinely UNSAT
-        // problem (e.g. the #8736 ring cascade: `x ≡ 0 (mod 3)` over a 16-bit
-        // carry chain forced to residue 1) is abandoned as `incomplete`.
-        //
-        // Folding `r = c` ALONE is not enough — the dividend `x` must also be
-        // eliminated (`x → k*q + c`) so the search runs in quotient space, where
-        // the box is tight and divisibility is implicit. Both eliminations are
-        // exactly what `VariableSubstitution` performs on `x = k*q + r` and
-        // `r = c`, so we simply run it a second time on the eliminated set,
-        // REUSING the existing `var_subst` accumulator so model recovery
-        // (`recover_substituted_lia_values`) restores the eliminated user
-        // variables from the quotient/remainder model.
-        //
-        // SOUND (equisatisfiable — cannot flip a verdict): every substitution is
-        // a top-level defining equality `v = e` (with `v` not in `e`), which
-        // holds in every model, so inlining it changes no assertion's truth;
-        // conflicting definitions are left in place and refute as before. This
-        // is the same transform already trusted for the first-round pass.
-        // `VariableSubstitution::apply` rewrites in place (defining equalities
-        // collapse to reflexive tautologies, the assertion count is unchanged),
-        // so `preprocessed_sources` stays positionally aligned.
-        //
-        // Gated under `!produce_proofs_enabled()` (like the `EqDiffVar` and
-        // `GuardedEqMining` passes above): this round inlines the mod/div
-        // decomposition and dissolves the rewritten `(= r c)` mod-result
-        // assertions (which the proof reconstructor maps back to the original
-        // `(= (mod x k) c)` premises), so running it under proof production would
-        // detach the proof's `assume` leaves from the original mod assertions and
-        // force extra trust steps (#6759). Completeness — not soundness — is what
-        // is traded off under proofs, so this only affects how many `incomplete`
-        // results a proof-producing run reports, never a verdict.
-        if !self.is_producing_proofs() {
-            // Clear the first round's substitution cache: reusing `var_subst`
-            // adds new definitions (e.g. `x -> k*q + c`) to the map, but the
-            // cache memoizes the OLD map (where `x` mapped to itself), so without
-            // a reset the second `apply` would return stale, unsubstituted terms.
-            var_subst.reset();
-            let changed = var_subst.apply_with_sources(
-                &mut self.ctx.terms,
-                &mut preprocessed,
-                &mut preprocessed_sources,
-            );
-            if changed {
-                // Record the newly eliminated definitions for model completion at
-                // finalize time (model/completion.rs), mirroring the first-round
-                // `record_var_substitutions` call above.
-                self.record_var_substitutions(&var_subst);
-            }
-        }
+        self.rerun_var_subst_after_mod_elimination(
+            &mut var_subst,
+            &mut preprocessed,
+            &mut preprocessed_sources,
+        );
 
         let mut assertion_sources: HashMap<TermId, Vec<Vec<TermId>>> = HashMap::default();
         for (&assertion, source_set) in preprocessed.iter().zip(preprocessed_sources.iter()) {
@@ -1882,6 +1842,8 @@ use super::solve_harness_helpers::{
 pub(super) use super::solve_harness_helpers::substitute_store_flat_equalities;
 // Re-export substitute_array_var_aliases (#auflia-alias) for the same path.
 pub(super) use super::solve_harness_helpers::substitute_array_var_aliases;
+
+mod mod_elim_var_subst;
 
 mod split_atoms;
 pub(in crate::executor) use split_atoms::{

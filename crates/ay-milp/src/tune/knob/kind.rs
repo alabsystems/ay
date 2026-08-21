@@ -350,9 +350,8 @@ pub(crate) enum Knob {
     DumpVertex,
     /// Force the ay-dpll SMT lowering lane instead of native B&B (A/B).
     SmtLane,
-    /// MEASUREMENT-ONLY node cap (load-invariant branching A/B): stop the
-    /// tree after N processed nodes and return the interrupted-but-valid
-    /// Feasible/dual-bound outcome. `Some(0)` stops before the first node.
+    /// MEASUREMENT-ONLY node cap: stop after N nodes with a valid Feasible or
+    /// dual-bound outcome. `Some(0)` stops before the first node.
     MaxNodes,
 
     // B49 knobs: the test-steered opt-in arms (were test-only-set env vars;
@@ -378,9 +377,8 @@ pub(crate) enum Knob {
     ImplLane,
     /// Implication-lane arming node override (default: the mixed-lever arm).
     ImplArm,
-    /// Leaf-drought plunge cadence/arming override (the 80-binary zero-leaves
-    /// fix): `0` kills the lane, `n` arms it at node `n` with a dive every `n`
-    /// pops; unset = the shipped `DROUGHT_ARM_NODES`/`DROUGHT_DIVE_EVERY`.
+    /// Leaf-drought plunge cadence: `0` disables; `n` arms at node `n` and dives
+    /// every `n` pops; unset uses `DROUGHT_ARM_NODES`/`DROUGHT_DIVE_EVERY`.
     DroughtDive,
     /// Propagation-conflict learning: `false` = off, `true` = force, unset =
     /// the implication/feasibility class auto.
@@ -395,6 +393,8 @@ pub(crate) enum Knob {
     LbStrict,
     /// Opt in to the singleton-substitution reduction.
     SingletonSub,
+    /// Opt in to the exact implied-free equality-aggregation reduction.
+    AffineAgg,
     /// Node-cut slot count override (`0` disables; setting it at all opts
     /// node cuts in).
     NodeCutSlots,
@@ -446,8 +446,10 @@ pub(crate) enum Knob {
     KnapDbg,
     /// Root MIR aggregation arm.
     MirAggRoot,
-    /// LNP probe presolve arm.
-    LnpProbePresolve,
+    // RETIRED: `LnpProbePresolve`. Its only reader lived inside a `#[cfg(test)]`
+    // probe in `cuts.rs` and it had no writer on any surface, so no build could
+    // set it and the branch it guarded was unreachable. Deleting the variant is
+    // behaviour-preserving; see the note at the former reader.
     /// Cold dual simplex on ALL LPs.
     ColdDualAll,
     /// Warm-started cut rounds arm.

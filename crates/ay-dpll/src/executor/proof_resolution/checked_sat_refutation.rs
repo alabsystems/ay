@@ -42,11 +42,11 @@ use std::sync::Arc;
 
 use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::sat_proof_manager::{
-    ExactOriginalProofError, ExactOriginalProofFragment, SatProofManager,
+    ExactOriginalProofError, ExactOriginalProofFragment, FragmentContextDerivation, SatProofManager,
 };
 use crate::verification::ConflictSemanticVerifyMemo;
 use derivation_evidence::{
-    sealed_fragment_derivation_maps, sealed_instance_root_derivations,
+    sealed_context_derivations, sealed_fragment_derivation_maps, sealed_instance_root_derivations,
     sealed_propagation_environment,
 };
 #[cfg(test)]
@@ -796,83 +796,7 @@ fn authenticate_assumption_unit_premises(
     Ok(())
 }
 
-/// Premise table whose only proof-kernel deferrals have all been discharged by
-/// the semantic conflict verifier in this exact query.
-///
-/// The raw deferred table is intentionally private to this constructor.  A
-/// caller cannot obtain a clause through this wrapper until every `Generic`
-/// theory premise in the fragment has an exact `true` memo entry.  The memo is
-/// cleared at query entry and whenever quantified support axioms change, so a
-/// match carries the same term/support state under which the conflict was
-/// independently re-solved before it was learned.
-#[derive(Debug)]
-struct SemanticallyCompletedPremiseClauses {
-    premises: PremiseClausesWithDeferredGeneric,
-}
-
-impl SemanticallyCompletedPremiseClauses {
-    fn complete(
-        premises: PremiseClausesWithDeferredGeneric,
-        semantic_memo: &ConflictSemanticVerifyMemo,
-        terms: &TermStore,
-        meter: &mut CheckedRefutationMeter,
-    ) -> Result<Self, CheckedSatRefutationError> {
-        for (step, clause) in premises.deferred_generic_clauses() {
-            let bytes = checked_resource_mul(
-                clause.len(),
-                size_of::<TheoryLit>(),
-                ResolutionValidationResource::Bytes,
-            )?;
-            let work = checked_resource_add(
-                clause.len(),
-                clause_sort_work(clause.len())?,
-                ResolutionValidationResource::Work,
-            )?;
-            meter.charge(work, bytes)?;
-
-            let mut key = Vec::new();
-            key.try_reserve_exact(clause.len()).map_err(|_| {
-                ResolutionValidationError::AllocationFailed {
-                    resource: ResolutionValidationResource::Bytes,
-                }
-            })?;
-            charge_capacity_excess::<TheoryLit>(key.capacity(), clause.len(), meter)?;
-            for (index, &literal) in clause.iter().enumerate() {
-                if literal.index() >= terms.len() {
-                    return Err(CheckedSatRefutationError::StaleDeferredGenericTerm {
-                        step,
-                        term: literal,
-                    });
-                }
-                key.push(match terms.get(literal) {
-                    TermData::Not(inner) => TheoryLit::new(*inner, true),
-                    _ => TheoryLit::new(literal, false),
-                });
-                if index % 1024 == 0 {
-                    meter.charge(0, 0)?;
-                }
-            }
-            key.sort_unstable();
-            if semantic_memo.get(&key) != Some(&true) {
-                return Err(
-                    CheckedSatRefutationError::DeferredGenericNotSemanticallyVerified { step },
-                );
-            }
-        }
-        meter.charge(0, 0)?;
-        Ok(Self { premises })
-    }
-
-    fn step_count(&self) -> usize {
-        self.premises.step_count()
-    }
-
-    fn clause(&self, step: ProofId) -> Option<&[TermId]> {
-        self.premises
-            .strictly_authenticated_clause(step)
-            .or_else(|| self.premises.deferred_generic_clause(step))
-    }
-}
+include!("checked_sat_refutation/semantically_completed_premises.rs");
 
 /// Opaque proof that one exact query has a strictly authenticated SAT-level
 /// refutation.
@@ -1155,6 +1079,37 @@ fn translate_sat_clause(
     Ok(normalize_clause_metered(&clause, meter)?)
 }
 
+fn verify_exact_composition_shape(
+    mapping_count: usize,
+    fragment: &ExactOriginalProofFragment,
+    authenticated: &SemanticallyCompletedPremiseClauses,
+    original_id_cone: Option<&ay_core::kani_compat::DetHashSet<u64>>,
+    meter: &mut CheckedRefutationMeter,
+) -> Result<(), CheckedSatRefutationError> {
+    meter.charge(
+        mapping_count,
+        checked_resource_mul(
+            mapping_count,
+            size_of::<Option<Vec<TermId>>>(),
+            ResolutionValidationResource::Bytes,
+        )?,
+    )?;
+    let expected_bindings = original_id_cone.map_or(mapping_count, |cone| cone.len());
+    if expected_bindings != fragment.binding_count() {
+        return Err(CheckedSatRefutationError::OriginalCountMismatch {
+            validated: expected_bindings,
+            semantic: fragment.binding_count(),
+        });
+    }
+    if authenticated.step_count() != fragment.proof().steps.len() {
+        return Err(CheckedSatRefutationError::AuthenticatedStepCountMismatch {
+            fragment: fragment.proof().steps.len(),
+            authenticated: authenticated.step_count(),
+        });
+    }
+    Ok(())
+}
+
 /// Join the independently validated structural and semantic identities.
 ///
 /// Count equality plus iteration over every structural original makes the
@@ -1165,34 +1120,25 @@ fn verify_exact_composition<E: CheckedResolutionEvidence>(
     validated: &E,
     fragment: &ExactOriginalProofFragment,
     authenticated: &SemanticallyCompletedPremiseClauses,
+    original_id_cone: Option<&ay_core::kani_compat::DetHashSet<u64>>,
     var_to_term: &HashMap<u32, TermId>,
     scope_assumptions: &[Literal],
     terms: &mut TermStore,
     meter: &mut CheckedRefutationMeter,
 ) -> Result<(), CheckedSatRefutationError> {
     let mappings = validated.original_mappings();
-    meter.charge(
+    verify_exact_composition_shape(
         mappings.len(),
-        checked_resource_mul(
-            mappings.len(),
-            size_of::<Option<Vec<TermId>>>(),
-            ResolutionValidationResource::Bytes,
-        )?,
+        fragment,
+        authenticated,
+        original_id_cone,
+        meter,
     )?;
-    if mappings.len() != fragment.binding_count() {
-        return Err(CheckedSatRefutationError::OriginalCountMismatch {
-            validated: mappings.len(),
-            semantic: fragment.binding_count(),
-        });
-    }
-    if authenticated.step_count() != fragment.proof().steps.len() {
-        return Err(CheckedSatRefutationError::AuthenticatedStepCountMismatch {
-            fragment: fragment.proof().steps.len(),
-            authenticated: authenticated.step_count(),
-        });
-    }
 
     for mapping in mappings {
+        if original_id_cone.is_some_and(|cone| !cone.contains(&mapping.trace_id())) {
+            continue;
+        }
         let source_len = mapping.trace_entry().clause.len();
         // Stable-ID, source-position, SAT-byte, DAG, and translated-clause
         // comparisons all scan this original. Account for those scans before
@@ -1295,8 +1241,24 @@ impl Executor {
             }
             Err(error) => {
                 tracing::debug!(%error, "checked SAT refutation unavailable");
-                crate::executor::unsat_cert::probe_cert_reject(|| {
-                    format!("checked SAT refutation unavailable: {error}")
+                // Bounded opt-in diagnostics: an unauthenticated original is
+                // reported WITH its rendered terms — the gate that refused it
+                // is otherwise unobservable outside this crate, and the term
+                // ids alone do not identify the axiom/rewrite family.
+                let rendered_unauthenticated = match &error {
+                    CheckedSatRefutationError::OriginalProof(
+                        ExactOriginalProofError::UnauthenticatedOriginalClause { clause, .. },
+                    ) if ay_core::misc_cli_flags().probe_cert_reject => {
+                        Some(self.bounded_cert_reject_probe_terms(clause))
+                    }
+                    _ => None,
+                };
+                crate::executor::unsat_cert::probe_cert_reject(|| match rendered_unauthenticated {
+                    Some(rendered) => format!(
+                        "checked SAT refutation unavailable: {error}
+  rendered: {rendered}"
+                    ),
+                    None => format!("checked SAT refutation unavailable: {error}"),
                 });
             }
         }
@@ -1817,6 +1779,7 @@ mod tests {
             &validated_a,
             &fragment_b,
             &authenticated_b,
+            None,
             &map_b,
             &[],
             &mut terms,

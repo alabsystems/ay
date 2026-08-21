@@ -281,3 +281,67 @@ fn linear_factor_expansion_keeps_genuine_products_opaque() {
     assert!(atoms.iter().any(|(atom, _)| *atom == product));
     assert!(constant.is_zero());
 }
+
+/// UNIFIED-RESOLVER CONTRACT, both halves at once.
+///
+/// [`NraSolver::check_monomial_consistency`] resolves factors through
+/// [`NraSolver::monomial_factor_value`] rather than `var_value`, and that
+/// function asks the tableau FIRST and only then evaluates structurally. This
+/// test pins both properties on the HORNER shape they exist for — a product
+/// whose last factor is a compound `+`, as MetiTarski's Taylor polynomials emit.
+///
+/// 1. RESOLVES WHAT THE TABLEAU CANNOT. `var_value` answers `None` for the
+///    compound `+` (it is a linear combination, not a column). Under the
+///    fail-CLOSED residual that would reject the monomial for lack of evidence
+///    instead of checking it on its merits — historically the shape that let
+///    `sqrt-1mcosq-7-chunk-0170` pass all 30 of its monomials vacuously.
+///
+/// 2. OPAQUE FIRST, AND THAT ORDER IS LOAD-BEARING. The nested product `x*x`
+///    contributes the value the LINEAR abstraction gave it, NOT a structural
+///    recomputation from `x`. Here the abstraction is still unfaithful — `x = 2`
+///    while its opaque `x*x` column is `0` — so the Horner factor must come back
+///    as `0 + 1 = 1`. If it ever returns `4 + 1 = 5`, the structural path is
+///    recomputing nested products, every monomial then agrees with itself, and
+///    `check_monomial_consistency` can never fail again.
+#[test]
+fn horner_factor_resolves_through_the_tableau_first() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let one = terms.mk_rational(integer(1));
+    let two = terms.mk_rational(integer(2));
+    // `(* x (+ (* x x) 1))` — the Horner shape: a compound `+` as last factor.
+    let inner = terms.mk_mul(vec![x, x]);
+    let horner = terms.mk_add(vec![inner, one]);
+    let product = terms.mk_mul(vec![x, horner]);
+    let hundred = terms.mk_rational(integer(100));
+    let assertions = [terms.mk_eq(x, two), terms.mk_le(product, hundred)];
+    let mut solver = NraSolver::new(&terms);
+    for atom in assertions {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.check();
+
+    assert!(
+        solver.compound_factors.contains(&horner),
+        "the `+` node must be recorded as a compound factor"
+    );
+    assert_eq!(
+        solver.var_value(horner),
+        None,
+        "precondition: the tableau does not carry the compound `+` node, which \
+         is exactly why `var_value` alone is not enough"
+    );
+
+    let opaque_inner = solver
+        .var_value(inner)
+        .expect("the nested product has an opaque LRA column");
+    let resolved = solver
+        .monomial_factor_value(horner)
+        .expect("the Horner factor must resolve through the structural path");
+    assert_eq!(
+        resolved,
+        opaque_inner + integer(1),
+        "the Horner factor must be the OPAQUE nested-product value plus one, \
+         never a structural recomputation of x*x"
+    );
+}

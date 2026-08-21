@@ -145,6 +145,13 @@ where
     while let Some(idx) = stack.pop() {
         let step = &proof.steps[idx];
         match step {
+            // NOTE on `fresh_def_bound`: it is a premise-free `Step` and is
+            // counted as NEITHER a trust nor a hole, deliberately. It is a
+            // CERTIFIED leaf — `ay_proof`'s `FreshDefRegistry` re-derives the
+            // freshness that makes it a conservative extension — so counting
+            // it as an unverified fallback would misreport a proof that has
+            // none. It also cannot seed the walk: its clause is a unit, never
+            // empty.
             ProofStep::Step { rule, premises, .. } => {
                 if matches!(rule, AletheRule::Trust) {
                     report.trust_rule_on_path = report.trust_rule_on_path.saturating_add(1);

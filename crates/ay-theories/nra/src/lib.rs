@@ -26,13 +26,59 @@
     clippy::wrong_self_convention
 )]
 pub mod algebraic;
+// Real algebraic numbers over DYADIC isolating intervals — z3's
+// `math/polynomial/algebraic_numbers`. Square-free defining polynomial plus an
+// `a/2^k` interval, exact comparison decided by a gcd/Sturm certificate rather
+// than by a refinement budget, and arithmetic through the fraction-free
+// subresultant PRS.
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod anum;
 mod check_loop;
 pub(crate) mod feasible_set;
 mod grounding;
+// Conflict explanation: an empty feasible set becomes a learned clause that is
+// valid in the theory and false under the current assignment — z3's
+// `nlsat/nlsat_explain`. Carries its own INDEPENDENT implication checker, and
+// declines rather than returning a clause it cannot prove implied.
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod explain;
 mod icp;
+// Interval sets over REAL ALGEBRAIC endpoints, each interval tagged with the
+// literal that justifies it — z3's `nlsat/nlsat_interval_set`. Construction
+// from a sign condition, intersection keeping justifications, emptiness as the
+// conflict signal, a simplicity ladder for `pick`, and complement / subtract.
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+// `nonlinear-common/src/feasible_set.rs` is the WIRED BigRational structure and
+// is neither touched nor duplicated; see this module's header for the measured
+// difference.
+#[allow(dead_code)]
+mod ialg;
 mod monomial;
+// Binary rationals (`a / 2^k`) and the interval refinement / sample-point
+// selection that rests on them — z3's `util/mpbq`.
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod mpbq;
+// Real-root isolation of a MULTIVARIATE polynomial at an algebraic sample
+// point (z3's `isolate_roots(p, x2v, roots)` / `isolate_roots_closest`).
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod mroot;
 mod nlsat;
 mod patch;
+// The sparse multivariate polynomial manager over Z: interned monomials,
+// pseudo-division, PRS and modular GCD, per-variable square-free part.
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+/// Thin public facade over the crate-private exact univariate / real-algebraic
+/// primitives, so the dev-only z3 differential oracle (`crates/ay-nra-oracle`)
+/// can drive them. Compiled only under the `oracle-api` feature, which exists
+/// for that purpose and is never enabled in a shipping build.
+#[cfg(feature = "oracle-api")]
+pub mod oracle_api;
+#[allow(dead_code)]
+mod polymanager;
 pub mod rcf_api;
 mod sign;
 mod sos;
@@ -43,12 +89,29 @@ mod subresultant;
 mod tangent;
 mod theory_impl;
 mod univariate;
+// Dense univariate polynomials over Z and over Z_p, and complete factorization
+// over Z_p (square-free -> distinct-degree -> Cantor-Zassenhaus).
+// Deliberately NOT wired into any solve path yet: it cannot change a verdict.
+#[allow(dead_code)]
+mod upoly;
 mod verification;
 
+#[cfg(test)]
+mod anum_profile;
+#[cfg(test)]
+mod av_probe;
+#[cfg(test)]
+mod explain_cost;
+#[cfg(test)]
+mod ialg_cost;
+#[cfg(test)]
+mod mpbq_tests;
 #[cfg(test)]
 mod scaled_product_tests;
 #[cfg(test)]
 mod theory_tests;
+#[cfg(test)]
+mod upoly_tests;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
@@ -129,6 +192,11 @@ enum SignConstraintTrailEntry {
     Variable(TermId),
 }
 
+/// Exact content of one linearization row: `(source, coefficients, bound,
+/// is_lower)`. Two rows with this key equal are the SAME linear constraint, so
+/// re-adding the second one cannot tighten the relaxation.
+type LinearizationRowKey = (TermId, Vec<(u32, BigRational)>, BigRational, bool);
+
 /// NRA theory solver using model-based incremental linearization
 pub struct NraSolver<'a> {
     /// Reference to the term store
@@ -145,6 +213,12 @@ pub struct NraSolver<'a> {
     compound_factors: Vec<TermId>,
     /// Compound-factor identities already emitted in the active LRA scope.
     compound_defs_emitted: HashSet<TermId>,
+    /// Exact content of every linearization row already live in the active LRA
+    /// scope. Lets [`NraSolver::add_linearization_cut`] suppress a byte-identical
+    /// re-emission and, more importantly, report it as "no new lemma" so the
+    /// refinement loop's `added == 0` stop fires at the real saturation point.
+    /// Cleared with the scope in [`NraSolver::undo_tentative_patch`].
+    linearization_rows: HashSet<LinearizationRowKey>,
     /// Sign constraints on monomials
     sign_constraints: HashMap<Vec<TermId>, Vec<(SignConstraint, TermId)>>,
     /// Sign constraints on variables
@@ -281,6 +355,23 @@ pub struct NraSolver<'a> {
     /// A [`Cell`](std::cell::Cell) because `check()`'s exact procedures take
     /// `&self`.
     pub(crate) grid_budget: std::cell::Cell<usize>,
+
+    /// Nodes available to the grid's SECOND pass — the exact last-coordinate
+    /// solve — held SEPARATELY from [`Self::grid_budget`].
+    ///
+    /// Pass 2 re-sweeps the tree pass 1 has just swept and fails on, so billing
+    /// both to one counter charges pass 1's interior nodes twice plus
+    /// `GRID_EXACT_NODE_COST` per exact decision. That overdraft is invisible on
+    /// the call that spends it — pass 2 only runs after pass 1 has already
+    /// failed — and is paid by a LATER `check()`, whose pass 1 finds the counter
+    /// drained. Splitting them makes pass 1's accounting identical to what it is
+    /// with the exact pass compiled out.
+    ///
+    /// The caveat on [`Self::grid_budget`] applies here unchanged: the DPLL(T)
+    /// pipeline constructs a fresh `NraSolver` per refinement, so this bounds an
+    /// INSTANCE, not a solve. Cost-only, never soundness — exhaustion declines
+    /// the pass and leaves the verdict at the `unknown` it would otherwise be.
+    pub(crate) grid_exact_budget: std::cell::Cell<usize>,
 }
 
 impl<'a> NraSolver<'a> {
@@ -298,6 +389,7 @@ impl<'a> NraSolver<'a> {
             aux_to_monomial: HashMap::default(),
             compound_factors: Vec::new(),
             compound_defs_emitted: HashSet::default(),
+            linearization_rows: HashSet::default(),
             sign_constraints: HashMap::default(),
             var_sign_constraints: HashMap::default(),
             sign_constraint_trail: Vec::new(),
@@ -325,6 +417,7 @@ impl<'a> NraSolver<'a> {
             algebraic_model: Vec::new(),
             last_unsat_certificate: None,
             grid_budget: std::cell::Cell::new(icp::GRID_SOLVE_NODES),
+            grid_exact_budget: std::cell::Cell::new(icp::GRID_EXACT_SOLVE_NODES),
         }
     }
 

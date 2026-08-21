@@ -14,6 +14,7 @@
 use std::fmt::Write as _;
 use std::time::Instant;
 
+use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
 use ay_milp::{BabSession, Col, Model, Outcome, Row, Sense, SolveOpts};
 
 struct Rng(u64);
@@ -144,11 +145,10 @@ fn to_mps_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
 fn main() {
     // B40b: `--smt-lane` replaces the --smt-lane env force.
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let flags = ay_milp::engine_cli::Flags::parse(&raw, ay_milp::engine_cli::VALUE_FLAGS)
-        .unwrap_or_else(|e| {
-            eprintln!("usage: milp_speed [n m seed] [--smt-lane]: {e}");
-            std::process::exit(2);
-        });
+    let flags = Flags::parse(&raw, VALUE_FLAGS, &switch_flags()).unwrap_or_else(|e| {
+        eprintln!("usage: milp_speed [n m seed] [--smt-lane]: {e}");
+        std::process::exit(2);
+    });
     let args = &flags.positional;
     let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(30);
     let m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);

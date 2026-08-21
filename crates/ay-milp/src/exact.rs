@@ -20,7 +20,22 @@
 //! throughout, so termination is guaranteed and iteration caps are a belt,
 //! not the proof. Anything the budget cuts short is `Unknown` — never a
 //! partial verdict (fail-closed).
+//!
+//! TWO REPRESENTATIONS, ONE TABLEAU. The rows are held either as reduced
+//! rationals ([`Form::Reduced`], the historical form and the default) or as
+//! integers over a per-row divisor ([`Form::FractionFree`], see
+//! [`fraction_free`]), and a solve moves from the first to the second at most
+//! once, when the census in [`ExactLp::close_window`] measures the tableau
+//! leaving the inline `i64` path. The two forms denote the SAME coefficients —
+//! `t/den`, with `den = 1` in the first — so the pivot RULE never sees the
+//! difference, the pivot SEQUENCE is identical, and the optimum is
+//! bit-identical either way. What differs is only what the arithmetic under
+//! the rule costs: the reduced form pays a gcd per entry to keep entries
+//! narrow, which is the right trade while they fit in a machine word and the
+//! wrong one once they do not. See [`SWITCH_WINDOW`] for the policy and the
+//! measurements behind it.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
 use ay_lra::rational::Rational;
@@ -30,6 +45,134 @@ use num_traits::Zero;
 use crate::cert::{BoundSide, FactRef, FarkasCertificate, Multiplier};
 use crate::model::{exact, Col, Model, Row};
 use crate::outcome::UnknownReason;
+
+mod fraction_free;
+#[cfg(test)]
+mod probe;
+
+/// Which arithmetic the tableau is held in. See [`ExactLp::form`] for the
+/// policy that moves between them; the two forms denote the SAME numbers, so
+/// nothing about a verdict depends on which one is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// One fully reduced [`Rational`] per entry, `den = 1` on every row.
+    /// The rim's historical representation and still its default.
+    Reduced,
+    /// Integers over a per-row divisor (Bareiss). See [`fraction_free`].
+    FractionFree,
+}
+
+/// THE SWITCH, in four constants.
+///
+/// The signal is the share of tableau entries a pivot writes that stay on
+/// `Rational::Small` — the inline `(i64, i64)` path. It costs a branch per
+/// sampled entry against the gcd-bearing multiply that produced that entry,
+/// and it is exactly the quantity the two representations trade against each
+/// other (the reduced form pays gcds to keep entries narrow; the fraction-free
+/// form pays width to remove the gcds).
+///
+/// MEASURED, `cargo test exact::probe -- --ignored`, per-window census with
+/// the rim driven directly:
+///
+/// ```text
+///   dcmulti  1,632 pivots   100.000% inline in EVERY window
+///   p0201      616 pivots   100.000% inline in EVERY window
+///   qiu      9,189 pivots   100.000% inline in EVERY window
+///   qnet1   80,733 pivots   100.000% inline in EVERY window
+///   mas76      583 pivots   100% to pivot 128, then 96.1 / 60.3 / 50.2 / 3.5 / 0.0
+///   mas74      534 pivots   100% to pivot 128, then the same cliff
+///   blend2   2,511 pivots   100% to pivot 512, 97-99% to 1,400, then 88 / 79 / 61 / 47
+/// ```
+///
+/// THE CLASSES DO NOT OVERLAP, and the reduced class's side of the gap is not
+/// near-100% but EXACTLY it: `dcmulti`, `p0201`, `qiu` and `qnet1` write
+/// 11.7M, 1.2M, 2.1 BILLION and 1.3 BILLION tableau entries respectively and
+/// not ONE of them leaves the inline path. So no threshold below 100% can
+/// fire on that class at all — that is arithmetic, not a margin — and the
+/// threshold's only real job is to catch the other class early.
+///
+/// * [`SWITCH_INLINE_PERCENT`] = 99 — a window is COLD when more than one
+///   entry in a hundred left the inline path. It reads tight and is not: the
+///   reduced form's whole cost is the gcd it runs on entries that are NOT
+///   word-sized, so a small share of them already dominates the window.
+///   MEASURED on `blend2`, which sits at 97-99% for 800 pivots before its
+///   cliff: converting there is worth 2.4x (29.3s reduced, 12.5s switched,
+///   12.9s converted at the first pivot), and a 90% threshold — which waits
+///   for the cliff — is a WASH (29.3s).
+/// * [`SWITCH_WINDOW`] = 16 pivots — the decision is made on ENTRIES, and 16
+///   pivots is 28,000 entries on `mas76` and 64,000 on `blend2`. Sixteen was
+///   chosen against 32 and 64 because the cliff is sharp and the delay is
+///   pure loss: `mas76` converts at pivot 160 rather than 192 or 256, and its
+///   solve goes 1.583s / 2.036s / 3.376s against 1.491s for converting at the
+///   first pivot that can.
+/// * [`SWITCH_SUSTAIN`] = 2 windows — 32 pivots of agreement before a one-way,
+///   tableau-wide rewrite. One window is enough on this corpus; the second is
+///   what stops a single wide pivot from committing the solve.
+/// * [`SWITCH_SAMPLE_STRIDE`] = 8 — see [`ExactLp::census`]. A share does not
+///   need every entry, and charging the reduced class for entries it will
+///   never act on is the one way this policy could have cost it anything.
+///
+/// IF IT NEVER FIRES the rim runs the reduced-rational tableau it has always
+/// run: the policy's whole footprint is a sampled counter pair, a window
+/// comparison in integer arithmetic, and one `Rational` multiply per pivot to
+/// carry `|det B|`. There is no time-based fallback and no second chance — a
+/// solve that stays on the inline path stays reduced, and a solve whose model
+/// could not be integralised never even counts (see
+/// [`ExactLp::convertible`]).
+///
+/// # What a 67-probe sweep found afterwards (2026-08-20)
+///
+/// THE CLASS IS FIFTEEN, NOT THREE. Over 46 distinct matrices (14 MILP corpus
+/// + 15 witness + 38 oracle LP relaxations, 21 of them the same matrices),
+/// the switch fires on `blend2`, `mas74`, `mas76`, `pk1`, `harp2` and all ten
+/// `domset_mw19_*` relaxations. `pk1` (sw@688) is a corpus member and was
+/// independently confirmed at 2.45x on interleaved reps.
+///
+/// THERE IS NO CHEAP STATIC PREDICTOR, which vindicates censusing rather than
+/// classifying: density crosses the boundary (`mas76` 90.5% dense converts,
+/// hexgrid 0.25% does not), matrix integrality crosses it (`pk1` has 0
+/// non-integral rows and converts, `p2756` has 380 and does not), row count
+/// crosses it (12 rows converts, 12,650 does not), and so does λ.
+///
+/// AND THE HONEST OTHER HALF OF "the reduced class pays 0.6-1.9%": AT LEAST
+/// NINE OF ITS MEMBERS WOULD BE 1.5x TO 24.6x FASTER IF THEY CONVERTED, and
+/// this policy cannot see it. Forcing conversion is 24.60x on `air03`, 11.66x
+/// on `l152lav`, 10.48x on `air05`, 10.32x on `mod010`, 6.50x on `enigma`,
+/// 3.49x on `mod008`, 2.74x on `misc07`, 2.14x on `misc03`, 1.50x on `p0201`
+/// — every one bit-identical at identical pivot counts — while costing 3x-7x
+/// on `dcmulti`, `gt2`, `lseu`, `p0282`, `p0548`, `p2756`, `qnet1`, `qiu`.
+/// ONE quantity separates all 28 measured models with zero exceptions, and it
+/// is not the one this policy watches: whether the FRACTION-FREE entries
+/// (`Δ·c`) stay inline. Winners are 100.00% FF-inline; losers 0.00-51.13%.
+/// `Δ` is already carried in [`ExactLp::det`] from the first pivot, so the
+/// missing trigger costs one multiply and one range check per sampled entry
+/// and no new state. Tuning THIS threshold is not the lever: at 100% across
+/// 18 models exactly one switch point moved and nothing new converted.
+///
+/// Before building that trigger, settle whether the rim is on a path anyone
+/// pays for: across ten 30s MILP solves and 1.36M nodes the rim was entered
+/// ONCE for 0.00s, and even the pure-LP lane reaches it only under
+/// `--no-float` (`mas76_lprelax` is 0.037s float-first, 1.241s on the rim).
+const SWITCH_WINDOW: u64 = 16;
+const SWITCH_INLINE_PERCENT: u64 = 99;
+const SWITCH_SUSTAIN: u32 = 2;
+/// One rewritten row in this many is censused — see [`ExactLp::census`].
+const SWITCH_SAMPLE_STRIDE: u64 = 8;
+
+/// The three constants, read once per census window. A test build can move
+/// them (that is how the numbers in [`SWITCH_WINDOW`]'s note were produced);
+/// a shipped build cannot, and has no input to this decision but the census.
+#[inline]
+fn switch_params() -> (u64, u64, u32) {
+    #[cfg(test)]
+    {
+        probe::params()
+    }
+    #[cfg(not(test))]
+    {
+        (SWITCH_WINDOW, SWITCH_INLINE_PERCENT, SWITCH_SUSTAIN)
+    }
+}
 
 /// Iteration/deadline budget for one solve.
 #[derive(Debug, Clone)]
@@ -68,22 +211,82 @@ pub(crate) enum LpOptimum {
     Unknown(UnknownReason),
 }
 
-/// One tableau row: `basic = Σ terms` where every term variable is nonbasic.
-/// Rows are homogeneous (no constant): logical variables carry the row
-/// constants as bounds instead.
+/// One tableau row: `basic = Σ (terms / den)` where every term variable is
+/// nonbasic. Rows are homogeneous (no constant): logical variables carry the
+/// row constants as bounds instead.
+///
+/// ONE STRUCT, TWO REPRESENTATIONS. In [`Form::Reduced`] `den` is 1 and the
+/// stored values ARE the coefficients, fully reduced — the rim's historical
+/// tableau, unchanged. In [`Form::FractionFree`] the stored values are
+/// INTEGERS and the coefficient is `t/den`. `den > 0` in both, so a SIGN test
+/// may read the stored value directly; every arithmetic use goes through
+/// [`coefficient`].
 #[derive(Debug, Clone)]
 struct TabRow {
     basic: u32,
-    /// Sorted by variable index; no zeros.
+    /// Sorted by variable index; no zeros. Numerators over `den`.
     terms: Vec<(u32, Rational)>,
+    /// This row's divisor. Always 1 under [`Form::Reduced`]. Under
+    /// [`Form::FractionFree`] it is `|det B|` for the basis at the pivot that
+    /// last REWROTE this row — which is the current basis only for the rows
+    /// that pivot touched. A row a pivot does not touch keeps its value, hence
+    /// its numerators AND its divisor, and costs that pivot nothing.
+    ///
+    /// PER ROW, NOT SHARED, because a single shared divisor makes every pivot
+    /// rewrite every row — the reduced form never did, and neither does this.
+    /// MEASURED by the round that built the fraction-free arm: one shared
+    /// divisor ran `dcmulti` in 7.477s against the reduced form's 0.579s and
+    /// got `qnet1` through 12,462 Phase I pivots against its 53,747; per-row
+    /// divisors take those to 3.028s and 23,220.
+    den: Rational,
 }
 
 impl TabRow {
-    fn coeff_of(&self, var: u32) -> Option<&Rational> {
+    /// The stored NUMERATOR of `var`'s coefficient — `den` times the true
+    /// value. Sign-faithful in both forms (`den > 0`); not the coefficient.
+    fn numer_of(&self, var: u32) -> Option<&Rational> {
         self.terms
             .binary_search_by_key(&var, |&(v, _)| v)
             .ok()
             .map(|i| &self.terms[i].1)
+    }
+
+    /// The true coefficient of `var`. Borrowed under [`Form::Reduced`], where
+    /// the stored value already is it.
+    fn coeff_of(&self, var: u32) -> Option<Cow<'_, Rational>> {
+        let t = self.numer_of(var)?;
+        Some(if is_unit(&self.den) {
+            Cow::Borrowed(t)
+        } else {
+            Cow::Owned(fraction_free::over(t, &self.den))
+        })
+    }
+}
+
+/// The coefficient a stored numerator denotes.
+#[inline]
+fn coefficient(t: &Rational, den: &Rational) -> Rational {
+    if is_unit(den) {
+        t.clone()
+    } else {
+        fraction_free::over(t, den)
+    }
+}
+
+/// Is this the integer 1? `Rational::Small` is normalised, so the constant is
+/// the only representation of it the tableau ever holds.
+#[inline]
+fn is_unit(r: &Rational) -> bool {
+    matches!(r, Rational::Small(1, 1))
+}
+
+/// Is this an integer? The invariant the fraction-free form rests on, checked
+/// rather than assumed at the one place a solve can enter it.
+#[inline]
+fn is_integral(r: &Rational) -> bool {
+    match r {
+        Rational::Small(_, d) => *d == 1,
+        Rational::Big(b) => b.is_integer(),
     }
 }
 
@@ -99,6 +302,50 @@ pub(crate) struct ExactLp {
     rows: Vec<TabRow>,
     /// var -> row index when basic.
     basic_of: Vec<Option<u32>>,
+    /// The tableau representation in force. Starts [`Form::Reduced`] and moves
+    /// to [`Form::FractionFree`] at most once, never back.
+    form: Form,
+    /// `|det B|` for the current basis of the ROW-INTEGRALISED matrix
+    /// `[ΛA | −I]` — a positive integer, 1 at the logical basis, multiplied by
+    /// `|c_re|` at each pivot (`det B' = det B · c_re` when a pivot swaps one
+    /// basis column). It is the fraction-free form's divisor `Δ`: under
+    /// [`Form::FractionFree`] every freshly written row carries it.
+    ///
+    /// It is also the ONLY thing the reduced form has to carry for the switch
+    /// to be legal, and the reason it is carried from the first pivot rather
+    /// than reconstructed at the switch: `Δ` has to be a determinant of the
+    /// integer matrix for [`fraction_free::fused`]'s divisions to be exact,
+    /// and there is no cheap way to recover one from a tableau that did not
+    /// track it. Cost is one `Rational` multiply per pivot against a pivot's
+    /// whole substitution pass — on `qnet1`, 80,733 of them against 1.3
+    /// BILLION entry writes.
+    det: Rational,
+    /// Per-row integralising scale `λ_r > 0`: the tableau's logical variable
+    /// for row `r` is `λ_r·(a_r·x)`, so the matrix it pivots on is integral
+    /// and `det` starts at 1. `λ_r = 1` for every row of an
+    /// integer-coefficient model. A multiplier over row `r`'s bound is scaled
+    /// BACK by `λ_r` on the way out (see [`ExactLp::multiplier`]).
+    row_scale: Vec<Rational>,
+    /// Set when a fraction-free division left a remainder — i.e. when the
+    /// tableau stopped satisfying the identity its arithmetic rests on. Every
+    /// verdict then becomes `Unknown`: the rim never reports a result derived
+    /// from state it cannot justify.
+    poisoned: bool,
+    /// May this solve switch at all? Cleared when a row could not be
+    /// integralised on the inline path (see [`ExactLp::new_within`]), which
+    /// leaves `det` meaningless and the switch unavailable. It also switches
+    /// OFF the census and the determinant carry, so a model that cannot use
+    /// the policy does not pay for it.
+    convertible: bool,
+    /// The current census window: entries written, of which inline, and pivots
+    /// so far. Reset every [`SWITCH_WINDOW`] pivots.
+    window_entries: u64,
+    window_inline: u64,
+    window_pivots: u64,
+    /// Consecutive windows below [`SWITCH_INLINE_PERCENT`].
+    cold_windows: u32,
+    /// Rewritten rows seen, for the census's fixed-stride sampling.
+    census_seq: u64,
 }
 
 /// Direction a nonbasic variable is moved.
@@ -108,209 +355,8 @@ enum Dir {
     Down,
 }
 
-/// Which structural columns start at their UPPER bound instead of the default
-/// lower one — the exact rim's port of the f64 simplex's upper crash
-/// (`ay_pb_core::optimize::safe_lp_bound::crash_at_upper`, `cb11447d8`).
-///
-/// WHY: the default start puts every structural on its lower bound, so on a
-/// COVERING model (`a_rj > 0`, row lower bound `b_r > 0`, no row upper bound)
-/// all `m` logical variables start BELOW their bound and [`ExactLp::make_feasible`]
-/// has to walk every one of them out, one exact pivot each — and each pivot
-/// substitutes the entering column into every other row, so the tableau fills in
-/// and the rationals lengthen as it goes. MEASURED on `mw19_19` (467x466, HiGHS
-/// milliseconds): 466 of 466 logicals violated at the start, 951 Phase I pivots
-/// in 60s and still not feasible. Starting those columns at their upper bound
-/// instead satisfies every row outright: same instance, 0 Phase I pivots, 4.3µs.
-///
-/// The decision is per column, on the single move `x_j: lower -> upper`
-/// evaluated against the default point — `act_r` is row `r`'s activity there,
-/// `span_j = ub_j - lb_j`, `delta = a_rj * span_j`:
-///
-/// * `gain` — violation the move actually removes, capped per row by what that
-///   row is short (`max(0, lb_r - act_r)`) or over (`max(0, act_r - ub_r)`);
-///   overshooting a satisfied row buys nothing;
-/// * `harm` — violation it can create, charged IN FULL (`|delta|`) against the
-///   row's opposite bound whenever that bound is finite, whatever slack the row
-///   actually has.
-///
-/// Crash at upper iff `gain > harm` with a finite, positive span. Covering rows
-/// give `gain > 0 = harm` (no finite row upper bound to charge), so every column
-/// crashes; packing rows give `0 = gain < harm`, so none does. A row with BOTH
-/// bounds finite charges at least as much harm as it credits gain, so
-/// equality/ranged shapes — set partitioning above all — can never tip a column
-/// and reproduce the old all-at-lower start term for term. Mixed models get the
-/// per-column verdict, and Phase I repairs whatever the estimate got wrong.
-///
-/// NOT shape-gated: the per-column rule self-gates (a covering test is exactly
-/// what `gain > harm` is), and a "does this model look like covering"
-/// precondition would be a second, weaker copy of it that mixed models would
-/// fall through.
-///
-/// WHY THE FULL HARM CHARGE IS THE LOAD-BEARING CHOICE: charging `|delta|`
-/// against any finite opposite bound means a column can only tip when EVERY row
-/// it raises is unbounded above and every row it lowers is unbounded below. So
-/// a crashed column cannot increase any row's violation — and two crashed
-/// columns cannot fight over a row either, since a row that one raises and
-/// another lowers would need both `ub_r = +inf` and `lb_r = -inf`, which leaves
-/// it unviolatable. The crashed start is therefore never worse than the
-/// all-at-lower one, by construction rather than by measurement. The weaker
-/// "harm = slack actually eaten" reading has no such property: it tips whole
-/// set-partitioning models (`a_rj = 1`, `lb_r = ub_r = 1`) on the grounds that
-/// the first unit of slack is free.
-///
-/// [`start_is_better`] then enforces the same property numerically before the
-/// mask is adopted, and adds the one thing the algebra does not: a start that
-/// is ALREADY feasible is left alone (nothing to gain, and a different starting
-/// vertex on a degenerate LP is a different optimal vertex downstream).
-///
-/// EXACTNESS: this is a heuristic read of the model's `f64` view, and it moves
-/// the STARTING POINT only — to a bound already held exactly in `upper`. No
-/// verdict, Farkas certificate or multiplier depends on it; a wrong guess costs
-/// pivots, never soundness. `f64` is therefore the right arithmetic here: two
-/// cheap passes over the matrix rather than rational ones, on a construction
-/// path that is already seconds on a 1.85M-nnz model.
-fn upper_crash_mask(model: &Model, deadline: Option<Instant>) -> Option<Vec<bool>> {
-    let n = model.num_cols();
-    let m = model.num_rows();
-    // The default (all-at-lower) start and each column's crash span, in f64.
-    // A column with an infinite or empty span is not a candidate: its default
-    // start is already the only finite bound it has, or it has none.
-    let mut start = vec![0.0f64; n];
-    let mut span = vec![0.0f64; n];
-    for j in 0..n {
-        let (lb, ub) = model.col_bounds(Col(j as u32));
-        start[j] = if lb.is_finite() {
-            lb
-        } else if ub.is_finite() {
-            ub
-        } else {
-            0.0
-        };
-        if lb.is_finite() && ub.is_finite() && ub > lb {
-            span[j] = ub - lb;
-        }
-    }
-    let mut gain = vec![0.0f64; n];
-    let mut harm = vec![0.0f64; n];
-    for r in 0..m {
-        if r % 64 == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
-            return None;
-        }
-        let (coeffs, lb, ub) = model.row(Row(r as u32));
-        let mut act = 0.0f64;
-        for &(c, a) in coeffs {
-            act += a * start[c as usize];
-        }
-        let short = if lb.is_finite() {
-            (lb - act).max(0.0)
-        } else {
-            0.0
-        };
-        let over = if ub.is_finite() {
-            (act - ub).max(0.0)
-        } else {
-            0.0
-        };
-        for &(c, a) in coeffs {
-            let j = c as usize;
-            let delta = a * span[j];
-            if delta > 0.0 {
-                gain[j] += delta.min(short);
-                if ub.is_finite() {
-                    harm[j] += delta;
-                }
-            } else if delta < 0.0 {
-                gain[j] += (-delta).min(over);
-                if lb.is_finite() {
-                    harm[j] += -delta;
-                }
-            }
-        }
-    }
-    let mask: Vec<bool> = (0..n)
-        .map(|j| span[j] > 0.0 && gain[j].is_finite() && harm[j].is_finite() && gain[j] > harm[j])
-        .collect();
-    if !start_is_better(model, &mask, &start, &span, deadline)? {
-        return Some(vec![false; n]);
-    }
-    Some(mask)
-}
-
-/// Does the crashed start leave the logicals in better shape than the
-/// all-at-lower one? The DOMINANCE GUARD on [`upper_crash_mask`]: adopt the
-/// mask only where it demonstrably helps, so no model can be handed a worse
-/// start than the one it has today.
-///
-/// "Better" is measured the way Phase I pays for it — first on the NUMBER of
-/// logicals outside their bounds (each one costs at least one exact repair
-/// pivot, and each pivot substitutes into every row), then, on a tie, on total
-/// violation. A tie in both keeps the old start: an equally-violated but
-/// radically different starting vertex is a change with no case for it.
-///
-/// A non-finite activity anywhere (an overflowing `f64` dot product) declines
-/// the crash outright — the estimate cannot be trusted on numbers it cannot
-/// represent, and declining costs only the old behaviour.
-///
-/// This is a BELT, not the proof: the full harm charge in [`upper_crash_mask`]
-/// already makes a crashed column unable to raise any row's violation, and a
-/// non-empty mask means some row's shortfall strictly falls, so the guard
-/// passes whenever it is consulted. It is kept because it costs one `f64` pass
-/// on a rational construction path, it is what catches a rounding-tipped column
-/// or a future weakening of the rule, and it states the invariant a reader
-/// would otherwise have to re-derive.
-fn start_is_better(
-    model: &Model,
-    mask: &[bool],
-    start: &[f64],
-    span: &[f64],
-    deadline: Option<Instant>,
-) -> Option<bool> {
-    if !mask.iter().any(|&on| on) {
-        return Some(false);
-    }
-    let (mut count_lower, mut count_crash) = (0usize, 0usize);
-    let (mut viol_lower, mut viol_crash) = (0.0f64, 0.0f64);
-    for r in 0..model.num_rows() {
-        if r % 64 == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
-            return None;
-        }
-        let (coeffs, lb, ub) = model.row(Row(r as u32));
-        let mut act_lower = 0.0f64;
-        let mut act_crash = 0.0f64;
-        for &(c, a) in coeffs {
-            let j = c as usize;
-            act_lower += a * start[j];
-            act_crash += a * if mask[j] {
-                start[j] + span[j]
-            } else {
-                start[j]
-            };
-        }
-        if !act_lower.is_finite() || !act_crash.is_finite() {
-            return Some(false);
-        }
-        for (act, count, viol) in [
-            (act_lower, &mut count_lower, &mut viol_lower),
-            (act_crash, &mut count_crash, &mut viol_crash),
-        ] {
-            let short = if lb.is_finite() {
-                (lb - act).max(0.0)
-            } else {
-                0.0
-            };
-            let over = if ub.is_finite() {
-                (act - ub).max(0.0)
-            } else {
-                0.0
-            };
-            if short > 0.0 || over > 0.0 {
-                *count += 1;
-                *viol += short + over;
-            }
-        }
-    }
-    Some(count_crash < count_lower || (count_crash == count_lower && viol_crash < viol_lower))
-}
+mod construction;
+mod pivot;
 
 impl ExactLp {
     /// Build from a model, relaxing integrality (binary columns become their
@@ -325,93 +371,6 @@ impl ExactLp {
     /// construction deadline whose cost the caller owns.
     pub(crate) fn new(model: &Model) -> Self {
         Self::new_within(model, None).expect("no deadline to miss")
-    }
-
-    /// As [`Self::new`], declining (fail-closed) if `deadline` passes mid-build.
-    pub(crate) fn new_within(model: &Model, deadline: Option<Instant>) -> Option<Self> {
-        let n = model.num_cols();
-        let m = model.num_rows();
-        let total = n + m;
-        let mut lower: Vec<Option<Rational>> = Vec::with_capacity(total);
-        let mut upper: Vec<Option<Rational>> = Vec::with_capacity(total);
-        let mut values: Vec<Rational> = Vec::with_capacity(total);
-        for i in 0..n {
-            if i & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
-                return None;
-            }
-            let (lb, ub) = model.col_bounds(Col(i as u32));
-            let lb = exact(lb).map(Rational::from_big);
-            let ub = exact(ub).map(Rational::from_big);
-            // Nonbasic start value: a finite bound, else 0.
-            let v = lb
-                .clone()
-                .or_else(|| ub.clone())
-                .unwrap_or_else(Rational::zero);
-            lower.push(lb);
-            upper.push(ub);
-            values.push(v);
-        }
-        // Upper-bound crash (see [`upper_crash_mask`]): choose each structural's
-        // starting bound BEFORE the rows are built, so the exact activity pass
-        // below lands on the crashed point directly and no second rational pass
-        // over the matrix is needed. Nonbasics still sit on a bound, which is
-        // what `make_feasible`'s termination argument requires.
-        let crash = upper_crash_mask(model, deadline)?;
-        for (j, at_upper) in crash.iter().enumerate() {
-            if *at_upper {
-                if let Some(ub) = &upper[j] {
-                    values[j] = ub.clone();
-                }
-            }
-        }
-        let mut rows = Vec::with_capacity(m);
-        for r in 0..m {
-            if r % 64 == 0 {
-                if let Some(d) = deadline {
-                    if Instant::now() >= d {
-                        return None;
-                    }
-                }
-            }
-            let (coeffs, lb, ub) = model.row(Row(r as u32));
-            // VERDICT-CRITICAL: the exact rim tableau is built from the TRUE
-            // model. A rounded `f64` coefficient/bound is read from the
-            // exact-rational side-store, so the rim produces Farkas/optimum
-            // verdicts over the model the file actually wrote.
-            let mut terms = Vec::with_capacity(coeffs.len());
-            for (entry, &(c, a)) in coeffs.iter().enumerate() {
-                if entry & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
-                    return None;
-                }
-                terms.push((c, Rational::from_big(model.row_coeff_exact(r, c, a))));
-            }
-            let mut v = Rational::zero();
-            for (entry, (c, a)) in terms.iter().enumerate() {
-                if entry & 0xff == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) {
-                    return None;
-                }
-                v += a.clone() * values[*c as usize].clone();
-            }
-            lower.push(model.row_lb_exact(r, lb).map(Rational::from_big));
-            upper.push(model.row_ub_exact(r, ub).map(Rational::from_big));
-            values.push(v);
-            rows.push(TabRow {
-                basic: (n + r) as u32,
-                terms,
-            });
-        }
-        let mut basic_of = vec![None; total];
-        for (ri, row) in rows.iter().enumerate() {
-            basic_of[row.basic as usize] = Some(ri as u32);
-        }
-        Some(Self {
-            n_structural: n,
-            lower,
-            upper,
-            values,
-            rows,
-            basic_of,
-        })
     }
 
     /// The current structural point, exact.
@@ -480,51 +439,10 @@ impl ExactLp {
         self.values[var as usize] += delta.clone();
         for row in &self.rows {
             if let Some(c) = row.coeff_of(var) {
-                let d = c.clone() * delta.clone();
+                let d = c.into_owned() * delta.clone();
                 self.values[row.basic as usize] += d;
             }
         }
-    }
-
-    /// Algebraic pivot: `entering` (nonbasic, in row `ri`) becomes basic,
-    /// the row's current basic leaves. Values are not touched.
-    fn pivot(&mut self, ri: usize, entering: u32) {
-        let row = &self.rows[ri];
-        let leaving = row.basic;
-        let c_e = row
-            .coeff_of(entering)
-            .expect("pivot: entering not in row")
-            .clone();
-        // x_e = (1/c_e)·x_leaving − Σ_{k≠e} (c_k/c_e)·x_k
-        let inv = Rational::new(1, 1) / c_e;
-        let mut new_terms: Vec<(u32, Rational)> = Vec::with_capacity(row.terms.len());
-        for (v, c) in &row.terms {
-            if *v == entering {
-                continue;
-            }
-            new_terms.push((*v, -(c.clone() * inv.clone())));
-        }
-        new_terms.push((leaving, inv));
-        new_terms.sort_unstable_by_key(|&(v, _)| v);
-        let new_row = TabRow {
-            basic: entering,
-            terms: new_terms,
-        };
-        // Substitute x_e in every other row.
-        for rj in 0..self.rows.len() {
-            if rj == ri {
-                continue;
-            }
-            let d = match self.rows[rj].coeff_of(entering) {
-                Some(d) => d.clone(),
-                None => continue,
-            };
-            let substituted = substitute(&self.rows[rj].terms, entering, &d, &new_row.terms);
-            self.rows[rj].terms = substituted;
-        }
-        self.basic_of[leaving as usize] = None;
-        self.basic_of[entering as usize] = Some(ri as u32);
-        self.rows[ri] = new_row;
     }
 
     /// Phase A: repair basic-variable bound violations (Bland). On success
@@ -566,10 +484,12 @@ impl ExactLp {
             };
             let row = &self.rows[ri];
             let basic = row.basic;
-            // Smallest-index nonbasic that can absorb the repair.
+            // Smallest-index nonbasic that can absorb the repair. The sign test
+            // reads the stored numerator directly — `den > 0`, so the sign is
+            // the coefficient's own, in either representation.
             let mut entering: Option<(u32, Rational)> = None;
-            for (v, c) in &row.terms {
-                let pos = c > &Rational::zero();
+            for (v, t) in &row.terms {
+                let pos = t > &Rational::zero();
                 let suitable = if need_increase {
                     // basic must increase: raise a positive-coeff var or
                     // lower a negative-coeff var.
@@ -580,11 +500,11 @@ impl ExactLp {
                         || (!pos && self.can_increase(*v as usize))
                 };
                 if suitable {
-                    entering = Some((*v, c.clone()));
+                    entering = Some((*v, t.clone()));
                     break; // terms sorted by index: first hit is Bland's choice
                 }
             }
-            let Some((evar, ecoeff)) = entering else {
+            let Some((evar, enumer)) = entering else {
                 return LpFeasibility::Infeasible(self.farkas_from_row(ri, need_increase));
             };
             // Move entering so that basic lands exactly on its violated bound.
@@ -594,10 +514,13 @@ impl ExactLp {
                 self.upper[basic as usize].clone().expect("violated upper")
             };
             let delta_basic = target - self.values[basic as usize].clone();
-            let delta_e = delta_basic / ecoeff;
+            let delta_e = delta_basic / coefficient(&enumer, &self.rows[ri].den);
             self.shift_nonbasic(evar, &delta_e);
             // basic now sits on its bound (exactly, by construction).
             self.pivot(ri, evar);
+            if self.poisoned {
+                return LpFeasibility::Unknown(poisoned_reason());
+            }
         }
     }
 
@@ -609,42 +532,75 @@ impl ExactLp {
         let basic = row.basic;
         let mut multipliers = Vec::with_capacity(row.terms.len() + 1);
         let one = BigRational::from_integer(1.into());
-        if need_increase {
+        let basic_side = if need_increase {
             // basic < lb, and every term is saturated against raising it.
-            multipliers.push(Multiplier {
-                fact: self.fact_of(basic, BoundSide::Lower),
-                coeff: one,
-            });
-            for (v, c) in &row.terms {
-                let (side, coeff) = if c > &Rational::zero() {
-                    (BoundSide::Upper, c.to_big())
-                } else {
-                    (BoundSide::Lower, -c.to_big())
-                };
-                multipliers.push(Multiplier {
-                    fact: self.fact_of(*v, side),
-                    coeff,
-                });
-            }
+            BoundSide::Lower
         } else {
             // basic > ub, and every term is saturated against lowering it.
-            multipliers.push(Multiplier {
-                fact: self.fact_of(basic, BoundSide::Upper),
-                coeff: one,
-            });
-            for (v, c) in &row.terms {
-                let (side, coeff) = if c > &Rational::zero() {
-                    (BoundSide::Lower, c.to_big())
-                } else {
-                    (BoundSide::Upper, -c.to_big())
-                };
-                multipliers.push(Multiplier {
-                    fact: self.fact_of(*v, side),
-                    coeff,
-                });
-            }
+            BoundSide::Upper
+        };
+        multipliers.push(self.multiplier(basic, basic_side, one));
+        for (v, t) in &row.terms {
+            let c = coefficient(t, &row.den);
+            let positive = c > Rational::zero();
+            let (side, coeff) = match (need_increase, positive) {
+                (true, true) => (BoundSide::Upper, c.to_big()),
+                (true, false) => (BoundSide::Lower, -c.to_big()),
+                (false, true) => (BoundSide::Lower, c.to_big()),
+                (false, false) => (BoundSide::Upper, -c.to_big()),
+            };
+            multipliers.push(self.multiplier(*v, side, coeff));
         }
         FarkasCertificate { multipliers }
+    }
+
+    /// One certificate multiplier over a MODEL fact.
+    ///
+    /// The tableau's logical variable for row `r` is `λ_r·(a_r·x)` (see
+    /// [`Self::row_scale`]), so a tableau multiplier `μ` on its bound is `μ·λ_r`
+    /// on the model's own row bound: the model fact `a_r·x ≥ b_r` has to be
+    /// scaled by `λ_r` to become the fact the tableau reasoned with. Structural
+    /// columns are never scaled, so their multipliers pass through untouched —
+    /// as does every multiplier of an integer-coefficient model, where every
+    /// `λ_r` is 1.
+    fn multiplier(&self, var: u32, side: BoundSide, coeff: BigRational) -> Multiplier {
+        let coeff = match (var as usize).checked_sub(self.n_structural) {
+            Some(r) if !is_unit(&self.row_scale[r]) => coeff * self.row_scale[r].to_big(),
+            _ => coeff,
+        };
+        Multiplier {
+            fact: self.fact_of(var, side),
+            coeff,
+        }
+    }
+
+    /// Express a structural objective over the current nonbasic variables.
+    fn objective_row(&self, obj: &[(u32, Rational)]) -> Vec<(u32, Rational)> {
+        let mut row = Vec::new();
+        for (var, coefficient) in obj {
+            if coefficient.is_zero() {
+                continue;
+            }
+            match self.basic_of[*var as usize] {
+                None => merge_term(&mut row, *var, coefficient.clone()),
+                Some(index) => {
+                    let tableau = &self.rows[index as usize];
+                    let scaled = if is_unit(&tableau.den) {
+                        coefficient.clone()
+                    } else {
+                        coefficient.clone() / tableau.den.clone()
+                    };
+                    for (term_var, term_coefficient) in &tableau.terms {
+                        merge_term(
+                            &mut row,
+                            *term_var,
+                            scaled.clone() * term_coefficient.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        row
     }
 
     /// Phase B: minimize `Σ obj·x` (structural coefficients) from a feasible
@@ -655,21 +611,7 @@ impl ExactLp {
             LpFeasibility::Infeasible(cert) => return LpOptimum::Infeasible(cert),
             LpFeasibility::Unknown(r) => return LpOptimum::Unknown(r),
         }
-        // Express the objective over nonbasic variables.
-        let mut d: Vec<(u32, Rational)> = Vec::new();
-        for (v, c) in obj {
-            if c.is_zero() {
-                continue;
-            }
-            match self.basic_of[*v as usize] {
-                None => merge_term(&mut d, *v, c.clone()),
-                Some(ri) => {
-                    for (tv, tc) in &self.rows[ri as usize].terms {
-                        merge_term(&mut d, *tv, c.clone() * tc.clone());
-                    }
-                }
-            }
-        }
+        let mut d = self.objective_row(obj);
         let mut iters: u64 = 0;
         loop {
             iters += 1;
@@ -722,13 +664,14 @@ impl ExactLp {
             // smallest basic index.
             let mut row_limit: Option<(Rational, usize, u32)> = None;
             for (ri, row) in self.rows.iter().enumerate() {
-                let Some(c) = row.coeff_of(evar) else {
+                let Some(t) = row.numer_of(evar) else {
                     continue;
                 };
-                // basic delta per unit step: +c (Up) or −c (Down).
+                // basic delta per unit step: +c (Up) or −c (Down). `den > 0`,
+                // so the stored numerator carries the sign.
                 let increases_basic = match dir {
-                    Dir::Up => c > &Rational::zero(),
-                    Dir::Down => c < &Rational::zero(),
+                    Dir::Up => t > &Rational::zero(),
+                    Dir::Down => t < &Rational::zero(),
                 };
                 let b = row.basic as usize;
                 let room = if increases_basic {
@@ -741,7 +684,7 @@ impl ExactLp {
                         .map(|lb| self.values[b].clone() - lb.clone())
                 };
                 let Some(room) = room else { continue };
-                let rate = c.clone().abs();
+                let rate = coefficient(t, &row.den).abs();
                 let limit = room / rate;
                 let replace = match &row_limit {
                     None => true,
@@ -773,15 +716,22 @@ impl ExactLp {
                     // Update the objective row: substitute the entering
                     // variable using the post-pivot row.
                     self.pivot(ri, evar);
+                    if self.poisoned {
+                        return LpOptimum::Unknown(poisoned_reason());
+                    }
                     let e_coeff = d
                         .binary_search_by_key(&evar, |&(v, _)| v)
                         .ok()
                         .map(|i| d[i].1.clone());
                     if let Some(dc) = e_coeff {
                         d.retain(|&(v, _)| v != evar);
+                        // The row is the POST-pivot pivot row, in whatever
+                        // divisor's units that pivot left it.
+                        let den = self.rows[ri].den.clone();
+                        let scaled = if is_unit(&den) { dc } else { dc / den };
                         let expr = self.rows[ri].terms.clone();
                         for (tv, tc) in expr {
-                            merge_term(&mut d, tv, dc.clone() * tc);
+                            merge_term(&mut d, tv, scaled.clone() * tc);
                         }
                     }
                 }
@@ -805,15 +755,22 @@ impl ExactLp {
             } else {
                 (BoundSide::Upper, -dc.to_big())
             };
-            multipliers.push(Multiplier {
-                fact: self.fact_of(*v, side),
-                coeff,
-            });
+            multipliers.push(self.multiplier(*v, side, coeff));
         }
         LpOptimum::Optimal {
             value: value.to_big(),
             multipliers,
         }
+    }
+}
+
+/// The reason a poisoned tableau reports. It cannot fire on a correct
+/// fraction-free pivot: `Δ` divides every combination the identity produces.
+/// If it ever does, the rim withholds the verdict rather than continuing on
+/// arithmetic it has just caught being wrong.
+fn poisoned_reason() -> UnknownReason {
+    UnknownReason::WitnessRejected {
+        detail: "exact rim: fraction-free tableau division left a remainder".to_string(),
     }
 }
 
@@ -858,127 +815,4 @@ fn signed(magnitude: &Rational, dir: Dir) -> Rational {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn budget() -> Budget {
-        Budget {
-            deadline: None,
-            max_iters: 10_000,
-        }
-    }
-
-    /// No logical starts outside its bounds ⇔ `make_feasible` returns without
-    /// pivoting once.
-    fn phase_one_is_empty(lp: &ExactLp) -> bool {
-        lp.rows
-            .iter()
-            .all(|row| !lp.below_lower(row.basic as usize) && !lp.above_upper(row.basic as usize))
-    }
-
-    fn unit_objective(n: u32) -> Vec<(u32, Rational)> {
-        (0..n).map(|j| (j, Rational::new(1, 1))).collect()
-    }
-
-    /// COVERING — the class the crash exists for: every column tips to its
-    /// upper bound, which leaves Phase I with nothing to repair, and the
-    /// optimum is unchanged by the different starting point.
-    #[test]
-    fn covering_columns_crash_and_leave_phase_one_empty() {
-        let mut m = Model::new();
-        let x = m.add_col(0.0, 1.0);
-        let y = m.add_col(0.0, 1.0);
-        let z = m.add_col(0.0, 1.0);
-        m.add_row(1.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
-        m.add_row(1.0, f64::INFINITY, &[(y, 1.0), (z, 1.0)]);
-        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![true, true, true]);
-        let mut lp = ExactLp::new(&m);
-        assert!(phase_one_is_empty(&lp));
-        // min x+y+z over that cover is 1 (y = 1), crash or no crash.
-        let LpOptimum::Optimal { value, .. } = lp.minimize(&unit_objective(3), &budget()) else {
-            panic!("covering LP must be optimal");
-        };
-        assert_eq!(value, BigRational::from_integer(1.into()));
-    }
-
-    /// PACKING — `gain` is 0 and `harm` is not, so nothing tips and the start
-    /// is the historical all-at-lower one.
-    #[test]
-    fn packing_columns_do_not_crash() {
-        let mut m = Model::new();
-        let x = m.add_col(0.0, 1.0);
-        let y = m.add_col(0.0, 1.0);
-        m.add_row(f64::NEG_INFINITY, 1.0, &[(x, 1.0), (y, 1.0)]);
-        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![false, false]);
-        let lp = ExactLp::new(&m);
-        assert!(lp.values[..2].iter().all(Rational::is_zero));
-    }
-
-    /// SET PARTITIONING — a row with both bounds finite charges at least as
-    /// much harm as it credits gain, so an equality model can never tip a
-    /// column. This is what keeps `air03`/`nw04`-shaped models on their old
-    /// start.
-    #[test]
-    fn equality_rows_never_crash() {
-        let mut m = Model::new();
-        let x = m.add_col(0.0, 1.0);
-        let y = m.add_col(0.0, 1.0);
-        let z = m.add_col(0.0, 1.0);
-        m.add_row(1.0, 1.0, &[(x, 1.0), (y, 1.0)]);
-        m.add_row(1.0, 1.0, &[(y, 1.0), (z, 1.0)]);
-        assert_eq!(
-            upper_crash_mask(&m, None).unwrap(),
-            vec![false, false, false]
-        );
-    }
-
-    /// A start that is already feasible is left alone: with nothing short,
-    /// nothing has anything to gain, so no column tips and the starting vertex
-    /// — which is what a degenerate LP's reported optimum hangs on — does not
-    /// move.
-    #[test]
-    fn a_feasible_start_is_not_disturbed() {
-        let mut m = Model::new();
-        let x = m.add_col(0.0, 1.0);
-        let y = m.add_col(0.0, 1.0);
-        // Covering-shaped (no finite row upper bound) but satisfied at x=y=0.
-        m.add_row(0.0, f64::INFINITY, &[(x, 1.0), (y, 1.0)]);
-        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![false, false]);
-        let lp = ExactLp::new(&m);
-        assert!(lp.values[..2].iter().all(Rational::is_zero));
-    }
-
-    /// An unbounded column has no upper bound to crash to; a fixed column has
-    /// nowhere to move. Neither is a candidate.
-    #[test]
-    fn infinite_and_empty_spans_are_not_candidates() {
-        let mut m = Model::new();
-        let free = m.add_col(0.0, f64::INFINITY);
-        let fixed = m.add_col(1.0, 1.0);
-        let boxed = m.add_col(0.0, 1.0);
-        m.add_row(
-            5.0,
-            f64::INFINITY,
-            &[(free, 1.0), (fixed, 1.0), (boxed, 1.0)],
-        );
-        assert_eq!(
-            upper_crash_mask(&m, None).unwrap(),
-            vec![false, false, true]
-        );
-    }
-
-    /// The crash is a STARTING POINT, not a verdict: an infeasible covering
-    /// model is still refuted, with the same exact answer either way.
-    #[test]
-    fn crash_does_not_change_an_infeasible_verdict() {
-        let mut m = Model::new();
-        let x = m.add_col(0.0, 1.0);
-        m.add_row(2.0, f64::INFINITY, &[(x, 1.0)]);
-        assert_eq!(upper_crash_mask(&m, None).unwrap(), vec![true]);
-        let mut lp = ExactLp::new(&m);
-        assert!(matches!(
-            lp.make_feasible(&budget()),
-            LpFeasibility::Infeasible(_)
-        ));
-    }
-}
+mod tests;

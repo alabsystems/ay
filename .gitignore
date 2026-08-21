@@ -284,6 +284,7 @@ chc-obligations/
 # ...except the committed DRAT canary fixtures (checker regression inputs).
 !benchmarks/sat/canary/*.cnf.drat
 benchmarks/smt-lib-incremental/QF_LIA/
+benchmarks/smt-lib-incremental/incremental/
 benchmarks/sat/*.tar.zst
 benchmarks/smt-lib-incremental/*.tar.zst
 benchmarks/minizinc/*.tar.zst

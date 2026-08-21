@@ -26,6 +26,8 @@ mod application_evaluation;
 mod guarded_range;
 #[path = "bv_lia_query_int.rs"]
 mod integer_evaluation;
+#[path = "bv_lia_query_interval.rs"]
+mod interval_refutation;
 #[path = "bv_lia_query_pins.rs"]
 mod pins;
 #[path = "bv_lia_query_sort.rs"]
@@ -194,132 +196,7 @@ pub fn authenticate_bv_lia_unsat_query(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Value {
-    Bool(bool),
-    Int(BigInt),
-    BitVec { value: u64, width: u32 },
-}
-
-#[derive(Default)]
-struct Environment {
-    bools: HashMap<TermId, bool>,
-    ints: HashMap<TermId, BigInt>,
-    int_limbs: u64,
-    bvs: HashMap<TermId, (u64, u32)>,
-}
-
-impl Environment {
-    fn clear_ints(&mut self) {
-        self.ints.clear();
-        self.int_limbs = 0;
-    }
-}
-
-struct CollectedVariables {
-    ints: Vec<TermId>,
-    bools: Vec<TermId>,
-    bitvecs: Vec<(TermId, u32)>,
-}
-
-#[derive(Debug)]
-enum Dimension {
-    Bool(TermId),
-    BitVec {
-        term: TermId,
-        width: u32,
-    },
-    IntClass {
-        members: Vec<TermId>,
-        lower: BigInt,
-        count: u64,
-    },
-}
-
-impl Dimension {
-    fn count(&self) -> u64 {
-        match self {
-            Self::Bool(_) => 2,
-            Self::BitVec { width, .. } => 1_u64 << width,
-            Self::IntClass { count, .. } => *count,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ClassBounds {
-    lower: Option<BigInt>,
-    upper: Option<BigInt>,
-}
-
-struct IntClasses {
-    class_of: HashMap<TermId, usize>,
-    members: Vec<Vec<TermId>>,
-    bounds: Vec<ClassBounds>,
-}
-
-impl IntClasses {
-    fn members_for(&self, term: TermId) -> Option<&[TermId]> {
-        self.class_of
-            .get(&term)
-            .map(|&class| self.members[class].as_slice())
-    }
-
-    fn semantic_key(&self, term: TermId) -> Option<usize> {
-        self.class_of.get(&term).copied()
-    }
-}
-
-enum QueryDecision {
-    Sat,
-    Unsat,
-}
-
-struct Meter {
-    work: u64,
-    deadline: Option<Instant>,
-}
-
-impl Meter {
-    fn charge(&mut self, amount: u64) -> Result<(), BvLiaUnsatAuthenticationError> {
-        let previous_work = self.work;
-        self.work =
-            self.work
-                .checked_add(amount)
-                .ok_or(BvLiaUnsatAuthenticationError::ResourceLimit {
-                    resource: "work accounting",
-                })?;
-        if self.work > MAX_WORK {
-            return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
-                resource: "deterministic work budget",
-            });
-        }
-        // Bulk limb charges need not land exactly on a sampling boundary.
-        // Compare buckets so crossing one or many boundaries always samples.
-        if (previous_work >> 14) != (self.work >> 14)
-            && self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
-                resource: "caller deadline",
-            });
-        }
-        Ok(())
-    }
-
-    fn check_entry(&mut self) -> Result<(), BvLiaUnsatAuthenticationError> {
-        if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(BvLiaUnsatAuthenticationError::ResourceLimit {
-                resource: "caller deadline",
-            });
-        }
-        self.charge(1)
-    }
-}
+include!("bv_lia_query/state.rs");
 
 struct QueryChecker<'a> {
     terms: &'a TermStore,
@@ -956,7 +833,14 @@ impl<'a> QueryChecker<'a> {
                 return Ok(true);
             }
         }
-        self.has_guarded_bv2nat_range_contradiction(assertions)
+        if self.has_guarded_bv2nat_range_contradiction(assertions)? {
+            return Ok(true);
+        }
+        // Width-independent interval refutation. This is the only lane that
+        // reaches a query carrying a free 64-bit BV carrier, which the finite
+        // enumerator below declines by construction; see
+        // `bv_lia_query_interval.rs`.
+        self.has_interval_contradiction(assertions)
     }
 
     fn interval_proves_false(

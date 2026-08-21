@@ -18,6 +18,13 @@ pub(in super::super) fn sealed_propagation_environment(
         return FragmentPropagationEnvironment::default();
     }
     let mut environment = FragmentPropagationEnvironment::default();
+    if ay_core::misc_cli_flags().debug_cert {
+        eprintln!(
+            "CERT/seal propagation: raw entries={} raw rewrites={}",
+            executor.propagated_value_provenance.entries.len(),
+            executor.propagated_value_provenance.rewrites.len(),
+        );
+    }
     let entries = executor.propagated_value_provenance.entries.clone();
     for entry in entries.iter().take(MAX_SEALED_DERIVATIONS) {
         let Some(token) = CheckedPropagationEntry::seal(executor, entry) else {
@@ -42,6 +49,43 @@ pub(in super::super) fn sealed_propagation_environment(
         environment.record_by_after.entry(after).or_insert(bridge);
     }
     environment
+}
+
+/// Seal every context-derivation producer hint recorded for this query
+/// (#dt-context-derivation). First-wins per normalized clause; anything that
+/// fails to seal is silently dropped (fail-closed: a missing map entry can
+/// only decline an authentication).
+pub(in super::super) fn sealed_context_derivations(
+    executor: &mut Executor,
+) -> HashMap<Vec<TermId>, FragmentContextDerivation> {
+    if !crate::quant_unit_authority::quant_unit_authority_enabled() {
+        return HashMap::default();
+    }
+    let records = executor.dt_context_conflict_records.records.clone();
+    let mut map: HashMap<Vec<TermId>, FragmentContextDerivation> = HashMap::default();
+    let mut seal_declines = 0usize;
+    // The sink dedups at record time, so every entry is a distinct clause;
+    // seal them all (the sink's own cap bounds this).
+    for record in records.iter() {
+        let Some(token) = CheckedContextDerivation::seal(executor, record) else {
+            seal_declines += 1;
+            continue;
+        };
+        let Some((key, derivation)) = token.into_current(executor) else {
+            seal_declines += 1;
+            continue;
+        };
+        map.entry(key).or_insert(derivation);
+    }
+    if std::env::var("AY_DT_DEBUG").is_ok() {
+        eprintln!(
+            "c context-seal-debug records={} sealed={} declined={}",
+            records.len(),
+            map.len(),
+            seal_declines,
+        );
+    }
+    map
 }
 
 /// Seal every qpf premise-forced instance root recorded for this query

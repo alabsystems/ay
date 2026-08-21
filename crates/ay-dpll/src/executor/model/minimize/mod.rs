@@ -19,7 +19,9 @@ use {ay_arrays::ArrayInterpretation, num_traits::One, num_traits::Zero};
 use super::{EvalValue, Model};
 use crate::executor::Executor;
 
+mod bv_dependents;
 mod candidates;
+use bv_dependents::BvDependentIndex;
 use candidates::*;
 
 /// Maximum minimization passes. After shrinking one variable, others may
@@ -100,6 +102,19 @@ impl Executor {
         // of seconds past the solve deadline. A stop before any mutation returns
         // immediately. A stop after a kept candidate restores the original
         // model before returning, so the deadline cannot bypass the final gate.
+        // Observable proof that the cosmetic pass RAN (#model-demand). The
+        // demand gate lives at the four call sites, so without a counter here
+        // "it was skipped" is only visible as a wall-clock difference, and a
+        // gate that quietly stopped gating would look identical to one that
+        // works. Counts entries, not accepted candidates: a pass that shrinks
+        // nothing still spent the time this gate exists to save.
+        let runs = self
+            .last_statistics
+            .get_int("model_minimization.runs")
+            .unwrap_or(0);
+        self.last_statistics
+            .set_int("model_minimization.runs", runs.saturating_add(1));
+
         let mut pre_minimization: Option<Model> = None;
         let mut scalar_changed = false;
         let mut stopped = false;
@@ -108,12 +123,12 @@ impl Executor {
                 stopped = true;
                 break;
             }
-            // Phase 1: Collect all variables and their candidate lists.
-            let mut attempts = match self.last_model.as_ref() {
-                Some(model) => self.collect_min_attempts(model),
-                None => return,
+            // Phase 1: candidate lists, plus the BV dependency index they share
+            // (one walk per pass, not one per candidate leaf).
+            let Some((mut attempts, dependents)) = self.collect_min_attempts_and_dependents()
+            else {
+                return;
             };
-
             if attempts.is_empty() {
                 break;
             }
@@ -142,7 +157,7 @@ impl Executor {
                         self.try_lra_candidates(term_id, candidates)
                     }
                     MinAttempt::Bv(term_id, candidates) => {
-                        self.try_bv_candidates(term_id, candidates)
+                        self.try_bv_candidates(term_id, candidates, &dependents)
                     }
                 };
                 any_changed |= changed;
@@ -417,7 +432,15 @@ impl Executor {
     }
 
     /// Try replacing a BV variable with smaller candidates. Returns true if changed.
-    fn try_bv_candidates(&mut self, term_id: TermId, candidates: Vec<BigInt>) -> bool {
+    ///
+    /// `dependents` is the pass's [`BvDependentIndex`]; it answers "which cached
+    /// compound values go stale if I move this leaf?" in one hash lookup.
+    fn try_bv_candidates(
+        &mut self,
+        term_id: TermId,
+        candidates: Vec<BigInt>,
+        dependents: &BvDependentIndex,
+    ) -> bool {
         let original = match self
             .last_model
             .as_ref()
@@ -439,20 +462,13 @@ impl Executor {
         // candidate is rejected — fail-closed). Restore the entries verbatim
         // when every candidate is rejected; recompute them semantically when
         // one is kept.
-        let stale: Vec<(TermId, BigInt)> =
-            match self.last_model.as_ref().and_then(|m| m.bv_model.as_ref()) {
-                Some(bv) => bv
-                    .values
-                    .iter()
-                    .filter(|&(&t, _)| {
-                        t != term_id
-                            && !matches!(self.ctx.terms.get(t), TermData::Var(_, _))
-                            && Self::term_mentions(&self.ctx.terms, t, term_id)
-                    })
-                    .map(|(&t, v)| (t, v.clone()))
-                    .collect(),
-                None => return false,
-            };
+        //
+        // Served from the pass's reverse index instead of re-walking the whole
+        // BV model per candidate leaf; debug builds re-derive the set by the
+        // original full scan as the oracle (see `bv_dependents`).
+        let Some(stale) = self.stale_bv_cache_entries(term_id, dependents) else {
+            return false;
+        };
         if let Some(bv) = self.last_model.as_mut().and_then(|m| m.bv_model.as_mut()) {
             for (t, _) in &stale {
                 bv.values.remove(t);
@@ -517,42 +533,6 @@ impl Executor {
         false
     }
 
-    /// Whether `needle` occurs in the subtree rooted at `root`.
-    ///
-    /// Iterative worklist with a visited set so shared (DAG) subterms are
-    /// walked once — the naive recursive version is exponential on DAGs.
-    pub(in crate::executor::model) fn term_mentions(
-        terms: &ay_core::TermStore,
-        root: TermId,
-        needle: TermId,
-    ) -> bool {
-        let mut visited: ay_core::kani_compat::DetHashSet<TermId> =
-            ay_core::kani_compat::DetHashSet::default();
-        let mut worklist = vec![root];
-        while let Some(t) = worklist.pop() {
-            if t == needle {
-                return true;
-            }
-            if !visited.insert(t) {
-                continue;
-            }
-            match terms.get(t) {
-                TermData::App(_, args) => worklist.extend(args.iter().copied()),
-                TermData::Not(inner) => worklist.push(*inner),
-                TermData::Ite(c, th, el) => worklist.extend([*c, *th, *el]),
-                TermData::Let(bindings, body) => {
-                    worklist.extend(bindings.iter().map(|(_, b)| *b));
-                    worklist.push(*body);
-                }
-                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
-                    worklist.push(*body);
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-
     /// Check whether all assertions evaluate to true under the stored model.
     pub(in crate::executor) fn model_satisfies_assertions(&self) -> bool {
         let model = match self.last_model.as_ref() {
@@ -604,9 +584,9 @@ impl Executor {
         }
 
         for _pass in 0..AGGRESSIVE_PASSES {
-            let mut attempts = match self.last_model.as_ref() {
-                Some(model) => self.collect_min_attempts(model),
-                None => return,
+            let Some((mut attempts, dependents)) = self.collect_min_attempts_and_dependents()
+            else {
+                return;
             };
 
             if attempts.is_empty() {
@@ -625,7 +605,7 @@ impl Executor {
                         self.try_lra_candidates(term_id, candidates)
                     }
                     MinAttempt::Bv(term_id, candidates) => {
-                        self.try_bv_candidates(term_id, candidates)
+                        self.try_bv_candidates(term_id, candidates, &dependents)
                     }
                 };
                 any_changed |= changed;
@@ -671,3 +651,7 @@ impl Executor {
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+
+#[allow(clippy::panic)]
+#[cfg(test)]
+mod demand_tests;

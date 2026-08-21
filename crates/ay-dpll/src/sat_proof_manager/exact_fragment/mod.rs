@@ -6,6 +6,7 @@
 
 mod build_steps;
 mod builder;
+mod intrinsic_authority;
 mod metering;
 mod propagation_chains;
 mod types;
@@ -13,8 +14,9 @@ mod unit_chains;
 
 pub(super) use types::OrFoldUnitPlan;
 pub(crate) use types::{
-    ExactOriginalProofError, ExactOriginalProofFragment, FragmentInstanceDerivation,
-    FragmentInstanceRootDerivation, FragmentPropagationEnvironment, FragmentSkolemDerivation,
+    ExactOriginalProofError, ExactOriginalProofFragment, FragmentContextDerivation,
+    FragmentInstanceDerivation, FragmentInstanceRootDerivation, FragmentPropagationEnvironment,
+    FragmentSkolemDerivation,
 };
 
 use ay_sat::{ResolutionValidationError, ResolutionValidationResource};

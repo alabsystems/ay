@@ -8,6 +8,115 @@ use super::{
     rust_sources_below,
 };
 
+/// A finite-model witness is established exactly once, before strict
+/// validation, and cannot replace another current affine certificate owner.
+#[test]
+fn finite_model_producer_precedes_strict_and_quantified_gate_is_consult_only() {
+    let sat_emit = read("src/executor/model/sat_emit.rs");
+    let funnel_start = sat_emit
+        .find("pub(in crate::executor) fn emit_sat_verdict(")
+        .expect("sat_emit must define emit_sat_verdict");
+    let funnel_end = sat_emit[funnel_start..]
+        .find("fn apply_sat_validation_postcondition(")
+        .map(|offset| funnel_start + offset)
+        .expect("sat_emit must define its postcondition");
+    let funnel = &sat_emit[funnel_start..funnel_end];
+    let producer = funnel
+        .find("self.try_install_unowned_finite_model_sat_certificate(&publication_roots);")
+        .expect("the finite-model producer must have one publication hook");
+    let strict = funnel
+        .find("self.apply_strict_gate_to_affine_certificate_model()")
+        .expect("certificate models must pass the affine strict gate");
+    assert!(
+        producer < strict,
+        "model replacement must precede strict validation"
+    );
+    assert_eq!(
+        funnel
+            .matches("self.try_install_unowned_finite_model_sat_certificate(&publication_roots);")
+            .count(),
+        1,
+        "the SAT funnel must have one finite-model establishment point"
+    );
+
+    assert!(
+        sat_emit.contains("mod finite_model_owner;"),
+        "the owner guard must remain a dedicated SAT-emission submodule"
+    );
+    let owner_source = read("src/executor/model/sat_emit/finite_model_owner.rs");
+    let helper_start = owner_source
+        .find("fn try_install_unowned_finite_model_sat_certificate(")
+        .expect("the finite-model owner module must define the current-owner guard");
+    let helper_end = owner_source[helper_start..]
+        .find("#[cfg(test)]")
+        .map(|offset| helper_start + offset)
+        .expect("the owner guard must end before its tests");
+    let owner_guard = &owner_source[helper_start..helper_end];
+    for owner in [
+        "finite_table_owner_current",
+        "const_interp_owner_current",
+        "bv_owner_current",
+        "cegqi_owner_current",
+        "has_current_model_free_mbqi_sat_authority",
+        "has_current_model_bound_quantified_sat_authority",
+    ] {
+        assert!(
+            owner_guard.contains(owner),
+            "missing current owner `{owner}`"
+        );
+    }
+    assert!(
+        owner_guard
+            .contains("!quantified_owner_current && self.try_finite_model_sat_certificate()"),
+        "the finite producer must be current-owner gated"
+    );
+
+    let independent = read("src/executor/model/independent_gate.rs");
+    let gate_start = independent
+        .find("pub(in crate::executor) fn apply_quantified_model_failclosed_gate(")
+        .expect("independent gate must define the quantified publication gate");
+    assert!(
+        !independent[gate_start..].contains("try_finite_model_sat_certificate("),
+        "the post-strict quantified gate must remain consult-only"
+    );
+
+    let finite_model = read("src/executor/finite_model_mbqi.rs");
+    let scope_start = finite_model
+        .find("fn finite_model_plain_sat_scope(")
+        .expect("finite-model lane must define one optimization-scope guard");
+    let scope = &finite_model[scope_start..];
+    assert!(
+        scope.contains("self.ctx.objectives().is_empty()")
+            && scope.contains("self.ctx.soft_constraints().is_empty()")
+            && finite_model
+                .matches("self.finite_model_plain_sat_scope()")
+                .count()
+                == 2
+            && finite_model
+                .matches("finite_model_certificate_pass(")
+                .count()
+                == 3,
+        "every certificate-pass entry must decline optimization scope"
+    );
+
+    // Native API softs live above the frontend context at rest. Pin their
+    // transaction ordering so the scope guard sees them for the whole solve.
+    let native_maxsmt = read("src/api/solving/maxsmt.rs");
+    let install_native = native_maxsmt
+        .find(".replace_soft_constraints(native_softs)")
+        .expect("native MaxSMT must install its soft set");
+    let execute = native_maxsmt
+        .find("self.executor.execute_native_maxsmt_check_sat()")
+        .expect("native MaxSMT must enter the executor once");
+    let restore_parsed = native_maxsmt
+        .find(".replace_soft_constraints(parsed_softs)")
+        .expect("native MaxSMT must restore parsed softs");
+    assert!(
+        install_native < execute && execute < restore_parsed,
+        "native softs must remain visible throughout the executor solve"
+    );
+}
+
 pub(super) fn assert_command_boundary(executor_normalized: &str) {
     // `NativeMaxSmtTextContinuation` is an admitting boundary. Native
     // optimization remains the sole non-admitting boundary because its typed

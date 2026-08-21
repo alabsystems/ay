@@ -24,23 +24,40 @@ use super::*;
 // the trust stub exactly as before (fail-closed): this never converts an
 // unprovable head into a typed one, it only stops discarding the provable ones.
 //
-// Scoped to the array recognizer on purpose. The wider funnel can return kinds
-// whose validators need a payload this closer has none of (a positional Farkas
-// certificate for `LiaGeneric`/`LraFarkas`); emitting one of those would turn
-// today's `Generic` rejection — which the deferred trust discharge is defined
-// over and can still rescue — into an `InvalidTheoryLemma` rejection it
-// declines, converting published `unsat` into `unknown`. Array kinds carry no
-// payload, so they cannot do that.
+// Scoped to PAYLOAD-FREE recognizers on purpose, and that is the whole rule
+// here. The wider funnel can return kinds whose validators need a payload this
+// closer has none of (a positional Farkas certificate for
+// `LiaGeneric`/`LraFarkas`); emitting one of those would turn today's
+// `Generic` rejection — which the deferred trust discharge is defined over and
+// can still rescue — into an `InvalidTheoryLemma` rejection it declines,
+// converting published `unsat` into `unknown`.
+//
+// #4751: `recognize_int_cut_lattice_gap` satisfies the same test the array
+// recognizer does and is admitted on the same terms. It carries NO annotation,
+// it IS `validate_int_cut_lattice_gap` (the checker's own entry point calls
+// this exact function), and it subsumes `recognize_int_bound_lattice_gap`, so
+// one call covers both integer rules. A head it accepts therefore cannot
+// become an `InvalidTheoryLemma` rejection: the strict checker re-runs the
+// identical decision procedure on the identical clause. A head it declines is
+// left exactly as before.
+//
+// These heads are the closer's claim "the leaves this chain resolves against
+// are jointly inconsistent", and on #4751 that claim is an INTEGER fact —
+// their negations are satisfiable over ℚ — which is why no Farkas
+// reconstruction ever rescued them.
 pub(super) fn add_head(terms: &TermStore, proof: &mut Proof, negated_clause: &[TermId]) -> ProofId {
-    match ay_proof::recognize_array_theory_lemma(terms, negated_clause) {
-        Some(kind) => proof.add_theory_lemma_with_kind("Arrays", negated_clause.to_vec(), kind),
-        // Genuine trust fallback: SAT proof reconstruction could not derive the
-        // empty clause from existing steps and no theory schema covers the
-        // head, so `Generic` is the honest label.
-        None => proof.add_theory_lemma_with_kind(
-            "trust",
-            negated_clause.to_vec(),
-            TheoryLemmaKind::Generic,
-        ),
+    if let Some(kind) = ay_proof::recognize_array_theory_lemma(terms, negated_clause) {
+        return proof.add_theory_lemma_with_kind("Arrays", negated_clause.to_vec(), kind);
     }
+    if ay_core::proof_validation::recognize_int_cut_lattice_gap(terms, negated_clause) {
+        return proof.add_theory_lemma_with_kind(
+            "LIA",
+            negated_clause.to_vec(),
+            TheoryLemmaKind::IntCutLatticeGap,
+        );
+    }
+    // Genuine trust fallback: SAT proof reconstruction could not derive the
+    // empty clause from existing steps and no theory schema covers the head,
+    // so `Generic` is the honest label.
+    proof.add_theory_lemma_with_kind("trust", negated_clause.to_vec(), TheoryLemmaKind::Generic)
 }

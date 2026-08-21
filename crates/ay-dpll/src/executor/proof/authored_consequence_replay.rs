@@ -91,6 +91,22 @@ impl Executor {
         self.try_translate_authored_consequence_replay_unsat_with(&[])
     }
 
+    /// Like [`Self::try_translate_authored_consequence_replay_unsat_with`],
+    /// additionally admitting NEGATED-EXISTENTIAL DUAL universals as instance
+    /// sources (see [`NegatedExistsDual`]). Used by the ground-instantiation
+    /// lane; the duals carry no authority of their own — each one's authored
+    /// `(not (exists ...))` source must be derivable, and the emitted
+    /// `qnt_neg_exists` step is re-derived by the strict checker.
+    pub(in crate::executor) fn try_translate_authored_consequence_replay_unsat_with_duals(
+        &mut self,
+        extra_records: &[crate::ematching::ForallInstantiationProvenance],
+        extra_duals: &[NegatedExistsDual],
+    ) -> bool {
+        let candidate =
+            self.build_authored_consequence_replay_refutation(extra_records, extra_duals);
+        self.install_consequence_replay_candidate(candidate)
+    }
+
     /// Like [`Self::try_translate_authored_consequence_replay_unsat`], with
     /// caller-supplied additional instance provenance (e.g. the closed
     /// universal literal-witness lane's exact refuting tuple). Extra records
@@ -101,8 +117,15 @@ impl Executor {
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
     ) -> bool {
-        let Some(candidate) = self.build_authored_consequence_replay_refutation(extra_records)
-        else {
+        let candidate = self.build_authored_consequence_replay_refutation(extra_records, &[]);
+        self.install_consequence_replay_candidate(candidate)
+    }
+
+    /// Shared installation boundary: re-gate a built candidate over the exact
+    /// authored scope and install it as `last_proof`, or leave every byte of
+    /// proof state as found.
+    fn install_consequence_replay_candidate(&mut self, candidate: Option<Proof>) -> bool {
+        let Some(candidate) = candidate else {
             return false;
         };
         let authored = self.exact_concrete_authored_scope();
@@ -191,7 +214,7 @@ impl Executor {
         if self.check_proof_strict_with_datatypes(proof).is_ok() {
             return;
         }
-        let Some(candidate) = self.build_authored_consequence_replay_refutation(&[]) else {
+        let Some(candidate) = self.build_authored_consequence_replay_refutation(&[], &[]) else {
             return;
         };
         let authored = self.exact_concrete_authored_scope();
@@ -205,9 +228,14 @@ impl Executor {
     /// recorded instance to add (a pure-ground problem must not be re-solved
     /// here), an underivable consequence, a probe that cannot produce a
     /// strict-complete proof, or a stitch that fails a bound.
+    ///
+    /// `extra_duals` supplies an additional class of derivable instance SOURCE
+    /// — the De Morgan dual of an authored `(not (exists ...))` root — and is
+    /// empty for every caller but the ground-instantiation lane.
     fn build_authored_consequence_replay_refutation(
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
+        extra_duals: &[NegatedExistsDual],
     ) -> Option<Proof> {
         if !crate::quant_unit_authority::consequence_replay_enabled() {
             return None;
@@ -235,6 +263,12 @@ impl Executor {
         let mut instance_plan: ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan> =
             ay_core::kani_compat::DetHashMap::default();
         let mut instances: Vec<TermId> = Vec::new();
+
+        // Negated-existential duals FIRST: they are instance SOURCES, not
+        // consequences, so they never enter the probe's assertion vector.
+        let dual_foralls =
+            Self::plan_negated_exists_duals(extra_duals, &derivable_sources, &mut instance_plan);
+
         let recorded = extra_records
             .iter()
             .map(|record| (record.quantifier, &record.binding, record.instance))
@@ -247,7 +281,7 @@ impl Executor {
             if instances.len() >= MAX_INSTANCES {
                 break;
             }
-            if !derivable_sources.contains(&quantifier)
+            if !(derivable_sources.contains(&quantifier) || dual_foralls.contains(&quantifier))
                 || instance == quantifier
                 || crate::ematching::contains_quantifier(&self.ctx.terms, instance)
                 || instance_plan.contains_key(&instance)
@@ -289,8 +323,10 @@ impl Executor {
             );
             instances.push(record.asserted);
         }
-        if instance_plan.is_empty() {
-            // Nothing this lane can add over the plain ground problem.
+        if instances.is_empty() {
+            // Nothing this lane can add over the plain ground problem. (A
+            // dual with no instance is a source without a consequence, which
+            // is exactly the pure-ground case this guard refuses.)
             replay_note(|| {
                 format!(
                     "decline: no derivable recorded instance ({} records)",
@@ -366,6 +402,100 @@ impl Executor {
             });
         }
         stitched
+    }
+
+    /// Derive the unit clause `(cl term)` for a PLANNED consequence — one the
+    /// authored scope does not assume directly. Each arm recursively derives
+    /// its own source's unit first, so a plan may chain (a dual universal's
+    /// instance rests on the dual, which rests on the authored `(not E)`).
+    #[allow(clippy::too_many_arguments)]
+    fn planned_consequence_unit(
+        &mut self,
+        candidate: &mut Proof,
+        term: TermId,
+        plan: ConsequencePlan,
+        authored_set: &ay_core::kani_compat::DetHashSet<TermId>,
+        authored: &[TermId],
+        instance_plan: &ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan>,
+        unit_ids: &mut ay_core::kani_compat::DetHashMap<TermId, ProofId>,
+    ) -> Option<ProofId> {
+        let source = match &plan {
+            ConsequencePlan::ForallInstance { quantifier, .. } => *quantifier,
+            ConsequencePlan::SkolemInstance { source, .. } => *source,
+            ConsequencePlan::NegatedExistsDual {
+                not_exists_root, ..
+            } => *not_exists_root,
+        };
+        let source_unit = self.consequence_unit(
+            candidate,
+            source,
+            authored_set,
+            authored,
+            instance_plan,
+            unit_ids,
+        )?;
+        match plan {
+            ConsequencePlan::ForallInstance {
+                quantifier,
+                binding,
+            } => self.add_forall_instance_values_from_unit(
+                candidate,
+                source_unit,
+                quantifier,
+                &binding,
+                term,
+            ),
+            ConsequencePlan::SkolemInstance {
+                quantified,
+                witness,
+                instance,
+                positive,
+                ..
+            } => self.add_skolem_instance_from_unit(
+                candidate,
+                source_unit,
+                quantified,
+                witness,
+                instance,
+                positive,
+                term,
+            ),
+            ConsequencePlan::NegatedExistsDual { exists, .. } => Some(
+                Self::add_negated_exists_dual(candidate, source_unit, exists, term),
+            ),
+        }
+    }
+
+    /// Admit the negated-existential duals as instance SOURCES and return the
+    /// set of dual universals the instance planner may then draw on.
+    ///
+    /// A dual carries NO authority: its authored `(not (exists ...))` root must
+    /// itself be derivable from the authored scope, and `consequence_unit`
+    /// mints `(cl F)` only through a `qnt_neg_exists` + `resolution` pair the
+    /// strict checker re-derives from `E` itself.
+    fn plan_negated_exists_duals(
+        extra_duals: &[NegatedExistsDual],
+        derivable_sources: &AndConjunctClosure,
+        instance_plan: &mut ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan>,
+    ) -> ay_core::kani_compat::DetHashSet<TermId> {
+        let mut dual_foralls: ay_core::kani_compat::DetHashSet<TermId> =
+            ay_core::kani_compat::DetHashSet::default();
+        for dual in extra_duals {
+            if !derivable_sources.contains(&dual.not_exists_root)
+                || instance_plan.contains_key(&dual.forall)
+            {
+                continue;
+            }
+            instance_plan.insert(
+                dual.forall,
+                ConsequencePlan::NegatedExistsDual {
+                    not_exists_root: dual.not_exists_root,
+                    exists: dual.exists,
+                },
+            );
+            dual_foralls.insert(dual.forall);
+        }
+        dual_foralls
     }
 
     /// Replace every probe `assume` with an authored-scope derivation and
@@ -470,53 +600,15 @@ impl Executor {
         let unit = if authored_set.contains(&term) {
             candidate.add_assume(term, None)
         } else if let Some(plan) = instance_plan.get(&term).cloned() {
-            match plan {
-                ConsequencePlan::ForallInstance {
-                    quantifier,
-                    binding,
-                } => {
-                    let source_unit = self.consequence_unit(
-                        candidate,
-                        quantifier,
-                        authored_set,
-                        authored,
-                        instance_plan,
-                        unit_ids,
-                    )?;
-                    self.add_forall_instance_values_from_unit(
-                        candidate,
-                        source_unit,
-                        quantifier,
-                        &binding,
-                        term,
-                    )?
-                }
-                ConsequencePlan::SkolemInstance {
-                    source,
-                    quantified,
-                    witness,
-                    instance,
-                    positive,
-                } => {
-                    let source_unit = self.consequence_unit(
-                        candidate,
-                        source,
-                        authored_set,
-                        authored,
-                        instance_plan,
-                        unit_ids,
-                    )?;
-                    self.add_skolem_instance_from_unit(
-                        candidate,
-                        source_unit,
-                        quantified,
-                        witness,
-                        instance,
-                        positive,
-                        term,
-                    )?
-                }
-            }
+            self.planned_consequence_unit(
+                candidate,
+                term,
+                plan,
+                authored_set,
+                authored,
+                instance_plan,
+                unit_ids,
+            )?
         } else {
             let (source, path) = self.find_authored_and_path(authored, instance_plan, term)?;
             let mut unit = self.consequence_unit(
@@ -541,6 +633,28 @@ impl Executor {
         };
         unit_ids.insert(term, unit);
         Some(unit)
+    }
+
+    /// Emit the De Morgan dual step pair from an ALREADY-DERIVED
+    /// `(cl (not E))` unit, leaving the unit `(cl F)`.
+    ///
+    /// The two-literal `qnt_neg_exists` tautology `(cl E F)` is valid because
+    /// `F` is exactly `¬E`; resolving it against `(cl (not E))` on the pivot
+    /// `E` leaves `(cl F)`. `validate_qnt_neg_exists` re-derives the duality
+    /// (identical binder vector, singly-negated body) independently.
+    fn add_negated_exists_dual(
+        candidate: &mut Proof,
+        not_exists_unit: ProofId,
+        exists: TermId,
+        forall: TermId,
+    ) -> ProofId {
+        let neg_exists = candidate.add_rule_step(
+            AletheRule::QntNegExists,
+            vec![exists, forall],
+            Vec::new(),
+            Vec::new(),
+        );
+        candidate.add_resolution(vec![forall], exists, not_exists_unit, neg_exists)
     }
 
     /// Find a derivable source (authored root or planned instance) with an
@@ -793,6 +907,31 @@ enum ConsequencePlan {
         instance: TermId,
         positive: bool,
     },
+    /// The De Morgan dual universal of an authored `(not (exists x⃗ φ))` root:
+    /// `qnt_neg_exists` + one `resolution`, keyed by the dual `forall`.
+    NegatedExistsDual {
+        not_exists_root: TermId,
+        exists: TermId,
+    },
+}
+
+/// One authored `(not (exists ...))` root together with the De Morgan dual
+/// universal it licenses, offered to the consequence-replay stitcher as an
+/// instance SOURCE.
+///
+/// This is a HINT with no authority. The stitcher checks that
+/// `not_exists_root` is derivable from the authored scope, and the strict
+/// `qnt_neg_exists` validator independently re-derives that `forall` is the
+/// exact dual of `exists` (identical binder vector, singly-negated body)
+/// before anything publishes.
+#[derive(Clone, Copy)]
+pub(in crate::executor) struct NegatedExistsDual {
+    /// The authored root, literally `(not E)`.
+    pub not_exists_root: TermId,
+    /// `E = (exists (x⃗) φ)`.
+    pub exists: TermId,
+    /// `F = (forall (x⃗) (not φ))`.
+    pub forall: TermId,
 }
 
 /// Ordered members of the authored `and`-conjunct closure.

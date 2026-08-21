@@ -205,23 +205,187 @@ fn count_with_phases<W: value::CountValue>(
     (engine, result)
 }
 
+include!("weight_preparation.rs");
+
+fn solve_unweighted(
+    instance: &Instance,
+    clauses: &[Vec<i32>],
+    options: &SolveOptions,
+    mut warnings: Vec<String>,
+) -> SolveOutcome {
+    // Pure-XOR shortcut (unprojected only): GF(2) elimination gives
+    // the exact count without search.
+    let unprojected = instance
+        .show
+        .as_ref()
+        .is_none_or(|show| show.len() == instance.num_vars);
+    if unprojected {
+        if let Some(count) = xor::pure_xor_count(instance.num_vars, clauses) {
+            warnings.push("pure-XOR system: counted by GF(2) elimination".into());
+            let satisfiable = !num_traits::Zero::is_zero(&count);
+            return SolveOutcome {
+                ptype: instance.ptype,
+                satisfiable: Some(satisfiable),
+                value: Some(ExactValue::Nat(count)),
+                warnings,
+                stats: None,
+            };
+        }
+    }
+    // Independent support (unweighted, unprojected): if every var outside S
+    // is Padoa-defined by S, projected models extend uniquely, so pmc(F, S) =
+    // #F. Branching restricted to S with SAT-checked remainders is dramatically
+    // cheaper on gate-heavy instances (ganak's signature preprocessing).
+    let indep_show: Option<Vec<u32>> = if unprojected {
+        let started = std::time::Instant::now();
+        let support = prep_eg::independent_support(
+            instance.num_vars,
+            clauses,
+            std::time::Duration::from_secs(5),
+            100,
+        );
+        if ay_core::misc_cli_flags().count_debug {
+            eprintln!(
+                "c o [debug] indep support: {:?} vars in {:.2}s",
+                support.as_ref().map(Vec::len),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        support
+    } else {
+        None
+    };
+    let effective_show: Option<&[u32]> = match &indep_show {
+        Some(show) => {
+            warnings.push(format!(
+                "independent support: {} of {} occurring vars",
+                show.len(),
+                instance.num_vars
+            ));
+            Some(show.as_slice())
+        }
+        None => instance.show.as_deref(),
+    };
+    let (engine, result) = count_with_phases::<num_bigint::BigUint>(
+        instance.num_vars,
+        clauses,
+        WeightTable::unweighted(),
+        effective_show,
+        options,
+        &mut warnings,
+    );
+    match result {
+        Ok(count) => {
+            let satisfiable = !num_traits::Zero::is_zero(&count);
+            SolveOutcome {
+                ptype: instance.ptype,
+                satisfiable: Some(satisfiable),
+                value: Some(ExactValue::Nat(count)),
+                warnings,
+                stats: options.stats.then(|| engine.stats.clone()),
+            }
+        }
+        Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
+    }
+}
+
+fn solve_real_weighted(
+    instance: &Instance,
+    clauses: &[Vec<i32>],
+    options: &SolveOptions,
+    mut warnings: Vec<String>,
+    weights: &[BigRational],
+) -> SolveOutcome {
+    // Every model's weight product carries each variable's denominator exactly
+    // once. Count integer numerators, then divide by their product once.
+    let (scaled, global_den) = scale_weights_to_integers(weights);
+    let (mut engine, result) = count_with_phases::<num_bigint::BigInt>(
+        instance.num_vars,
+        clauses,
+        WeightTable::weighted(scaled),
+        instance.show.as_deref(),
+        options,
+        &mut warnings,
+    );
+    match result {
+        Ok(int_count) => {
+            let count = BigRational::new(int_count, global_den);
+            let satisfiable = if num_traits::Zero::is_zero(&count) {
+                // Zero weighted count does not imply UNSAT (zero weights).
+                engine.formula_is_sat().ok()
+            } else {
+                Some(true)
+            };
+            SolveOutcome {
+                ptype: instance.ptype,
+                satisfiable,
+                value: Some(ExactValue::Rat(count)),
+                warnings,
+                stats: options.stats.then(|| engine.stats.clone()),
+            }
+        }
+        Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
+    }
+}
+
+fn solve_complex_weighted(
+    instance: &Instance,
+    clauses: &[Vec<i32>],
+    options: &SolveOptions,
+    mut warnings: Vec<String>,
+    weights: &[(BigRational, BigRational)],
+) -> SolveOutcome {
+    // Use the same integer-scaling technique over Gaussian integers.
+    let (scaled, global_den) = scale_complex_weights_to_integers(weights);
+    let (mut engine, result) = count_with_phases::<GaussInt>(
+        instance.num_vars,
+        clauses,
+        WeightTable::weighted(scaled),
+        instance.show.as_deref(),
+        options,
+        &mut warnings,
+    );
+    match result {
+        Ok(count) => {
+            let is_zero = value::CountValue::is_zero(&count);
+            let re = BigRational::new(count.re, global_den.clone());
+            let im = BigRational::new(count.im, global_den);
+            let satisfiable = if is_zero {
+                engine.formula_is_sat().ok()
+            } else {
+                Some(true)
+            };
+            SolveOutcome {
+                ptype: instance.ptype,
+                satisfiable,
+                value: Some(ExactValue::Complex(re, im)),
+                warnings,
+                stats: options.stats.then(|| engine.stats.clone()),
+            }
+        }
+        Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
+    }
+}
+
 /// Solve a parsed instance, producing a renderable outcome.
 ///
 /// This runs on the calling thread; the recursion depth is bounded by the
 /// variable count, so callers should provide a large stack (see
 /// [`solve_instance_big_stack`]).
+/// Invalid options, inconsistent public [`Instance`] fields, and malformed
+/// weight declarations produce an `UNKNOWN` outcome with no value.
 pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutcome {
     let mut warnings = instance.warnings.clone();
     if let Err(error) = options.validate() {
-        warnings.push(error.to_string());
-        return SolveOutcome {
-            ptype: instance.ptype,
-            satisfiable: None,
-            value: None,
-            warnings,
-            stats: None,
-        };
+        return no_value_outcome(instance.ptype, warnings, error.to_string());
     }
+    if let Err(error) = instance.validate() {
+        return format_error_outcome(instance.ptype, warnings, error);
+    }
+    let prepared_weights = match prepare_weights(instance, &mut warnings) {
+        Ok(prepared) => prepared,
+        Err(error) => return format_error_outcome(instance.ptype, warnings, error),
+    };
     // Count-safe preprocessing (equivalence-preserving: same models over the
     // same variables, so sound for every track).
     let weighted = matches!(
@@ -269,192 +433,13 @@ pub fn solve_instance(instance: &Instance, options: &SolveOptions) -> SolveOutco
     }
     let clauses = &prepped.clauses;
 
-    match instance.ptype {
-        ProblemType::Mc | ProblemType::Pmc => {
-            // Pure-XOR shortcut (unprojected only): GF(2) elimination gives
-            // the exact count without search.
-            let unprojected = instance
-                .show
-                .as_ref()
-                .is_none_or(|s| s.len() == instance.num_vars);
-            if unprojected {
-                if let Some(count) = xor::pure_xor_count(instance.num_vars, clauses) {
-                    warnings.push("pure-XOR system: counted by GF(2) elimination".into());
-                    let satisfiable = !num_traits::Zero::is_zero(&count);
-                    return SolveOutcome {
-                        ptype: instance.ptype,
-                        satisfiable: Some(satisfiable),
-                        value: Some(ExactValue::Nat(count)),
-                        warnings,
-                        stats: None,
-                    };
-                }
-            }
-            // Independent support (unweighted, unprojected): if every var
-            // outside S is Padoa-defined by S, projected models extend
-            // uniquely, so pmc(F, S) = #F — and branching restricted to S
-            // with SAT-checked remainders is dramatically cheaper on
-            // gate-heavy instances (ganak's signature preprocessing).
-            let indep_show: Option<Vec<u32>> = if unprojected {
-                let t0 = std::time::Instant::now();
-                let s = prep_eg::independent_support(
-                    instance.num_vars,
-                    clauses,
-                    std::time::Duration::from_secs(5),
-                    100,
-                );
-                if ay_core::misc_cli_flags().count_debug {
-                    eprintln!(
-                        "c o [debug] indep support: {:?} vars in {:.2}s",
-                        s.as_ref().map(Vec::len),
-                        t0.elapsed().as_secs_f64()
-                    );
-                }
-                s
-            } else {
-                None
-            };
-            let effective_show: Option<&[u32]> = match &indep_show {
-                Some(s) => {
-                    warnings.push(format!(
-                        "independent support: {} of {} occurring vars",
-                        s.len(),
-                        instance.num_vars
-                    ));
-                    Some(s.as_slice())
-                }
-                None => instance.show.as_deref(),
-            };
-            let (engine, result) = count_with_phases::<num_bigint::BigUint>(
-                instance.num_vars,
-                clauses,
-                WeightTable::unweighted(),
-                effective_show,
-                options,
-                &mut warnings,
-            );
-            match result {
-                Ok(count) => {
-                    let satisfiable = !num_traits::Zero::is_zero(&count);
-                    SolveOutcome {
-                        ptype: instance.ptype,
-                        satisfiable: Some(satisfiable),
-                        value: Some(ExactValue::Nat(count)),
-                        warnings,
-                        stats: options.stats.then(|| engine.stats.clone()),
-                    }
-                }
-                Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
-            }
+    match prepared_weights {
+        PreparedWeights::Unweighted => solve_unweighted(instance, clauses, options, warnings),
+        PreparedWeights::Real(weights) => {
+            solve_real_weighted(instance, clauses, options, warnings, &weights)
         }
-        ProblemType::Wmc | ProblemType::Pwmc => {
-            let projected_mask = instance.show.as_ref().map(|show| {
-                let mut mask = vec![false; instance.num_vars];
-                for &v in show {
-                    mask[v as usize - 1] = true;
-                }
-                mask
-            });
-            let resolved = match parse::resolve_real_weights(
-                instance.num_vars,
-                &instance.weights,
-                projected_mask.as_deref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    warnings.push(format!("format error: {e}"));
-                    return SolveOutcome {
-                        ptype: instance.ptype,
-                        satisfiable: None,
-                        value: None,
-                        warnings,
-                        stats: None,
-                    };
-                }
-            };
-            warnings.extend(resolved.warnings);
-            // Integer-scaled weighted counting: scale each variable's weight
-            // pair to integer numerators over a per-var denominator; count
-            // in signed BigInt (no per-operation gcd), divide once at the
-            // end. Sound: every model's weight product carries each var's
-            // denominator exactly once (assigned or free), so the integer
-            // total equals count * prod(d_v).
-            let (scaled, global_den) = scale_weights_to_integers(&resolved.weights);
-            let (mut engine, result) = count_with_phases::<num_bigint::BigInt>(
-                instance.num_vars,
-                clauses,
-                WeightTable::weighted(scaled),
-                instance.show.as_deref(),
-                options,
-                &mut warnings,
-            );
-            match result {
-                Ok(int_count) => {
-                    let count = BigRational::new(int_count, global_den.clone());
-                    let satisfiable = if num_traits::Zero::is_zero(&count) {
-                        // Zero weighted count does not imply UNSAT (zero
-                        // weights); decide the s line with a SAT check.
-                        engine.formula_is_sat().ok()
-                    } else {
-                        Some(true)
-                    };
-                    SolveOutcome {
-                        ptype: instance.ptype,
-                        satisfiable,
-                        value: Some(ExactValue::Rat(count)),
-                        warnings,
-                        stats: options.stats.then(|| engine.stats.clone()),
-                    }
-                }
-                Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
-            }
-        }
-        ProblemType::AmcComplex => {
-            let resolved =
-                match parse::resolve_complex_weights(instance.num_vars, &instance.weights) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warnings.push(format!("format error: {e}"));
-                        return SolveOutcome {
-                            ptype: instance.ptype,
-                            satisfiable: None,
-                            value: None,
-                            warnings,
-                            stats: None,
-                        };
-                    }
-                };
-            warnings.extend(resolved.warnings);
-            // Same integer-scaling trick over Gaussian integers.
-            let (scaled, global_den) = scale_complex_weights_to_integers(&resolved.weights);
-            let (mut engine, result) = count_with_phases::<GaussInt>(
-                instance.num_vars,
-                clauses,
-                WeightTable::weighted(scaled),
-                instance.show.as_deref(),
-                options,
-                &mut warnings,
-            );
-            match result {
-                Ok(count) => {
-                    let is_zero = value::CountValue::is_zero(&count);
-                    let re = BigRational::new(count.re, global_den.clone());
-                    let im = BigRational::new(count.im, global_den);
-                    let satisfiable = if is_zero {
-                        engine.formula_is_sat().ok()
-                    } else {
-                        Some(true)
-                    };
-                    SolveOutcome {
-                        ptype: instance.ptype,
-                        satisfiable,
-                        value: Some(ExactValue::Complex(re, im)),
-                        warnings,
-                        stats: options.stats.then(|| engine.stats.clone()),
-                    }
-                }
-                Err(abort) => unknown_outcome(instance.ptype, warnings, abort),
-            }
+        PreparedWeights::Complex(weights) => {
+            solve_complex_weighted(instance, clauses, options, warnings, &weights)
         }
     }
 }

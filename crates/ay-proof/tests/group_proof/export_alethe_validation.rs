@@ -175,10 +175,33 @@ fn exports_lia_certificate_that_is_strictly_valid_and_carcara_parseable() {
 
     let alethe = export_alethe_with_problem_scope(&proof, &terms, &[x_le_5, x_ge_10]);
     assert!(
-        alethe.contains(":rule lia_generic :args (1 1)"),
-        "expected lia_generic export with Farkas args:\n{alethe}"
+        alethe.contains(":rule la_generic :args (1 1)"),
+        "expected checked la_generic promotion with Farkas args:\n{alethe}"
     );
+    assert!(!alethe.contains(":rule lia_generic"), "{alethe}");
     assert_carcara_accepts("lia_bounds_gap", QF_LIA_UNSAT, &alethe);
+}
+
+#[test]
+fn exports_unpromotable_lia_certificate_as_honest_carcara_hole() {
+    let terms = TermStore::new();
+    let mut proof = Proof::new();
+    proof.add_step(ay_core::ProofStep::TheoryLemma {
+        theory: "LIA".to_string(),
+        clause: Vec::new(),
+        // Deliberate arity mismatch: this cannot prove the empty clause and
+        // must never acquire `la_generic` authority.
+        farkas: Some(FarkasAnnotation::from_ints(&[1])),
+        kind: TheoryLemmaKind::LiaGeneric,
+        lia: None,
+    });
+
+    let alethe = export_alethe_with_problem_scope(&proof, &terms, &[]);
+    assert!(alethe.contains("(step t0 (cl) :rule hole)"), "{alethe}");
+    assert!(!alethe.contains(":rule lia_generic"), "{alethe}");
+    assert!(!alethe.contains(":rule la_generic"), "{alethe}");
+    assert!(!alethe.contains(":args"), "{alethe}");
+    assert_carcara_verdict("lia_bad_farkas_hole", QF_LIA_UNSAT, &alethe, "holey");
 }
 
 const QF_EQ_TRANS_DISTINCT_UNSAT: &str = r#"
@@ -455,6 +478,10 @@ fn exports_flattened_conjunct_and_pos_certificate_that_carcara_accepts() {
 }
 
 fn assert_carcara_accepts(label: &str, problem: &str, proof: &str) {
+    assert_carcara_verdict(label, problem, proof, "valid");
+}
+
+fn assert_carcara_verdict(label: &str, problem: &str, proof: &str, expected: &str) {
     let Some(carcara) = find_carcara() else {
         eprintln!("carcara not found, skipping external Alethe validation for {label}");
         return;
@@ -472,11 +499,12 @@ fn assert_carcara_accepts(label: &str, problem: &str, proof: &str) {
     let _ = std::fs::remove_file(&problem_path);
     let _ = std::fs::remove_file(&proof_path);
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "carcara rejected generated Alethe proof ({label})\nstderr: {}\nproof:\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        proof
+        output.status.success() && stdout.trim() == expected,
+        "carcara verdict mismatch for generated Alethe proof ({label})\n\
+         expected: {expected}\nstdout: {stdout}\nstderr: {stderr}\nproof:\n{proof}"
     );
 }
 

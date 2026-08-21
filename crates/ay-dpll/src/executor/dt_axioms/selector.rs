@@ -2947,7 +2947,14 @@ impl Executor {
         };
 
         // Collect asserted equalities for union-find
-        let mut asserted_equalities: Vec<(TermId, TermId)> = Vec::new();
+        let mut asserted_equalities: Vec<(TermId, TermId, TermId)> = Vec::new();
+        // #dt-context-derivation: asserted premise terms justifying each
+        // var_to_ctor binding — the direct asserted equality, plus (for a
+        // binding spread through the equivalence-class walk) every asserted
+        // var-var equality of the class. Recorded as producer hints so the
+        // certification fragment can DERIVE the collapsed ground facts this
+        // expander emits instead of trusting them.
+        let mut binding_premises: HashMap<TermId, Vec<TermId>> = HashMap::default();
 
         // Maps: term p -> (ctor_name, args, selectors) for direct `p = C(args)` equalities
         let mut var_to_ctor: HashMap<TermId, CtorBinding> = HashMap::default();
@@ -3027,7 +3034,7 @@ impl Executor {
 
                         // Collect variable-to-variable equalities for union-find (#1741)
                         if !lhs_is_ctor && !rhs_is_ctor {
-                            asserted_equalities.push((lhs, rhs));
+                            asserted_equalities.push((lhs, rhs, term));
                         }
 
                         // Try to find which side is a constructor
@@ -3060,6 +3067,7 @@ impl Executor {
                                                             Some((term, ctor_term)),
                                                         ),
                                                     );
+                                                    binding_premises.insert(p, vec![term]);
                                                 }
                                             }
                                         }
@@ -3082,7 +3090,7 @@ impl Executor {
         }
 
         // Build union-find from asserted equalities (#1741)
-        for (a, b) in &asserted_equalities {
+        for (a, b, _) in &asserted_equalities {
             uf_union(&mut uf_parent, *a, *b);
         }
 
@@ -3094,15 +3102,38 @@ impl Executor {
         direct_mappings.sort_by_key(|(term, _)| term.0);
         for (term, ctor_info) in direct_mappings {
             let root = uf_find(&mut uf_parent, term);
+            // #dt-context-derivation: the premise SET for every member of
+            // this class — the direct binding's asserted equality plus every
+            // asserted var-var equality inside the class. A superset of the
+            // minimal chain is deliberately fine: extra premises only WEAKEN
+            // the sealed lemma (more discharge steps), never strengthen it.
+            let class_equalities: Vec<TermId> = asserted_equalities
+                .iter()
+                .filter(|(a, b, _)| {
+                    uf_find(&mut uf_parent, *a) == root && uf_find(&mut uf_parent, *b) == root
+                })
+                .map(|(_, _, eq_term)| *eq_term)
+                .collect();
+            let direct_premises = binding_premises.get(&term).cloned().unwrap_or_default();
             // Find all terms in same equivalence class
-            for (a, b) in &asserted_equalities {
-                for t in [*a, *b] {
+            let equality_sides: Vec<(TermId, TermId)> = asserted_equalities
+                .iter()
+                .map(|(a, b, _)| (*a, *b))
+                .collect();
+            for (a, b) in equality_sides {
+                for t in [a, b] {
                     if t != term && uf_find(&mut uf_parent, t) == root {
                         var_to_ctor.entry(t).or_insert_with(|| {
                             let (ctor, args, sels, _) = ctor_info.clone();
                             // The equality holds only TRANSITIVELY for `t`, so
                             // no single asserted premise justifies the binding.
                             (ctor, args, sels, None)
+                        });
+                        binding_premises.entry(t).or_insert_with(|| {
+                            let mut premises = direct_premises.clone();
+                            premises.extend(class_equalities.iter().copied());
+                            premises.dedup();
+                            premises
                         });
                     }
                 }
@@ -3177,12 +3208,18 @@ impl Executor {
         //   (assert (= p (mk-pair x y)))
         //   (assert (not (= (fst p) x)))
         // Where we need `fst(p) = x` to derive a contradiction.
-        for (p, (_ctor_name, args, selectors, _provenance)) in &var_to_ctor {
+        let indirection_bindings: Vec<(TermId, Vec<TermId>, SelectorList)> = var_to_ctor
+            .iter()
+            .map(|(p, (_ctor, args, selectors, _prov))| (*p, args.clone(), selectors.clone()))
+            .collect();
+        for (p, args, selectors) in indirection_bindings {
+            let premises = binding_premises.get(&p).cloned().unwrap_or_default();
             for (idx, (sel_name, sel_sort)) in selectors.iter().enumerate() {
                 // Check if sel_i(p) appears in the term store
                 if let Some(apps) = selector_apps.get(sel_name) {
-                    for &(sel_app, sel_arg) in apps {
-                        if sel_arg == *p {
+                    let apps = apps.clone();
+                    for (sel_app, sel_arg) in apps {
+                        if sel_arg == p {
                             // Found sel_i(p), generate axiom sel_i(p) = a_i
                             let Some(eq) = mk_eq_same_sort(&mut self.ctx.terms, sel_app, args[idx])
                             else {
@@ -3194,6 +3231,9 @@ impl Executor {
                             }
                             if seen.insert(eq) {
                                 extra.push(eq);
+                                // #dt-context-derivation: the axiom is entailed
+                                // by the binding's asserted premises.
+                                self.record_dt_context_conflict(vec![eq], premises.clone());
                             }
                         }
                     }
@@ -3204,7 +3244,7 @@ impl Executor {
                 let sel_app =
                     self.ctx
                         .terms
-                        .mk_app(Symbol::named(sel_name), vec![*p], sel_sort.clone());
+                        .mk_app(Symbol::named(sel_name), vec![p], sel_sort.clone());
                 let Some(eq) = mk_eq_same_sort(&mut self.ctx.terms, sel_app, args[idx]) else {
                     continue;
                 };
@@ -3214,6 +3254,8 @@ impl Executor {
                 }
                 if seen.insert(eq) {
                     extra.push(eq);
+                    // #dt-context-derivation (see above).
+                    self.record_dt_context_conflict(vec![eq], premises.clone());
                 }
             }
         }
@@ -3827,6 +3869,12 @@ impl Executor {
 
             if !base_assertions.contains(&tester_app) && seen.insert(tester_app) {
                 extra.push(tester_app);
+                // #dt-context-derivation: the tester unit is entailed by the
+                // binding's asserted premises (direct AND transitive).
+                if let Some(premises) = binding_premises.get(&p) {
+                    let premises = premises.clone();
+                    self.record_dt_context_conflict(vec![tester_app], premises);
+                }
                 if self.produce_proofs_enabled() {
                     if let Some((asserted_eq, ctor_term)) = provenance {
                         let tester_ctor = self.ctx.terms.mk_app(
@@ -4227,6 +4275,8 @@ impl Executor {
         // Fix: Group var_to_ctor entries by (ctor_name, args). For each group with 2+
         // variables, generate pairwise equality axioms.
         {
+            // #dt-context-derivation producer hints, drained after the loop.
+            let mut context_records: Vec<(TermId, Vec<TermId>)> = Vec::new();
             // Group variables by their constructor binding:
             // (ctor_name, args) -> [(var_term, binding provenance)]
             let mut binding_groups: HashMap<
@@ -4254,6 +4304,20 @@ impl Executor {
                         let eq = self.ctx.terms.mk_eq(p, q);
                         if !base_assertions.contains(&eq) && seen.insert(eq) {
                             extra.push(eq);
+                            // #dt-context-derivation: the pairwise equality is
+                            // entailed by BOTH bindings' asserted premises
+                            // (direct and transitive alike).
+                            if let (Some(p_premises), Some(q_premises)) =
+                                (binding_premises.get(&p), binding_premises.get(&q))
+                            {
+                                let mut premises = p_premises.clone();
+                                for &premise in q_premises {
+                                    if !premises.contains(&premise) {
+                                        premises.push(premise);
+                                    }
+                                }
+                                context_records.push((eq, premises));
+                            }
                             // Proof side: for two DIRECT bindings the unit is
                             // an `EufTransitive` chain `p = C(args) = q`, not a
                             // trust admission. (Hash-consing guarantees both
@@ -4266,6 +4330,9 @@ impl Executor {
                         }
                     }
                 }
+            }
+            for (eq, premises) in context_records {
+                self.record_dt_context_conflict(vec![eq], premises);
             }
             if self.produce_proofs_enabled() {
                 for (eq, p_eq, q_eq, _ctor_term) in derivations {

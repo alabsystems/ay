@@ -13,7 +13,8 @@ use ay_core::{TermId, TermStore};
 use ay_euf::EufModel;
 
 use super::pattern_helpers::{
-    collect_patterns_from_term, synthesize_trigger_groups_with_fallback, user_pattern_to_ematch,
+    collect_patterns_from_term, collect_patterns_under_nested_binders,
+    synthesize_trigger_groups_with_fallback, user_pattern_to_ematch,
 };
 use super::EMATCH_STACK_RED_ZONE;
 use super::EMATCH_STACK_SIZE;
@@ -658,6 +659,30 @@ fn auto_trigger_groups(
         terms.quantifier_no_patterns(quantifier),
         &mut patterns,
     );
+
+    // #quant-trigger-nested: `collect_patterns_from_term` stops at a nested
+    // binder, so for `forall x. (... (exists y. P (f x) y) ...)` it never sees
+    // `f x` — a perfectly legal single trigger for `x` — and the quantifier ends
+    // up with NO trigger at all. Measured on the SQ Arith selection, this is the
+    // ONLY trigger-selection defect present: 10 of 244 quantifiers land in it,
+    // and zero land in "synthesis dropped a legal same-level candidate".
+    //
+    // Deliberately a FALLBACK, not a widening of the main traversal: it runs
+    // only when the same-level pass produced nothing, so every quantifier that
+    // has a trigger today keeps byte-identically the same one, and the new code
+    // can only turn "no trigger" into "some trigger". That also bounds the cost
+    // — the descent is quadratic in nesting depth, and it is paid only on
+    // quantifiers that are otherwise about to be handed to MBQI/CEGQI anyway.
+    if patterns.is_empty() {
+        collect_patterns_under_nested_binders(
+            terms,
+            body,
+            actual_var_names,
+            actual_names_by_idx,
+            terms.quantifier_no_patterns(quantifier),
+            &mut patterns,
+        );
+    }
 
     let synthesized =
         synthesize_trigger_groups_with_fallback(patterns, num_vars, actual_names_by_idx);

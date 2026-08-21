@@ -231,16 +231,13 @@ fn bve_density_threshold_is_named_only_when_it_changes_admission() {
     let output = ay_command()
         .arg("--stats")
         .arg(&input)
-        .env("--sat-bve-sparse-max-density", "1")
+        .args(["--sat-bve-sparse-max-density", "1"])
         .output()
         .expect("run changed BVE density threshold");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(20), "stderr={stderr}");
     let line = capability_line(&stderr, "bve");
-    assert!(
-        line.contains("off") && line.contains("env:--sat-bve-sparse-max-density"),
-        "{line}"
-    );
+    assert!(line.contains("off") && line.contains("cli"), "{line}");
 }
 
 #[test]

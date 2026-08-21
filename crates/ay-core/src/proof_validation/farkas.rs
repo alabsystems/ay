@@ -148,6 +148,27 @@ impl LinearExpr {
         if scale.is_zero() {
             return;
         }
+        // `λ = ±1` is the overwhelmingly common multiplier: every certificate
+        // built as `FarkasAnnotation::from_ints(&vec![1; n])` (the producer
+        // default across `ay-dpll`) and every `+`/`-` node walked by
+        // `parse_linear_expr` lands here. `1·x` and `(-1)·x` are EXACT on
+        // `BigRational` — the type is kept in lowest terms with a positive
+        // denominator, so the product is bit-for-bit the operand (resp. its
+        // negation) — and `add_expr`/`sub_expr` are defined as exactly those
+        // two cases. Taking them skips a BigInt gcd plus two divisions per
+        // coefficient, which `Ratio::mul` performs to re-reduce a fraction
+        // that was already reduced.
+        if scale.denom().is_one() {
+            if scale.numer().is_one() {
+                self.add_expr(other);
+                return;
+            }
+            if scale.numer().is_negative() && scale.numer().magnitude().is_one() {
+                // `scale` is exactly `-1`.
+                self.sub_expr(other);
+                return;
+            }
+        }
 
         self.constant += scale * &other.constant;
         for (var, coeff) in &other.coeffs {
@@ -342,12 +363,138 @@ pub fn verify_farkas_conflict_lits_linear(
     verify_farkas_conflict_lits_impl(terms, conflict, farkas, false)
 }
 
+/// [`verify_farkas_conflict_lits_full`] for callers that discard the error.
+///
+/// Same ACCEPT/REJECT decision, byte for byte: the only thing dropped is the
+/// construction of the rejection's diagnostic payload. That payload is not
+/// free — [`farkas_diagnostics`] re-sums the whole combination with exact
+/// `BigRational` arithmetic purely to name a surviving variable or a
+/// non-contradictory constant — and the producers that drive the repeated
+/// subset searches (`derive_numeric_negation`'s bounded support enumeration,
+/// `classifiable_core_decomposition`'s bounded core search) throw it away
+/// immediately with `.is_ok()`.
+pub fn verify_farkas_conflict_lits_full_holds(
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+) -> bool {
+    verify_farkas_conflict_lits_holds_impl(terms, conflict, farkas, true)
+}
+
+/// [`verify_farkas_conflict_lits_linear`] for callers that discard the error.
+///
+/// See [`verify_farkas_conflict_lits_full_holds`] for why this exists.
+pub fn verify_farkas_conflict_lits_linear_holds(
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+) -> bool {
+    verify_farkas_conflict_lits_holds_impl(terms, conflict, farkas, false)
+}
+
 fn verify_farkas_conflict_lits_impl(
     terms: &TermStore,
     conflict: &[TheoryLit],
     farkas: &FarkasAnnotation,
     use_congruence: bool,
 ) -> Result<(), FarkasValidationError> {
+    let prepared = prepare_farkas_combination(terms, conflict, farkas, use_congruence)?;
+    if farkas_combination_holds(&prepared, use_congruence) {
+        return Ok(());
+    }
+    prepared.diagnose(use_congruence)
+}
+
+/// [`verify_farkas_conflict_lits_impl`] without the rejection diagnostics.
+///
+/// Structurally identical: it runs the SAME `prepare` and the SAME decision,
+/// so it accepts exactly the same `(conflict, certificate)` pairs. A shape
+/// error and a failed combination both simply become `false`.
+fn verify_farkas_conflict_lits_holds_impl(
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+    use_congruence: bool,
+) -> bool {
+    match prepare_farkas_combination(terms, conflict, farkas, use_congruence) {
+        Ok(prepared) => farkas_combination_holds(&prepared, use_congruence),
+        Err(_) => false,
+    }
+}
+
+/// The normalized rows of one `(conflict, certificate)` pair, ready to decide.
+struct PreparedFarkas {
+    alternatives: Vec<Vec<NormalizedConstraint>>,
+    lambdas: Vec<BigRational>,
+    disequality_index: Option<usize>,
+}
+
+impl PreparedFarkas {
+    /// The rejection path: rebuild the failing combination's diagnostics.
+    ///
+    /// Always `Err`; the callers that only need the verdict skip it.
+    fn diagnose(&self, use_congruence: bool) -> Result<(), FarkasValidationError> {
+        match self.disequality_index {
+            Some(diseq_idx) => {
+                for branch in 0..2 {
+                    let branch_alternatives = self.branch_alternatives(diseq_idx, branch);
+                    if !farkas_combination_contradicts(
+                        &branch_alternatives,
+                        &self.lambdas,
+                        use_congruence,
+                    ) {
+                        return farkas_diagnostics(&branch_alternatives, &self.lambdas);
+                    }
+                }
+                // Unreachable while `diagnose` is only called after
+                // `farkas_combination_holds` returned false, but stay
+                // fail-closed rather than reporting success from the error arm.
+                farkas_diagnostics(&self.alternatives, &self.lambdas)
+            }
+            None => farkas_diagnostics(&self.alternatives, &self.lambdas),
+        }
+    }
+
+    fn branch_alternatives(
+        &self,
+        diseq_idx: usize,
+        branch: usize,
+    ) -> Vec<Vec<NormalizedConstraint>> {
+        let mut branch_alternatives = self.alternatives.clone();
+        let fixed = branch_alternatives[diseq_idx][branch].clone();
+        branch_alternatives[diseq_idx] = vec![fixed];
+        branch_alternatives
+    }
+}
+
+/// The ACCEPT decision, shared by the `Result` and the `bool` entry points.
+fn farkas_combination_holds(prepared: &PreparedFarkas, use_congruence: bool) -> bool {
+    match prepared.disequality_index {
+        Some(diseq_idx) => {
+            // Case split: each branch fixes the disequality to one strict
+            // alternative; both must yield a contradiction.
+            (0..2).all(|branch| {
+                farkas_combination_contradicts(
+                    &prepared.branch_alternatives(diseq_idx, branch),
+                    &prepared.lambdas,
+                    use_congruence,
+                )
+            })
+        }
+        None => farkas_combination_contradicts(
+            &prepared.alternatives,
+            &prepared.lambdas,
+            use_congruence,
+        ),
+    }
+}
+
+fn prepare_farkas_combination(
+    terms: &TermStore,
+    conflict: &[TheoryLit],
+    farkas: &FarkasAnnotation,
+    use_congruence: bool,
+) -> Result<PreparedFarkas, FarkasValidationError> {
     verify_farkas_signed_shape(terms, conflict, farkas)?;
 
     let lambdas: Vec<BigRational> = farkas
@@ -426,24 +573,11 @@ fn verify_farkas_conflict_lits_impl(
         }
     }
 
-    if let Some(&diseq_idx) = disequality_indices.first() {
-        // Case split: each branch fixes the disequality to one strict
-        // alternative; both must yield a contradiction.
-        for branch in 0..2 {
-            let mut branch_alternatives = alternatives.clone();
-            let fixed = branch_alternatives[diseq_idx][branch].clone();
-            branch_alternatives[diseq_idx] = vec![fixed];
-            if !farkas_combination_contradicts(&branch_alternatives, &lambdas, use_congruence) {
-                return farkas_diagnostics(&branch_alternatives, &lambdas);
-            }
-        }
-        return Ok(());
-    }
-
-    if farkas_combination_contradicts(&alternatives, &lambdas, use_congruence) {
-        return Ok(());
-    }
-    farkas_diagnostics(&alternatives, &lambdas)
+    Ok(PreparedFarkas {
+        alternatives,
+        lambdas,
+        disequality_index: disequality_indices.first().copied(),
+    })
 }
 
 /// Union-find over `TermId`s used to canonicalize a Farkas conflict's linear

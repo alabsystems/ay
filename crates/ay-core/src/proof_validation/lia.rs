@@ -278,13 +278,80 @@ pub fn recognize_int_bounds_tautology(terms: &TermStore, clause: &[TermId]) -> b
 /// disequality. The first two literals are the split branches and the third is
 /// the equality guard. Integer branches leave exactly the one-value equality
 /// gap; Real branches are the two strict orders on the guarded operands.
+///
+/// Over `Int` the guard may be the branch equality SCALED by a positive
+/// integer — see [`arith_disequality_split_guard_multiplier`], which this
+/// delegates to.
 #[must_use]
 pub fn recognize_arith_disequality_split(terms: &TermStore, clause: &[TermId]) -> bool {
+    arith_disequality_split_guard_multiplier(terms, clause).is_some()
+}
+
+/// True exactly when `clause` is a guarded arithmetic disequality split whose
+/// guard is PRIMITIVE — the `k = 1` case, where the guard's canonical linear
+/// form is the branch form itself (every `Real` split is primitive by
+/// construction).
+///
+/// This is the emission-side narrowing of [`recognize_arith_disequality_split`]:
+/// a printer that lowers the lemma to `(<= lhs rhs)` / `(<= rhs lhs)` over the
+/// GUARD's own operands justifies those two sub-steps only when the guard and
+/// the branches share one linear form. For `k >= 2` the guard's operands span a
+/// wider interval than the branches do, so that lowering is not licensed and
+/// the caller must fall back to an unreconstructed wire step.
+#[must_use]
+pub fn arith_disequality_split_has_primitive_guard(terms: &TermStore, clause: &[TermId]) -> bool {
+    use num_traits::One;
+    arith_disequality_split_guard_multiplier(terms, clause)
+        .is_some_and(|k| k == num_bigint::BigInt::one())
+}
+
+/// The positive integer `k` scaling the guard of a guarded arithmetic
+/// disequality split, or `None` when `clause` is not such a split.
+///
+/// # Soundness
+///
+/// The clause is `(cl  C_b <= T_b - 1   C_b >= T_b + 1   guard)` where `C_b` is
+/// the branches' shared canonical integer linear form and `guard` is an
+/// equality whose own canonical form is `C_g = T_g`. Take any INTEGER
+/// assignment. If either branch holds the clause holds. Otherwise
+/// `¬(C_b <= T_b - 1) ∧ ¬(C_b >= T_b + 1)` gives `C_b >= T_b` and `C_b <= T_b`,
+/// hence `C_b = T_b` — this is where integrality is load-bearing, and
+/// [`int_linear_diff`] fails closed on any non-`Int`-sorted atom or
+/// non-integral coefficient, so a `Real` form (satisfiable strictly between the
+/// branches) can never reach here. Then `C_g = k·C_b = k·T_b`, so the guard
+/// holds precisely when `T_g = k·T_b`. Both conditions are checked, so the
+/// accepted clause is a tautology over the integers.
+///
+/// `k` MUST be a positive integer and the multiplier is verified against EVERY
+/// coefficient, not just a pivot:
+///
+/// * `k = 0` collapses `C_g` and `k·T_b` to zero, which would admit any guard
+///   whose canonical form is `0 = 0` regardless of the branches — rejected;
+/// * `k < 0` would need the branch bracketing to flip direction — rejected;
+/// * a non-integer `k` leaves `k·T_b` outside `ℤ` and is not licensed by the
+///   argument above — rejected (fail-closed: some such clauses are in fact
+///   valid, e.g. `2q<=-1 ∨ 2q>=1 ∨ 3q=0`, and are simply not certified here);
+/// * a coefficient set that is not uniformly scaled — a different variable, a
+///   missing variable, or a per-variable ratio — is rejected by the full
+///   verification loop.
+///
+/// The affine case needs no separate handling: [`canonical_int_equality`] and
+/// [`parse_int_comparison`] both push the constant term into the TARGET, so
+/// `T_g = k·T_b` IS the requirement that the constant scale with the
+/// coefficients. The benchmark shape `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`
+/// canonicalizes to branch `(C_b = q, T_b = 0)` and guard `(C_g = 2q, T_g = 0)`,
+/// i.e. `k = 2` with `T_g = 2·0`.
+#[must_use]
+pub fn arith_disequality_split_guard_multiplier(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<num_bigint::BigInt> {
     use crate::term::{Symbol, TermData};
     use crate::Sort;
+    use num_traits::One;
 
     let [first, second, guard] = clause else {
-        return false;
+        return None;
     };
     let decode_equality = |term: TermId| match terms.get(term) {
         TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
@@ -298,11 +365,9 @@ pub fn recognize_arith_disequality_split(terms: &TermStore, clause: &[TermId]) -
         },
         _ => None,
     };
-    let Some((lhs, rhs)) = decode_equality(*guard) else {
-        return false;
-    };
+    let (lhs, rhs) = decode_equality(*guard)?;
     if terms.sort(lhs) != terms.sort(rhs) {
-        return false;
+        return None;
     }
 
     match terms.sort(lhs) {
@@ -319,28 +384,66 @@ pub fn recognize_arith_disequality_split(terms: &TermStore, clause: &[TermId]) -
             // with the reverse strict branch and vice versa. Keep the producer
             // order exact instead of silently accepting a permutation for
             // which that derivation would be invalid.
-            a == Some((lhs, rhs)) && b == Some((rhs, lhs))
+            (a == Some((lhs, rhs)) && b == Some((rhs, lhs))).then(num_bigint::BigInt::one)
         }
         Sort::Int => {
-            let Some((eq_coeffs, eq_target)) = canonical_int_equality(terms, lhs, rhs) else {
-                return false;
-            };
-            let Some((a_coeffs, a_upper, a_value)) = parse_int_comparison(terms, *first, true)
-            else {
-                return false;
-            };
-            let Some((b_coeffs, b_upper, b_value)) = parse_int_comparison(terms, *second, true)
-            else {
-                return false;
-            };
-            if a_coeffs != eq_coeffs || b_coeffs != eq_coeffs || !a_upper || b_upper {
-                return false;
+            let (eq_coeffs, eq_target) = canonical_int_equality(terms, lhs, rhs)?;
+            let (a_coeffs, a_upper, a_value) = parse_int_comparison(terms, *first, true)?;
+            let (b_coeffs, b_upper, b_value) = parse_int_comparison(terms, *second, true)?;
+            // The two branches must bracket ONE shared linear form with the
+            // exact one-value gap `C_b <= T_b - 1` / `C_b >= T_b + 1`.
+            if a_coeffs != b_coeffs || !a_upper || b_upper {
+                return None;
             }
-            a_value == &eq_target - num_bigint::BigInt::from(1)
-                && b_value == &eq_target + num_bigint::BigInt::from(1)
+            let branch_target = a_value + num_bigint::BigInt::one();
+            if b_value != &branch_target + num_bigint::BigInt::one() {
+                return None;
+            }
+            // `k = 1`: the guard IS the branch equality. This is the historical
+            // rule, kept as its own arm so the accepted set below is a strict
+            // SUPERSET of what it accepted (including the degenerate
+            // no-variable form, which the multiplier search rejects).
+            if eq_coeffs == a_coeffs && eq_target == branch_target {
+                return Some(num_bigint::BigInt::one());
+            }
+            let k = positive_integer_scale(&a_coeffs, &eq_coeffs)?;
+            (eq_target == &k * &branch_target).then_some(k)
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// The unique positive integer `k` with `scaled == k * base` coefficient-wise,
+/// or `None` when no such `k` exists.
+///
+/// Both maps come from [`int_linear_diff`], whose `LinearExpr` source is
+/// CANONICAL — a key is present exactly when its coefficient is non-zero — so
+/// the pivot below cannot be a hidden zero and equal lengths plus a full
+/// per-key check means the key SETS are equal. Every rejection is fail-closed:
+/// an empty/all-zero `base` (no pivot), a `scaled` missing the pivot,
+/// a non-integral ratio, `k <= 0`, or any coefficient that does not scale.
+pub(super) fn positive_integer_scale(
+    base: &std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+    scaled: &std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+) -> Option<num_bigint::BigInt> {
+    use num_integer::Integer;
+    use num_traits::{Signed, Zero};
+
+    if base.len() != scaled.len() {
+        return None;
+    }
+    let (pivot_var, pivot_base) = base.iter().find(|(_, c)| !c.is_zero())?;
+    let pivot_scaled = scaled.get(pivot_var)?;
+    let (k, remainder) = pivot_scaled.div_rem(pivot_base);
+    if !remainder.is_zero() || !k.is_positive() {
+        return None;
+    }
+    for (var, coeff) in base {
+        if scaled.get(var) != Some(&(&k * coeff)) {
+            return None;
+        }
+    }
+    Some(k)
 }
 
 fn recognize_rounded_integer_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
@@ -524,7 +627,7 @@ fn int_linear_diff(
 /// returning the linear `L = A - B`'s variable coefficients, whether the literal
 /// constrains `L` from ABOVE (`true`) or BELOW, and the (integer-rounded) bound
 /// value on `L`. `A ≤ B ⟺ L ≤ -const`; strict `<`/`>` round by ±1 over integers.
-fn parse_int_bound(
+pub(super) fn parse_int_bound(
     terms: &TermStore,
     lit: TermId,
 ) -> Option<(

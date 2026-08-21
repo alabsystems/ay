@@ -416,3 +416,65 @@ fn test_storecomm_invalid_30_008_tracks_open_sat_target_8785() -> Result<()> {
     );
     Ok(())
 }
+
+/// #qf-auflia-array-dependent-leaf — CORPUS-FREE regression for the two
+/// completeness defects that made the whole skolemized-extensionality family
+/// publish `unknown`.
+///
+/// Shape: two store chains over ONE base that differ at exactly one index, an
+/// uninterpreted `sk` over the two ARRAY arguments producing the witness
+/// index, and reads compared for disequality. `i` is pinned by NOTHING except
+/// `(= i (sk l1 r2))`, so the model can only pin it after the array
+/// interpretations are complete.
+///
+/// Two defects had to be fixed for this to publish:
+///   1. the store chains' extracted cells were keyed by EUF SPECULATIVE class
+///      integers for the arithmetically unconstrained elements `e1`/`e2`, a
+///      later pass committed different values, and the completion merge read
+///      that staleness as a contradiction — poisoning the chains through
+///      `read_conflicted` and making every array assertion unevaluable;
+///   2. the scalar completion phases all run BEFORE array completion, so `i`
+///      — whose only definition reads an array interpretation — could never be
+///      pinned and reached the independent gate as an unpinned leaf.
+///
+/// z3 and cvc5 both answer `sat`.
+#[test]
+#[ntest::timeout(20_000)]
+fn test_sk_over_arrays_witness_index_is_pinned_after_array_completion() -> Result<()> {
+    let outcome = run_executor_smt_with_timeout(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun a1 () (Array Int Int))
+        (declare-fun e1 () Int)
+        (declare-fun e2 () Int)
+        (declare-fun l1 () (Array Int Int))
+        (declare-fun r1 () (Array Int Int))
+        (declare-fun r2 () (Array Int Int))
+        (declare-fun i () Int)
+        (declare-fun el () Int)
+        (declare-fun er () Int)
+        (declare-fun sk ((Array Int Int) (Array Int Int)) Int)
+        (assert (= l1 (store a1 1 e1)))
+        (assert (= r1 (store a1 2 e2)))
+        (assert (= r2 (store r1 1 e1)))
+        (assert (= el (select l1 i)))
+        (assert (= er (select r2 i)))
+        (assert (= i (sk l1 r2)))
+        (assert (not (= el er)))
+        (check-sat)
+        "#,
+        10,
+    )?;
+    assert_ne!(
+        outcome,
+        SolverOutcome::Unsat,
+        "SOUNDNESS: the skolemized-extensionality witness shape is SAT (z3 and cvc5 agree)",
+    );
+    assert_eq!(
+        outcome,
+        SolverOutcome::Sat,
+        "#qf-auflia-array-dependent-leaf: the witness index is pinned by an array-dependent \
+         definition, so it must be recovered AFTER array completion; got {outcome:?}",
+    );
+    Ok(())
+}

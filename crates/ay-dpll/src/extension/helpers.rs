@@ -59,6 +59,216 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     }
 
     /// Convert a theory literal to a SAT literal
+    /// #dt-context-derivation: record the (surviving blocking clause,
+    /// level-0 premise facts) pair for a theory conflict about to be
+    /// level-0-minimized by `minimize_conflict_with_levels`. The minimization
+    /// strips exactly the blocking literals falsified at decision level 0 —
+    /// i.e. the asserted premises that make the surviving clause
+    /// context-dependent. The record grants no authority: sealing and the
+    /// certification fragment independently re-derive the entailment. Fails
+    /// closed to no record on any term/literal/negation mapping gap.
+    pub(super) fn record_context_conflict_premises(
+        &mut self,
+        conflict_terms: &[ay_core::TheoryLit],
+        ctx: &dyn ay_sat::SolverContext,
+    ) {
+        const MAX_CONTEXT_CONFLICT_LITERALS: usize = 64;
+        if self.context_records.is_none()
+            || conflict_terms.is_empty()
+            || conflict_terms.len() > MAX_CONTEXT_CONFLICT_LITERALS
+        {
+            return;
+        }
+        let Some(proof) = self.proof.as_ref() else {
+            return;
+        };
+        let negations = proof.negations;
+        let mut premises: Vec<TermId> = Vec::new();
+        let mut surviving: Vec<TermId> = Vec::new();
+        for conflict_lit in conflict_terms {
+            let Some(literal) = self.term_to_literal(conflict_lit.term, !conflict_lit.value) else {
+                return;
+            };
+            let Some(&negation) = negations.get(&conflict_lit.term) else {
+                return;
+            };
+            let (fact, blocking) = if conflict_lit.value {
+                (conflict_lit.term, negation)
+            } else {
+                (negation, conflict_lit.term)
+            };
+            if ctx.var_level(literal.variable()) == Some(0) {
+                premises.push(fact);
+            } else {
+                surviving.push(blocking);
+            }
+        }
+        if premises.is_empty() || surviving.is_empty() {
+            return;
+        }
+        // Level-0 reason expansion: a stripped premise is often itself a
+        // BCP-derived fact (e.g. a negative tester forced by a committed
+        // equality), not an asserted term. Walk the level-0 implication
+        // graph and record one auxiliary hint per derived fact — clause =
+        // the fact's unit, premises = the negations of its reason clause's
+        // other literals — so the consumption chain can discharge the whole
+        // tree down to assertion activation units. Bounded; every mapping
+        // gap simply stops that branch (fail-closed).
+        const MAX_REASON_EXPANSIONS: usize = 1024;
+        let mut expansions: Vec<crate::executor::DtContextConflictRecord> = Vec::new();
+        {
+            let mut visited: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut pending: Vec<Literal> = Vec::new();
+            for conflict_lit in conflict_terms {
+                if let Some(literal) = self.term_to_literal(conflict_lit.term, conflict_lit.value) {
+                    if ctx.var_level(literal.variable()) == Some(0) {
+                        pending.push(literal);
+                    }
+                }
+            }
+            let fact_term_of = |this: &Self, literal: Literal| -> Option<TermId> {
+                let atom = *this.var_to_term.get(&(literal.variable().index() as u32))?;
+                if literal.is_positive() {
+                    Some(atom)
+                } else {
+                    negations.get(&atom).copied()
+                }
+            };
+            while let Some(true_literal) = pending.pop() {
+                if visited.len() >= MAX_REASON_EXPANSIONS
+                    || !visited.insert(true_literal.variable().index() as u32)
+                {
+                    continue;
+                }
+                let Some(initial_side) = ctx.var_reason_side(true_literal.variable()) else {
+                    continue;
+                };
+                if initial_side.is_empty() {
+                    continue;
+                }
+                let Some(fact) = fact_term_of(self, true_literal) else {
+                    continue;
+                };
+                // A side literal over a Tseitin AUX variable has no term; it
+                // is itself level-0-propagated, so resolve THROUGH it by
+                // flattening its own reason side in (unit resolution on the
+                // aux variable — the composed premises still entail the
+                // fact). Bounded; any gap abandons this fact fail-closed.
+                let mut side_facts: Vec<TermId> = Vec::new();
+                let mut atom_sides: Vec<Literal> = Vec::new();
+                let mut side_work = initial_side;
+                let mut seen_side: std::collections::BTreeSet<u64> =
+                    std::collections::BTreeSet::new();
+                let mut flatten_budget = 64usize;
+                let mut complete = true;
+                while let Some(side_literal) = side_work.pop() {
+                    if flatten_budget == 0 {
+                        complete = false;
+                        break;
+                    }
+                    flatten_budget -= 1;
+                    let side_key = (side_literal.variable().index() as u64) * 2
+                        + u64::from(side_literal.is_positive());
+                    if !seen_side.insert(side_key) {
+                        continue;
+                    }
+                    // The side literal is FALSE; its negation is the fact.
+                    if let Some(side_fact) = fact_term_of(self, side_literal.negated()) {
+                        if !side_facts.contains(&side_fact) {
+                            side_facts.push(side_fact);
+                            atom_sides.push(side_literal);
+                        }
+                        continue;
+                    }
+                    let aux_true = side_literal.negated();
+                    if ctx.var_level(aux_true.variable()) != Some(0) {
+                        complete = false;
+                        break;
+                    }
+                    let Some(aux_side) = ctx.var_reason_side(aux_true.variable()) else {
+                        complete = false;
+                        break;
+                    };
+                    side_work.extend(aux_side);
+                }
+                if !complete || side_facts.is_empty() {
+                    continue;
+                }
+                for side_literal in atom_sides {
+                    pending.push(side_literal.negated());
+                }
+                expansions.push(crate::executor::DtContextConflictRecord {
+                    clause: vec![fact],
+                    premises: side_facts,
+                });
+            }
+        }
+        let Some(records) = self.context_records.as_deref_mut() else {
+            return;
+        };
+        records.record(surviving, premises);
+        for expansion in expansions {
+            records.record(expansion.clause, expansion.premises);
+        }
+    }
+
+    /// Whether the #dt-context-derivation record sink is at capacity (so the
+    /// lazy path can skip reason materialization entirely).
+    pub(super) fn context_records_full(&self) -> bool {
+        self.context_records
+            .as_deref()
+            .is_none_or(crate::executor::DtContextConflictSink::is_full)
+    }
+
+    /// #dt-context-derivation: hint-record one theory propagation as
+    /// `fact ← reason facts` so certification-time premise chains can
+    /// discharge level-0 theory propagations (lazy reasons are invisible to
+    /// the SAT-side reason walk). Pure hint: no tracker step, no clause, no
+    /// behavior change; sealing independently re-derives the entailment.
+    pub(super) fn record_context_propagation(
+        &mut self,
+        literal: &ay_core::TheoryLit,
+        reason: &[ay_core::TheoryLit],
+    ) {
+        const MAX_CONTEXT_PREMISES: usize = 16;
+        if reason.is_empty()
+            || reason.len() > MAX_CONTEXT_PREMISES
+            || self.context_records.is_none()
+        {
+            return;
+        }
+        let Some(proof) = self.proof.as_ref() else {
+            return;
+        };
+        let negations = proof.negations;
+        let fact_of = |lit: &ay_core::TheoryLit| -> Option<TermId> {
+            if lit.value {
+                Some(lit.term)
+            } else {
+                negations.get(&lit.term).copied()
+            }
+        };
+        let Some(fact) = fact_of(literal) else {
+            return;
+        };
+        let mut premises: Vec<TermId> = Vec::with_capacity(reason.len());
+        for reason_lit in reason {
+            let Some(premise) = fact_of(reason_lit) else {
+                return;
+            };
+            if premise != fact && !premises.contains(&premise) {
+                premises.push(premise);
+            }
+        }
+        if premises.is_empty() {
+            return;
+        }
+        let Some(records) = self.context_records.as_deref_mut() else {
+            return;
+        };
+        records.record(vec![fact], premises);
+    }
+
     pub(super) fn term_to_literal(&self, term: TermId, value: bool) -> Option<Literal> {
         self.var_for_term(term).map(|var| {
             if value {

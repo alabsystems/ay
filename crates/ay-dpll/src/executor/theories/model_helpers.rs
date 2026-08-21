@@ -269,7 +269,11 @@ impl Executor {
                 // Skip when assumptions are active: minimization only checks
                 // permanent assertions, not assumptions, so it can produce models
                 // that violate assumption constraints (#5121).
-                if self.minimize_counterexamples_enabled()
+                //
+                // DEMAND (#model-demand): this is witness cosmetics, so it is
+                // also skipped when nothing in the run can read a model. The
+                // gates below are NOT skipped — they decide the verdict.
+                if self.counterexample_minimization_demanded()
                     && self.last_assumptions.is_none()
                     && !self.defer_counterexample_minimization
                 {
@@ -281,6 +285,7 @@ impl Executor {
                 // gives inter-variable constraints more opportunity to converge
                 // to a globally minimal counterexample.
                 if self.aggressive_model_minimize
+                    && self.model_output_is_demanded()
                     && self.last_assumptions.is_none()
                     && !self.defer_counterexample_minimization
                 {

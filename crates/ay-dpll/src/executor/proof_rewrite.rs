@@ -172,13 +172,17 @@ impl Executor {
     /// Rewrite proof terms to use surface syntax for canonicalized operators,
     /// then run the ASSUME-AUTHORIZATION tail.
     ///
-    /// Only the surface-override collection needs the parsed AST. Everything
-    /// after it — `demote_auxiliary_non_problem_assumptions`,
+    /// Only the surface-override collection needs the parsed AST. The tail —
+    /// `demote_auxiliary_non_problem_assumptions`,
     /// `derive_conjunct_assumptions_from_problem_roots`,
     /// `demote_non_problem_assumptions` and
-    /// `rebuild_trust_leaf_proof_from_original_assertions` — decides whether
-    /// the MANDATORY UNSAT certificate can be minted at all, and must run
-    /// whether or not a parsed AST was retained.
+    /// `rebuild_trust_leaf_proof_from_original_assertions` — reasons purely
+    /// over canonical `TermId`s and decides whether the certificate that
+    /// `66538b006f` made MANDATORY can be minted at all. Skipping the whole
+    /// tail with the parsed AST is therefore wrong; running ALL of it without
+    /// the parsed AST is also wrong (see the NARROWED subset below). With no
+    /// parsed prefix this function delegates to
+    /// [`Self::run_assumption_authority_passes_without_parsed_syntax`].
     ///
     /// #retain-parsed-verdict-divergence. Retaining the parsed AST is a
     /// peak-RSS optimization the CLI turns OFF whenever no proof artifact can
@@ -208,6 +212,37 @@ impl Executor {
     /// The overrides themselves still degrade to nothing without a parsed
     /// stack: both `override_pairs` arms zip against `parsed_assertions`, so
     /// an empty parsed stack yields no pairs and no term overrides.
+    ///
+    /// # The retention-off path is a NARROWED subset, not this whole function
+    ///
+    /// #cause-b-narrow-split. Running the *entire* tail with no parsed prefix
+    /// was measured over 2,166 non-QF_Datatypes instances (frozen arms, banked
+    /// argv, killpg walls): **+301 gained, 12 LOST, 0 wrong**. Every one of the
+    /// 12 losses traces to ONE pass in the tail,
+    /// [`Self::derive_conjunct_assumptions_from_problem_roots`], by two
+    /// independent mechanisms:
+    ///
+    ///  * 8 losses (all `QF_IDL/parity`) — the pass RESTRUCTURES the proof
+    ///    (10,503 → 13,073 steps on `19.200.graph`) and downstream
+    ///    re-validation then hits an unmemoized recursive predicate:
+    ///    `matches_negated_components` is 76% of samples and its
+    ///    `vec![false; n]` alloc a further 17%. The pass body itself costs
+    ///    8.5 ms; BASE validates the same proof in 0.3 ms. `04.100.graph` goes
+    ///    0.05 s → 139-167 s.
+    ///  * 4 losses — a CORRECTNESS DEFECT in the same pass: it emits a
+    ///    malformed `and_pos` ("clause must contain the and gate literal and
+    ///    the indexed conjunct") and then rejects its own derivation. Spans
+    ///    `QF_IDL/parity`, `QF_IDL/sep/hardware` and `QF_LIA/convert`, so no
+    ///    family-scoped gate can contain it.
+    ///
+    /// And it is not needed for the loss the split exists to fix: measured on
+    /// the cause-B exemplar and on the tracked reduced repro,
+    /// [`Self::demote_non_problem_assumptions`] alone restores the verdict.
+    /// So the retention-off configuration runs
+    /// [`Self::run_assumption_authority_passes_without_parsed_syntax`] — the
+    /// demotion passes and the trust-leaf rebuild, and NOT the derivation pass.
+    /// It is gated there exactly as it was before 540fe30fb, i.e. it still only
+    /// ever runs when a parsed prefix was retained.
     pub(super) fn apply_input_syntax_rewrites_to_proof(&mut self, proof: &mut Proof) {
         self.last_proof_term_overrides = None;
         if Self::proof_has_nonportable_ground_evaluate(&self.ctx.terms, proof) {
@@ -216,6 +251,9 @@ impl Executor {
         if self.ctx.assertions.is_empty() {
             return;
         }
+        // Main's fail-closed source-work audit runs FIRST so the retention-off
+        // path below is still governed by it: budget exhaustion must poison the
+        // proof regardless of which authority subset would have run.
         if !self.proof_source_work.spend(
             super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxRewrite,
             self.ctx.assertions_parsed(),
@@ -225,286 +263,25 @@ impl Executor {
             *proof = poisoned;
             return;
         }
+        if self.ctx.assertions_parsed().is_empty() {
+            // cause-b-narrow-authority-split-v1
+            self.run_assumption_authority_passes_without_parsed_syntax(proof);
+            return;
+        }
 
         let aux_assume_steps =
             Self::collect_assume_steps_with_aux_mod_div_vars(&self.ctx.terms, proof);
         let mut rewrites: HashMap<TermId, TermId> = HashMap::default();
-        let mut term_overrides: HashMap<TermId, String> = HashMap::default();
-        let problem_assertions = self.proof_problem_assertions();
-        let original_problem_assertions = self.proof_original_problem_assertions();
-        // Borrow parsed assertion ASTs while building `override_pairs`, which clones only pairs it
-        // keeps); the wholesale `.to_vec()` doubled that cost on every UNSAT
-        // (#proof-tax: recursive `Term::clone` of the whole problem was the
-        // single largest rewrite-pass leaf on the qg5 QF_UF family).
-        let parsed_assertions: &[ay_frontend::command::Term] = self.ctx.assertions_parsed();
-        // Deduplicate borrowed source indices before cloning parsed ASTs. Provenance may mention
-        // one source through many assertions, so pair count and repeated source work are
-        // bounded explicitly.
-        let mut override_plan_valid = problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN
-            && original_problem_assertions.len() <= MAX_OVERRIDE_SOURCE_SCAN;
-        let mut source_scan_work = problem_assertions.len();
-        let mut pair_specs: Vec<(TermId, usize)> = if override_plan_valid {
-            if let Some(provenance) = &self.proof_problem_assertion_provenance {
-                let parsed_by_original: HashMap<TermId, usize> = original_problem_assertions
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(index, term)| (term, index))
-                    .collect();
-                let mut pairs = Vec::new();
-                let mut seen = HashSet::default();
-                'problem_sources: for &canonical in &problem_assertions {
-                    let Some(source_sets) = provenance.assertion_sources.get(&canonical) else {
-                        continue;
-                    };
-                    let Some(next_work) = source_scan_work.checked_add(source_sets.len()) else {
-                        override_plan_valid = false;
-                        break;
-                    };
-                    if next_work > MAX_OVERRIDE_SOURCE_SCAN {
-                        override_plan_valid = false;
-                        break;
-                    }
-                    source_scan_work = next_work;
-                    for source_set in source_sets {
-                        if let [source] = source_set.as_slice() {
-                            if let Some(&parsed_index) = parsed_by_original.get(source) {
-                                if seen.insert((canonical, parsed_index)) {
-                                    if pairs.len() >= MAX_OVERRIDE_PAIRS {
-                                        override_plan_valid = false;
-                                        break 'problem_sources;
-                                    }
-                                    pairs.push((canonical, parsed_index));
-                                }
-                            }
-                        }
-                    }
-                }
-                // Original assertions that appear in MULTI-source provenance
-                // sets (e.g. a propagated theory atom sourced from a Boolean
-                // definition `(= c atom)` plus the defining literal `c`) are
-                // problem premises in their own right: the derivation pass can
-                // re-introduce them as `assume` steps. Pair each with its own
-                // parsed form so those assumes — and their surface subterms —
-                // print with the problem file's syntax and carcara can match
-                // them to the original premises.
-                let mut paired: ay_core::kani_compat::DetHashSet<TermId> =
-                    pairs.iter().map(|(c, _)| *c).collect();
-                'all_sources: for source_sets in provenance.assertion_sources.values() {
-                    let Some(next_work) = source_scan_work.checked_add(source_sets.len()) else {
-                        override_plan_valid = false;
-                        break;
-                    };
-                    if next_work > MAX_OVERRIDE_SOURCE_SCAN {
-                        override_plan_valid = false;
-                        break;
-                    }
-                    source_scan_work = next_work;
-                    for source_set in source_sets {
-                        if source_set.len() < 2 {
-                            continue;
-                        }
-                        let Some(next_work) = source_scan_work.checked_add(source_set.len()) else {
-                            override_plan_valid = false;
-                            break 'all_sources;
-                        };
-                        if next_work > MAX_OVERRIDE_SOURCE_SCAN {
-                            override_plan_valid = false;
-                            break 'all_sources;
-                        }
-                        source_scan_work = next_work;
-                        for &source in source_set {
-                            if paired.insert(source) {
-                                if let Some(&parsed_index) = parsed_by_original.get(&source) {
-                                    if seen.insert((source, parsed_index)) {
-                                        if pairs.len() >= MAX_OVERRIDE_PAIRS {
-                                            override_plan_valid = false;
-                                            break 'all_sources;
-                                        }
-                                        pairs.push((source, parsed_index));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                pairs
-            } else if problem_assertions.len() <= MAX_OVERRIDE_PAIRS {
-                problem_assertions
-                    .iter()
-                    .enumerate()
-                    .map(|(index, &canonical)| (canonical, index))
-                    .collect()
-            } else {
-                override_plan_valid = false;
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        surface_pairs::retain_available_surface_pairs(&mut pair_specs, parsed_assertions.len());
-        let canonical_plan_is_bounded =
-            super::proof_surface_syntax::surface_override_roots_have_bounded_work(
-                &self.ctx.terms,
-                pair_specs.iter().map(|(canonical, _)| *canonical),
-            );
-        if !override_plan_valid
-            || pair_specs.len() > MAX_OVERRIDE_PAIRS
-            || !canonical_plan_is_bounded
-            || !self.proof_source_work.spend(
-                super::proof_trust_surgery_surface_audit::ProofSourcePass::InputSyntaxOverridePairs,
-                pair_specs
-                    .iter()
-                    .filter_map(|(_, index)| parsed_assertions.get(*index)),
-            )
-        {
-            let mut poisoned = Proof::new();
-            poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-            *proof = poisoned;
+        let Some((override_pairs, mut term_overrides)) = self.prepare_surface_overrides() else {
+            Self::poison_input_syntax_rewrite(proof);
             return;
-        }
-        let override_pairs: Vec<(TermId, ay_frontend::command::Term)> = pair_specs
-            .drain(..)
-            .filter_map(|(canonical, index)| {
-                let parsed = parsed_assertions.get(index)?;
-                // The native API marker aligns counts; it is not surface text.
-                (!matches!(
-                    strip_frontend_annotations(parsed),
-                    ay_frontend::command::Term::Symbol(name)
-                        if name == super::NATIVE_API_ASSERTION_PLACEHOLDER
-                ))
-                .then(|| (canonical, parsed.clone()))
-            })
-            .collect();
-        for (canonical, parsed) in &override_pairs {
-            if !collect_surface_term_overrides(
-                &mut self.ctx,
-                *canonical,
-                parsed,
-                &mut term_overrides,
-            ) || !surface_override_map_is_bounded(&term_overrides)
-            {
-                let mut poisoned = Proof::new();
-                poisoned.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-                *proof = poisoned;
-                return;
-            }
-        }
+        };
 
-        // A `forall_inst` instance must use the source quantifier's own
-        // surface spelling.  Canonical term rewriting alone is insufficient:
-        // `(forall ((x Int)) (> x 0))` is stored as `< 0 x`, and its exact
-        // ground instance is a different TermId that the ordinary source walk
-        // never visits.  Derive an override from the parsed binder body and
-        // the step's positional arguments.  A conflicting rendering for one
-        // shared TermId cannot be represented by the global printer table, so
-        // suppress external export rather than emit a certificate an external
-        // checker would reject; the internal strict verdict certificate is
-        // unaffected.
-        let parsed_foralls: HashMap<TermId, ay_frontend::command::Term> = override_pairs
-            .iter()
-            .filter(|(_, parsed)| {
-                matches!(
-                    strip_frontend_annotations(parsed),
-                    ay_frontend::command::Term::Forall(..)
-                )
-            })
-            .cloned()
-            .collect();
-        let mut forall_instance_override_failed = false;
-        for step in &proof.steps {
-            let ProofStep::Step {
-                rule: AletheRule::ForallInst,
-                clause,
-                args,
-                ..
-            } = step
-            else {
-                continue;
-            };
-            let [implication] = clause.as_slice() else {
-                continue;
-            };
-            let TermData::App(Symbol::Named(name), disjuncts) = self.ctx.terms.get(*implication)
-            else {
-                continue;
-            };
-            if name != "or" || disjuncts.len() != 2 {
-                continue;
-            }
-            let TermData::Not(quantifier) = self.ctx.terms.get(disjuncts[0]) else {
-                continue;
-            };
-            let Some(parsed) = parsed_foralls.get(quantifier) else {
-                continue;
-            };
-            let instance = disjuncts[1];
-            let Some(surface) =
-                format_forall_instance_surface(&self.ctx.terms, parsed, args, &term_overrides)
-            else {
-                // The internal proof uses canonical terms, but an external
-                // checker reads the authored SMT-LIB surface.  If we cannot
-                // reconstruct the exact authored substitution, there is no
-                // safe printable rendering for this step.
-                forall_instance_override_failed = true;
-                break;
-            };
-            if term_overrides
-                .get(&instance)
-                .is_some_and(|existing| existing != &surface)
-            {
-                forall_instance_override_failed = true;
-                break;
-            }
-            term_overrides.insert(instance, surface);
-        }
-        if forall_instance_override_failed {
-            self.suppress_unsat_proof_reconstruction();
-        }
+        self.add_forall_instance_surface_overrides(proof, &override_pairs, &mut term_overrides);
 
         Self::infer_auxiliary_division_rewrites(&mut self.ctx.terms, proof, &mut rewrites);
 
-        // #authored-aux-name-collision — this surface rewrite is COSMETIC (it
-        // prints `div`/`mod` in the exported proof instead of the client's
-        // quotient/remainder encoding), but it can move an `Assume` LEAF out of
-        // the authored problem obligation, and an unauthorized assume is a hard
-        // reject in the mandatory strict certification. A correct `unsat` then
-        // publishes as `unknown`. Print fidelity must yield to the verdict.
-        //
-        // The trigger is that `as_aux_quotient_var` / `as_aux_remainder_var`
-        // recognise the encoder's auxiliaries purely by variable NAME PREFIX
-        // (`_mod_q`, `_div_q`, `_divmod_q` and the `_r` twins). AY's own
-        // div/mod elimination never mints those names — only ay-chc's
-        // `ChcExpr::eliminate_mod` does, and it declares them to the executor as
-        // ordinary `(declare-const _mod_q_0 Int)`. So every variable this
-        // heuristic ever matches belongs to the CLIENT, and the "side
-        // conditions" it infers from are frequently DERIVED terms (here, the
-        // post-substitution `(= (+ (* _mod_q_2 2) _mod_r_3) (+ (* _mod_q_0 2)
-        // _mod_r_1 1))`) rather than authored ones — so filtering on "is this an
-        // authored assertion" does not catch it. What is decisive is the effect:
-        // if applying the rewrites would change an `Assume` leaf into a term the
-        // obligation does not contain, drop the whole rewrite.
-        //
-        // Verified on the query
-        // `adaptive::tests::test_try_synthesis_accepts_chccomp_extra_small_lia_safe_summaries`
-        // issues: renaming ONLY `_mod_q_`/`_mod_r_` to `zzq`/`zzr` in the dumped
-        // `.smt2` — semantically identical, and enough to make the heuristic miss
-        // — flipped it from `unknown (self-check-rejected)` to `unsat`.
-        if !rewrites.is_empty() {
-            let obligation = self.problem_assertions_for_strict_proof();
-            let mut cache: HashMap<TermId, TermId> = HashMap::default();
-            let breaks_authorization = proof.steps.iter().any(|step| {
-                let ProofStep::Assume(term) = step else {
-                    return false;
-                };
-                let rewritten =
-                    Self::rewrite_term(&mut self.ctx.terms, *term, &rewrites, &mut cache);
-                rewritten != *term && !obligation.contains(&rewritten)
-            });
-            if breaks_authorization {
-                rewrites.clear();
-            }
-        }
+        self.drop_rewrites_that_break_assumption_authority(proof, &mut rewrites);
 
         if !rewrites.is_empty() {
             let step_count_before = proof.steps.len();
@@ -521,7 +298,78 @@ impl Executor {
 
         self.finish_input_syntax_rewrite(proof, &rewrites, term_overrides, &aux_assume_steps);
     }
+
+    /// The ASSUMPTION-AUTHORITY subset of
+    /// [`Self::apply_input_syntax_rewrites_to_proof`] that is safe to run with
+    /// no parsed-assertion prefix.
+    ///
+    /// # Why this function exists at all (#cause-b-parsed-gate)
+    ///
+    /// `66538b006f` made the strict UNSAT certificate MANDATORY: every
+    /// published `unsat` now goes through the certification funnel. Separately,
+    /// the #rss-vs-z3 optimization has the CLI call
+    /// `set_retain_parsed_assertions(false)` whenever the session can emit no
+    /// proof artifact — `--no-proof`, `--z3-mode`, competition mode
+    /// (`crates/ay/src/run.rs:7969` and `:8582`) — because the parsed-AST clone
+    /// was ~190 MB of a 318 MB peak. Those two features interact:
+    /// `apply_input_syntax_rewrites_to_proof` used to bail wholesale on an
+    /// empty parsed prefix, which switched off not only the COSMETIC
+    /// surface-syntax half (which genuinely needs the frontend ASTs) but also
+    /// the authority passes, which reason purely over canonical `TermId`s and
+    /// need no parse tree. Foreign leaves therefore stayed bare `Assume`s;
+    /// `ProofCheckError::UnauthorizedAssumption` is NOT trust-eligible in
+    /// `unsat_cert.rs`, so `discharge_trust_steps_for_certification` — the
+    /// funnel's own rescue — was never reached, and a computed, correct
+    /// refutation published as `unknown`. Measured 89 such discarded UNSATs.
+    ///
+    /// # Why the derivation pass is deliberately absent
+    ///
+    /// See the 12-loss measurement on
+    /// [`Self::apply_input_syntax_rewrites_to_proof`].
+    /// `derive_conjunct_assumptions_from_problem_roots` is BOTH the source of
+    /// the `QF_IDL/parity` re-validation blowup and of the malformed `and_pos`
+    /// correctness defect, and cause B does not need it: the demotion below is
+    /// sufficient on the cause-B exemplar and on the tracked reduced repro.
+    /// Leaving it out keeps the retention-off path strictly narrower than the
+    /// retention-on path it was measured against. `proof_rewrite_tests.rs`
+    /// pins that absence so a later refactor cannot silently re-enable it.
+    ///
+    /// # This grants no authority
+    ///
+    /// Demotion turns an unauthorized `assume` into a `trust` step that
+    /// `mint_unsat_certificate` must still discharge INDEPENDENTLY (forged-
+    /// UNSAT fresh re-solve, full strict validation of every non-trust step,
+    /// per-clause confirmation). `problem_assertions_for_strict_proof()` is not
+    /// touched, so nothing solver-generated enters the frozen obligation.
+    fn run_assumption_authority_passes_without_parsed_syntax(&mut self, proof: &mut Proof) {
+        debug_assert!(
+            self.ctx.assertions_parsed().is_empty(),
+            "BUG: the narrowed authority subset is only for the retention-off configuration"
+        );
+        tracing::debug!(
+            "cause-b-narrow-authority-split-v1: no parsed prefix retained; running the \
+             assumption-authority subset (demote + trust-leaf rebuild) and skipping both the \
+             COSMETIC surface-syntax half and derive_conjunct_assumptions_from_problem_roots"
+        );
+
+        let aux_assume_steps =
+            Self::collect_assume_steps_with_aux_mod_div_vars(&self.ctx.terms, proof);
+        // No surface rewrites are collected on this path, so the exportable
+        // whitelist is built against an empty rewrite map.
+        let no_rewrites: HashMap<TermId, TermId> = HashMap::default();
+        let extended_assertions = self.proof_exportable_assertions(&no_rewrites);
+        Self::demote_auxiliary_non_problem_assumptions(
+            proof,
+            &extended_assertions,
+            &aux_assume_steps,
+        );
+        // DELIBERATELY NOT `derive_conjunct_assumptions_from_problem_roots`.
+        Self::demote_non_problem_assumptions(proof, &extended_assertions);
+        self.rebuild_trust_leaf_proof_from_original_assertions(proof);
+    }
 }
+
+include!("proof_rewrite/surface_planning.rs");
 
 #[cfg(test)]
 #[path = "proof_rewrite_tests.rs"]

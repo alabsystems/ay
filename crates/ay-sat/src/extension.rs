@@ -239,6 +239,16 @@ pub trait SolverContext {
     /// Get the level at which a variable was assigned (None if unassigned)
     fn var_level(&self, var: Variable) -> Option<u32>;
 
+    /// The reason-side literals of a PROPAGATED variable: the OTHER literals
+    /// of the clause (or binary jump) that propagated it — each FALSE under
+    /// the current assignment. `None` for decisions, unassigned variables,
+    /// lazy theory reasons, stale arena offsets, and implementations without
+    /// reason access (the default). Provenance-only: a `None` means
+    /// "antecedents unknown", never an error.
+    fn var_reason_side(&self, _var: Variable) -> Option<Vec<Literal>> {
+        None
+    }
+
     /// Get all currently assigned literals (the trail)
     fn trail(&self) -> &[Literal];
 

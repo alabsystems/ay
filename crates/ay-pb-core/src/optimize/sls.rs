@@ -83,6 +83,10 @@ use crate::optimize::unified_score::{rows_fit, ScoreInt};
 use crate::solver::eval_objective;
 use crate::types::{PbInstance, PbObjective, PbRel, PbTerm};
 
+mod options;
+
+pub(crate) use options::SlsOptions;
+
 /// Maximum number of variables an SLS run will accept. Above this the
 /// per-flip bookkeeping and the periodic full re-verification become too coarse
 /// to help within a time slice; decline (mirrors LNS's `MAX_LNS_VARS`).
@@ -1318,89 +1322,6 @@ pub(crate) fn search_with_limits(
     )
 }
 
-/// Additive per-run options for [`search_with_seeds`]. `Default` reproduces the
-/// exact behavior of `search` (`fast_bump = false`, default caps, no external
-/// seeds), so existing call sites keep compiling and behaving unchanged through
-/// the thin wrappers above.
-pub(crate) struct SlsOptions<'a> {
-    /// O(violated) PAWS bump — see [`Tracker::bump_violated_weights`].
-    pub(crate) fast_bump: bool,
-    /// Per-run variable cap — see [`search_with_limits`].
-    pub(crate) max_vars: usize,
-    /// Hard cap on flips (defaults to [`MAX_FLIPS`]). A small cap lets tests run
-    /// the loop fully deterministically, with no wall-clock deadline.
-    pub(crate) max_flips: u64,
-    /// OPTIONAL externally-provided restart seed points (design §3.1's third
-    /// restart layer, e.g. a future LP-rounded fractional point): candidate
-    /// assignments the [`RestartLayer::ExternalSeed`] layer cycles through.
-    /// Empty disables the layer (the cycle is then biased-random ↔
-    /// best-incumbent only). Only consulted when `restarts` is on. ADVISORY
-    /// ONLY — a bad seed just wastes a restart; every incumbent is still
-    /// independently re-verified before it is reported.
-    pub(crate) external_seeds: &'a [Vec<bool>],
-    /// Layered stagnation restarts (design §3.1) — DEFAULT OFF. Restarts are
-    /// the DIVERSIFICATION arm for parallel primal workers (design §2.3), not
-    /// part of the single default trajectory: the full-slice A/B (2026-07-10,
-    /// 30s, 107 instances) measured enabled-by-default as net-negative in the
-    /// sequential trajectory — answer coverage identical to baseline (95/107,
-    /// 0 wrong) but per-instance quality net −4, because restarts rescue
-    /// SMTI-class FLATLINED feasibility hunts (SMTI_10000 UNKNOWN→SAT,
-    /// plain-cod2 o −2805→−7458) while interfering with whole-budget
-    /// CONVERGING grinds (RCPSP j120 SAT→UNKNOWN, benchsMusee_binary
-    /// −1791→−35) whose answers only land in the final flush. When off, the
-    /// scheduler is never constructed and the loop reproduces the pre-restart
-    /// trajectory bit-for-bit; a diversified worker opts in explicitly.
-    pub(crate) restarts: bool,
-    /// XOR-diversifier folded into the structural RNG seed (design §2.3): a
-    /// diversified parallel worker passes its own fixed nonzero constant so
-    /// its trajectory deterministically differs from the default worker's on
-    /// the same instance (and from the other diversified workers'). Still
-    /// structure-only — no entropy, no instance identity — so every run stays
-    /// bit-for-bit reproducible. `0` (the default) reproduces the unmodified
-    /// [`structural_seed`] exactly.
-    pub(crate) seed_xor: u64,
-    /// OPTIONAL starting assignment (e.g. the LP-rounded point of the
-    /// `lp-round-sls-opt` worker). Used only when its length matches the
-    /// variable count; otherwise the default all-false start applies.
-    /// ADVISORY ONLY — the start point steers the trajectory, never
-    /// soundness: every incumbent is still independently re-verified.
-    pub(crate) start: Option<&'a [bool]>,
-    /// Feasibility-phase plateau weighting scheme (design §2.2) — DEFAULT
-    /// [`WeightScheme::Paws`], which reproduces the historical trajectory
-    /// bit-for-bit. [`WeightScheme::Ddfw`] is the A/B-gated quality-increment
-    /// arm for DIVERSIFIED workers (the 60-strictly-suboptimal axis): at each
-    /// stuck event, weight is TRANSFERRED into every violated row from its
-    /// max-weight satisfied neighbor instead of additively bumped (see
-    /// [`Tracker::ddfw_transfer_weights`]). ADVISORY ONLY — weights steer the
-    /// search; every incumbent is still independently re-verified.
-    pub(crate) weighting: WeightScheme,
-    /// Smoothed Configuration Checking (design §2.2) — DEFAULT OFF (the
-    /// default trajectory stays bit-identical). When on (an A/B-gated
-    /// diversified-worker arm), only configuration-changed variables — those
-    /// with a neighbor flipped since their own last flip — are eligible for
-    /// the feasibility-phase GREEDY pick (falling back to the existing noise
-    /// pick when no candidate is eligible), with a random small fraction
-    /// re-enabled on the [`SCC_SMOOTH_INTERVAL`] smoothing cadence. ADVISORY
-    /// ONLY — eligibility steers the search, never soundness.
-    pub(crate) scc: bool,
-}
-
-impl Default for SlsOptions<'_> {
-    fn default() -> Self {
-        SlsOptions {
-            fast_bump: false,
-            max_vars: MAX_SLS_VARS,
-            max_flips: MAX_FLIPS,
-            external_seeds: &[],
-            restarts: false,
-            seed_xor: 0,
-            start: None,
-            weighting: WeightScheme::Paws,
-            scc: false,
-        }
-    }
-}
-
 /// As [`search_with_limits`], but taking the full additive option set
 /// ([`SlsOptions`]), including the externally-provided restart seed points.
 /// This is the real two-phase search entry; every other `search*` entry point
@@ -1596,7 +1517,7 @@ fn search_loop<T: ScoreInt>(
                 &mut rng,
                 &mut stale,
                 endgame_threshold,
-                options.weighting,
+                options,
             );
         } else {
             // Reached (or are at) a feasible point. Re-verify and record before
@@ -1915,7 +1836,6 @@ pub(crate) fn up_seed(instance: &PbInstance) -> Option<Vec<bool>> {
 /// [`WeightScheme::Ddfw`] (design §2.2). Under SCC (also opt-in, design §2.2)
 /// the greedy pick considers only configuration-changed candidates, falling
 /// back to the existing noise pick when none is eligible.
-#[allow(clippy::too_many_arguments)]
 fn feasibility_step<T: ScoreInt>(
     instance: &PbInstance,
     assignment: &mut [bool],
@@ -1923,7 +1843,7 @@ fn feasibility_step<T: ScoreInt>(
     rng: &mut SplitMix64,
     stale: &mut u64,
     endgame_threshold: usize,
-    weighting: WeightScheme,
+    options: &SlsOptions<'_>,
 ) {
     // Pick a random violated constraint directly from the incrementally-maintained
     // violated-set (O(1), no full constraint rescan).
@@ -1952,7 +1872,7 @@ fn feasibility_step<T: ScoreInt>(
         return;
     }
 
-    let chosen = if rng.below(1000) < WALK_NOISE_PERMILLE as usize {
+    let chosen = if rng.below(1000) < options.walk_permille as usize {
         // Random-walk: pick any variable from the constraint.
         candidate_vars[rng.below(candidate_vars.len())]
     } else {
@@ -2023,7 +1943,7 @@ fn feasibility_step<T: ScoreInt>(
     // swap. PAWS bumps additively; the DDFW arm (design §2.2) TRANSFERS weight
     // into the violated rows from their satisfied neighbors instead.
     *stale += 1;
-    match weighting {
+    match options.weighting {
         WeightScheme::Paws => {
             if *stale >= PAWS_BUMP_INTERVAL {
                 tracker.bump_violated_weights();
@@ -4075,7 +3995,7 @@ mod tests {
             &mut rng,
             &mut stale,
             0,
-            WeightScheme::Paws,
+            &SlsOptions::default(),
         );
         let flipped: Vec<usize> = (0..2).filter(|&v| assignment[v]).collect();
         assert_eq!(flipped.len(), 1, "the fallback must still flip one row var");

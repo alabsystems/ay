@@ -141,6 +141,16 @@ impl MarginMapping {
     pub(crate) fn map(self, orig: &Model, reframed: Outcome) -> Reframed {
         map_reframed(orig, self.row, self.sense, &self.threshold, reframed)
     }
+
+    /// The `(sense, threshold)` pair [`record`] needs, captured BEFORE
+    /// [`Self::map`] consumes the mapping.
+    ///
+    /// [`reframe`] takes the same two fields inline; the session's shared
+    /// nested helper cannot, because `MarginMapping`'s fields are private to
+    /// this module. Same values, same order, one accessor instead of two.
+    pub(crate) fn telemetry_key(&self) -> (Sense, BigRational) {
+        (self.sense, self.threshold.clone())
+    }
 }
 
 impl MarginProofTarget<'_> {
@@ -158,25 +168,40 @@ impl MarginProofTarget<'_> {
     }
 }
 
-/// Attempt the margin reframe for `model` under `opts`.
+/// Attempt the margin reframe for `model` under `opts`, as ONE self-contained
+/// nested solve.
 ///
 /// Returns `None` when the reframe DECLINES (no margin named or detected, kill
 /// switch set, a non-≡0 objective, or a margin row that is not a clean single
-/// one-sided inequality) — the caller then runs the plain feasibility solve,
-/// unchanged. Returns `Some(Reframed)` with a mapped verdict (or an honest
-/// `Unknown`) otherwise.
+/// one-sided inequality). Returns `Some(Reframed)` with a mapped verdict (or an
+/// honest `Unknown`) otherwise.
 ///
-/// This is the ORDINARY `check()` entry, so it takes the AUTO-DETECTED margin
-/// when the caller named none (see [`auto_margin_row`]). The explicit
-/// shared-margin API goes through [`prepare`] instead and still requires a mark.
+/// ⚠ THIS IS THE DIAGNOSTIC ENTRY, NOT THE SESSION ONE. It used to be
+/// `BabSession::check`'s `MarginMode::Auto` arm, and being a second,
+/// independent construction is exactly what cost that arm two capabilities:
+/// this body passes NO [`MarginProofTarget`] (so the whole threshold-crossing
+/// machinery was dead code on it) and hands the caller's `opts` — certificate
+/// policy included — straight to the sub-session, which discards a finished
+/// reframed `Optimal` that has no primal-meeting certificate. The session now
+/// runs [`prepare_auto`] through its own shared nested helper
+/// (`session::BabSession::run_reframed_nested`), which both marked-margin
+/// entries share. Keep this one for [`diag_margin_reframe_with`], and do not
+/// re-point a verdict path at it.
 pub(crate) fn reframe(model: &Model, opts: &SolveOpts) -> Option<Reframed> {
     let PreparedMargin {
         reframed_model,
         mapping,
     } = prepare_auto(model)?;
+    // Captured before `map` consumes the mapping: the pair a consumer needs to
+    // read the bound is (bound, threshold), and the threshold is the mapping's.
+    let sense = mapping.sense;
+    let threshold = mapping.threshold.clone();
+    let started = std::time::Instant::now();
     let mut sub = BabSession::new(reframed_model, opts).ok()?;
     let reframed_outcome = sub.check().ok()?;
-    Some(mapping.map(model, reframed_outcome))
+    let reframed = mapping.map(model, reframed_outcome);
+    record(sense, &threshold, &reframed.info, started.elapsed());
+    Some(reframed)
 }
 
 /// Validate and construct a margin reframe without starting a solver, from a
@@ -318,12 +343,29 @@ fn auto_margin_row(model: &Model) -> Option<Row> {
     }
     (0..n).rev().map(|r| Row(r as u32)).find(|&row| {
         let (coeffs, lb, ub) = model.row(row);
-        let [(c, _)] = coeffs[..] else { return false };
+        if coeffs.is_empty() {
+            return false;
+        }
         if lb.is_finite() == ub.is_finite() {
             return false; // not one-sided (equality, range, or free)
         }
-        let (clb, cub) = model.col_bounds(Col(c));
-        clb == f64::NEG_INFINITY && cub == f64::INFINITY && row_uses[c as usize] >= 2
+        // EVERY column of the candidate must be FREE and defined elsewhere. The original
+        // detector demanded a SINGLETON (the downstream optimization consumer's W1 shape declares an explicit slack column);
+        // the downstream optimization consumer's safenlp captures instead assert the violation directly over the two free
+        // OUTPUT columns (`Y0 − Y1 <= 0`, both defined by their own dense equality rows), so
+        // the singleton rule declined the whole class and the reframe stayed dormant on it.
+        // The free-and-defined-elsewhere test carries the same meaning the singleton rule
+        // encoded — the row is the ONLY thing constraining that direction, i.e. a violation
+        // ASSERTION rather than an ordinary network constraint — and nests the singleton
+        // case exactly. Auto-detection stays opt-in (`with_auto_margin(true)`) and every
+        // mapped verdict is still re-adjudicated by `finish` against the ORIGINAL model.
+        coeffs.iter().all(|&(c, a)| {
+            let (clb, cub) = model.col_bounds(Col(c));
+            a != 0.0
+                && clb == f64::NEG_INFINITY
+                && cub == f64::INFINITY
+                && row_uses[c as usize] >= 2
+        })
     })
 }
 
@@ -506,13 +548,173 @@ fn map_reframed(
             },
             info: info("UNBOUNDED", None, false),
         },
-        Outcome::Bound { .. } => Reframed {
+        // An interrupted tree's rigorous dual bound is not verdict authority
+        // (it maps to `Unknown`, exactly as before), but it IS the number this
+        // module exists to produce, and dropping it here was the reason a
+        // consumer could not tell a reframe that ran out of wall one ulp from
+        // the band from one that never left the root. Diagnostics only:
+        // `ReframeInfo` reaches no verdict, no certificate, and no caller.
+        Outcome::Bound { dual_bound, .. } => Reframed {
             verdict: Outcome::Unknown {
                 reason: UnknownReason::Timeout,
             },
-            info: info("BOUND", None, false),
+            info: info("BOUND", Some(dual_bound), false),
         },
     }
+}
+
+// ------------------------------------------------------------------ telemetry
+//
+// THE MARGIN DUAL, MADE READABLE FROM OUTSIDE THE CRATE.
+//
+// [`ReframeInfo`] already carries the number the whole module exists to produce
+// — the reframed dual bound, next to the trivial 0 of the zero objective — but
+// it is crate-private and [`BabSession::check`] drops it, so an embedding
+// consumer sees the mapped verdict and nothing else. That is precisely what
+// makes an ENGAGED null unclassifiable from outside: a reframe that spent its
+// whole deadline creeping toward the band and one that never moved off the root
+// both return `Unknown`.
+//
+// Same shape the crate already uses for `sb_profile_line`: process-global
+// atomics written at ONE site, a public one-liner reader, empty until something
+// is sampled, and never read by the engine. Recording is unconditional because
+// it is six relaxed stores per reframed SOLVE (not per node), and a diagnostic
+// that must be armed in advance is not available on the run that surprises you.
+// It is a process-global LAST-WRITE snapshot, not a per-call return value:
+// concurrent reframes overwrite each other, which is why the reader is a
+// diagnostic line rather than an API.
+
+static REFRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STATUS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SENSE_IS_MAX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DECIDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BOUND_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static THRESHOLD_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WALL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The statuses [`map_reframed`] can stamp, in a fixed order so the atomic
+/// carries an index rather than a pointer. Index 0 is "nothing sampled".
+const STATUSES: [&str; 8] = [
+    "-",
+    "OPTIMAL",
+    "INFEASIBLE",
+    "FEASIBLE_INCUMBENT",
+    "FEASIBLE_UNDECIDED",
+    "UNKNOWN",
+    "UNBOUNDED",
+    "BOUND",
+];
+
+/// One margin-reframe snapshot, as plain values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Snapshot {
+    reframes: u64,
+    status: &'static str,
+    sense_is_max: bool,
+    decided: bool,
+    /// `NaN` when the outcome shape carried no bound at all.
+    bound: f64,
+    threshold: f64,
+    wall_secs: f64,
+}
+
+/// Record one completed reframe. Never fails, never blocks, never branches on
+/// anything the engine can observe.
+///
+/// `pub(crate)` because the reframed solve no longer runs only from
+/// [`reframe`]: the session's shared nested helper drives the same solve for
+/// BOTH marked-margin entries, and the profile line has to stay a fact about
+/// whichever one ran rather than about the one that happened to keep the call.
+pub(crate) fn record(
+    sense: Sense,
+    threshold: &BigRational,
+    info: &ReframeInfo,
+    wall: std::time::Duration,
+) {
+    use num_traits::ToPrimitive;
+    use std::sync::atomic::Ordering::Relaxed;
+    let status = STATUSES
+        .iter()
+        .position(|&name| name == info.reframed_status)
+        .unwrap_or(0) as u64;
+    let bound = info
+        .reframed_bound
+        .as_ref()
+        .and_then(BigRational::to_f64)
+        .unwrap_or(f64::NAN);
+    STATUS.store(status, Relaxed);
+    SENSE_IS_MAX.store(sense == Sense::Maximize, Relaxed);
+    DECIDED.store(info.decided, Relaxed);
+    BOUND_BITS.store(bound.to_bits(), Relaxed);
+    THRESHOLD_BITS.store(threshold.to_f64().unwrap_or(f64::NAN).to_bits(), Relaxed);
+    WALL_NANOS.store(wall.as_nanos().min(u128::from(u64::MAX)) as u64, Relaxed);
+    // Published LAST: a nonzero count is the reader's signal that every other
+    // field above belongs to a completed reframe.
+    REFRAMES.fetch_add(1, Relaxed);
+}
+
+fn snapshot() -> Snapshot {
+    use std::sync::atomic::Ordering::Relaxed;
+    Snapshot {
+        reframes: REFRAMES.load(Relaxed),
+        status: STATUSES
+            .get(STATUS.load(Relaxed) as usize)
+            .copied()
+            .unwrap_or("-"),
+        sense_is_max: SENSE_IS_MAX.load(Relaxed),
+        decided: DECIDED.load(Relaxed),
+        bound: f64::from_bits(BOUND_BITS.load(Relaxed)),
+        threshold: f64::from_bits(THRESHOLD_BITS.load(Relaxed)),
+        wall_secs: WALL_NANOS.load(Relaxed) as f64 / 1e9,
+    }
+}
+
+/// `distance` is signed TOWARD EXCLUSION: how far the dual still has to travel
+/// to put the band out of reach, negative while it is still inside.
+fn line_from(snapshot: Snapshot) -> String {
+    if snapshot.reframes == 0 {
+        return String::new();
+    }
+    let sense = if snapshot.sense_is_max {
+        "maximize"
+    } else {
+        "minimize"
+    };
+    let distance = if snapshot.sense_is_max {
+        snapshot.threshold - snapshot.bound
+    } else {
+        snapshot.bound - snapshot.threshold
+    };
+    let render = |value: f64| {
+        if value.is_nan() {
+            "-".to_owned()
+        } else {
+            format!("{value:.9}")
+        }
+    };
+    format!(
+        "MARGINREFRAME reframes={} status={} sense={sense} threshold={} bound={} \
+         distance={} decided={} wall={:.3}s",
+        snapshot.reframes,
+        snapshot.status,
+        render(snapshot.threshold),
+        render(snapshot.bound),
+        render(distance),
+        snapshot.decided,
+        snapshot.wall_secs,
+    )
+}
+
+/// Machine-readable one-liner for the LAST margin reframe this process ran
+/// through the ordinary [`BabSession::check`] entry. Empty when no reframe has
+/// completed.
+///
+/// Diagnostics only, and a process-global last-write snapshot rather than a
+/// per-call value: it can be contaminated by a concurrent or detached solve,
+/// exactly like [`crate::sb_profile_line`], and it can never affect a verdict.
+#[must_use]
+pub fn margin_profile_line() -> String {
+    line_from(snapshot())
 }
 
 /// Compose the reframed [`OptimalityCertificate`] with the violation row's own
@@ -556,8 +758,65 @@ fn margin_farkas(
 /// dual bound next to the trivial-0 zero-objective bound, plus the mapped
 /// verdict. Mirrors [`crate::diag_float_lp`]; used by the `mps_solve` example
 /// under the margin-row demo flag.
+///
+/// Runs under the DEFAULT engine profile. Every caller that has parsed engine
+/// flags wants [`diag_margin_reframe_with`] instead — see its note.
 #[must_use]
 pub fn diag_margin_reframe(model: &Model, secs: f64) -> String {
+    diag_margin_reframe_with(model, secs, &SolveOpts::new())
+}
+
+/// [`diag_margin_reframe`] under a caller's own [`SolveOpts`] — the variant a
+/// flagged harness or CLI lane calls.
+///
+/// WHY IT EXISTS (the same dead-flag family as [`crate::diag_float_lp_with`]).
+/// Three separate reads on this path resolve through `tune`'s CALLER layer and
+/// none of them could see a flag before this variant existed:
+///
+/// * [`reframe_disabled`] (`--no-margin-reframe`), the module's whole kill
+///   switch, read by `prepare`/`prepare_auto` BEFORE any session exists;
+/// * [`auto_margin_row`]'s arming knob (`--auto-margin`);
+/// * every pricing knob the root LP walk reads, since the "before" number came
+///   from the zero-opts [`crate::diag_float_lp`].
+///
+/// The old body did build a `SolveOpts` for the nested [`reframe`] — but a
+/// THROWAWAY `SolveOpts::new()` with only a time limit, so the caller's flags
+/// were shadowed one line before the only place they could have mattered. That
+/// is the same one-line shadow `diag cross-check` and `diag profile` carried.
+///
+/// MEASURED, release binary + `target-cpu=native`,
+/// `ay-milp diag margin-row benchmarks/milp-ny/safenlp/safenlp_ruarobot_1181_feas.mps 30 --row last`:
+///
+/// | flag | tail of the line |
+/// |---|---|
+/// | `--no-margin-reframe` | `reframed_solve=DECLINED reframed_bound=- decided=false => original=plain-feasibility`, 3/3 repeats |
+/// | (none) | `reframed_solve=FEASIBLE_UNDECIDED … => original=UNKNOWN`, 5/5 repeats |
+///
+/// Two independent controls on two different reads. `--no-margin-reframe` is the
+/// module kill switch, read BEFORE any session exists, so it proves the
+/// `activate_caller` frame; it flips a CATEGORICAL field and is exactly
+/// reproducible.
+///
+/// `--devex` is the second, and it needs a caveat that is the whole reason it is
+/// written down: **`reframed_bound` is an ANYTIME number on this model** — the
+/// reframed search does not terminate inside the budget (`FEASIBLE_UNDECIDED`),
+/// so the digits move run to run and a single before/after pair would be
+/// meaningless. Five repeats of each arm, release binary, 30 s budget:
+///
+/// ```text
+/// (none)    -0.016926  -0.022446  -0.024704  -0.027859  -0.110415
+/// --devex   +0.146599  +0.146471  +0.146367  +0.145837  +0.149808
+/// ```
+///
+/// The two ranges do not overlap and do not even share a sign, so the flag
+/// reaches the nested `BabSession` — but quote the RANGES, never one pair.
+///
+/// `--row last` on the `_margin` sibling model is a bad control bed — its last
+/// row is two-sided, so `mark_margin_row` refuses before the diagnostic is ever
+/// reached.
+#[must_use]
+pub fn diag_margin_reframe_with(model: &Model, secs: f64, opts: &SolveOpts) -> String {
+    let _tuned = crate::tune::activate_caller(opts.engine().profile());
     use num_traits::ToPrimitive;
     let Some(row) = model.margin_row() else {
         return "diag_margin_reframe: no margin row marked (call mark_margin_row)".to_owned();
@@ -583,16 +842,20 @@ pub fn diag_margin_reframe(model: &Model, secs: f64) -> String {
     // objective's is the trivial 0. Extracted from the shared `diag_float_lp`
     // so it measures exactly the engine's root LP.
     let lp_budget = secs.min(15.0);
-    let root_lp = crate::diag_float_lp(&reframed_model, lp_budget)
+    let root_lp = crate::diag_float_lp_with(&reframed_model, lp_budget, opts)
         .split("obj(min-form)=")
         .nth(1)
         .and_then(|s| s.split_whitespace().next())
         .unwrap_or("?")
         .to_owned();
 
-    // The full reframe + verdict map (what the session would return).
-    let opts = SolveOpts::new().with_time_limit(std::time::Duration::from_secs_f64(secs.min(30.0)));
-    let mapped = reframe(model, &opts);
+    // The full reframe + verdict map (what the session would return). The
+    // caller's own opts, re-budgeted — NOT a fresh `SolveOpts::new()`, which is
+    // the one-line shadow this `_with` variant exists to remove.
+    let sub = opts
+        .clone()
+        .with_time_limit(std::time::Duration::from_secs_f64(secs.min(30.0)));
+    let mapped = reframe(model, &sub);
     let (status, bound, decided, verdict) = match mapped {
         Some(r) => {
             let b = r.info.reframed_bound.as_ref().map_or_else(
@@ -685,6 +948,120 @@ mod tests {
             crate::tune::Setting::Flag(false),
         ));
         assert_eq!(auto_margin_row(&m), None);
+    }
+
+    /// The consumer-facing contract of the telemetry line: empty until a
+    /// reframe completes, and a `distance` signed TOWARD EXCLUSION in both
+    /// orientations (that sign is the whole wall-bound / shape-bound read).
+    #[test]
+    fn margin_profile_line_is_empty_until_sampled_and_signs_distance_toward_exclusion() {
+        let base = Snapshot {
+            reframes: 0,
+            status: "BOUND",
+            sense_is_max: false,
+            decided: false,
+            bound: -0.25,
+            threshold: 0.0,
+            wall_secs: 6.5,
+        };
+        assert_eq!(line_from(base), "", "nothing sampled is an EMPTY line");
+
+        // `min c·x` must rise ABOVE a `c·x <= t` band to exclude it.
+        let inside = line_from(Snapshot {
+            reframes: 1,
+            ..base
+        });
+        assert!(inside.contains("status=BOUND"), "unexpected: {inside}");
+        assert!(inside.contains("sense=minimize"), "unexpected: {inside}");
+        assert!(
+            inside.contains("distance=-0.250000000"),
+            "unexpected: {inside}"
+        );
+        assert!(inside.contains("decided=false"), "unexpected: {inside}");
+        assert!(inside.contains("wall=6.500s"), "unexpected: {inside}");
+        let crossed = line_from(Snapshot {
+            reframes: 1,
+            bound: 0.25,
+            ..base
+        });
+        assert!(
+            crossed.contains("distance=0.250000000"),
+            "unexpected: {crossed}"
+        );
+
+        // `max c·x` must fall BELOW a `c·x >= t` band to exclude it.
+        let maximize = line_from(Snapshot {
+            reframes: 1,
+            sense_is_max: true,
+            bound: -0.25,
+            ..base
+        });
+        assert!(
+            maximize.contains("sense=maximize"),
+            "unexpected: {maximize}"
+        );
+        assert!(
+            maximize.contains("distance=0.250000000"),
+            "unexpected: {maximize}"
+        );
+
+        // An outcome shape with no bound renders as `-`, never as a number.
+        let unbounded = line_from(Snapshot {
+            reframes: 1,
+            status: "UNKNOWN",
+            bound: f64::NAN,
+            ..base
+        });
+        assert!(unbounded.contains("bound=-"), "unexpected: {unbounded}");
+        assert!(unbounded.contains("distance=-"), "unexpected: {unbounded}");
+    }
+
+    /// An interrupted tree's rigorous dual bound must SURVIVE into the
+    /// diagnostics while the verdict it maps to stays `Unknown`.
+    #[test]
+    fn an_interrupted_bound_is_diagnosable_without_becoming_a_verdict() {
+        let (m, _lo, hi) = w1_shape();
+        let threshold = BigRational::from_integer(0.into());
+        let reframed = map_reframed(
+            &m,
+            hi,
+            Sense::Minimize,
+            &threshold,
+            Outcome::Bound {
+                dual_bound: BigRational::new(1.into(), 4.into()),
+                rigorous: true,
+            },
+        );
+        assert!(
+            matches!(
+                reframed.verdict,
+                Outcome::Unknown {
+                    reason: UnknownReason::Timeout
+                }
+            ),
+            "a bare bound must never gain verdict authority"
+        );
+        assert!(!reframed.info.decided);
+        assert_eq!(reframed.info.reframed_status, "BOUND");
+        assert_eq!(
+            reframed.info.reframed_bound,
+            Some(BigRational::new(1.into(), 4.into())),
+            "the reframed dual bound must reach the diagnostics"
+        );
+
+        // And the recorded line reflects it.
+        record(
+            Sense::Minimize,
+            &threshold,
+            &reframed.info,
+            std::time::Duration::from_millis(1500),
+        );
+        let line = margin_profile_line();
+        assert!(
+            line.starts_with("MARGINREFRAME reframes="),
+            "unexpected: {line}"
+        );
+        assert!(line.contains("status=BOUND"), "unexpected: {line}");
     }
 
     #[test]

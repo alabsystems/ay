@@ -3231,6 +3231,19 @@ impl Executor {
                     premises,
                     ..
                 } if premises.is_empty() && clause.len() == 1 => Some(clause[0]),
+                // A GENERIC-kind unit theory lemma is the same defect in a
+                // different coat: an unpedigreed leaf the strict checker
+                // rejects by kind. The DT lazy lane's indexed-authority
+                // recording (2026-08-20) moved its propagated
+                // selector-through-equality leaves from unit `trust` steps to
+                // exactly this shape, which silently disengaged the bridge —
+                // the leaf is unchanged, only its spelling moved. Same repair
+                // contract: derivable from authored premises or left as-is.
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::Generic,
+                    clause,
+                    ..
+                } if clause.len() == 1 => Some(clause[0]),
                 _ => None,
             };
             let Some(term) = term else {
@@ -3691,13 +3704,24 @@ impl Executor {
                     farkas,
                     kind,
                     lia,
-                } => new_proof.add_step(ProofStep::TheoryLemma {
-                    theory: theory.clone(),
-                    clause: clause.clone(),
-                    farkas: farkas.clone(),
-                    kind: *kind,
-                    lia: lia.clone(),
-                }),
+                } => {
+                    // The Generic-coat defective leaf (see the collector):
+                    // swap in the derived bridge unit exactly like a repaired
+                    // unit `trust` step.
+                    if matches!(kind, TheoryLemmaKind::Generic) && clause.len() == 1 {
+                        if let Some(&id) = bridge_unit.get(&clause[0]) {
+                            remap[idx] = Some(id);
+                            continue;
+                        }
+                    }
+                    new_proof.add_step(ProofStep::TheoryLemma {
+                        theory: theory.clone(),
+                        clause: clause.clone(),
+                        farkas: farkas.clone(),
+                        kind: *kind,
+                        lia: lia.clone(),
+                    })
+                }
                 ProofStep::Step {
                     rule,
                     clause,

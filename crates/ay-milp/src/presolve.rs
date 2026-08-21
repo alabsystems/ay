@@ -12,26 +12,20 @@
 //! c·z  =  yᵀ(Mz) + (c − Mᵀy)·z  =  d·z  ≥  Σ_j  min over the box of  d_j · z_j
 //! ```
 //!
-//! and that last term is `−∞` the moment a single column is unbounded in the direction its
-//! reduced cost points. One such column and the whole node has NO BOUND — it cannot be pruned,
-//! and (because a bound-less node looks infinitely promising) it is explored FIRST.
+//! Any column unbounded in its reduced-cost direction makes that last term `−∞`.
+//! The node then has no prunable bound and looks infinitely promising to search.
 //!
-//! A binary model never shows this: every column is boxed in `[0, 1]`. Real models are full of
-//! continuous columns declared `[0, ∞)` because the modeller never had to say otherwise, and on
-//! them the effect is total — measured across MIPLIB, `blend2` had no bound on 11 of 12 nodes,
-//! `rout` on 39 of 48, `dcmulti` on 1788 of 3263. The search was not searching.
+//! Binary models box every column in `[0, 1]`; real models often leave continuous columns open.
+//! Measured unbounded-node counts were `blend2` 11/12, `rout` 39/48, and `dcmulti` 1788/3263.
 //!
-//! But those columns are not really unbounded. A row `Σ a_k x_k ≤ u` with every OTHER column
-//! bounded below pins `x_j` from above, and that bound is IMPLIED — it cuts off no feasible
-//! point, so imposing it is free. Deriving it is all this module does.
+//! A row `Σ a_k x_k ≤ u` whose other columns are bounded below can imply an upper bound on
+//! `x_j`. Imposing that bound removes no feasible point; deriving such bounds is this module's job.
 //!
 //! # Why it is exact
 //!
-//! A derived bound that is a hair too tight cuts off a feasible point, and if that point was the
-//! optimum the solver now lies. So the activities are accumulated in rationals — the model's
-//! coefficients are exactly representable, so this is clean — and the derived bound is rounded
-//! OUTWARD on its way back to `f64`. A bound that is a hair too loose costs a little search; a
-//! bound that is a hair too tight costs correctness, and those are not the same mistake.
+//! A too-tight bound can discard the optimum. Activities therefore accumulate exactly in
+//! rationals, and each derived bound rounds outward when converted to `f64`. A loose bound costs
+//! search; a tight one costs correctness.
 
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
@@ -48,6 +42,12 @@ pub(crate) mod structure;
 mod structure_adversary;
 mod structure_attack;
 pub(crate) use structure::{eliminate_structure, struct_elim_enabled, StructurePostsolve};
+pub(crate) mod implied_free;
+pub(crate) use implied_free::{aggregate_implied_free_equalities, AffineAggregationPostsolve};
+pub use implied_free::{
+    AffineAggregationCertificate, AffineAggregationCertificateError, AffineAggregationClaim,
+    AffineAggregationInnerProof, AffineAggregationVerification, AffineRecovery,
+};
 pub(crate) mod objective_singleton;
 pub(crate) use objective_singleton::{
     substitute_objective_singletons, substitute_objective_singletons_with_deadline,

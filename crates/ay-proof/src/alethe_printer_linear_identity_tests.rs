@@ -5,9 +5,9 @@
 //! External lowering tests for strict LIA linear identities.
 //!
 //! The pinned Carcara checker ignores `lia_generic`, so a ground identity must
-//! use its independently checked `evaluate` rule. The lowering is deliberately
-//! limited to truths admitted by the independent ground evaluator; symbolic or
-//! false ground literals keep their faithful `lia_generic` surface.
+//! use its independently checked `evaluate` rule. Symbolic clauses promote
+//! only when their actual Farkas certificate validates as `la_generic`; every
+//! residual case becomes an honest `hole`.
 
 use super::*;
 use ay_core::{FarkasAnnotation, LiaAnnotation, Sort, Symbol, TermStore, TheoryLemmaKind};
@@ -48,7 +48,7 @@ fn ground_linear_identity_lowers_to_argument_free_evaluate() {
 }
 
 #[test]
-fn symbolic_linear_identity_preserves_lia_generic() {
+fn symbolic_linear_identity_promotes_to_checked_la_generic() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);
     let zero = terms.mk_int(BigInt::from(0));
@@ -58,13 +58,14 @@ fn symbolic_linear_identity_preserves_lia_generic() {
 
     let rendered = AlethePrinter::new(&terms)
         .format_step(&step, ProofId(8))
-        .expect("symbolic identity must retain its ordinary rendering");
+        .expect("symbolic identity must render");
 
     assert!(
-        rendered.contains(":rule lia_generic :args (1)"),
+        rendered.contains(":rule la_generic :args (1)"),
         "{rendered}"
     );
     assert!(!rendered.contains(":rule evaluate"), "{rendered}");
+    assert!(!rendered.contains(":rule lia_generic"), "{rendered}");
 }
 
 #[test]
@@ -91,7 +92,7 @@ fn ground_disequality_lowers_to_checked_evaluate_bridge() {
 }
 
 #[test]
-fn false_ground_disequality_preserves_lia_generic() {
+fn false_ground_disequality_becomes_honest_hole() {
     let mut terms = TermStore::new();
     let zero = terms.mk_int(BigInt::from(0));
     let equality = terms.mk_app(Symbol::named("="), [zero, zero], Sort::Bool);
@@ -100,17 +101,16 @@ fn false_ground_disequality_preserves_lia_generic() {
 
     let rendered = AlethePrinter::new(&terms)
         .format_step(&step, ProofId(10))
-        .expect("false ground literal must retain its ordinary rendering");
+        .expect("false ground literal must retain a diagnostic rendering");
 
-    assert!(
-        rendered.contains(":rule lia_generic :args (1)"),
-        "{rendered}"
-    );
+    assert!(rendered.contains(":rule hole"), "{rendered}");
+    assert!(!rendered.contains(":args"), "{rendered}");
+    assert!(!rendered.contains(":rule lia_generic"), "{rendered}");
     assert!(!rendered.contains(":rule evaluate"), "{rendered}");
 }
 
 #[test]
-fn ground_truth_with_surface_drift_preserves_lia_generic() {
+fn ground_truth_with_surface_drift_hits_override_barrier() {
     let mut terms = TermStore::new();
     let two = terms.mk_int(BigInt::from(2));
     let three = terms.mk_int(BigInt::from(3));
@@ -123,12 +123,11 @@ fn ground_truth_with_surface_drift_preserves_lia_generic() {
 
     let rendered = AlethePrinter::new_with_overrides(&terms, Some(&overrides))
         .format_step(&step, ProofId(11))
-        .expect("surface drift must retain the ordinary rendering");
+        .expect("surface drift must retain an honest diagnostic rendering");
 
     assert!(rendered.contains("(= (+ 2 3) 6)"), "{rendered}");
-    assert!(
-        rendered.contains(":rule lia_generic :args (1)"),
-        "{rendered}"
-    );
+    assert!(rendered.contains(":rule hole"), "{rendered}");
+    assert!(!rendered.contains(":args"), "{rendered}");
+    assert!(!rendered.contains(":rule lia_generic"), "{rendered}");
     assert!(!rendered.contains(":rule evaluate"), "{rendered}");
 }

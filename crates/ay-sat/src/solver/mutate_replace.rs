@@ -302,6 +302,18 @@ impl Solver {
             }
         }
 
+        // #trace-divergence: same fail-closed rule as `replace_clause_impl` —
+        // an in-place replacement whose proof row could not be recorded (the
+        // writer-less clause-trace lane mints no ids) must not mutate the
+        // arena, or every later chain citing this clause id replays against
+        // the stale trace snapshot.
+        if self.cold.lrat_enabled
+            && replacement_clause_id.is_none()
+            && self.cold.clause_trace.is_some()
+        {
+            return ReplaceResult::Skipped;
+        }
+
         self.clear_level0_reasons_removed_by_replacement(
             clause_idx,
             &old_lits,
@@ -363,6 +375,16 @@ impl Solver {
 
         self.check_solution_on_replaced_clause(&reordered);
 
+        self.finish_clause_replacement_core(clause_ref, &reordered, watched, replacement_clause_id)
+    }
+
+    fn finish_clause_replacement_core(
+        &mut self,
+        clause_ref: ClauseRef,
+        reordered: &[Literal],
+        watched: Option<(Literal, Literal)>,
+        replacement_clause_id: Option<u64>,
+    ) -> ReplaceResult {
         if let Some((lit0, lit1)) = watched {
             // Attach watches unconditionally. During BVE (watches_disconnected),
             // reconnect_bve_watches will detach and re-attach with optimal order

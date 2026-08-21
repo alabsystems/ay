@@ -7,6 +7,8 @@
 //! The remaining macros centralize the incremental conflict and replay helpers
 //! that are still shared after the legacy split-loop deletion.
 
+include!("pipeline_proof_macros.rs");
+
 /// Thin control-flow shim over [`crate::pipeline_fns::add_incremental_conflict_clause`].
 ///
 /// The clause-building / level-0-minimization / verdict logic was de-macro'd into
@@ -178,14 +180,12 @@ macro_rules! pipeline_map_incremental_split_conflict_clause {
                 if $proof_enabled {
                     for (_pmc_source_index, _pmc_original_id) in extra_original_ids {
                         let _pmc_extra = &extra_conflicts[_pmc_source_index];
-                        let _pmc_annotation =
-                            $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
-                                &mut $self.proof_tracker,
-                                Some(&$self.ctx.terms),
-                                $negations.as_map(),
-                                _pmc_extra,
-                            )
-                            .1;
+                        let _pmc_annotation = dt_farkas_proof!(
+                            $self,
+                            $negations,
+                            _pmc_extra,
+                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+                        );
                         if let Some(_pmc_annotation) = _pmc_annotation {
                             $crate::pipeline_fns::place_original_clause_authority_at_id(
                                 &$solver,
@@ -408,7 +408,11 @@ macro_rules! pipeline_build_eager_extension {
         // #verify-memo (--verify-memo=1): the sampled propagation-verification
         // memo — Executor-owned so accepts survive per-iteration extension
         // rebuilds; inert unless the env flag is armed.
-        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);
+        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo)
+        // #dt-context-derivation: the Executor-owned producer record sink so
+        // the level-0 conflict minimization can preserve its stripped
+        // premises for certification (records grant no authority).
+        .with_context_records(&mut $self.dt_context_conflict_records);
         if $proof_enabled {
             _pbe_ext = _pbe_ext.with_proof_tracking(
                 &mut $self.proof_tracker, $negations.as_map(),
@@ -544,7 +548,11 @@ macro_rules! pipeline_build_eager_extension {
         // #verify-memo (--verify-memo=1): the sampled propagation-verification
         // memo — Executor-owned so accepts survive per-iteration extension
         // rebuilds; inert unless the env flag is armed.
-        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);
+        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo)
+        // #dt-context-derivation: the Executor-owned producer record sink so
+        // the level-0 conflict minimization can preserve its stripped
+        // premises for certification (records grant no authority).
+        .with_context_records(&mut $self.dt_context_conflict_records);
         // #8256: When continuing after a budget-exhausted iteration, the theory
         // solver already has all assertions from the previous iteration (because
         // soft_reset_warm was skipped). Set the trail position to the current

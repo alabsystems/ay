@@ -67,6 +67,10 @@ impl NraSolver<'_> {
     /// Add a single McCormick bound: m - a*y - b*x [cmp] -a*b
     ///
     /// `vars`: (m_var, x_var, y_var) — LRA variable indices for the monomial.
+    ///
+    /// Returns `true` when the row was NEW (see
+    /// [`NraSolver::add_linearization_cut`]); a row identical to one already
+    /// live in this scope is suppressed and reported as no progress.
     fn add_mccormick_bound(
         &mut self,
         m: TermId,
@@ -75,7 +79,7 @@ impl NraSolver<'_> {
         a_val: &BigRational,
         b_val: &BigRational,
         is_lower: bool,
-    ) {
+    ) -> bool {
         let (m_var, x_var, y_var) = vars;
         let coeffs = vec![
             (m_var, aux_reciprocal.clone()),
@@ -83,7 +87,7 @@ impl NraSolver<'_> {
             (x_var, -b_val.clone()),
         ];
         let bound = -(a_val * b_val);
-        self.lra.add_gomory_cut(
+        self.add_linearization_cut(
             &GomoryCut {
                 coeffs,
                 bound,
@@ -92,29 +96,35 @@ impl NraSolver<'_> {
                 source_term: None,
             },
             m,
-        );
+        )
     }
 
     /// Add McCormick envelope constraints for a binary monomial m = x*y.
     ///
     /// Uses bounds from the LRA solver to generate globally valid linear
-    /// relaxations. Returns the number of constraints added.
-    pub(crate) fn add_mccormick_constraints(&mut self, mon: &Monomial) -> usize {
+    /// relaxations. Returns `(new_rows, available_rows)`: `available_rows`
+    /// counts the envelope rows the current bounds support at all (0 means the
+    /// factors are too unbounded for McCormick, which is what selects the
+    /// tangent-hyperplane fallback), while `new_rows` counts only the ones this
+    /// call actually added. The two differ exactly when the envelope has
+    /// SATURATED — the loop has already emitted these rows and re-deriving them
+    /// is not progress.
+    pub(crate) fn add_mccormick_constraints(&mut self, mon: &Monomial) -> (usize, usize) {
         if !mon.is_binary() {
-            return 0;
+            return (0, 0);
         }
 
-        let Some(x) = mon.x() else { return 0 };
-        let Some(y) = mon.y() else { return 0 };
+        let Some(x) = mon.x() else { return (0, 0) };
+        let Some(y) = mon.y() else { return (0, 0) };
         let m = mon.aux_var;
 
         let (x_lb, x_ub) = match self.lra.get_bounds(x) {
             Some((lb, ub)) => (lb, ub),
-            None => return 0,
+            None => return (0, 0),
         };
         let (y_lb, y_ub) = match self.lra.get_bounds(y) {
             Some((lb, ub)) => (lb, ub),
-            None => return 0,
+            None => return (0, 0),
         };
 
         let vars = (
@@ -124,66 +134,68 @@ impl NraSolver<'_> {
         );
         let aux_reciprocal = BigRational::one() / &mon.coeff;
 
-        let mut count = 0;
+        let mut new_rows = 0;
+        let mut available = 0;
 
         // Lower bound 1: m ≥ xL*y + yL*x - xL*yL
         if let (Some(ref xl), Some(ref yl)) = (&x_lb, &y_lb) {
-            self.add_mccormick_bound(
+            available += 1;
+            new_rows += usize::from(self.add_mccormick_bound(
                 m,
                 vars,
                 &aux_reciprocal,
                 &xl.value_big(),
                 &yl.value_big(),
                 true,
-            );
-            count += 1;
+            ));
         }
         // Lower bound 2: m ≥ xU*y + yU*x - xU*yU
         if let (Some(ref xu), Some(ref yu)) = (&x_ub, &y_ub) {
-            self.add_mccormick_bound(
+            available += 1;
+            new_rows += usize::from(self.add_mccormick_bound(
                 m,
                 vars,
                 &aux_reciprocal,
                 &xu.value_big(),
                 &yu.value_big(),
                 true,
-            );
-            count += 1;
+            ));
         }
         // Upper bound 1: m ≤ xU*y + yL*x - xU*yL
         if let (Some(ref xu), Some(ref yl)) = (&x_ub, &y_lb) {
-            self.add_mccormick_bound(
+            available += 1;
+            new_rows += usize::from(self.add_mccormick_bound(
                 m,
                 vars,
                 &aux_reciprocal,
                 &xu.value_big(),
                 &yl.value_big(),
                 false,
-            );
-            count += 1;
+            ));
         }
         // Upper bound 2: m ≤ xL*y + yU*x - xL*yU
         if let (Some(ref xl), Some(ref yu)) = (&x_lb, &y_ub) {
-            self.add_mccormick_bound(
+            available += 1;
+            new_rows += usize::from(self.add_mccormick_bound(
                 m,
                 vars,
                 &aux_reciprocal,
                 &xl.value_big(),
                 &yu.value_big(),
                 false,
-            );
-            count += 1;
+            ));
         }
 
         if self.debug {
             tracing::debug!(
-                "[NRA] McCormick envelope: {} constraints for m={:?}",
-                count,
+                "[NRA] McCormick envelope: {} new of {} available constraints for m={:?}",
+                new_rows,
+                available,
                 m
             );
         }
 
-        count
+        (new_rows, available)
     }
 
     /// Add a tangent hyperplane constraint for a general degree-N monomial.
@@ -241,7 +253,12 @@ impl NraSolver<'_> {
             source_term: None,
         };
 
-        self.lra.add_gomory_cut(&cut, m);
+        // A tangent plane is taken AT the model point, so an identical row means
+        // the point has not moved — no progress, and the caller must be told so
+        // rather than counting the same plane again.
+        if !self.add_linearization_cut(&cut, m) {
+            return false;
+        }
 
         if self.debug {
             tracing::debug!(
@@ -324,6 +341,16 @@ impl NraSolver<'_> {
             let mut factor_values = Vec::with_capacity(mon.vars.len());
             let mut all_known = true;
             for &var in &mon.vars {
+                // DELIBERATELY `var_value`, not `monomial_factor_value`: every
+                // cut below feeds the factor to `lra.ensure_var_registered`,
+                // and `intern_var` mints a FRESH, DISCONNECTED column for any
+                // term it has not seen — a compound Horner factor `(+ ...)`
+                // would become an LRA variable unrelated to its own summands.
+                // Cuts over such a column constrain nothing real and two of
+                // them can contradict, manufacturing a spurious UNSAT. So a
+                // factor without a tableau column is skipped here: this path
+                // may only refine monomials it can express, and the published
+                // model's correctness is the executor strict oracle's job.
                 if let Some(val) = self.var_value(var) {
                     factor_values.push(val);
                 } else {
@@ -369,9 +396,15 @@ impl NraSolver<'_> {
                 count += 2;
                 continue;
             }
-            let mc = self.add_mccormick_constraints(&mon);
-            if mc > 0 {
-                count += mc;
+            // Branch on rows the bounds SUPPORT, not on rows newly added: a
+            // saturated envelope still means "McCormick is the right relaxation
+            // here", so a saturated monomial must not silently acquire a
+            // model-point tangent plane (that variant is measured in
+            // the development design notes; it converted nothing and pushed five
+            // instances into timeouts). Only the COUNT changes.
+            let (mc_new, mc_available) = self.add_mccormick_constraints(&mon);
+            if mc_available > 0 {
+                count += mc_new;
             } else {
                 // McCormick unavailable (unbounded variables). Add basic lemmas
                 // and tangent hyperplane at model point instead.

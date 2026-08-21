@@ -203,3 +203,125 @@ fn c3_record_funnel_classified_lemma_adopts_reordered_clause() {
     assert_eq!(*step.0, TheoryLemmaKind::EufTransitive);
     assert_eq!(step.1, &recorded, "tracker must hold the validator order");
 }
+
+// =====================================================================
+// #4751: the arithmetic equality triangle in a NON-canonical order
+// =====================================================================
+
+/// The exact #4751 census clause, `(cl (= 0 d) (not (<= 0 d)) (not (<= d 0)))`.
+fn census_triangle_clause(terms: &mut TermStore) -> Vec<TermId> {
+    let zero = terms.mk_int(BigInt::from(0));
+    let d = terms.mk_var("__ay_eqdv!10", Sort::Int);
+    let equality = terms.mk_eq(zero, d);
+    let forward = terms.mk_le(zero, d);
+    let reverse = terms.mk_le(d, zero);
+    let not_forward = terms.mk_not(forward);
+    let not_reverse = terms.mk_not(reverse);
+    vec![equality, not_forward, not_reverse]
+}
+
+/// The funnel classifies the census triangle as `ArithEqTriangle` and returns
+/// the VALIDATOR's order; the input order is validator-rejected, so adopting
+/// the returned clause is what makes the classification legal.
+#[test]
+fn funnel_recognizes_the_census_triangle_permutation() {
+    let mut terms = TermStore::new();
+    let clause = census_triangle_clause(&mut terms);
+    let (kind, ordered) =
+        infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, None, None);
+    assert_eq!(kind, TheoryLemmaKind::ArithEqTriangle);
+    let ordered = ordered.into_owned();
+    assert_ne!(ordered, clause, "the census order must have been reordered");
+    assert!(ay_proof::recognize_arith_eq_triangle(&terms, &ordered));
+    assert!(
+        !ay_proof::recognize_arith_eq_triangle(&terms, &clause),
+        "precondition: the producer's own order must be validator-rejected"
+    );
+    let mut sorted_in = clause;
+    sorted_in.sort_unstable();
+    let mut sorted_out = ordered;
+    sorted_out.sort_unstable();
+    assert_eq!(sorted_in, sorted_out, "reorder must be a permutation");
+}
+
+/// The macro-arm recorder stops normalizing this clause back to `Generic`:
+/// the tracker holds a typed `ArithEqTriangle` step carrying the validator
+/// order, which is the whole point of the classification.
+#[test]
+fn record_funnel_classified_lemma_types_the_census_triangle() {
+    let mut terms = TermStore::new();
+    let clause = census_triangle_clause(&mut terms);
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    let (kind, recorded) = record_funnel_classified_lemma(&mut tracker, &terms, clause, None);
+    assert_eq!(kind, TheoryLemmaKind::ArithEqTriangle);
+    assert!(!kind.is_trust(), "the census clause must stop being trust");
+
+    let proof = tracker.take_proof();
+    let step = proof
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ay_core::ProofStep::TheoryLemma { kind, clause, .. } => Some((kind, clause)),
+            _ => None,
+        })
+        .expect("theory lemma recorded");
+    assert_eq!(*step.0, TheoryLemmaKind::ArithEqTriangle);
+    assert_eq!(step.1, &recorded, "tracker must hold the validator order");
+    assert!(ay_proof::recognize_arith_eq_triangle(&terms, step.1));
+}
+
+/// GUARD: `farkas.is_none()`. A positional certificate is not consumed by
+/// `validate_arith_eq_triangle` while trace rebinding and external printing
+/// do consume it, and this arm REORDERS, which would detach it. With a
+/// certificate present the clause keeps its pre-existing classification and
+/// its caller order.
+#[test]
+fn a_certificate_bearing_triangle_is_not_reordered_into_the_kind() {
+    let mut terms = TermStore::new();
+    let clause = census_triangle_clause(&mut terms);
+    let farkas = FarkasAnnotation::from_ints(&[1i64, 1, 1]);
+    let (kind, ordered) =
+        infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, Some(&farkas), None);
+    assert_ne!(kind, TheoryLemmaKind::ArithEqTriangle);
+    assert_eq!(
+        ordered.as_ref(),
+        clause.as_slice(),
+        "a certificate-bearing clause must keep the caller order"
+    );
+}
+
+/// GUARD: the three-literal gate. Widening the census clause with one extra
+/// disjunct must not promote it — the kind authorizes exactly three literals.
+#[test]
+fn a_widened_triangle_stays_trust_in_the_funnel() {
+    let mut terms = TermStore::new();
+    let mut clause = census_triangle_clause(&mut terms);
+    let junk = terms.mk_var("__ay_junk", Sort::Bool);
+    clause.push(junk);
+    let (kind, _) =
+        infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, None, None);
+    assert_ne!(kind, TheoryLemmaKind::ArithEqTriangle);
+}
+
+/// GUARD: Gate 2, the strict validator itself. FALSIFIED AT `a = 0, b = 0,
+/// c = 1` — every literal of `(cl (= a c) (not (<= a b)) (not (<= b a)))` is
+/// false there, so no permutation may be promoted and the clause must stay a
+/// trust-recorded kind.
+#[test]
+fn a_false_near_triangle_is_never_promoted_by_the_funnel() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let equality = terms.mk_eq(a, c);
+    let forward = terms.mk_le(a, b);
+    let reverse = terms.mk_le(b, a);
+    let not_forward = terms.mk_not(forward);
+    let not_reverse = terms.mk_not(reverse);
+    let clause = vec![equality, not_forward, not_reverse];
+    let (kind, ordered) =
+        infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, None, None);
+    assert_ne!(kind, TheoryLemmaKind::ArithEqTriangle);
+    assert_eq!(ordered.as_ref(), clause.as_slice());
+}

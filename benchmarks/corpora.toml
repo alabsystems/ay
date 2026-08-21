@@ -60,6 +60,20 @@ sha256 = "a243dbe78292c1338221b3c804157fed668f6a62eeeb7d8b34fdbe2f6be16385"
 size_bytes = 180741
 
 [[corpus]]
+# SMT-LIB 2019 incremental benchmark release, QF_UF division, family
+# `20190906-CLEARSY` (1012 .smt2 files, ~48 MB uncompressed). Upstream origin:
+# the SMT-LIB incremental benchmarks (https://smtlib.cs.uiowa.edu/benchmarks.shtml,
+# incremental/QF_UF/20190906-CLEARSY). The archive has the single root
+# `20190906-CLEARSY` so the on-disk layout stays `incremental/QF_UF/...`, which
+# scripts/clearsy_repair_differential.sh resolves as
+# ROOT=benchmarks/smt-lib-incremental + the upstream-relative path.
+name = "smt-lib-incremental-qf-uf-clearsy"
+extract_to = "benchmarks/smt-lib-incremental/incremental/QF_UF/20190906-CLEARSY"
+asset = "smt-lib-incremental-qf-uf-clearsy-v1.tar.zst"
+sha256 = "0248f4435d638ac4189cbb2b1103a0cee30128965aaef0e8ba053cde75326f87"
+size_bytes = 1174603
+
+[[corpus]]
 # Official 400-instance SAT Competition 2025 selection. Keep the small,
 # immutable URI list as its own pinned asset so a fresh clone can materialize
 # the content-addressed GBD files without a repository-generated manifest.

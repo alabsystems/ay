@@ -8,6 +8,8 @@ repository.workspace = true
 readme.workspace = true
 
 [features]
+# Dev-only: exposes `oracle_api` for crates/ay-nra-oracle. Never in a shipping build.
+oracle-api = []
 default = []
 
 [lints]

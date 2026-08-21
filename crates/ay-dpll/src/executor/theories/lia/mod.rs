@@ -167,7 +167,8 @@ impl Executor {
                 }
             }
 
-            if self.minimize_counterexamples_enabled() && self.last_assumptions.is_none() {
+            // #model-demand: witness cosmetics, skipped when no consumer exists.
+            if self.counterexample_minimization_demanded() && self.last_assumptions.is_none() {
                 self.minimize_model_sat_preserving();
             }
             // #div0: When mod/div elimination introduced an unconstrained fresh
@@ -935,7 +936,8 @@ impl Executor {
                 }
             }
 
-            if self.minimize_counterexamples_enabled() && self.last_assumptions.is_none() {
+            // #model-demand: witness cosmetics, skipped when no consumer exists.
+            if self.counterexample_minimization_demanded() && self.last_assumptions.is_none() {
                 self.minimize_model_sat_preserving();
             }
             // #div0: see solve_lia_incremental — bypass full model replay of the

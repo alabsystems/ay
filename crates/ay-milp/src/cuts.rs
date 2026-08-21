@@ -1288,7 +1288,7 @@ fn separate_cover_view(
 mod cover_view_tests {
     use super::*;
     use crate::model::Sense;
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use ay_test_support::env::lock_env;
 
     #[test]
     fn enabled_minimal_cover_reaches_separator_and_keeps_every_integer_point() {
@@ -2140,6 +2140,164 @@ mod mik_gate_tests {
     }
 }
 
+/// THE BIG-M INDICATOR SHAPE (W-safenlp-1) — the downstream optimization consumer's safenlp class, and the structure the
+/// aggregated-MIR family was measured to be the missing capability on.
+///
+/// The shape is a *paired* indicator encoding, per switch binary `z`:
+///
+/// ```text
+///     y − u·z              <= 0        (the two-column VUB row:  y <= u·z)
+///     y − x + |l|·z        <= |l|      (a WIDER big-M row naming BOTH y and z)
+/// ```
+///
+/// with `y` CONTINUOUS — a trained-network ReLU (`y = max(x, 0)` under exact big-M bounds),
+/// or any indicator whose big-M row and VUB row share the same `(y, z)` pair. The pair test
+/// is the discriminator against every fixed-charge shape already in the journal: a
+/// fixed-charge network's switch binary lives ONLY in its VUB row (rout, khb05250, qiu — the
+/// capacity/conservation rows carry no binary), and qnet1's VUB'd columns are INTEGER, so
+/// none of them can satisfy "a ≥3-term row contains both the VUB'd continuous column and its
+/// switch". Measured on the corpus this gate is therefore inert; on the safenlp captures it
+/// counts 112/112 pairs.
+///
+/// What the gate arms (all in `add_root_cuts`):
+///   * `separate_mir_agg` in EVERY MIR-class round — the family that closes this class's
+///     root (measured on `safenlp_ruarobot_1181_margin`: gain 0.220 → 2.80 of a 4.32 gap,
+///     65% closure, vs Gurobi's 70% with 249 MIR + 78 flow covers);
+///   * the MIR extension rounds (like the mik gate), at [`bigm_mir_ext_cuts_per_round`]
+///     rather than the tuned 4 — an extension round here costs one ~10ms LP re-solve and
+///     each 32-cut round was measured to keep paying in bound through round ~10;
+///   * the VUB-switch row admission in `separate_mir_family_with` (the dense output rows
+///     of this class carry NO binary directly — the z enters only through the VUB
+///     substitution, so the direct-fractionality admission never even tried them);
+///   * the verification economy: `root_gap_wide` must NOT force the RINS cadence to 1 on
+///     this shape (a margin race is dual-bound-bound; the ledger measured rins at 43% of
+///     all simplex iterations for an incumbent that settles nothing).
+pub(crate) fn is_bigm_indicator(model: &Model) -> bool {
+    if model.has_inexact_coeffs() {
+        // Same rule as `is_mixed_integer_knapsack`: never classify a proxy matrix.
+        return false;
+    }
+    let nrows = model.num_rows();
+    let ncols = model.num_cols();
+    if nrows == 0 || ncols == 0 {
+        return false;
+    }
+    // The VUB pairs with a CONTINUOUS bounded column: y (continuous) <= u·z.
+    let vubs = variable_upper_bounds(model);
+    let mut pair_of: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (&y, &(_, z)) in &vubs {
+        if matches!(model.col_kind(Col(y as u32)), ColKind::Continuous) {
+            pair_of.insert(y, z);
+        }
+    }
+    if pair_of.len() < BIGM_MIN_PAIRS {
+        return false;
+    }
+    // A pair is CONFIRMED when some ≥3-term row names both members.
+    let mut confirmed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for r in 0..nrows {
+        let (coeffs, _, _) = model.row(Row(r as u32));
+        if coeffs.len() < 3 {
+            continue;
+        }
+        for &(c, a) in coeffs {
+            if a == 0.0 {
+                continue;
+            }
+            let y = c as usize;
+            if confirmed.contains(&y) {
+                continue;
+            }
+            if let Some(&z) = pair_of.get(&y) {
+                if coeffs.iter().any(|&(c2, a2)| c2 as usize == z && a2 != 0.0) {
+                    confirmed.insert(y);
+                }
+            }
+        }
+        if confirmed.len() >= pair_of.len() {
+            break;
+        }
+    }
+    confirmed.len() >= BIGM_MIN_PAIRS && 2 * confirmed.len() >= pair_of.len()
+}
+
+/// The pair-count floor for [`is_bigm_indicator`]: below this the base budget's families
+/// already cover the model, and a tiny model must never trip a class economy meant for a
+/// 112-indicator network encoding.
+const BIGM_MIN_PAIRS: usize = 8;
+
+/// The MIR extension round cap on the big-M indicator shape — a backstop exactly like
+/// [`MIK_MIR_EXT_ROUNDS`]: the extension self-terminates on the bound-stall test, and the
+/// loop's share deadline bounds it in wall regardless.
+const BIGM_MIR_EXT_ROUNDS: usize = 50;
+pub(crate) fn bigm_mir_ext_rounds() -> usize {
+    BIGM_MIR_EXT_ROUNDS
+}
+
+/// The per-round MIR-class budget on the big-M indicator shape, replacing the tuned
+/// [`MAX_MIR_EXT_CUTS`] (4) there. Measured on `safenlp_ruarobot_1181_margin`
+/// (`AY_ROOT_CLOSURE`, 60s): 8 rounds × 4 cuts closes 1.28 of the 4.32 root gap; 10 × 16
+/// closes 2.60; 10–30 × 32 closes 2.80 and SATURATES (60 × 64 reaches 2.82). The class's
+/// aggregated-MIR candidates are shallow individually and the closure comes from volume;
+/// the stall test still ends the extension the round the bound stops paying.
+const BIGM_MIR_EXT_CUTS: usize = 32;
+pub(crate) fn bigm_mir_ext_cuts_per_round() -> usize {
+    BIGM_MIR_EXT_CUTS
+}
+
+#[cfg(test)]
+mod bigm_gate_tests {
+    use super::*;
+
+    /// Build one indicator neuron: pre-activation x in [l, u] (free column), output
+    /// y in [0, u], switch z binary, rows `y − u·z <= 0` and `−x + y + |l|·z <= |l|`.
+    fn add_neuron(m: &mut Model, l: f64, u: f64) -> (Col, Col, Col) {
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let y = m.add_col(0.0, u);
+        let z = m.add_binary_col();
+        m.add_row(f64::NEG_INFINITY, 0.0, &[(y, 1.0), (z, -u)]);
+        m.add_row(f64::NEG_INFINITY, -l, &[(x, -1.0), (y, 1.0), (z, -l)]);
+        (x, y, z)
+    }
+
+    #[test]
+    fn bigm_gate_fires_on_the_indicator_shape_and_not_on_fixed_charge() {
+        // The safenlp shape in miniature: BIGM_MIN_PAIRS paired ReLU neurons.
+        let mut m = Model::new();
+        for _ in 0..BIGM_MIN_PAIRS {
+            add_neuron(&mut m, -0.5, 0.75);
+        }
+        assert!(
+            is_bigm_indicator(&m),
+            "paired big-M indicator rows must fire the gate"
+        );
+
+        // Fixed-charge shape (rout/khb05250): VUB rows exist, but no wider row ever
+        // names the switch binary — the capacity row is over the flows alone.
+        let mut fc = Model::new();
+        let mut flows = Vec::new();
+        for _ in 0..BIGM_MIN_PAIRS {
+            let x = fc.add_col(0.0, f64::INFINITY);
+            let z = fc.add_binary_col();
+            fc.add_row(f64::NEG_INFINITY, 0.0, &[(x, 1.0), (z, -40.0)]);
+            flows.push(x);
+        }
+        let cap: Vec<(Col, f64)> = flows.iter().map(|&x| (x, 1.0)).collect();
+        fc.add_row(f64::NEG_INFINITY, 100.0, &cap);
+        assert!(
+            !is_bigm_indicator(&fc),
+            "a fixed-charge network (no row naming both y and z) must NOT fire"
+        );
+
+        // Below the pair floor: never fires, however clean the pairs.
+        let mut tiny = Model::new();
+        for _ in 0..(BIGM_MIN_PAIRS - 1) {
+            add_neuron(&mut tiny, -0.5, 0.75);
+        }
+        assert!(!is_bigm_indicator(&tiny), "under the pair floor: inert");
+    }
+}
+
 /// How many MIR-class rows one EXTENSION round may adopt -- its own budget, like the aggregated
 /// flow covers' `MAX_FLOW_AGG_CUTS`, because `cuts_per_round()`'s four was tuned against the
 /// expensive separators and an extension round's whole cost is one cheap LP re-solve. Measured on
@@ -2843,6 +3001,13 @@ pub(crate) fn separate_mir_cached(
         mir_from_row,
         vubs,
         orients,
+        // NODE rounds keep the historical direct-fractionality admission. The
+        // VUB-switch widening (see the admission note in `_with`) is a ROOT
+        // lever: at a node the exact delta search runs per node, and admitting
+        // the wide big-M rows there was measured to blow the tree's deadline on
+        // the safenlp class for zero cuts (single-row MIR separates nothing on
+        // those rows; the aggregated family that does is root-only).
+        false,
     )
 }
 
@@ -3012,9 +3177,26 @@ fn separate_mir_family(
     if mir_family_inert(model) {
         return Vec::new();
     }
-    separate_mir_family_with(model, x, n_rows, budget, row_fn, &node_vubs(model), None)
+    // The VUB-switch admission is a CLASS lever, not a global one: on the big-M indicator
+    // shape the rows that carry the objective name no binary at all (the z enters only
+    // through the VUB substitution), so the direct-fractionality admission never tried
+    // them. Off-shape the historical admission is kept byte-identical — there is no local
+    // corpus measurement behind widening it everywhere, and the gate keeps the blast
+    // radius exactly the class the change was measured on.
+    let vub_admission = is_bigm_indicator(model);
+    separate_mir_family_with(
+        model,
+        x,
+        n_rows,
+        budget,
+        row_fn,
+        &node_vubs(model),
+        None,
+        vub_admission,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn separate_mir_family_with(
     model: &Model,
     x: &[f64],
@@ -3029,6 +3211,7 @@ fn separate_mir_family_with(
     ) -> Option<Cut>,
     vubs: &Vubs,
     orients: Option<&[(u32, bool)]>,
+    vub_admission: bool,
 ) -> Vec<Cut> {
     // NOT ON AN ALL-BINARY MODEL -- see `mir_family_inert` for what this gate does and does not
     // exclude. (It used to exclude every all-INTEGRAL model, which cost haprp its proof.)
@@ -3091,7 +3274,22 @@ fn separate_mir_family_with(
             continue;
         }
         let (coeffs, lb, ub) = model.row(Row(r));
-        if !coeffs.iter().any(|&(c, _)| frac[c as usize]) {
+        // A row bites when it mentions a fractional integer column DIRECTLY — or when one of
+        // its continuous columns carries a variable upper bound whose SWITCH binary is
+        // fractional, because `mir_collect_vub_subs` is about to rewrite `a·x = a·u·y − a·s`
+        // and hand the rounding that binary. The direct-only test silently excluded the one
+        // row class a big-M model is made of: the downstream optimization consumer's safenlp margin/output rows are dense
+        // equalities over the ReLU outputs `y_j ∈ [0, u_j·z_j]` and contain NO binary of
+        // their own (the z_j live only in the two-column VUB rows), so the family that was
+        // built to see fixed-charge structure never looked at the rows carrying the
+        // objective. Same shape as the qiu capacity rows `mir_chain.rs` records: "the
+        // binaries enter only later, through the VUB substitution — so the capacity rows are
+        // never even considered." Admission only widens which rows are TRIED; the violation
+        // screen and the efficacy floor still decide what ships.
+        if !coeffs.iter().any(|&(c, _)| {
+            frac[c as usize]
+                || (vub_admission && vubs.get(&(c as usize)).is_some_and(|&(_, y)| frac[y]))
+        }) {
             continue; // nothing fractional in it: the rounding has nothing to bite on
         }
         {
@@ -3541,7 +3739,7 @@ struct MixRow {
 ///
 /// The production call site gates on `is_mixed_integer_knapsack` — the same gate the extended MIR
 /// rounds are armed by, which excludes every one of the 16 home instances — and this function
-/// independently checks the working rows' local signature. Exact-side-store models fail closed.
+/// Checks local signatures; see `cuts/mixing_history.md`. Exact-side-store models fail closed.
 pub(crate) fn separate_mixing(model: &Model, x: &[f64], n_rows: usize, budget: usize) -> Vec<Cut> {
     if budget == 0 || false || model.has_inexact_coeffs() {
         return Vec::new();
@@ -7390,8 +7588,11 @@ fn flow_cover_from_row(
     rhs: f64,
     vubs: &std::collections::HashMap<usize, (BigRational, usize)>,
 ) -> Option<Cut> {
-    // The right-hand side, which pays only for what it MUST -- see the out-arc note below.
-    let b = exact(rhs)?;
+    // The right-hand side of the SHIFTED row: it absorbs `a_j · bound_j` for every non-cover
+    // column rewritten over a nonnegative variable below. λ and the switch payments are
+    // computed in that shifted space; the final cut re-adds the KEPT columns' `a_j · bound_j`
+    // (`keep_back`) so it is stated over the model's own columns.
+    let mut b = exact(rhs)?;
 
     struct Arc {
         j: usize,
@@ -7400,7 +7601,8 @@ fn flow_cover_from_row(
         m: BigRational, // |a_j| · u_j -- the most this arc can carry
     }
     let mut arcs: Vec<Arc> = Vec::new(); // in-arcs: a_j > 0, with a VUB. The cover comes from here.
-    let mut out: Vec<Arc> = Vec::new(); // out-arcs: a_j < 0, with a VUB. These stay as `y` terms.
+    let mut out: Vec<Arc> = Vec::new(); // kept-explicit columns; their own `x` terms, no `y`.
+    let mut keep_back = BigRational::zero();
 
     for &(c, raw) in coeffs {
         let j = c as usize;
@@ -7408,47 +7610,64 @@ fn flow_cover_from_row(
         if a.is_zero() {
             continue;
         }
-        let (lo, _up) = model.col_bounds(Col(c));
-        // The derivation is written for `x >= 0`. A column with a nonzero lower bound would need
-        // shifting, and a free one cannot be bounded at all -- leave those rows to MIR.
-        if lo != 0.0 {
-            return None;
+        let (lo, up) = model.col_bounds(Col(c));
+        // An in-arc: a candidate for the cover. It needs the plain `x >= 0` domain the cover
+        // argument is written for, and a real switch.
+        if a.is_positive() && lo == 0.0 {
+            if let Some((u, yj)) = vubs.get(&j) {
+                if *yj != j {
+                    arcs.push(Arc {
+                        j,
+                        y: *yj,
+                        a: a.clone(),
+                        m: &a * u,
+                    });
+                    continue;
+                }
+            }
         }
-        match (a.is_positive(), vubs.get(&j)) {
-            // An in-arc: a candidate for the cover.
-            (true, Some((u, yj))) if *yj != j => arcs.push(Arc {
-                j,
-                y: *yj,
-                a: a.clone(),
-                m: &a * u,
-            }),
-            // Positive, but no switch to charge: `a_j·x_j >= 0`, so dropping it only makes the left
-            // side smaller. Free.
-            (true, _) => {}
-            // AN OUT-ARC. KEEP IT EXACTLY AS IT IS. This is what the simple cover threw away, and
-            // throwing it away is what made this family useless on rout.
-            //
-            // A negative term holds the row down, so REMOVING it lets the left side grow -- by as
-            // much as `|a_j|·u_j`, which the simple cover paid to the right-hand side. On a
-            // flow-CONSERVATION row (which is where rout's variable upper bounds actually live: 13
-            // arcs in, 11 arcs out) that payment inflates `b` so far that `λ = Σ_C m_j − b` is never
-            // positive: no cover exists at all, and 322 row-sides yield nothing.
-            //
-            // Relaxing the arc to `−m_j·y_j` instead of paying a constant does restore the cover
-            // (0 covers -> 300 on rout) and it is still the wrong move: at ANY LP-feasible point
-            // `x_j <= m_j·y_j`, so `−m_j·y_j` is always the MORE negative of the two and the cut
-            // gives away exactly the violation it was separated for. Measured: 300 covers, best
-            // violation 0.0000.
-            //
-            // The derivation permits any subset of the out-arcs to stay explicit -- the proof only
-            // ever uses `x_j >= 0` for them -- so keep them ALL, with their own coefficients. No
-            // relaxation, no payment, and no variable upper bound needed on an out-arc at all.
-            (false, _) => out.push(Arc {
+        // EVERY OTHER COLUMN is rewritten over a nonnegative variable and then either DROPPED
+        // (a positive shifted term only helps the row) or KEPT EXPLICITLY (a negative shifted
+        // term needs no bound at all — keeping the out-arcs verbatim is what made this family
+        // say anything on rout, see the journal note in this function's doc). This used to be
+        // a whole-row REFUSAL for any column with `lo != 0`, which is what kept the family off
+        // the downstream optimization consumer's big-M output rows: their stable-neuron and output columns are free/interval
+        // columns in a row that is otherwise a textbook single-node flow set (W-safenlp-1).
+        //
+        //   a > 0, lo finite:  a·x = a·(x−lo) + a·lo;  drop  a·(x−lo) >= 0     (shift)
+        //   a > 0, lo = −∞:    a·x = a·u − a·(u−x);    keep −a·(u−x)           (complement)
+        //   a < 0, lo finite:  a·x = a·(x−lo) + a·lo;  keep  a·(x−lo)          (shift)
+        //   a < 0, lo = −∞:    a·x = a·u − a·(u−x);    drop −a·(u−x) >= 0      (complement)
+        //
+        // All four absorb `a·bound` into the shifted rhs; a KEPT term re-adds it through
+        // `keep_back` on the way out, so kept columns appear with their ORIGINAL coefficient
+        // and the historical `lo == 0` out-arc path is reproduced bit-for-bit (`bound = 0`).
+        // A column free on both sides still refuses the row — nothing can bound it.
+        let (bound, keep) = if a.is_positive() {
+            if lo.is_finite() {
+                (lo, false)
+            } else if up.is_finite() {
+                (up, true)
+            } else {
+                return None;
+            }
+        } else if lo.is_finite() {
+            (lo, true)
+        } else if up.is_finite() {
+            (up, false)
+        } else {
+            return None;
+        };
+        let bnd = exact(bound)?;
+        b -= &a * &bnd;
+        if keep {
+            keep_back += &a * &bnd;
+            out.push(Arc {
                 j,
                 y: usize::MAX, // unused: the arc keeps its own `x` term, not a `y` term
                 a: a.clone(),
                 m: BigRational::zero(),
-            }),
+            });
         }
     }
     if arcs.len() < 2 {
@@ -7483,7 +7702,9 @@ fn flow_cover_from_row(
         //                                             ≤  b − Σ_{j∈C} (m_j − λ)⁺
         let mut terms: std::collections::HashMap<usize, BigRational> =
             std::collections::HashMap::new();
-        let mut rhs = b.clone();
+        // Back into ORIGINAL variables: the kept columns' `a·bound` returns to the rhs
+        // (`keep_back` is zero whenever every kept column had `lo == 0` — the historical path).
+        let mut rhs = &b + &keep_back;
         for &i in &chosen {
             let arc = &arcs[i];
             *terms.entry(arc.j).or_insert_with(BigRational::zero) += &arc.a;
@@ -7664,6 +7885,122 @@ mod flow_cover_tests {
         assert!(
             fired > 0,
             "no flow cover was ever separated: the guard is vacuous"
+        );
+    }
+
+    /// The SHIFT/COMPLEMENT paths (W-safenlp-1) must not delete a feasible point either.
+    ///
+    /// The widened classifier admits rows whose non-cover columns have nonzero or one-sided
+    /// bounds — exactly what the historical `lo != 0` whole-row refusal excluded, and exactly
+    /// the shape of the downstream optimization consumer's big-M output rows (free stable-neuron columns, interval outputs).
+    /// One model per new path:
+    ///   * `d` in [1, 3], coefficient +1  — positive with nonzero finite `lo`: shift, DROP;
+    ///   * `v` in [−2, 2], coefficient −1 — negative with finite `lo`: shift, KEEP;
+    ///   * `w` in (−∞, 2], coefficient +1 — positive free-below: complement at `ub`, KEEP.
+    /// Unit coefficients keep the relaxation's vertex set integral (interval matrix), so the
+    /// integer sweep below is a validity proof, not a spot check; `w` is additionally probed
+    /// beneath any finite window (the kept `+1·w` term only ever LOWERS the activity there).
+    #[test]
+    fn shifted_and_complemented_flow_covers_never_remove_a_feasible_point() {
+        let mut seed = 0x5AFE_2026_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+
+        let mut fired = 0usize;
+        for _case in 0..400 {
+            const IN: usize = 3;
+            let cin: Vec<i64> = (0..IN).map(|_| 1 + rnd() % 4).collect();
+
+            let mut m = Model::new();
+            let fin: Vec<Col> = cin.iter().map(|&u| m.add_col(0.0, u as f64)).collect();
+            let sin: Vec<Col> = (0..IN).map(|_| m.add_binary_col()).collect();
+            for k in 0..IN {
+                m.add_row(
+                    f64::NEG_INFINITY,
+                    0.0,
+                    &[(fin[k], 1.0), (sin[k], -(cin[k] as f64))],
+                );
+            }
+            let d = m.add_col(1.0, 3.0); // shift-drop
+            let v = m.add_col(-2.0, 2.0); // shift-keep
+            let w = m.add_col(f64::NEG_INFINITY, 2.0); // complement-keep
+            let total: i64 = cin.iter().sum();
+            let b = 1 + rnd() % total.max(2);
+            if b >= total {
+                continue;
+            }
+            let mut bal: Vec<(Col, f64)> = fin.iter().map(|&c| (c, 1.0)).collect();
+            bal.push((d, 1.0));
+            bal.push((v, -1.0));
+            bal.push((w, 1.0));
+            m.add_row(f64::NEG_INFINITY, b as f64, &bal);
+            m.set_objective(&[(fin[0], 1.0)], Sense::Minimize);
+
+            let n = m.num_cols();
+            let x: Vec<f64> = (0..n).map(|_| (rnd() % 40) as f64 / 10.0).collect();
+            let cuts = separate_flow_cover(&m, &x, m.num_rows());
+            fired += cuts.len();
+            if cuts.is_empty() {
+                continue;
+            }
+
+            // Enumerate every integer point of the box (w swept to −4, below which the
+            // kept `+1·w` coefficient makes the activity monotonically smaller).
+            for code in 0..(1i64 << IN) {
+                let y: Vec<i64> = (0..IN).map(|t| (code >> t) & 1).collect();
+                let mut idx = vec![0i64; IN];
+                loop {
+                    for dv in 1..=3i64 {
+                        for vv in -2..=2i64 {
+                            for wv in -4..=2i64 {
+                                let gated = (0..IN).all(|t| idx[t] <= cin[t] * y[t]);
+                                let net: i64 = idx.iter().sum::<i64>() + dv - vv + wv;
+                                if !(gated && net <= b) {
+                                    continue;
+                                }
+                                let mut p = vec![0.0f64; n];
+                                for t in 0..IN {
+                                    p[fin[t].index()] = idx[t] as f64;
+                                    p[sin[t].index()] = y[t] as f64;
+                                }
+                                p[d.index()] = dv as f64;
+                                p[v.index()] = vv as f64;
+                                p[w.index()] = wv as f64;
+                                for c in &cuts {
+                                    let act: f64 =
+                                        c.coeffs.iter().map(|&(j, a)| a * p[j.index()]).sum();
+                                    assert!(
+                                        act <= c.ub + 1e-7,
+                                        "shifted flow cover deleted a feasible point: \
+                                         cin={cin:?} b={b} y={y:?} x={idx:?} d={dv} v={vv} \
+                                         w={wv} activity={act} > ub={}",
+                                        c.ub
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let mut t = 0;
+                    while t < IN {
+                        idx[t] += 1;
+                        if idx[t] <= cin[t] {
+                            break;
+                        }
+                        idx[t] = 0;
+                        t += 1;
+                    }
+                    if t == IN {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            fired > 0,
+            "no shifted flow cover was ever separated: the widened classifier is inert \
+             and this guard proves nothing"
         );
     }
 }
@@ -11846,16 +12183,14 @@ mod lnp_tests {
         };
         let text = std::fs::read_to_string(&path).expect("readable mps");
         let p = crate::mps::read_mps(&text).expect("parses");
-        let mut owned = p.model.clone();
-        if crate::tune::caller_flag(crate::tune::Knob::LnpProbePresolve) == Some(true) {
-            if let crate::presolve::Presolved::Tightened(t) =
-                crate::presolve::tighten_bounds(&owned, None)
-            {
-                owned = *t;
-                eprintln!("probe: presolved");
-            }
-        }
-        let m = &owned;
+        // RETIRED KNOB (`--lnp-probe-presolve`). Its only reader was HERE, inside
+        // this `#[cfg(test)]` probe, and it had no writer anywhere — so no build
+        // could ever make it true and the presolve branch was unreachable code
+        // behind an unreachable switch. Deleting both is provably behaviour-
+        // preserving: the taken arm is the one every build already took. If the
+        // probe ever wants a presolved model again, call `tighten_bounds` here
+        // directly rather than reviving a knob no surface can set.
+        let m = &p.model;
         let obj: Vec<(u32, f64)> = (0..m.num_cols())
             .filter_map(|j| {
                 let c = m.obj_coeff(Col(j as u32));

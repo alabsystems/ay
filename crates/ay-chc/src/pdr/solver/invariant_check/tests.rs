@@ -223,8 +223,7 @@ fn inductive_subset_rejects_init_invalid_single_predicate_lemma() {
                 "inductive-subset must not accept an init-invalid model"
             );
         }
-        super::safety_proof_inductive::InductiveSubsetOutcome::Cascade(_)
-        | super::safety_proof_inductive::InductiveSubsetOutcome::Insufficient => {}
+        super::safety_proof_inductive::InductiveSubsetOutcome::Cascade(_) => {}
     }
 }
 
@@ -359,9 +358,6 @@ fn single_predicate_bv_non_strict_inductive_subset_routes_to_cascade_issue_7964(
                 "non-strict single-predicate BV inductive subset must not be exposed as Proven, got {:?}",
                 model
             );
-        }
-        super::safety_proof_inductive::InductiveSubsetOutcome::Insufficient => {
-            panic!("single-predicate BV inductive subset should still return a model for cascade")
         }
     }
 }

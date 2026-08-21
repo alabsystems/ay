@@ -115,6 +115,125 @@ fn executor_with_single_proof_step(step: ProofStep) -> Executor {
     exec
 }
 
+fn executor_with_symbolic_lia_farkas(coefficients: &[i64]) -> (Executor, TermId) {
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    let x = exec.ctx.terms.mk_var("lia_wire_x", Sort::Int);
+    let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+    let lower = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+    let upper = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("<"), [x, zero], Sort::Bool);
+    let not_lower = exec.ctx.terms.mk_not_raw(lower);
+    let not_upper = exec.ctx.terms.mk_not_raw(upper);
+    let mut proof = Proof::new();
+    let lower_assumption = proof.add_assume(lower, None);
+    let upper_assumption = proof.add_assume(upper, None);
+    let lemma = proof.add_step(ProofStep::TheoryLemma {
+        theory: "LIA".to_string(),
+        clause: vec![not_lower, not_upper],
+        farkas: Some(FarkasAnnotation::from_ints(coefficients)),
+        kind: TheoryLemmaKind::LiaGeneric,
+        lia: None,
+    });
+    let reduced = proof.add_resolution(vec![not_upper], lower, lower_assumption, lemma);
+    proof.add_resolution(Vec::new(), upper, upper_assumption, reduced);
+    exec.last_proof = Some(proof);
+    (exec, x)
+}
+
+fn export_executor_proof(exec: &Executor) -> String {
+    let proof = exec.last_proof.as_ref().expect("fixture retains its proof");
+    let overrides = exec.proof_export_term_overrides();
+    let scope: Vec<_> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Assume(term) => Some(*term),
+            _ => None,
+        })
+        .collect();
+    ay_proof::try_export_alethe_with_problem_scope_and_overrides(
+        proof,
+        &exec.ctx.terms,
+        &scope,
+        overrides.as_ref(),
+    )
+    .expect("the diagnostic proof must remain printable")
+}
+
+#[test]
+fn lia_farkas_promotion_is_shared_by_gate_and_printer() {
+    let (exec, _) = executor_with_symbolic_lia_farkas(&[1, 1]);
+    let quality = ay_proof::check_proof_strict(
+        exec.last_proof.as_ref().expect("fixture retains its proof"),
+        &exec.ctx.terms,
+    )
+    .expect("AY's strict checker must independently accept the actual certificate");
+    assert!(quality.is_complete());
+    assert!(
+        !exec.unsat_proof_has_known_wire_gap(),
+        "the exact checked Farkas promotion carries external authority"
+    );
+    let wire = export_executor_proof(&exec);
+    assert!(wire.contains(":rule la_generic :args (1 1)"), "{wire}");
+    assert!(!wire.contains(":rule lia_generic"), "{wire}");
+    assert!(!wire.contains(":rule hole"), "{wire}");
+}
+
+#[test]
+fn lia_farkas_mismatch_is_a_disclosed_hole_in_both_consumers() {
+    let (exec, _) = executor_with_symbolic_lia_farkas(&[1, 0]);
+    assert!(
+        ay_proof::check_proof_strict(
+            exec.last_proof.as_ref().expect("fixture retains its proof"),
+            &exec.ctx.terms,
+        )
+        .is_err(),
+        "AY's strict checker must reject the mismatched coefficients"
+    );
+    assert!(
+        exec.unsat_proof_has_known_wire_gap(),
+        "a coefficient mismatch must withhold external authority"
+    );
+    let wire = export_executor_proof(&exec);
+    assert!(wire.contains(":rule hole"), "{wire}");
+    assert!(!wire.contains(":rule lia_generic"), "{wire}");
+    assert!(!wire.contains(":rule la_generic"), "{wire}");
+    assert!(
+        !wire.contains(":args"),
+        "a hole carries no Farkas args: {wire}"
+    );
+}
+
+#[test]
+fn lia_surface_override_barrier_is_shared_by_gate_and_printer() {
+    let (mut exec, x) = executor_with_symbolic_lia_farkas(&[1, 1]);
+    let mut overrides = ay_core::kani_compat::DetHashMap::default();
+    overrides.insert(x, "(+ lia_wire_x 1)".to_string());
+    exec.last_proof_term_overrides = Some(overrides);
+
+    assert!(exec.unsat_proof_has_known_wire_gap());
+    let wire = export_executor_proof(&exec);
+    assert!(wire.contains("(+ lia_wire_x 1)"), "{wire}");
+    assert!(wire.contains(":rule hole"), "{wire}");
+    assert!(!wire.contains(":rule lia_generic"), "{wire}");
+    assert!(!wire.contains(":rule la_generic"), "{wire}");
+
+    // Even an installed-but-empty channel is a barrier. This pins the exact
+    // state input so the gate cannot silently treat `Some(empty)` as `None`
+    // while the printer follows the stricter branch.
+    let (mut empty, _) = executor_with_symbolic_lia_farkas(&[1, 1]);
+    empty.last_proof_term_overrides = Some(ay_core::kani_compat::DetHashMap::default());
+    assert!(empty.unsat_proof_has_known_wire_gap());
+    let wire = export_executor_proof(&empty);
+    assert!(wire.contains(":rule hole"), "{wire}");
+}
+
 #[test]
 fn known_wire_gap_rejects_bare_required_string_content_theory() {
     let exec = executor_with_single_proof_step(ProofStep::TheoryLemma {

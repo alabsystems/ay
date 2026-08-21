@@ -299,6 +299,19 @@ impl EufSolver<'_> {
     /// conflict/soundness authority — but the full-scan-per-BCP-call this
     /// replaces was the #1 profile leaf on QF_UFLIA model search (hash_sat:
     /// ~220 decisions/s with EufSolver::propagate dominating).
+    ///
+    /// #euf-inc-neg-pop (opt-in, `--euf-inc-neg-pop`): a third mode extends
+    /// the incremental scan across the POP boundary. Baseline arms a full
+    /// candidate pass after every backtrack, which on backtrack-heavy search
+    /// costs O(pops x n_eqs); with the flag on, a pop that can certify its delta
+    /// hands over the reps it split (`neg_pop_split_reps`) plus the atoms it
+    /// unassigned (`neg_pop_retracted`) and only those are revisited, alongside
+    /// the usual post-pop event set (`neg_dirty_reps`). The split reps get the
+    /// direct index probe only — no cong-neg lookahead, matching what a baseline
+    /// post-pop pass does. The index-restoration duties of the full scan still
+    /// run, so the state `check()` reads is unchanged — see
+    /// `inc_neg_pop_enabled`.
+    ///
     /// #cong-neg-scan-gate: is the cascade lookahead worth calling AT ALL for this
     /// scan?
     ///
@@ -331,13 +344,79 @@ impl EufSolver<'_> {
     }
 
     pub(crate) fn propagate_disequalities(&mut self, propagations: &mut Vec<TheoryPropagation>) {
-        if !self.inc_neg_enabled || self.neg_full_scan_needed {
+        // #euf-inc-neg-pop: a pop that could certify its delta (see the gate in
+        // `pop`) hands the scan `neg_dirty_reps` + `neg_pop_retracted` instead of
+        // arming an unconditional full candidate pass. `neg_pop_delta_valid` is
+        // permanently `false` unless `--euf-inc-neg-pop`, so with the flag off
+        // this reduces to the original two-way dispatch.
+        let pop_delta = self.neg_pop_delta_valid;
+        if !self.inc_neg_enabled || (self.neg_full_scan_needed && !pop_delta) {
             self.propagate_disequalities_full_scan();
             self.neg_full_scan_needed = false;
             self.neg_dirty_reps.clear();
             self.pending_neg_eqs.clear();
+            // #euf-inc-neg-pop: a full pass IS the anchor — it makes every
+            // pending delta redundant.
+            self.neg_pop_delta_valid = false;
+            self.neg_pop_retracted.clear();
+            self.neg_pop_split_reps.clear();
         } else {
-            self.propagate_disequalities_incremental();
+            if pop_delta {
+                // Perform the index-restoration half of what the full scan would
+                // have done, and ONLY that half — the O(n_eqs) candidate pass is
+                // what this path replaces. Both restoration modes leave exactly
+                // the state the baseline full scan leaves (index contents,
+                // `pending_diseq_conflicts`, `diseq_index_base_depth`), so
+                // `check_disequality_conflicts` is entered on identical state and
+                // its soundness argument is untouched; only the proposed
+                // propagation set may be smaller.
+                self.neg_pop_delta_valid = false;
+                self.neg_full_scan_needed = false;
+                // The dirty reps handed over by the pop(s) must be usable as
+                // `class_eqs` keys; asserted once here rather than per pop (the
+                // sets accumulate across a deep backjump, so a per-pop check is
+                // O(pops^2) and throttles debug fuzzing).
+                #[cfg(debug_assertions)]
+                self.debug_assert_neg_dirty_reps_are_roots();
+                if self.neg_index_prebuilt {
+                    // Trail-restored index: already exact (the pop cross-checked
+                    // its key set). `propagate_disequalities_incremental` calls
+                    // `sync_diseq_index`, which refreshes the inverse index and
+                    // drains `pending_neg_eqs` — the same two duties the prebuilt
+                    // branch of the full scan performs, including recording the
+                    // newly-indexed keys as match candidates. The queue is then
+                    // cleared below, exactly as the full-scan caller does.
+                    self.neg_index_prebuilt = false;
+                } else {
+                    // The pop fell back on the index (no undo coverage), so the
+                    // authoritative from-scratch build is still required; only the
+                    // candidate pass is skipped.
+                    self.rebuild_diseq_pair_index_from_assigns();
+                    // The rebuild reads `assigns`, so it has ALREADY indexed the
+                    // disequalities still queued in `pending_neg_eqs` — typically
+                    // including the literal the backjump just asserted. A later
+                    // `sync_diseq_index` would therefore find their keys resident,
+                    // treat them as redundant witnesses, and record NO match
+                    // candidates and NO cong-neg triggers for them: a coverage
+                    // hole the full pass never had (its O(n_eqs) sweep saw them).
+                    // Dirty the classes they touch first, then drop the queue
+                    // exactly as the full-scan branch does (the rebuild is
+                    // authoritative over it).
+                    self.dirty_reps_for_pending_neg_eqs();
+                    self.pending_neg_eqs.clear();
+                }
+            }
+            self.propagate_disequalities_incremental(pop_delta);
+            if pop_delta {
+                // Baseline parity: the full-scan caller clears `pending_neg_eqs`
+                // right after the scan. `sync_diseq_index` (run inside the scan)
+                // re-queues entries whose terms are not in the e-graph yet; the
+                // full pass drops those, and leaving them behind would keep the
+                // queue permanently non-empty, which disables BOTH the
+                // trail-restore fast path (`diseq_incremental_ok`) and this delta
+                // path (`pop_delta_ok`) for the rest of the solve.
+                self.pending_neg_eqs.clear();
+            }
         }
         self.emit_diseq_propagations(propagations);
         self.emit_cong_diseq_propagations(propagations);
@@ -1222,6 +1301,61 @@ impl EufSolver<'_> {
         self.scratch_cong_neg_props.clear();
     }
 
+    /// Build `diseq_pair_index` / `diseq_keys_by_rep` FROM SCRATCH out of the
+    /// current assignments: `(min_rep, max_rep) -> (a, b, eq_term)` for every
+    /// asserted `(= a b) = false` whose endpoints are in distinct classes, with
+    /// already-violated pairs queued as conflict candidates instead.
+    ///
+    /// Extracted verbatim from `propagate_disequalities_full_scan` so the
+    /// pop-delta scan (#euf-inc-neg-pop) can perform the same index-restoration
+    /// duty without also running the full O(n_eqs) candidate pass. This is the
+    /// authoritative construction — it reads `assigns` directly — and it is what
+    /// makes the incremental `check_disequality_conflicts` path safe to enter
+    /// afterwards.
+    pub(crate) fn rebuild_diseq_pair_index_from_assigns(&mut self) {
+        // Build diseq index: (min_rep, max_rep) -> (a, b, eq_term)
+        self.diseq_pair_index.clear();
+        self.diseq_keys_by_rep.clear();
+        // #euf-inc-diseq-undo: this from-scratch build bakes in every
+        // current disequality without an undo record, so the incremental
+        // pop-restore is valid only down to the depth it runs at.
+        self.diseq_index_base_depth = self.scopes.len();
+        for (&lit_term, &value) in &self.assigns {
+            if value {
+                continue; // only interested in false equalities (disequalities)
+            }
+            if let Some((a, b)) = self.decode_eq(lit_term) {
+                if self.terms.sort(a) != self.terms.sort(b) {
+                    continue;
+                }
+                if (a.0 as usize) >= self.enodes.len() || (b.0 as usize) >= self.enodes.len() {
+                    continue;
+                }
+                let (a_rep, b_rep) = (self.enode_find_const(a.0), self.enode_find_const(b.0));
+                if a_rep == b_rep {
+                    // Conflict, not propagation — check() reports it. In
+                    // incremental mode ALSO record the candidate: this rebuild
+                    // clears `neg_full_scan_needed`, so a subsequent
+                    // incremental check would otherwise never see this
+                    // already-violated pair (it is not in the index).
+                    if self.inc_neg_enabled {
+                        self.pending_diseq_conflicts.push((a, b, lit_term));
+                    }
+                    continue;
+                }
+                let key = (a_rep.min(b_rep), a_rep.max(b_rep));
+                if self
+                    .diseq_pair_index
+                    .insert(key, (a, b, lit_term))
+                    .is_none()
+                {
+                    self.diseq_keys_by_rep.entry(key.0).or_default().push(key);
+                    self.diseq_keys_by_rep.entry(key.1).or_default().push(key);
+                }
+            }
+        }
+    }
+
     /// FULL negative scan: rebuild `diseq_pair_index`/`diseq_keys_by_rep` from
     /// all current assignments and check every equality term against it.
     fn propagate_disequalities_full_scan(&mut self) {
@@ -1251,47 +1385,7 @@ impl EufSolver<'_> {
             // as the incremental scan / check would.
             self.sync_diseq_index();
         } else {
-            // Build diseq index: (min_rep, max_rep) -> (a, b, eq_term)
-            self.diseq_pair_index.clear();
-            self.diseq_keys_by_rep.clear();
-            // #euf-inc-diseq-undo: this from-scratch build bakes in every
-            // current disequality without an undo record, so the incremental
-            // pop-restore is valid only down to the depth it runs at.
-            self.diseq_index_base_depth = self.scopes.len();
-            for (&lit_term, &value) in &self.assigns {
-                if value {
-                    continue; // only interested in false equalities (disequalities)
-                }
-                if let Some((a, b)) = self.decode_eq(lit_term) {
-                    if self.terms.sort(a) != self.terms.sort(b) {
-                        continue;
-                    }
-                    if (a.0 as usize) >= self.enodes.len() || (b.0 as usize) >= self.enodes.len() {
-                        continue;
-                    }
-                    let (a_rep, b_rep) = (self.enode_find_const(a.0), self.enode_find_const(b.0));
-                    if a_rep == b_rep {
-                        // Conflict, not propagation — check() reports it. In
-                        // incremental mode ALSO record the candidate: this rebuild
-                        // clears `neg_full_scan_needed`, so a subsequent
-                        // incremental check would otherwise never see this
-                        // already-violated pair (it is not in the index).
-                        if self.inc_neg_enabled {
-                            self.pending_diseq_conflicts.push((a, b, lit_term));
-                        }
-                        continue;
-                    }
-                    let key = (a_rep.min(b_rep), a_rep.max(b_rep));
-                    if self
-                        .diseq_pair_index
-                        .insert(key, (a, b, lit_term))
-                        .is_none()
-                    {
-                        self.diseq_keys_by_rep.entry(key.0).or_default().push(key);
-                        self.diseq_keys_by_rep.entry(key.1).or_default().push(key);
-                    }
-                }
-            }
+            self.rebuild_diseq_pair_index_from_assigns();
         }
 
         self.scratch_neg_props.clear();
@@ -1453,6 +1547,48 @@ impl EufSolver<'_> {
         self.pending_neg_eqs.extend(requeue);
     }
 
+    /// #euf-inc-neg-pop: mark the classes touched by every still-queued negated
+    /// equality dirty, so the incremental candidate pass revisits their atoms.
+    ///
+    /// Used only on the pop-delta path's from-scratch-rebuild branch, where the
+    /// rebuild pre-empts `sync_diseq_index`'s own triggering (see the call site).
+    /// Both endpoint reps are dirtied — an equality atom matching the new
+    /// disequality has an endpoint in one of those classes, and `class_eqs`
+    /// indexes each atom under both of its endpoint reps — plus, when the
+    /// negative-congruence lookahead is on, the application-member argument
+    /// classes `sync_diseq_index` would have dirtied for it.
+    fn dirty_reps_for_pending_neg_eqs(&mut self) {
+        let pending = std::mem::take(&mut self.pending_neg_eqs);
+        for &(lit_term, a, b) in &pending {
+            if self.assigns.get(&lit_term) != Some(&false) {
+                continue; // retracted or flipped since queueing
+            }
+            if (a.0 as usize) >= self.enodes.len() || (b.0 as usize) >= self.enodes.len() {
+                continue; // not in the e-graph; the rebuild skipped it too
+            }
+            let a_rep = self.enode_find_const(a.0);
+            let b_rep = self.enode_find_const(b.0);
+            // Baseline dirties only `dirty_app_member_args(a_rep)/(b_rep)`, never
+            // the endpoint classes themselves, so on the pop-delta path these must
+            // go to the no-lookahead split set — otherwise a backjump asserting a
+            // disequality over PLAIN terms (no app members: the dominant
+            // blocksworld/QF_Datatypes shape) lookaheads every direct-miss atom in
+            // both classes where baseline runs none.
+            if self.neg_pop_delta_valid {
+                self.neg_pop_split_reps.insert(a_rep);
+                self.neg_pop_split_reps.insert(b_rep);
+            } else {
+                self.neg_dirty_reps.insert(a_rep);
+                self.neg_dirty_reps.insert(b_rep);
+            }
+            if self.cong_neg_enabled {
+                self.dirty_app_member_args(a_rep);
+                self.dirty_app_member_args(b_rep);
+            }
+        }
+        self.pending_neg_eqs = pending;
+    }
+
     /// Dirty the argument-class representatives of every function-application
     /// member of `class_rep`'s equivalence class (#cong-neg-prop trigger),
     /// recursing `cong_neg_depth` argument levels so equality atoms that can
@@ -1508,7 +1644,15 @@ impl EufSolver<'_> {
 
     /// INCREMENTAL negative scan: process only new disequalities and equalities
     /// touching merge-dirtied class reps. See `propagate_disequalities`.
-    fn propagate_disequalities_incremental(&mut self) {
+    ///
+    /// `pop_delta` says this call is standing in for a post-pop FULL candidate
+    /// pass (#euf-inc-neg-pop); it only arms the debug subset cross-check.
+    fn propagate_disequalities_incremental(&mut self, pop_delta: bool) {
+        #[cfg(not(debug_assertions))]
+        let _ = pop_delta;
+        // #cong-neg-scan-gate: advanced exactly once per scan here as well, so a
+        // pop-delta scan (#euf-inc-neg-pop) moves the re-probe counter precisely
+        // as far as the post-pop full scan it stands in for would have.
         let _cong_neg_skip_scan2 = self.cong_neg_scan_suspended();
         self.scratch_neg_props.clear();
         self.scratch_cong_neg_props.clear();
@@ -1551,13 +1695,68 @@ impl EufSolver<'_> {
             self.scratch_class_eq_idxs = idxs;
         }
 
+        // (a2) #euf-inc-neg-pop: equalities a pop UNASSIGNED since the last scan.
+        // They are propagation candidates for the first time — the full pass only
+        // ever looks at unassigned atoms — and their classes need not have
+        // changed, so the representative delta in (b) cannot cover them. Same
+        // predicate as the full pass, atom by atom: still unassigned, same-sorted,
+        // endpoints in distinct classes, key live in the index. A miss is dropped
+        // rather than sent to the cong-neg lookahead, matching the post-pop full
+        // pass, which runs no lookahead sweep either (see
+        // `neg_full_scan_la_needed`). Empty unless `--euf-inc-neg-pop`.
+        if !self.neg_pop_retracted.is_empty() {
+            let retracted = std::mem::take(&mut self.neg_pop_retracted);
+            for &(term_id, lhs, rhs) in &retracted {
+                if self.assigns.contains_key(&term_id) {
+                    continue; // re-asserted since the pop
+                }
+                if self.terms.sort(lhs) != self.terms.sort(rhs) {
+                    continue; // never propagated (see `init_eq_terms`)
+                }
+                let (lhs_rep, rhs_rep) =
+                    (self.enode_find_const(lhs.0), self.enode_find_const(rhs.0));
+                if lhs_rep == rhs_rep {
+                    continue; // positive propagation's case
+                }
+                let key = (lhs_rep.min(rhs_rep), lhs_rep.max(rhs_rep));
+                if let Some(&(diseq_a, diseq_b, diseq_term)) = self.diseq_pair_index.get(&key) {
+                    self.scratch_neg_props
+                        .push((term_id, lhs, rhs, diseq_a, diseq_b, diseq_term));
+                }
+            }
+            // Restore the (now consumed) buffer to keep its capacity.
+            self.neg_pop_retracted = retracted;
+            self.neg_pop_retracted.clear();
+        }
+
         // (b) Merge-dirtied reps: re-check their equalities against the index
         // (same iteration shape as the incremental positive scan).
+        //
+        // #euf-inc-neg-pop: TWO rep sets with different lookahead rights, visited
+        // in one pass. `neg_dirty_reps` holds post-pop EVENTS (merges, newly
+        // indexed disequalities) — a baseline post-pop full pass gives exactly
+        // these the cong-neg lookahead, so `la_ok = true`. `neg_pop_split_reps`
+        // holds reps a pop SPLIT apart; the baseline post-pop pass runs ZERO
+        // lookahead simulations over them (`pop` deliberately leaves
+        // `neg_full_scan_la_needed` unarmed), so they get the direct index probe
+        // with `la_ok = false`. Event reps are iterated FIRST and `seen` dedups,
+        // so an atom reachable from an event rep keeps its lookahead even when a
+        // split rep also indexes it. Both sets are empty unless
+        // `--euf-inc-neg-pop` grants a pop delta.
         let dirty = std::mem::take(&mut self.neg_dirty_reps);
+        let split = std::mem::take(&mut self.neg_pop_split_reps);
+        // Snapshot of the lookahead-entitled reps, for the debug cross-check
+        // against what a post-pop full pass would have proposed.
+        #[cfg(debug_assertions)]
+        let la_dirty = if pop_delta { Some(dirty.clone()) } else { None };
         let mut seen = std::mem::take(&mut self.scratch_seen_eq_idxs);
         seen.clear();
         let mut idxs = std::mem::take(&mut self.scratch_class_eq_idxs);
-        for rep in dirty {
+        for (rep, la_ok) in dirty
+            .into_iter()
+            .map(|r| (r, true))
+            .chain(split.iter().map(|&r| (r, false)))
+        {
             idxs.clear();
             match self.class_eqs.get(&rep) {
                 Some(v) => idxs.extend_from_slice(v),
@@ -1580,7 +1779,7 @@ impl EufSolver<'_> {
                 if let Some(&(diseq_a, diseq_b, diseq_term)) = self.diseq_pair_index.get(&key) {
                     self.scratch_neg_props
                         .push((term_id, lhs, rhs, diseq_a, diseq_b, diseq_term));
-                } else if self.cong_neg_enabled && !_cong_neg_skip_scan2 {
+                } else if self.cong_neg_enabled && la_ok && !_cong_neg_skip_scan2 {
                     // #cong-neg-prop: cascade congruence lookahead on direct
                     // miss. Trigger coverage: `incremental_merge` dirties the
                     // arg classes of every reinserted parent, and
@@ -1588,7 +1787,9 @@ impl EufSolver<'_> {
                     // disequal classes' application members (recursing
                     // `cong_neg_depth` argument levels for the cascade), so
                     // an atom whose lookahead status may have changed lands
-                    // in `dirty` here.
+                    // in `dirty` here. `la_ok` is false for pop-SPLIT reps,
+                    // whose lookahead the baseline post-pop pass does not run
+                    // either (#euf-inc-neg-pop; see `neg_pop_split_reps`).
                     if let Some(cascade) = self.cong_diseq_lookahead_memo(lhs, rhs) {
                         self.scratch_cong_neg_props
                             .push((term_id, lhs, rhs, cascade));
@@ -1598,6 +1799,14 @@ impl EufSolver<'_> {
         }
         self.scratch_class_eq_idxs = idxs;
         self.scratch_seen_eq_idxs = seen;
+        // Restore the (consumed) split set to keep its capacity; nothing below a
+        // pop ever inserts into it, so no post-take insert can be lost here.
+        self.neg_pop_split_reps = split;
+        self.neg_pop_split_reps.clear();
+        #[cfg(debug_assertions)]
+        if let Some(la_dirty) = la_dirty {
+            self.debug_assert_pop_delta_props_subset_of_full_scan(&la_dirty);
+        }
     }
 
     /// Emit the propagations collected in `scratch_neg_props` (shared tail of

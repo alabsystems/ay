@@ -3239,3 +3239,118 @@ fn test_evaluate_rejects_false_negated_comparison_unit() {
     validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
         .expect_err("a true closed comparison claimed false must be rejected");
 }
+
+/// `(op a b)` with no builder-side simplification — the shape the split
+/// producer actually emits.
+fn split_raw2(terms: &mut TermStore, op: &str, a: TermId, b: TermId, sort: Sort) -> TermId {
+    terms.mk_app(ay_core::Symbol::named(op), vec![a, b], sort)
+}
+
+/// `(+ (* v coeff) constant)`, unsimplified.
+fn split_affine(terms: &mut TermStore, v: TermId, coeff: i64, constant: i64) -> TermId {
+    let c = terms.mk_int(BigInt::from(coeff));
+    let k = terms.mk_int(BigInt::from(constant));
+    let scaled = split_raw2(terms, "*", v, c, Sort::Int);
+    split_raw2(terms, "+", scaled, k, Sort::Int)
+}
+
+/// `(cl (<= v upper) (<= lower v) (= (+ (* v gc) ge) (+ (* v gf) gg)))`.
+fn scaled_split_clause(
+    terms: &mut TermStore,
+    v: TermId,
+    bounds: (i64, i64),
+    guard: (i64, i64, i64, i64),
+) -> Vec<TermId> {
+    let (upper, lower) = bounds;
+    let (gc, ge, gf, gg) = guard;
+    let upper_const = terms.mk_int(BigInt::from(upper));
+    let lower_const = terms.mk_int(BigInt::from(lower));
+    let first = split_raw2(terms, "<=", v, upper_const, Sort::Bool);
+    let second = split_raw2(terms, "<=", lower_const, v, Sort::Bool);
+    let lhs = split_affine(terms, v, gc, ge);
+    let rhs = split_affine(terms, v, gf, gg);
+    let guard = split_raw2(terms, "=", lhs, rhs, Sort::Bool);
+    vec![first, second, guard]
+}
+
+#[test]
+fn guarded_split_strict_checker_accepts_a_positive_integer_scaled_guard() {
+    // END-TO-END through the REAL strict validator (`validate_step`, strict
+    // = true), not the recognizer alone. This is the dillig12_m clause the
+    // div/mod-elimination route emits: `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("_mod_q_0", Sort::Int);
+    let scaled = scaled_split_clause(&mut terms, q, (-1, 1), (2, 1, 4, 1));
+    validate_theory_lemma_strict(&terms, scaled, TheoryLemmaKind::ArithDisequalitySplit)
+        .expect("a guard scaled by a positive integer must validate strictly");
+
+    // The `k = 1` control from the same probe stays accepted.
+    let primitive = scaled_split_clause(&mut terms, q, (-1, 1), (1, 0, 0, 0));
+    validate_theory_lemma_strict(&terms, primitive, TheoryLemmaKind::ArithDisequalitySplit)
+        .expect("the primitive guard must keep validating");
+}
+
+#[test]
+fn guarded_split_strict_checker_rejects_every_unsound_scaling() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+
+    // Each of these is a genuine NON-tautology; the falsifying assignment is
+    // named. Every one must FAIL to validate.
+    for (bounds, guard, why) in [
+        (
+            (0_i64, 2_i64),
+            (2_i64, 0_i64, 0_i64, 1_i64),
+            "2q = 1 at q = 1",
+        ),
+        ((0, 2), (1, 0, 0, 2), "q = 2 at q = 1"),
+        ((-1, 1), (2, 0, 0, 1), "2q = 1 at q = 0"),
+        ((-1, 1), (0, 0, 0, 0), "k = 0 collapses the guard to 0 = 0"),
+        (
+            (-2, 1),
+            (2, 0, 0, 0),
+            "the branch gap is two values wide, q = -1",
+        ),
+        (
+            (-1, 1),
+            (2, 0, 0, 3),
+            "2q = 3 has no integer solution at all",
+        ),
+    ] {
+        let clause = scaled_split_clause(&mut terms, q, bounds, guard);
+        validate_theory_lemma_strict(&terms, clause, TheoryLemmaKind::ArithDisequalitySplit)
+            .expect_err(why);
+    }
+
+    // A scaled guard on a DIFFERENT variable.
+    let r = terms.mk_var("r", Sort::Int);
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let zero = terms.mk_int(BigInt::from(0));
+    let two = terms.mk_int(BigInt::from(2));
+    let first = split_raw2(&mut terms, "<=", q, minus_one, Sort::Bool);
+    let second = split_raw2(&mut terms, "<=", one, q, Sort::Bool);
+    let two_r = split_raw2(&mut terms, "*", r, two, Sort::Int);
+    let foreign = split_raw2(&mut terms, "=", two_r, zero, Sort::Bool);
+    validate_theory_lemma_strict(
+        &terms,
+        vec![first, second, foreign],
+        TheoryLemmaKind::ArithDisequalitySplit,
+    )
+    .expect_err("2r = 0 is false at q = 0, r = 1");
+
+    // Reordering is still rejected: the scaling extension must not smuggle in
+    // a permutation-tolerant match.
+    let scaled = scaled_split_clause(&mut terms, q, (-1, 1), (2, 1, 4, 1));
+    validate_theory_lemma_strict(
+        &terms,
+        vec![scaled[1], scaled[0], scaled[2]],
+        TheoryLemmaKind::ArithDisequalitySplit,
+    )
+    .expect_err("a reordered scaled split must still fail closed");
+
+    // And a clause that is simply not a split at all.
+    let p = terms.mk_var("p", Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![p], TheoryLemmaKind::ArithDisequalitySplit)
+        .expect_err("a bare Boolean literal is not a guarded split");
+}

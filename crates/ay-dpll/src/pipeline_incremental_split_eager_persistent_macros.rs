@@ -874,12 +874,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         break 'split_loop Ok(SolveResult::Unknown);
                                     }
                                     let _fc_conflict_annotation = if proof_enabled {
-                                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                            &mut $self.proof_tracker,
-                                            Some(&$self.ctx.terms),
-                                            _islp_negations.as_map(),
+                                        dt_conflict_proof!(
+                                            $self,
+                                            _islp_negations,
                                             &conflict_lits,
-                                        ).1
+                                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+                                        )
                                     } else { None };
                                     pipeline_export_theory_state!(
                                         theory, $export_theory, $export_expr,
@@ -951,19 +951,19 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                         break 'split_loop Ok(SolveResult::Unknown);
                                     }
                                     let _fc_conflict_annotation = if proof_enabled && _fc_farkas_valid {
-                                        $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
-                                            &mut $self.proof_tracker,
-                                            Some(&$self.ctx.terms),
-                                            _islp_negations.as_map(),
+                                        dt_farkas_proof!(
+                                            $self,
+                                            _islp_negations,
                                             &conflict,
-                                        ).1
+                                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+                                        )
                                     } else if proof_enabled {
-                                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                            &mut $self.proof_tracker,
-                                            Some(&$self.ctx.terms),
-                                            _islp_negations.as_map(),
+                                        dt_conflict_proof!(
+                                            $self,
+                                            _islp_negations,
                                             &conflict.literals,
-                                        ).1
+                                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+                                        )
                                     } else { None };
                                     pipeline_export_theory_state!(
                                         theory, $export_theory, $export_expr,

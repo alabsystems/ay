@@ -74,6 +74,12 @@ fn iter_ledger_on() -> bool {
     ITER_LEDGER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn emit_nonempty_stderr(line: String) {
+    if !line.is_empty() {
+        eprintln!("{line}");
+    }
+}
+
 fn main() {
     // Dump on EVERY exit path, including the diagnostic early returns (`AY_ROOT_CLOSURE` is the
     // deterministic, load-invariant way to measure the root cut loop, and it returns before the
@@ -95,9 +101,19 @@ fn main() {
     // B38: trailing `--<engine-flag>` args ride the shared engine CLI (the
     // measurement harnesses pass them instead of the retired AY_MILP_* envs).
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let flags = ay_milp::engine_cli::Flags::parse(&raw, ay_milp::engine_cli::VALUE_FLAGS)
+    // STRICT: an unknown `--flag` exits 2 with a message naming it (and the
+    // nearest known spelling), instead of parsing as a switch that does
+    // nothing — or, for a value flag, donating its value to the positionals
+    // where it used to be read as a seed-solution path.
+    let mut value_flags: Vec<&str> = ay_milp::engine_cli::VALUE_FLAGS.to_vec();
+    value_flags.push("margin-row");
+    let mut switch_flags = ay_milp::engine_cli::switch_flags();
+    switch_flags.extend(["iter-ledger", "allocstat"]);
+    let flags = ay_milp::engine_cli::Flags::parse(&raw, &value_flags, &switch_flags)
         .unwrap_or_else(|e| {
-            eprintln!("usage: mps_solve <file.mps> [seconds] [--engine-flags]: {e}");
+            eprintln!(
+                "usage: mps_solve <file.mps> [seconds] [seed.sol] [--engine-flags]\nmps_solve: {e}"
+            );
             std::process::exit(2);
         });
     if flags.has("iter-ledger") {
@@ -107,12 +123,56 @@ fn main() {
         // per-phase counters on.
         ay_milp::enable_iter_ledger();
     }
-    let mut args = flags.positional.iter().cloned();
-    let Some(path) = args.next() else {
-        eprintln!("usage: mps_solve <file.mps> [seconds]");
+    // POSITIONALS ARE NOW CHECKED, all three of them.
+    //
+    // `<file.mps> [seconds] [seed.sol]` is the whole grammar; a fourth
+    // positional, or a second one that is not a number, is a MISPARSE (it used
+    // to be a silent default-to-60 or a silent discard), and the third is a
+    // path that must exist before it is adopted as a seed solution — reading
+    // it blind is what turned a misspelled flag into
+    // `read seed solution: NotFound`.
+    let Some(path) = flags.positional.first().cloned() else {
+        eprintln!("usage: mps_solve <file.mps> [seconds] [seed.sol] [--engine-flags]");
         std::process::exit(2);
     };
-    let secs: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
+    if let Some(extra) = flags.positional.get(3) {
+        eprintln!(
+            "mps_solve: unexpected argument `{extra}` \
+             (grammar: <file.mps> [seconds] [seed.sol] [--engine-flags])"
+        );
+        std::process::exit(2);
+    }
+    let secs: f64 = match flags.positional.get(1) {
+        None => 60.0,
+        Some(s) => match s.parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "mps_solve: second argument `{s}` is not a number of seconds \
+                     (grammar: <file.mps> [seconds] [seed.sol] [--engine-flags])"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
+    // Explicit beats positional: `--seed-solution <path>` says what it is.
+    let seed_solution = flags
+        .get("seed-solution")
+        .cloned()
+        .or_else(|| flags.positional.get(2).cloned());
+    // Checked HERE, before the model is read and the session built, so a
+    // mistyped argument costs nothing and is reported as itself.
+    if let Some(seedf) = &seed_solution {
+        if !std::path::Path::new(seedf).is_file() {
+            eprintln!(
+                "mps_solve: seed solution `{seedf}` is not a readable file\n  \
+                 the third positional is a seed-solution file (or pass \
+                 --seed-solution <path>); if this was meant to be a flag, it is \
+                 missing its `--`"
+            );
+            std::process::exit(2);
+        }
+    }
 
     let text = read_maybe_gz(&path).unwrap_or_else(|e| {
         eprintln!("cannot read {path}: {e}");
@@ -186,6 +246,21 @@ fn main() {
         p.model.sense()
     );
 
+    // ENGINE FLAGS APPLY TO THE DIAGNOSTIC MODES TOO. This parse used to sit BELOW every
+    // diagnostic early return, so `AY_ROOT_CLOSURE=1 ... --root-cuts-per-round 200` silently
+    // measured the DEFAULT root loop — the flags were parsed for a solve that never ran. The
+    // opts built here are the ones the solve path consumes below, unchanged; the diagnostics
+    // now receive the same object instead of constructing an unflagged one.
+    let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+    if let Some(cutoff) = dual_cutoff_model_frame {
+        let engine = opts.engine().with_dual_cutoff(cutoff);
+        opts = opts.with_engine(engine);
+    }
+    opts = ay_milp::engine_cli::apply(&flags, opts).unwrap_or_else(|e| {
+        eprintln!("bad engine flag: {e}");
+        std::process::exit(2);
+    });
+
     // W0 MEASUREMENT: root dual bound before and after the cut loop, no branching.
     // The one signal that attributes a change to the CUTS rather than to the tree.
     // Reported on stdout in the file's own objective frame (un-scaled, re-sensed), so
@@ -193,7 +268,7 @@ fn main() {
     // root bound.
     if std::env::var_os("AY_ROOT_CLOSURE").is_some() {
         use num_traits::ToPrimitive as _;
-        let line = ay_milp::diag_root_closure(&p.model, secs);
+        let line = ay_milp::diag_root_closure_with(&p.model, secs, &opts);
         // The diagnostic already reports in the model's own sense/offset frame; what it
         // cannot undo is the reader's integralising objective scale, which lives here.
         let scale = p.obj_scale.to_f64().unwrap_or(1.0);
@@ -225,8 +300,19 @@ fn main() {
 
     // Diagnostic: solve just the float-lane LP relaxation (cold) and report
     // iteration economics; --lp-stats adds per-phase LPSTAT lines.
+    //
+    // `_with(&opts)` IS LOAD-BEARING, and its absence was incident five of the
+    // dead-flag family. `diag_float_lp(&p.model, secs)` pushed no
+    // `tune::activate_caller` frame, so every caller-layer knob was inert on this
+    // lane. Measured on release binaries either side of the change:
+    // `AY_LP_ONLY=1 mps_solve qiu.mps 60 --devex` reported primal=3455 (byte-
+    // identical to the unflagged arm) before, primal=2176 after; and
+    // `--diag-plain-cold`, which `diag_float_lp` reads in its own body, was
+    // byte-identical on fast0507 before (primal=18811 dual=15410) and switches
+    // the lane after (primal=14387 dual=0 refac=289). The flags were parsed
+    // above; they now reach the diagnostic.
     if std::env::var_os("AY_LP_ONLY").is_some() {
-        eprintln!("{}", ay_milp::diag_float_lp(&p.model, secs));
+        eprintln!("{}", ay_milp::diag_float_lp_with(&p.model, secs, &opts));
         // B12: caller-enabled profilers return empty lines when inactive.
         {
             let line = ay_milp::rt_profile_line();
@@ -257,10 +343,10 @@ fn main() {
     // informative) versus the trivial 0 of the zero objective. This exercises
     // the same `mark_margin_row` + reframe path `BabSession::check` takes.
     // B22: --margin-row <spec> example flag (was a retired env var).
-    if let Some(spec) = {
-        let mut args = std::env::args();
-        args.find(|a| a == "--margin-row").and_then(|_| args.next())
-    } {
+    // B22: `--margin-row <spec>` is a VALUE flag on the shared parser now. It
+    // used to be re-scanned out of `std::env::args()` behind the parser's
+    // back, so its value also landed in `positional` — i.e. in the seed slot.
+    if let Some(spec) = flags.get("margin-row").cloned() {
         let nrows = p.model.num_rows();
         let row_idx = if spec.eq_ignore_ascii_case("last") {
             nrows.checked_sub(1)
@@ -277,7 +363,18 @@ fn main() {
             eprintln!("mark_margin_row({row_idx}): {e}");
             std::process::exit(2);
         }
-        eprintln!("{}", ay_milp::diag_margin_reframe(&m, secs));
+        // THE THIRD FRAMELESS LANE, now REPAIRED rather than refused.
+        //
+        // This branch used to reject every engine flag, because
+        // `diag_margin_reframe(&m, secs)` took no `SolveOpts`, pushed no
+        // `tune::activate_caller` frame, and built a throwaway `SolveOpts::new()`
+        // for its nested `reframe` — so a flag here parsed and changed nothing,
+        // and refusing beat measuring under it. `diag_margin_reframe_with` is the
+        // real repair, the same one `diag_float_lp_with` is above: the flags
+        // parsed at the top of `main` now reach the module's own kill switch
+        // (`--no-margin-reframe`), its arming knob (`--auto-margin`) and the root
+        // LP walk. Refusing after that would be refusing a flag that DOES fire.
+        eprintln!("{}", ay_milp::diag_margin_reframe_with(&m, secs, &opts));
         return;
     }
 
@@ -312,7 +409,14 @@ fn main() {
             }
         }
         eprintln!("cross-check: pinned {pinned} integer columns to the reference solution");
-        let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+        // THE SECOND FRAMELESS LANE, repaired. This used to SHADOW the flagged
+        // `opts` built above with a fresh `SolveOpts::new()`, so every engine flag
+        // on a `--check-sol` run was parsed and discarded one line before the
+        // session that would have consumed it. `BabSession::check` installs the
+        // caller frame from whatever opts it is handed, so handing it the flagged
+        // ones is the entire fix. The default path is unchanged: with no engine
+        // flag given, `engine_cli::apply` leaves `EngineEconomics` untouched and
+        // this is the same object the shadowing line built.
         // Lever A: hand the pinned model to the session (moved, not cloned); `m`
         // is not read again on this cross-check branch.
         let mut s = BabSession::new(m, &opts).expect("model");
@@ -329,15 +433,7 @@ fn main() {
         return;
     }
 
-    let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
-    if let Some(cutoff) = dual_cutoff_model_frame {
-        let engine = opts.engine().with_dual_cutoff(cutoff);
-        opts = opts.with_engine(engine);
-    }
-    opts = ay_milp::engine_cli::apply(&flags, opts).unwrap_or_else(|e| {
-        eprintln!("bad engine flag: {e}");
-        std::process::exit(2);
-    });
+    // (opts were built and flag-applied above, before the diagnostic branches.)
     // Measurement lever (retired to the CLI): the tree-certificate
     // leaf budget (default 256). Set it to 0 to opt into the certificate-free
     // fast path, which enables duplicate-column merging and makes the separately
@@ -379,8 +475,25 @@ fn main() {
     // had to pad positionals to dodge it (an audit found an `empty.seed` doing
     // exactly that). Reading the parsed positional makes flags and the seed
     // composable, which is the whole point of the shared engine CLI.
-    if let Some(seedf) = args.next() {
-        let text = std::fs::read_to_string(&seedf).expect("read seed solution");
+    if let Some(seedf) = seed_solution {
+        // WAS: `read_to_string(..).expect("read seed solution")`. A flag the
+        // parser did not know produced a positional here, and the panic that
+        // followed ("read seed solution: NotFound") reached a harness as a
+        // missing datum instead of as a misparse. Both halves are fixed: the
+        // parser refuses the unknown flag, and a seed path that is not a
+        // readable file is refused BY NAME with exit 2.
+        let text = match std::fs::read_to_string(&seedf) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!(
+                    "mps_solve: cannot read seed solution `{seedf}`: {e}\n  \
+                     the third positional is a seed-solution file (or pass \
+                     --seed-solution <path>); if this was meant to be a flag, \
+                     it is missing its `--`"
+                );
+                std::process::exit(2);
+            }
+        };
         let index: std::collections::HashMap<&str, usize> = p
             .col_names
             .iter()
@@ -469,32 +582,17 @@ fn main() {
     }
     // B12: caller-enabled profilers return empty lines when inactive.
     {
-        let line = ay_milp::rt_profile_line();
-        if !line.is_empty() {
-            eprintln!("{line}");
-        }
-        let uline = ay_milp::upd_profile_line();
-        if !uline.is_empty() {
-            eprintln!("{uline}");
-        }
-        let pxline = ay_milp::px_profile_line();
-        if !pxline.is_empty() {
-            eprintln!("{pxline}");
-        }
-        let sbline = ay_milp::sb_profile_line();
-        if !sbline.is_empty() {
-            eprintln!("{sbline}");
-        }
+        emit_nonempty_stderr(ay_milp::rt_profile_line());
+        emit_nonempty_stderr(ay_milp::upd_profile_line());
+        emit_nonempty_stderr(ay_milp::px_profile_line());
+        emit_nonempty_stderr(ay_milp::sb_profile_line());
     }
     // ITERATION LEDGER (--iter-ledger): one parseable ITERLEDGER line
     // attributing every simplex iteration to the solve phase that ran it, with
     // the solve count per phase so iterations-per-solve is readable. Counts
     // only, never time: the line is identical on an idle and a contended box.
     if iter_ledger_on() {
-        let ledger = ay_milp::iter_ledger_line();
-        if !ledger.is_empty() {
-            eprintln!("{ledger}");
-        }
+        emit_nonempty_stderr(ay_milp::iter_ledger_line());
     }
     // B20: --allocstat example flag (was a retired env var).
     if std::env::args().any(|a| a == "--allocstat") {

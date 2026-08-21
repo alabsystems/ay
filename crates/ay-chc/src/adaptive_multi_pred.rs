@@ -1488,8 +1488,11 @@ impl AdaptivePortfolio {
         self.apply_user_hints(&mut case_split_config);
         let case_split_start = Instant::now();
         if let Some(result) = PdrSolver::try_case_split_solve(&self.problem, case_split_config) {
-            // Validate case-split result (#5549 soundness fix)
-            let validated = self.validate_adaptive_result(result);
+            // Validate case-split result (#5549 soundness fix).
+            // #4751 cause-4: pass the deadline so the mandatory re-validation
+            // gets a budget proportional to what the solve actually has left.
+            // A fixed 1.5s gate discarded an already-verified merged model here.
+            let validated = self.validate_adaptive_result_with_deadline(result, deadline);
             if !matches!(validated, PdrResult::Unknown) {
                 self.decision_log.log_decision(DecisionEntry {
                     stage: "multi_pred_linear_case_split",

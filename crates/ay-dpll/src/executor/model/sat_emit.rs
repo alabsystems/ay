@@ -45,6 +45,8 @@ use crate::executor_types::{Result, SolveResult, UnknownReason};
 
 use super::completion::CheckedProjectionOutputCompletion;
 
+mod finite_model_owner;
+
 /// Unforgeable witness that a `Sat` verdict passed one complete checked
 /// emission lane.
 ///
@@ -496,12 +498,10 @@ impl Executor {
                 return Ok(SolveResult::Unknown);
             }
 
-            // Certificate models are affine. Move the one already-completed
-            // checked witness into `last_model`; never clone or semantically
-            // mutate it in this funnel. Finite/constant packages receive their
-            // replacement-sensitive identity immediately on the local object,
-            // before it becomes visible to the read-only gate stack.
+            // Stage finite-FP's checked witness before classification and
+            // strict validation; every later gate is read-only on success.
             let publication_roots = self.ctx.assertions.clone();
+            self.try_install_unowned_finite_model_sat_certificate(&publication_roots);
             let model_free_mbqi_theorem_lane =
                 self.has_current_model_free_mbqi_sat_authority(&publication_roots);
             if model_free_mbqi_theorem_lane {
@@ -689,6 +689,51 @@ impl Executor {
             if !certificate_model_lane {
                 self.complete_unconstrained_constants_for_output(roots);
                 self.materialize_symbolic_array_defaults();
+                // NRA RATIONAL REFINEMENT, BEFORE THE GATES (#nra-refine-pre-gate).
+                //
+                // This is the same decline-only search `(get-model)` already ran
+                // (`refine_nra_algebraic_model_for_print`), moved AHEAD of the
+                // gates. It used to be reachable only from the `GetModel`
+                // dispatch, which is strictly AFTER the independent gate — so a
+                // model carrying an algebraic witness had to survive the gate
+                // before the refinement it needed was ever attempted.
+                //
+                // It could not survive it. A residue-valued entry (`y! = 0.99·α
+                // + 0.01·α²`, i.e. `RealAlgebraicValue::is_identity() == false`)
+                // is not convertible to a gate `ModelValue`: `algebraic_leaf`
+                // takes only the identity residue and `eval_value_to_model_value`
+                // maps `EvalValue::Algebraic` to `None`. The leaf therefore
+                // arrived UNPINNED, the gate correctly refused to confirm
+                // ("model does not pin this leaf: y!"), and a solve that had a
+                // perfectly good witness in hand published `unknown` — with
+                // `:theory-unknown-count 0`, because no theory had declined
+                // (20200911-Pine/1599121886379408000.smt2, measured).
+                //
+                // Refining FIRST hands the gates a fully rational model, which
+                // they can pin and check. Two properties make the move safe:
+                //   * decline-only — a candidate is installed only after EVERY
+                //     assertion re-evaluates to `Bool(true)` under the exact
+                //     evaluator, and on failure the algebraic model is restored
+                //     bit-for-bit, so this can never manufacture a witness the
+                //     gates would then have to catch;
+                //   * gate-preserving — it only ever REPLACES a leaf the gate
+                //     could not read with one it can, so no model that is
+                //     confirmable today becomes unconfirmable.
+                // A declined refinement leaves today's behaviour exactly as it
+                // was: the algebraic model goes to the gate unchanged.
+                //
+                // It is also what makes such a `sat` externally validatable.
+                // An unrefined witness prints in z3's `root-obj` syntax, which
+                // is not SMT-LIB: Dolmen rejects it with `E:unbound-id`
+                // (measured), so an unrefined algebraic `sat` scores as an MV
+                // ERROR — worse than the `unknown` it replaced. Only the
+                // rational form earns the answer.
+                //
+                // Cost is confined: the pass returns immediately unless the
+                // model actually carries algebraic values (rare), and it is
+                // attempted at most once per SAT verdict. Running it here makes
+                // the later `(get-model)` call a no-op.
+                self.refine_nra_algebraic_model_for_print();
             }
             self.record_gate_span_ms("phase.sat_gate.completion.ms", span);
 

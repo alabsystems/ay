@@ -151,8 +151,8 @@ FAULTS = {
     ),
     "sweep-trust-header": (
         SWEEP_PY,
-        'agree_against = [v for v in (z, c) if v in ("sat", "unsat") and v != ans]',
-        "agree_against = [st] if st and st != ans else []",
+        "        against = [v for v in decisive if v != ans]",
+        "        against = [st] if st and st != ans else []",
         "Trust the :status header instead of adjudicating, so a benchmark with a "
         "WRONG header is reported as an AY wrong answer.",
     ),
@@ -446,7 +446,9 @@ def test_guards(scripts, tmp, r, verbose):
     r.expect(re.search(r"\(2 proofs checked\)", p.stdout) is not None,
              "good --bench-root: 2 proofs actually reached carcara", gist(p.stdout))
 
-    # 3h. the sweep's empty-corpus guard.
+    # 3h. a nonexistent sweep corpus is a broken invocation. Keep this separate
+    #     from the empty-corpus case below: it exits before `collect`, so it
+    #     cannot discriminate the `if not files` measurement guard.
     p = run([sys.executable, scripts["sweep"], "--bench-root",
              "/nonexistent-bench-root"], env={"AY_BIN": str(FAKE_AY)},
             verbose=verbose)
@@ -454,7 +456,18 @@ def test_guards(scripts, tmp, r, verbose):
     r.expect("CLEAN" not in strip_ansi(p.stdout),
              "sweep bad --bench-root: does NOT print CLEAN", gist(p.stdout))
 
-    # 3i. the sweep's no-answer guard: AY never speaks.
+    # 3i. the sweep's EMPTY-CORPUS guard. The root must exist so execution
+    #     reaches `if not files`; otherwise the seeded guard deletion is never
+    #     exercised and can slip through this self-test undetected.
+    empty_bench = Path(tmp) / "empty-sweep-corpus"
+    empty_bench.mkdir()
+    p = run([sys.executable, scripts["sweep"], "--bench-root", empty_bench],
+            env={"AY_BIN": str(FAKE_AY)}, verbose=verbose)
+    r.expect(p.returncode == 2, "sweep empty corpus: exit 2", f"got {p.returncode}")
+    r.expect("CLEAN" not in strip_ansi(p.stdout),
+             "sweep empty corpus: does NOT print CLEAN", gist(p.stdout))
+
+    # 3j. the sweep's no-answer guard: AY never speaks.
     p = run([sys.executable, scripts["sweep"], "--bench-root",
              FIX / "guard", "no_answer", "--timeout", "10"],
             env={"AY_BIN": str(FAKE_AY)}, verbose=verbose)

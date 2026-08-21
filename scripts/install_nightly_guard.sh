@@ -16,7 +16,10 @@ set -u
 LABEL="ai.andrewyates.ay.corpus-guard"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 REPO="${AY_REPO:-$HOME/ay}"
-CORPUS="${AY_CORPUS:-$HOME/ay-corpus}"
+# The canonical MILP gate corpus. Was $HOME/ay-corpus, which does not exist on
+# this machine and never has -- so every LaunchAgent installed from this script
+# baked a dead path into its plist. See scripts/milp_gate_corpus.py.
+CORPUS="${AY_CORPUS:-$HOME/ay-bench/milp-gate/instances}"
 
 case "${1:-install}" in
   --status)

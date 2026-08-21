@@ -119,6 +119,11 @@ def main():
                          "competition configuration (the submission always writes a proof). "
                          "Pair with a solver wrapper that requests --proof and checks the "
                          "certificate, e.g. ~/ay-bench/bin/ay-proofmode.")
+    ap.add_argument("--phantom-memout-frac", type=float, default=0.15,
+                    help="a memout/SIGKILL row that dies in under this fraction of "
+                         "the timeout is suspect (rss watchdog tripped by CONCURRENT "
+                         "machine load, not the instance) and is retried once, "
+                         "sequentially, after the sweep; 0 disables")
     ap.add_argument("--out", default="sweep_results.json")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
@@ -167,17 +172,51 @@ def main():
 
     jobs = [(name, path, cnf) for cnf in cnfs for name, path in solvers.items()]
     results = []
+    row_jobs = []  # results[i] came from row_jobs[i]; needed to re-run a row
     done = 0
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(run_one, n, p, c, args.timeout, enforced_mem_mb,
-                          plan.nbcore, extras.get(n, ()), args.proof_mode): (n, c)
+                          plan.nbcore, extras.get(n, ()), args.proof_mode): (n, p, c)
                 for (n, p, c) in jobs}
         for fut in cf.as_completed(futs):
             r = fut.result()
             results.append(r)
+            row_jobs.append(futs[fut])
             done += 1
             if done % 10 == 0 or done == len(jobs):
                 print(f"  {done}/{len(jobs)} done", flush=True)
+
+    # Phantom-memout guard: concurrent machine load (another session's build)
+    # can spike system memory and make the rss watchdog SIGKILL a healthy child
+    # within seconds -- a "memout" the instance does not reproduce standalone
+    # (2026-08-20: two rows killed at ~9.7s as memout ran the full 300s alone),
+    # contaminating paired A/B measurements. A memout / rc=-9 row that died in
+    # under --phantom-memout-frac of the timeout is suspect; retry each once
+    # sequentially now that the parallel phase is over (quieter machine). A
+    # changed verdict replaces the row ("retried_phantom_memout"); a repeat
+    # keeps it ("memout_confirmed").
+    frac = args.phantom_memout_frac
+    suspects = [i for i, r in enumerate(results)
+                if frac > 0 and not r.get("cancelled")
+                and (r["verdict"] == "memout" or r.get("rc") == -9)
+                and r["time"] < frac * args.timeout]
+    corrected = 0
+    if suspects:
+        print(f"retrying {len(suspects)} suspect memout(s) sequentially "
+              f"(died <{frac:.0%} of timeout)", flush=True)
+    for i in suspects:
+        n, p, c = row_jobs[i]
+        retry = run_one(n, p, c, args.timeout, enforced_mem_mb, plan.nbcore,
+                        extras.get(n, ()), args.proof_mode)
+        if retry["verdict"] != results[i]["verdict"]:
+            retry["retried_phantom_memout"] = True
+            results[i] = retry
+            corrected += 1
+        else:
+            results[i]["memout_confirmed"] = True
+    if suspects:
+        print(f"{len(suspects)} suspect memouts retried, {corrected} corrected",
+              flush=True)
 
     # Aggregate per solver + cross-check soundness.
     by_inst = {}

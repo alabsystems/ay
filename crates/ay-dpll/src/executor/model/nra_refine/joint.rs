@@ -99,9 +99,9 @@ const MAX_SEPARATION_ROUNDS: usize = 8;
 const MAX_JOINT_CANDIDATE_BITS: u64 = 512;
 
 /// One positive-polarity equality plus the arithmetic variables it mentions.
-struct Equality {
-    lhs: TermId,
-    rhs: TermId,
+pub(super) struct Equality {
+    pub(super) lhs: TermId,
+    pub(super) rhs: TermId,
     vars: Vec<TermId>,
 }
 
@@ -384,7 +384,10 @@ impl Executor {
             }
         }
         let saved = self.nra_algebraic_model.values().clone();
-        let Some(txn) = self.install_refined_candidates(&assignment) else {
+        // No definitional closure here: the joint pass derives its partners
+        // itself, from the equality cluster it planned (`plan.solves`), and its
+        // proposal is already total over the variables it moves.
+        let Some(txn) = self.install_refined_candidates(&assignment, &[]) else {
             return false;
         };
         if self.refined_model_satisfies_all_assertions() {
@@ -477,7 +480,7 @@ impl Executor {
         eq: &Equality,
     ) -> Option<BigRational> {
         let saved = self.nra_algebraic_model.values().clone();
-        let txn = self.install_refined_candidates(assignment)?;
+        let txn = self.install_refined_candidates(assignment, &[])?;
         let value = match self.last_model.as_ref() {
             None => None,
             Some(model) => with_isolated_eval_memo(|| {

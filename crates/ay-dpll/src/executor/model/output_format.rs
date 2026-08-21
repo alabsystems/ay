@@ -276,6 +276,50 @@ impl Executor {
         let params_str = params.join(" ");
         let result_sort_str = format_sort_surface(&self.ctx, result_sort);
 
+        let resolved_table =
+            self.printed_uf_table_rows(name, arg_sorts, result_sort, table, model)?;
+
+        // Build nested ite expression from resolved table.
+        let body = if resolved_table.is_empty() {
+            // Empty table: no application of this function is constrained by
+            // the formula, so ANY total function is a valid witness — complete
+            // it with the canonical constant body (legitimate model
+            // completion of an unconstrained function, not a fabricated value
+            // for a missing one).
+            format_default_value_surface(&self.ctx, result_sort)
+        } else {
+            self.format_function_body(arg_sorts, result_sort, &resolved_table)
+        };
+
+        Ok(format!(
+            "  (define-fun {} ({}) {}\n    {})",
+            quote_symbol(name),
+            params_str,
+            result_sort_str,
+            body
+        ))
+    }
+
+    /// The EXACT row list `format_function_table` turns into the printed
+    /// `(define-fun f ...)` body: phantom rows dropped, `@?N` placeholders
+    /// resolved, first-match duplicates removed. Split out of
+    /// `format_function_table` (which is its only former body) so the
+    /// independent model gate can evaluate the SAME total interpretation the
+    /// printer emits instead of re-deriving one — see
+    /// `IndependentModelView::printed_uf_interpretation_value`
+    /// (#g3-gate-reads-printed-uf).
+    ///
+    /// The emitted body is a FIRST-MATCH `ite` chain over these rows with the
+    /// LAST row's value as the `else` branch (see `format_function_body`), so
+    /// this list plus that rule is the whole printed interpretation.
+    pub(in crate::executor) fn printed_uf_table_rows(
+        &self,
+        name: &str,
+        arg_sorts: &[Sort],
+        result_sort: &Sort,
+        table: &[(Vec<String>, String)],
+        model: &Model,
+    ) -> Result<Vec<(Vec<String>, String)>, String> {
         // Resolve @?N placeholders in table entries (#5452).
         let mut resolved_table: Vec<(Vec<String>, String)> = Vec::with_capacity(table.len());
         for (args, result) in table {
@@ -344,27 +388,7 @@ impl Executor {
                 }
             }
         }
-        let resolved_table = deduped;
-
-        // Build nested ite expression from resolved table.
-        let body = if resolved_table.is_empty() {
-            // Empty table: no application of this function is constrained by
-            // the formula, so ANY total function is a valid witness — complete
-            // it with the canonical constant body (legitimate model
-            // completion of an unconstrained function, not a fabricated value
-            // for a missing one).
-            format_default_value_surface(&self.ctx, result_sort)
-        } else {
-            self.format_function_body(arg_sorts, result_sort, &resolved_table)
-        };
-
-        Ok(format!(
-            "  (define-fun {} ({}) {}\n    {})",
-            quote_symbol(name),
-            params_str,
-            result_sort_str,
-            body
-        ))
+        Ok(deduped)
     }
 
     /// Format an exact certificate-constructed total function whose default

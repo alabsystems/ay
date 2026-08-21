@@ -111,7 +111,9 @@ impl Executor {
     /// positions only (`and` under positive polarity, `or` under negative,
     /// `not` flipping it). An equality under a positive disjunction is not
     /// harvested because it need not hold in the model.
-    pub(super) fn collect_positive_equalities(&self) -> Option<Vec<Equality>> {
+    pub(in crate::executor::model::nra_refine) fn collect_positive_equalities(
+        &self,
+    ) -> Option<Vec<Equality>> {
         let mut out: Vec<Equality> = Vec::new();
         let mut seen: DetHashSet<(TermId, bool)> = DetHashSet::default();
         let mut stack: Vec<(TermId, bool)> = self
@@ -160,7 +162,11 @@ impl Executor {
     }
 
     /// Append the arithmetic variables of `term` to `out`.
-    fn collect_arith_vars(&self, term: TermId, out: &mut Vec<TermId>) -> Option<()> {
+    pub(in crate::executor::model::nra_refine) fn collect_arith_vars(
+        &self,
+        term: TermId,
+        out: &mut Vec<TermId>,
+    ) -> Option<()> {
         let mut seen: DetHashSet<TermId> = DetHashSet::default();
         let mut stack = vec![term];
         let mut visited = 0usize;

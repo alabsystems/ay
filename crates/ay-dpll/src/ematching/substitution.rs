@@ -311,13 +311,18 @@ pub(crate) fn subst_vars(
 
 /// Substitute variables without applying any semantic simplification.
 ///
-/// This deliberately supports only the quantifier-free fragment accepted by
-/// Alethe's strict `forall_inst` checker.  It is the certificate-producing
-/// counterpart of [`subst_vars`]: applications, negations, and ITEs are rebuilt
-/// with raw constructors so an instance such as `(< 0 0)` cannot collapse to
-/// `false` before the checker compares it with the authored quantifier body.
-/// Nested binders and lets fail closed instead of approximating capture rules
-/// that the checker does not accept.
+/// This is the certificate-producing counterpart of [`subst_vars`]:
+/// applications, negations, and ITEs are rebuilt with raw constructors so an
+/// instance such as `(< 0 0)` cannot collapse to `false` before the checker
+/// compares it with the authored quantifier body.
+///
+/// The historical `_qf` name is retained for call-site stability, but the
+/// strict checker now accepts capture-safe substitution beneath preserved
+/// `forall`/`exists` binders. Mirror that exact lane here: nested binding lists
+/// and trigger-group structure are preserved, shadowed names are blocked, and a
+/// replacement which contains any source/nested binder name (or another binder
+/// or let) fails closed. Lets in the authored body remain unsupported, exactly
+/// like the checker.
 pub(crate) fn subst_vars_exact_qf(
     terms: &mut TermStore,
     term: TermId,
@@ -325,97 +330,276 @@ pub(crate) fn subst_vars_exact_qf(
 ) -> Option<TermId> {
     const WORK_LIMIT: usize = 100_000;
 
+    fn nested_binder_names(
+        terms: &TermStore,
+        root: TermId,
+        work: &mut usize,
+    ) -> Option<HashSet<String>> {
+        let mut names = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if *work >= WORK_LIMIT {
+                return None;
+            }
+            *work += 1;
+            match terms.get(term) {
+                TermData::Forall(bindings, body, triggers)
+                | TermData::Exists(bindings, body, triggers) => {
+                    names.extend(bindings.iter().map(|(name, _)| name.clone()));
+                    stack.push(*body);
+                    stack.extend(triggers.iter().flatten().copied());
+                }
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_branch, else_branch) => {
+                    stack.extend([*condition, *then_branch, *else_branch]);
+                }
+                TermData::Let(..) => return None,
+                _ => {}
+            }
+        }
+        Some(names)
+    }
+
+    fn replacement_is_ground_for(
+        terms: &TermStore,
+        root: TermId,
+        source_binders: &HashSet<String>,
+        work: &mut usize,
+    ) -> Option<bool> {
+        let mut seen = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if *work >= WORK_LIMIT {
+                return None;
+            }
+            *work += 1;
+            match terms.get(term) {
+                TermData::Var(name, _) if source_binders.contains(name) => return Some(false),
+                TermData::Var(..) | TermData::Const(..) => {}
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_branch, else_branch) => {
+                    stack.extend([*condition, *then_branch, *else_branch]);
+                }
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                    return Some(false);
+                }
+                _ => return Some(false),
+            }
+        }
+        Some(true)
+    }
+
+    fn replacement_avoids_nested_names(
+        terms: &TermStore,
+        root: TermId,
+        nested_names: &HashSet<String>,
+        work: &mut usize,
+    ) -> Option<bool> {
+        let mut seen = HashSet::default();
+        let mut stack = vec![root];
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if *work >= WORK_LIMIT {
+                return None;
+            }
+            *work += 1;
+            match terms.get(term) {
+                TermData::Var(name, _) if nested_names.contains(name) => return Some(false),
+                TermData::Var(..) | TermData::Const(..) => {}
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_branch, else_branch) => {
+                    stack.extend([*condition, *then_branch, *else_branch]);
+                }
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                    return Some(false);
+                }
+                _ => return Some(false),
+            }
+        }
+        Some(true)
+    }
+
     fn visit(
         terms: &mut TermStore,
         term: TermId,
         subst: &HashMap<String, TermId>,
-        memo: &mut HashMap<TermId, TermId>,
+        blocked: &HashSet<String>,
         matched_var_ids: &mut HashMap<String, u32>,
         work: &mut usize,
     ) -> Option<TermId> {
-        if let Some(&rewritten) = memo.get(&term) {
-            return Some(rewritten);
-        }
+        // Deliberately do not memoize this exact walk. The strict checker visits
+        // every structural pattern/instance occurrence, including repeated DAG
+        // edges; producer memoization could otherwise emit a proof which later
+        // exceeds the checker's shared work limit.
         if *work >= WORK_LIMIT {
             return None;
         }
         *work += 1;
-        let rewritten =
-            stacker::maybe_grow(SUBST_STACK_RED_ZONE, SUBST_STACK_SIZE, || {
-                match terms.get(term).clone() {
-                    TermData::Var(name, id) => {
-                        let Some(&replacement) = subst.get(&name) else {
-                            return Some(term);
-                        };
-                        if terms.sort(term) != terms.sort(replacement) {
-                            return None;
-                        }
-                        match matched_var_ids.get(&name) {
-                            Some(&seen) if seen != id => return None,
-                            Some(_) => {}
-                            None => {
-                                matched_var_ids.insert(name, id);
-                            }
-                        }
-                        Some(replacement)
+        stacker::maybe_grow(SUBST_STACK_RED_ZONE, SUBST_STACK_SIZE, || {
+            match terms.get(term).clone() {
+                TermData::Var(name, id) => {
+                    if blocked.contains(&name) {
+                        return Some(term);
                     }
-                    TermData::Const(_) => Some(term),
-                    TermData::App(symbol, args) => {
-                        let sort = terms.sort(term).clone();
-                        let rewritten: Vec<TermId> = args
-                            .iter()
-                            .copied()
-                            .map(|arg| visit(terms, arg, subst, memo, matched_var_ids, work))
-                            .collect::<Option<_>>()?;
-                        if rewritten == args {
-                            Some(term)
-                        } else {
-                            Some(terms.mk_app(symbol, rewritten, sort))
+                    let Some(&replacement) = subst.get(&name) else {
+                        return Some(term);
+                    };
+                    if terms.sort(term) != terms.sort(replacement) {
+                        return None;
+                    }
+                    match matched_var_ids.get(&name) {
+                        Some(&seen) if seen != id => return None,
+                        Some(_) => {}
+                        None => {
+                            matched_var_ids.insert(name, id);
                         }
                     }
-                    TermData::Not(inner) => {
-                        let rewritten = visit(terms, inner, subst, memo, matched_var_ids, work)?;
-                        if rewritten == inner {
-                            Some(term)
-                        } else {
-                            Some(terms.mk_not_raw(rewritten))
-                        }
-                    }
-                    TermData::Ite(condition, then_branch, else_branch) => {
-                        let rewritten_condition =
-                            visit(terms, condition, subst, memo, matched_var_ids, work)?;
-                        let rewritten_then =
-                            visit(terms, then_branch, subst, memo, matched_var_ids, work)?;
-                        let rewritten_else =
-                            visit(terms, else_branch, subst, memo, matched_var_ids, work)?;
-                        if (rewritten_condition, rewritten_then, rewritten_else)
-                            == (condition, then_branch, else_branch)
-                        {
-                            Some(term)
-                        } else {
-                            Some(terms.mk_ite_raw(
-                                rewritten_condition,
-                                rewritten_then,
-                                rewritten_else,
-                            ))
-                        }
-                    }
-                    TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => None,
-                    _ => None,
+                    Some(replacement)
                 }
-            })?;
-        memo.insert(term, rewritten);
-        Some(rewritten)
+                TermData::Const(_) => Some(term),
+                TermData::App(symbol, args) => {
+                    let sort = terms.sort(term).clone();
+                    let rewritten: Vec<TermId> = args
+                        .iter()
+                        .copied()
+                        .map(|arg| visit(terms, arg, subst, blocked, matched_var_ids, work))
+                        .collect::<Option<_>>()?;
+                    if rewritten == args {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_app(symbol, rewritten, sort))
+                    }
+                }
+                TermData::Not(inner) => {
+                    let rewritten = visit(terms, inner, subst, blocked, matched_var_ids, work)?;
+                    if rewritten == inner {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_not_raw(rewritten))
+                    }
+                }
+                TermData::Ite(condition, then_branch, else_branch) => {
+                    let rewritten_condition =
+                        visit(terms, condition, subst, blocked, matched_var_ids, work)?;
+                    let rewritten_then =
+                        visit(terms, then_branch, subst, blocked, matched_var_ids, work)?;
+                    let rewritten_else =
+                        visit(terms, else_branch, subst, blocked, matched_var_ids, work)?;
+                    if (rewritten_condition, rewritten_then, rewritten_else)
+                        == (condition, then_branch, else_branch)
+                    {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_ite_raw(rewritten_condition, rewritten_then, rewritten_else))
+                    }
+                }
+                TermData::Forall(bindings, body, triggers) => {
+                    let mut nested_blocked = blocked.clone();
+                    nested_blocked.extend(bindings.iter().map(|(name, _)| name.clone()));
+                    let rewritten_body =
+                        visit(terms, body, subst, &nested_blocked, matched_var_ids, work)?;
+                    let rewritten_triggers: Vec<Vec<TermId>> = triggers
+                        .iter()
+                        .map(|group| {
+                            group
+                                .iter()
+                                .copied()
+                                .map(|trigger| {
+                                    visit(
+                                        terms,
+                                        trigger,
+                                        subst,
+                                        &nested_blocked,
+                                        matched_var_ids,
+                                        work,
+                                    )
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<_>>()?;
+                    if rewritten_body == body && rewritten_triggers == triggers {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_forall_with_triggers(
+                            bindings,
+                            rewritten_body,
+                            rewritten_triggers,
+                        ))
+                    }
+                }
+                TermData::Exists(bindings, body, triggers) => {
+                    let mut nested_blocked = blocked.clone();
+                    nested_blocked.extend(bindings.iter().map(|(name, _)| name.clone()));
+                    let rewritten_body =
+                        visit(terms, body, subst, &nested_blocked, matched_var_ids, work)?;
+                    let rewritten_triggers: Vec<Vec<TermId>> = triggers
+                        .iter()
+                        .map(|group| {
+                            group
+                                .iter()
+                                .copied()
+                                .map(|trigger| {
+                                    visit(
+                                        terms,
+                                        trigger,
+                                        subst,
+                                        &nested_blocked,
+                                        matched_var_ids,
+                                        work,
+                                    )
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<_>>()?;
+                    if rewritten_body == body && rewritten_triggers == triggers {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_exists_with_triggers(
+                            bindings,
+                            rewritten_body,
+                            rewritten_triggers,
+                        ))
+                    }
+                }
+                TermData::Let(..) => None,
+                _ => None,
+            }
+        })
     }
 
     let mut work = 0usize;
-    let mut memo = HashMap::default();
+    let nested_names = nested_binder_names(terms, term, &mut work)?;
+    let source_binders = subst.keys().cloned().collect::<HashSet<_>>();
+    for &replacement in subst.values() {
+        // Keep the two scans separate and in checker order. Besides checking
+        // the same predicates, this ensures the producer consumes at least the
+        // same shared work budget as `forall_inst` validation.
+        if replacement_is_ground_for(terms, replacement, &source_binders, &mut work) != Some(true)
+            || replacement_avoids_nested_names(terms, replacement, &nested_names, &mut work)
+                != Some(true)
+        {
+            return None;
+        }
+    }
     let mut matched_var_ids = HashMap::default();
+    let blocked = HashSet::default();
     visit(
         terms,
         term,
         subst,
-        &mut memo,
+        &blocked,
         &mut matched_var_ids,
         &mut work,
     )

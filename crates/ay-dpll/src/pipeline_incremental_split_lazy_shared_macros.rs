@@ -89,14 +89,16 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 }
                 // Record structured theory proof (#6725) — mirrors no-split
                 // incremental path (pipeline_incremental_macros.rs:248).
+                // This shared dispatcher has no pipeline-level registry cache,
+                // so the registry data stays scoped to the proof-recording call
+                // and remains absent for non-DT problems.
                 let _sld_theory_proof = if $pe {
-                    $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                        &mut $self.proof_tracker,
-                        Some(&$self.ctx.terms),
-                        $neg.as_map(),
+                    dt_conflict_proof!(
+                        $self,
+                        $neg,
                         &conflict_terms,
+                        $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
                     )
-                    .1
                 } else {
                     None
                 };
@@ -209,21 +211,19 @@ macro_rules! pipeline_incremental_split_lazy_dispatch_theory_result {
                 // — mirrors no-split incremental path (pipeline_incremental_macros.rs:321-327).
                 let _sld_theory_proof = if $pe {
                     if _sld_farkas_proof_valid {
-                        $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
-                            &mut $self.proof_tracker,
-                            Some(&$self.ctx.terms),
-                            $neg.as_map(),
+                        dt_farkas_proof!(
+                            $self,
+                            $neg,
                             &conflict,
+                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
                         )
-                        .1
                     } else {
-                        $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                            &mut $self.proof_tracker,
-                            Some(&$self.ctx.terms),
-                            $neg.as_map(),
+                        dt_conflict_proof!(
+                            $self,
+                            $neg,
                             &conflict.literals,
+                            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
                         )
-                        .1
                     }
                 } else {
                     None

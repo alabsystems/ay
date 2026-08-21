@@ -391,7 +391,7 @@ pub(crate) fn lagrangian_dual_floor(
 /// Ablation twin of [`lagrangian_dual_floor`] with the single-row-closure
 /// separator disabled — the paired arm for measuring what SRC contributes to
 /// the subgradient floor (`ay-pb-dev probe subfloor`). Never a production path.
-#[cfg(any(test, feature = "dev-tools"))]
+#[cfg(feature = "dev-tools")]
 pub(crate) fn lagrangian_dual_floor_without_src(
     objective: &PbObjective,
     constraints: &[PbConstraint],
@@ -401,7 +401,7 @@ pub(crate) fn lagrangian_dual_floor_without_src(
     lagrangian_dual_floor_impl(objective, constraints, num_vars, should_stop, false)
 }
 
-/// Body of [`lagrangian_dual_floor`]. `use_src` exists solely so the dev/test
+/// Body of [`lagrangian_dual_floor`]. `use_src` exists solely so the dev-tool
 /// ablation twin can run the IDENTICAL loop minus the SRC separator; every
 /// production caller passes `true`.
 fn lagrangian_dual_floor_impl(
@@ -2930,7 +2930,6 @@ pub(crate) fn generate_farkas_anchor_json() -> Result<(String, String), String> 
 mod tests {
     use super::*;
     use crate::types::{PbConstraint, PbLit, PbObjective, PbRel, PbTerm};
-    use ay_test_support::env::with_serialized_env_vars;
 
     fn lit(var: u32) -> PbLit {
         PbLit {

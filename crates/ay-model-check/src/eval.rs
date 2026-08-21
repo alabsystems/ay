@@ -326,7 +326,16 @@ impl<'a> Evaluator<'a> {
                         args: Vec::new(),
                     })
                 })
-                .ok_or_else(|| "model does not pin this leaf".to_string()),
+                // NAME and sort the leaf. A bare "does not pin this leaf" gave
+                // a `cannot-confirm` no attribution at all, so every
+                // completeness investigation had to re-instrument the gate to
+                // learn WHICH leaf and carrier the model failed to cover.
+                .ok_or_else(|| {
+                    format!(
+                        "model does not pin this leaf: {name} : {:?}",
+                        self.terms.sort(term)
+                    )
+                }),
             TermData::Not(inner) => Ok(ModelValue::Bool(!self.eval_bool(*inner, depth + 1)?)),
             TermData::Ite(c, t, e) => {
                 if self.eval_bool(*c, depth + 1)? {
@@ -1022,7 +1031,15 @@ impl<'a> Evaluator<'a> {
         // the evaluator vs. complete the model — and the misattribution sends a
         // reader to the wrong one. Keep `dt_err` in the text so the datatype
         // path is still diagnosable when that is genuinely the cause.
-        let val = if let Some(committed) = self.model.uf_app_value(term) {
+        //
+        // The argument values are passed through (`uf_app_value_at`) so an
+        // implementor whose PUBLISHED model interprets the function totally —
+        // a table plus an else branch — can answer AT this argument point, and
+        // can RECONCILE a per-application pin against that published body. The
+        // value is still keyed into `uf_graph` by these same argument values
+        // below, so single-valuedness is enforced identically
+        // (#g3-gate-reads-printed-uf).
+        let val = if let Some(committed) = self.model.uf_app_value_at(term, &arg_vals) {
             // A normal model commitment always wins. The typed fallback exists
             // solely for otherwise-uncommitted theory applications.
             committed

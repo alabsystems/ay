@@ -211,6 +211,65 @@ pub(crate) struct QpfPremiseForcedInstanceRecord {
     pub(crate) asserted: TermId,
 }
 
+/// Producer hint for the #dt-context-derivation fragment channel: a solver-
+/// injected clause that is NOT a standalone theory tautology but IS entailed
+/// by the recorded `premises` (asserted top-level facts). The record grants
+/// no authority by itself: sealing independently re-derives the entailment
+/// (the widened clause `clause ∨ ¬premises` must pass the bounded ground
+/// refuter), and the fragment lane re-derives it AGAIN at consumption while
+/// discharging every premise as an authored assumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DtContextConflictRecord {
+    /// The emitted clause's literal terms, in emission order.
+    pub(crate) clause: Vec<TermId>,
+    /// Asserted premise terms that make the clause entailed.
+    pub(crate) premises: Vec<TermId>,
+}
+
+/// Deduplicated, capped store for [`DtContextConflictRecord`] producer hints
+/// (#dt-context-derivation). Theory propagations re-mint across restarts by
+/// the thousands; first-wins keying by the normalized clause keeps one hint
+/// per distinct fact so the firehose cannot crowd out conflict records.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DtContextConflictSink {
+    pub(crate) records: Vec<DtContextConflictRecord>,
+    keys: ay_core::kani_compat::DetHashSet<Vec<TermId>>,
+}
+
+impl DtContextConflictSink {
+    const MAX_RECORDS: usize = 16384;
+    const MAX_PREMISES: usize = 16;
+
+    /// First-wins record with dedup and caps; degenerate hints are dropped
+    /// (a missing hint can only decline an authentication, never mint one).
+    pub(crate) fn record(&mut self, clause: Vec<TermId>, premises: Vec<TermId>) {
+        if clause.is_empty()
+            || premises.is_empty()
+            || premises.len() > Self::MAX_PREMISES
+            || self.records.len() >= Self::MAX_RECORDS
+        {
+            return;
+        }
+        let mut key = clause.clone();
+        key.sort_unstable();
+        key.dedup();
+        if !self.keys.insert(key) {
+            return;
+        }
+        self.records
+            .push(DtContextConflictRecord { clause, premises });
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.records.len() >= Self::MAX_RECORDS
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+        self.keys.clear();
+    }
+}
+
 /// The clique behind a finite-enum pigeonhole refutation, with per-pair source
 /// provenance so the proof layer can emit real `Assume` steps.
 #[derive(Debug, Clone)]

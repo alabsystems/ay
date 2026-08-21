@@ -8,6 +8,7 @@ use crate::tune::Knob;
 use std::time::{Duration, Instant};
 
 mod branch_and_bound;
+mod carriers;
 mod config;
 mod dual_simplex;
 mod profile;
@@ -153,6 +154,7 @@ pub struct EngineEconomics {
     full_pricing: Option<bool>,
     dual_bypass: Option<usize>,
     eager_perturb: Option<usize>,
+    float_lane: Option<bool>,
     mir_knap: Option<bool>,
     bound_branch: Option<bool>,
     child_order: Option<usize>,
@@ -196,6 +198,9 @@ pub struct EngineEconomics {
     vsids: Option<bool>,
     root_probe_all: Option<bool>,
     sepstat: Option<bool>,
+    root_closure_presolve: Option<bool>,
+    tableau_mir: Option<bool>,
+    mir_agg_root: Option<bool>,
     lp_stats: Option<bool>,
     step_trace: Option<usize>,
     bump_diag: Option<bool>,
@@ -205,6 +210,7 @@ pub struct EngineEconomics {
     smt_lane: Option<bool>,
     max_nodes: Option<usize>,
     struct_elim: Option<bool>,
+    affine_agg: Option<bool>,
     bound_cover: Option<bool>,
     pump_iter_mult: Option<f64>,
     pump_iter_cap: Option<bool>,
@@ -220,6 +226,76 @@ pub struct EngineEconomics {
     lb_arm: Option<usize>,
     lb_strict: Option<bool>,
     dual_cutoff: Option<f64>,
+    // ------------------------------------------------------------------
+    // CARRIERS FOR THE READER-WITHOUT-WRITER CENSUS (`opts/carriers.rs`).
+    //
+    // Each knob had a reader but no writer, making its CLI switch unrecognised and inert.
+    // `tests/knob_census.rs` fails if that state returns. Every field remains
+    // `None` by default, so no compiled default moves.
+    // ------------------------------------------------------------------
+    singleton_sub: Option<bool>,
+    node_cut_eager: Option<bool>,
+    amo_multiway: Option<bool>,
+    node_rc: Option<bool>,
+    rc_cap_guard: Option<bool>,
+    tri_crash_all: Option<bool>,
+    sym_branch: Option<bool>,
+    stab_orbit: Option<bool>,
+    orbitope_dyn: Option<bool>,
+    tree_floor: Option<bool>,
+    tree_bound_outcome: Option<bool>,
+    root_floor: Option<bool>,
+    cover_minimal: Option<bool>,
+    gub_clique: Option<bool>,
+    gmi_cut_trace: Option<bool>,
+    cond_tighten: Option<bool>,
+    mod_k: Option<bool>,
+    knap_dbg: Option<bool>,
+    cold_dual_all: Option<bool>,
+    cut_warm: Option<bool>,
+    rlt: Option<bool>,
+    dive_commit_stopped: Option<bool>,
+    root_warm: Option<bool>,
+    orbitope_branch: Option<bool>,
+    orbitope_ilv: Option<bool>,
+    orbitope_branch_dyn: Option<bool>,
+    node_cut_local: Option<bool>,
+    cond_scout: Option<bool>,
+    hybrid_pb_lp: Option<bool>,
+    attrib: Option<bool>,
+    acensus: Option<bool>,
+    hybrid_term: Option<bool>,
+    root_probe_lp_rank: Option<bool>,
+    ms_dive: Option<bool>,
+    mas74_plunge: Option<bool>,
+    relax_lift: Option<bool>,
+    force_devex: Option<bool>,
+    bump_btf: Option<bool>,
+    node_cut_slots: Option<usize>,
+    node_cut_every: Option<usize>,
+    node_gmi: Option<usize>,
+    node_gmi_every: Option<usize>,
+    scale: Option<usize>,
+    cut_topk: Option<usize>,
+    sb_probe_iters: Option<usize>,
+    root_probe_cap: Option<usize>,
+    root_probe_clique_cap: Option<usize>,
+    node_cut_batch: Option<usize>,
+    node_cut_age: Option<usize>,
+    ms_dive_steps: Option<usize>,
+    gmi_max_rows: Option<usize>,
+    chain_probe: Option<usize>,
+    bump_lu_min: Option<usize>,
+    cold_lu_eta_rebuilds: Option<usize>,
+    adopt_ft_max_rows: Option<usize>,
+    refactor_every: Option<usize>,
+    eta_cap_mult: Option<usize>,
+    lu_max_fill_nnz: Option<usize>,
+    node_gmi_margin: Option<f64>,
+    dive_probe_secs: Option<f64>,
+    rens_window: Option<f64>,
+    root_probe_share: Option<f64>,
+    prop_first: Option<f64>,
 }
 
 /// Which arm solves the dual long-step's flip aggregate (B19).

@@ -767,3 +767,382 @@ fn mod_range_rejects_every_non_theorem_shape() {
         "the theorem must have negated-equality polarity"
     );
 }
+
+// ─── Guarded disequality split: the POSITIVE-INTEGER-SCALED guard ───────────
+//
+// `recognize_arith_disequality_split` historically required the guard's
+// canonical linear form to be IDENTICAL to the branch form (`k = 1`). The
+// producer in `split_incremental` emits the guard as the asserted
+// disequality's own equality, which on the div/mod-elimination route is scaled
+// — `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`. These tests pin the extension AND the
+// exact boundary it must not cross.
+
+/// Build `(op a b)` with no builder-side simplification, so the tested clause
+/// is byte-for-byte the shape the producer emits.
+fn split_atom(terms: &mut TermStore, op: &str, a: TermId, b: TermId, sort: Sort) -> TermId {
+    terms.mk_app(crate::Symbol::named(op), vec![a, b], sort)
+}
+
+/// `(+ (* v coeff) constant)`, unsimplified.
+fn affine(terms: &mut TermStore, v: TermId, coeff: i64, constant: i64) -> TermId {
+    let c = terms.mk_int(BigInt::from(coeff));
+    let k = terms.mk_int(BigInt::from(constant));
+    let scaled = split_atom(terms, "*", v, c, Sort::Int);
+    split_atom(terms, "+", scaled, k, Sort::Int)
+}
+
+/// `(cl (<= v upper) (<= lower v) (= (+ (* v gc) ge) (+ (* v gf) gg)))`.
+fn scaled_split_clause(
+    terms: &mut TermStore,
+    v: TermId,
+    bounds: (i64, i64),
+    guard: (i64, i64, i64, i64),
+) -> Vec<TermId> {
+    let (upper, lower) = bounds;
+    let (gc, ge, gf, gg) = guard;
+    let upper_const = terms.mk_int(BigInt::from(upper));
+    let lower_const = terms.mk_int(BigInt::from(lower));
+    let first = split_atom(terms, "<=", v, upper_const, Sort::Bool);
+    let second = split_atom(terms, "<=", lower_const, v, Sort::Bool);
+    let lhs = affine(terms, v, gc, ge);
+    let rhs = affine(terms, v, gf, gg);
+    let guard = split_atom(terms, "=", lhs, rhs, Sort::Bool);
+    vec![first, second, guard]
+}
+
+#[test]
+fn scaled_guard_accepts_the_benchmark_clause_and_reports_its_multiplier() {
+    // The exact dillig12_m clause: `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`.
+    // Branch form `(q, T=0)`; the guard canonicalizes to `2q = 0`, so `k = 2`
+    // and `T_g = 2·0`. Affine on BOTH sides — the constant is absorbed into
+    // the canonical TARGET, which is exactly why `T_g = k·T_b` IS the whole
+    // constant-scaling requirement.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("_mod_q_0", Sort::Int);
+    let clause = scaled_split_clause(&mut terms, q, (-1, 1), (2, 1, 4, 1));
+    assert!(super::lia::recognize_arith_disequality_split(
+        &terms, &clause
+    ));
+    assert_eq!(
+        super::lia::arith_disequality_split_guard_multiplier(&terms, &clause),
+        Some(BigInt::from(2))
+    );
+    // The emission-side narrowing: a scaled guard is NOT primitive, so the
+    // Alethe printer must not lower it through the guard's own operands.
+    assert!(!super::lia::arith_disequality_split_has_primitive_guard(
+        &terms, &clause
+    ));
+}
+
+#[test]
+fn scaled_guard_accepts_primitive_control_unchanged() {
+    // The `k = 1` control from the same probe: `q <= -1 ∨ q >= 1 ∨ q = 0`.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let first = split_atom(&mut terms, "<=", q, minus_one, Sort::Bool);
+    let second = split_atom(&mut terms, "<=", one, q, Sort::Bool);
+    let guard = split_atom(&mut terms, "=", q, zero, Sort::Bool);
+    let clause = vec![first, second, guard];
+    assert_eq!(
+        super::lia::arith_disequality_split_guard_multiplier(&terms, &clause),
+        Some(BigInt::from(1))
+    );
+    assert!(super::lia::arith_disequality_split_has_primitive_guard(
+        &terms, &clause
+    ));
+}
+
+#[test]
+fn scaled_guard_accepts_a_nonzero_branch_target() {
+    // `q <= 0 ∨ q >= 2 ∨ 3q + 1 = 4` — branch target `T_b = 1`, guard
+    // canonical `3q = 3 = 3·T_b`. The constant MUST scale with the
+    // coefficients; this is the case a homogeneous-only implementation would
+    // pass for the wrong reason.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let clause = scaled_split_clause(&mut terms, q, (0, 2), (3, 1, 0, 4));
+    assert_eq!(
+        super::lia::arith_disequality_split_guard_multiplier(&terms, &clause),
+        Some(BigInt::from(3))
+    );
+}
+
+#[test]
+fn scaled_guard_rejects_a_target_that_does_not_scale() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    // ADVERSARIAL: guard scaled by 2, target left at `T_b = 1`.
+    // `q <= 0 ∨ q >= 2 ∨ 2q = 1` is FALSE at q = 1.
+    let guard_scaled_only = scaled_split_clause(&mut terms, q, (0, 2), (2, 0, 0, 1));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &guard_scaled_only
+    ));
+    // ADVERSARIAL: target scaled by 2, coefficients left at `k = 1`.
+    // `q <= 0 ∨ q >= 2 ∨ q = 2` is FALSE at q = 1.
+    let target_scaled_only = scaled_split_clause(&mut terms, q, (0, 2), (1, 0, 0, 2));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &target_scaled_only
+    ));
+    // ADVERSARIAL: `2q = 1` against branch target 0.
+    // `q <= -1 ∨ q >= 1 ∨ 2q = 1` is FALSE at q = 0.
+    let unsolvable_guard = scaled_split_clause(&mut terms, q, (-1, 1), (2, 0, 0, 1));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &unsolvable_guard
+    ));
+}
+
+#[test]
+fn scaled_guard_rejects_zero_and_non_integer_multipliers() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    // ADVERSARIAL k = 0: the guard's canonical form collapses to `0 = 0`, so
+    // it carries no relation to the branches at all. Rejected — accepting it
+    // would make the multiplier search unable to tell a degenerate guard from
+    // a genuinely scaled one.
+    let zero_scale = scaled_split_clause(&mut terms, q, (-1, 1), (0, 0, 0, 0));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &zero_scale
+    ));
+    // ADVERSARIAL non-integer k: branches on `2q`, guard on `3q` (`k = 3/2`).
+    // Fail-closed — this clause happens to be valid and is simply not
+    // certified by this rule.
+    let two = terms.mk_int(BigInt::from(2));
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let two_q = split_atom(&mut terms, "*", q, two, Sort::Int);
+    let first = split_atom(&mut terms, "<=", two_q, minus_one, Sort::Bool);
+    let second = split_atom(&mut terms, "<=", one, two_q, Sort::Bool);
+    let three = terms.mk_int(BigInt::from(3));
+    let zero = terms.mk_int(BigInt::from(0));
+    let three_q = split_atom(&mut terms, "*", q, three, Sort::Int);
+    let guard = split_atom(&mut terms, "=", three_q, zero, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[first, second, guard]
+    ));
+}
+
+#[test]
+fn scaled_guard_rejects_mismatched_variables() {
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let r = terms.mk_var("r", Sort::Int);
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let zero = terms.mk_int(BigInt::from(0));
+    let two = terms.mk_int(BigInt::from(2));
+    let first = split_atom(&mut terms, "<=", q, minus_one, Sort::Bool);
+    let second = split_atom(&mut terms, "<=", one, q, Sort::Bool);
+    // ADVERSARIAL: the guard scales a DIFFERENT variable.
+    // `q <= -1 ∨ q >= 1 ∨ 2r = 0` is FALSE at q = 0, r = 1.
+    let two_r = split_atom(&mut terms, "*", r, two, Sort::Int);
+    let other_var = split_atom(&mut terms, "=", two_r, zero, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[first, second, other_var]
+    ));
+    // ADVERSARIAL: the guard carries an EXTRA variable.
+    // `q <= -1 ∨ q >= 1 ∨ 2q + 2r = 0` is FALSE at q = 0, r = 1.
+    let two_q = split_atom(&mut terms, "*", q, two, Sort::Int);
+    let sum = split_atom(&mut terms, "+", two_q, two_r, Sort::Int);
+    let extra_var = split_atom(&mut terms, "=", sum, zero, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[first, second, extra_var]
+    ));
+    // ADVERSARIAL: the two BRANCHES bracket different forms.
+    // `q <= -1 ∨ r >= 1 ∨ 2q = 0` is FALSE at q = 1, r = 0.
+    let r_lower = split_atom(&mut terms, "<=", one, r, Sort::Bool);
+    let scaled_guard = split_atom(&mut terms, "=", two_q, zero, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[first, r_lower, scaled_guard]
+    ));
+}
+
+#[test]
+fn scaled_guard_rejects_a_gap_wider_than_one_value() {
+    // ADVERSARIAL: `q <= -2 ∨ q >= 1 ∨ 2q = 0` is FALSE at q = -1 — the
+    // branches no longer force `C_b = T_b`, so no multiplier can rescue it.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let clause = scaled_split_clause(&mut terms, q, (-2, 1), (2, 0, 0, 0));
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms, &clause
+    ));
+}
+
+#[test]
+fn scaled_guard_stays_out_of_the_real_arm() {
+    // ADVERSARIAL: over Real the branches do NOT force `C_b = T_b`
+    // (`T_b - 1 < x < T_b + 1` has non-integer solutions), so the scaling
+    // argument is invalid there. The Real arm is untouched and matches only
+    // the exact strict-order pair on the guard's own operands.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let two = terms.mk_rational(num_rational::BigRational::from(BigInt::from(2)));
+    let forward = split_atom(&mut terms, "<", x, y, Sort::Bool);
+    let reverse = split_atom(&mut terms, "<", y, x, Sort::Bool);
+    let two_x = split_atom(&mut terms, "*", x, two, Sort::Real);
+    let two_y = split_atom(&mut terms, "*", y, two, Sort::Real);
+    let scaled_guard = split_atom(&mut terms, "=", two_x, two_y, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[forward, reverse, scaled_guard]
+    ));
+}
+
+#[test]
+fn positive_integer_scale_rejects_zero_negative_and_fractional() {
+    use std::collections::BTreeMap;
+    let base_var = TermId(7);
+    let other_var = TermId(9);
+    let base: BTreeMap<TermId, BigInt> = [(base_var, BigInt::from(2))].into_iter().collect();
+    let scale = |c: i64| -> BTreeMap<TermId, BigInt> {
+        [(base_var, BigInt::from(c))].into_iter().collect()
+    };
+
+    // The canonical maps `int_linear_diff` produces can never SPELL a zero or
+    // negative multiplier (`LinearExpr` drops a coefficient the moment it
+    // reaches zero, and both callers normalize the leading coefficient
+    // positive), so these branches are pinned at the helper — the only place
+    // they are reachable at all.
+    assert_eq!(
+        super::lia::positive_integer_scale(&base, &scale(0)),
+        None,
+        "k = 0 must be rejected"
+    );
+    assert_eq!(
+        super::lia::positive_integer_scale(&base, &scale(-4)),
+        None,
+        "k < 0 must be rejected"
+    );
+    assert_eq!(
+        super::lia::positive_integer_scale(&base, &scale(3)),
+        None,
+        "k = 3/2 is not an integer and must be rejected"
+    );
+    assert_eq!(
+        super::lia::positive_integer_scale(&base, &scale(6)),
+        Some(BigInt::from(3))
+    );
+    // A different variable at the same arity must not scale.
+    let renamed: BTreeMap<TermId, BigInt> = [(other_var, BigInt::from(4))].into_iter().collect();
+    assert_eq!(super::lia::positive_integer_scale(&base, &renamed), None);
+    // A pivot that scales while a sibling does not.
+    let two_var_base: BTreeMap<TermId, BigInt> =
+        [(base_var, BigInt::from(2)), (other_var, BigInt::from(3))]
+            .into_iter()
+            .collect();
+    let inconsistent: BTreeMap<TermId, BigInt> =
+        [(base_var, BigInt::from(4)), (other_var, BigInt::from(7))]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        super::lia::positive_integer_scale(&two_var_base, &inconsistent),
+        None
+    );
+    let empty: BTreeMap<TermId, BigInt> = BTreeMap::new();
+    assert_eq!(super::lia::positive_integer_scale(&empty, &empty), None);
+}
+
+#[test]
+fn scaled_guard_accepts_only_genuine_integer_tautologies() {
+    // EXHAUSTIVE ADVERSARIAL SWEEP. Every clause of the split's own shape
+    //     `q <= upper ∨ lower <= q ∨ (gc·q + ge = gf·q + gg)`
+    // over a small coefficient box is offered to the recognizer, and every
+    // ACCEPT is independently re-evaluated at 81 integer points. An accept
+    // that is false anywhere is a meta-false-PROVE, so this is the test that
+    // catches a mis-stated multiplier rule.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("sweep-q", Sort::Int);
+    let range = -2_i64..=2;
+    let mut accepted = 0_u32;
+    for upper in range.clone() {
+        for lower in range.clone() {
+            for gc in range.clone() {
+                for ge in range.clone() {
+                    for gf in range.clone() {
+                        for gg in range.clone() {
+                            let clause = scaled_split_clause(
+                                &mut terms,
+                                q,
+                                (upper, lower),
+                                (gc, ge, gf, gg),
+                            );
+                            if !super::lia::recognize_arith_disequality_split(&terms, &clause) {
+                                continue;
+                            }
+                            accepted += 1;
+                            for value in -40_i64..=40 {
+                                let holds = value <= upper
+                                    || lower <= value
+                                    || gc * value + ge == gf * value + gg;
+                                assert!(
+                                    holds,
+                                    "ACCEPTED a non-tautology: \
+                                     q <= {upper} | {lower} <= q | {gc}q + {ge} = {gf}q + {gg} \
+                                     is FALSE at q = {value}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Guard against the sweep silently accepting nothing, which would make the
+    // assertion above vacuous.
+    assert!(
+        accepted >= 20,
+        "sweep degenerated: only {accepted} clauses accepted"
+    );
+}
+
+#[test]
+fn scaled_guard_rejects_a_per_variable_ratio() {
+    // ADVERSARIAL: the multiplier must be UNIFORM. Branches bracket `q + r`;
+    // the guard scales `q` by 2 and `r` by 3. `q + r <= -1 ∨ q + r >= 1 ∨
+    // 2q + 3r = 0` is FALSE at q = 1, r = -1 (the branch form is 0, the guard
+    // form is -1). Only the full per-coefficient verification rejects this —
+    // a pivot-only check would accept it.
+    let mut terms = TermStore::new();
+    let q = terms.mk_var("q", Sort::Int);
+    let r = terms.mk_var("r", Sort::Int);
+    let minus_one = terms.mk_int(BigInt::from(-1));
+    let one = terms.mk_int(BigInt::from(1));
+    let zero = terms.mk_int(BigInt::from(0));
+    let two = terms.mk_int(BigInt::from(2));
+    let three = terms.mk_int(BigInt::from(3));
+    let sum = split_atom(&mut terms, "+", q, r, Sort::Int);
+    let first = split_atom(&mut terms, "<=", sum, minus_one, Sort::Bool);
+    let second = split_atom(&mut terms, "<=", one, sum, Sort::Bool);
+    let two_q = split_atom(&mut terms, "*", q, two, Sort::Int);
+    let three_r = split_atom(&mut terms, "*", r, three, Sort::Int);
+    let skewed = split_atom(&mut terms, "+", two_q, three_r, Sort::Int);
+    let guard = split_atom(&mut terms, "=", skewed, zero, Sort::Bool);
+    assert!(!super::lia::recognize_arith_disequality_split(
+        &terms,
+        &[first, second, guard]
+    ));
+
+    // The UNIFORM companion is accepted: `2q + 2r = 0` is `k = 2`.
+    let two_r = split_atom(&mut terms, "*", r, two, Sort::Int);
+    let uniform = split_atom(&mut terms, "+", two_q, two_r, Sort::Int);
+    let uniform_guard = split_atom(&mut terms, "=", uniform, zero, Sort::Bool);
+    assert_eq!(
+        super::lia::arith_disequality_split_guard_multiplier(
+            &terms,
+            &[first, second, uniform_guard]
+        ),
+        Some(BigInt::from(2))
+    );
+}

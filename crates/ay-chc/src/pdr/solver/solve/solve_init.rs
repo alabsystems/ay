@@ -393,27 +393,11 @@ impl PdrSolver {
                     // Map clause variables to canonical predicate variables
                     if let Some(canonical_vars) = self.canonical_vars(*pred) {
                         if head_args.len() == canonical_vars.len() {
-                            // Build substitution from clause vars to canonical vars
-                            let mut rewritten = constraint.clone();
-                            // #2492: Also extract constituent vars from expression head args
-                            for (arg, canon_var) in head_args.iter().zip(canonical_vars.iter()) {
-                                match arg {
-                                    ChcExpr::Var(arg_var) => {
-                                        rewritten = rewritten.substitute(&[(
-                                            arg_var.clone(),
-                                            ChcExpr::var(canon_var.clone()),
-                                        )]);
-                                    }
-                                    expr => {
-                                        for v in expr.vars() {
-                                            rewritten = rewritten.substitute(&[(
-                                                v.clone(),
-                                                ChcExpr::var(v.clone()),
-                                            )]);
-                                        }
-                                    }
-                                }
-                            }
+                            let rewritten = fact_summary::rewrite_fact_summary(
+                                &constraint,
+                                head_args,
+                                canonical_vars,
+                            );
                             if self.config.verbose {
                                 safe_eprintln!(
                                     "PDR: Init must-summary for pred {} at level 0: {}",

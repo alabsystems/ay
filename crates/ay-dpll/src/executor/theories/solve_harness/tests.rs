@@ -9,6 +9,7 @@ use num_rational::BigRational;
 use num_traits::FromPrimitive;
 
 mod split_atoms;
+mod var_subst_provenance;
 
 fn rat(n: i64) -> BigRational {
     BigRational::from_i64(n).unwrap()
@@ -155,13 +156,13 @@ const EQ_DIFFVAR_GUARDED_SCRIPT: &str = r#"
 "#;
 
 /// Inc-18 / #eq-diffvar-uncertifiable: `:ay-eq-diffvar` selects the EqDiffVar
-/// pass for THIS executor only, and the default is OFF.
+/// pass for THIS executor only, and the default is ON again.
 ///
 /// The arms drive `preprocess_lia_artifacts` DIRECTLY rather than through
 /// `(check-sat)`: that isolates the option from solve-time routing, so this
 /// test pins the option's meaning and nothing else. The published-verdict
 /// consequence is pinned separately by
-/// `eq_diffvar_must_not_break_mandatory_unsat_certification`.
+/// `eq_diffvar_runs_and_mandatory_unsat_certification_survives`.
 #[test]
 fn set_option_ay_eq_diffvar_selects_pass_per_run() {
     /// Load the declares/asserts (no `(check-sat)`, so no public solve begins),
@@ -177,17 +178,18 @@ fn set_option_ay_eq_diffvar_selects_pass_per_run() {
         exec
     }
 
-    // Default: OFF. The reduction is opt-in because it costs correct `unsat`
-    // verdicts — see `Executor::eq_diffvar_pass_enabled`.
+    // Default: ON. The two failures that made it opt-in no longer reproduce —
+    // see `Executor::eq_diffvar_pass_enabled` for today's measurements.
     let exec = preprocess_only("");
-    assert!(!exec.eq_diffvar_pass_enabled());
-    assert_eq!(
-        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
-        None,
-        "the EqDiffVar reduction must be opt-in"
+    assert!(exec.eq_diffvar_pass_enabled());
+    assert!(
+        exec.statistics()
+            .get_int("preprocess.eq_diffvar.diff_vars")
+            .is_some_and(|n| n > 0),
+        "the EqDiffVar reduction runs by default"
     );
 
-    // Explicit opt-in still runs the pass, unchanged.
+    // Explicit opt-in is still honoured, unchanged.
     let exec = preprocess_only("(set-option :ay-eq-diffvar true)");
     assert!(exec.eq_diffvar_pass_enabled());
     assert!(
@@ -261,25 +263,30 @@ fn set_option_ay_unit_prop_false_disables_pass_per_run() {
     );
 }
 
-/// #eq-diffvar-uncertifiable: the difference-variable reduction must not run
-/// on a DEFAULT-mode public solve.
+/// #eq-diffvar-uncertifiable: the difference-variable reduction RUNS on a
+/// default-mode public solve, and the mandatory UNSAT certification survives it.
 ///
-/// The pass asserts a fresh `d` via the definitional pair `(<= d lin)` /
-/// `(>= d lin)`. Those assertions are solver-invented, so the reconstructed
-/// refutation's leaves for them carry no `assume` authority and are demoted
-/// to unit `trust` — which the MANDATORY UNSAT certification rejects, turning
-/// a correct `unsat` into `unknown`. The certification's rescue re-solve is
-/// no way out either: that executor inherits `ctx`, so it inherits the pass,
-/// and on the guarded shape the pass is what makes it miss its 2000ms budget.
+/// This test used to assert the opposite — that the pass must not run — because
+/// its fresh `d`, asserted via the definitional pair `(<= d lin)` / `(>= d lin)`,
+/// is solver-invented: the reconstructed refutation's leaves for it carried no
+/// `assume` authority, were demoted to unit `trust`, and mandatory certification
+/// turned a correct `unsat` into `unknown`. On today's certification lanes
+/// neither of the two historical failures reproduces, so the pass is enabled
+/// again and this pins the property that actually matters.
 ///
-/// This pins the PUBLISHED VERDICT, not the pass wiring — the point is the
-/// answer, and both queries below published `unknown` while the pass defaulted
-/// on. z3 agrees `unsat` on both. `preprocess.eq_diffvar.diff_vars` is asserted
-/// absent only as the attribution: it says WHY the verdict came back, so a
-/// future change that re-enables the pass fails here loudly instead of
-/// silently trading the verdict away again.
+/// It asserts three things per shape, and the third is the point: the verdict is
+/// `unsat`, the pass DID run (so the verdict is not coming from a fallback that
+/// quietly skipped the reduction), and the `unsat` is backed by a REAL
+/// certificate rather than published as a bare admission. Without the third
+/// assertion a future regression could re-introduce the downgrade and still pass
+/// here by publishing an uncertified verdict.
+///
+/// (a) certifies STRICTLY; (b) certifies through the deferred-trust discharge
+/// lane, which is a sanctioned discharge and not a downgrade — see the RESIDUAL
+/// GAP note on `Executor::eq_diffvar_pass_enabled` for why (b) is not strict and
+/// what the sound repair is.
 #[test]
-fn eq_diffvar_must_not_break_mandatory_unsat_certification() {
+fn eq_diffvar_runs_and_mandatory_unsat_certification_survives() {
     // (a) Unguarded: `distinct` over three ints in a two-value range. Three
     // disequality atoms, three difference variables, no sharing at all.
     let pigeon = r#"
@@ -304,11 +311,19 @@ fn eq_diffvar_must_not_break_mandatory_unsat_certification() {
         "3 pigeons / 2 holes is UNSAT (z3 agrees); a preprocessing pass that \
          costs the mandatory UNSAT certificate must not run here"
     );
-    assert_eq!(
-        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
-        None,
-        "the verdict must come from the plain pipeline, not from a run that \
-         happened to certify despite the reduction"
+    assert!(
+        exec.statistics()
+            .get_int("preprocess.eq_diffvar.diff_vars")
+            .is_some_and(|n| n > 0),
+        "the reduction must actually have run — otherwise this proves nothing \
+         about certification surviving it"
+    );
+    assert!(
+        exec.last_command_unsat_was_strictly_verified()
+            || exec.last_command_unsat_was_independently_verified()
+            || exec.last_command_unsat_was_exact_semantically_verified(),
+        "the `unsat` must be backed by a real certificate, not published as a \
+         bare admission"
     );
 
     // (b) Guarded var-var equality chain — the pass's own target shape.
@@ -336,11 +351,19 @@ fn eq_diffvar_must_not_break_mandatory_unsat_certification() {
         vec!["unsat"],
         "the guarded conservation network is UNSAT and must certify"
     );
-    assert_eq!(
-        exec.statistics().get_int("preprocess.eq_diffvar.diff_vars"),
-        None,
-        "the verdict must come from the plain pipeline, not from a run that \
-         happened to certify despite the reduction"
+    assert!(
+        exec.statistics()
+            .get_int("preprocess.eq_diffvar.diff_vars")
+            .is_some_and(|n| n > 0),
+        "the reduction must actually have run — otherwise this proves nothing \
+         about certification surviving it"
+    );
+    assert!(
+        exec.last_command_unsat_was_strictly_verified()
+            || exec.last_command_unsat_was_independently_verified()
+            || exec.last_command_unsat_was_exact_semantically_verified(),
+        "the `unsat` must be backed by a real certificate, not published as a \
+         bare admission"
     );
 }
 

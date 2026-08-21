@@ -1,0 +1,33 @@
+[package]
+name = "ay-nra-oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "Dev-only differential oracle: drives z3's algebraic-number and polynomial C API against AY's exact univariate / real-algebraic primitives"
+publish = false
+
+[[bin]]
+name = "ay-nra-oracle"
+path = "src/main.rs"
+
+[dependencies]
+# libz3 is dlopen'd at RUNTIME (RTLD_NOW | RTLD_LOCAL). Nothing links against
+# z3 at build time, so the oracle builds on a machine that has no z3 at all and
+# simply reports "oracle unavailable" when the dylib is missing.
+libloading = "0.8"
+libc = { workspace = true }
+num-bigint = { workspace = true }
+num-integer = { workspace = true }
+num-rational = { workspace = true }
+num-traits = { workspace = true }
+serde_json = { workspace = true }
+# The AY side under test. `oracle-api` is a dev-only facade feature over the
+# crate-private exact primitives; no shipping build enables it.
+ay-nra = { workspace = true, features = ["oracle-api"] }
+
+[lints]
+workspace = true

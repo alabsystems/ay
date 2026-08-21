@@ -203,6 +203,14 @@ impl Executor {
             return;
         };
         drop(pass);
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/proof-records merged: propagation entries={} rewrites={} exec={:p}",
+                records.entries.len(),
+                records.rewrites.len(),
+                self as *const _,
+            );
+        }
         self.merge_propagation_records(records);
     }
 
@@ -316,7 +324,7 @@ impl Executor {
             // cannot reach the recorded `after` still declines to today's
             // demotion. The constant leg is untouched, so the existing
             // derivations are byte-identical.
-            if !matches!(self.ctx.terms.get(value), ay_core::TermData::Const(_))
+            if !matches!(self.ctx.terms.get(value), TermData::Const(_))
                 && !Self::is_recorded_defining_equality(
                     &self.ctx.terms,
                     source_assertion,
@@ -351,26 +359,6 @@ impl Executor {
         }
 
         self.merge_propagation_records(PropagationRecords { rewrites, entries });
-    }
-
-    /// Whether `source` is spelled `(= expr value)` or `(= value expr)` — the
-    /// only shape the replay's entry arm may hand back as its licensing
-    /// equality. Mirrors the consumer-side `is_defining_equality` check in
-    /// `proof_propagated_rewrite::equality`, applied at MINT time so a
-    /// non-constant replacement can never seed an entry the consumer would
-    /// have to take on faith.
-    fn source_is_defining_equality(
-        terms: &TermStore,
-        source: TermId,
-        expr: TermId,
-        value: TermId,
-    ) -> bool {
-        match terms.get(source) {
-            TermData::App(symbol, args) if symbol.name() == "=" && args.len() == 2 => {
-                (args[0] == expr && args[1] == value) || (args[0] == value && args[1] == expr)
-            }
-            _ => false,
-        }
     }
 
     /// Mint `PropagateValues`-shaped provenance for the top-level
@@ -473,7 +461,15 @@ impl Executor {
         }
     }
 
-    fn merge_propagation_records(&mut self, records: PropagationRecords) {
+    pub(in crate::executor) fn merge_propagation_records(&mut self, records: PropagationRecords) {
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/proof-records merge_propagation_records: entries={} rewrites={} exec={:p}",
+                records.entries.len(),
+                records.rewrites.len(),
+                self as *const _,
+            );
+        }
         let store = &mut self.propagated_value_provenance;
         let offset = store
             .rewrites

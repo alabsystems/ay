@@ -17,6 +17,7 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
+mod configuration;
 mod derivation;
 mod exact_fragment;
 mod folded_unit_authority;
@@ -33,8 +34,9 @@ use ay_sat::{ClauseTrace, Literal};
 #[cfg(test)]
 use exact_fragment::EXACT_NEW_NOT_BYTES;
 pub(crate) use exact_fragment::{
-    ExactOriginalProofError, ExactOriginalProofFragment, FragmentInstanceDerivation,
-    FragmentInstanceRootDerivation, FragmentPropagationEnvironment, FragmentSkolemDerivation,
+    ExactOriginalProofError, ExactOriginalProofFragment, FragmentContextDerivation,
+    FragmentInstanceDerivation, FragmentInstanceRootDerivation, FragmentPropagationEnvironment,
+    FragmentSkolemDerivation,
 };
 
 /// SAT-level proof manager for translating clause traces to Alethe steps
@@ -63,6 +65,9 @@ pub(crate) struct SatProofManager<'a> {
     instance_derivations: Option<&'a HashMap<TermId, FragmentInstanceDerivation>>,
     /// Executor-sealed Skolemization derivations keyed by asserted term.
     skolem_derivations: Option<&'a HashMap<TermId, FragmentSkolemDerivation>>,
+    /// Executor-sealed context derivations (#dt-context-derivation), keyed by
+    /// the NORMALIZED clause (sorted, deduplicated literal TermIds).
+    context_derivations: Option<&'a HashMap<Vec<TermId>, FragmentContextDerivation>>,
     /// Executor-sealed `PropagateValues` licensing environment (#ppp-c7).
     propagation_environment: Option<&'a FragmentPropagationEnvironment>,
     /// Executor-sealed qpf premise-forced instance roots (#ppp-c7).
@@ -79,6 +84,13 @@ pub(crate) struct SatProofManager<'a> {
     /// out and returns `None` (best-effort synthesized-default certificates
     /// only; see `Executor::set_proof_reconstruction_step_budget`, #A2b).
     step_budget: Option<u64>,
+    /// Datatype registries for the pedigree-free DT authentication lane
+    /// (#dt-ground-conflict): mid-solve conflicts added through the SAT-core
+    /// extension have no annotation channel to the indexed ledgers, so the
+    /// exact-fragment builder re-derives their theory validity directly from
+    /// the clause against these registries (recognizer == strict validator).
+    /// `None` on datatype-free problems: the lane is skipped entirely.
+    dt_registry_data: Option<&'a crate::theory_inference::DatatypeRegistryData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,150 +115,6 @@ enum HintDerivationError {
 }
 
 impl<'a> SatProofManager<'a> {
-    /// Create a new SAT proof manager
-    pub(crate) fn new(var_to_term: &'a HashMap<u32, TermId>, terms: &'a mut TermStore) -> Self {
-        SatProofManager {
-            var_to_term,
-            terms,
-            clausification_proofs: None,
-            original_clause_theory_proofs: None,
-            theory_lemma_proofs: None,
-            scope_assumptions: &[],
-            instance_derivations: None,
-            skolem_derivations: None,
-            propagation_environment: None,
-            instance_root_derivations: None,
-            trust_fallback_count: 0,
-            untranslatable_entries: 0,
-            unmapped_var_min: None,
-            unmapped_var_max: None,
-            step_budget: None,
-        }
-    }
-
-    /// Set the deterministic RUP-replay step budget (`None` = unlimited).
-    pub(crate) fn set_step_budget(&mut self, budget: Option<u64>) {
-        self.step_budget = budget;
-    }
-
-    /// Install solver-minted active-scope premises from the same immutable
-    /// trace snapshot.  They must be negative, unique, and outside the SMT
-    /// variable map; every mismatch fails closed.
-    pub(crate) fn set_scope_assumptions(
-        &mut self,
-        assumptions: &'a [Literal],
-    ) -> Result<(), ExactOriginalProofError> {
-        let mut previous = None;
-        for &assumption in assumptions {
-            let variable = assumption.variable().index() as u32;
-            if assumption.is_positive() {
-                return Err(ExactOriginalProofError::PositiveScopeAssumption { variable });
-            }
-            if self.var_to_term.contains_key(&variable) {
-                return Err(ExactOriginalProofError::MappedScopeAssumption { variable });
-            }
-            if let Some(prior) = previous {
-                if variable == prior {
-                    return Err(ExactOriginalProofError::DuplicateScopeAssumption { variable });
-                }
-                if variable < prior {
-                    return Err(ExactOriginalProofError::UnorderedScopeAssumption {
-                        previous: prior,
-                        variable,
-                    });
-                }
-            }
-            previous = Some(variable);
-        }
-        self.scope_assumptions = assumptions;
-        Ok(())
-    }
-
-    fn is_scope_assumption_variable(&self, variable: u32) -> bool {
-        self.scope_assumptions
-            .binary_search_by_key(&variable, |assumption| assumption.variable().index() as u32)
-            .is_ok()
-    }
-
-    /// Attach clausification proof annotations from the Tseitin encoder (#6031).
-    ///
-    /// When set, `add_original_clause_step` emits premiseless tautology rule
-    /// steps (e.g., `and_pos`, `or_neg`) for annotated clauses instead of
-    /// the generic `assume` + `or` pattern. Annotations are parallel to the
-    /// original clause IDs (`id - 1` indexes this slice). Reserved IDs remain
-    /// represented so omitted tautologies cannot shift later annotations.
-    pub(crate) fn set_clausification_proofs(&mut self, proofs: &'a [Option<ClausificationProof>]) {
-        self.clausification_proofs = Some(proofs);
-    }
-
-    fn original_annotation_by_id<T>(
-        annotations: Option<&[Option<T>]>,
-        clause_id: u64,
-    ) -> Option<&T> {
-        let index = usize::try_from(clause_id.checked_sub(1)?).ok()?;
-        annotations?.get(index)?.as_ref()
-    }
-
-    /// Attach direct original-clause theory annotations for SAT reconstruction.
-    pub(crate) fn set_original_clause_theory_proofs(
-        &mut self,
-        proofs: &'a [Option<TheoryLemmaProof>],
-    ) {
-        self.original_clause_theory_proofs = Some(proofs);
-    }
-
-    /// Attach executor-sealed quantifier-instantiation derivations. Consulted
-    /// only in the `(None, None)` arm of exact fragment construction for a
-    /// non-authored unit original; the emitted `forall_inst` chain is fully
-    /// re-validated by the strict premise authenticator.
-    pub(crate) fn set_instance_derivations(
-        &mut self,
-        derivations: &'a HashMap<TermId, FragmentInstanceDerivation>,
-    ) {
-        self.instance_derivations = Some(derivations);
-    }
-
-    /// Attach executor-sealed Skolemization derivations (same contract).
-    pub(crate) fn set_skolem_derivations(
-        &mut self,
-        derivations: &'a HashMap<TermId, FragmentSkolemDerivation>,
-    ) {
-        self.skolem_derivations = Some(derivations);
-    }
-
-    /// Attach the executor-sealed `PropagateValues` licensing environment
-    /// (#ppp-c7). Consulted only by the c7 arm of exact fragment
-    /// construction for a non-authored unit original; the emitted replay
-    /// chain is fully re-validated by the strict premise authenticator.
-    pub(crate) fn set_propagation_environment(
-        &mut self,
-        environment: &'a FragmentPropagationEnvironment,
-    ) {
-        self.propagation_environment = Some(environment);
-    }
-
-    /// Attach executor-sealed qpf premise-forced instance roots (#ppp-c7,
-    /// same contract).
-    pub(crate) fn set_instance_root_derivations(
-        &mut self,
-        derivations: &'a [FragmentInstanceRootDerivation],
-    ) {
-        self.instance_root_derivations = Some(derivations);
-    }
-
-    /// Attach theory lemma proof annotations (#6031 Phase 4).
-    ///
-    /// Keyed by normalized clause content (sorted TermIds). When an original
-    /// clause in the clause trace matches a theory lemma annotation,
-    /// `add_original_clause_step` emits a `TheoryLemma` proof step with
-    /// the proper Alethe rule instead of the generic `assume` + `or` pattern.
-    pub(crate) fn set_theory_lemma_proofs(
-        &mut self,
-        proofs: &'a HashMap<Vec<TermId>, TheoryLemmaProof>,
-    ) {
-        self.theory_lemma_proofs = Some(proofs);
-    }
-
     /// Convert a SAT literal to an SMT term
     ///
     /// - `pos(v)` -> normalized proof literal for `var_to_term[v]`

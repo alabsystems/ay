@@ -22,9 +22,20 @@ impl SatProofManager<'_> {
         authored_problem_terms: &[TermId],
         unit_authority: bool,
         progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
-    ) -> Result<(HashSet<TermId>, HashMap<TermId, OrFoldUnitPlan>), ResolutionValidationError> {
+    ) -> Result<
+        (
+            HashSet<TermId>,
+            HashMap<TermId, OrFoldUnitPlan>,
+            Vec<(TermId, TermId, TermId)>,
+        ),
+        ResolutionValidationError,
+    > {
         let mut authored_conjunct_closure = HashSet::default();
         let mut or_fold_candidates = Vec::new();
+        // Boolean-ITE closure members (#ite-expansion-authority): activation
+        // units of `rewrite_assertion_bool_ites` products are authenticated
+        // against these via the strict checker's own shared matcher.
+        let mut authored_bool_ites: Vec<(TermId, TermId, TermId)> = Vec::new();
         if unit_authority {
             let mut stack: Vec<TermId> = authored_problem_terms.to_vec();
             let mut expanded = HashSet::default();
@@ -41,6 +52,10 @@ impl SatProofManager<'_> {
                 // Authored roots are not yet validated against the term store
                 // here. A stale root must fail closed later, never panic here.
                 if term.index() >= self.terms.len() {
+                    continue;
+                }
+                if let TermData::Ite(cond, then_term, else_term) = self.terms.get(term) {
+                    authored_bool_ites.push((*cond, *then_term, *else_term));
                     continue;
                 }
                 let TermData::App(Symbol::Named(name), args) = self.terms.get(term) else {
@@ -66,6 +81,10 @@ impl SatProofManager<'_> {
             progress(pending_pops, 0)?;
         }
         let or_fold_unit_plans = self.build_or_fold_unit_plans(&or_fold_candidates, progress)?;
-        Ok((authored_conjunct_closure, or_fold_unit_plans))
+        Ok((
+            authored_conjunct_closure,
+            or_fold_unit_plans,
+            authored_bool_ites,
+        ))
     }
 }

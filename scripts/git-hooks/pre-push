@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ay-script: pre-push-hook
-# In-tree pre-push hook: enforce zero active first-party Python test skips and
-# run the SMT soundness-differential gate before every push. This opt-in local
-# coverage supplements the repository's GitHub Actions checks.
+# In-tree pre-push hook: enforce zero active first-party Python test skips, run
+# the SMT soundness-differential gate, and re-measure the MILP node ratchet
+# before every push. This opt-in local coverage supplements the repository's
+# GitHub Actions checks.
 #
 # INSTALL (the owner installs it; it is never forced):
 #     git config core.hooksPath scripts/git-hooks
@@ -14,6 +15,24 @@
 # It preserves the repo's existing Git-LFS pre-push behavior by chaining to it
 # first, then runs scripts/ci/smt_soundness_gate.sh (hermetic declared-status
 # oracle + 2-solver diff vs libz3 when present). A wrong verdict fails the push.
+#
+# WHAT STEP 4 COSTS, stated plainly because a gate whose price is a surprise is a
+# gate that gets uninstalled:
+#
+#     cargo build --release -p ay-milp --example mps_solve   0s warm, ~2m15s cold
+#     milp_node_gate.py --check --tier all                   46.9s, 19 instances
+#                                                            (44.8s solving, the
+#                                                             rest process start
+#                                                             + MPS parse)
+#
+# `--tier all`, not `--tier fast` (7.2s, 14 instances). The five extra instances
+# cost 37.6s of solving and buy pk1 (274,435 nodes) and mas76 (273,252) — the two largest
+# trees in the corpus and the only two big enough for a node-economy regression to
+# show up in them first. A push already pays for a build and the SMT gate; 47s more
+# is affordable and this is the only lane in the repository that runs on a code
+# change at all. If a future push budget cannot afford it, drop to `--tier fast`
+# here and leave `--tier all` in the nightly (scripts/nightly_corpus_guard.sh) —
+# do not delete the step.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -45,4 +64,69 @@ if ! bash "$REPO_ROOT/scripts/ci/smt_soundness_gate.sh"; then
     exit 1
 fi
 echo "pre-push: SMT soundness gate PASSED."
+
+# --- 4. MILP node ratchet ----------------------------------------------------
+# WHY THIS IS HERE AND NOT ONLY IN THE NIGHTLY. The blend2 regression (3,882 ->
+# 9,070 nodes, bisected to dd591eb1b) landed on main and cleared the standing
+# checks untouched. The nightly corpus guard would have caught it a day later, if
+# anything had been running the nightly corpus guard; nothing was. A per-commit
+# lane is what turns "which of yesterday's 30 commits did this" into "this push".
+echo ""
+echo "pre-push: re-measuring the MILP node ratchet (--tier all, ~47s + build) ..."
+build_log="$(mktemp -t ay-prepush-build)"
+# --manifest-path, not bare `cargo build`: the hook must build the checkout it is
+# gating. `milp_node_gate.py` resolves its solver relative to its OWN location, so
+# both sides have to agree on which tree that is when the push comes from a
+# worktree or a subdirectory.
+if ! cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
+        --release -p ay-milp --example mps_solve >"$build_log" 2>&1; then
+    echo ""
+    tail -20 "$build_log"
+    echo ""
+    echo "pre-push: BLOCKED — ay-milp release build failed; the node ratchet did not run."
+    echo "          A gate that cannot build is UNKNOWN, never clean."
+    rm -f "$build_log"
+    exit 1
+fi
+rm -f "$build_log"
+
+# LET THE BUILD'S OWN LOAD DRAIN BEFORE MEASURING. The gate refuses above
+# 0.35 x cpu_count because two pinned instances are wall-deadline coupled, and
+# the build immediately above is itself a load spike: measured, the FIRST push
+# after a cold build self-blocked at load 5.8 on a box that sat at 2.36 before
+# the hook started. That is a false block with nothing wrong behind it, and a
+# gate that cries wolf on its own exhaust is a gate people learn to --no-verify.
+# So wait for the average to come down, bounded — if the box is genuinely busy
+# for two minutes the SETUP exit below still fires and still refuses to guess.
+settle_target=$(python3 -c 'import os; print(0.35 * (os.cpu_count() or 1))')
+for _ in $(seq 1 24); do
+    load=$(uptime | sed -E 's/.*load averages?: ([0-9.]+).*/\1/')
+    if python3 -c "import sys; sys.exit(0 if float('$load') <= float('$settle_target') else 1)"; then
+        break
+    fi
+    sleep 5
+done
+
+python3 "$REPO_ROOT/scripts/milp_node_gate.py" --check --tier all
+rc=$?
+case $rc in
+  0) echo "pre-push: MILP node ratchet PASSED (19 instances, exact)." ;;
+  1) echo ""
+     echo "pre-push: BLOCKED — a pinned node count, objective or status moved."
+     echo "          If the change is INTENDED, ratchet it deliberately in the same commit:"
+     echo "              python3 scripts/milp_node_gate.py --ratchet --tier all"
+     echo "          and put the old -> new numbers in the commit message. That includes"
+     echo "          improvements: an unratcheted improvement is how a pin rots into folklore."
+     exit 1 ;;
+  *) # SETUP (2) is NOT a pass. The two causes are a busy box (the gate refuses
+     # above 0.35 x cpu_count because two instances are wall-deadline coupled)
+     # and a missing corpus. Both mean the gate measured nothing, and "measured
+     # nothing" reported as clean is the failure this whole lane exists to end.
+     echo ""
+     echo "pre-push: BLOCKED — the node ratchet could not measure (exit $rc, SETUP)."
+     echo "          Quiet the box and re-push, rebuild the corpus with"
+     echo "              python3 scripts/milp_gate_corpus.py --build"
+     echo "          or bypass this push with: git push --no-verify"
+     exit 1 ;;
+esac
 exit 0

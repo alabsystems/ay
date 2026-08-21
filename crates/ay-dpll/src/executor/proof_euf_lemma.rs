@@ -32,6 +32,8 @@ use ay_core::{AletheRule, Proof, ProofId, Sort, Symbol, TermId};
 use super::proof_trust_surgery_provenance::SurgeryPlanningBudget;
 use super::Executor;
 
+#[path = "proof_euf_lemma_packed_surface.rs"]
+mod packed_surface;
 #[path = "proof_euf_lemma_plan.rs"]
 mod plan;
 #[path = "proof_euf_lemma_surface.rs"]
@@ -675,37 +677,15 @@ impl Executor {
         let n = proof.steps.len();
         let mut planning = SurgeryPlanningBudget::new();
         let mut plans: Vec<Option<EufLemmaPlan>> = vec![None; n];
+        let mut typed_packed_transitive = vec![false; n];
         for (idx, step) in proof.steps.iter().enumerate() {
             if !preflight.reachable[idx] {
                 continue;
             }
-            // Two trust shapes carry certificate-free EUF leaves that
-            // `plan_euf_lemma` can independently re-derive:
-            //   (1) `TheoryLemma{Generic}`  — the lazy EUF engine's fused
-            //       congruence/substitution-chain lemmas; and
-            //   (2) `Step{Trust}`           — an `(or …)`-wrapped
-            //       eq_transitive/eq_congruent leaf the array-extensionality
-            //       lane emits as a raw trust step (it is a `Step`, so the
-            //       TheoryLemma-only classifier/splitter passes never touch
-            //       it, and its residual presence made this pass's whole-proof
-            //       strict gate revert an otherwise-valid rebuild of (1)).
-            // Both are self-contained EUF tautologies (their hypotheses are the
-            // clause's own negated literals), so re-deriving them as a pure
-            // tautology never depends on the original premises. `plan_euf_lemma`
-            // is fail-closed (any non-EUF clause → `None`) and the whole-proof
-            // strict gate below is the backstop, so a mis-recognition reverts.
-            let clause = match step {
-                ay_core::ProofStep::TheoryLemma {
-                    kind: ay_core::TheoryLemmaKind::Generic,
-                    clause,
-                    ..
-                } => clause,
-                ay_core::ProofStep::Step {
-                    rule: AletheRule::Trust,
-                    clause,
-                    ..
-                } => clause,
-                _ => continue,
+            let Some((clause, is_typed_packed_transitive)) =
+                packed_surface::promotion_clause(&self.ctx.terms, step)
+            else {
+                continue;
             };
             if !planning.spend_work(clause.len().saturating_add(1))
                 || !planning.spend_terms(&self.ctx.terms, clause)
@@ -713,6 +693,7 @@ impl Executor {
                 return;
             }
             plans[idx] = self.plan_euf_lemma_with_budget(clause, &mut planning);
+            typed_packed_transitive[idx] = is_typed_packed_transitive && plans[idx].is_some();
         }
         if ay_core::misc_cli_flags().trace_cegqi_attr {
             for (idx, step) in proof.steps.iter().enumerate() {
@@ -741,7 +722,12 @@ impl Executor {
         if plans.iter().all(Option::is_none) {
             return;
         }
-        if !self.generic_euf_promotion_surface_is_safe(proof, &plans) {
+        if !packed_surface::promotion_surfaces_are_safe(
+            self,
+            proof,
+            &plans,
+            &typed_packed_transitive,
+        ) {
             if ay_core::misc_cli_flags().trace_cegqi_attr {
                 eprintln!("[euf-leaf] surface audit refused");
             }

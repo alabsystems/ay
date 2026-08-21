@@ -275,6 +275,243 @@ pub(super) fn collect_patterns_from_term(
     );
 }
 
+/// Hard cap on candidate patterns harvested from under nested binders
+/// (#quant-trigger-nested). Downstream multi-trigger synthesis is O(n^2) in
+/// pairs and O(n^3) in triples over the partial-coverage candidates, and a deep
+/// prenex nest (the SQ Arith LRA `formula_*` family reaches 61 binders in one
+/// assertion) can otherwise hand it an unbounded list. Reaching the cap only
+/// truncates the candidate set — the quantifier keeps whatever triggers the
+/// retained prefix yields, which is still strictly more than today's none.
+const MAX_NESTED_DESCENT_CANDIDATES: usize = 64;
+
+/// Harvest trigger candidates that live UNDER a nested binder
+/// (#quant-trigger-nested).
+///
+/// `collect_patterns_from_term` treats `forall`/`exists` as opaque leaves, so a
+/// legal trigger for the OUTER quantifier that happens to sit inside an inner
+/// binder's body is invisible to it. This pass descends through binders and
+/// collects the candidates it refuses.
+///
+/// WELL-FORMEDNESS, and it is the whole soundness argument here: a term is a
+/// legal trigger for this quantifier only if every variable it mentions is
+/// bound by THIS quantifier. A candidate that also mentions a variable bound by
+/// an inner binder is refused outright (`mentions_any_name`), because
+/// instantiating the outer body from such a match would capture the inner
+/// binder's variable. Name shadowing is covered by the same test: an inner
+/// binder that rebinds an outer name puts that name in `inner_bound`, so any
+/// candidate under it is refused rather than silently rebound to the wrong
+/// binder. The rule is conservative — it can only decline a candidate, never
+/// admit an ill-formed one.
+///
+/// Everything downstream is unchanged: the candidates flow into the SAME
+/// `synthesize_trigger_groups_with_fallback` (so multi-patterns, specificity
+/// ranking, and the primary/fallback split all apply) and thence into the same
+/// E-matching index. There is no second matching path.
+pub(super) fn collect_patterns_under_nested_binders(
+    terms: &TermStore,
+    term: TermId,
+    var_indices: &HashMap<String, usize>,
+    actual_var_names: &[String],
+    no_patterns: &[TermId],
+    out: &mut Vec<(EMatchPattern, Vec<String>)>,
+) {
+    let mut inner_bound: HashSet<String> = HashSet::default();
+    let let_scopes = Vec::new();
+    descend_nested_binders(
+        terms,
+        term,
+        var_indices,
+        actual_var_names,
+        &let_scopes,
+        no_patterns,
+        &mut inner_bound,
+        false,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn descend_nested_binders(
+    terms: &TermStore,
+    term: TermId,
+    var_indices: &HashMap<String, usize>,
+    actual_var_names: &[String],
+    let_scopes: &[LetScopeFrame],
+    no_patterns: &[TermId],
+    inner_bound: &mut HashSet<String>,
+    under_binder: bool,
+    out: &mut Vec<(EMatchPattern, Vec<String>)>,
+) {
+    if out.len() >= MAX_NESTED_DESCENT_CANDIDATES {
+        return;
+    }
+    stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
+        match terms.get(term) {
+            TermData::App(sym, args) => {
+                // Only harvest BELOW a binder: at the same level
+                // `collect_patterns_from_term` already ran and found nothing, so
+                // re-deciding those nodes here could only duplicate its verdict.
+                if under_binder
+                    && !is_builtin_symbol(sym)
+                    && !no_patterns.contains(&term)
+                    && args.iter().any(|&arg| {
+                        term_has_bound_var_in_let_scope(terms, arg, var_indices, let_scopes)
+                    })
+                    && !mentions_any_name_in_let_scope(terms, term, inner_bound, let_scopes)
+                {
+                    let pattern_args: Vec<EMatchArg> = args
+                        .iter()
+                        .map(|&arg| {
+                            term_to_pattern_arg_in_let_scope(terms, arg, var_indices, let_scopes)
+                        })
+                        .collect();
+                    out.push((
+                        EMatchPattern {
+                            symbol: sym.clone(),
+                            args: pattern_args,
+                        },
+                        actual_var_names.to_vec(),
+                    ));
+                }
+                for &arg in args {
+                    descend_nested_binders(
+                        terms,
+                        arg,
+                        var_indices,
+                        actual_var_names,
+                        let_scopes,
+                        no_patterns,
+                        inner_bound,
+                        under_binder,
+                        out,
+                    );
+                }
+            }
+            TermData::Not(inner) => descend_nested_binders(
+                terms,
+                *inner,
+                var_indices,
+                actual_var_names,
+                let_scopes,
+                no_patterns,
+                inner_bound,
+                under_binder,
+                out,
+            ),
+            TermData::Ite(c, t, e) => {
+                for &sub in &[*c, *t, *e] {
+                    descend_nested_binders(
+                        terms,
+                        sub,
+                        var_indices,
+                        actual_var_names,
+                        let_scopes,
+                        no_patterns,
+                        inner_bound,
+                        under_binder,
+                        out,
+                    );
+                }
+            }
+            TermData::Let(bindings, body) => {
+                let inner_scopes = extend_let_scopes(let_scopes, bindings);
+                descend_nested_binders(
+                    terms,
+                    *body,
+                    var_indices,
+                    actual_var_names,
+                    &inner_scopes,
+                    no_patterns,
+                    inner_bound,
+                    under_binder,
+                    out,
+                );
+            }
+            TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
+                // Push this binder's names, remembering only the ones we added
+                // so a shadowed name is not popped out from under an outer
+                // binder that also declared it.
+                let added: Vec<String> = vars
+                    .iter()
+                    .filter(|(name, _)| inner_bound.insert(name.clone()))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                descend_nested_binders(
+                    terms,
+                    *body,
+                    var_indices,
+                    actual_var_names,
+                    let_scopes,
+                    no_patterns,
+                    inner_bound,
+                    true,
+                    out,
+                );
+                for name in &added {
+                    inner_bound.remove(name);
+                }
+            }
+            _ => {}
+        }
+    })
+}
+
+/// Does `term` mention any variable name in `names` after resolving the active
+/// SMT-LIB `let` aliases? Used to refuse a trigger candidate that would capture
+/// an inner binder's variable.
+///
+/// Looking only at the surface `Var` name is insufficient: under
+/// `(let ((z (h x y))) (g z))`, `g(z)` transitively mentions the inner-bound
+/// `y`. The pattern conversion already resolves `z`; this guard must inspect
+/// the same value or it can admit a candidate the surface-only check declared
+/// capture-free.
+fn mentions_any_name_in_let_scope(
+    terms: &TermStore,
+    term: TermId,
+    names: &HashSet<String>,
+    let_scopes: &[LetScopeFrame],
+) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
+        match terms.get(term) {
+            TermData::Var(name, _) => lookup_let_alias(name, let_scopes)
+                .map(|alias| {
+                    mentions_any_name_in_let_scope(
+                        terms,
+                        alias.term,
+                        names,
+                        visible_let_scopes(let_scopes, alias.visible_scope_count),
+                    )
+                })
+                .unwrap_or_else(|| names.contains(name)),
+            TermData::App(_, args) => args
+                .iter()
+                .any(|&arg| mentions_any_name_in_let_scope(terms, arg, names, let_scopes)),
+            TermData::Not(inner) => {
+                mentions_any_name_in_let_scope(terms, *inner, names, let_scopes)
+            }
+            TermData::Ite(c, t, e) => {
+                mentions_any_name_in_let_scope(terms, *c, names, let_scopes)
+                    || mentions_any_name_in_let_scope(terms, *t, names, let_scopes)
+                    || mentions_any_name_in_let_scope(terms, *e, names, let_scopes)
+            }
+            TermData::Let(bindings, body) => {
+                let inner_scopes = extend_let_scopes(let_scopes, bindings);
+                mentions_any_name_in_let_scope(terms, *body, names, &inner_scopes)
+            }
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => {
+                // Conservative for a quantifier occurring inside an application
+                // argument: treating a shadowed occurrence as a mention can only
+                // decline a trigger, while overlooking one could capture it.
+                mentions_any_name_in_let_scope(terms, *body, names, let_scopes)
+            }
+            _ => false,
+        }
+    })
+}
+
 fn collect_patterns_from_term_with_let_scopes(
     terms: &TermStore,
     term: TermId,

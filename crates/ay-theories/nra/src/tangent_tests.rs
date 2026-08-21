@@ -843,4 +843,208 @@ fn test_tangent_plane_small_fractions() {
     assert_eq!(t_at_ab, expected);
 }
 
+// ============================================================================
+// Honest saturation of the linearization loop
+// ============================================================================
+
+/// The zankl matrix-interpretation shape: every factor is `>= 0` with NO upper
+/// bound, so McCormick supports exactly ONE row (`m >= 0`) and can never
+/// support another. The envelope must report that row as available forever but
+/// NEW only once — otherwise the refinement loop's `added == 0` stop can never
+/// fire and it burns its whole iteration cap re-deriving one constraint.
+#[test]
+fn half_bounded_mccormick_envelope_saturates_after_one_row() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(rat(1));
+
+    let atoms = [
+        terms.mk_ge(x, zero),
+        terms.mk_ge(y, zero),
+        terms.mk_ge(xy, one),
+    ];
+    let mut solver = NraSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+
+    // The envelope reads LRA BOUNDS, which exist only once LRA has seen the
+    // atoms; the check loop reaches it the same way.
+    let _ = solver.lra.check();
+
+    let mut key = vec![x, y];
+    key.sort_by_key(|t| t.0);
+    let mon = solver.monomials.get(&key).expect("x*y registered").clone();
+
+    // Refinement rows live in a tentative scope in the production check loop.
+    // Mirror that lifecycle so `undo_tentative_patch` below removes both the
+    // row and its cache key, rather than merely re-adding a duplicate base row.
+    solver.lra.push();
+    solver.tentative_depth += 1;
+    let first = solver.add_mccormick_constraints(&mon);
+    let second = solver.add_mccormick_constraints(&mon);
+    let third = solver.add_mccormick_constraints(&mon);
+    assert_eq!(
+        first,
+        (1, 1),
+        "one lower corner is available from x >= 0, y >= 0 and it is new"
+    );
+    assert_eq!(second, (0, 1), "the identical row is not a new lemma");
+    assert_eq!(third, (0, 1), "and stays not-new on every later iteration");
+
+    // Retiring the scope retires the cache with it, so the row is emitted
+    // again against a fresh LRA state rather than silently skipped.
+    solver.undo_tentative_patch();
+    assert_eq!(
+        solver.add_mccormick_constraints(&mon),
+        (1, 1),
+        "the suppression is scoped to the live tentative scope"
+    );
+}
+
+/// `TheorySolver::reset` retires the complete LRA state, so it must retire the
+/// exact-row cache at the same boundary. A stale key would make the next solve
+/// skip a McCormick row that is no longer present in LRA.
+#[test]
+fn linearization_cache_is_cleared_by_full_solver_reset() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("reset_x", Sort::Real);
+    let y = terms.mk_var("reset_y", Sort::Real);
+    let xy = terms.mk_mul(vec![x, y]);
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(rat(1));
+    let atoms = [
+        terms.mk_ge(x, zero),
+        terms.mk_ge(y, zero),
+        terms.mk_ge(xy, one),
+    ];
+
+    let mut solver = NraSolver::new(&terms);
+    for &atom in &atoms {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.lra.check();
+    let mut key = vec![x, y];
+    key.sort_by_key(|term| term.0);
+    let mon = solver.monomials.get(&key).expect("x*y registered").clone();
+    assert_eq!(solver.add_mccormick_constraints(&mon), (1, 1));
+    assert_eq!(solver.add_mccormick_constraints(&mon), (0, 1));
+
+    solver.reset();
+    for &atom in &atoms {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.lra.check();
+    let mon = solver
+        .monomials
+        .get(&key)
+        .expect("x*y re-registered")
+        .clone();
+    assert_eq!(
+        solver.add_mccormick_constraints(&mon),
+        (1, 1),
+        "a reset LRA must receive its first live McCormick row again"
+    );
+}
+
+/// Proof/conflict metadata is outside the cache key. Such rows must bypass
+/// deduplication in every build so identical linear content cannot erase
+/// distinct evidence.
+#[test]
+fn metadata_bearing_linearization_rows_are_never_deduplicated() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("metadata_x", Sort::Real);
+    let zero = terms.mk_rational(BigRational::zero());
+    let premise = terms.mk_ge(x, zero);
+    let mut solver = NraSolver::new(&terms);
+    solver.assert_literal(premise, true);
+    let lra_var = solver.lra.ensure_var_registered(x);
+    let cut = GomoryCut {
+        coeffs: vec![(lra_var, BigRational::one())],
+        bound: BigRational::zero(),
+        is_lower: true,
+        reasons: vec![(premise, true)],
+        source_term: Some(premise),
+    };
+
+    assert!(solver.add_linearization_cut(&cut, premise));
+    assert!(solver.add_linearization_cut(&cut, premise));
+    assert!(
+        solver.linearization_rows.is_empty(),
+        "metadata-bearing rows must never enter the content-only cache"
+    );
+}
+
+/// End to end on the same shape: the check loop must stop at the saturation
+/// point instead of re-emitting the same relaxation once per iteration. The
+/// lemma counter is the observable — before this change it grew with the
+/// iteration cap (500 in release, 15 in debug) rather than with the number of
+/// distinct lemmas the problem actually supports.
+#[test]
+fn half_bounded_refinement_stops_at_saturation_instead_of_the_cap() {
+    let mut terms = TermStore::new();
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(rat(1));
+    let mut atoms = Vec::new();
+    let mut squares = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        let v = terms.mk_var(name, Sort::Real);
+        atoms.push(terms.mk_ge(v, zero));
+        squares.push(v);
+    }
+    // A few half-bounded products, each forced away from its `m >= 0` row.
+    for pair in squares.windows(2) {
+        let product = terms.mk_mul(vec![pair[0], pair[1]]);
+        atoms.push(terms.mk_ge(product, one));
+    }
+
+    let mut solver = NraSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+    let _ = solver.check();
+    assert!(
+        solver.tangent_lemma_count <= 32,
+        "saturated relaxation emitted {} lemmas; the loop is re-deriving \
+         duplicates instead of stopping",
+        solver.tangent_lemma_count
+    );
+}
+
+/// Guard on the documented meti-tarski trap: a scaled product must never gain
+/// authority it did not have. `2*x*y >= 1` with `x >= 0`, `y >= 0` is plainly
+/// satisfiable (x = y = 1), so no amount of relaxation bookkeeping may report
+/// UNSAT for it.
+#[test]
+fn scaled_half_bounded_product_never_refutes_a_satisfiable_system() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Real);
+    let y = terms.mk_var("y", Sort::Real);
+    let two = terms.mk_rational(rat(2));
+    let scaled = terms.mk_mul(vec![two, x, y]);
+    let zero = terms.mk_rational(BigRational::zero());
+    let one = terms.mk_rational(rat(1));
+
+    let atoms = [
+        terms.mk_ge(x, zero),
+        terms.mk_ge(y, zero),
+        terms.mk_ge(scaled, one),
+    ];
+    let mut solver = NraSolver::new(&terms);
+    for atom in atoms {
+        solver.assert_literal(atom, true);
+    }
+    let result = solver.check();
+    assert!(
+        !matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "2*x*y >= 1 with x,y >= 0 is satisfiable; got {result:?}"
+    );
+}
+
 include!("tangent_tests/fixed_factor.rs");

@@ -59,7 +59,6 @@ fn real_rules_pass_through_unchanged() {
         "eq_congruent",
         "eq_transitive",
         "la_generic",
-        "lia_generic",
         "arrays_ext",
         "arrays_row",
         "arrays_idx",
@@ -125,6 +124,17 @@ fn every_name_the_checker_rejects_becomes_hole() {
 }
 
 #[test]
+fn recognized_semantic_placeholders_become_the_canonical_hole() {
+    for name in ["hole", "lia_generic"] {
+        assert!(
+            is_checkable_alethe_rule(name),
+            "{name} remains part of the checker dispatch vocabulary"
+        );
+        assert_eq!(wire_rule_name(name), UNPROVED_STEP_RULE);
+    }
+}
+
+#[test]
 fn premise_or_arg_required_table_is_sorted_and_deduped() {
     // `alethe_rule_requires_premises_or_args` binary-searches it; an
     // out-of-order entry silently stops matching and the guard goes quiet.
@@ -185,11 +195,10 @@ fn rules_a_bare_step_can_back_are_left_alone() {
         "arrays_idx",
         "true",
         "false",
-        // Deliberately absent: their argument count is computed from the
-        // conclusion, and the printer either supplies `:args` or refuses
-        // the step outright. Listing them would mute that fail-loud.
+        // Deliberately absent: `la_generic`'s argument count is computed from
+        // the conclusion, and the printer either supplies `:args` or refuses
+        // the step outright. Listing it would mute that fail-loud.
         "la_generic",
-        "lia_generic",
     ] {
         assert!(
             !alethe_rule_requires_premises_or_args(name),
@@ -309,8 +318,5 @@ fn wire_rendering_preserves_internal_identity_and_exposes_holes() {
 
     // A theory lemma that DOES have a real Alethe rule keeps it.
     assert_eq!(TheoryLemmaKind::LraFarkas.alethe_wire_rule(), "la_generic");
-    assert_eq!(
-        TheoryLemmaKind::LiaGeneric.alethe_wire_rule(),
-        "lia_generic"
-    );
+    assert_eq!(TheoryLemmaKind::LiaGeneric.alethe_wire_rule(), "hole");
 }

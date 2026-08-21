@@ -33,6 +33,11 @@ use crate::outcome::{Outcome, UnknownReason};
 use crate::simplex::{Candidate, FloatLp, SimplexStatus, WarmSolveMode};
 use crate::tree_cert::{exact_farkas_from_float_ray, MilpInfeasibilityCertificate, TreeNode};
 
+mod affine;
+mod supplemental_proof;
+
+use supplemental_proof::SupplementalProof;
+
 fn fixed_assignment_tree_start_assignment(
     warm_start: Option<FixedAssignmentTreeWarmStart>,
 ) -> usize {
@@ -493,11 +498,30 @@ mod fixed_assignment_tree_warm_mode_tests {
     }
 }
 
-/// Whether the float lane runs. Off via `the no-float knob`, which forces every
-/// solve down the exact rim — the A/B switch the float lane's speedup is
-/// measured with, and the escape hatch if it ever misbehaves. Read once: this
-/// sits on the per-solve path.
-fn float_lane_enabled() -> bool {
+/// Whether the float lane runs. Off via `--no-float`
+/// ([`crate::EngineEconomics::with_float_lane`]), which forces every solve down
+/// the exact rim — the A/B switch the float lane's speedup is measured with,
+/// and the escape hatch if it ever misbehaves.
+///
+/// TWO LAYERS, AND WHY BOTH ARE NEEDED. The typed `SolveOpts` value is read
+/// FIRST and directly, exactly as `continuous_float_first_eager` reads
+/// `eager_perturb_mode`: the all-continuous lane
+/// (`check_with_shared_binary_prefix_in_frame_inner`) installs NO
+/// `tune::activate_caller` frame, so on the very class this switch exists for
+/// — the covering LPs the exact rim cannot solve — `tune::caller_flag` reports
+/// the compiled default no matter what the operator passed. Wiring only the
+/// `tune` carrier would leave `--no-float` a silent no-op on that lane, which
+/// is the defect this repairs. The `tune` read is kept as the second layer for
+/// an embedding consumer that runs a solve inside its own `activate_caller`
+/// frame; it stays cached in a `OnceLock` because it sits on the per-solve path
+/// and because `prime_env` forces it at solve entry.
+fn float_lane_enabled(opts: &SolveOpts) -> bool {
+    opts.engine().float_lane() != Some(false) && float_lane_tune_enabled()
+}
+
+/// The `tune` half of [`float_lane_enabled`], cached. Split out so
+/// [`prime_env`] can force the read without inventing a `SolveOpts`.
+fn float_lane_tune_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::NoFloat) != Some(true))
 }
@@ -514,6 +538,18 @@ fn float_lane_enabled() -> bool {
 /// spent half — never a different verdict.
 const CONTINUOUS_FLOAT_FIRST_SHARE: f64 = 0.5;
 
+/// The anti-degeneracy retry's share of the budget REMAINING after the plain
+/// walk's [`CONTINUOUS_FLOAT_FIRST_SHARE`] — see `continuous_float_first_eager`.
+///
+/// The plain walk is unbudgeted by this constant: it keeps its whole share, so
+/// every model it solves is untouched. Only a walk that already failed reaches
+/// here, and what it spends is budget that would otherwise go to the exact rim —
+/// which, measured over all 33 members this lane solves, contributes zero
+/// verdicts. Three quarters is what the measured retries need with headroom
+/// (`hexgrid_opt_ncols_380`: 84.4s of a 112.5s slice at a 300s budget) while
+/// still leaving the rim a real quarter rather than nothing.
+const CONTINUOUS_FLOAT_FIRST_EAGER_SHARE: f64 = 0.75;
+
 /// The row cap for the all-continuous lane's exact basis adjudication.
 ///
 /// NOT [`MAX_EXACT_BASIS_ROWS`]: that constant is the point above which exact
@@ -525,6 +561,115 @@ const CONTINUOUS_FLOAT_FIRST_SHARE: f64 = 0.5;
 /// back-substitution — is the cost control instead. The cap survives only as a
 /// guard against an absurd allocation.
 const CONTINUOUS_FLOAT_FIRST_MAX_ROWS: usize = 1_000_000;
+
+/// ANTI-DEGENERACY RETRY FOR THE ALL-CONTINUOUS FLOAT-FIRST WALK.
+///
+/// # The engine's anti-degeneracy device is UNREACHABLE on this lane
+///
+/// [`crate::simplex::FloatLp`] answers primal degeneracy by nudging the box apart
+/// (`perturb_box`: every bound moved by a hashed multiple of `1e-9`, far below
+/// `feas_tol`), solving the perturbed LP, restoring the TRUE box and polishing
+/// from the perturbed basis. It reaches that device by exactly two doors, and on
+/// this lane BOTH are nailed shut:
+///
+/// * the EAGER door (`eager_perturb_mode` = 1, the default) is *armed*: it fires
+///   only on a cold solve of an LP that has ALREADY stalled once
+///   (`FloatLp::cold_stalled`). This lane solves each LP exactly once, so nothing
+///   ever arms.
+/// * the LAZY door fires after the walk returns `Stopped` — but a walk that is
+///   merely degenerate does not return `Stopped` until it runs out of BUDGET, and
+///   by then the retry has none. Measured on `hexgrid_opt_ncols_290`: the lazy
+///   retry ran ZERO times (`REFAC-WHY pert=0`).
+///
+/// So on the one class this lane exists for — weighted covering, all-1
+/// coefficients, RHS 1, hence ties in the ratio test everywhere — the walk had no
+/// anti-degeneracy at all. The ratio test itself has none to spare: it is a
+/// single pass with `t = max(0, (target-cur)/slope)`, tie-broken fixed-basic-first
+/// then by smallest basis index. There is no Harris two-pass, no feasibility-
+/// tolerance band and no EXPAND. Devex arrives after `m.clamp(2_000, 8_000)`
+/// non-improving iterations and Bland `20_000` after that; neither breaks a tie
+/// that is a genuine coincidence of bounds.
+///
+/// # What that cost, measured (`hexgrid_opt_ncols_290`, 4,060x4,060, 60s budget)
+///
+/// ```text
+///                      plain (HEAD)      eager
+///   float status       Stopped           Optimal (26.1s)
+///   primal pivots      17,001            44,264
+///   degenerate         12,472 (73.4%)    245 (0.55%)
+///   objective-moving   1,039             42,745
+///   longest stall      6,567 iters       4 iters
+///   eta rebuilds       2,466             0
+///   basis repairs      2                 0
+/// ```
+///
+/// Phase II was the wall: 6,720 iterations of which 3,981 were degenerate and
+/// FIFTEEN moved the objective. More budget does not fix it — at a 120s budget
+/// phase II ran 112,960 iterations with 111,574 degenerate, 36 moving, and a
+/// 111,576-iteration stall.
+///
+/// # The refactorization storm was a SYMPTOM of this, not a second cause
+///
+/// The same baseline burns 53% of its wall rebuilding the product-form inverse,
+/// one rebuild per ~5.6 pivots. That is downstream: the degenerate walk pivots the
+/// basis singular at working precision (`repairs = 2`), the LU engine DEMOTES to
+/// the eta file, and the eta file's own fresh rebuild is 13.2x the nnz cap it is
+/// then tested against (859,672 entries against `max(4*nnz, 16*m, 1024) = 64,960`),
+/// so the growth trigger is armed permanently and refires every 5 pivots
+/// (`nnz_trig = 2,465` against `cad_trig = 222`: 91.7% of rebuilds). Remove the
+/// degeneracy and the walk never leaves the LU lane: `eta rebuilds = 0`.
+/// (The cap's own storm guard — `refactorize`'s "BIG-LP CAP FLOOR" — is gated to
+/// models at least 8,192x8,192 and so misses this 4,060x4,060 one. Lifting that
+/// gate is a real, separate fix: on the eta lane alone it took the same LP from
+/// 19,756 to 120,021 pivots in 60s. It is NOT part of this change, because with
+/// the degeneracy gone the eta lane is never entered.)
+///
+/// # Why a RETRY and not the default
+///
+/// Because perturbing unconditionally is a large REGRESSION on the walks that
+/// already work. Measured, whole oracle corpus at a 300s budget, plain vs
+/// perturbed-from-the-start:
+///
+/// ```text
+///   hexgrid_opt_ncols_160    0.63s ->  11.91s
+///   hexgrid_opt_ncols_400    8.56s ->  81.56s
+///   qiu                      0.43s ->  88.67s
+///   domset_mw19_17          24.78s ->  TIMEOUT at 300s   (a LOST verdict)
+/// ```
+///
+/// The retry inverts that: the plain walk keeps its whole share and every model it
+/// solves is untouched, and only a walk that has ALREADY failed pays for the
+/// perturbed one. Same shape, and for the same reason, as the root cut loop's
+/// eager retry (`bab.rs`: *"the retry fires only after the plain solve has already
+/// failed"*), which was added against this very instance family.
+///
+/// # Why the retry may spend the exact rim's budget
+///
+/// Because on this corpus the rim answers nothing. MEASURED over all 33 members
+/// this lane solves today (300s budget): the float walk returns `Optimal` on
+/// EVERY one of them, slowest 16.2s (`domset_mw19_23`), and the exact rim
+/// contributes zero verdicts. The rim is still left
+/// `1 - CONTINUOUS_FLOAT_FIRST_EAGER_SHARE` of what remains, so it keeps a real
+/// slice on any model whose two float walks both decline.
+///
+/// # Soundness
+///
+/// Unchanged, and not resting on any of the above. Perturbation "changes only the
+/// path, never the answer": the true box is restored and the basis re-polished
+/// before anything is called `Optimal`. And on THIS lane the answer is not the
+/// float lane's to give at all — the basis is a combinatorial object adjudicated
+/// in exact rationals by [`certify_model_basis_within`], which fails closed.
+///
+/// `--eager-perturb-mode 0` disables the retry, restoring the previous behavior
+/// byte-identically. It is read off [`SolveOpts`] rather than through
+/// [`crate::tune`] because this lane installs no caller profile — see
+/// [`crate::EngineEconomics::eager_perturb_mode`]. The `tune` read is kept as
+/// well, for an embedding consumer that runs this solve inside its own
+/// `activate_caller` frame.
+fn continuous_float_first_eager(opts: &SolveOpts) -> bool {
+    opts.engine().eager_perturb_mode() != Some(0)
+        && crate::tune::count_opt(crate::tune::Knob::EagerPerturbMode) != Some(0)
+}
 
 /// FLOAT-FIRST START FOR THE ALL-CONTINUOUS LANE (`MilpLane::Exact`).
 ///
@@ -558,8 +703,9 @@ fn continuous_float_first_optimum(
     model: &Model,
     objective: &[(u32, f64)],
     deadline: Option<Instant>,
+    opts: &SolveOpts,
 ) -> Option<Outcome> {
-    if !float_lane_enabled() {
+    if !float_lane_enabled(opts) {
         return None;
     }
     let now = Instant::now();
@@ -571,7 +717,31 @@ fn continuous_float_first_optimum(
     let mut lp = FloatLp::from_model_with_deadline(model, objective, model.sense(), share)?;
     // The session lane's measured configuration (see `FloatLp::plain_cold`).
     lp.plain_cold = true;
-    let cand = lp.solve(share);
+    let mut budget = share;
+    let mut cand = lp.solve(budget);
+    // ANTI-DEGENERACY RETRY — see `continuous_float_first_eager`. Runs ONLY on a
+    // walk that already failed, so it cannot cost anything that works.
+    if cand.status != SimplexStatus::Optimal && continuous_float_first_eager(opts) {
+        let now = Instant::now();
+        budget = deadline.map(|limit| {
+            now + limit
+                .saturating_duration_since(now)
+                .mul_f64(CONTINUOUS_FLOAT_FIRST_EAGER_SHARE)
+        });
+        // A FRESH `FloatLp`, NOT `lp` again. The failed walk leaves its engine
+        // state behind, and on this class that state is exactly what the retry
+        // must not inherit: a degenerate walk pivots the basis singular at
+        // working precision, `Simplex::refactorize` DEMOTES the LU operator and
+        // latches the demotion (`lu_late_locked`), and every later solve on that
+        // `FloatLp` runs on the product-form eta file. Measured on
+        // `hexgrid_opt_ncols_380`: the retry on the used `lp` does not finish in
+        // 112s, while the identical perturbed walk on a fresh one takes 84.4s.
+        // Construction is one pass over the non-zeros.
+        let mut fresh = FloatLp::from_model_with_deadline(model, objective, model.sense(), budget)?;
+        fresh.plain_cold = true;
+        fresh.eager_perturb = true;
+        cand = fresh.solve(budget);
+    }
     if cand.status != SimplexStatus::Optimal {
         return None;
     }
@@ -580,7 +750,7 @@ fn continuous_float_first_optimum(
         model,
         &cand.basis,
         &cand.at,
-        share,
+        budget,
         CONTINUOUS_FLOAT_FIRST_MAX_ROWS,
     )?;
     Some(Outcome::Optimal {
@@ -669,56 +839,6 @@ where
     }
     out.sort_unstable_by_key(|&(c, _)| c);
     Some(out)
-}
-
-/// Independently checked evidence carried beside [`Outcome`].  Most proof
-/// objects live directly in the outcome; exact reduction artifacts have their
-/// own typed export channel and must be named explicitly at this policy gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SupplementalProof {
-    None,
-    VerifiedSatReluInfeasibility,
-    VerifiedBlockAngularOptimality,
-    VerifiedParityInfeasibility,
-    VerifiedNetworkDesignInfeasibility,
-    VerifiedNetworkDesignOptimality,
-    VerifiedSingleMachineSchedulingOptimality,
-    VerifiedSingleRowDpInfeasibility,
-    VerifiedMultiRowBddInfeasibility,
-    VerifiedOpenDomainSingleRowDpInfeasibility,
-    VerifiedOpenDomainMultiRowBddInfeasibility,
-    VerifiedOpenDomainHybridPbLpInfeasibility,
-    VerifiedOpenDomainHybridIntegerLiftInfeasibility,
-    VerifiedHybridPbLpInfeasibility,
-    VerifiedHybridIntegerLiftInfeasibility,
-}
-
-impl SupplementalProof {
-    fn certifies_infeasibility(self) -> bool {
-        matches!(
-            self,
-            Self::VerifiedSatReluInfeasibility
-                | Self::VerifiedParityInfeasibility
-                | Self::VerifiedNetworkDesignInfeasibility
-                | Self::VerifiedSingleRowDpInfeasibility
-                | Self::VerifiedMultiRowBddInfeasibility
-                | Self::VerifiedOpenDomainSingleRowDpInfeasibility
-                | Self::VerifiedOpenDomainMultiRowBddInfeasibility
-                | Self::VerifiedOpenDomainHybridPbLpInfeasibility
-                | Self::VerifiedOpenDomainHybridIntegerLiftInfeasibility
-                | Self::VerifiedHybridPbLpInfeasibility
-                | Self::VerifiedHybridIntegerLiftInfeasibility
-        )
-    }
-
-    fn certifies_optimality(self) -> bool {
-        matches!(
-            self,
-            Self::VerifiedBlockAngularOptimality
-                | Self::VerifiedNetworkDesignOptimality
-                | Self::VerifiedSingleMachineSchedulingOptimality
-        )
-    }
 }
 
 /// Apply `require_certificates` policy: strip-or-degrade uncertified
@@ -3286,7 +3406,7 @@ impl LpSession {
         offset: f64,
         deadline: Option<Instant>,
     ) -> Option<Outcome> {
-        if !float_lane_enabled() {
+        if !float_lane_enabled(&self.opts) {
             return None;
         }
         let mut lp = self.float_lp(coeffs, sense)?;
@@ -3324,7 +3444,7 @@ impl LpSession {
         offset: f64,
         deadline: Option<Instant>,
     ) -> Option<Outcome> {
-        if !float_lane_enabled() {
+        if !float_lane_enabled(&self.opts) {
             return None;
         }
         let mut lp = FloatLp::from_model_with_deadline(&self.model, coeffs, sense, deadline)?;
@@ -3374,7 +3494,7 @@ impl LpSession {
         deadline: Option<Instant>,
         stronger_than: Option<&BigRational>,
     ) -> Option<CertifiedRow> {
-        if !float_lane_enabled() || self.model.num_rows() <= MAX_EXACT_BASIS_ROWS {
+        if !float_lane_enabled(&self.opts) || self.model.num_rows() <= MAX_EXACT_BASIS_ROWS {
             return None;
         }
 
@@ -3659,7 +3779,7 @@ impl LpSession {
                 });
             }
         }
-        if expr.is_empty() || !float_lane_enabled() {
+        if expr.is_empty() || !float_lane_enabled(&self.opts) {
             return Ok(None);
         }
         let scale = match sense {
@@ -3762,7 +3882,7 @@ impl LpSession {
     fn ns_bound_expr(&self, expr: &[(Col, f64)], sense: Sense) -> Option<BigRational> {
         // Same side-store caveat as `ns_bound`: NS encloses the f64 matrix, not a different
         // true rational held alongside it.
-        if self.model.has_inexact_coeffs() || !float_lane_enabled() {
+        if self.model.has_inexact_coeffs() || !float_lane_enabled(&self.opts) {
             return None;
         }
         // Minimize form; `-1` scaling encodes maximize.
@@ -3857,7 +3977,7 @@ impl LpSession {
         // different true rational held in the model's side-store.  Calling the
         // result rigorous in that case can over-tighten OBBT and delete a true
         // feasible point, so side-store models go straight to the exact rim.
-        if self.model.has_inexact_coeffs() || !float_lane_enabled() {
+        if self.model.has_inexact_coeffs() || !float_lane_enabled(&self.opts) {
             return None;
         }
         // Minimize form: `min (coeff · x_col)`; coeff = −1 encodes maximize.
@@ -4134,7 +4254,7 @@ impl LpSession {
         split: Col,
         threshold: &BigRational,
     ) -> Option<CertifiedSplitHarvest> {
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || split.index() >= self.model.num_cols()
             || self.model.col_bounds(split) != (0.0, 1.0)
             || coeffs
@@ -4456,7 +4576,7 @@ impl LpSession {
         threshold: &BigRational,
     ) -> Option<CertifiedBinaryTreeHarvest> {
         let depth = splits.len();
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || depth == 0
             || depth > MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES.ilog2() as usize
             || coeffs
@@ -4584,7 +4704,7 @@ impl LpSession {
         fsb_opts: &TargetFsbOpts,
     ) -> Option<(CertifiedBinaryTreeHarvest, TargetFsbReport)> {
         let candidate_count = candidates.len();
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || !(2..=MAX_TARGET_FSB_CANDIDATES).contains(&candidate_count)
             || self.model.has_inexact_coeffs()
             || coeffs
@@ -4859,7 +4979,7 @@ impl LpSession {
     )> {
         let candidate_count = candidates.len();
         let root_split = *candidates.get(root_candidate_index)?;
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || !(2..=MAX_TARGET_FSB_CANDIDATES).contains(&candidate_count)
             || self.model.has_inexact_coeffs()
             || coeffs
@@ -5156,7 +5276,7 @@ impl LpSession {
     )> {
         let candidate_count = candidates.len();
         let root_split = *candidates.get(root_candidate_index)?;
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || !(3..=MAX_TARGET_FSB_CANDIDATES).contains(&candidate_count)
             || self.model.has_inexact_coeffs()
             || coeffs
@@ -5537,7 +5657,7 @@ impl LpSession {
     )> {
         let candidate_count = candidates.len();
         let root_split = *candidates.get(root_candidate_index)?;
-        if !float_lane_enabled()
+        if !float_lane_enabled(&self.opts)
             || !(4..=MAX_TARGET_FSB_CANDIDATES).contains(&candidate_count)
             || self.model.has_inexact_coeffs()
             || coeffs
@@ -6213,6 +6333,30 @@ enum MarginMode<'a> {
     ReframedProof(crate::margin::MarginProofTarget<'a>),
 }
 
+/// What a mapped `Infeasible` must carry before
+/// [`BabSession::run_reframed_nested`] will publish it.
+///
+/// The two marked-margin entries run the SAME nested construction and part
+/// company only here — deliberately, because their contracts differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarginEvidenceBar {
+    /// [`BabSession::check_marked_margin_shared_binary_prefix`]'s documented
+    /// contract, kept byte-identical: an UNSAT mapping is authoritative ONLY
+    /// with a complete caller-frame MILP tree.
+    VerifiedTree,
+    /// The ordinary [`BabSession::check`] lane. Any artifact that
+    /// independently re-verifies against the ORIGINAL model counts: the whole
+    /// tree, the Farkas `margin::margin_farkas` composes from a continuous
+    /// reframed dual, or the one the root-crossing enrichment derives below.
+    ///
+    /// This is exactly the bar the UNMARKED plain solve already meets at
+    /// `check`'s own post-verdict enrichment. The tree-only bar here would
+    /// make MARKING a row strictly weaker than not marking it on a root
+    /// crossing — and would silently delete the continuous lane's composed
+    /// Farkas, which is the one piece of this module that has always worked.
+    VerifiedTreeOrRootFarkas,
+}
+
 /// One-shot continuation passed from certificate-first network work to the
 /// later default/replay boundary in the same `check`. It either carries a
 /// checked conclusive raw result or authorizes exactly the distinct lazy
@@ -6300,6 +6444,11 @@ pub struct BabSession {
     /// "trust me" annotation attach to another solve's verdict, which is
     /// precisely the failure the certificate format exists to prevent.
     replay_claims: Vec<crate::cert_io::ReplayClaim>,
+    /// Ordered exact propagation/substitution replay from the last native
+    /// solve, with any proof kept in its rebuilt reduced frame.
+    affine_aggregation_certificate: Option<crate::AffineAggregationCertificate>,
+    /// Result of independently rebuilding the artifact against `self.model`.
+    affine_aggregation_verification: Option<crate::AffineAggregationVerification>,
     /// Exact source-row parity contradiction produced by the GF(2) route.
     parity_infeasibility_certificate: Option<crate::ParityInfeasibilityCertificate>,
     /// Exact SAT/ReLU projection plus independently replayed RUP refutation.
@@ -6468,6 +6617,8 @@ impl BabSession {
             root_strong_branch_shortlist: Vec::new(),
             pending_network_design_replay: None,
             replay_claims: Vec::new(),
+            affine_aggregation_certificate: None,
+            affine_aggregation_verification: None,
             parity_infeasibility_certificate: None,
             sat_relu_infeasibility_certificate: None,
             network_design_infeasibility_certificate: None,
@@ -6746,6 +6897,7 @@ impl BabSession {
     fn invalidate_last_evidence(&mut self) {
         self.pending_network_design_replay = None;
         self.replay_claims.clear();
+        self.clear_affine_evidence();
         self.parity_infeasibility_certificate = None;
         self.sat_relu_infeasibility_certificate = None;
         crate::parity::clear_pending_infeasibility_certificate();
@@ -7160,6 +7312,149 @@ impl BabSession {
         Ok(out)
     }
 
+    /// THE ONE NESTED REFRAMED SOLVE, shared by both marked-margin entries.
+    ///
+    /// `MarginMode::Required` and `MarginMode::Auto` differ in exactly two
+    /// things — which prefix they seat (`Required` a validated 1..=4 column
+    /// partition, `Auto` none) and which evidence bar they publish under — and
+    /// they must differ in nothing else. They used to differ in EVERYTHING,
+    /// and each difference cost the `Auto` lane a capability:
+    ///
+    /// * `margin::reframe` ran a PLAIN nested `check()`, with no
+    ///   [`crate::margin::MarginProofTarget`] at all. The threshold-crossing
+    ///   machinery (`strictly_excludes`, `preview_margin_cover`,
+    ///   `finalize_margin_cover`) was therefore dead code on the lane every
+    ///   model that arrives as a FILE takes.
+    /// * That nested solve INHERITED the caller's `require_certificates`, which
+    ///   discards a FINISHED reframed `Optimal` carrying no primal-meeting
+    ///   certificate — and the native tree emits an `OptimalityCertificate`
+    ///   only for a ZERO objective, which the reframed model never has. So the
+    ///   policy did not make the nested search worse; it threw a completed
+    ///   answer away, by construction, on every integral model.
+    ///
+    /// NO NEW VERDICT AUTHORITY. The evidence is the same whole-tree
+    /// certificate the explicit API already ships — every leaf re-proved in
+    /// exact rationals against the ORIGINAL lowered model, margin row included
+    /// — and it is verified again by [`crate::margin::MarginMapping::map`] and
+    /// once more by the outer [`finish`].
+    fn run_reframed_nested(
+        &self,
+        prepared: crate::margin::PreparedMargin,
+        shared_binary_prefix: &[Col],
+        target_fsb_prefix: Option<crate::bab::TargetFsbPrefixRequest<'_>>,
+        bar: MarginEvidenceBar,
+    ) -> Result<crate::margin::Reframed, MilpError> {
+        let crate::margin::PreparedMargin {
+            reframed_model,
+            mapping,
+        } = prepared;
+        // Captured before `map` consumes the mapping: the pair a consumer needs
+        // to read the bound is (bound, threshold), and the threshold is the
+        // mapping's.
+        let (sense, threshold) = mapping.telemetry_key();
+        let started = Instant::now();
+        let target = mapping.proof_target(&self.model);
+        // Certificate policy belongs to the ORIGINAL verdict. A reframed MILP
+        // optimum may carry no optimality artifact even though its point is a
+        // complete original-feasibility witness; rejecting it here would
+        // discard authority the outer `finish` can independently check. The
+        // outer policy still requires evidence for any mapped Infeasible claim.
+        let sub_opts = self.opts.clone().with_require_certificates(false);
+        let mut sub = BabSession::new(reframed_model, &sub_opts)?;
+        sub.hint_branch_order(&self.branch_hints);
+        sub.shortlist_root_strong_branch_candidates(&self.root_strong_branch_shortlist);
+        let reframed_outcome = sub.check_with_shared_binary_prefix(
+            shared_binary_prefix,
+            None,
+            MarginMode::ReframedProof(target),
+            target_fsb_prefix,
+        )?;
+        let mut reframed = mapping.map(&self.model, reframed_outcome);
+        // This explicit proof API has a stronger contract than the generic
+        // `require_certificates` policy: an UNSAT mapping is authoritative only
+        // with a complete caller-frame MILP tree. In particular, a fully solved
+        // reframed MILP may report an uncertified `Optimal` result; mapping its
+        // value past the threshold must not manufacture a bare original-model
+        // `Infeasible` when the caller left the generic policy off.
+        //
+        // `MarginMapping::map` has already filtered tree artifacts against the
+        // original model. Presence here therefore means verified; the outer
+        // `finish` gate independently verifies the retained tree again without
+        // adding another full tree walk at this boundary. The same is true of a
+        // root Farkas: `map` keeps one only if it re-verified against the
+        // original, and `margin_farkas` verifies its own composition before
+        // returning it.
+        let admitted = match (bar, &reframed.verdict) {
+            (_, Outcome::Infeasible { tree_cert, .. }) if tree_cert.is_some() => true,
+            (MarginEvidenceBar::VerifiedTreeOrRootFarkas, Outcome::Infeasible { cert, .. }) => {
+                cert.is_some()
+            }
+            _ => false,
+        };
+        if reframed.verdict.is_infeasible() && !admitted {
+            // THE ROOT-CROSSING ENRICHMENT ARM. A crossing the reframed tree
+            // proved but could not COVER (the finalize replay did not fit, or
+            // capture was never armed) leaves a mapped `Infeasible` with no
+            // artifact at all. The UNMARKED plain solve does not give up there:
+            // `check`'s own post-verdict pass proposes a root ray with the
+            // float LP and proves it exactly (5.6 ms / 3.2 ms on the downstream optimization consumer's captured
+            // W1 corpus against 29.0 s / 16.4 s for the cold exact rim). Not
+            // reaching for the same witness here is precisely what made MARKING
+            // a row weaker than not marking it on a root crossing.
+            //
+            // Strictly additive and strictly checked: `root_float_farkas`
+            // exactifies the float ray and re-verifies the combination against
+            // THIS model before returning it, and the outer `finish` verifies
+            // it again. A decline costs the bounded `cert_budget_native` grace
+            // and falls through to the honest `Unknown` below.
+            let root_farkas = match bar {
+                MarginEvidenceBar::VerifiedTree => None,
+                MarginEvidenceBar::VerifiedTreeOrRootFarkas => {
+                    let budget = cert_budget_native(&self.model, &self.opts);
+                    crate::tree_cert::root_float_farkas(&self.model, budget.deadline)
+                }
+            };
+            if structure_trace_enabled() {
+                // R7/R9: the arm reports whether it RAN and whether it HIT, so
+                // a null here is never vacuous. `MARGINREFRAME ... decided`
+                // carries the same fact without the trace flag: a crossed
+                // distance with `decided=false` is a refused reframe.
+                eprintln!(
+                    "--trace margin-nested-refusal bar={} root_farkas={} status={} \
+                     prefix={}",
+                    match bar {
+                        MarginEvidenceBar::VerifiedTree => "verified-tree",
+                        MarginEvidenceBar::VerifiedTreeOrRootFarkas => "tree-or-root-farkas",
+                    },
+                    match (bar, &root_farkas) {
+                        (MarginEvidenceBar::VerifiedTree, _) => "not-attempted",
+                        (_, Some(_)) => "hit",
+                        (_, None) => "miss",
+                    },
+                    reframed.info.reframed_status,
+                    shared_binary_prefix.len(),
+                );
+            }
+            reframed.verdict = match root_farkas {
+                Some(cert) => Outcome::Infeasible {
+                    cert: Some(cert),
+                    tree_cert: None,
+                },
+                None => {
+                    // The reframe no longer DECIDES the original verdict, and
+                    // the profile line must say so rather than report the
+                    // nested solve's own `decided`.
+                    reframed.info.decided = false;
+                    Outcome::Unknown {
+                        reason: UnknownReason::CertificateUnavailable,
+                    }
+                }
+            };
+        }
+        crate::margin::record(sense, &threshold, &reframed.info, started.elapsed());
+        Ok(reframed)
+    }
+
     fn check_with_shared_binary_prefix_in_frame_inner(
         &mut self,
         shared_binary_prefix: &[Col],
@@ -7180,6 +7475,16 @@ impl BabSession {
         // lanes now SHARE it, and a lane handed an already-spent budget declines rather than
         // starting over.
         let started = Instant::now();
+        // The caller's typed knob profile, active for the SESSION-LEVEL prelude too. The
+        // bab entry points have always activated it for the tree, so every knob read from
+        // inside a solve saw the caller's engine settings — but the routing prelude and
+        // the margin dispatch run BEFORE bab, and a `tune::caller_flag` there (e.g.
+        // `Knob::AutoMargin` inside `margin::reframe`) read an empty stack and silently
+        // reported "no opinion". `with_auto_margin(true)` was therefore unreachable from
+        // any session caller: the lane it arms is consulted only at a layer the profile
+        // never reached. Nested sessions push their own frame on the same stack (LIFO,
+        // guard-restored), exactly as the sub-MIP lanes already do.
+        let _session_tuned = crate::tune::activate_caller(self.opts.engine().profile());
         // Any claim left on this thread by an earlier solve is not this solve's
         // evidence. Drop it before starting rather than risk attributing it.
         let _ = crate::cert_io::ledger::take();
@@ -8835,76 +9140,60 @@ impl BabSession {
                 }
             }
         }
-        // `Auto` is the historical empty-prefix margin behavior. `Required`
-        // creates one nested optimization session under this already-pinned
-        // deadline. `ReframedProof` reaches the native call below; its exact
+        // `Auto` (the ordinary `check()` entry, no prefix) and `Required` (the
+        // explicit 1..=4 column partition) now create the SAME single nested
+        // optimization session under this already-pinned deadline — see
+        // `run_reframed_nested`, and `MarginEvidenceBar` for the one place they
+        // differ. `ReframedProof` reaches the native call below; its exact
         // bound can trigger proof replay but cannot authorize a verdict.
         let margin_proof_target = match margin_mode {
             MarginMode::Auto => {
-                if let Some(reframed) = crate::margin::reframe(&self.model, &self.opts) {
-                    let solved = SolvedObjective {
-                        coeffs: &objective,
-                        sense: self.model.sense(),
-                        offset: self.model.objective_offset(),
-                        exact: exact_objective,
-                    };
-                    return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
+                // THE ORDINARY `check()` LANE, through the SAME nested
+                // construction the explicit API uses. `prepare_auto` keeps the
+                // detection semantics unchanged (a caller-NAMED row first, the
+                // `with_auto_margin` detector second), and a decline is
+                // fail-safe: the plain feasibility solve below runs unmodified.
+                //
+                // A nested-session ERROR is also a decline, exactly as
+                // `margin::reframe`'s `.ok()?` was — the plain solve then
+                // decides, rather than the caller receiving an error for an
+                // optional strategy they never asked for.
+                match crate::margin::prepare_auto(&self.model).and_then(|prepared| {
+                    self.run_reframed_nested(
+                        prepared,
+                        &[],
+                        None,
+                        MarginEvidenceBar::VerifiedTreeOrRootFarkas,
+                    )
+                    .ok()
+                }) {
+                    Some(reframed) => {
+                        let solved = SolvedObjective {
+                            coeffs: &objective,
+                            sense: self.model.sense(),
+                            offset: self.model.objective_offset(),
+                            exact: exact_objective,
+                        };
+                        return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
+                    }
+                    None => None,
                 }
-                None
             }
             MarginMode::Disabled => None,
             MarginMode::Required => {
-                let crate::margin::PreparedMargin {
-                    reframed_model,
-                    mapping,
-                } = crate::margin::prepare(&self.model).ok_or_else(|| MilpError::Session {
-                    message: "marked-margin shared prefix requires an enabled, objective-zero, \
-                              nonempty one-sided margin row"
-                        .to_owned(),
-                })?;
-                let target = mapping.proof_target(&self.model);
-                // Certificate policy belongs to the ORIGINAL verdict. A
-                // reframed MILP optimum may carry no optimality artifact even
-                // though its point is a complete original-feasibility witness;
-                // rejecting it here would discard authority the outer
-                // `finish` can independently check. The outer policy still
-                // requires evidence for any mapped Infeasible claim.
-                let sub_opts = self.opts.clone().with_require_certificates(false);
-                let mut sub = BabSession::new(reframed_model, &sub_opts)?;
-                sub.hint_branch_order(&self.branch_hints);
-                sub.shortlist_root_strong_branch_candidates(&self.root_strong_branch_shortlist);
-                let reframed_outcome = sub.check_with_shared_binary_prefix(
+                let prepared =
+                    crate::margin::prepare(&self.model).ok_or_else(|| MilpError::Session {
+                        message:
+                            "marked-margin shared prefix requires an enabled, objective-zero, \
+                                  nonempty one-sided margin row"
+                                .to_owned(),
+                    })?;
+                let reframed = self.run_reframed_nested(
+                    prepared,
                     shared_binary_prefix,
-                    None,
-                    MarginMode::ReframedProof(target),
                     target_fsb_prefix,
+                    MarginEvidenceBar::VerifiedTree,
                 )?;
-                let mut reframed = mapping.map(&self.model, reframed_outcome);
-                // This explicit proof API has a stronger contract than the
-                // generic `require_certificates` policy: an UNSAT mapping is
-                // authoritative only with a complete caller-frame MILP tree.
-                // In particular, a fully solved reframed MILP may report an
-                // uncertified `Optimal` result; mapping its value past the
-                // threshold must not manufacture a bare original-model
-                // `Infeasible` when the caller left the generic policy off.
-                //
-                // `MarginMapping::map` has already filtered tree artifacts
-                // against the original model. Presence here therefore means
-                // verified; the outer `finish` gate independently verifies the
-                // retained tree again without adding another full tree walk at
-                // this boundary.
-                let has_verified_margin_tree = matches!(
-                    &reframed.verdict,
-                    Outcome::Infeasible {
-                        tree_cert: Some(_),
-                        ..
-                    }
-                );
-                if reframed.verdict.is_infeasible() && !has_verified_margin_tree {
-                    reframed.verdict = Outcome::Unknown {
-                        reason: UnknownReason::CertificateUnavailable,
-                    };
-                }
                 let solved = SolvedObjective {
                     coeffs: &objective,
                     sense: self.model.sense(),
@@ -8964,7 +9253,17 @@ impl BabSession {
                         &self.branch_hints,
                         &self.root_strong_branch_shortlist,
                     ),
-                    None if !shared_binary_prefix.is_empty() => {
+                    // B2, UNBLOCKED: `|| margin_proof_target.is_some()`. The
+                    // prefix and the proof target are INDEPENDENT obligations,
+                    // and gating the margin-proof entry on a nonempty prefix
+                    // silently dropped the target on every empty-prefix call —
+                    // which is every `MarginMode::Auto` solve, i.e. the whole
+                    // ordinary `check()` lane. The plumbing below the entry was
+                    // already prefix-agnostic (`solve_milp_in_impl` keys the
+                    // finalize reserve, the live preview and the terminal
+                    // `finalize_margin_cover` on `margin_proof_target.is_some()`
+                    // and never on the prefix); only the entry asserted.
+                    None if !shared_binary_prefix.is_empty() || margin_proof_target.is_some() => {
                         match (proof_first_workers, margin_proof_target.as_ref()) {
                             (Some(workers), None) => {
                                 crate::bab::solve_milp_shared_binary_prefix_proof_first(
@@ -8976,17 +9275,15 @@ impl BabSession {
                                     &self.root_strong_branch_shortlist,
                                 )
                             }
-                            (None, Some(target)) => {
-                                crate::bab::solve_milp_shared_binary_prefix_with_margin_proof(
-                                    &self.model,
-                                    &self.opts,
-                                    shared_binary_prefix,
-                                    target,
-                                    &self.branch_hints,
-                                    &self.root_strong_branch_shortlist,
-                                    target_fsb_prefix,
-                                )
-                            }
+                            (None, Some(target)) => crate::bab::solve_milp_margin_proof(
+                                &self.model,
+                                &self.opts,
+                                shared_binary_prefix,
+                                target,
+                                &self.branch_hints,
+                                &self.root_strong_branch_shortlist,
+                                target_fsb_prefix,
+                            ),
                             (None, None) => crate::bab::solve_milp_shared_binary_prefix(
                                 &self.model,
                                 &self.opts,
@@ -9015,6 +9312,7 @@ impl BabSession {
                         &self.root_strong_branch_shortlist,
                     ),
                 };
+                self.capture_affine_certificate(&raw);
                 // The parity device lives below branch-and-bound's public
                 // `Outcome`, so drain its typed side artifact immediately after
                 // that call.  Rebuild the contradiction from this session's
@@ -9091,7 +9389,9 @@ impl BabSession {
                     Outcome::Infeasible {
                         cert: None,
                         tree_cert: None,
-                    } if self.parity_infeasibility_certificate.is_none() => {
+                    } if self.parity_infeasibility_certificate.is_none()
+                        && !self.affine_infeasibility_verified() =>
+                    {
                         // Bounded post-verdict certificate pass.
                         // Only when NO evidence exists yet: with a tree
                         // certificate in hand the verdict is already
@@ -9192,6 +9492,16 @@ impl BabSession {
                                 let mut lp = ExactLp::new(&self.model);
                                 match lp.make_feasible(&budget) {
                                     LpFeasibility::Infeasible(cert) => {
+                                        // Debug-only for the reason spelled out
+                                        // at the `MilpLane::Exact` optimum
+                                        // below: `finish` -> `validate_witnesses`
+                                        // re-verifies this Farkas certificate in
+                                        // RELEASE and withholds the verdict if it
+                                        // does not hold. Verified in a release
+                                        // build by negating one multiplier:
+                                        // `UNKNOWN WitnessRejected { detail:
+                                        // "Farkas certificate does not verify:
+                                        // multiplier 0 is not strictly positive" }`.
                                         debug_assert!(cert.verify(&self.model).is_ok());
                                         Outcome::Infeasible {
                                             cert: Some(cert),
@@ -9218,9 +9528,12 @@ impl BabSession {
                 // solve takes it — a feasibility solve's verdict is
                 // `Outcome::Feasible`, and an optimum is not that verdict.
                 if has_objective && !expired(&self.opts) {
-                    if let Some(fast) =
-                        continuous_float_first_optimum(&self.model, &objective, self.opts.deadline)
-                    {
+                    if let Some(fast) = continuous_float_first_optimum(
+                        &self.model,
+                        &objective,
+                        self.opts.deadline,
+                        &self.opts,
+                    ) {
                         break 'exact fast;
                     }
                 }
@@ -9261,6 +9574,24 @@ impl BabSession {
                                 bound: bound.clone(),
                                 multipliers,
                             };
+                            // CONSTRUCTION-SITE assertion, deliberately debug-only.
+                            // The RELEASE check is not missing: every verdict
+                            // this match produces leaves through `finish` ->
+                            // `validate_witnesses`, which re-verifies `cert`
+                            // against this same model with no `cfg` gate and
+                            // fails the whole verdict closed to
+                            // `UnknownReason::WitnessRejected`. Verified in a
+                            // release build by negating one multiplier here:
+                            // `UNKNOWN WitnessRejected { detail: "optimality
+                            // certificate does not verify: multiplier 0 is not
+                            // strictly positive" }`. Re-verifying HERE as well
+                            // would pay a second exact re-derivation of the
+                            // whole certificate on every all-continuous
+                            // optimum, and dropping the certificate on failure
+                            // (`cert: None`) would be strictly WEAKER than
+                            // today: it would publish an uncertified `Optimal`
+                            // where the exit gate withholds the verdict
+                            // entirely.
                             debug_assert!(cert.verify(&self.model).is_ok());
                             Outcome::Optimal {
                                 value: bound + offset,
@@ -9321,19 +9652,15 @@ impl BabSession {
         if !parity_infeasibility_verified && outcome.is_infeasible() {
             self.parity_infeasibility_certificate = None;
         }
-        let out = if original_margin_tree_verified {
-            outcome
-        } else if parity_infeasibility_verified {
-            finish_exact_reduction_with_supplemental_proof(
-                outcome,
-                &self.model,
-                &solved,
-                &self.opts,
-                SupplementalProof::VerifiedParityInfeasibility,
-            )
-        } else {
-            finish(outcome, &self.model, &solved, &self.opts)
-        };
+        let out = affine::finish_native_outcome(
+            outcome,
+            &self.model,
+            &solved,
+            &self.opts,
+            original_margin_tree_verified,
+            parity_infeasibility_verified,
+            self.affine_aggregation_verification,
+        );
         // THE DEFERRED CLAIM COMES BACK. This is the half of the invariant that
         // makes deferral safe: a claim held for being below the anchor's
         // evidence reach is published verbatim whenever the anchor did not in
@@ -9776,7 +10103,7 @@ mod lp_lazy_tests {
 
     #[test]
     fn certified_float_verdict_never_materializes_the_exact_rim() {
-        if !float_lane_enabled() {
+        if !float_lane_enabled(&SolveOpts::new()) {
             return;
         }
         let mut model = Model::new();
@@ -10447,6 +10774,6 @@ mod tests {
 /// It only moves *when* they are read, from "scattered across the solve" to "once,
 /// at a point the caller controls".
 pub(crate) fn prime_env() {
-    let _ = float_lane_enabled();
+    let _ = float_lane_tune_enabled();
     let _ = smt_lane_forced();
 }

@@ -10,10 +10,50 @@ impl NraSolver<'_> {
     /// Check `aux == coeff * product(factors)` under a fully available model.
     /// Missing values are unavailable evidence and therefore inconsistent for
     /// every gate that could authorize a theory-level `Sat`.
+    ///
+    /// # Why the strong resolver and the strict residual belong together
+    ///
+    /// This is the only thing tying the LINEAR abstraction back to nonlinear
+    /// reality on a `nra_check_loop` Sat exit: every product is a free opaque
+    /// LRA column, and nothing else forces that column to equal what it denotes.
+    /// So the predicate has two independent halves, and each was once wrong on
+    /// its own:
+    ///
+    /// 1. HOW A FACTOR IS RESOLVED. Resolving with `var_value` alone answers
+    ///    only for terms the tableau carries. MetiTarski emits Taylor
+    ///    polynomials in HORNER form, so every product nests a compound `+` as
+    ///    its last factor — a linear combination, not a column — and
+    ///    `var_value` returns `None` for it. Measured on
+    ///    `sqrt-1mcosq-7-chunk-0170`: ALL 30 monomials were unresolvable that
+    ///    way. Factors therefore resolve through
+    ///    [`NraSolver::monomial_factor_value`], which asks the tableau FIRST and
+    ///    only then evaluates structurally. That order is load-bearing: a nested
+    ///    product aux term must contribute the OPAQUE value the abstraction
+    ///    assigned it, because recomputing it structurally would make the
+    ///    monomial agree with itself and the check could never fail.
+    ///
+    /// 2. WHAT AN UNRESOLVABLE FACTOR MEANS. Fail-OPEN — treating "no value" as
+    ///    "consistent" — lets an unchecked monomial authorize `Sat`, which is
+    ///    exactly the vacuous-pass defect above. So the residual is fail-CLOSED.
+    ///
+    /// Fail-closing was previously argued to cost solves, and it did: on top of
+    /// resolver (1)'s blind spot, nearly every Horner monomial fell into the
+    /// residual, so closing it rejected models that were genuinely `Sat`. With
+    /// the strong resolver in front, "unresolvable" is rare and means what it
+    /// says — no evidence — and closing it is both sound and cheap. The two
+    /// halves are only safe as a pair.
+    ///
+    /// The aux side stays on `var_value` deliberately: it is the opaque column
+    /// under test, and must never be recomputed through the structural path.
+    ///
+    /// [`emit_factor_definitions`](Self::emit_factor_definitions) and
+    /// [`has_undefined_compound_factors`](Self::has_undefined_compound_factors)
+    /// remain the independent cross-check, so a compound factor must ALSO agree
+    /// with its exact linear definition.
     pub(super) fn check_monomial_consistency(&self, monomial: &crate::monomial::Monomial) -> bool {
         let mut product = BigRational::one();
         for &factor in &monomial.vars {
-            let Some(value) = self.var_value(factor) else {
+            let Some(value) = self.monomial_factor_value(factor) else {
                 return false;
             };
             product *= value;

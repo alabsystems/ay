@@ -114,6 +114,70 @@ pub(crate) fn consequence_replay_enabled() -> bool {
     !ay_core::misc_cli_flags().no_consequence_replay
 }
 
+/// Kill switch for QUANTIFIED-query trace arming under competition proof
+/// shedding (#quantified-trace-arming). Default ON — on a public query whose
+/// authored problem contains a quantifier, `--rigor fast` records the internal
+/// proof trace instead of shedding it.
+///
+/// WHY THIS IS NOT AN ARTIFACT PREFERENCE. On a quantified problem the
+/// recorded trace is not a user-facing artifact, it is the mechanism that
+/// publishes an instantiation-driven refutation: E-matching / CEGQI writers
+/// register their exact ground instances as `forall_inst` derivations, and
+/// `disambiguate_cegqi_unsat` (result_mapping.rs) publishes `unsat` precisely
+/// when those recorded derivations strict-check against the immutable authored
+/// problem. Shedding the tracker deletes the evidence, so the SAME refutation
+/// that publishes at `--rigor standard` degrades to `unknown` at `--rigor
+/// fast`. Measured on a 40-instance SQ Equality_LinearArith sample: `fast`
+/// solved 1, `standard` solved 6, with the five lost rows all independently
+/// confirmed `unsat` by z3 and cvc5 — the weaker rigor level publishing
+/// strictly less, which is a non-monotone ladder and a pure loss on the
+/// competition posture.
+///
+/// WHERE IT FIRES. On the `Unknown` FALLBACK only
+/// (`Executor::quantified_trace_arming_unknown_retry`), never at the
+/// public-solve boundary. Two measured reasons:
+///
+///  * Routing publication through the certified funnel — the first attempt,
+///    which made the quantified case defeat `competition_shedding_active()`
+///    outright — lost
+///    `UFDTLIA/20241211-verus/anvil/splinterdb-smt-exec__MiniAllocator_v.1`:
+///    a 0.3s raw `unsat` became a 60s `unknown` in the trust-rejected proof
+///    cascade.
+///  * Arming the recorder for the whole solve — the second attempt — is not
+///    verdict-neutral either: `produce_proofs_enabled()` flips true, which
+///    changes proof-preserving preprocessing and the classification arms that
+///    consult it. Over a 231-instance sweep spanning every non-incremental
+///    quantified logic it gained 9 rows and LOST 6 the shed path answers
+///    today, three of them in well under a second.
+///
+/// On the fallback there is by construction no verdict to lose: the first pass
+/// is byte-identical to the shed baseline, the B3 `CompetitionRaw` admission
+/// lane is untouched, and the retry can only replace `unknown` with a verdict
+/// that cleared every mandatory gate.
+///
+/// Setting `--no-quantified-shedding-yield` restores the pre-change behaviour
+/// byte-for-byte so the barrier can be mutation-tested.
+pub(crate) fn quantified_shedding_yield_enabled() -> bool {
+    !ay_core::misc_cli_flags().no_quantified_shedding_yield
+}
+
+/// Kill switch for the negated-existential ground-instantiation artifact
+/// firewall translation (#inc-fparith-negated-exists-inst): the producer that
+/// instantiates the De Morgan dual of an authored `(not (exists ...))` root at
+/// ground terms drawn from the problem, hands the resulting ground consequence
+/// set to the consequence-replay stitcher, and installs the stitched strict
+/// proof as `last_proof`.
+///
+/// Default ON. `--no-negated-exists-ground-inst` (or the parent
+/// `--no-consequence-replay`, which starves the stitcher itself) restores the
+/// baseline fail-closed `unknown` byte-for-byte. UNSAT-only: consulted at
+/// exactly one place — the artifact firewall's downgrade — so its only
+/// reachable transition is `unknown -> unsat`, and the verdict it lets through
+/// is still adjudicated by the unchanged mandatory certification mint.
+pub(crate) fn negated_exists_ground_inst_enabled() -> bool {
+    consequence_replay_enabled() && !ay_core::misc_cli_flags().no_negated_exists_ground_inst
+}
+
 /// Kill switch for the ground-conflict decomposition arms of the proof
 /// builder (#ground-conflict-decomp): the general EUF-chain + Farkas-bridge
 /// split of a fused ground Generic conflict, and the array read-over-write

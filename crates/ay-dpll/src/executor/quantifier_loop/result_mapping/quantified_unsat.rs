@@ -25,7 +25,34 @@ impl Executor {
         &mut self,
         missing_proof_reason: UnknownReason,
     ) -> Result<SolveResult> {
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/qsu entry exec={:p} epoch_present={} epoch_current={:?} assumptions_bound={:?}",
+                self as *const _,
+                self.unsat_query_epoch.is_some(),
+                self.checked_sat_refutation_query_scope().is_some(),
+                self.checked_sat_refutation_query_assumptions().is_some(),
+            );
+            self.debug_report_authored_shape_census();
+        }
         if self.translated_unsat_proof_required() {
+            self.translated_unsat_proof_or_downgrade(missing_proof_reason)
+        } else {
+            Ok(self.publish_quantified_verdict_only_unsat())
+        }
+    }
+
+    /// The mandatory-artifact arm: four fail-closed legs, then the downgrade.
+    ///
+    /// Three of them CONSULT for an artifact that already exists; the fourth
+    /// BUILDS one. Every leg's outcome is reported under `--debug-cert` so a
+    /// division-wide census can attribute each surviving `unknown` to the exact
+    /// leg that declined, rather than to a generic "quantifier unhandled".
+    fn translated_unsat_proof_or_downgrade(
+        &mut self,
+        missing_proof_reason: UnknownReason,
+    ) -> Result<SolveResult> {
+        {
             // (#bv-mbqi-false-instance-authority, P3b) Before discarding the
             // verdict, consult the checked SAT-refutation sidecar for the
             // EXACT public query. The refutation-driven re-solve can mint a
@@ -50,10 +77,15 @@ impl Executor {
             // substitution replay, and an independently re-lowered,
             // fully-replayed Bool/BV+UF-leaf refutation of the exact
             // instance. Same kill switch, fail-closed on every leg.
-            if crate::quant_unit_authority::quant_unit_authority_enabled()
-                && (self.checked_sat_refutation_authorizes_current_query()
-                    || self.checked_qpf_instance_refutation_authorizes_current_query())
-            {
+            let enabled = crate::quant_unit_authority::quant_unit_authority_enabled();
+            let sidecar = enabled && self.checked_sat_refutation_authorizes_current_query();
+            let qpf = !sidecar
+                && enabled
+                && self.checked_qpf_instance_refutation_authorizes_current_query();
+            Self::debug_leg(&format_args!(
+                "sidecar={sidecar} qpf={qpf} authority_enabled={enabled}"
+            ));
+            if sidecar || qpf {
                 self.last_unknown_reason = None;
                 return Ok(SolveResult::unsat());
             }
@@ -75,16 +107,75 @@ impl Executor {
             // a ground-refutable query degrades to `unknown` merely because a
             // quantifier is present somewhere else in the problem, which is the
             // #8759-era regression this restores.
-            if self.authored_ground_core_refutes() {
+            let ground_core = self.authored_ground_core_refutes();
+            Self::debug_leg(&format_args!("ground_core={ground_core}"));
+            if ground_core {
                 self.last_unknown_reason = None;
                 return Ok(SolveResult::unsat());
             }
+            // (#inc-fparith-negated-exists-inst) Last, and only once the three
+            // consulting legs above have all declined: TRY to BUILD the
+            // artifact this gate exists to demand, rather than consulting for
+            // one. `¬∃x⃗.φ ⊨ ∀x⃗.¬φ ⊨ ¬φ[t⃗]` for ground `t⃗`, so the authored
+            // negated existential plus the authored ground conjuncts reduce to
+            // a purely GROUND refutation; the translation stitches the probe's
+            // strict ground proof onto `qnt_neg_exists` → `forall_inst`
+            // derivations over the authored roots and installs it as
+            // `last_proof`. On success the ORDINARY publication funnel still
+            // mints (or refuses to mint) the token, so this can only turn a
+            // firewalled `unknown` into a strictly-certified `unsat`, never
+            // widen what publishes.
+            let ground_inst = self.try_translate_negated_exists_ground_instantiation_unsat();
+            Self::debug_leg(&format_args!("ground_inst={ground_inst}"));
+            if ground_inst {
+                self.last_unknown_reason = None;
+                return Ok(SolveResult::unsat());
+            }
+            Self::debug_leg(&format_args!("DOWNGRADE reason={missing_proof_reason:?}"));
             self.clear_cegqi_inner_unsat_artifacts();
             self.last_unknown_reason = Some(missing_proof_reason);
             Ok(SolveResult::Unknown)
-        } else {
-            Ok(self.publish_quantified_verdict_only_unsat())
         }
+    }
+
+    /// `--debug-cert` only: the single stderr channel for this gate's per-leg
+    /// attribution. One site, so the whole census reads as one stream.
+    fn debug_leg(detail: &std::fmt::Arguments<'_>) {
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!("CERT/qsu leg {detail}");
+        }
+    }
+
+    /// `--debug-cert` only: name the authored-root shapes this gate is looking
+    /// at, so a division-wide census can attribute each downgrade to a shape
+    /// rather than to a generic "quantifier unhandled".
+    fn debug_report_authored_shape_census(&self) {
+        use ay_core::TermData;
+
+        let roots = self
+            .authored_hard_unsat_roots_for_isolated_recheck()
+            .unwrap_or_else(|| self.ctx.concrete_authored_assertion_terms());
+        let mut ground = 0usize;
+        let mut forall = 0usize;
+        let mut not_exists = 0usize;
+        let mut other_quant = 0usize;
+        for &root in &roots {
+            if !crate::ematching::contains_quantifier(&self.ctx.terms, root) {
+                ground += 1;
+            } else if matches!(self.ctx.terms.get(root), TermData::Forall(..)) {
+                forall += 1;
+            } else if matches!(self.ctx.terms.get(root), TermData::Not(inner)
+                if matches!(self.ctx.terms.get(*inner), TermData::Exists(..)))
+            {
+                not_exists += 1;
+            } else {
+                other_quant += 1;
+            }
+        }
+        eprintln!(
+            "CERT/qsu shape roots={} ground={ground} forall={forall} not_exists={not_exists} other_quant={other_quant}",
+            roots.len()
+        );
     }
 
     /// Whether the AUTHORED quantifier-free conjuncts alone are UNSAT.

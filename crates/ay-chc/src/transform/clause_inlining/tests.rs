@@ -2344,3 +2344,79 @@ fn boolean_call_completion_requires_a_unique_polarity() {
         None
     );
 }
+
+/// A defining clause whose head both REPEATS a variable and carries a COMPOUND
+/// argument — `P(x, f(x), x)`, exactly what `LocalVarEliminator` leaves behind
+/// for `v10 := v8` next to `v9 := v8 < v7` — used to lose the positional
+/// equality between the two `x` positions.
+///
+/// `build_head_normalization` pushed a SECOND `x -> fresh` pair onto the
+/// substitution. `ChcExpr::substitute` collects the pairs into a map, so the
+/// LATER pair won for the body while the equality already frozen for the
+/// compound argument kept the EARLIER name. The two formals came out
+/// decoupled: one constrained by the body, the other free. The interpretation
+/// `synthesize_interpretation` then built for the inlined predicate
+/// over-approximated it, and `validate_safe` rejected an otherwise correct
+/// SAFE model on the original problem — reported as `unknown`.
+#[test]
+fn test_normalize_head_repeated_var_with_compound_keeps_positional_equality() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Int, ChcSort::Int, ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    // P(x, x + 1, x) ⇐ true
+    let clause = HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(
+            p,
+            vec![
+                ChcExpr::var(x.clone()),
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+                ChcExpr::var(x),
+            ],
+        ),
+    );
+
+    let normalized = ClauseInliner::normalize_head_for_back_translation(&clause);
+    let ClauseHead::Predicate(_, args) = &normalized.head else {
+        panic!("head must stay a predicate application");
+    };
+    let formals: Vec<ChcVar> = args
+        .iter()
+        .map(|a| match a {
+            ChcExpr::Var(v) => v.clone(),
+            other => panic!("normalized head arg must be a plain variable, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(formals.len(), 3);
+    assert_ne!(
+        formals[0].name, formals[2].name,
+        "each head POSITION needs its own formal parameter"
+    );
+
+    // The constraint must still force position 0 = position 2.
+    let constraint = normalized.body.constraint.clone().expect("constraint");
+    let probe = ChcExpr::and_all(vec![
+        constraint.clone(),
+        ChcExpr::eq(ChcExpr::var(formals[0].clone()), ChcExpr::int(0)),
+        ChcExpr::eq(ChcExpr::var(formals[2].clone()), ChcExpr::int(1)),
+    ]);
+    let folded = probe.into_propagate_equalities().simplify_constants();
+    assert!(
+        matches!(folded, ChcExpr::Bool(false)),
+        "positional equality between the repeated head positions was lost; \
+         got {folded:?} from {constraint:?}"
+    );
+
+    // And position 1 must still be pinned to position 0 plus one.
+    let probe = ChcExpr::and_all(vec![
+        constraint.clone(),
+        ChcExpr::eq(ChcExpr::var(formals[0].clone()), ChcExpr::int(0)),
+        ChcExpr::eq(ChcExpr::var(formals[1].clone()), ChcExpr::int(7)),
+    ]);
+    let folded = probe.into_propagate_equalities().simplify_constants();
+    assert!(
+        matches!(folded, ChcExpr::Bool(false)),
+        "compound head argument lost its defining equality; \
+         got {folded:?} from {constraint:?}"
+    );
+}

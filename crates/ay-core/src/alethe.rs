@@ -352,12 +352,29 @@ pub const UNPROVED_STEP_RULE: &str = "hole";
 /// of that inference anywhere in the calculus.
 const WIRE_RULE_ALIASES: [(&str, &str); 0] = [];
 
-/// True if the Alethe checker implements `name`, i.e. emitting it produces a
-/// checked step rather than `invalid`.
+/// True if the Alethe checker recognizes `name`, i.e. dispatching it does not
+/// fail with an unknown-rule `invalid` verdict.
+///
+/// This is deliberately only a parser/dispatch vocabulary predicate. Some
+/// recognized rules are semantic placeholders: notably `hole` and
+/// `lia_generic` are accepted but leave the document holey rather than
+/// checking the inference. Callers deciding proof authority must use the
+/// effective wire rule selected for the complete step, not this name-only
+/// predicate.
 #[must_use]
 pub fn is_checkable_alethe_rule(name: &str) -> bool {
     CHECKABLE_ALETHE_RULES.binary_search(&name).is_ok()
 }
+
+/// Checker-recognized rule names that do not establish their conclusion.
+///
+/// Keep this separate from [`CHECKABLE_ALETHE_RULES`]: the document parser
+/// must continue to recognize both spellings, while production emission must
+/// disclose them as the single canonical unproved rule. `lia_generic` is an
+/// integer-arithmetic placeholder in the pinned checker; an actual linear
+/// certificate may be promoted to `la_generic` only by the proof exporter's
+/// complete-step wire decision.
+const SEMANTICALLY_UNCHECKED_ALETHE_RULES: [&str; 2] = ["hole", "lia_generic"];
 
 /// Alethe rules the pinned checker accepts ONLY when the step itself carries
 /// premises and/or `:args`.
@@ -385,11 +402,12 @@ pub fn is_checkable_alethe_rule(name: &str) -> bool {
 /// `carcara/src/checker/shared.rs`.
 ///
 /// Rules whose required argument count is computed from the conclusion rather
-/// than fixed — `la_generic`, `lia_generic`, `forall_inst`, `bind` — are
-/// deliberately NOT listed. They are unreachable as a bare theory-lemma wire
-/// name: the printer either emits their `:args` (the Farkas path) or refuses
-/// the step outright with `MissingFarkasAnnotation`, and listing them here
-/// would convert that fail-loud into a silent hole.
+/// than fixed — `la_generic`, `forall_inst`, `bind` — are deliberately NOT
+/// listed. They are unreachable as a bare theory-lemma wire name: the printer
+/// either emits their required evidence or refuses the step. `lia_generic` is
+/// absent for a different reason: although the checker dispatches it, the rule
+/// is a semantic placeholder and [`wire_rule_name`] already maps it to the
+/// canonical hole before this count-side screen runs.
 const PREMISE_OR_ARG_REQUIRED_ALETHE_RULES: [&str; 65] = [
     "and",
     "and_intro",
@@ -494,6 +512,12 @@ pub fn alethe_rule_requires_premises_or_args(name: &str) -> bool {
 /// withdrawn.
 #[must_use]
 pub fn wire_rule_name(name: &str) -> &str {
+    if SEMANTICALLY_UNCHECKED_ALETHE_RULES
+        .binary_search(&name)
+        .is_ok()
+    {
+        return UNPROVED_STEP_RULE;
+    }
     if is_checkable_alethe_rule(name) {
         return name;
     }
@@ -753,6 +777,30 @@ pub enum AletheRule {
     ///
     /// Appended to preserve serialized discriminants of the older variants.
     QntNegExists,
+
+    /// One bound of a FRESH-symbol definitional extension: `(cl (<= d lin))`
+    /// or `(cl (<= lin d))`, with the defined symbol `d` in `:args`.
+    ///
+    /// This is NOT an inference and its clause is NOT a tautology — `d <= lin`
+    /// is false for most valuations of a symbol the problem constrains. It is
+    /// sound for exactly the same reason `array_ext_diff_intro` is: `d` is a
+    /// symbol the PROBLEM never mentions, so any model of the problem extends
+    /// to one that also satisfies the bound by taking `d := lin`, and a
+    /// refutation of the extended set is therefore a refutation of the
+    /// original. Adding facts about a fresh symbol is conservative; adding the
+    /// same fact about a constrained symbol is not, and only a checker that
+    /// verifies freshness AGAINST the problem can tell the two apart.
+    ///
+    /// The whole-proof conditions (one definiens per symbol, no introduced
+    /// symbol inside any definiens, matching sorts, freshness against the
+    /// problem and against every `assume`) are enforced once by
+    /// `ay_proof`'s `FreshDefRegistry`; see its `collect` for the soundness
+    /// argument and the guard-by-guard rationale. Emitted by the executor's
+    /// `derive_fresh_definitional_bounds` lane in place of the premiseless
+    /// `trust` these leaves used to demote to.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    FreshDefBound,
 }
 
 impl AletheRule {
@@ -844,6 +892,7 @@ impl AletheRule {
             Self::Custom(name) => name,
             Self::Evaluate => "evaluate",
             Self::QntNegExists => "qnt_neg_exists",
+            Self::FreshDefBound => "fresh_def_bound",
         }
     }
 

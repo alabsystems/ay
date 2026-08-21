@@ -6,8 +6,9 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::TermId;
 
 use crate::executor::{
-    BvMbqiFalseInstanceRecord, EmatchingProofRecord, QpfPremiseForcedInstanceRecord,
-    QuantExpansionRecord, SkolemInstanceRecord, SkolemWitnessRecord,
+    BvMbqiFalseInstanceRecord, DtContextConflictSink, EmatchingProofRecord,
+    QpfPremiseForcedInstanceRecord, QuantExpansionRecord, SkolemInstanceRecord,
+    SkolemWitnessRecord,
 };
 use crate::preprocess::PropagationRecords;
 
@@ -21,6 +22,7 @@ pub(super) struct DtLazyProofState {
     skolem_witnesses: Vec<SkolemWitnessRecord>,
     bv_mbqi_false_instances: Vec<BvMbqiFalseInstanceRecord>,
     qpf_premise_forced_instances: Vec<QpfPremiseForcedInstanceRecord>,
+    dt_context_conflicts: DtContextConflictSink,
     propagated_values: PropagationRecords,
     rebuild_originals: Vec<TermId>,
     term_overrides: Option<HashMap<TermId, String>>,
@@ -38,6 +40,7 @@ impl DtLazyProofState {
             skolem_witnesses: executor.skolem_witness_records.clone(),
             bv_mbqi_false_instances: executor.bv_mbqi_false_instance_records.clone(),
             qpf_premise_forced_instances: executor.qpf_premise_forced_instance_records.clone(),
+            dt_context_conflicts: executor.dt_context_conflict_records.clone(),
             propagated_values: executor.propagated_value_provenance.clone(),
             rebuild_originals: executor.last_proof_rebuild_originals.clone(),
             term_overrides: executor.last_proof_term_overrides.clone(),
@@ -54,6 +57,7 @@ impl DtLazyProofState {
         executor.skolem_witness_records = self.skolem_witnesses;
         executor.bv_mbqi_false_instance_records = self.bv_mbqi_false_instances;
         executor.qpf_premise_forced_instance_records = self.qpf_premise_forced_instances;
+        executor.dt_context_conflict_records = self.dt_context_conflicts;
         executor.propagated_value_provenance = self.propagated_values;
         executor.last_proof_rebuild_originals = self.rebuild_originals;
         executor.last_proof_term_overrides = self.term_overrides;

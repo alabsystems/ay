@@ -32,10 +32,56 @@ impl NraSolver<'_> {
             self.tentative_depth -= 1;
         }
         self.compound_defs_emitted.clear();
+        self.linearization_rows.clear();
+    }
+
+    /// Add one linearization row, suppressing a row whose linear content is
+    /// already live in the current tentative scope.  Returns `true` when the
+    /// row is NEW.
+    ///
+    /// This is what makes the refinement loop's own `added == 0` stop honest.
+    /// [`NraSolver::add_mccormick_constraints`] builds its rows from the LRA
+    /// BOUNDS, not from the model point, so on a half-bounded monomial
+    /// (`x >= 0` with no upper bound — the whole zankl matrix-interpretation
+    /// shape) it re-emits the identical `m >= 0` row on every iteration and
+    /// returns a positive count.  `added` therefore never reached 0, the
+    /// "no new lemma" stop could never fire, and the loop burned all 500
+    /// iterations re-deriving one constraint before declining anyway
+    /// (measured: zankl/matrix-1-all-01 logs the same eight
+    /// `McCormick envelope: 1 constraints` at iteration 1 and at iteration
+    /// 500).  A duplicate row cannot tighten the relaxation, so suppressing it
+    /// removes work, not information.
+    pub(crate) fn add_linearization_cut(
+        &mut self,
+        cut: &ay_lra::GomoryCut,
+        source: TermId,
+    ) -> bool {
+        // This cache deliberately keys only the reasonless, source-free rows
+        // emitted by the model-guided linearization loop.  A future caller may
+        // attach proof/conflict metadata that distinguishes two otherwise
+        // identical inequalities.  Never let a release build erase that
+        // evidence merely because the debug assertion which used to guard this
+        // contract is compiled out: metadata-bearing rows bypass the cache and
+        // are reported as progress.
+        if !cut.reasons.is_empty() || cut.source_term.is_some() {
+            self.lra.add_gomory_cut(cut, source);
+            return true;
+        }
+        let key = (source, cut.coeffs.clone(), cut.bound.clone(), cut.is_lower);
+        if !self.linearization_rows.insert(key) {
+            return false;
+        }
+        self.lra.add_gomory_cut(cut, source);
+        true
     }
 
     /// Inject model-derived sign bounds for original variables into a tentative
     /// LRA scope. Based on Z3's `nla_basics_lemmas.cpp:sign_lemma()`.
+    ///
+    /// Returns the number of NEW rows, on the same contract as
+    /// [`NraSolver::add_linearization_cut`]: a sign cut identical to one already
+    /// live in this scope leaves LRA unchanged, so counting it would report
+    /// progress the loop did not make.
     fn inject_tentative_sign_cuts(&mut self) -> usize {
         use ay_lra::GomoryCut;
         let vars = sign::vars_needing_model_sign(
@@ -57,7 +103,7 @@ impl NraSolver<'_> {
                 continue; // val == 0: no cut needed
             };
             let lra_var = self.lra.ensure_var_registered(var_id);
-            self.lra.add_gomory_cut(
+            added += usize::from(self.add_linearization_cut(
                 &GomoryCut {
                     coeffs: vec![(lra_var, BigRational::one())],
                     bound: zero.clone(),
@@ -66,8 +112,7 @@ impl NraSolver<'_> {
                     source_term: None,
                 },
                 var_id,
-            );
-            added += 1;
+            ));
         }
         added
     }
@@ -143,6 +188,27 @@ impl NraSolver<'_> {
 
     /// Check if any tracked division has an inconsistent model value.
     /// Returns true if `model(denom) * model(div_term) != model(num)`.
+    /// # Fail-open surface, PROBED and found unreached — but structurally present
+    ///
+    /// The three `else { continue; }` guards below are the same shape as the
+    /// defect fixed in `check_monomial_consistency`: when a value cannot be
+    /// resolved, the loop skips that purification, which reports the division
+    /// CONSISTENT having checked nothing. `term_value` resolves only an LRA
+    /// column or a literal constant, so any COMPOUND numerator — a Horner
+    /// polynomial, exactly what broke the monomial check — returns `None` here.
+    ///
+    /// MEASURED 2026-08-06 with an env-gated probe on both `term_value`
+    /// numerator guards: **0 of 145 files reach it** (the 17 invalid-model
+    /// files, the 8 `wrong_unsat_metitarski_exp` canaries, and a 120-file
+    /// random sample of the MV QF_NRA selection). So this is a latent hazard,
+    /// not a live defect, and it is deliberately NOT being "fixed" — swapping in
+    /// the structural resolver would change refinement behaviour on a path with
+    /// no measured problem, which is how a lane trades a real asset for a
+    /// speculative one.
+    ///
+    /// What to do if it ever IS reached: use the structural resolver
+    /// (`factor_value`) for the numerator, exactly as `monomial_factor_value`
+    /// does, and re-measure the whole MV selection for refinement regressions.
     pub(crate) fn has_inconsistent_divisions(&self) -> bool {
         for purif in &self.div_purifications {
             let Some(denom_val) = self.var_value(purif.denominator) else {
@@ -245,6 +311,109 @@ impl NraSolver<'_> {
         }
         added
     }
+
+    /// Exact value of a monomial FACTOR under the current linear model.
+    ///
+    /// A factor is NOT always a simplex-rowed term. `lra.get_value` answers only
+    /// for terms the tableau actually carries — the declared variables and the
+    /// opaque aux terms that stand for whole nonlinear products. MetiTarski-style
+    /// Taylor polynomials are emitted in HORNER form, so every product nests a
+    /// compound `+` term as its last factor:
+    ///
+    /// ```text
+    /// (* skoX skoX (+ (* skoX skoX (+ (* skoX skoX 1/720) -1/24)) 1/2))
+    /// ```
+    ///
+    /// That inner `(+ ...)` is a linear combination, not a tableau column, so
+    /// `lra.get_value` returns `None` for it — and the caller used to read that
+    /// `None` as "consistent" (see [`Self::check_monomial_consistency`]).
+    ///
+    /// Resolution order matters and is deliberate:
+    ///
+    /// 1. `lra.get_value` FIRST, so a nested product aux term contributes the
+    ///    OPAQUE value the linear abstraction assigned it. That keeps the check
+    ///    local — each monomial is verified against its immediate factors, and
+    ///    global consistency follows by induction over the monomial set. It is
+    ///    also what makes the check able to FAIL: recomputing a nested product
+    ///    structurally would make every monomial trivially agree with itself.
+    /// 2. Structural evaluation only for terms the tableau does not carry:
+    ///    constants and `+`/`-`/`*`/`/` nodes over factors that resolve.
+    ///
+    /// Returns `None` when the value genuinely cannot be determined. See
+    /// [`Self::check_monomial_consistency`] for what the caller does with that.
+    ///
+    /// Call through [`Self::monomial_factor_value`] rather than passing a depth
+    /// by hand.
+    fn factor_value(&self, term: TermId, depth: u32) -> Option<BigRational> {
+        if let Some(v) = self.lra.get_value(term) {
+            return Some(v);
+        }
+        // Depth guard: term graphs are DAGs and can nest arbitrarily. Horner
+        // chains in this corpus reach ~12; 64 leaves headroom while keeping a
+        // hostile input from exhausting the stack.
+        if depth == 0 {
+            return None;
+        }
+        match self.terms.get(term) {
+            TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
+            TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
+            TermData::App(ay_core::term::Symbol::Named(name), args) => match name.as_str() {
+                "+" if !args.is_empty() => {
+                    let mut acc = BigRational::zero();
+                    for &a in args {
+                        acc += self.factor_value(a, depth - 1)?;
+                    }
+                    Some(acc)
+                }
+                "*" if !args.is_empty() => {
+                    let mut acc = BigRational::one();
+                    for &a in args {
+                        acc *= self.factor_value(a, depth - 1)?;
+                    }
+                    Some(acc)
+                }
+                "-" if args.len() == 1 => Some(-self.factor_value(args[0], depth - 1)?),
+                "-" if args.len() >= 2 => {
+                    let mut acc = self.factor_value(args[0], depth - 1)?;
+                    for &a in &args[1..] {
+                        acc -= self.factor_value(a, depth - 1)?;
+                    }
+                    Some(acc)
+                }
+                "/" if args.len() == 2 => {
+                    let num = self.factor_value(args[0], depth - 1)?;
+                    let den = self.factor_value(args[1], depth - 1)?;
+                    // Division by zero is left to the dedicated zero-divisor
+                    // machinery (`zero_divisor_model_is_unsound`); do not
+                    // invent a quotient here.
+                    if den.is_zero() {
+                        None
+                    } else {
+                        Some(num / den)
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Value of a monomial factor at the standard evaluation depth. Single
+    /// entry point so every consumer of a monomial (consistency check, model
+    /// patcher, tangent refinement) resolves factors identically — they used to
+    /// disagree only by each having its own copy of the same blind spot.
+    pub(crate) fn monomial_factor_value(&self, term: TermId) -> Option<BigRational> {
+        // Depth guard: term graphs are DAGs and can nest arbitrarily. Horner
+        // chains in this corpus reach ~12; 64 leaves headroom while keeping a
+        // hostile input from exhausting the stack.
+        const FACTOR_EVAL_MAX_DEPTH: u32 = 64;
+        self.factor_value(term, FACTOR_EVAL_MAX_DEPTH)
+    }
+
+    // `check_monomial_consistency` lives in `check_loop/factor_definition.rs`,
+    // and resolves its factors through `monomial_factor_value` above. See that
+    // function for why the two halves — this resolver and that residual policy —
+    // belong together.
 
     /// Generate refinement lemmas for inconsistent monomials.
     ///
@@ -691,6 +860,12 @@ impl NraSolver<'_> {
                     // convergence. This is the "path case" from the clauseSMT
                     // paper — we already know a feasible value and direct the
                     // LRA solver toward it.
+                    //
+                    // Counted as progress on the same contract as every other
+                    // row source: these bounds change the LRA state the next
+                    // `check()` reads, so an iteration that adds one is NOT
+                    // stalled even when the relaxation itself has saturated.
+                    let mut look_ahead_rows = 0usize;
                     if let Some((var, suggested_val)) = self.feasible_set_look_ahead() {
                         if self.tentative_depth == 0 {
                             self.lra.push();
@@ -699,7 +874,7 @@ impl NraSolver<'_> {
                         // Inject both lower and upper bounds to fix the variable
                         // at the suggested value.
                         let lra_var = self.lra.ensure_var_registered(var);
-                        self.lra.add_gomory_cut(
+                        look_ahead_rows += usize::from(self.add_linearization_cut(
                             &ay_lra::GomoryCut {
                                 coeffs: vec![(lra_var, BigRational::one())],
                                 bound: suggested_val.clone(),
@@ -708,8 +883,8 @@ impl NraSolver<'_> {
                                 source_term: None,
                             },
                             var,
-                        );
-                        self.lra.add_gomory_cut(
+                        ));
+                        look_ahead_rows += usize::from(self.add_linearization_cut(
                             &ay_lra::GomoryCut {
                                 coeffs: vec![(lra_var, BigRational::one())],
                                 bound: suggested_val,
@@ -718,7 +893,7 @@ impl NraSolver<'_> {
                                 source_term: None,
                             },
                             var,
-                        );
+                        ));
                     }
 
                     // Step 5a: Tentative sign cuts for variables with unknown
@@ -767,6 +942,13 @@ impl NraSolver<'_> {
                     if div_added > 0 {
                         added += div_added;
                     }
+                    // Progress is "a row entered LRA this iteration", from ANY
+                    // source. The look-ahead pin and the sign cuts move the state
+                    // the next `check()` reads just as a tangent plane does, so
+                    // an iteration that produced one must not be reported as
+                    // stalled — otherwise making the relaxation's stop honest
+                    // would cost the loop the iterations those phases need.
+                    added += look_ahead_rows + sign_cuts;
                     if added == 0 && iteration < MAX_ITERATIONS {
                         // A bound or tentative patch may make the current model
                         // consistent while adding no refinement. Re-enter so a

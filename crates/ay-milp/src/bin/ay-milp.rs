@@ -40,6 +40,9 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use ay_milp::engine_cli as engine_flags;
 use ay_milp::engine_cli::Flags;
 
+#[path = "ay_milp/solve_options.rs"]
+mod solve_options;
+
 const USAGE: &str = "\
 ay-milp — MILP/LP engine with certified verdicts
 
@@ -84,9 +87,16 @@ fn main() -> ExitCode {
     ay_sys::govern::arm();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
+    if args.is_empty() {
         print!("{USAGE}");
-        return ExitCode::from(if args.is_empty() { 2 } else { 0 });
+        return ExitCode::from(2);
+    }
+    // Help is accepted ANYWHERE, not just first: the subcommand parsers refuse
+    // an unknown flag now, and `ay-milp solve --help` asking for help must not
+    // be answered with "unknown flag `--help`".
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
     }
     // THE CORRECTNESS FIX, on every invocation: an `AY_*` name nothing reads is
     // a campaign silently measuring the wrong arm. It now REFUSES rather than
@@ -183,13 +193,33 @@ enum Require {
 
 #[allow(clippy::too_many_lines)]
 fn cmd_solve(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, engine_flags::VALUE_FLAGS) {
+    // The engine switches PLUS this command's own three. An unknown `--flag`
+    // is refused here rather than parsed into silence (see `Flags::parse`).
+    let mut switches = engine_flags::switch_flags();
+    switches.extend(["no-emit-cert", "deterministic", "no-deterministic"]);
+    let flags = match Flags::parse(args, engine_flags::VALUE_FLAGS, &switches) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
     let Some(path) = flags.positional.first().cloned() else {
         return die("solve needs a model file");
     };
+    // `solve <file> <secs>` is the documented shape; anything past it was
+    // silently ignored, which is how a misspelled flag's VALUE used to ride
+    // through as a positional and be mistaken for an argument.
+    if let Some(extra) = flags.positional.get(2) {
+        return die(&format!(
+            "unexpected argument `{extra}`: solve takes <file.mps[.gz]> [seconds] and flags"
+        ));
+    }
+    if let Some(secs) = flags.positional.get(1) {
+        if secs.parse::<f64>().is_err() {
+            return die(&format!(
+                "second argument `{secs}` is not a number of seconds \
+                 (use --time-limit <secs>, or a flag it belongs to)"
+            ));
+        }
+    }
     // Positional seconds remain accepted: `mps_solve <file> <secs>` is how every
     // measurement script in the journal invokes the solver.
     let secs: f64 = flags
@@ -224,68 +254,10 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     // that model shape would discard a proof before learning which claim the
     // solve actually needs to make.
 
-    let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
-    if require == Require::Full {
-        opts = opts.with_require_certificates(true);
-    }
-    opts = match engine_flags::apply(&flags, opts) {
+    let opts = match solve_options::from_flags(&flags, require, secs) {
         Ok(opts) => opts,
         Err(message) => return die(&message),
     };
-    let tree_cert_leaves_explicit = flags.get("tree-cert-leaves").cloned(); // B22: env fallback retired.
-    if let Some(v) = &tree_cert_leaves_explicit {
-        match v.parse::<usize>() {
-            Ok(n) => opts = opts.with_tree_cert_leaves(n),
-            Err(_) => return die("--tree-cert-leaves needs an integer"),
-        }
-    }
-    // A TREE CERTIFICATE WITH NO CONSUMER IS NOT BOUGHT.
-    //
-    // The artifact is paid for by a whole re-solve (`harvest_tree_cert_by_resolve`),
-    // and `--no-emit-cert` used to leave the leaf budget at its 256 default — so the
-    // re-solve ran on every infeasible verdict and the result was thrown away
-    // unwritten. Measured over 8 infeasible bench instances: 8.638 s -> 7.539 s
-    // (-1.099 s, 12.7%), worst case neos859080 1.131 -> 0.386 s (2.93x), at
-    // byte-identical verdicts.
-    //
-    // `--require full` is EXCLUDED because that posture must be able to refuse a
-    // verdict it cannot back: the evidence has to exist even when it is not written.
-    // An explicit `--tree-cert-leaves` is also honoured —
-    // asking for a budget outright is a deliberate act, and silently zeroing it would
-    // make the knob lie.
-    //
-    // This is what makes a larger evidence-path budget affordable at all: the cost of
-    // proving is now charged only to callers who asked to be able to check.
-    if flags.has("no-emit-cert") && require != Require::Full && tree_cert_leaves_explicit.is_none()
-    {
-        opts = opts.with_tree_cert_leaves(0);
-    }
-    if let Some(v) = flag_or_env(&flags, "threads", "AY_MILP_THREADS") {
-        match v.parse::<u32>() {
-            Ok(n) if n > 1 => opts = opts.with_threads(n).with_determinism(false),
-            Ok(_) => {}
-            Err(_) => return die("--threads needs an integer"),
-        }
-    }
-    if let Some(v) = flags.get("seed") {
-        match v.parse::<u64>() {
-            Ok(n) => opts = opts.with_seed(n),
-            Err(_) => return die("--seed needs an integer"),
-        }
-    }
-    if flags.has("deterministic") {
-        opts = opts.with_determinism(true);
-    }
-    if flags.has("no-deterministic") {
-        opts = opts.with_determinism(false);
-    }
-    // B7: the AY_MILP_OPEN_BYTES env alias is deleted; --memory-budget is the interface.
-    if let Some(v) = flags.get("memory-budget").cloned() {
-        match v.parse::<usize>() {
-            Ok(n) => opts = opts.with_memory_budget(Some(n)),
-            Err(_) => return die("--memory-budget needs an integer"),
-        }
-    }
 
     let col_names = p.col_names.clone();
     let obj_scale = p.obj_scale.clone();
@@ -362,6 +334,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             obj_scale: &obj_scale,
             provenance: &provenance(),
             replay_claims: s.replay_claims(),
+            affine_aggregation_certificate: s.affine_aggregation_certificate(),
             parity_infeasibility_certificate: s.parity_infeasibility_certificate(),
             sat_relu_infeasibility_certificate: s.sat_relu_infeasibility_certificate(),
             network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
@@ -678,7 +651,7 @@ fn write_witness(
 // ---------------------------------------------------------------------------
 
 fn cmd_verify(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &["model", "cert"]) {
+    let flags = match Flags::parse(args, &["model", "cert"], &["accept-replay", "exit-zero"]) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
@@ -762,6 +735,7 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
     let flags = match Flags::parse(
         args,
         &["model", "point", "repair-time-limit", "memory-budget"],
+        &["repair-continuous"],
     ) {
         Ok(f) => f,
         Err(e) => return die(&e),
@@ -1068,8 +1042,93 @@ mod point_repair_tests {
 // diag — the old env-var modes, as subcommands
 // ---------------------------------------------------------------------------
 
+/// `diag` modes whose lane threads a caller [`SolveOpts`], so an engine flag
+/// given there actually reaches the engine.
+///
+/// `root-closure`, `lp-only`, `dualfix` and `margin-row` reach it through the
+/// `_with` diagnostics; `cross-check` and `profile` reach it through
+/// `BabSession::check`, which installs the caller frame from whatever opts it is
+/// handed — they were only missing it because each built a throwaway
+/// `SolveOpts::new()` beside the flagged one.
+///
+/// EACH ENTRY HAS A MEASURED POSITIVE CONTROL — a flag that demonstrably moves
+/// that mode's own output on a real model. Listing a mode here without one would
+/// recreate the dead-flag defect in a new place, since the entry is precisely the
+/// promise that a flag given to the mode is honoured:
+///
+/// | mode | control | measured effect | when |
+/// |---|---|---|---|
+/// | `dualfix` | `--no-dualfix` | `p0548`: `int_after=477 fixings=55 … rounds=3` → `fixings=0 DECLINED` | this change |
+/// | `margin-row` | `--no-margin-reframe` | `…_1181_feas`: `reframed_solve=FEASIBLE_UNDECIDED … => original=UNKNOWN` → `reframed_solve=DECLINED reframed_bound=- … => original=plain-feasibility`, 3/3 repeats | this change |
+/// | `margin-row` | `--devex` | same model, 5 repeats each: `reframed_bound` ∈ [-0.110, -0.017] unflagged vs [+0.1464, +0.1498] flagged — disjoint ranges, not one pair, because that field is an ANYTIME bound (see `diag_margin_reframe_with`) | this change |
+/// | `lp-only` | `--devex` | `qiu` primal 3455 → 2176 | 814b23485 |
+/// | `root-closure` | `--root-cuts-per-round` | cut count / `bound_cut` move | 814b23485 |
+/// | `cross-check` | `--devex` | reaches the nested `BabSession` | 814b23485 |
+/// | `profile` | `--devex` | reaches the nested `BabSession` | 814b23485 |
+///
+/// The `when` column is not decoration: the last four are INHERITED claims, taken
+/// on the commit that added those entries, and re-verifying them was not part of
+/// this change. The first three were measured on the binary this comment ships
+/// with.
+///
+/// `block-angular` is NOT here, and that is a finding, not an omission. Its
+/// diagnostic reports the stage/decline/term/round census of the EXACT
+/// block-angular decomposition, and `block_angular_route.rs` contains ZERO knob
+/// reads — `grep -c 'tune::' crates/ay-milp/src/block_angular_route.rs` is 0 over
+/// 7,007 lines. Recognition, pricing and certificate replay are deterministic by
+/// construction, and the one nested LP it runs is a restricted master whose
+/// `SolveOpts` the route builds itself with `require_certificates = true` and
+/// `structure_routing = false` because its exactness argument depends on those
+/// two settings, not on the caller's taste. A `_with` variant would parse a flag,
+/// thread it, and move no number — the exact defect this list exists to prevent
+/// — so `block-angular` keeps refusing, loudly, at exit 2.
+///
+/// Its two real knobs are `diag`'s own and both work today. Measured on the
+/// two-block covering fixture from `tests/cert_io.rs`:
+///
+/// ```text
+/// (default)            … status=optimal … terms=1334 rounds=104 master_rows=1 blocks=2 route_budget_bytes=67108864 phase_cap_bytes=33554432
+/// --memory-budget 8388608  … status=optimal … terms=1334 rounds=104 master_rows=1 blocks=2 route_budget_bytes=8388608  phase_cap_bytes=4194304
+/// ```
+const DIAG_MODES_WITH_OPTS: &[&str] = &[
+    "root-closure",
+    "lp-only",
+    "dualfix",
+    "margin-row",
+    "cross-check",
+    "profile",
+];
+
+/// `diag`'s OWN carriers — parsed here, not by `engine_flags::apply`.
+const DIAG_OWN_FLAGS: &[&str] = &["time-limit", "memory-budget", "row", "solution"];
+
 fn cmd_diag(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &["time-limit", "memory-budget", "row", "solution"]) {
+    // ENGINE FLAGS REACH THE TWO MODES THAT CAN HONOUR THEM.
+    //
+    // `diag` used to refuse every engine flag, which was the safe half of the
+    // dead-flag repair: `--devex` on `lp-only` changed nothing, so refusing it
+    // beat measuring under it. The other half is this — `root-closure` and
+    // `lp-only` now build `SolveOpts`, run `engine_flags::apply` on it and hand
+    // it to the `_with` variant, so the flag moves the number it names.
+    //
+    // The accept list is `applied_flags()`, NOT `VALUE_FLAGS`: the latter also
+    // carries `solve`'s own names (`--emit-cert`, `--require`, `--threads`),
+    // which no diagnostic reads, and accepting one of those here would be the
+    // same defect in a new place.
+    let applied = engine_flags::applied_flags();
+    let all_switches = engine_flags::switch_flags();
+    let switches: Vec<&str> = all_switches
+        .iter()
+        .copied()
+        .filter(|n| applied.contains(n))
+        .collect();
+    let mut value_flags: Vec<&str> = DIAG_OWN_FLAGS.to_vec();
+    for name in &applied {
+        if !switches.contains(name) && !value_flags.contains(name) {
+            value_flags.push(name);
+        }
+    }
+    let flags = match Flags::parse(args, &value_flags, &switches) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
@@ -1077,6 +1136,23 @@ fn cmd_diag(args: &[String]) -> ExitCode {
         return die("diag needs a mode \
              (root-closure|lp-only|dualfix|block-angular|margin-row|cross-check|profile)");
     };
+    // A mode that threads no opts must not accept a flag it cannot honour. The
+    // parser cannot enforce this (the mode is a positional, read after parsing),
+    // so the refusal is here, and it names the flag and the modes that do take it.
+    if !DIAG_MODES_WITH_OPTS.contains(&mode.as_str()) {
+        if let Some(stray) = flags
+            .names_given()
+            .into_iter()
+            .find(|n| !DIAG_OWN_FLAGS.contains(n))
+        {
+            return die(&format!(
+                "`diag {mode}` threads no SolveOpts, so `--{stray}` would have been parsed \
+                 and IGNORED — REFUSED rather than measured under a flag that does nothing. \
+                 Engine flags apply to: {}.",
+                DIAG_MODES_WITH_OPTS.join(", ")
+            ));
+        }
+    }
     let Some(path) = flags.positional.get(1).cloned() else {
         return die("diag needs a model file");
     };
@@ -1085,6 +1161,16 @@ fn cmd_diag(args: &[String]) -> ExitCode {
         .and_then(|s| s.parse().ok())
         .or_else(|| flags.positional.get(2).and_then(|s| s.parse().ok()))
         .unwrap_or(60.0);
+    // The flagged opts the two `_with` lanes consume. Built even when no engine
+    // flag was given: `SolveOpts::new()` plus the time limit is what those lanes
+    // used to construct internally, so the default path is unchanged.
+    let opts = match engine_flags::apply(
+        &flags,
+        SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs)),
+    ) {
+        Ok(o) => o,
+        Err(e) => return die(&format!("bad engine flag: {e}")),
+    };
     let text = match read_maybe_gz(&path) {
         Ok(t) => t,
         Err(e) => return die(&format!("cannot read {path}: {e}")),
@@ -1096,7 +1182,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
     report_shape(&p);
     match mode.as_str() {
         "root-closure" => {
-            let line = ay_milp::diag_root_closure(&p.model, secs);
+            let line = ay_milp::diag_root_closure_with(&p.model, secs, &opts);
             // The diagnostic reports in the model's sense/offset frame; what it
             // cannot undo is the reader's integralising objective scale.
             let scale = p.obj_scale.to_f64().unwrap_or(1.0);
@@ -1115,7 +1201,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         "lp-only" => {
-            eprintln!("{}", ay_milp::diag_float_lp(&p.model, secs));
+            eprintln!("{}", ay_milp::diag_float_lp_with(&p.model, secs, &opts));
             print_profiles();
             ExitCode::SUCCESS
         }
@@ -1123,9 +1209,23 @@ fn cmd_diag(args: &[String]) -> ExitCode {
         // is the `DualReductions=0` arm and `int_after` the default one, both
         // measured on the same pass so the attribution needs no second run.
         "dualfix" => {
-            println!("{}", ay_milp::diag_dualfix(&p.model, secs));
+            // `--no-dualfix` is the rule's only kill switch and it lives on the
+            // caller layer, so the flagged `opts` — not a throwaway — is what
+            // makes it reachable here at all.
+            println!("{}", ay_milp::diag_dualfix_with(&p.model, secs, &opts));
             ExitCode::SUCCESS
         }
+        // THE ONE MODE THAT STAYS FRAMELESS, ON PURPOSE. `diag_block_angular`
+        // takes no `SolveOpts` and is not given one, because there is nothing on
+        // its path for a caller profile to reach: `block_angular_route.rs` reads
+        // ZERO `tune` knobs, and the restricted-master LP it runs is configured
+        // by the route itself (`require_certificates = true`,
+        // `structure_routing = false`) because the exactness argument depends on
+        // those two settings, not on the caller's taste. Threading opts here
+        // would satisfy the letter of DIAG_MODES_WITH_OPTS and reintroduce its
+        // defect: a flag that parses, threads, and moves no number. Its real
+        // knobs (`--time-limit`, `--memory-budget`) are `diag`'s own, and both
+        // already work.
         "block-angular" => {
             let memory_budget = match flags.get("memory-budget") {
                 Some(value) => match value.parse::<usize>() {
@@ -1157,7 +1257,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             if let Err(e) = m.mark_margin_row(row) {
                 return die(&format!("mark_margin_row({row_idx}): {e}"));
             }
-            eprintln!("{}", ay_milp::diag_margin_reframe(&m, secs));
+            eprintln!("{}", ay_milp::diag_margin_reframe_with(&m, secs, &opts));
             ExitCode::SUCCESS
         }
         "cross-check" => {
@@ -1183,7 +1283,9 @@ fn cmd_diag(args: &[String]) -> ExitCode {
                 }
             }
             eprintln!("cross-check: pinned {pinned} integer columns to the reference solution");
-            let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+            // The flagged `opts` from above, not a throwaway `SolveOpts::new()`.
+            // `check` installs the caller frame from what it is handed, so the
+            // one-line shadow was the whole reason `--devex` did nothing here.
             let mut s = match BabSession::new(m, &opts) {
                 Ok(s) => s,
                 Err(e) => return die(&format!("{e:?}")),
@@ -1199,7 +1301,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         "profile" => {
-            let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+            // Same one-line shadow as `cross-check`, same repair.
             let mut s = match BabSession::new(p.model, &opts) {
                 Ok(s) => s,
                 Err(e) => return die(&format!("{e:?}")),
@@ -1236,7 +1338,7 @@ fn print_profiles() {
 // ---------------------------------------------------------------------------
 
 fn cmd_knobs(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &["bucket"]) {
+    let flags = match Flags::parse(args, &["bucket"], &["list", "audit", "deprecated"]) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };
@@ -1290,7 +1392,7 @@ fn cmd_knobs(args: &[String]) -> ExitCode {
 }
 
 fn cmd_features(args: &[String]) -> ExitCode {
-    let flags = match Flags::parse(args, &[]) {
+    let flags = match Flags::parse(args, &[], &["list"]) {
         Ok(f) => f,
         Err(e) => return die(&e),
     };

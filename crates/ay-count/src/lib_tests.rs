@@ -49,6 +49,127 @@ fn invalid_numeric_options_fail_closed_without_panicking() {
 }
 
 #[test]
+fn invalid_public_instance_fields_fail_closed_before_solving() {
+    let mut instance = parse::parse_instance("p cnf 1 0\n").expect("parses");
+    instance.clauses.push(vec![0]);
+
+    let outcome = solve_instance(&instance, &SolveOptions::default());
+
+    assert_eq!(outcome.satisfiable, None);
+    assert_eq!(outcome.value, None);
+    assert!(outcome
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("format error: clause 1: clause literal 0")));
+}
+
+#[test]
+fn contradictory_projection_track_state_fails_closed_before_solving() {
+    let base = parse::parse_instance("p cnf 2 0\n").expect("parses");
+    let mut mc = base.clone();
+    mc.show = Some(vec![1]);
+    let mut wmc = base;
+    wmc.ptype = ProblemType::Wmc;
+    wmc.show = Some(vec![1]);
+
+    for (label, instance, expected_warning) in [
+        ("mc", mc, "mc instances cannot contain a projection set"),
+        ("wmc", wmc, "wmc instances cannot contain a projection set"),
+    ] {
+        let outcome = solve_instance(&instance, &SolveOptions::default());
+
+        assert_eq!(outcome.satisfiable, None, "{label}");
+        assert_eq!(outcome.value, None, "{label}");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(expected_warning)),
+            "{label}: {:?}",
+            outcome.warnings
+        );
+    }
+}
+
+#[test]
+fn projected_tracks_without_show_records_count_the_empty_projection() {
+    for (problem_type, expected) in [
+        ("pmc", ExactValue::Nat(num_bigint::BigUint::from(1u32))),
+        ("pwmc", ExactValue::Rat(BigRational::from_integer(1.into()))),
+    ] {
+        let instance =
+            parse::parse_instance(&format!("c t {problem_type}\np cnf 2 0\n")).expect("parses");
+        assert_eq!(instance.show, Some(Vec::new()), "{problem_type}");
+
+        let outcome = solve_instance(&instance, &SolveOptions::default());
+
+        assert_eq!(outcome.satisfiable, Some(true), "{problem_type}");
+        assert_eq!(outcome.value, Some(expected), "{problem_type}");
+    }
+}
+
+#[test]
+fn manually_projected_complex_track_fails_closed_before_solving() {
+    let mut instance = parse::parse_instance("c t amc-complex\np cnf 1 0\n").expect("parses");
+    instance.show = Some(vec![1]);
+
+    let outcome = solve_instance(&instance, &SolveOptions::default());
+
+    assert_eq!(outcome.satisfiable, None);
+    assert_eq!(outcome.value, None);
+    assert!(outcome.warnings.iter().any(|warning| {
+        warning.contains("amc-complex instances cannot contain a projection set")
+    }));
+}
+
+#[test]
+fn conflicting_weight_declarations_fail_closed_end_to_end() {
+    let instance = parse::parse_instance(
+        "c t wmc\np cnf 1 0\nc p weight 1 1 0\nc p weight 1 2 0\nc p weight -1 1 0\n",
+    )
+    .expect("individual declarations parse");
+
+    let outcome = solve_instance(&instance, &SolveOptions::default());
+
+    assert_eq!(outcome.satisfiable, None);
+    assert_eq!(outcome.value, None);
+    assert!(outcome
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("conflicting duplicate weight for literal 1")));
+}
+
+#[test]
+fn malformed_weights_fail_closed_before_unsat_shortcut() {
+    for (label, text, expected_warning) in [
+        (
+            "real",
+            "c t wmc\np cnf 1 2\nc p weight 1 2 0\n1 0\n-1 0\n",
+            "requires the complement weight",
+        ),
+        (
+            "complex",
+            "c t amc-complex\np cnf 1 2\nc p weight 1 1+0i 0\n1 0\n-1 0\n",
+            "only one polarity",
+        ),
+    ] {
+        let instance = parse::parse_instance(text).expect("declarations parse individually");
+        let outcome = solve_instance(&instance, &SolveOptions::default());
+
+        assert_eq!(outcome.satisfiable, None, "{label}");
+        assert_eq!(outcome.value, None, "{label}");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(expected_warning)),
+            "{label}: {:?}",
+            outcome.warnings
+        );
+    }
+}
+
+#[test]
 fn end_to_end_spec_example_1() {
     let text = "p cnf 6 4\nc t mc\n-1 -2\n0\n2 3 -4 0\n4 5 0\n4 6 0\n";
     let outcome = solve_text(text);

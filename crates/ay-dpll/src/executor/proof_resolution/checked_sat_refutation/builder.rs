@@ -4,6 +4,8 @@
 
 //! Ordered construction stages for CheckedSatRefutation.
 
+use ay_core::kani_compat::DetHashSet as HashSet;
+
 use super::*;
 use crate::sat_proof_manager::{
     FragmentInstanceDerivation, FragmentInstanceRootDerivation, FragmentPropagationEnvironment,
@@ -17,6 +19,7 @@ struct SealedAuthority {
     skolem_derivations: HashMap<TermId, FragmentSkolemDerivation>,
     propagation_environment: FragmentPropagationEnvironment,
     instance_root_derivations: Vec<FragmentInstanceRootDerivation>,
+    context_derivations: HashMap<Vec<TermId>, FragmentContextDerivation>,
 }
 
 struct ReplayValidation {
@@ -43,15 +46,33 @@ fn seal_authority(executor: &mut Executor) -> Result<SealedAuthority, CheckedSat
     let (instance_derivations, skolem_derivations) = sealed_fragment_derivation_maps(executor);
     let propagation_environment = sealed_propagation_environment(executor);
     let instance_root_derivations = sealed_instance_root_derivations(executor);
+    let context_derivations = sealed_context_derivations(executor);
     let (query_epoch, source_context_stamp) = executor
         .checked_sat_refutation_query_scope()
-        .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
+        .ok_or_else(|| {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!("CERT/seal decline: scope accessor None");
+            }
+            CheckedSatRefutationError::UnsupportedQueryScope
+        })?;
     let bound_assumptions = executor
         .checked_sat_refutation_query_assumptions()
-        .ok_or(CheckedSatRefutationError::UnsupportedQueryScope)?;
+        .ok_or_else(|| {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!("CERT/seal decline: assumptions accessor None");
+            }
+            CheckedSatRefutationError::UnsupportedQueryScope
+        })?;
     let solver_assumptions_match = executor.last_assumptions.as_deref() == Some(bound_assumptions)
         || (bound_assumptions.is_empty() && executor.last_assumptions.is_none());
     if !solver_assumptions_match {
+        if ay_core::misc_cli_flags().debug_cert {
+            eprintln!(
+                "CERT/seal decline: solver assumptions mismatch: last={:?} bound={:?}",
+                executor.last_assumptions.as_deref().map(<[TermId]>::len),
+                bound_assumptions.len(),
+            );
+        }
         return Err(CheckedSatRefutationError::UnsupportedQueryScope);
     }
     Ok(SealedAuthority {
@@ -61,6 +82,7 @@ fn seal_authority(executor: &mut Executor) -> Result<SealedAuthority, CheckedSat
         skolem_derivations,
         propagation_environment,
         instance_root_derivations,
+        context_derivations,
     })
 }
 
@@ -182,10 +204,76 @@ fn prepare_strict_context(
     })
 }
 
+/// The stable trace ids of every ORIGINAL clause in the empty-clause
+/// hint-closure of the validated DAG (#cone-scoped-authority).
+///
+/// Walks derived rows' RUP hints transitively from the terminal empty clause.
+/// Only cone originals are premises of the published refutation, so only they
+/// need semantic authentication. Any structural inconsistency (an id outside
+/// both namespaces, a derived index mismatch, a canonical id without a trace
+/// mapping) returns `None`, which keeps the historical EXHAUSTIVE
+/// authentication — strictly fail-closed.
+fn original_cone_trace_ids(
+    validated: &ValidatedPremisedClauseTraceResolution,
+    meter: &mut CheckedRefutationMeter,
+) -> Result<Option<HashSet<u64>>, CheckedSatRefutationError> {
+    let dag = validated.dag();
+    let originals_len = dag.original_clauses.len() as u64;
+    let mut visited: HashSet<u64> = HashSet::default();
+    let mut cone_original_canonicals: HashSet<u64> = HashSet::default();
+    let mut stack: Vec<u64> = vec![dag.empty_clause_id];
+    while let Some(id) = stack.pop() {
+        meter.charge(1, 0)?;
+        if !visited.insert(id) {
+            continue;
+        }
+        if id == 0 {
+            return Ok(None);
+        }
+        if id <= originals_len {
+            cone_original_canonicals.insert(id);
+            continue;
+        }
+        let Ok(derived_index) = usize::try_from(id - originals_len - 1) else {
+            return Ok(None);
+        };
+        let Some(step) = dag.derived.get(derived_index) else {
+            return Ok(None);
+        };
+        if step.id != id {
+            return Ok(None);
+        }
+        meter.charge(step.rup_hints.len(), 0)?;
+        stack.extend(step.rup_hints.iter().copied());
+    }
+    let mappings = validated.original_mappings();
+    meter.charge(
+        mappings.len(),
+        checked_resource_mul(
+            cone_original_canonicals.len(),
+            size_of::<u64>() * 2,
+            ResolutionValidationResource::Bytes,
+        )?,
+    )?;
+    let mut cone_trace_ids: HashSet<u64> = HashSet::default();
+    for mapping in mappings {
+        if cone_original_canonicals.contains(&mapping.canonical_id()) {
+            cone_trace_ids.insert(mapping.trace_id());
+        }
+    }
+    if cone_trace_ids.len() != cone_original_canonicals.len() {
+        // A cone member without a trace mapping (or a duplicated trace id):
+        // fall back to exhaustive authentication.
+        return Ok(None);
+    }
+    Ok(Some(cone_trace_ids))
+}
+
 fn build_fragment(
     executor: &mut Executor,
     authority: &SealedAuthority,
     authored: &AuthoredTerms,
+    original_id_cone: Option<&HashSet<u64>>,
     meter: &mut CheckedRefutationMeter,
 ) -> Result<ExactOriginalProofFragment, CheckedSatRefutationError> {
     let trace = executor
@@ -201,8 +289,13 @@ fn build_fragment(
         .ok_or(CheckedSatRefutationError::MissingScopeAuthority)?;
     let clausification_proofs = executor.last_clausification_proofs.as_deref();
     let theory_proofs = executor.last_original_clause_theory_proofs.as_deref();
+    // #dt-ground-conflict: registries for the pedigree-free DT lane, built
+    // BEFORE the manager takes the mutable term-store borrow. `None` on
+    // datatype-free problems — the lane is then skipped entirely.
+    let dt_registry = crate::theory_inference::dt_funnel_registry_data(&executor.ctx);
 
     let mut manager = SatProofManager::new(var_to_term, &mut executor.ctx.terms);
+    manager.set_dt_registry_data(dt_registry.as_ref());
     manager.set_scope_assumptions(scope_assumptions)?;
     if let Some(proofs) = clausification_proofs {
         manager.set_clausification_proofs(proofs);
@@ -222,9 +315,13 @@ fn build_fragment(
     if !authority.instance_root_derivations.is_empty() {
         manager.set_instance_root_derivations(&authority.instance_root_derivations);
     }
+    if !authority.context_derivations.is_empty() {
+        manager.set_context_derivations(&authority.context_derivations);
+    }
     Ok(manager.build_exact_original_proof_fragment_metered(
         trace,
         &authored.combined,
+        original_id_cone,
         &mut |work, bytes| meter.charge(work, bytes),
     )?)
 }
@@ -235,6 +332,7 @@ fn authenticate_and_compose(
     replay: &mut ReplayValidation,
     authored: &AuthoredTerms,
     strict: &StrictContext,
+    original_id_cone: Option<&HashSet<u64>>,
 ) -> Result<(), CheckedSatRefutationError> {
     let authentication_bytes = strict_authentication_bytes(fragment.proof(), &mut replay.meter)?;
     replay
@@ -282,6 +380,7 @@ fn authenticate_and_compose(
         &replay.validated,
         fragment,
         &authenticated,
+        original_id_cone,
         var_to_term,
         scope_assumptions,
         &mut executor.ctx.terms,
@@ -346,7 +445,21 @@ pub(super) fn build(
     let mut replay = replay_trace(executor)?;
     let authored = copy_authored_terms(executor, &mut replay.meter)?;
     let strict = prepare_strict_context(executor, &mut replay.meter)?;
-    let fragment = build_fragment(executor, &authority, &authored, &mut replay.meter)?;
-    authenticate_and_compose(executor, &fragment, &mut replay, &authored, &strict)?;
+    let original_id_cone = original_cone_trace_ids(&replay.validated, &mut replay.meter)?;
+    let fragment = build_fragment(
+        executor,
+        &authority,
+        &authored,
+        original_id_cone.as_ref(),
+        &mut replay.meter,
+    )?;
+    authenticate_and_compose(
+        executor,
+        &fragment,
+        &mut replay,
+        &authored,
+        &strict,
+        original_id_cone.as_ref(),
+    )?;
     finish_capability(authority, authored, &mut replay)
 }

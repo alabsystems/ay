@@ -1143,6 +1143,28 @@ impl XorShift {
 #[test]
 #[serial]
 fn test_inc_neg_differential_vs_full_scan() {
+    // `false`: the historical trajectory, byte for byte — no extra RNG draws.
+    run_inc_neg_differential(false);
+}
+
+/// #euf-inc-neg-pop: the same differential with a THIRD solver arm whose
+/// `inc_neg_pop_enabled` is forced ON, so the delta-across-pop branch is covered
+/// even when `--euf-inc-neg-pop` was not passed on the command line. Without this arm
+/// the differential never entered the new code at all.
+///
+/// The trajectory additionally follows half its pops with an assert BEFORE the
+/// next propagate — what a CDCL backjump actually does (pop to the backjump
+/// level, then assert the flipped literal), and the case where the delta path
+/// must not let its index restoration swallow the new disequality's trigger.
+/// Those extra draws are gated on this arm precisely so the flag-off test above
+/// keeps its pre-existing 600-step stream.
+#[test]
+#[serial]
+fn test_inc_neg_pop_delta_differential_vs_full_scan() {
+    run_inc_neg_differential(true);
+}
+
+fn run_inc_neg_differential(pop_delta_arm: bool) {
     use std::collections::BTreeSet;
 
     let mut store = TermStore::new();
@@ -1164,9 +1186,17 @@ fn test_inc_neg_differential_vs_full_scan() {
     inc.inc_neg_enabled = true;
     inc.inc_pos_enabled = true;
     full.inc_neg_enabled = false;
+    // #euf-inc-neg-pop third arm: same incremental configuration as `inc`, with
+    // the pop-delta lever pinned (ON for the delta test, OFF for the historical
+    // one) so the arm is deterministic regardless of `--euf-inc-neg-pop`.
+    let mut popd = EufSolver::new(&store);
+    popd.inc_neg_enabled = true;
+    popd.inc_pos_enabled = true;
+    popd.inc_neg_pop_enabled = pop_delta_arm;
 
     let mut rng = XorShift(0x5eed_2026_0702);
     let mut inc_cumulative: BTreeSet<(TermId, bool)> = BTreeSet::new();
+    let mut popd_cumulative: BTreeSet<(TermId, bool)> = BTreeSet::new();
     let mut depth = 0usize;
 
     let props_of = |props: &[ay_core::TheoryPropagation]| -> BTreeSet<(TermId, bool)> {
@@ -1185,23 +1215,53 @@ fn test_inc_neg_differential_vs_full_scan() {
             let value = rng.below(2) == 0;
             inc.assert_literal(atom, value);
             full.assert_literal(atom, value);
+            popd.assert_literal(atom, value);
         } else if action < 75 {
             inc.push();
             full.push();
+            popd.push();
             depth += 1;
         } else if action < 90 && depth > 0 {
             inc.pop();
             full.pop();
+            popd.pop();
             depth -= 1;
-            inc_cumulative.clear(); // pop forces a full incremental rescan
+            // A pop that arms the full rescan re-announces every live match, so
+            // the completeness ledger restarts there. #euf-inc-neg-pop: a pop
+            // that instead handed over a DELTA announces only what the pop
+            // changed, so the ledger must carry over — the claim being checked is
+            // then "announced at least once since the last COMPLETE pass", which
+            // is exactly the invariant the delta path relies on.
+            if !inc.neg_pop_delta_valid {
+                inc_cumulative.clear();
+            }
+            if !popd.neg_pop_delta_valid {
+                popd_cumulative.clear();
+            }
+            // #euf-inc-neg-pop: half the pops are followed by an assert BEFORE
+            // the next propagate — the real CDCL backjump shape. FLAG-GATED so
+            // the historical flag-off trajectory keeps its exact RNG stream.
+            if pop_delta_arm && rng.below(2) == 0 {
+                let atom = eq_atoms[rng.below(eq_atoms.len())];
+                let value = rng.below(2) == 0;
+                inc.assert_literal(atom, value);
+                full.assert_literal(atom, value);
+                popd.assert_literal(atom, value);
+            }
         } else {
             // check() keeps verdicts aligned and drives closure rebuilds.
             let r_inc = inc.check();
             let r_full = full.check();
+            let r_popd = popd.check();
             assert_eq!(
                 matches!(r_inc, TheoryResult::Unsat(_)),
                 matches!(r_full, TheoryResult::Unsat(_)),
                 "step {step}: check() verdicts diverged: inc={r_inc:?} full={r_full:?}"
+            );
+            assert_eq!(
+                matches!(r_popd, TheoryResult::Unsat(_)),
+                matches!(r_full, TheoryResult::Unsat(_)),
+                "step {step}: check() verdicts diverged: pop-delta={r_popd:?} full={r_full:?}"
             );
             // On conflict both solvers keep their state; continue.
             continue;
@@ -1209,7 +1269,9 @@ fn test_inc_neg_differential_vs_full_scan() {
 
         let inc_props = props_of(&inc.propagate());
         let full_props = props_of(&full.propagate());
+        let popd_props = props_of(&popd.propagate());
         inc_cumulative.extend(inc_props.iter().copied());
+        popd_cumulative.extend(popd_props.iter().copied());
 
         for p in &inc_props {
             assert!(
@@ -1225,15 +1287,37 @@ fn test_inc_neg_differential_vs_full_scan() {
                  incremental path since the last pop (missed propagation)"
             );
         }
+        // Same two directions for the pop-delta arm (#euf-inc-neg-pop).
+        for p in &popd_props {
+            assert!(
+                full_props.contains(p),
+                "step {step}: pop-delta scan proposed {p:?} that full scan does \
+                 not (invalid propagation)"
+            );
+        }
+        for p in &full_props {
+            assert!(
+                popd_cumulative.contains(p),
+                "step {step}: full scan proposes {p:?} never announced by the \
+                 pop-delta path since the last complete pass (missed propagation)"
+            );
+        }
 
         // The incremental check_disequality_conflicts path must agree with the
         // full-scan path on conflict existence after EVERY event.
         let r_inc = inc.check();
         let r_full = full.check();
+        let r_popd = popd.check();
         assert_eq!(
             matches!(r_inc, TheoryResult::Unsat(_)),
             matches!(r_full, TheoryResult::Unsat(_)),
             "step {step}: post-event check() verdicts diverged: inc={r_inc:?} full={r_full:?}"
+        );
+        assert_eq!(
+            matches!(r_popd, TheoryResult::Unsat(_)),
+            matches!(r_full, TheoryResult::Unsat(_)),
+            "step {step}: post-event check() verdicts diverged: \
+             pop-delta={r_popd:?} full={r_full:?}"
         );
     }
 }
@@ -2030,4 +2114,74 @@ proptest! {
             );
         }
     }
+}
+
+// ========================================================================
+// #euf-inc-neg-pop: delta-dirty negative rescan across the pop boundary
+// ========================================================================
+
+/// A disequality asserted AFTER a pop whose delta is still pending must still
+/// trigger the matching equality atoms.
+///
+/// This is the CDCL backjump shape: pop to the backjump level, assert the
+/// flipped literal, then propagate. On the pop-delta path the index restoration
+/// happens to be a from-scratch rebuild out of `assigns`, which already contains
+/// that literal — so the later `sync_diseq_index` sees its key resident, treats
+/// it as a redundant witness and records no trigger for it. Without an explicit
+/// dirtying of the classes it touches, every equality atom matching the new
+/// disequality is silently skipped.
+///
+/// Setup: `a = b` merged; the pop splits the UNRELATED pair `e, f` (so the
+/// representative delta contains neither `a` nor `c`); then `a != c` is
+/// asserted. `b = c` is unassigned and matches the new disequality's class pair,
+/// so it must be proposed false.
+#[test]
+fn test_inc_neg_pop_delta_covers_diseq_asserted_after_pop() {
+    let mut store = TermStore::new();
+    let u = Sort::Uninterpreted("U".to_string());
+    let a = store.mk_var("a".to_string(), u.clone());
+    let b = store.mk_var("b".to_string(), u.clone());
+    let c = store.mk_var("c".to_string(), u.clone());
+    let e = store.mk_var("e".to_string(), u.clone());
+    let f = store.mk_var("f".to_string(), u.clone());
+    let eq_ab = store.mk_eq(a, b);
+    let eq_ac = store.mk_eq(a, c);
+    let eq_bc = store.mk_eq(b, c);
+    let eq_ef = store.mk_eq(e, f);
+
+    let mut euf = new_incremental_euf(&store);
+    euf.inc_neg_pop_enabled = true;
+
+    euf.assert_literal(eq_ab, true);
+    let _ = euf.check();
+    // Anchor: a complete negative pass (also clears `neg_full_scan_la_needed`,
+    // which the pop-delta gate requires).
+    let _ = euf.propagate();
+
+    euf.push();
+    euf.assert_literal(eq_ef, true);
+    let _ = euf.check();
+    let _ = euf.propagate();
+    euf.pop();
+    assert!(
+        euf.neg_pop_delta_valid,
+        "the pop should have handed over a delta (gate refused it)"
+    );
+
+    // The backjump-asserted literal: a NEW disequality between classes neither
+    // of which the pop touched.
+    euf.assert_literal(eq_ac, false);
+    let _ = euf.check();
+    let props = euf.propagate();
+    assert!(
+        props
+            .iter()
+            .any(|p| p.literal.term == eq_bc && !p.literal.value),
+        "pop-delta scan lost the propagation of (b = c) := false implied by the \
+         post-pop disequality (a != c) with a = b; got {:?}",
+        props
+            .iter()
+            .map(|p| (p.literal.term, p.literal.value))
+            .collect::<Vec<_>>()
+    );
 }

@@ -379,6 +379,10 @@ fn nested_array_of_array_const_symbolic_index_congruence_is_refuted() {
         (check-sat)
     "#;
     let lines = results(&crate::common::solve(smt));
+    assert_ne!(
+        lines[0], "sat",
+        "SOUNDNESS: a nested array-of-array congruence conflict must never be sat:\n{lines:?}"
+    );
     assert_eq!(
         lines[0], "unsat",
         "the nested array-of-array congruence conflict is refutable and now \

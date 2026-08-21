@@ -414,3 +414,28 @@ fn test_gate_qf_ax_array_valued_symbolic_select_has_strict_proof() {
         ProofExpectation::InternalChecked,
     );
 }
+
+#[test]
+#[timeout(10_000)]
+fn test_gate_qf_ax_array_valued_symbolic_select_generated_proof_checks_strictly() {
+    let (exec, outputs) = execute_script(
+        r#"
+        (set-logic QF_AX)
+        (set-option :produce-proofs true)
+        (declare-const outer (Array Bool (Array Bool Bool)))
+        (declare-const cell (Array Bool Bool))
+        (declare-const p Bool)
+        (assert (= (select outer false) cell))
+        (assert (= (select outer true) cell))
+        (assert (not (= (select outer p) cell)))
+        (check-sat)
+    "#,
+    );
+    assert_eq!(outputs, vec!["unsat"]);
+    let proof = exec
+        .last_proof()
+        .expect("the generated UNSAT result carries a proof");
+    let quality = ay_proof::check_proof_strict(proof, exec.terms())
+        .expect("the generated QF_AX proof passes the strict checker");
+    assert_eq!(quality.trust_count, 0);
+}

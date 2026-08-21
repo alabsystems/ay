@@ -50,10 +50,15 @@ impl NraSolver<'_> {
     }
 
     /// Compute the product of a monomial's factors from the current model.
+    ///
+    /// Uses [`NraSolver::monomial_factor_value`], not `var_value`: a Horner
+    /// factor such as `(+ (* x x c) d)` is not a tableau column, and reading it
+    /// as "no value" made the patcher skip exactly the monomials that most need
+    /// patching.
     fn compute_monomial_product(&self, mon: &Monomial) -> Option<BigRational> {
         let mut product = BigRational::one();
         for &var in &mon.vars {
-            product *= self.var_value(var)?;
+            product *= self.monomial_factor_value(var)?;
         }
         Some(mon.aux_from_product(&product))
     }
@@ -276,7 +281,14 @@ impl NraSolver<'_> {
         let mon_patches = self.collect_inconsistent_monomials();
         let div_patches = self.collect_inconsistent_division_patches();
         if mon_patches.is_empty() && div_patches.is_empty() {
-            return !self.has_inconsistent_monomials();
+            // "Nothing to patch" is NOT the same as "the model is consistent".
+            // `collect_inconsistent_monomials` can only report a monomial whose
+            // factors it could evaluate; one it could not evaluate is silently
+            // absent from `mon_patches`. Returning `true` on that emptiness
+            // hands the caller a Sat exit on the strength of a scan that never
+            // looked. Ask the consistency predicate directly instead — with
+            // Horner factors now resolving, the two answers actually differ.
+            return !self.has_inconsistent_monomials() && !self.has_inconsistent_divisions();
         }
 
         let mut all_plans = match self.plan_patches(&mon_patches) {

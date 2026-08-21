@@ -180,8 +180,9 @@ impl Executor {
         }
 
         // Run deferred minimization against restored assertions if applicable
+        // (#model-demand: cosmetics, skipped when no consumer exists).
         if matches!(result, Ok(Ok(SolveResult::Sat)))
-            && self.minimize_counterexamples_enabled()
+            && self.counterexample_minimization_demanded()
             && self.last_assumptions.is_none()
         {
             self.minimize_model_sat_preserving();

@@ -726,6 +726,82 @@ pub struct EufSolver<'a> {
     /// per popped level.
     pub(crate) diseq_keys_dirty: bool,
     // ========================================================================
+    // Delta-dirty negative rescan across the pop boundary (#euf-inc-neg-pop)
+    // ========================================================================
+    /// #euf-inc-neg-pop: opt in (`--euf-inc-neg-pop`, default OFF; B77 moved
+    /// the carrier off the former `AY_EUF_INC_NEG_POP=1` env read) to
+    /// extending the INCREMENTAL negative scan across the `pop` boundary.
+    ///
+    /// MEASURED 2026-08-20, default-flip A/B, NOT A WIN (default stays OFF):
+    /// one `7100410db` release binary, `--rigor fast`, 30 s, order-balanced
+    /// A B B A (2 samples/arm), 157 status-stripped instances (50 QF_DT
+    /// blocksworld incl. 29 baseline timeouts, 40 incremental QF_UF CLEARSY
+    /// push/pop files, 67 non-incremental QF_UF over 9 subfamilies): solved
+    /// runs 252 -> 254 (the +2 are two blocksworld `bmc_9` files solved at
+    /// 28.8 s on ONE sample against the 30 s limit, timed out on the other),
+    /// 0 reproduced losses, 0 reproduced gains, 0 wrong answers (z3 reference
+    /// on 1746 incremental check-sats), commonly-solved (126) median
+    /// 0.051 s -> 0.051 s, mean 0.887 s -> 0.914 s (+3 %). Gate was >= +5
+    /// solved or >= 15 % median. Agrees with the pre-merge 2026-07-26 reading
+    /// (0.97x median, `SQ_BLOCKSWORLD_PLAN.md` §6c). Raw data + harness:
+    /// the development design notes.
+    ///
+    /// Baseline: every `pop` clears `neg_dirty_reps` and arms
+    /// `neg_full_scan_needed`, so the first `propagate_disequalities` after any
+    /// backtrack re-walks every entry of `eq_terms` against the restored
+    /// `diseq_pair_index` (O(pops x n_eqs)). With this on, `pop` instead RECORDS
+    /// the deltas its undo replay produced — the class representatives it split
+    /// apart (`neg_dirty_reps`) and the equality atoms it unassigned
+    /// (`neg_pop_retracted`) — and the next scan visits only those.
+    ///
+    /// SAFETY (guidance, not soundness). Disequality PROPAGATIONS are search
+    /// guidance: `check()` is the conflict/soundness authority and still scans
+    /// the authoritative state (`assigns` while `neg_full_scan_needed`, and
+    /// `pending_diseq_conflicts` — which is seeded by the same index-restoring
+    /// code the baseline runs — afterwards). A dirty representative this path
+    /// misses costs pruning, never correctness; this is exactly the argument the
+    /// existing incremental path already relies on (see the "Missing a trigger
+    /// costs only search guidance, never soundness" note in `merge.rs`). The
+    /// index-restoration duties of the full scan (trail-restored index, or the
+    /// from-scratch rebuild from `assigns`) are performed UNCHANGED on this
+    /// path, so the state `check()` later reads is bit-identical to baseline —
+    /// only the set of proposed propagations may be smaller.
+    pub(crate) inc_neg_pop_enabled: bool,
+    /// #euf-inc-neg-pop: `neg_dirty_reps` + `neg_pop_split_reps` +
+    /// `neg_pop_retracted` cover every
+    /// change to negative-propagation status since the last COMPLETE negative
+    /// candidate pass, so the next scan may stay incremental even though
+    /// `neg_full_scan_needed` is armed by a pop. Set by a `pop` that could
+    /// certify the cover (see the gate in `pop`), consumed and cleared by
+    /// `propagate_disequalities`, and cleared by every path that invalidates the
+    /// index or the anchor (reset / soft-reset / unwind / any full scan).
+    /// Always `false` while `inc_neg_pop_enabled` is off, which makes the flag
+    /// off path byte-identical to baseline.
+    pub(crate) neg_pop_delta_valid: bool,
+    /// #euf-inc-neg-pop: equality atoms `(eq_term, lhs, rhs)` that a `pop`
+    /// UNASSIGNED since the last negative candidate pass. These become
+    /// propagation candidates for the first time (the full scan only ever
+    /// considers unassigned atoms), and their class representatives need not
+    /// have changed, so the representative-delta alone does not cover them.
+    /// Drained by the next negative scan.
+    pub(crate) neg_pop_retracted: Vec<(TermId, TermId, TermId)>,
+    /// #euf-inc-neg-pop: class representatives a `pop` SPLIT apart — the
+    /// `SetRoot.old_root`s its undo replay handed nodes back to.
+    ///
+    /// They need the DIRECT `diseq_pair_index` probe over their `class_eqs`
+    /// bucket (an unassigned equality whose `(min_rep,max_rep)` key changed sits
+    /// exactly there), but they must NOT drive the cong-neg LOOKAHEAD. The
+    /// baseline post-pop candidate pass runs ZERO lookahead simulations: `pop`
+    /// deliberately does not re-arm `neg_full_scan_la_needed` (every lookahead
+    /// implication proposed before the pop survives as a permanent SAT clause
+    /// that BCP re-fires by itself), which was the fix for the #1 profile cost
+    /// on QG-classification/NEQ QF_UF. Routing these reps through the
+    /// lookahead arm would re-introduce precisely that cost — so they are kept
+    /// SEPARATE from `neg_dirty_reps`, whose entries are post-pop EVENTS (merges
+    /// and freshly asserted disequalities) that the baseline post-pop pass DOES
+    /// give the lookahead. Drained by the next negative scan.
+    pub(crate) neg_pop_split_reps: HashSet<u32>,
+    // ========================================================================
     // Verification-only mode (#8529 perf)
     // ========================================================================
     /// When `true`, this solver instance is used ONLY to recompute the
@@ -1069,6 +1145,115 @@ impl<'a> EufSolver<'a> {
         );
     }
 
+    /// #euf-inc-neg-pop safety net: after a POP-DELTA incremental negative scan
+    /// (the `--euf-inc-neg-pop` path that replaces the post-pop FULL candidate
+    /// pass), assert that the propagation set it proposed is a SUBSET of what
+    /// that full candidate pass would have proposed over the very same restored
+    /// `diseq_pair_index`. A SUBSET is expected and fine — fewer hints, and
+    /// hints are only search guidance. A SUPERSET or a DIFFERENT set means the
+    /// delta path invented a candidate the authoritative pass would not accept,
+    /// which is a bug. Debug/test/fuzz only.
+    ///
+    /// Two sets are compared, mirroring the two things the full pass produces:
+    /// - `scratch_neg_props`: direct hits — unassigned, same-sorted, endpoint
+    ///   classes distinct, and their `(min_rep,max_rep)` key live in the index.
+    /// - `scratch_cong_neg_props`: negative-congruence lookahead candidates. A
+    ///   post-pop full pass runs NO lookahead sweep (`neg_full_scan_la_needed`
+    ///   is not re-armed by `pop`), so its lookahead candidates are exactly the
+    ///   direct MISSES whose endpoint class is in the EVENT-dirty set — the
+    ///   `la_dirty` snapshot this takes as an argument, which the caller reads
+    ///   off `neg_dirty_reps` at the same point the full pass reads it. Passing
+    ///   the snapshot in is what makes this half of the assert non-vacuous: reps
+    ///   a pop merely SPLIT live in `neg_pop_split_reps` and are absent from it,
+    ///   so a delta scan that let them drive the lookahead trips this.
+    ///
+    /// Atoms absent from `eq_terms` are exempt: that index is built once
+    /// (`init_eq_terms`) and the full pass iterates it, so a term appended to
+    /// the store afterwards is invisible to the full pass while the delta path
+    /// (which reads the assignment trail) can still see it. Proposing such an
+    /// atom is extra guidance, never a soundness question — every propagation
+    /// is re-validated against the live e-graph in `emit_diseq_propagations`.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_pop_delta_props_subset_of_full_scan(&self, la_dirty: &HashSet<u32>) {
+        let known: std::collections::BTreeSet<u32> =
+            self.eq_terms.iter().map(|&(t, _, _)| t.0).collect();
+        let mut full_direct: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut full_miss: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        for &(term_id, lhs, rhs) in &self.eq_terms {
+            if self.assigns.contains_key(&term_id) {
+                continue;
+            }
+            let (l, r) = (self.enode_find_const(lhs.0), self.enode_find_const(rhs.0));
+            if l == r {
+                continue; // positive propagation's case
+            }
+            let key = (l.min(r), l.max(r));
+            if self.diseq_pair_index.contains_key(&key) {
+                full_direct.insert(term_id.0);
+            } else if self.cong_neg_enabled && (la_dirty.contains(&l) || la_dirty.contains(&r)) {
+                // The per-atom lookahead gate of the post-pop full pass.
+                full_miss.insert(term_id.0);
+            }
+        }
+        for &(term_id, ..) in &self.scratch_neg_props {
+            debug_assert!(
+                !known.contains(&term_id.0) || full_direct.contains(&term_id.0),
+                "BUG(#euf-inc-neg-pop): pop-delta negative scan proposed eq term {} \
+                 which the full candidate pass would NOT propose (subset violated)",
+                term_id.0
+            );
+        }
+        for cand in &self.scratch_cong_neg_props {
+            let term_id = cand.0;
+            debug_assert!(
+                !known.contains(&term_id.0) || full_miss.contains(&term_id.0),
+                "BUG(#euf-inc-neg-pop): pop-delta negative scan proposed cong-neg \
+                 lookahead for eq term {} which the post-pop full pass would NOT \
+                 look ahead on — either not a direct miss, or its classes are not \
+                 EVENT-dirty (a pop-split rep must not drive the lookahead)",
+                term_id.0
+            );
+        }
+    }
+
+    /// #euf-inc-neg-pop safety net: the dirty reps a `pop` hands to the delta scan
+    /// must be USABLE as `class_eqs` keys — the scan looks up `class_eqs[rep]`,
+    /// and `class_eqs` is keyed by CURRENT class representatives, so an entry
+    /// whose class has since been absorbed would silently find nothing.
+    ///
+    /// Asserted invariant: every recorded rep (in EITHER the event set
+    /// `neg_dirty_reps` or the pop-split set `neg_pop_split_reps`) is a live
+    /// representative, or its current representative is ALSO recorded in one of
+    /// the two. The second case is legitimate — a rep recorded by an earlier pop
+    /// of the same backjump can be absorbed by a merge asserted afterwards, and
+    /// that merge did NOT get unwound by this pop (it can sit in an outer scope).
+    /// `incremental_merge` inserts the SURVIVOR rep into `neg_dirty_reps` on
+    /// every merge, so the absorbing chain always leaves its endpoint behind and
+    /// coverage is preserved: the atoms that moved out of the stale rep's bucket
+    /// moved into the survivor's, which is dirty. See the derivation in `pop`.
+    ///
+    /// Called at the CONSUMPTION site (`propagate_disequalities`), not from
+    /// `pop`: the sets accumulate across the many pops of one backjump, so a
+    /// per-pop call is O(pops^2) and throttles debug fuzzing.
+    /// Debug/test/fuzz only.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_neg_dirty_reps_are_roots(&self) {
+        for &rep in self.neg_dirty_reps.iter().chain(&self.neg_pop_split_reps) {
+            if (rep as usize) >= self.enodes.len() {
+                continue; // terms outside the e-graph are singletons
+            }
+            let root = self.enode_find_const(rep);
+            debug_assert!(
+                root == rep
+                    || self.neg_dirty_reps.contains(&root)
+                    || self.neg_pop_split_reps.contains(&root),
+                "BUG(#euf-inc-neg-pop): dirty rep {rep} was absorbed into {root}, \
+                 which is NOT in the dirty set — the atoms that moved into {root}'s \
+                 class_eqs bucket would be missed"
+            );
+        }
+    }
+
     /// #euf-inc-diseq-undo: rebuild the inverse index `diseq_keys_by_rep` from
     /// the (already restored) `diseq_pair_index`. The undo-trail replay restores
     /// the forward index exactly but leaves the inverse index keyed by the
@@ -1355,6 +1540,14 @@ impl<'a> EufSolver<'a> {
             neg_index_prebuilt: false,
             diseq_index_base_depth: 0,
             diseq_keys_dirty: false,
+            // #euf-inc-neg-pop: OPT-IN (default OFF). Flag off ==> the pop path
+            // clears the dirty sets and arms the full negative rescan exactly as
+            // before, so behaviour is byte-identical to baseline.
+            // B77: `--euf-inc-neg-pop` is the carrier (was AY_EUF_INC_NEG_POP).
+            inc_neg_pop_enabled: ay_core::misc_cli_flags().euf_inc_neg_pop,
+            neg_pop_delta_valid: false,
+            neg_pop_retracted: Vec::new(),
+            neg_pop_split_reps: HashSet::default(),
             // Verification-only mode (#8529 perf): default OFF. Only the two
             // verification constructors flip this on via verify_only().
             verify_only: false,

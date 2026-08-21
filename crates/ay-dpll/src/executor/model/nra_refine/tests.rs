@@ -375,3 +375,314 @@ fn refined_value_is_read_by_evaluation() {
              consistent with the printed model"
     );
 }
+
+// ---------------- definitional closure (#nra-definitional-closure) ----------
+
+/// A variable the assertions DEFINE (`z = x + 1`) is not a free coordinate: it
+/// must be RECOMPUTED from the refined value of `x`, not searched for
+/// independently.
+///
+/// This is the shape that made 20200911-Pine publish `unknown`. The per-value
+/// pass alone rounds `x` and `z` in their OWN isolating intervals, with no
+/// reason for the rounded pair to retain the exact unit offset, so the re-check
+/// can refuse every candidate. The declined algebraic witness then reaches the
+/// independent gate as a residue value it cannot read, and a solved instance
+/// is published `unknown`.
+#[test]
+fn definitional_variable_follows_the_refined_free_variable() {
+    let (mut exec, out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun z () Real)
+(assert (> x 1.0))
+(assert (< (* x x) 3.0))
+(assert (= z (+ x 1.0)))
+(check-sat)
+"#,
+    );
+    assert_eq!(out[0], "sat");
+    let x = exec.ctx.terms.mk_var("x", Sort::Real);
+    let z = exec.ctx.terms.mk_var("z", Sort::Real);
+
+    // Force the algebraic-witness state the NRA certificate lane produces:
+    // x = sqrt(2) and the DEFINED z = x+1 carried as a residue value, with no
+    // rational LRA entry for either.
+    let root = sqrt2_value();
+    let shifted = root.add_rational(&rat(1, 1));
+    exec.nra_algebraic_model.insert(x, root);
+    exec.nra_algebraic_model.insert(z, shifted);
+    if let Some(model) = exec.last_model.as_mut() {
+        if let Some(lra) = model.lra_model.as_mut() {
+            lra.values.remove(&x);
+            lra.values.remove(&z);
+        }
+    }
+    exec.nra_algebraic_model.reset_print_refinement_attempted();
+
+    exec.refine_nra_algebraic_model_for_print();
+
+    assert!(
+        exec.nra_algebraic_model.is_empty(),
+        "both the free and the defined witness must be refined away"
+    );
+    let value = |t| {
+        exec.last_model
+            .as_ref()
+            .and_then(|m| m.lra_model.as_ref())
+            .and_then(|l| l.values.get(&t))
+            .expect("refined rational value")
+            .clone()
+    };
+    let (rx, rz) = (value(x), value(z));
+    assert_eq!(
+        rz,
+        &rx + rat(1, 1),
+        "the defined variable must be recomputed from its body, not rounded \
+         independently: got z = {rz}, x = {rx}"
+    );
+    assert!(
+        rx > rat(1, 1) && rz < rat(4, 1),
+        "the refined assignment must satisfy the assertions exactly: \
+         x = {rx}, z = {rz}"
+    );
+    let printed = exec.model();
+    assert!(
+        !printed.contains("root-obj"),
+        "the refined model must print plain SMT-LIB rationals — `root-obj` is \
+         a z3 extension external validators reject: {printed}"
+    );
+}
+
+/// Definition closure is a transaction, not just a set of final writes. A
+/// dependency visited before its source can be rewritten on two fixpoint
+/// passes; rollback must then unwind both writes in reverse order. Validation
+/// evidence is equally transactional: it is revoked while the candidate is
+/// installed and restored only when the old model is restored.
+#[test]
+fn repeated_definition_writes_rollback_exactly_with_validation_evidence() {
+    let (mut exec, out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun z () Real)
+(declare-fun y () Real)
+(assert (= z (+ y 1.0)))
+(assert (= y (* x x)))
+(check-sat)
+"#,
+    );
+    assert_eq!(out[0], "sat");
+    let x = exec.ctx.terms.mk_var("x", Sort::Real);
+    let z = exec.ctx.terms.mk_var("z", Sort::Real);
+    let y = exec.ctx.terms.mk_var("y", Sort::Real);
+
+    // Deliberately start from a stale chain. Installing x = 3/2 first writes
+    // z = 6 and y = 9/4, then a second closure pass rewrites z = 13/4.
+    exec.nra_algebraic_model.insert(x, sqrt2_value());
+    let initial_lra = {
+        let model = exec.last_model.as_mut().expect("SAT model");
+        let lra = model.lra_model.get_or_insert_with(|| LraModel {
+            values: Default::default(),
+        });
+        lra.values.remove(&x);
+        lra.values.insert(y, rat(5, 1));
+        lra.values.insert(z, rat(3, 1));
+        lra.values.clone()
+    };
+    let saved_nra = exec.nra_algebraic_model.values().clone();
+    let definitions = exec.algebraic_definitions();
+    assert_eq!(
+        definitions.iter().map(|d| d.term).collect::<Vec<_>>(),
+        vec![z, y],
+        "the test requires the dependent definition to be visited first"
+    );
+
+    exec.last_model_validated = true;
+    let txn = exec
+        .install_refined_candidates(&[(x, rat(3, 2))], &definitions)
+        .expect("install candidate");
+    assert_eq!(
+        txn.prev_lra.iter().filter(|(term, _)| *term == z).count(),
+        2,
+        "z must have two displaced values in the transaction log"
+    );
+    assert!(
+        !exec.last_model_validated,
+        "validation evidence for the predecessor model must be revoked"
+    );
+
+    exec.rollback_refined_candidates(&saved_nra, txn);
+    assert_eq!(
+        exec.last_model
+            .as_ref()
+            .and_then(|model| model.lra_model.as_ref())
+            .expect("restored LRA model")
+            .values,
+        initial_lra,
+        "rollback must restore the complete LRA map, not an intermediate pass"
+    );
+    assert_eq!(exec.nra_algebraic_model.len(), saved_nra.len());
+    assert_eq!(
+        exec.nra_algebraic_model
+            .get(&x)
+            .expect("restored algebraic x")
+            .eq_value(saved_nra.get(&x).expect("saved algebraic x")),
+        Some(true),
+        "rollback must restore the exact algebraic witness"
+    );
+    assert!(
+        exec.last_model_validated,
+        "restoring the predecessor model must restore its validation evidence"
+    );
+}
+
+/// `(= t (* t (* t t)))` CONSTRAINS `t`; it does not define it. Treating a
+/// self-referential equality as a definition would recompute `t` from a body
+/// that mentions `t`, so the occurrence check must reject it.
+#[test]
+fn self_referential_equality_is_not_a_definition() {
+    let (mut exec, _out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun t () Real)
+(assert (> t 1.0))
+(assert (< (* t t) 3.0))
+(assert (= t (* t (* t t))))
+(check-sat)
+"#,
+    );
+    let t = exec.ctx.terms.mk_var("t", Sort::Real);
+    exec.nra_algebraic_model.insert(t, sqrt2_value());
+    assert!(
+        exec.algebraic_definitions().is_empty(),
+        "an equality whose body mentions the variable itself is a constraint, \
+         not a definition"
+    );
+}
+
+/// A DEFINED variable whose current value is already an exact rational must
+/// still be recomputed. On `20200911-Pine/1599121886379408000.smt2` the model
+/// is `y = α`, `y! = 0.99α + 0.01α²`, and `x! = 103/343` — rational, because
+/// its body mentions only `y²` and `α² = 1279/8575`. Skipping such a variable
+/// (the first cut of this pass only closed algebraic-valued entries) froze
+/// `x!` at a value pinned to the OLD irrational `y`, so the instant `y` moved
+/// its defining equality broke and every candidate was refused.
+#[test]
+fn definitions_include_a_defined_variable_whose_value_is_rational() {
+    let (mut exec, _out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun y () Real)
+(declare-fun x2 () Real)
+(assert (> y 1.0))
+(assert (< (* y y) 3.0))
+(assert (= x 3.0))
+(assert (= x2 (+ x (* y y))))
+(check-sat)
+"#,
+    );
+    let y = exec.ctx.terms.mk_var("y", Sort::Real);
+    let x2 = exec.ctx.terms.mk_var("x2", Sort::Real);
+    // Only `y` carries an algebraic witness; `x2` is exactly rational
+    // (`3 + (sqrt 2)^2 = 5`) yet DEPENDS on the irrational `y`.
+    exec.nra_algebraic_model.insert(y, sqrt2_value());
+    let definitions = exec.algebraic_definitions();
+    assert!(
+        definitions.iter().any(|d| d.term == x2),
+        "a defined variable must be closed over even when its own value is \
+         already rational — it still has to follow the variables that move"
+    );
+}
+
+/// An equality under a positive DISJUNCTION need not hold in the model, so it
+/// must never be read as a definition (the harvest is positive-polarity,
+/// conjunctive-position only).
+#[test]
+fn disjunctive_equality_is_not_a_definition() {
+    let (mut exec, _out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun z () Real)
+(assert (> x 1.0))
+(assert (< (* x x) 3.0))
+(assert (or (= z (* x x)) (= z 0.0)))
+(check-sat)
+"#,
+    );
+    let z = exec.ctx.terms.mk_var("z", Sort::Real);
+    exec.nra_algebraic_model.insert(z, sqrt2_value());
+    assert!(
+        exec.algebraic_definitions().is_empty(),
+        "an equality in a disjunctive position is not asserted, so it cannot \
+         define a model value"
+    );
+}
+
+/// The closure must not weaken the decline path: `x*x = 2 /\ x > 0` has NO
+/// rational model, and adding a defined companion `z = x + 1` must not let any
+/// rational assignment through. A wrong rational model is the one outcome this
+/// pass exists to avoid.
+#[test]
+fn definitional_closure_still_declines_when_no_rational_model_exists() {
+    let (mut exec, out) = run_script(
+        r#"
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun z () Real)
+(assert (> x 1.0))
+(assert (< (* x x) 3.0))
+(check-sat)
+"#,
+    );
+    assert_eq!(out[0], "sat");
+
+    // Exercise the private decline-only search directly. Current hardened
+    // publication may fail closed before exposing a candidate for the full
+    // irrational script; that authority decision is deliberately orthogonal
+    // to this unit's transaction/closure invariant.
+    let x = exec.ctx.terms.mk_var("x", Sort::Real);
+    let z = exec.ctx.terms.mk_var("z", Sort::Real);
+    let two = exec.ctx.terms.mk_rational(rat(2, 1));
+    let one = exec.ctx.terms.mk_rational(rat(1, 1));
+    let square = exec.ctx.terms.mk_mul(vec![x, x]);
+    let pinned = exec.ctx.terms.mk_eq(square, two);
+    let shifted_body = exec.ctx.terms.mk_add(vec![x, one]);
+    let definition = exec.ctx.terms.mk_eq(z, shifted_body);
+    exec.ctx.assertions.push(pinned);
+    exec.ctx.assertions.push(definition);
+
+    let root = sqrt2_value();
+    let shifted = root.add_rational(&rat(1, 1));
+    exec.nra_algebraic_model.insert(x, root);
+    exec.nra_algebraic_model.insert(z, shifted);
+    if let Some(model) = exec.last_model.as_mut() {
+        if let Some(lra) = model.lra_model.as_mut() {
+            lra.values.remove(&x);
+            lra.values.remove(&z);
+        }
+    }
+    let saved = exec.nra_algebraic_model.values().clone();
+    exec.last_model_validated = false;
+    exec.nra_algebraic_model.reset_print_refinement_attempted();
+
+    exec.refine_nra_algebraic_model_for_print();
+
+    assert!(
+        exec.nra_algebraic_model.len() == saved.len()
+            && exec
+                .nra_algebraic_model
+                .get(&x)
+                .and_then(|value| value.eq_value(saved.get(&x)?))
+                == Some(true)
+            && exec
+                .nra_algebraic_model
+                .get(&z)
+                .and_then(|value| value.eq_value(saved.get(&z)?))
+                == Some(true),
+        "no rational point satisfies x*x = 2, so the refinement MUST decline \
+         and restore both exact algebraic witnesses"
+    );
+}

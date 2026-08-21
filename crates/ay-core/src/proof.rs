@@ -73,8 +73,12 @@ pub enum TheoryLemmaKind {
     /// Uses Alethe rule `la_generic`
     LraFarkas,
 
-    /// LIA: may include cutting planes or GCD reasoning
-    /// Uses Alethe rule `lia_generic`
+    /// LIA: may include cutting planes or GCD reasoning.
+    ///
+    /// `lia_generic` is the internal identity, but the pinned external checker
+    /// treats that spelling as an unchecked placeholder. Export therefore
+    /// emits an honest `hole` unless the complete step lowers to checked
+    /// `evaluate` or its actual linear certificate promotes to `la_generic`.
     LiaGeneric,
 
     /// Euclidean integer-remainder range theorem.
@@ -700,6 +704,21 @@ pub enum TheoryLemmaKind {
     /// constructor registry; without that registry strict mode fails closed.
     DatatypeTesterEval,
 
+    /// Datatype tester pairwise exclusivity over ONE scrutinee:
+    /// `(cl (not (is-C t)) (not (is-D t)))` where `C` and `D` are DISTINCT
+    /// declared constructors of `t`'s datatype — every datatype value is built
+    /// by exactly one constructor, so two distinct testers cannot both hold.
+    /// This is the pairwise-exclusivity half of the DT axiom family the
+    /// selector passes inject alongside [`Self::DatatypeExhaustive`] coverage.
+    ///
+    /// Uses AY's `dt_tester_exclusive` rule (the pinned external Alethe
+    /// calculus has no datatype rules, so it renders as an honest `hole` on
+    /// that wire). Validated by `ay-proof` against the datatype constructor
+    /// registry — distinctness and shared-datatype membership are re-derived
+    /// from the declarations, never taken from the clause; without the
+    /// registry this kind fails closed in strict mode.
+    DatatypeTesterExclusive,
+
     /// Datatype constructor-coverage (exhaustiveness) over ONE scrutinee:
     /// `(cl (is-C1 t) (is-C2 t) ... (is-Ck t))` where `C1 .. Ck` are ALL the
     /// declared constructors of `t`'s datatype — every datatype value is built
@@ -742,21 +761,21 @@ pub enum TheoryLemmaKind {
 
     /// Direct acyclicity (occurs check): the clause denies an equality whose
     /// one side is a registered-constructor application properly containing
-    /// the other side through constructor applications only — unsatisfiable
-    /// because datatype values are finite constructor trees. Validated by an
-    /// ITERATIVE bounded containment walk (visited set, hard node budget, no
-    /// recursion) with the datatype registry as constructor identity
-    /// authority; fails closed on occurrences under selectors or
-    /// uninterpreted functions and whenever the registry is absent
-    /// (C5b reintroduction, 2026-08-19). It renders as an honest Alethe
-    /// `hole` on the external wire.
+    /// the other side through constructors only. A bounded iterative walk
+    /// derives constructor identity from the registry and fails closed under
+    /// selectors, uninterpreted functions, or without a registry. Renders as
+    /// an Alethe `hole`.
     DatatypeAcyclicDirect,
 
-    /// Reserved C5b datatype value-equality vocabulary. Exact constructor and
-    /// selector signatures are authenticated, but this kind remains disabled
-    /// with the rest of C5b pending a fresh resource and stack-safety review. It
-    /// renders as an honest Alethe `hole`.
+    /// Datatype value-equality biconditional: complete tester/guarded-field
+    /// expansion, or the nullary tester bridge. Both registries determine
+    /// coverage; a missing registry fails closed. Renders as an Alethe `hole`.
     DatatypeValueEqCongruence,
+
+    /// Ground DT/EUF conflict certified by bounded congruence closure and
+    /// datatype rules. Registries identify symbols; unsupported or exhausted
+    /// searches fail closed. Renders as an Alethe `hole`.
+    DatatypeGroundConflict,
 
     /// Bounded exact tautology over a pure total-order / term-ITE fragment.
     /// Numeric leaves are at most six Int or Real variables; numeric terms may
@@ -797,6 +816,27 @@ pub enum TheoryLemmaKind {
     /// equality guard and the first two literals are precisely the two Int or
     /// Real branches whose falsity forces that equality.
     ArithDisequalitySplit,
+
+    /// WIDE integer arithmetic clause certified by an attainable-value gap:
+    /// the clause's negation squeezes one shared all-`Int` linear form into a
+    /// range holding no multiple of its coefficient `gcd`, so no integer model
+    /// falsifies the clause. Every other literal is irrelevant, which is what
+    /// makes this usable on a learned conflict clause 7-34 literals wide.
+    /// Subsumes the pair-sized `IntBoundsTautology` and adds the strictly
+    /// integer case with NO rational Farkas certificate (`2q >= 1 ∧ 2q <= 1`
+    /// is satisfiable at `q = 1/2`). `ay-proof` re-derives the core from the
+    /// clause — there is no annotation payload to forge; see
+    /// `proof_validation::lia_bound_lattice` for the soundness argument. Uses
+    /// AY's `int_bound_lattice_gap` rule, an honest `hole` on the Alethe wire.
+    IntBoundLatticeGap,
+
+    /// [`Self::IntBoundLatticeGap`] after a rank-1 TWO-ROW cut: no single form
+    /// carries both directions, but one canonical variable-eliminating
+    /// combination of two rows does. Subsumes that kind; `ay-proof` re-derives
+    /// BOTH multipliers and core from the clause, so there is no payload to
+    /// forge. Soundness argument and declined classes:
+    /// `proof_validation::lia_cut_lattice`. Honest `hole` on the wire.
+    IntCutLatticeGap,
 
     /// If-then-else with identical branches: `(= (ite c x x) x)` — a conditional
     /// whose two branches are the same term equals that branch, for ANY condition
@@ -1004,107 +1044,26 @@ pub enum TheoryLemmaKind {
     /// Appended after the older variants so their serialized enum ordinals do
     /// not move.
     QuantifierNegatedExistsDual,
+
+    /// Equals-for-equals substitution under asserted ground equalities:
+    /// `(cl (not (= e_1 v_1)) .. (not (= e_k v_k)) (not P) Q)` where every
+    /// `v_i` is a literal constant, `P` is quantifier-free, and `Q` is EXACTLY
+    /// `P` with every occurrence of each `e_i` simultaneously replaced by
+    /// `v_i`. Valid by substitution of equals (capture-impossible: `P` is
+    /// quantifier-free and every `v_i` is a closed literal); the validator
+    /// independently re-walks `P` and `Q` in parallel against the map and
+    /// fails closed on any node the map does not explain. Introduced for the
+    /// checked-SAT refutation's ground-encoding bridge: a solver lane can
+    /// substitute an entailed constant (`len -> 1`) into a recorded
+    /// quantifier instance below every provenance seam, and this lemma
+    /// re-derives the substituted clause from the exact recorded instance
+    /// plus the authored defining equalities (the deductive-checks letleak shape).
+    /// No external Alethe rule exists; the wire prints the honest `hole`
+    /// fallback.
+    GroundEqualitySubstitution,
 }
 
-/// Proof annotation for a theory lemma clause in the SAT clause trace (#6031 Phase 4).
-///
-/// Parallel to `ClausificationProof`: when the SAT clause trace contains an
-/// "original" clause that was actually a theory lemma (added via `add_theory_lemma`),
-/// this annotation tells `SatProofManager` to emit a `TheoryLemma` proof step
-/// instead of the generic `assume + or` pattern.
-#[derive(Debug, Clone)]
-pub struct TheoryLemmaProof {
-    /// The lemma clause in the exact order used when its positional
-    /// annotations were produced. SAT watched-literal movement may permute a
-    /// traced copy, so consumers must rebind annotations by literal identity
-    /// rather than zipping them with the trace order.
-    pub clause: Vec<TermId>,
-    /// The kind of theory lemma (determines the Alethe rule)
-    pub kind: TheoryLemmaKind,
-    /// Optional Farkas coefficients for arithmetic theories
-    pub farkas: Option<FarkasAnnotation>,
-    /// Optional LIA-specific annotation (bounds gap, divisibility, cutting plane)
-    pub lia: Option<LiaAnnotation>,
-}
-
-/// A proof step (Alethe-compatible)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[non_exhaustive]
-pub enum ProofStep {
-    /// Input assertion from the problem
-    Assume(TermId),
-    /// Resolution inference (SAT solver)
-    Resolution {
-        /// The resolvent clause (result of resolution)
-        clause: Vec<TermId>,
-        /// Pivot literal (resolved on)
-        pivot: TermId,
-        /// First clause premise
-        clause1: ProofId,
-        /// Second clause premise
-        clause2: ProofId,
-    },
-
-    /// Theory lemma (from theory solver)
-    TheoryLemma {
-        /// Theory name (e.g., "EUF", "LRA", "LIA", "BV")
-        theory: String,
-        /// The lemma clause (disjunction of literals)
-        clause: Vec<TermId>,
-        /// Farkas coefficients for arithmetic theories (LRA/LIA)
-        /// Used for Craig interpolation
-        farkas: Option<FarkasAnnotation>,
-        /// Kind of lemma (determines Alethe rule)
-        kind: TheoryLemmaKind,
-        /// Optional LIA-specific annotation (bounds gap, divisibility, cutting plane)
-        lia: Option<LiaAnnotation>,
-    },
-
-    /// Generic proof step (Alethe-style)
-    Step {
-        /// The rule name (e.g., "trans", "cong", "and", "resolution")
-        rule: AletheRule,
-        /// The conclusion clause (disjunction of literals)
-        clause: Vec<TermId>,
-        /// Premise step IDs
-        premises: Vec<ProofId>,
-        /// Additional arguments (rule-specific)
-        args: Vec<TermId>,
-    },
-
-    /// Subproof anchor (start of nested proof)
-    Anchor {
-        /// The step that ends this subproof
-        end_step: ProofId,
-        /// Variables introduced in this subproof
-        variables: Vec<(String, crate::sort::Sort)>,
-    },
-}
-pub use crate::alethe::{
-    alethe_rule_requires_premises_or_args, is_checkable_alethe_rule, wire_rule_name, AletheRule,
-    CHECKABLE_ALETHE_RULES, UNPROVED_STEP_RULE,
-};
-
-/// Proof step identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct ProofId(pub u32);
-
-impl std::fmt::Display for ProofId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "t{}", self.0)
-    }
-}
-
-/// A complete proof (Alethe-compatible)
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct Proof {
-    /// Proof steps
-    pub steps: Vec<ProofStep>,
-    /// Named step IDs (for assume commands)
-    pub named_steps: crate::kani_compat::KaniHashMap<String, ProofId>,
-}
+include!("proof/proof_steps.rs");
 
 #[allow(clippy::panic)]
 #[cfg(test)]

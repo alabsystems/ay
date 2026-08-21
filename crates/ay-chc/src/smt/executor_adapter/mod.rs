@@ -61,11 +61,9 @@ pub(super) fn dv_unknown_retry_enabled() -> bool {
 /// only to attribute certification cost to the channel that paid it
 /// (`ay_dpll::CertificationAccounting`).
 ///
-/// The split is nonetheless kept honest, because a later stage may key policy
-/// on it: `InternalLemma` may be declared ONLY where the verdict feeds the CHC
-/// engine's own search and the engine re-derives its published claim from
-/// scratch afterwards. Every channel on which a raw `"unsat"` BECOMES the
-/// published claim stays `Published` — in this module that is
+/// The split is nonetheless kept honest: `InternalLemma` may be declared ONLY
+/// where CHC search re-derives its published claim from scratch. Every channel
+/// on which raw `"unsat"` BECOMES the published claim stays `Published`, including
 /// `check_unsat_smtlib_via_executor` (the ghost-pair quantified certification
 /// fallback), `smtlib_first_verdict_via_executor` (the checked-replay
 /// obligation re-execution), and the strict-unsat-cert obligation lane, none
@@ -75,6 +73,7 @@ pub(crate) enum ExecutorQueryRole {
     /// The verdict is (or becomes) a published claim.
     Published,
     /// The verdict is consumed only as CHC search guidance.
+    #[cfg(test)]
     InternalLemma,
 }
 
@@ -93,6 +92,7 @@ fn execute_commands_via_executor(
             // declaration only attributes this channel's certification cost.
             let executed = match role {
                 ExecutorQueryRole::Published => exec.execute_all(commands),
+                #[cfg(test)]
                 ExecutorQueryRole::InternalLemma => exec.execute_all_internal_lemma(commands),
             };
             match executed {

@@ -479,6 +479,14 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// check-path array-context carve-out pattern-matches) is preserved
     /// byte-identically on every failure path.
     pub(super) verify_memo: Option<&'a mut crate::verification::ConflictSemanticVerifyMemo>,
+    /// #dt-context-derivation producer sink: Executor-owned record vector for
+    /// (minimized conflict clause, stripped level-0 premise facts) pairs. The
+    /// level-0 minimization below removes exactly the asserted premises that
+    /// make the added clause context-dependent; recording them here lets the
+    /// certification fragment re-derive the entailment. Records grant no
+    /// authority (sealing independently re-checks); `None` (the default)
+    /// keeps the eager path record-free.
+    pub(super) context_records: Option<&'a mut crate::executor::DtContextConflictSink>,
     /// Cached `AY_DISABLE_THEORY_CHECK` env var (read once at construction).
     pub(super) disable_theory_check: bool,
     /// #8008: Total BCP theory checks performed (independent of propagation

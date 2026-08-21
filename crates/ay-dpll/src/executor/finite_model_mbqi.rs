@@ -91,11 +91,50 @@
 //! of UNSAT obligations, so dropping a pin makes those refutations HARDER to
 //! obtain, never easier, and can only cost a decision.
 //!
-//! Totality is nevertheless REQUIRED, for the emitted model rather than the
-//! answer. The structure the argument exhibits need not be `last_model` unless
-//! the pins fix every symbol the bodies read; with total pins, `last_model` is
-//! itself a model of `P` and therefore one of the structures covered, so a
-//! `(get-model)` after one of these `sat`s is sound too.
+//! The EMITTED MODEL is a separate obligation, and it is DISCHARGED BY CHECKING
+//! rather than by an argument about totality. `last_model` satisfies the ground
+//! ABSTRACTION, in which every quantifier node is an unconstrained Boolean, so
+//! even a totally-pinned `last_model` may assign a node the opposite of the
+//! value `P` forces and thus fail to satisfy the authored roots (measured, on
+//! `rlim_invariant` index 88). [`Executor::finite_model_prepare_witness`]
+//! therefore completes a semantic clone — with the invented pin values, then
+//! with a witness probe of the residual — and REQUIRES every residual root and
+//! every pin to evaluate to `true` under the result. The checked clone is only
+//! published later by the atomic model-bound authority installer. A
+//! `(get-model)` after one of these `sat`s is then sound because that exact
+//! model was evaluated against the query, not because the pins were total.
+//!
+//! Totality of the pin set is still required, but only for what it always
+//! really bought: a truth value that is fixed in every model of `P`. A leaf the
+//! candidate model leaves UNASSIGNED is completed with
+//! [`Executor::unconstrained_default_value`] rather than declining the pass —
+//! `P` is an arbitrary ground premise as far as the argument is concerned.
+//!
+//! ## What this lane COSTS, and the budget that bounds it
+//!
+//! Reaching the pass is not free. One pass runs a refutation per universal, a
+//! counterexample probe, the residual `confirm` solve and the witness probe,
+//! each capped at [`FINITE_MODEL_PROBE_MS`]; and
+//! [`Executor::try_finite_model_forall_refinement`] runs the whole thing up to
+//! [`MAX_FINITE_MODEL_ROUNDS`] times, while
+//! [`Executor::try_finite_model_sat_certificate`] runs another pass from the
+//! publication gates and the last-chance hook. Per-sub-solve caps therefore
+//! bound a check-sat's exposure at TENS OF SECONDS. That is invisible on a
+//! ten-file FP corpus and fatal on an incremental trace with 1,645 check-sats:
+//! sampling `exp_loop_true-unreach-call.c` (Inc Equality_MachineArith) put 64%
+//! of the solve inside this lane, for 14 answers in 150s.
+//!
+//! Two limits bound it, and BOTH fail closed:
+//!
+//! * [`FINITE_MODEL_LANE_BUDGET_MS`] — what one invocation may spend across
+//!   every sub-solve it runs;
+//! * [`FINITE_MODEL_LANE_SEED_MS`] — what the lane may spend on DECLINES in a
+//!   SESSION before it has to have paid for itself, after which it may spend
+//!   on failures at most what it has already spent on successes.
+//!
+//! Neither touches the witness check, which is the only thing standing between
+//! pin completion and a published wrong model and which runs in full on every
+//! certified pass.
 //!
 //! ## Why RoundingMode binders are excluded
 //!
@@ -127,16 +166,21 @@
 //! quantifier module runs over bit-blasted binders.
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
+use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::time::Instant;
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
 use num_bigint::BigInt;
+use std::time::Duration;
 
 use super::model::EvalValue;
 use super::quantifier_loop::result_mapping::CheckedGroundDecision;
 use super::Executor;
 use crate::ematching::{contains_quantifier, subst_vars};
-use crate::executor_types::{Result, SolveResult};
+use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
+
+mod witness;
+use witness::PassOutcome;
 
 /// Maximum synth/verify refinement rounds before failing closed.
 ///
@@ -154,8 +198,174 @@ const MAX_FINITE_MODEL_ROUNDS: usize = 12;
 /// A short budget keeps a hard instance from consuming the enclosing query.
 const FINITE_MODEL_PROBE_MS: u64 = 2_000;
 
-/// Cap on pins so a huge ground slice cannot blow up the sub-queries.
-const MAX_PINS: usize = 256;
+/// Wall budget for the SUB-SOLVES of one invocation of this lane
+/// (#witness-check-cost).
+///
+/// NOT a bound on the invocation's total spend — review measured invocations at
+/// 2,981 ms (float-to-double1) and 3,582 ms (rlim_invariant) against this
+/// 2,500 ms figure, and the original wording claimed the stronger property. The
+/// ground re-solve sits INSIDE the account window but OUTSIDE `sub_solve_ms()`:
+/// it is charged to the account, so the session rule still sees it, but it is
+/// not capped by this constant. Read this as "the budget every sub-solve draws
+/// from", not "the most an invocation can cost".
+///
+/// WHY A LANE-WIDE CAP AND NOT A PER-SUB-SOLVE ONE.
+/// [`FINITE_MODEL_PROBE_MS`] already caps each sub-solve, but a pass runs many:
+/// one or two refutations per universal, a counterexample probe, the residual
+/// `confirm` solve, and the witness probe — and
+/// [`Executor::try_finite_model_forall_refinement`] runs up to
+/// [`MAX_FINITE_MODEL_ROUNDS`] passes. The per-sub-solve cap therefore bounds a
+/// check-sat's exposure at tens of seconds.
+///
+/// WHERE 2.5 s COMES FROM. Measured, not guessed: with the budget removed and
+/// `--debug-cert` reporting every invocation's wall cost, the invocations that
+/// CERTIFY cost
+///
+/// ```text
+///   file                     n     mean    p90    max
+///   rlim_invariant         582    314ms  809ms  2456ms
+///   float-to-double1       155    659ms 1398ms  1789ms
+///   exp_loop                31   1080ms 1491ms  2349ms
+/// ```
+///
+/// so 2.5 s admits every certificate any of the three produced, while the
+/// DECLINED invocations on `exp_loop` (mean 881 ms, p90 4.5 s, max 6.0 s) are
+/// exactly what it truncates. A cap of 1 s was tried first and cost 25% of
+/// `float-to-double1`'s certificates and 8% of `rlim_invariant`'s — measured,
+/// on the division that must hold.
+///
+/// FAIL CLOSED. Exhausting the budget declines the pass, i.e. publishes the
+/// `unknown` the lane existed to avoid — never a weaker check and never a
+/// verdict this lane would not otherwise have been entitled to.
+const FINITE_MODEL_LANE_BUDGET_MS: u64 = 2_500;
+
+/// Speculative capital: what the lane may spend on DECLINES in one session
+/// before it has to have paid for itself (#witness-check-cost).
+///
+/// The per-invocation cap alone does not fix an incremental trace, because the
+/// trace multiplies it: 1,645 check-sats times a per-query cap is still a
+/// budget-sized number. The session rule is
+///
+/// ```text
+///   declined_spend <= FINITE_MODEL_LANE_SEED_MS + certified_spend
+/// ```
+///
+/// — after the seed, the lane may spend on failures at most what it has already
+/// spent on successes.
+///
+/// WHY THIS STATISTIC. It is scale-free: no millisecond threshold has to track
+/// how fast the host is. And it separates the two divisions by two orders of
+/// magnitude. Measured with the budget removed:
+///
+/// ```text
+///   file                declined     certified   ratio needed
+///   float-to-double1      16.6s        102.1s          0.16
+///   rlim_invariant        61.8s        183.0s          0.34
+///   exp_loop             359.4s         33.5s         10.73
+/// ```
+///
+/// A ratio of 1 cuts `exp_loop`'s lane spend to 7% of what it was. It does NOT
+/// leave both FP files alone — review measured that claim false for
+/// `rlim_invariant`: its peak deficit reaches 20,057 ms against the 20,000 ms
+/// seed, the latch trips at invocation ~1062, 1,297 invocations are refused,
+/// and it keeps 159 certificates rather than the 582 claimed here.
+/// float-to-double1 does match (153 kept, 0 latch events).
+///
+/// FPArith survives that at -1 answer and still clears the bar, but the margin
+/// is 6, so the safety argument for this constant is empirical, not structural.
+/// Note also that the latch is ABSORBING: `finite_model_lane_open` returns
+/// `None` before any settle, so once a session's lane closes it can never earn
+/// its way back open.
+///
+/// The seed is deliberately several invocations' worth: with a seed near the
+/// per-invocation cap, one expensive first decline would close the lane for the
+/// whole session before it ever had a chance to certify.
+const FINITE_MODEL_LANE_SEED_MS: u64 = 20_000;
+
+/// Session-scoped spend and yield for this lane (#witness-check-cost).
+///
+/// Lives here rather than as loose `Executor` fields so the rule and the state
+/// it reads are one unit. Deliberately NOT reset per check-sat: the whole point
+/// is that an incremental trace which the lane never pays back stops paying for
+/// it, and a per-call reset would restore the compounding cost exactly.
+/// `reset-assertions` starts a new problem, so it does clear the account.
+#[derive(Clone, Debug, Default)]
+pub(in crate::executor) struct LaneAccount {
+    /// Wall spent on invocations that returned nothing, in milliseconds.
+    declined_ms: u64,
+    /// Wall spent on invocations that returned a certificate.
+    certified_ms: u64,
+    /// How many certificates that was — trace only, the rule reads the times.
+    certificates: u64,
+    /// Test-only override of the per-invocation cap
+    /// ([`FINITE_MODEL_LANE_BUDGET_MS`] when `None`).
+    ///
+    /// Exists so the lane's barrier test can drive an ALREADY-SPENT account
+    /// through the real lane on a fixture that certifies today. Never set on
+    /// any production path.
+    pub(in crate::executor) budget_ms_override: Option<u64>,
+}
+
+impl LaneAccount {
+    /// Fresh speculative capital for a new problem.
+    pub(in crate::executor) fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The spend limit for one lane invocation.
+///
+/// Constructed at the lane's entry points ONLY, so every sub-solve of a
+/// check-sat's pass — across refinement rounds — draws on the same account.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LaneBudget {
+    opened: Instant,
+    deadline: Instant,
+}
+
+impl LaneBudget {
+    /// Open an account worth `budget_ms` from now.
+    ///
+    /// `budget_ms == 0` yields an account that is already spent, which is what
+    /// the barrier test drives.
+    fn start(budget_ms: u64) -> Self {
+        let opened = Instant::now();
+        Self {
+            opened,
+            deadline: opened + Duration::from_millis(budget_ms),
+        }
+    }
+
+    /// Milliseconds left, saturating at zero.
+    fn remaining_ms(&self) -> u64 {
+        let now = Instant::now();
+        if now >= self.deadline {
+            0
+        } else {
+            u64::try_from((self.deadline - now).as_millis()).unwrap_or(u64::MAX)
+        }
+    }
+
+    /// Milliseconds actually spent since the account was opened.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from((Instant::now() - self.opened).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Nothing left to spend.
+    pub(super) fn spent(&self) -> bool {
+        self.remaining_ms() == 0
+    }
+
+    /// Budget for ONE sub-solve: never more than the lane still has.
+    ///
+    /// Handing a sub-solve the full [`FINITE_MODEL_PROBE_MS`] out of an account
+    /// with less than that left is how a "bounded" pass overruns its cap by an
+    /// order of magnitude, so the two limits are combined here rather than at
+    /// each call site.
+    pub(super) fn sub_solve_ms(&self) -> u64 {
+        self.remaining_ms().min(FINITE_MODEL_PROBE_MS)
+    }
+}
 
 /// `--debug-cert` trace for this lane. Every decline reports WHICH step
 /// declined, so a measured null is attributable instead of anonymous.
@@ -490,107 +700,84 @@ fn fp_value_term(terms: &mut TermStore, value: &ay_fp::FpModelValue) -> TermId {
     }
 }
 
-/// Collect the FREE finite-sorted `Var` leaves of `term`.
-///
-/// `bound` holds the binder names of the enclosing quantifiers. AY represents a
-/// bound variable as an ordinary `TermData::Var` (substitution is by name), so
-/// without this filter the binder itself is collected as a pin target, has no
-/// model value, and the totality check fails on every single query.
-fn collect_finite_var_leaves(
-    terms: &TermStore,
-    term: TermId,
-    bound: &HashSet<String>,
-    out: &mut Vec<TermId>,
-    seen: &mut HashSet<TermId>,
-) {
-    if !seen.insert(term) {
-        return;
-    }
-    match terms.get(term) {
-        TermData::Var(name, _) => {
-            if !bound.contains(name) && is_pinnable_finite_sort(terms.sort(term)) {
-                out.push(term);
-            }
-        }
-        TermData::App(_, args) => {
-            for &arg in args {
-                collect_finite_var_leaves(terms, arg, bound, out, seen);
-            }
-        }
-        TermData::Not(inner) => collect_finite_var_leaves(terms, *inner, bound, out, seen),
-        TermData::Ite(condition, then_term, else_term) => {
-            for sub in [*condition, *then_term, *else_term] {
-                collect_finite_var_leaves(terms, sub, bound, out, seen);
-            }
-        }
-        TermData::Let(bindings, body) => {
-            let (bindings, body) = (bindings.clone(), *body);
-            for (_, value) in &bindings {
-                collect_finite_var_leaves(terms, *value, bound, out, seen);
-            }
-            collect_finite_var_leaves(terms, body, bound, out, seen);
-        }
-        // A nested quantifier cannot appear (candidates have QF bodies), and a
-        // constant leaf needs no pin. Any future `TermData` variant is skipped
-        // too: a missed pin only WEAKENS the obligation (module note), so
-        // failing to descend is conservative rather than unsound.
-        _ => {}
-    }
-}
-
 impl Executor {
-    /// Quantifier-free slice of the current assertions — the premise `G`.
-    fn finite_model_ground_slice(&self) -> Vec<TermId> {
-        self.ctx
-            .assertions
-            .iter()
-            .copied()
-            .filter(|&assertion| !contains_quantifier(&self.ctx.terms, assertion))
-            .collect()
+    /// Whether the live query is exactly the hard/assumption SAT scope this
+    /// certificate covers. Native API softs are installed into the frontend
+    /// context for the duration of their executor transaction, so both parsed
+    /// and native MaxSMT queries fail this same check.
+    fn finite_model_plain_sat_scope(&self) -> bool {
+        self.ctx.objectives().is_empty() && self.ctx.soft_constraints().is_empty()
     }
 
-    /// Ground equalities pinning the free finite-sorted symbols of `bodies` to
-    /// their values in the current candidate model, plus whether EVERY such
-    /// symbol was pinned.
+    /// Milliseconds one lane invocation may spend (#witness-check-cost).
     ///
-    /// The answer this lane publishes is sound under a partial pin set (module
-    /// note), but the EMITTED MODEL is not: the structure the proof exhibits
-    /// need not be `last_model` unless the pins fix every symbol the leaf
-    /// bodies read. Totality is therefore required by the caller, so that
-    /// `last_model` — which is a model of its own pins by construction — is
-    /// itself one of the structures the proof covers.
-    fn finite_model_pins(&mut self, leaves_of: &[AuthoredUniversal]) -> (Vec<TermId>, bool) {
-        let Some(model) = self.last_model.clone() else {
-            return (Vec::new(), false);
-        };
-        let bound: HashSet<String> = leaves_of
-            .iter()
-            .flat_map(|leaf| leaf.vars.iter().map(|(name, _)| name.clone()))
-            .collect();
-        let mut leaves: Vec<TermId> = Vec::new();
-        let mut seen: HashSet<TermId> = HashSet::default();
-        for leaf in leaves_of {
-            collect_finite_var_leaves(&self.ctx.terms, leaf.body, &bound, &mut leaves, &mut seen);
-        }
-        leaves.sort_unstable();
-        leaves.dedup();
-        if leaves.len() > MAX_PINS {
-            return (Vec::new(), false);
-        }
+    /// [`FINITE_MODEL_LANE_BUDGET_MS`] unless a caller has overridden it. The
+    /// override exists so the barrier test can drive a SPENT account through
+    /// the real lane on a fixture that certifies today — there is no way to
+    /// reach a budget decline from outside otherwise, and a barrier that never
+    /// runs is the vacuous kind this lane has already shipped once.
+    fn finite_model_lane_budget_ms(&self) -> u64 {
+        self.finite_model_lane
+            .budget_ms_override
+            .unwrap_or(FINITE_MODEL_LANE_BUDGET_MS)
+    }
 
-        let mut pins: Vec<TermId> = Vec::new();
-        let mut total = true;
-        for leaf in leaves {
-            let sort = self.ctx.terms.sort(leaf).clone();
-            let value = self.evaluate_term(&model, leaf);
-            if let Some(value_term) = finite_value_term(&mut self.ctx.terms, &sort, &value) {
-                let pin = self.ctx.terms.mk_eq(leaf, value_term);
-                pins.push(pin);
-            } else {
-                total = false;
-            }
+    /// Open an account for one lane invocation, or `None` if the lane has
+    /// outrun what it has earned in this session (#witness-check-cost).
+    ///
+    /// See [`FINITE_MODEL_LANE_SEED_MS`] for the rule. Returning `None` is a
+    /// decline, which is this lane's ordinary fail-closed outcome.
+    fn finite_model_lane_open(&self) -> Option<LaneBudget> {
+        let per_invocation = self.finite_model_lane_budget_ms();
+        let allowance =
+            FINITE_MODEL_LANE_SEED_MS.saturating_add(self.finite_model_lane.certified_ms);
+        let left = allowance.saturating_sub(self.finite_model_lane.declined_ms);
+        if left == 0 {
+            trace(|| {
+                format!(
+                    "lane closed: declined={}ms allowance={}ms certified={}ms certificates={}",
+                    self.finite_model_lane.declined_ms,
+                    allowance,
+                    self.finite_model_lane.certified_ms,
+                    self.finite_model_lane.certificates
+                )
+            });
+            return None;
         }
-        (pins, total)
+        // Bounded by the DECLINE allowance as well as the per-invocation cap:
+        // an invocation may not open a hole larger than the account can cover
+        // if it turns out to be a decline. An override of 0 must still produce
+        // a SPENT account, so the cap wins the `min` at zero.
+        Some(LaneBudget::start(per_invocation.min(left)))
+    }
+
+    /// Book what one lane invocation cost and what it returned.
+    ///
+    /// Called on EVERY exit path of both entry points; a spend that is not
+    /// booked is a spend the session rule cannot see.
+    fn finite_model_lane_settle(&mut self, budget: LaneBudget, certified: bool) {
+        let cost = budget.elapsed_ms();
+        if certified {
+            self.finite_model_lane.certified_ms =
+                self.finite_model_lane.certified_ms.saturating_add(cost);
+            self.finite_model_lane.certificates =
+                self.finite_model_lane.certificates.saturating_add(1);
+        } else {
+            self.finite_model_lane.declined_ms =
+                self.finite_model_lane.declined_ms.saturating_add(cost);
+        }
+        // The economics this rule is set from: what one invocation cost, what
+        // it returned, and the running session totals. Choosing the constants
+        // off anything else is guessing.
+        trace(|| {
+            format!(
+                "lane settle: cost={cost}ms certified={certified} \
+                 session_declined={}ms session_certified={}ms session_certificates={}",
+                self.finite_model_lane.declined_ms,
+                self.finite_model_lane.certified_ms,
+                self.finite_model_lane.certificates
+            )
+        });
     }
 
     /// `matrix[x_bar := fresh skolems]` for one leaf, with the skolems.
@@ -619,12 +806,16 @@ impl Executor {
         (matrix, skolems)
     }
 
-    /// Is `assertions` checked-UNSAT?
-    fn finite_model_refutes(&mut self, assertions: Vec<TermId>) -> bool {
+    /// Is `assertions` checked-UNSAT, within what the lane has left to spend?
+    ///
+    /// A budget-exhausted call answers "not refuted", which is the same shape
+    /// as a sub-solve that ran out its own budget: the caller loses a decision,
+    /// never gains one.
+    fn finite_model_refutes(&mut self, assertions: Vec<TermId>, budget: LaneBudget) -> bool {
         self.checked_ground_solve(
             assertions.clone(),
             LogicCategory::Other,
-            FINITE_MODEL_PROBE_MS,
+            budget.sub_solve_ms(),
         )
         .is_some_and(|decision| match decision {
             CheckedGroundDecision::Unsat(checked) => checked.consume(self, &assertions),
@@ -677,7 +868,12 @@ impl Executor {
         &mut self,
         leaf: &AuthoredUniversal,
         pins: &[TermId],
+        budget: LaneBudget,
     ) -> TruthOutcome {
+        if budget.spent() {
+            trace(|| "truth value: lane budget spent".to_string());
+            return TruthOutcome::Unknown;
+        }
         let (matrix_sk, skolems) = self.finite_model_skolemize(leaf);
         let negated = self.ctx.terms.mk_not(matrix_sk);
 
@@ -689,7 +885,7 @@ impl Executor {
         };
 
         if leaf.universal {
-            if self.finite_model_refutes(with(pins, negated)) {
+            if self.finite_model_refutes(with(pins, negated), budget) {
                 return TruthOutcome::Determined(true);
             }
             // A counterexample point exists somewhere. Pin one down and certify
@@ -697,14 +893,14 @@ impl Executor {
             let Some(values) = self.probe_finite_witness_values(
                 with(pins, negated),
                 &skolems,
-                FINITE_MODEL_PROBE_MS,
+                budget.sub_solve_ms(),
             ) else {
                 return TruthOutcome::Unknown;
             };
             let Some(instance) = self.finite_model_instance_at(leaf, &values) else {
                 return TruthOutcome::Unknown;
             };
-            if self.finite_model_refutes(with(pins, instance)) {
+            if self.finite_model_refutes(with(pins, instance), budget) {
                 return TruthOutcome::Determined(false);
             }
             // Undetermined under these pins: offer the instance for refinement.
@@ -713,11 +909,11 @@ impl Executor {
             let Some(values) = self.probe_finite_witness_values(
                 with(pins, matrix_sk),
                 &skolems,
-                FINITE_MODEL_PROBE_MS,
+                budget.sub_solve_ms(),
             ) else {
                 // No witness point at all under the pins — if that is CERTIFIED,
                 // the existential is false in every model of them.
-                return if self.finite_model_refutes(with(pins, matrix_sk)) {
+                return if self.finite_model_refutes(with(pins, matrix_sk), budget) {
                     TruthOutcome::Determined(false)
                 } else {
                     TruthOutcome::Unknown
@@ -727,7 +923,7 @@ impl Executor {
                 return TruthOutcome::Unknown;
             };
             let negated_instance = self.ctx.terms.mk_not(instance);
-            if self.finite_model_refutes(with(pins, negated_instance)) {
+            if self.finite_model_refutes(with(pins, negated_instance), budget) {
                 TruthOutcome::Determined(true)
             } else {
                 TruthOutcome::Unknown
@@ -735,39 +931,49 @@ impl Executor {
         }
     }
 
-    /// ONE certificate pass over the authored leaves, with no state mutation.
+    /// ONE certificate pass over the authored leaves, with no installed-model
+    /// mutation.
     ///
-    /// `Some(true)` installs nothing but reports that the pass certified the
-    /// window (the caller mints and installs). `Some(false)` means the pass
-    /// found counterexample instances, returned in `instances`. `None` is a
-    /// decline.
+    /// The pass mints no authority and asserts nothing.
+    /// [`PassOutcome::Certified`] reports that the window is satisfiable AND has
+    /// returned a staged model verified against the residual (see
+    /// [`Self::finite_model_prepare_witness`]) for the caller to seal;
+    /// [`PassOutcome::Refined`] returns counterexample instances in `instances`;
+    /// [`PassOutcome::Declined`] establishes nothing.
     fn finite_model_certificate_pass(
         &mut self,
         round: usize,
         roots: &[TermId],
         universals: &[AuthoredUniversal],
         instances: &mut Vec<TermId>,
-    ) -> Option<bool> {
+        budget: LaneBudget,
+    ) -> PassOutcome {
+        if budget.spent() {
+            trace(|| format!("round {round}: lane budget spent before the pass"));
+            return PassOutcome::Declined;
+        }
         // ONE pin set shared by every leaf in the pass. Per-leaf pin sets
         // would fix each truth value in a DIFFERENT structure, and the residual
         // formula below needs them all true in the SAME one.
-        let (pins, pins_total) = self.finite_model_pins(universals);
+        let mut completions: Vec<(TermId, EvalValue)> = Vec::new();
+        let (pins, pins_total) = self.finite_model_pins(universals, &mut completions);
         trace(|| {
             format!(
-                "round {round}: pins={} total={pins_total} model={}",
+                "round {round}: pins={} total={pins_total} completed={} model={}",
                 pins.len(),
+                completions.len(),
                 self.last_model.is_some()
             )
         });
         if !pins_total {
             trace(|| format!("round {round}: pin set not total"));
-            return None;
+            return PassOutcome::Declined;
         }
 
         let mut values: HashMap<TermId, TermId> = HashMap::default();
         let mut refined = false;
         for leaf in universals {
-            match self.finite_model_truth_value(leaf, &pins) {
+            match self.finite_model_truth_value(leaf, &pins, budget) {
                 TruthOutcome::Determined(value) => {
                     let constant = self.ctx.terms.mk_bool(value);
                     values.insert(leaf.node, constant);
@@ -778,19 +984,19 @@ impl Executor {
                     // of the problem (#quant-alternation wrong-UNSAT).
                     if !leaf.refinable {
                         trace(|| format!("round {round}: undetermined non-conjunctive quantifier"));
-                        return None;
+                        return PassOutcome::Declined;
                     }
                     instances.push(instance);
                     refined = true;
                 }
                 TruthOutcome::Unknown => {
                     trace(|| format!("round {round}: truth value undetermined"));
-                    return None;
+                    return PassOutcome::Declined;
                 }
             }
         }
         if refined {
-            return Some(false);
+            return PassOutcome::Refined;
         }
 
         // RESIDUAL: the authored roots with every quantifier replaced by the
@@ -806,18 +1012,34 @@ impl Executor {
             .map(|&root| replace_subterms(&mut self.ctx.terms, root, &values, &mut memo))
             .collect();
         confirm.extend_from_slice(&pins);
-        let confirmed = self
-            .checked_ground_solve(confirm.clone(), LogicCategory::Other, FINITE_MODEL_PROBE_MS)
-            .is_some_and(|decision| match decision {
-                CheckedGroundDecision::Sat(checked) => checked.consume(self, &confirm),
-                CheckedGroundDecision::Unsat(_) => false,
-            });
-        trace(|| format!("round {round}: all determined; confirm={confirmed}"));
-        confirmed.then_some(true)
+        let decision =
+            self.checked_ground_solve(confirm.clone(), LogicCategory::Other, budget.sub_solve_ms());
+        let outcome = match decision {
+            // The witness stage below is NOT budgeted away. It is the only
+            // check standing between pin completion and a published wrong
+            // model, so a spent account must never let a staged model through
+            // unchecked — `finite_model_prepare_witness` returns `None` when it
+            // cannot verify, and `None` declines. Its own gap-filling probe is
+            // bounded by whatever the account has left, exactly like every
+            // other sub-solve, and a probe that gets nothing simply fails the
+            // re-check.
+            Some(CheckedGroundDecision::Sat(checked)) => checked
+                .consume(self, &confirm)
+                .then(|| self.finite_model_prepare_witness(&confirm, &completions, budget))
+                .flatten()
+                .map_or(PassOutcome::Declined, PassOutcome::Certified),
+            // A refuted residual says only that no model of the PINS satisfies
+            // the roots. The pins are an extra hypothesis nobody asserted, so
+            // on its own that refutes nothing about the query. See the
+            // `PassOutcome` doc for the dual that would, and why it is absent.
+            Some(CheckedGroundDecision::Unsat(_)) | None => PassOutcome::Declined,
+        };
+        trace(|| format!("round {round}: all determined; confirm={}", outcome.label()));
+        outcome
     }
 
     /// Establish and INSTALL finite-sort quantified SAT authority for the
-    /// current authored root window, in a single non-mutating pass.
+    /// current authored root window, with one atomic model replacement.
     ///
     /// This is the hook for the shape the MBQI lane never sees: a positive,
     /// conjunctive-position `exists` over FP binders. The quantifier loop
@@ -829,11 +1051,21 @@ impl Executor {
     /// Adds NO assertions and runs NO outer re-solve, so it is safe to call
     /// from inside the emission funnel.
     pub(in crate::executor) fn try_finite_model_sat_certificate(&mut self) -> bool {
-        if self.should_abort_theory_loop() {
+        // This theorem covers only the exact hard/assumption root window. An
+        // objective or soft constraint adds a public obligation outside that
+        // window, so this producer must not mint authority for optimization.
+        if self.should_abort_theory_loop() || !self.finite_model_plain_sat_scope() {
             return false;
         }
+        // Opened BEFORE the root/leaf analysis. A closed lane must cost a
+        // predicate, not a traversal of every authored root, on each of an
+        // incremental trace's check-sats.
+        let Some(budget) = self.finite_model_lane_open() else {
+            return false;
+        };
         let authority_roots = self.independent_gate_query_roots();
         let Some(universals) = authored_universal_leaves_impl(self, &authority_roots) else {
+            self.finite_model_lane_settle(budget, false);
             return false;
         };
         let certified_nodes: Vec<TermId> = universals.iter().map(|u| u.node).collect();
@@ -845,23 +1077,135 @@ impl Executor {
             )
         });
         let mut instances = Vec::new();
-        if self.finite_model_certificate_pass(0, &authority_roots, &universals, &mut instances)
-            != Some(true)
-        {
-            return false;
-        }
-        let Some(evidence) = super::bv_mbqi::checked_full_domain_sat_authority(
-            self,
+        let outcome = self.finite_model_certificate_pass(
+            0,
             &authority_roots,
-            &certified_nodes,
-        ) else {
-            trace(|| "gate-hook: authority roots do not cover".to_string());
-            return false;
-        };
-        let installed = self.install_bv_full_domain_sat_authority(evidence);
-        self.bv_quantifier_full_domain_proof = installed;
-        trace(|| format!("gate-hook: installed={installed}"));
-        installed
+            &universals,
+            &mut instances,
+            budget,
+        );
+        self.finite_model_lane_settle(budget, matches!(outcome, PassOutcome::Certified(_)));
+        match outcome {
+            PassOutcome::Certified(model) => {
+                let Some(evidence) = super::bv_mbqi::checked_full_domain_sat_authority(
+                    self,
+                    &authority_roots,
+                    &certified_nodes,
+                ) else {
+                    trace(|| "gate-hook: authority roots do not cover".to_string());
+                    return false;
+                };
+                let installed =
+                    self.install_finite_model_full_domain_sat_authority(evidence, model);
+                trace(|| format!("gate-hook: installed={installed}"));
+                installed
+            }
+            PassOutcome::Refined | PassOutcome::Declined => false,
+        }
+    }
+
+    /// LAST-CHANCE consult of [`Self::try_finite_model_sat_certificate`] on an
+    /// `Unknown(QuantifierUnhandled)` the quantifier loop already published.
+    ///
+    /// # The gap this closes (#inc-fparith-last-mile)
+    ///
+    /// MECHANISM, corrected by review — the original account here was refuted
+    /// by tracing the code on the queries this hook actually gains.
+    ///
+    /// The tempting story is "the lane never gets that far". It is FALSE. On
+    /// 8 of 8 sampled gained indices (103, 181, 209, 944, 1039, 1250, 1495,
+    /// 1757) the pre-hook binary already prints 6-7 `FMQ` lines INCLUDING
+    /// `FMQ enter`: `try_finite_model_forall_refinement` is entered, runs
+    /// `finite_model_certificate_pass` round 0 to completion, and reports
+    /// `round 0: all determined; confirm=false`. 11 of 12 randomly sampled
+    /// still-missing indices also print `FMQ` lines.
+    ///
+    /// What this hook really does is RE-RUN the identical certificate pass a
+    /// second time, in a different executor state. On idx 103 the same roots
+    /// `[TermId(400), TermId(107), TermId(408)]` and the same
+    /// `pins=1 total=true` yield `confirm=false` inside the loop and
+    /// `confirm=true` at the return value. That is a legitimate rescue, but it
+    /// is a state-dependence result, not a reachability one — and any residual
+    /// analysis aimed by the old model (e.g. "the next lever is
+    /// `finite_model_pins`") is aimed wrong.
+    ///
+    /// Also corrected: it is NOT true that all three call sites are downstream
+    /// of MBQI having produced a verdict. `model/independent_gate.rs:4302` sits
+    /// inside `apply_quantified_model_failclosed_gate`, a PUBLICATION gate in
+    /// `emit_sat_verdict`, reached from a proposed ground `Sat`.
+    ///
+    /// # Why it cannot change a correct answer
+    ///
+    /// * It is consulted ONLY on `Unknown`, so no `Sat`/`Unsat` can be
+    ///   reinterpreted; the sole reachable transition is `Unknown -> Sat`.
+    /// * It is consulted only for `QuantifierUnhandled`, the reason that means
+    ///   "a quantifier had no complete instantiation path" — never for a
+    ///   timeout, memout, or a fragment the engine deliberately refuses.
+    /// * The grant itself is [`Self::try_finite_model_sat_certificate`],
+    ///   unchanged: it adds no assertions, runs no outer re-solve, reads every
+    ///   quantifier's truth value off CHECKED UNSAT results, and only succeeds
+    ///   when `checked_full_domain_sat_authority` confirms the certified nodes
+    ///   are EXACTLY the quantifier nodes of the authored root window. A
+    ///   ground SAT is never authority for a quantified formula here, which is
+    ///   why the `has_unsafe_partial_quantifiers` hazard (ay #8729 / Z3 #6303)
+    ///   does not reach it.
+    /// * The resulting `Sat` still traverses the ordinary emission funnel and
+    ///   its publication gates, exactly as it does from the other three call
+    ///   sites.
+    ///
+    /// # Why it cannot recurse
+    ///
+    /// Every sub-solve this lane runs goes through `checked_ground_solve`,
+    /// i.e. `checked_isolated_solve` in `CheckedIsolatedMode::GroundDecision`,
+    /// which returns `None` for any assertion vector containing a quantifier.
+    /// A quantifier-free probe cannot produce `QuantifierUnhandled`, so a
+    /// nested `check_sat` can never re-enter this hook.
+    ///
+    /// The composition with [`Executor::cegar_refine_solve`] lives here rather
+    /// than at the call site so the whole argument stays in one file.
+    pub(in crate::executor) fn cegar_refine_solve_with_finite_model_last_chance(
+        &mut self,
+    ) -> Result<SolveResult> {
+        let result = self.cegar_refine_solve()?;
+        Ok(self.finite_model_last_chance(result))
+    }
+
+    /// NO DISCRIMINATING TEST EXISTS FOR THIS HOOK. Stated plainly rather than
+    /// papered over, because review proved it: replacing this body with an
+    /// unconditional `return result;` leaves the suite byte-identical at 6,902
+    /// passed, and all four committed `fp_universal_lane` fixtures are
+    /// answer-identical on main and branch.
+    ///
+    /// Why a unit fixture does not work: the promote direction needs the
+    /// certificate to CONFIRM, which needs a candidate model with total pins.
+    /// A synthetic `(not (exists ((x Float32)) (P x)))` executor has no model,
+    /// so `try_finite_model_sat_certificate` declines and any assertion behind
+    /// it is skipped. An `if confirmed { .. }` test therefore PASSES under the
+    /// no-op mutation — that vacuous version was written here and deleted
+    /// rather than shipped.
+    ///
+    /// What would discriminate, measured: the rlim_invariant slice at index
+    /// 103 (pre-hook `unknown`, post-hook `sat`, both bitwuzla and z3 `sat`).
+    /// A hand-minimised 8-line variant does NOT discriminate, so the
+    /// surrounding assertion stack is load-bearing and any shrunk fixture must
+    /// be re-validated against the PRE-HOOK binary before it is trusted.
+    fn finite_model_last_chance(&mut self, result: SolveResult) -> SolveResult {
+        if !matches!(result, SolveResult::Unknown)
+            || !matches!(
+                self.last_unknown_reason,
+                Some(UnknownReason::QuantifierUnhandled)
+            )
+        {
+            return result;
+        }
+        trace(|| "last-chance: consulting the finite-sort certificate".to_string());
+        if !self.try_finite_model_sat_certificate() {
+            return result;
+        }
+        self.defer_model_validation = false;
+        self.last_model_validated = true;
+        self.last_unknown_reason = None;
+        SolveResult::Sat
     }
 
     /// Model-relative refinement lane for finite-sort (FP-bearing) universals.
@@ -875,12 +1219,17 @@ impl Executor {
         trigger_quants: &[TermId],
         category: LogicCategory,
     ) -> Option<Result<SolveResult>> {
-        if trigger_quants.is_empty() {
+        if trigger_quants.is_empty() || !self.finite_model_plain_sat_scope() {
             return None;
         }
+        // Opened here, alongside the other reasons this lane declines to
+        // engage at all, so a closed lane neither traverses the roots nor
+        // revokes an authority it is not going to replace.
+        let budget = self.finite_model_lane_open()?;
         let authority_roots = self.independent_gate_query_roots();
         let Some(universals) = authored_universal_leaves_impl(self, &authority_roots) else {
             trace(|| "authored leaves not all finite-sort universals".to_string());
+            self.finite_model_lane_settle(budget, false);
             return None;
         };
         trace(|| {
@@ -897,6 +1246,35 @@ impl Executor {
 
         let certified_nodes: Vec<TermId> = universals.iter().map(|u| u.node).collect();
 
+        // ONE account for the whole refinement loop, not one per round: the
+        // per-round cap is what let a single check-sat spend
+        // `MAX_FINITE_MODEL_ROUNDS` times the intended amount.
+        let mut certified = false;
+        let outcome = self.finite_model_refinement_rounds(
+            &authority_roots,
+            &universals,
+            &certified_nodes,
+            category,
+            budget,
+            &mut certified,
+        );
+        // Settled on EVERY exit path, including the re-solve legs: a spend the
+        // session rule cannot see is a spend that never stops.
+        self.finite_model_lane_settle(budget, certified);
+        outcome
+    }
+
+    /// The refinement rounds themselves, split out so the caller can settle the
+    /// lane account exactly once however this returns.
+    fn finite_model_refinement_rounds(
+        &mut self,
+        authority_roots: &[TermId],
+        universals: &[AuthoredUniversal],
+        certified_nodes: &[TermId],
+        category: LogicCategory,
+        budget: LaneBudget,
+        certified: &mut bool,
+    ) -> Option<Result<SolveResult>> {
         for round in 0..MAX_FINITE_MODEL_ROUNDS {
             if self.should_abort_theory_loop() {
                 trace(|| format!("round {round}: abort requested"));
@@ -906,26 +1284,29 @@ impl Executor {
             let mut new_instances: Vec<TermId> = Vec::new();
             match self.finite_model_certificate_pass(
                 round,
-                &authority_roots,
-                &universals,
+                authority_roots,
+                universals,
                 &mut new_instances,
+                budget,
             ) {
-                None => return None,
-                Some(true) => {
-                    let evidence = super::bv_mbqi::checked_full_domain_sat_authority(
+                PassOutcome::Declined => return None,
+                PassOutcome::Certified(model) => {
+                    *certified = true;
+                    let Some(evidence) = super::bv_mbqi::checked_full_domain_sat_authority(
                         self,
-                        &authority_roots,
-                        &certified_nodes,
-                    );
-                    if evidence.is_none() {
+                        authority_roots,
+                        certified_nodes,
+                    ) else {
                         trace(|| format!("round {round}: authority roots do not cover"));
                         return None;
+                    };
+                    if !self.install_finite_model_full_domain_sat_authority(evidence, model) {
+                        trace(|| format!("round {round}: staged witness install declined"));
+                        return None;
                     }
-                    self.bv_quantifier_full_domain_proof = true;
-                    self.bv_quantifier_full_domain_pending_evidence = evidence;
                     return Some(Ok(SolveResult::Sat));
                 }
-                Some(false) => {}
+                PassOutcome::Refined => {}
             }
 
             trace(|| format!("round {round}: {} new instance(s)", new_instances.len()));
@@ -948,6 +1329,83 @@ impl Executor {
             }
         }
         None
+    }
+}
+
+/// The session yield rule (#witness-check-cost), driven at the accountant.
+///
+/// The end-to-end barrier for the budget lives in `witness.rs` (it drives a
+/// SPENT account through a fixture that certifies today). These pin the rule
+/// itself: seed capital, exhaustion, and the earning step.
+#[cfg(test)]
+mod lane_account_tests {
+    use super::*;
+
+    #[test]
+    fn seed_capital_opens_the_lane_and_declines_beyond_it_close_it() {
+        let mut executor = Executor::new();
+        assert!(
+            executor.finite_model_lane_open().is_some(),
+            "a fresh session must have speculative capital"
+        );
+
+        executor.finite_model_lane.declined_ms = FINITE_MODEL_LANE_SEED_MS;
+        assert!(
+            executor.finite_model_lane_open().is_none(),
+            "spending the seed on declines alone must close the lane"
+        );
+
+        executor.finite_model_lane.certified_ms = 1;
+        assert!(
+            executor.finite_model_lane_open().is_some(),
+            "time spent on a certificate must buy back an equal time for declines"
+        );
+
+        executor.finite_model_lane.declined_ms = FINITE_MODEL_LANE_SEED_MS + 1;
+        assert!(
+            executor.finite_model_lane_open().is_none(),
+            "and no more than an equal time"
+        );
+
+        // Success at scale is what keeps a paying session open: this is the
+        // shape of the FP files (declines cost 0.16-0.34 of certificates).
+        executor.finite_model_lane.certified_ms = 102_000;
+        executor.finite_model_lane.declined_ms = 16_600;
+        assert!(executor.finite_model_lane_open().is_some());
+        // And this is the shape of `exp_loop` (declines cost 10.7x).
+        executor.finite_model_lane.certified_ms = 33_500;
+        executor.finite_model_lane.declined_ms = 359_400;
+        assert!(executor.finite_model_lane_open().is_none());
+    }
+
+    #[test]
+    fn settling_books_the_spend_on_the_side_that_earned_it() {
+        let mut executor = Executor::new();
+        let budget = LaneBudget::start(0);
+        executor.finite_model_lane_settle(budget, true);
+        assert_eq!(executor.finite_model_lane.certificates, 1);
+        executor.finite_model_lane_settle(budget, false);
+        assert_eq!(
+            executor.finite_model_lane.certificates, 1,
+            "a decline must not count as a certificate"
+        );
+        // A zero-cost account books zero on both sides; the split is what is
+        // under test, not the clock.
+        assert_eq!(executor.finite_model_lane.certified_ms, 0);
+        assert_eq!(executor.finite_model_lane.declined_ms, 0);
+    }
+
+    /// A zero override must produce a SPENT account, not an unfunded-but-live
+    /// one — this is what the end-to-end barrier depends on.
+    #[test]
+    fn a_zero_override_opens_an_already_spent_account() {
+        let mut executor = Executor::new();
+        executor.finite_model_lane.budget_ms_override = Some(0);
+        let budget = executor
+            .finite_model_lane_open()
+            .expect("the session rule must still admit the invocation");
+        assert!(budget.spent());
+        assert_eq!(budget.sub_solve_ms(), 0);
     }
 }
 
@@ -1120,5 +1578,81 @@ mod refinable_contract_tests {
             assert!(!universal, "a bare Exists node is not a universal leaf");
             assert!(!refinable, "negated={negated}");
         }
+    }
+
+    /// The last-chance hook's ENTRY CONDITION, pinned.
+    ///
+    /// The hook is the only thing standing between a published `Unknown` and a
+    /// published `Sat` on this route, so the set of results it will even look
+    /// at is a soundness-relevant contract, not a heuristic. It must decline —
+    /// byte-identically, without consulting the certificate — for every result
+    /// that is not `Unknown`, and for every `Unknown` whose reason is not
+    /// `QuantifierUnhandled` (a timeout or a memout is not an unhandled
+    /// quantifier, and re-deciding one would hide a budget failure as a
+    /// capability).
+    #[test]
+    fn last_chance_only_fires_on_unknown_quantifier_unhandled() {
+        let declines: Vec<(SolveResult, Option<UnknownReason>)> = vec![
+            (SolveResult::Sat, None),
+            (SolveResult::Sat, Some(UnknownReason::QuantifierUnhandled)),
+            (
+                SolveResult::unsat(),
+                Some(UnknownReason::QuantifierUnhandled),
+            ),
+            (SolveResult::Unknown, None),
+            (SolveResult::Unknown, Some(UnknownReason::Timeout)),
+            (SolveResult::Unknown, Some(UnknownReason::MemoryLimit)),
+            (SolveResult::Unknown, Some(UnknownReason::Incomplete)),
+            (SolveResult::Unknown, Some(UnknownReason::SelfCheckRejected)),
+            (
+                SolveResult::Unknown,
+                Some(UnknownReason::QuantifierRoundLimit),
+            ),
+        ];
+        for (result, reason) in declines {
+            let mut executor = Executor::new();
+            executor.last_unknown_reason = reason;
+            let before = result.clone();
+            let after = executor.finite_model_last_chance(result);
+            assert_eq!(
+                format!("{after:?}"),
+                format!("{before:?}"),
+                "the hook must pass {before:?} / reason {reason:?} through untouched"
+            );
+            assert_eq!(
+                executor.last_unknown_reason, reason,
+                "a declined consult must not clear the reason"
+            );
+            assert!(
+                !executor.last_model_validated,
+                "a declined consult must not claim model validation"
+            );
+        }
+    }
+
+    /// The one admitted entry — and it still fails CLOSED.
+    ///
+    /// `Unknown(QuantifierUnhandled)` on an executor with no candidate model
+    /// reaches the certificate and the certificate declines (`finite_model_pins`
+    /// needs `last_model`), so the published result is unchanged. This pins
+    /// that reaching the hook is not the same as being granted by it.
+    #[test]
+    fn last_chance_consults_but_fails_closed_without_a_model() {
+        let mut executor = Executor::new();
+        let exists = exists_p(&mut executor.ctx.terms);
+        let root = executor.ctx.terms.mk_not(exists);
+        executor.ctx.assertions.push(root);
+        executor.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
+
+        let after = executor.finite_model_last_chance(SolveResult::Unknown);
+        assert!(
+            matches!(after, SolveResult::Unknown),
+            "no candidate model means no pins, so the certificate must decline"
+        );
+        assert_eq!(
+            executor.last_unknown_reason,
+            Some(UnknownReason::QuantifierUnhandled),
+            "a declined consult leaves the published reason exactly as it was"
+        );
     }
 }

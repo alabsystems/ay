@@ -13,7 +13,7 @@ use super::*;
 /// (a no-op) — skipping it restores identically. Core trail path (all LRA/LIA):
 /// gate behind full-suite + adversarial review before any default-on.
 fn cond_trail_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| ay_core::misc_cli_flags().lra_cond_trail)
 }
 

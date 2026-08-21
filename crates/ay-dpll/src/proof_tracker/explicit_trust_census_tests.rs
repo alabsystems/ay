@@ -114,12 +114,20 @@ const VETTED: &[(&str, usize, usize, &str)] = &[
     ),
     (
         "theory_inference/mod.rs",
-        5,
+        2,
         0,
-        "the classifier funnel's own Generic residuals: blocking-clause-miss \
-         fallback + whole-conflict Generic + extension-lane \
-         polarity-incomplete fallback + extension-lane Generic + farkas-path \
-         Generic (each after classification declined; C1/C3 audited)",
+        "the extension-lane polarity-incomplete fallback + extension-lane \
+         Generic residual (each after classification declined; C1/C3 audited)",
+    ),
+    (
+        "theory_inference/recording_dt.rs",
+        3,
+        0,
+        "the registry-aware recorder's blocking-clause-miss fallback + \
+         whole-conflict Generic residual + Farkas-path Generic residual; \
+         moved byte-for-byte from theory_inference/mod.rs by the quality \
+         split, with the same classifier/DT/decomposition gates (C1/C3 \
+         audited)",
     ),
 ];
 

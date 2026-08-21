@@ -1778,97 +1778,49 @@ enum LeverFlag {
     TriState(&'static str),
     Value(&'static str),
 }
-
+#[rustfmt::skip]
 fn lever_env_to_cli_flag(env_name: &str) -> Option<LeverFlag> {
     Some(match env_name {
         "AY_BCP_TELEMETRY" => LeverFlag::Bool("--sat-bcp-telemetry"),
         "AY_SAT_BCP_LEAN" => LeverFlag::Bool("--sat-bcp-lean"),
-        "AY_SAT_BCP_DISABLE_TRAIL_LOOKAHEAD_PREFETCH" => {
-            LeverFlag::Bool("--sat-bcp-disable-trail-lookahead-prefetch")
-        }
+        "AY_SAT_BCP_DISABLE_TRAIL_LOOKAHEAD_PREFETCH" => LeverFlag::Bool("--sat-bcp-disable-trail-lookahead-prefetch"),
         "AY_SAT_BCP_ADVANCE_SAVED_POS" => LeverFlag::Bool("--sat-bcp-advance-saved-pos"),
-        "AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-false-saved-pos-reset")
-        }
-        "AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-true-tail-relocation")
-        }
-        "AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION" => {
-            LeverFlag::Bool("--sat-bcp-learned-618-true-tail-relocation")
-        }
-        "AY_SAT_BCP_LEARNED_617_TAIL_REORDER" => {
-            LeverFlag::Bool("--sat-bcp-learned-617-tail-reorder")
-        }
-        "AY_SAT_BCP_LEARNED_18_TAIL_REORDER" => {
-            LeverFlag::Bool("--sat-bcp-learned-18-tail-reorder")
-        }
-        "AY_SAT_BCP_LEARNED_1963_TAIL_REORDER" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-tail-reorder")
-        }
+        "AY_SAT_BCP_LEARNED_1963_FALSE_SAVED_POS_RESET" => LeverFlag::Bool("--sat-bcp-learned-1963-false-saved-pos-reset"),
+        "AY_SAT_BCP_LEARNED_1963_TRUE_TAIL_RELOCATION" => LeverFlag::Bool("--sat-bcp-learned-1963-true-tail-relocation"),
+        "AY_SAT_BCP_LEARNED_618_TRUE_TAIL_RELOCATION" => LeverFlag::Bool("--sat-bcp-learned-618-true-tail-relocation"),
+        "AY_SAT_BCP_LEARNED_617_TAIL_REORDER" => LeverFlag::Bool("--sat-bcp-learned-617-tail-reorder"),
+        "AY_SAT_BCP_LEARNED_18_TAIL_REORDER" => LeverFlag::Bool("--sat-bcp-learned-18-tail-reorder"),
+        "AY_SAT_BCP_LEARNED_1963_TAIL_REORDER" => LeverFlag::Bool("--sat-bcp-learned-1963-tail-reorder"),
         "AY_SAT_BVE_OCC_DELTA_VALIDATION" => LeverFlag::Bool("--sat-bve-occ-delta-validation"),
         "AY_SAT_BVE_OCC_SAVED_STATE_REUSE" => LeverFlag::Bool("--sat-bve-occ-saved-state-reuse"),
-        "AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE" => {
-            LeverFlag::Bool("--sat-dense-mutex-focused-restart-gate")
-        }
+        "AY_SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE" => LeverFlag::Bool("--sat-dense-mutex-focused-restart-gate"),
         "AY_SAT_DENSE_CLIQUE_MAB_BRANCH" => LeverFlag::Bool("--sat-dense-clique-mab-branch"),
         "AY_SAT_BVE_LRAT_SCOUT_ROUTE" => LeverFlag::Bool("--sat-bve-lrat-scout-route"),
-        "AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE" => {
-            LeverFlag::Bool("--sat-fmla-decompose-lrat-preflight-route")
-        }
+        "AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE" => LeverFlag::Bool("--sat-fmla-decompose-lrat-preflight-route"),
         "AY_SAT_DENSE_CLIQUE_SCOUT" => LeverFlag::Bool("--sat-dense-clique-scout"),
-        "AY_SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT" => {
-            LeverFlag::Bool("--sat-multiplier-equiv-conservation-scout")
-        }
-        "AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-used5-fsw-saved-pos-reset")
-        }
-        "AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-fsw-conflict-saved-pos-reset")
-        }
-        "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE" => {
-            LeverFlag::Bool("--sat-bcp-learned-no-replacement-saved-pos-update")
-        }
-        "AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-fsw-gent-skip")
-        }
-        "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE" => {
-            LeverFlag::Bool("--sat-bcp-learned-no-replacement-scan-pressure")
-        }
+        "AY_SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT" => LeverFlag::Bool("--sat-multiplier-equiv-conservation-scout"),
+        "AY_SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET" => LeverFlag::Bool("--sat-bcp-learned-1963-used5-fsw-saved-pos-reset"),
+        "AY_SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET" => LeverFlag::Bool("--sat-bcp-learned-1963-fsw-conflict-saved-pos-reset"),
+        "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SAVED_POS_UPDATE" => LeverFlag::Bool("--sat-bcp-learned-no-replacement-saved-pos-update"),
+        "AY_SAT_BCP_LEARNED_1963_FSW_GENT_SKIP" => LeverFlag::Bool("--sat-bcp-learned-1963-fsw-gent-skip"),
+        "AY_SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE" => LeverFlag::Bool("--sat-bcp-learned-no-replacement-scan-pressure"),
         "AY_SAT_BCP_LEARNED_1963_IDENTITY" => LeverFlag::Bool("--sat-bcp-learned-1963-identity"),
-        "AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-pressure-reduction")
-        }
-        "AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-pressure-retention")
-        }
-        "AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH" => {
-            LeverFlag::Bool("--sat-bcp-disable-learned-1963-no-replacement-unit-blocker-refresh")
-        }
-        "AY_SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE" => {
-            LeverFlag::Bool("--sat-inprocessing-yield-productivity-rescue")
-        }
+        "AY_SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION" => LeverFlag::Bool("--sat-bcp-learned-1963-pressure-reduction"),
+        "AY_SAT_BCP_LEARNED_1963_PRESSURE_RETENTION" => LeverFlag::Bool("--sat-bcp-learned-1963-pressure-retention"),
+        "AY_SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH" => LeverFlag::Bool("--sat-bcp-disable-learned-1963-no-replacement-unit-blocker-refresh"),
+        "AY_SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE" => LeverFlag::Bool("--sat-inprocessing-yield-productivity-rescue"),
         "AY_SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE" => {
             LeverFlag::TriState("--sat-lrat-proof-clamp-probe-rescue")
         }
         "AY_SAT_YIELD_RESCUE_BACKBONE_COOLDOWN" => {
-            LeverFlag::Bool("--sat-yield-rescue-backbone-cooldown")
+            LeverFlag::TriState("--sat-yield-rescue-backbone-cooldown")
         }
-        "AY_SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF" => {
-            LeverFlag::Bool("--sat-bounded-backbone-zero-decompose-backoff")
-        }
-        "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW" => {
-            LeverFlag::Bool("--sat-bcp-learned-1963-blocker-cert-shadow")
-        }
-        "AY_SAT_BCP_SEARCH_INPLACE_WATCH_SCAN" => {
-            LeverFlag::TriState("--sat-bcp-search-inplace-watch-scan")
-        }
-        "AY_SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION" => {
-            LeverFlag::TriState("--sat-backbone-post-vivify-binary-admission")
-        }
+        "AY_SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF" => LeverFlag::Bool("--sat-bounded-backbone-zero-decompose-backoff"),
+        "AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW" => LeverFlag::Bool("--sat-bcp-learned-1963-blocker-cert-shadow"),
+        "AY_SAT_BCP_SEARCH_INPLACE_WATCH_SCAN" => LeverFlag::TriState("--sat-bcp-search-inplace-watch-scan"),
+        "AY_SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION" => LeverFlag::TriState("--sat-backbone-post-vivify-binary-admission"),
         "AY_AB_FINALIZE_RESCUE" => LeverFlag::TriState("--sat-finalize-rescue"),
-        "AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET" => {
-            LeverFlag::Value("--sat-bcp-learned-1963-tail-reorder-swap-budget")
-        }
+        "AY_SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET" => LeverFlag::Value("--sat-bcp-learned-1963-tail-reorder-swap-budget"),
         _ => return None,
     })
 }

@@ -13,292 +13,92 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TheoryLemmaKind, TheoryLit, TheorySolver};
 use ay_dt::DtSolver;
 
+mod axiom_proof;
+mod dt_abandon;
 mod lazy_proof_state;
+
+use axiom_proof::recognized_axiom_kind;
 
 /// Budget for post-`Sat` model-e-graph recheck lemma rounds per
 /// `solve_with_dt_axioms` call (fail-closed Unknown past it; #dt-model-recheck).
 const DT_MODEL_RECHECK_MAX_ROUNDS: u32 = 32;
 
-/// Outcome of [`Executor::dt_model_egraph_recheck`].
-enum DtModelRecheck {
-    /// No datatype clash/cycle among the accepted model's TRUE datatype
-    /// equalities: the model respects the D0 rules.
-    Clean,
-    /// A verified datatype conflict was found; its tautology clause(s) were
-    /// appended to the assertions. The caller must RE-SOLVE (the previous
-    /// `Sat` must not be returned).
-    LemmasInjected,
-    /// A datatype conflict exists but no new clause can be emitted (already
-    /// emitted this solve, or its explanation failed independent fresh-EUF
-    /// re-derivation). The model must not be accepted; the caller returns a
-    /// sound `Unknown` (fail-closed).
-    Inconclusive,
-}
-
-/// Replace a speculative AUFLIA term universe with the exact owned entry
-/// universe. Taking the snapshot by value is load-bearing: `TermStore::clone`
-/// mints a new rollback identity, so cloning here would break every checkpoint
-/// bound to the saved store and briefly allocate a third full term universe.
-fn restore_dt_auflia_entry_terms(current: &mut ay_core::TermStore, entry: ay_core::TermStore) {
-    *current = entry;
-}
-
-/// Executor-owned state that a discarded lazy-DT sub-solve may mutate.
-///
-/// The public query does not restart between the lazy attempt and its eager
-/// fallback. Restoring only assertions/terms is therefore insufficient: a
-/// validation bypass, refinement lemma, model-repair latch, or TermId-keyed
-/// memo from the failed attempt can change what the eager authority accepts.
-/// Keep the transaction boundary explicit and shared by both lazy lanes.
-struct DtLazyAttemptState {
-    last_assumptions: Option<Vec<TermId>>,
-    last_assumption_core: Option<Vec<TermId>>,
-    last_core_term_to_name: Option<HashMap<TermId, String>>,
-    nra_algebraic_model: HashMap<TermId, ay_nra::RealAlgebraicValue>,
-    model_validation_delegated_assertions: HashSet<TermId>,
-    dt_solver_added_axiom_terms: HashSet<TermId>,
-    row_seeded_terms: HashSet<TermId>,
-    recorded_var_substitutions: HashMap<TermId, TermId>,
-    array_default_epsilon_by_sort: HashMap<Sort, TermId>,
-    array_default_diag_by_sort: HashMap<Sort, String>,
-    qfax_refinement_clause: Option<Vec<(TermId, bool)>>,
-    last_rejected_array_assertion: Option<TermId>,
-    cegar_pending_lemma: Option<TermId>,
-    cegar_rounds_remaining: u32,
-    cegar_emitted_lemmas: HashSet<TermId>,
-    array_ext_shadow: crate::executor::ArrayExtShadow,
-    array_ext_witness_cache: crate::executor::ArrayExtWitnessCache,
-    array_axiom_scope: Option<(HashSet<TermId>, usize)>,
-    dt_lazy_splits: Option<(Vec<(String, Vec<String>, bool)>, Vec<(TermId, Vec<TermId>)>)>,
-    active_support_axioms: Vec<TheoryLit>,
-    conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
-    prop_semantic_verify_memo: crate::verification::PropSemanticVerifyMemo,
-    named_assert_rewrites: HashMap<TermId, TermId>,
-    // `lemma_cache` is intentionally absent. Both lazy lanes call
-    // `dt_lazy_lemma_cache_isolation_available` before capture, excluding
-    // persistence and any pre-existing entries; the attempted solve therefore
-    // cannot retain speculative TermIds there. This avoids cloning a bounded
-    // but potentially large lemma/dedup ledger.
-    uflia_repair_candidates: Vec<crate::executor::model::Model>,
-    uflia_repair_conflict_tables: Vec<String>,
-    last_degrade_was_datatype_array: bool,
-    nested_array_row_reduction_unsat: bool,
-    uflia_congruence_lane: bool,
-    uflia_congruence_gate_rejected: bool,
-    qfax_retry_done: bool,
-    uflia_congruence_retry_done: bool,
-    uflia_model_repair_done: bool,
-    sat_validated_by_mod_div_or_branch: bool,
-    defer_model_validation: bool,
-    skip_model_eval: bool,
-    read_pin_repair_done: bool,
-    dt_array_injectivity_gate_bypass: bool,
-    original_problem_had_quantifiers: bool,
-    in_nested_array_residue_probe: bool,
-    residue_probe_failures: u32,
-    mod_div_or_branch_rescue_depth: u8,
-}
-
-impl DtLazyAttemptState {
-    fn capture(executor: &Executor) -> Self {
-        Self {
-            last_assumptions: executor.last_assumptions.clone(),
-            last_assumption_core: executor.last_assumption_core.clone(),
-            last_core_term_to_name: executor.last_core_term_to_name.clone(),
-            nra_algebraic_model: executor.nra_algebraic_model.values().clone(),
-            model_validation_delegated_assertions: executor
-                .model_validation_delegated_assertions
-                .clone(),
-            dt_solver_added_axiom_terms: executor.dt_solver_added_axiom_terms.clone(),
-            row_seeded_terms: executor.row_seeded_terms.clone(),
-            recorded_var_substitutions: executor.recorded_var_substitutions.clone(),
-            array_default_epsilon_by_sort: executor.array_default_epsilon_by_sort.clone(),
-            array_default_diag_by_sort: executor.array_default_diag_by_sort.clone(),
-            qfax_refinement_clause: executor.qfax_refinement_clause.clone(),
-            last_rejected_array_assertion: executor.last_rejected_array_assertion,
-            cegar_pending_lemma: executor.cegar_pending_lemma,
-            cegar_rounds_remaining: executor.cegar_rounds_remaining,
-            cegar_emitted_lemmas: executor.cegar_emitted_lemmas.clone(),
-            array_ext_shadow: executor.array_ext_shadow.clone(),
-            array_ext_witness_cache: executor.array_ext_witness_cache.clone(),
-            array_axiom_scope: executor.array_axiom_scope.clone(),
-            dt_lazy_splits: executor.dt_lazy_splits.clone(),
-            active_support_axioms: executor.active_support_axioms.clone(),
-            conflict_semantic_verify_memo: executor.conflict_semantic_verify_memo.clone(),
-            prop_semantic_verify_memo: executor.prop_semantic_verify_memo.clone(),
-            named_assert_rewrites: executor.named_assert_rewrites.clone(),
-            uflia_repair_candidates: executor.uflia_repair_candidates.clone(),
-            uflia_repair_conflict_tables: executor.uflia_repair_conflict_tables.clone(),
-            last_degrade_was_datatype_array: executor.last_degrade_was_datatype_array,
-            nested_array_row_reduction_unsat: executor.nested_array_row_reduction_unsat,
-            uflia_congruence_lane: executor.uflia_congruence_lane,
-            uflia_congruence_gate_rejected: executor.uflia_congruence_gate_rejected,
-            qfax_retry_done: executor.qfax_retry_done,
-            uflia_congruence_retry_done: executor.uflia_congruence_retry_done,
-            uflia_model_repair_done: executor.uflia_model_repair_done,
-            sat_validated_by_mod_div_or_branch: executor.sat_validated_by_mod_div_or_branch,
-            defer_model_validation: executor.defer_model_validation,
-            skip_model_eval: executor.skip_model_eval,
-            read_pin_repair_done: executor.read_pin_repair_done,
-            dt_array_injectivity_gate_bypass: executor.dt_array_injectivity_gate_bypass,
-            original_problem_had_quantifiers: executor.original_problem_had_quantifiers,
-            in_nested_array_residue_probe: executor.in_nested_array_residue_probe,
-            residue_probe_failures: executor.residue_probe_failures,
-            mod_div_or_branch_rescue_depth: executor.mod_div_or_branch_rescue_depth,
-        }
-    }
-
-    /// Move the entry state back without allocating after arbitrary inner growth.
-    /// The proof-coupled witness cache is returned for the caller to commit only
-    /// after the proof/term rollback succeeds.
-    fn restore(self, executor: &mut Executor) -> crate::executor::ArrayExtWitnessCache {
-        executor.last_assumptions = self.last_assumptions;
-        executor.last_assumption_core = self.last_assumption_core;
-        executor.last_core_term_to_name = self.last_core_term_to_name;
-        executor.restore_nra_values(self.nra_algebraic_model);
-        executor.model_validation_delegated_assertions = self.model_validation_delegated_assertions;
-        executor.dt_solver_added_axiom_terms = self.dt_solver_added_axiom_terms;
-        executor.row_seeded_terms = self.row_seeded_terms;
-        executor.recorded_var_substitutions = self.recorded_var_substitutions;
-        executor.array_default_epsilon_by_sort = self.array_default_epsilon_by_sort;
-        executor.array_default_diag_by_sort = self.array_default_diag_by_sort;
-        executor.qfax_refinement_clause = self.qfax_refinement_clause;
-        executor.last_rejected_array_assertion = self.last_rejected_array_assertion;
-        executor.cegar_pending_lemma = self.cegar_pending_lemma;
-        executor.cegar_rounds_remaining = self.cegar_rounds_remaining;
-        executor.cegar_emitted_lemmas = self.cegar_emitted_lemmas;
-        executor.array_ext_shadow = self.array_ext_shadow;
-        executor.array_axiom_scope = self.array_axiom_scope;
-        executor.dt_lazy_splits = self.dt_lazy_splits;
-        executor.active_support_axioms = self.active_support_axioms;
-        executor.conflict_semantic_verify_memo = self.conflict_semantic_verify_memo;
-        executor.prop_semantic_verify_memo = self.prop_semantic_verify_memo;
-        executor.named_assert_rewrites = self.named_assert_rewrites;
-        executor.uflia_repair_candidates = self.uflia_repair_candidates;
-        executor.uflia_repair_conflict_tables = self.uflia_repair_conflict_tables;
-        executor.last_degrade_was_datatype_array = self.last_degrade_was_datatype_array;
-        executor.nested_array_row_reduction_unsat = self.nested_array_row_reduction_unsat;
-        executor.uflia_congruence_lane = self.uflia_congruence_lane;
-        executor.uflia_congruence_gate_rejected = self.uflia_congruence_gate_rejected;
-        executor.qfax_retry_done = self.qfax_retry_done;
-        executor.uflia_congruence_retry_done = self.uflia_congruence_retry_done;
-        executor.uflia_model_repair_done = self.uflia_model_repair_done;
-        executor.sat_validated_by_mod_div_or_branch = self.sat_validated_by_mod_div_or_branch;
-        executor.defer_model_validation = self.defer_model_validation;
-        executor.skip_model_eval = self.skip_model_eval;
-        executor.read_pin_repair_done = self.read_pin_repair_done;
-        executor.dt_array_injectivity_gate_bypass = self.dt_array_injectivity_gate_bypass;
-        executor.original_problem_had_quantifiers = self.original_problem_had_quantifiers;
-        executor.in_nested_array_residue_probe = self.in_nested_array_residue_probe;
-        executor.residue_probe_failures = self.residue_probe_failures;
-        executor.mod_div_or_branch_rescue_depth = self.mod_div_or_branch_rescue_depth;
-        self.array_ext_witness_cache
-    }
-}
+include!("dt/lazy_attempt_state.rs");
 
 impl Executor {
+    fn has_persistent_dt_lazy_session(&self) -> bool {
+        self.incremental_mode
+            || self.incr_theory_state.as_ref().is_some_and(|state| {
+                state.scope_depth > 0
+                    || state.pending_push > 0
+                    || !state.encoded_assertions.is_empty()
+                    || !state.pre_push_assertions.is_empty()
+                    || state.persistent_sat.is_some()
+                    || state.lia_persistent_sat.is_some()
+            })
+    }
+
     fn dt_lazy_lemma_cache_isolation_available(&self) -> bool {
         !self.lemma_persistence && self.lemma_cache.is_empty()
     }
 
-    /// Record injected DT axioms as proof-tracker theory lemmas, upgrading
-    /// `Generic` to a strict-checkable typed kind exactly when the checker's
-    /// OWN recognizer accepts the recorded clause (#trust-count→0, C1.iv).
-    ///
-    /// Each probe calls an `ay_proof` recognizer that IS the strict validator
-    /// (`validate_*(..).is_ok()`; checker/datatype_axiom.rs), fed the SAME
-    /// registries the mint-time strict check receives
-    /// (`datatype_decls_for_strict_proof` /
-    /// `ctor_selector_decls_for_strict_proof`), so a lemma is tagged only when
-    /// strict mode will independently re-validate that exact clause —
-    /// classifier and checker cannot drift (the `promote_datatype_distinct_lemmas`
-    /// / `push_array_axiom_assertion_site` precedent). The enabled probes stay
-    /// limited to the established C1.iv/C5 families. Everything outside those
-    /// lanes — including array∘DT bridge implications, guard-resolved and direct
-    /// acyclicity clauses, forced guard-unit literals, depth axioms, value-eq
-    /// congruence biconditionals, same-constructor structural disequalities,
-    /// and the (F1)/(F2) BARE injectivity field-equality units — is recorded
-    /// `Generic` so publication fails closed.
-    ///
-    /// The recorded lemma is the unit clause `[axiom]` where the axiom may be
-    /// an `or`/`=>` term; the DT validators or-flatten internally
-    /// (`flatten_clause_literals`), so probing the exact recorded clause
-    /// performs the same flattened comparison the euf.rs precedent makes
-    /// explicitly — and guarantees the probe sees precisely what the checker
-    /// will later validate.
+    /// Indexed theory authority for a solver-injected axiom assertion's
+    /// activation unit, from the query-scoped registry
+    /// [`Self::record_dt_axiom_theory_lemmas`] populates. `None` for authored
+    /// assertions and untyped (`Generic`) injections; their pre-existing
+    /// fail-closed placement remains unchanged.
+    #[cfg(test)]
+    pub(crate) fn injected_axiom_theory_proof(
+        &self,
+        term: TermId,
+    ) -> Option<ay_core::TheoryLemmaProof> {
+        let kind = *self.injected_axiom_theory_kinds.get(&term)?;
+        Some(ay_core::TheoryLemmaProof {
+            clause: vec![term],
+            kind,
+            farkas: None,
+            lia: None,
+        })
+    }
+
+    /// Record injected DT axioms with a typed kind only when the strict
+    /// checker's recognizer accepts the exact unit clause. Context-dependent
+    /// residues remain explicit trust lemmas.
+    fn record_recognized_dt_axiom(&mut self, axiom: TermId, kind: TheoryLemmaKind) {
+        let _ = self
+            .proof_tracker
+            .add_theory_lemma_with_kind(vec![axiom], kind);
+        self.injected_axiom_theory_kinds.insert(axiom, kind);
+    }
+
+    /// Record a #dt-context-derivation producer hint: `clause` is entailed
+    /// by the asserted `premises`. The record grants no authority — sealing
+    /// and the fragment lane independently re-derive the entailment and
+    /// discharge every premise. Capped; overflow and degenerate records are
+    /// silently dropped (a missing hint can only decline an authentication).
+    pub(crate) fn record_dt_context_conflict(
+        &mut self,
+        clause: Vec<TermId>,
+        premises: Vec<TermId>,
+    ) {
+        self.dt_context_conflict_records.record(clause, premises);
+    }
+
     fn record_dt_axiom_theory_lemmas(&mut self, axioms: &[TermId]) {
         let dt_decls = self.datatype_decls_for_strict_proof();
         let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
-        // An "axiom" that is literally one of the current assertions must NOT
-        // be recorded as a lemma at all: the assertion enters the proof as an
-        // `Assume`, and recording a `Generic` trust lemma for the same term
-        // first HIJACKS that — `add_assumption`'s preprocessing-producer reuse
-        // maps the assertion onto the trust step, so an AUTHORED fact enters
-        // the published proof as an unverified fallback and mandatory
-        // certification demotes the whole verdict to proof-trusted. Measured
-        // on verification-consumer's extern_spec Option::unwrap obligation: the driver's
-        // own ground facts (`(= (bridge old_opt) (bridge opt))`, tester and
-        // postcondition units) were re-mined into `extra_axioms` by the DT
-        // relevance passes and re-labeled as trust, 30 steps per proof.
+        // Authored assertions enter as `Assume`; recording them as Generic
+        // first would let preprocessing reuse replace that authority.
         let asserted: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         for &axiom in axioms {
             if asserted.contains(&axiom) {
                 continue;
             }
             let clause = [axiom];
-            // Family (A) selector projection `sel_i(C(a..)) = a_i`.
-            if ay_proof::recognize_datatype_selector_project(
-                &self.ctx.terms,
-                &clause,
-                &ctor_selectors,
-            ) {
-                let _ = self.proof_tracker.add_theory_lemma_with_kind(
-                    vec![axiom],
-                    TheoryLemmaKind::DatatypeSelectorProject,
-                );
-            // Family (D) constructor coverage `(or (is-C1 x) .. (is-Ck x))`
-            // over a non-constructor scrutinee (unit `(is-C x)` for a
-            // single-constructor datatype). Probed BEFORE the tester lane:
-            // the tester validator's general exhaustiveness lane accepts the
-            // k>=2 disjunctions too, so this probe only moves clauses between
-            // two strict-checkable kinds — to the one that names the family —
-            // and never widens what escapes `Generic` by mislabeling (C5).
-            } else if ay_proof::recognize_datatype_exhaustive(&self.ctx.terms, &clause, &dt_decls) {
-                let _ = self
-                    .proof_tracker
-                    .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::DatatypeExhaustive);
-            // Family (C) guarded constructor reconstruction
-            // `(or (not (is-C x)) (= x (C (sel_1 x) .. (sel_k x))))` (the
-            // emitted `mk_implies` desugars to this disjunction). Selector
-            // list + field order are re-derived from the registries by the
-            // recognizer=validator, so a permuted or truncated chain stays
-            // `Generic` (C5).
-            } else if ay_proof::recognize_datatype_constructor_reconstruct(
-                &self.ctx.terms,
-                &clause,
-                &dt_decls,
-                &ctor_selectors,
-            ) {
-                let _ = self.proof_tracker.add_theory_lemma_with_kind(
-                    vec![axiom],
-                    TheoryLemmaKind::DatatypeConstructorReconstruct,
-                );
-            // Families (B)/(B') tester evaluation `is-C(C(..))` /
-            // `(not (is-C' (C ..)))` (the `= true/false` forms fold to these at
-            // `mk_eq`), plus whatever else the tester validator itself accepts
-            // (nullary-sibling exhaustiveness form). The `_with_selectors`
-            // variant matches the checker dispatch exactly:
-            // `check_proof_strict_with_datatypes` always supplies both
-            // registries (checker/mod.rs `DatatypeTesterEval` arm).
-            } else if ay_proof::recognize_datatype_tester_eval_with_selectors(
-                &self.ctx.terms,
-                &clause,
-                &dt_decls,
-                &ctor_selectors,
-            ) {
-                let _ = self
-                    .proof_tracker
-                    .add_theory_lemma_with_kind(vec![axiom], TheoryLemmaKind::DatatypeTesterEval);
+            if let Some(kind) =
+                recognized_axiom_kind(&self.ctx.terms, &clause, &dt_decls, &ctor_selectors)
+            {
+                self.record_recognized_dt_axiom(axiom, kind);
             } else {
                 let _ = self.proof_tracker.add_explicit_trust_lemma(vec![axiom]);
             }
@@ -1310,16 +1110,7 @@ impl Executor {
         // Incremental gate (#dt-lazy-incremental-gate): the lane's term-store
         // rollback contract is unenforceable under a persistent incremental
         // session (recycled TermIds alias stale encodings → wrong-UNSAT). Skip.
-        if self.incremental_mode
-            || self.incr_theory_state.as_ref().is_some_and(|s| {
-                s.scope_depth > 0
-                    || s.pending_push > 0
-                    || !s.encoded_assertions.is_empty()
-                    || !s.pre_push_assertions.is_empty()
-                    || s.persistent_sat.is_some()
-                    || s.lia_persistent_sat.is_some()
-            })
-        {
+        if self.has_persistent_dt_lazy_session() {
             return Ok(None);
         }
         if !self.dt_lazy_lemma_cache_isolation_available() {
@@ -1453,6 +1244,14 @@ impl Executor {
         let sparse = self.dt_auflia_lazy_relevant_axioms();
         let sparse_count = sparse.len();
         extra_axioms.extend(sparse);
+
+        // #dt-lazy-axiom-authority: exactly like the eager lanes, every
+        // injected axiom must carry a typed theory-lemma record, or its
+        // original clause has no exact proof authority and mandatory
+        // certification discards the lane's UNSAT downstream.
+        if self.produce_proofs_enabled() {
+            self.record_dt_axiom_theory_lemmas(&extra_axioms);
+        }
 
         let base_assertions_exact = self.ctx.assertions.clone();
         let base_len = base_assertions_exact.len();
@@ -1953,17 +1752,11 @@ impl Executor {
         if !self.bulk_state_clone_fits_memory() {
             return Ok(None);
         }
-        let Ok(entry_proof_checkpoint) = self.bounded_proof_rollback_checkpoint() else {
-            // Optional lane: fall through before mutating assertion/term state.
-            return Ok(None);
-        };
-
         // On FALLBACK restore assertions so the eager lane mines the ORIGINAL
         // shapes; its pre-lift snapshot must not see an already-lifted list or
         // the fuzz881 acyclicity units are lost. Unasserted appended terms are
         // harmless to every lane.
-        let entry_assertions = self.ctx.assertions.clone();
-        let entry_pre_lift = std::mem::take(&mut self.dt_pre_lift_assertions);
+        //
         // Entry TERM-STORE snapshot (#dt-lazy-isolation, mv-rerun-20260718
         // Barrett regression, merge 547590f8): every term this attempt
         // creates — the flatten/lift rewrites, the depth-1 axiom slice's
@@ -1985,63 +1778,28 @@ impl Executor {
         //
         // PROOF-PRODUCTION INTERACTION (read this before touching): proof
         // steps and their assumption/lemma/name maps contain TermIds minted by
-        // the attempt. The paired proof-tracker checkpoint is rolled back
-        // BEFORE the TermStore checkpoint, removing the entire dependent
-        // ledger (including speculative nested scopes). This keeps fallback
-        // isolation active in both proof and non-proof modes without dangling
-        // IDs or preserving failed-lane scaffolding.
-        let entry_terms_len = self.ctx.terms.len();
-        let entry_terms_checkpoint = self.ctx.terms.rollback_checkpoint();
-        let entry_lazy_proof_state = lazy_proof_state::DtLazyProofState::capture(self);
-        let entry_attempt_state = DtLazyAttemptState::capture(self);
-        let entry_lia_probe_state = ay_lia::save_probe_state();
-        // Every fallback callsite returns immediately. Make the transaction
-        // affine so all entry snapshots are moved back rather than cloned
-        // after the inner solve may have grown the corresponding structures.
-        let rollback_on_fallback = move |this: &mut Self| {
-            // #dt-lazy-isolation, repaired 2026-08-07.
-            //
-            // This guard used to skip the rollback whenever proof steps existed,
-            // and its own comment recorded the precondition that made that safe:
-            // "the SMT-COMP configuration (--z3-mode) never enables proofs and
-            // always takes the rollback". 66538b006 made proof tracking
-            // unconditional and silently voided it — the rollback stopped firing,
-            // the failed lazy attempt's scaffold survived, and the pre-fix unknown
-            // returned. Measured cost: 99 answers on MV QF_Datatypes, with SQ and
-            // MV QF_Datatypes lost outright.
-            //
-            // The old guard existed because rolling terms back under recorded
-            // proof steps dangles them. The proof-ledger checkpoint below now
-            // removes those steps and every correlated ProofId map first, so
-            // this lane can always restore its TermStore isolation contract.
-            //
-            // Note this is the try_solve_dt_lazy lane ONLY. The sibling
-            // try_solve_dt_auflia_lazy guard above must stay — enabling it
-            // regresses FP/BV/NRA (measured: 14 FP failures).
-            // Revoke only the discarded attempt's result artifacts. The active
-            // public UNSAT epoch and Pareto state belong to the enclosing query.
-            this.ctx.assertions = entry_assertions;
-            this.dt_pre_lift_assertions = entry_pre_lift;
-            this.revoke_dt_lazy_attempt_artifacts();
-            this.clear_dt_theory_model();
-            this.dt_egraph_assignment.replace(None);
-            let entry_array_ext_witness_cache = entry_attempt_state.restore(this);
-            ay_lia::restore_probe_state(entry_lia_probe_state);
-            crate::executor::model::eval_memo_clear();
-            entry_lazy_proof_state.restore(this);
-            this.clear_dt_lazy_rebuildable_term_indexes();
-            if !this.proof_tracker.rollback_to(entry_proof_checkpoint) {
-                // The checkpoint's prefix was moved out by a nested proof
-                // reset/take. Keep the speculative terms so no escaped proof
-                // can dangle; eager fallback remains sound, just less isolated.
-                return;
-            }
-            this.array_ext_witness_cache = entry_array_ext_witness_cache;
-            this.ctx.terms.rollback_to(entry_terms_checkpoint);
-            this.clear_dt_lazy_rebuildable_term_indexes();
-            if ay_core::misc_cli_flags().phase_trace {
-                eprintln!("c phase-trace dt-lazy-rollback to={entry_terms_len}");
-            }
+        // the attempt. This lane's rollback used to be skipped whenever proof
+        // steps existed; 66538b006 made proof tracking unconditional and
+        // silently voided the precondition that made that safe (measured: 99
+        // answers on MV QF_Datatypes, SQ 394 -> 198; repaired 2026-08-07,
+        // 71ab33c05). The bracket (#dt-lazy-abandon-restore, `dt_abandon.rs`)
+        // instead runs the attempt inside a proof-tracker speculative scope
+        // and rolls the paired proof-ledger checkpoint back BEFORE the
+        // TermStore checkpoint, removing the entire dependent ledger. This
+        // keeps fallback isolation active in both proof and non-proof modes
+        // without dangling IDs or preserving failed-lane scaffolding.
+        //
+        // Note this is the try_solve_dt_lazy lane ONLY. The sibling
+        // try_solve_dt_auflia_lazy keeps its (narrowed, 15252d939) guard —
+        // removing it regresses FP/BV/NRA (measured: 14 FP failures).
+        //
+        // Every fallback callsite returns immediately; the bracket is affine
+        // (consumed by value) so all entry snapshots are moved back rather
+        // than cloned after the inner solve may have grown them.
+        let Some(entry_state) = self.dt_lazy_capture_entry_state() else {
+            // Optional lane: the proof checkpoint was declined; fall through
+            // before mutating assertion/term state.
+            return Ok(None);
         };
 
         // Preamble parity with `solve_with_dt_axioms` on the pieces the
@@ -2059,6 +1817,7 @@ impl Executor {
         let occurs_check_assertions = self.ctx.assertions.clone();
         if self.dt_occurs_check_unsat_from_equalities(&occurs_check_assertions, &[]) {
             self.last_unknown_reason = None;
+            self.dt_lazy_commit_attempt(entry_state);
             return Ok(Some(SolveResult::unsat()));
         }
 
@@ -2079,6 +1838,13 @@ impl Executor {
             extra_axioms.extend(self.dt_guarded_acyclicity_disjuncts(&pre_lift, &[]));
             extra_axioms.extend(self.dt_guarded_acyclicity_guard_units(&pre_lift, &[]));
         }
+        // #dt-lazy-axiom-authority: exactly like the eager lanes, every
+        // injected axiom must carry a typed theory-lemma record, or its
+        // original clause has no exact proof authority and mandatory
+        // certification discards the lane's UNSAT downstream.
+        if self.produce_proofs_enabled() {
+            self.record_dt_axiom_theory_lemmas(&extra_axioms);
+        }
         let base_assertions_exact = self.ctx.assertions.clone();
         self.ctx.assertions.extend(extra_axioms);
 
@@ -2086,7 +1852,7 @@ impl Executor {
         // projection pairing also covers axiom-synthesized selector/ctor
         // terms.
         let Some((dt_registry, bases)) = self.dt_lazy_prepare() else {
-            rollback_on_fallback(self);
+            self.dt_lazy_discard_attempt(entry_state, "dt-lazy");
             return Ok(None);
         };
 
@@ -2098,7 +1864,7 @@ impl Executor {
         if let Some(deadline) = saved_deadline {
             let now = ay_core::time::Instant::now();
             if deadline <= now {
-                rollback_on_fallback(self);
+                self.dt_lazy_discard_attempt(entry_state, "dt-lazy");
                 return Ok(None);
             }
             self.solve_deadline.set(Some(now + (deadline - now) / 2));
@@ -2116,19 +1882,9 @@ impl Executor {
                 self.last_unknown_reason
             );
         }
-        // Refuted-witness fallback (#dt-lazy-refuted-fallback): a lane `Sat`
-        // whose stored witness the INDEPENDENT, fail-closed gate ground-
-        // REFUTES (`ModelViolates`) can never survive the emit funnel — the
-        // #sat-chokepoint would fail-close it to a public Unknown anyway
-        // (observed on the lazy lane's free-slack collisions: in-loop
-        // validation passes on the model's own evaluator, the gate then
-        // refutes an asserted distinctness). Treat it as a lane MISS instead:
-        // full entry restore + store rollback, and the eager lane — which
-        // solves these instances outright — gets its clean shot. Strictly
-        // sound: only a gate-refuted Sat is demoted (the same evidence class
-        // the deepening loop's #dt-deepen-refuted-witness backstop acts on),
-        // and the public verdict can only improve (Unknown -> the eager
-        // lane's gate-confirmed answer).
+        // A gate-refuted or incomplete lazy-lane witness cannot survive the
+        // public emit funnel; restore the transaction and let the eager lane
+        // decide instead.
         let result = match result {
             Ok(SolveResult::Sat)
                 if matches!(
@@ -2142,15 +1898,6 @@ impl Executor {
                 self.last_model_validated = false;
                 Ok(SolveResult::Unknown)
             }
-            // Partial-emission fallback (#dt-lazy-partial-fallback): the lane's
-            // model would print WITHOUT a definition for a user-declared
-            // datatype constant (its class was poisoned by the single-source
-            // assignment's failed self-check — the printer's fail-closed
-            // omission, stage-4 review F2). A partial model scores zero to a
-            // model validator, while the eager lane typically produces a
-            // complete gate-confirmed witness for the same instance — a lane
-            // miss is strictly better. Only the completeness CHECK is new;
-            // the values themselves are untouched.
             Ok(SolveResult::Sat) if self.dt_lazy_sat_would_print_partial() => {
                 if ay_core::misc_cli_flags().phase_trace {
                     eprintln!("c phase-trace dt-lazy-partial-fallback");
@@ -2165,10 +1912,13 @@ impl Executor {
                 // Fallback: hand the eager lane the ORIGINAL assertion shapes
                 // AND the original term store (see entry snapshots above,
                 // #dt-lazy-isolation).
-                rollback_on_fallback(self);
+                self.dt_lazy_discard_attempt(entry_state, "dt-lazy");
                 Ok(None)
             }
-            other => other.map(Some),
+            other => {
+                self.dt_lazy_commit_attempt(entry_state);
+                other.map(Some)
+            }
         }
     }
 
@@ -2891,9 +2641,8 @@ mod dt_axiom_attribution_tests {
         }
     }
 
-    /// Fail-closed regression: DT axiom families without an enabled promotion
-    /// lane must remain explicit `Generic` trust, including value-equality
-    /// congruence and mined structural disequalities.
+    /// C5b families type through strict recognizers while contextual residues
+    /// remain explicit `Generic` trust.
     #[test]
     fn dt_axiom_recording_keeps_unpromoted_families_generic() {
         let mut exec = Executor::new();
@@ -2909,17 +2658,11 @@ mod dt_axiom_attribution_tests {
         .expect("datatype declarations parse");
         exec.execute_all(&commands).expect("declarations execute");
         exec.proof_tracker.enable();
-
         let x = exec.ctx.terms.lookup("x").expect("x is declared");
         let y = exec.ctx.terms.lookup("y").expect("y is declared");
         let g = exec.ctx.terms.lookup("g").expect("g is declared");
         let list_sort = exec.ctx.terms.sort(x).clone();
         let one = exec.ctx.terms.mk_int(1.into());
-
-        // Value-eq congruence biconditional, built exactly as
-        // `emit_dt_value_eq_congruence` interns it for the two-constructor
-        // List: tester agreement per constructor + guarded field congruence
-        // per cons field.
         let is_nil_x = exec
             .ctx
             .terms
@@ -2961,17 +2704,12 @@ mod dt_axiom_attribution_tests {
         let rhs = exec.ctx.terms.mk_and(vec![t_nil, t_cons, g_hd, g_tl]);
         let eq_xy = exec.ctx.terms.mk_eq(x, y);
         let value_eq_bic = exec.ctx.terms.mk_eq(eq_xy, rhs);
-
-        // Mined direct-cycle unit `(not (= x (cons 1 x)))`.
         let cons_x = exec
             .ctx
             .terms
             .mk_app(Symbol::named("cons"), vec![one, x], list_sort.clone());
         let eq_cycle = exec.ctx.terms.mk_eq(x, cons_x);
         let acyclic_unit = exec.ctx.terms.mk_not(eq_cycle);
-
-        // Mined same-constructor unit whose tails are refuted by
-        // well-foundedness: `(not (= (cons 1 x) (cons 1 (cons 1 x))))`.
         let outer = exec
             .ctx
             .terms
@@ -2979,34 +2717,45 @@ mod dt_axiom_attribution_tests {
         let eq_inj = exec.ctx.terms.mk_eq(cons_x, outer);
         let injective_unit = exec.ctx.terms.mk_not(eq_inj);
 
-        // Other unsupported residues: a forced guard-unit literal and an
-        // (F1)-style BARE field equality (modus ponens against an asserted
-        // constructor equality — not a standalone theorem).
         let guard_unit = exec.ctx.terms.mk_not(g);
         let bare_field_eq = exec.ctx.terms.mk_eq(hd_x, one);
 
         let axioms = [
-            value_eq_bic,
-            acyclic_unit,
-            injective_unit,
-            guard_unit,
-            bare_field_eq,
+            (value_eq_bic, TheoryLemmaKind::DatatypeValueEqCongruence),
+            (acyclic_unit, TheoryLemmaKind::DatatypeAcyclicDirect),
+            (injective_unit, TheoryLemmaKind::DatatypeAcyclicDirect),
+            (guard_unit, TheoryLemmaKind::Generic),
+            (bare_field_eq, TheoryLemmaKind::Generic),
         ];
-        exec.record_dt_axiom_theory_lemmas(&axioms);
+        let terms: Vec<TermId> = axioms.iter().map(|&(axiom, _)| axiom).collect();
+        exec.record_dt_axiom_theory_lemmas(&terms);
         let proof = exec.proof_tracker.take_proof();
 
         assert_eq!(proof.steps.len(), axioms.len());
-        for (step, axiom) in proof.steps.iter().zip(axioms) {
+        for (step, (axiom, expected_kind)) in proof.steps.iter().zip(axioms) {
             match step {
                 ProofStep::TheoryLemma { kind, clause, .. } => {
                     assert_eq!(clause, &vec![axiom]);
                     assert_eq!(
-                        *kind,
-                        TheoryLemmaKind::Generic,
-                        "unsupported DT axiom must remain fail-closed: {clause:?}"
+                        *kind, expected_kind,
+                        "axiom must record with its recognizer-derived kind: {clause:?}"
                     );
                 }
                 other => panic!("expected theory lemma, got {other:?}"),
+            }
+        }
+        for (axiom, expected_kind) in axioms {
+            match expected_kind {
+                TheoryLemmaKind::Generic => {
+                    assert!(exec.injected_axiom_theory_proof(axiom).is_none());
+                }
+                typed => {
+                    let proof = exec
+                        .injected_axiom_theory_proof(axiom)
+                        .expect("typed axiom must be registered");
+                    assert_eq!(proof.kind, typed);
+                    assert_eq!(proof.clause, vec![axiom]);
+                }
             }
         }
     }

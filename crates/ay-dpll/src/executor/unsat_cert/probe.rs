@@ -36,7 +36,7 @@ impl Executor {
         format!("{}…", &formatted[..cut])
     }
 
-    fn bounded_cert_reject_probe_terms(&self, terms: &[TermId]) -> String {
+    pub(in crate::executor) fn bounded_cert_reject_probe_terms(&self, terms: &[TermId]) -> String {
         let mut formatted: Vec<String> = terms
             .iter()
             .take(CERT_REJECT_PROBE_MAX_TERMS)

@@ -121,7 +121,13 @@ impl Executor {
     }
 
     /// Collect the exact authored `not (exists ...)` roots this lane can replay.
-    fn exact_authored_negated_exists_roots(
+    ///
+    /// Shared with the ground-instantiation sibling
+    /// (`authored_negated_exists_ground_inst`), which needs the identical
+    /// recognition — an authored root that is literally `Not(Exists(..))` —
+    /// and must NOT reach for `forall_ids_in_conjunctive_position`, whose NNF
+    /// rewrite mints a FRESH `Forall` id that is not the authored node.
+    pub(super) fn exact_authored_negated_exists_roots(
         &self,
         authored: &[TermId],
     ) -> Vec<AuthoredNegatedExists> {

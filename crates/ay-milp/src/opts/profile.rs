@@ -8,6 +8,8 @@ use crate::tune::{Knob, Profile, Setting};
 
 use super::EngineEconomics;
 
+mod affine;
+
 impl EngineEconomics {
     /// Lower these settings into the engine's internal knob carrier.
     ///
@@ -20,7 +22,8 @@ impl EngineEconomics {
         let profile = self.base_profile();
         let profile = self.extend_retired_env_profile(profile);
         let profile = self.extend_branch_and_bound_profile(profile);
-        self.extend_dual_simplex_profile(profile)
+        let profile = self.extend_dual_simplex_profile(profile);
+        self.extend_census_profile(profile)
     }
 
     fn base_profile(&self) -> Profile {
@@ -278,6 +281,15 @@ impl EngineEconomics {
         if let Some(v) = self.sepstat {
             p = p.with(Knob::Sepstat, Setting::Flag(v));
         }
+        if let Some(v) = self.root_closure_presolve {
+            p = p.with(Knob::RootClosurePresolve, Setting::Flag(v));
+        }
+        if let Some(v) = self.tableau_mir {
+            p = p.with(Knob::TableauMir, Setting::Flag(v));
+        }
+        if let Some(v) = self.mir_agg_root {
+            p = p.with(Knob::MirAggRoot, Setting::Flag(v));
+        }
         if let Some(v) = self.lp_stats {
             p = p.with(Knob::LpStats, Setting::Flag(v));
         }
@@ -302,9 +314,7 @@ impl EngineEconomics {
         if let Some(v) = self.max_nodes {
             p = p.with(Knob::MaxNodes, Setting::Count(v));
         }
-        if let Some(v) = self.struct_elim {
-            p = p.with(Knob::StructElim, Setting::Flag(v));
-        }
+        p = affine::extend_reduction_profile(self, p);
         if let Some(v) = self.bound_cover {
             p = p.with(Knob::NoBoundCover, Setting::Flag(!v));
         }

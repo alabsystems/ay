@@ -149,6 +149,17 @@ pub(crate) struct FragmentInstanceRootDerivation {
     pub(crate) refuted_disjuncts: Vec<TermId>,
 }
 
+/// Sealed context-derivation payload (#dt-context-derivation): the asserted
+/// premise terms that make the (map-key) clause entailed. Validity is never
+/// taken from this record — the fragment lane re-derives the widened clause
+/// through the bounded ground refuter and discharges each premise as an
+/// authored assumption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FragmentContextDerivation {
+    /// Asserted premise terms, in the producer's emission order.
+    pub(crate) premises: Vec<TermId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FragmentSkolemDerivation {
     pub(crate) source: TermId,

@@ -155,6 +155,70 @@ fn options_ay_dispatches_on_are_accepted() {
     }
 }
 
+/// AY's OWN options must reach the executor. They are not z3 options -- the
+/// oracle rejects every one -- but AY reads them back through
+/// `Context::get_option` at solve time, and the CLI's unknown-key check used to
+/// print the error and RETURN BEFORE `execute_authored`, so the key never
+/// reached `ctx.options` at all. Every AY-specific option was dead through the
+/// binary while working through the library API.
+///
+/// Deliberate, documented divergence: a z3-authored script cannot contain these
+/// spellings, so accepting them changes no z3 transcript, whereas rejecting
+/// them makes AY ignore options AY itself documents.
+#[test]
+fn ay_native_options_are_accepted() {
+    for (option, value) in [
+        ("ay-diff-logic", "false"),
+        ("ay-eq-diffvar", "false"),
+        ("ay-maxsmt-engine", "oll"),
+        ("ay-proof-no-varsubst", "false"),
+        ("ay-unit-prop", "false"),
+        ("check-proofs-strict", "false"),
+        ("minimize-counterexamples", "false"),
+    ] {
+        let (_, out) = run(&format!("(set-option :{option} {value})\n(check-sat)\n"));
+        assert!(
+            !out.contains("unknown parameter"),
+            ":{option} is an AY option and must be accepted: {out:?}"
+        );
+    }
+}
+
+/// Acceptance is not the point -- ARRIVAL is. Read the value back: the option
+/// can only echo `false` if the `set-option` command actually executed against
+/// the elaboration context. Before the fix this printed `unsupported`, because
+/// `get_option_value` found no entry and the z3-compat layer maps the resulting
+/// `unknown option` error to that word.
+#[test]
+fn ay_native_option_value_reaches_the_executor() {
+    let (_, out) = run("(set-option :minimize-counterexamples false)\n\
+         (get-option :minimize-counterexamples)\n\
+         (check-sat)\n");
+    assert!(
+        out.lines()
+            .any(|l| l.trim() == "(:minimize-counterexamples false)"),
+        "the option must be readable back as set, got: {out:?}"
+    );
+    assert!(
+        !out.contains("unsupported"),
+        "a stored option must not read back as unsupported: {out:?}"
+    );
+}
+
+/// A key that is neither z3's nor AY's still reports exactly as before, so the
+/// new list widened the surface by its own entries and nothing else.
+#[test]
+fn unrelated_ay_looking_keys_are_still_unknown() {
+    for option in ["ay-nonesuch", "minimize-counterexample", "check-proofs"] {
+        let (code, out) = run(&format!("(set-option :{option} true)\n(check-sat)\n"));
+        assert_eq!(code, 1, ":{option} must still be rejected: {out:?}");
+        assert!(
+            out.contains("unknown parameter"),
+            ":{option} must still be rejected: {out:?}"
+        );
+    }
+}
+
 /// Valid module-qualified options stay accepted. Rejecting them turned VALID
 /// options into errors and changed answers -- `:opt.priority box` drives box
 /// optimization, and treating it as a global parameter broke it outright.

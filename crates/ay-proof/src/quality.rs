@@ -22,7 +22,7 @@ use ay_core::{
 use crate::checker::{
     ensure_terminal_empty_clause, quantifier, validate_datatype_signature_context, validate_step,
     validate_step_with_datatypes_and_progress, DatatypeMemberSignature, ExtDiffRegistry,
-    ProofCheckError,
+    FreshDefRegistry, ProofCheckError,
 };
 use crate::partial::PartialProofCheck;
 
@@ -1231,25 +1231,39 @@ fn validate_problem_assumptions_metered(
         }
     }
 
+    // Boolean-ITE closure members (#ite-expansion-authority): parity with the
+    // unmetered `checker::validate_problem_assumptions`. The executor's
+    // `rewrite_assertion_bool_ites` pass asserts the branch implications of a
+    // top-level Bool ITE; an assume of one of those forms is an ENTAILED
+    // premise, re-derived here from the SUPPLIED problem terms through the
+    // shared structural matcher — nothing producer-side is trusted. Without
+    // this arm the production strict paths (which all run the METERED
+    // validator) rejected exactly the assumes the fragment's
+    // #ite-expansion-authority lane emits.
+    let mut authored_bool_ites: Vec<(TermId, TermId, TermId)> = Vec::new();
     while let Some(term) = stack.pop() {
         charge_progress(progress, 1, 0)?;
-        let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
-            continue;
-        };
-        if name != "and" {
-            continue;
-        }
-        for &arg in args {
-            // Charge before the hash-set insertion and possible stack growth.
-            // Duplicate conjunct edges are deliberately charged as work too.
-            charge_progress(
-                progress,
-                1,
-                checked_add_usize(checked_mul_usize(size_of::<TermId>(), 2)?, 32)?,
-            )?;
-            if allowed.insert(arg) {
-                stack.push(arg);
+        match terms.get(term) {
+            TermData::Ite(cond, then_term, else_term) => {
+                charge_progress(progress, 1, checked_mul_usize(size_of::<TermId>(), 3)?)?;
+                authored_bool_ites.push((*cond, *then_term, *else_term));
             }
+            TermData::App(Symbol::Named(name), args) if name == "and" => {
+                for &arg in args {
+                    // Charge before the hash-set insertion and possible stack
+                    // growth. Duplicate conjunct edges are deliberately
+                    // charged as work too.
+                    charge_progress(
+                        progress,
+                        1,
+                        checked_add_usize(checked_mul_usize(size_of::<TermId>(), 2)?, 32)?,
+                    )?;
+                    if allowed.insert(arg) {
+                        stack.push(arg);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1257,10 +1271,19 @@ fn validate_problem_assumptions_metered(
         charge_progress(progress, 1, 0)?;
         if let ProofStep::Assume(term) = step {
             if !allowed.contains(term) {
-                return Err(ProofCheckError::UnauthorizedAssumption {
-                    step: ProofId(index as u32),
-                    term: *term,
-                });
+                // The matcher walk is bounded by the assumed term's or-arity
+                // times the ITE list; charge one unit per candidate ITE.
+                charge_progress(progress, authored_bool_ites.len().max(1), 0)?;
+                if !crate::checker::assumed_is_authored_bool_ite_consequence(
+                    terms,
+                    *term,
+                    &authored_bool_ites,
+                ) {
+                    return Err(ProofCheckError::UnauthorizedAssumption {
+                        step: ProofId(index as u32),
+                        term: *term,
+                    });
+                }
             }
         }
     }
@@ -1312,6 +1335,45 @@ fn ext_diff_registry_charge(
         checked_mul_usize(dependency_edges, dependency_entry_bytes)?,
     )?;
     bytes = checked_add_usize(bytes, checked_mul_usize(bindings, 128)?)?;
+    Ok((work, bytes))
+}
+
+/// Debit `FreshDefRegistry::collect`'s worst case before entering it.
+///
+/// Like `ext_diff_registry_charge`, the registry it guards is built ONCE and
+/// before any step: `FreshDefRegistry::collect` is where freshness,
+/// single-definiens and non-recursiveness are decided, and a malformed
+/// introduction must fail the check even when no later step cites it. Unlike
+/// `ext_diff` the registry is built with OR without a problem assertion set —
+/// see `FreshDefRegistry::collect` for why `None` there must not fail closed.
+///
+/// The collector is two DAG traversals with SHARED visited sets — one over the
+/// problem assertions and the proof's `assume` leaves, one over the recorded
+/// definientia — plus one linear scan of the proof. `payload.work` already
+/// bounds a whole-proof traversal, so two of them dominate.
+fn fresh_def_registry_charge(
+    proof: &Proof,
+    payload: PayloadStats,
+) -> Result<(usize, usize), ProofCheckError> {
+    let mut bounds = 0_usize;
+    for step in &proof.steps {
+        if matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::FreshDefBound,
+                ..
+            }
+        ) {
+            bounds = checked_add_usize(bounds, 1)?;
+        }
+    }
+    if bounds == 0 {
+        return Ok((proof.steps.len(), 0));
+    }
+    let mut work = checked_mul_usize(2, payload.work)?;
+    work = checked_add_usize(work, proof.steps.len())?;
+    let mut bytes = checked_mul_usize(2, payload.bytes)?;
+    bytes = checked_add_usize(bytes, checked_mul_usize(bounds, 128)?)?;
     Ok((work, bytes))
 }
 
@@ -2121,6 +2183,11 @@ fn validate_strict_steps_with_context(
     };
     charge_progress(progress, 0, 0)?;
 
+    // Fresh-symbol definitional extensions; see `fresh_def_registry_charge`.
+    let (fresh_def_work, fresh_def_bytes) = fresh_def_registry_charge(proof, payload_stats)?;
+    charge_progress(progress, fresh_def_work, fresh_def_bytes)?;
+    let fresh_defs = FreshDefRegistry::collect(proof, terms, problem_assertions)?;
+
     // Unlike ext-diff introductions, the empty-set equality closure has no
     // whole-proof validity condition of its own. Build it only when a lemma
     // actually consults it, then use the registry's metered linear BFS.
@@ -2218,6 +2285,7 @@ fn validate_strict_steps_with_context(
             datatype_member_signatures,
             ext_diff.as_ref(),
             empty_sets.as_ref(),
+            Some(&fresh_defs),
             collect_this_generic.then_some(&mut deferred_generic),
             progress,
         )?;

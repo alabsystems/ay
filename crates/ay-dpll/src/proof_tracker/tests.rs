@@ -247,280 +247,7 @@ fn test_single_forall_skolem_ite_nnf_bridge_is_strict_context_valid() {
     assert_eq!(quality.trust_count, 0);
 }
 
-#[test]
-fn test_normalized_forall_instance_uses_strict_farkas_rewrites() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("normalized_forall_x", Sort::Int);
-    let k = terms.mk_var("normalized_forall_k", Sort::Int);
-    let n = terms.mk_var("normalized_forall_n", Sort::Int);
-    let zero = terms.mk_int(BigInt::from(0));
-    let cond = terms.mk_var("normalized_forall_cond", Sort::Bool);
-    let p_x = terms.mk_app(Symbol::named("normalized_forall_p"), [x], Sort::Bool);
-    let q_x = terms.mk_app(Symbol::named("normalized_forall_q"), [x], Sort::Bool);
-    let ite_x = terms.mk_ite_raw(cond, p_x, q_x);
-    let nonnegative_x = terms.mk_le(zero, x);
-    let in_upper_bound_x = terms.mk_lt(x, n);
-    let not_nonnegative_x = terms.mk_not_raw(nonnegative_x);
-    let not_in_upper_bound_x = terms.mk_not_raw(in_upper_bound_x);
-    let authored_body = terms.mk_or(vec![ite_x, not_nonnegative_x, not_in_upper_bound_x]);
-    let authored = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        authored_body,
-    );
-
-    let below_zero_x = terms.mk_lt(x, zero);
-    let at_or_above_n_x = terms.mk_le(n, x);
-    let normalized_body = terms.mk_or(vec![ite_x, below_zero_x, at_or_above_n_x]);
-    let normalized = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        normalized_body,
-    );
-
-    let p_k = terms.mk_app(Symbol::named("normalized_forall_p"), [k], Sort::Bool);
-    let q_k = terms.mk_app(Symbol::named("normalized_forall_q"), [k], Sort::Bool);
-    let ite_k = terms.mk_ite_raw(cond, p_k, q_k);
-    let below_zero_k = terms.mk_lt(k, zero);
-    let at_or_above_n_k = terms.mk_le(n, k);
-    let target = terms.mk_or(vec![ite_k, below_zero_k, at_or_above_n_k]);
-
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    let derived = tracker
-        .add_normalized_forall_instantiated_assertion(
-            &mut terms,
-            authored,
-            normalized,
-            &[k],
-            target,
-        )
-        .expect("exact NNF arithmetic normalization must have a checked derivation");
-    let mut proof = tracker.take_proof();
-    assert!(
-        matches!(
-            proof.get_step(derived),
-            Some(ProofStep::Resolution { clause, .. }) if clause == &[target]
-        ),
-        "tracker must derive the exact E-matching target"
-    );
-    let not_target = terms.mk_not_raw(target);
-    let negated = proof.add_assume(not_target, None);
-    proof.add_resolution(Vec::new(), target, derived, negated);
-    let quality = ay_proof::check_proof_strict_with_context(
-        &proof,
-        &terms,
-        None,
-        None,
-        Some(&[authored, not_target]),
-    )
-    .expect("normalized forall derivation must pass the independent strict checker");
-    assert!(quality.is_complete());
-    assert_eq!(quality.trust_count, 0);
-
-    fn assert_normalized_forall_rejected(
-        terms: &mut TermStore,
-        authored: TermId,
-        normalized: TermId,
-        values: &[TermId],
-        target: TermId,
-        reason: &str,
-    ) {
-        let mut tracker = ProofTracker::new();
-        tracker.enable();
-        assert!(
-            tracker
-                .add_normalized_forall_instantiated_assertion(
-                    terms, authored, normalized, values, target,
-                )
-                .is_none(),
-            "{reason}"
-        );
-        assert_eq!(
-            tracker.num_steps(),
-            0,
-            "{reason}: rejection must precede proof emission"
-        );
-    }
-
-    let minus_one = terms.mk_int(BigInt::from(-1));
-    let forged_below_minus_one_x = terms.mk_lt(x, minus_one);
-    let forged_normalized_body =
-        terms.mk_or(vec![ite_x, forged_below_minus_one_x, at_or_above_n_x]);
-    let forged_normalized = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        forged_normalized_body,
-    );
-    let forged_below_minus_one = terms.mk_lt(k, minus_one);
-    let forged_bound = terms.mk_or(vec![ite_k, forged_below_minus_one, at_or_above_n_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        forged_normalized,
-        &[k],
-        forged_bound,
-        "a changed arithmetic bound must fail the Farkas gate",
-    );
-
-    let forged_eq_zero_x = terms.mk_eq(x, zero);
-    let forged_operator_body = terms.mk_or(vec![ite_x, forged_eq_zero_x, at_or_above_n_x]);
-    let forged_operator_quantified = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        forged_operator_body,
-    );
-    let forged_eq_zero_k = terms.mk_eq(k, zero);
-    let forged_operator_target = terms.mk_or(vec![ite_k, forged_eq_zero_k, at_or_above_n_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        forged_operator_quantified,
-        &[k],
-        forged_operator_target,
-        "a changed comparison operator must fail the Farkas gate",
-    );
-
-    let forged_p_x = terms.mk_app(Symbol::named("normalized_forall_forged_p"), [x], Sort::Bool);
-    let forged_ite_x = terms.mk_ite_raw(cond, forged_p_x, q_x);
-    let forged_branch_body = terms.mk_or(vec![forged_ite_x, below_zero_x, at_or_above_n_x]);
-    let forged_branch_quantified = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        forged_branch_body,
-    );
-    let forged_p_k = terms.mk_app(Symbol::named("normalized_forall_forged_p"), [k], Sort::Bool);
-    let forged_ite_k = terms.mk_ite_raw(cond, forged_p_k, q_k);
-    let forged_branch_target = terms.mk_or(vec![forged_ite_k, below_zero_k, at_or_above_n_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        forged_branch_quantified,
-        &[k],
-        forged_branch_target,
-        "a changed Boolean branch must not be admitted as arithmetic normalization",
-    );
-
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        normalized,
-        &[cond],
-        target,
-        "a wrong-sort positional binding must fail closed",
-    );
-
-    let other_p_x = terms.mk_app(
-        Symbol::named("normalized_forall_other_source"),
-        [x],
-        Sort::Bool,
-    );
-    let other_ite_x = terms.mk_ite_raw(cond, other_p_x, q_x);
-    let other_authored_body =
-        terms.mk_or(vec![other_ite_x, not_nonnegative_x, not_in_upper_bound_x]);
-    let other_authored = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        other_authored_body,
-    );
-    assert_normalized_forall_rejected(
-        &mut terms,
-        other_authored,
-        normalized,
-        &[k],
-        target,
-        "a forged authored source mapping must fail exact/Farkas validation",
-    );
-
-    let triggered_authored = terms.mk_forall_with_triggers(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        authored_body,
-        vec![vec![p_x]],
-    );
-    assert_normalized_forall_rejected(
-        &mut terms,
-        triggered_authored,
-        normalized,
-        &[k],
-        target,
-        "source and normalized trigger groups must agree exactly",
-    );
-
-    let z = terms.mk_var("normalized_forall_z", Sort::Int);
-    let pair_x_z = terms.mk_app(Symbol::named("normalized_forall_pair"), [x, z], Sort::Bool);
-    let ordered_authored_body = terms.mk_or(vec![pair_x_z, not_nonnegative_x]);
-    let ordered_authored = terms.mk_forall(
-        vec![
-            ("normalized_forall_x".to_string(), Sort::Int),
-            ("normalized_forall_z".to_string(), Sort::Int),
-        ],
-        ordered_authored_body,
-    );
-    let ordered_normalized_body = terms.mk_or(vec![pair_x_z, below_zero_x]);
-    let ordered_normalized = terms.mk_forall(
-        vec![
-            ("normalized_forall_x".to_string(), Sort::Int),
-            ("normalized_forall_z".to_string(), Sort::Int),
-        ],
-        ordered_normalized_body,
-    );
-    let pair_k_n = terms.mk_app(Symbol::named("normalized_forall_pair"), [k, n], Sort::Bool);
-    let ordered_target = terms.mk_or(vec![pair_k_n, below_zero_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        ordered_authored,
-        ordered_normalized,
-        &[n, k],
-        ordered_target,
-        "same-sort binding values in the wrong positional order must fail closed",
-    );
-
-    let short_normalized_body = terms.mk_or(vec![ite_x, below_zero_x]);
-    let short_normalized = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        short_normalized_body,
-    );
-    let short_target = terms.mk_or(vec![ite_k, below_zero_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        short_normalized,
-        &[k],
-        short_target,
-        "a normalized target with changed disjunct arity must fail closed",
-    );
-
-    let nonflat_normalized =
-        terms.mk_forall(vec![("normalized_forall_x".to_string(), Sort::Int)], p_x);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        authored,
-        nonflat_normalized,
-        &[k],
-        p_k,
-        "a non-disjunctive normalized target must fail closed",
-    );
-
-    let y = terms.mk_var("normalized_forall_y", Sort::Int);
-    let nested_p_y = terms.mk_app(Symbol::named("normalized_forall_nested"), [y], Sort::Bool);
-    let nested = terms.mk_forall(
-        vec![("normalized_forall_y".to_string(), Sort::Int)],
-        nested_p_y,
-    );
-    let nested_authored_body = terms.mk_or(vec![nested, not_nonnegative_x]);
-    let nested_authored = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        nested_authored_body,
-    );
-    let nested_normalized_body = terms.mk_or(vec![nested, below_zero_x]);
-    let nested_normalized = terms.mk_forall(
-        vec![("normalized_forall_x".to_string(), Sort::Int)],
-        nested_normalized_body,
-    );
-    let nested_target = terms.mk_or(vec![nested, below_zero_k]);
-    assert_normalized_forall_rejected(
-        &mut terms,
-        nested_authored,
-        nested_normalized,
-        &[k],
-        nested_target,
-        "a nested binder in the authored body must fail closed",
-    );
-}
+include!("tests/normalized_forall.rs");
 
 #[test]
 fn exact_forall_instance_survives_ground_constant_folding() {
@@ -564,6 +291,107 @@ fn exact_forall_instance_survives_ground_constant_folding() {
         "the simplified constant must never be emitted as forall_inst"
     );
     assert_eq!(rejected.num_steps(), 0);
+}
+
+/// Producer/checker parity for #quant-trigger-nested. E-matching can now find
+/// an outer trigger below a preserved inner binder, so the exact proof producer
+/// must be able to derive the corresponding nested `forall_inst` rather than
+/// marking every such solve translation-incomplete. Two instantiations close a
+/// concrete arithmetic contradiction, and AY's strict checker is the authority
+/// for the complete chain.
+#[test]
+fn exact_forall_instance_under_nested_binder_strictly_checks() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("producer_outer_x", Sort::Int);
+    let y = terms.mk_var("producer_inner_y", Sort::Int);
+    let body = terms.mk_app(Symbol::named("<"), [y, x], Sort::Bool);
+    let trigger = terms.mk_app(Symbol::named("producer_nested_f"), [x, y], Sort::Int);
+    let inner = terms.mk_forall_with_triggers(
+        vec![("producer_inner_y".to_string(), Sort::Int)],
+        body,
+        vec![vec![trigger]],
+    );
+    let outer = terms.mk_forall(vec![("producer_outer_x".to_string(), Sort::Int)], inner);
+    let zero = terms.mk_int(BigInt::from(0));
+    let outer_instance_body = terms.mk_app(Symbol::named("<"), [y, zero], Sort::Bool);
+    let outer_instance_trigger =
+        terms.mk_app(Symbol::named("producer_nested_f"), [zero, y], Sort::Int);
+    let outer_instance = terms.mk_forall_with_triggers(
+        vec![("producer_inner_y".to_string(), Sort::Int)],
+        outer_instance_body,
+        vec![vec![outer_instance_trigger]],
+    );
+    let ground_instance = terms.mk_app(Symbol::named("<"), [zero, zero], Sort::Bool);
+
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker
+        .add_forall_instantiated_assertion(&mut terms, outer, &[zero], outer_instance)
+        .expect("outer substitution beneath the preserved inner binder must be derivable");
+    tracker
+        .add_forall_instantiated_assertion(&mut terms, outer_instance, &[zero], ground_instance)
+        .expect("the derived inner universal must remain available as proof authority");
+    let proof = tracker.take_proof();
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::Resolution { clause, .. } if clause.is_empty()
+    )));
+    let quality =
+        ay_proof::check_proof_strict_with_context(&proof, &terms, None, None, Some(&[outer]))
+            .expect("the nested forall_inst chain must pass AY's strict checker");
+    assert!(quality.is_complete());
+    assert_eq!(quality.trust_count, 0);
+}
+
+/// Tamper controls for the nested producer lane: a witness carrying the inner
+/// binder's free name would be captured, and duplicate source binder names make
+/// positional substitution ambiguous. Both must fail before emitting a proof
+/// step; the strict checker independently rejects the same shapes.
+#[test]
+fn exact_nested_forall_instance_rejects_capture_and_duplicate_binders() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("producer_capture_x", Sort::Int);
+    let y = terms.mk_var("producer_capture_y", Sort::Int);
+    let p_xy = terms.mk_app(Symbol::named("producer_capture_p"), [x, y], Sort::Bool);
+    let inner = terms.mk_forall(vec![("producer_capture_y".to_string(), Sort::Int)], p_xy);
+    let outer = terms.mk_forall(vec![("producer_capture_x".to_string(), Sort::Int)], inner);
+
+    let mut captured = ProofTracker::new();
+    captured.enable();
+    assert!(
+        captured
+            .add_forall_instantiated_assertion(&mut terms, outer, &[y], inner)
+            .is_none(),
+        "a witness named by the inner binder must not be captured"
+    );
+    assert_eq!(captured.num_steps(), 0);
+
+    let duplicate_body = terms.mk_app(Symbol::named("producer_duplicate_p"), [x], Sort::Bool);
+    let duplicate = terms.mk_forall(
+        vec![
+            ("producer_capture_x".to_string(), Sort::Int),
+            ("producer_capture_x".to_string(), Sort::Int),
+        ],
+        duplicate_body,
+    );
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let duplicate_instance =
+        terms.mk_app(Symbol::named("producer_duplicate_p"), [zero], Sort::Bool);
+    let mut ambiguous = ProofTracker::new();
+    ambiguous.enable();
+    assert!(
+        ambiguous
+            .add_forall_instantiated_assertion(
+                &mut terms,
+                duplicate,
+                &[zero, one],
+                duplicate_instance,
+            )
+            .is_none(),
+        "duplicate binder names must not collapse into one substitution slot"
+    );
+    assert_eq!(ambiguous.num_steps(), 0);
 }
 
 #[test]

@@ -247,9 +247,9 @@ impl UniPoly {
 
 /// A constraint reduced to `poly REL 0` over a single variable.
 #[derive(Clone, Debug)]
-struct UniConstraint {
-    poly: UniPoly,
-    rel: Rel,
+pub(crate) struct UniConstraint {
+    pub(crate) poly: UniPoly,
+    pub(crate) rel: Rel,
 }
 
 /// The six comparison relations against zero.
@@ -2247,7 +2247,7 @@ enum AtomClass {
     OutOfScope,
 }
 
-enum SingleVarResult {
+pub(crate) enum SingleVarResult {
     /// SAT with an exact rational witness.
     Witness(BigRational),
     /// SAT, but the only feasible points are irrational. The procedure proved
@@ -2315,7 +2315,7 @@ impl RootMarker {
 ///   * Feasible iff some cell satisfies all constraints. SAT verdict; if the
 ///     only feasible cells are irrational closed cells, report IrrationalSat.
 ///   * If NO cell is feasible, the feasible set is provably empty ⇒ UNSAT.
-fn decide_single_variable(constraints: &[UniConstraint]) -> SingleVarResult {
+pub(crate) fn decide_single_variable(constraints: &[UniConstraint]) -> SingleVarResult {
     // Build the combined square-free product polynomial P.
     let mut combined = UniPoly::constant(BigRational::one());
     let mut seen: Vec<UniPoly> = Vec::new();

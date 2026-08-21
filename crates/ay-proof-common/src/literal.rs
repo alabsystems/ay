@@ -156,7 +156,21 @@ impl Literal {
     /// mask the real error (#5327).
     #[inline]
     pub fn to_dimacs_i64(self) -> i64 {
-        let var_1indexed = i64::from(self.variable().id()) + 1;
+        // `as i64` rather than `i64::from`, deliberately. Both are the same
+        // value-preserving zero-extension of a `u32` for every input, but
+        // `<i64 as From<u32>>::from` is an ABSENT CALLEE to the deductive verifier
+        // (its body is not in the lowered bundle), so the result is havoc'd to a
+        // fresh symbolic, the `u32` range link is lost, and the following add is
+        // encoded as satisfiable at `i64::MAX`. MEASURED 2026-08-20 on sealed
+        // toolchain trust-e9ca4908: `i64::from(x) + 1` reports
+        // `[overflow:add] FAILED (ay-in-process); counterexample:
+        // _3 = 9223372036854775807`; `(x as i64) + 1` reports PROVED. The cast
+        // form lowers as a widening the encoder can see through. Clippy's
+        // `cast_lossless` is allowed workspace-wide (Cargo.toml:180), so this is
+        // not lint-suppressed, and `trivial_numeric_casts` does not apply to a
+        // widening cast. If a future toolchain models the `From` impl, either
+        // spelling proves and this comment can go.
+        let var_1indexed = (self.variable().id() as i64) + 1;
         if self.is_positive() {
             var_1indexed
         } else {

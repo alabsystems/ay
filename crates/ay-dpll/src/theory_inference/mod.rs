@@ -21,6 +21,7 @@ mod euf;
 mod funnel;
 #[cfg(test)]
 mod funnel_tests;
+mod recording_dt;
 
 use std::borrow::Cow;
 
@@ -41,8 +42,13 @@ use arith_farkas_classification::{
 // Re-export pub(crate) items from submodules.
 pub(crate) use decompose::{decompose_generic_combined_real_lemma, CombinedDecompositionBudget};
 pub(crate) use funnel::{
-    dt_funnel_registry_data, infer_theory_lemma_kind_from_clause_terms_and_farkas,
-    record_funnel_classified_lemma, DatatypeRegistries,
+    dt_funnel_registry_data, infer_dt_lemma_kind,
+    infer_theory_lemma_kind_from_clause_terms_and_farkas, record_funnel_classified_lemma,
+    DatatypeRegistries, DatatypeRegistryData,
+};
+pub(crate) use recording_dt::{
+    record_theory_conflict_unsat_with_annotation_and_dt,
+    record_theory_conflict_unsat_with_farkas_and_annotation_and_dt,
 };
 
 /// Record a theory conflict and infer the most specific Alethe rule.
@@ -68,64 +74,7 @@ pub(crate) fn record_theory_conflict_unsat_with_annotation(
     negations: &HashMap<TermId, TermId>,
     conflict: &[TheoryLit],
 ) -> (Option<ProofId>, Option<ay_core::TheoryLemmaProof>) {
-    if !tracker.is_enabled() {
-        return (None, None);
-    }
-
-    let Some(clause) = build_blocking_clause_terms(negations, conflict) else {
-        let raw_clause = conflict.iter().map(|lit| lit.term).collect::<Vec<_>>();
-        let id = tracker.add_explicit_trust_lemma(raw_clause);
-        return (id, None);
-    };
-
-    // When no single classifier recognises the whole conflict, try
-    // combined-theory decomposition before falling back to Generic/trust.
-    let (kind, ordered_clause) = if let Some(terms) = terms {
-        match classify_whole_conflict(terms, negations, conflict, &clause) {
-            Some(result) => result,
-            None => {
-                // #combined-theory-decompose: a conflict no classifier accepts
-                // is usually MIXED — a single-theory core plus literals from
-                // other theories that the combination happened to carry along.
-                // The core's blocking clause IS a checkable single-theory
-                // lemma, and the full blocking clause follows from it by
-                // `weakening`, so emit the core with its real kind and weaken
-                // up to the clause the caller expects.
-                if let Some((core_kind, core_clause, full_clause)) =
-                    classifiable_core_decomposition(terms, negations, conflict, &clause)
-                {
-                    let id = tracker.add_theory_lemma_weakened(core_clause, core_kind, full_clause);
-                    return (id, None);
-                }
-                (TheoryLemmaKind::Generic, clause)
-            }
-        }
-    } else {
-        (TheoryLemmaKind::Generic, clause)
-    };
-
-    let farkas = matches!(
-        kind,
-        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas
-    )
-    .then(|| FarkasAnnotation::from_ints(&vec![1i64; ordered_clause.len()]));
-    let id = match (kind, farkas.as_ref()) {
-        (TheoryLemmaKind::Generic, _) => tracker.add_explicit_trust_lemma(ordered_clause.clone()),
-        (TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas, Some(unit_farkas)) => tracker
-            .add_theory_lemma_with_farkas_and_kind(
-                ordered_clause.clone(),
-                unit_farkas.clone(),
-                kind,
-            ),
-        _ => tracker.add_theory_lemma_with_kind(ordered_clause.clone(), kind),
-    };
-    let annotation = id.map(|_| ay_core::TheoryLemmaProof {
-        clause: ordered_clause,
-        kind,
-        farkas,
-        lia: None,
-    });
-    (id, annotation)
+    record_theory_conflict_unsat_with_annotation_and_dt(tracker, terms, negations, conflict, None)
 }
 
 /// Classify a clause as the strict-checkable guarded arithmetic
@@ -333,62 +282,9 @@ pub(crate) fn record_theory_conflict_unsat_with_farkas_and_annotation(
     negations: &HashMap<TermId, TermId>,
     conflict: &TheoryConflict,
 ) -> (Option<ProofId>, Option<ay_core::TheoryLemmaProof>) {
-    if !tracker.is_enabled() {
-        return (None, None);
-    }
-
-    let Some(farkas) = conflict.farkas.clone() else {
-        // #trust->0 C1.i: no Farkas certificate on the conflict — delegate to
-        // `record_theory_conflict_unsat` so the WHOLE-conflict classifier
-        // (EUF/arith/array/string/FP + combined-theory core decomposition)
-        // runs instead of recording a bare `Generic`/trust lemma.
-        //
-        // Fail-closed nuance preserved: this site historically recorded
-        // NOTHING (`?` early return) when the negation cache cannot express
-        // the blocking clause, while the delegate's fallback records the
-        // UNNEGATED literal terms — a wrong-polarity clause no validator can
-        // accept (the mod.rs `build_blocking_clause_terms` miss class,
-        // Wave-3). Keep the stricter no-record behavior on that residual by
-        // probing the builder first.
-        if build_blocking_clause_terms(negations, &conflict.literals).is_none() {
-            return (None, None);
-        }
-        return record_theory_conflict_unsat_with_annotation(
-            tracker,
-            terms,
-            negations,
-            &conflict.literals,
-        );
-    };
-
-    let Some(clause) = build_blocking_clause_terms(negations, &conflict.literals) else {
-        return (None, None);
-    };
-
-    let kind = match terms {
-        Some(terms) => classify_arith_conflict_kind(terms, &conflict.literals, Some(&farkas)),
-        // No TermStore -- cannot classify Farkas conflict.
-        None => TheoryLemmaKind::Generic,
-    };
-
-    let (id, recorded_farkas) = match kind {
-        TheoryLemmaKind::Generic => (tracker.add_explicit_trust_lemma(clause.clone()), None),
-        TheoryLemmaKind::LiaGeneric | TheoryLemmaKind::LraFarkas => (
-            tracker.add_theory_lemma_with_farkas_and_kind(clause.clone(), farkas.clone(), kind),
-            Some(farkas),
-        ),
-        _ => (
-            tracker.add_theory_lemma_with_kind(clause.clone(), kind),
-            None,
-        ),
-    };
-    let annotation = id.map(|_| ay_core::TheoryLemmaProof {
-        clause,
-        kind,
-        farkas: recorded_farkas,
-        lia: None,
-    });
-    (id, annotation)
+    record_theory_conflict_unsat_with_farkas_and_annotation_and_dt(
+        tracker, terms, negations, conflict, None,
+    )
 }
 
 pub(crate) fn build_blocking_clause_terms(
@@ -936,6 +832,46 @@ pub(crate) fn minimize_conflict_with_levels(
     original_len - clause.len()
 }
 
+/// Whether any subterm of the clause is sorted by a REGISTERED datatype —
+/// the relevance gate for the conflict-path ground-refuter last resort
+/// (#dt-ground-conflict). Bounded iterative walk with a visited set.
+fn clause_mentions_registered_datatype(
+    terms: &TermStore,
+    clause: &[TermId],
+    datatypes: &[(String, Vec<String>)],
+) -> bool {
+    use ay_core::kani_compat::DetHashSet;
+    let matches_registered = |sort: &Sort| -> bool {
+        let name = match sort {
+            Sort::Uninterpreted(name) => name.as_str(),
+            Sort::Datatype(definition) => definition.name.as_str(),
+            _ => return false,
+        };
+        datatypes.iter().any(|(dt, _)| dt == name)
+    };
+    let mut visited: DetHashSet<TermId> = DetHashSet::default();
+    let mut pending: Vec<TermId> = clause.to_vec();
+    while let Some(term) = pending.pop() {
+        if !visited.insert(term) || visited.len() > 4096 {
+            continue;
+        }
+        if matches_registered(terms.sort(term)) {
+            return true;
+        }
+        match terms.get(term) {
+            TermData::App(_, args) => pending.extend(args.iter().copied()),
+            TermData::Not(inner) => pending.push(*inner),
+            TermData::Ite(c, t, e) => {
+                pending.push(*c);
+                pending.push(*t);
+                pending.push(*e);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Run the single-theory classifier chain over a whole conflict.
 ///
 /// Extracted so the same chain can be applied to a SUB-conflict during
@@ -945,6 +881,7 @@ fn classify_whole_conflict(
     negations: &HashMap<TermId, TermId>,
     conflict: &[TheoryLit],
     clause: &[TermId],
+    dt: Option<&DatatypeRegistries<'_>>,
 ) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
     classify_whole_conflict_gated(
         terms,
@@ -952,6 +889,7 @@ fn classify_whole_conflict(
         conflict,
         clause,
         &SortedTheoryPresence::over(terms, clause),
+        dt,
     )
 }
 
@@ -1021,6 +959,7 @@ fn classify_whole_conflict_gated(
     conflict: &[TheoryLit],
     clause: &[TermId],
     present: &SortedTheoryPresence<'_>,
+    dt: Option<&DatatypeRegistries<'_>>,
 ) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
     euf::infer_euf_lemma(terms, negations, conflict)
         // Before the arithmetic gates: the guarded disequality-split schema
@@ -1043,6 +982,17 @@ fn classify_whole_conflict_gated(
                 .floating_point()
                 .then(|| infer_fp_ground_eval_lemma(terms, clause))
                 .flatten()
+        })
+        // #dt-ground-conflict: registry-gated DT recognition — the NAMED
+        // single schemas only, whole-conflict only (sub-clause decomposition
+        // passes `None`, keeping the 512-attempt search cheap). The general
+        // ground refuter deliberately does NOT run here: it would preempt
+        // `classifiable_core_decomposition`'s supported-wire cores; it runs
+        // as the last resort after decomposition declines.
+        .or_else(|| {
+            let dt = dt?;
+            let kind = funnel::infer_dt_lemma_kind_specific(terms, clause, dt)?;
+            Some((kind, clause.to_vec()))
         })
         .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
 }
@@ -1078,17 +1028,13 @@ fn classifiable_core_decomposition(
     conflict: &[TheoryLit],
     clause: &[TermId],
 ) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>)> {
-    // `clause[i]` is the blocking literal for `conflict[i]`
-    // (`build_blocking_clause_terms` maps them positionally).
     if conflict.len() != clause.len() || conflict.len() < 2 {
         return None;
     }
 
     let mut attempts = 0usize;
     let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
-    // At most one walk per gate for up to DECOMPOSE_MAX_ATTEMPTS
-    // classifications; see `SortedTheoryPresence` for why deciding it on the
-    // full clause is exact, and why it is lazy.
+    // Share each lazy theory-presence walk across the bounded core search.
     let present = SortedTheoryPresence::over(terms, clause);
 
     // Prefer the LARGEST core: dropping fewer literals keeps more of the
@@ -1113,6 +1059,11 @@ fn classifiable_core_decomposition(
                 &sub_conflict,
                 &sub_clause,
                 &present,
+                // Sub-clause core search: skip the DT lane — running the
+                // ground refuter up to DECOMPOSE_MAX_ATTEMPTS times per
+                // conflict is the wrong cost model, and the whole-conflict
+                // pass above already probed it.
+                None,
             ) {
                 // (#ground-conflict-decomp) The weakened recorder
                 // (`add_theory_lemma_weakened` -> `add_theory_lemma_with_kind`)

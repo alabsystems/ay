@@ -2291,6 +2291,7 @@ mod tests {
             obj_scale: scale,
             provenance: "sat-relu-rup-e2e-test",
             replay_claims: session.replay_claims(),
+            affine_aggregation_certificate: session.affine_aggregation_certificate(),
             parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
             sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
             network_design_infeasibility_certificate: session
@@ -3098,7 +3099,6 @@ mod tests {
             total >= plan.peak_bytes(),
             "this boundary must isolate the proof allowance from recognition"
         );
-
         reset_test_cdcl_invocations();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         assert!(plan
@@ -3208,6 +3208,7 @@ mod tests {
             provenance: "sat-relu-rup-e2e-test",
             replay_claims: session.replay_claims(),
             parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
+            affine_aggregation_certificate: None,
             sat_relu_infeasibility_certificate: Some(certificate),
             network_design_infeasibility_certificate: session
                 .network_design_infeasibility_certificate(),
@@ -3244,7 +3245,6 @@ mod tests {
             crate::cert_io::CheckStatus::Verified,
             "{report:#?}"
         );
-
         let mut exact_rescaled = session.model().clone();
         let exact_scale = BigRational::from_integer(
             (num_bigint::BigInt::one() << 80usize) + num_bigint::BigInt::one(),

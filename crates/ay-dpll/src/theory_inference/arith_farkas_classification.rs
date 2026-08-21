@@ -48,8 +48,9 @@ impl LinearFarkasVerdict {
         farkas: &FarkasAnnotation,
     ) -> bool {
         *self.0.get_or_insert_with(|| {
-            ay_core::proof_validation::verify_farkas_conflict_lits_linear(terms, conflict, farkas)
-                .is_ok()
+            ay_core::proof_validation::verify_farkas_conflict_lits_linear_holds(
+                terms, conflict, farkas,
+            )
         })
     }
 }

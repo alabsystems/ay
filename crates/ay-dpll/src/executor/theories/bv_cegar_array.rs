@@ -6,7 +6,6 @@
 //!
 //! Audits bit-blasted SAT assignments for functional consistency (FC): selects
 //! on the same array and concrete index must have equal result values.
-//!
 //! When FC violations are found, the corresponding FC axiom clauses are
 //! generated and returned for injection into the SAT solver. The caller
 //! re-solves until no violations remain or a max iteration count is reached.
@@ -18,7 +17,7 @@
 use ay_bv::BvBits;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
-use ay_core::TermId;
+use ay_core::{Sort, TermId};
 use ay_sat::Literal as SatLiteral;
 use num_bigint::BigInt;
 
@@ -54,148 +53,9 @@ struct CegarArrayBuild {
     newly_covered: HashSet<(TermId, TermId)>,
 }
 
+mod fc_check;
+
 impl Executor {
-    /// Check array functional consistency against a concrete SAT model.
-    ///
-    /// For each pair of select terms on the same direct array operand where the
-    /// concrete index values are equal but the concrete result values
-    /// differ, generate the corresponding FC axiom clauses.
-    ///
-    /// `already_covered` tracks pairs that have had FC axioms generated
-    /// in previous CEGAR iterations to avoid duplicate work.
-    pub(in crate::executor) fn check_array_fc_violations(
-        &mut self,
-        sat_model: &[bool],
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
-        next_var_offset: usize,
-        already_covered: &mut HashSet<(TermId, TermId)>,
-    ) -> CegarArrayCheck {
-        let Some(select_terms) = self.collect_fc_select_terms(term_bits) else {
-            return CegarArrayCheck::Incomplete;
-        };
-        if select_terms.is_empty() {
-            return CegarArrayCheck::Consistent;
-        }
-
-        // Group selects by their DIRECT array operand, not root.
-        //
-        // FC (functional consistency) requires: if two selects are on the
-        // SAME array and have equal indices, their values must be equal.
-        // Selects on DIFFERENT arrays (even if they share a root through
-        // store chains) can legitimately have different values at the same
-        // index because stores modify the array.
-        //
-        // Example: select(a, 5) vs select(store(a, 5, v), 5)
-        // These share root `a` but are on different arrays. The first
-        // returns the original value, the second returns `v`. FC does
-        // NOT require them to be equal.
-        //
-        // After expand_select_store, most selects are on base arrays,
-        // but when the symbolic ITE budget is exhausted, selects on
-        // intermediate store terms remain. Grouping by root would
-        // incorrectly flag these as FC violations and add unsound axioms.
-        let mut selects_by_array: HashMap<TermId, Vec<(TermId, TermId)>> = HashMap::default();
-        for &(select_term, array, index) in &select_terms {
-            selects_by_array
-                .entry(array)
-                .or_default()
-                .push((select_term, index));
-        }
-
-        let Some(initial_next_var) = next_var_offset.checked_add(1) else {
-            return CegarArrayCheck::Incomplete;
-        };
-        let Ok(next_var) = u32::try_from(initial_next_var) else {
-            return CegarArrayCheck::Incomplete;
-        };
-        let mut build = CegarArrayBuild {
-            clauses: Vec::new(),
-            next_var,
-            new_vars: 0,
-            inspected_bits: 0,
-            pair_attempts: 0,
-            newly_covered: HashSet::default(),
-        };
-
-        for (_array_root, selects) in &selects_by_array {
-            if selects.len() < 2 {
-                continue;
-            }
-
-            // Compute concrete index values for each select.
-            let mut concrete_selects: Vec<(TermId, TermId, BigInt, BigInt)> = Vec::new();
-
-            for &(select_term, index_term) in selects {
-                let Some(idx_bits) = term_bits.get(&index_term) else {
-                    return CegarArrayCheck::Incomplete;
-                };
-                let Some(sel_bits) = term_bits.get(&select_term) else {
-                    return CegarArrayCheck::Incomplete;
-                };
-
-                let Some(idx_val) = self.concrete_bv_value_bounded(
-                    sat_model,
-                    idx_bits,
-                    var_offset,
-                    &mut build.inspected_bits,
-                ) else {
-                    return CegarArrayCheck::Incomplete;
-                };
-                let Some(sel_val) = self.concrete_bv_value_bounded(
-                    sat_model,
-                    sel_bits,
-                    var_offset,
-                    &mut build.inspected_bits,
-                ) else {
-                    return CegarArrayCheck::Incomplete;
-                };
-
-                concrete_selects.push((select_term, index_term, idx_val, sel_val));
-            }
-
-            // Group by concrete index value, find violations.
-            let mut by_index: HashMap<BigInt, Vec<(TermId, TermId, BigInt)>> = HashMap::default();
-            for (select, index, idx_val, sel_val) in concrete_selects {
-                by_index
-                    .entry(idx_val)
-                    .or_default()
-                    .push((select, index, sel_val));
-            }
-
-            for group in by_index.values() {
-                if group.len() < 2 {
-                    continue;
-                }
-                let first_val = &group[0].2;
-                let has_violation = group.iter().skip(1).any(|entry| entry.2 != *first_val);
-                if !has_violation {
-                    continue;
-                }
-
-                if !self.append_fc_group_refinement(
-                    group,
-                    term_bits,
-                    var_offset,
-                    already_covered,
-                    &mut build,
-                ) {
-                    return CegarArrayCheck::Incomplete;
-                }
-            }
-        }
-
-        if build.clauses.is_empty() {
-            return CegarArrayCheck::Consistent;
-        }
-
-        already_covered.extend(build.newly_covered);
-        CegarArrayCheck::Refinement(CegarArrayResult {
-            clauses: build.clauses,
-            num_new_vars: build.new_vars,
-        })
-    }
-
     fn append_fc_group_refinement(
         &mut self,
         group: &[(TermId, TermId, BigInt)],
@@ -266,6 +126,26 @@ impl Executor {
             }
         }
         true
+    }
+
+    /// Does the bit-blaster OWE this term an entry in `term_bits`?
+    ///
+    /// True exactly for the sorts it can represent as a bit string: `BitVec`,
+    /// `Bool` (a single literal) and `FloatingPoint` (its IEEE encoding). For
+    /// those, a missing entry means the audit cannot read a value it should
+    /// have been able to read — an incomplete audit, which fails closed.
+    ///
+    /// Every other sort — an uninterpreted sort, a datatype, `Int`/`Real`,
+    /// `Seq`, `String`, `RegLan`, a nested `Array` — has no bit encoding in
+    /// this blaster at all, so a `(select A i)` at that sort is not something
+    /// the BIT-LEVEL FC audit failed to check; it is something the audit does
+    /// not speak about. Its congruence obligation lives in the
+    /// model-validation layer (`#array-select-congruence-gate`) instead.
+    fn fc_audit_owes_bits(&self, term: TermId) -> bool {
+        matches!(
+            self.ctx.terms.sort(term),
+            Sort::BitVec(_) | Sort::Bool | Sort::FloatingPoint(_, _)
+        )
     }
 
     fn collect_fc_select_terms(

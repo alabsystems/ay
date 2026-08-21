@@ -2330,9 +2330,112 @@ fn git_path_status(
         .status
 }
 
+/// Run git in `dir`, returning the first stdout line as a canonicalized path.
+/// Returns `None` on any failure so callers can fail closed.
+fn git_capture_dir(context: &GitContext, dir: &Path, args: &[&str]) -> Option<PathBuf> {
+    let output = Command::new(&context.executable)
+        .args(["--literal-pathspecs", "-c"])
+        .arg(format!("core.excludesFile={}", git_null_device()))
+        .args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(&context.environment)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let line = stdout.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(line);
+    let absolute = if raw.is_absolute() {
+        raw
+    } else {
+        dir.join(raw)
+    };
+    absolute.canonicalize().ok()
+}
+
+/// Classify a Cargo config that Cargo's upward discovery finds ABOVE the
+/// workspace root.
+///
+/// A workspace checked out as a linked git worktree INSIDE another working
+/// tree of the same repository (this repo's agent-isolation layout,
+/// `<checkout>/.claude/worktrees/<agent>`) legitimately observes the enclosing
+/// checkout's tracked `.cargo/config.toml`. That file is project-governed
+/// source — versioned, attributable, and content-hashed into the
+/// configuration identity exactly like the workspace's own config — so it is
+/// source-bound, not a machine-local override. Everything else above the
+/// workspace (untracked or ignored files, configs of a FOREIGN repository,
+/// paths that cross a symlink) stays outside the source trust boundary and
+/// keeps failing closed in `reject_unbound_semantic_cargo_config`.
+fn enclosing_checkout_config_is_source_bound(
+    context: &GitContext,
+    workspace: &Path,
+    path: &Path,
+) -> bool {
+    let Some(config_dir) = path.parent() else {
+        return false;
+    };
+    let Some(enclosing_root) =
+        git_capture_dir(context, config_dir, &["rev-parse", "--show-toplevel"])
+    else {
+        return false;
+    };
+    // The workspace must be a working tree of the SAME repository as the
+    // checkout that owns the config: identical common git dirs.
+    let Some(enclosing_common) =
+        git_capture_dir(context, &enclosing_root, &["rev-parse", "--git-common-dir"])
+    else {
+        return false;
+    };
+    let Some(workspace_common) =
+        git_capture_dir(context, workspace, &["rev-parse", "--git-common-dir"])
+    else {
+        return false;
+    };
+    if enclosing_common != workspace_common {
+        return false;
+    }
+    // Mirror the in-workspace symlink hygiene: the config must sit inside the
+    // enclosing working tree without crossing a symlink.
+    let Ok(relative) = path.strip_prefix(&enclosing_root) else {
+        return false;
+    };
+    let mut component_path = enclosing_root.clone();
+    for component in relative.components() {
+        component_path.push(component);
+        let Ok(metadata) = std::fs::symlink_metadata(&component_path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    if !canonical.starts_with(&enclosing_root) {
+        return false;
+    }
+    // Tracked in the enclosing checkout ⇒ source-bound. Unlike the
+    // in-workspace branch there is no untracked-but-not-ignored allowance:
+    // outside the workspace only content governed by the repository counts.
+    git_path_status(
+        context,
+        &enclosing_root,
+        &["ls-files", "--error-unmatch", "--"],
+        relative,
+    )
+    .success()
+}
+
 fn cargo_config_is_source_bound(context: &GitContext, workspace: &Path, path: &Path) -> bool {
     if !path.starts_with(workspace) {
-        return false;
+        return enclosing_checkout_config_is_source_bound(context, workspace, path);
     }
     let relative = path
         .strip_prefix(workspace)
@@ -3798,7 +3901,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_cargo_directory_cannot_supply_a_compiler_wrapper() {
+    fn symlinked_cargo_directory_cannot_supply_semantic_config() {
         use std::os::unix::fs::symlink;
 
         let repository = empty_repository();
@@ -3808,9 +3911,12 @@ mod tests {
         run_git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
 
         let external = tempfile::tempdir().expect("external Cargo config directory");
+        // A semantic key: `build.rustc-wrapper` alone would ride the explicit
+        // build-acceleration allowance in reject_unbound_semantic_cargo_config
+        // and never panic, leaving this fixture vacuous.
         std::fs::write(
             external.path().join("config.toml"),
-            b"[build]\nrustc-wrapper = 'fake-wrapper'\n",
+            b"[target.aarch64-apple-darwin]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
         )
         .expect("write external Cargo config");
         symlink(external.path(), repository.path().join(".cargo"))
@@ -3823,6 +3929,126 @@ mod tests {
             })
             .is_err(),
             "a config reached through a symlinked parent must not enter the source trust boundary"
+        );
+    }
+
+    #[test]
+    fn enclosing_checkout_tracked_semantic_config_is_source_bound_for_nested_worktree() {
+        let repository = empty_repository();
+        std::fs::write(repository.path().join("Cargo.toml"), b"[workspace]\n")
+            .expect("write workspace fixture");
+        std::fs::create_dir(repository.path().join(".cargo"))
+            .expect("create tracked Cargo config directory");
+        std::fs::write(
+            repository.path().join(".cargo/config.toml"),
+            b"[target.aarch64-apple-darwin]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+        )
+        .expect("write tracked semantic Cargo config");
+        run_git(
+            repository.path(),
+            &["add", "Cargo.toml", ".cargo/config.toml"],
+        );
+        run_git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
+        run_git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                ".claude/worktrees/agent-fixture",
+            ],
+        );
+        let worktree = repository.path().join(".claude/worktrees/agent-fixture");
+        let cargo_home = tempfile::tempdir().expect("temporary Cargo home");
+
+        // The enclosing checkout's tracked config is project-governed source:
+        // the identity computation must accept it rather than reject it as an
+        // unbound semantic override, and it must be deterministic.
+        let first = cargo_configuration_identity(&worktree, cargo_home.path());
+        let second = cargo_configuration_identity(&worktree, cargo_home.path());
+        assert_eq!(
+            first, second,
+            "nested-worktree Cargo config identity must be deterministic"
+        );
+    }
+
+    #[test]
+    fn foreign_enclosing_repository_semantic_config_stays_unbound() {
+        let outer = empty_repository();
+        std::fs::create_dir(outer.path().join(".cargo"))
+            .expect("create outer Cargo config directory");
+        std::fs::write(
+            outer.path().join(".cargo/config.toml"),
+            b"[target.aarch64-apple-darwin]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+        )
+        .expect("write outer semantic Cargo config");
+        std::fs::write(outer.path().join("Cargo.toml"), b"[workspace]\n")
+            .expect("write outer workspace fixture");
+        run_git(outer.path(), &["add", "Cargo.toml", ".cargo/config.toml"]);
+        run_git(outer.path(), &["commit", "--quiet", "-m", "fixture"]);
+
+        // An INDEPENDENT repository nested under the outer checkout: the outer
+        // config is tracked, but by a foreign repository, so it must remain
+        // outside the source trust boundary.
+        let inner = outer.path().join("inner");
+        std::fs::create_dir(&inner).expect("create inner repository directory");
+        run_git(&inner, &["init", "--quiet"]);
+        run_git(&inner, &["config", "user.name", "AY Tests"]);
+        run_git(
+            &inner,
+            &["config", "user.email", "ay-tests@example.invalid"],
+        );
+        std::fs::write(inner.join("Cargo.toml"), b"[workspace]\n")
+            .expect("write inner workspace fixture");
+        run_git(&inner, &["add", "Cargo.toml"]);
+        run_git(&inner, &["commit", "--quiet", "-m", "fixture"]);
+        let cargo_home = tempfile::tempdir().expect("temporary Cargo home");
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                cargo_configuration_identity(&inner, cargo_home.path())
+            })
+            .is_err(),
+            "a foreign repository's semantic config must not enter the source trust boundary"
+        );
+    }
+
+    #[test]
+    fn untracked_enclosing_checkout_semantic_config_stays_unbound() {
+        let repository = empty_repository();
+        std::fs::write(repository.path().join("Cargo.toml"), b"[workspace]\n")
+            .expect("write workspace fixture");
+        run_git(repository.path(), &["add", "Cargo.toml"]);
+        run_git(repository.path(), &["commit", "--quiet", "-m", "fixture"]);
+        run_git(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                ".claude/worktrees/agent-fixture",
+            ],
+        );
+        // Written AFTER the commit: tracked by no commit, so even inside the
+        // enclosing checkout of the same repository it stays unbound.
+        std::fs::create_dir(repository.path().join(".cargo"))
+            .expect("create untracked Cargo config directory");
+        std::fs::write(
+            repository.path().join(".cargo/config.toml"),
+            b"[target.aarch64-apple-darwin]\nrustflags = [\"-C\", \"target-cpu=native\"]\n",
+        )
+        .expect("write untracked semantic Cargo config");
+        let worktree = repository.path().join(".claude/worktrees/agent-fixture");
+        let cargo_home = tempfile::tempdir().expect("temporary Cargo home");
+
+        assert!(
+            std::panic::catch_unwind(|| {
+                cargo_configuration_identity(&worktree, cargo_home.path())
+            })
+            .is_err(),
+            "an untracked enclosing config must not inject semantics outside source identity"
         );
     }
 

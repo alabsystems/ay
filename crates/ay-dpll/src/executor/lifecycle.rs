@@ -8,6 +8,17 @@ use ay_core::Sort;
 mod finite_array_sat;
 mod proof_access;
 mod proof_records;
+mod public_solve;
+
+/// Reconstruction step budget installed when a quantified public query arms
+/// the proof trace under competition shedding (#quantified-trace-arming;
+/// `--no-quantified-shedding-yield` is the kill switch).
+///
+/// Deliberately the same value as `ay::run::DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET`,
+/// the budget the default rigor level installs: the whole point of the yield is
+/// to land in the already-exercised best-effort configuration rather than a new
+/// one. Deterministic (a step count, never wall time).
+const QUANTIFIED_SHEDDING_YIELD_STEP_BUDGET: u64 = 1_000_000;
 
 impl Default for Executor {
     fn default() -> Self {
@@ -137,6 +148,13 @@ impl Executor {
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
         self.last_command_unsat_admission = None;
+        if ay_core::misc_cli_flags().debug_cert && self.unsat_query_epoch.is_some() {
+            eprintln!(
+                "CERT/epoch cleared: lifecycle reset (had epoch) exec={:p}\n{}",
+                self as *const _,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         self.unsat_query_epoch = None;
         self.last_assumptions = None;
         self.last_assumption_core = None;
@@ -147,7 +165,7 @@ impl Executor {
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         if self.proof_problem_assertion_provenance.is_some() {
-            super::unsat_cert::probe_cert_reject(|| {
+            unsat_cert::probe_cert_reject(|| {
                 "proof-source provenance CLEARED by invalidate_last_check_result".to_string()
             });
         }
@@ -166,6 +184,7 @@ impl Executor {
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
+        self.injected_axiom_theory_kinds.clear();
         self.proof_check_result = None;
         self.proof_check_ok = false;
         self.last_bv_drat_self_cert = false;
@@ -217,133 +236,11 @@ impl Executor {
             model.revoke_all_quantified_model_seals();
         }
     }
+}
 
-    /// Close every decision-trace writer retained by an incremental SAT lane.
-    ///
-    /// Persistent solvers keep their buffered writer across `check-sat` calls.
-    /// A CLI-level fail-closed result must detach those file descriptors before
-    /// removing the now-non-authoritative trace; reopening or truncating the
-    /// path while an old writer remains live can corrupt or re-expose it.
-    fn detach_persistent_decision_trace_writers(&mut self) {
-        if let Some(state) = self.incr_bv_state.as_mut() {
-            if let Some(sat) = state.persistent_sat.as_mut() {
-                sat.disable_decision_trace();
-            }
-        }
-        if let Some(state) = self.incr_theory_state.as_mut() {
-            if let Some(sat) = state.persistent_sat.as_mut() {
-                sat.disable_decision_trace();
-            }
-            if let Some(sat) = state.lia_persistent_sat.as_mut() {
-                sat.disable_decision_trace();
-            }
-        }
-        if ay_core::trace_config().decision_trace_path.is_some() {
-            // Once a public/raw mismatch occurs, a later partial trace cannot
-            // replay the full session honestly. Leave tracing disabled for the
-            // rest of this process instead of silently starting a forged stream.
-            ay_sat::suppress_decision_trace_after_public_mismatch();
-        }
-    }
+include!("lifecycle/unknown_publication.rs");
 
-    /// Publish `Unknown` from an authoritative production origin and revoke
-    /// every artifact belonging to an older or partially completed decision.
-    ///
-    /// CLI preflight rejection and panic containment can decide to fail closed
-    /// without receiving a normal `Unknown` from the solver. This canonical
-    /// transition prevents subsequent model/proof/core queries from observing
-    /// a stale result. Decision tracing is also detached and permanently
-    /// suppressed when configured, because replay would reproduce the solver's
-    /// raw result rather than the external boundary's synthesized result.
-    pub(crate) fn publish_unknown_from_origin(&mut self, origin: UnknownOrigin) {
-        self.detach_persistent_decision_trace_writers();
-        self.invalidate_last_check_result();
-        self.last_result = Some(SolveResult::Unknown);
-        self.last_unknown_reason = Some(origin.reason());
-        self.last_unknown_origin = Some(origin);
-    }
-
-    /// Compatibility entrypoint for existing external fail-closed callers.
-    ///
-    /// The reason is immediately converted to its unique registered origin;
-    /// callers cannot create a mismatched reason/origin pair.
-    pub fn replace_last_result_with_unknown(&mut self, reason: UnknownReason) {
-        self.publish_unknown_from_origin(reason.origin());
-    }
-
-    /// Classify a provisional internal Unknown through the typed origin
-    /// registry. The public solve boundary subsequently calls
-    /// [`Self::finalize_unknown_publication`] to revoke artifacts and publish
-    /// the result. Production origin sites use this instead of independently
-    /// pairing a reason with a code string.
-    pub(crate) fn record_unknown_from_origin(&mut self, origin: UnknownOrigin) {
-        self.last_unknown_reason = Some(origin.reason());
-        self.last_unknown_origin = Some(origin);
-    }
-
-    /// Inject an exact registered production origin for the authenticated
-    /// conformance executable's negative/coverage campaign.
-    ///
-    /// This is not a solver option and ordinary solving never calls it. The
-    /// hidden probe reports the injection honestly and pairs it with the
-    /// audited production chokepoint from [`UnknownOrigin::production_chokepoint`].
-    #[doc(hidden)]
-    pub fn conformance_inject_unknown_origin(&mut self, origin: UnknownOrigin) {
-        self.record_unknown_from_origin(origin);
-        let _ = self.finalize_unknown_publication(SolveResult::Unknown);
-    }
-
-    /// Publish and fully revoke an external stop observed at a result boundary.
-    ///
-    /// This is shared by definite-token admission and the interruptible
-    /// transaction's error path. An executor error does not authorize any
-    /// verdict, but a concurrently fired caller stop still owns the public
-    /// Unknown classification and must be recorded before local controls are
-    /// restored.
-    pub(crate) fn finalize_external_stop_for_publication(&mut self) -> Option<SolveResult> {
-        if !self.should_abort_theory_loop() {
-            return None;
-        }
-        if !self.is_producing_proofs() {
-            self.proof_tracker.disable();
-        }
-        Some(self.finalize_unknown_publication(SolveResult::Unknown))
-    }
-
-    /// Revoke a provisional definite verdict when a live external solve
-    /// control has fired before its publication capability is consumed.
-    ///
-    /// SAT and UNSAT use different certification funnels, but their final
-    /// native/text consumers share this last admission rule. Keeping it on the
-    /// executor preserves the typed interrupt/deadline/memory origin and routes
-    /// every rejection through the canonical artifact-revoking Unknown state.
-    pub(crate) fn decline_definite_publication_on_external_stop(
-        &mut self,
-        proposed: SolveResult,
-    ) -> SolveResult {
-        if proposed.is_unknown() {
-            return proposed;
-        }
-        self.finalize_external_stop_for_publication()
-            .unwrap_or(proposed)
-    }
-
-    /// Apply the mandatory public Unknown boundary to a provisional result.
-    ///
-    /// This is intentionally idempotent. Every public solve route calls it
-    /// after the internal lane chooses a result, so direct internal writes to
-    /// `last_unknown_reason` cannot bypass result-artifact revocation.
-    pub(crate) fn finalize_unknown_publication(&mut self, proposed: SolveResult) -> SolveResult {
-        if proposed.is_unknown() {
-            let reason = self.last_unknown_reason.unwrap_or(UnknownReason::Unknown);
-            self.publish_unknown_from_origin(reason.origin());
-            SolveResult::Unknown
-        } else {
-            self.last_unknown_origin = None;
-            proposed
-        }
-    }
-
+impl Executor {
     /// Exact production origin for the last public Unknown result.
     #[must_use]
     pub fn unknown_origin(&self) -> Option<UnknownOrigin> {
@@ -393,140 +290,6 @@ impl Executor {
         true
     }
 
-    /// Revoke every user-visible artefact at the start of a public decision
-    /// query, before preflight or elaboration can fail. Consecutive Pareto
-    /// queries are the sole case that may retain algorithmic enumeration state;
-    /// the previously emitted result/model/certificate are still always cleared.
-    pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
-        self.advance_query_authority_epoch();
-        // M0(a): these counters describe one public publication attempt.
-        // Internal probes deliberately share their enclosing attempt, while a
-        // new user-visible decision starts a fresh attribution window.
-        self.strict_check_invocations.set(0);
-        self.strict_check_steps_validated.set(0);
-        #[cfg(test)]
-        {
-            self.last_authored_query_authority_seen = false;
-        }
-        self.array_ext_witness_cache
-            .begin_public_solve(&self.ctx.terms);
-        // Proof output is optional; proof-backed UNSAT correctness is not.
-        // Enable internal proof tracking for every public decision before the
-        // authored scope is finalized. `--no-proof` and `:produce-proofs false`
-        // still suppress user-facing artifacts, but cannot disable the soundness
-        // certificate required to publish `unsat`.
-        //
-        // Competition mode (#proof-capability B1) is the sole, explicit opt-out
-        // of that invariant: with no proof demand in scope the tracker is left
-        // DISABLED so search pays no recording cost. PRECEDENCE, not conflict —
-        // `--proof`/`set_produce_proofs(true)`, in-script `(set-option
-        // :produce-proofs true)`, `(set-option :check-proofs-strict true)`, and
-        // self-check mode each defeat shedding and restore the certified lanes
-        // for this and later solves (`competition_shedding_active`). The
-        // explicit `disable()` (rather than merely skipping `enable()`) makes
-        // re-shedding after `(set-option :produce-proofs false)` deterministic.
-        // Publication under shedding goes through the B3 CompetitionRaw
-        // admission lane (unsat_cert.rs, `certify_unsat_presentation`): the
-        // exact query scope still authenticates and stops still revoke, but no
-        // checked certificate backs the verdict — the documented product
-        // carve-out. A raw UNSAT whose scope fails authentication still
-        // fail-closes to `unknown`.
-        if self.competition_shedding_active() {
-            self.proof_tracker.disable();
-        } else {
-            self.proof_tracker.enable();
-        }
-        // #boolarg-orphan: drop the previous query's orphan->twin map.
-        //
-        // The field doc says a proxy from an earlier check-sat "can never be
-        // read back" because every purification REPLACES the map. That holds
-        // only while `purify_bool_args` actually runs on every solve — a later
-        // query routed past the pass would inherit the previous query's entries
-        // and could resolve an application through a twin THIS solve never
-        // pinned. Clearing per public solve is what makes that doc claim true
-        // rather than nearly true: an unrun pass now leaves an EMPTY map, which
-        // fails closed to today's behaviour, instead of a stale one.
-        self.bool_arg_orphan_index.clear();
-        // Retention re-arm is gated exactly like the tracker: a shedding
-        // competition session keeps whatever retention state the CLI/API chose
-        // (the CLI turns it off at session start), while any proof demand —
-        // including an in-script `:produce-proofs true` — re-arms it here for
-        // proof surface-syntax alignment.
-        if !self.competition_shedding_active() {
-            self.ctx.set_retain_parsed_assertions(true);
-        }
-        let authored_assertions = self.ctx.assertions.clone();
-        let pareto_state = if preserve_pareto_enumeration {
-            self.pareto_state.take()
-        } else {
-            None
-        };
-        self.invalidate_last_check_result();
-        if preserve_pareto_enumeration {
-            self.pareto_state = pareto_state;
-        }
-        self.begin_unsat_query_epoch(&authored_assertions);
-        // Install the pre-elaboration proof authority at the public-query
-        // boundary. SMT-LIB command dispatch may replace it exactly once with
-        // authenticated schematic instances; recursive retries and
-        // optimization/probe solves then inherit those roots rather than
-        // recapturing their generated working set as authored input.
-        self.install_proof_source_provenance(&authored_assertions);
-        super::unsat_cert::probe_cert_reject(|| {
-            format!(
-                "begin_public_solve: tracker={} provenance={} authored_roots={}",
-                self.produce_proofs_enabled(),
-                self.proof_problem_assertion_provenance.is_some(),
-                authored_assertions.len()
-            )
-        });
-        // #proof-capability B1 mis-plumbing canary: a competition-mode
-        // executor with no proof demand must leave this public solve with the
-        // tracker OFF — if a future edit re-enables it unconditionally above
-        // (or in a helper called from here), the shedding silently dies and
-        // every competition run pays the certified-mode proof cycle again.
-        debug_assert!(
-            !self.competition_shedding_active() || !self.proof_tracker.is_enabled(),
-            "competition-mode executor with no proof demand must have the proof \
-             tracker disabled after begin_public_solve"
-        );
-    }
-
-    /// Start a caller-visible decision query and replenish resource envelopes
-    /// that must remain cumulative across every nested solve/restart it owns.
-    pub(crate) fn begin_external_decision_query(&mut self, preserve_pareto_enumeration: bool) {
-        self.begin_external_proof_checkpoint_budget();
-        self.finite_array_expansion
-            .prune_to_active_assertions(&self.ctx.terms, &self.ctx.assertions);
-        self.finite_array_expansion.begin_external_query();
-        self.begin_public_solve(preserve_pareto_enumeration);
-    }
-
-    /// Bind public UNSAT/proof authority to the frontend's final query roots.
-    ///
-    /// `begin_public_solve` runs before command elaboration so even a malformed
-    /// query revokes stale artifacts. SMT-LIB 2.7 schematic assertions are
-    /// materialized during that elaboration, however, and must be included in
-    /// the exact epoch before any solver lane runs. This is the sole permitted
-    /// pre-solve rebind; the epoch method refuses it once assumptions are bound.
-    pub(crate) fn bind_materialized_public_query(&mut self) {
-        let assertions = self.ctx.assertions.clone();
-        let had = self.proof_problem_assertion_provenance.is_some();
-        self.proof_problem_assertion_provenance = None;
-        let rebound = self.rebind_unsat_query_epoch_assertions(&assertions);
-        if rebound {
-            self.install_proof_source_provenance(&assertions);
-        }
-        super::unsat_cert::probe_cert_reject(|| {
-            format!(
-                "bind_materialized_public_query: had_provenance={had} rebound={rebound} \
-                 provenance={} epoch={}",
-                self.proof_problem_assertion_provenance.is_some(),
-                self.unsat_query_epoch.is_some()
-            )
-        });
-    }
-
     /// Native API assertions bypass `Command::Assert`, so they must manually
     /// invalidate stale solve artifacts.
     ///
@@ -571,8 +334,6 @@ impl Executor {
 
     /// Body of [`Executor::new`], called only through the stack guard above.
     fn new_stack_guarded() -> Self {
-        // Process memory policy belongs to the host; this type must not mutate ay-sys's
-        // global ceiling, which would couple libtests through retained RSS.
         Self {
             ctx: Context::new(),
             query_authority_epoch: QueryAuthorityEpoch::fresh(),
@@ -617,6 +378,7 @@ impl Executor {
             proof_source_work: Default::default(),
             quantified_proof_translation_incomplete: false,
             deep_qe_retry_armed: false,
+            quantified_trace_retry_armed: false,
             prepass_reachability: PrepassReachability::default(),
             last_lrat_certificate: None,
             last_proof_term_overrides: None,
@@ -624,12 +386,14 @@ impl Executor {
             quant_expansion_records: Vec::new(),
             ematching_proof_records: Vec::new(),
             consequence_replay_attempts: Cell::new(0),
+            negated_exists_ground_inst_attempts: Cell::new(0),
             skolem_instance_records: Vec::new(),
             skolem_witness_records: Vec::new(),
             bv_mbqi_false_instance_records: Vec::new(),
             mbqi_refinement_instance_records: Vec::new(),
             ground_conflict_decomp_meters: Default::default(),
             qpf_premise_forced_instance_records: Vec::new(),
+            dt_context_conflict_records: Default::default(),
             propagated_value_provenance: Default::default(),
             last_proof_rebuild_originals: Vec::new(),
             last_proof_decline: None,
@@ -665,6 +429,7 @@ impl Executor {
             last_trail_provenance: None,
             last_clausification_proofs: None,
             last_original_clause_theory_proofs: None,
+            injected_axiom_theory_kinds: Default::default(),
             quantifier_manager: None,
             learned_clause_limit: None,
             clause_db_bytes_limit: None,
@@ -688,6 +453,7 @@ impl Executor {
             cegqi_uf_recompletion_grant: None,
             finite_table_cert_witness_state: None,
             const_interp_cert_witness_state: None,
+            finite_model_lane: Default::default(),
             solve_deadline: SolveDeadlineCell::new(),
             quantifier_deadline_backstop_installed: false,
             quantifier_deadline_policy: QuantifierDeadlinePolicy::RelaxToBackstop,
@@ -741,6 +507,7 @@ impl Executor {
             required_terms_index: std::cell::RefCell::new(None),
             recorded_var_substitutions: HashMap::default(),
             original_problem_had_quantifiers: false,
+            quantified_query_defeats_shedding: false,
             sat_validated_by_mod_div_or_branch: false,
             nested_array_row_reduction_unsat: false,
             ho_seq_unfold_array_free_unsat: false,
@@ -767,6 +534,7 @@ impl Executor {
             progress_enabled: false,
             progress_json_path: None,
             aggressive_model_minimize: false,
+            model_output_shed: false,
             #[cfg(test)]
             last_applied_sat_random_seed: Cell::new(None),
             #[cfg(test)]
@@ -797,11 +565,9 @@ impl Executor {
             array_ext_shadow: ArrayExtShadow::default(),
             array_ext_witness_cache: ArrayExtWitnessCache::default(),
             finite_array_expansion: FiniteArrayExpansionLedger::default(),
-            // M-A2 lazy-persistent-combiner shadow: OFF by default (§5 A2).
+            // Debug-only AUFLIA shadow and demand overrides are off by default.
             #[cfg(debug_assertions)]
             auflia_persistent_shadow: false,
-            // M5 demand-lane: PRODUCTION-authoritative for classified families;
-            // the debug-only force-eager differential override is OFF by default.
             #[cfg(debug_assertions)]
             demand_force_eager: false,
         }
@@ -983,6 +749,11 @@ impl Executor {
     ///
     /// Consulted at every `begin_public_solve`, so an in-script option flip
     /// re-arms (or re-sheds) the certified lanes on the NEXT public solve.
+    /// This predicate is the ADMISSION decision and is deliberately unchanged
+    /// by #quantified-trace-arming: a quantified competition query still
+    /// publishes a raw UNSAT through the B3 lane. That campaign changes only
+    /// what happens AFTER a shed solve fails closed — see
+    /// [`Self::quantified_trace_arming_unknown_retry`].
     pub(crate) fn competition_shedding_active(&self) -> bool {
         self.competition_mode
             && !self.is_producing_proofs()
@@ -1025,6 +796,56 @@ impl Executor {
     /// record that made it fire.
     pub(in crate::executor) fn theory_window_provenance_survives_unsat(&self) -> bool {
         !self.competition_shedding_active()
+    }
+
+    /// Arm the internal proof trace for the #quantified-trace-arming retry.
+    ///
+    /// Called ONLY from [`Self::quantified_trace_arming_unknown_retry`], after
+    /// a shed solve has already failed closed to `Unknown`. Enables the
+    /// recorder and re-arms parsed retention, and bounds the best-effort
+    /// reconstruction the recorder makes reachable: without an explicit proof
+    /// request the budget slot is `None` (unbounded), which is right when
+    /// nobody asked for an artifact but wrong when the recorder is armed purely
+    /// for internal certification — reconstruction must never trade a fast
+    /// verdict for minutes of materialization. A mandatory proof request keeps
+    /// its unbudgeted slot.
+    pub(in crate::executor) fn arm_quantified_trace_for_retry(&mut self) {
+        self.quantified_query_defeats_shedding = true;
+        self.proof_tracker.enable();
+        self.ctx.set_retain_parsed_assertions(true);
+        if !self.proof_artifact_required && self.proof_reconstruction_step_budget.is_none() {
+            self.proof_reconstruction_step_budget = Some(QUANTIFIED_SHEDDING_YIELD_STEP_BUDGET);
+        }
+        // The public-query lifecycle installs proof-source provenance at
+        // `begin_public_solve`, but `install_proof_source_provenance`
+        // SELF-GATES on `produce_proofs_enabled()` — correctly, since under
+        // shedding no proof is being built. The retry IS building one, and
+        // `authenticate_unsat_query_scope` demands a provenance that is both
+        // PRESENT and bound to the epoch's exact authored vector, so without
+        // this every certified mint on the retry pass fails
+        // `AssertionEpochMismatch` and the correct verdict is discarded.
+        // Measured: 8 of the 8 recovered SQ Equality_LinearArith rows are lost
+        // when this install is omitted.
+        //
+        // Sourced from the EPOCH, never from `ctx.assertions` — the working set
+        // is rewritten by preprocessing and appended to by the demand lane, so
+        // it is not the vector the authenticator compares against. Fail closed:
+        // with no epoch there is no public query to authenticate, and the retry
+        // simply cannot mint.
+        if self.proof_problem_assertion_provenance.is_none() {
+            if let Some(authored) = self.unsat_query_epoch_authored_assertions() {
+                self.install_proof_source_provenance(&authored);
+            }
+        }
+    }
+
+    /// Undo [`Self::arm_quantified_trace_for_retry`]'s recorder arming so the
+    /// executor leaves the public decision in its ordinary shed posture.
+    pub(in crate::executor) fn disarm_quantified_trace_after_retry(&mut self) {
+        self.quantified_query_defeats_shedding = false;
+        if self.competition_shedding_active() {
+            self.proof_tracker.disable();
+        }
     }
 
     /// Whether the last `check_sat` produced a pure-QF_BV UNSAT under
@@ -1137,8 +958,21 @@ impl Executor {
     /// (#rss-vs-z3 campaign). The CLI turns retention OFF when the session can
     /// never emit a proof (`--no-proof`, `--z3-mode`, competition mode). A
     /// later `set_produce_proofs(true)` or in-script
-    /// `(set-option :produce-proofs true)` turns it back on. Verdicts are
-    /// unaffected — every consumer degrades gracefully on an empty prefix.
+    /// `(set-option :produce-proofs true)` turns it back on.
+    ///
+    /// Consumers MUST degrade gracefully on an empty prefix — but "gracefully"
+    /// means "skip the surface work", not "skip the whole pass". That
+    /// distinction became load-bearing when `66538b006f` made the strict UNSAT
+    /// certificate MANDATORY: `apply_input_syntax_rewrites_to_proof` bailed
+    /// wholesale on an empty prefix and took the ASSUMPTION-AUTHORITY passes
+    /// with it, so 89 correct refutations were computed and then discarded as
+    /// `UnauthorizedAssumption` in `--z3-mode` ONLY — invisible to `cargo
+    /// test`, which runs the default (retaining) mode. See
+    /// `#cause-b-parsed-gate` / `#cause-b-narrow-split` on
+    /// `Executor::run_assumption_authority_passes_without_parsed_syntax`.
+    /// Before adding an `assertions_parsed().is_empty()` early return anywhere,
+    /// check whether the pass behind it reasons over canonical `TermId`s (keep
+    /// it running) or over `ay_frontend` ASTs (safe to skip).
     pub fn set_retain_parsed_assertions(&mut self, retain: bool) {
         self.ctx.set_retain_parsed_assertions(retain);
     }
@@ -1343,6 +1177,32 @@ impl Executor {
         self.memory_limit
     }
 
+    /// Whether the caller's interrupt flag is currently raised.
+    ///
+    /// Diagnostics only. `make_should_stop` folds the interrupt and the deadline
+    /// into one boolean, which is the right shape for the hot path and the wrong
+    /// shape for reporting WHICH of them stopped a solve; this and
+    /// [`Self::solve_deadline_state`] recover that distinction.
+    pub(crate) fn solve_interrupt_is_set(&self) -> bool {
+        self.solve_interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Render the solve deadline as `none`, `expired by <n>ms`, or
+    /// `<n>ms remaining`. Diagnostics only.
+    pub(crate) fn solve_deadline_state(&self) -> String {
+        let Some(deadline) = self.solve_deadline.get() else {
+            return "none".to_string();
+        };
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            format!("expired by {}ms", (now - deadline).as_millis())
+        } else {
+            format!("{}ms remaining", (deadline - now).as_millis())
+        }
+    }
+
     /// Disable (or re-enable) LRA theory propagation inside LIA theory
     /// solvers created by this executor.
     ///
@@ -1414,6 +1274,47 @@ impl Executor {
         self.aggressive_model_minimize
     }
 
+    /// Declare that no model can be consumed for the rest of this session.
+    ///
+    /// The caller is asserting a WHOLE-RUN fact it can actually prove: it has
+    /// the complete command list and none of those commands reads a model, and
+    /// no host flag prints one. A host that discovers its commands one at a
+    /// time (interactive `-in`, the library API) must never set this — the
+    /// default is demand-assumed.
+    ///
+    /// Only cosmetics are shed; see the `model_output_shed` field doc.
+    pub fn set_model_output_shedding(&mut self, enabled: bool) {
+        self.model_output_shed = enabled;
+    }
+
+    /// Whether a model produced by this solve can still reach a consumer.
+    ///
+    /// Two independent ways to answer no: the host proved nothing in the run
+    /// reads a model (`set_model_output_shedding`), or the script turned
+    /// `:produce-models` off, which makes `(get-model)`/`(get-value)` an error
+    /// (`model/output.rs`) and so leaves no reader either.
+    ///
+    /// COSMETICS GATE ONLY. Validation never asks this question: a model that
+    /// no one will read is still checked, because the check is what authorizes
+    /// publishing `sat` at all.
+    pub(super) fn model_output_is_demanded(&self) -> bool {
+        !self.model_output_shed && self.produce_models_enabled()
+    }
+
+    /// Whether to spend time shrinking the witness for readability.
+    ///
+    /// Two conditions, and they answer different questions. `:minimize-
+    /// counterexamples` (or the typed [`crate::CounterexampleStyle`]) says
+    /// whether the user WANTS a small witness; `model_output_is_demanded` says
+    /// whether anyone will ever SEE one. Minimization is a pure re-render of
+    /// an already-validated model — every candidate is accepted only if the
+    /// same gate that will judge the final model confirms it, and the
+    /// pre-minimization snapshot is restored otherwise — so declining to run
+    /// it can only leave the solver-produced witness in place.
+    pub(super) fn counterexample_minimization_demanded(&self) -> bool {
+        self.minimize_counterexamples_enabled() && self.model_output_is_demanded()
+    }
+
     /// Get the current random seed, if set.
     #[must_use]
     pub fn random_seed(&self) -> Option<u64> {
@@ -1470,10 +1371,16 @@ impl Executor {
     }
 
     pub(super) fn minimize_counterexamples_enabled(&self) -> bool {
-        !matches!(
-            self.effective_counterexample_style(),
-            crate::CounterexampleStyle::Any
-        )
+        // Counterexample minimization is model *presentation* work.  Keep the
+        // always-on validation model intact, but do not spend time rewriting a
+        // model the caller disabled from output with `:produce-models false`.
+        // In particular, the validation pipeline still completes and checks
+        // its private witness before a SAT verdict is published.
+        self.produce_models_enabled()
+            && !matches!(
+                self.effective_counterexample_style(),
+                crate::CounterexampleStyle::Any
+            )
     }
 
     /// Reset the executor to initial state.
@@ -1532,6 +1439,36 @@ mod result_rejection_tests {
     use super::*;
     use crate::incremental_state::IncrementalTheoryState;
     use ay_sat::Solver as SatSolver;
+
+    #[test]
+    fn disabled_model_output_disables_presentation_minimization_only() {
+        let mut executor = Executor::new();
+        assert!(executor.produce_models_enabled());
+        assert!(executor.minimize_counterexamples_enabled());
+
+        executor
+            .execute(&Command::SetOption(
+                ":produce-models".to_string(),
+                ay_frontend::SExpr::False,
+            ))
+            .expect("disable model output");
+        executor
+            .execute(&Command::SetOption(
+                ":minimize-counterexamples".to_string(),
+                ay_frontend::SExpr::True,
+            ))
+            .expect("request minimization explicitly");
+
+        assert!(!executor.produce_models_enabled());
+        assert!(matches!(
+            executor.effective_counterexample_style(),
+            crate::CounterexampleStyle::Minimal
+        ));
+        assert!(
+            !executor.minimize_counterexamples_enabled(),
+            "an explicit minimization request cannot create model demand"
+        );
+    }
 
     #[test]
     fn direct_reset_revokes_every_query_artifact() {

@@ -54,16 +54,20 @@ impl TheoryLemmaKind {
             Self::DatatypeEnumPigeonhole => "dt_enum_pigeonhole",
             Self::DatatypeSelectorProject => "dt_project",
             Self::DatatypeTesterEval => "dt_tester",
+            Self::DatatypeTesterExclusive => "dt_tester_exclusive",
             Self::DatatypeExhaustive => "dt_exhaustive",
             Self::DatatypeConstructorReconstruct => "dt_ctor_reconstruct",
             Self::DatatypeInjective => "dt_injective",
             Self::DatatypeAcyclicDirect => "dt_acyclic_direct",
             Self::DatatypeValueEqCongruence => "dt_value_eq_congruence",
+            Self::DatatypeGroundConflict => "dt_ground_conflict",
             Self::OrderIteTautology => "order_ite_tautology",
             Self::BoolTautology => "bool_tautology",
             Self::ArithEqTriangle => "arith_eq_triangle",
             Self::ArithEqImpliesBound => "arith_eq_implies_bound",
             Self::IntBoundsTautology => "int_bounds_tautology",
+            Self::IntBoundLatticeGap => "int_bound_lattice_gap",
+            Self::IntCutLatticeGap => "int_cut_lattice_gap",
             Self::ArithDisequalitySplit => "arith_disequality_split",
             Self::IteSame => "ite_same",
             Self::FpClassification { .. } => "fp_classification",
@@ -77,6 +81,7 @@ impl TheoryLemmaKind {
             Self::ArrayFiniteExtensionality => "array_finite_extensionality",
             Self::ArrayFiniteSelectExpansion => "array_finite_select_expansion",
             Self::QuantifierNegatedExistsDual => "quantifier_negated_exists_dual",
+            Self::GroundEqualitySubstitution => "ground_equality_substitution",
         }
     }
 

@@ -37,6 +37,8 @@ mod array_map_8533;
 mod array_model_store_chain_witness;
 #[path = "group_arrays/array_soundness_4304.rs"]
 mod array_soundness_4304;
+#[path = "group_arrays/census_memo_consistency.rs"]
+mod census_memo_consistency;
 #[path = "group_arrays/const_array_card1_soundness.rs"]
 mod const_array_card1_soundness;
 #[path = "group_arrays/default_lambda_wrong_sat.rs"]

@@ -478,6 +478,25 @@ pub trait ModelView {
         }
     }
 
+    /// The model's value for the uninterpreted-function application `t` whose
+    /// arguments the evaluator has ALREADY reduced to `arg_values`.
+    ///
+    /// Identical contract to [`uf_app_value`](ModelView::uf_app_value) — the
+    /// value is still keyed into the evaluator's `uf_graph` by those argument
+    /// values, so single-valuedness is enforced exactly as before. The extra
+    /// parameter exists because a model can be TOTAL on a function without
+    /// pinning the individual application term: an implementor whose emitted
+    /// model serialises `f` as a complete table-plus-default interpretation can
+    /// read that interpretation AT this argument point, which a TermId-only
+    /// lookup cannot express.
+    ///
+    /// The default implementation ignores `arg_values` and delegates, so every
+    /// existing implementor keeps its current behaviour verbatim.
+    fn uf_app_value_at(&self, t: TermId, arg_values: &[ModelValue]) -> Option<ModelValue> {
+        let _ = arg_values;
+        self.uf_app_value(t)
+    }
+
     /// The model's committed value for the array-`select` application term `t`
     /// (`(select A i)`), or `None` if the model does not pin it.
     ///

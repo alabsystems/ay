@@ -465,8 +465,23 @@ impl ClauseInliner {
     ///
     /// Returns `(fresh_vars, equalities, substitution)` where:
     /// - `fresh_vars[i]` is a fresh variable replacing `head_args[i]`
-    /// - `equalities` are `fresh_i = expr_i` for non-Var head args
-    /// - `substitution` maps original vars to fresh vars
+    /// - `equalities` are `fresh_i = expr_i` for non-Var head args, PLUS
+    ///   `fresh_i = fresh_j` whenever positions `i` and `j` share one original
+    ///   variable (see below)
+    /// - `substitution` maps each DISTINCT original var to exactly one fresh var
+    ///
+    /// A repeated head argument — `P(.., x, .., x, ..)`, which a copy
+    /// assignment (`v10 := v8`) produces as soon as `LocalVarEliminator` folds
+    /// the copy away — used to push a SECOND `x -> fresh_j` pair onto `subst`.
+    /// `ChcExpr::substitute` collects the pairs into a map, so the later pair
+    /// silently WINS for the body while any equality already frozen for an
+    /// earlier compound argument kept the earlier name. The two formals then
+    /// came out completely decoupled: one constrained by the body, the other
+    /// free. The synthesized interpretation for the inlined predicate lost
+    /// `fresh_i = fresh_j` and over-approximated, so a genuinely SAFE model was
+    /// rejected by `validate_safe` on the original problem — reported as
+    /// `unknown`. Bind each original variable ONCE and carry the repeat as an
+    /// explicit equality.
     fn build_head_normalization(
         head_args: &[ChcExpr],
     ) -> (Vec<ChcVar>, Vec<ChcExpr>, Vec<(ChcVar, ChcExpr)>) {
@@ -489,7 +504,16 @@ impl ClauseInliner {
         for (i, arg) in head_args.iter().enumerate() {
             match arg {
                 ChcExpr::Var(v) => {
-                    subst.push((v.clone(), ChcExpr::var(fresh_vars[i].clone())));
+                    // Already bound (a repeated head variable, or a variable
+                    // first freshened as a constituent of an earlier compound
+                    // argument): keep the single existing binding and link this
+                    // position's formal to it explicitly.
+                    if let Some((_, bound)) = subst.iter().find(|(sv, _)| sv.name == v.name) {
+                        let bound = bound.clone();
+                        equalities.push(ChcExpr::eq(ChcExpr::var(fresh_vars[i].clone()), bound));
+                    } else {
+                        subst.push((v.clone(), ChcExpr::var(fresh_vars[i].clone())));
+                    }
                 }
                 expr => {
                     for v in expr.vars() {

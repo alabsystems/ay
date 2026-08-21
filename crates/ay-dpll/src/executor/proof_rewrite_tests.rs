@@ -359,3 +359,6 @@ fn test_rewrite_term_through_not() {
         "rewrite_term should descend through Not wrappers"
     );
 }
+
+// ---------------------------------------------------------------------------
+include!("proof_rewrite_tests/cause_b_authority.rs");

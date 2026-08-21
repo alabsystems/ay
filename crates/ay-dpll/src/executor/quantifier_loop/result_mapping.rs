@@ -34,64 +34,7 @@ use crate::executor::unsat_cert::CheckedExactClosedForallUnsat;
 use crate::executor::{QuantifiedSatAuthorityGrant, QueryAuthorityEpoch};
 use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 
-/// #unit-conjunctive: a top-level assertion counts as a unit FACT only when it
-/// is a plain ATOM — no Boolean structure, no quantifier. Restricting it this
-/// way is what keeps the unit simplification from smuggling in an obligation:
-/// only something unconditionally true may be used to simplify.
-fn is_unit_atom(terms: &ay_core::TermStore, t: TermId) -> bool {
-    match terms.get(t) {
-        TermData::Forall(..) | TermData::Exists(..) | TermData::Not(..) => false,
-        TermData::App(ay_core::Symbol::Named(name), _) => {
-            !matches!(name.as_str(), "and" | "or" | "=>" | "not" | "ite" | "xor")
-        }
-        _ => true,
-    }
-}
-
-/// Truth of `t` under the top-level unit facts, if determined: `Some(true)` /
-/// `Some(false)`, or `None` when the units say nothing about it. Handles a
-/// negated atom by flipping its atom's unit value.
-fn unit_value(
-    terms: &ay_core::TermStore,
-    units: &ay_core::kani_compat::DetHashMap<TermId, bool>,
-    t: TermId,
-) -> Option<bool> {
-    if let Some(&v) = units.get(&t) {
-        return Some(v);
-    }
-    if let TermData::Not(inner) = terms.get(t) {
-        if let Some(&v) = units.get(inner) {
-            return Some(!v);
-        }
-    }
-    None
-}
-
-/// Rebuild an evaluated scalar as a constant of exactly `sort`.
-///
-/// `EvalValue::Rational` represents both SMT `Int` and `Real` values, so the
-/// expected term sort is load-bearing: integral Reals must remain Real, Ints
-/// must be integral, and bit-vector widths must agree. Any incompatible pair
-/// fails closed instead of relying on `mk_eq` to discover a sort mismatch.
-fn pin_eval_const_for_sort(
-    terms: &mut ay_core::TermStore,
-    sort: &ay_core::Sort,
-    value: &EvalValue,
-) -> Option<TermId> {
-    match (sort, value) {
-        (ay_core::Sort::Bool, EvalValue::Bool(value)) => Some(terms.mk_bool(*value)),
-        (ay_core::Sort::Int, EvalValue::Rational(value)) if value.is_integer() => {
-            Some(terms.mk_int(value.numer().clone()))
-        }
-        (ay_core::Sort::Real, EvalValue::Rational(value)) => Some(terms.mk_rational(value.clone())),
-        (ay_core::Sort::BitVec(sort), EvalValue::BitVec { value, width })
-            if sort.width == *width =>
-        {
-            Some(terms.mk_bitvec(value.clone(), *width))
-        }
-        _ => None,
-    }
-}
+include!("result_mapping/unit_helpers.rs");
 use crate::logic_detection::LogicCategory;
 use ay_core::kani_compat::DetHashMap as HashMap;
 
@@ -823,11 +766,6 @@ mod cegqi_unsat_authority {
         if crate::quant_unit_authority::consequence_replay_enabled()
             && executor.authored_scope_strict_proof_installed()
         {
-            if ay_core::misc_cli_flags().trace_cegqi_attr {
-                eprintln!(
-                    "[consequence-replay] certify: reusing installed authored-scope strict proof"
-                );
-            }
             return Some(Checked {
                 source_context_stamp: executor.ctx.source_context_stamp(),
                 translated_strict_proof: true,
@@ -2759,6 +2697,12 @@ impl Executor {
             eprintln!(
                 "CERT/classify: result={kind} em_added={ematching_added_instantiations} cegqi_f={cegqi_has_forall} cegqi_e={cegqi_has_exists} uninst={has_uninstantiated_quantifiers} unhandled={has_completely_unhandled_quantifiers}"
             );
+            for &q in unhandled_quantifiers.iter().take(4) {
+                eprintln!(
+                    "CERT/classify unhandled quantifier: {}",
+                    ay_proof::render_term_canonical(&self.ctx.terms, q)
+                );
+            }
         }
 
         // A CEGQI-forall UNSAT with no surviving CE identifier is not a raw
@@ -2797,41 +2741,13 @@ impl Executor {
             return self.cegqi_fail_closed_unknown();
         }
 
-        // SOUNDNESS (#quant-alternation wrong-unsat, disjunctive instances): a
-        // ground UNSAT cannot be trusted when it may rest on instances of a
-        // `forall` that sits in a NON-conjunctive position. E-matching and
-        // enumerative instantiation add every collected `forall`'s instances to
-        // the assertion set CONJUNCTIVELY; for a `forall` in a disjunction (or
-        // negated antecedent — `(=> (forall ...) c)` is NNF `(or (exists. forall
-        // ...) c)`) this is unsound: the conjoined instances can manufacture a
-        // contradiction the original disjunctive formula does not have. When the
-        // UNSAT did NOT come from interleaved refinement or CEGQI, and there is at
-        // least one collected `forall` that is not in conjunctive position,
-        // re-validate by re-solving ONLY the quantifier-free conjuncts of the
-        // pre-instantiation snapshot. If that ground core is not itself UNSAT, the
-        // contradiction was instance-manufactured — fail closed to Unknown rather
-        // than report a wrong UNSAT. (A genuine top-level-conjunct forall driven
-        // to UNSAT by MBQI is handled by the conjunctive-position arm below and is
-        // unaffected: all its foralls ARE conjunctive, so this guard is skipped.)
-        // `ematching_added_instantiations` is included because the unsound
-        // conjoined-instance UNSAT can also arise when a non-conjunctive `forall`
-        // WAS instantiated by E-matching (so there are no LEFTOVER uninstantiated
-        // quantifiers): the e-matched instances are conjoined just the same. The
-        // body still fails closed only when the snapshot has a non-conjunctive
-        // forall AND its quantifier-free ground core is satisfiable, so genuine
-        // conjunctive-forall and genuine ground-core UNSATs are untouched.
-        // This ALSO covers `unsat_from_interleaved`: the unsound conjoined-instance
-        // UNSAT arises identically whether the non-conjunctive `forall`'s instances
-        // were added up front or by interleaved E-matching (the dt/array case
-        // `(not (= (ite (forall v. (= (select a v) (select b v))) ...) ...))`
-        // reaches UNSAT via interleaved e-matching at array-extensionality Skolem
-        // witnesses). The soundness gate is the BODY: degrade only when the
-        // snapshot actually has a non-conjunctive `forall` AND its quantifier-free
-        // ground core is satisfiable — i.e. the contradiction was manufactured by
-        // conjoining instances of a disjunctively/conditionally-positioned forall.
-        // Genuine conjunctive-forall UNSATs (every forall conjunctive ⇒
-        // `snapshot_has_nonconjunctive_forall` false) and genuine ground-core
-        // UNSATs are untouched; `cegqi_*` UNSATs are handled by the arms below.
+        // SOUNDNESS (#quant-alternation wrong-unsat): instances of a `forall`
+        // in a disjunctive or conditional position are not top-level facts;
+        // conjoining them can manufacture UNSAT. This applies to eager and
+        // interleaved E-matching even when no uninstantiated forall remains.
+        // Re-solve the authored quantifier-free conjuncts and fail closed unless
+        // that ground core is independently UNSAT. Conjunctive foralls, genuine
+        // ground-core UNSATs, and the separately checked CEGQI arms are untouched.
         if matches!(result, Ok(SolveResult::Unsat(_))) && !cegqi_has_forall && !cegqi_has_exists {
             if let Some(snapshot) = refinement_assertions {
                 if self.snapshot_has_nonconjunctive_forall(snapshot)
@@ -3481,6 +3397,27 @@ impl Executor {
                                                 );
                                             }
                                             if self.bv_quantifier_full_domain_proof {
+                                                // The finite-model lane installs its
+                                                // staged output witness and a
+                                                // model-bound grant atomically before
+                                                // returning Sat. Accept that exact-
+                                                // current grant directly. Generic BV
+                                                // producers retain the legacy pending-
+                                                // evidence path below.
+                                                let gate_roots =
+                                                    self.independent_gate_query_roots();
+                                                let installed_current = self
+                                                    .bv_quantifier_full_domain_query_grant
+                                                    .as_ref()
+                                                    .is_some_and(|grant| {
+                                                        grant.is_current_for(self, &gate_roots)
+                                                    });
+                                                if installed_current {
+                                                    self.defer_model_validation = false;
+                                                    self.last_model_validated = true;
+                                                    self.last_unknown_reason = None;
+                                                    return Ok(SolveResult::Sat);
+                                                }
                                                 if let Some(evidence) = self
                                                     .bv_quantifier_full_domain_pending_evidence
                                                     .take()

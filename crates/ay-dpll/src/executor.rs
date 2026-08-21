@@ -37,49 +37,7 @@ pub use proof::ProofDeclineMechanism;
 // Incremental state types
 use crate::incremental_state::{IncrementalBvState, IncrementalTheoryState};
 
-/// Bounded E-matching passes per check-sat to allow instantiation chaining.
-///
-/// Each round builds a fresh TermIndex, so terms created by instantiation in
-/// round N become matchable in round N+1. A chain of depth D (where axiom A's
-/// output triggers axiom B, whose output triggers axiom C, etc.) requires D
-/// rounds.
-///
-/// Budget 16 covers typical axiom chains in verification-consumer's 21-axiom Seq encoding
-/// (#3994) plus deeper iterator/permutation clusters whose instantiation chains
-/// exceed the original budget of 8 (the chain output of round N only becomes
-/// matchable in round N+1, so an axiom family of depth D needs D rounds).
-/// Generation-based cost filtering (eager/lazy thresholds) prevents
-/// self-triggering patterns from consuming the budget, and the solve deadline
-/// floor keeps each chain terminating even when the round budget is raised.
-const MAX_EMATCHING_ROUNDS: usize = 16;
-
-/// Hard ceiling on the configurable E-matching round limit.
-///
-/// Callers (e.g. verification-consumer proof obligations) may raise the per-solver round
-/// limit via [`Executor::set_ematching_round_limit`] up to this bound to allow
-/// very deep quantifier chains. The solve deadline still bounds wall-clock
-/// time, so a high ceiling cannot cause a non-terminating solve.
-const MAX_EMATCHING_ROUND_CEILING: usize = 128;
-
-/// Maximum interleaved E-matching refinement rounds after initial SAT solve.
-///
-/// After the initial E-matching preprocessing + SAT solve, the interleaved loop
-/// re-runs E-matching with the fresh EUF model from the solve. New congruence
-/// equalities discovered during solving can trigger new pattern matches that
-/// weren't available during preprocessing. Each round: E-match → add instances
-/// → re-solve → repeat until fixpoint or budget (#5927).
-///
-/// Budget 4 is conservative — enough for typical multi-step quantifier chains
-/// (e.g., verification-consumer's `f(g(a)) = b` patterns that need 2-3 rounds) without
-/// excessive overhead on already-converged formulas.
-const MAX_INTERLEAVED_EMATCHING_ROUNDS: usize = 4;
-
-/// Parsed-assertion sentinel for constraints authored through the native API.
-///
-/// Native assertions have no SMT-LIB surface term to re-elaborate during proof
-/// reconstruction.  Both anonymous and named assertions must therefore carry
-/// the same sentinel: the optional name is unsat-core metadata, not syntax.
-pub(crate) const NATIVE_API_ASSERTION_PLACEHOLDER: &str = "__ay_api_assertion__";
+include!("executor/config.rs");
 
 mod accessors;
 mod array_ext_shadow;
@@ -116,6 +74,7 @@ mod partition_rescue;
 mod proof;
 mod proof_array_ext;
 mod proof_euf_lemma;
+mod proof_fresh_def;
 mod proof_original_rebuild;
 mod proof_repair;
 use proof_repair::*;
@@ -150,10 +109,11 @@ pub(in crate::executor) use query_authority::AuthoredPlainHardQueryPermit;
 pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
 pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
 pub(crate) use query_state::{
-    BvMbqiFalseInstanceRecord, EmatchingProofRecord, FiniteArrayCachedAxiom,
-    FiniteArrayExpansionLedger, FiniteEnumPigeonholeWitness, GroundConflictDecompMeters,
-    PrepassReachability, QpfPremiseForcedInstanceRecord, QuantExpansionRecord,
-    SkolemInstanceRecord, SkolemWitnessRecord,
+    BvMbqiFalseInstanceRecord, DtContextConflictRecord, DtContextConflictSink,
+    EmatchingProofRecord, FiniteArrayCachedAxiom, FiniteArrayExpansionLedger,
+    FiniteEnumPigeonholeWitness, GroundConflictDecompMeters, PrepassReachability,
+    QpfPremiseForcedInstanceRecord, QuantExpansionRecord, SkolemInstanceRecord,
+    SkolemWitnessRecord,
 };
 pub(crate) use solve_deadline::SolveDeadlineCell;
 pub(crate) use unsat_cert::UnsatCertificate;
@@ -522,6 +482,11 @@ pub struct Executor {
     /// certificate-bearing authored shape is never erased on a solve that could
     /// still decide it.
     deep_qe_retry_armed: bool,
+    /// The #quantified-trace-arming `Unknown`-fallback lane is active for the
+    /// solve currently in flight. Set ONLY by
+    /// [`Executor::quantified_trace_arming_unknown_retry`], which owns the
+    /// one-attempt-per-public-solve contract.
+    quantified_trace_retry_armed: bool,
     /// Lifetime reachability counters for the check-sat pre-passes that carry a
     /// mode guard (#prepass-reachability).  Monotone across solves and NEVER
     /// cleared by `invalidate_last_check_result`: their only consumer is the
@@ -564,6 +529,12 @@ pub struct Executor {
     /// re-solving an already-declined consequence set. Cleared per check-sat
     /// alongside `ematching_proof_records`.
     pub(crate) consequence_replay_attempts: Cell<u8>,
+    /// Probe attempts consumed by the negated-existential ground-instantiation
+    /// artifact-firewall translation for the CURRENT check-sat
+    /// (#inc-fparith-negated-exists-inst). Counted separately from
+    /// `consequence_replay_attempts` so the two lanes cannot starve each
+    /// other. Cleared per check-sat alongside `ematching_proof_records`.
+    pub(crate) negated_exists_ground_inst_attempts: Cell<u8>,
     /// Single-binder Skolemization provenance for assertions REPLACED in place
     /// by `skolemize_existentials` (#skolem-unit-authority). Each record binds
     /// the authored source (`exists x. B` or `not (forall x. B)`), the exact
@@ -610,6 +581,13 @@ pub struct Executor {
     /// both nested-solve rollbacks so no record outlives a rolled-back
     /// speculative window.
     pub(crate) qpf_premise_forced_instance_records: Vec<QpfPremiseForcedInstanceRecord>,
+    /// Context-derivation producer hints (#dt-context-derivation): solver-
+    /// injected clauses entailed only under recorded asserted premises.
+    /// Lifecycle mirrors `qpf_premise_forced_instance_records`: cleared per
+    /// check-sat, saved+restored across the DT lazy lane's speculative
+    /// window. Capped; overflow drops silently (a missing hint can only
+    /// decline an authentication, never mint one).
+    pub(crate) dt_context_conflict_records: DtContextConflictSink,
     /// `PropagateValues` producer provenance for the current check-sat
     /// (#ppp-provenance): in-place rewrite records plus the asserted defining
     /// equalities that licensed each `value_map` entry, drained from the
@@ -828,6 +806,15 @@ pub struct Executor {
     /// Last original-clause theory proof annotations for SAT reconstruction.
     /// Parallel to SAT original clause order, including incremental NeedLemmas.
     last_original_clause_theory_proofs: Option<Vec<Option<TheoryLemmaProof>>>,
+    /// Query-scoped theory-lemma kinds for solver-INJECTED axiom assertions
+    /// (the DT selector/exclusivity/reconstruction families the eager and
+    /// lazy DT lanes append to `ctx.assertions`). The pipeline's
+    /// activation-clause placement consults this so an injected axiom's unit
+    /// original carries an indexed theory authority; without it the
+    /// exact-fragment builder cannot authenticate the clause and mandatory
+    /// certification discards the lane's UNSAT (#dt-lazy-axiom-authority).
+    pub(crate) injected_axiom_theory_kinds:
+        ay_core::kani_compat::DetHashMap<TermId, ay_core::TheoryLemmaKind>,
     /// Quantifier manager for persisting generation tracking across E-matching rounds
     pub(crate) quantifier_manager: Option<QuantifierManager>,
     /// Maximum learned clauses for SAT solver (None = no limit) (#1609)
@@ -946,6 +933,9 @@ pub struct Executor {
     /// sidecar entries after the theorem was checked; publication reinstalls
     /// this model/entry pair atomically before consulting the grant marker.
     const_interp_cert_witness_state: Option<mbqi::ConstInterpWitnessState>,
+    /// Session-scoped spend/yield account for the finite-model lane
+    /// (#witness-check-cost). See `finite_model_mbqi::LaneAccount`.
+    pub(in crate::executor) finite_model_lane: finite_model_mbqi::LaneAccount,
     /// Deadline propagated from API-level timeout settings.
     ///
     /// LIVE shared cell (#quantifier-determinism): stop closures capture a
@@ -1365,6 +1355,24 @@ pub struct Executor {
     /// produced spurious UNSAT, e.g. `forall x. select c x = f x` with
     /// `(= a c)`). Set fresh each solve in `check_sat`.
     original_problem_had_quantifiers: bool,
+    /// #quantified-trace-arming: the internal proof trace is armed for the
+    /// RETRY pass of the solve currently in flight, even though competition
+    /// shedding is otherwise active.
+    ///
+    /// Cleared by `begin_public_solve`, so every public decision STARTS shed
+    /// and its first pass is byte-identical to the pre-campaign behaviour. Set
+    /// only by [`Executor::arm_quantified_trace_for_retry`], from the
+    /// `Unknown` fallback in `quantified_trace_arming_unknown_retry`, because
+    /// on a quantified problem the trace is the publication mechanism for an
+    /// instantiation-driven refutation rather than a user-facing artifact:
+    /// `disambiguate_cegqi_unsat` publishes `unsat` exactly when the recorded
+    /// `forall_inst` derivations strict-check against the immutable authored
+    /// problem, and with no trace that route cannot run.
+    ///
+    /// The ADMISSION lane — [`Executor::competition_shedding_active`] and the
+    /// `CompetitionRaw` branch in `certify_unsat_presentation` — is untouched
+    /// in both passes.
+    quantified_query_defeats_shedding: bool,
     /// When true, SAT was established by solving a syntactically stronger
     /// symbolic mod/div OR branch. The original assertion may still contain
     /// unsupported symbolic division terms that model evaluation cannot replay,
@@ -1540,6 +1548,20 @@ pub struct Executor {
     /// check-sat returns SAT. This targets BV variables with 0/1 candidates
     /// beyond the standard minimization pipeline. Exposed via CLI `--minimize-model`.
     aggressive_model_minimize: bool,
+    /// When true, NOTHING in this session can consume a model: the host has
+    /// proved that no model-reading command and no model-printing flag is in
+    /// scope for the whole run. Set only by a host that sees the entire
+    /// command list up front (the SMT-LIB FILE lane); the streaming/interactive
+    /// and library lanes leave it `false`, which is the demand-assumed default.
+    ///
+    /// It suppresses COSMETICS ONLY — SAT-preserving counterexample
+    /// minimization, whose own module doc calls it "best-effort COSMETICS for
+    /// witness quality — the stored model is already valid". Every validation
+    /// gate, the model completion those gates read, and the array
+    /// select-congruence census run exactly as before: this flag must never be
+    /// consulted from `finalize_sat_model_validation` or anything it calls.
+    /// See `model_output_is_demanded`.
+    model_output_shed: bool,
     /// Test-only trace of the last seed applied to a raw SAT solver instance.
     #[cfg(test)]
     last_applied_sat_random_seed: Cell<Option<u64>>,
@@ -1727,91 +1749,7 @@ impl Executor {
     }
 }
 
-/// Central registry of incremental subsystems (#5992).
-///
-/// Adding a new incremental subsystem requires:
-/// 1. Implementing `IncrementalSubsystem` for the type
-/// 2. Adding the field to this macro (and whether it's `Option<T>` or direct)
-///
-/// The macro dispatches push/pop/reset to all subsystems uniformly,
-/// eliminating the 4×N shotgun surgery pattern.
-macro_rules! for_each_incremental_subsystem {
-    // Push: init-or-get for Option fields, call directly for non-Option.
-    (push $self:expr, $n:expr) => {{
-        let bv = $self
-            .incr_bv_state
-            .get_or_insert_with(IncrementalBvState::new);
-        for _ in 0..$n {
-            bv.push();
-        }
-        // NOTE: Theory state has special pre-push assertion logic handled
-        // by the caller before this macro invocation. The push itself is
-        // dispatched here.
-        let ts = $self
-            .incr_theory_state
-            .get_or_insert_with(IncrementalTheoryState::new);
-        for _ in 0..$n {
-            ts.push();
-        }
-        let qm = $self
-            .quantifier_manager
-            .get_or_insert_with(QuantifierManager::new);
-        for _ in 0..$n {
-            qm.push();
-        }
-        for _ in 0..$n {
-            $self.proof_tracker.push();
-        }
-    }};
-    // Pop: if-let for Option fields, call directly for non-Option.
-    // Returns true if all subsystems popped successfully.
-    (pop $self:expr, $n:expr) => {{
-        let mut ok = true;
-        if let Some(ref mut s) = $self.incr_bv_state {
-            for _ in 0..$n {
-                ok &= s.pop();
-            }
-        }
-        if let Some(ref mut s) = $self.incr_theory_state {
-            for _ in 0..$n {
-                let popped = s.pop();
-                ok &= popped;
-            }
-        }
-        if let Some(ref mut s) = $self.quantifier_manager {
-            for _ in 0..$n {
-                let popped = s.pop();
-                ok &= popped;
-            }
-        }
-        for _ in 0..$n {
-            let popped = $self.proof_tracker.pop();
-            ok &= popped;
-        }
-        ok
-    }};
-    // Reset: if-let for Option fields, call directly for non-Option.
-    (reset $self:expr) => {{
-        if let Some(ref mut s) = $self.incr_bv_state {
-            s.reset();
-        }
-        if let Some(ref mut s) = $self.incr_theory_state {
-            s.reset();
-        }
-        if let Some(ref mut s) = $self.quantifier_manager {
-            s.reset();
-        }
-        $self.proof_tracker.reset();
-    }};
-    // Drop: set Option fields to None, reset non-Option fields.
-    // Used by ResetAssertions which discards all state.
-    (drop $self:expr) => {{
-        $self.incr_bv_state = None;
-        $self.incr_theory_state = None;
-        $self.quantifier_manager = None;
-        $self.proof_tracker.reset();
-    }};
-}
+include!("executor/incremental_subsystem_macro.rs");
 
 mod command_boundary;
 mod lifecycle;
@@ -2066,6 +2004,14 @@ impl Executor {
             Command::Reset => {
                 self.incremental_mode = false;
                 self.lemma_cache.clear();
+                // `(reset)` is strictly stronger than `(reset-assertions)`, so
+                // anything the latter clears this must clear too. The lane
+                // account was missed: review measured `(reset)` between two
+                // identical problems carrying session_certificates=2 across the
+                // boundary, where `(reset-assertions)` correctly restarts at 1.
+                // Costs lost answers only (a carried-over deficit closes the
+                // lane early), never a wrong one.
+                self.finite_model_lane.reset();
                 for_each_incremental_subsystem!(reset self);
             }
             // reset-assertions clears assertions and scopes in the frontend
@@ -2079,6 +2025,7 @@ impl Executor {
                 // created on the next push. Stay in incremental_mode per
                 // SMT-LIB 2.6 §4.2.2.
                 self.lemma_cache.clear();
+                self.finite_model_lane.reset();
                 for_each_incremental_subsystem!(drop self);
             }
             // Wire :random-seed option to executor for SAT solver (#6961)

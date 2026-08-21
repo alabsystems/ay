@@ -7,6 +7,12 @@ use ay_core::{string_literal, AletheRule, Sort, Symbol};
 
 #[path = "alethe_printer_bare_step_rule_tests.rs"]
 mod alethe_printer_bare_step_rule_tests;
+#[path = "alethe_printer_fresh_def_tests.rs"]
+mod alethe_printer_fresh_def_tests;
+#[path = "alethe_printer_int_bound_lattice_tests.rs"]
+mod alethe_printer_int_bound_lattice_tests;
+#[path = "alethe_printer_int_cut_lattice_tests.rs"]
+mod alethe_printer_int_cut_lattice_tests;
 #[path = "alethe_printer_linear_identity_tests.rs"]
 mod alethe_printer_linear_identity_tests;
 #[path = "alethe_printer_resolution_args_tests.rs"]
@@ -15,6 +21,8 @@ mod alethe_printer_resolution_args_tests;
 mod alethe_printer_surface_and_pos_tests;
 #[path = "alethe_printer_surface_symm_tests.rs"]
 mod alethe_printer_surface_symm_tests;
+#[path = "arith_eq_triangle_permutation_tests.rs"]
+mod arith_eq_triangle_permutation_tests;
 
 /// A problem scope covering every term the proof mentions.
 ///

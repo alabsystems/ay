@@ -32,6 +32,9 @@ mod uncertifiable_symmetry_refusal;
 #[path = "group_cli/set_option_unknown_key.rs"]
 mod set_option_unknown_key;
 
+#[path = "group_cli/model_output_demand.rs"]
+mod model_output_demand;
+
 #[path = "group_cli/unconfirmed_diagnostic_scope.rs"]
 mod unconfirmed_diagnostic_scope;
 

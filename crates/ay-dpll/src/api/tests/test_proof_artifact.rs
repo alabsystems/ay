@@ -9,7 +9,7 @@
 
 use crate::api::proofs::strict_verdict_from_result;
 use crate::api::*;
-use ay_core::{AletheRule, ProofStep, Symbol, TheoryLemmaKind};
+use ay_core::{AletheRule, FarkasAnnotation, ProofStep, Symbol, TheoryLemmaKind};
 
 #[test]
 fn finite_enum_artifact_is_native_strict_and_explicitly_holey_on_alethe_wire() {
@@ -603,7 +603,6 @@ fn bundle_export_rechecks_datatype_array_extensionality() {
             ay_proof::AlethePrintError::UnsupportedArrayExtensionality { .. }
         ))
     ));
-
     let (strict_checks_before, strict_steps_before) =
         solver.executor.strict_check_counters_for_test();
     let proof_steps = proof.steps.len() as u64;
@@ -620,7 +619,8 @@ fn bundle_export_rechecks_datatype_array_extensionality() {
         proof_steps,
         "artifact fallback must walk the native proof exactly once"
     );
-    assert_eq!(artifact.alethe.matches(":rule hole").count(), 1);
+    assert_eq!(artifact.alethe.matches(":rule hole").count(), 2);
+    assert!(!artifact.alethe.contains(":rule trust"));
     assert_eq!(
         artifact
             .alethe
@@ -871,23 +871,7 @@ fn artifact_qf_lra_strict_but_not_restricted_subset() {
     );
 }
 
-/// SAT result returns None for the proof artifact.
-#[test]
-fn artifact_sat_returns_none() {
-    #[allow(deprecated)]
-    let mut solver = Solver::new(Logic::QfUf);
-    solver.set_produce_proofs(true);
-
-    let p = solver.declare_const("p", Sort::Bool);
-    solver.assert_term(p);
-
-    assert_eq!(solver.check_sat(), SolveResult::Sat);
-
-    assert!(
-        solver.export_last_unsat_artifact().is_none(),
-        "artifact must be None after SAT result"
-    );
-}
+include!("test_proof_artifact/ground_lra_collapse.rs");
 
 /// Proofs disabled returns None for the proof artifact.
 #[test]
@@ -2333,7 +2317,7 @@ fn assert_congruence_value_refutation_is_plainly_checked(solver: &Solver) {
                 kind: TheoryLemmaKind::EufCongruent,
                 ..
             } | ProofStep::Step {
-                rule: ay_core::AletheRule::EqCongruent,
+                rule: AletheRule::EqCongruent,
                 ..
             }
         )),

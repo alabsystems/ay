@@ -137,10 +137,24 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
     (
         "executor/theories/solve_harness/mod.rs",
         0,
-        3,
+        2,
         0,
-        "explicit-demand gates: eq_diffvar, GuardedEqMining, second \
-         variable-substitution round",
+        "explicit-demand gates: eq_diffvar, GuardedEqMining. The second \
+         variable-substitution round's gate MOVED with the round itself to \
+         mod_elim_var_subst.rs (#4751); it is the same site, re-vetted there",
+    ),
+    (
+        "executor/theories/solve_harness/mod_elim_var_subst.rs",
+        0,
+        1,
+        0,
+        "explicit-demand gate for the #8736 second variable-substitution \
+         round, relocated verbatim out of preprocess_lia_artifacts (#4751). \
+         Completeness-only: the round inlines the mod/div decomposition, so \
+         skipping it under an explicit proof demand costs `incomplete` \
+         results, never a verdict. Its proof-provenance MINT is separately \
+         gated on produce_proofs_enabled() -- a POSITIVE site, not counted \
+         here -- so a tracker-recording run still gets replayable records",
     ),
     (
         "executor/theories/strings_word_prop.rs",

@@ -369,3 +369,53 @@ fn test_deep_extensionality_clause_records_active_binding_chain() {
     assert!(cache.is_active_witness(&terms, outer_witness));
     assert!(cache.is_active_witness(&terms, inner_witness));
 }
+
+/// SOUNDNESS BARRIER (#7892): BV equality-congruence conclusions are valid
+/// only under the equality that justifies them. These clauses are global, so
+/// an omitted or incorrectly polarized guard can survive `pop` and cause false
+/// UNSAT in a later scope.
+#[test]
+fn bv_eq_congruence_clauses_are_guarded_by_the_hypothesis() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::BitVec(ay_core::BitVecSort::new(4)));
+    let b = terms.mk_var("b", Sort::BitVec(ay_core::BitVecSort::new(4)));
+    let c = terms.mk_var("c", Sort::BitVec(ay_core::BitVecSort::new(4)));
+    let eq_ab = terms.mk_eq(a, b);
+    let eq_ac = terms.mk_eq(a, c);
+    let eq_bc = terms.mk_eq(b, c);
+
+    let mut bv = ay_bv::BvSolver::new(&terms);
+    let hyp_lit = bv
+        .bitblast_predicate(eq_ab)
+        .expect("hypothesis equality must bit-blast");
+    let ac_lit = bv
+        .bitblast_predicate(eq_ac)
+        .expect("(= a c) must bit-blast");
+    let bc_lit = bv
+        .bitblast_predicate(eq_bc)
+        .expect("(= b c) must bit-blast");
+
+    let clauses = bv_encoding::generate_bv_eq_congruence_clauses(&terms, &[eq_ab], &bv, 0);
+
+    assert!(
+        !clauses.is_empty(),
+        "expected congruence clauses relating (= a c) and (= b c)"
+    );
+    for clause in &clauses {
+        let lits = clause.literals();
+        assert!(
+            lits.contains(&-hyp_lit),
+            "congruence clause {lits:?} is not guarded by {}: it would survive a \
+             pop of the scope that asserted (= a b)",
+            -hyp_lit,
+        );
+        assert!(
+            lits.iter().any(|&lit| lit == ac_lit || lit == -ac_lit),
+            "congruence clause {lits:?} does not mention (= a c)"
+        );
+        assert!(
+            lits.iter().any(|&lit| lit == bc_lit || lit == -bc_lit),
+            "congruence clause {lits:?} does not mention (= b c)"
+        );
+    }
+}

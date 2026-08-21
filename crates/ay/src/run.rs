@@ -568,6 +568,14 @@ struct SmtTranscriptState {
     /// transaction remains armed until the decision trace settles and every
     /// participant is revalidated immediately before the verdict is emitted.
     smt_unsat_publication: SmtUnsatPublicationState,
+    /// #model-owed: a `sat` has reached the regular output channel while z3
+    /// `-model` is active, and the model that answer owes has NOT been printed
+    /// yet. In the non-incremental file path the model is a *separate* stream
+    /// command (`append_get_model_command`), so the cooperative timeout could
+    /// fire in the gap and exit 124 between the verdict and its model. In
+    /// Model-Validation a `sat` carrying no model scores exactly ZERO, so that
+    /// gap silently discarded solves AY had already finished paying for.
+    owes_model_emission: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -636,6 +644,7 @@ impl SmtTranscriptState {
             defer_unsat_publication: false,
             pending_unsat_output: None,
             smt_unsat_publication: SmtUnsatPublicationState::Unprepared,
+            owes_model_emission: false,
         }
     }
 
@@ -688,6 +697,7 @@ impl SmtTranscriptState {
         self.result_certification_rejected = false;
         self.pending_unsat_output = None;
         self.smt_unsat_publication = SmtUnsatPublicationState::Unprepared;
+        self.owes_model_emission = false;
     }
 
     fn record_public_verdict(&mut self, verdict: PublicVerdict) {
@@ -697,6 +707,7 @@ impl SmtTranscriptState {
         self.result_certification_rejected = false;
         self.pending_unsat_output = None;
         self.smt_unsat_publication = SmtUnsatPublicationState::Unprepared;
+        self.owes_model_emission = false;
     }
 
     fn record_executor_unknown(&mut self, reason: Option<String>) {
@@ -706,6 +717,7 @@ impl SmtTranscriptState {
         self.result_certification_rejected = false;
         self.pending_unsat_output = None;
         self.smt_unsat_publication = SmtUnsatPublicationState::Unprepared;
+        self.owes_model_emission = false;
     }
 
     fn record_synthesized_unknown(&mut self, reason: impl Into<String>) {
@@ -715,6 +727,7 @@ impl SmtTranscriptState {
         self.result_certification_rejected = false;
         self.pending_unsat_output = None;
         self.smt_unsat_publication = SmtUnsatPublicationState::Unprepared;
+        self.owes_model_emission = false;
     }
 
     fn reject_result_certification(&mut self, reason: impl Into<String>) {
@@ -1083,6 +1096,56 @@ fn command_contributes_to_problem(cmd: &Command) -> bool {
 
 fn collect_command_sources(input: &str) -> Vec<CommandSource> {
     collect_command_sources_from_line(input, 1)
+}
+
+/// Command names whose execution READS the model of the preceding `check-sat`.
+///
+/// `(include "f")` is here because AY does not implement it: the spliced file's
+/// commands are invisible to this scan, so any script mentioning it must be
+/// treated as possibly reading a model.
+const MODEL_READING_COMMANDS: &[&str] = &[
+    "check-synth",
+    "eval",
+    "get-assignment",
+    "get-model",
+    "get-objective-certificates",
+    "get-objectives",
+    "get-value",
+    "include",
+];
+
+/// Whether anything in `input` could read a model, answered by a deliberately
+/// CONSERVATIVE token scan of the raw text.
+///
+/// The scan over-approximates on purpose. It does not skip comments or string
+/// literals and does not care whether the name is in command position, so
+/// `; remember to add (get-model)` and `(declare-fun get-value () Bool)` both
+/// count as demand. Over-approximating costs a little wasted witness polish;
+/// under-approximating would silently degrade a model someone then prints, so
+/// every uncertainty resolves toward "demanded".
+///
+/// Soundness of the *negative* answer rests on one fact: an SMT-LIB command
+/// name is literal source text. There is no macro, no `include` AY honors (the
+/// spelling is in the list above), and no runtime construction of a command —
+/// so a reader that runs must have its name written here.
+fn smt_text_may_consume_a_model(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let is_symbol_byte =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'?');
+    MODEL_READING_COMMANDS.iter().any(|name| {
+        let needle = name.as_bytes();
+        bytes.windows(needle.len()).enumerate().any(|(at, window)| {
+            window == needle
+                && !bytes
+                    .get(at.wrapping_sub(1))
+                    .copied()
+                    .is_some_and(is_symbol_byte)
+                && !bytes
+                    .get(at + needle.len())
+                    .copied()
+                    .is_some_and(is_symbol_byte)
+        })
+    })
 }
 
 /// Like [`collect_command_sources`] but numbers the first line `line_base`
@@ -2247,13 +2310,49 @@ fn z3_unknown_option_error(state: &SmtTranscriptState, keyword: &str) -> Option<
         "print-warning",
     ];
 
+    // AY's OWN options -- keys z3 has never had, that AY reads back through
+    // `Context::get_option` inside the executor. The two lists above are the
+    // z3 surface; this one is the AY surface, and it is deliberately NOT a
+    // conformance claim: z3 rejects every key here.
+    //
+    // They were rejected as unknown until 2026-08-20, which meant the CLI
+    // PRINTED an error and RETURNED BEFORE `executor.execute_authored(cmd)`
+    // -- so the key never reached `ctx.options` and every reader fell back to
+    // its default. Every AY-specific option was therefore dead through the
+    // binary while working through the library API (which is why the
+    // in-crate `:minimize-counterexamples` regressions all pass). Measured on
+    // ABVFPLRA/inv_Newton: `(set-option :minimize-counterexamples false)` left
+    // `minimize_model_sat_preserving` running and the wall clock unchanged,
+    // and run.rs's own comment about a script enabling strict proofs with
+    // `(set-option :check-proofs-strict true)` described something the binary
+    // could not do.
+    //
+    // Divergence accepted knowingly: a script written for z3 cannot contain
+    // these keys, so accepting them changes no z3-authored transcript, whereas
+    // rejecting them makes AY ignore options AY itself documents. An unknown
+    // key that is neither z3's nor AY's still reports exactly as before.
+    const AY_NATIVE_OPTIONS: &[&str] = &[
+        "ay-diff-logic",
+        "ay-eq-diffvar",
+        "ay-maxsmt-engine",
+        "ay-proof-no-varsubst",
+        "ay-unit-prop",
+        "check-proofs-strict",
+        "minimize-counterexamples",
+    ];
+
     // z3 resolves the two families differently, and the difference is
     // observable. SMT-LIB options match VERBATIM: `:produce-models` is
     // accepted, `:produce_models` is not. Global parameters are normalized
     // `-` -> `_` first, so `:auto_config` and `:auto-config` both resolve.
-    // Verified against the oracle for all four combinations.
+    // Verified against the oracle for all four combinations. AY's own keys
+    // match verbatim like the SMT-LIB family: `ctx.get_option` looks them up
+    // by their exact hyphenated spelling.
     let name = keyword.trim_start_matches(':');
-    if SMTLIB_OPTIONS.contains(&name) || AY_DISPATCHED_OPTIONS.contains(&name) {
+    if SMTLIB_OPTIONS.contains(&name)
+        || AY_DISPATCHED_OPTIONS.contains(&name)
+        || AY_NATIVE_OPTIONS.contains(&name)
+    {
         return None;
     }
 
@@ -2435,7 +2534,32 @@ fn exit_if_transcript_had_recoverable_error(state: &SmtTranscriptState) {
     }
 }
 
+/// #model-owed: hold the cooperative timeout exit while a published `sat` still
+/// owes the model it promised.
+///
+/// `-model` on the non-incremental file path appends a literal `(get-model)`
+/// *after* the `(check-sat)`, so the verdict and the model it answers with are
+/// two different stream commands. The post-command timeout check sits in that
+/// gap, and taking it there exits 124 having printed a bare `sat` — which in
+/// Model-Validation scores exactly ZERO, identical to never having solved the
+/// instance at all. Reproduced on `atan-vega-3-weak-chunk-0144.smt2`, which
+/// answers `sat` with zero `define-fun`s at `-T:30` and three at `-T:60`.
+///
+/// The debt is bounded: it is armed only by a published `sat`, and
+/// `execute_and_print` clears it as soon as the `(get-model)` command has run,
+/// whatever that command produced. Extracting an already-found assignment is
+/// not a search — measured at ~0.1s on the repro (`-T:30` exits at 31.46s;
+/// `-T:60` prints verdict *and* model at 31.34s) — so this spends effectively
+/// none of the watchdog's existing post-deadline grace, and the hard-exit
+/// fallback still bounds the process unconditionally.
+fn timeout_exit_would_strand_owed_model(state: &SmtTranscriptState) -> bool {
+    state.owes_model_emission && state.public_verdict == Some(PublicVerdict::Sat)
+}
+
 fn exit_if_timed_out_with_transcript_context(state: &SmtTranscriptState) {
+    if timeout_exit_would_strand_owed_model(state) {
+        return;
+    }
     if is_timed_out() && state.had_recoverable_error && !z3_mode_enabled() {
         let count = state.recoverable_error_count.max(1);
         let plural = if count == 1 { "" } else { "s" };
@@ -2465,6 +2589,9 @@ fn exit_if_timed_out_with_stats(
     formula_stats: Option<&FormulaStats>,
     stats_cfg: stats_output::StatsConfig,
 ) {
+    if timeout_exit_would_strand_owed_model(state) {
+        return;
+    }
     if is_timed_out() && stats_cfg.any() {
         print_smt_stats(executor, state, formula_stats, stats_cfg);
     }
@@ -3989,6 +4116,20 @@ fn execute_and_print(
         Ok(r) => r,
         Err(_panic) => return handle_executor_panic(executor, cmd, transcript),
     };
+    // The owed model has now had its turn. Clear the debt HERE, before the
+    // result is matched, so it is cleared on EVERY outcome — `Ok(Some)`,
+    // `Ok(None)` and `Err` alike.
+    //
+    // This used to sit inside the `Ok(Some(output))` arm below while its comment
+    // claimed it ran "whatever the query produced". It did not: a `(get-model)`
+    // returning `Ok(None)` or `Err` skipped it entirely and left the debt armed
+    // permanently, disabling cooperative timeout exit for the rest of the run.
+    // Bounded by the hard watchdog (`main.rs` `hard_timeout_fallback_exit`), so
+    // never a hang and never a soundness break — but the stated invariant was
+    // not the implemented one. It is now.
+    if matches!(cmd, Command::GetModel) {
+        transcript.owes_model_emission = false;
+    }
     match exec_result {
         Ok(Some(output)) => {
             // Strict-proof mode: downgrade UNSAT to Unknown when the terminal
@@ -4098,7 +4239,23 @@ fn execute_and_print(
                         super::mark_decisive_verdict_printed();
                     }
                 }
+                // #model-owed: arm the debt the instant the `sat` becomes
+                // observable. `-model` on the non-incremental file path does
+                // NOT print the model here — it appends a literal
+                // `(get-model)` that arrives as a later stream command — so
+                // from this point until that command runs the process is
+                // carrying a `sat` with no model. A cooperative timeout exit
+                // taken inside that window publishes a Model-Validation ZERO
+                // for a solve that already succeeded.
+                if emitted_verdict
+                    && raw_output == "sat"
+                    && z3_model_enabled()
+                    && !emit_z3_model_inline
+                {
+                    transcript.owes_model_emission = true;
+                }
             }
+            // (debt already cleared before the match — see the note there)
             // SMT-LIB compliance: emit reason-unknown to stderr when
             // check-sat produces "unknown", so users always know why.
             if raw_output == "unknown" {
@@ -8605,6 +8762,28 @@ fn run_smt_file_content(
     let mut formula_stats = FormulaStats::default();
     let mut smt_logic: Option<String> = None;
     let command_sources = collect_command_sources(content);
+    // MODEL-OUTPUT DEMAND (#model-demand). This lane — and only this lane —
+    // holds the entire script before the first solve, so it is the one place
+    // that can PROVE no model will ever be read. When that holds and no host
+    // flag prints or post-processes one either, tell the executor to skip
+    // witness COSMETICS (counterexample minimization). Validation is untouched:
+    // AY checks every model it publishes whether or not anyone reads it.
+    //
+    // Measured motive: ABVFPLRA/inv_Newton is 85 `(check-sat)` and zero
+    // `(get-model)`, and every one of those sat answers paid for a minimization
+    // pass whose result was discarded unread.
+    //
+    // Each disqualifier below is a real consumer: `--model` prints the model
+    // after a `sat` verdict, `--minimize-model` is an explicit request for a
+    // SMALL witness (honour the intent even with no reader in the script), and
+    // a visualization renders solver state. The interactive `-in` lane never
+    // reaches here, so it always keeps the demand-assumed default.
+    executor.set_model_output_shedding(
+        !smt_text_may_consume_a_model(content)
+            && !z3_model_enabled()
+            && !MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+            && visualization.is_none(),
+    );
     // Rewrite synthesized non-Alethe configs to Alethe for SMT
     // (Finding A in the development design notes).
     let adapted = adapt_proof_config_for_smt(proof_config);

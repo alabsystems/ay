@@ -145,6 +145,23 @@ enum ExistingArrayDefaultPolicy {
     Ignore,
 }
 
+/// How a pre-existing array CELL competes with a completion candidate's cell
+/// for the same index (#qf-auflia-stale-store-cell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingArrayCellPolicy {
+    /// The extracted cell is an INDEPENDENT observation (a committed read
+    /// attributed to a base array). A disagreement is a genuine internal
+    /// inconsistency and taints the dependency component.
+    Authoritative,
+    /// The term is a `store`/`const-array` APPLICATION: its interpretation is
+    /// a pure function of its own chain under the current model, and
+    /// extraction never attributes a read to an application (reads are
+    /// attributed to the peeled BASE). A disagreement is therefore staleness
+    /// in the extracted echo, not a contradiction, and the freshly evaluated
+    /// definitional cell wins. See the rationale at the use site.
+    DefinitionalChain,
+}
+
 impl Executor {
     /// Complete the last SAT model so it is total over the original free
     /// variables (Bool/Int/Real/BitVec sorts), then leave acceptance to
@@ -435,6 +452,65 @@ impl Executor {
                 .set_int("model_completion.arrays_completed", arrays_completed as u64);
         }
 
+        // Phase 7 (#qf-auflia-array-dependent-leaf): re-attempt the scalar gaps
+        // that are DEFINED BY AN ARRAY-DEPENDENT term. Phases 1-3 ran before
+        // Phase 6, so any variable whose only definition reads an array
+        // interpretation was evaluated against interpretations that were not
+        // yet total — it came back `Unknown` and was left unpinned forever.
+        //
+        // The measured shape is the QF_AUFLIA skolemized-extensionality family
+        // (`storecomm_invalid_*_pp_sf_ni_*`): `(= i (sk A B))` is the ONLY
+        // constraint on the witness index `i`, and `sk`'s evaluation falls back
+        // to `array_extensional_witness_index`, which needs the completed
+        // interpretations of `A` and `B`. Before this phase `i` reached the
+        // independent gate unpinned ("model does not pin this leaf: i_386"),
+        // three assertions were therefore unevaluable, and a genuine `sat`
+        // published as `unknown`.
+        //
+        // Fill-only and strictly gated: a variable that already resolves is
+        // never touched, only values DERIVED FROM AN ASSERTED EQUALITY are
+        // installed (never a fabricated default), and the completed model still
+        // faces the whole strict oracle battery plus the independent
+        // fail-closed gate. A wrong derivation therefore falsifies its own
+        // assertion and degrades exactly as an unpinned leaf did — it can
+        // never manufacture a `sat`.
+        //
+        // SCOPE: gated on an array interpretation actually being present. This
+        // phase exists because Phase 6 — and ONLY Phase 6 — runs after the
+        // scalar phases, so re-deriving is pointless where no array
+        // interpretation was built, and running it everywhere is scope creep
+        // with a real cost: measured on `group_strings`, an unrestricted
+        // re-derivation installed a value for a string-carrier leaf that the
+        // strict oracle then refuted, turning `soundness_no_bridge_length_
+        // equality_no_false_unsat` from `sat` into `unknown`. Non-array
+        // problems must observe exactly the pre-existing completion behaviour.
+        let mut array_dependent = 0usize;
+        for var in model
+            .array_model
+            .is_some()
+            .then(|| self.collect_assertion_free_vars())
+            .unwrap_or_default()
+        {
+            if !matches!(self.evaluate_term(&model, var), EvalValue::Unknown) {
+                continue;
+            }
+            let Some(value) = self
+                .extract_value_from_asserted_equalities(&model, var)
+                .filter(|value| !matches!(value, EvalValue::Unknown))
+            else {
+                continue;
+            };
+            if Self::insert_completed_value(&self.ctx.terms, &mut model, var, &value) {
+                array_dependent += 1;
+            }
+        }
+        if array_dependent > 0 {
+            self.last_statistics.set_int(
+                "model_completion.array_dependent_leaves",
+                array_dependent as u64,
+            );
+        }
+
         self.last_model = Some(model);
     }
 
@@ -598,6 +674,7 @@ impl Executor {
                 candidate,
                 array_sort,
                 ExistingArrayDefaultPolicy::Preserve,
+                Self::array_cell_policy_for(&self.ctx.terms, term),
             ) {
                 Ok(candidate) => {
                     candidates.insert(term, candidate.clone());
@@ -647,6 +724,10 @@ impl Executor {
                     } else {
                         ExistingArrayDefaultPolicy::Ignore
                     },
+                    // A defined TARGET is an array variable, and extraction
+                    // does attribute committed reads to variables — keep the
+                    // strict conflict -> taint path here.
+                    ExistingArrayCellPolicy::Authoritative,
                 ) {
                     Ok(candidate) => candidate,
                     Err(()) => {
@@ -873,6 +954,7 @@ impl Executor {
                         candidate,
                         array_sort,
                         ExistingArrayDefaultPolicy::Preserve,
+                        Self::array_cell_policy_for(&self.ctx.terms, term),
                     ) {
                         Ok(candidate) => candidate,
                         Err(()) => continue,
@@ -925,6 +1007,7 @@ impl Executor {
                             } else {
                                 ExistingArrayDefaultPolicy::Ignore
                             },
+                            ExistingArrayCellPolicy::Authoritative,
                         ) {
                             Ok(candidate) => candidate,
                             Err(()) => continue,
@@ -1150,6 +1233,7 @@ impl Executor {
         mut candidate: ArrayInterpretation,
         array_sort: &ay_core::ArraySort,
         default_policy: ExistingArrayDefaultPolicy,
+        cell_policy: ExistingArrayCellPolicy,
     ) -> Result<ArrayInterpretation, ()> {
         candidate.index_sort = Some(array_sort.index_sort.clone());
         candidate.element_sort = Some(array_sort.element_sort.clone());
@@ -1233,6 +1317,40 @@ impl Executor {
                     if index.contains('@') || value.contains('@') || authority.contains('@') {
                         continue;
                     }
+                    // #qf-auflia-stale-store-cell: the candidate is
+                    // DEFINITIONAL — `term` is a `store`/`const-array`
+                    // APPLICATION, so its interpretation is a pure function of
+                    // its own chain under the CURRENT model, and extraction
+                    // never writes select-derived cells to an application (it
+                    // attributes every read to the peeled BASE variable). The
+                    // two sides are therefore not independent observations of
+                    // one cell: they are the SAME store-value term read at two
+                    // different times. Extraction keyed the cell by
+                    // `euf_model.term_values` (a SPECULATIVE class integer for
+                    // an arithmetically unconstrained element), and a later
+                    // pass committed a different value for that same term into
+                    // `lia_model` without refreshing the array interpretation
+                    // — measured on QF_AUFLIA storecomm_invalid_*_pp_sf_ni_*:
+                    // `e2` extracted as 12 (EUF speculative) while the final
+                    // model evaluates it to 0 (LIA fill). Calling that a
+                    // contradiction poisoned the whole store chain through
+                    // `read_conflicted`, made every array-bearing assertion
+                    // unevaluable, and degraded a genuine `sat` to `unknown`
+                    // via the `arrays-read-conflict-uneval` oracle. Take the
+                    // fresh definitional value: it is what `evaluate_term`
+                    // — and therefore validation itself — already believes.
+                    //
+                    // Soundness: this only makes the interpretation agree with
+                    // the evaluator that judges it. It cannot manufacture a
+                    // `sat`: every assertion is still re-checked under the
+                    // resulting model by the full strict oracle battery and the
+                    // independent gate, and a cell that is genuinely wrong now
+                    // falsifies its assertion DEFINITIVELY (degrade) instead of
+                    // hiding behind an unevaluable poisoned array.
+                    if matches!(cell_policy, ExistingArrayCellPolicy::DefinitionalChain) {
+                        *authority = value;
+                        continue;
+                    }
                     return Err(());
                 }
                 Some(_) => {}
@@ -1241,6 +1359,28 @@ impl Executor {
         }
         candidate.stores = merged_stores;
         Ok(candidate)
+    }
+
+    /// Decide whether an extracted cell for `term` is an independent
+    /// observation or a stale echo of the term's own definitional chain
+    /// (#qf-auflia-stale-store-cell).
+    ///
+    /// ONLY a bare `store`/`const-array` application qualifies as definitional.
+    /// Array VARIABLES are excluded even when an asserted equality defines them
+    /// as a chain: extraction attributes every committed read to the peeled
+    /// BASE variable, so a variable's interpretation genuinely can hold
+    /// select-derived cells that the chain does not predict, and a
+    /// disagreement there is real evidence of an inconsistent model.
+    fn array_cell_policy_for(terms: &ay_core::TermStore, term: TermId) -> ExistingArrayCellPolicy {
+        match terms.get(term) {
+            TermData::App(symbol, args)
+                if (symbol.name() == "store" && args.len() == 3)
+                    || (symbol.name() == "const-array" && args.len() == 1) =>
+            {
+                ExistingArrayCellPolicy::DefinitionalChain
+            }
+            _ => ExistingArrayCellPolicy::Authoritative,
+        }
     }
 
     pub(super) fn same_array_interpretation(
@@ -2731,7 +2871,7 @@ impl Executor {
     /// an absent theory sub-model: materializing e.g. an empty `bv_model` would
     /// change theory-routing decisions for every OTHER term guarded by
     /// `bv_model.is_some()` (#no-fabricated-model-values).
-    fn insert_completed_value(
+    pub(in crate::executor) fn insert_completed_value(
         terms: &ay_core::TermStore,
         model: &mut Model,
         var: TermId,

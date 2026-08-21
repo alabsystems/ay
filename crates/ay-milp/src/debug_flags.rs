@@ -55,17 +55,19 @@ pub fn milp_debug_flags() -> MilpDebugFlags {
 /// Consumer-test seam (B66): force the tri-crash-all knob for the guard's
 /// scope. Doc-hidden — external LU tests are the only intended caller.
 #[doc(hidden)]
-pub struct TriCrashAllGuard(crate::tune::Active);
+pub struct TriCrashAllGuard {
+    _active: crate::tune::Active,
+}
 
 #[doc(hidden)]
 #[must_use]
 pub fn force_tri_crash_all_for_test() -> TriCrashAllGuard {
-    TriCrashAllGuard(crate::tune::activate_caller(
-        crate::tune::Profile::EMPTY.with(
+    TriCrashAllGuard {
+        _active: crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
             crate::tune::Knob::TriCrashAll,
             crate::tune::Setting::Flag(true),
-        ),
-    ))
+        )),
+    }
 }
 
 /// Consumer-test seam (B71): the bump-LU harness pins the bump floor and the
@@ -73,16 +75,18 @@ pub fn force_tri_crash_all_for_test() -> TriCrashAllGuard {
 #[doc(hidden)]
 #[must_use]
 pub fn force_bump_lu_for_test() -> TriCrashAllGuard {
-    TriCrashAllGuard(crate::tune::activate_caller(
-        crate::tune::Profile::EMPTY
-            .with(
-                crate::tune::Knob::TriCrashAll,
-                crate::tune::Setting::Flag(true),
-            )
-            .with(crate::tune::Knob::BumpLuMin, crate::tune::Setting::Count(1))
-            .with(
-                crate::tune::Knob::RefactorEvery,
-                crate::tune::Setting::Count(1),
-            ),
-    ))
+    TriCrashAllGuard {
+        _active: crate::tune::activate_caller(
+            crate::tune::Profile::EMPTY
+                .with(
+                    crate::tune::Knob::TriCrashAll,
+                    crate::tune::Setting::Flag(true),
+                )
+                .with(crate::tune::Knob::BumpLuMin, crate::tune::Setting::Count(1))
+                .with(
+                    crate::tune::Knob::RefactorEvery,
+                    crate::tune::Setting::Count(1),
+                ),
+        ),
+    }
 }

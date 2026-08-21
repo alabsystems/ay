@@ -871,7 +871,11 @@ impl ProofTracker {
             if terms.sort(value) != sort {
                 return None;
             }
-            substitution.insert(name.clone(), value);
+            if substitution.insert(name.clone(), value).is_some() {
+                // The strict checker rejects duplicate binder names because a
+                // positional argument vector cannot map them unambiguously.
+                return None;
+            }
         }
         if crate::ematching::subst_vars_exact_qf(terms, body, &substitution)? != instance {
             return None;
@@ -1017,7 +1021,9 @@ impl ProofTracker {
             if terms.sort(value) != sort {
                 return None;
             }
-            substitution.insert(name.clone(), value);
+            if substitution.insert(name.clone(), value).is_some() {
+                return None;
+            }
         }
         if crate::ematching::subst_vars_exact_qf(terms, normalized_body, &substitution)? != instance
         {
@@ -1575,5 +1581,16 @@ impl ProofTracker {
             let _ = self.scope_named_steps.pop();
         }
         committed
+    }
+
+    /// Number of live `push()` watermarks on the scope stack.
+    ///
+    /// A speculative bracket records this at entry and unwinds back DOWN TO it
+    /// on abandon, so an inner solve that leaked an unmatched `push()` cannot
+    /// leave the bracket's own watermark buried (a plain single `pop()` would
+    /// then truncate to the LEAKED watermark and keep the speculation's steps).
+    /// See `Executor::dt_lazy_discard_attempt` (#dt-lazy-abandon-restore).
+    pub(crate) fn scope_depth(&self) -> usize {
+        self.scope_stack.len()
     }
 }

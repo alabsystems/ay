@@ -115,6 +115,7 @@ fn validate_strict_typed(
         None,
         None,
         None,
+        None,
     )
 }
 

@@ -423,6 +423,7 @@ fn solve_with_opts_and_emit(text: &str, opts: &SolveOpts) -> (String, Outcome) {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: s.replay_claims(),
+        affine_aggregation_certificate: s.affine_aggregation_certificate(),
         parity_infeasibility_certificate: s.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: s.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
@@ -789,7 +790,6 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
     assert!(session.single_row_dp_infeasibility_certificate().is_none());
     assert!(session.multi_row_bdd_infeasibility_certificate().is_some());
     assert!(session.replay_claims().is_empty());
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: BDD_INF,
@@ -797,6 +797,7 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -827,7 +828,6 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
     assert!(parsed.multi_row_bdd.is_some());
     let report = cert_io::check(&ayc, BDD_INF);
     assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
-
     let format = "ay.multi-row-bdd-infeasible.v1";
     assert!(ayc.contains(format));
     let corrupted = reseal(&ayc.replacen(format, "ay.multi-row-bdd-infeasible.x1", 1));
@@ -837,7 +837,6 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
         rejected.claims_in(ClaimStanding::Refuted),
         vec!["infeasible"]
     );
-
     session.push().expect("scope");
     session
         .add_row(f64::NEG_INFINITY, f64::INFINITY, &[])
@@ -896,7 +895,6 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
                 .open_domain_multi_row_bdd_infeasibility_certificate()
                 .is_some()
     );
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: OPEN_INF,
@@ -904,6 +902,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -984,7 +983,6 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
         .is_some());
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: OPEN_HYBRID_INF,
@@ -992,6 +990,7 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -1063,7 +1062,6 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
     assert!(session
         .open_domain_hybrid_integer_lift_infeasibility_certificate()
         .is_some());
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: OPEN_HYBRID_INTEGER_INF,
@@ -1071,6 +1069,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -1145,6 +1144,7 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -1178,7 +1178,6 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     assert!(parsed.hybrid_pb_lp.is_some());
     let report = cert_io::check(&ayc, HYBRID_INF);
     assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
-
     let format = "ay.hybrid-pb-lp-infeasible.v1";
     assert!(ayc.contains(format));
     let corrupted = reseal(&ayc.replacen(format, "ay.hybrid-pb-lp-infeasible.x1", 1));
@@ -1210,7 +1209,6 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
         .is_some());
-
     let ctx = cert_io::EmitCtx {
         model: session.model(),
         model_text: HYBRID_INTEGER_INF,
@@ -1218,6 +1216,7 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
         parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: session
@@ -1849,6 +1848,7 @@ fn a_size_cap_downgrades_the_claim_it_drops() {
         obj_scale: &scale,
         provenance: "host=test",
         replay_claims: s.replay_claims(),
+        affine_aggregation_certificate: s.affine_aggregation_certificate(),
         parity_infeasibility_certificate: s.parity_infeasibility_certificate(),
         sat_relu_infeasibility_certificate: s.sat_relu_infeasibility_certificate(),
         network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),

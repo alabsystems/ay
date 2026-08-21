@@ -25,12 +25,11 @@ pub(in crate::executor) fn certificate_valid_for_blocking_clause(
     clause: &[TermId],
     farkas: &ay_core::FarkasAnnotation,
 ) -> bool {
-    ay_core::proof_validation::verify_farkas_conflict_lits_full(
+    ay_core::proof_validation::verify_farkas_conflict_lits_full_holds(
         terms,
         &blocking_clause_to_conflict(terms, clause),
         farkas,
     )
-    .is_ok()
 }
 
 /// Clear arithmetic proof annotations that no longer certify their exact

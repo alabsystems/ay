@@ -56,3 +56,24 @@ zero `(forall`**. A census over all ten (`--debug-cert`, `-T:45`) recorded
 one**. The universal branch, the refinement loop, and the lane's only
 definite-UNSAT return are entirely unexercised by that corpus; the measured
 gain comes solely from the existential path.
+
+
+## Corrected 2026-08-20 after review
+
+Two fixture names asserted a mechanism the code refutes:
+
+- `negated_exists_disjunctive_now_decides.smt2` was named for a change it does
+  NOT demonstrate — it already decides on main, via the
+  `independent_gate.rs:4302` producer (main's trace shows
+  `FMQ gate-hook: installed=true` with no `last-chance` line). Renamed to
+  `..._decides_on_main_too.smt2`.
+- `positive_forall_never_reaches_lane.smt2` — "never reaches the lane" is false
+  on the gained population: 8 of 8 sampled gained indices print `FMQ enter`.
+  Renamed to `positive_forall_declines.smt2`, which is what it actually shows.
+
+None of these four fixtures discriminates the last-chance hook: all four are
+answer-identical on main and branch. The discriminating case is the rlim slice
+at index 103 (main `unknown`, branch `sat`, both oracles `sat`), and a
+hand-minimised 8-line variant does NOT discriminate — the surrounding assertion
+stack is load-bearing, so do not trust a shrunk version without re-running the
+pre-hook binary on it.

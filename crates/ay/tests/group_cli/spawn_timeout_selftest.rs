@@ -17,6 +17,12 @@ mod unix_tests {
 
     use crate::spawn::OutputTimeout;
 
+    #[derive(Clone, Copy)]
+    enum Invocation {
+        Output,
+        Stdin,
+    }
+
     struct Cleanup(PathBuf);
 
     impl Drop for Cleanup {
@@ -37,14 +43,7 @@ mod unix_tests {
         ))
     }
 
-    /// Spawn `ay pb solve` on a FIFO that is never written: the child blocks
-    /// forever reading its input (same deterministic-hang trick as
-    /// pb26_sigterm.rs). `output_timeout(1s)` must return
-    /// `io::ErrorKind::TimedOut` promptly and leave no surviving `ay`
-    /// process behind.
-    #[test]
-    #[timeout(30_000)]
-    fn output_timeout_kills_hung_ay_and_leaves_no_orphan() {
+    fn assert_hung_child_is_reaped(invocation: Invocation) {
         let ay_path = env!("CARGO_BIN_EXE_ay");
         let fifo = unique_fifo_path();
         let mkfifo_status = Command::new("mkfifo")
@@ -55,10 +54,14 @@ mod unix_tests {
         let _cleanup = Cleanup(fifo.clone());
 
         let started = Instant::now();
-        let result = Command::new(ay_path)
+        let mut command = Command::new(ay_path);
+        command
             .args(["pb", "solve", "--timeout", "60000"])
-            .arg(&fifo)
-            .output_timeout(Duration::from_secs(1));
+            .arg(&fifo);
+        let result = match invocation {
+            Invocation::Output => command.output_timeout(Duration::from_secs(1)),
+            Invocation::Stdin => command.output_timeout_with_stdin(b"", Duration::from_secs(1)),
+        };
         let elapsed = started.elapsed();
 
         // 1. Honest TimedOut error, not a hang and not a success.
@@ -96,5 +99,22 @@ mod unix_tests {
             "orphaned ay survived the group kill: pgrep -f {fifo_name} -> {}",
             String::from_utf8_lossy(&pgrep.stdout)
         );
+    }
+
+    /// Spawn `ay pb solve` on a FIFO that is never written: the child blocks
+    /// forever reading its input. The no-stdin timeout path must kill and reap
+    /// the complete process group.
+    #[test]
+    #[timeout(30_000)]
+    fn output_timeout_kills_hung_ay_and_leaves_no_orphan() {
+        assert_hung_child_is_reaped(Invocation::Output);
+    }
+
+    /// The piped-stdin timeout path used by SMT-LIB tests has the same
+    /// process-group kill and reap guarantee.
+    #[test]
+    #[timeout(30_000)]
+    fn stdin_timeout_kills_hung_ay_and_leaves_no_orphan() {
+        assert_hung_child_is_reaped(Invocation::Stdin);
     }
 }

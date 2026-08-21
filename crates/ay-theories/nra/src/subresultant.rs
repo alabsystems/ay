@@ -204,6 +204,15 @@ impl Mono {
         self.vars.iter().map(|&(_, e)| e).sum()
     }
 
+    /// The `(variable, exponent)` pairs, ascending by variable.
+    ///
+    /// Read-only accessor for the dev-only `oracle_api` facade, which
+    /// specializes multivariate coefficients at a point to compare against z3.
+    /// It computes nothing: no algorithm in this module calls it.
+    pub(crate) fn pairs(&self) -> &[(MVar, u32)] {
+        &self.vars
+    }
+
     /// Product of two monomials.
     fn mul(&self, other: &Self) -> Self {
         let mut out: Vec<(MVar, u32)> = Vec::with_capacity(self.vars.len() + other.vars.len());
@@ -358,6 +367,14 @@ impl MPolyZ {
     /// the polynomial is zero.
     fn lead(&self) -> Option<&(Mono, BigInt)> {
         self.terms.first()
+    }
+
+    /// The canonical term list, descending under graded-lex.
+    ///
+    /// Read-only accessor for the dev-only `oracle_api` facade. It computes
+    /// nothing: no algorithm in this module calls it.
+    pub(crate) fn terms(&self) -> &[(Mono, BigInt)] {
+        &self.terms
     }
 }
 

@@ -544,3 +544,12 @@ spend the whole heuristic budget on one model.
 conditional big-M tightening became a default and the opt-in name stopped being
 consulted; reverting that default (it measured 3.1x WORSE on dcmulti under later
 changes) makes the opt-in the live read site once more, so it returns to Arm.
+(no count change, 2026-08-20): Knob::AffineAgg (Arm, typed-only — no env
+spelling, per the B49 contract). Exact fixed-column / implied-free equality
+aggregation with the affine replay-certificate lane, salvaged from the
+June-era local branch perf/implied-free-aggregation-1785664248 and re-wired
+from its retired AY_MILP_NO_EQUALITY_AGGREGATION default-ON env gate into a
+DEFAULT-OFF caller-flag arm. Ships OFF until the corpus A/B is run; the
+structure-elimination journal's own conclusion ("the reductions that pay
+are the ones that change what the relaxation can see") names this family
+as the candidate that substitutes rather than deletes.

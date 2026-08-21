@@ -11,14 +11,20 @@
 
 use std::time::{Duration, Instant};
 
+use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
 use ay_milp::{BabSession, Outcome, SolveOpts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+    // Trailing `--<engine-flag>` args ride the shared engine CLI, exactly as
+    // `mps_solve` does, so an evidence measurement can be taken under the same
+    // configuration the throughput measurement was.
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let flags = Flags::parse(&raw, VALUE_FLAGS, &switch_flags()).map_err(std::io::Error::other)?;
+    let mut args = flags.positional.iter().cloned();
     let path = args.next().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage: cert_probe <file.mps> [secs] [0|1]",
+            "usage: cert_probe <file.mps> [secs] [0|1] [--engine-flags]",
         )
     })?;
     let secs: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
@@ -31,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = SolveOpts::new()
         .with_time_limit(Duration::from_secs_f64(secs))
         .with_require_certificates(require);
+    let opts = ay_milp::engine_cli::apply(&flags, opts).map_err(std::io::Error::other)?;
     let mut s = BabSession::new(p.model, &opts)?;
     let t0 = Instant::now();
     let out = s.check();
@@ -41,9 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(Outcome::Optimal { value, cert, .. }) => {
             let ev = match cert {
                 Some(c) => {
+                    // Timed: this is the SAME `verify` call the release exit
+                    // gate (`session::validate_witnesses`) already makes, so
+                    // the number below prices one certificate re-derivation —
+                    // i.e. what a second, redundant release check would cost.
+                    let t = Instant::now();
                     let ok = c.verify(&model).is_ok();
+                    let verify_secs = t.elapsed().as_secs_f64();
                     format!(
-                        "dual-cert(mults={},verify={})+witness",
+                        "dual-cert(mults={},verify={},verify_secs={verify_secs:.6})+witness",
                         c.multipliers.len(),
                         if ok { "OK" } else { "FAIL" }
                     )

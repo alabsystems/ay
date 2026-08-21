@@ -52,6 +52,16 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use $crate::executor::theories::solve_harness::TheoryModels;
 
         let proof_enabled = $self.produce_proofs_enabled();
+        // #dt-ground-conflict: datatype registries for the conflict-path
+        // classifier, built once per pipeline run (None when the problem
+        // declares no datatypes — zero cost outside DT logics).
+        // Reuse the owned registry data across plain and Farkas conflict arms.
+        // Recorder calls borrow a short-lived view of this owned data.
+        let _itp_dt_registry_data = if proof_enabled {
+            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+        } else {
+            None
+        };
         let _itp_problem_assertions = if proof_enabled {
             $self.proof_problem_assertions()
         } else {
@@ -436,12 +446,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 // Record single theory lemma; proof-time
                                 // decomposition in decompose_combined_real_conflict_lemmas
                                 // handles EUF+LRA split (#6756 Packet 2).
-                                $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                    &mut $self.proof_tracker,
-                                    Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(),
+                                dt_conflict_proof!(
+                                    $self,
+                                    _itp_negations,
                                     &conflict_terms,
-                                ).1
+                                    _itp_dt_registry_data
+                                )
                             } else { None };
 
                             if $track_stats {
@@ -550,19 +560,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             }
 
                             let _itp_conflict_annotation = if proof_enabled && _itp_farkas_proof_valid {
-                                $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
-                                    &mut $self.proof_tracker,
-                                    Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(),
-                                    &conflict,
-                                ).1
+                                dt_farkas_proof!($self, _itp_negations, &conflict, _itp_dt_registry_data)
                             } else if proof_enabled {
-                                $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                    &mut $self.proof_tracker,
-                                    Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(),
-                                    &conflict.literals,
-                                ).1
+                                dt_conflict_proof!($self, _itp_negations, &conflict.literals, _itp_dt_registry_data)
                             } else { None };
 
                             if $track_stats {
@@ -844,6 +844,15 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         use $crate::executor::theories::solve_harness::TheoryModels;
 
         let proof_enabled = $self.produce_proofs_enabled();
+        // #dt-ground-conflict: datatype registries for the conflict-path
+        // classifier, built once per pipeline run (None when the problem
+        // declares no datatypes — zero cost outside DT logics).
+        // Reuse the owned registry data across plain and Farkas conflict arms.
+        let _itp_dt_registry_data = if proof_enabled {
+            $crate::theory_inference::dt_funnel_registry_data(&$self.ctx)
+        } else {
+            None
+        };
         let _itp_problem_assertions = if proof_enabled {
             $self.proof_problem_assertions()
         } else {
@@ -1181,10 +1190,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 break Ok(SolveResult::Unknown);
                             }
                             let _itp_conflict_annotation = if proof_enabled {
-                                $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                    &mut $self.proof_tracker, Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(), &conflict_terms,
-                                ).1
+                                dt_conflict_proof!($self, _itp_negations, &conflict_terms, _itp_dt_registry_data)
                             } else { None };
                             if $track_stats {
                                 state.theory_conflicts = state.theory_conflicts.saturating_add(1);
@@ -1265,15 +1271,9 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 }
                             }
                             let _itp_conflict_annotation = if proof_enabled && _itp_farkas_proof_valid {
-                                $crate::theory_inference::record_theory_conflict_unsat_with_farkas_and_annotation(
-                                    &mut $self.proof_tracker, Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(), &conflict,
-                                ).1
+                                dt_farkas_proof!($self, _itp_negations, &conflict, _itp_dt_registry_data)
                             } else if proof_enabled {
-                                $crate::theory_inference::record_theory_conflict_unsat_with_annotation(
-                                    &mut $self.proof_tracker, Some(&$self.ctx.terms),
-                                    _itp_negations.as_map(), &conflict.literals,
-                                ).1
+                                dt_conflict_proof!($self, _itp_negations, &conflict.literals, _itp_dt_registry_data)
                             } else { None };
                             if $track_stats {
                                 state.theory_conflicts = state.theory_conflicts.saturating_add(1);

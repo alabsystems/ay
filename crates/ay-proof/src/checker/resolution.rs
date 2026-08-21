@@ -369,6 +369,27 @@ pub(crate) fn validate_resolution_rule(
 /// Alethe's argument-directed resolution form. Each link contributes exactly
 /// `(pivot, polarity)`: `true` means the pivot occurs in the accumulator and
 /// its negation occurs in the next premise; `false` means the reverse.
+///
+/// #carcara-subset — WHY the shape of the list is judged here and not merely
+/// tolerated. `alethe_printer::format_external_args` prints a resolution
+/// step's `:args` VERBATIM, so whatever this function accepts reaches the
+/// wire. carcara 1.1.0 routes any non-empty list to its pivot-directed checker
+/// and refuses the document when the count is wrong, MEASURED:
+///
+/// ```text
+/// :args (a)            on a 3-premise chain => expected 4 arguments, got 1
+/// :args (a true)       on a 3-premise chain => expected 4 arguments, got 2
+/// :args (a)            on a 2-premise step  => expected 2 arguments, got 1
+/// ```
+///
+/// A wrong count or a non-Boolean polarity slot is therefore
+/// [`ProofCheckError::MalformedResolutionArgs`] (the annotation is not an
+/// Alethe annotation at all); a well-formed list that names a pivot the fold
+/// cannot eliminate is [`ProofCheckError::InvalidResolution`]. Polarity was
+/// measured rather than assumed: with premises `({a}, {(not a), q})` the
+/// annotation `:args (a true)` is `valid` and `:args (a false)` is `pivot was
+/// not found in clause: '(not a)'`. Fail-closed throughout: a malformed list
+/// is an error, never a silently-ignored hint.
 fn validate_pivot_directed_resolution_rule(
     terms: &TermStore,
     step_id: ProofId,
@@ -377,22 +398,35 @@ fn validate_pivot_directed_resolution_rule(
     premise_clauses: &[&[TermId]],
     args: &[TermId],
 ) -> Result<(), ProofCheckError> {
+    if premise_clauses.len() < 2 {
+        return Err(ProofCheckError::UnsupportedResolutionArity {
+            step: step_id,
+            rule: rule.name().to_string(),
+            premise_count: premise_clauses.len(),
+        });
+    }
+    let expected = (premise_clauses.len() - 1).saturating_mul(2);
+    let malformed = || ProofCheckError::MalformedResolutionArgs {
+        step: step_id,
+        rule: rule.name().to_string(),
+        premise_count: premise_clauses.len(),
+        expected,
+        got: args.len(),
+    };
+    if args.len() != expected {
+        return Err(malformed());
+    }
     let invalid = || ProofCheckError::InvalidResolution {
         step: step_id,
         rule: rule.name().to_string(),
     };
-    if premise_clauses.len() < 2
-        || args.len() != premise_clauses.len().saturating_sub(1).saturating_mul(2)
-    {
-        return Err(invalid());
-    }
 
     let mut accumulator =
         exact::clause_as_unique_set(terms, premise_clauses[0]).ok_or_else(&invalid)?;
     for (next, annotation) in premise_clauses[1..].iter().zip(args.chunks_exact(2)) {
         let polarity = match terms.get(annotation[1]) {
             TermData::Const(Constant::Bool(value)) => *value,
-            _ => return Err(invalid()),
+            _ => return Err(malformed()),
         };
         let pivot = exact::decode_literal(terms, annotation[0]);
         let negated_pivot = pivot.with_outer_not().ok_or_else(&invalid)?;
@@ -445,7 +479,15 @@ fn validate_pivot_directed_resolution_rule(
 /// Literals are normalized only by leading-`not` parity. This matches
 /// Carcara's argument-free RUP fallback. A De Morgan equivalent such as
 /// `(and a b)` versus `(or (not a) (not b))` remains a distinct atom and is not
-/// a resolution pivot.
+/// a resolution pivot — even though AY's `mk_not` INTERNS the negation of
+/// the former as the latter (#carcara-subset). Pairing them here would be a
+/// pure false accept, MEASURED on carcara 1.1.0 for chain and binary alike:
+///
+/// ```text
+/// {(and a b), (not r)}, {(or (not a) (not b)), s}, {r} |- {s}
+///   => checking failed with rule 'resolution':
+///      pivot was not eliminated: '(and a b)'
+/// ```
 pub(crate) fn validate_chain_resolution_rule(
     terms: &TermStore,
     step_id: ProofId,

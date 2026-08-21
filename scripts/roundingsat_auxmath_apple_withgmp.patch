@@ -1,0 +1,16 @@
+diff --git a/src/auxmath.hpp b/src/auxmath.hpp
+index b2d9542..82dcdbd 100644
+--- a/src/auxmath.hpp
++++ b/src/auxmath.hpp
+@@ -215,7 +215,10 @@ bool fitsIn([[maybe_unused]] const S& x) {
+   return fits<T>(bigint(x));
+ }
+ 
+-#ifdef __APPLE__
++// [groundtruth patch] Under WITHGMP, int128 == boost::multiprecision::int128_t,
++// so these would redefine the int128_t specializations above. Only needed when
++// int128 is the native __int128 (the non-WITHGMP Apple path).
++#if defined(__APPLE__) && !WITHGMP
+ template <>
+ inline int128 abs(const int128& x) {
+   return x < 0 ? -x : x;

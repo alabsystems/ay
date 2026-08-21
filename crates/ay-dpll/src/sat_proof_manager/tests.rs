@@ -7,7 +7,10 @@ use super::*;
 use ay_core::{Sort, Symbol, TermStore};
 use ay_sat::{ClauseTrace, Literal, Variable};
 
+mod finite_select_unit_authority;
 mod folded_unit_authority;
+mod intrinsic_datatype_clause_authority;
+mod intrinsic_euf_clause_authority;
 mod propagation_unit_authority;
 
 fn setup_test_terms() -> (TermStore, HashMap<u32, TermId>, HashMap<TermId, TermId>) {
@@ -1144,7 +1147,7 @@ fn exact_original_fragment_charges_full_clausification_source_before_clone() {
         let mut manager = SatProofManager::new(&var_to_term, &mut terms);
         manager.set_clausification_proofs(&annotations);
         manager
-            .build_exact_original_proof_fragment_metered(&trace, &[], &mut progress)
+            .build_exact_original_proof_fragment_metered(&trace, &[], None, &mut progress)
             .expect_err("a huge hidden source cannot bypass the aggregate work limit")
     };
 
@@ -1184,7 +1187,7 @@ fn exact_original_fragment_precharges_term_store_interning_growth() {
         let mut manager = SatProofManager::new(&var_to_term, &mut terms);
         manager.set_clausification_proofs(&annotations);
         manager
-            .build_exact_original_proof_fragment_metered(&trace, &[], &mut progress)
+            .build_exact_original_proof_fragment_metered(&trace, &[], None, &mut progress)
             .expect("the false clausification unit has exact authority")
     };
 
@@ -1924,10 +1927,6 @@ fn test_process_trace_hint_mismatch_falls_back_to_trust_with_premises() {
         "trust fallback should preserve reconstructable premise IDs"
     );
 }
-
-// ============================================================================
-// RUP/LRAT-style unit-propagation replay (#rank-4 increment 1)
-// ============================================================================
 
 /// Three Boolean atoms a, b, c with their negations.
 fn setup_three_terms() -> (TermStore, HashMap<u32, TermId>, Vec<TermId>, Vec<TermId>) {

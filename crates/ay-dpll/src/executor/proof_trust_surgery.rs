@@ -891,6 +891,9 @@ fn complement_of(terms: &mut ay_core::TermStore, lit: TermId) -> TermId {
     }
 }
 
+include!("proof_trust_surgery/ground_linear_collapse.rs");
+include!("proof_trust_surgery/false_collapse_shape.rs");
+
 /// How a defective `assume` gets repaired.
 enum AssumePlan {
     /// Surface `(distinct x1 .. xn)`, n >= 3, exported as the expanded
@@ -6008,10 +6011,10 @@ impl Executor {
     ///   — `distinct_elim` + `equiv_pos2` (+ `and_pos` for the n-ary
     ///   conjunction form) down to `(not (= t t))`, refuted by
     ///   `eq_reflexive`.
-    /// - **ground arithmetic `(= a b)` falsity** — a single-literal
-    ///   `la_generic` lemma `(cl (not (= a b)))`, re-verified by the
-    ///   independent Farkas checker (fail-closed) and printed with
-    ///   sign-resolved coefficients.
+    /// - **ground linear-arithmetic literal falsity** — derive the complement
+    ///   of an authored `=`, `<`, `<=`, `>`, or `>=` atom (optionally under one
+    ///   `not`) through either a sign-resolved, independently re-verified
+    ///   `la_generic` row or a primitive checked `evaluate` derivation.
     /// - **`(and .. p .. (not p) ..)` with a syntactically complementary
     ///   conjunct pair** — two `and_pos` extractions resolved to `⊥`.
     ///
@@ -6031,116 +6034,16 @@ impl Executor {
         authored_originals: &[(TermId, FrontendTerm)],
         allow_premise_binding_fallback: bool,
     ) -> bool {
-        // (1) Recognize the whole-proof collapse shape on the LIVE steps.
-        let Some(live) = taut_surface::live_steps(proof) else {
+        let Some(FalseCollapseShape {
+            assume,
+            assume_count,
+            false_step,
+            trust_false,
+            lia_lemma,
+        }) = self.recognize_false_collapse_shape(proof)
+        else {
             return false;
         };
-        let mut assume: Option<TermId> = None;
-        let mut assume_count = 0usize;
-        let mut false_step: Option<(TermId, TermId)> = None; // (clause lit, arg)
-        let mut trust_false = false;
-        let mut lia_lemma = false;
-        let mut closing = false;
-        for (idx, step) in proof.steps.iter().enumerate() {
-            if !live[idx] {
-                continue;
-            }
-            match step {
-                ProofStep::Assume(t) => {
-                    assume_count += 1;
-                    if assume.is_none() {
-                        assume = Some(*t);
-                    }
-                }
-                ProofStep::TheoryLemma {
-                    kind: TheoryLemmaKind::LiaGeneric,
-                    ..
-                } if !lia_lemma => {
-                    lia_lemma = true;
-                }
-                ProofStep::Step {
-                    rule: AletheRule::False,
-                    clause,
-                    premises,
-                    args,
-                } if false_step.is_none() && clause.len() == 1 && premises.is_empty() => {
-                    // Shape A carries the assumed term as the single arg;
-                    // shape C's wiring step is `(cl (not false)) :rule false`.
-                    if args.len() == 1 {
-                        false_step = Some((clause[0], args[0]));
-                    } else if !matches!(
-                        self.ctx.terms.get(atom_of(&self.ctx.terms, clause[0])),
-                        TermData::Const(ay_core::term::Constant::Bool(false))
-                    ) {
-                        return false;
-                    }
-                }
-                ProofStep::Step {
-                    rule: AletheRule::Trust,
-                    clause,
-                    premises,
-                    ..
-                } if !trust_false
-                    && clause.len() == 1
-                    && premises.is_empty()
-                    && matches!(
-                        self.ctx.terms.get(clause[0]),
-                        TermData::Const(ay_core::term::Constant::Bool(false))
-                    ) =>
-                {
-                    trust_false = true;
-                }
-                // Shape C also arrives as a THEORY LEMMA, not a `Step` with
-                // AletheRule::Trust: the datatype/preprocessor paths record the
-                // collapse via `add_theory_lemma`, which is a distinct IR
-                // variant. Without this arm the shape is never recognised and
-                // no rebuild can fire (#dt-premise-binding).
-                // The `(cl (not false))` WIRING lemma that accompanies the
-                // collapse. The `Step`-form equivalent is handled by the
-                // `AletheRule::False` arm above; the theory-lemma form must be
-                // accepted the same way (no-op, leaving `false_step` unset so
-                // `wiring_ok` holds) or the shape aborts on it.
-                ProofStep::TheoryLemma { clause, kind, .. }
-                    if kind.is_trust()
-                        && clause.len() == 1
-                        && matches!(
-                            self.ctx.terms.get(atom_of(&self.ctx.terms, clause[0])),
-                            TermData::Const(ay_core::term::Constant::Bool(false))
-                        )
-                        && clause[0] != atom_of(&self.ctx.terms, clause[0]) =>
-                {
-                    // negated `false` — wiring only, nothing to record.
-                }
-                ProofStep::TheoryLemma { clause, kind, .. }
-                    if !trust_false
-                        && kind.is_trust()
-                        && clause.len() == 1
-                        && matches!(
-                            self.ctx.terms.get(clause[0]),
-                            TermData::Const(ay_core::term::Constant::Bool(false))
-                        ) =>
-                {
-                    trust_false = true;
-                }
-                ProofStep::Resolution { clause, .. }
-                | ProofStep::Step {
-                    rule: AletheRule::Resolution | AletheRule::ThResolution,
-                    clause,
-                    ..
-                } => {
-                    if clause.is_empty() {
-                        if closing {
-                            return false;
-                        }
-                        closing = true;
-                    }
-                }
-                _ => return false,
-            }
-        }
-        if !closing {
-            return false;
-        }
         // Substitution-chain shape: equality assumes closed by ONE
         // `lia_generic` lemma (an external checker HOLE). Re-prove from the
         // original equalities with a synthesized, re-verified `la_generic`
@@ -6191,58 +6094,7 @@ impl Executor {
             return false;
         }
 
-        // (2) The assume holds the folded canonical term: recover the parsed
-        // original assertion(s) it came from and pick the certified
-        // derivation by the ORIGINAL surface shape. First recognized shape
-        // wins; no match keeps the proof byte-identical.
-        for (original_idx, (canonical, parsed)) in originals.iter().enumerate() {
-            if *canonical != x {
-                continue;
-            }
-            let stripped = strip_frontend_annotations(parsed);
-            // CAV09-family assertions wrap the conjunction in `let` sugar:
-            // expand it (capture-safe, fail-closed) so the shape dispatch
-            // sees the underlying application. The rebuilt assume prints the
-            // EXPANDED form, which external checkers accept (carcara runs
-            // with `--expand-let-bindings`, comparing modulo let expansion).
-            let expanded;
-            let stripped = if matches!(stripped, FrontendTerm::Let(..)) {
-                match expand_surface_lets(stripped, &std::collections::HashMap::new()) {
-                    Some(t) => {
-                        expanded = t;
-                        strip_frontend_annotations(&expanded)
-                    }
-                    None => continue,
-                }
-            } else {
-                stripped
-            };
-            let FrontendTerm::App(head, operands) = stripped else {
-                continue;
-            };
-            let ok =
-                match head.as_str() {
-                    "distinct" if operands.len() >= 2 => {
-                        self.rebuild_duplicate_distinct_collapse(proof, operands)
-                    }
-                    "=" if operands.len() == 2 => {
-                        self.rebuild_ground_equality_collapse(proof, operands)
-                    }
-                    "and" if operands.len() >= 2 => {
-                        let authored_root = authored_originals.get(original_idx).and_then(
-                            |(root, authored_parsed)| (authored_parsed == parsed).then_some(*root),
-                        );
-                        authored_root.is_some_and(|root| {
-                            self.rebuild_complementary_and_collapse(proof, root, operands.len())
-                        }) || self.rebuild_linear_and_collapse(proof, operands)
-                    }
-                    _ => false,
-                };
-            if ok {
-                return true;
-            }
-        }
-        false
+        self.try_rebuild_false_collapse_from_originals(proof, x, originals, authored_originals)
     }
 
     /// `(distinct ..)` with a syntactically duplicated operand: derive
@@ -6380,76 +6232,6 @@ impl Executor {
             );
             new_proof.add_resolution(Vec::new(), eq_dup, r3, er);
         }
-        *proof = new_proof;
-        true
-    }
-
-    /// Ground arithmetic `(= a b)` falsity: a single-literal `la_generic`
-    /// lemma `(cl (not (= a b)))`, re-verified by the independent Farkas
-    /// checker before emission (fail-closed).
-    fn rebuild_ground_equality_collapse(
-        &mut self,
-        proof: &mut Proof,
-        operands: &[FrontendTerm],
-    ) -> bool {
-        let (Some(lhs), Some(rhs)) = (
-            self.ctx.elaborate_surface_subterm(&operands[0]),
-            self.ctx.elaborate_surface_subterm(&operands[1]),
-        ) else {
-            return false;
-        };
-        if !matches!(self.ctx.terms.sort(lhs), Sort::Int | Sort::Real)
-            || self.ctx.terms.sort(lhs) != self.ctx.terms.sort(rhs)
-        {
-            return false;
-        }
-        // Re-intern the folded equality RAW (see the distinct emitter).
-        let x = self
-            .ctx
-            .terms
-            .mk_app(Symbol::named("="), [lhs, rhs], Sort::Bool);
-        if !matches!(
-            self.ctx.terms.get(x),
-            TermData::App(Symbol::Named(op), a) if op == "=" && a.len() == 2 && a[0] == lhs && a[1] == rhs
-        ) {
-            return false;
-        }
-        if !equality_is_pure_linear_arith(&self.ctx.terms, x) {
-            return false;
-        }
-        let farkas = FarkasAnnotation::from_ints(&[1]);
-        let lits = [TheoryLit::new(x, true)];
-        if ay_core::proof_validation::verify_farkas_conflict_lits_full(
-            &self.ctx.terms,
-            &lits,
-            &farkas,
-        )
-        .is_err()
-        {
-            return false;
-        }
-        // The printer orients equality coefficients from the certificate;
-        // require the orientation to exist so the printed signs are sound.
-        if ay_core::proof_validation::resolve_equality_coefficient_signs(
-            &self.ctx.terms,
-            &lits,
-            &farkas,
-        )
-        .is_none()
-        {
-            return false;
-        }
-        let not_x = self.ctx.terms.mk_not_raw(x);
-        let mut new_proof = Proof::new();
-        let assume_id = new_proof.add_assume(x, None);
-        let lemma = new_proof.add_step(ProofStep::TheoryLemma {
-            theory: "LRA".to_string(),
-            clause: vec![not_x],
-            farkas: Some(farkas),
-            kind: TheoryLemmaKind::LraFarkas,
-            lia: None,
-        });
-        new_proof.add_resolution(Vec::new(), x, lemma, assume_id);
         *proof = new_proof;
         true
     }

@@ -157,8 +157,12 @@ pub struct SatAbSwitches {
     /// ab_lrat_clamp_confirm_900s.json). `--sat-lrat-proof-clamp-probe-rescue
     /// false` is the opt-out; None = ON.
     pub lrat_proof_clamp_probe_rescue: Option<bool>,
-    /// `--sat-yield-rescue-backbone-cooldown` (B75; was `AY_SAT_YIELD_RESCUE_BACKBONE_COOLDOWN`)
-    pub yield_rescue_backbone_cooldown: bool,
+    /// M3 FLIP (2026-08-19): default ON — paired full-400 300s proof-mode
+    /// lost 0 / gained 1, and the 900s confirmation held the gain (arm 430s
+    /// vs base timeout at 900s) with zero regressions
+    /// (ab_backbone_cooldown_300s.json + _confirm_900s.json).
+    /// `--sat-yield-rescue-backbone-cooldown false` is the opt-out; None = ON.
+    pub yield_rescue_backbone_cooldown: Option<bool>,
     /// `--sat-bounded-backbone-zero-decompose-backoff` (B75; was `AY_SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF`)
     pub bounded_backbone_zero_decompose_backoff: bool,
     /// `--sat-bcp-learned-1963-blocker-cert-shadow` (B75; was `AY_SAT_BCP_LEARNED_1963_BLOCKER_CERT_SHADOW`)

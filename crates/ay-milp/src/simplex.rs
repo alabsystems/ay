@@ -10437,10 +10437,10 @@ impl Simplex {
         // columns), air03 (124 / 10,757), mod010 (146 / 2,655), air05 (426 / 7,195) -- against
         // every dense instance here, which sits near 1:1.
         let wide = lp.n >= DEVEX_WIDTH * lp.m.max(1);
-        // `the devex knob` forces Devex from iteration 0 regardless of shape
-        // (measurement lever: square-ish NN LPs grind Dantzig phase 1).
-        // (B22 briefly retired this as "never set" — WRONG: the
-        // milp_portfolio.py "devex" arm sets it through a dict literal.)
+        // `--devex` forces Devex from iteration 0 regardless of shape.
+        // The corpus evidence and rejected gate are recorded in
+        // `../DEVEX_MEASUREMENT.md`; mixed results keep this a caller-owned lever.
+        // `--no-devex` independently disables the wide-shape default.
         let force_devex = crate::tune::caller_flag(crate::tune::Knob::Devex) == Some(true);
         // CHAIN-shape LPs (see `FloatLp::chain_shape`) need Devex from
         // iteration 0 exactly like wide ones — on their COLD walks: the k=546

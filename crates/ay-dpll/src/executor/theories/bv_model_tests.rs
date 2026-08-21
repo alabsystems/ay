@@ -322,3 +322,229 @@ fn test_recover_substituted_bv_values_drops_unrecovered_stale_value_11936() {
         "stale value for unrecovered substituted variable must not survive"
     );
 }
+
+/// #8512-forced-or: a store-chain definition sitting in the ONLY arm of a
+/// disjunction the model does not falsify is forced, so the chain is walked and
+/// the resulting interpretation is complete — hence NOT read-conflicted.
+#[test]
+fn test_forced_or_arm_store_chain_definition_is_recovered_8512() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort);
+    let p = terms.mk_var("p", Sort::bitvec(32));
+
+    let idx1 = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let idx2 = terms.mk_bitvec(BigInt::from(7u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let inner = terms.mk_store(base, idx1, value);
+    let store = terms.mk_store(inner, idx2, value);
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    let one = terms.mk_bitvec(BigInt::from(1u8), 32);
+    let two = terms.mk_bitvec(BigInt::from(2u8), 32);
+    let p_is_one = terms.mk_eq_coerce(p, one);
+    let p_is_two = terms.mk_eq_coerce(p, two);
+    let read = terms.mk_select(mem, idx2);
+    let read_is_one = terms.mk_eq_coerce(read, value);
+    let arm_live = terms.mk_and(vec![p_is_one, def]);
+    let arm_dead = terms.mk_and(vec![p_is_two, read_is_one]);
+    let assertion = terms.mk_or(vec![arm_live, arm_dead]);
+
+    // The model sets p = 1, so `p = 2` is FALSE and the second arm cannot hold.
+    let mut values = HashMap::default();
+    values.insert(p, BigInt::from(1u8));
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+
+    assert!(
+        !array_model.read_conflicted.contains(&mem),
+        "a forced arm's chain resolves completely, so nothing should be withheld"
+    );
+    let interp = array_model
+        .array_values
+        .get(&mem)
+        .expect("forced `or` arm should recover the mem model");
+    for expected in ["#x00000003", "#x00000007"] {
+        assert!(
+            interp
+                .stores
+                .iter()
+                .any(|(idx, val)| idx == expected && val == "#xaa"),
+            "expected store at {expected} -> #xaa, got {:?}",
+            interp.stores
+        );
+    }
+}
+
+/// #8512-forced-or, the soundness half: with TWO arms the model leaves live,
+/// the disjunction forces neither, so the nested definition must NOT be adopted
+/// — the model is free to satisfy the other arm. The variable keeps its partial
+/// interpretation and stays read-conflicted.
+#[test]
+fn test_two_live_or_arms_leave_store_chain_definition_unadopted_8512() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort);
+    let p = terms.mk_var("p", Sort::bitvec(32));
+
+    let idx = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let store = terms.mk_store(base, idx, value);
+    // A bare array equality: the BV model cannot evaluate it, so this arm is
+    // never "known false" and the disjunction is not unit.
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    let two = terms.mk_bitvec(BigInt::from(2u8), 32);
+    let p_is_two = terms.mk_eq_coerce(p, two);
+    let assertion = terms.mk_or(vec![def, p_is_two]);
+
+    let mut values = HashMap::default();
+    values.insert(p, BigInt::from(2u8));
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+
+    assert!(
+        array_model.read_conflicted.contains(&mem),
+        "an unforced nested definition must leave mem withheld, not adopted"
+    );
+    assert!(
+        array_model
+            .array_values
+            .get(&mem)
+            .is_none_or(|interp| !interp.stores.iter().any(|(i, _)| i == "#x00000003")),
+        "the unforced store chain must not have been written into the model"
+    );
+}
+
+/// #8512-forced-or: a forced arm is not enough on its own. When a chain pair
+/// cannot be made concrete by the BV model the interpretation still has a hole,
+/// which would read back as the array's `default`, so the variable stays
+/// read-conflicted.
+#[test]
+fn test_forced_or_arm_with_unresolvable_chain_pair_stays_read_conflicted_8512() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort);
+    let p = terms.mk_var("p", Sort::bitvec(32));
+    // No model value and no evaluable definition: this index never resolves.
+    let opaque_idx = terms.mk_var("opaque_idx", Sort::bitvec(32));
+
+    let idx1 = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let inner = terms.mk_store(base, idx1, value);
+    let store = terms.mk_store(inner, opaque_idx, value);
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    let one = terms.mk_bitvec(BigInt::from(1u8), 32);
+    let two = terms.mk_bitvec(BigInt::from(2u8), 32);
+    let p_is_one = terms.mk_eq_coerce(p, one);
+    let p_is_two = terms.mk_eq_coerce(p, two);
+    let arm_live = terms.mk_and(vec![p_is_one, def]);
+    let arm_dead = terms.mk_and(vec![p_is_two, p_is_two]);
+    let assertion = terms.mk_or(vec![arm_live, arm_dead]);
+
+    let mut values = HashMap::default();
+    values.insert(p, BigInt::from(1u8));
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+
+    assert!(
+        array_model.read_conflicted.contains(&mem),
+        "an unresolved chain pair leaves a hole, so mem must stay withheld"
+    );
+}
+
+/// #8512-forced-or: the arm-liveness test has to see past an UNEVALUABLE
+/// conjunct. Real arms are hundred-conjunct BMC blocks that always contain an
+/// array equality the BV model cannot evaluate; `model_bool_value` returns
+/// `None` for the whole `and` in that case, which would leave every arm "live"
+/// and the disjunction never unit. The structural short-circuit — one false
+/// conjunct settles the conjunction — is what makes the rule fire at all.
+#[test]
+fn test_definitely_false_arm_short_circuits_past_an_unevaluable_conjunct_8512() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::bitvec(32), Sort::bitvec(8));
+    let base = terms.mk_var("base", array_sort.clone());
+    let mem = terms.mk_var("mem", array_sort.clone());
+    let other = terms.mk_var("other", array_sort);
+    let p = terms.mk_var("p", Sort::bitvec(32));
+
+    let idx = terms.mk_bitvec(BigInt::from(3u8), 32);
+    let value = terms.mk_bitvec(BigInt::from(0xaau8), 8);
+    let store = terms.mk_store(base, idx, value);
+    let def = terms.mk_eq_coerce_no_ite_expand(mem, store);
+
+    // The dead arm pairs a FALSE scalar with an array equality that has no
+    // model value at all. Only the short-circuit can call this arm false.
+    let other_store = terms.mk_store(base, idx, value);
+    let unevaluable = terms.mk_eq_coerce_no_ite_expand(other, other_store);
+
+    let one = terms.mk_bitvec(BigInt::from(1u8), 32);
+    let two = terms.mk_bitvec(BigInt::from(2u8), 32);
+    let p_is_one = terms.mk_eq_coerce(p, one);
+    let p_is_two = terms.mk_eq_coerce(p, two);
+    let arm_live = terms.mk_and(vec![p_is_one, def]);
+    let arm_dead = terms.mk_and(vec![p_is_two, unevaluable]);
+    let assertion = terms.mk_or(vec![arm_live, arm_dead]);
+
+    let mut values = HashMap::default();
+    values.insert(p, BigInt::from(1u8));
+    let bv_model = BvModel {
+        values,
+        term_to_bits: HashMap::default(),
+        bool_overrides: HashMap::default(),
+    };
+
+    let array_model = Executor::extract_array_model_from_bv_model(
+        &terms,
+        &bv_model,
+        &[assertion],
+        &Default::default(),
+    );
+
+    let interp = array_model
+        .array_values
+        .get(&mem)
+        .expect("the dead arm's unevaluable conjunct must not block the walk");
+    assert!(
+        interp
+            .stores
+            .iter()
+            .any(|(i, v)| i == "#x00000003" && v == "#xaa"),
+        "expected store at #x00000003 -> #xaa, got {:?}",
+        interp.stores
+    );
+}

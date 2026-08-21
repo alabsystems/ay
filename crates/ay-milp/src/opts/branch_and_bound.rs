@@ -463,6 +463,32 @@ impl EngineEconomics {
         self
     }
 
+    /// Run the root-closure diagnostic on the presolve-tightened model — the
+    /// model the SEARCH actually hands its cut loop — instead of the raw file.
+    /// Measurement-only: the diagnostic knob existed but had no typed carrier,
+    /// so it was unreachable from the harness CLIs (W-safenlp-1).
+    #[must_use]
+    pub fn with_root_closure_presolve(mut self, enabled: bool) -> Self {
+        self.root_closure_presolve = Some(enabled);
+        self
+    }
+
+    /// Float-BTRAN tableau MIR in the root cut loop (opt-in measurement arm).
+    #[must_use]
+    pub fn with_tableau_mir(mut self, enabled: bool) -> Self {
+        self.tableau_mir = Some(enabled);
+        self
+    }
+
+    /// Admit aggregated MIR (`separate_mir_agg`) into every MIR-class root round
+    /// (the measurement arm for the aggregation family; stage-two extension
+    /// rounds are unreachable on the shapes it was written for).
+    #[must_use]
+    pub fn with_mir_agg_root(mut self, enabled: bool) -> Self {
+        self.mir_agg_root = Some(enabled);
+        self
+    }
+
     /// Per-solve LP statistics line (B40 diagnostic).
     #[must_use]
     pub fn with_lp_stats(mut self, enabled: bool) -> Self {

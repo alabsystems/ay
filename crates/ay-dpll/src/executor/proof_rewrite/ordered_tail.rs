@@ -66,6 +66,17 @@ impl Executor {
             );
         }
         Self::demote_non_problem_assumptions(proof, &extended_assertions);
+        // #eq-diffvar-uncertifiable — promote the demotions that are a FRESH
+        // symbol's definitional bound to a checked `fresh_def_bound` step.
+        //
+        // AFTER the demotion, not before, and that ordering is the whole point:
+        // the checker decides freshness against the finished proof's `assume`
+        // set, so this lane has to see the same set. Before the demotion the
+        // preprocessed assertions that MENTION the fresh symbol are still
+        // `Assume` steps and every promotion would decline. See
+        // `proof_fresh_def` for the admission test and `ay_proof`'s
+        // `FreshDefRegistry` for the soundness argument the checker re-runs.
+        self.promote_fresh_definitional_bounds(proof, &extended_assertions);
         // Last resort: rebuild from the original assertions only. Failure keeps
         // the existing proof unchanged.
         self.rebuild_trust_leaf_proof_from_original_assertions(proof);

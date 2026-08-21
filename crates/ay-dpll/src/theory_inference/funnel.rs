@@ -138,6 +138,31 @@ pub(crate) fn infer_theory_lemma_kind_from_clause_terms_and_farkas<'c>(
     dt: Option<&DatatypeRegistries<'_>>,
 ) -> (TheoryLemmaKind, Cow<'c, [TermId]>) {
     let kind = infer_theory_lemma_kind_in_caller_order(terms, clause, farkas);
+    // Alethe's arithmetic antisymmetry triangle in a NON-canonical literal
+    // order. The schema is order-sensitive and the caller-order arms above
+    // cannot reorder, so `(cl (= a b) (not (<= a b)) (not (<= b a)))` — the
+    // `[1, 2, 0]` permutation the EqDiffVar definitional pairs are emitted in
+    // — otherwise stops at `LiaGeneric` and is normalized straight back to
+    // trust for want of a certificate it can never have (its conflict carries
+    // a DISEQUALITY, which no Farkas row can express).
+    //
+    // `farkas.is_none()` is the ONE guard, and it is the same split-authority
+    // rule the `Generic` residual below states for the EUF/DT arms:
+    // `validate_arith_eq_triangle` does not consume a positional certificate
+    // while downstream trace rebinding and external printing do, and this arm
+    // REORDERS, which would detach one. It needs no priority guard beyond
+    // that: `la_disequality` is the pinned calculus's own rule for exactly
+    // this rigid three-literal shape, so no other classification of a clause
+    // this recognizer accepts is more externally checkable than the one it
+    // returns.
+    if farkas.is_none() {
+        if let Some(ordered) = infer_arith_eq_triangle_permutation(terms, clause) {
+            if ordered == clause {
+                return (TheoryLemmaKind::ArithEqTriangle, Cow::Borrowed(clause));
+            }
+            return (TheoryLemmaKind::ArithEqTriangle, Cow::Owned(ordered));
+        }
+    }
     if kind != TheoryLemmaKind::Generic {
         return (kind, Cow::Borrowed(clause));
     }
@@ -192,9 +217,32 @@ fn infer_theory_lemma_kind_in_caller_order(
         return kind;
     }
     if arith_conflict_is_integer(terms, &conflict) {
+        // WIDE integer clauses whose validity is a LATTICE fact, not a
+        // rational one, would otherwise stop here: `LiaGeneric` without a
+        // certificate is normalized back to `Generic`/trust by BOTH recorders,
+        // and no rational Farkas certificate can exist for this family (its
+        // negation is satisfiable over ℚ — `2q >= 1 ∧ 2q <= 1` at `q = 1/2`).
+        // Recognition IS the strict checker's own `validate_int_bound_lattice_gap`
+        // run on exactly this clause in exactly this order, so the classifier
+        // cannot promote a clause the checker will reject. Ordered here and at
+        // the terminal `Generic` below — never ahead of a rational arm — so a
+        // lemma that DOES have a Farkas certificate keeps the externally
+        // checkable `la_generic` wire and only the residual takes the honest
+        // `hole`. The two arms cannot overlap: `synthesize_equality_farkas`,
+        // the only way a `LiaGeneric` here still earns a certificate, needs two
+        // EQUALITY literals, and an equality never parses as an integer bound.
+        if ay_core::proof_validation::recognize_int_bound_lattice_gap(terms, clause) {
+            return TheoryLemmaKind::IntBoundLatticeGap;
+        }
         return TheoryLemmaKind::LiaGeneric;
     }
-    infer_opaque_farkas_kind(terms, &conflict, farkas).unwrap_or(TheoryLemmaKind::Generic)
+    if let Some(kind) = infer_opaque_farkas_kind(terms, &conflict, farkas) {
+        return kind;
+    }
+    if ay_core::proof_validation::recognize_int_bound_lattice_gap(terms, clause) {
+        return TheoryLemmaKind::IntBoundLatticeGap;
+    }
+    TheoryLemmaKind::Generic
 }
 
 /// Preserve the established arithmetic classifications before the C3
@@ -259,6 +307,44 @@ fn infer_opaque_farkas_kind(
         None => false,
     };
     valid.then_some(TheoryLemmaKind::LraFarkas)
+}
+
+/// Try to classify a three-literal clause as Alethe's arithmetic
+/// equality-antisymmetry triangle in ANY literal order, returning it in the
+/// VALIDATOR's order (`[not_forward, not_reverse, equality]`).
+///
+/// The two gates that keep the classifier equal to the validator are the same
+/// pair [`infer_euf_lemma_from_clause`] documents, and here the first is
+/// discharged by construction rather than by a check: every candidate is a
+/// PERMUTATION of the caller's three literals, so the recorded clause is
+/// always the caller's literal multiset and trace-side set-equivalence
+/// authentication is unaffected. The second gate is
+/// `ay_proof::recognize_arith_eq_triangle`, i.e. the strict checker's own
+/// `validate_arith_eq_triangle` run on exactly the order that will be
+/// recorded — so a permutation the checker would reject is never returned.
+///
+/// All six permutations are probed rather than the one the benchmark needs:
+/// the schema pins each position to a distinct term shape (`not`-wrapped `<=`
+/// twice, then a bare `=`), so at most one permutation can be accepted and the
+/// sweep cannot make acceptance order-dependent.
+fn infer_arith_eq_triangle_permutation(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<Vec<TermId>> {
+    let &[a, b, c] = clause else {
+        return None;
+    };
+    [
+        [a, b, c],
+        [a, c, b],
+        [b, a, c],
+        [b, c, a],
+        [c, a, b],
+        [c, b, a],
+    ]
+    .into_iter()
+    .find(|ordered| ay_proof::recognize_arith_eq_triangle(terms, ordered))
+    .map(Vec::from)
 }
 
 /// Try to classify a materialized clause as an EUF lemma
@@ -335,7 +421,28 @@ fn infer_euf_lemma_from_clause(
 /// evaluation (the `_with_selectors` variant, matching the checker's
 /// `DatatypeTesterEval` dispatch which always receives both registries), then
 /// constructor distinctness. Everything declined stays `Generic`.
-fn infer_dt_lemma_kind(
+pub(crate) fn infer_dt_lemma_kind(
+    terms: &TermStore,
+    clause: &[TermId],
+    dt: &DatatypeRegistries<'_>,
+) -> Option<TheoryLemmaKind> {
+    infer_dt_lemma_kind_specific(terms, clause, dt).or_else(|| {
+        // General ground conflict (#dt-ground-conflict), probed LAST: the
+        // named schemas above carry precise wire rules; the refuter is the
+        // catch-all for whatever structural mix they declined.
+        ay_proof::recognize_datatype_ground_conflict(terms, clause, dt.datatypes, dt.ctor_selectors)
+            .then_some(TheoryLemmaKind::DatatypeGroundConflict)
+    })
+}
+
+/// The named single-schema DT lanes ONLY — no ground-refuter catch-all.
+///
+/// The conflict-path classifier uses this variant so the general refuter
+/// cannot preempt `classifiable_core_decomposition`: a mixed conflict with a
+/// supported-wire core (e.g. an array read-over-write core + weakening) must
+/// keep that precise rendering; the refuter runs strictly AFTER decomposition
+/// declines (see `record_theory_conflict_unsat_with_annotation_and_dt`).
+pub(crate) fn infer_dt_lemma_kind_specific(
     terms: &TermStore,
     clause: &[TermId],
     dt: &DatatypeRegistries<'_>,
@@ -359,6 +466,35 @@ fn infer_dt_lemma_kind(
     // identically at certification.
     if ay_proof::recognize_datatype_acyclic_direct(terms, clause, dt.datatypes) {
         return Some(TheoryLemmaKind::DatatypeAcyclicDirect);
+    }
+    // Constructor coverage, pairwise tester exclusivity, guarded
+    // reconstruction, and the value-equality biconditionals (incl. the (F3)
+    // nullary tester bridge): the same recognizer==validator families the
+    // injected-axiom recorder probes (`record_dt_axiom_theory_lemmas`), so
+    // funnel and recorder classification cannot drift. The bridge matters to
+    // the #dt-context-derivation premise discharge: level-0 reason chains
+    // bottom out at these injected activation units.
+    if ay_proof::recognize_datatype_exhaustive(terms, clause, dt.datatypes) {
+        return Some(TheoryLemmaKind::DatatypeExhaustive);
+    }
+    if ay_proof::recognize_datatype_tester_exclusive(terms, clause, dt.datatypes) {
+        return Some(TheoryLemmaKind::DatatypeTesterExclusive);
+    }
+    if ay_proof::recognize_datatype_constructor_reconstruct(
+        terms,
+        clause,
+        dt.datatypes,
+        dt.ctor_selectors,
+    ) {
+        return Some(TheoryLemmaKind::DatatypeConstructorReconstruct);
+    }
+    if ay_proof::recognize_datatype_value_eq_congruence(
+        terms,
+        clause,
+        dt.datatypes,
+        dt.ctor_selectors,
+    ) {
+        return Some(TheoryLemmaKind::DatatypeValueEqCongruence);
     }
     None
 }

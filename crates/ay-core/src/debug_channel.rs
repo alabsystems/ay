@@ -1131,6 +1131,18 @@ pub struct MiscCliFlags {
     pub no_quant_unit_authority: bool,
     /// `--no-consequence-replay` — disable authored consequence replay (B66).
     pub no_consequence_replay: bool,
+    /// `--no-quantified-shedding-yield` — restore proof shedding on QUANTIFIED
+    /// public queries (#quantified-shedding-yield). Default off, i.e. shedding
+    /// yields. Setting this reinstates the measured non-monotone rigor ladder
+    /// where `--rigor fast` publishes strictly fewer answers than `--rigor
+    /// standard` on quantified problems; it exists only so the barrier can be
+    /// mutation-tested.
+    pub no_quantified_shedding_yield: bool,
+    /// `--no-negated-exists-ground-inst` — disable the negated-existential
+    /// ground-instantiation artifact-firewall translation
+    /// (#inc-fparith-negated-exists-inst). UNSAT-only; disabling restores the
+    /// baseline fail-closed `unknown` byte-for-byte.
+    pub no_negated_exists_ground_inst: bool,
     /// `--no-ground-conflict-decomp` — disable the ground-conflict
     /// decomposition arms of the proof builder (#ground-conflict-decomp):
     /// the EUF-chain + Farkas-bridge split, and the array read-over-write
@@ -1289,6 +1301,16 @@ pub struct MiscCliFlags {
     pub max_propagate_rounds: Option<u64>,
     /// `--lra-cond-trail` (B75): experimental LRA conditional bound trail.
     pub lra_cond_trail: bool,
+    /// `--euf-inc-neg-pop` (B77): experimental EUF incremental negative-pop arm.
+    /// Default-flip A/B 2026-08-20: NOT A WIN (+2/314 runs, both limit-edge;
+    /// median unchanged) — stays opt-in. the development design notes.
+    pub euf_inc_neg_pop: bool,
+    /// `--nra-diag` (B77): NRA ICP diagnostics.
+    pub nra_diag: bool,
+    /// `--nra-grid-probe` (B77): NRA ICP grid probe diagnostics.
+    pub nra_grid_probe: bool,
+    /// `--nra-witness <PATH>` (B77): NRA witness dump path.
+    pub nra_witness: Option<String>,
 }
 
 /// Global miscellaneous CLI flags, initialized once per process.
@@ -1305,7 +1327,6 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
                                          // B72: --dpll-trace-file is the carrier; env fallback deleted.
     let dpll_trace_file = None;
     MiscCliFlags {
-        // B72: --dump-auflia-assertions is the carrier; env fallback deleted.
         dump_auflia_assertions: false,
         sat_variant: std::env::var("AY_SAT_VARIANT")
             .ok()
@@ -1433,6 +1454,8 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         keep_alethe_artifacts: false,
         no_quant_unit_authority: false,
         no_consequence_replay: false,
+        no_quantified_shedding_yield: false,
+        no_negated_exists_ground_inst: false,
         no_ground_conflict_decomp: false,
         vacuous_marker_narrow: false,
         proj_axiom_budget: None,
@@ -1511,6 +1534,11 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         max_propagate_rounds: None,
         // B75: --lra-cond-trail is the carrier; no env fallback.
         lra_cond_trail: false,
+        // B77: the reintroduced euf/nra experiment + diagnostics reads.
+        euf_inc_neg_pop: false,
+        nra_diag: false,
+        nra_grid_probe: false,
+        nra_witness: None,
     }
 }
 
@@ -1616,72 +1644,4 @@ pub fn set_global_misc_cli_flags_with(configure: impl FnOnce(&mut MiscCliFlags))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    include!("debug_channel/tests.rs");
-
-    /// The consumer-facing half of the measurement gap: a Rust-API caller can
-    /// name a diagnostic channel without naming all ~120 `MiscCliFlags` fields,
-    /// and building the value installs nothing.
-    #[test]
-    fn misc_cli_flags_with_applies_configuration_and_installs_nothing() {
-        let base = misc_cli_flags_with(|_| {});
-        assert!(
-            !base.probe_cert_reject && !base.phase_trace && !base.debug_cert,
-            "no AY_* fallback may resurrect a retired diagnostic carrier"
-        );
-
-        let tuned = misc_cli_flags_with(|flags| {
-            flags.probe_cert_reject = true;
-            flags.phase_trace = true;
-        });
-        assert!(tuned.probe_cert_reject, "configure must be applied");
-        assert!(tuned.phase_trace, "configure must be applied");
-        assert!(
-            !tuned.debug_cert,
-            "configure must not disturb the fields it did not name"
-        );
-
-        // Purity: building a value must not initialize (or mutate) the global.
-        let before = misc_cli_flags().probe_cert_reject;
-        let _ = misc_cli_flags_with(|flags| flags.probe_cert_reject = true);
-        assert_eq!(
-            misc_cli_flags().probe_cert_reject,
-            before,
-            "misc_cli_flags_with must be pure"
-        );
-    }
-
-    #[test]
-    #[serial(trace_file_claim)]
-    fn test_trace_file_available_false_when_no_env_var() {
-        // In the test environment no trace file is configured,
-        // so trace_file_available() should return false regardless of claim state.
-        release_trace_file();
-        assert!(
-            !trace_file_available(),
-            "trace_file_available should be false when no trace file is configured"
-        );
-    }
-
-    #[test]
-    #[serial(trace_file_claim)]
-    fn test_claim_release_cycle() {
-        // Simulate a solver reuse scenario: claim -> solve -> release -> claim again
-        release_trace_file();
-
-        claim_trace_file();
-        assert!(TRACE_FILE_CLAIMED.load(Ordering::Acquire));
-
-        release_trace_file();
-        assert!(!TRACE_FILE_CLAIMED.load(Ordering::Acquire));
-
-        // Second solve can claim again
-        claim_trace_file();
-        assert!(TRACE_FILE_CLAIMED.load(Ordering::Acquire));
-
-        release_trace_file();
-    }
-}
+mod tests;

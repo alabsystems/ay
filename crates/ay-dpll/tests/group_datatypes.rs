@@ -9,6 +9,8 @@
 
 mod common;
 
+#[path = "group_datatypes/cause_b_parsed_gate.rs"]
+mod cause_b_parsed_gate;
 #[path = "group_datatypes/dt_array_field_model_witness.rs"]
 mod dt_array_field_model_witness;
 #[path = "group_datatypes/dt_bv_selector_over_ite_soundness.rs"]

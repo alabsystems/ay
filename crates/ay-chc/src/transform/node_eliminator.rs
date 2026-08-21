@@ -316,6 +316,77 @@ mod tests {
         }
     }
 
+    /// Loop-SCC linearization: a mutual-recursion 2-cycle of multi-defined
+    /// block predicates (A <-> B, neither self-recursive, each with two
+    /// definitions) is exactly the shape the contracted loop SCC of a counted
+    /// loop reduces to. The default `#9604` rule forbids BOTH cycle endpoints
+    /// (refusing to break the cycle); graph-collapse must drop ONE endpoint and
+    /// eliminate the other by one-level resolution, leaving a SINGLE
+    /// self-recursive predicate (the shape PDR discharges). Verdict preserved
+    /// (Safe) and the back-translated model validates on the ORIGINAL clauses.
+    #[test]
+    fn linearizes_mutual_recursion_cycle_and_proves_safe() {
+        let input = r#"
+(set-logic HORN)
+(declare-fun A (Int) Bool)
+(declare-fun B (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (A x))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (< x 10) (= y (+ x 1))) (B y))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (>= x 10) (= y x)) (B y))))
+(assert (forall ((x Int)) (=> (and (B x) (>= x 0)) (A x))))
+(assert (forall ((x Int)) (=> (and (B x) (< x 0)) false)))
+(check-sat)
+"#;
+        let problem = parse(input);
+        let result = collapse(problem.clone());
+
+        // The 2-cycle must linearize to at most a single (self-recursive)
+        // predicate — the previous behavior left both A and B in place.
+        assert!(
+            result.problem.predicates().len() <= 1,
+            "mutual-recursion cycle must linearize to <=1 predicate, got {}",
+            result.problem.predicates().len()
+        );
+
+        let mut solver = PdrSolver::new(result.problem.clone(), bounded_pdr_config());
+        match solver.solve() {
+            PdrResult::Safe(model) => {
+                let translated = result.back_translator.translate_validity(model);
+                let mut verifier = PdrSolver::new(problem, bounded_pdr_config());
+                assert!(
+                    verifier.verify_model(&translated),
+                    "back-translated model must verify on the original mutual-recursion clauses"
+                );
+            }
+            other => panic!("expected Safe on linearized mutual recursion, got {other:?}"),
+        }
+    }
+
+    /// The same mutual-recursion linearization must preserve a reachable bad
+    /// state: when the back-edge decrements past zero the collapsed single
+    /// predicate stays Unsafe (satisfiability preserved exactly).
+    #[test]
+    fn linearizes_mutual_recursion_cycle_preserves_unsafe() {
+        let input = r#"
+(set-logic HORN)
+(declare-fun A (Int) Bool)
+(declare-fun B (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (A x))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (< x 10) (>= x 0) (= y (- x 1))) (B y))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (>= x 10) (= y x)) (B y))))
+(assert (forall ((x Int)) (=> (and (B x) (>= x 0)) (A x))))
+(assert (forall ((x Int)) (=> (and (B x) (< x 0)) false)))
+(check-sat)
+"#;
+        let problem = parse(input);
+        let result = collapse(problem);
+        let mut solver = PdrSolver::new(result.problem, bounded_pdr_config());
+        match solver.solve() {
+            PdrResult::Unsafe(_) => {}
+            other => panic!("expected Unsafe on linearized mutual recursion, got {other:?}"),
+        }
+    }
+
     /// Oversized problems must pass through untouched (identity translator).
     #[test]
     fn oversized_problem_skips_collapse() {

@@ -41,6 +41,9 @@ impl Executor {
         // ordered roots are rechecked below.
         self.last_unsat_certificate = None;
         let Some(assumption_entries) = UnsatQueryEpoch::capture_entries(self, assumptions) else {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!("CERT/epoch cleared: bind_unsat_query_assumptions decline");
+            }
             self.unsat_query_epoch = None;
             return;
         };
@@ -48,6 +51,12 @@ impl Executor {
             return;
         };
         if !epoch.is_current(self) {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!(
+                    "CERT/epoch cleared: bind stale (not current) exec={:p}",
+                    self as *const _
+                );
+            }
             self.unsat_query_epoch = None;
             return;
         }
@@ -67,6 +76,12 @@ impl Executor {
             _ => true,
         };
         if retire {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!(
+                    "CERT/epoch cleared: bind retire (assumption change) exec={:p}",
+                    self as *const _
+                );
+            }
             self.unsat_query_epoch = None;
             return;
         }
@@ -120,6 +135,12 @@ impl Executor {
         self.last_unsat_certificate = None;
         self.pending_nested_array_bool_bv_unsat = None;
         if !matches!(state, Some((true, false))) {
+            if ay_core::misc_cli_flags().debug_cert {
+                eprintln!(
+                    "CERT/epoch cleared: literal-false-source retire exec={:p}",
+                    self as *const _
+                );
+            }
             self.unsat_query_epoch = None;
             return;
         }

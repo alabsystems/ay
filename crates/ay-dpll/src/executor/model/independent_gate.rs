@@ -50,6 +50,7 @@ use super::{EvalValue, Model, QuantifiedConfirmationModelEpoch};
 use crate::ematching::contains_quantifier;
 use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
 use crate::executor::{Executor, QueryAuthorityEpoch};
+use crate::executor_format::format_default_value_surface;
 use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
@@ -203,6 +204,61 @@ struct IndependentModelView<'a> {
     /// conditions (bool/bv discriminators, independent of array defs) evaluate
     /// without recursing back into a half-built index.
     building_index: Cell<bool>,
+    /// Memo of the PUBLISHED total UF interpretation per function identity
+    /// (#g3-gate-reads-printed-uf, perf-only). Deriving it re-resolves every
+    /// `@?N` placeholder in the whole function table, so without this memo an
+    /// input with many applications of one large-table function costs
+    /// O(applications x table rows) (the clearsy_00302 prefix publishes 1,067
+    /// `define-fun`s). The rows are a pure function of the FIXED model,
+    /// exactly like `resolved`/`def_index`, so memoizing changes how OFTEN
+    /// they are derived and never what they are. `None` records "no printed
+    /// total interpretation to reconcile against" (the printer publishes this
+    /// symbol through another channel, or cannot print it) so the derivation
+    /// is not retried.
+    printed_uf_tables: RefCell<HashMap<String, Option<Rc<PrintedUfInterpretation>>>>,
+}
+
+/// The PUBLISHED total interpretation of one uninterpreted function, i.e. the
+/// `(define-fun f ((x0 S0) ..) T (ite (and (= x0 a0) ..) v0 .. else))` body
+/// `(get-model)` renders, read back into gate values ONCE at derivation time
+/// (#g3-gate-reads-printed-uf). `rows` are the `ite` arms in printed
+/// (first-match) order and `else_value` the final branch; an empty table
+/// prints as the canonical constant body, which is `else_value` with no rows.
+struct PrintedUfInterpretation {
+    arity: usize,
+    rows: Vec<(Vec<ModelValue>, ModelValue)>,
+    else_value: ModelValue,
+}
+
+impl PrintedUfInterpretation {
+    /// Evaluate the printed body at `arg_values` with the printer's own
+    /// first-match rule (`format_function_body`). `None` on an arity mismatch
+    /// or when a row key and the gate's argument value are of INCOMPARABLE
+    /// shapes (one value in two encodings): the evaluator's `uf_graph` treats
+    /// that as an error, not as "not this row", and silently falling through
+    /// to the `else` branch would answer from an arm the printed `ite` chain
+    /// would not select.
+    fn value_at(&self, arg_values: &[ModelValue]) -> Option<&ModelValue> {
+        if arg_values.len() != self.arity {
+            return None;
+        }
+        for (row_args, row_value) in &self.rows {
+            let mut matches_point = true;
+            for (expected, actual) in row_args.iter().zip(arg_values) {
+                if std::mem::discriminant(expected) != std::mem::discriminant(actual) {
+                    return None;
+                }
+                if !values_equal(expected, actual) {
+                    matches_point = false;
+                    break;
+                }
+            }
+            if matches_point {
+                return Some(row_value);
+            }
+        }
+        Some(&self.else_value)
+    }
 }
 
 impl ModelView for IndependentModelView<'_> {
@@ -650,6 +706,62 @@ impl ModelView for IndependentModelView<'_> {
             .flatten()
     }
 
+    /// RECONCILED read of a UF application at the argument point the gate
+    /// computed itself (#g3-gate-reads-printed-uf).
+    ///
+    /// Two sources can answer: the per-application PIN
+    /// ([`uf_app_value`](Self::uf_app_value), keyed by TermId) and the
+    /// PUBLISHED total interpretation
+    /// ([`printed_uf_interpretation`](Self::printed_uf_interpretation), the
+    /// `(define-fun f ..)` body `(get-model)` prints). They are reconciled, not
+    /// prioritised — the defect that kept the first version of this patch out
+    /// of main (the development design notes) was
+    /// "pin wins, else printed table": a function answered partly from pins and
+    /// partly from the printed body is self-consistent to the value-keyed
+    /// `uf_graph` yet can differ from the interpretation the model PUBLISHES,
+    /// yielding a `sat` whose own printed witness a validator refutes.
+    ///
+    ///   * no printed total interpretation for this function  => the pin, or
+    ///     `None` (byte-for-byte today's behaviour — the printer publishes the
+    ///     symbol through another channel or cannot print it, so there is no
+    ///     second interpretation to certify against);
+    ///   * printed body exists, no pin                         => the printed
+    ///     value at this point (the gap this closes: the model is total and
+    ///     printable but the application TermId was never pinned);
+    ///   * printed body exists AND a pin exists                => the pin ONLY
+    ///     if the printed body gives the SAME value at this point; a
+    ///     disagreement returns `None` (`CannotConfirm`, fail-closed).
+    ///
+    /// Because EVERY application the evaluator routes here is checked against
+    /// the printed body whenever one exists, a confirmed verdict certifies the
+    /// PUBLISHED interpretation — never a hybrid. A stale certified
+    /// constant-interpretation package closes the application before either
+    /// source is consulted, exactly as in `uf_app_value`.
+    fn uf_app_value_at(&self, t: TermId, arg_values: &[ModelValue]) -> Option<ModelValue> {
+        if self.certified_const_interp_value(t).is_err() {
+            return None;
+        }
+        let pin = self.uf_app_value(t);
+        let Some(interp) = self.printed_uf_interpretation_for_app(t) else {
+            return pin;
+        };
+        let printed = interp.value_at(arg_values)?;
+        match pin {
+            None => Some(printed.clone()),
+            Some(p) if values_equal(&p, printed) => Some(p),
+            Some(p) => {
+                tracing::debug!(
+                    term = ?t,
+                    pinned = ?p,
+                    printed = ?printed,
+                    "#g3-gate-reads-printed-uf: per-application pin disagrees with the \
+                     printed total interpretation at this argument point; failing closed"
+                );
+                None
+            }
+        }
+    }
+
     /// The model's committed value for an array-`select` read `t` = `(select A
     /// i)`. The gate calls this ONLY when it could not resolve `A` to a concrete
     /// `(default, finite-store)` interpretation (a partial/unreconstructable
@@ -709,6 +821,7 @@ impl<'a> IndependentModelView<'a> {
             cycle_hits: Cell::new(0),
             def_index: caches.def_index,
             building_index: Cell::new(false),
+            printed_uf_tables: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -791,13 +904,34 @@ impl IndependentModelView<'_> {
     /// The root object for a Real leaf the NRA lane assigned an algebraic
     /// value, re-validated by the independent checker.
     ///
-    /// Only the algebraic POINT is published. A non-identity residue is a
-    /// derived expression rather than a variable's assignment, and the gate
-    /// computes derived values itself from the term — so declining here keeps
-    /// the checker's arithmetic independent of the solver's.
+    /// Only the algebraic POINT is published, plus a residue that reduces to an
+    /// exact rational (which is what the model printer emits for it anyway). An
+    /// IRRATIONAL non-identity residue is a derived expression rather than a
+    /// variable's assignment, and the gate computes derived values itself from
+    /// the term — so declining that keeps the checker's arithmetic independent
+    /// of the solver's.
     fn algebraic_leaf(&self, t: TermId) -> Option<ModelValue> {
         let value = self.exec.nra_algebraic_model.get(&t)?;
         if !value.is_identity() {
+            // A residue that reduces to an exact RATIONAL is a rational leaf
+            // wearing an algebraic representation, and the model PRINTER
+            // already emits it as one: `output.rs` resolves the same
+            // `to_number_for_output()` and writes `format_real(&r)`. Declining
+            // it here left the gate reading `EvalValue::Algebraic` — which
+            // `eval_value_to_model_value` maps to `None` — so the leaf came out
+            // UNPINNED and a witness that prints as ordinary SMT-LIB failed
+            // closed to `unknown`. Publishing the same rational the printer
+            // publishes is what keeps gate and emitted model in agreement; the
+            // gate still checks every assertion under it, so a wrong value is
+            // caught as `ModelViolates`, never confirmed.
+            //
+            // A genuinely IRRATIONAL residue stays declined: only the algebraic
+            // POINT is published, because a derived expression is something the
+            // gate computes itself from the term — declining keeps the checker's
+            // arithmetic independent of the solver's.
+            if let Some(ay_nra::RealScalar::Rational(rational)) = value.to_number_for_output() {
+                return Some(ModelValue::Real(rational));
+            }
             return None;
         }
         let alpha = value.alpha();
@@ -1954,6 +2088,228 @@ impl IndependentModelView<'_> {
             None => {}
         }
         result
+    }
+
+    /// The PUBLISHED total interpretation of the function applied at `t`, or
+    /// `None` when `t` is not a positive-arity application or `(get-model)`
+    /// would not print one through the EUF-table route
+    /// (#g3-gate-reads-printed-uf).
+    ///
+    /// WHY THIS EXISTS. Commit 66538b006f turned the `CannotConfirm` arm of
+    /// `apply_independent_model_gate` from fail-OPEN into fail-CLOSED. That is
+    /// the right posture, but it exposed a gap: a model can interpret a
+    /// function TOTALLY without pinning the individual application term.
+    /// `(get-model)` serialises such a function as a complete
+    /// `(define-fun f (..) S (ite <point> v .. else))`, so every EXTERNAL
+    /// consumer sees a total interpretation — but
+    /// [`uf_app_value`](Self::uf_app_value) resolves only through
+    /// `Executor::evaluate_term`, keyed by the application's TermId, and
+    /// returns `Unknown` at an argument point the extracted table does not
+    /// list. The gate then downgraded a model that is total, printable and
+    /// (measured) VALID: over the 10,773-file census in
+    /// the development design notes this is
+    /// mechanism class C — 4 files / 12 query-level `sat`s, z3 4.16.0 and
+    /// cvc5 1.3.0 agreeing `sat` on every one, and z3 re-checking the emitted
+    /// 1,067-`define-fun` model of
+    /// `benchmarks/smt/regression/euf_bool_arg_guard_seed/clearsy_00302_prefix3.smt2`
+    /// as `sat`. The 4th file (`QF_AUFLIA/cvc/fb_var_27_8.smt2`, an
+    /// ARRAY-returning UF) stays closed and SHOULD: its `(get-model)` answers
+    /// `(error "model value for function RF is not available ...")`, which is
+    /// exactly the `None` this function returns for an unprintable table.
+    ///
+    /// FAITHFULNESS. The rows come from [`Executor::printed_uf_table_rows`] —
+    /// the function whose output `format_function_table` renders — after the
+    /// SAME placeholder sequencing, `@?N` resolution and datatype e-graph
+    /// rewrite the printer applies, and are read back with the printer's
+    /// first-match/else rule. The publication guards below mirror the branch
+    /// order of `Executor::format_model`: a symbol the printer suppresses or
+    /// publishes through another channel (projection, certified total UF,
+    /// constant-interpretation certificate, formula-neutral default, adopted
+    /// macro, problem-defined, DT-internal, solver-internal) has NO EUF-table
+    /// interpretation in the emitted model, so reading one here would certify
+    /// against something the validator never sees. Every failure is `None`:
+    /// with a pin the gate then behaves exactly as before this patch, without
+    /// one it stays `CannotConfirm`.
+    fn printed_uf_interpretation_for_app(&self, t: TermId) -> Option<Rc<PrintedUfInterpretation>> {
+        let TermData::App(sym, args) = self.exec.ctx.terms.get(t) else {
+            return None;
+        };
+        if args.is_empty() {
+            return None;
+        }
+        let interp = self.printed_uf_interpretation(sym.name())?;
+        (interp.arity == args.len()).then_some(interp)
+    }
+
+    /// Derive (once per view) the PUBLISHED total interpretation of the
+    /// function whose model identity is `identity`; see
+    /// [`Self::printed_uf_interpretation_for_app`].
+    fn printed_uf_interpretation(&self, identity: &str) -> Option<Rc<PrintedUfInterpretation>> {
+        if let Some(hit) = self.printed_uf_tables.borrow().get(identity) {
+            return hit.clone();
+        }
+        let built = self.build_printed_uf_interpretation(identity).map(Rc::new);
+        self.printed_uf_tables
+            .borrow_mut()
+            .insert(identity.to_string(), built.clone());
+        built
+    }
+
+    /// Uncached body of [`Self::printed_uf_interpretation`]: the printer's own
+    /// pipeline, in the printer's order, over the model's extracted table.
+    fn build_printed_uf_interpretation(&self, identity: &str) -> Option<PrintedUfInterpretation> {
+        let euf = self.model.euf_model.as_ref()?;
+        let raw = euf.function_tables.get(identity)?;
+
+        // Locate the DECLARED signature `(get-model)` would print this table
+        // under, and reproduce the printer's suppression / other-channel
+        // rules (`Executor::format_model`, same order).
+        let ctx = &self.exec.ctx;
+        let (surface, info) = ctx
+            .symbol_iter()
+            .find(|(name, info)| ctx.symbol_identity_name(name, info) == identity)?;
+        if self.exec.is_exact_dt_internal_symbol(identity) || ctx.is_internal_symbol(surface) {
+            return None;
+        }
+        let symbol = Symbol::named(identity);
+        if !matches!(
+            self.model.projection_ufs.projected_argument_for_signature(
+                &symbol,
+                &info.arg_sorts,
+                &info.sort,
+            ),
+            Ok(None)
+        ) {
+            return None;
+        }
+        if self
+            .model
+            .certified_total_ufs
+            .by_symbol
+            .contains_key(identity)
+            || self
+                .exec
+                .const_interp_cert_witness_entries(self.model)
+                .iter()
+                .any(|entry| entry.name() == Some(surface.as_str()))
+            || self
+                .model
+                .has_formula_neutral_function_default_symbol(&symbol)
+            || ctx.adopted_macro_interp(surface).is_some()
+            || ctx.is_defined_fun(surface)
+        {
+            return None;
+        }
+        let arg_sorts: &[Sort] = &info.arg_sorts;
+        let result_sort = &info.sort;
+        if arg_sorts.is_empty() {
+            return None;
+        }
+
+        let table = self
+            .exec
+            .sequence_table_provenance_placeholders(
+                identity,
+                arg_sorts,
+                result_sort,
+                raw,
+                euf.function_table_terms.get(identity).map(Vec::as_slice),
+            )
+            .ok()?;
+        let table = self.exec.resolve_function_table(self.model, &table);
+        let table =
+            match self
+                .exec
+                .dt_egraph_rewrite_uf_table(self.model, arg_sorts, result_sort, &table)
+            {
+                super::dt_egraph_values::DtUfTableRewrite::NotApplicable => table,
+                super::dt_egraph_values::DtUfTableRewrite::Rewritten(t) => t,
+                // The printer OMITS this definition, leaving the model partial here.
+                super::dt_egraph_values::DtUfTableRewrite::Drop => return None,
+            };
+        let rows = self
+            .exec
+            .printed_uf_table_rows(identity, arg_sorts, result_sort, &table, self.model)
+            .ok()?;
+
+        // Read the printed body back into gate values ONCE. An atom this view
+        // cannot parse — or parses into anything but the gate's canonical
+        // encoding for its sort — leaves the whole interpretation unreadable
+        // (`None`): a partially readable body could match the wrong `ite` arm.
+        // MEASURED instance of the encoding case: for a QF_UFDT enum
+        // `(declare-datatype Unit ((u0) (u1)))` the EUF table of `f : Unit ->
+        // Unit` is keyed by the class tokens `@Unit!N`, and `(get-model)`
+        // prints `(ite (= x0 (as @Unit!1 Unit)) (as @Unit!0 Unit) ..)` while
+        // the gate (and the printed constant `x`) hold the value as the
+        // CONSTRUCTOR `u1` (#dt-element-canon). Those tokens would never match
+        // a constructor-valued argument, so every read would fall to the
+        // `else` arm; the table is therefore declared unreadable and the
+        // application keeps today's pin-only read
+        // (`test_enum_sat_lane_gate_excludes_uf_at_variable_args` pins that).
+        let read_atom = |atom: &str, sort: &Sort| -> Option<ModelValue> {
+            let v = self.parse_leaf(atom, sort)?;
+            self.printed_atom_in_gate_encoding(&v, sort).then_some(v)
+        };
+        let Some((_, else_atom)) = rows.last() else {
+            // Empty table => the printer emits the canonical constant body.
+            let else_value =
+                read_atom(&format_default_value_surface(ctx, result_sort), result_sort)?;
+            return Some(PrintedUfInterpretation {
+                arity: arg_sorts.len(),
+                rows: Vec::new(),
+                else_value,
+            });
+        };
+        let else_value = read_atom(else_atom, result_sort)?;
+        let mut parsed_rows = Vec::with_capacity(rows.len() - 1);
+        for (row_args, row_value) in rows.iter().take(rows.len() - 1) {
+            if row_args.len() != arg_sorts.len() {
+                return None;
+            }
+            let mut point = Vec::with_capacity(row_args.len());
+            for (atom, sort) in row_args.iter().zip(arg_sorts) {
+                point.push(read_atom(atom, sort)?);
+            }
+            parsed_rows.push((point, read_atom(row_value, result_sort)?));
+        }
+        Some(PrintedUfInterpretation {
+            arity: arg_sorts.len(),
+            rows: parsed_rows,
+            else_value,
+        })
+    }
+
+    /// Whether `v` is the encoding in which THIS view hands values of `sort`
+    /// to the evaluator — the only encoding a printed atom may be compared
+    /// against (#g3-gate-reads-printed-uf, see
+    /// [`Self::build_printed_uf_interpretation`]). A datatype sort, including
+    /// one lowered to `Sort::Uninterpreted`, is always `Datatype`
+    /// (#dt-element-canon); sorts this gate reads only through richer paths
+    /// (`Seq`, `RegLan`, `Char`, algebraic Reals) are declined, which keeps the
+    /// printed-table read CLOSED there rather than guessing.
+    fn printed_atom_in_gate_encoding(&self, v: &ModelValue, sort: &Sort) -> bool {
+        use ModelValue as V;
+        if self.exec.datatype_sort_name(sort).is_some() {
+            return matches!(v, V::Datatype { .. });
+        }
+        match (sort, v) {
+            (Sort::Bool, V::Bool(_))
+            | (Sort::Int, V::Int(_))
+            | (Sort::Real, V::Real(_))
+            | (Sort::String, V::Str(_))
+            | (Sort::Uninterpreted(_), V::Uninterpreted(_))
+            | (Sort::Array(_), V::Array(_)) => true,
+            (Sort::BitVec(bv), V::BitVec { width, .. }) => bv.width == *width,
+            (
+                Sort::FloatingPoint(eb, sb),
+                V::FloatingPoint {
+                    exponent_bits,
+                    significand_bits,
+                    ..
+                },
+            ) => *eb == *exponent_bits && *sb == *significand_bits,
+            _ => false,
+        }
     }
 
     /// Parse a model-emitted value string for the given sort into a gate value,
@@ -4283,23 +4639,10 @@ impl Executor {
             );
             return result;
         }
-        // FINITE-SORT (FP) CERTIFICATE PRODUCER (#inc-fp-no-complete-lane).
-        //
-        // A conjunctive-position `exists` over `FloatingPoint` binders is
-        // Skolemized by the quantifier loop, so it is neither uninstantiated
-        // nor unhandled and `try_mbqi_refinement` — and with it the finite-sort
-        // lane — is never reached. The ground `Sat` arrives here instead, where
-        // the leaf cannot be evaluated against a partially-pinned model and the
-        // gate fails closed. Try to ESTABLISH the certificate rather than only
-        // consult one: the lane discharges each authored leaf with checked
-        // ground solves (Skolemization for an existential, a pinned refutation
-        // of the negation for a universal) and installs the same full-domain
-        // authority the consult below reads. It mutates no assertions and runs
-        // no outer re-solve, and its own sub-solves are quantifier-free so they
-        // return from this gate immediately.
-        if !self.bv_quantifier_full_domain_proof {
-            self.try_finite_model_sat_certificate();
-        }
+        // FINITE-SORT (FP) authority is consult-only here. Its producer runs
+        // before strict validation in `emit_sat_verdict`; establishing it at
+        // this point would replace the model after the strict gate and let
+        // stale validation evidence survive a semantic witness mutation.
         // A BV quantifier full-domain proof is equally authoritative: every
         // binder value was covered either by exact finite-domain expansion,
         // exhaustive BV-MBQI enumeration, or a symbolic entailment refutation.
@@ -10727,6 +11070,166 @@ mod tests {
             &mut elems,
         )
         .is_none());
+    }
+    // -----------------------------------------------------------------------
+    // #g3-gate-reads-printed-uf — RECONCILED read of the published UF
+    // interpretation (`IndependentModelView::uf_app_value_at`).
+    //
+    // These forge the model directly (no `check-sat`), so each pair below
+    // holds the FORMULA and the CODE PATH fixed and varies only the model —
+    // the same non-vacuity bar as `forall_exists_witness_route_confirm_is_model_sensitive`.
+    // The end-to-end positive cases live in `executor_tests/smt/qf_uflia.rs`
+    // (`test_clearsy_00302_prefix_first_query_is_sat`,
+    // `test_clearsy_00307_printed_uf_interpretation_queries_are_sat`).
+    // -----------------------------------------------------------------------
+
+    /// [`synthetic_euf_model`] plus the `function_tables` rows `(get-model)`
+    /// prints (last row = `else` branch).
+    fn synthetic_euf_model_with_tables(
+        term_values: &[(TermId, &str)],
+        function_tables: &[(&str, &[(&[&str], &str)])],
+    ) -> Model {
+        let mut model = synthetic_euf_model(term_values);
+        let euf = model.euf_model.as_mut().expect("euf model just installed");
+        for &(f, rows) in function_tables {
+            euf.function_tables.insert(
+                f.to_string(),
+                rows.iter()
+                    .map(|(args, v)| (args.iter().map(|a| a.to_string()).collect(), v.to_string()))
+                    .collect(),
+            );
+        }
+        model
+    }
+
+    const G3_UNLISTED_POINT_PREFIX: &str = "(set-logic QF_UF)\
+         (declare-sort U 0)\
+         (declare-fun mem (U U) Bool)\
+         (declare-fun bool (Bool) U)\
+         (declare-fun a () U)\
+         (declare-fun s () U)\
+         (assert (mem a s))";
+
+    /// Load [`G3_UNLISTED_POINT_PREFIX`] plus `extra_assertion` and publish a
+    /// model in which `(mem (bool true) s)` is an UNPINNED application at an
+    /// argument point the `mem` table does not list:
+    ///
+    ///     (define-fun bool ((x0 Bool)) U (as @U!2 U))
+    ///     (define-fun mem ((x0 U) (x1 U)) Bool
+    ///       (ite (and (= x0 (as @U!0 U)) (= x1 (as @U!1 U))) true false))
+    ///
+    /// so the printed interpretation answers `false` at `(mem @U!2 @U!1)`.
+    fn g3_unlisted_point_gate(extra_assertion: &str) -> Executor {
+        let mut exec = loaded(&format!("{G3_UNLISTED_POINT_PREFIX}{extra_assertion}"));
+        let u = Sort::Uninterpreted("U".to_string());
+        let a = exec.ctx.terms.mk_var("a", u.clone());
+        let s = exec.ctx.terms.mk_var("s", u);
+        exec.last_model = Some(synthetic_euf_model_with_tables(
+            &[(a, "@U!0"), (s, "@U!1")],
+            &[
+                (
+                    "mem",
+                    &[(&["@U!0", "@U!1"], "true"), (&["@U!1", "@U!1"], "false")],
+                ),
+                ("bool", &[(&["true"], "@U!2")]),
+            ],
+        ));
+        exec
+    }
+
+    /// POSITIVE: the unlisted point reads the printed `else` branch (`false`),
+    /// so `(not (mem (bool true) s))` holds and the gate CONFIRMS — the
+    /// completeness gap class C of
+    /// the development design notes, which returned
+    /// `CannotConfirm` ("model commits no value for this application") before
+    /// this patch.
+    #[test]
+    fn g3_unlisted_uf_point_reads_printed_else_branch() {
+        let exec = g3_unlisted_point_gate("(assert (not (mem (bool true) s)))");
+        assert!(
+            matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::ConfirmedSat
+            ),
+            "#g3-gate-reads-printed-uf: an application at an argument point the \
+             table omits must be read from the PUBLISHED total interpretation"
+        );
+    }
+
+    /// NEGATIVE CONTROL (the real one): the SAME model, and the assertion now
+    /// needs the unlisted point to be `true`. The printed interpretation says
+    /// `false` there, so the published witness falsifies the assertion and the
+    /// gate must REFUTE it — never confirm, never merely "cannot confirm". This
+    /// is the property that separates reading the published witness from
+    /// relaxing the gate.
+    #[test]
+    fn g3_unlisted_uf_point_printed_value_falsifying_assertion_is_refuted() {
+        let exec = g3_unlisted_point_gate("(assert (mem (bool true) s))");
+        assert!(
+            matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::ModelViolates { .. }
+            ),
+            "#g3-gate-reads-printed-uf: the printed else branch answers `false` \
+             at the unlisted point, so the published witness must be REFUTED"
+        );
+    }
+
+    const G3_PIN_VS_PRINTED: &str = "(set-logic QF_UF)\
+         (declare-sort U 0)\
+         (declare-fun g (U) U)\
+         (declare-fun a () U)\
+         (declare-fun b () U)\
+         (assert (= (g a) b))";
+
+    /// Load [`G3_PIN_VS_PRINTED`] with `(g a)` PINNED to `@U!1` (= `b`) and the
+    /// printed table for `g` answering `printed_g_a` at `a`'s value.
+    fn g3_pin_vs_printed_gate(printed_g_a: &str) -> Executor {
+        let mut exec = loaded(G3_PIN_VS_PRINTED);
+        let u = Sort::Uninterpreted("U".to_string());
+        let a = exec.ctx.terms.mk_var("a", u.clone());
+        let b = exec.ctx.terms.mk_var("b", u.clone());
+        let g_a = exec.ctx.terms.mk_app(Symbol::named("g"), [a], u);
+        exec.last_model = Some(synthetic_euf_model_with_tables(
+            &[(a, "@U!0"), (b, "@U!1"), (g_a, "@U!1")],
+            &[("g", &[(&["@U!0"], printed_g_a)])],
+        ));
+        exec
+    }
+
+    /// POSITIVE: pin and printed body AGREE at the point, so the gate confirms
+    /// exactly as it did before this patch.
+    #[test]
+    fn g3_pin_agreeing_with_printed_table_confirms() {
+        let exec = g3_pin_vs_printed_gate("@U!1");
+        assert!(matches!(
+            exec.confirm_sat_with_independent_gate(),
+            GateVerdict::ConfirmedSat
+        ));
+    }
+
+    /// NEGATIVE CONTROL: the per-application pin says `g(a) = @U!1` (which
+    /// satisfies the assertion) while `(get-model)` publishes
+    /// `(define-fun g ((x0 U)) U (as @U!2 U))`, under which `(= (g a) b)` is
+    /// FALSE. "Pin wins" — the semantics of the first, unlanded version of
+    /// this patch — confirms this hybrid and ships a `sat` whose own printed
+    /// witness a validator refutes (the counterexample in
+    /// the development design notes). The reconciled
+    /// gate must REFUSE (`CannotConfirm`: the two sources disagree, so there is
+    /// no single interpretation to certify).
+    #[test]
+    fn g3_pin_disagreeing_with_printed_table_is_refused() {
+        let exec = g3_pin_vs_printed_gate("@U!2");
+        match exec.confirm_sat_with_independent_gate() {
+            GateVerdict::CannotConfirm { reason } => assert!(
+                reason.contains("model commits no value for this application of `g`"),
+                "the refusal must come from the reconciled UF read, got: {reason}"
+            ),
+            other => panic!(
+                "#g3-gate-reads-printed-uf: a pin that disagrees with the published \
+                 interpretation at the same point must fail closed, got {other:?}"
+            ),
+        }
     }
 }
 

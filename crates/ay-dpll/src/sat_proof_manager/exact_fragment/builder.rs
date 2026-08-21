@@ -16,9 +16,20 @@ use super::{exact_checked_add, exact_checked_mul, exact_sort_work};
 use crate::sat_proof_manager::SatProofManager;
 
 struct FragmentBuildState<'a> {
+    /// When `Some`, only original trace entries whose stable id is in this
+    /// set — the empty-clause hint-closure CONE of the validated DAG — get a
+    /// proof step and binding (#cone-scoped-authority). Entries outside the
+    /// cone are never premises of the published refutation; skipping them is
+    /// what makes authentication cost proportional to the refutation, not
+    /// the whole search. `None` keeps the historical exhaustive build.
+    original_id_cone: Option<&'a HashSet<u64>>,
     authored_problem_terms: &'a [TermId],
     authored_problem_term_set: HashSet<TermId>,
     authored_conjunct_closure: HashSet<TermId>,
+    /// Boolean-ITE closure members (#ite-expansion-authority); activation
+    /// units of their branch implications authenticate via the strict
+    /// checker's shared matcher.
+    authored_bool_ites: Vec<(TermId, TermId, TermId)>,
     or_fold_unit_plans: HashMap<TermId, OrFoldUnitPlan>,
     proof: Proof,
     bindings: HashMap<u64, ExactOriginalClauseBinding>,
@@ -52,6 +63,7 @@ impl SatProofManager<'_> {
         self.build_exact_original_proof_fragment_metered(
             trace,
             authored_problem_terms,
+            None,
             &mut unbounded,
         )
     }
@@ -65,6 +77,7 @@ impl SatProofManager<'_> {
         &mut self,
         trace: &ClauseTrace,
         authored_problem_terms: &[TermId],
+        original_id_cone: Option<&HashSet<u64>>,
         progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
     ) -> Result<ExactOriginalProofFragment, ExactOriginalProofError> {
         let initial_work = exact_checked_add(
@@ -90,13 +103,15 @@ impl SatProofManager<'_> {
         // One flag per build keeps every quantifier-unit campaign channel
         // consistently on or off within a single fragment construction.
         let unit_authority = crate::quant_unit_authority::quant_unit_authority_enabled();
-        let (authored_conjunct_closure, or_fold_unit_plans) =
+        let (authored_conjunct_closure, or_fold_unit_plans, authored_bool_ites) =
             self.build_folded_unit_authority(authored_problem_terms, unit_authority, progress)?;
         let mut state = FragmentBuildState {
+            original_id_cone,
             authored_problem_terms,
             authored_problem_term_set,
             authored_conjunct_closure,
             or_fold_unit_plans,
+            authored_bool_ites,
             proof: Proof::new(),
             bindings: HashMap::default(),
             // Distinct original IDs may carry the same unit. Share its sealed
@@ -129,6 +144,14 @@ impl SatProofManager<'_> {
         if !entry.is_original {
             return Ok(());
         }
+        // #cone-scoped-authority: an original outside the refutation's
+        // hint-closure cone is never a premise of the published proof.
+        if state
+            .original_id_cone
+            .is_some_and(|cone| !cone.contains(&entry.id))
+        {
+            return Ok(());
+        }
         // Charge all retained per-entry structures before their allocations.
         Self::preflight_exact_original_entry(entry, state, progress)?;
         let clause = self.translate_exact_original_clause(
@@ -153,6 +176,7 @@ impl SatProofManager<'_> {
                 &clause,
                 &state.authored_problem_term_set,
                 &state.authored_conjunct_closure,
+                &state.authored_bool_ites,
                 state.authored_problem_terms,
                 &state.or_fold_unit_plans,
                 &mut state.unit_chain_memo,

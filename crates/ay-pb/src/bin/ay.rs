@@ -1984,13 +1984,12 @@ static CLIQUE_ROW_MAP_SIDECAR: std::sync::OnceLock<bool> = std::sync::OnceLock::
 #[cfg(test)]
 thread_local! {
     /// Per-test override (RAII via `tests::set_clique_row_map_sidecar`).
-    static CLIQUE_ROW_MAP_SIDECAR_TEST: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    static CLIQUE_ROW_MAP_SIDECAR_TEST: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 fn clique_row_map_sidecar_enabled() -> bool {
     #[cfg(test)]
-    if let Some(v) = CLIQUE_ROW_MAP_SIDECAR_TEST.with(std::cell::Cell::get) {
+    if let Some(v) = CLIQUE_ROW_MAP_SIDECAR_TEST.with(Cell::get) {
         return v;
     }
     CLIQUE_ROW_MAP_SIDECAR.get().copied().unwrap_or(false)
@@ -4127,13 +4126,12 @@ static OPT_CERT_PORTFOLIO_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::
 thread_local! {
     /// Per-test override consulted before the CLI value (RAII via
     /// `tests::set_opt_cert_portfolio`).
-    static OPT_CERT_PORTFOLIO_TEST: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
+    static OPT_CERT_PORTFOLIO_TEST: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 fn opt_cert_portfolio_enabled() -> bool {
     #[cfg(test)]
-    if let Some(v) = OPT_CERT_PORTFOLIO_TEST.with(std::cell::Cell::get) {
+    if let Some(v) = OPT_CERT_PORTFOLIO_TEST.with(Cell::get) {
         return v;
     }
     !OPT_CERT_PORTFOLIO_OFF.get().copied().unwrap_or(false)
@@ -4147,8 +4145,7 @@ static CERT_NATIVE_CAP_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new()
 thread_local! {
     /// Per-test override consulted before the CLI value (RAII via
     /// `tests::set_cert_native_cap_ms`).
-    static CERT_NATIVE_CAP_MS_TEST: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
+    static CERT_NATIVE_CAP_MS_TEST: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// Test/tuning override for the certified-optimization native slice: pins the
@@ -4156,7 +4153,7 @@ thread_local! {
 /// improvement grace. Soundness-free — it only moves the interrupt point.
 fn cert_native_cap_ms_override() -> Option<u64> {
     #[cfg(test)]
-    if let Some(v) = CERT_NATIVE_CAP_MS_TEST.with(std::cell::Cell::get) {
+    if let Some(v) = CERT_NATIVE_CAP_MS_TEST.with(Cell::get) {
         return Some(v);
     }
     CERT_NATIVE_CAP_MS.get().copied()
@@ -4509,7 +4506,7 @@ mod tests {
     use super::*;
     // The one workspace env choke point: serialized, restore-on-exit env
     // mutation (unifies the former CERT_ENV_LOCK onto it).
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use ay_test_support::env::lock_env;
     use std::fs;
 
     #[test]

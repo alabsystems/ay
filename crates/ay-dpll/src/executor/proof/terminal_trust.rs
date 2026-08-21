@@ -362,14 +362,16 @@ impl Executor {
             || self.unsat_proof_references_uncheckable_seq_theory()
     }
 
-    /// Conservative, allocation-free screen for native steps whose default
-    /// Alethe spelling is known to require an honest unproved fallback.
+    /// Conservative screen for native steps whose effective Alethe spelling
+    /// is known to require an honest unproved fallback.
     ///
     /// This is deliberately deny-only. It scans every stored step because the
     /// exporter emits the whole proof, not just the terminal cone, but it does
-    /// not attempt to predict every clause-sensitive printer rewrite. A known
-    /// wire gap is sufficient to refuse `:check-proofs-strict`; absence of one
-    /// is not advertised as external semantic validation.
+    /// not attempt to predict every clause-sensitive printer rewrite. The one
+    /// evidence-sensitive exception is `LiaGeneric`, whose complete-step
+    /// decision is shared with the printer. A known wire gap is sufficient to
+    /// refuse `:check-proofs-strict`; absence of one is not advertised as
+    /// external semantic validation.
     #[must_use]
     pub fn unsat_proof_has_known_wire_gap(&self) -> bool {
         let Some(proof) = self.retained_unsat_proof_for_policy() else {
@@ -382,11 +384,15 @@ impl Executor {
     /// into `last_proof`. Proof construction uses this so it never has to
     /// overwrite retained query state merely to inspect a candidate.
     pub(super) fn proof_has_known_wire_gap(&self, proof: &Proof) -> bool {
+        // This is the same effective source-syntax channel handed to the
+        // ordinary Alethe exporter. In particular, a `LiaGeneric` Farkas
+        // certificate may not gain `la_generic` authority from the internal
+        // term DAG while the printer is rendering different text.
+        let term_overrides = self.proof_export_term_overrides();
         proof.steps.iter().any(|step| match step {
             ProofStep::Assume(term) => {
                 matches!(self.ctx.terms.get(*term), TermData::Let(..))
-                    || self
-                        .last_proof_term_overrides
+                    || term_overrides
                         .as_ref()
                         .and_then(|overrides| overrides.get(term))
                         // Keep this predicate identical to the printer's let
@@ -395,7 +401,12 @@ impl Executor {
                         // be screened as well as whitespace-separated syntax.
                         .is_some_and(|surface| surface.starts_with("(let"))
             }
-            ProofStep::TheoryLemma { clause, kind, .. } => {
+            ProofStep::TheoryLemma {
+                clause,
+                farkas,
+                kind,
+                ..
+            } => {
                 if matches!(
                     kind,
                     ay_core::TheoryLemmaKind::BvBitBlast
@@ -404,7 +415,13 @@ impl Executor {
                 {
                     return false;
                 }
-                let wire = kind.alethe_wire_rule();
+                let wire = ay_proof::promoted_wire_rule(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    farkas.as_ref(),
+                    term_overrides.as_ref(),
+                );
                 wire == ay_core::UNPROVED_STEP_RULE
                     || ay_core::alethe_rule_requires_premises_or_args(wire)
             }

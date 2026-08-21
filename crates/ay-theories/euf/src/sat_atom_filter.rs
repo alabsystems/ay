@@ -47,6 +47,12 @@ impl EufSolver<'_> {
             self.diseq_keys_by_rep.clear();
             self.neg_dirty_reps.clear();
             self.neg_full_scan_needed = true;
+            // #euf-inc-neg-pop: the candidate set the delta cover was anchored
+            // on is gone with `eq_terms`; the armed full pass must actually run.
+            // No-op while the flag is off (the state is never set then).
+            self.neg_pop_delta_valid = false;
+            self.neg_pop_retracted.clear();
+            self.neg_pop_split_reps.clear();
         }
     }
 

@@ -267,7 +267,7 @@ fn unknown_origin_inventory_names_real_production_source_anchors() {
         ),
         (
             UnknownOrigin::UntaggedSolverUnknown,
-            include_str!("../executor/lifecycle.rs"),
+            include_str!("../executor/lifecycle/unknown_publication.rs"),
             "UnknownReason::Unknown",
         ),
         (

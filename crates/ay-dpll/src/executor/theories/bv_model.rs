@@ -1091,7 +1091,8 @@ impl Executor {
         //
         // This is needed for EXTERNAL_CODEGEN GPU/memory semantic encoding where array
         // variables represent memory states connected by store chains.
-        Self::populate_store_chain_array_models(terms, bv_model, assertions, &mut array_values);
+        let store_chain_populated =
+            Self::populate_store_chain_array_models(terms, bv_model, assertions, &mut array_values);
 
         // #array-def-equality: an array variable asserted equal — transitively
         // through `(= x y)` chains — to a const-array or store chain must adopt
@@ -1134,13 +1135,34 @@ impl Executor {
         // is the established channel (`array_from_model` refuses a listed term as
         // evidence for a total array and the leaf becomes unevaluable), so the
         // gate reports an honest coverage gap rather than a false violation.
-        let read_conflicted =
-            Self::array_vars_defined_only_under_nested_equality(terms, assertions);
+        //
+        // #8512-forced-or: withholding is only the right answer while the store
+        // set really is incomplete. When the model FORCES the arm the definition
+        // sits in (every sibling disjunct is false), the chain was walked and
+        // every (index, value) pair resolved concretely, so the interpretation
+        // covers each index the definition constrains and is no longer partial —
+        // keeping it withheld would cost a provable `sat` for nothing.
+        //
+        // A variable is released only if its store-chain BASE is not itself a
+        // nested-only definition: the chain inherits the base's entries for the
+        // indices it does not overwrite, so an unresolved base leaves the same
+        // hole one level down. That test reads the ORIGINAL nested set, not the
+        // set being edited, so the outcome does not depend on iteration order.
+        let nested_only = Self::array_vars_defined_only_under_nested_equality(terms, assertions);
+        let mut read_conflicted = nested_only.clone();
+        for (var, base) in &store_chain_populated {
+            if !nested_only.contains(base) {
+                read_conflicted.remove(var);
+            }
+        }
 
+        // Both fields listed exhaustively, no `..Default::default()`: if a third
+        // field is ever added to `ArrayModel` this builder must make a decision
+        // about it rather than silently inherit a default — the entire bug this
+        // code path exists for was a silent default standing in for "unknown".
         ArrayModel {
             array_values,
             read_conflicted,
-            ..Default::default()
         }
     }
 
@@ -1575,12 +1597,20 @@ impl Executor {
     /// 1. Extracting store chain entries (index/value pairs with ground truth)
     /// 2. Inheriting base array entries for indices not in the store chain
     /// 3. Removing any select-based entries that conflict with store chain values
+    ///
+    /// Returns the `(array_var, store_chain_base)` pairs whose chain resolved
+    /// COMPLETELY — every (index, value) term in the chain came back concrete
+    /// from the BV model. Only those interpretations cover every index the
+    /// definition speaks to; a chain with even one unresolved pair leaves a hole
+    /// that would read back as the array's `default`. The caller uses this to
+    /// decide which nested-only definitions no longer need to be withheld as
+    /// read-conflicted (see [`Self::extract_array_model_from_bv_model`]).
     fn populate_store_chain_array_models(
         terms: &TermStore,
         bv_model: &BvModel,
         assertions: &[TermId],
         array_values: &mut HashMap<TermId, ArrayInterpretation>,
-    ) {
+    ) -> Vec<(TermId, TermId)> {
         use num_bigint::BigInt;
 
         // First pass: collect all (Var, store_chain_term, base_array) tuples.
@@ -1607,8 +1637,10 @@ impl Executor {
         }
 
         if store_defs.is_empty() {
-            return;
+            return Vec::new();
         }
+
+        let mut fully_resolved: Vec<(TermId, TermId)> = Vec::new();
 
         // Second pass: for each store-defined array variable, build the model.
         for (var_id, store_term, base_array) in store_defs {
@@ -1632,6 +1664,11 @@ impl Executor {
             }
 
             let mut index_to_value: HashMap<String, String> = HashMap::default();
+            // Cleared by any chain pair the BV model cannot make concrete: the
+            // resulting interpretation then has a hole at an index the
+            // definition constrains, and reporting it as total would claim the
+            // `default` holds there.
+            let mut all_pairs_resolved = true;
 
             // Step 1: Store chain entries (ground truth, highest priority).
             for (idx_term, val_term) in &chain_entries {
@@ -1662,6 +1699,8 @@ impl Executor {
                     index_to_value
                         .entry(idx_str)
                         .or_insert_with(|| ev_str.clone());
+                } else {
+                    all_pairs_resolved = false;
                 }
             }
 
@@ -1699,7 +1738,13 @@ impl Executor {
             }
 
             array_values.insert(var_id, interp);
+
+            if all_pairs_resolved {
+                fully_resolved.push((var_id, base_array));
+            }
         }
+
+        fully_resolved
     }
 
     fn collect_true_store_chain_defs(
@@ -1827,11 +1872,73 @@ impl Executor {
                         store_defs,
                     );
                 }
+                "or" if !args.is_empty() => {
+                    Self::propagate_forced_or_arm(
+                        terms,
+                        bv_model,
+                        args,
+                        depth,
+                        visited,
+                        seen_store_defs,
+                        store_defs,
+                    );
+                }
                 _ => {}
             },
             TermData::App(_, _) => {}
             TermData::Let(_, _) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {}
             _ => {}
+        }
+    }
+
+    /// #8512-forced-or: an asserted-true disjunction forces an arm exactly when
+    /// every OTHER arm is false under the model — unit propagation. That arm
+    /// then holds, so its conjuncts (including a store-chain definition) are
+    /// real definitions and may be walked, the same discipline
+    /// [`Self::propagate_true_bool_ite`] applies to a model-forced `ite` branch.
+    ///
+    /// With two or more arms still live the model is free to satisfy either one,
+    /// and adopting a definition out of one of them would FABRICATE an array
+    /// value. Nothing is collected then, and the variables involved keep their
+    /// partial interpretation and stay read-conflicted (see
+    /// [`Self::array_vars_defined_only_under_nested_equality`]).
+    ///
+    /// The liveness test never consults an array interpretation — only the BV
+    /// assignment — so it cannot depend on the very definitions being decided.
+    fn propagate_forced_or_arm(
+        terms: &TermStore,
+        bv_model: &BvModel,
+        args: &[TermId],
+        depth: usize,
+        visited: &mut HashSet<(TermId, StoreChainTruth)>,
+        seen_store_defs: &mut HashSet<(TermId, TermId, TermId)>,
+        store_defs: &mut Vec<(TermId, TermId, TermId)>,
+    ) {
+        let mut memo = BvEvalMemo::default();
+        let mut false_cache: HashMap<TermId, bool> = HashMap::default();
+        let mut live: Option<TermId> = None;
+        let mut live_count = 0usize;
+        for &arg in args {
+            if Self::model_bool_is_false(terms, bv_model, arg, 0, &mut memo, &mut false_cache) {
+                continue;
+            }
+            live_count += 1;
+            if live_count > 1 {
+                return;
+            }
+            live = Some(arg);
+        }
+        if let Some(arm) = live {
+            Self::collect_true_store_chain_defs(
+                terms,
+                bv_model,
+                arm,
+                StoreChainTruth::BoolTrue,
+                depth + 1,
+                visited,
+                seen_store_defs,
+                store_defs,
+            );
         }
     }
 
@@ -2096,18 +2203,82 @@ impl Executor {
     }
 
     fn model_bool_value(terms: &TermStore, bv_model: &BvModel, term: TermId) -> Option<bool> {
+        // Local memo: one-shot evaluation, fixed env for its duration.
+        let mut memo = BvEvalMemo::default();
+        Self::model_bool_value_memo(terms, bv_model, term, &mut memo)
+    }
+
+    /// Whether `term` is definitely FALSE under the BV model, decided
+    /// STRUCTURALLY through `and`/`or` so one false conjunct settles a
+    /// conjunction whose siblings are not evaluable at all.
+    ///
+    /// `model_bool_value` propagates `None` out of `and` as soon as any operand
+    /// is unevaluable. That is the right answer to "what is this term's value",
+    /// but too weak for "can this arm still be satisfied": the arms this is
+    /// asked about are hundred-conjunct BMC blocks that always contain an array
+    /// equality, which the BV model cannot evaluate, so the whole arm would come
+    /// back `None` even when a scalar conjunct already falsifies it.
+    ///
+    /// One-sided by construction: `true` means "false in this model", `false`
+    /// means only "not known to be false" — never "known true". Callers may
+    /// therefore treat a `true` answer as a refutation and must treat `false`
+    /// as no information.
+    fn model_bool_is_false(
+        terms: &TermStore,
+        bv_model: &BvModel,
+        term: TermId,
+        depth: usize,
+        memo: &mut BvEvalMemo,
+        cache: &mut HashMap<TermId, bool>,
+    ) -> bool {
+        const MAX_DEPTH: usize = 256;
+        if depth >= MAX_DEPTH {
+            return false;
+        }
+        if let Some(&known) = cache.get(&term) {
+            return known;
+        }
+        let decided = match terms.get(term) {
+            TermData::App(sym, args) if *terms.sort(term) == Sort::Bool => match sym.name() {
+                // False as soon as ANY conjunct is false, whatever the rest do.
+                "and" => args.iter().any(|&arg| {
+                    Self::model_bool_is_false(terms, bv_model, arg, depth + 1, memo, cache)
+                }),
+                // False only when EVERY disjunct is false.
+                "or" => {
+                    !args.is_empty()
+                        && args.iter().all(|&arg| {
+                            Self::model_bool_is_false(terms, bv_model, arg, depth + 1, memo, cache)
+                        })
+                }
+                _ => Self::model_bool_value_memo(terms, bv_model, term, memo) == Some(false),
+            },
+            _ => Self::model_bool_value_memo(terms, bv_model, term, memo) == Some(false),
+        };
+        cache.insert(term, decided);
+        decided
+    }
+
+    /// [`Self::model_bool_value`] against a caller-owned evaluation memo, so a
+    /// scan over many sibling terms shares one memo instead of rebuilding it per
+    /// term. The memo caches only `Some` results and the environment is fixed
+    /// for its lifetime, so sharing cannot change any answer.
+    fn model_bool_value_memo(
+        terms: &TermStore,
+        bv_model: &BvModel,
+        term: TermId,
+        memo: &mut BvEvalMemo,
+    ) -> Option<bool> {
         if *terms.sort(term) != Sort::Bool {
             return None;
         }
         bv_model.bool_overrides.get(&term).copied().or_else(|| {
-            // Local memo: one-shot evaluation, fixed env for its duration.
-            let mut memo = BvEvalMemo::default();
             Self::evaluate_bool_substitution(
                 terms,
                 term,
                 &bv_model.values,
                 &bv_model.bool_overrides,
-                &mut memo,
+                memo,
             )
         })
     }

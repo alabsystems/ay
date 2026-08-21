@@ -446,6 +446,28 @@ impl Executor {
         // configured timeout rather than inherit an exhausted budget.
         let previous_deadline = self.install_timeout_deadline_for_call();
         let base_assertions = self.ctx.assertions.clone();
+        // The rescue is a full second solve of the SAME public decision
+        // problem, but it runs while the outer epoch is PARKED (check_sat.rs
+        // parks it so nested finalizers cannot destroy it) and binds none of
+        // its own — so every proof-authority lane (checked-SAT sidecar, qpf
+        // instance authority, the quantifier UNSAT funnel) consulted a missing
+        // scope and a rescue UNSAT needing a quantifier-instance proof always
+        // demoted to unknown (the deductive-checks letleak shape: every VC assert is
+        // `:named`, the redirect strips them into assumptions).
+        //
+        // Bind the rescue the exact identity its solve decides:
+        // `check-sat-assuming A` == `check-sat (base && A)`, and
+        // `solve_scoped_assumptions` folds the assumptions into the assertion
+        // view — so the query is roots = base ++ A with an EMPTY bound
+        // assumption set, every root caller-authored. Not borrowed authority:
+        // certificates minted against it are re-verified by the ordinary
+        // publication funnel, and the caller restores (and re-authenticates)
+        // the parked outer authority after this returns.
+        let mut rescue_roots = base_assertions.clone();
+        rescue_roots.extend_from_slice(assumptions);
+        self.begin_unsat_query_epoch(&rescue_roots);
+        self.install_proof_source_provenance(&rescue_roots);
+        self.bind_unsat_query_assumptions(&[]);
         let result = self.solve_scoped_assumptions(
             &base_assertions,
             assumptions,
@@ -510,6 +532,7 @@ impl Executor {
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
+        self.injected_axiom_theory_kinds.clear();
         self.last_assumption_core = None;
         self.last_core_term_to_name = None;
         self.last_model_validated = false;
@@ -1672,78 +1695,6 @@ mod solve_session_reset_tests {
     }
 }
 
-#[cfg(test)]
-mod nested_recheck_authority_tests {
-    use super::super::theories::solve_harness::ProofProblemAssertionProvenance;
-    use super::*;
-
-    fn provenance_of(roots: &[TermId], window: &[TermId]) -> ProofProblemAssertionProvenance {
-        ProofProblemAssertionProvenance::passthrough(roots, window)
-    }
-
-    /// The assumption-core recheck runs on the SAME executor and reaches the
-    /// public publication funnel, whose unknown path calls
-    /// `invalidate_last_check_result` and CLEARS the authored proof
-    /// provenance. Re-rooting must reinstate the outer authority, or a later
-    /// preprocessing lane rebuilds provenance from its own transformed working
-    /// set and mandatory UNSAT certification rejects a correct refutation with
-    /// `AssertionEpochMismatch`.
-    #[test]
-    fn cleared_provenance_is_restored_to_the_outer_authored_roots() {
-        let mut exec = Executor::new();
-        let a = exec.ctx.terms.mk_var("a", Sort::Bool);
-        let b = exec.ctx.terms.mk_var("b", Sort::Bool);
-        let authored = vec![a, b];
-        let outer = provenance_of(&authored, &authored);
-
-        exec.proof_problem_assertion_provenance = None;
-        exec.reroot_proof_authority(Some(&outer));
-
-        assert_eq!(exec.proof_original_problem_assertions(), authored);
-    }
-
-    /// Re-rooting NARROWS: a nested lane's transformed working set must never
-    /// survive as authored authority, which is exactly the promotion that
-    /// forged the 60-term "authored" set behind the certification rejection.
-    #[test]
-    fn nested_working_set_cannot_keep_its_own_authority() {
-        let mut exec = Executor::new();
-        let a = exec.ctx.terms.mk_var("a", Sort::Bool);
-        let b = exec.ctx.terms.mk_var("b", Sort::Bool);
-        let generated = exec.ctx.terms.mk_var("solver_generated", Sort::Bool);
-        let authored = vec![a, b];
-        let outer = provenance_of(&authored, &authored);
-
-        // What a preprocessing lane installs after the clear: it treats its own
-        // window (authored MINUS a folded premise, PLUS a generated axiom) as
-        // the authored roots.
-        let nested_window = vec![b, generated];
-        exec.proof_problem_assertion_provenance =
-            Some(provenance_of(&nested_window, &nested_window));
-
-        exec.reroot_proof_authority(Some(&outer));
-
-        let rooted = exec
-            .proof_problem_assertion_provenance
-            .as_ref()
-            .expect("re-rooting installs provenance");
-        assert_eq!(rooted.original_problem_assertions, authored);
-        assert!(
-            !rooted.problem_assertions.contains(&generated),
-            "a solver-generated term must not become an authored premise"
-        );
-    }
-
-    /// With no outer authority to rebase onto there is nothing to restore, and
-    /// inventing one would be the widening this gate exists to prevent.
-    #[test]
-    fn absent_outer_authority_is_left_alone() {
-        let mut exec = Executor::new();
-        exec.proof_problem_assertion_provenance = None;
-        exec.reroot_proof_authority(None);
-        assert!(exec.proof_problem_assertion_provenance.is_none());
-    }
-}
-
+include!("check_sat_assuming/nested_recheck_authority_tests.rs");
 #[cfg(test)]
 mod nested_publication_tests;

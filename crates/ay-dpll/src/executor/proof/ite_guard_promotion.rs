@@ -68,7 +68,7 @@ struct IteGuardPlan {
 /// equality (the clausifier rebuilds conditions with the canonicalizing
 /// constructor, which may reverse the substituted orientation).
 fn same_equality_modulo_orientation(
-    terms: &ay_core::TermStore,
+    terms: &TermStore,
     candidate: TermId,
     reference: TermId,
 ) -> bool {
@@ -253,7 +253,7 @@ impl Executor {
 
     /// Recognize one guard-clause or-term against the candidate roots.
     fn plan_ite_guard_leaf(
-        terms: &ay_core::TermStore,
+        terms: &TermStore,
         roots: &[TermId],
         or_term: TermId,
     ) -> Option<IteGuardPlan> {

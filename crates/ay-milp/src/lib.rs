@@ -66,11 +66,15 @@ pub use bab::{
     diag_dump_root_basis,
     diag_exact_probe,
     diag_float_lp,
+    // The flagged variant: a caller with parsed engine flags MUST use this one,
+    // or the LP-only lane measures the compiled default under the flag's name.
+    diag_float_lp_with,
     diag_pin_probe,
     diag_presolve,
     diag_refine_probe,
     // W0 measurement: root dual bound before/after the cut loop, no branching.
     diag_root_closure,
+    diag_root_closure_with,
     // P0 instrument: nodes-to-proof, the load-invariant search metric.
     drought_dives_launched,
     nodes_explored,
@@ -111,9 +115,48 @@ pub use dualfix::diag_dualfix_campaign_at_scale;
 /// integer columns free before, after propagation alone (the `DualReductions=0`
 /// arm), and after the full fixpoint. Measurement scaffold for `ay-milp diag
 /// dualfix`, not a shipped API.
+///
+/// Runs under the DEFAULT engine profile. Every caller that has parsed engine
+/// flags wants [`diag_dualfix_with`] instead — see its note.
 #[doc(hidden)]
 #[must_use]
 pub fn diag_dualfix(model: &Model, secs: f64) -> String {
+    diag_dualfix_with(model, secs, &SolveOpts::new())
+}
+
+/// [`diag_dualfix`] under a caller's own [`SolveOpts`] — the variant a flagged
+/// harness or CLI lane calls.
+///
+/// WHY IT EXISTS (the same dead-flag family as [`diag_float_lp_with`] and
+/// [`diag_root_closure_with`]). `dualfix::dual_fix` opens with the reduction's
+/// only kill switch, `tune::on(Knob::NoDualfix)`, which resolves through `tune`'s
+/// CALLER layer — the layer a real solve installs at its entry point from
+/// `opts.engine().profile()` and this diagnostic never installed. So
+/// `ay-milp diag dualfix --no-dualfix` could not have turned the rule off: the
+/// flag would have parsed and reached nothing. `ay-milp diag` was refusing the
+/// flag outright for exactly that reason, which was the safe half of the repair;
+/// this is the other half.
+///
+/// MEASURED, release binary + `target-cpu=native`, `ay-milp diag dualfix <m> 20`:
+///
+/// | model | flag | line |
+/// |---|---|---|
+/// | `p0548` | (none) | `DUALFIX gate=off rows=176 cols=548 int_before=548 int_prop_only=532 int_after=477 fixings=55 to_upper=2 to_lower=53 rounds=3 max_den_bits=1` |
+/// | `p0548` | `--no-dualfix` | `DUALFIX gate=off rows=176 cols=548 fixings=0 DECLINED` |
+/// | `p0282` | (none) | `… int_after=202 fixings=80 to_upper=0 to_lower=80 rounds=2 …` |
+/// | `p0282` | `--no-dualfix` | `DUALFIX gate=off rows=241 cols=282 fixings=0 DECLINED` |
+///
+/// Pick a model where the rule actually FIRES when re-checking this: on a model
+/// that declines for another reason (inexact coefficients, a marked margin row,
+/// nothing to fix) both arms print the same `DECLINED` line and the control is
+/// vacuous — `benchmarks/milp-ny/safenlp/safenlp_medical_1739_feas.mps` is one
+/// such, and it is the first thing this control was tried on.
+///
+/// The zero-opts wrapper above pins the historical default-profile behaviour.
+#[doc(hidden)]
+#[must_use]
+pub fn diag_dualfix_with(model: &Model, secs: f64, opts: &SolveOpts) -> String {
+    let _tuned = tune::activate_caller(opts.engine().profile());
     dualfix::diag_line(model, secs)
 }
 mod error;
@@ -137,7 +180,7 @@ mod lattice;
 mod lu;
 mod margin;
 #[doc(hidden)]
-pub use margin::diag_margin_reframe;
+pub use margin::{diag_margin_reframe, diag_margin_reframe_with, margin_profile_line};
 mod model;
 mod mps;
 mod network_design_benders;
@@ -215,6 +258,10 @@ pub use opts::{
     EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, FlipSolveMode, SolveOpts,
 };
 pub use outcome::{Outcome, Trust, UnknownReason};
+pub use presolve::{
+    AffineAggregationCertificate, AffineAggregationCertificateError, AffineAggregationClaim,
+    AffineAggregationInnerProof, AffineAggregationVerification, AffineRecovery,
+};
 pub use session::{
     AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,

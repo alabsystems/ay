@@ -24,6 +24,7 @@ mod authored_guarded_linear;
 mod authored_helpers;
 mod authored_linear;
 mod authored_negated_exists;
+mod authored_negated_exists_ground_inst;
 mod authored_nested_forall;
 mod authored_nested_forall_search;
 mod authored_store_permutation;
@@ -45,6 +46,7 @@ mod finite_enum;
 mod finite_enum_surface;
 #[cfg(test)]
 mod finite_enum_tests;
+mod finite_select_surface;
 mod generic_promotion;
 mod ite_guard_promotion;
 mod lane_policy;
@@ -533,8 +535,7 @@ impl Executor {
         // explicit weakening for unused conflict literals. Atomic strict
         // validation prevents partial promotion from masking any other trust.
         // Authenticated array-extensionality leaves are deferred: the EUF pass
-        // promotes them only on its strict-check clone, while the real proof's
-        // final extensionality pass below remains after every surgery.
+        // promotes them only on its strict clone; the final pass stays below.
         // Boolean-ITE guard-clause rebuild (#ite-guard-promotion): an
         // asserted Shannon-lifted `(ite c A B)` — the recorded update-axiom
         // instance shape the consequence-replay probe re-solves — is
@@ -547,10 +548,10 @@ impl Executor {
         // MUST run before `promote_certified_generic_euf_leaves`: that pass's
         // whole-proof atomic gate reverts while these trust leaves remain,
         // and this pass's output is what lets it commit. This is what lets
-        // the same-context probe certify the frame-quantifier refutations
-        // (#mbqi-completeness Q2).
+        // the same-context probe certify frame-quantifier UNSAT (#mbqi-completeness Q2).
         self.promote_shannon_ite_guard_trust_leaves(&mut proof);
 
+        self.promote_bool_finite_select_expansion_surface(&mut proof);
         self.promote_certified_generic_euf_leaves(&mut proof);
 
         // Shadowed-store equality expansion: the eager array fixpoint uses the
@@ -7221,9 +7222,6 @@ fn plan_euf_lia_value_conflict(terms: &mut TermStore, clause: &[TermId]) -> Opti
 /// does not consume are restored with an explicit `weakening` step,
 /// reproducing the original clause as a literal set.
 struct EufChainFarkasBridgePlan {
-    /// The single direct edge literal joining the bridge (no `eq_transitive`
-    /// or congruence step needed); exclusive with the fields below.
-    direct_edge: Option<TermId>,
     /// Per-position `(Aᵢ, Bᵢ, chain)` plans for the congruence `p = u`
     /// (empty ⇒ `p` participates in the equality graph directly).
     cong_plans: Vec<(TermId, TermId, Vec<TermId>)>,
@@ -7553,7 +7551,6 @@ fn finish_chain_bridge_plan(
         .filter(|lit| !consumed.contains(lit))
         .collect();
     Some(EufChainFarkasBridgePlan {
-        direct_edge,
         cong_plans,
         cong_eq,
         cong_neg,

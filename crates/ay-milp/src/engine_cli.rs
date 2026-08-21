@@ -13,8 +13,8 @@ type UsizeBuilder = fn(EngineEconomics, usize) -> EngineEconomics;
 type FloatBuilder = fn(EngineEconomics, f64) -> Result<EngineEconomics, crate::EngineConfigError>;
 
 /// Hand-rolled argument bag (this crate takes no CLI dependency): `--x v` /
-/// `--x=v` for names in `value_flags`, bare `--x` switches otherwise,
-/// positionals passed through.
+/// `--x=v` for names in `value_flags`, bare `--x` for names in `switch_flags`,
+/// positionals passed through, and anything else REFUSED.
 pub struct Flags {
     pub positional: Vec<String>,
     named: Vec<(String, String)>,
@@ -22,45 +22,79 @@ pub struct Flags {
 }
 
 impl Flags {
-    /// Parse `args`; names listed in `value_flags` take a value.
+    /// Parse `args`; names in `value_flags` take a value, names in
+    /// `switch_flags` are bare switches, and an unrecognised `--flag` is an
+    /// ERROR.
+    ///
+    /// # Why an unknown flag cannot be tolerated
+    ///
+    /// This parser is the front door of a MEASUREMENT INSTRUMENT. It used to
+    /// accept any bare `--x` as a switch, so `--devx` (a typo for `--devex`)
+    /// and `--total-nonsense-zz` alike parsed cleanly, set nothing, and the
+    /// run reported its numbers under the flag's name — the A/B measured the
+    /// same arm twice, silently. A VALUE flag with no entry in `value_flags`
+    /// was worse: its value fell through to `positional`, where
+    /// `examples/mps_solve.rs` reads a seed-solution path, so the run died in
+    /// `read seed solution: NotFound` and a harness that swallows stderr
+    /// recorded a MISSING DATUM rather than a misparse.
+    ///
+    /// `tests/knob_census.rs` closed the other half (a flag whose knob has no
+    /// carrier); this closes the parser half.
+    ///
+    /// A bare `--` ends flag parsing: everything after it is positional,
+    /// which is how a path that starts with `--` gets through.
     ///
     /// # Errors
     ///
-    /// A message when a value flag is missing its value or a switch was
-    /// given one.
-    pub fn parse(args: &[String], value_flags: &[&str]) -> Result<Self, String> {
+    /// A message when a flag is unknown (naming it, and the nearest known
+    /// spelling when there is one), when a value flag is missing its value,
+    /// or when a switch was given one.
+    pub fn parse(
+        args: &[String],
+        value_flags: &[&str],
+        switch_flags: &[&str],
+    ) -> Result<Self, String> {
         let mut f = Flags {
             positional: Vec::new(),
             named: Vec::new(),
             switches: Vec::new(),
         };
         let mut i = 0;
+        let mut only_positional = false;
         while i < args.len() {
             let a = &args[i];
-            if let Some(name) = a.strip_prefix("--") {
-                let (name, inline) = match name.split_once('=') {
-                    Some((n, v)) => (n, Some(v.to_string())),
-                    None => (name, None),
-                };
-                if value_flags.contains(&name) {
-                    let v = match inline {
-                        Some(v) => v,
-                        None => {
-                            i += 1;
-                            args.get(i)
-                                .ok_or_else(|| format!("--{name} needs a value"))?
-                                .clone()
-                        }
-                    };
-                    f.named.push((name.to_string(), v));
-                } else {
-                    if inline.is_some() {
-                        return Err(format!("--{name} takes no value"));
+            match a.strip_prefix("--") {
+                Some(rest) if !only_positional => {
+                    if rest.is_empty() {
+                        only_positional = true;
+                        i += 1;
+                        continue;
                     }
-                    f.switches.push(name.to_string());
+                    let (name, inline) = match rest.split_once('=') {
+                        Some((n, v)) => (n, Some(v.to_string())),
+                        None => (rest, None),
+                    };
+                    if value_flags.contains(&name) {
+                        let v = match inline {
+                            Some(v) => v,
+                            None => {
+                                i += 1;
+                                args.get(i)
+                                    .ok_or_else(|| format!("--{name} needs a value"))?
+                                    .clone()
+                            }
+                        };
+                        f.named.push((name.to_string(), v));
+                    } else if switch_flags.contains(&name) {
+                        if inline.is_some() {
+                            return Err(format!("--{name} takes no value"));
+                        }
+                        f.switches.push(name.to_string());
+                    } else {
+                        return Err(unknown_flag(name, value_flags, switch_flags));
+                    }
                 }
-            } else {
-                f.positional.push(a.clone());
+                _ => f.positional.push(a.clone()),
             }
             i += 1;
         }
@@ -82,6 +116,167 @@ impl Flags {
     pub fn has(&self, name: &str) -> bool {
         self.switches.iter().any(|s| s == name)
     }
+
+    /// Every flag name given on the command line — values and bare switches
+    /// alike, deduplicated and sorted.
+    ///
+    /// The `ay-milp diag` front door reads this to REFUSE an engine flag on a
+    /// diagnostic mode that threads no [`SolveOpts`], where the flag would
+    /// otherwise parse and change nothing. A front door that accepts a flag it
+    /// cannot honour is the exact failure this module exists to stop, and
+    /// widening a parser is how it gets reintroduced.
+    #[must_use]
+    pub fn names_given(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .named
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .chain(self.switches.iter().map(String::as_str))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+}
+
+/// The refusal, spelled so a human can act on it in one read.
+///
+/// A misspelled measurement flag is the failure this whole module exists to
+/// stop, and the overwhelmingly common case is one wrong character, so the
+/// message names the nearest known flag when there is one.
+fn unknown_flag(name: &str, value_flags: &[&str], switch_flags: &[&str]) -> String {
+    match nearest(name, value_flags, switch_flags) {
+        Some(near) => format!(
+            "unknown flag `--{name}` — did you mean `--{near}`? \
+             (this run was REFUSED rather than measured under a flag that does nothing)"
+        ),
+        None => format!(
+            "unknown flag `--{name}` \
+             (this run was REFUSED rather than measured under a flag that does nothing)"
+        ),
+    }
+}
+
+/// The closest known flag, if one is close enough to be a plausible typo.
+///
+/// The tolerance grows with the name's length — one edit on a four-character
+/// flag is a different flag, three on a twenty-character one is a slip.
+fn nearest<'a>(name: &str, value_flags: &[&'a str], switch_flags: &[&'a str]) -> Option<&'a str> {
+    let budget = match name.len() {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    };
+    value_flags
+        .iter()
+        .chain(switch_flags)
+        .map(|&candidate| (edit_distance(name, candidate), candidate))
+        .filter(|&(distance, _)| distance <= budget)
+        // Ties go to the shorter name, then alphabetically: a deterministic
+        // message is a message a test can pin.
+        .min_by_key(|&(distance, candidate)| (distance, candidate.len(), candidate))
+        .map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein distance, two rows. Flag names are tens of bytes and this runs
+/// only on the error path, so the quadratic is free and a real edit-distance
+/// crate would be a dependency for nothing.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = substitute.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Bare switches [`apply`] reads that are not `EngineEconomics` builders: the
+/// diagnostic taps lowered into [`crate::debug_flags::MilpDebugFlags`] and the
+/// structure-routing opt-out.
+pub const DEBUG_SWITCHES: &[&str] = &[
+    "trace",
+    "ms-dive-trace",
+    "coef-tighten-debug",
+    "sym-debug",
+    "shape-census",
+    "sep-screen-audit",
+    "no-structure-route",
+];
+
+/// Every bare switch [`apply`] understands — the switch half of what
+/// [`VALUE_FLAGS`] is for values.
+///
+/// Built from the builder table itself rather than restated, so a flag added
+/// to `BOOL_BUILDERS` is accepted by every caller of [`Flags::parse`] that
+/// passes this, and a flag deleted there stops being accepted, with no second
+/// list to forget.
+#[must_use]
+pub fn switch_flags() -> Vec<&'static str> {
+    BOOL_BUILDERS
+        .iter()
+        .map(|&(name, _, _)| name)
+        .chain(DEBUG_SWITCHES.iter().copied())
+        .collect()
+}
+
+/// The flags [`apply`] reads by hand, outside the four builder tables.
+///
+/// Kept next to [`applied_flags`] because that function is a CONTRACT — "these
+/// names, and only these, change the engine" — and the hand-rolled arms in
+/// `apply` are the half no table can enumerate. `hand_rolled_names_are_declared`
+/// in this module's tests pins every entry to [`VALUE_FLAGS`]; a new hand-rolled
+/// arm that is not listed here makes `ay-milp diag` refuse a flag it could have
+/// honoured, which is a loud failure rather than a silent one.
+const HAND_ROLLED: &[&str] = &[
+    "lnp-probe",
+    "kernel-scan-dir",
+    "flip-solve",
+    "fc-mode",
+    "sat-stop-secs",
+    "flip-cap-secs",
+    "sym-branch-band",
+    "dual-perturb",
+    "cert-grace-secs",
+    "pump-share",
+    "setpart-share",
+    "heur-share",
+    "bumpdiff-lanes",
+    "sym-mode",
+    "rins",
+    "sat-stop-mult",
+    "child-order",
+    "ft-spike",
+    "cut-eff-floor",
+    "ng-branch-pct",
+    "dual-bypass-mode",
+    "eager-perturb-mode",
+    "chain-devex",
+    "ft-growth-tol",
+];
+
+/// Every flag name [`apply`] actually CONSUMES — values and switches together.
+///
+/// [`VALUE_FLAGS`] is a superset: it also carries the `solve` subcommand's own
+/// names (`--emit-cert`, `--require`, `--threads`, `--seed`, …), which `apply`
+/// never reads. A caller that wants to accept "the engine flags" and refuse
+/// everything else — `ay-milp diag` does — needs the smaller set, because
+/// accepting a flag one cannot honour is precisely the dead-flag failure.
+#[must_use]
+pub fn applied_flags() -> Vec<&'static str> {
+    BOOL_BUILDERS
+        .iter()
+        .map(|&(name, _, _)| name)
+        .chain(DEBUG_SWITCHES.iter().copied())
+        .chain(USIZE_BUILDERS.iter().map(|&(name, _)| name))
+        .chain(FLOAT_BUILDERS.iter().map(|&(name, _)| name))
+        .chain(HAND_ROLLED.iter().copied())
+        .collect()
 }
 
 pub const VALUE_FLAGS: &[&str] = &[
@@ -150,6 +345,33 @@ pub const VALUE_FLAGS: &[&str] = &[
     "step-trace",
     "bumpdiff-lanes",
     "drought-dive",
+    // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
+    // gave their knobs a writer. See `tests/knob_census.rs`.
+    "node-cut-slots",
+    "node-cut-every",
+    "node-gmi",
+    "node-gmi-every",
+    "scale",
+    "cut-topk",
+    "sb-probe-iters",
+    "root-probe-cap",
+    "root-probe-clique-cap",
+    "node-cut-batch",
+    "node-cut-age",
+    "ms-dive-steps",
+    "gmi-max-rows",
+    "chain-probe",
+    "bump-lu-min",
+    "cold-lu-eta-rebuilds",
+    "adopt-ft-max-rows",
+    "refactor-every",
+    "eta-cap-mult",
+    "lu-max-fill-nnz",
+    "node-gmi-margin",
+    "dive-probe-secs",
+    "rens-window",
+    "root-probe-share",
+    "prop-first",
 ];
 
 // `--no-x` carries false into a positive-sense builder; diagnostics carry true.
@@ -289,6 +511,13 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
     ("no-vsids", EngineEconomics::with_vsids, false),
     ("root-probe-all", EngineEconomics::with_root_probe_all, true),
     ("sepstat", EngineEconomics::with_sepstat, true),
+    (
+        "root-closure-presolve",
+        EngineEconomics::with_root_closure_presolve,
+        true,
+    ),
+    ("tableau-mir", EngineEconomics::with_tableau_mir, true),
+    ("mir-agg-root", EngineEconomics::with_mir_agg_root, true),
     ("lp-stats", EngineEconomics::with_lp_stats, true),
     ("bump-diag", EngineEconomics::with_bump_diag, true),
     (
@@ -303,6 +532,7 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
         EngineEconomics::with_margin_reframe,
         false,
     ),
+    ("auto-margin", EngineEconomics::with_auto_margin, true),
     ("dense-gmi-lu", EngineEconomics::with_dense_gmi_lu, true),
     ("no-chain-shape", EngineEconomics::with_chain_shape, false),
     (
@@ -312,6 +542,69 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
     ),
     ("no-bump-lu", EngineEconomics::with_bump_lu, false),
     ("full-pricing", EngineEconomics::with_full_pricing, true),
+    ("no-float", EngineEconomics::with_float_lane, false),
+    // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
+    // gave their knobs a writer. See `tests/knob_census.rs`.
+    ("singleton-sub", EngineEconomics::with_singleton_sub, true),
+    ("node-cut-eager", EngineEconomics::with_node_cut_eager, true),
+    ("amo-multiway", EngineEconomics::with_amo_multiway, true),
+    ("node-rc", EngineEconomics::with_node_rc, true),
+    ("no-rc-cap-guard", EngineEconomics::with_rc_cap_guard, false),
+    ("tri-crash-all", EngineEconomics::with_tri_crash_all, true),
+    ("sym-branch", EngineEconomics::with_sym_branch, true),
+    ("no-sym-branch", EngineEconomics::with_sym_branch, false),
+    ("stab-orbit", EngineEconomics::with_stab_orbit, true),
+    ("orbitope-dyn", EngineEconomics::with_orbitope_dyn, true),
+    ("no-tree-floor", EngineEconomics::with_tree_floor, false),
+    (
+        "no-tree-bound-outcome",
+        EngineEconomics::with_tree_bound_outcome,
+        false,
+    ),
+    ("no-root-floor", EngineEconomics::with_root_floor, false),
+    ("cover-minimal", EngineEconomics::with_cover_minimal, true),
+    ("gub-clique", EngineEconomics::with_gub_clique, true),
+    ("gmi-cut-trace", EngineEconomics::with_gmi_cut_trace, true),
+    ("cond-tighten", EngineEconomics::with_cond_tighten, true),
+    ("mod-k", EngineEconomics::with_mod_k, true),
+    ("knap-dbg", EngineEconomics::with_knap_dbg, true),
+    ("cold-dual-all", EngineEconomics::with_cold_dual_all, true),
+    ("cut-warm", EngineEconomics::with_cut_warm, true),
+    ("rlt", EngineEconomics::with_rlt, true),
+    (
+        "dive-commit-stopped",
+        EngineEconomics::with_dive_commit_stopped,
+        true,
+    ),
+    ("no-root-warm", EngineEconomics::with_root_warm, false),
+    (
+        "orbitope-branch",
+        EngineEconomics::with_orbitope_branch,
+        true,
+    ),
+    ("orbitope-ilv", EngineEconomics::with_orbitope_ilv, true),
+    (
+        "orbitope-branch-dyn",
+        EngineEconomics::with_orbitope_branch_dyn,
+        true,
+    ),
+    ("node-cut-local", EngineEconomics::with_node_cut_local, true),
+    ("no-cond-scout", EngineEconomics::with_cond_scout, false),
+    ("hybrid-pb-lp", EngineEconomics::with_hybrid_pb_lp, true),
+    ("attrib", EngineEconomics::with_attrib, true),
+    ("acensus", EngineEconomics::with_acensus, true),
+    ("hybrid-term", EngineEconomics::with_hybrid_term, true),
+    (
+        "root-probe-no-lp-rank",
+        EngineEconomics::with_root_probe_lp_rank,
+        false,
+    ),
+    ("ms-dive", EngineEconomics::with_ms_dive, true),
+    ("mas74-plunge", EngineEconomics::with_mas74_plunge, true),
+    ("no-mas74-plunge", EngineEconomics::with_mas74_plunge, false),
+    ("relax-lift", EngineEconomics::with_relax_lift, true),
+    ("devex", EngineEconomics::with_force_devex, true),
+    ("bump-btf", EngineEconomics::with_bump_btf, true),
 ];
 
 const USIZE_BUILDERS: &[(&str, UsizeBuilder)] = &[
@@ -344,6 +637,34 @@ const USIZE_BUILDERS: &[(&str, UsizeBuilder)] = &[
     ("ms-walk-moves", EngineEconomics::with_ms_walk_moves),
     ("gub-meas-every", EngineEconomics::with_gub_meas_every),
     ("drought-dive", EngineEconomics::with_drought_dive),
+    // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
+    // gave their knobs a writer. See `tests/knob_census.rs`.
+    ("node-cut-slots", EngineEconomics::with_node_cut_slots),
+    ("node-cut-every", EngineEconomics::with_node_cut_every),
+    ("node-gmi", EngineEconomics::with_node_gmi),
+    ("node-gmi-every", EngineEconomics::with_node_gmi_every),
+    ("scale", EngineEconomics::with_scale),
+    ("cut-topk", EngineEconomics::with_cut_topk),
+    ("sb-probe-iters", EngineEconomics::with_sb_probe_iters),
+    ("root-probe-cap", EngineEconomics::with_root_probe_cap),
+    (
+        "root-probe-clique-cap",
+        EngineEconomics::with_root_probe_clique_cap,
+    ),
+    ("node-cut-batch", EngineEconomics::with_node_cut_batch),
+    ("node-cut-age", EngineEconomics::with_node_cut_age),
+    ("ms-dive-steps", EngineEconomics::with_ms_dive_steps),
+    ("gmi-max-rows", EngineEconomics::with_gmi_max_rows),
+    ("chain-probe", EngineEconomics::with_chain_probe),
+    ("bump-lu-min", EngineEconomics::with_bump_lu_min),
+    (
+        "cold-lu-eta-rebuilds",
+        EngineEconomics::with_cold_lu_eta_rebuilds,
+    ),
+    ("adopt-ft-max-rows", EngineEconomics::with_adopt_ft_max_rows),
+    ("refactor-every", EngineEconomics::with_refactor_every),
+    ("eta-cap-mult", EngineEconomics::with_eta_cap_mult),
+    ("lu-max-fill-nnz", EngineEconomics::with_lu_max_fill_nnz),
 ];
 
 const FLOAT_BUILDERS: &[(&str, FloatBuilder)] = &[
@@ -351,6 +672,13 @@ const FLOAT_BUILDERS: &[(&str, FloatBuilder)] = &[
     ("flip-share", EngineEconomics::with_flip_lns_share),
     ("presolve-share", EngineEconomics::with_presolve_share),
     ("diag-cost-perturb", EngineEconomics::with_diag_cost_perturb),
+    // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
+    // gave their knobs a writer. See `tests/knob_census.rs`.
+    ("node-gmi-margin", EngineEconomics::with_node_gmi_margin),
+    ("dive-probe-secs", EngineEconomics::with_dive_probe_secs),
+    ("rens-window", EngineEconomics::with_rens_window),
+    ("root-probe-share", EngineEconomics::with_root_probe_share),
+    ("prop-first", EngineEconomics::with_prop_first),
 ];
 
 pub fn apply(flags: &Flags, mut opts: SolveOpts) -> Result<SolveOpts, String> {
@@ -585,3 +913,7 @@ pub fn apply(flags: &Flags, mut opts: SolveOpts) -> Result<SolveOpts, String> {
     }
     Ok(opts)
 }
+
+#[cfg(test)]
+#[path = "engine_cli/tests.rs"]
+mod tests;

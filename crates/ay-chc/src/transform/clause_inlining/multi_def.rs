@@ -125,19 +125,71 @@ impl ClauseInliner {
         candidates.retain(|pred| !forbidden.contains(pred));
 
         // A one-level rewrite may not remove a selected predicate whose
-        // definition introduces another selected predicate.
-        let mut dependency_forbidden: FxHashSet<PredicateId> = FxHashSet::default();
-        for &pred in &candidates {
-            for &idx in &def_indices[&pred] {
-                for (body_pred, _) in &clauses[idx].body.predicates {
-                    if candidates.contains(body_pred) {
-                        dependency_forbidden.insert(pred);
-                        dependency_forbidden.insert(*body_pred);
+        // definition introduces another selected predicate: the selected set
+        // must be "def-independent". The default path enforces this by dropping
+        // BOTH endpoints of every offending edge — simple, but it refuses to
+        // break a mutual-recursion 2-cycle (P0's def references P1 and P1's def
+        // references P0), which is exactly the shape a contracted loop SCC
+        // (header <-> body block) reduces to, and a multi-predicate cyclic
+        // shape PDR cannot discharge.
+        //
+        // #loop-scc-linearization (graph-collapse mode only): drop exactly ONE
+        // endpoint per offending edge. The dropped predicate stays as an
+        // ordinary predicate; the other is eliminated by one-level resolution
+        // against its uses, closing a 2-cycle into a single SELF-recursive
+        // predicate — the shape the IC3 lane / PDR already prove. Sound because
+        // it is still one-level substitution (the eliminated predicate's def now
+        // references only non-selected predicates), and the graph-collapse
+        // back-translator re-validates every Safe model and replays every
+        // Unsafe witness against the ORIGINAL clauses, so an over-eager
+        // elimination can never turn a refuted obligation safe
+        // (`node_eliminator::tests::linearizes_mutual_recursion_cycle_*`).
+        if self.graph_collapse_node_rule {
+            // Iteratively remove one endpoint (deterministically the
+            // larger-index predicate) of the first offending edge in index
+            // order until the selected set is def-independent; the outer
+            // NodeEliminator loop then peels one block-predicate per round.
+            loop {
+                let mut sorted: Vec<PredicateId> = candidates.iter().copied().collect();
+                sorted.sort_unstable_by_key(|p| p.index());
+                let offending = sorted.iter().find_map(|&pred| {
+                    def_indices[&pred].iter().find_map(|&idx| {
+                        clauses[idx]
+                            .body
+                            .predicates
+                            .iter()
+                            .find_map(|(body_pred, _)| {
+                                (*body_pred != pred && candidates.contains(body_pred)).then(|| {
+                                    if pred.index() >= body_pred.index() {
+                                        pred
+                                    } else {
+                                        *body_pred
+                                    }
+                                })
+                            })
+                    })
+                });
+                match offending {
+                    Some(drop) => {
+                        candidates.remove(&drop);
+                    }
+                    None => break,
+                }
+            }
+        } else {
+            let mut dependency_forbidden: FxHashSet<PredicateId> = FxHashSet::default();
+            for &pred in &candidates {
+                for &idx in &def_indices[&pred] {
+                    for (body_pred, _) in &clauses[idx].body.predicates {
+                        if candidates.contains(body_pred) {
+                            dependency_forbidden.insert(pred);
+                            dependency_forbidden.insert(*body_pred);
+                        }
                     }
                 }
             }
+            candidates.retain(|pred| !dependency_forbidden.contains(pred));
         }
-        candidates.retain(|pred| !dependency_forbidden.contains(pred));
 
         MultiDefPlan {
             candidates,

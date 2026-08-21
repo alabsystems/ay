@@ -2029,3 +2029,225 @@ fn negated_exists_is_still_surfaced_as_its_forall_dual() {
         "not(exists x. phi) must be surfaced as the universal forall x. not(phi)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #quant-trigger-nested: trigger candidates that live under a nested binder.
+//
+// `collect_patterns_from_term` treats a nested `forall`/`exists` as an opaque
+// leaf, so a legal trigger for the OUTER quantifier that happens to sit inside
+// an inner binder was invisible and the quantifier got NO trigger at all.
+// ---------------------------------------------------------------------------
+
+/// `forall x. exists y. P(f(x), y)` — `f x` mentions only `x`, so it is a legal
+/// single trigger for the outer `forall`, even though it sits under the inner
+/// `exists`. Before the fix this quantifier extracted nothing.
+#[test]
+fn nested_binder_trigger_candidate_is_found_for_the_outer_quantifier() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let p = terms.mk_app(Symbol::named("P"), vec![f_x, y], Sort::Bool);
+    let inner = terms.mk_exists(vec![("y".to_string(), Sort::Int)], p);
+    let outer = terms.mk_forall(vec![("x".to_string(), Sort::Int)], inner);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.patterns.iter().map(|p| p.symbol.name()))
+        .collect();
+    assert!(
+        symbols.contains(&"f"),
+        "f(x) under a nested exists must be available as a trigger for the \
+         outer forall; got {symbols:?}"
+    );
+}
+
+/// SOUNDNESS: a candidate under a nested binder that ALSO mentions the inner
+/// binder's variable is not a well-formed trigger for the outer quantifier —
+/// matching it would capture `y`. It must be refused.
+#[test]
+fn nested_binder_candidate_capturing_an_inner_var_is_refused() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    // g(x, y) mentions the inner-bound y -> illegal trigger for `forall x`.
+    let g_xy = terms.mk_app(Symbol::named("g"), vec![x, y], Sort::Int);
+    let p = terms.mk_app(Symbol::named("P"), vec![g_xy], Sort::Bool);
+    let inner = terms.mk_exists(vec![("y".to_string(), Sort::Int)], p);
+    let outer = terms.mk_forall(vec![("x".to_string(), Sort::Int)], inner);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.patterns.iter().map(|p| p.symbol.name()))
+        .collect();
+    assert!(
+        !symbols.contains(&"g"),
+        "g(x, y) captures the inner-bound y and must NOT become a trigger for \
+         the outer forall; got {symbols:?}"
+    );
+    assert!(
+        !symbols.contains(&"P"),
+        "P(g(x, y)) transitively mentions the inner-bound y and must also be \
+         refused; got {symbols:?}"
+    );
+}
+
+/// SOUNDNESS (shadowing): an inner binder that REBINDS the outer name makes
+/// every candidate under it refer to the inner variable. Refusing on the name
+/// is what keeps the outer quantifier from adopting a trigger that is really
+/// about a different binder.
+#[test]
+fn nested_binder_shadowing_the_outer_name_refuses_the_candidate() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let p = terms.mk_app(Symbol::named("P"), vec![f_x], Sort::Bool);
+    // Inner binder rebinds "x": inside, f(x) is about the INNER x.
+    let inner = terms.mk_forall(vec![("x".to_string(), Sort::Int)], p);
+    let outer = terms.mk_forall(vec![("x".to_string(), Sort::Int)], inner);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.patterns.iter().map(|p| p.symbol.name()))
+        .collect();
+    assert!(
+        !symbols.contains(&"f"),
+        "f(x) under a binder that shadows x must not become the outer \
+         quantifier's trigger; got {symbols:?}"
+    );
+}
+
+/// The descent is a FALLBACK: when the same-level pass already found a trigger,
+/// selection must be identical to before. Here `Q(x)` is available at the outer
+/// level, so the nested `f(x)` must not be harvested as well.
+#[test]
+fn nested_descent_does_not_run_when_a_same_level_trigger_exists() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let q_x = terms.mk_app(Symbol::named("Q"), vec![x], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let p = terms.mk_app(Symbol::named("P"), vec![f_x, y], Sort::Bool);
+    let inner = terms.mk_exists(vec![("y".to_string(), Sort::Int)], p);
+    let body = terms.mk_and(vec![q_x, inner]);
+    let outer = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|g| g.patterns.iter().map(|p| p.symbol.name()))
+        .collect();
+    assert!(
+        symbols.contains(&"Q"),
+        "same-level Q(x) is still the trigger; got {symbols:?}"
+    );
+    assert!(
+        !symbols.contains(&"f"),
+        "nested descent must NOT run once a same-level candidate exists, or it \
+         would change selection for quantifiers that already work; got {symbols:?}"
+    );
+}
+
+/// A user-supplied `:pattern` still wins outright: the descent is part of
+/// auto-extraction and must never override an authored trigger.
+#[test]
+fn nested_descent_never_overrides_a_user_supplied_pattern() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let q_x = terms.mk_app(Symbol::named("Q"), vec![x], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x], Sort::Int);
+    let p = terms.mk_app(Symbol::named("P"), vec![f_x, y], Sort::Bool);
+    let inner = terms.mk_exists(vec![("y".to_string(), Sort::Int)], p);
+    let body = terms.mk_and(vec![q_x, inner]);
+    let outer =
+        terms.mk_forall_with_triggers(vec![("x".to_string(), Sort::Int)], body, vec![vec![q_x]]);
+
+    let groups = extract_patterns(&terms, outer);
+    assert!(
+        groups
+            .iter()
+            .all(|g| g.patterns.iter().all(|p| p.symbol.name() == "Q")),
+        "the authored :pattern Q(x) must be the only primary trigger"
+    );
+}
+
+/// SOUNDNESS (let transparency): the surface candidate `g(z)` is not
+/// capture-free when the active let binds `z := h(x, y)` and `y` belongs to the
+/// inner quantifier. Pattern conversion resolves the alias, so the capture gate
+/// must resolve it too.
+#[test]
+fn nested_binder_capture_hidden_behind_let_alias_is_refused() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("let_capture_x", Sort::Int);
+    let y = terms.mk_var("let_capture_y", Sort::Int);
+    let z = terms.mk_var("let_capture_z", Sort::Int);
+    let h_xy = terms.mk_app(Symbol::named("let_capture_h"), [x, y], Sort::Int);
+    let g_z = terms.mk_app(Symbol::named("let_capture_g"), [z], Sort::Int);
+    let p_g_z = terms.mk_app(Symbol::named("let_capture_p"), [g_z], Sort::Bool);
+    let let_body = terms.mk_let(vec![("let_capture_z".to_string(), h_xy)], p_g_z);
+    let inner = terms.mk_exists(vec![("let_capture_y".to_string(), Sort::Int)], let_body);
+    let outer = terms.mk_forall(vec![("let_capture_x".to_string(), Sort::Int)], inner);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|group| group.patterns.iter().map(|pattern| pattern.symbol.name()))
+        .collect();
+    assert!(
+        !symbols.contains(&"let_capture_g") && !symbols.contains(&"let_capture_p"),
+        "g(z) resolves to g(h(x,y)) and captures inner y; got {symbols:?}"
+    );
+}
+
+/// Positive twin of the let-capture test: an alias whose value mentions only
+/// the outer variable remains a legal nested trigger.
+#[test]
+fn nested_binder_outer_only_let_alias_remains_a_trigger() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("let_outer_x", Sort::Int);
+    let y = terms.mk_var("let_outer_y", Sort::Int);
+    let z = terms.mk_var("let_outer_z", Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("let_outer_f"), [x], Sort::Int);
+    let g_z = terms.mk_app(Symbol::named("let_outer_g"), [z], Sort::Int);
+    let p = terms.mk_app(Symbol::named("let_outer_p"), [g_z, y], Sort::Bool);
+    let let_body = terms.mk_let(vec![("let_outer_z".to_string(), f_x)], p);
+    let inner = terms.mk_exists(vec![("let_outer_y".to_string(), Sort::Int)], let_body);
+    let outer = terms.mk_forall(vec![("let_outer_x".to_string(), Sort::Int)], inner);
+
+    let groups = extract_patterns(&terms, outer);
+    let symbols: Vec<&str> = groups
+        .iter()
+        .flat_map(|group| group.patterns.iter().map(|pattern| pattern.symbol.name()))
+        .collect();
+    assert!(
+        symbols.contains(&"let_outer_g") || symbols.contains(&"let_outer_f"),
+        "an alias of f(x) mentions no inner variable and remains legal; got {symbols:?}"
+    );
+}
+
+/// Producer/checker metering parity: the strict checker walks every occurrence
+/// of a shared DAG subtree. The exact producer must fail closed at the same
+/// 100k structural-work boundary instead of charging only distinct term IDs and
+/// emitting an artifact the checker cannot finish validating.
+#[test]
+fn exact_substitution_meters_repeated_dag_edges_like_the_checker() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("metered_exact_x", Sort::Int);
+    let r_x = terms.mk_app(Symbol::named("metered_exact_r"), [x], Sort::Int);
+    let q_r_x = terms.mk_app(Symbol::named("metered_exact_q"), [r_x], Sort::Int);
+    let p_q_r_x = terms.mk_app(Symbol::named("metered_exact_p"), [q_r_x], Sort::Bool);
+    let repeated = vec![p_q_r_x; 25_000];
+    let body = terms.mk_app(Symbol::named("and"), repeated, Sort::Bool);
+    let zero = terms.mk_int(BigInt::from(0));
+    let mut substitution = HashMap::default();
+    substitution.insert("metered_exact_x".to_string(), zero);
+
+    assert!(
+        subst_vars_exact_qf(&mut terms, body, &substitution).is_none(),
+        "repeated DAG edges above the strict checker's work budget must fail closed"
+    );
+}

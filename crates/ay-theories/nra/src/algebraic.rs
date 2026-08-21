@@ -71,8 +71,10 @@ pub struct RealAlgebraic {
 
 /// Result of interval refinement: either a strictly smaller isolating
 /// interval, or the exact (rational) root when a bisection midpoint hits it.
-enum Refined {
+pub(crate) enum Refined {
+    /// A strictly narrower isolating interval, endpoints still non-roots.
     Interval(BigRational, BigRational),
+    /// The bisection landed exactly on the root, which is therefore rational.
     Exact(BigRational),
 }
 
@@ -240,6 +242,19 @@ impl RealAlgebraic {
         } else {
             Some(Refined::Interval(mid, hi.clone()))
         }
+    }
+
+    /// One bisection of an enclosure of THIS number, against its own defining
+    /// polynomial.
+    ///
+    /// `(lo, hi)` must isolate this number (the constructor's interval, or any
+    /// interval derived from it by this method). Exposed for
+    /// [`crate::mroot`], whose interval fast path narrows several algebraic
+    /// coordinates in lockstep and therefore has to drive refinement itself
+    /// rather than call a fixed-cap helper. `None` is the same fail-closed
+    /// refusal [`Self::refine_step`] makes on a violated invariant.
+    pub(crate) fn refine_from(&self, lo: &BigRational, hi: &BigRational) -> Option<Refined> {
+        Self::refine_step(&self.poly, lo, hi)
     }
 
     /// Exact sign of an arbitrary polynomial `p` at this algebraic number.

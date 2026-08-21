@@ -1004,6 +1004,9 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                     );
                     return ExtPropagateResult::none();
                 }
+                // #dt-context-derivation: preserve the premises the level-0
+                // strip below is about to discard.
+                self.record_context_conflict_premises(&conflict_terms, ctx);
                 // #8424: Pre-minimize conflict clause with level-0 removal.
                 let removed =
                     crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
@@ -1420,6 +1423,30 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                             }
                         } else {
                             // Unassigned — use lazy path.
+                            // #dt-context-derivation: at decision level 0 the
+                            // propagated fact becomes a stripped premise of
+                            // later conflicts, and its lazy reason is
+                            // invisible to the SAT-side reason walk.
+                            // Materialize the reason ONCE for hint-recording
+                            // (level-0 propagations are bounded); the lazy
+                            // handle still goes to the SAT core unchanged.
+                            // Level-0 only: any-level hints were measured to
+                            // SHADOW the conflict-time records via first-wins
+                            // keying (the and-def circular premise shape
+                            // claims a fact's key with an undischargeable
+                            // premise set; 57 -> 72 unauthenticated). The
+                            // stripped premises that matter are level-0.
+                            if ctx.decision_level() == 0
+                                && self.context_records.is_some()
+                                && !self.context_records_full()
+                            {
+                                if let Some(reason) = self
+                                    .theory
+                                    .explain_propagation(prop.literal.term, reason_data)
+                                {
+                                    self.record_context_propagation(&prop.literal, &reason);
+                                }
+                            }
                             lazy_propagation_pairs.push((lit, reason_data));
                             continue;
                         }
@@ -2085,6 +2112,13 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                 // closes these rejections, it is not "record more here".
                 // See the development design notes.
                 if ctx.decision_level() == 0 {
+                    // #dt-context-derivation: hint-record the propagation so
+                    // certification premise chains can discharge it. Pure
+                    // hint — independent of the deliberately narrow lemma
+                    // recorder below (see its DO-NOT-WIDEN history): no
+                    // tracker step, no clause, no search behavior change.
+                    // Level-0 only — see the lazy twin's shadowing note.
+                    self.record_context_propagation(&prop.literal, &prop.reason);
                     let terms_opt = self.terms;
                     if let Some(proof_ctx) = self.proof.as_mut() {
                         let mut term_clause: Vec<TermId> = Vec::with_capacity(clause.len());

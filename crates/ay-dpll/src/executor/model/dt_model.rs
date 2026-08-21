@@ -18,6 +18,9 @@ use crate::executor_format::{format_default_value_surface, format_sort_surface};
 
 use super::rendered_dt_limits::SchemaSourceBudget;
 use super::{EvalValue, Executor, Model};
+use census_values::{CensusCtx, CensusKey, CensusMemo};
+
+pub(in crate::executor::model) mod census_values;
 
 const CEGAR_DISTINCT_OPERAND_LIMIT: usize = 256;
 
@@ -1267,6 +1270,7 @@ impl Executor {
     pub(in crate::executor) fn datatype_array_census_certifies(&self, model: &Model) -> bool {
         /// Reconstruction depth for datatype canonical values.
         const CANON_DEPTH: u32 = 20;
+        let memo = CensusMemo::new();
         let datatype_ctors: HashSet<String> = self
             .ctx
             .datatype_iter()
@@ -1290,7 +1294,12 @@ impl Executor {
         // array equalities + derived nested-select identity, and the observed
         // cell function per identity class. Shared verbatim with the general
         // select-congruence gate so the two never diverge.
-        let (reachable, uf, class_cells) = self.census_build_identity(model);
+        let (reachable, uf, class_cells) = self.census_build_identity(model, &memo);
+        let ctx = CensusCtx {
+            uf: &uf,
+            class_cells: &class_cells,
+            memo: &memo,
+        };
 
         // The census is the certification boundary for datatype-ELEMENT arrays
         // (select-congruence over datatype VALUES). A problem whose only
@@ -1310,7 +1319,7 @@ impl Executor {
 
         // (2) Group datatype-carrying-array selects by (identity class, evaluated
         // index). A select whose index is undecidable fails closed.
-        let mut groups: HashMap<(TermId, String), Vec<TermId>> = HashMap::default();
+        let mut groups: HashMap<(TermId, CensusKey), Vec<TermId>> = HashMap::default();
         for &t in &reachable {
             let Some((array, index)) = self.exact_cegar_select_parts(t) else {
                 continue;
@@ -1318,7 +1327,7 @@ impl Executor {
             if !is_dt_array(array, self) {
                 continue;
             }
-            let Some(idx_key) = self.census_index_key(model, index) else {
+            let Some(idx_key) = self.census_index_key(model, index, &memo) else {
                 if ay_core::misc_cli_flags().census_trace {
                     eprintln!(
                         "c census-reject undecidable-index sort={}",
@@ -1344,22 +1353,15 @@ impl Executor {
             }
             for i in 0..reads.len() {
                 for j in (i + 1)..reads.len() {
-                    match self.census_compatible(
-                        model,
-                        reads[i],
-                        reads[j],
-                        &class_cells,
-                        &uf,
-                        CANON_DEPTH,
-                    ) {
+                    match self.census_compatible(model, reads[i], reads[j], CANON_DEPTH, &ctx) {
                         Some(true) => {}
                         Some(false) => {
                             if ay_core::misc_cli_flags().census_trace {
                                 eprintln!(
                                     "c census-reject congruence-conflict {} vs {}",
-                                    self.census_value_key(model, reads[i], CANON_DEPTH)
+                                    self.census_value_key(model, reads[i], CANON_DEPTH, &memo)
                                         .unwrap_or_else(|| "?".into()),
-                                    self.census_value_key(model, reads[j], CANON_DEPTH)
+                                    self.census_value_key(model, reads[j], CANON_DEPTH, &memo)
                                         .unwrap_or_else(|| "?".into()),
                                 );
                             }
@@ -1422,10 +1424,9 @@ impl Executor {
                         model,
                         dt_operands[i],
                         dt_operands[j],
-                        &uf,
                         &groups,
-                        &class_cells,
                         CANON_DEPTH,
+                        &ctx,
                     ) {
                         return false;
                     }
@@ -1434,6 +1435,93 @@ impl Executor {
         }
 
         true
+    }
+
+    /// Whether arrays `x`,`y` are WITNESSED distinct under the model: some common
+    /// evaluated index at which their reconstructed cell values differ. Uses the
+    /// already-built `groups` (class,idx -> reads) — for each idx-key observed on
+    /// BOTH classes, compares the reconstructed value. Returns false (fail-closed)
+    /// when they agree on every common observed key.
+    pub(super) fn census_arrays_witnessed_distinct(
+        &self,
+        model: &Model,
+        x: TermId,
+        y: TermId,
+        groups: &HashMap<(TermId, CensusKey), Vec<TermId>>,
+        depth: u32,
+        ctx: &CensusCtx<'_>,
+    ) -> bool {
+        let cx = Self::census_find(ctx.uf, x);
+        let cy = Self::census_find(ctx.uf, y);
+        if cx == cy {
+            return false; // same identity class -> provably NOT distinct
+        }
+        // Common observed index keys.
+        let mut keys_x: HashSet<CensusKey> = Default::default();
+        for (cls, k) in groups.keys() {
+            if *cls == cx {
+                keys_x.insert(k.clone());
+            }
+        }
+        for (cls, k) in groups.keys() {
+            if *cls != cy || !keys_x.contains(k) {
+                continue;
+            }
+            let vx = groups
+                .get(&(cx, k.clone()))
+                .and_then(|r| r.first())
+                .copied();
+            let vy = groups
+                .get(&(cy, k.clone()))
+                .and_then(|r| r.first())
+                .copied();
+            if let (Some(a), Some(b)) = (vx, vy) {
+                // A distinct is witnessed only by a DEFINITE incompatibility at a
+                // common cell — `census_compatible == Some(false)`. String
+                // inequality of canonicals would over-witness (two model-equal
+                // array fields carry distinct `arr#id` markers), certifying a
+                // disequality the model does not actually satisfy — a false SAT.
+                if self.census_compatible(model, a, b, depth, ctx) == Some(false) {
+                    return true; // witnessed difference (definite)
+                }
+            }
+        }
+        // No witnessed differing cell among common observed indices. The distinct
+        // is STILL satisfiable when the two (different-identity-class) arrays can
+        // differ at an UNOBSERVED index — which they always can if the index
+        // domain has a free slot beyond the observed keys (an infinite index
+        // sort, or a finite one not fully pinned). A completion that differs
+        // there satisfies the disequality, so certifying is sound (the union-find
+        // already excluded genuinely-equal arrays via `cx == cy` above, including
+        // transitively-equated ones). Fixes over-refutation of `(distinct v3 v5)`
+        // over unconstrained datatype-element arrays (#dt-array-distinct-freeslot).
+        if self.census_index_domain_has_free_slot(x, &keys_x) {
+            return true;
+        }
+        false
+    }
+
+    /// Whether array `arr`'s index domain has a value NOT among the `observed`
+    /// keys — a slot at which two different-identity arrays can be completed to
+    /// differ. True for an infinite index sort (Int/Real); for a finite BitVec
+    /// index only when its `2^width` slots exceed the observed count.
+    /// Conservative (`false`) for index sorts of unknown cardinality, so a
+    /// disequality is never spuriously certified there.
+    pub(super) fn census_index_domain_has_free_slot(
+        &self,
+        arr: TermId,
+        observed: &HashSet<CensusKey>,
+    ) -> bool {
+        match self.ctx.terms.sort(arr) {
+            Sort::Array(a) => match &a.index_sort {
+                Sort::Int | Sort::Real => true,
+                Sort::BitVec(bv) => {
+                    bv.width >= 63 || (observed.len() as u128) < (1u128 << bv.width)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Build the model's array-identity structure, shared by the datatype census
@@ -1451,10 +1539,11 @@ impl Executor {
     fn census_build_identity(
         &self,
         model: &Model,
+        memo: &CensusMemo,
     ) -> (
         HashSet<TermId>,
         HashMap<TermId, TermId>,
-        HashMap<TermId, Vec<(String, TermId)>>,
+        HashMap<TermId, Vec<(CensusKey, TermId)>>,
     ) {
         let mut reachable: HashSet<TermId> = Default::default();
         {
@@ -1507,9 +1596,9 @@ impl Executor {
                 }
             }
         }
-        let arr_sel_idx: Vec<Option<String>> = arr_selects
+        let arr_sel_idx: Vec<Option<CensusKey>> = arr_selects
             .iter()
-            .map(|&(_, _, idx)| self.census_index_key(model, idx))
+            .map(|&(_, _, idx)| self.census_index_key(model, idx, memo))
             .collect();
         // Fixpoint-union array-valued selects that read the SAME inner array:
         // equal base identity class AND equal evaluated index. Grouped by
@@ -1542,16 +1631,30 @@ impl Executor {
             }
         }
 
-        let mut class_cells: HashMap<TermId, Vec<(String, TermId)>> = HashMap::default();
-        for &term in &reachable {
+        let class_cells = self.census_class_cells(model, &reachable, &uf, memo);
+        (reachable, uf, class_cells)
+    }
+
+    /// Per identity-class rep, the `(evaluated-index key, select term)` cells
+    /// actually read on that class. A select whose index the model does not
+    /// determine contributes no cell (fail-closed at every consumer).
+    fn census_class_cells(
+        &self,
+        model: &Model,
+        reachable: &HashSet<TermId>,
+        uf: &HashMap<TermId, TermId>,
+        memo: &CensusMemo,
+    ) -> HashMap<TermId, Vec<(CensusKey, TermId)>> {
+        let mut class_cells: HashMap<TermId, Vec<(CensusKey, TermId)>> = HashMap::default();
+        for &term in reachable {
             if let Some((array, index)) = self.exact_cegar_select_parts(term) {
-                if let Some(key) = self.census_index_key(model, index) {
-                    let class = Self::census_find(&uf, array);
+                if let Some(key) = self.census_index_key(model, index, memo) {
+                    let class = Self::census_find(uf, array);
                     class_cells.entry(class).or_default().push((key, term));
                 }
             }
         }
-        (reachable, uf, class_cells)
+        class_cells
     }
 
     /// General model-based SELECT-CONGRUENCE gate — the sound backstop for the
@@ -1569,10 +1672,45 @@ impl Executor {
     /// do NOT trip it — completeness is preserved for everything except the
     /// specific inconsistency.
     pub(in crate::executor) fn array_select_congruence_violated(&self, model: &Model) -> bool {
+        let memo = CensusMemo::new();
+        let violation = self.census_first_congruence_violation(model, &memo);
+        if let Some((r1, r2)) = violation {
+            if ay_core::misc_cli_flags().census_trace {
+                const CANON_DEPTH: u32 = 20;
+                eprintln!(
+                    "c select-cong-violation {} vs {}",
+                    self.census_value_key(model, r1, CANON_DEPTH, &memo)
+                        .unwrap_or_else(|| "?".into()),
+                    self.census_value_key(model, r2, CANON_DEPTH, &memo)
+                        .unwrap_or_else(|| "?".into()),
+                );
+            }
+        }
+        violation.is_some()
+    }
+
+    /// The FIRST pair of reads that share an (identity class, evaluated index)
+    /// cell and whose element values are DEFINITELY incompatible
+    /// (`census_compatible == Some(false)`) — the single scan behind both the
+    /// general select-congruence gate and the CEGAR lemma distiller, which used
+    /// to carry byte-identical copies of it.
+    ///
+    /// Undecidable comparisons (`None`) are NOT violations: the gate degrades
+    /// only on a proven inconsistency, so completeness is preserved.
+    fn census_first_congruence_violation(
+        &self,
+        model: &Model,
+        memo: &CensusMemo,
+    ) -> Option<(TermId, TermId)> {
         const CANON_DEPTH: u32 = 20;
-        let (_reachable, uf, class_cells) = self.census_build_identity(model);
+        let (_reachable, uf, class_cells) = self.census_build_identity(model, memo);
+        let ctx = CensusCtx {
+            uf: &uf,
+            class_cells: &class_cells,
+            memo,
+        };
         // Group ALL selects by (identity class, evaluated index).
-        let mut cells: HashMap<(TermId, String), Vec<TermId>> = HashMap::default();
+        let mut cells: HashMap<(TermId, CensusKey), Vec<TermId>> = HashMap::default();
         for (cls, list) in &class_cells {
             for (k, t) in list {
                 cells.entry((*cls, k.clone())).or_default().push(*t);
@@ -1584,30 +1722,15 @@ impl Executor {
             }
             for i in 0..reads.len() {
                 for j in (i + 1)..reads.len() {
-                    if self.census_compatible(
-                        model,
-                        reads[i],
-                        reads[j],
-                        &class_cells,
-                        &uf,
-                        CANON_DEPTH,
-                    ) == Some(false)
+                    if self.census_compatible(model, reads[i], reads[j], CANON_DEPTH, &ctx)
+                        == Some(false)
                     {
-                        if ay_core::misc_cli_flags().census_trace {
-                            eprintln!(
-                                "c select-cong-violation {} vs {}",
-                                self.census_value_key(model, reads[i], CANON_DEPTH)
-                                    .unwrap_or_else(|| "?".into()),
-                                self.census_value_key(model, reads[j], CANON_DEPTH)
-                                    .unwrap_or_else(|| "?".into()),
-                            );
-                        }
-                        return true; // proven select-congruence violation
+                        return Some((reads[i], reads[j]));
                     }
                 }
             }
         }
-        false
+        None
     }
 
     /// Phase 2 CEGAR (#dt-array-cegar): distill the array select-congruence
@@ -1622,39 +1745,10 @@ impl Executor {
         &mut self,
         model: &Model,
     ) -> Option<TermId> {
-        const CANON_DEPTH: u32 = 20;
         // Phase A (immutable analysis): locate the first violating read pair.
         let pair = {
-            let (_reachable, uf, class_cells) = self.census_build_identity(model);
-            let mut cells: HashMap<(TermId, String), Vec<TermId>> = HashMap::default();
-            for (cls, list) in &class_cells {
-                for (k, t) in list {
-                    cells.entry((*cls, k.clone())).or_default().push(*t);
-                }
-            }
-            let mut found: Option<(TermId, TermId)> = None;
-            'outer: for reads in cells.values() {
-                if reads.len() < 2 {
-                    continue;
-                }
-                for a in 0..reads.len() {
-                    for b in (a + 1)..reads.len() {
-                        if self.census_compatible(
-                            model,
-                            reads[a],
-                            reads[b],
-                            &class_cells,
-                            &uf,
-                            CANON_DEPTH,
-                        ) == Some(false)
-                        {
-                            found = Some((reads[a], reads[b]));
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            found
+            let memo = CensusMemo::new();
+            self.census_first_congruence_violation(model, &memo)
         };
         let (r1, r2) = pair?;
         // Phase B (mutable construction): build the congruence lemma.
@@ -1774,7 +1868,7 @@ impl Executor {
     }
 
     /// Union-find find (no compression; read-only over `uf`).
-    fn census_find(uf: &HashMap<TermId, TermId>, x: TermId) -> TermId {
+    pub(super) fn census_find(uf: &HashMap<TermId, TermId>, x: TermId) -> TermId {
         let mut r = x;
         while let Some(&p) = uf.get(&r) {
             if p == r {
@@ -1796,357 +1890,6 @@ impl Executor {
             }
             _ => false,
         }
-    }
-
-    /// Canonical model key of an INDEX term: a datatype index reconstructs to its
-    /// canonical constructor tuple; a scalar index to its evaluated value. `None`
-    /// if the model does not determine it (fail-closed at the call site).
-    fn census_index_key(&self, model: &Model, index: TermId) -> Option<String> {
-        self.census_value_key(model, index, 20)
-    }
-
-    /// Recursive canonical model key of a term — the census `RValue` tree
-    /// flattened to a string: a datatype value reconstructs to its constructor
-    /// tuple `(ctor field..)` with EACH field recursively keyed (INCLUDING
-    /// array-typed fields, which `dt_mat_canonical` bailed on with `None`); an
-    /// array to a const/store/identity canonical; a scalar/uninterpreted leaf to
-    /// its evaluated value. `None` when the model does not determine it
-    /// (fail-closed at the call site). Two terms are model-equal iff their keys
-    /// are equal (over-approximate for bare-array fields — same syntactic term ⇒
-    /// same key; a false inequality can only over-reject to a sound `unknown`,
-    /// never certify a false SAT).
-    fn census_value_key(&self, model: &Model, term: TermId, depth: u32) -> Option<String> {
-        if depth == 0 {
-            return None;
-        }
-        let sort = self.ctx.terms.sort(term).clone();
-        if let Sort::Array(_) = sort {
-            return self.census_array_canonical(model, term, depth);
-        }
-        let is_dt = matches!(&sort, Sort::Datatype(dt) if self.ctx.datatype_iter().any(|(n,_)| n==dt.name.as_str()))
-            || matches!(&sort, Sort::Uninterpreted(n) if self.ctx.datatype_iter().any(|(d,_)| d==n.as_str()));
-        if is_dt {
-            // Literal constructor application: head + recursively-keyed args.
-            if let TermData::App(sym, args) = self.ctx.terms.get(term) {
-                if let Some((_dt, ctor)) = self.ctx.is_constructor(sym.name()) {
-                    let args_v: Vec<TermId> = args.clone();
-                    let mut parts = vec![ctor];
-                    for arg in args_v {
-                        parts.push(self.census_value_key(model, arg, depth - 1)?);
-                    }
-                    return Some(format!("({})", parts.join(" ")));
-                }
-            }
-            // Datatype-sorted variable / selector result: read the model's
-            // constructor, then each field via its selector application.
-            let (ctor, _) = self.dt_constructor_of(model, term)?;
-            let selectors: Vec<String> = self
-                .ctx
-                .constructor_selectors(&ctor)
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            if selectors.is_empty() {
-                return Some(ctor);
-            }
-            let mut parts = vec![ctor];
-            for sel in selectors {
-                let sel_app = self.find_dt_selector_app(&sel, term)?;
-                parts.push(self.census_value_key(model, sel_app, depth - 1)?);
-            }
-            return Some(format!("({})", parts.join(" ")));
-        }
-        // A read the preprocessor substituted away (its live twin carries the
-        // bits) evaluates Unknown by TermId; the asserted equality that PINS it
-        // (`(= (ptr (select A j)) #xFF)`) still defines its model value — the
-        // same resolution `concrete_select_pairs` uses for the strict oracle.
-        let v = match self.evaluate_term(model, term) {
-            EvalValue::Unknown => self
-                .extract_value_from_asserted_equalities(model, term)
-                .unwrap_or(EvalValue::Unknown),
-            v => v,
-        };
-        match v {
-            EvalValue::BitVec { value, width } => Some(format!("bv{width}:{value}")),
-            EvalValue::Bool(b) => Some(format!("b:{b}")),
-            EvalValue::Rational(r) => Some(format!("r:{r}")),
-            EvalValue::Element(e) => Some(format!("e:{e}")),
-            _ => None,
-        }
-    }
-
-    /// Canonical of an ARRAY term under the model: a const-array to
-    /// `const(<fill>)`, a store to `store(<base>,<idx>,<val>)`, a nested
-    /// `(select B k)` to `sel(<B id>,<eval k>)` (same base term + evaluated index ⇒
-    /// same inner array, by array congruence), and any other bare/computed array
-    /// to an identity marker `arr#<term id>`. SOUND: identity-by-term over-rejects
-    /// (degrades) two model-equal but syntactically-distinct arrays, never
-    /// under-rejects. Used to key datatype ARRAY fields (e.g. `Slice.data`).
-    fn census_array_canonical(&self, model: &Model, arr: TermId, depth: u32) -> Option<String> {
-        if depth == 0 {
-            return None;
-        }
-        if let Some(fill) = self.ctx.terms.get_const_array(arr) {
-            return Some(format!(
-                "const({})",
-                self.census_value_key(model, fill, depth - 1)?
-            ));
-        }
-        if let Some((base_term, index, value)) = self.exact_cegar_store_parts(arr) {
-            let base = self.census_array_canonical(model, base_term, depth - 1)?;
-            let idx = self.census_index_key(model, index)?;
-            let val = self.census_value_key(model, value, depth - 1)?;
-            return Some(format!("store({base},{idx},{val})"));
-        }
-        if let Some((base, index)) = self.exact_cegar_select_parts(arr) {
-            let idx = self.census_index_key(model, index)?;
-            return Some(format!("sel({},{idx})", base.0));
-        }
-        Some(format!("arr#{}", arr.0))
-    }
-
-    /// Whether arrays `x`,`y` are WITNESSED distinct under the model: some common
-    /// evaluated index at which their reconstructed cell values differ. Uses the
-    /// already-built `groups` (class,idx -> reads) — for each idx-key observed on
-    /// BOTH classes, compares the reconstructed value. Returns false (fail-closed)
-    /// when they agree on every common observed key.
-    fn census_arrays_witnessed_distinct(
-        &self,
-        model: &Model,
-        x: TermId,
-        y: TermId,
-        uf: &HashMap<TermId, TermId>,
-        groups: &HashMap<(TermId, String), Vec<TermId>>,
-        class_cells: &HashMap<TermId, Vec<(String, TermId)>>,
-        depth: u32,
-    ) -> bool {
-        let cx = Self::census_find(uf, x);
-        let cy = Self::census_find(uf, y);
-        if cx == cy {
-            return false; // same identity class -> provably NOT distinct
-        }
-        // Common observed index keys.
-        let mut keys_x: HashSet<String> = Default::default();
-        for (cls, k) in groups.keys() {
-            if *cls == cx {
-                keys_x.insert(k.clone());
-            }
-        }
-        for (cls, k) in groups.keys() {
-            if *cls != cy || !keys_x.contains(k) {
-                continue;
-            }
-            let vx = groups
-                .get(&(cx, k.clone()))
-                .and_then(|r| r.first())
-                .copied();
-            let vy = groups
-                .get(&(cy, k.clone()))
-                .and_then(|r| r.first())
-                .copied();
-            if let (Some(a), Some(b)) = (vx, vy) {
-                // A distinct is witnessed only by a DEFINITE incompatibility at a
-                // common cell — `census_compatible == Some(false)`. String
-                // inequality of canonicals would over-witness (two model-equal
-                // array fields carry distinct `arr#id` markers), certifying a
-                // disequality the model does not actually satisfy — a false SAT.
-                if self.census_compatible(model, a, b, class_cells, uf, depth) == Some(false) {
-                    return true; // witnessed difference (definite)
-                }
-            }
-        }
-        // No witnessed differing cell among common observed indices. The distinct
-        // is STILL satisfiable when the two (different-identity-class) arrays can
-        // differ at an UNOBSERVED index — which they always can if the index
-        // domain has a free slot beyond the observed keys (an infinite index
-        // sort, or a finite one not fully pinned). A completion that differs
-        // there satisfies the disequality, so certifying is sound (the union-find
-        // already excluded genuinely-equal arrays via `cx == cy` above, including
-        // transitively-equated ones). Fixes over-refutation of `(distinct v3 v5)`
-        // over unconstrained datatype-element arrays (#dt-array-distinct-freeslot).
-        if self.census_index_domain_has_free_slot(x, &keys_x) {
-            return true;
-        }
-        false
-    }
-
-    /// Whether array `arr`'s index domain has a value NOT among the `observed`
-    /// keys — a slot at which two different-identity arrays can be completed to
-    /// differ. True for an infinite index sort (Int/Real); for a finite BitVec
-    /// index only when its `2^width` slots exceed the observed count.
-    /// Conservative (`false`) for index sorts of unknown cardinality, so a
-    /// disequality is never spuriously certified there.
-    fn census_index_domain_has_free_slot(&self, arr: TermId, observed: &HashSet<String>) -> bool {
-        match self.ctx.terms.sort(arr) {
-            Sort::Array(a) => match &a.index_sort {
-                Sort::Int | Sort::Real => true,
-                Sort::BitVec(bv) => {
-                    bv.width >= 63 || (observed.len() as u128) < (1u128 << bv.width)
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
-    /// Structural model-COMPATIBILITY of two terms: `Some(true)` iff the model's
-    /// partial assignment can be completed with both denoting the SAME value,
-    /// `Some(false)` iff they are DEFINITELY unequal (differing constructor,
-    /// differing scalar/EUF value, or a common observed array cell that
-    /// conflicts), `None` if a needed value is undecidable (caller fails closed).
-    ///
-    /// This is the sound notion of "select-congruent" for values carrying
-    /// arrays: two array fields are compatible unless they disagree on a cell
-    /// BOTH were observed at — disjoint / unread cells complete freely, so two
-    /// unconstrained `Slice.data` arrays are compatible rather than falsely
-    /// conflicting on their `arr#id` identity. Certifying on compatibility is
-    /// sound because a satisfying completion demonstrably exists; only cells the
-    /// model already pins can force `Some(false)`.
-    fn census_compatible(
-        &self,
-        model: &Model,
-        t1: TermId,
-        t2: TermId,
-        class_cells: &HashMap<TermId, Vec<(String, TermId)>>,
-        uf: &HashMap<TermId, TermId>,
-        depth: u32,
-    ) -> Option<bool> {
-        if depth == 0 {
-            return None; // recursion budget exhausted -> undecidable, fail closed
-        }
-        let sort = self.ctx.terms.sort(t1).clone();
-        // Arrays: compatible unless a COMMON observed cell (or overlapping
-        // const-default) conflicts.
-        if let Sort::Array(_) = sort {
-            let (c1, d1) = self.census_collect_cells(model, t1, class_cells, uf, depth);
-            let (c2, d2) = self.census_collect_cells(model, t2, class_cells, uf, depth);
-            for (k, v1) in &c1 {
-                if let Some(v2) = c2.get(k).copied().or(d2) {
-                    if !self.census_compatible(model, *v1, v2, class_cells, uf, depth - 1)? {
-                        return Some(false);
-                    }
-                }
-            }
-            if let Some(dv1) = d1 {
-                for (k, v2) in &c2 {
-                    if c1.contains_key(k) {
-                        continue;
-                    }
-                    if !self.census_compatible(model, dv1, *v2, class_cells, uf, depth - 1)? {
-                        return Some(false);
-                    }
-                }
-                if let Some(dv2) = d2 {
-                    if !self.census_compatible(model, dv1, dv2, class_cells, uf, depth - 1)? {
-                        return Some(false);
-                    }
-                }
-            }
-            return Some(true);
-        }
-        // Datatype values: same constructor, then each field pairwise compatible.
-        let is_dt = matches!(&sort, Sort::Datatype(dt) if self.ctx.datatype_iter().any(|(n,_)| n==dt.name.as_str()))
-            || matches!(&sort, Sort::Uninterpreted(n) if self.ctx.datatype_iter().any(|(d,_)| d==n.as_str()));
-        if is_dt {
-            let (c1, _) = self.dt_constructor_of(model, t1)?;
-            let (c2, _) = self.dt_constructor_of(model, t2)?;
-            if c1 != c2 {
-                return Some(false); // different constructors -> definitely unequal
-            }
-            let selectors: Vec<String> = self
-                .ctx
-                .constructor_selectors(&c1)
-                .map(|s| s.to_vec())
-                .unwrap_or_default();
-            for sel in selectors {
-                let dbg = ay_core::misc_cli_flags().census_trace;
-                let (Some(a1), Some(a2)) = (
-                    self.find_dt_selector_app(&sel, t1),
-                    self.find_dt_selector_app(&sel, t2),
-                ) else {
-                    if dbg {
-                        eprintln!(
-                            "c census-dbg no-selector-app sel={sel} t1={} t2={}",
-                            t1.0, t2.0
-                        );
-                    }
-                    return None;
-                };
-                let r = self.census_compatible(model, a1, a2, class_cells, uf, depth - 1);
-                if dbg && r.is_none() {
-                    eprintln!(
-                        "c census-dbg field-undecidable sel={sel} a1={} ({}) a2={} ({})",
-                        a1.0,
-                        self.format_term(a1),
-                        a2.0,
-                        self.format_term(a2)
-                    );
-                }
-                if !r? {
-                    return Some(false);
-                }
-            }
-            return Some(true);
-        }
-        // Scalar / EUF leaf: compare evaluated values (undecidable -> None).
-        let dbg = ay_core::misc_cli_flags().census_trace;
-        let k1 = self.census_value_key(model, t1, depth);
-        let k2 = self.census_value_key(model, t2, depth);
-        if dbg && (k1.is_none() || k2.is_none()) {
-            eprintln!(
-                "c census-dbg leaf-undecidable t1={} ({}) k1={:?} t2={} ({}) k2={:?}",
-                t1.0,
-                self.format_term(t1),
-                k1,
-                t2.0,
-                self.format_term(t2),
-                k2
-            );
-        }
-        Some(k1? == k2?)
-    }
-
-    /// Observed cell function of an array term under the model: `(cells, default)`
-    /// where `cells` maps an evaluated-index key to a value term and `default` is
-    /// a const-array fill (if the array is/reduces to `((as const ..) f)`).
-    /// Combines the array's syntactic `store`/const structure with every
-    /// `(select S k)` read on its identity class. Used by `census_compatible` to
-    /// compare two array fields cell-by-cell.
-    fn census_collect_cells(
-        &self,
-        model: &Model,
-        arr: TermId,
-        class_cells: &HashMap<TermId, Vec<(String, TermId)>>,
-        uf: &HashMap<TermId, TermId>,
-        depth: u32,
-    ) -> (HashMap<String, TermId>, Option<TermId>) {
-        let mut cells: HashMap<String, TermId> = HashMap::default();
-        let mut default: Option<TermId> = None;
-        // Walk the syntactic store/const chain: outermost store wins each index.
-        let mut cur = arr;
-        for _ in 0..depth.min(64) {
-            if let Some(fill) = self.ctx.terms.get_const_array(cur) {
-                default = Some(fill);
-                break;
-            }
-            if let Some((base, index, value)) = self.exact_cegar_store_parts(cur) {
-                if let Some(key) = self.census_index_key(model, index) {
-                    cells.entry(key).or_insert(value);
-                }
-                cur = base;
-                continue;
-            }
-            break;
-        }
-        // Observed selects on the array's (and the reduced base's) identity class.
-        for base in [arr, cur] {
-            let cls = Self::census_find(uf, base);
-            if let Some(list) = class_cells.get(&cls) {
-                for (k, t) in list {
-                    cells.entry(k.clone()).or_insert(*t);
-                }
-            }
-        }
-        (cells, default)
     }
 
     pub(super) fn dt_constructor_of(
