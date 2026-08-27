@@ -117,6 +117,10 @@ impl Solver {
         clone.decision_domain = None;
         clone.bucket_queue_active = false;
         clone.domain_restarts = 0;
+        // The independent support is keyed to the formula this solver was
+        // analysed on; a clone re-derives it (or runs unrestricted).
+        clone.indep_support.clear();
+        clone.indep_support_frozen.clear();
 
         clone
     }
@@ -173,6 +177,7 @@ impl Solver {
             var_data: self.var_data.clone(),
             phase: self.phase.clone(),
             chrono_enabled: self.chrono_enabled,
+            two_stage_clause_management: self.two_stage_clause_management,
             ghost_guard_needed: self.ghost_guard_needed,
             lambda: self.lambda.clone(),
             suppress_phase_saving: self.suppress_phase_saving,
@@ -261,7 +266,7 @@ impl Solver {
             gc_occ: None,         // Rebuilt on demand
             gc_occ_scratch: None, // Scratch allocation, rebuilt on demand
             inproc_ctrl: self.inproc_ctrl.clone(),
-            inproc_ctrl_pre_proof: self.inproc_ctrl_pre_proof.clone(),
+            inproc_ctrl_pre_proof: None,
             preprocessing_quick_mode: self.preprocessing_quick_mode,
             // Re-initialize inprocessing engines fresh (cold state,
             // not needed for IC3 short queries).
@@ -282,7 +287,13 @@ impl Solver {
             bucket_queue_active: self.bucket_queue_active,
             domain_restarts: self.domain_restarts,
             relevancy_branching: self.relevancy_branching,
-            relevancy_buf: Vec::new(),
+            // The support whitelist is keyed to the analysed formula; a clone
+            // starts unrestricted and re-derives it on its own solve.
+            indep_support: Vec::new(),
+            indep_support_frozen: Vec::new(),
+            // The incremental frontier is a CACHE keyed by this solver's arena
+            // offsets and trail; a clone rebuilds it on first use.
+            relevancy_frontier: relevancy_frontier::RelevancyFrontier::default(),
             relevancy_decisions: self.relevancy_decisions,
             relevancy_hard: self.relevancy_hard,
             wander_abort_armed: false,
@@ -358,6 +369,7 @@ impl cold::ColdState {
 
             // Reduction scheduling
             next_reduce_db: self.next_reduce_db,
+            two_stage_next_decay: self.two_stage_next_decay,
             num_reductions: self.num_reductions,
             original_clause_boundary: self.original_clause_boundary,
             last_inprobe_reduction: self.last_inprobe_reduction,
@@ -452,7 +464,6 @@ impl cold::ColdState {
             disconnected_deletions: 0,
             last_round_simplifications: self.last_round_simplifications,
             consecutive_low_productivity_rounds: self.consecutive_low_productivity_rounds,
-
             // Variable mapping
             eliminated_ext_vals: self.eliminated_ext_vals.clone(),
             e2i: self.e2i.clone(),
@@ -463,7 +474,9 @@ impl cold::ColdState {
 
             // LRAT/proof state (copied for clause ID consistency)
             clause_ids: self.clause_ids.clone(),
+            clause_ids_reserve_hint: self.clause_ids_reserve_hint,
             clause_ids_disabled: self.clause_ids_disabled,
+            load_slack_reclaimed_bytes: self.load_slack_reclaimed_bytes,
             bcp_learned_clause_birth_conflicts: self.bcp_learned_clause_birth_conflicts.clone(),
             clause_birth_solve: self.clause_birth_solve.clone(),
             level0_proof_id: self.level0_proof_id.clone(),
@@ -475,11 +488,12 @@ impl cold::ColdState {
             next_original_clause_id: self.next_original_clause_id,
             issued_original_clause_id_max: self.issued_original_clause_id_max,
             original_clause_id_bits: self.original_clause_id_bits.clone(),
-            lrat_enabled: false, // No LRAT in cloned solver
+            lrat_enabled: false,
+            internal_lrat_enabled: false,
             unsat_certificate_enabled: self.unsat_certificate_enabled,
             ambient_artifacts_enabled: self.ambient_artifacts_enabled,
             retain_unsat_certificate: self.retain_unsat_certificate,
-            backward_proof_limits: self.backward_proof_limits.clone(),
+            backward_proof_limits: None,
             backward_proof_failure: None,
             dense_factor_bve_lrat_route_enabled: false,
             circuit_bve_lrat_route_enabled: false,
@@ -526,7 +540,7 @@ impl cold::ColdState {
             lazy_materialization_failed: false,
             extension_trusted_lemmas: self.extension_trusted_lemmas,
 
-            // Streaming core (per-solve, reset)
+            // Streaming support (per-solve, reset)
             streaming_core: None,
             streaming_core_num_originals: 0,
             scope_selector_set: self.scope_selector_set.clone(),
@@ -548,6 +562,8 @@ impl cold::ColdState {
             rephase_count_focused: self.rephase_count_focused,
             next_rephase: self.next_rephase,
             stable_only_rephase_enabled: self.stable_only_rephase_enabled,
+            large_rephase_walk: self.large_rephase_walk,
+            mode_equiticks_large_band: self.mode_equiticks_large_band,
             flip_search_enabled: self.flip_search_enabled,
             flip_last_ticks: self.flip_last_ticks,
             flip_stats: self.flip_stats.clone(),
@@ -562,6 +578,10 @@ impl cold::ColdState {
             preprocess_watches_valid: self.preprocess_watches_valid,
             preprocess_deadline: None,
             solve_deadline: None,
+            // A parked enumeration belongs to the solve that built it: it is
+            // compiled against one clause set and one variable numbering, and
+            // the clone starts its own solve.
+            indep_enum_pending: None,
             incremental_watch_boundary: self.incremental_watch_boundary,
             symmetry_enabled: self.symmetry_enabled,
             symmetry_stats: self.symmetry_stats.clone(),
@@ -685,6 +705,10 @@ impl cold::ColdState {
             ic3_domain_cache_expanded: Vec::new(),
             ic3_domain_cache_hash: 0,
             ic3_baseline_arena_words: self.ic3_baseline_arena_words,
+
+            // Within-solve transient: a latched rephase-walk model is only
+            // valid for the rephase call that produced it — never cloned.
+            rephase_walk_model: None,
 
             // Persistent reusable buffers (#8602): start empty in clone,
             // will be lazily grown on first use.

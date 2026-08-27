@@ -205,6 +205,37 @@ pub(super) fn promotion_clause<'a>(
                 matches!(kind, ay_core::TheoryLemmaKind::EufTransitive),
             ))
         }
+        // The datatype ground-conflict CATCH-ALL is offered to the EUF planner
+        // as well. Scoped to this one kind on purpose: it is the fallback that
+        // fuses clauses no single-schema recognizer claimed, so it is the only
+        // kind whose members are routinely not datatype reasoning at all.
+        // Offering every `hole`-wired kind instead would put the planner in
+        // front of genuine BV and datatype lemmas on every proof for no
+        // expected gain, so the widening stays narrow.
+        //
+        // `infer_dt_lemma_kind`'s single-schema recognizers each accept ONE
+        // shape, so a clause that mixes congruence with transitivity matches
+        // none of them and falls through to the datatype ground-conflict
+        // catch-all. That refuter closes it correctly — but `dt_ground_conflict`
+        // has no rule in the pinned external calculus, so the step renders as
+        // an honest `hole` and `unsat_proof_has_known_wire_gap` refuses the
+        // whole verdict under `:check-proofs-strict`. The clause itself is
+        // ordinary congruence + transitivity, both of which the external
+        // checker DOES have rules for, so the right answer is to spell it in
+        // those rules rather than to relax the wire policy.
+        //
+        // Offering it here is safe by construction: `plan_euf_lemma_with_budget`
+        // must re-derive the clause from congruence closure alone, every
+        // synthesized step is re-recognized, and the rebuilt proof is installed
+        // only if the strict checker still accepts the whole document. A lemma
+        // that is genuinely datatype-entailed (dt_distinct, dt_tester, ...) is
+        // not EUF-entailed, so the planner declines and the step is copied
+        // through byte-for-byte.
+        ProofStep::TheoryLemma {
+            kind: ay_core::TheoryLemmaKind::DatatypeGroundConflict,
+            clause,
+            ..
+        } => Some((clause, false)),
         _ => None,
     }
 }

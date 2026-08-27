@@ -1178,7 +1178,7 @@ fn as_membership(terms: &TermStore, lit: TermId) -> Option<Membership> {
 /// Whether the clause carries a group of `str.in_re` literals over one common
 /// subject whose jointly-denied intersection is provably EMPTY.
 ///
-/// This is the EXACT precondition of [`validate_regex_intersect_empty`], so the
+/// This is the EXACT precondition of `validate_regex_intersect_empty`, so the
 /// proof classifier in `ay-dpll` can only assign the kind to lemmas strict mode
 /// will then accept — no classifier/checker drift. All decision logic lives
 /// ONLY in this module.

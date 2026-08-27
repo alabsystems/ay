@@ -165,7 +165,7 @@ impl Solver {
     /// is enabled. No-op (and no cost beyond an `Option` check) otherwise.
     #[inline]
     pub(super) fn record_hint_lookup(&self, omission: Option<crate::HintOmission>) {
-        if let Some(trace) = self.cold.clause_trace.as_ref() {
+        if let Some(trace) = self.live_clause_trace() {
             trace.record_hint_lookup(omission);
         }
     }
@@ -209,7 +209,7 @@ impl Solver {
     /// replay cannot resolve and must be discarded.
     #[inline]
     fn trace_materialized_level0_unit(&mut self, unit_id: u64, unit_lit: Literal, hints: &[u64]) {
-        if unit_id == 0 || self.cold.clause_trace.is_none() {
+        if unit_id == 0 || !self.has_live_clause_trace() {
             return;
         }
 
@@ -222,7 +222,7 @@ impl Solver {
         if !self.charge_proof_bookkeeping(units) {
             return;
         }
-        if let Some(trace) = self.cold.clause_trace.as_mut() {
+        if let Some(trace) = self.live_clause_trace_mut() {
             trace.add_clause_with_hint_slices(unit_id, &[unit_lit], false, hints);
         }
     }

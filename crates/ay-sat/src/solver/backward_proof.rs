@@ -1814,10 +1814,10 @@ mod tests {
         }
     }
 
-    // ── Streaming UNSAT core integration tests (#8250) ────────────────
+    // ── Streaming support integration tests (#8250) ────────────────
 
     #[test]
-    fn test_streaming_core_trivial_unsat() {
+    fn test_streaming_support_trivial_unsat() {
         // {x} and {-x}: contradictory unit clauses
         use crate::literal::Variable;
         let v0 = Variable(0);
@@ -1828,16 +1828,16 @@ mod tests {
         let result = solver.solve();
         match result.into_inner() {
             SatResult::Unsat(cert) => {
-                // Streaming core should be present and non-empty.
+                // Streaming support should be present and non-empty.
                 // Both clauses are needed: {x} (ID 1) and {-x} (ID 2).
-                let core = cert.minimal_core();
+                let support = cert.tracked_original_clause_ids();
                 assert!(
-                    !core.is_empty(),
-                    "streaming core should be non-empty for UNSAT"
+                    !support.is_empty(),
+                    "streaming support should be non-empty for this derivation"
                 );
-                // All IDs in core should be valid original clause IDs (1 or 2).
-                for &id in &core {
-                    assert!((1..=2).contains(&id), "core ID {id} out of range [1, 2]");
+                // Every support ID should be a valid original clause ID (1 or 2).
+                for &id in &support {
+                    assert!((1..=2).contains(&id), "support ID {id} out of range [1, 2]");
                 }
             }
             other => panic!("expected UNSAT, got {:?}", other.is_sat()),
@@ -1845,8 +1845,8 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_core_sat_instance_has_no_core() {
-        // SAT: {x}. No conflict analysis, so streaming core should be empty.
+    fn test_streaming_support_sat_instance_has_no_certificate() {
+        // SAT: {x}. SAT results carry no proof certificate.
         use crate::literal::Variable;
         let v0 = Variable(0);
         let mut solver = Solver::new(1);
@@ -1854,14 +1854,14 @@ mod tests {
 
         let result = solver.solve();
         assert!(result.is_sat(), "expected SAT for single positive unit");
-        // SAT results don't have ProofCertificate with a streaming core,
+        // SAT results don't have ProofCertificate with streaming support,
         // but the solver's internal bitmap should be all-false.
         // We verify this indirectly: after SAT, if we could access the
-        // certificate (we can't for SAT), it would have no core.
+        // certificate (we can't for SAT), it would have no support.
     }
 
     #[test]
-    fn test_streaming_core_small_unsat() {
+    fn test_streaming_support_small_unsat() {
         // (x | y) & (-x) & (-y): UNSAT
         // Original clause IDs: 1=(x|y), 2=(-x), 3=(-y)
         // All three are needed to derive contradiction.
@@ -1876,17 +1876,16 @@ mod tests {
         let result = solver.solve();
         match result.into_inner() {
             SatResult::Unsat(cert) => {
-                let core = cert.minimal_core();
+                let support = cert.tracked_original_clause_ids();
                 assert!(
-                    !core.is_empty(),
-                    "streaming core should be non-empty for UNSAT"
+                    !support.is_empty(),
+                    "streaming support should be non-empty for this derivation"
                 );
-                // Streaming core should not require proof materialization
-                // (if streaming core is present, it returns without DAG walk).
-                if cert.has_streaming_core() {
+                // Streaming support does not require proof materialization.
+                if cert.has_streaming_support() {
                     assert!(
                         cert.is_deferred(),
-                        "streaming core should not trigger proof materialization"
+                        "streaming support should not trigger proof materialization"
                     );
                 }
             }
@@ -1895,9 +1894,9 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_core_with_redundant_clauses() {
+    fn test_streaming_support_with_redundant_clauses() {
         // (x) & (-x) & (y): clause (y) is redundant for UNSAT.
-        // Streaming core should contain at most {1, 2} (not 3).
+        // This solve's tracked support should contain {1, 2}, not 3.
         use crate::literal::Variable;
         let v0 = Variable(0);
         let v1 = Variable(1);
@@ -1909,20 +1908,21 @@ mod tests {
         let result = solver.solve();
         match result.into_inner() {
             SatResult::Unsat(cert) => {
-                let core = cert.minimal_core();
+                let support = cert.tracked_original_clause_ids();
                 assert!(
-                    !core.is_empty(),
-                    "streaming core should be non-empty for UNSAT"
+                    !support.is_empty(),
+                    "streaming support should be non-empty for this derivation"
                 );
-                // The redundant clause (ID 3) should not be in the core.
+                // This particular redundant clause should not have been observed.
+                // This pins current tracking, not a general redundancy guarantee.
                 assert!(
-                    !core.contains(&3),
-                    "redundant clause (y) should not be in streaming core, got: {core:?}"
+                    !support.contains(&3),
+                    "redundant clause (y) unexpectedly appeared in support: {support:?}"
                 );
-                // Both conflicting clauses should be present.
+                // Both conflicting clauses should have been observed.
                 assert!(
-                    core.contains(&1) && core.contains(&2),
-                    "both conflicting unit clauses should be in core, got: {core:?}"
+                    support.contains(&1) && support.contains(&2),
+                    "both conflicting unit clauses should be in support: {support:?}"
                 );
             }
             other => panic!("expected UNSAT, got {:?}", other.is_sat()),

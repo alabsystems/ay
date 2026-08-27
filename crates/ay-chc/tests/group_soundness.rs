@@ -17,6 +17,8 @@ mod had_sat_no_cube_soundness;
 mod init_fact_head_args_9312;
 #[path = "group_soundness/kind_soundness.rs"]
 mod kind_soundness;
+#[path = "group_soundness/nycert_absent_callee_corpus.rs"]
+mod nycert_absent_callee_corpus;
 #[path = "group_soundness/pdkind_soundness.rs"]
 mod pdkind_soundness;
 #[path = "group_soundness/preprocessing_soundness.rs"]

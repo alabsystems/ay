@@ -625,6 +625,7 @@ fn proof_format_name(format: ProofFormat) -> &'static str {
         ProofFormat::Lrat => "lrat",
         ProofFormat::Lean4 => "lean4",
         ProofFormat::Alethe => "alethe",
+        ProofFormat::Veripb => "veripb",
     }
 }
 

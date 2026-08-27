@@ -18,6 +18,7 @@
 use super::*;
 
 use num_traits::FromPrimitive;
+use std::f64::consts::SQRT_2;
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -219,7 +220,7 @@ fn univariate_needs_no_assignment() {
     // x^2 - 2 with nothing assigned: +- sqrt(2).
     let p = mp(&[(1, &[(X, 2)]), (-2, &[])]);
     let roots = isolate_roots_at(&p, X, &Var2Anum::new()).expect("isolates");
-    assert_roots(&roots, &[-1.414_213_562, 1.414_213_562]);
+    assert_roots(&roots, &[-SQRT_2, SQRT_2]);
 }
 
 #[test]
@@ -244,7 +245,7 @@ fn the_sieve_removes_conjugate_roots() {
     let p = mp(&[(1, &[(X, 1)]), (-1, &[(Y, 1)])]);
     let a = assign(&[(Y, Anum::Alg(sqrt2()))]);
     let roots = isolate_roots_at(&p, X, &a).expect("isolates");
-    assert_roots(&roots, &[1.414_213_562]);
+    assert_roots(&roots, &[SQRT_2]);
 }
 
 #[test]
@@ -276,7 +277,7 @@ fn repeated_roots_are_reported_once() {
     let p = mp(&[(1, &[(X, 2)]), (-2, &[(X, 1), (Y, 1)]), (1, &[(Y, 2)])]);
     let a = assign(&[(Y, Anum::Alg(sqrt2()))]);
     let roots = isolate_roots_at(&p, X, &a).expect("isolates");
-    assert_roots(&roots, &[1.414_213_562]);
+    assert_roots(&roots, &[SQRT_2]);
 }
 
 #[test]
@@ -385,7 +386,7 @@ fn vanishing_resultant_escape_linear_case() {
     ]);
     let a = assign(&[(Y, Anum::Alg(sqrt2_reducible()))]);
     let roots = isolate_roots_at(&p, X, &a).expect("isolates");
-    assert_roots(&roots, &[1.414_213_562]);
+    assert_roots(&roots, &[SQRT_2]);
 }
 
 #[test]

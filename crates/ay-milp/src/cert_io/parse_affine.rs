@@ -14,7 +14,7 @@ pub(super) fn parse_affine_bound(token: &str) -> Option<Option<BigRational>> {
 
 // ceil(log10(2) * MAX_RATIONAL_BITS), with log10(2) rounded upward.
 pub(super) const MAX_AFFINE_DECIMAL_DIGITS: usize =
-    ((MAX_RATIONAL_BITS as usize) * 30_103 + 99_999) / 100_000;
+    ((MAX_RATIONAL_BITS as usize) * 30_103).div_ceil(100_000);
 // Optional numerator sign, slash, numerator digits, and denominator digits.
 pub(super) const MAX_AFFINE_RATIONAL_TOKEN_BYTES: usize = MAX_AFFINE_DECIMAL_DIGITS * 2 + 2;
 

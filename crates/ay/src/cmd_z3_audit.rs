@@ -497,8 +497,14 @@ const BROADER_SURFACE_SPECS: &[SurfaceSpec] = &[
         goal: "1/1 current SAT-COMP-shaped packet with solved count, PAR-2, model/proof validity, 0 wrong answers, and 0 reference-only solves",
         missing: "clean SAT-COMP-shaped scoreboard packet from scripts/run_satcomp_matrix.sh",
         command: concat!(
+            // The proof format MUST match what the SAT profile matrix declares
+            // (`requirements.unsat_proof.format`), or the generator fails
+            // closed before it writes anything. That declaration moved from
+            // drat/lrat to veripb on 2026-08-25 when the submission's declared
+            // checker became VeriPB; a stale `--proof-format lrat` here is not
+            // a cosmetic mismatch, it is a documented command that cannot run.
             "competition/prepare_sat26_submission.sh --variant default --track main --ai-class regular ",
-            "--proof-format lrat --stage-binary ./target/release/ay ",
+            "--proof-format veripb --stage-binary ./target/release/ay ",
             "--allow-local-runsh-preflight-binary --output \"$PWD/target/sat26-submission\" && ",
             "scripts/run_satcomp_matrix.sh --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf ",
             "--expected sat --family canary --category sanity ",

@@ -23,7 +23,48 @@ pub(super) fn check_dual(
             check_network_optimality(certificate, model, claimed_value)
         }
         Some("optcert") => check_optcert(certificate, model, claimed_value),
+        Some("optimality-tree") => check_optimality_tree(certificate, model, claimed_value),
         _ => (false, "claim names an unsupported dual block".into()),
+    }
+}
+
+/// Re-derive the DUAL half of an optimality claim from the `opttree` block.
+///
+/// Every fact this consults comes from the re-parsed model or from the verdict
+/// line; the block itself contributes only a split skeleton and multiplier
+/// lists. In particular the leaf boxes are RECONSTRUCTED by
+/// [`verify_optimality_tree_bound`] (model column bounds intersected with the
+/// path's splits) rather than read, and the target is `claimed` — the same
+/// value `check_primal` pins the witness to — so the two halves cannot be
+/// priced against different numbers.
+fn check_optimality_tree(
+    certificate: &Certificate,
+    model: &Model,
+    claimed: Option<&BigRational>,
+) -> (bool, String) {
+    let Some(root) = &certificate.opt_tree else {
+        return (false, "claim names an opttree block that is absent".into());
+    };
+    let Some(claimed) = claimed else {
+        return (
+            false,
+            "an optimality-tree claim has no verdict value to be priced against".into(),
+        );
+    };
+    match verify_optimality_tree_bound(model, claimed, root) {
+        Ok(()) => (
+            true,
+            "every leaf of the split tree was re-priced in exact rational arithmetic at a box \
+             reconstructed from the re-parsed model's own column bounds intersected with the \
+             branch path, and each is either Farkas-empty or carries positive multipliers whose \
+             oriented combination is the model's objective bounded by the claimed value; the \
+             splits are integer cuts on integral columns, so the leaves tile the feasible set"
+                .into(),
+        ),
+        Err(error) => (
+            false,
+            format!("the whole-tree optimality artifact DOES NOT verify: {error}"),
+        ),
     }
 }
 

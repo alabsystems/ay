@@ -653,7 +653,7 @@ fn cooper(terms: &mut TermStore, literals: &[Literal], var: TermId) -> Option<Te
     // it can cost.
     let instances = i64::try_from(&delta)
         .ok()
-        .and_then(|d| i64::try_from(bset.len()).ok().map(|b| (d, b)))
+        .zip(i64::try_from(bset.len()).ok())
         .and_then(|(d, b)| b.checked_add(1).and_then(|k| d.checked_mul(k)));
     // `None` here means δ or the product overflowed i64 — far past the cap.
     match instances {

@@ -40,12 +40,12 @@ WHAT IT CHECKS, and why each tripwire is the shape it is:
 
 WHAT IT IS *NOT*, since 2026-08-20 — and why it was kept anyway.
 
-`scripts/milp_node_gate.py` now pins EXACT node counts for nineteen deterministic
+`scripts/milp_node_gate.py` now pins EXACT node counts for twenty deterministic
 instances and runs pre-push. It is strictly sharper than this file's node
-tripwire on the TEN instances they share (air03 blend2 dcmulti gt2 mas76 mod010
-p0201 pk1 qnet1 rout), so the temptation was to retire this one. Four things here
-have no equivalent there, and each of them is a defect class this repo has
-actually shipped:
+tripwire on the ELEVEN instances they share (air03 blend2 dcmulti gt2 mas76
+mod010 p0201 pk1 qiu qnet1 rout), so the temptation was to retire this one. Four
+things here have no equivalent there, and each of them is a defect class this
+repo has actually shipped:
 
   * the WALL tripwire at UNCHANGED node count — the prelude-tax/pump-budget
     signature. The ratchet RECORDS `wall_s` and deliberately does not gate it.
@@ -53,10 +53,13 @@ actually shipped:
     BYTE-IDENTICAL nine-node tree. No node count can see that.
   * RESIDUAL INCUMBENT QUALITY on instances that never prove optimal (air05).
     The ratchet pins only instances that terminate.
-  * NINE instances the ratchet does not or cannot carry: air05 flugpl gen
-    khb05250 markshare1 markshare2 are simply not in it, and misc07 mas74 qiu are
+  * EIGHT instances the ratchet does not or cannot carry: air05 flugpl gen
+    khb05250 markshare1 markshare2 are simply not in it, and misc07 mas74 are
     in its [flaky] list BY NAME because they move run-to-run at a fixed
-    configuration. misc07 is the sharp one — its root cut loop is wall-deadline
+    configuration. (qiu was a ninth until 2026-08-26; it is a ratchet pin now —
+    28 runs at 2,831 nodes across load 2.5..19.7 settled it, and this file's own
+    baseline had read 2,831 the whole time.)
+    misc07 is the sharp one — its root cut loop is wall-deadline
     bounded (measured spread 30.4 %), so an exact pin would cry wolf, but a 40 %
     band still catches a 208x explosion of the `gt2` kind. A banded gate is the
     only kind that can watch a non-deterministic instance at all, and that is
@@ -64,6 +67,12 @@ actually shipped:
 
 So: NARROW, exact, seconds, pre-push = the ratchet. BROAD, banded, minutes,
 nightly = this. The two overlap on purpose; neither subsumes the other.
+
+BASELINE PROVENANCE. `head` and `when` name the last full-corpus capture. A
+hand-measured row must not silently inherit that identity: it belongs in the
+top-level `provenance_overrides` map with the source revision that was measured
+and the commit that recorded it. An unknown capture time is `null`, not an
+invented timestamp. A fresh `--baseline` capture clears the override map.
 
 TWO THINGS ABOUT THIS FILE WERE FALSE UNTIL 2026-08-20, and both are the reason
 it caught none of the above in practice:
@@ -113,10 +122,24 @@ it caught none of the above in practice:
   other wall delta in the same run tracked a node delta or was inside the 30%
   band.)
 
+IT REFUSES TO RUN ON A BUSY BOX, since 2026-08-26 and not before. Three of the
+five tripwires above are WALL RATIOS (#4 at 30%, #5 at 1.25x, and #2 reads a
+120 s deadline an instance can be pushed past), so this guard is MORE
+load-coupled than the node ratchet next door -- which has refused above
+0.35 x cpu_count since it was written, while this file had no such check at all.
+The bill, as REPORTED BY TWO AUDITORS and not re-derived here: 18 FAILs at load
+~30, 12 at ~25, 8 at ~3.4 and a mas74 OPTIMAL -> FEASIBLE flake, all on diffs
+that could not have caused them, all wall-only at UNCHANGED node counts. The
+MECHANISM was reproduced on demand and is in `quiet_box_ok`, which also records
+why the threshold is the ratchet's rather than a tighter one invented here, and
+why that makes this a PARTIAL fix.
+
 USAGE
   corpus_guard.py --baseline          capture the current state as the baseline
   corpus_guard.py --check             compare against it; exit 1 on any FAIL
   corpus_guard.py --check --json OUT  also write the full measurement
+  corpus_guard.py --check --allow-busy   measure anyway (only to reproduce a
+                                      failure you already have in hand)
 
 Exit codes: 0 clean (warnings allowed), 1 regression, 2 harness/setup problem.
 """
@@ -131,6 +154,11 @@ SOLVER = os.path.join(REPO, 'target', 'release', 'examples', 'mps_solve')
 # ONE definition of where the corpus lives, imported rather than re-typed.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from milp_gate_corpus import DEFAULT_CORPUS  # noqa: E402
+# ...and ONE definition of the quiet-box precondition, for the same reason. This
+# file had NO load guard at all until 2026-08-26 while the ratchet next door
+# refused above 0.35 x cpu_count, so the BROADER and MORE load-coupled of the two
+# gates was the unguarded one. See `quiet_box_ok` below.
+from milp_node_gate import busy_box  # noqa: E402
 
 # Known optima. An answer that does not match one of these is a CORRECTNESS
 # failure, not a performance one, and is never downgraded to a warning.
@@ -300,6 +328,116 @@ def compare(base, cur):
     return fails, warns, notes
 
 
+def quiet_box_ok(allow_busy):
+    """False on a busy box -- the caller's cue for SETUP (2), never FAIL (1).
+
+    Exactly the precondition `scripts/milp_node_gate.py` has always had, imported
+    from it rather than re-typed.
+
+    THIS FILE HAD NO LOAD GUARD FOR SIX DAYS AFTER IT STARTED BEING RUN, and it
+    is the gate that needs one MOST -- the ratchet next door pins only nodes and
+    explicitly does not gate `wall_s`, whereas tripwires #4 (WALL at 30%) and #5
+    (LIMIT-INVARIANCE at 1.25x) here are wall ratios, and tripwire #2 (STATUS)
+    reads a 120 s deadline that contention can push an instance past. Every one
+    of those is a ratio the machine's neighbours can move without a commit.
+
+    WHAT IT COST, reported by two independent auditors of this file's output and
+    NOT re-derived here (their run logs are not in the tree; the counts are
+    theirs, the mechanism below is reproduced): 18 FAILs at load ~30, 12 at load
+    ~25, 8 at load ~3.4, plus a `mas74` OPTIMAL -> FEASIBLE flake -- every
+    node-bearing one wall-only at an UNCHANGED node count, on diffs that could
+    not have caused them. One of them nearly filed a phantom regression.
+
+    THE THRESHOLD IS DELIBERATELY THE RATCHET'S, imported and not re-tuned, and
+    that is a partial fix stated as such: 0.35 x cpu_count is 4.9 on this
+    14-core box, so the recorded 8-FAIL run at load ~3.4 would still have gone
+    through. Tightening it here alone would fork the two gates' notion of
+    "quiet" on no evidence. If a quiet-box run ever produces wall-only FAILs
+    again, the fix is a MEDIAN OF THREE for the wall tripwire, not a lower
+    number here -- a threshold shaved to fit one observation is folklore.
+
+    THE PHANTOM, REPRODUCED ON DEMAND. Same box, 14 cpus, HEAD c7462bd40, the
+    UNMODIFIED release binary, the committed baseline, `--only gen mod010 qnet1
+    dcmulti p0201`, under 16 synthetic spinners at 1-minute load 27.9:
+
+        guard ON      -> exit 2, SETUP, nothing measured
+        --allow-busy  -> exit 1, FOUR FAILs, every one wall-only at an
+                         UNCHANGED node count:
+                           dcmulti  0.280s -> 0.367s (1.31x)
+                           mod010   1.544s -> 2.506s (1.62x)
+                           p0201    0.317s -> 0.444s (1.40x)
+                           qnet1    4.663s -> 8.482s (1.82x)
+
+    Four regressions with no commit behind them, from nothing but neighbours.
+    That is the run that gets a gate muted, and `--allow-busy` is now the only
+    way to produce it.
+
+    AND IT IS NOT A MUTE BUTTON -- the failure mode of adding a guard like this
+    is that it swallows REAL regressions too, which would be strictly worse than
+    the status quo. Both halves were measured on the same quiet box, with the
+    guard ON and no override:
+
+        `--only qiu`, shipped default, load 4.5   -> 0 fail, exit 0
+        `--only qiu`, same binary with the tall-cold-dual rescue disarmed,
+        load 3.1                                  -> exit 1,
+            `FAIL qiu: NODES 2831 -> 6529 (2.31x, tol 5%)`
+
+    A genuine 2.31x node regression is still a FAIL. Only the wall-ratio
+    phantoms are gone, and only because they are no longer measured at all.
+    `--baseline` is behind the same check and was verified to refuse too (exit 2
+    at load 12.3, the development design notes untouched): a baseline captured
+    under contention is the same defect one release later and harder to see.
+
+    ONE PRACTICAL CONSEQUENCE, stated because it will bite someone: this guard's
+    OWN sweep is minutes of single-threaded solving and contributes ~1.0 to the
+    1-minute average, so back-to-back runs can push themselves over the line.
+    Observed here: a run that started at load 4.5 left the box at 5.3 and the
+    next invocation refused. Start below ~3.9, or wait between runs.
+    """
+    busy, load, cpus = busy_box()
+    if not busy or allow_busy:
+        return True
+    print('SETUP: load average %.1f on %d cpus -- this guard is only valid on a '
+          'quiet box.\n       Its WALL (30%%), LIMIT-INVARIANCE (1.25x) and STATUS '
+          'tripwires are ratios a\n       busy neighbour moves on its own. At load '
+          '27.9 on this box an UNMODIFIED\n       binary produced FOUR FAILs -- '
+          'dcmulti 1.31x, mod010 1.62x, p0201 1.40x,\n       qnet1 1.82x -- every one '
+          'wall-only at an UNCHANGED node count.\n'
+          '       Wait, or pass --allow-busy to reproduce a failure you already have.'
+          % (load, cpus), file=sys.stderr)
+    return False
+
+
+def validate_provenance_overrides(payload):
+    """Return a validated per-row provenance map for a baseline payload."""
+    overrides = payload.get('provenance_overrides', {})
+    if not isinstance(overrides, dict):
+        raise ValueError('provenance_overrides must be an object')
+    results = payload.get('results', {})
+    for name, provenance in overrides.items():
+        if name not in results:
+            raise ValueError('provenance override names missing result %r' % name)
+        if not isinstance(provenance, dict):
+            raise ValueError('provenance override for %r must be an object' % name)
+        for field in ('measured_head', 'recorded_in'):
+            value = provenance.get(field)
+            if not isinstance(value, str) or not value:
+                raise ValueError('%s for %r must be a nonempty string' % (field, name))
+        measured_when = provenance.get('measured_when')
+        if measured_when is not None and not isinstance(measured_when, str):
+            raise ValueError('measured_when for %r must be a string or null' % name)
+    return overrides
+
+
+def format_provenance_overrides(overrides):
+    """Render deterministic, explicit provenance for hand-measured rows."""
+    return ', '.join(
+        '%s@%s [recorded %s]' %
+        (name, provenance['measured_head'], provenance['recorded_in'])
+        for name, provenance in sorted(overrides.items())
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--corpus', default=DEFAULT_CORPUS,
@@ -311,6 +449,10 @@ def main():
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--json')
     ap.add_argument('--only', nargs='*')
+    ap.add_argument('--allow-busy', action='store_true',
+                    help='skip the load-average precondition (see quiet_box_ok: '
+                         'the wall and limit-invariance tripwires are ratios that '
+                         'contention moves on their own)')
     a = ap.parse_args()
 
     if not os.path.isdir(a.corpus):
@@ -319,6 +461,11 @@ def main():
               % a.corpus, file=sys.stderr); return 2
     if not os.path.exists(a.solver):
         print('SETUP: solver not built at %s' % a.solver, file=sys.stderr); return 2
+    # Before ANY solve, and before `--baseline` too: a baseline captured on a busy
+    # box bakes the contention into the pin, which is the same defect one release
+    # later and harder to see.
+    if not quiet_box_ok(a.allow_busy):
+        return 2
 
     cur = measure(a.corpus, a.solver, a.limit, a.short_limit, a.only)
     if not cur:
@@ -328,7 +475,8 @@ def main():
     head = subprocess.run(['git', '-C', REPO, 'rev-parse', '--short', 'HEAD'],
                           capture_output=True, text=True).stdout.strip()
     payload = {'when': stamp, 'head': head, 'limit': a.limit,
-               'short_limit': a.short_limit, 'results': cur}
+               'short_limit': a.short_limit, 'results': cur,
+               'provenance_overrides': {}}
 
     if a.json:
         with open(a.json, 'w') as f:
@@ -344,6 +492,11 @@ def main():
     if not os.path.exists(BASELINE):
         print('SETUP: no baseline; run --baseline first', file=sys.stderr); return 2
     base = json.load(open(BASELINE))
+    try:
+        provenance_overrides = validate_provenance_overrides(base)
+    except ValueError as error:
+        print('SETUP: invalid baseline provenance: %s' % error, file=sys.stderr)
+        return 2
 
     fails, warns, notes = compare(base['results'], cur)
 
@@ -352,8 +505,11 @@ def main():
                             'fails': len(fails), 'warns': len(warns),
                             'results': cur}, sort_keys=True) + '\n')
 
-    print('=== corpus guard: HEAD %s vs baseline %s (%s) ==='
+    print('=== corpus guard: HEAD %s vs full-capture baseline %s (%s) ==='
           % (head, base.get('head', '?'), base.get('when', '?')))
+    if provenance_overrides:
+        print('  baseline row overrides: %s' %
+              format_provenance_overrides(provenance_overrides))
     for n in notes: print('  NOTE  %s' % n)
     for w in warns: print('  WARN  %s' % w)
     for x in fails: print('  FAIL  %s' % x)

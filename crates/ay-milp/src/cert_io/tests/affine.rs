@@ -12,7 +12,7 @@ pub(super) fn affine_optimality_wire_round_trips_and_checks_end_to_end() {
     let parsed = parse(&wire).expect("affine wire parses");
     assert!(parsed.affine_aggregation.is_some());
     let report = check(&wire, AFFINE_OPTIMAL_MPS);
-    assert_eq!(report.status, CheckStatus::Verified, "{:?}", report.notes);
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     assert_eq!(
         report.claims_in(ClaimStanding::Verified),
         vec!["primal", "dual"]
@@ -53,7 +53,7 @@ pub(super) fn unsupported_affine_optimality_stays_partial_but_replays() {
     assert!(wire.contains("evidence dual NONE"));
     assert!(!wire.contains("evidence dual SUCCINCT affine-aggregation"));
     let report = check(&wire, AFFINE_OPTIMAL_MPS);
-    assert_eq!(report.status, CheckStatus::Partial, "{:?}", report.notes);
+    assert_eq!(report.status(), CheckStatus::Partial, "{report:#?}");
     assert_eq!(report.claims_in(ClaimStanding::Verified), vec!["primal"]);
     assert_eq!(report.claims_in(ClaimStanding::Unbacked), vec!["dual"]);
 }
@@ -71,7 +71,7 @@ pub(super) fn unsupported_affine_infeasibility_is_unverified_and_cannot_be_promo
     assert!(wire.contains("inner unsupported"));
     assert!(wire.contains("evidence infeasible NONE"));
     let report = check(&wire, AFFINE_OPTIMAL_MPS);
-    assert_eq!(report.status, CheckStatus::Unverified, "{:?}", report.notes);
+    assert_eq!(report.status(), CheckStatus::Unverified, "{report:#?}");
     assert_eq!(
         report.claims_in(ClaimStanding::Unbacked),
         vec!["infeasible"]
@@ -88,7 +88,7 @@ pub(super) fn unsupported_affine_infeasibility_is_unverified_and_cannot_be_promo
     let digest = sha256_hex(promoted.as_bytes());
     let _ = writeln!(promoted, "%END sha256:{digest}");
     let report = check(&promoted, AFFINE_OPTIMAL_MPS);
-    assert_eq!(report.status, CheckStatus::Refuted, "{:?}", report.notes);
+    assert_eq!(report.status(), CheckStatus::Refuted, "{report:#?}");
     assert_eq!(report.claims_in(ClaimStanding::Refuted), vec!["infeasible"]);
 }
 
@@ -100,7 +100,7 @@ pub(super) fn affine_codec_caps_are_atomic_and_legacy_v1_stays_readable() {
     assert!(capped.contains("truncated affine-aggregation"));
     assert!(capped.contains("evidence dual NONE truncated"));
     assert_eq!(
-        check(&capped, AFFINE_OPTIMAL_MPS).status,
+        check(&capped, AFFINE_OPTIMAL_MPS).status(),
         CheckStatus::Unverified
     );
 
@@ -109,7 +109,7 @@ pub(super) fn affine_codec_caps_are_atomic_and_legacy_v1_stays_readable() {
     let parsed = parse(&legacy).expect("pre-affine v1 shape remains readable");
     assert!(parsed.affine_aggregation.is_none());
     assert_eq!(
-        check(&legacy, AFFINE_OPTIMAL_MPS).status,
+        check(&legacy, AFFINE_OPTIMAL_MPS).status(),
         CheckStatus::Partial
     );
 }
@@ -139,7 +139,7 @@ pub(super) fn affine_wire_checker_rejects_every_tampered_boundary() {
     let rejected = |certificate: &AffineAggregationCertificate| {
         let wire = emit_affine_fixture(&problem, certificate, &outcome);
         let report = check(&wire, AFFINE_OPTIMAL_MPS);
-        assert_eq!(report.status, CheckStatus::Refuted, "{:?}", report.notes);
+        assert_eq!(report.status(), CheckStatus::Refuted, "{report:#?}");
     };
 
     let mut tampered = certificate.clone();

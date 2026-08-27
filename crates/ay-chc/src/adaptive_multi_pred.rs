@@ -1475,12 +1475,8 @@ impl AdaptivePortfolio {
             max_frames: 100,
             verbose: self.config.verbose,
             max_escalation_level: if features.uses_datatypes { 0 } else { 3 },
-            // Scale case-split from the budget that actually remains, capped at
-            // 16s and with roughly one third preserved for TPA/PDKIND and later
-            // retries. The branch allocator additionally reserves 2s per future
-            // branch and 500ms for merged-model verification. Thus the historical
-            // 8s stage receives 5.5s + 2s + 0.5s, while a 16s stage gives the
-            // harder first dillig12_m branch 13.5s without starving the portfolio.
+            // Preserve future branches and merged-model verification while scaling
+            // the case split from the remaining wall (#4751 cause-4).
             solve_timeout: Some(case_split_budget),
             ..PdrConfig::default()
         })
@@ -1488,10 +1484,7 @@ impl AdaptivePortfolio {
         self.apply_user_hints(&mut case_split_config);
         let case_split_start = Instant::now();
         if let Some(result) = PdrSolver::try_case_split_solve(&self.problem, case_split_config) {
-            // Validate case-split result (#5549 soundness fix).
-            // #4751 cause-4: pass the deadline so the mandatory re-validation
-            // gets a budget proportional to what the solve actually has left.
-            // A fixed 1.5s gate discarded an already-verified merged model here.
+            // Validate case-split result (#5549); deadline-scaled budget (#4751 cause-4).
             let validated = self.validate_adaptive_result_with_deadline(result, deadline);
             if !matches!(validated, PdrResult::Unknown) {
                 self.decision_log.log_decision(DecisionEntry {

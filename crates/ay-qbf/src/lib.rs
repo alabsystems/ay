@@ -37,6 +37,9 @@
 //!     vec![QuantifierBlock::exists(vec![1])],
 //!     vec![vec![Literal::positive(ay_sat::Variable::new(1))]],
 //! );
+//! assert_eq!(formula.num_vars(), 1);
+//! assert_eq!(formula.prefix().len(), 1);
+//! assert_eq!(formula.clauses().len(), 1);
 //! let mut solver = QbfSolver::new(formula);
 //! let result = solver.solve();
 //! assert!(matches!(result, QbfResult::Sat(_)));

@@ -32,7 +32,7 @@ impl Solver {
             // Propagate replacement clause + resolution hints to clause_trace
             // (#4124). The proof_manager already has the LRAT step; the
             // clause_trace needs a matching entry for SMT proof reconstruction.
-            if let Some(ref mut trace) = self.cold.clause_trace {
+            if let Some(trace) = self.live_clause_trace_mut() {
                 trace.add_clause_with_hints(
                     new_clause_id,
                     reordered.to_vec(),
@@ -54,7 +54,7 @@ impl Solver {
     ) -> Option<Option<u64>> {
         let mut replacement_clause_id = None;
         // Forward check + proof emit: add clause, then delete old (#4564).
-        if let Ok(new_id) = self.proof_emit_add(&reordered, &proof_hints, proof_kind) {
+        if let Ok(new_id) = self.proof_emit_add(reordered, proof_hints, proof_kind) {
             // Guard: LRAT returns Ok(0) as a no-op sentinel after I/O
             // failure (CaDiCaL-style). Do NOT update clause ID state
             // with this sentinel -- it would corrupt clause_ids and
@@ -73,9 +73,7 @@ impl Solver {
         // `bmc_7` row 61370-class rejections). Fail closed instead: keep
         // the original clause. Solving strength is unchanged outside the
         // trace lane (a writer that returns a real id is unaffected).
-        if self.cold.lrat_enabled
-            && replacement_clause_id.is_none()
-            && self.cold.clause_trace.is_some()
+        if self.cold.lrat_enabled && replacement_clause_id.is_none() && self.has_live_clause_trace()
         {
             return None;
         }
@@ -111,14 +109,14 @@ impl Solver {
         // just-deleted old clause (#8093).
         self.clear_level0_reasons_removed_by_replacement(
             clause_idx,
-            &old_lits,
-            &reordered,
+            old_lits,
+            reordered,
             old_clause_id,
         );
 
         // Delete old clause unconditionally (CaDiCaL: always emit delete
         // for replaced clause regardless of add outcome).
-        let _ = self.proof_emit_delete(&old_lits, old_clause_id);
+        let _ = self.proof_emit_delete(old_lits, old_clause_id);
         Some(replacement_clause_id)
     }
 }

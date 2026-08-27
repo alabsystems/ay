@@ -116,7 +116,14 @@ impl Executor {
         self.close_authored_ground_unit(candidate, instance, instance_unit, authored)
     }
 
-    fn apply_implication_unit(
+    /// Emit `implies_pos` + two resolutions from an ALREADY-DERIVED
+    /// `(cl implication)` and `(cl antecedent)`, leaving the unit
+    /// `(cl consequent)`.
+    ///
+    /// Shared with the consequence-replay `ImpliedConsequent` plan
+    /// (#implied-forall-ground-inst): one construction, one strict validator
+    /// (`validate_implies_pos`), so the two lanes cannot drift.
+    pub(super) fn apply_implication_unit(
         &mut self,
         candidate: &mut Proof,
         implication: TermId,

@@ -3,7 +3,6 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Model storage and proof building helpers.
-
 // #8529: Use deterministic hash maps in all builds.
 use ay_arrays::ArrayModel;
 use ay_bv::BvModel;
@@ -21,6 +20,9 @@ use crate::executor_types::{Result, SolveResult, UnknownOrigin, UnknownReason};
 
 use super::super::model::Model;
 use super::super::Executor;
+
+mod model_output;
+mod resource_budget;
 
 impl Executor {
     /// Record SAT-side `Unknown` reason if one was reported by ay-sat.
@@ -280,17 +282,7 @@ impl Executor {
                     self.minimize_model_sat_preserving();
                 }
 
-                // Aggressive BV/LIA/LRA minimization (#8297): run additional
-                // passes that specifically target pinning values to 0/1. This
-                // gives inter-variable constraints more opportunity to converge
-                // to a globally minimal counterexample.
-                if self.aggressive_model_minimize
-                    && self.model_output_is_demanded()
-                    && self.last_assumptions.is_none()
-                    && !self.defer_counterexample_minimization
-                {
-                    self.aggressive_minimize_model();
-                }
+                self.maybe_aggressively_minimize_model_for_output();
 
                 // Soundness guard for known string tautology patterns that should
                 // never appear as SAT when negated.

@@ -9,9 +9,11 @@ use ay_sat::{ExtCheckResult, ExtPropagateResult, Extension, Literal, SolverConte
 
 use crate::component::split_components;
 use crate::constraint::XorConstraint;
+use crate::gaussian::chunked_proof::{ChunkedComponentState, MAX_XOR_CHUNKED_PROOF_TOTAL_CLAUSES};
 use crate::gaussian::{GaussResult, GaussianSolver};
 use crate::preprocess::{component_within_limits, MAX_NUM_MATRICES};
 use crate::VarId;
+use ay_sat::ExtProofStep;
 
 /// An assignment record for backtracking.
 #[derive(Debug, Clone)]
@@ -31,6 +33,17 @@ pub(crate) struct PendingPropagation {
     source_row: usize,
     /// The component index that produced this propagation.
     component: usize,
+}
+
+/// Chunked proof emission state (see `gaussian::chunked_proof`).
+#[derive(Debug)]
+struct ChunkedProofState {
+    /// Per accepted component, aligned with `XorExtension::components`.
+    comps: Vec<ChunkedComponentState>,
+    /// Next fresh DRAT extension variable. Starts at the DIMACS variable
+    /// count (all fresh variables live ABOVE the input range and are
+    /// proof-only — they never reach the solver or a model).
+    next_fresh: VarId,
 }
 
 /// Per-component solver state.
@@ -79,6 +92,21 @@ pub struct XorExtension {
     /// Per-component Gaussian solvers. When the constraint system is fully
     /// connected, this has exactly one entry (no splitting overhead).
     components: Vec<ComponentSolver>,
+    /// Per-component count of elimination-trace rows already emitted as DRAT
+    /// helper clauses (task #20): derived-row conflict/reason clauses are only
+    /// RUP once their row encodings are in the proof stream, and each row must
+    /// be emitted at most once or the proof bloats per conflict.
+    emitted_proof_rows: Vec<usize>,
+    /// Cached whole-extension proof-ladder feasibility. Elimination traces are
+    /// immutable after construction, so recomputing the width/count walk on
+    /// every propagation would be pure hot-path overhead.
+    proof_ladders_complete: bool,
+    /// Chunked (Tseitin-chain) proof emission state, built on demand by
+    /// [`Self::set_proof_fresh_var_base`] when the monolithic ladder envelope
+    /// is exceeded but the trace fits the chunked budget. `Some` switches the
+    /// proof drains from monolithic DB lemmas to lazy proof-only cone
+    /// emission over fresh DRAT extension variables.
+    chunked: Option<ChunkedProofState>,
     /// Map from variable ID to component index for O(1) routing.
     var_to_component: HashMap<VarId, usize>,
     /// Original constraints (flat, needed for final soundness check).
@@ -187,8 +215,12 @@ impl XorExtension {
         }
 
         let needs_propagate = !initial_props.is_empty() || conflict.is_some();
+        let proof_ladders_complete = Self::components_have_complete_proof_ladders(&components);
 
         Self {
+            emitted_proof_rows: vec![0; components.len()],
+            proof_ladders_complete,
+            chunked: None,
             components,
             var_to_component,
             constraints,
@@ -467,6 +499,8 @@ impl XorExtension {
     }
 }
 
+include!("extension/proof.rs");
+
 impl Extension for XorExtension {
     fn propagate(&mut self, ctx: &dyn SolverContext) -> ExtPropagateResult {
         #[cfg(debug_assertions)]
@@ -476,25 +510,53 @@ impl Extension for XorExtension {
         self.sync_with_context(ctx);
 
         // Conflicts take priority over unit propagations.
-        if let Some((conflict, _row_idx)) = self.conflict.take() {
+        if let Some((conflict, row_idx)) = self.conflict.take() {
             self.needs_propagate = self.needs_resync || !self.pending_propagations.is_empty();
+            // Chunked proof mode: emit the conflict row's derivation cone as
+            // proof-only chain scaffolding (empty and non-empty conflicts
+            // alike — the conflict clause is RUP through the row's chain).
+            if self.chunked.is_some() {
+                let script = row_idx
+                    .and_then(|global| self.global_row_to_target(global))
+                    .map(|target| self.drain_chunked_targets(&[target]))
+                    .unwrap_or_default();
+                let mut result = ExtPropagateResult::conflict(conflict);
+                result.proof_script = script;
+                return result;
+            }
             // When the conflict is empty (0=1 row with no assigned variables),
             // generate intermediate proof clauses from the RREF rows (#4533).
             // These clauses are CNF encodings of derived XOR constraints that
             // are RUP-derivable from the original XOR-encoding clauses. Without
             // them, external DRAT checkers cannot verify the empty clause.
             if conflict.is_empty() {
+                if !self.proof_ladders_complete {
+                    return ExtPropagateResult::conflict(conflict);
+                }
                 let mut proof_clauses = Vec::new();
                 for comp in &self.components {
-                    proof_clauses.extend(comp.solver.generate_proof_clauses());
+                    let Some(clauses) = comp.solver.try_generate_complete_proof_clauses() else {
+                        // The certified DIMACS route preflights this condition.
+                        // Other direct extension users retain semantic solving,
+                        // while their external checker rejects the deliberately
+                        // incomplete proof instead of accepting an unsound one.
+                        return ExtPropagateResult::conflict(conflict);
+                    };
+                    proof_clauses.extend(clauses);
                 }
                 return ExtPropagateResult::new(proof_clauses, vec![], Some(conflict), false);
             }
-            return ExtPropagateResult::conflict(conflict);
+            // Task #20: the non-empty conflict clause is the CNF image of a
+            // DERIVED row under the current assignment — emit the pending row
+            // encodings first or the clause is not RUP and an external
+            // checker rejects the whole certificate.
+            let proof_clauses = self.drain_new_proof_clauses().unwrap_or_default();
+            return ExtPropagateResult::new(proof_clauses, vec![], Some(conflict), false);
         }
 
         if !self.pending_propagations.is_empty() {
             let mut propagations = Vec::new();
+            let mut reason_targets: Vec<(usize, usize)> = Vec::new();
             let mut malformed_reason = false;
             let pending = std::mem::take(&mut self.pending_propagations);
 
@@ -509,6 +571,7 @@ impl Extension for XorExtension {
                     prop.source_row,
                 ) {
                     propagations.push((clause, prop.lit));
+                    reason_targets.push((prop.component, prop.source_row));
                 } else {
                     malformed_reason = true;
                     debug_assert!(
@@ -522,7 +585,16 @@ impl Extension for XorExtension {
             self.needs_resync = malformed_reason;
             self.needs_propagate = malformed_reason;
             if !propagations.is_empty() {
-                return ExtPropagateResult::new(vec![], propagations, None, false);
+                // Task #20: reason clauses also come from derived rows — same
+                // RUP requirement as the non-empty conflict path.
+                if self.chunked.is_some() {
+                    let script = self.drain_chunked_targets(&reason_targets);
+                    let mut result = ExtPropagateResult::new(vec![], propagations, None, false);
+                    result.proof_script = script;
+                    return result;
+                }
+                let proof_clauses = self.drain_new_proof_clauses().unwrap_or_default();
+                return ExtPropagateResult::new(proof_clauses, propagations, None, false);
             }
         }
 

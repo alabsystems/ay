@@ -1479,6 +1479,7 @@ fn test_unknown_from_extension_stop_with_empty_formula() {
                 conflict: None,
                 stop: true,
                 bump_vars: vec![],
+                proof_script: vec![],
             }
         }
 
@@ -1534,6 +1535,7 @@ fn test_unsat_from_extension_empty_conflict() {
                     conflict: Some(vec![]), // empty conflict = contradiction
                     stop: false,
                     bump_vars: vec![],
+                    proof_script: vec![],
                 }
             } else {
                 ExtPropagateResult::none()
@@ -1581,6 +1583,7 @@ fn test_extension_stop_does_not_mask_level0_unsat() {
                 conflict: None,
                 stop: true,
                 bump_vars: vec![],
+                proof_script: vec![],
             }
         }
 

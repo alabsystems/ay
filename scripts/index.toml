@@ -36,6 +36,15 @@ publish = "public"
 cli_note = "no fronting subcommand yet"
 
 [[script]]
+name    = "quality-baseline-reconcile"
+path    = "scripts/quality_baseline_reconcile.py"
+lang    = "python"
+group   = "audit.flags"
+summary = "Reconcile the file/function/construct size ratchets and file_size waiver ceilings from the quality gate's own report; seeds new construct sites so a second pass can pick up the true fingerprint."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
 name    = "flag-audit"
 path    = "scripts/flag_audit.py"
 lang    = "python"
@@ -52,6 +61,34 @@ group   = "bench.sat"
 summary = "Lightweight SAT sweep harness: one or more solvers over a DIMACS corpus at a fixed timeout."
 publish = "public"
 tools   = ["kissat"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "lever-eligibility"
+path    = "scripts/lever_eligibility.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Compute each default-OFF SAT lever's eligible population from CNF headers, applying that lever's own gate arithmetic."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "lever-ab-verdict"
+path    = "scripts/lever_ab_verdict.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Score one paired lever A/B sweep per arm (certificates joined on the arm, never collapsed) and print a FLIP / NO-FLIP verdict."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "run-lever-ab"
+path    = "scripts/run_lever_ab.sh"
+lang    = "bash"
+group   = "bench.sat"
+summary = "One command: build the lever binary off the main target dir, sweep each default-OFF lever's eligible population with both arms paired in one run, drain certificates, print a flip verdict per lever."
+publish = "public"
 requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
@@ -237,6 +274,55 @@ group   = "lib"
 summary = "Aggregate admission control for harness children: cap concurrency, hand each child MEMLIMIT/NBCORE env."
 publish = "public"
 entrypoint = "library"
+
+[[script]]
+name    = "nra-oracle-shards"
+path    = "scripts/nra_oracle_shards.py"
+lang    = "python"
+group   = "oracle.nra"
+summary = "Run resource-enveloped ay-nra-oracle fuzz shards with bounded concurrency and durable abandonment evidence."
+publish = "public"
+requires = ["oom-guard", "nra-oracle-campaign", "nra-oracle-shards-lib"]
+cli_note = "no fronting subcommand yet; requires a prebuilt ay-nra-oracle binary and an explicit trusted Z3 path"
+
+[[script]]
+name    = "nra-oracle-campaign"
+path    = "scripts/nra_oracle_campaign.py"
+lang    = "python"
+group   = "lib"
+summary = "Bounded scheduling, child supervision, and harness-abort coordination for NRA oracle shards."
+publish = "public"
+requires = ["oom-guard", "nra-oracle-shards-lib"]
+entrypoint = "library"
+
+[[script]]
+name    = "nra-oracle-shards-lib"
+path    = "scripts/nra_oracle_shards_lib.py"
+lang    = "python"
+group   = "lib"
+summary = "Persistence, terminal-summary validation, and shard-range primitives for NRA oracle campaigns."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "nra-oracle-shards-tests"
+path    = "scripts/tests/test_nra_oracle_shards.py"
+lang    = "python"
+group   = "test"
+summary = "Resource-envelope, bounded-scheduler, and persistence tests for NRA oracle sharding."
+publish = "public"
+requires = ["nra-oracle-shards", "nra-oracle-campaign", "nra-oracle-shards-lib"]
+entrypoint = "test"
+
+[[script]]
+name    = "nra-oracle-shards-terminal-tests"
+path    = "scripts/tests/test_nra_oracle_shards_terminal.py"
+lang    = "python"
+group   = "test"
+summary = "Rejection-matrix and harness-abort regression tests for NRA oracle sharding."
+publish = "public"
+requires = ["nra-oracle-shards", "nra-oracle-campaign", "nra-oracle-shards-lib"]
+entrypoint = "test"
 
 [[script]]
 name    = "oom-guard-tests"

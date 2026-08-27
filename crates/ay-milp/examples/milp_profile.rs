@@ -6,18 +6,28 @@
 //      LP engine even run" question (PFI cannot on the downstream optimization consumer's hard-six sizes),
 //   2. the full MIP feasibility solve (BabSession::check).
 //
-// The LU / Forrest-Tomlin engine is env-gated by --lu at simplex.rs:473,
-// exercised by both sessions. Run:
+// STALE CLAIM, DELETED RATHER THAN KEPT: this header used to say "the LU /
+// Forrest-Tomlin engine is env-gated by --lu at simplex.rs:473". It was false
+// three ways -- that line is a refac counter, `--lu` has no carrier at all
+// (see `main`), and the lane is not gated by any lever: it is chosen by SHAPE
+// (`FloatLp::tall_lu` / `wide_tall` / `cold_root_lu`). The levers that DO
+// carry are the kill switches `--no-tall-lu`, `--no-node-lu`, `--no-cold-lu`,
+// and this harness passes them through `engine_cli::apply` like any other
+// engine flag. Do not reinstate a force-lever claim without a carrier and a
+// measurement.
 //   milp_profile <file.milp> <seconds> [lp|mip|both|shared|proof|family]
 // `shared` / `proof` / `family` read --prefix-cols as comma-separated
 // column indices. `shared` is the staged one-root serial native frontier;
-// `proof` prepares its prefix LPs on AY_MILP_PREFIX_WORKERS owned workers;
+// `proof` prepares its prefix LPs on a fixed owned-worker count (the
+// AY_MILP_PREFIX_WORKERS override this line used to name was deleted in B7 --
+// see the note at the `proof` arm, which had already recorded the deletion
+// while this header went on advertising it);
 // `family` is the old cloned-session control under one common wall deadline.
 
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
+use ay_milp::engine_cli::Flags;
 use ay_milp::{
     nodes_explored, reset_nodes_explored, BabSession, Col, LpSession, Model, Outcome, Sense,
     SolveOpts,
@@ -262,17 +272,17 @@ fn basis_file_arg() -> String {
 fn parse_profile_flags(raw: &[String]) -> Flags {
     // B40b: harness switches ride the shared engine CLI parser
     // (--lu, --prefix-cols i,j, --obbt-cols <file>) instead of env.
-    let mut value_flags: Vec<&str> = VALUE_FLAGS.to_vec();
-    value_flags.extend(["prefix-cols", "obbt-cols", "basis-file"]);
+    // `applied_flags()` PLUS this harness's own three value names and one
+    // switch — NOT `VALUE_FLAGS`, which is `ay-milp solve`'s table and also
+    // accepted sixteen names this file cannot carry.
     // `--basis-file <path>` is read by `basis_file_arg()` straight off
     // `env::args()`, but it must ALSO be declared here: strict parsing refuses
     // an undeclared flag and keeps its value out of `positional`.
-    let mut switch_flags = switch_flags();
-    switch_flags.push("lu");
-    Flags::parse(raw, &value_flags, &switch_flags).unwrap_or_else(|e| {
-        eprintln!("usage: milp_profile <file.milp> <seconds> [lp|mip|both] [--flags]: {e}");
-        std::process::exit(2);
-    })
+    ay_milp::engine_cli::parse_applied(raw, &["prefix-cols", "obbt-cols", "basis-file"], &["lu"])
+        .unwrap_or_else(|e| {
+            eprintln!("usage: milp_profile <file.milp> <seconds> [lp|mip|both] [--flags]: {e}");
+            std::process::exit(2);
+        })
 }
 
 fn main() {
@@ -285,10 +295,37 @@ fn main() {
     let secs: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
     let mode = args.next().unwrap_or_else(|| "both".to_string());
 
+    // `--lu` IS A DEAD SWITCH AND THIS LINE USED TO HIDE THAT. It is declared in
+    // `switch_flags` so strict parsing accepts it, read here, echoed as `lu=on`
+    // -- and used NOWHERE ELSE in this file or in `engine_cli` (`grep '"lu"'`
+    // there returns nothing). So a run that passed `--lu` printed `lu=on` and
+    // selected no lane, which is exactly the reader-without-writer family the
+    // knob census closed inside the crate but which never covered the examples.
+    // It is NOT removed here because six `simplex.rs` docstrings cited `--lu`
+    // as the force-lever their measurements were taken with; deleting the flag
+    // would erase the evidence trail. THAT ROUND HAS NOW HAPPENED and the
+    // answer is in `simplex::lu_enabled`: the lever those measurements used was
+    // the env var `AY_MILP_LU=1`, live 939184496 (2026-07-14) .. 8875fea71
+    // (2026-08-15), and 8875fea71 rewrote the citations to `--lu` textually
+    // while pointing the reader at `env::var_os("--lu")`. So the data was taken
+    // with a working lever and MIS-CITED; the flag itself never worked. The six
+    // citations now name `AY_MILP_LU=1` again.
+    //
+    // Measured on 5ebf652ba, this harness, mip mode, a synthetic m=1050 tall
+    // model, 3 interleaved reps: `--lu` leaves `--trace LUFACT count` in the
+    // same nonzero range as no flag at all (41..79 on both sides), while
+    // `--no-tall-lu` -- a REAL carrier, on this same harness and binary --
+    // drives it to 0 in 3 reps of 3. The echo must not claim control it does
+    // not have, and `tests/knob_census.rs::every_harness_declared_flag_is_
+    // dispositioned` now refuses any successor flag that is not written down.
     let lu = flags.has("lu");
     eprintln!(
         "=== lu={} timeout={secs}s mode={mode} ===",
-        if lu { "on" } else { "off" }
+        if lu {
+            "REQUESTED-BUT-INERT(no carrier)"
+        } else {
+            "off"
+        }
     );
 
     let text = std::fs::read_to_string(&path).expect("read .milp");
@@ -482,7 +519,25 @@ fn main() {
                 let bit = prefix.len() - level - 1;
                 child.fix_col(col, f64::from(((assignment >> bit) & 1) as u8));
             }
-            let child_opts = SolveOpts::new()
+            // THE CONTROL ARM USED TO DISCARD EVERY ENGINE FLAG. This built a
+            // fresh `SolveOpts::new()`, so the flagged `opts` that `shared` and
+            // `proof` run under never reached the `family` children — and
+            // `family` is the CONTROL those two are measured against, so a
+            // flagged shared-vs-family comparison put a flagged arm against an
+            // unflagged one. Same shape as `mps_solve`'s repaired `--check-sol`
+            // shadowing, one file over. `opts.clone()` is what `shared_opts`
+            // above already does.
+            //
+            // MEASURED on 5ebf652ba, this harness, a synthetic m=1050 tall MIP,
+            // `--prefix-cols 0,8 --trace`, 2 interleaved reps: under `shared`,
+            // `--no-tall-lu` drove `LUFACT count` to 0 in 2 of 2 reps (against
+            // 121 unflagged); under `family` it left LUFACT at 73/79 with the
+            // flag and 41/79 without it — indistinguishable, because the flag
+            // was not there. The deadline still governs: `time_limit` and
+            // `deadline` combine with the EARLIER winning, and this absolute
+            // deadline is earlier than any child's relative one.
+            let child_opts = opts
+                .clone()
                 .with_deadline(deadline)
                 .with_tree_cert_leaves(0);
             let mut session = BabSession::new(child, &child_opts).expect("family child session");
@@ -554,8 +609,27 @@ fn main() {
 
     if mode == "flp" {
         // MEASUREMENT: one cold float-lane LP solve with iteration economics.
+        //
+        // `_with(&opts)` IS LOAD-BEARING and its absence was the LAST live site
+        // of the dead-flag family. This example parses engine flags at the top
+        // and then handed the diagnostic a bare `diag_float_lp`, so every
+        // caller-layer knob was inert here — including `--dump-vertex`, whose
+        // whole output is caller-gated. MEASURED on the release binaries either
+        // side of this change, `milp_profile safenlp_ruarobot_1181_feas.milp 20
+        // flp --dump-vertex`: 0 VERTEX lines before (2/2 runs), 2 after, while
+        // the already-fixed `ay-milp diag lp-only` sibling printed 2 in both.
+        // The flag parsed and reached nothing.
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
-        println!("{}", ay_milp::diag_float_lp(&model, secs));
+        println!("{}", ay_milp::diag_float_lp_with(&model, secs, &opts));
+        return;
+    }
+
+    if mode == "shipped-lp" {
+        // THE SHIPPED LANE on the same subject as `flp`. `flp` is one cold walk
+        // with no ladder; this is `session::continuous_float_first_optimum`,
+        // the entry a real solve uses, with its exactly certified verdict.
+        let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
+        println!("{}", ay_milp::diag_shipped_float_lp(&model, secs, &opts));
         return;
     }
 

@@ -181,7 +181,7 @@ fn replay_steps(
             return Err(AffineAggregationCertificateError::Caps);
         }
         let candidate =
-            replay_candidate(&work, step).ok_or(AffineAggregationCertificateError::Replay)?;
+            replay_candidate(work, step).ok_or(AffineAggregationCertificateError::Replay)?;
         apply_candidate(work, candidate, guard).ok_or(AffineAggregationCertificateError::Replay)?;
         if work.recover.last() != Some(step) {
             return Err(AffineAggregationCertificateError::Replay);

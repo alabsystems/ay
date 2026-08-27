@@ -36,7 +36,27 @@ fn observed_memory_bytes(current_footprint: usize, peak_rss: impl FnOnce() -> us
 /// If memory measurement is unavailable, returns `false` (assume under limit).
 #[inline]
 pub(crate) fn memory_exceeded(limit: Option<usize>) -> bool {
-    memory_exceeded_at(limit, current_memory_bytes())
+    // Short-circuit BEFORE reading the process footprint. `memory_exceeded_at`
+    // is `limit.is_some_and(..)`, so with no limit the reading is discarded --
+    // but Rust evaluates arguments first, so the old spelling paid for a
+    // reading it then threw away.
+    //
+    // That reading is not free: `current_memory_bytes` is a `task_info`
+    // (TASK_VM_INFO) Mach RPC, measured at ~0.67us. This predicate sits inside
+    // the resolution-replay conversion loop, which polls it per clause-slice
+    // copy, so on a large refutation the discarded readings run into the
+    // millions. The common case for a solve is exactly `None`: neither the CLI
+    // nor the CHC lane calls `set_memory_limit` (the CLI arms
+    // `ay_sys::set_process_memory_limit` instead), so `Executor::memory_limit`
+    // is `None` and every one of those RPCs was pure waste.
+    //
+    // Value-preserving by construction: `memory_exceeded_at(None, _)` is
+    // `false` for every possible reading, which is the documented contract
+    // above. This changes what is COMPUTED, never what is ANSWERED.
+    let Some(limit) = limit else {
+        return false;
+    };
+    memory_exceeded_at(Some(limit), current_memory_bytes())
 }
 
 fn memory_exceeded_at(limit: Option<usize>, current: usize) -> bool {

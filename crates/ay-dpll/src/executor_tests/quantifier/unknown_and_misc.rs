@@ -41,9 +41,8 @@ fn test_unknown_reason_quantifiers() {
     }
 }
 
-/// A dead trigger controls instantiation only; it does not weaken the universal.
-/// An E-matching-only (`no_mbqi`) quantifier can have an impossible body even
-/// without a ground trigger head; the old vacuous-trigger shortcut fabricated SAT.
+/// A dead trigger controls instantiation, not truth: an impossible `no_mbqi`
+/// universal without a ground trigger must not become SAT.
 #[test]
 fn no_mbqi_dead_trigger_with_impossible_body_never_sat() {
     let mut executor = Executor::new();
@@ -304,16 +303,37 @@ fn test_6045_13chain_ematching_budget_must_not_return_sat() {
     );
 }
 
-// #quantifier_consumer-arith soundness regression (deductive-checks exec_spec_unverified
-// five_wrong): a spec-fn UF definition axiom over BV8 alongside a GROUND
-// counterexample query whose atoms are pure BV comparisons over free constants.
-// The formula is satisfiable, but a ground model plus one matched definition
-// point does not construct a total model for the universal: cost filtering and
-// presolve-model filtering can omit other indexed applications. Without an
-// independently materialized and re-checked interpretation, fail closed.
+// #quantifier_consumer-arith, superseded by the quantified-UFBV projection certificate.
+//
+// The original test demanded `unknown` on this query. Its reasoning: the SAT
+// rested on a ground model plus one matched definition point, which does not
+// construct a total model for the universal, because cost filtering and
+// presolve-model filtering can omit other indexed applications. Its own comment
+// named the exit — "without an independently materialized and re-checked
+// interpretation, fail closed".
+//
+// AY now materializes that interpretation, so `unknown` is no longer the
+// property worth pinning; asserting it would ratchet the solver backwards.
+// What replaces it is strictly stronger: the verdict must be `sat`, AND the
+// published interpretation for `five` must be TOTAL and must be the axiom's own
+// definiens. That is exactly the evidence the old comment demanded — it makes
+// the universal true by reflexivity rather than by an unchecked instantiation —
+// and a partial interpretation, or a filtered table with a fabricated default,
+// fails the assertion below.
+//
+// Cross-checked externally: z3 confirms the query is satisfiable, and confirms
+// that AY's published model, pinned back as `define-fun`s, satisfies all four
+// authored assertions.
+//
+// The fail-closed discipline this test used to carry now lives in the four
+// `..._never_sat` probes below, which cover the shapes a syntactic "read the
+// body off the axiom" projection would get wrong: a self-referential definiens,
+// two conflicting definitions of one symbol, and an implication-shaped axiom
+// that is not a definition at all.
 #[test]
-fn test_bv_uf_definition_axiom_ground_counterexample_fails_closed() {
+fn test_bv_uf_definition_axiom_ground_counterexample_publishes_total_interpretation() {
     let smt = r#"
+        (set-option :produce-models true)
         (set-logic ALL)
         (declare-fun five ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
         (declare-const x1 (_ BitVec 8))
@@ -330,16 +350,214 @@ fn test_bv_uf_definition_axiom_ground_counterexample_fails_closed() {
         (assert (= (five x1 x2 x3 x4 x5)
                    (and (= x1 x2) (not (= x3 x4)) (not (= x3 x5)) (not (= x2 x5)))))
         (check-sat)
+        (get-model)
     "#;
 
     let commands = parse(smt).unwrap();
     let mut exec = Executor::new();
     let outputs = exec.execute_all(&commands).unwrap();
+
     assert_eq!(
-        outputs,
-        vec!["unknown"],
-        "a syntactic UF-definition candidate must not grant sat"
+        outputs[0], "sat",
+        "the projection certificate decides this query"
     );
+    let model = &outputs[1];
+    assert_eq!(
+        canonical_define_fun(model, "five"),
+        "(define-fun five ((@1 (_ BitVec 8)) (@2 (_ BitVec 8)) (@3 (_ BitVec 8)) \
+         (@4 (_ BitVec 8)) (@5 (_ BitVec 8))) Bool \
+         (and (= @1 @2) (not (= @3 @4)) (not (= @3 @5)) (not (= @2 @5))))",
+        "`five` must be published as a total closed definition, not a filtered \
+         table or a partial interpretation\n{model}"
+    );
+}
+
+/// One published `define-fun`, whitespace-normalised and with its parameters
+/// renamed positionally to `@1..@n`.
+///
+/// The interning suffixes on internal parameter names (`v1_6`) and the
+/// printer's line breaks are not part of any contract; the signature and the
+/// exact body are. Canonicalising the first two lets an assertion pin the last
+/// two without going brittle.
+fn canonical_define_fun(model: &str, name: &str) -> String {
+    let start = model
+        .find(&format!("(define-fun {name} ("))
+        .unwrap_or_else(|| panic!("no `define-fun {name}` in published model:\n{model}"));
+    let mut depth = 0usize;
+    let mut end = None;
+    for (offset, ch) in model[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let whole = &model[start..end.expect("unbalanced `define-fun` in published model")];
+
+    let tokens: Vec<String> = whole
+        .replace('(', " ( ")
+        .replace(')', " ) ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+
+    // `( define-fun NAME (` — the parameter list opens at index 3, so index 4
+    // is the first token inside it.
+    let mut params: Vec<String> = Vec::new();
+    let mut depth = 1usize;
+    let mut index = 4usize;
+    while index < tokens.len() {
+        match tokens[index].as_str() {
+            "(" => {
+                depth += 1;
+                if depth == 2 {
+                    params.push(tokens[index + 1].clone());
+                }
+            }
+            ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    let mut rendered = String::new();
+    for token in &tokens {
+        let token = match params.iter().position(|param| param == token) {
+            Some(position) => format!("@{}", position + 1),
+            None => token.clone(),
+        };
+        if token == ")" {
+            rendered.push(')');
+        } else {
+            if !rendered.is_empty() && !rendered.ends_with('(') {
+                rendered.push(' ');
+            }
+            rendered.push_str(&token);
+        }
+    }
+    rendered
+}
+
+/// The canonicalisation contract itself: parameters are renamed positionally,
+/// the printer's whitespace is normalised away, and nothing else is rewritten.
+/// Without this the assertion above could pass on a mangled string.
+#[test]
+fn canonical_define_fun_renames_parameters_and_normalises_whitespace() {
+    let model = "(model\n  (define-fun f ((a_12 Int) (b_13 Int)) Int\n    (ite (= a_12 b_13)\n         a_12\n         b_13))\n)";
+    assert_eq!(
+        canonical_define_fun(model, "f"),
+        "(define-fun f ((@1 Int) (@2 Int)) Int (ite (= @1 @2) @1 @2))"
+    );
+}
+
+/// A definition-shaped axiom whose definiens mentions the symbol it defines is
+/// not a definition: `∀v. h(v) = ¬h(v)` is unsatisfiable. A projection that
+/// reads the body off the axiom would build the ill-founded `h := λv. ¬h(v)`
+/// and grant `sat`, so this pins that it does not.
+#[test]
+fn uf_definition_axiom_self_referential_bool_body_never_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-fun h ((_ BitVec 8)) Bool)
+        (declare-const a (_ BitVec 8))
+        (assert (forall ((v (_ BitVec 8))) (= (h v) (not (h v)))))
+        (assert (= a a))
+        (check-sat)
+    "#;
+
+    let commands = parse(smt).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs[0], "sat",
+        "a self-referential definiens must never be projected into a model"
+    );
+    assert_eq!(outputs, vec!["unsat"], "and AY refutes it outright");
+}
+
+/// The arithmetic twin: `∀v. g(v) = g(v) + 1` over BV8 is unsatisfiable for the
+/// same reason, and the ground half is trivially satisfiable, so nothing but
+/// the axiom can decide it.
+#[test]
+fn uf_definition_axiom_self_referential_bv_body_never_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-fun g ((_ BitVec 8)) (_ BitVec 8))
+        (declare-const a (_ BitVec 8))
+        (assert (forall ((v (_ BitVec 8))) (= (g v) (bvadd (g v) #x01))))
+        (assert (= a a))
+        (check-sat)
+    "#;
+
+    let commands = parse(smt).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs[0], "sat",
+        "a self-referential definiens must never be projected into a model"
+    );
+    assert_eq!(outputs, vec!["unsat"], "and AY refutes it outright");
+}
+
+/// Two definition-shaped axioms for the SAME symbol disagree at `v = #x00`, so
+/// the conjunction is unsatisfiable. A projection that picks one candidate and
+/// stops looking would grant `sat`; every definition of a symbol has to hold.
+#[test]
+fn conflicting_uf_definition_axioms_never_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-fun p ((_ BitVec 8)) Bool)
+        (declare-const a (_ BitVec 8))
+        (assert (forall ((v (_ BitVec 8))) (= (p v) (= v #x00))))
+        (assert (forall ((v (_ BitVec 8))) (= (p v) (= v #x01))))
+        (assert (= a a))
+        (check-sat)
+    "#;
+
+    let commands = parse(smt).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs[0], "sat",
+        "a second definition of the same symbol must not be ignored"
+    );
+    assert_eq!(outputs, vec!["unsat"], "and AY refutes it outright");
+}
+
+/// An implication-shaped universal is a CONSTRAINT, not a definition: it pins
+/// `q` on `[0, 16)` and says nothing elsewhere. `(not (q #x05))` contradicts it.
+/// Treating the consequent as a definiens would grant `sat` on an unsatisfiable
+/// query.
+#[test]
+fn implication_shaped_universal_is_not_a_definition_never_sat() {
+    let smt = r#"
+        (set-logic ALL)
+        (declare-fun q ((_ BitVec 8)) Bool)
+        (declare-const x (_ BitVec 8))
+        (assert (forall ((v (_ BitVec 8))) (=> (bvult v #x10) (q v))))
+        (assert (not (q #x05)))
+        (check-sat)
+    "#;
+
+    let commands = parse(smt).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    assert_ne!(
+        outputs[0], "sat",
+        "an implication-shaped universal must not be read as a definition"
+    );
+    assert_eq!(outputs, vec!["unsat"], "and AY refutes it outright");
 }
 
 /// UNSAT twin of the test above: the wrapper body matches the spec exactly,
@@ -1043,3 +1261,4 @@ fn test_negated_exists_diagonal_still_refutes() {
 }
 
 mod negated_exists_sat;
+include!("unknown_and_misc/no_mbqi_rewrite_transfer.rs");

@@ -14,8 +14,7 @@ fn m(r: &WeRegex, s: &str) -> bool {
 fn witness_max_len_s1_lifts_the_cap() {
     // B9: the env override is retired; the cap is the compiled per-mode
     // constant, and S1 must strictly lift it or the S1 lane is pointless.
-    assert!(WITNESS_MAX_LEN_S1 > WITNESS_MAX_LEN);
-    assert!(WITNESS_MAX_LEN > 0);
+    const _: () = assert!(WITNESS_MAX_LEN_S1 > WITNESS_MAX_LEN && WITNESS_MAX_LEN > 0);
 }
 
 #[test]

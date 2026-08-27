@@ -66,7 +66,7 @@ fn a_supplied_deadline_does_not_change_the_optimum() {
 
     let mut timed = build();
     timed.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_secs(120),
+        std::time::Instant::now() + std::time::Duration::from_mins(2),
     ));
     match timed.solve_interruptible(&|| false, &mut |_| {}) {
         MaxSatResult::Optimal { cost, .. } => assert_eq!(

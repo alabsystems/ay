@@ -122,6 +122,7 @@ mod combined_solvers;
 mod construction;
 mod diagnostic_trace;
 mod dpll_error;
+mod dpll_proof_lifecycle;
 mod dpll_solve;
 mod dpll_support;
 mod dpll_tracing;
@@ -763,21 +764,6 @@ impl<T: TheorySolver> DpllT<'_, T> {
         for atom in atoms {
             self.theory.internalize_atom(atom);
         }
-    }
-
-    /// Take the clause trace from the SAT solver (for SAT proof reconstruction)
-    ///
-    /// Returns the clause trace if one was being recorded, otherwise None.
-    /// This consumes the trace from the SAT solver.
-    pub fn take_clause_trace(&mut self) -> Option<ClauseTrace> {
-        self.sat.take_clause_trace()
-    }
-
-    /// Set the deterministic search-time proof bookkeeping work budget
-    /// (#A2b construction budget; `None` = unbudgeted). See
-    /// `ay_sat::Solver::set_proof_bookkeeping_budget`.
-    pub fn set_proof_bookkeeping_budget(&mut self, budget: Option<u64>) {
-        self.sat.set_proof_bookkeeping_budget(budget);
     }
 
     /// Get a reference to the var_to_term mapping

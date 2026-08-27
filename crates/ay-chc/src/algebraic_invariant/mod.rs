@@ -15,11 +15,13 @@
 //! the development design notes
 //! Issue: #7170 (s_multipl_22), #5651 (s_multipl_25)
 
+use crate::cancellation::CancellationToken;
 use crate::pdr::model::{InvariantModel, InvariantVerificationMethod, PredicateInterpretation};
 use crate::recurrence::{analyze_transition, ClosedForm};
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseHead, Predicate, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use ay_core::time::Instant;
+use std::cell::Cell;
 
 mod bv_gate;
 mod init;
@@ -47,6 +49,94 @@ struct NormalizedSelfLoop {
     /// `_next` variables or substituting post-vars preserves the real sort
     /// (BitVec, Int, Real, ...) instead of defaulting to `ChcSort::Int`.
     var_sorts: FxHashMap<String, ChcSort>,
+}
+
+/// Cooperative stop condition for algebraic synthesis and validation.
+///
+/// Bundles the wall-clock deadline the caller hands down with the portfolio's
+/// cancellation token so both are checked by one call.
+///
+/// # The budget this replaced was unenforceable (#9110)
+///
+/// The deadline used to be consulted in exactly three places: the transfer
+/// loop (#9004), the per-clause head of the SMT validation loop (#8753), and
+/// the pre-query check inside it. Every one of them sits at the top of a loop
+/// whose SINGLE iteration is where the time actually goes, so the checks
+/// looked correct and bounded nothing:
+///
+/// * The pre-strategy had no entry gate, and it is entered up to three times
+///   per solve (original problem, BvToInt retry, adaptive escalation round)
+///   sharing one deadline — so entries two and three replayed the entire
+///   phase against a deadline that had already passed.
+/// * The per-predicate synthesis loop never polled at all.
+/// * [`conjoin`] folded with `reduce(ChcExpr::and)`, which is Θ(n²)
+///   hash-consing (see its docs) and a single un-pollable statement.
+/// * `validation_body_syntactically_implies_head` scans every head conjunct
+///   against the whole body — Θ(|head|·|body|) inside ONE iteration of the
+///   per-clause loop, and it took no deadline in any form.
+///
+/// The last of those dominated: on a 120-variable lockstep problem given a
+/// 10 ms budget, 2.024 s of the 2.035 s spent was that one loop. The symptom
+/// this produces is a total runtime that does not move when the budget moves,
+/// which is what the corpus cells showed (33.67 s at a nominal 5 s, 33.63 s at
+/// 20 s).
+///
+/// The cancellation token never reached this module in any form either, so a
+/// caller that armed `cancellation_handle().cancel_after(..)` saw no effect
+/// beyond the cost of arming it.
+///
+/// `tripped` latches: once either condition has fired, further polls are a
+/// single `Cell` load rather than a clock read. This matters because the polls
+/// are now on hot inner loops.
+pub(super) struct SynthesisBudget {
+    deadline: Option<Instant>,
+    cancellation: Option<CancellationToken>,
+    tripped: Cell<bool>,
+}
+
+impl SynthesisBudget {
+    pub(super) fn new(deadline: Option<Instant>, cancellation: Option<CancellationToken>) -> Self {
+        Self {
+            deadline,
+            cancellation,
+            tripped: Cell::new(false),
+        }
+    }
+
+    /// A budget that never trips, for callers with no deadline and no token.
+    #[cfg(test)]
+    pub(super) fn unbounded() -> Self {
+        Self::new(None, None)
+    }
+
+    /// The wall-clock deadline, for the phases that still take one directly.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// True once the deadline has passed or the caller cancelled.
+    ///
+    /// Every caller of this treats `true` as "abandon synthesis and report
+    /// [`AlgebraicResult::NotApplicable`]". No caller may keep a partial
+    /// result: weakening a candidate interpretation is not a safe default here
+    /// because the validator can read a too-weak interpretation as evidence
+    /// that bad states are reachable and report `Unsafe`.
+    pub(super) fn expired(&self) -> bool {
+        if self.tripped.get() {
+            return true;
+        }
+        let done = self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+        if done {
+            self.tripped.set(true);
+        }
+        done
+    }
 }
 
 /// Result of algebraic invariant synthesis.
@@ -85,28 +175,85 @@ pub(crate) fn try_algebraic_solve_with_deadline(
     verbose: bool,
     deadline: Option<Instant>,
 ) -> AlgebraicResult {
-    try_algebraic_solve_with_deadline_impl(problem, verbose, deadline, None)
+    try_algebraic_solve_with_deadline_impl(
+        problem,
+        verbose,
+        &SynthesisBudget::new(deadline, None),
+        None,
+    )
 }
 
+/// [`try_algebraic_solve_with_deadline`] that also observes a cancellation
+/// token.
+///
+/// The portfolio and adaptive layers pass their own token here so an embedding
+/// driver's `cancellation_handle().cancel()` / `.cancel_after(..)` winds the
+/// pre-strategy down, exactly as it already does for the engine lanes.
+pub(crate) fn try_algebraic_solve_with_budget(
+    problem: &ChcProblem,
+    verbose: bool,
+    deadline: Option<Instant>,
+    cancellation: Option<CancellationToken>,
+) -> AlgebraicResult {
+    try_algebraic_solve_with_deadline_impl(
+        problem,
+        verbose,
+        &SynthesisBudget::new(deadline, cancellation),
+        None,
+    )
+}
+
+/// Deadline-only shim over [`try_algebraic_solve_with_budget_and_stats`].
+///
+/// Production callers pass a cancellation token as well and go through the
+/// budget entry point directly; this spelling is kept for the regression tests,
+/// which exercise deadline behaviour on its own.
+#[cfg(test)]
 pub(crate) fn try_algebraic_solve_with_deadline_and_stats(
     problem: &ChcProblem,
     verbose: bool,
     deadline: Option<Instant>,
 ) -> (AlgebraicResult, AlgebraicValidationStats) {
+    try_algebraic_solve_with_budget_and_stats(problem, verbose, deadline, None)
+}
+
+pub(crate) fn try_algebraic_solve_with_budget_and_stats(
+    problem: &ChcProblem,
+    verbose: bool,
+    deadline: Option<Instant>,
+    cancellation: Option<CancellationToken>,
+) -> (AlgebraicResult, AlgebraicValidationStats) {
     let mut stats = AlgebraicValidationStats::default();
-    let result =
-        try_algebraic_solve_with_deadline_impl(problem, verbose, deadline, Some(&mut stats));
+    let result = try_algebraic_solve_with_deadline_impl(
+        problem,
+        verbose,
+        &SynthesisBudget::new(deadline, cancellation),
+        Some(&mut stats),
+    );
     (result, stats)
 }
 
 fn try_algebraic_solve_with_deadline_impl(
     problem: &ChcProblem,
     verbose: bool,
-    deadline: Option<Instant>,
+    budget: &SynthesisBudget,
     mut validation_stats: Option<&mut AlgebraicValidationStats>,
 ) -> AlgebraicResult {
     let predicates = problem.predicates();
     if predicates.is_empty() {
+        return AlgebraicResult::NotApplicable;
+    }
+
+    // Entry gate. The pre-strategy is entered twice per solve on BV problems
+    // (once on the original problem, once on the BvToInt abstraction, sharing
+    // one deadline), and the adaptive layer's escalation round re-enters it
+    // again. Without this check the second and third entries each replayed the
+    // whole unpolled synthesis phase against a deadline that had already
+    // passed — the dominant term in the measured overrun.
+    if budget.expired() {
+        if verbose {
+            safe_eprintln!("Algebraic: deadline already expired on entry; not starting synthesis");
+        }
         return AlgebraicResult::NotApplicable;
     }
 
@@ -125,6 +272,21 @@ fn try_algebraic_solve_with_deadline_impl(
     );
 
     for pred in predicates {
+        // Per-predicate poll. One clock read against a synthesis pipeline that
+        // scans every clause in the problem is free, and without it this loop
+        // ran to completion over every predicate no matter how long ago the
+        // budget expired.
+        if budget.expired() {
+            if verbose {
+                safe_eprintln!(
+                    "Algebraic: synthesis deadline exceeded, handing control back to the portfolio"
+                );
+            }
+            if let Some(validation_stats) = validation_stats.as_deref_mut() {
+                validation_stats.merge(&synthesis_stats);
+            }
+            return AlgebraicResult::NotApplicable;
+        }
         if verbose {
             safe_eprintln!("Algebraic: checking pred {} (id {:?})", pred.name, pred.id);
         }
@@ -298,7 +460,23 @@ fn try_algebraic_solve_with_deadline_impl(
             .collect();
 
         solved_invariants.insert(pred.id, invariants.clone());
-        let formula = conjoin(invariants);
+        // The conjunction itself is polled: hash-consing one large invariant
+        // set is a single outer iteration with unbounded inner cost, so a
+        // per-predicate check cannot bound it. A trip abandons synthesis
+        // outright — see `conjoin_checked` for why no partial conjunction may
+        // be kept.
+        let Some(formula) = conjoin_checked(invariants, budget) else {
+            if verbose {
+                safe_eprintln!(
+                    "Algebraic: deadline exceeded while conjoining pred {} invariants",
+                    pred.name
+                );
+            }
+            if let Some(validation_stats) = validation_stats.as_deref_mut() {
+                validation_stats.merge(&synthesis_stats);
+            }
+            return AlgebraicResult::NotApplicable;
+        };
         if verbose {
             safe_eprintln!("Algebraic: pred {} formula {:?}", pred.name, formula);
         }
@@ -332,8 +510,20 @@ fn try_algebraic_solve_with_deadline_impl(
     }
 
     loop {
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
+        if budget.expired() {
+            if verbose {
+                safe_eprintln!(
+                    "Algebraic: transfer deadline exceeded, handing control back to portfolio (#9004)"
+                );
+            }
+            if let Some(validation_stats) = validation_stats.as_deref_mut() {
+                validation_stats.merge(&synthesis_stats);
+            }
+            return AlgebraicResult::NotApplicable;
+        }
+        let mut changed = false;
+        for pred in predicates {
+            if budget.expired() {
                 if verbose {
                     safe_eprintln!(
                         "Algebraic: transfer deadline exceeded, handing control back to portfolio (#9004)"
@@ -343,22 +533,6 @@ fn try_algebraic_solve_with_deadline_impl(
                     validation_stats.merge(&synthesis_stats);
                 }
                 return AlgebraicResult::NotApplicable;
-            }
-        }
-        let mut changed = false;
-        for pred in predicates {
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    if verbose {
-                        safe_eprintln!(
-                            "Algebraic: transfer deadline exceeded, handing control back to portfolio (#9004)"
-                        );
-                    }
-                    if let Some(validation_stats) = validation_stats.as_deref_mut() {
-                        validation_stats.merge(&synthesis_stats);
-                    }
-                    return AlgebraicResult::NotApplicable;
-                }
             }
             if solved_preds.contains(&pred.id) {
                 continue;
@@ -430,13 +604,22 @@ fn try_algebraic_solve_with_deadline_impl(
         return AlgebraicResult::NotApplicable;
     }
 
-    // Validate via SMT
+    // Validate via SMT. Validation takes the whole budget, not just the
+    // deadline: its per-clause and pre-query polls now observe cancellation
+    // too, and its Θ(|head|·|body|) syntactic fast path polls on a stride
+    // (#9110) so a clause cannot outrun the budget from the inside.
+    if budget.expired() {
+        if let Some(validation_stats) = validation_stats.as_deref_mut() {
+            validation_stats.merge(&synthesis_stats);
+        }
+        return AlgebraicResult::NotApplicable;
+    }
     let (validation, stats) = validate_model_with_algebraic_fallback_and_stats(
         problem,
         &model,
         &solved_preds,
         verbose,
-        deadline,
+        budget,
     );
     if let Some(validation_stats) = validation_stats {
         validation_stats.merge(&synthesis_stats);
@@ -475,11 +658,39 @@ fn try_algebraic_solve_with_deadline_impl(
     }
 }
 
+/// Conjoin a derived invariant set into one formula.
+///
+/// `reduce(ChcExpr::and)` looked linear and was not: `ChcExpr::and(a, b)` is
+/// `and_all([a, b])`, which re-flattens and re-deep-hashes the whole
+/// accumulator on every step, so folding `n` conjuncts did Θ(n²) hash-consing.
+/// A single `and_all` over the whole vector produces the identical expression
+/// — same left-to-right order, same nested-`And` flattening, same
+/// first-occurrence deduplication, same `false`/`true` folding — in one pass.
+/// The zero- and one-element cases keep their original spellings so a lone
+/// conjunct is still returned untouched rather than normalized.
 pub(super) fn conjoin(exprs: Vec<ChcExpr>) -> ChcExpr {
     match exprs.len() {
         0 => ChcExpr::Bool(true),
-        1 => exprs.into_iter().next().unwrap(),
-        _ => exprs.into_iter().reduce(ChcExpr::and).unwrap(),
+        1 => exprs.into_iter().next().expect("len==1"),
+        _ => ChcExpr::and_all(exprs),
+    }
+}
+
+/// [`conjoin`] under a [`SynthesisBudget`], returning `None` when it trips.
+///
+/// SOUNDNESS: `None` means "abandon synthesis", never "use what was built so
+/// far". Truncating the conjunction would hand the validator a WEAKER
+/// interpretation than the one the synthesizer derived, and a too-weak
+/// interpretation is not merely useless — `validate_model_with_algebraic_
+/// fallback` reads a query clause that the interpretation fails to exclude as
+/// evidence that bad states are reachable and reports `UnsafeDetected`. Every
+/// caller therefore maps `None` to [`AlgebraicResult::NotApplicable`], which
+/// yields no verdict at all and returns the budget to the portfolio.
+fn conjoin_checked(exprs: Vec<ChcExpr>, budget: &SynthesisBudget) -> Option<ChcExpr> {
+    match exprs.len() {
+        0 => Some(ChcExpr::Bool(true)),
+        1 => Some(exprs.into_iter().next().expect("len==1")),
+        _ => ChcExpr::and_all_checked(exprs, || budget.expired()),
     }
 }
 

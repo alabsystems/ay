@@ -95,7 +95,7 @@ fn replacement_shape_certificate_is_not_authority_for_original_clause() {
         kind: TheoryLemmaKind::LiaGeneric,
         lia: None,
     });
-    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[equality], &[]);
+    reconstruct_missing_farkas_coefficients(&mut terms, &mut proof, &[equality], &[], &|| false);
     let ProofStep::TheoryLemma { farkas, clause, .. } = &proof.steps[0] else {
         panic!("expected theory lemma");
     };

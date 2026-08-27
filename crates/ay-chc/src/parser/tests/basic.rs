@@ -231,3 +231,81 @@ fn test_parse_comments() {
     let problem = ChcParser::parse(input).expect("test should succeed");
     assert_eq!(problem.predicates().len(), 1);
 }
+
+// --- Quantifier variable capture (the development design notes) ---
+//
+// Stripping a binder hoists it into the flat clause scope. Two binders in ONE
+// clause sharing a name used to become one variable, collapsing two independent
+// quantifications — a wrong-answer bug whose verdict depended on the binder's
+// NAME. Renaming is applied ONLY to binder-vs-binder collisions; shadowing a
+// file-scoped `declare-var` is the ordinary idiom and must stay untouched.
+
+#[test]
+fn sibling_binders_sharing_a_name_do_not_collapse() {
+    let problem = ChcParser::parse(
+        "(set-logic HORN)\
+         (declare-fun P (Int) Bool)\
+         (declare-fun R (Int) Bool)\
+         (assert (forall ((u Int)) (=> (= u 0) (P u))))\
+         (assert (forall ((u Int)) (=> (= u 1) (R u))))\
+         (assert (=> (and (exists ((y Int)) (P y)) (exists ((y Int)) (R y))) false))\
+         (check-sat)",
+    )
+    .expect("parses");
+    // The two `y` binders must denote DIFFERENT variables. Before the fix both
+    // resolved to a single `y` and the clause was satisfiable (wrong).
+    let last = problem.clauses().last().expect("a clause");
+    let text = format!("{last:?}");
+    assert!(
+        text.contains("ay!cap!"),
+        "second sibling binder must be renamed; got {text}"
+    );
+}
+
+#[test]
+fn binder_shadowing_a_declare_var_renames_the_binder() {
+    // A binder shadowing a file-scoped `declare-var` DOES capture whenever the
+    // clause also uses the outer name outside the binder:
+    //
+    //   (rule (=> (and (exists ((y Int)) (P y)) (= y 7)) (Q y)))
+    //
+    // where `y` in `(= y 7)` / `(Q y)` is the declare-var. AY answered unsat
+    // where z3 and the truth say sat (fp_single_shadow.smt2).
+    //
+    // Renaming the BINDER is sound whether or not the outer name is used again:
+    // the declare-var binding is left completely intact and the binder simply
+    // gets a private name. That is the opposite of the earlier attempt, which
+    // removed names from scope and cost five regressions.
+    let problem = ChcParser::parse(
+        "(set-logic HORN)\
+         (declare-var x Int)\
+         (declare-fun P (Int) Bool)\
+         (assert (forall ((x Int)) (=> (= x 0) (P x))))\
+         (check-sat)",
+    )
+    .expect("parses");
+    let text = format!("{:?}", problem.clauses());
+    assert!(
+        text.contains("ay!cap!"),
+        "declare-var shadowing must rename the binder: {text}"
+    );
+}
+
+#[test]
+fn the_same_binder_name_in_separate_clauses_is_not_capture() {
+    // Binder scopes are per-clause; `u` in clause after clause is ordinary.
+    let problem = ChcParser::parse(
+        "(set-logic HORN)\
+         (declare-fun P (Int) Bool)\
+         (declare-fun R (Int) Bool)\
+         (assert (forall ((u Int)) (=> (= u 0) (P u))))\
+         (assert (forall ((u Int)) (=> (= u 1) (R u))))\
+         (check-sat)",
+    )
+    .expect("parses");
+    let text = format!("{:?}", problem.clauses());
+    assert!(
+        !text.contains("ay!cap!"),
+        "cross-clause reuse must not rename: {text}"
+    );
+}

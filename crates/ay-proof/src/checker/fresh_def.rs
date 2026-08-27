@@ -16,6 +16,24 @@
 //! problem constrains). Before this module they demoted to a premiseless
 //! `trust` step and strict certification rejected a CORRECT refutation.
 //!
+//! `purify_bool_args` does the same thing in the more DIRECT form: it mints a
+//! fresh Boolean `p` for a compound Boolean argument `b` and asserts the
+//! equality `(= p b)` outright. That leaf arrives as
+//! [`AletheRule::FreshDefEq`], and this ONE registry vets both rules.
+//!
+//! # Why the two rules MUST share this registry
+//!
+//! Not a convenience — a soundness requirement. The guards below are about a
+//! SYMBOL, not about a step, and the population of definitions for a symbol is
+//! the union over both rules. A proof carrying `(<= d 0)` as a
+//! `fresh_def_bound` and `(= d (+ x 1))` as a `fresh_def_eq` has TWO
+//! definientia for one `d`, and jointly they force `x + 1 ≤ 0` — a genuine
+//! constraint on the problem's own `x`. Two separate registries would each see
+//! one definition, find it unique, and accept. One registry sees both and
+//! rejects on **SINGLE DEFINIENS**. The same argument applies to
+//! **INDEPENDENT**: a symbol defined by one rule must not occur in a definiens
+//! recorded by the other.
+//!
 //! # The soundness argument
 //!
 //! Write `A` for the proof's `assume` set and `P` for the set of bound atoms
@@ -39,11 +57,16 @@
 //! * `d^{M'} = lin_d^{M'}` is a legal assignment, because `d` and `lin_d` have
 //!   the same sort (guard **SORT**, checked in
 //!   [`ay_core::proof_validation::recognize_fresh_def_bound`]); and
-//! * every atom in `P` for `d` is `(<= d lin_d)` or `(<= lin_d d)` for the ONE
-//!   `lin_d` recorded for `d` (guard **SINGLE DEFINIENS**), each of which is
-//!   satisfied by `d = lin_d`.
+//! * every atom in `P` for `d` is `(<= d lin_d)`, `(<= lin_d d)` or
+//!   `(= d lin_d)` for the ONE `lin_d` recorded for `d` (guard **SINGLE
+//!   DEFINIENS**), each of which is satisfied by `d = lin_d` — the equality
+//!   most directly of all.
 //!
 //! Hence `M' ⊨ A ∪ P`. ∎
+//!
+//! The argument is INDIFFERENT to which of the two rules carried an atom: it
+//! only ever uses `d^{M'} = lin_d^{M'}`. That is why one registry suffices, and
+//! why the equality form needs no additional condition beyond the four.
 //!
 //! # What each guard is standing in for
 //!
@@ -87,10 +110,10 @@
 //! [`super::array_axiom::ExtDiffRegistry`] applies to extensionality witnesses.
 
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
-use ay_core::proof_validation::{recognize_fresh_def_bound, FreshDefBoundShape};
 use ay_core::term::TermData;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TermStore};
 
+use super::fresh_def_dispatch::recognize_fresh_definition;
 use super::ProofCheckError;
 
 /// One certified definitional extension: the introduced symbol and the term it
@@ -110,11 +133,12 @@ pub(crate) struct FreshDefBinding {
 
 /// Whole-proof registry of fresh-symbol definitional extensions.
 ///
-/// Built ONCE per check from the proof's `fresh_def_bound` steps and the
-/// problem's assertion terms. Construction enforces every whole-proof
-/// condition of the module-level soundness argument; per-step validation then
-/// only has to confirm that the bound in hand belongs to its symbol's recorded
-/// binding.
+/// Built ONCE per check from the proof's `fresh_def_bound` AND `fresh_def_eq`
+/// steps and the problem's assertion terms — one registry over both rules, for
+/// the soundness reason the module docs give. Construction enforces every
+/// whole-proof condition of the module-level soundness argument; per-step
+/// validation then only has to confirm that the atom in hand belongs to its
+/// symbol's recorded binding.
 #[derive(Debug, Default)]
 pub struct FreshDefRegistry {
     bindings: DetHashMap<String, FreshDefBinding>,
@@ -173,6 +197,9 @@ impl FreshDefRegistry {
     }
 
     /// (1) SHAPE and (2) SINGLE DEFINIENS, per introducing step.
+    ///
+    /// BOTH fresh-definition rules feed one map. See the module docs for why
+    /// splitting them would be unsound rather than merely redundant.
     fn collect_bindings(
         proof: &Proof,
         terms: &TermStore,
@@ -180,7 +207,7 @@ impl FreshDefRegistry {
         let mut bindings: DetHashMap<String, FreshDefBinding> = DetHashMap::default();
         for (index, step) in proof.steps.iter().enumerate() {
             let ProofStep::Step {
-                rule: AletheRule::FreshDefBound,
+                rule: rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq),
                 clause,
                 premises,
                 args,
@@ -189,9 +216,10 @@ impl FreshDefRegistry {
                 continue;
             };
             let step_id = ProofId(index as u32);
-            let shape = recognize_fresh_def_bound(terms, clause, premises.len(), args)
-                .map_err(|error| invalid(step_id, &error.to_string()))?;
-            let name = definiendum_name(terms, step_id, &shape)?;
+            let (definiendum, definiens) =
+                recognize_fresh_definition(terms, rule, clause, premises.len(), args)
+                    .map_err(|reason| invalid(step_id, &reason))?;
+            let name = definiendum_name(terms, step_id, definiendum)?;
             match bindings.get(&name) {
                 Some(prior) => {
                     // Two definientia for one symbol is an EQUATION between
@@ -207,7 +235,7 @@ impl FreshDefRegistry {
                     // the sort and therefore the symbol — and an unreachable
                     // branch is not a guard, because it cannot be
                     // mutation-checked.
-                    if prior.definiens != shape.definiens {
+                    if prior.definiens != definiens {
                         return Err(invalid(
                             step_id,
                             &format!(
@@ -223,7 +251,7 @@ impl FreshDefRegistry {
                     bindings.insert(
                         name,
                         FreshDefBinding {
-                            definiens: shape.definiens,
+                            definiens,
                             step: step_id,
                         },
                     );
@@ -250,16 +278,69 @@ impl FreshDefRegistry {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<TermId, ProofCheckError> {
-        let shape = recognize_fresh_def_bound(terms, clause, premises.len(), args)
-            .map_err(|error| invalid(step_id, &error.to_string()))?;
-        let name = definiendum_name(terms, step_id, &shape)?;
+        self.validate_introduction(
+            terms,
+            &AletheRule::FreshDefBound,
+            step_id,
+            clause,
+            premises,
+            args,
+        )
+    }
+
+    /// Validate one `fresh_def_eq` step against this registry and return the
+    /// atom it introduces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofCheckError::InvalidTheoryLemma`] when the step is
+    /// malformed or names a symbol this registry did not bind to this exact
+    /// definiens.
+    pub(crate) fn validate_eq(
+        &self,
+        terms: &TermStore,
+        step_id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<TermId, ProofCheckError> {
+        self.validate_introduction(
+            terms,
+            &AletheRule::FreshDefEq,
+            step_id,
+            clause,
+            premises,
+            args,
+        )
+    }
+
+    /// The per-step half, shared by both rules.
+    ///
+    /// It re-runs the SAME recognizer `collect_bindings` ran and then confirms
+    /// the step belongs to its symbol's ONE vetted binding. Consulting the
+    /// registry rather than re-deciding locally is the point: a step the
+    /// whole-proof pass never saw has had none of FRESH / INDEPENDENT /
+    /// SINGLE DEFINIENS checked.
+    fn validate_introduction(
+        &self,
+        terms: &TermStore,
+        rule: &AletheRule,
+        step_id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<TermId, ProofCheckError> {
+        let (definiendum, definiens) =
+            recognize_fresh_definition(terms, rule, clause, premises.len(), args)
+                .map_err(|reason| invalid(step_id, &reason))?;
+        let name = definiendum_name(terms, step_id, definiendum)?;
         let binding = self.bindings.get(&name).ok_or_else(|| {
             invalid(
                 step_id,
                 &format!("fresh definition `{name}` has no vetted whole-proof binding"),
             )
         })?;
-        if binding.definiens != shape.definiens {
+        if binding.definiens != definiens {
             return Err(invalid(
                 step_id,
                 &format!(
@@ -268,7 +349,10 @@ impl FreshDefRegistry {
                 ),
             ));
         }
-        Ok(shape.atom)
+        // The step's own clause literal, re-read from the recognizer rather
+        // than echoed from `clause`: the recognizer is what established the
+        // literal IS the definitional atom.
+        Ok(clause[0])
     }
 }
 
@@ -335,9 +419,9 @@ fn verify_fresh_and_independent(
 fn definiendum_name(
     terms: &TermStore,
     step_id: ProofId,
-    shape: &FreshDefBoundShape,
+    definiendum: TermId,
 ) -> Result<String, ProofCheckError> {
-    match terms.get(shape.definiendum) {
+    match terms.get(definiendum) {
         TermData::Var(name, _) => Ok(name.clone()),
         _ => Err(invalid(
             step_id,

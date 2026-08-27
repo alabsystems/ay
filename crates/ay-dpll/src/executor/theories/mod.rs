@@ -320,7 +320,7 @@ impl ArrayExtWitnessCache {
             .is_some_and(|identity| identity.term == witness && identity.still_matches(terms))
     }
 
-    #[cfg(test)]
+    /// Pair-keyed companion of [`Self::generated_clause_bindings`].
     pub(crate) fn pair_witness(
         &self,
         terms: &TermStore,
@@ -421,6 +421,65 @@ pub(in crate::executor) struct EufAxiomResult {
 /// QF_LIA is decidable, so we keep this high to reduce spurious `Unknown`
 /// results on hard-but-finite problems (#2472/#2475).
 pub(in crate::executor) const MAX_SPLITS_LIA: usize = 1_000_000;
+
+/// Budget on consecutive theory-conflict rounds whose own SAT search recorded
+/// ZERO propositional conflicts, i.e. rounds where none of the blocking clauses
+/// accumulated so far became falsified during the search.
+///
+/// A long run of such rounds is the signature of the loop enumerating total
+/// models with every blocking clause a point-block. `MAX_SPLITS_LIA` (1e6)
+/// cannot bound that -- at the measured ~40 rounds/s it is ~7h -- so in practice
+/// only the caller deadline or the memory watchdog ends the loop, which makes
+/// the verdict host-dependent (#7956).
+///
+/// This is a fixture-calibrated BUDGET, not a proof of non-productivity. A
+/// zero-conflict theory-conflict round is NOT evidence that the blocking
+/// clauses prune nothing: converging certified refutations contain stretches of
+/// exactly this signature. Two measured bounds fix the window (quiet host,
+/// 2026-08-25):
+///
+/// * LOWER. `group_quantifiers` is 321/0 at budgets >= 24, and 319/2 at 20 and
+///   16 (`array_frame_u64_guarded_witness_{,selfcheck_}discharges_unsat`). The
+///   longest zero-conflict run measured in any certified frame refutation is
+///   8 rounds.
+/// * UPPER. On `QUANTIFIER_CONSUMER_EXT_EQ_TSEITIN` (#7956) the diverging split-loop
+///   invocation reaches a 142-round run at split iteration ~991 (~6s) and does
+///   not reach 160 until ~69s. Anything > 142 leaves that divergence unbounded.
+///
+/// 128 sits near the top of [24, 142]: maximum completeness margin (5.3x the
+/// measured suite floor) while still firing on #7956, at the cost of only ~10%
+/// efficacy headroom.
+///
+/// It bounds ONE split-loop invocation, NOT the whole check-sat: on perturbed
+/// variants of the same fixture the guard fires once and the query still runs
+/// 45-100s afterwards in post-Unknown quantifier-loop routing, which has no
+/// deadline poll of its own (tracked separately). Exhausting the budget yields
+/// `UnknownReason::SplitLimit` -- the same fail-closed `Unknown` the split cap
+/// itself produces -- and the guard sits on the theory-conflict arm, where it
+/// can neither reach the Sat handler nor let the SAT solver conclude UNSAT. The
+/// cost is COMPLETENESS, never soundness.
+pub(in crate::executor) const MAX_UNPRODUCTIVE_CONFLICT_ROUNDS: usize = 128;
+
+/// Companion CUMULATIVE bound on unproductive rounds within one split-loop
+/// invocation.
+///
+/// `MAX_UNPRODUCTIVE_CONFLICT_ROUNDS` counts CONSECUTIVE zero-conflict rounds,
+/// so a single productive round anywhere in the stream resets it to zero. That
+/// is the right signal for the #7956 fixture, whose enumeration is one
+/// uninterrupted run -- but it is defeated by an enumeration that is merely
+/// SPRINKLED with conflicts. Measured: adding one unused `(declare-const)` to
+/// QUANTIFIER_CONSUMER_EXT_EQ_TSEITIN, a semantics-preserving perturbation, takes it from a
+/// 16s `Unknown` to burning a 120s budget, with `split_rounds` growing steadily
+/// while the consecutive counter keeps getting reset.
+///
+/// This bounds the TOTAL, so an enumeration cannot buy unbounded time with an
+/// occasional conflict. It is deliberately 8x the consecutive bound: a
+/// refutation that genuinely converges spends its unproductive rounds in short
+/// runs (the longest measured in any certified frame refutation is 8), so
+/// reaching 1024 of them in ONE invocation is already the enumeration
+/// signature. Same fail-closed exit, same `UnknownReason::SplitLimit`, same
+/// COMPLETENESS-not-soundness trade.
+pub(in crate::executor) const MAX_TOTAL_UNPRODUCTIVE_ROUNDS: usize = 1024;
 
 /// Maximum branch-and-bound split iterations for mixed Int/Real solvers.
 ///

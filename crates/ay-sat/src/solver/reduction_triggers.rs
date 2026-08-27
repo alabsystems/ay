@@ -83,10 +83,27 @@ impl Solver {
     #[inline]
     pub(crate) fn clause_db_memory_bytes(&self) -> usize {
         use std::mem::size_of;
+        // `clause_ids` defers its construction reservation to the first
+        // write (`ColdState::clause_ids_grow_for`). While unallocated, bill
+        // the deferred hint as a phantom charge: the historical trigger basis
+        // included the eager `with_capacity(clauses_capacity)` reservation,
+        // and dropping it would move WHEN reduction fires — the same
+        // exposure `load_slack_reclaimed_bytes` below compensates for. Once
+        // the first write lands, the real capacity equals the hint and takes
+        // over seamlessly.
+        let clause_ids_cap = match self.cold.clause_ids.capacity() {
+            0 => self.cold.clause_ids_reserve_hint,
+            cap => cap,
+        };
         self.arena.memory_bytes()
             + self.watches.heap_bytes()
-            + self.cold.clause_ids.capacity() * size_of::<u64>()
+            + clause_ids_cap * size_of::<u64>()
             + self.cold.original_ledger.heap_bytes()
+            // Load-time slack reclamation shrank the two REAL-capacity terms
+            // above; add back what it handed off so this trigger stays on its
+            // pre-shrink basis and the reduction cadence — hence the search —
+            // does not move. See `ColdState::load_slack_reclaimed_bytes`.
+            + self.cold.load_slack_reclaimed_bytes
             + self.inproc.reconstruction.memory_bytes()
     }
 

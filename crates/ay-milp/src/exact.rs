@@ -116,43 +116,9 @@ enum Form {
 /// run: the policy's whole footprint is a sampled counter pair, a window
 /// comparison in integer arithmetic, and one `Rational` multiply per pivot to
 /// carry `|det B|`. There is no time-based fallback and no second chance — a
-/// solve that stays on the inline path stays reduced, and a solve whose model
-/// could not be integralised never even counts (see
-/// [`ExactLp::convertible`]).
-///
-/// # What a 67-probe sweep found afterwards (2026-08-20)
-///
-/// THE CLASS IS FIFTEEN, NOT THREE. Over 46 distinct matrices (14 MILP corpus
-/// + 15 witness + 38 oracle LP relaxations, 21 of them the same matrices),
-/// the switch fires on `blend2`, `mas74`, `mas76`, `pk1`, `harp2` and all ten
-/// `domset_mw19_*` relaxations. `pk1` (sw@688) is a corpus member and was
-/// independently confirmed at 2.45x on interleaved reps.
-///
-/// THERE IS NO CHEAP STATIC PREDICTOR, which vindicates censusing rather than
-/// classifying: density crosses the boundary (`mas76` 90.5% dense converts,
-/// hexgrid 0.25% does not), matrix integrality crosses it (`pk1` has 0
-/// non-integral rows and converts, `p2756` has 380 and does not), row count
-/// crosses it (12 rows converts, 12,650 does not), and so does λ.
-///
-/// AND THE HONEST OTHER HALF OF "the reduced class pays 0.6-1.9%": AT LEAST
-/// NINE OF ITS MEMBERS WOULD BE 1.5x TO 24.6x FASTER IF THEY CONVERTED, and
-/// this policy cannot see it. Forcing conversion is 24.60x on `air03`, 11.66x
-/// on `l152lav`, 10.48x on `air05`, 10.32x on `mod010`, 6.50x on `enigma`,
-/// 3.49x on `mod008`, 2.74x on `misc07`, 2.14x on `misc03`, 1.50x on `p0201`
-/// — every one bit-identical at identical pivot counts — while costing 3x-7x
-/// on `dcmulti`, `gt2`, `lseu`, `p0282`, `p0548`, `p2756`, `qnet1`, `qiu`.
-/// ONE quantity separates all 28 measured models with zero exceptions, and it
-/// is not the one this policy watches: whether the FRACTION-FREE entries
-/// (`Δ·c`) stay inline. Winners are 100.00% FF-inline; losers 0.00-51.13%.
-/// `Δ` is already carried in [`ExactLp::det`] from the first pivot, so the
-/// missing trigger costs one multiply and one range check per sampled entry
-/// and no new state. Tuning THIS threshold is not the lever: at 100% across
-/// 18 models exactly one switch point moved and nothing new converted.
-///
-/// Before building that trigger, settle whether the rim is on a path anyone
-/// pays for: across ten 30s MILP solves and 1.36M nodes the rim was entered
-/// ONCE for 0.00s, and even the pure-LP lane reaches it only under
-/// `--no-float` (`mas76_lprelax` is 0.037s float-first, 1.241s on the rim).
+/// solve that stays on the inline path stays reduced, and a model that cannot
+/// be integralised never counts (see [`ExactLp::convertible`]).
+/// Extended sweep evidence lives in `exact/FRACTION_FREE_SWEEP.md`.
 const SWITCH_WINDOW: u64 = 16;
 const SWITCH_INLINE_PERCENT: u64 = 99;
 const SWITCH_SUSTAIN: u32 = 2;
@@ -346,6 +312,15 @@ pub(crate) struct ExactLp {
     cold_windows: u32,
     /// Rewritten rows seen, for the census's fixed-stride sampling.
     census_seq: u64,
+    /// Simplex iterations this rim has run, over BOTH phases
+    /// ([`Self::make_feasible`] and [`Self::minimize`]).
+    ///
+    /// A DETERMINISTIC work currency, and that is the whole point of it: it is
+    /// a function of the tableau alone, so two runs of the same solve spend the
+    /// same amount of it whatever else the machine is doing. [`crate::opt_cert`]
+    /// budgets its certifying descent in this rather than in seconds, because a
+    /// certificate whose contents depend on machine load is not evidence.
+    iters_total: u64,
 }
 
 /// Direction a nonbasic variable is moved.
@@ -371,6 +346,12 @@ impl ExactLp {
     /// construction deadline whose cost the caller owns.
     pub(crate) fn new(model: &Model) -> Self {
         Self::new_within(model, None).expect("no deadline to miss")
+    }
+
+    /// Simplex iterations this rim has run since it was built, over both
+    /// phases. See [`Self::iters_total`] for why a caller would budget in it.
+    pub(crate) fn iters_total(&self) -> u64 {
+        self.iters_total
     }
 
     /// The current structural point, exact.
@@ -451,6 +432,7 @@ impl ExactLp {
         let mut iters: u64 = 0;
         loop {
             iters += 1;
+            self.iters_total += 1;
             if iters > budget.max_iters {
                 return LpFeasibility::Unknown(UnknownReason::IterationLimit);
             }
@@ -615,6 +597,7 @@ impl ExactLp {
         let mut iters: u64 = 0;
         loop {
             iters += 1;
+            self.iters_total += 1;
             if iters > budget.max_iters {
                 return LpOptimum::Unknown(UnknownReason::IterationLimit);
             }

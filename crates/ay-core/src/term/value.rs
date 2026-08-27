@@ -184,12 +184,13 @@ pub enum Constant {
     /// Boolean constant
     Bool(bool),
     /// Integer constant (arbitrary precision)
-    Int(BigInt),
+    Int(#[serde(with = "crate::serde_bignum::bigint")] BigInt),
     /// Rational constant
     Rational(RationalWrapper),
     /// Bitvector constant with value and width
     BitVec {
         /// The numeric value of the bitvector
+        #[serde(with = "crate::serde_bignum::bigint")]
         value: BigInt,
         /// The bit width of the bitvector
         width: u32,
@@ -200,7 +201,7 @@ pub enum Constant {
 
 /// Wrapper for BigRational to implement Eq and Hash
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RationalWrapper(pub BigRational);
+pub struct RationalWrapper(#[serde(with = "crate::serde_bignum::bigrational")] pub BigRational);
 
 impl PartialEq for RationalWrapper {
     fn eq(&self, other: &Self) -> bool {

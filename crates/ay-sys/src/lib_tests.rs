@@ -438,29 +438,47 @@ fn test_sub_live_bytes_saturates_at_zero() {
 }
 
 #[test]
-fn test_process_memory_exceeded_trips_on_live_bytes() {
-    // Live-bytes alone (no RSS growth) must be able to trip the ceiling: this is
-    // the burst-detection property that peak-RSS-via-getrusage misses.
-    let old_limit = get_process_memory_limit();
-    let base = current_live_bytes();
-
-    // 1 GB ceiling; push live bytes to 1.5 GB (well above the 95% threshold).
-    let limit = 1024 * 1024 * 1024;
-    set_process_memory_limit(limit);
-    add_live_bytes(limit + limit / 2);
+fn test_advisory_prefers_physical_footprint_over_live_bytes() {
+    // The advisory keys on what the machine actually holds (phys footprint),
+    // not on allocator live-bytes: live bytes count reserved-but-untouched
+    // capacity, measured ~20-25% above physical on the .xz giants
+    // (live-bytes peak in (5700,6175] MB against a 4.79 GB physical settle),
+    // which aborted runs the physical budget allowed. Burst detection is the
+    // hard ceiling's job (`add_live_bytes`), which keeps exact live bytes.
+    let threshold = 950;
     assert!(
-        process_memory_exceeded(),
-        "live bytes above ceiling must trip process_memory_exceeded"
+        memory_signals_exceed(threshold, 1000, 0, 0),
+        "a footprint above threshold trips"
+    );
+    assert!(
+        !memory_signals_exceed(threshold, 900, usize::MAX, usize::MAX),
+        "with a footprint reading, neither live bytes nor RSS is consulted"
+    );
+    assert!(
+        memory_signals_exceed(threshold, 0, 1000, 0),
+        "no footprint API: live bytes still trip (the burst fallback)"
+    );
+    assert!(
+        memory_signals_exceed(threshold, 0, 0, 1000),
+        "no footprint, no counting allocator: peak RSS is the last resort"
+    );
+    assert!(
+        !memory_signals_exceed(threshold, 0, 0, 0),
+        "no signal, no trip"
     );
 
-    // Drop back below the threshold; with a real-but-modest RSS the check should
-    // clear (assuming the test process is not itself over a 1 GB limit, which is
-    // true for a unit-test binary).
-    sub_live_bytes(limit + limit / 2);
-    // Restore state before the RSS-dependent assertion to avoid leaking the
-    // limit into other tests on failure.
-    set_process_memory_limit(old_limit);
-    add_live_bytes(base.saturating_sub(current_live_bytes()));
+    // Real readings, same composition: an inflated live-bytes counter (a pure
+    // counter move — no real allocation, so the footprint does not follow)
+    // must not out-vote an in-budget footprint.
+    let footprint = current_footprint_bytes();
+    if footprint > 0 {
+        let generous = footprint.saturating_mul(4);
+        assert!(
+            !memory_signals_exceed(generous, footprint, generous + 1, generous + 1),
+            "an in-budget physical footprint must win over inflated \
+             live-bytes/RSS readings"
+        );
+    }
 }
 
 #[test]
@@ -468,41 +486,62 @@ fn test_process_memory_exceeded_at_percent_predictive_threshold() {
     // The lower (predictive) thresholds must trip on a smaller fraction of the
     // limit than the 95% hard guard. This is the pre-clone backpressure property:
     // at ~53% usage the imminent (≈1.8x) clone would breach, so the 53% probe
-    // fires while the 95% guard is still clear.
-    let old_limit = get_process_memory_limit();
-    let base = current_live_bytes();
-
-    // 1 GB ceiling; push live to 600 MB (60% of limit).
-    let limit = 1024 * 1024 * 1024;
-    set_process_memory_limit(limit);
+    // fires while the 95% guard is still clear. Pinned on the pure policy with
+    // a synthetic footprint at 60% of a 1 GB limit (the footprint is an OS
+    // reading the test cannot move for real).
+    let limit: usize = 1024 * 1024 * 1024;
     let used = limit * 60 / 100;
-    add_live_bytes(used);
-
-    // 53% probe trips (60% > 53%); 95% hard guard does not (60% < 95%).
     assert!(
-        process_memory_exceeded_at_percent(53),
+        memory_signals_exceed(limit * 53 / 100, used, 0, 0),
         "60% usage must trip the 53% predictive probe"
     );
     assert!(
-        !process_memory_exceeded_at_percent(95),
+        !memory_signals_exceed(limit * 95 / 100, used, 0, 0),
         "60% usage must NOT trip the 95% hard guard"
-    );
-    // The public alias is the 95% guard, so it must agree.
-    assert!(
-        !process_memory_exceeded(),
-        "process_memory_exceeded() is the 95% guard and must stay clear at 60%"
     );
 
     // No limit set => strict no-op for every percentage.
+    let old_limit = get_process_memory_limit();
     set_process_memory_limit(0);
     assert!(!process_memory_exceeded_at_percent(1));
     assert!(!process_memory_exceeded_at_percent(53));
-
-    // Restore.
-    sub_live_bytes(used);
     set_process_memory_limit(old_limit);
-    add_live_bytes(base.saturating_sub(current_live_bytes()));
 }
 
 #[path = "lib_tests/allocator.rs"]
 mod allocator;
+
+/// The per-thread CPU clock is monotone and charges work to the thread that
+/// did it: a busy loop on THIS thread advances it by roughly its wall time,
+/// while a sleep — the scheduler's idle, not ours — does not.
+#[test]
+fn test_thread_cpu_time_charges_work_not_sleep() {
+    let Some(before) = thread_cpu_time() else {
+        // macOS/Linux have CLOCK_THREAD_CPUTIME_ID; a None there is a failed
+        // call. Elsewhere the wall fallback is the documented answer.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        panic!("CLOCK_THREAD_CPUTIME_ID exists on this platform; the read failed");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let after_sleep = thread_cpu_time().expect("clock stays readable");
+    let charged_for_sleep = after_sleep
+        .checked_sub(before)
+        .unwrap_or_else(|| panic!("monotone: {before:?} -> {after_sleep:?}"));
+    assert!(
+        charged_for_sleep < std::time::Duration::from_millis(10),
+        "a 20 ms sleep is not this thread's work: charged {charged_for_sleep:?}"
+    );
+    let wall = std::time::Instant::now();
+    let mut acc = 0u64;
+    while wall.elapsed() < std::time::Duration::from_millis(20) {
+        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1);
+    }
+    let after_spin = thread_cpu_time().expect("clock stays readable");
+    let charged_for_spin = after_spin.saturating_sub(after_sleep);
+    assert!(
+        charged_for_spin >= std::time::Duration::from_millis(5),
+        "a 20 ms spin is this thread's work: charged only {charged_for_spin:?} (acc {acc})"
+    );
+}

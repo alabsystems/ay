@@ -11,6 +11,11 @@
 //!
 //! Reference: <https://github.com/ufmg-smite/carcara>
 
+mod bare_rule_requirements;
+pub use bare_rule_requirements::alethe_rule_requires_premises_or_args;
+#[cfg(test)]
+use bare_rule_requirements::PREMISE_OR_ARG_REQUIRED_ALETHE_RULES;
+
 /// Rule names the in-process Alethe document checker accepts.
 ///
 /// Production emission is the intersection of this compatibility vocabulary
@@ -44,7 +49,7 @@
 /// actually selects, alias targets, and direct printer lowerings.
 ///
 /// MUST stay sorted — [`is_checkable_alethe_rule`] binary-searches it.
-pub const CHECKABLE_ALETHE_RULES: [&str; 183] = [
+pub const CHECKABLE_ALETHE_RULES: [&str; 182] = [
     "ac_simp",
     "aci_simp",
     "and",
@@ -108,7 +113,6 @@ pub const CHECKABLE_ALETHE_RULES: [&str; 183] = [
     "div_simplify",
     "drat",
     "drup",
-    "dt_clash",
     "eq_congruent",
     "eq_congruent_pred",
     "eq_reflexive",
@@ -355,6 +359,23 @@ const WIRE_RULE_ALIASES: [(&str, &str); 0] = [];
 /// True if the Alethe checker recognizes `name`, i.e. dispatching it does not
 /// fail with an unknown-rule `invalid` verdict.
 ///
+/// The table is therefore a claim about the PINNED checker, not about Alethe in
+/// general, and it is only as good as the last time someone measured it.
+/// `dt_clash` was listed here until it was probed directly against the pinned
+/// `carcara 1.1.0 [git master 9a352ee]`, which answered
+/// `checking failed on step 't3' with rule 'dt_clash': unknown rule` and
+/// returned `invalid` for the whole document — exactly the verdict this
+/// predicate promises will not happen. Diffing the full table against that
+/// build's dispatch names showed it was the only such entry.
+///
+/// Nothing emitted it, so nothing was broken; the coverage test in
+/// `ay-proof/tests/wire_rule_coverage.rs` probes only names production can
+/// actually reach, which is why it stayed green. But `WIRE_RULE_ALIASES`
+/// already records one attempt to alias `dt_distinct` onto `dt_clash` that had
+/// to be reverted for this exact reason, and leaving the name in the
+/// vocabulary invites the same mistake a third time. The pinned checker
+/// implements no datatype rules at all.
+///
 /// This is deliberately only a parser/dispatch vocabulary predicate. Some
 /// recognized rules are semantic placeholders: notably `hole` and
 /// `lia_generic` are accepted but leave the document holey rather than
@@ -376,126 +397,10 @@ pub fn is_checkable_alethe_rule(name: &str) -> bool {
 /// complete-step wire decision.
 const SEMANTICALLY_UNCHECKED_ALETHE_RULES: [&str; 2] = ["hole", "lia_generic"];
 
-/// Alethe rules the pinned checker accepts ONLY when the step itself carries
-/// premises and/or `:args`.
-///
-/// [`is_checkable_alethe_rule`] answers "does the checker know this NAME"; it
-/// says nothing about whether the step being printed is one the checker can
-/// accept under it. For the rules below the gap is not a matter of clause
-/// shape at all — the checker rejects on the premise/argument COUNT before it
-/// ever inspects the clause, so a step printed with neither is rejected
-/// unconditionally and takes the whole document from `holey` to `invalid`.
-/// That is the failure mode [`wire_rule_name`]'s doc calls out: an unbacked
-/// rule name is not a weaker proof, it is *no* proof.
-///
-/// Membership is a MEASURED property of carcara 1.1.0 `[git master 9a352ee]`,
-/// not a judgement call: it is exactly the set of dispatched rules whose
-/// implementation opens with `assert_num_premises(premises, k)` or
-/// `assert_num_args(args, k)` for a lower bound `k >= 1`. Reproduce with
-///
-/// ```text
-/// grep -n 'assert_num_premises\|assert_num_args' \
-///     carcara/src/checker/rules/*.rs
-/// ```
-///
-/// and map each function back through the dispatch table in
-/// `carcara/src/checker/shared.rs`.
-///
-/// Rules whose required argument count is computed from the conclusion rather
-/// than fixed — `la_generic`, `forall_inst`, `bind` — are deliberately NOT
-/// listed. They are unreachable as a bare theory-lemma wire name: the printer
-/// either emits their required evidence or refuses the step. `lia_generic` is
-/// absent for a different reason: although the checker dispatches it, the rule
-/// is a semantic placeholder and [`wire_rule_name`] already maps it to the
-/// canonical hole before this count-side screen runs.
-const PREMISE_OR_ARG_REQUIRED_ALETHE_RULES: [&str; 65] = [
-    "and",
-    "and_intro",
-    "and_pos",
-    "arrays_ext",
-    "arrays_row",
-    "arrays_row_contra",
-    "bfun_elim",
-    "concat_conflict",
-    "concat_cprop_prefix",
-    "concat_cprop_suffix",
-    "concat_csplit_prefix",
-    "concat_csplit_suffix",
-    "concat_eq",
-    "concat_lprop_prefix",
-    "concat_lprop_suffix",
-    "concat_split_prefix",
-    "concat_split_suffix",
-    "concat_unify",
-    "cong",
-    "contraction",
-    "cp_addition",
-    "cp_division",
-    "cp_literal",
-    "cp_multiplication",
-    "cp_saturation",
-    "equiv1",
-    "equiv2",
-    "ho_cong",
-    "implies",
-    "ite1",
-    "ite2",
-    "not_and",
-    "not_equiv1",
-    "not_equiv2",
-    "not_implies1",
-    "not_implies2",
-    "not_ite1",
-    "not_ite2",
-    "not_or",
-    "not_symm",
-    "not_xor1",
-    "not_xor2",
-    "or",
-    "or_neg",
-    "pbblast_bvand_ith_bit",
-    "pbblast_bvxor_ith_bit",
-    "poly_simp_rel",
-    "re_concat_unfold_pos",
-    "re_inter",
-    "re_kleene_star_unfold_pos",
-    "re_unfold_neg",
-    "re_unfold_neg_concat_fixed_prefix",
-    "re_unfold_neg_concat_fixed_suffix",
-    "reordering",
-    "resolution",
-    "strict_resolution",
-    "string_decompose",
-    "string_length_non_empty",
-    "string_length_pos",
-    "symm",
-    "tautology",
-    "th_resolution",
-    "weakening",
-    "xor1",
-    "xor2",
-];
-
-/// True if the pinned Alethe checker rejects `name` outright on the
-/// premise/argument count, i.e. a step printed with neither premises nor
-/// `:args` can never be an instance of it.
-///
-/// A caller that prints a bare `(step id (cl …) :rule name)` must demote such
-/// a name to [`UNPROVED_STEP_RULE`]: `hole` checks as *holey* and stays
-/// machine-readable as unproved, where the unbacked name would void the
-/// entire certificate. This is the count-side half of the admissibility bar
-/// [`WIRE_RULE_ALIASES`] documents on the shape side.
-#[must_use]
-pub fn alethe_rule_requires_premises_or_args(name: &str) -> bool {
-    PREMISE_OR_ARG_REQUIRED_ALETHE_RULES
-        .binary_search(&name)
-        .is_ok()
-}
-
 /// Map an internal rule name to the name that may be written into a proof.
 ///
 /// Returns `name` unchanged when the checker implements it, its
-/// [`WIRE_RULE_ALIASES`] spelling when the checker implements the same
+/// `WIRE_RULE_ALIASES` spelling when the checker implements the same
 /// inference under another name, and [`UNPROVED_STEP_RULE`] otherwise. Never
 /// invents a rule name and never substitutes a *different* inference: claiming
 /// `arrays_ext` for a step that is not an `arrays_ext` inference would fail the
@@ -506,7 +411,7 @@ pub fn alethe_rule_requires_premises_or_args(name: &str) -> bool {
 /// `dt_distinct` → `dt_clash` alias demonstrated why: the installed carcara
 /// answered `unknown rule`, turning every affected document `invalid`, while
 /// the fallback below produces the strictly better `holey` verdict. See
-/// [`WIRE_RULE_ALIASES`] for the measured probe. This changes no native
+/// `WIRE_RULE_ALIASES` for the measured probe. This changes no native
 /// soundness gate: AY still re-validates datatype distinctness from the proof
 /// IR and constructor registry; only the unsupported external claim is
 /// withdrawn.
@@ -649,7 +554,7 @@ pub enum AletheRule {
     EqCongruent,
     /// Equality congruent predicate
     EqCongruentPred,
-    /// Distinct elimination: (= (distinct t1 .. tn) <pairwise-disequality expansion>)
+    /// Distinct elimination: `(= (distinct t1 .. tn) <pairwise-disequality expansion>)`
     DistinctElim,
 
     // === Arithmetic ===
@@ -801,6 +706,58 @@ pub enum AletheRule {
     ///
     /// Appended to preserve serialized discriminants of the older variants.
     FreshDefBound,
+
+    /// A FRESH-symbol definitional EQUALITY: `(cl (= d expr))`, with the
+    /// defined symbol `d` in `:args`.
+    ///
+    /// The sibling of [`Self::FreshDefBound`] and the more direct form of the
+    /// same conservative definitional extension: where a bound asserts one
+    /// HALF of `d = lin`, this asserts the definition outright, and over any
+    /// sort rather than only the arithmetic one `<=` admits. Measured on this
+    /// repository's corpus, the producer is `purify_bool_args`, which mints a
+    /// fresh Boolean `p` for a compound Boolean argument `b` and asserts
+    /// `(= p b)` so that EUF can congruence-close over `f(p)`.
+    ///
+    /// This is NOT an inference and its clause is NOT a tautology — `(= d
+    /// expr)` is false for most valuations of a symbol the problem constrains.
+    /// It is sound because `d` is a symbol the PROBLEM never mentions, so any
+    /// model of the problem extends to one that also satisfies the equality by
+    /// taking `d := expr`, and a refutation of the extended set is therefore a
+    /// refutation of the original. Adding facts about a fresh symbol is
+    /// conservative; adding the same fact about a constrained symbol is not,
+    /// and only a checker that verifies freshness AGAINST the problem can tell
+    /// the two apart.
+    ///
+    /// The whole-proof conditions (one definiens per symbol ACROSS BOTH fresh-
+    /// definition rules, no introduced symbol inside any definiens, matching
+    /// sorts, freshness against the problem and against every `assume`) are
+    /// enforced once by `ay_proof`'s `FreshDefRegistry`; see its `collect` for
+    /// the soundness argument and the guard-by-guard rationale. Sharing that
+    /// ONE registry with `fresh_def_bound` is a soundness requirement, not a
+    /// convenience: `(<= d 0)` from one rule and `(= d (+ x 1))` from the other
+    /// are two definientia for one symbol and jointly force `x + 1 <= 0`.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    FreshDefEq,
+
+    /// Clause PERMUTATION: the conclusion carries exactly the premise's
+    /// literals, with the same multiplicities, in a different order.
+    ///
+    /// An Alethe clause IS a disjunction, and `or` is commutative, so a
+    /// permutation of a derived clause is entailed by it — the rule adds no
+    /// information and needs no theory. It exists because several of AY's own
+    /// validators are ORDER-SENSITIVE (`eq_transitive` wants its positive
+    /// conclusion LAST), so a producer that must record a clause in a
+    /// validator's accepted order still owes its consumers the order they
+    /// already reference. `reordering` is the step that reconciles the two
+    /// without touching either.
+    ///
+    /// `reordering` is a pinned wire rule (`CHECKABLE_ALETHE_RULES`), so the
+    /// printer lowers it under its own name and the external checker re-runs
+    /// the same permutation check `ay_proof`'s `validate_reordering` does.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    Reordering,
 }
 
 impl AletheRule {
@@ -893,6 +850,8 @@ impl AletheRule {
             Self::Evaluate => "evaluate",
             Self::QntNegExists => "qnt_neg_exists",
             Self::FreshDefBound => "fresh_def_bound",
+            Self::FreshDefEq => "fresh_def_eq",
+            Self::Reordering => "reordering",
         }
     }
 

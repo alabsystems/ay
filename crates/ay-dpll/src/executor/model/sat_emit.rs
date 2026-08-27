@@ -123,6 +123,13 @@ impl SatCertificate {
     }
 }
 
+#[cfg(test)]
+impl Executor {
+    pub(in crate::executor) fn plant_stale_sat_certificate_for_test(&mut self) {
+        self.last_sat_certificate = Some(SatCertificate(SatCertificateKind::ValidatedModel));
+    }
+}
+
 impl Executor {
     /// Record one SAT-gate timing span in milliseconds (float stats print with
     /// two decimals, so seconds-resolution would round sub-10ms gates to 0).

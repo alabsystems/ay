@@ -1,7 +1,9 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
 //! LIVENESS TORTURE for `mpbq`. Every call is timed; anything that does not
 //! return is a hang. Run under an external timeout.
-
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
 
 use ay_nra::oracle_api::{
     obq_enclose_rational, obq_refine_step_bound, obq_refine_to_width, obq_refine_until_separated,
@@ -19,20 +21,16 @@ fn t<T>(label: &str, f: impl FnOnce() -> T, show: impl FnOnce(&T) -> String) {
     println!("  [{ms:>6} ms] {label}: {}", show(&v));
 }
 
-fn main() {
-    let p = vec![BigInt::from(-2), BigInt::from(0), BigInt::from(1)]; // x^2 - 2
-    let iv =
-        OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0)).unwrap();
-
+fn probe_unmet_targets(p: &[BigInt], iv: &OBqInterval) {
     println!("=== 1. targets that cannot be met / are unrepresentable ===");
     t(
         "target = 0",
-        || obq_refine_to_width(&p, &iv, &OBq::zero()),
+        || obq_refine_to_width(p, iv, &OBq::zero()),
         |v| format!("{:?}", v.is_some()),
     );
     t(
         "target < 0",
-        || obq_refine_to_width(&p, &iv, &OBq::new(BigInt::from(-1), 3)),
+        || obq_refine_to_width(p, iv, &OBq::new(BigInt::from(-1), 3)),
         |v| format!("{:?}", v.is_some()),
     );
     for k in [16_383u32, 16_384, 16_385, 20_000, 100_000, 1_000_000] {
@@ -42,13 +40,15 @@ fn main() {
                 let tt = OBq::inv_two_pow(k);
                 (
                     obq_refine_step_bound(&iv.width(), &tt),
-                    obq_refine_to_width(&p, &iv, &tt).is_some(),
+                    obq_refine_to_width(p, iv, &tt).is_some(),
                 )
             },
             |v| format!("bound={:?} refined={}", v.0, v.1),
         );
     }
+}
 
+fn probe_huge_exponents() {
     println!("\n=== 2. huge denominator exponents fed straight to the entry points ===");
     for k in [1u32 << 20, 1 << 24, 1 << 26] {
         t(
@@ -88,7 +88,9 @@ fn main() {
             |v| format!("{:?}", v.as_ref().map(|i| i.max_k())),
         );
     }
+}
 
+fn probe_endpoint_spellings() {
     println!("\n=== 3. endpoints that compare equal but are written differently ===");
     let a = OBq::new(BigInt::from(3), 2);
     let b = OBq::new(BigInt::from(12), 4); // same value, different spelling
@@ -107,14 +109,16 @@ fn main() {
         || obq_select_int(&a, &b),
         |v| format!("{v:?}"),
     );
+}
 
+fn probe_separation(p: &[BigInt]) {
     println!("\n=== 4. separation at the full budget, including EQUAL roots ===");
     let two =
         OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0)).unwrap();
     for budget in [1_000u32, 16_384, u32::MAX] {
         t(
             &format!("refine_until_separated(x^2-2 vs ITSELF, budget {budget})"),
-            || obq_refine_until_separated(&p, &two, &p, &two, budget),
+            || obq_refine_until_separated(p, &two, p, &two, budget),
             |v| match v {
                 Some((OSeparation::Inconclusive, _, _, r)) => {
                     format!("Inconclusive after {r} rounds")
@@ -129,14 +133,16 @@ fn main() {
         OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0)).unwrap();
     t(
         "refine_until_separated(sqrt2 vs sqrt3, budget u32::MAX)",
-        || obq_refine_until_separated(&p, &two, &q, &thr, u32::MAX),
+        || obq_refine_until_separated(p, &two, &q, &thr, u32::MAX),
         |v| match v {
             Some((OSeparation::Ordered(o), _, _, r)) => format!("Ordered({o:?}) after {r} rounds"),
             Some((OSeparation::Inconclusive, _, _, r)) => format!("Inconclusive after {r}"),
             None => "None".into(),
         },
     );
+}
 
+fn probe_non_root() {
     println!("\n=== 5. select_non_root against a polynomial with many roots ===");
     // (x-1)(x-2)...(x-30) scaled: 30 roots, all integers, inside (0, 31)
     let mut poly = vec![BigInt::one()];
@@ -176,11 +182,13 @@ fn main() {
             )
         },
     );
+}
 
+fn probe_full_chain(p: &[BigInt], iv: &OBqInterval) {
     println!("\n=== 6. the full refinement chain at MAX_REFINE_STEPS ===");
     t(
         "refine_to_width to 2^-16000 from (1, 2)",
-        || obq_refine_to_width(&p, &iv, &OBq::inv_two_pow(16_000)),
+        || obq_refine_to_width(p, iv, &OBq::inv_two_pow(16_000)),
         |v| match v {
             Some((ORefined::Narrowed(i), tr)) => format!(
                 "Narrowed max_k={} steps={} bound={}",
@@ -192,7 +200,19 @@ fn main() {
             None => "None".into(),
         },
     );
+}
 
+fn main() {
+    let p = vec![BigInt::from(-2), BigInt::from(0), BigInt::from(1)]; // x^2 - 2
+    let iv =
+        OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0)).unwrap();
+
+    probe_unmet_targets(&p, &iv);
+    probe_huge_exponents();
+    probe_endpoint_spellings();
+    probe_separation(&p);
+    probe_non_root();
+    probe_full_chain(&p, &iv);
     println!("\nALL CALLS RETURNED — no hang.");
 }
 

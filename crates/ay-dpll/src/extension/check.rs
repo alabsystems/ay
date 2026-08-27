@@ -680,15 +680,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             );
             ExtCheckResult::Unknown
         } else {
-            // #dt-context-derivation: preserve the premises the level-0
-            // strip below is about to discard.
-            self.record_context_conflict_premises(&conflict_terms, ctx);
-            // #8424: Pre-minimize conflict clause with level-0 removal.
-            let removed =
-                crate::theory_inference::minimize_conflict_with_levels(&mut clause, |var| {
-                    ctx.var_level(var)
-                });
-            self.eager_stats.theory_minimize_lits_removed += removed as u64;
+            self.minimize_context_conflict(&conflict_terms, &mut clause, ctx);
             self.theory_conflict_count += 1;
             ExtCheckResult::Conflict(clause)
         }

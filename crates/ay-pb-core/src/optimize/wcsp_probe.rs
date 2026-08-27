@@ -83,7 +83,7 @@ fn wcsp_edac_budget_ms() -> u64 {
 /// A CHECKED root probe result: `c0` is a floor on the falsified-soft cost of
 /// every assignment satisfying the instance's hard one-hot rows, and the
 /// audit trail deriving it has passed the independent
-/// [`check_wcsp_transfer_trail`] replay (enforced by construction — this type
+/// `check_wcsp_transfer_trail` replay (enforced by construction — this type
 /// is only ever built by [`wcsp_root_edac_probe`] after the check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WcspEdacProbe {

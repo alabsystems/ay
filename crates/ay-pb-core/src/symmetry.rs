@@ -488,7 +488,7 @@ const MAX_VERIFIED_PARTITION_ASSEMBLY_WORK: usize = 1_000_000;
 ///
 /// The scalable individualise/refine engine proposes permutations, but grants
 /// no authority: it already passes every returned permutation through the
-/// exact [`is_automorphism`] oracle.  This adapter retains only pointwise
+/// exact `is_automorphism` oracle. This adapter retains only pointwise
 /// involutions and assembles a connected, equal-width partition covering every
 /// declared variable.  A miss is `Ok(None)`; malformed input, resource
 /// exhaustion, and deadlines are distinguished and never return a partial
@@ -890,7 +890,7 @@ fn mapped_block(
 /// knows the repeated blocks can submit their adjacent swaps directly, avoiding
 /// graph-automorphism discovery. The candidates carry no authority: every map
 /// is checked against the complete canonical constraint multiset and objective
-/// by the same exact [`is_automorphism`] oracle used by the generic detector.
+/// by the same exact `is_automorphism` oracle used by the generic detector.
 /// Invalid, malformed, duplicate-domain, out-of-range, or deadline-expired
 /// candidates add nothing.
 ///

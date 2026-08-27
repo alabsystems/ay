@@ -2,19 +2,20 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Unified proof output facade that abstracts over DRAT and LRAT formats.
+//! Unified proof output facade that abstracts over DRAT, LRAT and VeriPB formats.
 
-use super::{BoxedWriter, DratWriter, LratBoundedResourceFailure, LratWriter};
+use super::{BoxedWriter, DratWriter, LratBoundedResourceFailure, LratWriter, VeripbWriter};
 use crate::literal::Literal;
 use std::io::{self, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-/// Unified proof output that can be either DRAT or LRAT format.
+/// Unified proof output that can be DRAT, LRAT or VeriPB format.
 ///
-/// This enum allows the solver to write proofs in either format while maintaining
+/// This enum allows the solver to write proofs in any of them while maintaining
 /// a single proof_writer field. LRAT proofs include clause IDs and resolution hints
-/// for linear-time verification.
+/// for linear-time verification. VeriPB proofs are pseudo-Boolean and carry
+/// substitution witnesses on `red` steps.
 ///
 /// The writer type is erased via `BoxedWriter` so that `ProofOutput` (and therefore
 /// `ProofManager` and `Solver`) are non-generic. This eliminates the `W: Write`
@@ -26,12 +27,22 @@ pub enum ProofOutput {
     Drat(DratWriter<BoxedWriter>),
     /// LRAT proof format (with hints, ID-based deletions)
     Lrat(LratWriter<BoxedWriter>),
+    /// VeriPB pseudo-Boolean proof format (`red`/`rup`/`del spec` over the
+    /// DIMACS CNF read directly as OPB). Carries substitution witnesses
+    /// natively, which is why the SR symmetry routes can stay enabled under an
+    /// official 2026 checker declaration.
+    Veripb(VeripbWriter<BoxedWriter>),
 }
 
 impl ProofOutput {
     /// Create a new DRAT text proof output
     pub fn drat_text(writer: impl Write + Send + 'static) -> Self {
         Self::Drat(DratWriter::new_text(BoxedWriter::new(writer)))
+    }
+
+    /// Create a new VeriPB proof output. VeriPB has no binary encoding.
+    pub fn veripb(writer: impl Write + Send + 'static) -> Self {
+        Self::Veripb(VeripbWriter::new(BoxedWriter::new(writer)))
     }
 
     /// Create a new DRAT binary proof output
@@ -75,10 +86,21 @@ impl ProofOutput {
         matches!(self, Self::Lrat(_))
     }
 
+    /// Check if this is a VeriPB proof.
+    ///
+    /// The SR symmetry gate needs this: a DSR substitution witness is only
+    /// checkable when the DECLARED checker reads the surface it was written
+    /// on, and `dsr-trim` cannot read a `.pbp` any more than VeriPB can read a
+    /// `.drat`.
+    pub fn is_veripb(&self) -> bool {
+        matches!(self, Self::Veripb(_))
+    }
+
     /// Additions written so far (DRAT only; 0 for LRAT).
     pub fn adds_written(&self) -> u64 {
         match self {
             Self::Drat(w) => w.added_count(),
+            Self::Veripb(w) => w.added_count(),
             Self::Lrat(_) => 0,
         }
     }
@@ -92,6 +114,10 @@ impl ProofOutput {
     pub fn add(&mut self, clause: &[Literal], hints: &[u64]) -> io::Result<u64> {
         match self {
             Self::Drat(w) => {
+                w.add(clause)?;
+                Ok(0)
+            }
+            Self::Veripb(w) => {
                 w.add(clause)?;
                 Ok(0)
             }
@@ -113,34 +139,40 @@ impl ProofOutput {
                 w.add(clause)?;
                 Ok(0)
             }
+            Self::Veripb(w) => {
+                w.add(clause)?;
+                Ok(0)
+            }
             Self::Lrat(w) => w.add_signed_hints(clause, hints),
         }
     }
 
-    /// Add a PR (propagation-redundant) clause with a witness assignment.
+    /// Add a caller-supplied propagation-redundancy step.
     ///
-    /// For DRAT this emits a DPR `a`-line (`clause… witness… 0`). The LPR (linear
-    /// PR) route for LRAT is not yet wired — emitting a PR clause without its
-    /// linear hints would be unverifiable, so the LRAT arm fails closed with an
-    /// error rather than write an unsound/incomplete step.
+    /// DRAT output serializes the clause and witness as a DPR `a`-line. This API
+    /// does not validate the witness; callers must arrange independent PR/LPR
+    /// checking. Direct LPR emission is not wired, so LRAT fails closed.
     pub fn add_pr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         match self {
-            Self::Drat(w) => w.add_pr(clause, witness),
+            Self::Drat(writer) => writer.add_pr(clause, witness),
+            Self::Veripb(writer) => writer.add_pr(clause, witness),
             Self::Lrat(_) => Err(io::Error::other(
-                "PR/LPR clause emission is not yet supported on the LRAT writer",
+                "PR/LPR clause emission is not supported on the LRAT writer",
             )),
         }
     }
 
-    /// Add an SR (substitution-redundant) clause with a full substitution witness.
+    /// Add an SR (substitution-redundant) clause with a DSR witness token stream.
     ///
     /// For DRAT this emits a DSR `a`-line (`clause… witness… 0`) where `witness` is
-    /// the substitution-witness token stream. The LSR route for LRAT is not wired
-    /// (the SR proof is elaborated externally by `dsr-trim`), so the LRAT arm fails
-    /// closed rather than write an unverifiable step.
+    /// the witness token stream, which may contain a partial assignment, a
+    /// substitution, or both. The LSR route for LRAT is not wired (the SR proof is
+    /// elaborated externally by `dsr-trim`), so the LRAT arm fails closed rather
+    /// than write an unverifiable step.
     pub fn add_sr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         match self {
             Self::Drat(w) => w.add_sr(clause, witness),
+            Self::Veripb(w) => w.add_sr(clause, witness),
             Self::Lrat(_) => Err(io::Error::other(
                 "SR/LSR clause emission is not yet supported on the LRAT writer",
             )),
@@ -159,7 +191,7 @@ impl ProofOutput {
         hints: &[u64],
     ) -> io::Result<()> {
         match self {
-            Self::Drat(_) => Ok(()),
+            Self::Drat(_) | Self::Veripb(_) => Ok(()),
             Self::Lrat(w) => w.add_with_id(clause_id, clause, hints),
         }
     }
@@ -175,6 +207,10 @@ impl ProofOutput {
                 writer.add(clause)?;
                 Ok(0)
             }
+            Self::Veripb(writer) => {
+                writer.add(clause)?;
+                Ok(0)
+            }
             Self::Lrat(writer) => writer.add_bounded_prevalidated_rup(clause, hints),
         }
     }
@@ -187,7 +223,7 @@ impl ProofOutput {
         hints: &[i64],
     ) -> io::Result<()> {
         match self {
-            Self::Drat(_) => Ok(()),
+            Self::Drat(_) | Self::Veripb(_) => Ok(()),
             Self::Lrat(writer) => {
                 writer.add_with_id_bounded_prevalidated_rup(clause_id, clause, hints)
             }
@@ -206,7 +242,7 @@ impl ProofOutput {
         hints: &[i64],
     ) -> io::Result<()> {
         match self {
-            Self::Drat(_) => Ok(()),
+            Self::Drat(_) | Self::Veripb(_) => Ok(()),
             Self::Lrat(w) => w.add_with_id_signed_hints(clause_id, clause, hints),
         }
     }
@@ -218,21 +254,21 @@ impl ProofOutput {
     /// mechanism when theory-lemma writes are suppressed (#4713).
     pub fn reserve_id(&mut self) -> u64 {
         match self {
-            Self::Drat(_) => 0,
+            Self::Drat(_) | Self::Veripb(_) => 0,
             Self::Lrat(w) => w.reserve_id(),
         }
     }
 
     pub(crate) fn next_lrat_id(&self) -> Option<u64> {
         match self {
-            Self::Drat(_) => None,
+            Self::Drat(_) | Self::Veripb(_) => None,
             Self::Lrat(w) => Some(w.next_id()),
         }
     }
 
     pub(crate) fn has_pending_lrat_deletions(&self) -> bool {
         match self {
-            Self::Drat(_) => false,
+            Self::Drat(_) | Self::Veripb(_) => false,
             Self::Lrat(w) => w.has_pending_deletions(),
         }
     }
@@ -243,7 +279,7 @@ impl ProofOutput {
     /// separate path (ProofManager::next_lrat_id). No-op for DRAT.
     pub fn advance_past(&mut self, min_next: u64) {
         match self {
-            Self::Drat(_) => {}
+            Self::Drat(_) | Self::Veripb(_) => {}
             Self::Lrat(w) => w.advance_past(min_next),
         }
     }
@@ -254,6 +290,7 @@ impl ProofOutput {
     pub fn delete(&mut self, clause: &[Literal], clause_id: u64) -> io::Result<()> {
         match self {
             Self::Drat(w) => w.delete(clause),
+            Self::Veripb(w) => w.delete(clause),
             Self::Lrat(w) => w.delete(clause_id),
         }
     }
@@ -262,6 +299,7 @@ impl ProofOutput {
     pub fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Drat(w) => w.flush(),
+            Self::Veripb(w) => w.flush(),
             Self::Lrat(w) => w.flush(),
         }
     }
@@ -270,6 +308,7 @@ impl ProofOutput {
     pub fn added_count(&self) -> u64 {
         match self {
             Self::Drat(w) => w.added_count(),
+            Self::Veripb(w) => w.added_count(),
             Self::Lrat(w) => w.added_count(),
         }
     }
@@ -278,6 +317,7 @@ impl ProofOutput {
     pub fn deleted_count(&self) -> u64 {
         match self {
             Self::Drat(w) => w.deleted_count(),
+            Self::Veripb(w) => w.deleted_count(),
             Self::Lrat(w) => w.deleted_count(),
         }
     }
@@ -289,6 +329,7 @@ impl ProofOutput {
     pub fn has_io_error(&self) -> bool {
         match self {
             Self::Drat(w) => w.has_io_error(),
+            Self::Veripb(w) => w.has_io_error(),
             Self::Lrat(w) => w.has_io_error(),
         }
     }
@@ -296,7 +337,7 @@ impl ProofOutput {
     /// Typed failure from bounded LRAT storage outside the byte writer.
     pub(crate) fn lrat_bounded_resource_failure(&self) -> Option<LratBoundedResourceFailure> {
         match self {
-            Self::Drat(_) => None,
+            Self::Drat(_) | Self::Veripb(_) => None,
             Self::Lrat(writer) => writer.bounded_resource_failure(),
         }
     }
@@ -308,6 +349,7 @@ impl ProofOutput {
     pub fn into_inner(self) -> io::Result<BoxedWriter> {
         match self {
             Self::Drat(w) => w.into_inner(),
+            Self::Veripb(w) => w.into_inner(),
             Self::Lrat(w) => w.into_inner(),
         }
     }

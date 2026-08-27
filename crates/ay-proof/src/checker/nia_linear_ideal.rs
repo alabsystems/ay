@@ -357,14 +357,14 @@ pub(crate) fn validate_linear_ideal_refutation_with_progress(
 ///
 /// 1. the equality-span FAST PATH of this module, which decides polynomial
 ///    IDENTITY refutations (loop-invariant consecution) and ignores order;
-/// 2. [`super::nia_fourier_motzkin`], which decides the ORDER lane by
+/// 2. `super::nia_fourier_motzkin`, which decides the ORDER lane by
 ///    exact-rational Fourier–Motzkin elimination over the same constraints.
 ///
-/// Sharing one extraction and one [`WorkMeter`] matters: this runs on every
+/// Sharing one extraction and one `WorkMeter` matters: this runs on every
 /// trust-kind theory lemma of every proof, and re-parsing each clause would
 /// double the caller's proof-wide resource charge for the whole `Generic` arm.
 /// Declaration-free recognizer used by proof producers: `true` exactly when
-/// the strict [`crate::checker`] `ArithClauseTautology` arm accepts the
+/// the strict `crate::checker` `ArithClauseTautology` arm accepts the
 /// clause (recognizer IS the validator, so classifier and checker cannot
 /// drift). Runs under the validator's own work meter with an unbounded
 /// progress callback.

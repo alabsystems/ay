@@ -11,6 +11,8 @@ use super::super::datatype_axiom::{
 };
 use super::cycle::has_cycle;
 
+mod boolean;
+
 const MAX_GROUND_NODES: usize = 4096;
 const TRUE_NODE: u64 = 1 << 33;
 const FALSE_NODE: u64 = (1 << 33) + 1;
@@ -150,6 +152,7 @@ impl<'a> GroundRefuter<'a> {
         }
         self.close_tester_evaluation(&classes, changed);
         self.close_selector_projection(&classes, changed);
+        self.close_equality_clash(&classes, changed);
         self.has_tester_exclusivity()
             || self.has_direct_contradiction()
             || self.has_structural_cycle(&classes)
@@ -200,43 +203,6 @@ impl<'a> GroundRefuter<'a> {
                 *changed |= self.union(node, other);
             } else {
                 signatures.insert(signature, node);
-            }
-        }
-    }
-
-    fn close_boolean_semantics(&mut self, changed: &mut bool) {
-        for index in 0..self.universe.len() {
-            let term = self.universe[index];
-            let node = self.node(term);
-            if let TermData::Not(inner) = self.terms.get(term) {
-                let inner_node = self.node(*inner);
-                let (inner_root, node_root) = (self.find(inner_node), self.find(node));
-                if inner_root == self.find(TRUE_NODE) {
-                    *changed |= self.union(node, FALSE_NODE);
-                }
-                if inner_root == self.find(FALSE_NODE) {
-                    *changed |= self.union(node, TRUE_NODE);
-                }
-                if node_root == self.find(TRUE_NODE) {
-                    *changed |= self.union(inner_node, FALSE_NODE);
-                }
-                if node_root == self.find(FALSE_NODE) {
-                    *changed |= self.union(inner_node, TRUE_NODE);
-                }
-            }
-            if let Some((first, second)) = equality_sides(self.terms, term) {
-                let (first_node, second_node) = (self.node(first), self.node(second));
-                if self.find(first_node) == self.find(second_node) {
-                    *changed |= self.union(node, TRUE_NODE);
-                }
-                let root = self.find(node);
-                if root == self.find(TRUE_NODE) {
-                    *changed |= self.union(first_node, second_node);
-                }
-                if root == self.find(FALSE_NODE) && self.eq_false_seen.insert(term) {
-                    self.diseqs.push((first_node, second_node));
-                    *changed = true;
-                }
             }
         }
     }
@@ -297,6 +263,52 @@ impl<'a> GroundRefuter<'a> {
             }
         }
         false
+    }
+
+    /// Falsify an equality atom whose two sides sit in classes with
+    /// CLASHING registered constructor heads of the same datatype
+    /// (#dt-context-derivation): distinct constructors build distinct
+    /// values, so the equality is FALSE in every model. This is the
+    /// cross-class complement of the in-class clash rule — the transition
+    /// guards' skipped move-enum equalities die by exactly this inference
+    /// once the taken move's enum fact is assumed.
+    fn close_equality_clash(&mut self, classes: &HashMap<u64, Vec<TermId>>, changed: &mut bool) {
+        let mut head_by_root: HashMap<u64, (String, String)> = HashMap::default();
+        for (&root, members) in classes {
+            for &member in members {
+                if let Some((constructor, datatype)) =
+                    constructor_head(self.terms, self.dt_decls, member)
+                {
+                    head_by_root
+                        .entry(root)
+                        .or_insert_with(|| (constructor, datatype.to_string()));
+                    break;
+                }
+            }
+        }
+        for index in 0..self.universe.len() {
+            let term = self.universe[index];
+            let Some((first, second)) = equality_sides(self.terms, term) else {
+                continue;
+            };
+            let first_node = self.node(first);
+            let second_node = self.node(second);
+            let first_root = self.find(first_node);
+            let second_root = self.find(second_node);
+            if first_root == second_root {
+                continue;
+            }
+            let (Some((first_ctor, first_dt)), Some((second_ctor, second_dt))) = (
+                head_by_root.get(&first_root),
+                head_by_root.get(&second_root),
+            ) else {
+                continue;
+            };
+            if first_dt == second_dt && first_ctor != second_ctor {
+                let node = self.node(term);
+                *changed |= self.union(node, FALSE_NODE);
+            }
+        }
     }
 
     fn close_tester_evaluation(&mut self, classes: &HashMap<u64, Vec<TermId>>, changed: &mut bool) {

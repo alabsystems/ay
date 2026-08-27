@@ -516,6 +516,12 @@ impl FpSolver<'_> {
                 }
                 Some(acc)
             }
+            // Division and remainder — circuit, exactness obligations and their
+            // oracle verdicts all live in `bv_division.rs`. Without this arm the
+            // query bails to `unknown (:reason-unknown unsupported)`.
+            "bvudiv" | "bvurem" | "bvsdiv" | "bvsrem" | "bvsmod" => {
+                self.bitblast_bv_div_app(sym, args, expected_sz)
+            }
             "bvshl" if args.len() == 2 => {
                 let lhs = self.bitblast_bv_value(args[0], expected_sz)?;
                 let shift_sz = self.bv_width(args[1])?;
@@ -605,7 +611,7 @@ impl FpSolver<'_> {
         }
     }
 
-    fn bv_width(&self, term: TermId) -> Option<usize> {
+    pub(crate) fn bv_width(&self, term: TermId) -> Option<usize> {
         match self.terms.sort(term) {
             Sort::BitVec(bv) => Some(bv.width as usize),
             _ => None,

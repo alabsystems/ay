@@ -45,11 +45,6 @@ use crate::pdr::PdrConfig;
 use crate::portfolio::PortfolioResult;
 use crate::transform::cata_abstract::{build_cata_ladder, CataAbstraction};
 
-/// Kill switch: set to any value to disable the catamorphism lane.
-
-/// Kill switch for the CATA v2 multi-predicate affine-Houdini abstract solver
-/// (default ON). Setting it forces the v1 nested-portfolio abstract solve only.
-
 /// Toggle for the CATA v2 depth-1 GUARDED candidate families (flag-guarded
 /// ordering facts + non-convex min recurrences). Default ON; set
 /// `AY_CHC_CATA_GUARDED=0` (or `off`/`false`/`no`) to suppress them — the
@@ -124,26 +119,31 @@ const CATA_ELEMENT_EXTENSION: Duration = Duration::from_secs(45);
 /// no-op at sample budgets (0 regression by construction) and active only at
 /// competition-scale budgets.
 const CATA_ELEMENT_MIN_BUDGET: Duration = Duration::from_secs(45);
-/// Per-obligation SMT budget and per-level obligation-total cap.
+/// Per-obligation SMT budget: the hard bound on ONE `θ ∧ ¬θ# ⊨ ⊥` query.
+///
+/// This is the gate's only fixed time constant. The per-LEVEL aggregate caps
+/// that used to sit beside it (5 s for size levels, 20 s for element levels)
+/// are gone: they were sized when a clause obligation was ONE monolithic query,
+/// the per-conjunct split then multiplied the work per level without resizing
+/// them, and — because the gate is a property of the ABSTRACTION, not of any
+/// candidate model — an aggregate wall clock could guillotine a gate whose every
+/// sub-query had come back `unsat` well inside its own budget. The gate now runs
+/// once per level (resumable, see `CataAbstraction::run_obligation_gate`) and is
+/// bounded by the LEVEL deadline, which is derived from the caller's real
+/// deadline rather than invented.
 const CATA_PER_OBLIGATION_BUDGET: Duration = Duration::from_millis(1500);
-const CATA_OBLIGATIONS_TOTAL_CAP: Duration = Duration::from_secs(5);
-/// Element/ordering levels (Min/Max/Sorted) discharge their obligations
-/// CONJUNCT-BY-CONJUNCT (see `CataAbstraction::obligation_sub_scripts`): each
-/// sub-query is a millisecond-scale `θ ∧ ¬θ#ᵢ ⊨ ⊥`, but a sortedness clause has
-/// 100+ such conjuncts, so the per-LEVEL total needs more headroom than the
-/// size family's monolithic 5 s. Still bounded by the level deadline (the 45 s
-/// element extension divided across the element levels), so this only widens
-/// the cap where the split makes each individual query cheap.
-const CATA_ELEMENT_OBLIGATIONS_TOTAL_CAP: Duration = Duration::from_secs(20);
 /// Fresh full re-verification budget for the abstract model.
 const CATA_ABSTRACT_VERIFY_CAP: Duration = Duration::from_secs(6);
 /// Extra unrolling slack over the abstract counterexample depth.
 const CATA_CEX_DEPTH_SLACK: usize = 2;
 
+/// Whether caller configuration disables the entire catamorphism lane.
 fn cata_lane_disabled() -> bool {
     !crate::ab_switches::get().cata_route
 }
 
+/// Whether caller configuration disables the CATA v2 multi-predicate
+/// affine-Houdini solver, leaving only the v1 nested portfolio.
 fn cata_v2_disabled() -> bool {
     !crate::ab_switches::get().cata_v2
 }
@@ -439,16 +439,7 @@ impl AdaptivePortfolio {
             let _ = std::fs::write(dir.join(format!("abstract_L{level}.smt2")), script);
         }
 
-        // 2. Per-original-clause implication obligation cap (fail-closed
-        //    soundness gate; the transform is NOT trusted). The discharge
-        //    itself is deferred into `certify_and_compose_abstract_model` —
-        //    see the PERF note below.
-        let obligations_total_cap = if is_element {
-            CATA_ELEMENT_OBLIGATIONS_TOTAL_CAP
-        } else {
-            CATA_OBLIGATIONS_TOTAL_CAP
-        };
-        // PERF (PERF-3 residue, chc_dt_mutual_recursive): the per-clause
+        // 2. PERF (PERF-3 residue, chc_dt_mutual_recursive): the per-clause
         // implication obligations are DEFERRED into
         // `certify_and_compose_abstract_model` — they are only needed to
         // certify a SAFE verdict, and eagerly discharging them here charged
@@ -498,7 +489,6 @@ impl AdaptivePortfolio {
                     pool,
                     level,
                     level_deadline,
-                    obligations_total_cap,
                     route_start,
                     route_budget,
                     "affine houdini (v2)",
@@ -578,7 +568,6 @@ impl AdaptivePortfolio {
                             pool,
                             level,
                             level_deadline,
-                            obligations_total_cap,
                             route_start,
                             route_budget,
                             label,
@@ -689,7 +678,6 @@ impl AdaptivePortfolio {
                             pool,
                             level,
                             level_deadline,
-                            obligations_total_cap,
                             route_start,
                             route_budget,
                             label,
@@ -766,7 +754,6 @@ impl AdaptivePortfolio {
                     pool,
                     level,
                     level_deadline,
-                    obligations_total_cap,
                     route_start,
                     route_budget,
                     "nested portfolio",
@@ -861,7 +848,6 @@ impl AdaptivePortfolio {
         pool: &[crate::transform::cata_abstract::CataKind],
         level: usize,
         level_deadline: Instant,
-        obligations_total_cap: Duration,
         route_start: Instant,
         route_budget: Duration,
         source: &str,
@@ -900,14 +886,20 @@ impl AdaptivePortfolio {
         // (fail-closed soundness gate; the transform is NOT trusted). Deferred
         // here from the level entry (PERF-3 residue): a candidate abstract
         // model now exists, so this work is spent only on levels that can
-        // actually produce a Safe verdict — same budgets, same fail-closed
-        // polarity as the eager placement.
-        let obligations_deadline = Instant::now()
-            + obligations_total_cap.min(level_deadline.saturating_duration_since(Instant::now()));
-        if !abstraction.discharge_obligations(
-            CATA_PER_OBLIGATION_BUDGET,
-            Some(obligations_deadline.min(level_deadline)),
-        ) {
+        // actually produce a Safe verdict — same fail-closed polarity as the
+        // eager placement.
+        //
+        // BUDGET: the LEVEL deadline, not a separate aggregate constant. The
+        // gate depends only on the ABSTRACTION, so it is the same work for
+        // every candidate model at this level and `run_obligation_gate`
+        // memoizes it — a level pays for it at most once, and a clock-exhausted
+        // attempt keeps its progress instead of discarding proved obligations.
+        // A separate aggregate cap on top of that bought nothing but a
+        // load-sensitive failure: the cap was sized when a clause obligation was
+        // ONE monolithic query, and after the per-conjunct split it could
+        // guillotine a gate whose every sub-query had returned `unsat` well
+        // inside its own `CATA_PER_OBLIGATION_BUDGET`.
+        if !abstraction.discharge_obligations(CATA_PER_OBLIGATION_BUDGET, Some(level_deadline)) {
             tracing::debug!(
                 level,
                 pool = pool.len(),

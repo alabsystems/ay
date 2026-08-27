@@ -283,9 +283,7 @@ impl Solver {
             .proof_emit_add(lits, &[], ProofAddKind::Derived)
             .unwrap_or(0);
         let idx = self.arena.add(lits, true);
-        if idx >= self.cold.clause_ids.len() {
-            self.cold.clause_ids.resize(idx + 1, 0);
-        }
+        self.cold.clause_ids_grow_for(idx);
         self.cold.clause_ids[idx] = if pid != 0 {
             pid
         } else {

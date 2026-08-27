@@ -47,13 +47,10 @@
 //! c7 channel serve that HIGH-TRAFFIC route too. Two replay extensions cover
 //! the fold shapes that route produces, both fail-closed and re-derived by
 //! the untouched strict checker:
-//!  * and-headed conjunct elimination at the record-bridge level
-//!    (`and_bridge`): changed conjuncts must replay to literal `true` and
-//!    the canonical rebuild must reproduce the recorded survivor set;
-//!  * Bool `(= x true/false)` folds (`plan_bool_eq_const_fold`): a
-//!    `cong` + `equiv_pos`/`equiv_neg` + `true`/`false`-tautology chain
-//!    closing the `mk_eq` Boolean simplification as a term equality, valid
-//!    for arbitrary theory atoms `x`.
+//!  * and-headed elimination (`and_bridge`) replays changed conjuncts to `true`
+//!    and requires the canonical rebuild to reproduce the survivor set;
+//!  * Bool equality folds use a checked congruence/tautology chain to close the
+//!    `mk_eq` simplification for arbitrary theory atoms.
 //!
 //! Kill switch: `--no-quant-unit-authority` (the existing campaign switch)
 //! disables both record minting and this consumption, reproducing the
@@ -70,10 +67,22 @@ use ay_core::{
 use super::Executor;
 use crate::preprocess::{PropagateValues, PropagationRecords};
 use crate::sat_proof_manager::FragmentInstanceRootDerivation;
+use eq_diffvar_bridge::EqDiffVarAtomPlan;
 
 mod and_bridge;
 mod clause;
+mod connective_reorder;
+mod eq_diffvar_bridge;
+mod eq_diffvar_lane;
+mod eq_diffvar_mint;
+#[cfg(test)]
+#[path = "proof_propagated_rewrite/eq_diffvar_retention_tests.rs"]
+mod eq_diffvar_retention_tests;
+#[cfg(test)]
+#[path = "proof_propagated_rewrite/eq_diffvar_tests.rs"]
+mod eq_diffvar_tests;
 mod equality;
+mod ite_bridge;
 mod or_bridge;
 mod splice;
 #[cfg(test)]
@@ -82,6 +91,30 @@ mod tests;
 /// Merged-store cap; mirrors the pass-side cap. Overflow clears the store
 /// (fail-closed: no partial licensing environment may drive a replay).
 const MAX_STORED_PROPAGATION_RECORDS: usize = 4096;
+
+/// Width of the stamp slot [`Executor::merge_propagation_records`] gives each
+/// round it merges (#4751).
+///
+/// The replay decides whether an entry may license a rewrite by
+/// `entry.stamp <= target.stamp`, so a channel that runs BETWEEN two merged
+/// rounds needs a stamp value strictly between theirs. Consecutive merges used
+/// to take consecutive integers, which left no such value and forced
+/// [`Executor::extend_eq_diffvar_provenance`] to TIE with the round before it —
+/// making the `EqDiffVar` atom channel eligible while a top-level
+/// unit-propagation rewrite was being replayed, which reconstructs a term that
+/// pass never wrote and declines the whole chain.
+///
+/// Spacing the merged rounds two apart reserves the odd values for those
+/// in-between channels. It changes no replay decision on its own: every stamp
+/// on this axis is remapped by `s |-> SCALE*s + offset`, which is strictly
+/// increasing both within a merged batch and across batches (a batch's largest
+/// stamp is `SCALE*n + offset` and the next batch's smallest is
+/// `SCALE + SCALE*n + offset`), so every `<=` between two stamps on this axis
+/// holds exactly when it held before. MEASURED on `dillig12_m`: with only this
+/// half of the change applied the census is byte-identical to the baseline —
+/// 19 rejected proofs, 53 premiseless `Trust`, 14 `Generic`, same shape and
+/// same first-offender histogram, 3 runs each.
+const PROPAGATE_VALUES_STAMP_SCALE: u32 = 2;
 
 /// Total term-node budget for one derivation plan. Exceeding it fails the
 /// plan (the assume falls back to today's demotion path).
@@ -109,6 +142,17 @@ pub(crate) struct PlanCx<'a> {
     record_by_after: &'a HashMap<TermId, (TermId, u32)>,
     /// expr -> (value, source assertion, stamp), first harvest wins.
     entry_by_expr: &'a HashMap<TermId, (TermId, TermId, u32)>,
+    /// `EqDiffVar` atom folds, keyed by the AUTHORED atom (#4751). `None` for
+    /// every lane but [`Executor::derive_eq_diffvar_rewritten_assertions`], so
+    /// the `PropagateValues` rebuild lane and the c7 unit channel plan exactly
+    /// as they did before this channel existed.
+    eqdv_by_atom: Option<&'a HashMap<TermId, EqDiffVarAtomPlan>>,
+    /// `EqDiffVar` definitional bound atoms in the spelling the pass MINTED
+    /// them, keyed to their definiendum (#4751). A base case of
+    /// [`PropagationChainPlanner::plan_derive_clause`], so a LATER pass's
+    /// rewrite of the same bound is derived from the minted one rather than
+    /// binding the symbol a second time.
+    eqdv_definitions: Option<&'a HashMap<TermId, TermId>>,
     /// Sealed qpf premise-forced instance roots (#ppp-c7). Empty for the
     /// rebuild lane, so every L1 plan is unchanged.
     instance_roots: &'a [FragmentInstanceRootDerivation],
@@ -153,6 +197,8 @@ impl<'a> PlanCx<'a> {
             problem_roots,
             record_by_after,
             entry_by_expr,
+            eqdv_by_atom: None,
+            eqdv_definitions: None,
             instance_roots,
             closed_bv_bitblast_bridge,
             chain: Proof::new(),
@@ -172,6 +218,24 @@ impl<'a> PlanCx<'a> {
         self
     }
 
+    /// Enable the `EqDiffVar` atom-fold channel for this plan (#4751).
+    fn with_eq_diffvar_atoms(
+        self,
+        atoms: &'a HashMap<TermId, EqDiffVarAtomPlan>,
+        definitions: &'a HashMap<TermId, TermId>,
+    ) -> Self {
+        let mut cx = self.with_eq_diffvar_definitions(definitions);
+        cx.eqdv_by_atom = Some(atoms);
+        cx
+    }
+
+    /// Enable only the definitional-bound base case (#4751): phase A of the
+    /// lane re-derives a rewritten bound without folding any atom.
+    fn with_eq_diffvar_definitions(mut self, definitions: &'a HashMap<TermId, TermId>) -> Self {
+        self.eqdv_definitions = Some(definitions);
+        self
+    }
+
     /// Whether `candidate` is the literal Boolean constant this plan targets.
     pub(super) fn refuses_constant_conclusion(&self, candidate: TermId) -> bool {
         self.constant_target == Some(candidate)
@@ -182,6 +246,8 @@ impl<'a> PlanCx<'a> {
         Some(())
     }
 }
+
+include!("proof_propagated_rewrite/plan_checkpoint.rs");
 
 impl Executor {
     /// Drain `PropagateValues` producer provenance from a preprocessor run
@@ -208,7 +274,7 @@ impl Executor {
                 "CERT/proof-records merged: propagation entries={} rewrites={} exec={:p}",
                 records.entries.len(),
                 records.rewrites.len(),
-                self as *const _,
+                std::ptr::from_ref(self),
             );
         }
         self.merge_propagation_records(records);
@@ -358,7 +424,11 @@ impl Executor {
             return;
         }
 
-        self.merge_propagation_records(PropagationRecords { rewrites, entries });
+        self.merge_propagation_records(PropagationRecords {
+            rewrites,
+            entries,
+            ..PropagationRecords::default()
+        });
     }
 
     /// Mint `PropagateValues`-shaped provenance for the top-level
@@ -440,7 +510,11 @@ impl Executor {
             return;
         }
 
-        self.merge_propagation_records(PropagationRecords { rewrites, entries });
+        self.merge_propagation_records(PropagationRecords {
+            rewrites,
+            entries,
+            ..PropagationRecords::default()
+        });
     }
 
     /// Whether `source` is spelled exactly `(= expr value)` or
@@ -467,10 +541,20 @@ impl Executor {
                 "CERT/proof-records merge_propagation_records: entries={} rewrites={} exec={:p}",
                 records.entries.len(),
                 records.rewrites.len(),
-                self as *const _,
+                std::ptr::from_ref(self),
             );
         }
         let store = &mut self.propagated_value_provenance;
+        // The offset is computed over the `PropagateValues` vectors ALONE, and
+        // that is load-bearing (#4751): including the `EqDiffVar` halves would
+        // shift the stamps this store hands the EXISTING replay, which decides
+        // eligibility by `stamp <= target stamp`. Measured — shifting them
+        // changes which assertions that lane derives, which changes which
+        // UNSATs certify, which changes the lemmas PDR keeps, and turns two
+        // ay-chc route fixtures red. The `EqDiffVar` halves therefore share the
+        // offset without advancing it; see `extend_eq_diffvar_provenance` for
+        // why a tie with the `VariableSubstitution` round is the right and safe
+        // place for them.
         let offset = store
             .rewrites
             .iter()
@@ -478,16 +562,26 @@ impl Executor {
             .chain(store.entries.iter().map(|entry| entry.stamp))
             .max()
             .unwrap_or(0);
+        // Each merged round takes its own SLOT rather than the next integer, so
+        // a channel running between two merges has a value to sit on; see
+        // `PROPAGATE_VALUES_STAMP_SCALE` for why this is order-preserving and
+        // for the measurement.
         store
             .rewrites
             .extend(records.rewrites.into_iter().map(|mut record| {
-                record.stamp = record.stamp.saturating_add(offset);
+                record.stamp = record
+                    .stamp
+                    .saturating_mul(PROPAGATE_VALUES_STAMP_SCALE)
+                    .saturating_add(offset);
                 record
             }));
         store
             .entries
             .extend(records.entries.into_iter().map(|mut entry| {
-                entry.stamp = entry.stamp.saturating_add(offset);
+                entry.stamp = entry
+                    .stamp
+                    .saturating_mul(PROPAGATE_VALUES_STAMP_SCALE)
+                    .saturating_add(offset);
                 entry
             }));
         tracing::debug!(
@@ -510,114 +604,9 @@ impl Executor {
             *store = PropagationRecords::default();
         }
     }
-
-    /// Derive propagation-rewritten assumptions from their authored roots
-    /// before the demotion pass turns unsupported assumptions into `trust`.
-    pub(in crate::executor) fn derive_propagated_value_assumptions(
-        &mut self,
-        proof: &mut Proof,
-        problem_assertions: &[TermId],
-    ) {
-        if !crate::quant_unit_authority::quant_unit_authority_enabled()
-            || self.propagated_value_provenance.rewrites.is_empty()
-        {
-            return;
-        }
-        let problem_set = problem_assertions.iter().copied().collect();
-        let (record_by_after, entry_by_expr) = self.propagation_replay_indexes();
-        let candidates = Self::propagation_replay_candidates(proof, &problem_set, &record_by_after);
-        if candidates.is_empty() {
-            return;
-        }
-        let planned = self.plan_propagation_candidates(
-            candidates,
-            &problem_set,
-            problem_assertions,
-            &record_by_after,
-            &entry_by_expr,
-        );
-        if !planned.is_empty() {
-            splice::splice_propagated_plans(proof, planned);
-        }
-    }
-
-    fn propagation_replay_indexes(
-        &self,
-    ) -> (
-        HashMap<TermId, (TermId, u32)>,
-        HashMap<TermId, (TermId, TermId, u32)>,
-    ) {
-        let mut record_by_after = HashMap::default();
-        for record in &self.propagated_value_provenance.rewrites {
-            if record.before != record.after {
-                record_by_after
-                    .entry(record.after)
-                    .or_insert((record.before, record.stamp));
-            }
-        }
-        let mut entry_by_expr = HashMap::default();
-        for entry in &self.propagated_value_provenance.entries {
-            entry_by_expr.entry(entry.expr).or_insert((
-                entry.value,
-                entry.source_assertion,
-                entry.stamp,
-            ));
-        }
-        (record_by_after, entry_by_expr)
-    }
-
-    fn propagation_replay_candidates(
-        proof: &Proof,
-        problem_set: &HashSet<TermId>,
-        record_by_after: &HashMap<TermId, (TermId, u32)>,
-    ) -> Vec<(usize, TermId)> {
-        proof
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| {
-                let ProofStep::Assume(term) = step else {
-                    return None;
-                };
-                if problem_set.contains(term) || !record_by_after.contains_key(term) {
-                    return None;
-                }
-                Some((index, *term))
-            })
-            .collect()
-    }
-
-    fn plan_propagation_candidates(
-        &mut self,
-        candidates: Vec<(usize, TermId)>,
-        problem_set: &HashSet<TermId>,
-        problem_roots: &[TermId],
-        record_by_after: &HashMap<TermId, (TermId, u32)>,
-        entry_by_expr: &HashMap<TermId, (TermId, TermId, u32)>,
-    ) -> HashMap<usize, (Proof, ProofId)> {
-        let mut planned = HashMap::default();
-        for (index, term) in candidates {
-            let mut cx = PlanCx::new(
-                problem_set,
-                problem_roots,
-                record_by_after,
-                entry_by_expr,
-                &[],
-                false,
-            );
-            if matches!(self.ctx.terms.get(term), TermData::Const(Constant::Bool(_))) {
-                cx = cx.with_constant_target(term);
-            }
-            let mut planner = PropagationChainPlanner {
-                terms: &mut self.ctx.terms,
-            };
-            if let Some(conclusion) = planner.plan_derive_clause(&mut cx, term) {
-                planned.insert(index, (cx.chain, conclusion));
-            }
-        }
-        planned
-    }
 }
+
+include!("proof_propagated_rewrite/replay_methods.rs");
 
 /// Term-store-parameterized propagation replay planner shared by the L1
 /// rebuild lane (`derive_propagated_value_assumptions`) and the L2 c7

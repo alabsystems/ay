@@ -65,6 +65,64 @@ use super::proof_surface_syntax::{
 use super::proof_trust_surgery_provenance::OriginalSourceIndex;
 use super::Executor;
 
+mod substitution_leaf;
+
+/// Does every term reachable from `root` stay inside the independent BV/LIA
+/// checker's SORT fragment (Bool / Int / BitVec)?
+///
+/// Fail-closed: an unrecognised `TermData` shape, a binder, or any other sort
+/// (arrays, datatypes, uninterpreted sorts, Real, …) answers `false`.
+fn bv_lia_scalar_sorted_root(terms: &TermStore, root: TermId) -> bool {
+    let mut seen: HashSet<TermId> = HashSet::default();
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if !matches!(terms.sort(term), Sort::Bool | Sort::Int | Sort::BitVec(_)) {
+            return false;
+        }
+        match terms.get(term) {
+            TermData::Const(_) | TermData::Var(..) => {}
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(cond, then_term, else_term) => {
+                stack.push(*cond);
+                stack.push(*then_term);
+                stack.push(*else_term);
+            }
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The BV/LIA-fragment SUBSET of an authenticated root set.
+///
+/// The independent bounded interpreter decides Bool/Int/BV only, so ONE array
+/// (or datatype, or uninterpreted-sort) assertion anywhere in the query makes
+/// it decline the whole thing — even when that assertion is irrelevant to the
+/// contradiction. Retrying on the scalar subset recovers exactly those queries.
+///
+/// SOUNDNESS: the emitted certificate claims that the conjunction of the
+/// SELECTED roots is unsatisfiable, and every selected root is an immutable
+/// authored assertion of the same query. Proving a SUBSET unsatisfiable is a
+/// STRONGER statement than proving the full set unsatisfiable, so the
+/// resulting clause `(cl (not r_1) … (not r_k))` remains a valid consequence
+/// of the problem. Nothing is taken on the producer's word either: the caller
+/// re-authenticates the subset with `authenticate_bv_lia_unsat_query` and then
+/// strictly replays the whole candidate proof before it may replace anything.
+/// `None` when the filter changes nothing (the caller already tried that set)
+/// or removes everything.
+fn bv_lia_scalar_sorted_subset(terms: &TermStore, roots: &[TermId]) -> Option<Vec<TermId>> {
+    let subset: Vec<TermId> = roots
+        .iter()
+        .copied()
+        .filter(|&root| bv_lia_scalar_sorted_root(terms, root))
+        .collect();
+    (!subset.is_empty() && subset.len() < roots.len()).then_some(subset)
+}
+
 fn collect_bounded_bv_lia_roots(
     terms: &TermStore,
     authored_roots: &[TermId],
@@ -397,7 +455,7 @@ impl Executor {
         // collapse shape carries no trust step, only the misused `false`
         // rule. Fail-closed (whole-proof shape gated); see
         // `try_rebuild_false_collapse`.
-        if self.try_rebuild_false_collapse(proof, &originals, &authored_originals, false) {
+        if self.try_rebuild_false_collapse(proof, &originals, &authored_originals) {
             return;
         }
 
@@ -698,7 +756,7 @@ impl Executor {
         // checkable `la_disequality` proof for a conjoined-equalities collapse.
         // The later authored cascade may still replace this honest fallback;
         // the internal BV/LIA fallback runs after that cascade.
-        let _ = self.try_rebuild_false_collapse(proof, &originals, &authored_originals, true);
+        let _ = self.try_bind_false_collapse(proof, &originals, &authored_originals);
 
         // NOTE: the internal-certificate BV/LIA fallback deliberately does NOT
         // run here. This function executes EARLY in proof publication (from
@@ -784,14 +842,31 @@ impl Executor {
         let kind = match ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &roots, None) {
             Ok(_) => TheoryLemmaKind::BvLiaTautology,
             Err(error) if error.is_capability_decline() => {
-                let Some(subset) = ay_proof::recognize_seq_extensional_companion_contradiction(
+                if let Some(subset) = ay_proof::recognize_seq_extensional_companion_contradiction(
                     &self.ctx.terms,
                     &roots,
-                ) else {
-                    return false;
-                };
-                roots = subset.into();
-                TheoryLemmaKind::SeqExtensionalCompanionContradiction
+                ) {
+                    roots = subset.into();
+                    TheoryLemmaKind::SeqExtensionalCompanionContradiction
+                } else {
+                    // The interpreter declined on a SORT it does not model, not
+                    // on the reasoning. One irrelevant array/datatype assertion
+                    // (e.g. a Vec carrier's ground seed sitting beside a purely
+                    // arithmetic length obligation) was enough to withdraw the
+                    // certificate for the whole query. Retry on the in-fragment
+                    // subset; see `bv_lia_scalar_sorted_subset` for why a
+                    // subset certificate is sound.
+                    let Some(scalar) = bv_lia_scalar_sorted_subset(&self.ctx.terms, &roots) else {
+                        return false;
+                    };
+                    if ay_proof::authenticate_bv_lia_unsat_query(&self.ctx.terms, &scalar, None)
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    roots = scalar;
+                    TheoryLemmaKind::BvLiaTautology
+                }
             }
             Err(_) => return false,
         };
@@ -3218,34 +3293,7 @@ impl Executor {
         let reachable = Self::reachable_step_mask(proof);
         let mut defective: Vec<TermId> = Vec::new();
         for (idx, step) in proof.steps.iter().enumerate() {
-            let term = match step {
-                ProofStep::Assume(term) => Some(*term),
-                // The provenance demotion pass runs before this final repair
-                // and converts a generated Assume into an explicit unit
-                // `trust`. It is still repairable only when the same
-                // substitution planner derives that exact unit from authored
-                // premises; arbitrary trust clauses remain untouched.
-                ProofStep::Step {
-                    rule: AletheRule::Trust,
-                    clause,
-                    premises,
-                    ..
-                } if premises.is_empty() && clause.len() == 1 => Some(clause[0]),
-                // A GENERIC-kind unit theory lemma is the same defect in a
-                // different coat: an unpedigreed leaf the strict checker
-                // rejects by kind. The DT lazy lane's indexed-authority
-                // recording (2026-08-20) moved its propagated
-                // selector-through-equality leaves from unit `trust` steps to
-                // exactly this shape, which silently disengaged the bridge —
-                // the leaf is unchanged, only its spelling moved. Same repair
-                // contract: derivable from authored premises or left as-is.
-                ProofStep::TheoryLemma {
-                    kind: TheoryLemmaKind::Generic,
-                    clause,
-                    ..
-                } if clause.len() == 1 => Some(clause[0]),
-                _ => None,
-            };
+            let term = Self::substitution_bridge_leaf_term(step);
             let Some(term) = term else {
                 continue;
             };
@@ -3298,27 +3346,27 @@ impl Executor {
                 tautology_leaves.push((goal, TheoryLemmaKind::IteBranchProjection));
             } else if ay_proof::recognize_array_guarded_row_expansion(&self.ctx.terms, &[goal]) {
                 tautology_leaves.push((goal, TheoryLemmaKind::ArrayGuardedRowExpansion));
-            } else if {
+            } else {
                 let decls = self.datatype_decls_for_strict_proof();
                 let selectors = self.ctor_selector_decls_for_strict_proof();
-                !decls.is_empty()
+                let is_datatype_tester_eval = !decls.is_empty()
                     && ay_proof::recognize_datatype_tester_eval_with_selectors(
                         &self.ctx.terms,
                         &[goal],
                         &decls,
                         &selectors,
-                    )
-            } {
-                // Tester evaluation over a constructor application
-                // (`((_ is B) B)`), registry-validated.
-                tautology_leaves.push((goal, TheoryLemmaKind::DatatypeTesterEval));
-            } else if ay_proof::recognize_array_finite_select_expansion(&self.ctx.terms, &[goal]) {
-                // The Bool/finite-carrier symbolic-select expansion axiom the
-                // array solver injects (`(ite p (= (select A true) (select A p))
-                // (= (select A false) (select A p)))`) — an intrinsic
-                // array-theory tautology whose exhaustiveness the typed
-                // validator re-derives point by point.
-                tautology_leaves.push((goal, TheoryLemmaKind::ArrayFiniteSelectExpansion));
+                    );
+                if is_datatype_tester_eval {
+                    // Registry-validated tester evaluation over a constructor (`((_ is B) B)`).
+                    tautology_leaves.push((goal, TheoryLemmaKind::DatatypeTesterEval));
+                } else if ay_proof::recognize_array_finite_select_expansion(
+                    &self.ctx.terms,
+                    &[goal],
+                ) {
+                    // Typed validation re-derives this intrinsic Bool/finite-carrier
+                    // symbolic-select expansion point by point.
+                    tautology_leaves.push((goal, TheoryLemmaKind::ArrayFiniteSelectExpansion));
+                }
             }
         }
         // A POSITIVE-EQUALITY leaf may be derivable outright by the equality
@@ -4434,7 +4482,7 @@ impl Executor {
     }
 
     /// Cheap shape probe: is either equality side a unary application whose
-
+    ///
     /// head COULD be a selector? Gates the registry fetch in `plan_eq`'s
     /// direct-projection leg.
     fn eq_sides_have_selector_application(&self, a: TermId, b: TermId) -> bool {
@@ -5324,8 +5372,10 @@ enum SurfaceCanonicalization {
 #[path = "proof_original_rebuild_tests.rs"]
 mod proof_original_rebuild_tests;
 
+#[path = "proof_original_rebuild_bv_lia_recovery_state.rs"]
+pub(in crate::executor) mod bv_lia_recovery_state;
 #[path = "proof_original_rebuild_bv_lia_scope.rs"]
-mod proof_original_rebuild_bv_lia_scope;
+pub(in crate::executor) mod proof_original_rebuild_bv_lia_scope;
 #[cfg(test)]
 #[path = "proof_original_rebuild_bv_lia_tests.rs"]
 mod proof_original_rebuild_bv_lia_tests;

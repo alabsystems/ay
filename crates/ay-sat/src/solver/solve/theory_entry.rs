@@ -23,11 +23,11 @@ impl Solver {
     ///
     /// Note: For full DPLL(T), use this in combination with `trail()` and `value()`
     /// to incrementally sync theory state and check for propagations.
-    pub fn solve_with_theory<F>(&mut self, theory_check: F) -> VerifiedSatResult
+    pub fn solve_with_theory<F>(&mut self, theory_check: F) -> SolverSatResult
     where
         F: FnMut(&mut Self) -> TheoryPropResult,
     {
-        VerifiedSatResult::from_validated(self.solve_with_theory_raw(theory_check))
+        SolverSatResult::from_solver_result(self.solve_with_theory_raw(theory_check))
     }
 
     /// Internal theory solve returning raw `SatResult`.

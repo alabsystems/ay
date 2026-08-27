@@ -193,3 +193,114 @@ fn test_unit_strengthening_contradiction_detected() {
         "Expected UNSAT but got {result:?}"
     );
 }
+
+/// Build `C = {a,b,c,d}` forward-subsumed by `D = {a,b}`, ready for `subsume()`.
+/// Returns `(solver, subsumed_idx)`.
+fn forward_subsumption_fixture() -> (Solver, usize) {
+    let mut solver = Solver::new(4);
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+    let d = Literal::positive(Variable(3));
+
+    let subsumed_idx = solver.add_clause_db(&[a, b, c, d], false);
+    let _subsumer_idx = solver.add_clause_db(&[a, b], false);
+    solver.initialize_watches();
+    for v in solver.subsume_dirty.iter_mut() {
+        *v = true;
+    }
+    (solver, subsumed_idx)
+}
+
+/// A forward-subsumed clause that a queued theory conflict still owns must be
+/// RETAINED, and retaining it must not trip the subsumption post-condition.
+///
+/// The post-condition used to assert `is_reason_clause_marked` on every
+/// retained clause, exempting only the #6913 dead-subsumer case. A clause in
+/// `pending_theory_conflicts` is refused by `can_delete_clause` (the queue owns
+/// the `ClauseRef` until the solve loop consumes it, #6262) while being no
+/// var's reason, so it satisfied neither the assertion nor its exemptions and
+/// panicked a debug build mid-solve — with `BUG: subsume() left clause N active
+/// without reason protection`, which reads like a subsumption defect but is a
+/// correct, required retention.
+#[test]
+fn test_subsume_retains_queued_theory_conflict_without_tripping_postcondition() {
+    let (mut solver, subsumed_idx) = forward_subsumption_fixture();
+
+    solver
+        .pending_theory_conflicts
+        .push_back(ClauseRef(subsumed_idx as u32));
+
+    // The discriminator that decides "over-strong assert" vs "real subsume
+    // bug": the retained clause is not a reason for any assigned literal, so
+    // the old assertion's premise — not the algorithm — was what was wrong.
+    assert!(solver.trail.is_empty());
+    assert!(!solver.is_reason_clause_marked(subsumed_idx));
+    assert_eq!(
+        solver.classify_forward_subsumption_retention(subsumed_idx),
+        mutate::ForwardSubsumptionRetention::TheoryQueued,
+    );
+
+    solver.subsume();
+
+    assert!(
+        solver.arena.is_active(subsumed_idx) && !solver.arena.is_dead(subsumed_idx),
+        "a queued theory conflict's clause must survive subsumption — deleting it \
+         leaves take_pending_theory_conflict dereferencing a dead clause",
+    );
+}
+
+/// Narrowness pin for the retention tripwire: the classification must report
+/// `Unexplained` for a clause the pipeline has no reason to keep. Without this,
+/// widening the exemption set to silence the panic could quietly turn the
+/// tripwire into a constant `true`.
+#[test]
+fn test_forward_subsumption_retention_classifies_unexplained() {
+    let (solver, subsumed_idx) = forward_subsumption_fixture();
+
+    // Deletable clause: not a reason, not queued, LRAT off. Nothing explains
+    // keeping it, so a decline here would be a genuine pipeline bug.
+    assert!(solver.can_delete_clause(subsumed_idx, mutate::ReasonPolicy::Skip));
+    assert!(!solver.cold.lrat_enabled);
+    assert_eq!(
+        solver.classify_forward_subsumption_retention(subsumed_idx),
+        mutate::ForwardSubsumptionRetention::Unexplained,
+    );
+}
+
+/// The historical case the post-condition was written for still classifies as
+/// reason protection rather than falling through to the tripwire.
+#[test]
+fn test_forward_subsumption_retention_classifies_reason_protected() {
+    let (mut solver, subsumed_idx) = forward_subsumption_fixture();
+
+    // Make the clause the reason for a level-0 assignment.
+    let a = Literal::positive(Variable(0));
+    solver.enqueue(a, Some(ClauseRef(subsumed_idx as u32)));
+    solver.invalidate_reason_clause_marks();
+    solver.ensure_reason_clause_marks_current();
+
+    assert!(solver.is_reason_clause_marked(subsumed_idx));
+    assert_eq!(
+        solver.classify_forward_subsumption_retention(subsumed_idx),
+        mutate::ForwardSubsumptionRetention::ReasonProtected,
+    );
+}
+
+/// With LRAT on, a decline that `can_delete_clause` does not object to is the
+/// proof-bookkeeping case and must NOT trip the tripwire. This is the shape
+/// reachable under a solve deadline: `materialize_level0_unit_proofs_impl`
+/// honours the stop between proof rows and returns false, so
+/// `delete_clause_checked` reports `Skipped` for a clause that is neither a
+/// reason nor theory-queued.
+#[test]
+fn test_forward_subsumption_retention_classifies_proof_bookkeeping() {
+    let (mut solver, subsumed_idx) = forward_subsumption_fixture();
+    solver.cold.lrat_enabled = true;
+
+    assert!(solver.can_delete_clause(subsumed_idx, mutate::ReasonPolicy::Skip));
+    assert_eq!(
+        solver.classify_forward_subsumption_retention(subsumed_idx),
+        mutate::ForwardSubsumptionRetention::ProofBookkeeping,
+    );
+}

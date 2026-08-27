@@ -7,6 +7,7 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Proof, ProofId, ProofStep, TermId, TermStore, TheoryLemmaProof};
 
 use super::congruence::try_derive_empty_via_congruence_bridging;
+use super::empty_clause::boolean_closure::try_derive_empty_via_boolean_disjunction;
 use super::empty_clause::{
     derive_empty_via_trust_lemma, try_derive_empty_via_contradictory_assumptions,
     try_derive_empty_via_equality_contradiction, try_derive_empty_via_euf_transitivity,
@@ -95,6 +96,14 @@ impl Executor {
             return;
         }
         if try_derive_empty_via_contradictory_assumptions(&self.ctx.terms, proof) {
+            return;
+        }
+        // (#4751) Last resort before the trust head: close through the BOOLEAN
+        // structure of a wide disjunction leaf. Placed HERE on purpose — it
+        // only ever runs where `derive_empty_via_trust_lemma` would otherwise
+        // assert an unproved head, so it can replace a hole and can never
+        // pre-empt a strategy that already derives.
+        if try_derive_empty_via_boolean_disjunction(&mut self.ctx.terms, proof) {
             return;
         }
         derive_empty_via_trust_lemma(&mut self.ctx.terms, proof);

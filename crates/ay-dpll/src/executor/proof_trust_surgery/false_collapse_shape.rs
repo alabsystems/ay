@@ -2,14 +2,16 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-// Recognition of the complete live preprocessor-collapse proof shape.
+//! Recognition of the complete live preprocessor-collapse proof shape.
 
-struct FalseCollapseShape {
-    assume: Option<TermId>,
-    assume_count: usize,
-    false_step: Option<(TermId, TermId)>,
-    trust_false: bool,
-    lia_lemma: bool,
+use super::*;
+
+pub(super) struct FalseCollapseShape {
+    pub(super) assume: Option<TermId>,
+    pub(super) assume_count: usize,
+    pub(super) false_step: Option<(TermId, TermId)>,
+    pub(super) trust_false: bool,
+    pub(super) lia_lemma: bool,
 }
 
 impl Executor {
@@ -18,7 +20,10 @@ impl Executor {
     /// Theory-lemma and ordinary-step encodings of the `(not false)` wiring are
     /// equivalent here. Any extra live rule, repeated closing resolution, or
     /// malformed false step declines the repair without changing the proof.
-    fn recognize_false_collapse_shape(&self, proof: &Proof) -> Option<FalseCollapseShape> {
+    pub(super) fn recognize_false_collapse_shape(
+        &self,
+        proof: &Proof,
+    ) -> Option<FalseCollapseShape> {
         let live = taut_surface::live_steps(proof)?;
         let mut shape = FalseCollapseShape {
             assume: None,

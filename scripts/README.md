@@ -25,6 +25,9 @@ script does not exist until its index entry does
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
 | chc-cert-check | audit.chc | `scripts/chc_cert_check.py` | python | active | - | Independent CHC SAFE-certificate checker (external SMT arbiter). |
+| flag-audit | audit.flags | `scripts/flag_audit.py` | python | active | - | Compatibility/listing audit for the historical regex count (338 after B1); the Rust ay-quality-gate exact-set scanner is the build ratchet. |
+| flag-baseline-reconcile | audit.flags | `scripts/flag_baseline_reconcile.py` | python | active | - | Reconcile the env-flag exact-set baseline after deleting flags: prune entries, rebuild the key-site section sorted from the failing gate's own report. |
+| quality-baseline-reconcile | audit.flags | `scripts/quality_baseline_reconcile.py` | python | active | - | Reconcile the file/function/construct size ratchets and file_size waiver ceilings from the quality gate's own report; seeds new construct sites so a second pass can pick up the true fingerprint. |
 | proof-checkability-sweep | audit.proof | `scripts/proof_checkability_sweep.py` | python | active | - | Sweep a corpus for AY UNSAT verdicts that are independently kernel-checkable via the complete-conflict Lean firewall, cross-checking each verdict against z3 and :status. |
 | firewall-selfcert-check | audit.smt | `scripts/firewall-selfcert-check.sh` | bash | active | - | End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones. |
 | lra-bmc-validate | audit.smt | `scripts/lra_bmc_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .bmc files. |
@@ -57,6 +60,9 @@ script does not exist until its index entry does
 | pb-bench | bench.pb | `scripts/pb_bench.sh` | sh | active | - | Parallel PB benchmark runner for AY. |
 | pb-cert-coverage | bench.pb | `scripts/pb_cert_coverage.sh` | bash | active | - | PB certificate coverage probe: solve with --proof and check emitted proofs with VeriPB. |
 | pb-sweep | bench.pb | `scripts/pb_sweep.py` | python | active | - | Pseudo-Boolean sweep: AY-PB vs a reference (RoundingSat) on OPB/WBO with verdict cross-checks. |
+| lever-ab-verdict | bench.sat | `scripts/lever_ab_verdict.py` | python | active | - | Score one paired lever A/B sweep per arm (certificates joined on the arm, never collapsed) and print a FLIP / NO-FLIP verdict. |
+| lever-eligibility | bench.sat | `scripts/lever_eligibility.py` | python | active | - | Compute each default-OFF SAT lever's eligible population from CNF headers, applying that lever's own gate arithmetic. |
+| run-lever-ab | bench.sat | `scripts/run_lever_ab.sh` | bash | active | - | One command: build the lever binary off the main target dir, sweep each default-OFF lever's eligible population with both arms paired in one run, drain certificates, print a flip verdict per lever. |
 | sat-attribute | bench.sat | `scripts/sat_bench/attribute.py` | python | active | - | Classify a sat_compare results JSON: bucket instances and attribute the gap by family. |
 | sat-bve-audit | bench.sat | `scripts/sat_bench/audit.py` | python | active | - | Soundness audit for the BVE-enabled build: flag wrong answers on known-verdict instances. |
 | sat-combine-threeway | bench.sat | `scripts/sat_bench/combine_threeway.py` | python | active | - | Combine the split three-way @300s result JSONs into the full-set verdict. |
@@ -168,6 +174,8 @@ script does not exist until its index entry does
 | workspace-feature-unification-gate | gate.release | `scripts/ci/workspace_feature_unification_gate.sh` | bash | active | - | Fresh-target build gate for the ay CLI plus the system-allocator ay-pb binary under unified workspace features. |
 | sat-soundness-gate | gate.soundness | `scripts/ci/sat_soundness_gate.sh` | bash | active | `ay gate` | SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts. |
 | smt-soundness-gate | gate.soundness | `scripts/ci/smt_soundness_gate.sh` | bash | active | `ay gate` | SMT soundness-differential gate; the in-tree pre-push net. |
+| trust-ratchet-accounting | gate.soundness | `scripts/trust_ratchet_accounting.py` | python | active | - | Difference two ratchet baselines by obligation IDENTITY, so an obligation that was PROVED is distinguishable from one that merely STOPPED BEING ASKED: only `proved_solver_discharged`/`kernel_certified` are floors (deleting an obligation cannot raise them), gap counters are disclosed and never credited, and every run states proved-versus-not-asked in one line with removals attributed to the callee summary that caused them. |
+| trust-survey-parse | gate.soundness | `scripts/trust_survey_parse.py` | python | active | - | Parse a direct-compiler_consumer verification log into the ratchet baseline JSON: the authoritative per-function verdict lane plus in-band TRUST_JSON records, with the native-bundle `native_*` counters demoted to a labelled secondary engine-coverage metric. |
 
 ## hook
 
@@ -179,12 +187,15 @@ script does not exist until its index entry does
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
+| nra-oracle-campaign | lib | `scripts/nra_oracle_campaign.py` | python | active | - | Bounded scheduling, child supervision, and harness-abort coordination for NRA oracle shards. |
+| nra-oracle-shards-lib | lib | `scripts/nra_oracle_shards_lib.py` | python | active | - | Persistence, terminal-summary validation, and shard-range primitives for NRA oracle campaigns. |
 | oom-guard | lib | `scripts/_oom_guard.py` | python | active | - | Aggregate admission control for harness children: cap concurrency, hand each child MEMLIMIT/NBCORE env. |
 
 ## oracle
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
+| nra-oracle-shards | oracle.nra | `scripts/nra_oracle_shards.py` | python | active | - | Run resource-enveloped ay-nra-oracle fuzz shards with bounded concurrency and durable abandonment evidence. |
 | rewrite-oracle-build | oracle.rewrite | `scripts/build_rewrite_oracle.py` | python | active | - | Regenerate the fast-core rewrite golden oracle from AY harness results. |
 | rewrite-oracle-check | oracle.rewrite | `scripts/rewrite_oracle_check.py` | python | active | - | Regression oracle for the hash-consing / fast-core rewrite: run a binary on the golden verdict set. |
 
@@ -206,6 +217,8 @@ script does not exist until its index entry does
 | java-binding-smoke | test | `bindings/java/run.sh` | bash | active | - | Build and run the AY Java (FFM) binding test against libay_ffi. |
 | no-python-test-skips | test | `scripts/check_no_python_test_skips.py` | python | active | - | Fail-closed AST gate forbidding active skips and expected failures in first-party Python. |
 | no-python-test-skips-tests | test | `scripts/tests/test_no_python_test_skips.py` | python | active | - | Adversarial self-tests and repository-cleanliness pin for the Python zero-skip gate. |
+| nra-oracle-shards-terminal-tests | test | `scripts/tests/test_nra_oracle_shards_terminal.py` | python | active | - | Rejection-matrix and harness-abort regression tests for NRA oracle sharding. |
+| nra-oracle-shards-tests | test | `scripts/tests/test_nra_oracle_shards.py` | python | active | - | Resource-envelope, bounded-scheduler, and persistence tests for NRA oracle sharding. |
 | ocaml-binding-smoke | test | `bindings/ocaml/run.sh` | bash | active | - | Build and run the AY OCaml binding test against libay_ffi. |
 | oom-guard-tests | test | `scripts/tests/test_oom_guard.py` | python | active | - | Tests for _oom_guard.py resource planning and the harness wiring. |
 | resource-harness-tests | test | `scripts/tests/test_resource_harnesses.py` | python | active | - | Tests for benchmark drivers that consume the shared OOM guard. |

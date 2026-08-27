@@ -9,18 +9,19 @@
 //! structured rule can be inferred the proof is more precise than the generic
 //! `trust` fallback.
 //!
-//! Extracted from `proof_tracker.rs` for file-size hygiene (#4534).
-//! Split into submodules for code health (#5970):
+//! Extracted from `proof_tracker.rs` and split for code health (#4534, #5970):
 //! - `euf`: EUF congruence/transitivity lemma inference
 //! - `decompose`: Combined real-theory lemma decomposition
 //! - `funnel`: strict-checkable classification of materialized lemmas
 
 mod arith_farkas_classification;
+mod core_search;
 mod decompose;
 mod euf;
 mod funnel;
 #[cfg(test)]
 mod funnel_tests;
+pub(crate) mod intrinsic;
 mod recording_dt;
 
 use std::borrow::Cow;
@@ -38,6 +39,7 @@ use arith_farkas_classification::{
     linear_equality_arith_farkas_valid_memo, opaque_arith_farkas_valid,
     opaque_arith_farkas_valid_memo, LinearFarkasVerdict,
 };
+use core_search::{classifiable_core_decomposition, SortedTheoryPresence};
 
 // Re-export pub(crate) items from submodules.
 pub(crate) use decompose::{decompose_generic_combined_real_lemma, CombinedDecompositionBudget};
@@ -893,66 +895,16 @@ fn classify_whole_conflict(
     )
 }
 
-/// Which sort-gated recognizers in the chain can possibly fire.
+/// The classifier chain, shared by whole-conflict classification and by the
+/// bounded core search.
 ///
-/// `recognize_string_ground_eval` and `recognize_fp_ground_eval` each open with
-/// a hygiene gate — "does this clause mention any String/RegLan term", "…any
-/// FloatingPoint term" — implemented as a full walk of the clause's term DAG
-/// behind a freshly allocated visited-set. On a problem in neither theory the
-/// walk runs to completion and returns `false`, every time.
-///
-/// That is invisible at one call per conflict and dominant at 512 (see
-/// `DECOMPOSE_MAX_ATTEMPTS`): profiled on the #7956 AUFLIA ext_eq refutation —
-/// no strings, no floats — the two gates were 8.9% of runtime EACH, ~18%
-/// together, entirely inside `classifiable_core_decomposition`.
-///
-/// Deciding both gates once per conflict is exact, not an approximation. Every
-/// sub-clause the decomposition builds is a SUBSET of `clause`, so the terms
-/// reachable from it are a subset of those reachable from `clause`; if no
-/// String/RegLan (resp. FloatingPoint) term is reachable from the whole clause,
-/// none is reachable from any sub-clause, and the skipped recognizer would have
-/// returned `false` anyway. No conflict changes lemma kind, so no verdict and
-/// no proof artifact changes — only the work does.
-///
-/// Both gates are computed LAZILY, and that is load-bearing rather than tidy:
-/// the chain is ordered cheap-first, and a conflict classified by EUF or Farkas
-/// never reached the string/FP arms before this change. Computing the presence
-/// eagerly would have paid the walk on exactly the conflicts that used to skip
-/// it — turning a saving into a tax on the common path.
-struct SortedTheoryPresence<'a> {
-    terms: &'a TermStore,
-    clause: &'a [TermId],
-    string_or_regex: std::cell::OnceCell<bool>,
-    floating_point: std::cell::OnceCell<bool>,
-}
-
-impl<'a> SortedTheoryPresence<'a> {
-    /// Presence over the WHOLE conflict clause. Sub-clauses of `clause` share
-    /// this instance; see the type docs for why that is exact.
-    fn over(terms: &'a TermStore, clause: &'a [TermId]) -> Self {
-        Self {
-            terms,
-            clause,
-            string_or_regex: std::cell::OnceCell::new(),
-            floating_point: std::cell::OnceCell::new(),
-        }
-    }
-
-    /// Delegates to the recognizers' OWN gate predicates, so the fast path and
-    /// the strict validator cannot drift apart.
-    fn string_or_regex(&self) -> bool {
-        *self
-            .string_or_regex
-            .get_or_init(|| ay_proof::clause_mentions_string_or_regex(self.terms, self.clause))
-    }
-
-    fn floating_point(&self) -> bool {
-        *self
-            .floating_point
-            .get_or_init(|| ay_proof::clause_mentions_floating_point(self.terms, self.clause))
-    }
-}
-
+/// ADDING AN ARM HERE REQUIRES UPDATING `core_search::AttemptFeasibility`, which
+/// decides — from facts computed once per conflict — that NO arm below can
+/// accept a given sub-clause and skips the call. Its doc comment enumerates
+/// every arm and the necessary condition it reads; an arm not listed there is
+/// silently assumed unable to fire. `core_search_tests` decides the gated and
+/// exhaustive searches equal over a mixed alphabet, so a missed arm shows up
+/// there if the alphabet reaches it.
 fn classify_whole_conflict_gated(
     terms: &TermStore,
     negations: &HashMap<TermId, TermId>,
@@ -969,14 +921,29 @@ fn classify_whole_conflict_gated(
         // unpromotable `LiaGeneric` for an exactly-checkable clause.
         .or_else(|| infer_arith_diseq_split_lemma(terms, clause))
         .or_else(|| infer_arith_farkas(terms, conflict, clause))
-        .or_else(|| infer_array_lemma(terms, clause))
+        .or_else(|| {
+            present
+                .array()
+                .then(|| infer_array_lemma(terms, clause))
+                .flatten()
+        })
         .or_else(|| {
             present
                 .string_or_regex()
                 .then(|| infer_string_ground_eval_lemma(terms, clause))
                 .flatten()
         })
-        .or_else(|| infer_regex_intersect_empty_lemma(terms, clause))
+        .or_else(|| {
+            // `recognize_regex_intersect_empty` accepts only a clause with a
+            // group of memberships over a common subject, and every membership
+            // it decodes requires a `Sort::String` subject (`str.in_re`'s first
+            // argument, or a String equality against a ground constant). The
+            // same presence walk therefore gates it exactly.
+            present
+                .string_or_regex()
+                .then(|| infer_regex_intersect_empty_lemma(terms, clause))
+                .flatten()
+        })
         .or_else(|| {
             present
                 .floating_point()
@@ -995,149 +962,6 @@ fn classify_whole_conflict_gated(
             Some((kind, clause.to_vec()))
         })
         .filter(|(kind, _)| *kind != TheoryLemmaKind::Generic)
-}
-
-/// How many literals the core search may drop from a mixed conflict.
-///
-/// The mixed conflicts observed in practice carry a small number of foreign
-/// literals (sampled shapes: a datatype-tester core plus one or two equalities,
-/// a set/array core plus a select). Three covers those while keeping the search
-/// small; the attempt cap below is the real bound.
-const DECOMPOSE_MAX_DROPPED: usize = 3;
-
-/// Hard cap on classifier invocations per conflict, so a wide conflict cannot
-/// turn proof production into a combinatorial search.
-const DECOMPOSE_MAX_ATTEMPTS: usize = 512;
-
-/// Find a single-theory core inside a mixed conflict (#combined-theory-decompose).
-///
-/// Returns `(kind, core_clause, full_clause)` where `core_clause` is the
-/// classifier's own ordering of the core literals and `full_clause` is the
-/// complete blocking clause with `core_clause` as a PREFIX — the exact shape
-/// `weakening` requires (`ay-proof` `validate_weakening`: the premise clause
-/// must be a prefix of the result).
-///
-/// Soundness: the emitted core lemma is checked by its own kind's validator, and
-/// weakening a valid clause by appending literals preserves validity. The full
-/// clause is literal-for-literal the same SET the caller would have emitted as
-/// `Generic`, so nothing downstream sees a different fact — only a checkable
-/// justification for it.
-fn classifiable_core_decomposition(
-    terms: &TermStore,
-    negations: &HashMap<TermId, TermId>,
-    conflict: &[TheoryLit],
-    clause: &[TermId],
-) -> Option<(TheoryLemmaKind, Vec<TermId>, Vec<TermId>)> {
-    if conflict.len() != clause.len() || conflict.len() < 2 {
-        return None;
-    }
-
-    let mut attempts = 0usize;
-    let max_dropped = DECOMPOSE_MAX_DROPPED.min(conflict.len().saturating_sub(1));
-    // Share each lazy theory-presence walk across the bounded core search.
-    let present = SortedTheoryPresence::over(terms, clause);
-
-    // Prefer the LARGEST core: dropping fewer literals keeps more of the
-    // conflict inside the checked lemma.
-    for dropped in 1..=max_dropped {
-        let mut drop_idx = (0..dropped).collect::<Vec<usize>>();
-        loop {
-            if attempts >= DECOMPOSE_MAX_ATTEMPTS {
-                return None;
-            }
-            attempts += 1;
-
-            let keep: Vec<usize> = (0..conflict.len())
-                .filter(|i| !drop_idx.contains(i))
-                .collect();
-            let sub_conflict: Vec<TheoryLit> = keep.iter().map(|&i| conflict[i]).collect();
-            let sub_clause: Vec<TermId> = keep.iter().map(|&i| clause[i]).collect();
-
-            if let Some((kind, core_clause)) = classify_whole_conflict_gated(
-                terms,
-                negations,
-                &sub_conflict,
-                &sub_clause,
-                &present,
-                // Sub-clause core search: skip the DT lane — running the
-                // ground refuter up to DECOMPOSE_MAX_ATTEMPTS times per
-                // conflict is the wrong cost model, and the whole-conflict
-                // pass above already probed it.
-                None,
-            ) {
-                // (#ground-conflict-decomp) The weakened recorder
-                // (`add_theory_lemma_weakened` -> `add_theory_lemma_with_kind`)
-                // carries no LIA evidence, so a `LiaGeneric` core downgrades
-                // to a Generic trust CORE step there — and that is actively
-                // wrong: the integer gate classifies any all-integer
-                // sub-conflict WITHOUT semantic verification, so a
-                // manufactured core can be standalone-INVALID (measured: the
-                // guard-dropped `(cl (<= sk 0) (<= 2 sk))`, falsified at
-                // sk=1, recorded as trust). Refuse exactly that kind; the
-                // search continues, and an unclassifiable conflict falls back
-                // to the full-clause Generic exactly as before. `LraFarkas`
-                // cores are deliberately KEPT: the linear verifier accepted
-                // their certificate over the sub-conflict at classification
-                // time, so the recorded core is verified-valid (baseline
-                // behavior, and refusing them measurably regressed the
-                // un-guarded array-frame certification).
-                // Covered by `--no-ground-conflict-decomp` (off = baseline).
-                if matches!(kind, TheoryLemmaKind::LiaGeneric)
-                    && crate::quant_unit_authority::ground_conflict_decomp_enabled()
-                {
-                    if !advance_combination(&mut drop_idx, conflict.len()) {
-                        break;
-                    }
-                    continue;
-                }
-                // The classifier may reorder its literals; the core must stay a
-                // prefix, so rebuild the full clause as core ++ dropped.
-                let core_set: HashSet<TermId> = core_clause.iter().copied().collect();
-                if core_set.len() == core_clause.len() {
-                    let mut full_clause = core_clause.clone();
-                    for &lit in clause {
-                        if !core_set.contains(&lit) {
-                            full_clause.push(lit);
-                        }
-                    }
-                    // Only accept when the weakened clause still covers the
-                    // original blocking clause exactly. A malformed candidate
-                    // must not abort the bounded search: a later subset can
-                    // still expose an unambiguous core.
-                    let full_set: HashSet<TermId> = full_clause.iter().copied().collect();
-                    let orig_set: HashSet<TermId> = clause.iter().copied().collect();
-                    if full_set == orig_set {
-                        return Some((kind, core_clause, full_clause));
-                    }
-                }
-            }
-
-            // Next combination of dropped indices (lexicographic). Exhausting
-            // this cardinality continues the outer loop so cores that require
-            // dropping two or three foreign literals are still considered.
-            if !advance_combination(&mut drop_idx, conflict.len()) {
-                break;
-            }
-        }
-    }
-    None
-}
-
-fn advance_combination(indices: &mut [usize], universe_len: usize) -> bool {
-    let selected = indices.len();
-    for position in (0..selected).rev() {
-        let Some(max_index) = universe_len.checked_sub(selected - position) else {
-            return false;
-        };
-        if indices[position] < max_index {
-            indices[position] += 1;
-            for later in position + 1..selected {
-                indices[later] = indices[later - 1] + 1;
-            }
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]

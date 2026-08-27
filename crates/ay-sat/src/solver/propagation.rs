@@ -319,6 +319,14 @@ impl Solver {
         if assigned_reason != NO_REASON {
             self.reason_marks_invalidated = true;
         }
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15).
+        // The general `enqueue` is not only the decision path: the BCP loops
+        // fall back to it on the unit-clause and blocker branches, so leaving
+        // it out would silently undercount the score. Decisions pass
+        // `reason == None` and are not uses. No-op unless the arm is armed.
+        if let Some(reason) = reason_clause {
+            self.two_stage_note_bcp_use(reason);
+        }
         self.trail.push(lit);
         solver_log!(
             self,
@@ -499,6 +507,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         // Prefetch watch list for next propagation step.
@@ -602,6 +614,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         // Prefetch watch list for next propagation step.
@@ -676,6 +692,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         self.watches.prefetch_first(lit.negated());
@@ -723,6 +743,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         self.watches.prefetch_first(lit.negated());
@@ -778,6 +802,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         self.watches.prefetch_first(lit.negated());
@@ -822,6 +850,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         // No watch prefetch: IC3 working set fits in L1 cache.
@@ -866,6 +898,10 @@ impl Solver {
             flags: preserved_flags,
             _pad: [0; 3],
         };
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829 Algorithm 1 line 15):
+        // this clause just forced a literal. No-op unless the two-stage arm
+        // is armed; see `solver/reduction_two_stage.rs`.
+        self.two_stage_note_bcp_use(reason);
         // Reason marking deferred (#8569): see enqueue() comment.
         self.trail.push(lit);
         // No watch prefetch: IC3 working set fits in L1 cache.
@@ -1149,6 +1185,24 @@ impl Solver {
 
     #[inline]
     pub(super) fn pick_next_decision_variable_main(&mut self) -> Option<Variable> {
+        // Independent-support restriction (solver/indep_support.rs): while any
+        // support variable is unassigned, decide only on support variables —
+        // every other variable is a gate output that BCP derives. Placed
+        // before the random-decision injection so an off-support random pick
+        // cannot defeat the restriction.
+        //
+        // DECISIONS ONLY. An exhausted support returns `None` and FALLS
+        // THROUGH to the unrestricted route below; it is never a SAT signal,
+        // so a support that does not in fact determine every variable costs
+        // decisions, never a wrong answer.
+        if !self.indep_support.is_empty() {
+            if let Some(var) = self.pick_indep_support_decision() {
+                self.stats.indep_support_decisions += 1;
+                return Some(var);
+            }
+            self.stats.indep_support_fallback_decisions += 1;
+        }
+
         // Z3-style per-decision random frequency: with probability random_var_freq,
         // pick a random unassigned variable. Z3 SMT default: 0.01 (1%).
         if self.cold.random_var_freq > 0.0 {
@@ -1382,6 +1436,10 @@ impl Solver {
         const _: () = assert!(crate::arena_limits::MAX_ARENA_WORDS <= u32::MAX as u64);
 
         if self.watches.is_unbuilt() {
+            // Offset 0 means the formula is COMPLETE, so its reservation slack
+            // (~1GB on vlsat3_b99) goes back to `--memory` before the watch
+            // buffer is sized. See `super::load_slack`.
+            self.reclaim_load_time_slack(start_offset);
             // Whole-formula rebuild: the clause set is fully known, so every
             // region is sized exactly in one shot (see below).
             self.initialize_watches_exact(start_offset);

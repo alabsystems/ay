@@ -24,6 +24,13 @@ struct MultiDefPlan {
     def_indices: FxHashMap<PredicateId, Vec<usize>>,
 }
 
+struct MultiDefFacts {
+    head_count: FxHashMap<PredicateId, usize>,
+    tail_count: FxHashMap<PredicateId, usize>,
+    def_indices: FxHashMap<PredicateId, Vec<usize>>,
+    is_self_recursive: FxHashSet<PredicateId>,
+}
+
 impl ClauseInliner {
     /// Compute the exact phase-2 candidate set before trace-shape filtering.
     ///
@@ -32,6 +39,31 @@ impl ClauseInliner {
     /// conservative "all multi-defined predicates" approximation from
     /// blocking unrelated unique-definition collapse.
     fn plan_multi_def(&self, clauses: &[HornClause]) -> MultiDefPlan {
+        let MultiDefFacts {
+            head_count,
+            tail_count,
+            def_indices,
+            is_self_recursive,
+        } = Self::collect_multi_def_facts(clauses);
+        let mut candidates = self.initial_multi_def_candidates(
+            clauses,
+            &head_count,
+            &tail_count,
+            &def_indices,
+            &is_self_recursive,
+        );
+        Self::remove_cross_product_candidates(clauses, &head_count, &mut candidates);
+        self.retain_def_independent(clauses, &def_indices, &mut candidates);
+
+        MultiDefPlan {
+            candidates,
+            head_count,
+            tail_count,
+            def_indices,
+        }
+    }
+
+    fn collect_multi_def_facts(clauses: &[HornClause]) -> MultiDefFacts {
         let mut head_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
         let mut tail_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
         let mut def_indices: FxHashMap<PredicateId, Vec<usize>> = FxHashMap::default();
@@ -50,13 +82,29 @@ impl ClauseInliner {
             }
         }
 
+        MultiDefFacts {
+            head_count,
+            tail_count,
+            def_indices,
+            is_self_recursive,
+        }
+    }
+
+    fn initial_multi_def_candidates(
+        &self,
+        clauses: &[HornClause],
+        head_count: &FxHashMap<PredicateId, usize>,
+        tail_count: &FxHashMap<PredicateId, usize>,
+        def_indices: &FxHashMap<PredicateId, Vec<usize>>,
+        is_self_recursive: &FxHashSet<PredicateId>,
+    ) -> FxHashSet<PredicateId> {
         let mut candidates: FxHashSet<PredicateId> = FxHashSet::default();
         let query_body_preds = if self.preserve_query_body_predicates {
             Self::query_body_predicates(clauses)
         } else {
             FxHashSet::default()
         };
-        for (&pred, &h_count) in &head_count {
+        for (&pred, &h_count) in head_count {
             if h_count < 2 || query_body_preds.contains(&pred) {
                 continue;
             }
@@ -104,6 +152,14 @@ impl ClauseInliner {
             }
         }
 
+        candidates
+    }
+
+    fn remove_cross_product_candidates(
+        clauses: &[HornClause],
+        head_count: &FxHashMap<PredicateId, usize>,
+        candidates: &mut FxHashSet<PredicateId>,
+    ) {
         // Avoid cross-product expansion when multiple selected predicates
         // occur in one clause.
         let mut forbidden: FxHashSet<PredicateId> = FxHashSet::default();
@@ -123,7 +179,14 @@ impl ClauseInliner {
             }
         }
         candidates.retain(|pred| !forbidden.contains(pred));
+    }
 
+    fn retain_def_independent(
+        &self,
+        clauses: &[HornClause],
+        def_indices: &FxHashMap<PredicateId, Vec<usize>>,
+        candidates: &mut FxHashSet<PredicateId>,
+    ) {
         // A one-level rewrite may not remove a selected predicate whose
         // definition introduces another selected predicate: the selected set
         // must be "def-independent". The default path enforces this by dropping
@@ -178,7 +241,7 @@ impl ClauseInliner {
             }
         } else {
             let mut dependency_forbidden: FxHashSet<PredicateId> = FxHashSet::default();
-            for &pred in &candidates {
+            for &pred in candidates.iter() {
                 for &idx in &def_indices[&pred] {
                     for (body_pred, _) in &clauses[idx].body.predicates {
                         if candidates.contains(body_pred) {
@@ -189,13 +252,6 @@ impl ClauseInliner {
                 }
             }
             candidates.retain(|pred| !dependency_forbidden.contains(pred));
-        }
-
-        MultiDefPlan {
-            candidates,
-            head_count,
-            tail_count,
-            def_indices,
         }
     }
 

@@ -78,12 +78,12 @@
 //! [`root_separation_exponent`] — a Mahler/Davenport separation bound — so the
 //! number of bisections is a *derived* quantity, not a budget that guesses.
 //!
-//! # Why the refinement is reached by a ladder, MEASURED
+//! # Why refinement is reached by a ladder: historical pre-ladder evidence
 //!
 //! The separation bound is *proved* sufficient but exponentially conservative,
-//! and obeying it literally was where nearly all the time went.
-//! `anum_profile_cmp_phases` (load 8.66) split one `cmp_anum` on two distinct
-//! algebraic numbers into its phases:
+//! and obeying it literally was where nearly all the time went. Before the
+//! ladder existed, phase profiling of the direct-to-bound implementation (load
+//! 8.66) split one `cmp_anum` on two distinct algebraic numbers as follows:
 //!
 //! ```text
 //!   pair                      gcd  cert  radical  sep-bound  refine  TOTAL
@@ -382,9 +382,9 @@ pub(crate) fn root_separation_exponent(p: &ZPoly) -> Option<u32> {
 ///
 /// # Why this is not just `root_separation_exponent(normalize_defining(a*b))`
 ///
-/// MEASURED (`anum_profile_cmp_phases`, load 16.54): of the 70 us one
-/// `cmp_anum` spent on `3+sqrt2` vs `6+sqrt3`, the square-free radical of the
-/// PRODUCT was 17 us — 24% — and the exponent itself was **0 us**. The Yun
+/// Historical pre-ladder phase profiling (load 16.54) found that, of the 70 us
+/// one `cmp_anum` spent on `3+sqrt2` vs `6+sqrt3`, the square-free radical of
+/// the PRODUCT was 17 us — 24% — and the exponent itself was **0 us**. The Yun
 /// decomposition is the expensive half of "compute the separation bound", and
 /// it is unnecessary in the common case:
 ///
@@ -413,13 +413,13 @@ fn separation_exponent_for_pair(a: &ZPoly, b: &ZPoly, g: &ZPoly) -> Option<u32> 
 
 /// The escalation ladder for the separation search, in bits of precision.
 ///
-/// # Why a ladder, MEASURED
+/// # Why a ladder: historical pre-ladder evidence
 ///
 /// The Mahler/Davenport exponent is *proved* sufficient but is exponentially
-/// conservative. `anum_profile_cmp_phases` (load 16.54) measured, over seven
-/// representative pairs, a derived exponent of 38-227 bits driving 42-232
-/// bisections — while the number of bisections that actually made the two
-/// isolating intervals disjoint was **0, 0, 0, 0, 1, 2, 3**. The refinement was
+/// conservative. Before the ladder was introduced, profiling seven
+/// representative pairs (load 16.54) found a derived exponent of 38-227 bits
+/// driving 42-232 bisections, while the counts that actually made the two
+/// isolating intervals disjoint were **0, 0, 0, 0, 1, 2, 3**. Refinement was
 /// 76-95% of the whole call, so the bound was not expensive to COMPUTE; it was
 /// expensive to OBEY.
 ///
@@ -1246,12 +1246,12 @@ fn sum_resultant(p: &ZPoly, q: &ZPoly) -> Option<ZPoly> {
         if cj.is_zero() {
             continue;
         }
-        for i in 0..=j {
+        for (i, terms) in acc.iter_mut().enumerate().take(j + 1) {
             let mut coef = cj * binomial(j, i);
             if i % 2 == 1 {
                 coef = -coef;
             }
-            acc[i].push((Mono::var_pow(OUTER, u32::try_from(j - i).ok()?), coef));
+            terms.push((Mono::var_pow(OUTER, u32::try_from(j - i).ok()?), coef));
         }
     }
     let g = RPoly::from_coeffs(acc.into_iter().map(MPolyZ::from_terms).collect());
@@ -1274,12 +1274,12 @@ fn product_resultant(p: &ZPoly, q: &ZPoly) -> Option<ZPoly> {
         return None;
     }
     let mut gc: Vec<MPolyZ> = vec![MPolyZ::zero(); n + 1];
-    for i in 0..=n {
+    for (i, coefficient) in gc.iter_mut().enumerate() {
         let cj = &q.coeffs()[n - i];
         if cj.is_zero() {
             continue;
         }
-        gc[i] = MPolyZ::term(Mono::var_pow(OUTER, u32::try_from(n - i).ok()?), cj.clone());
+        *coefficient = MPolyZ::term(Mono::var_pow(OUTER, u32::try_from(n - i).ok()?), cj.clone());
     }
     let g = RPoly::from_coeffs(gc);
     mpoly_to_zpoly(&subresultant::resultant(&f, &g)?)
@@ -1307,7 +1307,7 @@ fn affine_shift(c: &AlgCell, m: &Bq) -> Option<Anum> {
         if cj.is_zero() {
             continue;
         }
-        for i in 0..=j {
+        for (i, coefficient) in out.iter_mut().enumerate().take(j + 1) {
             // c_j * C(j,i) * (2^k)^i * (-a)^(j-i) * (2^k)^(d-j)
             let e = u32::try_from(j - i).ok()?;
             let term = cj
@@ -1315,7 +1315,7 @@ fn affine_shift(c: &AlgCell, m: &Bq) -> Option<Anum> {
                 * two_k.pow(u32::try_from(i).ok()?)
                 * (-a.clone()).pow(e)
                 * two_k.pow(u32::try_from(d - j).ok()?);
-            out[i] += term;
+            *coefficient += term;
         }
     }
     let iv = BqInterval::new(c.iv.lo().add(m), c.iv.hi().add(m))?;
@@ -1335,9 +1335,9 @@ fn affine_scale(c: &AlgCell, m: &Bq) -> Option<Anum> {
     let (a, k) = (m.numerator().clone(), m.k());
     let two_k = BigInt::one() << k;
     let mut out = vec![BigInt::zero(); d + 1];
-    for i in 0..=d {
+    for (i, coefficient) in out.iter_mut().enumerate() {
         // `(2^k)^i == 2^(k*i)`, exactly the factor in the doc comment.
-        out[i] = &c.p.coeffs()[i]
+        *coefficient = &c.p.coeffs()[i]
             * two_k.pow(u32::try_from(i).ok()?)
             * a.pow(u32::try_from(d - i).ok()?);
     }

@@ -76,7 +76,10 @@ mod matching;
 mod pattern;
 mod pattern_helpers;
 mod persistent;
+mod relevance;
 mod substitution;
+#[cfg(test)]
+mod test_support;
 pub(crate) use ground_terms::{
     collect_bool_uf_arg_terms, collect_ground_terms_by_sort, contains_fixed_interpreted_arithmetic,
     enumerative_instantiation,
@@ -91,10 +94,16 @@ use pattern::{EMatchArg, EMatchPattern};
 #[cfg(test)]
 use pattern_helpers::pattern_covered_vars;
 pub(crate) use persistent::PersistentMatchState;
+pub(crate) use relevance::{
+    instance_features, relevance_config, score_instance, split_top_k, ModelStanding,
+    RelevanceConfig, ScoredInstance,
+};
 #[cfg(test)]
 use substitution::collect_free_var_names;
 use substitution::instantiate_body;
 pub(crate) use substitution::{mk_app_simplified, subst_vars, subst_vars_exact_qf};
+#[cfg(test)]
+use test_support::{perform_ematching, perform_ematching_with_config};
 
 /// Configuration for E-matching instantiation limits.
 ///
@@ -792,41 +801,36 @@ pub(crate) fn perform_ematching_with_generations(
                                 // A no_mbqi ("E-matching only") quantifier — the
                                 // Hilbert-`choose` combined axiom `forall i,j.
                                 // P(i,j) => P(chosen)` — must NOT be discharged by
-                                // matching a DIAGONAL ground term `P(c,c,..)` (all
-                                // args the SAME term). Over a transparent P the
-                                // diagonal is trivially true (reflexivity), and ay's
+                                // a ground term the SOLVER invented: ay's
                                 // `add_diagonal_forall_instances` completeness pass
-                                // manufactures exactly these `P(c,c)` ground terms
-                                // for every constant `c` — so matching one would
-                                // establish `P(chosen)` with NO genuine witness
-                                // (proves more than Verus, which is trigger-only). A
-                                // REAL program witness `P(7,8)` has DISTINCT args and
-                                // still matches, so witnessed cases still verify.
-                                // Sound: restricting instantiation only loses proofs,
-                                // never yields a wrong-UNSAT. (Fail-closed for the
-                                // rare diagonal-arg witness `P(5,5)`.) Generation is
-                                // NOT usable here: a concrete-literal witness is
-                                // re-materialized at generation>0, indistinguishable
-                                // from the synthesized diagonals by generation alone.
+                                // manufactures `P(c,c)` for every constant `c`, and
+                                // MBQI/CEGQI materialize `P(model-value,..)` apps —
+                                // matching one would establish `P(chosen)` with NO
+                                // genuine program witness (proving more than Verus,
+                                // which is trigger-only).
                                 //
-                                // The TERM-ID WATERMARK (terms.is_synthesized), by
-                                // contrast, IS robust: a hash-consed id never changes,
-                                // so a witness asserted in the original problem (e.g.
-                                // `f2(7,8)`) keeps its pre-watermark id even if MBQI
-                                // re-materializes it, while a witness the solver
-                                // invents from an LIA model value (`f2(-1,0)`) gets a
-                                // post-watermark id. Refuse the latter for a no_mbqi
-                                // (choose) axiom — a NON-diagonal synthesized witness
-                                // would otherwise discharge the choose existential with
-                                // no genuine program witness (proving more than Verus).
-                                // Sound: restricting instantiation only loses proofs.
-                                let diagonal = matches!(
-                                    terms.get(gt),
-                                    TermData::App(_, gargs)
-                                        if gargs.len() >= 2 && gargs.iter().all(|&a| a == gargs[0])
-                                );
-                                if terms.is_no_mbqi(quant) && (diagonal || terms.is_synthesized(gt))
-                                {
+                                // The TERM-ID WATERMARK (terms.is_synthesized) is
+                                // the exact discriminator: `set_synthesis_watermark`
+                                // runs at the top of the quantifier loop, BEFORE
+                                // Skolemization, the diagonal pass, and MBQI/CEGQI
+                                // value materialization, and a hash-consed id never
+                                // changes — so an authored witness (`f2(7, 8)`, and
+                                // equally the diagonal-arg `cnatf2(10, 10)`) keeps
+                                // its pre-watermark id even if a synthesis pass
+                                // re-materializes the same term, while every
+                                // solver-invented app allocates post-watermark.
+                                // Generation is NOT usable here (a re-materialized
+                                // witness reappears at generation>0), and a blanket
+                                // diagonal-shape refusal that used to sit alongside
+                                // the watermark refused genuine AUTHORED diagonal
+                                // witnesses too — `assert(cnatf2(10, 10))` before a
+                                // `choose` over `cnatf2` left the marked axiom
+                                // unfireable and a Verus-verified case unknown
+                                // (choose.rs `test_refine2_tuple`). Shape is not
+                                // provenance; the watermark is.
+                                // Sound: restricting instantiation only loses proofs,
+                                // never yields a wrong-UNSAT.
+                                if terms.is_no_mbqi(quant) && terms.is_synthesized(gt) {
                                     false
                                 } else if eqclasses_stable && !state.is_new_candidate(sym, gt) {
                                     // Already matched under this eqclass fingerprint:
@@ -1664,42 +1668,6 @@ pub(crate) fn collect_unconditional_foralls(
             _ => {}
         }
     }) // stacker::maybe_grow
-}
-
-#[allow(clippy::panic)]
-#[cfg(test)]
-fn perform_ematching(terms: &mut TermStore, assertions: &[TermId]) -> EMatchingResult {
-    let mut state = PersistentMatchState::new();
-    perform_ematching_with_generations(
-        terms,
-        assertions,
-        &EMatchingConfig::default(),
-        GenerationTracker::new(),
-        None,
-        &|| false,
-        &mut state,
-        None,
-    )
-}
-
-#[allow(clippy::panic)]
-#[cfg(test)]
-fn perform_ematching_with_config(
-    terms: &mut TermStore,
-    assertions: &[TermId],
-    config: &EMatchingConfig,
-) -> EMatchingResult {
-    let mut state = PersistentMatchState::new();
-    perform_ematching_with_generations(
-        terms,
-        assertions,
-        config,
-        GenerationTracker::new(),
-        None,
-        &|| false,
-        &mut state,
-        None,
-    )
 }
 
 #[allow(clippy::panic)]

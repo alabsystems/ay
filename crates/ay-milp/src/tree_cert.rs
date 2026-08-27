@@ -1412,13 +1412,40 @@ fn float_leaf_farkas(
 /// conventions are tried, and only an independently exact-verified Farkas
 /// certificate is returned.
 pub(crate) fn exact_farkas_from_float_ray(work: &Model, ray: &[f64]) -> Option<FarkasCertificate> {
+    exact_farkas_from_float_ray_grid(work, ray, None)
+}
+
+/// [`exact_farkas_from_float_ray`], with the ray first SNAPPED to a multiple of
+/// `2^-grid_bits`.
+///
+/// # Why this is safe, and why it is not the same argument as the bound leaf's
+///
+/// A Farkas certificate is a set of positive multipliers on the model's own
+/// facts whose oriented combination is `0·x >= -constant` with `constant < 0`.
+/// NOTHING about that is a property of the ray the float solver produced: the
+/// combination is recomputed exactly from whatever multipliers are proposed and
+/// re-verified by [`FarkasCertificate::verify`] against `work` before it is
+/// returned. So the ray is advice in exactly the sense the sign loop below
+/// already treats it as advice — two candidate rays are tried and only a
+/// verified one survives, and this simply makes some of the candidates coarser.
+///
+/// The DIFFERENCE from the bound leaf is that a snapped Farkas ray is much more
+/// likely to fail: the contradiction has to survive rounding, and the column
+/// residuals must still cancel against real bound facts. That is why the caller
+/// ladders down to `None` — a ray that will not close coarse is retried
+/// lossless, and only then is the leaf given up on.
+pub(crate) fn exact_farkas_from_float_ray_grid(
+    work: &Model,
+    ray: &[f64],
+    grid_bits: Option<u32>,
+) -> Option<FarkasCertificate> {
     if ray.len() != work.num_rows() {
         return None;
     }
     // The phase-I sign convention is not pinned down (see
     // `safe_farkas_proves_empty`); try the ray both ways.
     for sign in [1.0f64, -1.0] {
-        if let Some(cert) = ray_to_farkas(work, ray, sign) {
+        if let Some(cert) = ray_to_farkas(work, ray, sign, grid_bits) {
             if cert.verify(work).is_ok() {
                 return Some(cert);
             }
@@ -1438,7 +1465,12 @@ pub(crate) fn exact_farkas_from_float_ray(work: &Model, ray: &[f64]) -> Option<F
 /// a valid `y`). A COLUMN whose needed side is infinite has no bound fact to
 /// cancel against, so its residual is driven to EXACTLY zero instead — see
 /// [`eliminate_unbounded_residuals`].
-fn ray_to_farkas(work: &Model, ray: &[f64], sign: f64) -> Option<FarkasCertificate> {
+fn ray_to_farkas(
+    work: &Model,
+    ray: &[f64],
+    sign: f64,
+    grid_bits: Option<u32>,
+) -> Option<FarkasCertificate> {
     let n = work.num_cols();
     let m = work.num_rows();
     // Exact row multipliers, indexed by row; zero = the row contributes
@@ -1464,7 +1496,18 @@ fn ray_to_farkas(work: &Model, ray: &[f64], sign: f64) -> Option<FarkasCertifica
         if !finite {
             continue;
         }
-        let wr = exact(v)?;
+        // SNAP when asked. The bound SIDE was chosen from `v` above and stays
+        // correct: round-to-nearest cannot flip a sign, it can only collapse a
+        // value to ZERO, and a zero multiplier is exactly a row that
+        // contributes nothing -- so skip it rather than emit a multiplier
+        // `combine_bounded` would reject as non-positive.
+        let wr = match grid_bits {
+            Some(bits) => crate::opt_cert::snap_dyadic(v, bits)?,
+            None => exact(v)?,
+        };
+        if wr.is_zero() {
+            continue;
+        }
         accumulate_row(work, r, &wr, &mut d)?;
         w[r] = wr;
         any_row = true;
@@ -1875,7 +1918,7 @@ mod tests {
     #[test]
     fn the_rim_slice_bounds_one_leaf_and_never_outlives_the_caller() {
         let now = Instant::now();
-        let far = now + Duration::from_secs(120);
+        let far = now + Duration::from_mins(2);
         let slice = Duration::from_secs(5);
 
         let capped = budget(Some(far), Some(slice), 0, now)
@@ -2187,7 +2230,7 @@ mod tests {
         // One leaf, a whole minute of wall: the rim is affordable by any
         // measure, so the smaller certificate must be the one that ships.
         let b = budget(
-            Some(Instant::now() + Duration::from_secs(60)),
+            Some(Instant::now() + Duration::from_mins(1)),
             None,
             1,
             Instant::now(),
@@ -2219,7 +2262,7 @@ mod tests {
         let fat = bulky_but_valid(&model);
 
         let b = budget(
-            Some(Instant::now() + Duration::from_secs(60)),
+            Some(Instant::now() + Duration::from_mins(1)),
             None,
             1,
             Instant::now(),
@@ -2284,7 +2327,7 @@ mod tests {
     #[test]
     fn the_compaction_share_shrinks_with_the_leaves_still_ahead() {
         let t0 = Instant::now();
-        let far = t0 + Duration::from_secs(120);
+        let far = t0 + Duration::from_mins(2);
 
         let small = budget(Some(far), None, 2, t0);
         let big = budget(Some(far), None, 25_398, t0);
@@ -2327,7 +2370,7 @@ mod tests {
     #[test]
     fn three_fruitless_offers_close_the_lane_and_one_win_reopens_the_count() {
         let t0 = Instant::now();
-        let b = budget(Some(t0 + Duration::from_secs(120)), None, 1_000, t0);
+        let b = budget(Some(t0 + Duration::from_mins(2)), None, 1_000, t0);
 
         for _ in 0..COMPACTION_STRIKES - 1 {
             b.charge_compaction(Duration::from_millis(1), false);
@@ -2359,7 +2402,7 @@ mod tests {
     #[test]
     fn the_compaction_allowance_is_spent_once_and_then_the_lane_closes() {
         let t0 = Instant::now();
-        let b = budget(Some(t0 + Duration::from_secs(3_600)), None, 4, t0);
+        let b = budget(Some(t0 + Duration::from_hours(1)), None, 4, t0);
         b.charge_compaction(COMPACTION_WARMUP + Duration::from_millis(1), true);
         assert!(
             b.compaction_slice(0).is_none(),

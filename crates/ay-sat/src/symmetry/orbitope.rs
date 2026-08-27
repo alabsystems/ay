@@ -187,9 +187,9 @@ impl RowAmoMatrix {
     /// clause on the `a`-line. Per `dsr-trim`'s `parse_sr_clause_and_witness`,
     /// the second occurrence of the pivot opens the partial-assignment part and
     /// the third opens the substitution part; the pairs list the row swap as
-    /// positive `from to` literals. This differs from
-    /// [`super::detector`]'s `sr_witness_tokens` only in carrying one extra
-    /// assignment literal (`+M[i-1][j]`) between the two pivots.
+    /// positive `from to` literals. The extra assignment literal
+    /// (`+M[i-1][j]`) between the two pivots is part of this family-specific
+    /// construction.
     ///
     /// Validated end to end against the real `exam_75_65`: 2080 units,
     /// `dsr-trim` returns `s VERIFIED UNSAT`.
@@ -303,26 +303,20 @@ pub(crate) struct OrbitopeStats {
 }
 
 /// Whether to admit ALO-only columns by synthesizing the missing at-most-one
-/// clauses (`AY_SAT_ORBITOPE_ALO_COLUMNS=1`). **Default off.**
+/// clauses. **Default ON** (`--sat-no-orbitope-alo-columns` opts out).
 ///
-/// The route works and is worth 10 official instances — the whole graph-colouring
-/// family — solving `mulsol.i.1.48` in 849 ms and `fpsol2.i.2.29` in 2.4 s where
-/// both previously timed out at 300 s. It is off because **it can emit a
-/// certificate an external checker rejects**: of the 10 it solves, 9 give
-/// `dsr-trim` `s VERIFIED UNSAT` and `zeroin.i.3.29` gives
-/// `Error: [line 121051] No UP contradiction for RAT clause 168525`.
-///
-/// An answer whose proof is rejected is a disqualified submission, not a win
-/// (see `dimacs.rs::uncertifiable_symmetry_gate_error` for the same rule applied
-/// to the composite route), and nothing distinguishes the good nine from the bad
-/// one at emission time — so the whole extension stays behind the flag until the
-/// zeroin case is understood.
-///
-/// What is already known: the same construction verifies from the Python
-/// reference (`s VALID` on zeroin, AMO steps alone and AMO + staircase), so the
-/// defect is in this port, not in the mathematics. The prime suspect is the
-/// clique-first column ordering here differing from the reference's, since that
-/// changes which columns the staircase fixes and in what order.
+/// Worth 10 of the 11 official graph-colouring instances — every one a former
+/// 300 s timeout (`mulsol.i.1.48` 849 ms, `fpsol2.i.2.29` 2.4 s,
+/// `zeroin.i.3.29` under 2 s at current HEAD). Historical note: the route first
+/// shipped OFF because `zeroin.i.3.29` emitted a certificate `dsr-trim`
+/// rejected ("No UP contradiction for RAT clause"). That was NOT a defect in
+/// this construction — the synthesized AMO steps and staircase verified in
+/// isolation (`s VALID`), and the column-ordering suspicion recorded here at
+/// the time was wrong. The cause was BVE eliminating a synthesized AMO
+/// variable and deleting a clause the refutation needed; freezing the
+/// synthesized variables (see the fn body note, 2026-08-11) fixed it, and all
+/// ten certificates now externally verify (re-confirmed at HEAD 2026-08-21:
+/// zeroin solves in 1.9 s, `dsr-trim` `s VERIFIED UNSAT`).
 fn alo_only_columns_enabled() -> bool {
     // DEFAULT ON since 2026-08-11. It was off because zeroin.i.3.29 emitted a
     // certificate dsr-trim rejected; that is fixed — the synthesized AMO
@@ -525,47 +519,168 @@ pub(crate) fn detect_row_amo_matrices(
     // `min(rows, cols)` columns, so WHICH columns those are decides whether the
     // fixing propagates. Measured on `mulsol.i.2.30` with identical units: file
     // order gives 555 504 conflicts and UNKNOWN at 60 s, clique-first gives
-    // 1 635 conflicts and UNSAT in 13.3 s. Greedy: repeatedly take the column
-    // with the most at-most-one edges into the already-chosen prefix, breaking
-    // ties by total degree.
+    // 1 635 conflicts and UNSAT in 13.3 s.
+    //
+    // Two passes:
+    //
+    // 1. Greedy prefix-attachment: repeatedly take the column with the most
+    //    at-most-one edges into the already-chosen prefix, breaking ties by
+    //    total degree. This equals clique-first ONLY on chordal graphs — the
+    //    mulsol/fpsol/inithx family happens to be interval graphs, which is why
+    //    it looked sufficient.
+    // 2. True clique seeding: on `miles1500.72` (dense geometric graph, 128
+    //    columns, ω = 73 = rows + 1) the greedy prefix is a clique only through
+    //    column 55, so the forced root-BCP staircase dies at depth 55 and the
+    //    instance times out past 1.24 M conflicts. Finding a large clique of
+    //    the column adjacency graph directly (multi-start greedy over bitsets,
+    //    work-budgeted) and ordering its columns first closes the same
+    //    staircase at root: 0 conflicts, well under a second. The reorder only
+    //    happens when the found clique strictly beats the clique prefix the
+    //    greedy produced — an ordering that already works is never regressed.
     let ncols = entries.first().map_or(0, Vec::len);
     if ncols > 1 {
-        let degree = |col: usize, entries: &Vec<Vec<Vec<Variable>>>| -> usize {
-            entries
-                .iter()
-                .flat_map(|row| row[col].iter())
-                .map(|v| amo.get(v).map_or(0, BTreeSet::len))
-                .sum()
-        };
-        let mut remaining: Vec<usize> = (0..ncols).collect();
-        let first = *remaining
-            .iter()
-            .max_by_key(|&&c| degree(c, &entries))
-            .expect("ncols > 1");
-        remaining.retain(|&c| c != first);
-        let mut order = vec![first];
-        let mut prefix: BTreeSet<Variable> = entries
-            .iter()
-            .flat_map(|row| row[first].iter().copied())
-            .collect();
-        while !remaining.is_empty() {
-            let pick = *remaining
-                .iter()
-                .max_by_key(|&&c| {
-                    let into: usize = entries
+        // Greedy prefix-attachment order over `pool`, keeping `seed` verbatim
+        // as the head. With an empty seed this is the original ordering pass,
+        // tie-breaking included.
+        let greedy_order =
+            |seed: &[usize], pool: &[usize], entries: &[Vec<Vec<Variable>>]| -> Vec<usize> {
+                let degree = |col: usize| -> usize {
+                    entries
                         .iter()
-                        .flat_map(|row| row[c].iter())
-                        .map(|v| {
-                            amo.get(v)
-                                .map_or(0, |ns| ns.iter().filter(|n| prefix.contains(n)).count())
+                        .flat_map(|row| row[col].iter())
+                        .map(|v| amo.get(v).map_or(0, BTreeSet::len))
+                        .sum()
+                };
+                let mut order: Vec<usize> = seed.to_vec();
+                let mut remaining: Vec<usize> =
+                    pool.iter().copied().filter(|c| !seed.contains(c)).collect();
+                let mut prefix: BTreeSet<Variable> = order
+                    .iter()
+                    .flat_map(|&c| entries.iter().flat_map(move |row| row[c].iter().copied()))
+                    .collect();
+                if order.is_empty() {
+                    if let Some(&first) = remaining.iter().max_by_key(|&&c| degree(c)) {
+                        remaining.retain(|&c| c != first);
+                        prefix.extend(entries.iter().flat_map(|row| row[first].iter().copied()));
+                        order.push(first);
+                    }
+                }
+                while !remaining.is_empty() {
+                    let pick = *remaining
+                        .iter()
+                        .max_by_key(|&&c| {
+                            let into: usize = entries
+                                .iter()
+                                .flat_map(|row| row[c].iter())
+                                .map(|v| {
+                                    amo.get(v).map_or(0, |ns| {
+                                        ns.iter().filter(|n| prefix.contains(n)).count()
+                                    })
+                                })
+                                .sum();
+                            (into, degree(c), std::cmp::Reverse(c))
                         })
-                        .sum();
-                    (into, degree(c, &entries), std::cmp::Reverse(c))
+                        .expect("non-empty");
+                    remaining.retain(|&c| c != pick);
+                    prefix.extend(entries.iter().flat_map(|row| row[pick].iter().copied()));
+                    order.push(pick);
+                }
+                order
+            };
+        let all: Vec<usize> = (0..ncols).collect();
+        let mut order = greedy_order(&[], &all, &entries);
+
+        // True clique seeding. Skipped above the size cap, where the quadratic
+        // bitset would stop being cheap — the greedy order stands on its own.
+        const CLIQUE_MAX_COLS: usize = 4096;
+        if ncols <= CLIQUE_MAX_COLS {
+            // Column adjacency bitsets: columns adjacent iff any at-most-one
+            // edge joins their variables. `amo` is symmetric, so one direction
+            // per (variable, neighbour) pair fills both rows.
+            let words = ncols.div_ceil(64);
+            let mut adj = vec![0u64; ncols * words];
+            for (&v, &cv) in &col_of {
+                if let Some(ns) = amo.get(&v) {
+                    for n in ns {
+                        if let Some(&cn) = col_of.get(n) {
+                            if cn != cv {
+                                adj[cv * words + (cn >> 6)] |= 1u64 << (cn & 63);
+                            }
+                        }
+                    }
+                }
+            }
+            let has_edge = |a: usize, b: usize| adj[a * words + (b >> 6)] >> (b & 63) & 1 == 1;
+            // The longest prefix of the greedy order that IS a clique — the
+            // bar a found clique must strictly beat before the order changes.
+            let mut greedy_clique = 0usize;
+            for (i, &c) in order.iter().enumerate() {
+                if order[..i].iter().all(|&p| has_edge(c, p)) {
+                    greedy_clique = i + 1;
+                } else {
+                    break;
+                }
+            }
+            // Multi-start greedy clique: seed from every column in descending
+            // degree order, grow by max edges into the candidate set, keep the
+            // best. The work budget (words touched in the score loop) keeps
+            // pathological instances cheap; the degree bound ends the sweep
+            // once no remaining seed can beat the best (a clique through `c`
+            // has at most deg(c) + 1 columns, and seeds are degree-sorted).
+            let col_deg: Vec<u32> = (0..ncols)
+                .map(|c| {
+                    adj[c * words..(c + 1) * words]
+                        .iter()
+                        .map(|w| w.count_ones())
+                        .sum()
                 })
-                .expect("non-empty");
-            remaining.retain(|&c| c != pick);
-            prefix.extend(entries.iter().flat_map(|row| row[pick].iter().copied()));
-            order.push(pick);
+                .collect();
+            let mut seeds: Vec<usize> = (0..ncols).collect();
+            seeds.sort_unstable_by_key(|&c| (std::cmp::Reverse(col_deg[c]), c));
+            const CLIQUE_WORK_BUDGET: usize = 16_000_000;
+            let mut work = 0usize;
+            let mut best: Vec<usize> = Vec::new();
+            for &seed in &seeds {
+                if work >= CLIQUE_WORK_BUDGET || (col_deg[seed] as usize) < best.len() {
+                    break;
+                }
+                let mut clique = vec![seed];
+                let mut cand = adj[seed * words..(seed + 1) * words].to_vec();
+                loop {
+                    let mut pick = None;
+                    let mut pick_score = 0u32;
+                    for w in 0..words {
+                        let mut bits = cand[w];
+                        while bits != 0 {
+                            let c = (w << 6) | bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let score: u32 = adj[c * words..(c + 1) * words]
+                                .iter()
+                                .zip(&cand)
+                                .map(|(a, b)| (a & b).count_ones())
+                                .sum();
+                            work += words;
+                            if pick.is_none() || score > pick_score {
+                                pick = Some(c);
+                                pick_score = score;
+                            }
+                        }
+                    }
+                    let Some(c) = pick else { break };
+                    // `adj[c]` has no self-bit, so this also removes `c`.
+                    for w in 0..words {
+                        cand[w] &= adj[c * words + w];
+                    }
+                    clique.push(c);
+                }
+                if clique.len() > best.len() {
+                    best = clique;
+                }
+            }
+            if best.len() > greedy_clique {
+                let head = greedy_order(&[], &best, &entries);
+                order = greedy_order(&head, &all, &entries);
+            }
         }
         for row in &mut entries {
             let reordered: Vec<Vec<Variable>> = order.iter().map(|&c| row[c].clone()).collect();
@@ -739,6 +854,101 @@ mod tests {
             }
         }
         clauses
+    }
+
+    /// A `colours`-colouring CNF of an arbitrary graph: columns are vertices,
+    /// rows are colours, `var id = 1 + colours*v + c`.
+    fn colouring(n: i32, colours: i32, edges: &[(i32, i32)]) -> Vec<Vec<Literal>> {
+        let x = |v: i32, c: i32| 1 + colours * v + c;
+        let mut clauses = Vec::new();
+        for v in 0..n {
+            clauses.push((0..colours).map(|c| lit(x(v, c))).collect::<Vec<_>>());
+            for c in 0..colours {
+                for d in (c + 1)..colours {
+                    clauses.push(vec![lit(-x(v, c)), lit(-x(v, d))]);
+                }
+            }
+        }
+        for &(u, v) in edges {
+            for c in 0..colours {
+                clauses.push(vec![lit(-x(u, c)), lit(-x(v, c))]);
+            }
+        }
+        clauses
+    }
+
+    /// Non-chordal stress for the column order: a K4 `{0,1,2,3}` hidden behind
+    /// a higher-degree hub. The greedy prefix-attachment pass starts at the
+    /// hub (max total degree) and its prefix stops being a clique at size 2;
+    /// the multi-start clique pass must find the K4 and order those four
+    /// columns first. This is `miles1500.72` in miniature: there the greedy
+    /// prefix was a clique only through column 55 of 72, the forced staircase
+    /// died mid-chain, and the instance timed out.
+    #[test]
+    fn orders_the_true_max_clique_first_on_a_non_chordal_graph() {
+        // K4 on {0,1,2,3}; hub 4 adjacent to 0 and to five leaves 5..9.
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+            (2, 3), // the K4
+            (0, 4), // hub into the K4 (keeps the colour rows connected)
+            (4, 5),
+            (4, 6),
+            (4, 7),
+            (4, 8),
+            (4, 9), // the star that out-degrees the K4
+        ];
+        // Fixture sanity: the hub out-degrees every K4 member, so a
+        // degree-greedy start picks it and can never build the K4 prefix.
+        let deg = |v: i32| edges.iter().filter(|&&(a, b)| a == v || b == v).count();
+        assert!(deg(4) > (0..4).map(deg).max().unwrap());
+
+        let colours = 4;
+        let clauses = colouring(10, colours, &edges);
+        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        assert_eq!(matrices.len(), 1);
+        let m = &matrices[0];
+        assert_eq!(m.col_count(), 10);
+        assert_eq!(m.verified_rows, 4, "colours are interchangeable");
+        // Recover each ordered column's vertex: var id = 1 + colours*v + c.
+        let vertex_of = |col: usize| (m.entries[0][col][0].index() as i32 - 1) / colours;
+        let first_four: BTreeSet<i32> = (0..4).map(vertex_of).collect();
+        assert_eq!(
+            first_four,
+            BTreeSet::from([0, 1, 2, 3]),
+            "the true max clique must come first; greedy alone leads with the hub"
+        );
+    }
+
+    /// Chordal graphs are where the greedy prefix-attachment order is already
+    /// clique-first; the true-clique pass must leave that outcome intact (its
+    /// guard reorders only when the found clique strictly beats the greedy
+    /// prefix's clique). K3 `{0,1,2}` + vertex 3 adjacent to `{0,1}` +
+    /// pendant 4: ω = 3, and the first three ordered columns must realize it.
+    #[test]
+    fn keeps_a_clique_prefix_on_a_chordal_graph() {
+        let edges = [(0, 1), (0, 2), (1, 2), (0, 3), (1, 3), (3, 4)];
+        let colours = 3;
+        let clauses = colouring(5, colours, &edges);
+        let (matrices, _) = detect_row_amo_matrices(&clauses, OrbitopeLimits::default());
+        assert_eq!(matrices.len(), 1);
+        let m = &matrices[0];
+        assert_eq!(m.col_count(), 5);
+        let vertex_of = |col: usize| (m.entries[0][col][0].index() as i32 - 1) / colours;
+        let adjacent = |a: i32, b: i32| edges.contains(&(a, b)) || edges.contains(&(b, a));
+        for i in 0..3 {
+            for j in 0..i {
+                assert!(
+                    adjacent(vertex_of(i), vertex_of(j)),
+                    "prefix columns {i} and {j} (vertices {} and {}) must be adjacent",
+                    vertex_of(i),
+                    vertex_of(j)
+                );
+            }
+        }
     }
 
     /// Thickness 2 must be detected as a 3x3 matrix of 2-variable cells, not

@@ -123,7 +123,7 @@ pub(in crate::executor) fn rm_long_name(mode: RoundingMode) -> &'static str {
 
 /// The rounding-mode operand slot of an FP application, if it has one.
 /// Mirrors `theories/fp/support.rs::rounding_mode_operand`.
-fn fp_rounding_mode_operand(name: &str, args: &[TermId]) -> Option<TermId> {
+pub(in crate::executor) fn fp_rounding_mode_operand(name: &str, args: &[TermId]) -> Option<TermId> {
     match name {
         "fp.add" | "fp.sub" | "fp.mul" | "fp.div" | "fp.sqrt" | "fp.fma" | "fp.roundToIntegral" => {
             args.first().copied()

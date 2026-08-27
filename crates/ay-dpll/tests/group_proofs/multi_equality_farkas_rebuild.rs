@@ -334,10 +334,18 @@ fn test_native_api_diseq_half_prints_trust_free() {
 /// `hole_count == 0`. The sibling case lives in
 /// `complementary_literal_rebuild::test_nonlinear_diseq_contradiction_publishes_uncheckable_certificate`.
 ///
-/// THE WIRE DOCUMENT IS UNCHANGED and this test still pins that half: the
-/// Alethe printer has no spec rule name for `NraIntervalUnsat`, so `(get-proof)`
-/// keeps disclosing an unproved step. Internal certification and the exported
-/// text now disagree, and both directions are guarded below.
+/// PROMOTED AGAIN (2026-08-25) — THE WIRE DOCUMENT CLOSED. The previous
+/// revision pinned a residual unproved step, attributing it to the printer
+/// having no spec rule name for `NraIntervalUnsat`. Measurement says otherwise:
+/// the printer never names that kind at all, it LOWERS the refutation to
+/// `cong`/`trans`/`evaluate` over the ground consequences of `y = 3`, and the
+/// one step that stayed a `hole` — `(= (* 3 3) 9)` — was suppressed only by the
+/// whole-document surface-override barrier in `promoted_wire_rule`. With that
+/// barrier narrowed to the clauses an override actually reaches, AY's own
+/// ground evaluator admits it and the document carries no unproved step.
+/// Guard 2 below is therefore promoted, exactly as the note above predicted:
+/// it still forbids inventing a rule name for the interval kernel, and now
+/// additionally demands the fully checked document. Not a relaxation.
 #[test]
 #[timeout(10_000)]
 fn test_nonlinear_conjunct_publishes_uncheckable_certificate() {
@@ -395,11 +403,26 @@ fn test_nonlinear_conjunct_publishes_uncheckable_certificate() {
     );
 
     // SOUNDNESS GUARD 2 — the exported document must not overclaim a rule name
-    // it does not have.
+    // it does not have. The interval kernel has no Alethe spelling, so the one
+    // thing that must never appear is a rule name invented for it; the printer
+    // instead lowers the refutation to rules the pinned calculus implements.
     let alethe = outputs.get(1).expect("get-proof output");
+    for invented in ["nra_interval", "interval", "nra_"] {
+        assert!(
+            !alethe.contains(invented),
+            "no rule name may be invented for the interval kernel ({invented}):\n{alethe}"
+        );
+    }
+    // Every emitted rule is a checkable one, and the ground arithmetic the
+    // refutation turns on is discharged by AY's own ground evaluator rather
+    // than asserted. This is the half that used to disagree with the internal
+    // strict verdict; it no longer does.
     assert!(
-        alethe.contains(":rule hole") || alethe.contains(":rule trust"),
-        "the exported document has no rule name for the interval refutation and \
-         must stay honestly unproved:\n{alethe}"
+        alethe.contains("(step t8 (cl (= (* 3 3) 9)) :rule evaluate)"),
+        "the ground consequence of `y = 3` must be discharged by evaluate:\n{alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule hole") && !alethe.contains(":rule trust"),
+        "the lowered document must carry no unproved step:\n{alethe}"
     );
 }

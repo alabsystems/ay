@@ -479,6 +479,12 @@ struct CertifyConfig {
     limit: usize,
     veripb: PathBuf,
     veripb_sha256: String,
+    /// How many self-test probes the checker answered correctly before any of
+    /// its verdicts was believed. Carried into the sidecar because a record
+    /// that names the checker's DIGEST but not its demonstrated BEHAVIOUR
+    /// repeats, at the level of the durable evidence, the hole the self-test
+    /// closes in the campaign.
+    veripb_self_test_probes: usize,
     proof_dir: Option<PathBuf>,
     decline_policy: DeclinePolicy,
     minimum_verified: usize,
@@ -561,6 +567,7 @@ fn verification_sidecar(
          verdict=VERIFIED_UNSATISFIABLE\n\
          checker={:?}\n\
          checker_sha256={}\n\
+         checker_self_test_probes_passed={}\n\
          formula={formula:?}\n\
          proof={proof_path:?}\n\
          elapsed_ms={}\n\
@@ -571,6 +578,7 @@ fn verification_sidecar(
          envelope={}\n",
         config.veripb,
         config.veripb_sha256,
+        config.veripb_self_test_probes,
         receipt.elapsed().as_millis(),
         receipt.stdout().len(),
         receipt.stdout_truncated(),
@@ -698,11 +706,40 @@ fn cert_config(args: &ParsedArgs, default_limit: usize) -> Result<CertifyConfig,
     if !veripb.is_file() {
         return Err(format!("--veripb is not a file: {}", veripb.display()));
     }
+    // ORDER MATTERS, and the three steps are one argument.
+    //
+    // The sha256 pin says WHICH bytes ran; it says nothing about what those
+    // bytes DO, so on its own it waves through `ci/fake-checkers/always-unsat.sh`
+    // (a well-formed `s VERIFIED UNSATISFIABLE` for every input) and
+    // `parrot.sh`. The self-test is the half that establishes behaviour. It
+    // runs ONCE per campaign rather than once per file, and what makes that
+    // sound rather than a stale cache is the hash on either side of it plus the
+    // existing per-file re-hash below: the binary is hashed, PROVED to check
+    // proofs, hashed again to confirm the proof applies to the bytes that were
+    // hashed, and then re-hashed after every single file it certifies. Any swap
+    // at any point in that chain changes the digest and fails the campaign, so
+    // one self-test covers every file in it.
     let veripb_sha256 = sha256_file(&veripb)?;
+    let self_test = ay_pb::veripb_runner::self_test(&veripb, VeriPbEnvelope::bounded_default())
+        .map_err(|why| {
+            format!(
+                "the VeriPB checker at {} failed its self-test: {why}\n\
+                 Refusing to certify anything against a binary that cannot be shown \
+                 to check proofs. This is not a skip: fix the checker.",
+                veripb.display()
+            )
+        })?;
+    if sha256_file(&veripb)? != veripb_sha256 {
+        return Err(format!(
+            "VeriPB checker changed during its own self-test: {}",
+            veripb.display()
+        ));
+    }
     Ok(CertifyConfig {
         limit,
         veripb,
         veripb_sha256,
+        veripb_self_test_probes: self_test.probes(),
         proof_dir: value(args, "--proof-dir").map(PathBuf::from),
         decline_policy: DeclinePolicy::Reject,
         minimum_verified: 1,

@@ -62,7 +62,7 @@ use super::ProofCheckError;
 const MAX_FP_ASSIGNMENT_BITS: u32 = 16;
 
 /// Recognize whether `clause` is a strict-checkable FP classification/sign/
-/// structural/comparison lemma — i.e. whether [`validate_fp_classification`]
+/// structural/comparison lemma — i.e. whether `validate_fp_classification`
 /// would accept it. The exact inverse of the validator: the proof classifier
 /// (`ay-dpll`) calls this to upgrade a `Generic`/trust FP lemma into the
 /// strict-checkable `FpClassification` kind ONLY when strict mode will

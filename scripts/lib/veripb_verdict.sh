@@ -120,16 +120,25 @@ veripb_entailed_conclusion() {
 # stderr is folded into VERIPB_OUTPUT for reporting, but the verdict is taken
 # from stdout ALONE: a checker must not be able to satisfy a gate by writing a
 # success line to the wrong stream.
+# NOTE ON THE TEMP-DIR VARIABLE. It is `_vg_rundir`, deliberately not `_vg_dir`.
+# POSIX sh has no locals, so every `_vg_*` name here is global and this function
+# is called from inside loops that hold their own state. `_vg_dir` used to be
+# this scratch path AND the fixture root in veripb_soundness_probe: the first
+# call reassigned it to a mktemp path and then `rm -rf`'d it, so from the second
+# fixture on every path pointed into a deleted directory, the checker could not
+# open the files, printed no `s` line, and the probe scored that silence as a
+# REJECTION. Eight of nine fixtures were vacuous and the probe reported "PASSED
+# (9/9 refused)" for a checker that accepted all nine. Do not reuse `_vg_dir`.
 veripb_run() {
     _vg_checker=$1; _vg_flag=$2; _vg_formula=$3; _vg_proof=$4
-    _vg_dir=$(mktemp -d "${TMPDIR:-/tmp}/ay-veripb-run.XXXXXX")
+    _vg_rundir=$(mktemp -d "${TMPDIR:-/tmp}/ay-veripb-run.XXXXXX")
     VERIPB_EXIT=0
     "$_vg_checker" "$_vg_flag" "$_vg_formula" "$_vg_proof" \
-        >"$_vg_dir/out" 2>"$_vg_dir/err" || VERIPB_EXIT=$?
-    VERIPB_VERDICT=$(grep '^s ' "$_vg_dir/out" 2>/dev/null | head -1 \
+        >"$_vg_rundir/out" 2>"$_vg_rundir/err" || VERIPB_EXIT=$?
+    VERIPB_VERDICT=$(grep '^s ' "$_vg_rundir/out" 2>/dev/null | head -1 \
         | sed 's/[[:space:]]*$//' || true)
-    VERIPB_OUTPUT=$(cat "$_vg_dir/out" "$_vg_dir/err" 2>/dev/null || true)
-    rm -rf "$_vg_dir"
+    VERIPB_OUTPUT=$(cat "$_vg_rundir/out" "$_vg_rundir/err" 2>/dev/null || true)
+    rm -rf "$_vg_rundir"
     return 0
 }
 
@@ -347,22 +356,26 @@ sha256_file() {
 # The self-test battery above proves a binary BEHAVES like a proof checker. It
 # does not prove the binary is a CORRECT one, and that gap is not theoretical:
 # published VeriPB 3.0.2 passes all six self-test probes while answering
-# `s VERIFIED UNSATISFIABLE` for satisfiable formulas (fixtures 03 and 04) and
-# `s VERIFIED SATISFIABLE` for unsatisfiable ones (05 and 06). That is why
-# ci/veripb.pin pins a COMMIT AND A PATCH rather than a version number.
+# `s VERIFIED UNSATISFIABLE` for satisfiable formulas (fixtures 03, 04 and 07)
+# and `s VERIFIED SATISFIABLE` for unsatisfiable ones (05, 06 and 08). That is
+# why ci/veripb.pin pins a COMMIT AND ITS PATCHES rather than a version number.
 #
-# This probe faces the checker with the six formula/proof pairs whose verdicts
-# are known to contradict the truth. A checker AY is willing to certify against
-# must refuse all six. Rejection here means "printed no accepting `s ...` line
-# at any guarantee level" — `s VERIFIED NO CONCLUSION` is a rejection, and so is
-# a parse error with no `s` line.
+# This probe faces the checker with the TWENTY-TWO formula/proof pairs whose
+# verdicts are known to contradict the truth — twenty-two pairs for TWENTY-ONE
+# defects, because defect 7 (normalization wrapping) has two manifestations with
+# opposite wrong verdicts. A checker AY is willing to certify against must refuse
+# all twenty-two.
+# Rejection here means "printed no accepting `s ...` line at any guarantee
+# level" — `s VERIFIED NO CONCLUSION` is a rejection, and so is a parse error
+# with no `s` line. It does NOT mean "the checker produced no output": see the
+# readability guard in the loop below for why that distinction is load-bearing.
 #
 # <soundness-dir> is VERIPB_SOUNDNESS_DIR from ci/veripb.pin, relative to the
 # repo root. Returns 0 only when every fixture is refused.
 veripb_soundness_probe() {
     _vg_checker=$1
-    _vg_dir=$2
-    _vg_expected="$_vg_dir/expected.tsv"
+    _vg_root=$2
+    _vg_expected="$_vg_root/expected.tsv"
     [ -r "$_vg_expected" ] || {
         echo "ERROR: soundness fixture manifest missing: $_vg_expected" >&2
         return 1
@@ -373,8 +386,21 @@ veripb_soundness_probe() {
     while IFS='	' read -r _vg_name _vg_flag _vg_formula _vg_proof _vg_truth _vg_wrong; do
         case "$_vg_name" in ''|'#'*) continue ;; esac
         _vg_seen=$((_vg_seen + 1))
+        # A missing input is a BROKEN PROBE, never a rejection. The contract
+        # scores "printed no accepting `s` line" as a refusal, so a checker that
+        # cannot open its arguments looks exactly like a checker that refused
+        # them — which is how a clobbered fixture root once turned eight of the
+        # rows into free passes. Unreadable inputs fail loudly instead.
+        if [ ! -r "$_vg_root/$_vg_name/$_vg_formula" ] \
+           || [ ! -r "$_vg_root/$_vg_name/$_vg_proof" ]; then
+            echo "ERROR: soundness fixture $_vg_name is unreadable under $_vg_root" >&2
+            echo "       expected $_vg_root/$_vg_name/{$_vg_formula,$_vg_proof}" >&2
+            echo "       Refusing to score an unopenable fixture as a rejection." >&2
+            _vg_bad=1
+            continue
+        fi
         veripb_require_rejected "$_vg_checker" "$_vg_flag" \
-            "$_vg_dir/$_vg_name/$_vg_formula" "$_vg_dir/$_vg_name/$_vg_proof" \
+            "$_vg_root/$_vg_name/$_vg_formula" "$_vg_root/$_vg_name/$_vg_proof" \
             "checker-soundness/$_vg_name" || {
             echo "       truth is '$_vg_truth'; an unfixed checker answers '$_vg_wrong'" >&2
             _vg_bad=1
@@ -399,6 +425,6 @@ veripb_require_soundness() {
     veripb_soundness_probe "$1" "$2" && return 0
     echo "ERROR: the resolved checker gave a verdict contradicting known truth." >&2
     echo "       Refusing to certify against it. Build the pinned checker per" >&2
-    echo "       ci/veripb.pin (commit + reviewed patch), not an unpinned clone." >&2
+    echo "       ci/veripb.pin (commit + reviewed patches), not an unpinned clone." >&2
     exit 3
 }

@@ -29,6 +29,9 @@ mod reexec_supervisor_gate;
 #[path = "group_cli/uncertifiable_symmetry_refusal.rs"]
 mod uncertifiable_symmetry_refusal;
 
+#[path = "group_cli/declared_checker_sr_gate.rs"]
+mod declared_checker_sr_gate;
+
 #[path = "group_cli/set_option_unknown_key.rs"]
 mod set_option_unknown_key;
 

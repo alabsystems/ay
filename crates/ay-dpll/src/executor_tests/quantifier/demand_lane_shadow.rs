@@ -165,6 +165,23 @@ const GREEN_FREEVAR_BRIDGE_REPRO: &str = r#"
 (check-sat)
 "#;
 
+/// Satisfiable recursive definition that deterministically parks its generation-2
+/// instance at the preprocessing frontier. Because the first ground solve cannot
+/// refute a satisfiable obligation, Phase 0 must bump the frontier and flush that
+/// instance before result mapping. This is a publication probe: the verdict may
+/// remain `unknown` because the universal is intentionally unbounded, but the
+/// last-check statistics must describe the completed demand campaign.
+const SAT_PHASE0_STATISTICS_REFRESH: &str = r#"
+(set-logic ALL)
+(declare-datatypes ((Lst 0)) (((Nil) (Cons (tl Lst)))))
+(declare-fun f (Lst) Int)
+(assert (forall ((l Lst)) (! (= (f l) (ite ((_ is Cons) l) (f (tl l)) 0))
+   :pattern ((f l)))))
+(declare-const a Lst)
+(assert (= (f a) 0))
+(check-sat)
+"#;
+
 /// The tree analog RED (doubled recursive frontier). Its residual may stay the
 /// ground combiner; the test reports its shadow verdict + counters, not a flip.
 const RED_SUM_TREE_FORALL: &str = r#"
@@ -273,6 +290,29 @@ fn demand_shadow_bridge_cycle_converges_within_bounded_frontier() {
     assert!(
         diag.gated_families >= 1,
         "expected at least one bridge/self-chaining family to be gated"
+    );
+}
+
+/// Public demand statistics are a final-check snapshot, not the preprocessing
+/// prefix. The generation-2 instance in this satisfiable probe is parked while
+/// preprocessing runs at F=1, then necessarily flushed by Phase 0. Before the
+/// final refresh seam, all three counters below exposed their pre-Phase0 values
+/// (`frontier=1`, `flushes=0`, `flushed=0`).
+#[test]
+fn demand_statistics_include_phase0_frontier_flush() {
+    let (verdict, stats) = solve(SAT_PHASE0_STATISTICS_REFRESH, true, Duration::from_secs(10));
+    let diag = ShadowDiag::from_stats(&stats);
+    assert_ne!(
+        verdict, "unsat",
+        "statistics probe is satisfiable; an unsat verdict would be a soundness regression"
+    );
+    assert!(
+        diag.stats_present,
+        "statistics probe did not publish demand-lane counters: {diag:?}"
+    );
+    assert!(
+        diag.frontier >= 2 && diag.flushes >= 1 && diag.flushed >= 1,
+        "last-check statistics omitted the mandatory Phase 0 flush: {diag:?}"
     );
 }
 

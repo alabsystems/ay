@@ -48,6 +48,19 @@ fn assert_unsat(smt: &str, label: &str) {
     );
 }
 
+fn assert_selfcheck_unsat(smt: &str, label: &str) {
+    let results = crate::common::solve_authored_selfcheck_vec(smt);
+    assert!(
+        results.iter().any(|r| r == "unsat"),
+        "{label}: fail-closed self-check must accept the exact authored proof, \
+         got {results:?}"
+    );
+    assert!(
+        !results.iter().any(|r| r == "sat"),
+        "{label}: certified execution must NOT return sat, got {results:?}"
+    );
+}
+
 fn assert_not_unsat(smt: &str, label: &str) {
     let results = crate::common::solve_vec(smt);
     assert!(
@@ -60,6 +73,35 @@ fn assert_not_unsat(smt: &str, label: &str) {
 // ===========================================================================
 // VALID array-index frame goals that MUST now discharge (Unsat).
 // ===========================================================================
+
+const ARRAY_FRAME_INVARIANT_PRESERVED_ACROSS_UPDATE: &str = r#"
+    (set-logic ALL)
+    (declare-fun s () (Array Int Int))
+    (declare-fun snew () (Array Int Int))
+    (declare-fun val () Int)
+    (assert (= (select s 0) 10))
+    (assert (= (select s 1) 20))
+    (assert (= (select s 2) 30))
+    (assert (>= val 0))
+    (assert (forall ((k Int)) (= (select snew k) (ite (= k 1) val (select s k)))))
+    (assert (exists ((j Int)) (and (<= 0 j) (< j 3) (< (select snew j) 0))))
+    (check-sat)
+"#;
+
+const ARRAY_FRAME_U64_GUARDED_WITNESS: &str = r#"
+    (set-logic ALL)
+    (declare-fun s () (Array Int Int))
+    (declare-fun snew () (Array Int Int))
+    (declare-fun val () Int)
+    (assert (= (select s 0) 10))
+    (assert (= (select s 1) 20))
+    (assert (= (select s 2) 30))
+    (assert (>= val 0))
+    (assert (forall ((k Int)) (= (select snew k) (ite (= k 1) val (select s k)))))
+    (assert (exists ((j Int))
+        (and (>= j 0) (< j 18446744073709551616) (< j 3) (< (select snew j) 0))))
+    (check-sat)
+"#;
 
 /// Minimal shape: an array-indexing universal `forall k. a[k] >= 0` plus a
 /// ground violation `a[0] < 0`. Instantiating at k:=0 gives `(<= 0 a[0])`, which
@@ -85,20 +127,19 @@ fn array_index_forall_ground_violation_discharges_unsat() {
 #[test]
 #[timeout(20000)]
 fn array_frame_invariant_preserved_across_update_discharges_unsat() {
-    let smt = r#"
-        (set-logic ALL)
-        (declare-fun s () (Array Int Int))
-        (declare-fun snew () (Array Int Int))
-        (declare-fun val () Int)
-        (assert (= (select s 0) 10))
-        (assert (= (select s 1) 20))
-        (assert (= (select s 2) 30))
-        (assert (>= val 0))
-        (assert (forall ((k Int)) (= (select snew k) (ite (= k 1) val (select s k)))))
-        (assert (exists ((j Int)) (and (<= 0 j) (< j 3) (< (select snew j) 0))))
-        (check-sat)
-    "#;
-    assert_unsat(smt, "array_frame_invariant_preserved_across_update");
+    assert_unsat(
+        ARRAY_FRAME_INVARIANT_PRESERVED_ACROSS_UPDATE,
+        "array_frame_invariant_preserved_across_update",
+    );
+}
+
+#[test]
+#[timeout(20000)]
+fn array_frame_invariant_preserved_across_update_selfcheck_discharges_unsat() {
+    assert_selfcheck_unsat(
+        ARRAY_FRAME_INVARIANT_PRESERVED_ACROSS_UPDATE,
+        "array_frame_invariant_preserved_across_update_selfcheck",
+    );
 }
 
 /// The full Verus-faithful shape: the skolemized `u64` witness carries BOTH the
@@ -107,21 +148,19 @@ fn array_frame_invariant_preserved_across_update_discharges_unsat() {
 #[test]
 #[timeout(20000)]
 fn array_frame_u64_guarded_witness_discharges_unsat() {
-    let smt = r#"
-        (set-logic ALL)
-        (declare-fun s () (Array Int Int))
-        (declare-fun snew () (Array Int Int))
-        (declare-fun val () Int)
-        (assert (= (select s 0) 10))
-        (assert (= (select s 1) 20))
-        (assert (= (select s 2) 30))
-        (assert (>= val 0))
-        (assert (forall ((k Int)) (= (select snew k) (ite (= k 1) val (select s k)))))
-        (assert (exists ((j Int))
-            (and (>= j 0) (< j 18446744073709551616) (< j 3) (< (select snew j) 0))))
-        (check-sat)
-    "#;
-    assert_unsat(smt, "array_frame_u64_guarded_witness");
+    assert_unsat(
+        ARRAY_FRAME_U64_GUARDED_WITNESS,
+        "array_frame_u64_guarded_witness",
+    );
+}
+
+#[test]
+#[timeout(20000)]
+fn array_frame_u64_guarded_witness_selfcheck_discharges_unsat() {
+    assert_selfcheck_unsat(
+        ARRAY_FRAME_U64_GUARDED_WITNESS,
+        "array_frame_u64_guarded_witness_selfcheck",
+    );
 }
 
 // ===========================================================================

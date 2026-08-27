@@ -9,12 +9,7 @@ pub(super) fn parse_core_block(
     line: &mut usize,
     state: &mut ParseState,
 ) -> Result<(), CertIoError> {
-    match lines[*line]
-        .trim()
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-    {
+    match lines[*line].split_whitespace().next().unwrap_or_default() {
         "witness" => {
             let (values, next) = parse_witness(lines, *line)?;
             state.certificate.witness = Some(values);
@@ -34,6 +29,11 @@ pub(super) fn parse_core_block(
         "tree" => {
             let (root, next) = parse_tree(lines, *line + 1)?;
             state.certificate.tree = Some(MilpInfeasibilityCertificate { root });
+            *line = next;
+        }
+        "opttree" => {
+            let (root, next) = parse_opt_tree(lines, *line + 1)?;
+            state.certificate.opt_tree = Some(root);
             *line = next;
         }
         "affine-aggregation" => parse_unique_affine(lines, line, &mut state.certificate)?,
@@ -225,11 +225,7 @@ pub(super) fn parse_encoded_block(
     line: &mut usize,
     state: &mut ParseState,
 ) -> Result<(), CertIoError> {
-    let name = lines[*line]
-        .trim()
-        .split_whitespace()
-        .next()
-        .unwrap_or_default();
+    let name = lines[*line].split_whitespace().next().unwrap_or_default();
     match name {
         "single-row-dp" => {
             let (proof, next) = parse_single_row_dp(lines, *line)?;

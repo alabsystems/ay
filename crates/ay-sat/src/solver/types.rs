@@ -2,12 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Public types for the SAT solver: result enums, verified wrappers,
-//! watch-order policy, and per-variable flag constants.
-
-// Verified types (VerifiedSatResult, VerifiedAssumeResult) live in this module.
-// Crate-level `#![deny(unsafe_code)]` prevents unaudited type forgery while
-// permitting only explicitly scoped hot-path exceptions.
+//! Public result enums and supporting SAT-solver types.
 
 use crate::literal::Literal;
 use crate::proof_certificate::ProofCertificate;
@@ -151,8 +146,8 @@ impl std::fmt::Display for MemoryStats {
 pub enum SatResult {
     /// Unsatisfiable, with a lazily-materialized proof certificate.
     ///
-    /// The certificate is zero-cost when not consumed: proof reconstruction
-    /// is deferred until [`ProofCertificate::materialize()`] is called.
+    /// Backward reconstruction already ran during UNSAT finalization; public
+    /// proof-step conversion waits for [`ProofCertificate::materialize()`].
     Unsat(ProofCertificate),
     /// Satisfiable with model
     Sat(Vec<bool>),
@@ -298,13 +293,14 @@ pub(crate) enum WatchOrderPolicy {
 pub enum AssumeResult {
     /// Satisfiable with model
     Sat(Vec<bool>),
-    /// Unsatisfiable with core (subset of assumptions that caused UNSAT)
-    /// and an optional proof certificate for proof-based UNSAT core extraction.
+    /// Unsatisfiable with a solver-derived assumption core and optional proof
+    /// reconstruction data.
     ///
-    /// The `Option<ProofCertificate>` is `Some` when LRAT proof output is enabled.
-    /// Consumers can use [`ProofCertificate::minimal_core()`] to extract a
-    /// proof-minimal set of original clause IDs that participated in the
-    /// derivation of unsatisfiability.
+    /// The `Option<ProofCertificate>` may be `Some` when LRAT proof output is
+    /// enabled; early UNSAT paths can carry `None`. Consumers can use
+    /// [`ProofCertificate::tracked_original_clause_ids()`] to inspect the
+    /// producer's over-approximate original-clause support. That support is not
+    /// a checked or minimal UNSAT core.
     Unsat(Vec<Literal>, Option<ProofCertificate>),
     /// Unknown (timeout, etc.)
     Unknown,
@@ -349,282 +345,6 @@ impl AssumeResult {
         match self {
             Self::Unsat(_, Some(cert)) => Some(cert),
             _ => None,
-        }
-    }
-}
-
-/// Verified wrapper around [`SatResult`].
-///
-/// Guarantees that the enclosed result was produced by the SAT solver's
-/// validated pipeline (through `finalize_sat_model` for SAT outcomes).
-/// Can only be constructed within the `ay-sat` crate via `from_validated`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "solver results must be checked — ignoring Sat/Unsat loses correctness"]
-pub struct VerifiedSatResult {
-    result: SatResult,
-}
-
-impl VerifiedSatResult {
-    /// Construct from a validated SAT result. Only callable within ay-sat.
-    #[inline]
-    pub(crate) fn from_validated(result: SatResult) -> Self {
-        Self { result }
-    }
-
-    /// Extract the inner `SatResult` for pattern matching.
-    #[inline]
-    pub fn result(&self) -> &SatResult {
-        &self.result
-    }
-
-    /// Consume and return the inner `SatResult`.
-    ///
-    /// **Trust boundary:** The returned `SatResult` carries no compile-time
-    /// proof of verification. Verification happened at construction time (via
-    /// `finalize_sat_model`). Prefer using [`.result()`](Self::result) to borrow
-    /// or [`.is_sat()`](Self::is_sat) / [`.is_unsat()`](Self::is_unsat) to query
-    /// without stripping the verification wrapper.
-    #[inline]
-    pub fn into_inner(self) -> SatResult {
-        self.result
-    }
-
-    /// Returns `true` if the result is `Sat`.
-    #[inline]
-    pub fn is_sat(&self) -> bool {
-        matches!(self.result, SatResult::Sat(_))
-    }
-
-    /// Returns `true` if the result is `Unsat`.
-    #[inline]
-    pub fn is_unsat(&self) -> bool {
-        matches!(self.result, SatResult::Unsat(_))
-    }
-
-    /// Returns `true` if the result is `Unknown`.
-    #[inline]
-    pub fn is_unknown(&self) -> bool {
-        matches!(self.result, SatResult::Unknown)
-    }
-
-    /// Borrow the model if the result is `Sat`.
-    ///
-    /// Returns `None` for `Unsat` or `Unknown` results.
-    /// Preserves the verified wrapper (no trust boundary crossing).
-    #[inline]
-    pub fn model(&self) -> Option<&[bool]> {
-        match &self.result {
-            SatResult::Sat(model) => Some(model),
-            _ => None,
-        }
-    }
-
-    /// Consume and return the model if the result is `Sat`.
-    ///
-    /// Returns `None` for `Unsat` or `Unknown` results.
-    /// Prefer [`model()`](Self::model) when a borrow suffices.
-    #[inline]
-    pub fn into_model(self) -> Option<Vec<bool>> {
-        match self.result {
-            SatResult::Sat(model) => Some(model),
-            _ => None,
-        }
-    }
-}
-
-impl PartialEq<SatResult> for VerifiedSatResult {
-    fn eq(&self, other: &SatResult) -> bool {
-        self.result == *other
-    }
-}
-
-impl PartialEq<VerifiedSatResult> for SatResult {
-    fn eq(&self, other: &VerifiedSatResult) -> bool {
-        *self == other.result
-    }
-}
-
-impl std::fmt::Display for VerifiedSatResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.result {
-            SatResult::Sat(model) => write!(f, "sat (model size: {})", model.len()),
-            SatResult::Unsat(_) => write!(f, "unsat"),
-            SatResult::Unknown => write!(f, "unknown"),
-        }
-    }
-}
-
-/// Verified wrapper around [`AssumeResult`].
-///
-/// Guarantees that the enclosed result was produced by the SAT solver's
-/// validated assumption-solving pipeline. Can only be constructed within
-/// the `ay-sat` crate via `from_validated`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[must_use = "solver results must be checked — ignoring Sat/Unsat loses correctness"]
-pub struct VerifiedAssumeResult {
-    result: AssumeResult,
-}
-
-impl VerifiedAssumeResult {
-    /// Construct from a validated assumption result. Only callable within ay-sat.
-    #[inline]
-    pub(crate) fn from_validated(result: AssumeResult) -> Self {
-        Self { result }
-    }
-
-    /// Extract the inner `AssumeResult` for pattern matching.
-    #[inline]
-    pub fn result(&self) -> &AssumeResult {
-        &self.result
-    }
-
-    /// Consume and return the inner `AssumeResult`.
-    ///
-    /// **Trust boundary:** The returned `AssumeResult` carries no compile-time
-    /// proof of verification. Verification happened at construction time.
-    /// Prefer using [`.result()`](Self::result) to borrow or
-    /// [`.is_sat()`](Self::is_sat) / [`.is_unsat()`](Self::is_unsat) to query
-    /// without stripping the verification wrapper.
-    #[inline]
-    pub fn into_inner(self) -> AssumeResult {
-        self.result
-    }
-
-    /// Returns `true` if the result is `Sat`.
-    #[inline]
-    pub fn is_sat(&self) -> bool {
-        matches!(self.result, AssumeResult::Sat(_))
-    }
-
-    /// Returns `true` if the result is `Unsat`.
-    #[inline]
-    pub fn is_unsat(&self) -> bool {
-        matches!(self.result, AssumeResult::Unsat(..))
-    }
-
-    /// Returns `true` if the result is `Unknown`.
-    #[inline]
-    pub fn is_unknown(&self) -> bool {
-        matches!(self.result, AssumeResult::Unknown)
-    }
-
-    /// Borrow the model if the result is `Sat`.
-    ///
-    /// Returns `None` for `Unsat` or `Unknown` results.
-    /// Preserves the verified wrapper (no trust boundary crossing).
-    #[inline]
-    pub fn model(&self) -> Option<&[bool]> {
-        match &self.result {
-            AssumeResult::Sat(model) => Some(model),
-            _ => None,
-        }
-    }
-
-    /// Consume and return the model if the result is `Sat`.
-    ///
-    /// Returns `None` for `Unsat` or `Unknown` results.
-    /// Prefer [`model()`](Self::model) when a borrow suffices.
-    #[inline]
-    pub fn into_model(self) -> Option<Vec<bool>> {
-        match self.result {
-            AssumeResult::Sat(model) => Some(model),
-            _ => None,
-        }
-    }
-
-    /// Borrow the unsat core if the result is `Unsat`.
-    ///
-    /// The core is a subset of assumptions that caused unsatisfiability.
-    /// Returns `None` for `Sat` or `Unknown` results.
-    #[inline]
-    pub fn unsat_core(&self) -> Option<&[Literal]> {
-        match &self.result {
-            AssumeResult::Unsat(core, _) => Some(core),
-            _ => None,
-        }
-    }
-
-    /// Consume and return the unsat core if the result is `Unsat`.
-    ///
-    /// Returns `None` for `Sat` or `Unknown` results.
-    /// Prefer [`unsat_core()`](Self::unsat_core) when a borrow suffices.
-    #[inline]
-    pub fn into_unsat_core(self) -> Option<Vec<Literal>> {
-        match self.result {
-            AssumeResult::Unsat(core, _) => Some(core),
-            _ => None,
-        }
-    }
-
-    /// Borrow the proof certificate if the result is `Unsat` and a certificate
-    /// is available.
-    ///
-    /// Returns `None` for `Sat`, `Unknown`, or `Unsat` without proof output.
-    #[inline]
-    pub fn proof_certificate(&self) -> Option<&ProofCertificate> {
-        match &self.result {
-            AssumeResult::Unsat(_, Some(cert)) => Some(cert),
-            _ => None,
-        }
-    }
-
-    /// Compute the proof-minimal UNSAT core mapped back to assumption literals.
-    ///
-    /// Uses the LRAT proof certificate to find the minimal set of original
-    /// clause IDs that participated in the proof, then maps those clause IDs
-    /// back to the assumptions that introduced them. This produces a tighter
-    /// core than the implication-graph-based core.
-    ///
-    /// Returns `None` if no proof certificate is available.
-    ///
-    /// # Arguments
-    ///
-    /// * `assumption_clause_ids` - Maps each assumption literal to its clause ID
-    ///   in the solver's clause database (the unit clause added for that assumption).
-    #[inline]
-    pub fn assumption_minimal_core(
-        &self,
-        assumption_clause_ids: &[(Literal, u64)],
-    ) -> Option<Vec<Literal>> {
-        let cert = self.proof_certificate()?;
-        let core_ids = cert.minimal_core();
-        if core_ids.is_empty() {
-            return Some(Vec::new());
-        }
-        let core_id_set: crate::kani_compat::DetHashSet<u64> = core_ids.into_iter().collect();
-        let minimal = assumption_clause_ids
-            .iter()
-            .filter(|(_, id)| core_id_set.contains(id))
-            .map(|(lit, _)| *lit)
-            .collect();
-        Some(minimal)
-    }
-}
-
-impl PartialEq<AssumeResult> for VerifiedAssumeResult {
-    fn eq(&self, other: &AssumeResult) -> bool {
-        self.result == *other
-    }
-}
-
-impl PartialEq<VerifiedAssumeResult> for AssumeResult {
-    fn eq(&self, other: &VerifiedAssumeResult) -> bool {
-        *self == other.result
-    }
-}
-
-impl std::fmt::Display for VerifiedAssumeResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.result {
-            AssumeResult::Sat(model) => write!(f, "sat (model size: {})", model.len()),
-            AssumeResult::Unsat(core, cert) => {
-                write!(f, "unsat (core size: {}", core.len())?;
-                if cert.is_some() {
-                    write!(f, ", proof available")?;
-                }
-                write!(f, ")")
-            }
-            AssumeResult::Unknown => write!(f, "unknown"),
         }
     }
 }

@@ -187,13 +187,18 @@ impl Executor {
                 self.push_array_axiom_assertion_site(row1_clause, "row1_clause");
             }
 
-            if indices_provably_distinct {
-                self.push_array_axiom_assertion_site(row2_eq, "row2_unit_distinct_indices");
-                continue;
-            }
-
-            // ROW2 clause: (= i k) ∨ (= select_term (select base_array sel_index))
-            // "If the indices differ, the select passes through to the base array"
+            // #row2-unit-guard. This arm used to DROP the guard once `i != j`
+            // was read off the assertions and push the bare ROW2 unit as a
+            // premiseless `Generic` lemma — a step refutable on its own, since
+            // `i != j` is an ASSERTED fact and never a theory one. See
+            // `euf::tests::array_row_guard` and `ay-proof`'s
+            // `array_row_axiom_guard_negative_tests`. The guard is now always
+            // carried: `(= i k) ∨ (= select_term (select base_array sel_index))`
+            // is a tautology and is the shape `recognize_array_select_store`
+            // accepts; `(= i k)` is false at level 0 whenever the licensing
+            // disequality is a top-level unit, so the SAT layer still
+            // propagates the ROW2 equality there, and distinct CONSTANT indices
+            // fold `idx_eq` away and reproduce the old unit exactly.
             // Note: mk_select may simplify if base_array is also a store with known index
             let row2_clause = self.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
             // DIAGNOSTIC: trace ROW2 components for #8785 investigation
@@ -296,20 +301,20 @@ impl Executor {
             }
             let base_select = self.ctx.terms.mk_select(base_array, sel_index);
             let row2_eq = self.ctx.terms.mk_eq(select_term, base_select);
+            let idx_eq = self.ctx.terms.mk_eq(store_index, sel_index);
+            let row2_clause = self.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
             if self.are_terms_provably_distinct_from_assertions(
                 store_index,
                 sel_index,
                 &top_level_disequalities,
             ) {
-                self.push_array_axiom_assertion_site(row2_eq, "row2_unit_distinct_indices");
+                self.push_array_axiom_assertion_site(row2_clause, "row2_clause_distinct_indices");
                 emitted += 1;
             } else {
-                let idx_eq = self.ctx.terms.mk_eq(store_index, sel_index);
                 let not_idx_eq = self.ctx.terms.mk_not(idx_eq);
                 let row1_eq = self.ctx.terms.mk_eq(select_term, store_value);
                 let row1_clause = self.ctx.terms.mk_or(vec![not_idx_eq, row1_eq]);
                 self.push_array_axiom_assertion_site(row1_clause, "row1_clause");
-                let row2_clause = self.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
                 self.push_array_axiom_assertion_site(row2_clause, "row2_clause");
                 emitted += 2;
             }

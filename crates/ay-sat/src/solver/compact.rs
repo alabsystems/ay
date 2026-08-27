@@ -286,8 +286,9 @@ impl Solver {
                     );
                 }
             }
-            self.arena.refresh_signature(idx);
-            // Arena is the sole literal storage after #3904 cutover.
+            // Arena is the sole literal storage after #3904 cutover. No
+            // signature refresh needed: signatures are no longer stored —
+            // consumers recompute from the (now remapped) literals.
         }
 
         // Invalidate GC occ list — arena indices change (#8097). Drop the
@@ -307,6 +308,24 @@ impl Solver {
             if let Some(new_lit) = map.map_lit(lit) {
                 new_trail.push(new_lit);
             }
+        }
+        // #relevancy-frontier-incremental: variable compaction renumbers every
+        // variable and rewrites the trail; the frontier cache is keyed by both.
+        self.relevancy_frontier.invalidate();
+        // The independent-support whitelist (solver/indep_support.rs) holds
+        // raw variable indices, so compaction MUST remap it: a stale index
+        // outside the new range reaches BCP as a decision literal and panics
+        // the `vals` lookup. Members whose variable was eliminated drop out;
+        // the whitelist only ever shrinks, so the restriction policy that
+        // admitted it still holds.
+        if !self.indep_support.is_empty() {
+            let mut remapped = Vec::with_capacity(self.indep_support.len());
+            for &old in &self.indep_support {
+                if let Some(new) = map.map_var(old as usize) {
+                    remapped.push(new as u32);
+                }
+            }
+            self.indep_support = remapped;
         }
         self.trail = new_trail;
         self.qhead = self.trail.len();

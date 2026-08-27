@@ -72,6 +72,45 @@ impl MpsProblem {
     pub fn unscale(&self, value: &BigRational) -> BigRational {
         value / &self.obj_scale
     }
+
+    /// The clause a DIAGNOSTIC line must carry when this reader scaled the objective.
+    ///
+    /// # The defect this closes
+    ///
+    /// `bab::diag_float_lp` prints `obj(min-form)=` and
+    /// `session::diag_shipped_float_lp` prints `outcome=OPTIMAL value=… certified=true`,
+    /// and BOTH are the value of [`Self::model`] — i.e. of the SCALED model. Only
+    /// the `solve` CLI calls [`Self::unscale`]. On `gt2_lprelax.mps` the diag lanes
+    /// therefore say `1682.529134` where the file's optimum is
+    /// `13460.233074411897`: a factor of exactly 8, which is the RECIPROCAL of
+    /// `obj_scale` (the binary prints `obj_scale=1/8`), not an error. Mind that
+    /// direction — [`Self::unscale`] DIVIDES by `obj_scale`, so
+    /// `1682.529134 / (1/8) = 13460.233072`. A reader who multiplies by 8
+    /// instead of dividing by 1/8 happens to land right; one who divides by 8
+    /// lands 64x off, in the docstring of the very function that exists to stop
+    /// a scale factor being misread. An auditor checking a diag line against an
+    /// external reference would otherwise read a correct, exactly-certified
+    /// answer as an 8x wrong one.
+    ///
+    /// That is the same failure mode as the scaffold banner and the
+    /// `RELAXATION-NOT-MODEL` banner: a line that can be pasted somewhere it will
+    /// be misread. So the remedy is the same one — put it ON the line, because a
+    /// separate header does not travel with the number.
+    ///
+    /// Empty when the scale is 1, which is the common case; a diagnostic that
+    /// cries wolf on every model teaches readers to skip the clause.
+    #[must_use]
+    pub fn units_clause(&self) -> String {
+        if self.obj_scale.is_one() {
+            return String::new();
+        }
+        format!(
+            " [UNITS: the objective above is in the READER'S SCALED units, not the file's. \
+             obj_scale={}; divide by it for a value comparable to an external reference. \
+             `ay-milp solve` already does.]",
+            self.obj_scale
+        )
+    }
 }
 
 /// Why an MPS file could not be read.

@@ -69,6 +69,21 @@ enum EufDeriv {
         eq_term: TermId,
         edges: Vec<EufJust>,
     },
+    /// (#implied-forall-ground-inst) One read-over-write theory leaf
+    /// `(cl ¬(= i k) (= (select (store b i e) k) e))` — or the unguarded
+    /// unit form when the indices are syntactically equal — emitted as a
+    /// `TheoryLemmaKind::ArraySelectStore { index_eq: true }` step the strict
+    /// checker re-validates from the clause alone, with the guard equality
+    /// discharged through the ordinary justification machinery.
+    RowLeaf {
+        /// `(= (select (store b i e) k) e)`.
+        row_eq: TermId,
+        /// The guard equality `(= i k)` exactly as spelled in the leaf
+        /// clause; `None` when the indices are syntactically equal.
+        guard_eq: Option<TermId>,
+        /// Justification deriving the guard equality; present iff `guard_eq`.
+        guard: Option<EufJust>,
+    },
 }
 
 /// The entailed conclusion of the lemma.
@@ -145,6 +160,17 @@ enum CcReason {
     /// A congruence edge (the two endpoints are same-symbol applications
     /// whose argument pairs are CC-equal).
     Cong,
+    /// (#implied-forall-ground-inst) A read-over-write bridge edge merging
+    /// `select_term = (select a k)` with the VALUE of `store_term =
+    /// (store b i e)`, added only after the hypothesis closure already merged
+    /// `a` with `store_term` and `k` with `i`. Emitted as one strictly
+    /// validated `ArraySelectStore` leaf plus ordinary
+    /// `eq_congruent`/`eq_transitive` steps; a wrong bridge can only make the
+    /// rebuilt proof fail its final strict gate.
+    Row {
+        select_term: TermId,
+        store_term: TermId,
+    },
 }
 
 impl CcForest {
@@ -359,6 +385,10 @@ impl RecipeBuilder<'_> {
                 // The edge endpoints are exactly {s, t}: orient the
                 // congruence on the requested sides.
                 CcReason::Cong => self.plan_cong(s, t, want)?,
+                CcReason::Row {
+                    select_term,
+                    store_term,
+                } => self.plan_row(s, t, select_term, store_term, want)?,
             }
         } else {
             let mut edges = Vec::with_capacity(path.len());
@@ -369,6 +399,10 @@ impl RecipeBuilder<'_> {
                         EufJust::Hyp(lit)
                     }
                     CcReason::Cong => self.derive(x, y, None)?,
+                    CcReason::Row {
+                        select_term,
+                        store_term,
+                    } => self.plan_row(x, y, select_term, store_term, None)?,
                 };
                 edges.push(e);
             }
@@ -406,6 +440,103 @@ impl RecipeBuilder<'_> {
             None => self.raw_eq(lhs, rhs),
         };
         self.derivs.push(EufDeriv::Cong { eq_term, prems });
+        Some(EufJust::Derived(self.derivs.len() - 1))
+    }
+
+    /// Plan the ROW-under-equality bridge concluding `s = t`, where
+    /// `{s, t} = {select_term, e}` for `select_term = (select a k)` and the
+    /// value `e` of `store_term = (store b i e)` (#implied-forall-ground-inst).
+    ///
+    /// Emission shape: one `ArraySelectStore` leaf for
+    /// `(= (select store_term k) e)` guarded by `(= i k)` when the indices
+    /// differ, an `eq_congruent` step `(= (select a k) (select store_term k))`
+    /// over the closure's `a = store_term` path, and an `eq_transitive` chain
+    /// joining them. Termination: the guard and array paths were merged BEFORE
+    /// this row edge was unioned, so they cannot traverse it.
+    fn plan_row(
+        &mut self,
+        s: TermId,
+        t: TermId,
+        select_term: TermId,
+        store_term: TermId,
+        want: Option<TermId>,
+    ) -> Option<EufJust> {
+        let (sel_arr, sel_idx) = match self.terms.get(select_term) {
+            TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
+                (args[0], args[1])
+            }
+            _ => return None,
+        };
+        let (sto_idx, sto_val) = match self.terms.get(store_term) {
+            TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
+                (args[1], args[2])
+            }
+            _ => return None,
+        };
+        // The edge endpoints are exactly {select_term, value}.
+        if !(s == select_term && t == sto_val || s == sto_val && t == select_term) {
+            return None;
+        }
+        let (guard_eq, guard) = if sto_idx == sel_idx {
+            (None, None)
+        } else {
+            let just = self.derive(sto_idx, sel_idx, None)?;
+            let guard_eq = match just {
+                // Spell the guard from the hypothesis itself so the leaf's
+                // resolution-free clause literal IS the hypothesis literal.
+                EufJust::Hyp(lit) => match self.terms.get(lit) {
+                    TermData::Not(inner) => *inner,
+                    _ => return None,
+                },
+                EufJust::Derived(index) => match &self.derivs[index] {
+                    EufDeriv::Cong { eq_term, .. }
+                    | EufDeriv::Chain { eq_term, .. }
+                    | EufDeriv::RowLeaf {
+                        row_eq: eq_term, ..
+                    } => *eq_term,
+                },
+                EufJust::Refl(_) => return None,
+            };
+            (Some(guard_eq), Some(just))
+        };
+        let elem_sort = self.terms.sort(select_term).clone();
+        let select_store =
+            self.terms
+                .mk_app(Symbol::named("select"), [store_term, sel_idx], elem_sort);
+        let row_eq = self.raw_eq(select_store, sto_val);
+        self.derivs.push(EufDeriv::RowLeaf {
+            row_eq,
+            guard_eq,
+            guard,
+        });
+        let row_leaf = EufJust::Derived(self.derivs.len() - 1);
+        if select_store == select_term {
+            // The select already reads the store term: the leaf itself
+            // concludes the edge. A forced conclusion spelling this lane did
+            // not mint is degenerate; fail closed.
+            return match want {
+                None => Some(row_leaf),
+                Some(w) if w == row_eq => Some(row_leaf),
+                Some(_) => None,
+            };
+        }
+        let eq_sel = self.raw_eq(select_term, select_store);
+        let arr_just = self.derive(sel_arr, store_term, None)?;
+        self.derivs.push(EufDeriv::Cong {
+            eq_term: eq_sel,
+            prems: vec![arr_just, EufJust::Refl(sel_idx)],
+        });
+        let cong = EufJust::Derived(self.derivs.len() - 1);
+        let eq_term = match want {
+            Some(w) => w,
+            None => self.raw_eq(s, t),
+        };
+        let edges = if s == select_term {
+            vec![cong, row_leaf]
+        } else {
+            vec![row_leaf, cong]
+        };
+        self.derivs.push(EufDeriv::Chain { eq_term, edges });
         Some(EufJust::Derived(self.derivs.len() - 1))
     }
 }
@@ -467,9 +598,11 @@ impl Executor {
                 EufJust::Hyp(lit) => clause.push(lit),
                 EufJust::Derived(k) => {
                     let eq = match &plan.derivs[k] {
-                        EufDeriv::Cong { eq_term, .. } | EufDeriv::Chain { eq_term, .. } => {
-                            *eq_term
-                        }
+                        EufDeriv::Cong { eq_term, .. }
+                        | EufDeriv::Chain { eq_term, .. }
+                        | EufDeriv::RowLeaf {
+                            row_eq: eq_term, ..
+                        } => *eq_term,
                     };
                     let lit = self.ctx.terms.mk_not_raw(eq);
                     clause.push(lit);
@@ -541,6 +674,51 @@ impl Executor {
                     &edges,
                     &[eq_term],
                 ),
+                EufDeriv::RowLeaf {
+                    row_eq,
+                    guard_eq,
+                    guard,
+                } => {
+                    let mut clause: Vec<TermId> = Vec::with_capacity(2);
+                    let mut discharge: Option<(TermId, ProofId, Option<usize>)> = None;
+                    if let (Some(guard_eq), Some(just)) = (guard_eq, guard) {
+                        match just {
+                            EufJust::Hyp(lit) => clause.push(lit),
+                            EufJust::Refl(side) => {
+                                let (eq, id) = self.euf_refl_unit(new_proof, &mut refl_units, side);
+                                clause.push(self.ctx.terms.mk_not_raw(eq));
+                                discharge = Some((eq, id, None));
+                            }
+                            EufJust::Derived(k) => {
+                                clause.push(self.ctx.terms.mk_not_raw(guard_eq));
+                                discharge = Some((guard_eq, emitted[k].0, Some(k)));
+                            }
+                        }
+                    }
+                    clause.push(row_eq);
+                    let mut cur = new_proof.add_step(ay_core::ProofStep::TheoryLemma {
+                        theory: "Arrays".to_string(),
+                        clause: clause.clone(),
+                        farkas: None,
+                        kind: ay_core::TheoryLemmaKind::ArraySelectStore { index_eq: true },
+                        lia: None,
+                    });
+                    if let Some((eq, prem_id, src)) = discharge {
+                        let not_eq = self.ctx.terms.mk_not_raw(eq);
+                        if let Some(pos) = clause.iter().position(|&l| l == not_eq) {
+                            let _ = clause.remove(pos);
+                        }
+                        if let Some(k) = src {
+                            for &l in &emitted[k].1 {
+                                if l != eq {
+                                    clause.push(l);
+                                }
+                            }
+                        }
+                        cur = new_proof.add_resolution(clause.clone(), eq, cur, prem_id);
+                    }
+                    (cur, clause)
+                }
             };
             emitted.push(out);
         }
@@ -581,7 +759,11 @@ impl Executor {
                 // equality against its certified Farkas refutation unit.
                 let (chain_id, chain_clause) = emitted[*top].clone();
                 let eq_term = match &plan.derivs[*top] {
-                    EufDeriv::Cong { eq_term, .. } | EufDeriv::Chain { eq_term, .. } => *eq_term,
+                    EufDeriv::Cong { eq_term, .. }
+                    | EufDeriv::Chain { eq_term, .. }
+                    | EufDeriv::RowLeaf {
+                        row_eq: eq_term, ..
+                    } => *eq_term,
                 };
                 let unit_id = new_proof.add_step(ay_core::ProofStep::TheoryLemma {
                     theory: "LIA".to_string(),
@@ -815,6 +997,10 @@ impl Executor {
 #[cfg(test)]
 #[path = "proof_euf_lemma_ext_tests.rs"]
 mod ext_tests;
+
+#[cfg(test)]
+#[path = "proof_euf_lemma_row_tests.rs"]
+mod row_tests;
 
 #[cfg(test)]
 mod tests {

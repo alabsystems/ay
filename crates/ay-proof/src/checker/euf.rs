@@ -39,7 +39,7 @@ fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 /// reinterpreted. All downstream structural checks (chain connectivity,
 /// no-redundant-premise, per-argument matching) run on the flattened literals,
 /// so soundness is unchanged: the clause certifies iff the flat form does.
-fn flatten_or_clause(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
+pub(super) fn flatten_or_clause(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
     if clause.len() == 1 {
         if let TermData::App(Symbol::Named(sym), args) = terms.get(clause[0]) {
             if sym == "or" && args.len() >= 2 {
@@ -51,7 +51,7 @@ fn flatten_or_clause(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
 }
 
 /// Strip `Not` wrappers and return (inner_term, is_negated).
-fn strip_not(terms: &TermStore, mut term: TermId) -> (TermId, bool) {
+pub(super) fn strip_not(terms: &TermStore, mut term: TermId) -> (TermId, bool) {
     let mut negated = false;
     while let TermData::Not(inner) = terms.get(term) {
         term = *inner;

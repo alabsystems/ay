@@ -2,10 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-// Verified result wrappers (VerifiedSatResult, VerifiedAssumeResult) are
-// defined in `types.rs` and re-exported from this module.
-// Crate-level `#![deny(unsafe_code)]` blocks unaudited type forgery; narrow
-// hot-path exceptions opt in beside their safety invariants.
+// Solver-origin result wrappers are sealed in `origin_result.rs` and
+// re-exported from this module.
 
 //! Main CDCL SAT solver
 //!
@@ -69,6 +67,7 @@ mod jit_stubs;
 pub(crate) mod minimization_state;
 // PropagationContext-ABI kernel host: ay-sat drives the published
 // ay_sat_watch_bcp kernel surface as a shadow (#678).
+mod origin_result;
 pub(crate) mod phase_init_state;
 #[allow(dead_code)]
 pub(crate) mod solver_stats;
@@ -79,11 +78,12 @@ mod types;
 mod var_data;
 pub use incremental::VarAssignmentKind;
 pub use lookahead::LookaheadStats;
+pub use origin_result::{SolverAssumeResult, SolverSatResult};
 pub(crate) use state::ReasonKind;
 pub use state::Solver;
 pub use stats::{
-    BcpLongScanStats, BcpSavedPosStats, LratMaterializationStats, RephaseAttributionStats,
-    RestartAttributionStats,
+    BcpLongScanStats, BcpSavedPosStats, IndepEnumReport, LratMaterializationStats,
+    RephaseAttributionStats, RestartAttributionStats,
 };
 #[cfg(test)]
 pub(crate) use types::MemoryStats;
@@ -219,14 +219,19 @@ pub(crate) mod dip;
 #[allow(dead_code)]
 pub(crate) mod equiv_detection;
 mod flip_to_none;
+mod gf_probe;
 mod incremental;
+mod indep_enum;
+mod indep_support;
 mod inproc_control;
 #[allow(dead_code)]
 mod inprocessing;
 pub(crate) mod lifecycle;
+mod load_slack;
 mod lookahead;
 mod lookahead_schedule;
 mod lucky_scratch;
+mod memory_budget;
 mod mutate;
 mod mutate_delete;
 mod mutate_replace;
@@ -240,6 +245,7 @@ mod preprocess_verify;
 mod probe_implications;
 #[allow(dead_code)]
 mod profile;
+mod proof_consumer_lifecycle;
 mod proof_emit;
 mod propagation;
 mod propagation_bcp;
@@ -252,7 +258,9 @@ mod reduction;
 mod reduction_between_solves;
 mod reduction_execute;
 mod reduction_triggers;
+mod reduction_two_stage;
 mod relevancy;
+mod relevancy_frontier;
 mod rephase;
 mod restart;
 mod sat_whole_loop_guard;

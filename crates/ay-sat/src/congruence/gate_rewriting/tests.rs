@@ -4,7 +4,9 @@
 
 use super::super::union_find::UnionFind;
 use super::super::CongruenceClosure;
+use super::{GateSignature, GateTable};
 use crate::clause_arena::ClauseArena;
+use crate::gates::GateType;
 use crate::literal::{Literal, Variable};
 use crate::test_util::lit;
 use smallvec::SmallVec;
@@ -257,4 +259,75 @@ fn test_xnor_complementary_pair_reorders_after_uf_canonicalization() {
         "XNOR(t, b, ¬t) must not collapse to y ≡ ¬b, got edges {:?}",
         result.equivalence_edges
     );
+}
+
+/// The gate table's removal path (B77).
+///
+/// A gate is rewritten BECAUSE a merge changed one of its inputs'
+/// representatives, so recomputing its signature at removal time yields a
+/// different key from the one it was filed under: the removal misses and the
+/// entry is stranded, one per rewrite, unbounded. On SAT-COMP 2026
+/// `post-cbmc-aes-ee-r2` (a 33 MB input that 28 of 31 official solvers solve)
+/// that reached 17.6 GB resident and a `c memout` 8 s into a 300 s budget.
+fn gate_sig(gate_type: GateType, inputs: &[usize]) -> GateSignature {
+    GateSignature {
+        gate_type,
+        inputs: inputs.iter().copied().collect::<SmallVec<[usize; 5]>>(),
+    }
+}
+
+#[test]
+fn exact_removal_drops_the_entry_the_gate_was_filed_under() {
+    let mut table = GateTable::new(4, true);
+    let filed = gate_sig(GateType::And, &[2, 4]);
+    table.insert(filed.clone(), 1);
+    assert_eq!(table.len(), 1);
+
+    // A merge has since demoted input 4, so the caller's recomputed key is a
+    // different signature entirely. Exact removal must not consult it.
+    table.remove_gate(1, || gate_sig(GateType::And, &[2, 6]));
+
+    assert_eq!(
+        table.len(),
+        0,
+        "the entry the gate was filed under must be gone — recomputing the key \
+         after a merge is exactly the case that stranded it"
+    );
+    assert_eq!(table.get(&filed), None);
+}
+
+#[test]
+fn legacy_removal_strands_the_entry_when_the_key_moved() {
+    let mut table = GateTable::new(4, false);
+    let filed = gate_sig(GateType::And, &[2, 4]);
+    table.insert(filed.clone(), 1);
+
+    table.remove_gate(1, || gate_sig(GateType::And, &[2, 6]));
+
+    assert_eq!(
+        table.len(),
+        1,
+        "the opt-out arm must reproduce the leak verbatim, or a paired A/B is \
+         measuring something other than the fix"
+    );
+    assert_eq!(table.get(&filed), Some(1));
+}
+
+/// Exact removal must be a no-op for a gate that holds no entry, must not touch
+/// another gate's entry, and must be idempotent.
+#[test]
+fn exact_removal_is_scoped_to_one_gate() {
+    let mut table = GateTable::new(4, true);
+    table.insert(gate_sig(GateType::And, &[2, 4]), 1);
+    table.insert(gate_sig(GateType::Xor, &[6, 8]), 2);
+
+    table.remove_gate(3, || gate_sig(GateType::And, &[2, 4]));
+    assert_eq!(table.len(), 2, "a gate with no entry must remove nothing");
+
+    table.remove_gate(1, || unreachable!("exact removal must not recompute"));
+    assert_eq!(table.len(), 1);
+    assert_eq!(table.get(&gate_sig(GateType::Xor, &[6, 8])), Some(2));
+
+    table.remove_gate(1, || unreachable!("exact removal must not recompute"));
+    assert_eq!(table.len(), 1, "removing twice must be idempotent");
 }

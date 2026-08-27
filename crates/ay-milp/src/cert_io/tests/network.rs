@@ -100,6 +100,7 @@ pub(super) fn emitted_pattern_count_optimum_parses_and_checks_end_to_end() {
         network_design_infeasibility_certificate: None,
         network_design_optimality_certificate: Some(&certificate),
         block_angular_optimality_certificate: None,
+        milp_optimality_tree_certificate: None,
         single_machine_scheduling_optimality_certificate: None,
         single_row_dp_infeasibility_certificate: None,
         multi_row_bdd_infeasibility_certificate: None,
@@ -123,7 +124,7 @@ pub(super) fn emitted_pattern_count_optimum_parses_and_checks_end_to_end() {
     let parsed = parse(&wire).expect("public parser accepts the emitted certificate");
     assert!(parsed.network_design_optimality.is_some());
     let report = check(&wire, model_text);
-    assert_eq!(report.status, CheckStatus::Verified, "{}", report.census());
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     assert_eq!(
         report.claims_in(ClaimStanding::Verified),
         vec!["primal", "dual"]
@@ -148,9 +149,9 @@ fn assert_pattern_tampering_is_refuted(
         network_design_optimality_certificate: Some(&tampered),
         ..ctx
     };
-    let tampered_wire = emit(&tampered_ctx, &outcome);
+    let tampered_wire = emit(&tampered_ctx, outcome);
     let tampered_report = check(&tampered_wire, model_text);
-    assert_eq!(tampered_report.status, CheckStatus::Refuted);
+    assert_eq!(tampered_report.status(), CheckStatus::Refuted);
     assert_eq!(
         tampered_report.claims_in(ClaimStanding::Refuted),
         vec!["dual"]

@@ -309,37 +309,7 @@ fn search_declines_on_satisfiable_circle() {
     assert!(search(&[c0, c1], &[x, y]).is_none());
 }
 
-// ---------------------------------------------------------------------------
-// LP feasibility solver.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn lp_simple_feasible() {
-    // x + y = 1, x, y ≥ 0. Feasible; recovered point satisfies the equation.
-    let a = vec![vec![r(1), r(1)]];
-    let b = vec![r(1)];
-    let sol = lp_phase1_feasible(a, b, 2).expect("feasible");
-    assert_eq!(&sol[0] + &sol[1], r(1));
-    assert!(!sol[0].is_negative() && !sol[1].is_negative());
-}
-
-#[test]
-fn lp_infeasible_negative_target() {
-    // x = −1 with x ≥ 0 is infeasible.
-    let a = vec![vec![r(1)]];
-    let b = vec![r(-1)];
-    assert!(lp_phase1_feasible(a, b, 1).is_none());
-}
-
-#[test]
-fn lp_two_row_feasible() {
-    // x + y + z = 2, x − y = 0, all ≥ 0.
-    let a = vec![vec![r(1), r(1), r(1)], vec![r(1), r(-1), r(0)]];
-    let b = vec![r(2), r(0)];
-    let sol = lp_phase1_feasible(a, b, 3).expect("feasible");
-    assert_eq!(&sol[0] + &sol[1] + &sol[2], r(2));
-    assert_eq!(&sol[0] - &sol[1], r(0));
-}
+mod lp;
 
 // ---------------------------------------------------------------------------
 // Alethe rendering.

@@ -24,9 +24,13 @@ impl Executor {
         binding: &[TermId],
         ground_body: TermId,
         empty_model: &Model,
-        outputs: (&mut HashSet<TermId>, &mut Vec<TermId>),
+        outputs: (
+            &mut HashSet<TermId>,
+            &mut Vec<TermId>,
+            &mut Vec<crate::ematching::ForallInstantiationProvenance>,
+        ),
     ) -> bool {
-        let (seen_instantiations, new_instantiations) = outputs;
+        let (seen_instantiations, new_instantiations, refinement_provenance) = outputs;
         // Model-less rounds constant-fold against the empty model instead:
         // fully interpreted closed instances get a definite verdict, while
         // anything needing a model value fails closed to `Unknown`.
@@ -39,6 +43,24 @@ impl Executor {
             EvalValue::Bool(false) => {
                 if seen_instantiations.insert(ground_body) {
                     new_instantiations.push(ground_body);
+                    // Every pushed instance is a `forall_inst` consequence of
+                    // an authored universal, and that justification needs no
+                    // model: the model only guided the CHOICE of binding.
+                    // Without this record the proof layer cannot see where a
+                    // model-relative counterexample came from, so a genuine
+                    // refutation was demoted to Unknown (the wide-binder
+                    // regression). Records carry no authority of their own —
+                    // `CheckedInstanceDerivation::seal` replays the exact
+                    // substitution, so a wrong record can only decline.
+                    if crate::quant_unit_authority::consequence_replay_enabled() {
+                        refinement_provenance.push(
+                            crate::ematching::ForallInstantiationProvenance {
+                                quantifier,
+                                binding: binding.to_vec(),
+                                instance: ground_body,
+                            },
+                        );
+                    }
                     self.record_bv_mbqi_false_instance(
                         quantifier,
                         body,

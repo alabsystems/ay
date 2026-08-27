@@ -195,15 +195,14 @@ pub(crate) fn smtlib_first_verdict_via_executor(
 /// CHC replay obligation.
 ///
 /// Produced by [`smtlib_strict_unsat_cert_via_executor`] on a proof-enabled
-/// `ay-dpll` `Solver`. Both fields are self-contained and require NO external
-/// process (no z3, no carcara): `strict_verdict` is AY's own in-process native
-/// proof-IR check (`export_last_unsat_artifact().strict_verdict`), and `bundle`
-/// is the portable proof that AY's own offline checker
-/// (`ay_dpll::api::re_check_bundle_strict`) re-validates with no solver run.
-/// `alethe` is hash-bound diagnostic text and may disclose an honest `hole`
-/// for a native inference absent from the pinned external calculus.
+/// `ay-dpll` `Solver`. No external process (z3 or carcara) is invoked:
+/// `strict_verdict` is AY's in-process native proof-IR verdict, while `bundle`
+/// and `alethe` are retained for diagnostic hashing. A verdict that uses the
+/// sound deferred-trust theory rescue can accompany a bundle rejected by the
+/// narrower plain `ay_dpll::api::re_check_bundle_strict`; neither diagnostic
+/// payload is therefore a universal standalone offline certificate.
 pub(crate) struct StrictUnsatCert {
-    /// Offline-recheckable proof bundle (re-checked by `re_check_bundle_strict`).
+    /// Serialized proof-bundle diagnostic bound by the checked-replay row.
     pub bundle: ay_dpll::api::SerializableProofBundle,
     /// Rendered Alethe proof text (the human/tool-visible certificate).
     pub alethe: String,
@@ -217,11 +216,12 @@ pub(crate) struct StrictUnsatCert {
 /// rather than merely returning a trusted `unsat`/`sat`/`unknown` verdict, it
 /// builds a proof-enabled `ay-dpll` [`Solver`](ay_dpll::api::Solver), executes
 /// the obligation, and — only when the obligation is genuinely `unsat` and a
-/// proof was produced — returns the native strict certificate: an in-process
-/// [`StrictProofVerdict`](ay_dpll::api::StrictProofVerdict) plus the portable
-/// [`SerializableProofBundle`](ay_dpll::api::SerializableProofBundle) that AY's
-/// own offline checker can re-validate. Everything here is self-contained: no
-/// z3, no external checker.
+/// proof was produced — returns an in-process
+/// [`StrictProofVerdict`](ay_dpll::api::StrictProofVerdict) plus its serialized
+/// [`SerializableProofBundle`](ay_dpll::api::SerializableProofBundle)
+/// diagnostic. The in-process verdict is authoritative here; deferred-trust
+/// theory rescue is not reproduced by the narrower plain offline bundle
+/// checker. No z3 or external checker is invoked.
 ///
 /// The proof machinery is enabled by prepending
 /// `(set-option :produce-proofs true)`; the obligation carries its own

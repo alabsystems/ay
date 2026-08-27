@@ -471,6 +471,29 @@ fn test_cross_theory_euf_lia_conflict_split() {
         "cross-theory EUF+LIA conflict should be trust-free: {quality:?}\n{proof_text}"
     );
     assert!(proof_text.contains(":rule eq_congruent"));
-    assert!(proof_text.contains(":rule lia_generic") || proof_text.contains(":rule la_generic"));
+    // `lia_generic` is NOT an acceptable outcome: `wire_rule_name` degrades it
+    // to the canonical unproved rule, so a document that "contains lia_generic"
+    // is unreachable and the disjunct only ever masked a `hole`. Demand the
+    // checked Farkas promotion and the absence of any hole.
+    assert!(
+        proof_text.contains(":rule la_generic"),
+        "the solver-checked Farkas refutation must export as la_generic:\n{proof_text}"
+    );
+    assert!(
+        !proof_text.contains(":rule hole"),
+        "no step of this refutation may be degraded to a hole:\n{proof_text}"
+    );
+    // EXACT WIRE TEXT. `(> (f b) 5)` is the authored spelling of the atom AY
+    // interned as `(< 5 (f b))` (`mk_gt` swaps and converses), so the printed
+    // clause IS the validated clause. Pinning the whole step keeps that
+    // specific: re-canonicalizing the surface, dropping the `:args`, or
+    // reordering the literals fails here, not merely in `contains` above.
+    assert!(
+        proof_text.contains("(assume t2 (> (f b) 5))")
+            && proof_text
+                .contains("(cl (not (= 5 (f b))) (not (> (f b) 5))) :rule la_generic :args (1 1)"),
+        "the assume must keep the problem's spelling and the la_generic must \
+         carry that same orientation with its coefficients:\n{proof_text}"
+    );
     assert_last_unsat_proof_is_strict(&exec);
 }

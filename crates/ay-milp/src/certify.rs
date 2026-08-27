@@ -2832,9 +2832,7 @@ mod weak_dual_row_tests {
         BigRational::new(n.into(), d.into())
     }
 
-    /// [`certified_weak_dual_row_big_reference_proposal`] behind the same
-    /// verify-before-return contract [`certified_weak_dual_row`] enforces, so
-    /// the differential comparison covers the decline conditions too.
+    /// Big-reference proposal behind the production verify-before-return contract.
     fn certified_weak_dual_row_big_reference(
         model: &Model,
         q: &[f64],
@@ -2843,7 +2841,9 @@ mod weak_dual_row_tests {
     ) -> Option<CertifiedRow> {
         let row = certified_weak_dual_row_big_reference_proposal(model, q, row_duals, deadline)?;
         row.verify(model).ok()?;
-        (!deadline.is_some_and(|limit| std::time::Instant::now() >= limit)).then_some(row)
+        deadline
+            .is_none_or(|limit| std::time::Instant::now() < limit)
+            .then_some(row)
     }
 
     fn assert_matches_big_reference(model: &Model, q: &[f64], row_duals: &[f64]) -> CertifiedRow {

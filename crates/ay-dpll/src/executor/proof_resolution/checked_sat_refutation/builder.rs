@@ -6,10 +6,14 @@
 
 use ay_core::kani_compat::DetHashSet as HashSet;
 
+use super::derivation_evidence::{
+    sealed_context_derivations, sealed_fragment_derivation_maps, sealed_instance_root_derivations,
+    sealed_propagation_environment,
+};
 use super::*;
 use crate::sat_proof_manager::{
-    FragmentInstanceDerivation, FragmentInstanceRootDerivation, FragmentPropagationEnvironment,
-    FragmentSkolemDerivation,
+    FragmentContextDerivation, FragmentInstanceDerivation, FragmentInstanceRootDerivation,
+    FragmentPropagationEnvironment, FragmentSkolemDerivation,
 };
 
 struct SealedAuthority {
@@ -318,12 +322,15 @@ fn build_fragment(
     if !authority.context_derivations.is_empty() {
         manager.set_context_derivations(&authority.context_derivations);
     }
-    Ok(manager.build_exact_original_proof_fragment_metered(
-        trace,
-        &authored.combined,
-        original_id_cone,
-        &mut |work, bytes| meter.charge(work, bytes),
-    )?)
+    Ok(
+        manager.build_exact_original_proof_fragment_metered_with_diagnostic(
+            trace,
+            &authored.combined,
+            original_id_cone,
+            &mut |work, bytes| meter.charge(work, bytes),
+            &mut |message| crate::executor::probe_cert_reject_raw(|| message),
+        )?,
+    )
 }
 
 fn authenticate_and_compose(
@@ -441,11 +448,23 @@ fn finish_capability(
 pub(super) fn build(
     executor: &mut Executor,
 ) -> Result<CheckedSatRefutation, CheckedSatRefutationError> {
+    let phase_clock = ay_core::time::Instant::now();
+    let phase = |label: &str| {
+        if ay_core::misc_cli_flags().probe_cert_reject {
+            ay_core::safe_eprintln!(
+                "--probe-cert-reject: build phase {label} at {:?}",
+                phase_clock.elapsed()
+            );
+        }
+    };
     let authority = seal_authority(executor)?;
+    phase("sealed");
     let mut replay = replay_trace(executor)?;
+    phase("replayed");
     let authored = copy_authored_terms(executor, &mut replay.meter)?;
     let strict = prepare_strict_context(executor, &mut replay.meter)?;
     let original_id_cone = original_cone_trace_ids(&replay.validated, &mut replay.meter)?;
+    phase("cone");
     let fragment = build_fragment(
         executor,
         &authority,
@@ -453,6 +472,7 @@ pub(super) fn build(
         original_id_cone.as_ref(),
         &mut replay.meter,
     )?;
+    phase("fragment");
     authenticate_and_compose(
         executor,
         &fragment,

@@ -26,7 +26,7 @@ fn rl_max_cardinality(prefix: &[BigRational], c: &BigRational) -> Option<usize> 
     // prefix[0] == 0 <= c always, so the answer is at least 0.
     let (mut lo, mut hi) = (0usize, prefix.len() - 1);
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = lo + (hi - lo).div_ceil(2);
         if prefix[mid] <= *c {
             lo = mid;
         } else {

@@ -1153,14 +1153,18 @@ fn memory_watchdog_escalates_immediately_when_already_over_budget() {
 }
 
 /// A memout and a timeout both emit the required `unknown` verdict, but carry
-/// distinct `:reason-unknown` payloads so a harness can tell them apart.
+/// distinct markers so a harness can tell them apart. The competition memout
+/// additionally carries its `c memout` marker on STDOUT: wrapper scripts
+/// (~/ay-bench/bin/ay-proofmode) forward only stdout plus an exit code that is
+/// 0 for every competition unknown, so a stderr-only marker made a memout
+/// unscoreable through them.
 #[test]
 fn memout_and_timeout_share_the_verdict_but_not_the_reason() {
     for wrapper in [false, true] {
-        assert_eq!(
-            memory_stdout_line_for_sat_competition_wrapper(wrapper),
-            timeout_stdout_line_for_sat_competition_wrapper(wrapper),
-            "resource exhaustion must emit the same unknown verdict grammar"
+        assert!(
+            memory_stdout_line_for_sat_competition_wrapper(wrapper)
+                .ends_with(timeout_stdout_line_for_sat_competition_wrapper(wrapper)),
+            "resource exhaustion must end in the same unknown verdict grammar"
         );
         assert_ne!(
             memory_stderr_line_for_sat_competition_wrapper(wrapper),
@@ -1168,6 +1172,17 @@ fn memout_and_timeout_share_the_verdict_but_not_the_reason() {
             "a memout must be distinguishable from a timeout"
         );
     }
+    assert_eq!(
+        memory_stdout_line_for_sat_competition_wrapper(true),
+        b"c memout\ns UNKNOWN\n",
+        "competition memouts must carry the marker on stdout for \
+         stdout-only wrappers"
+    );
+    assert_eq!(
+        memory_stdout_line_for_sat_competition_wrapper(false),
+        b"unknown\n",
+        "the SMT-LIB verdict stream stays a bare verdict"
+    );
     assert_eq!(
         memory_stderr_line_for_sat_competition_wrapper(false),
         b"(:reason-unknown \"memout\")\n",

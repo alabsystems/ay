@@ -105,17 +105,26 @@ fn main() {
     // nearest known spelling), instead of parsing as a switch that does
     // nothing — or, for a value flag, donating its value to the positionals
     // where it used to be read as a seed-solution path.
-    let mut value_flags: Vec<&str> = ay_milp::engine_cli::VALUE_FLAGS.to_vec();
-    value_flags.push("margin-row");
-    let mut switch_flags = ay_milp::engine_cli::switch_flags();
-    switch_flags.extend(["iter-ledger", "allocstat"]);
-    let flags = ay_milp::engine_cli::Flags::parse(&raw, &value_flags, &switch_flags)
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "usage: mps_solve <file.mps> [seconds] [seed.sol] [--engine-flags]\nmps_solve: {e}"
-            );
-            std::process::exit(2);
-        });
+    // `applied_flags()` PLUS this harness's own four value names and two
+    // switches — NOT `VALUE_FLAGS`, which is `ay-milp solve`'s table and would
+    // also accept the fourteen names only `solve` reads (`--emit-cert`,
+    // `--require`, `--time-limit`, …). This harness takes its time limit as
+    // POSITIONAL #2, so accepting `--time-limit` was a lever that renamed the
+    // run without changing it.
+    //
+    // `check-sol` and `dual-cutoff` are here rather than in `VALUE_FLAGS`
+    // because THIS FILE is their only reader in the crate.
+    let flags = ay_milp::engine_cli::parse_applied(
+        &raw,
+        &["margin-row", "check-sol", "dual-cutoff", "seed-solution"],
+        &["iter-ledger", "allocstat"],
+    )
+    .unwrap_or_else(|e| {
+        eprintln!(
+            "usage: mps_solve <file.mps> [seconds] [seed.sol] [--engine-flags]\nmps_solve: {e}"
+        );
+        std::process::exit(2);
+    });
     if flags.has("iter-ledger") {
         ITER_LEDGER.store(true, std::sync::atomic::Ordering::Relaxed);
         // The library-side accumulation gate (B38 follow-up): without this the
@@ -246,11 +255,8 @@ fn main() {
         p.model.sense()
     );
 
-    // ENGINE FLAGS APPLY TO THE DIAGNOSTIC MODES TOO. This parse used to sit BELOW every
-    // diagnostic early return, so `AY_ROOT_CLOSURE=1 ... --root-cuts-per-round 200` silently
-    // measured the DEFAULT root loop — the flags were parsed for a solve that never ran. The
-    // opts built here are the ones the solve path consumes below, unchanged; the diagnostics
-    // now receive the same object instead of constructing an unflagged one.
+    // Parse once before every early return so diagnostics and the ordinary solve
+    // consume the same caller-layer engine flags.
     let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
     if let Some(cutoff) = dual_cutoff_model_frame {
         let engine = opts.engine().with_dual_cutoff(cutoff);
@@ -261,11 +267,8 @@ fn main() {
         std::process::exit(2);
     });
 
-    // W0 MEASUREMENT: root dual bound before and after the cut loop, no branching.
-    // The one signal that attributes a change to the CUTS rather than to the tree.
-    // Reported on stdout in the file's own objective frame (un-scaled, re-sensed), so
-    // it is directly comparable with a published optimum and with another solver's
-    // root bound.
+    // W0: root dual bound before/after cuts in the file objective frame, with no
+    // branching, isolates cut-loop gain from the tree.
     if std::env::var_os("AY_ROOT_CLOSURE").is_some() {
         use num_traits::ToPrimitive as _;
         let line = ay_milp::diag_root_closure_with(&p.model, secs, &opts);
@@ -298,21 +301,16 @@ fn main() {
         return;
     }
 
-    // Diagnostic: solve just the float-lane LP relaxation (cold) and report
-    // iteration economics; --lp-stats adds per-phase LPSTAT lines.
-    //
-    // `_with(&opts)` IS LOAD-BEARING, and its absence was incident five of the
-    // dead-flag family. `diag_float_lp(&p.model, secs)` pushed no
-    // `tune::activate_caller` frame, so every caller-layer knob was inert on this
-    // lane. Measured on release binaries either side of the change:
-    // `AY_LP_ONLY=1 mps_solve qiu.mps 60 --devex` reported primal=3455 (byte-
-    // identical to the unflagged arm) before, primal=2176 after; and
-    // `--diag-plain-cold`, which `diag_float_lp` reads in its own body, was
-    // byte-identical on fast0507 before (primal=18811 dual=15410) and switches
-    // the lane after (primal=14387 dual=0 refac=289). The flags were parsed
-    // above; they now reach the diagnostic.
+    // Cold float-lane relaxation diagnostics use the caller opts; this is
+    // load-bearing because caller-layer pricing knobs must reach the LP walk.
     if std::env::var_os("AY_LP_ONLY").is_some() {
-        eprintln!("{}", ay_milp::diag_float_lp_with(&p.model, secs, &opts));
+        // This is the exact emission `scripts/milp_w0.py::run_ay_lp` parses, so the
+        // scale factor has to be on it here too — see `MpsProblem::units_clause`.
+        eprintln!(
+            "{}{}",
+            ay_milp::diag_float_lp_with(&p.model, secs, &opts),
+            p.units_clause()
+        );
         // B12: caller-enabled profilers return empty lines when inactive.
         {
             let line = ay_milp::rt_profile_line();
@@ -337,15 +335,8 @@ fn main() {
         return;
     }
 
-    // MARGIN REFRAME DEMO. `--margin-row last` (or a 0-based row index)
-    // names a band-violation row in this objective-≡0 feasibility model and
-    // reports the reframed dual bound — the number that "comes alive" (nonzero,
-    // informative) versus the trivial 0 of the zero objective. This exercises
-    // the same `mark_margin_row` + reframe path `BabSession::check` takes.
-    // B22: --margin-row <spec> example flag (was a retired env var).
-    // B22: `--margin-row <spec>` is a VALUE flag on the shared parser now. It
-    // used to be re-scanned out of `std::env::args()` behind the parser's
-    // back, so its value also landed in `positional` — i.e. in the seed slot.
+    // `--margin-row <last|index>` uses the shared value parser and exercises the
+    // same caller-framed reframe path as `BabSession::check`.
     if let Some(spec) = flags.get("margin-row").cloned() {
         let nrows = p.model.num_rows();
         let row_idx = if spec.eq_ignore_ascii_case("last") {
@@ -363,17 +354,8 @@ fn main() {
             eprintln!("mark_margin_row({row_idx}): {e}");
             std::process::exit(2);
         }
-        // THE THIRD FRAMELESS LANE, now REPAIRED rather than refused.
-        //
-        // This branch used to reject every engine flag, because
-        // `diag_margin_reframe(&m, secs)` took no `SolveOpts`, pushed no
-        // `tune::activate_caller` frame, and built a throwaway `SolveOpts::new()`
-        // for its nested `reframe` — so a flag here parsed and changed nothing,
-        // and refusing beat measuring under it. `diag_margin_reframe_with` is the
-        // real repair, the same one `diag_float_lp_with` is above: the flags
-        // parsed at the top of `main` now reach the module's own kill switch
-        // (`--no-margin-reframe`), its arming knob (`--auto-margin`) and the root
-        // LP walk. Refusing after that would be refusing a flag that DOES fire.
+        // The `_with` entry carries the parsed kill switch, arming knob, and LP
+        // pricing profile into this formerly frameless diagnostic lane.
         eprintln!("{}", ay_milp::diag_margin_reframe_with(&m, secs, &opts));
         return;
     }

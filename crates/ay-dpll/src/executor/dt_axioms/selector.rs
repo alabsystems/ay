@@ -17,6 +17,9 @@ use super::SelectorList;
 use crate::executor::theories::{array_extensionality_witness, ArrayExtWitnessBinding};
 use crate::executor::Executor;
 
+mod context_bindings;
+mod term_inspection;
+
 /// Warm-start recursive-datatype unroll depth for the eager DT axiom pass.
 ///
 /// The eager [`Executor::dt_selector_axioms`] pass unrolls recursive selector
@@ -93,38 +96,6 @@ fn dt_sort_name(sort: &Sort, datatype_ctors: &HashMap<String, Vec<String>>) -> O
 }
 
 impl Executor {
-    /// Instance-correct selector signature: resolves `ctor_name`'s field sorts
-    /// for the SPECIFIC datatype instance `dt_name`. Parametric datatypes
-    /// monomorphize to several instances that share a constructor name but
-    /// differ in field sorts; using this (rather than the by-name map, which
-    /// keeps only the last instance) keeps synthesized selector/constructor
-    /// terms well-sorted so two instantiations can coexist without the axiom
-    /// machinery emitting sort-confused terms.
-    fn selector_signature_in(&self, dt_name: &str, ctor_name: &str) -> Option<SelectorList> {
-        self.ctx.constructor_selector_info_in(dt_name, ctor_name)
-    }
-
-    /// The datatype (instance) sort name of `term`, if it has a datatype sort.
-    fn dt_name_of(&self, term: TermId) -> Option<String> {
-        match self.ctx.terms.sort(term) {
-            Sort::Uninterpreted(n) => Some(n.clone()),
-            Sort::Datatype(dt) => Some(dt.name.clone()),
-            _ => None,
-        }
-    }
-
-    /// True when `term` is a datatype constructor application `C(...)`.
-    ///
-    /// Such terms have a known, explicit constructor, so the exhaustiveness (D)
-    /// and constructor (C) axioms — which exist to case-split genuinely free
-    /// datatype variables — are redundant for them.
-    fn term_is_constructor_app(&self, term: TermId) -> bool {
-        matches!(
-            self.ctx.terms.get(term),
-            TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some()
-        )
-    }
-
     /// Field-level selector-congruence for DATATYPE-valued array selects under
     /// symbolic indices (option C; the development design notes).
     ///
@@ -2919,33 +2890,6 @@ impl Executor {
         // Note: Nullary constructors are stored as Var terms, not App terms (#1745).
         let mut ctor_terms_for_testers: Vec<(TermId, String, String)> = Vec::new();
 
-        // Union-find for computing equivalence classes of asserted equalities.
-        // This handles transitive equality propagation (#1741): if `p = q` and `q = C(args)`,
-        // we need to generate selector axioms for `p` as well.
-        let mut uf_parent: HashMap<TermId, TermId> = HashMap::default();
-        let uf_find = |parent: &mut HashMap<TermId, TermId>, mut x: TermId| -> TermId {
-            let mut path = Vec::new();
-            while let Some(&p) = parent.get(&x) {
-                if p == x {
-                    break;
-                }
-                path.push(x);
-                x = p;
-            }
-            // Path compression
-            for node in path {
-                parent.insert(node, x);
-            }
-            x
-        };
-        let uf_union = |parent: &mut HashMap<TermId, TermId>, a: TermId, b: TermId| {
-            let ra = uf_find(parent, a);
-            let rb = uf_find(parent, b);
-            if ra != rb {
-                parent.insert(ra, rb);
-            }
-        };
-
         // Collect asserted equalities for union-find
         let mut asserted_equalities: Vec<(TermId, TermId, TermId)> = Vec::new();
         // #dt-context-derivation: asserted premise terms justifying each
@@ -3089,56 +3033,11 @@ impl Executor {
             }
         }
 
-        // Build union-find from asserted equalities (#1741)
-        for (a, b, _) in &asserted_equalities {
-            uf_union(&mut uf_parent, *a, *b);
-        }
-
-        // Propagate var_to_ctor through equivalence classes (#1741)
-        // If q = C(args) and p = q (transitively), then p should also map to C(args)
-        // Sort for deterministic propagation order (#3060)
-        let mut direct_mappings: Vec<_> =
-            var_to_ctor.iter().map(|(k, v)| (*k, v.clone())).collect();
-        direct_mappings.sort_by_key(|(term, _)| term.0);
-        for (term, ctor_info) in direct_mappings {
-            let root = uf_find(&mut uf_parent, term);
-            // #dt-context-derivation: the premise SET for every member of
-            // this class — the direct binding's asserted equality plus every
-            // asserted var-var equality inside the class. A superset of the
-            // minimal chain is deliberately fine: extra premises only WEAKEN
-            // the sealed lemma (more discharge steps), never strengthen it.
-            let class_equalities: Vec<TermId> = asserted_equalities
-                .iter()
-                .filter(|(a, b, _)| {
-                    uf_find(&mut uf_parent, *a) == root && uf_find(&mut uf_parent, *b) == root
-                })
-                .map(|(_, _, eq_term)| *eq_term)
-                .collect();
-            let direct_premises = binding_premises.get(&term).cloned().unwrap_or_default();
-            // Find all terms in same equivalence class
-            let equality_sides: Vec<(TermId, TermId)> = asserted_equalities
-                .iter()
-                .map(|(a, b, _)| (*a, *b))
-                .collect();
-            for (a, b) in equality_sides {
-                for t in [a, b] {
-                    if t != term && uf_find(&mut uf_parent, t) == root {
-                        var_to_ctor.entry(t).or_insert_with(|| {
-                            let (ctor, args, sels, _) = ctor_info.clone();
-                            // The equality holds only TRANSITIVELY for `t`, so
-                            // no single asserted premise justifies the binding.
-                            (ctor, args, sels, None)
-                        });
-                        binding_premises.entry(t).or_insert_with(|| {
-                            let mut premises = direct_premises.clone();
-                            premises.extend(class_equalities.iter().copied());
-                            premises.dedup();
-                            premises
-                        });
-                    }
-                }
-            }
-        }
+        let mut uf_parent = context_bindings::propagate_ctor_bindings(
+            &asserted_equalities,
+            &mut var_to_ctor,
+            &mut binding_premises,
+        );
 
         // Second pass: generate equality axioms.
         //
@@ -3977,7 +3876,7 @@ impl Executor {
             let mut uf_class_ctors: HashMap<TermId, Vec<(&String, &Vec<TermId>)>> =
                 HashMap::default();
             for (p, (ctor_name, args, _selectors, _provenance)) in &var_to_ctor {
-                let rep = uf_find(&mut uf_parent, *p);
+                let rep = context_bindings::find(&mut uf_parent, *p);
                 uf_class_ctors
                     .entry(rep)
                     .or_default()

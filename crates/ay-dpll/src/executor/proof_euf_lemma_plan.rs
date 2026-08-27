@@ -253,6 +253,58 @@ impl Executor {
             cc.close(terms);
         }
 
+        // (#implied-forall-ground-inst) ROW-under-equality saturation: for a
+        // `(select a k)` already in the universe whose array is CC-equal to a
+        // `(store b i e)` with `k` CC-equal to `i`, the read IS the stored
+        // value. MEASURED NEED: the #7956 same-context probe's decisive
+        // conflict is a 7-literal Generic lemma whose only non-EUF content is
+        // exactly one such read (`(select A (+ off 0))` under `A = (store c0
+        // 0 v)` with `0 = (+ off 0)` among the hypotheses); without the
+        // bridge the pure-congruence closure cannot link the read to `v` and
+        // the whole refutation stays an unpromotable trust step. Each bridge
+        // edge is emitted as one strictly validated `ArraySelectStore` leaf
+        // plus ordinary congruence steps, so the planner adds no authority.
+        {
+            const MAX_ROW_BRIDGE_PAIRS: usize = 4_096;
+            let mut selects: Vec<(TermId, TermId, TermId)> = Vec::new();
+            let mut stores: Vec<(TermId, TermId, TermId)> = Vec::new();
+            for &app in &cc.apps {
+                if let TermData::App(Symbol::Named(name), args) = terms.get(app) {
+                    if name == "select" && args.len() == 2 {
+                        selects.push((app, args[0], args[1]));
+                    } else if name == "store" && args.len() == 3 {
+                        stores.push((app, args[1], args[2]));
+                    }
+                }
+            }
+            if selects.len().saturating_mul(stores.len()) <= MAX_ROW_BRIDGE_PAIRS {
+                loop {
+                    let mut changed = false;
+                    for &(select_term, sel_arr, sel_idx) in &selects {
+                        for &(store_term, sto_idx, sto_val) in &stores {
+                            if cc.find(sel_arr) == cc.find(store_term)
+                                && cc.find(sel_idx) == cc.find(sto_idx)
+                                && cc.find(select_term) != cc.find(sto_val)
+                            {
+                                changed |= cc.union(
+                                    select_term,
+                                    sto_val,
+                                    CcReason::Row {
+                                        select_term,
+                                        store_term,
+                                    },
+                                );
+                                cc.close(terms);
+                            }
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+        }
+
         enum Found {
             Eq(TermId, TermId, TermId),
             Pred(TermId, TermId, TermId, TermId),
@@ -342,9 +394,11 @@ impl Executor {
                 return None;
             };
             let eq_term = match &builder.derivs[top] {
-                super::EufDeriv::Cong { eq_term, .. } | super::EufDeriv::Chain { eq_term, .. } => {
-                    *eq_term
-                }
+                super::EufDeriv::Cong { eq_term, .. }
+                | super::EufDeriv::Chain { eq_term, .. }
+                | super::EufDeriv::RowLeaf {
+                    row_eq: eq_term, ..
+                } => *eq_term,
             };
             let unit_lit = builder.terms.mk_not_raw(eq_term);
             let kind = ay_core::TheoryLemmaKind::LiaGeneric;

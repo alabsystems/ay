@@ -12,7 +12,13 @@ SAT_PROFILE_MATRIX="$SCRIPT_DIR/sat_profile_matrix.json"
 
 TRACK="main"
 AI_CLASS="regular"
-PROOF_FORMAT="drat"
+# DECLARED PROOF SURFACE (2026-08-25): veripb. The submission declares VeriPB as
+# its checker, and VeriPB reads only its own pseudo-Boolean derivation — a DRAT
+# stream is unreadable to it — so the format and the checker are one decision.
+# The matrix is the authority (`requirements.unsat_proof.{format,checker}`); this
+# default only has to agree with it, and `load_sat_profile_metadata` fails closed
+# if it does not.
+PROOF_FORMAT="veripb"
 OUTPUT_DIR="$REPO_ROOT/target/sat26-submission"
 STAGE_BINARY="none"
 SOURCE_MODE="archive"
@@ -33,6 +39,7 @@ declare -a PROFILE_RUNTIME_ENVS=()
 declare -a PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISIONS=()
 declare -a PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTES=()
 declare -a PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTES=()
+declare -a PROFILE_PROOF_CHECKERS=()
 
 usage() {
     cat <<'EOF'
@@ -49,7 +56,7 @@ Options:
   --variants A,B           Generate comma-separated variants.
   --track NAME             Competition track label (default: main).
   --ai-class NAME          SAT profile matrix id (default: regular).
-  --proof-format FORMAT    Proof format for UNSAT output (default: drat).
+  --proof-format FORMAT    Proof format for UNSAT output (default: veripb).
   --output DIR             Output directory (default: target/sat26-submission).
   --stage-binary MODE      auto, none, or path to ay (default: none).
   --source-mode MODE       archive or none (default: archive).
@@ -148,9 +155,9 @@ if [[ ${#VARIANTS[@]} -eq 0 ]]; then
 fi
 
 case "$PROOF_FORMAT" in
-    drat|lrat) ;;
+    veripb|drat|lrat) ;;
     *)
-        echo "ERROR: --proof-format supports drat (default) or lrat for SAT26 Main" >&2
+        echo "ERROR: --proof-format supports veripb (default), drat, or lrat for SAT26 Main" >&2
         exit 2
         ;;
 esac
@@ -504,6 +511,50 @@ if unsat_proof.get("format") != proof_format:
         file=sys.stderr,
     )
     sys.exit(2)
+# DECLARED CHECKER (2026-08-25): the profile's checker declaration travels to
+# the solver as `--proof-checker` in run.sh, and the solver clamps the
+# SR-witnessed symmetry routes whenever the declaration cannot consume them.
+# `veripb` is the only supported declaration: it is on the official 2026 menu
+# (dpr-trim/gratgen/veripb) AND its `red` rule carries the substitution witness
+# natively, so nothing has to be clamped and the symmetry bucket ships. The
+# earlier pins were both strictly worse — drat-trim is off-menu and rejects the
+# SR routes; dpr-trim is on-menu but also rejects them, which is what forced the
+# clamp that cost ~56 instances. dsr-trim would accept them but is not on the
+# menu.
+#
+# This guard FAILS CLOSED, and that is the point: a generated submission must be
+# unable to declare a checker it cannot satisfy. Both halves are checked,
+# because either one alone is a proof the run's own checker rejects:
+#   * the checker must be one this repo has measured against the routes the
+#     profile can emit (veripb);
+#   * the FORMAT must be the surface that checker reads. VeriPB does not consume
+#     DRAT at all, so `--proof-format drat --proof-checker veripb` is a
+#     declaration whose proofs are unreadable — the solver clamps SR under it
+#     (see proof_capability::declared_checker_accepts_sr_witnesses), and a
+#     submission generated that way would silently be the old, smaller solver.
+#
+# The table maps each supported declaration to the ONE surface that checker can
+# read, so adding a checker means stating its surface in the same breath.
+SUPPORTED_CHECKERS = {"veripb": "veripb"}
+proof_checker = str(unsat_proof.get("checker", ""))
+if proof_checker not in SUPPORTED_CHECKERS:
+    print(
+        "ERROR: SAT profile matrix declared proof checker must be one of "
+        f"{sorted(SUPPORTED_CHECKERS)} (see the defaults $comment in the "
+        f"matrix), got {proof_checker!r}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+required_surface = SUPPORTED_CHECKERS[proof_checker]
+if proof_format != required_surface:
+    print(
+        f"ERROR: declared proof checker {proof_checker!r} reads the "
+        f"{required_surface!r} proof surface, but the submission would emit "
+        f"{proof_format!r} — the checker could not read its own submission's "
+        "proofs",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 runtime_env = dict(profile.get("runtime_env", {}))
 # B76: profile-owned lever decisions live in `profile_levers` and reach the
@@ -562,10 +613,11 @@ print(json.dumps(runtime_env, sort_keys=True, separators=(",", ":")))
 print(str(profile_levers.get("bcp_learned_1963_blocker_cert_elision", "")))
 print(str(profile_levers.get("bcp_learned_1963_blocker_cert_false_reject_demote", "")))
 print(str(profile_levers.get("dense_clique_php_proof_route", "")))
+print(proof_checker)
 PY
     )
 
-    if [[ ${#SAT_PROFILE_METADATA[@]} -ne 9 ]]; then
+    if [[ ${#SAT_PROFILE_METADATA[@]} -ne 10 ]]; then
         echo "ERROR: SAT profile matrix resolver returned incomplete metadata" >&2
         exit 2
     fi
@@ -735,6 +787,8 @@ if flag_values("--proof") != [os.environ["SAT26_PREFLIGHT_EXPECTED_PROOF"]]:
     errors.append("--proof must be $2/proof.out")
 if flag_values("--proof-format") != [os.environ["SAT26_PREFLIGHT_PROOF_FORMAT"]]:
     errors.append("--proof-format does not match profile")
+if flag_values("--proof-checker") != [os.environ["SAT26_PREFLIGHT_PROOF_CHECKER"]]:
+    errors.append("--proof-checker does not match the profile's declared checker")
 if "--no-verify-proof" not in args:
     errors.append("--no-verify-proof missing")
 if flag_values("--timeout") != ["1234"]:
@@ -795,6 +849,7 @@ PY
     SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_ELISION="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISIONS[$idx]}" \
     SAT26_PREFLIGHT_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTES[$idx]}" \
     SAT26_PREFLIGHT_DENSE_CLIQUE_PHP_PROOF_ROUTE="${PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTES[$idx]}" \
+    SAT26_PREFLIGHT_PROOF_CHECKER="${PROFILE_PROOF_CHECKERS[$idx]}" \
     SAT26_PREFLIGHT_WRAPPER="$track-$ai_class-$variant-$proof_format-v1" \
         "$root_dir/run.sh" "$cnf" "$out_dir" >"$tmp_dir/run.stdout" 2>"$tmp_dir/run.stderr"
     run_code=$?
@@ -840,6 +895,7 @@ for variant in "${VARIANTS[@]}"; do
     PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISIONS+=("${SAT_PROFILE_METADATA[6]}")
     PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTES+=("${SAT_PROFILE_METADATA[7]}")
     PROFILE_DENSE_CLIQUE_PHP_PROOF_ROUTES+=("${SAT_PROFILE_METADATA[8]}")
+    PROFILE_PROOF_CHECKERS+=("${SAT_PROFILE_METADATA[9]}")
 done
 
 SOURCE_ARCHIVE=""
@@ -944,6 +1000,7 @@ for idx in "${!VARIANTS[@]}"; do
   "matrix_solver_variant": "${PROFILE_SOLVER_VARIANTS[$idx]}",
   "matrix_runtime_env": ${PROFILE_RUNTIME_ENVS[$idx]},
   "proof_format": "$PROOF_FORMAT",
+  "proof_checker": "${PROFILE_PROOF_CHECKERS[$idx]}",
   "run_contract": "run.sh <instance> <output_dir>",
   "unsat_proof": "proof.out",
   "pgo_policy": "$([[ "$SOURCE_MODE" == "archive" ]] && printf 'required-source-build-pgo/v1' || printf 'not-applicable-no-source/v1')",
@@ -969,6 +1026,7 @@ EOF
 - profile_identity: ${PROFILE_IDENTITIES[$idx]}
 - matrix_solver_variant: ${PROFILE_SOLVER_VARIANTS[$idx]}
 - proof_format: $PROOF_FORMAT
+- proof_checker: ${PROFILE_PROOF_CHECKERS[$idx]}
 - source_commit: $COMMIT
 - source_dirty_at_stage_time: $SOURCE_DIRTY_AT_STAGE_TIME
 - source_git_status_sha256: $SOURCE_GIT_STATUS_SHA256
@@ -1378,14 +1436,16 @@ run_pgo_training_instance() {
     variant="$(manifest_value variant)"
     profile_id="$(manifest_value profile_id)"
     profile_identity="$(manifest_value profile_identity)"
-    proof_path="$training_out/$(basename "$training_cnf").lrat"
+    # Train on the surface the SCORED run uses. Profiling the LRAT writer while
+    # run.sh emits VeriPB optimizes a program the competition never executes.
+    proof_path="$training_out/$(basename "$training_cnf").pbp"
 
     mkdir -p "$training_out"
     rm -f "$proof_path"
     set +e
     LLVM_PROFILE_FILE="$PGO_PROFILE_PATTERN" \
     AY_INTERNAL_PROVENANCE_CHILD=1 \
-    AY_INTERNAL_SATCOMP_WRAPPER="sat26-pgo-training-lrat-v1" \
+    AY_INTERNAL_SATCOMP_WRAPPER="sat26-pgo-training-veripb-v1" \
     AY_SAT_COMPETITION_PROFILE="$profile_id" \
     AY_SAT_PROFILE_ID="$profile_identity" \
     AY_SAT_VARIANT="$variant" \
@@ -1393,7 +1453,8 @@ run_pgo_training_instance() {
         "$training_bin" solve \
             --sat-variant "$variant" \
             --proof "$proof_path" \
-            --proof-format lrat \
+            --proof-format veripb \
+            --proof-checker veripb \
             --no-verify-proof \
             "$training_cnf" >/dev/null 2>&1
     rc=$?
@@ -1690,7 +1751,21 @@ ARGS=(
 
 PROOF_OUT="\$OUTPUT_DIR/proof.out"
 rm -f "\$PROOF_OUT"
-ARGS+=(--proof "\$PROOF_OUT" --proof-format "$PROOF_FORMAT" --no-verify-proof)
+# --proof-checker declares the checker the submission registered (matrix
+# requirements.unsat_proof.checker) and --proof-format selects the surface it
+# reads. The solver matches the two: SR-witnessed symmetry routes fire only when
+# the declared checker can verify a substitution witness ON THE LIVE SURFACE,
+# and clamp to plain CDCL otherwise, so the run can never write a proof.out its
+# own declared checker rejects (which would be disqualifying under the 2026
+# rules). Under the declared veripb/veripb pair nothing clamps: VeriPB's "red"
+# rule takes the substitution as its witness argument, so proof.out is a
+# "pseudo-Boolean proof version 3.0" derivation, checked as
+#     veripb --cnf <instance>.cnf proof.out
+# VeriPB parses the DIMACS CNF directly, so no OPB companion file is written.
+# NOTE: this heredoc is UNQUOTED so it can interpolate the generator's
+# variables, which means backticks in a comment would be COMMAND SUBSTITUTION.
+# Keep prose here backtick-free.
+ARGS+=(--proof "\$PROOF_OUT" --proof-format "$PROOF_FORMAT" --proof-checker "${PROFILE_PROOF_CHECKERS[$idx]}" --no-verify-proof)
 
 PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISION="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_ELISIONS[$idx]}"
 PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTE="${PROFILE_BCP_LEARNED_1963_BLOCKER_CERT_FALSE_REJECT_DEMOTES[$idx]}"
@@ -1728,7 +1803,16 @@ This generated root follows the SAT-COMP BenchCloud/NHR interface:
     ./build.sh
     ./run.sh <instance.cnf> <output_dir>
 
-UNSAT proofs are written to \`<output_dir>/proof.out\` in $PROOF_FORMAT format.
+UNSAT proofs are written to \`<output_dir>/proof.out\` in $PROOF_FORMAT format,
+declared against the \`${PROFILE_PROOF_CHECKERS[$idx]}\` checker (run.sh passes
+\`--proof-checker\`, so the solver never emits a proof step the declared
+checker is known to reject). Check a certificate with:
+
+    veripb --cnf <instance.cnf> <output_dir>/proof.out
+
+VeriPB parses the DIMACS CNF directly (variable \`i\` is \`x<i>\`), so there is
+no OPB companion file. See \`competition/checker_description.txt\` for the
+exact checker build every AY verification claim was measured against.
 The exact profile metadata is in \`profile/satcomp26_profile.json\`.
 The SAT profile matrix identity is \`${PROFILE_IDENTITIES[$idx]}\`.
 Package and source hash closures are recorded in \`package-files.sha256\`,
@@ -1757,6 +1841,7 @@ done
     printf '  "track": "%s",\n' "$TRACK"
     printf '  "ai_class": "%s",\n' "$AI_CLASS"
     printf '  "proof_format": "%s",\n' "$PROOF_FORMAT"
+    printf '  "proof_checker": "%s",\n' "${PROFILE_PROOF_CHECKERS[0]}"
     printf '  "roots": [\n'
     for idx in "${!ROOT_NAMES[@]}"; do
         comma=","

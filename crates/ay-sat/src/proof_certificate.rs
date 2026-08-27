@@ -5,26 +5,35 @@
 //! Lazily-materialized proof certificate for UNSAT results (Phase 4a, #8077).
 //!
 //! A `ProofCertificate` is intended to accompany every UNSAT result from the
-//! SAT solver. The proof is not reconstructed until the consumer explicitly
-//! requests it via [`ProofCertificate::materialize()`] or
-//! [`ProofCertificate::write_lean4()`]. Crate-internal helpers
-//! `write_lrat()` and `write_drat()` are also available for testing.
-//!
-//! This module defines the certificate type and its public API. The actual
-//! integration with `SatResult::Unsat` is deferred to a later phase to avoid
-//! a breaking API change.
+//! SAT solver. [`SatResult::Unsat`](crate::SatResult::Unsat) carries one. The
+//! solver reconstructs its LRAT dependencies during UNSAT finalization; public
+//! [`ProofStep`] conversion stays lazy until a consumer requests it.
 //!
 //! ## Design
 //!
 //! The certificate holds the LRAT steps from backward reconstruction. On first
 //! access, the proof is materialized into a sequence of [`ProofStep`] values
 //! and cached via `OnceCell`. Subsequent accesses return the cached result.
+//!
+//! ## Authority
+//!
+//! This type is reconstruction data, not an independently checked proof bound
+//! to a particular CNF. [`ProofCompleteness`] describes only whether the
+//! producer observed a gap while reconstructing its step stream. Consumers
+//! that need proof authority must check the steps against the intended original
+//! clauses and bind that checker verdict to those clauses.
 
 use std::cell::OnceCell;
 use std::io::{self, Write};
 
 use crate::literal::Literal;
 use crate::solver::backward_proof::LratStep;
+
+mod completeness;
+mod lrat_text;
+
+pub use completeness::ProofCompleteness;
+use lrat_text::parse_lrat_text_addition;
 
 /// A single LRAT proof step in a materialized proof certificate.
 ///
@@ -62,15 +71,16 @@ impl From<LratStep> for ProofStep {
 
 /// A lazily-materialized proof certificate.
 ///
-/// Always present on UNSAT results. The proof is not reconstructed
-/// until the consumer explicitly requests it via [`materialize()`](Self::materialize)
-/// or [`write_lean4()`](Self::write_lean4).
+/// Always present on [`SatResult::Unsat`](crate::SatResult::Unsat). Backward
+/// reconstruction has already run; [`materialize()`](Self::materialize) lazily
+/// converts those retained steps into the stable public representation used by
+/// exporters.
 ///
 /// # Zero-cost path
 ///
-/// If the consumer never inspects the proof (the common case in production),
-/// no reconstruction work is performed. Call [`is_deferred()`](Self::is_deferred)
-/// to check whether materialization has occurred.
+/// If the consumer never inspects the proof, public-step allocation and
+/// conversion are avoided. [`is_deferred()`](Self::is_deferred) reports that
+/// materialization state, not whether backward reconstruction ran.
 ///
 /// # Thread safety
 ///
@@ -82,23 +92,21 @@ pub struct ProofCertificate {
     steps: OnceCell<Vec<ProofStep>>,
     /// Pre-computed proof steps from backward reconstruction.
     lrat_steps: Vec<LratStep>,
-    /// Whether the backward reconstruction was complete.
-    complete: bool,
-    /// Streaming UNSAT core: pre-computed set of original clause IDs that
-    /// participated in the proof, tracked incrementally during conflict
-    /// analysis (#8250). When `Some`, `minimal_core()` returns this directly
-    /// instead of walking the proof DAG.
-    streaming_core: Option<Vec<u64>>,
+    /// Whether backward reconstruction completed without a known gap.
+    completeness: ProofCompleteness,
+    /// Streaming support: original clause IDs observed while conflicts were
+    /// analyzed. This may include clauses outside the terminal refutation.
+    streaming_support: Option<Vec<u64>>,
 }
 
 impl std::fmt::Debug for ProofCertificate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProofCertificate")
             .field("materialized", &self.steps.get().is_some())
-            .field("complete", &self.complete)
+            .field("completeness", &self.completeness)
             .field(
-                "streaming_core",
-                &self.streaming_core.as_ref().map(Vec::len),
+                "streaming_support",
+                &self.streaming_support.as_ref().map(Vec::len),
             )
             .finish()
     }
@@ -109,8 +117,8 @@ impl Clone for ProofCertificate {
         let new = Self {
             steps: OnceCell::new(),
             lrat_steps: self.lrat_steps.clone(),
-            complete: self.complete,
-            streaming_core: self.streaming_core.clone(),
+            completeness: self.completeness,
+            streaming_support: self.streaming_support.clone(),
         };
         if let Some(steps) = self.steps.get() {
             let _ = new.steps.set(steps.clone());
@@ -124,13 +132,18 @@ impl ProofCertificate {
     ///
     /// This is used by proof exporters that need to preserve the exact
     /// proof-visible LRAT stream rather than the deferred backward-only steps.
+    /// `completeness` records the producer's reconstruction status; this
+    /// constructor does not validate the derivations.
     #[must_use]
-    pub fn from_materialized_steps(steps: Vec<ProofStep>, complete: bool) -> Self {
+    pub(crate) fn from_materialized_steps(
+        steps: Vec<ProofStep>,
+        completeness: ProofCompleteness,
+    ) -> Self {
         let cert = Self {
             steps: OnceCell::new(),
             lrat_steps: Vec::new(),
-            complete,
-            streaming_core: None,
+            completeness,
+            streaming_support: None,
         };
         let _ = cert.steps.set(steps);
         cert
@@ -144,7 +157,10 @@ impl ProofCertificate {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidData`] if the LRAT text is malformed.
-    pub fn from_lrat_text(bytes: &[u8], complete: bool) -> io::Result<Self> {
+    /// Parsing does not check the proof against a CNF, so the returned
+    /// certificate is marked [`ProofCompleteness::NotEstablished`]. Only
+    /// the solver-owned reconstruction path can mint complete metadata.
+    pub fn from_lrat_text(bytes: &[u8]) -> io::Result<Self> {
         let text = std::str::from_utf8(bytes).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -162,7 +178,10 @@ impl ProofCertificate {
                 steps.push(step);
             }
         }
-        Ok(Self::from_materialized_steps(steps, complete))
+        Ok(Self::from_materialized_steps(
+            steps,
+            ProofCompleteness::NotEstablished,
+        ))
     }
 
     /// Create a proof certificate from pre-computed backward reconstruction results.
@@ -170,28 +189,30 @@ impl ProofCertificate {
     /// This is the primary constructor used by the solver after calling
     /// `reconstruct_lrat_backward()`. The proof steps are not materialized
     /// until explicitly requested.
-    pub(crate) fn from_backward_result(lrat_steps: Vec<LratStep>, complete: bool) -> Self {
+    pub(crate) fn from_backward_result(
+        lrat_steps: Vec<LratStep>,
+        completeness: ProofCompleteness,
+    ) -> Self {
         Self {
             steps: OnceCell::new(),
             lrat_steps,
-            complete,
-            streaming_core: None,
+            completeness,
+            streaming_support: None,
         }
     }
 
-    /// Attach a pre-computed streaming UNSAT core to this certificate (#8250).
+    /// Attach pre-computed streaming original-clause support (#8250).
     ///
-    /// The streaming core is a sorted, deduplicated list of original clause IDs
-    /// that participated in the proof. When present, `minimal_core()` returns
-    /// this directly instead of walking the proof DAG.
-    pub(crate) fn set_streaming_core(&mut self, core: Vec<u64>) {
-        self.streaming_core = Some(core);
+    /// The support is a sorted, deduplicated list accumulated across conflict
+    /// analyses. It is an over-approximation, not a minimal UNSAT core.
+    pub(crate) fn set_streaming_support(&mut self, support: Vec<u64>) {
+        self.streaming_support = Some(support);
     }
 
     /// Create an empty proof certificate (placeholder for cases where no proof
     /// data is available, e.g., UNSAT detected during preprocessing).
     pub fn empty() -> Self {
-        Self::from_backward_result(Vec::new(), false)
+        Self::from_backward_result(Vec::new(), ProofCompleteness::NotEstablished)
     }
 
     /// Materialize the full LRAT proof. First call converts the raw LRAT steps
@@ -256,50 +277,49 @@ impl ProofCertificate {
         self.steps.get().is_none()
     }
 
-    /// Returns true if the backward reconstruction was complete.
+    /// Return the producer's reconstruction status.
     ///
-    /// A complete proof means all antecedent clauses were resolved. An
-    /// incomplete proof may have gaps (e.g., clauses lost to garbage collection
-    /// or binary clause reasons not yet tracked).
+    /// This does not say that an independent checker accepted the proof.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.complete
+    pub const fn completeness(&self) -> ProofCompleteness {
+        self.completeness
     }
 
-    /// Compute a proof-minimal UNSAT core from the LRAT proof certificate.
+    /// Returns true if the producer reported complete backward reconstruction.
     ///
-    /// Walks the proof DAG backward from the empty clause (the contradiction
-    /// step), collecting all original input clause IDs that were actually used
-    /// in the derivation. Original clauses are those whose clause IDs appear
-    /// as hints in proof steps but are not themselves derived by any proof step.
-    ///
-    /// Returns a sorted, deduplicated list of original clause IDs that are
-    /// necessary to derive the contradiction. This is a subset of the full set
-    /// of input clauses and represents a proof-minimal UNSAT core.
-    ///
-    /// # Returns
-    ///
-    /// - An empty `Vec` if the proof is empty or contains no resolvable steps.
-    /// - A subset of the original clause IDs if the proof is complete.
-    /// - A possibly incomplete subset if the proof is incomplete (some
-    ///   antecedent clauses were lost to garbage collection).
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Build a set of all derived clause IDs (clause IDs that appear as the
-    ///    `clause_id` field of a proof step).
-    /// 2. Walk all proof steps, collecting hints (antecedent clause IDs).
-    /// 3. Any hint that is NOT in the derived set is an original input clause.
-    /// 4. Return the sorted, deduplicated set of original clause IDs.
+    /// This is reconstruction metadata, not an independent checker verdict;
+    /// see [`Self::completeness`].
     #[must_use]
-    pub fn minimal_core(&self) -> Vec<u64> {
-        // Fast path: streaming core is pre-computed during conflict analysis (#8250).
-        // Returns immediately without materializing the proof DAG.
-        if let Some(ref core) = self.streaming_core {
-            return core.clone();
+    pub const fn is_complete(&self) -> bool {
+        self.completeness.is_complete()
+    }
+
+    /// Return clause IDs tracked or syntactically classified as original support.
+    ///
+    /// When streaming support is present, this returns the original IDs observed
+    /// across conflict analyses. Otherwise it scans every retained proof step
+    /// and returns positive hint IDs that are not produced by another retained
+    /// step. The result is sorted and deduplicated. On an incomplete stream, a
+    /// missing derived step is indistinguishable from an original clause, so
+    /// this fallback may include IDs that were actually derived.
+    ///
+    /// This is deliberately an over-approximate, syntactic support set. It may
+    /// include redundant hints, unrelated retained branches, or conflicts that
+    /// do not lie on a terminal refutation. It does not validate the proof,
+    /// establish that an empty clause exists, bind IDs to a CNF, or prove that
+    /// the selected clauses are themselves unsatisfiable. An empty result means
+    /// only that no support IDs were tracked.
+    ///
+    /// [`ProofCompleteness::Complete`] does not strengthen these semantics; it
+    /// reports producer reconstruction status, not checker acceptance.
+    #[must_use]
+    pub fn tracked_original_clause_ids(&self) -> Vec<u64> {
+        // Fast path: streaming support was accumulated during conflict analysis.
+        if let Some(ref support) = self.streaming_support {
+            return support.clone();
         }
 
-        // Slow path: walk the proof DAG to extract original clause IDs.
+        // Fallback: classify hints across the entire retained step stream.
         let steps = self.materialize();
         if steps.is_empty() {
             return Vec::new();
@@ -309,9 +329,10 @@ impl ProofCertificate {
         let derived: crate::kani_compat::DetHashSet<u64> =
             steps.iter().map(|s| s.clause_id).collect();
 
-        // Collect all hint clause IDs that are NOT derived -- these are original
-        // input clauses used in the proof. Negative hints are RAT witness
-        // boundaries / deletion markers and are ignored for core extraction.
+        // Collect positive hint IDs not derived in the retained stream. An
+        // incomplete stream may make a missing derived ID look original.
+        // Negative hints are RAT witness boundaries / deletion markers and are
+        // ignored for support extraction.
         let mut original_ids: Vec<u64> = steps
             .iter()
             .flat_map(|s| s.hints.iter().copied())
@@ -325,22 +346,22 @@ impl ProofCertificate {
         original_ids
     }
 
-    /// Returns true if a streaming UNSAT core is available (#8250).
+    /// Whether streaming original-clause support is available (#8250).
     ///
-    /// When true, `minimal_core()` returns immediately without materializing
-    /// the proof DAG.
+    /// When true, [`Self::tracked_original_clause_ids`] returns that support
+    /// without materializing the proof steps.
     #[must_use]
-    pub fn has_streaming_core(&self) -> bool {
-        self.streaming_core.is_some()
+    pub fn has_streaming_support(&self) -> bool {
+        self.streaming_support.is_some()
     }
 
     /// Write the LRAT proof as a Lean4 proof script (#8253).
     ///
     /// This is the *data-only* emitter: it produces parseable Lean4 that
     /// encodes the proof as data but asserts no soundness claim (no theorem
-    /// is emitted). For a kernel-checked proof, use
-    /// [`write_lean4_kernel`](Self::write_lean4_kernel), which requires the
-    /// original clause table.
+    /// is emitted). For a soundness-grounded UNSAT theorem, use
+    /// [`write_lean4_verified`](Self::write_lean4_verified), which requires the
+    /// original clause table and the verified `AySoundness` project.
     ///
     /// Delegates to `crate::lean_export::write_lean4_lrat()`.
     pub fn write_lean4(&self, w: &mut dyn Write) -> io::Result<()> {
@@ -348,13 +369,15 @@ impl ProofCertificate {
         crate::lean_export::write_lean4_lrat(steps, w)
     }
 
-    /// Write a kernel-checked Lean4 LRAT proof (#8697 Phase 1).
+    /// Write a self-contained Lean4 checker-acceptance artifact.
     ///
     /// Emits a self-contained Lean4 file that defines a propositional RUP
     /// checker, encodes the original clauses + proof steps, and asserts
     /// `theorem proof_valid : lratCheck originalClauses proofSteps = true
     /// := by native_decide`. Running `lean <file.lean4>` exits with
-    /// status 1 if the proof is unsound.
+    /// status 1 if that embedded checker returns false. This does **not** prove
+    /// that checker acceptance implies UNSAT; it is not verdict authority. Use
+    /// [`Self::write_lean4_verified`] for the soundness theorem.
     ///
     /// # Arguments
     ///
@@ -398,79 +421,20 @@ impl ProofCertificate {
         crate::lean_export::write_lean4_verified(original_clauses, steps, w)
     }
 
-    /// Write the LRAT proof as an Alethe proof (#8296).
+    /// Refuse the retired SAT-level Alethe adapter.
     ///
-    /// Converts LRAT resolution steps to Alethe format suitable for
-    /// verification by carcara or clean certification pipelines.
-    ///
-    /// Delegates to `crate::alethe_export::write_alethe_lrat()`.
+    /// A `ProofCertificate` does not retain the literals of original DIMACS
+    /// clauses, so it cannot bind Alethe assumptions to the input problem.
+    /// Earlier versions emitted `true` placeholders for those assumptions;
+    /// that text was not proof authority. Use [`Self::write_lrat`] or
+    /// [`Self::write_drat`] for independently checkable SAT evidence. This
+    /// does not affect the input-bound SMT Alethe exporter in `ay-proof`.
+    #[deprecated(
+        note = "SAT Alethe export is unavailable without original DIMACS clauses; use write_lrat or write_drat"
+    )]
     pub fn write_alethe(&self, w: &mut dyn Write) -> io::Result<()> {
-        let steps = self.materialize();
-        crate::alethe_export::write_alethe_lrat(steps, w)
+        crate::alethe_export::refuse_unbound_alethe(w)
     }
-}
-
-fn invalid_lrat(line_number: usize, message: impl Into<String>) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "malformed LRAT text at line {line_number}: {}",
-            message.into()
-        ),
-    )
-}
-
-fn parse_lrat_text_addition(line: &str, line_number: usize) -> io::Result<Option<ProofStep>> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.is_empty() {
-        return Ok(None);
-    }
-    if tokens.len() >= 2 && tokens[1] == "d" {
-        return Ok(None);
-    }
-    let clause_id = tokens[0]
-        .parse::<u64>()
-        .map_err(|err| invalid_lrat(line_number, format!("invalid clause id: {err}")))?;
-
-    let first_zero = tokens
-        .iter()
-        .position(|&token| token == "0")
-        .ok_or_else(|| invalid_lrat(line_number, "missing literal terminator 0"))?;
-    if first_zero == 0 {
-        return Err(invalid_lrat(
-            line_number,
-            "missing clause id before literals",
-        ));
-    }
-    if tokens.last().copied() != Some("0") {
-        return Err(invalid_lrat(line_number, "missing final hint terminator 0"));
-    }
-
-    let mut literals = Vec::with_capacity(first_zero.saturating_sub(1));
-    for token in &tokens[1..first_zero] {
-        let raw = token
-            .parse::<i32>()
-            .map_err(|err| invalid_lrat(line_number, format!("invalid literal: {err}")))?;
-        if raw == 0 {
-            return Err(invalid_lrat(line_number, "literal 0 before terminator"));
-        }
-        literals.push(Literal::from_dimacs(raw));
-    }
-
-    let mut hints = Vec::with_capacity(tokens.len().saturating_sub(first_zero + 2));
-    for token in &tokens[first_zero + 1..tokens.len() - 1] {
-        hints.push(
-            token
-                .parse::<i64>()
-                .map_err(|err| invalid_lrat(line_number, format!("invalid hint: {err}")))?,
-        );
-    }
-
-    Ok(Some(ProofStep {
-        clause_id,
-        literals,
-        hints,
-    }))
 }
 
 #[cfg(test)]

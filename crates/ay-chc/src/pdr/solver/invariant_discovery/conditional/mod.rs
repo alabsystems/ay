@@ -11,6 +11,7 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use std::sync::Arc;
 
 mod conditional_inv;
+mod guarded_scaled_equality;
 mod linear_combination;
 mod linear_combination_verify;
 mod modular_equality;

@@ -136,9 +136,7 @@ impl Executor {
         &self,
         extra_roots: &[TermId],
     ) -> Option<Vec<(TermId, TermId)>> {
-        let Some(root_count) = self.ctx.assertions.len().checked_add(extra_roots.len()) else {
-            return None;
-        };
+        let root_count = self.ctx.assertions.len().checked_add(extra_roots.len())?;
         if root_count > MAX_DATATYPE_CELL_AUTHORITY_TERMS {
             return None;
         }
@@ -152,9 +150,7 @@ impl Executor {
         let mut seen = HashSet::default();
         let mut equalities = Vec::new();
         while let Some(root) = hard.pop() {
-            if self.ctx.terms.entry_stamp(root).is_none() {
-                return None;
-            }
+            self.ctx.terms.entry_stamp(root)?;
             if !seen.insert(root) {
                 continue;
             }
@@ -263,9 +259,7 @@ impl Executor {
             .term_values
             .iter()
             .filter_map(|(&term, carrier)| {
-                if self.ctx.terms.entry_stamp(term).is_none() {
-                    return None;
-                }
+                self.ctx.terms.entry_stamp(term)?;
                 let sort = self.ctx.terms.sort(term);
                 let candidate = completions.get(sort)?.get(carrier)?.as_deref()?;
                 let value = self.parse_rendered_dt_value_cached(candidate, sort, &guard)?;
@@ -311,9 +305,7 @@ impl Executor {
                     TermData::App(symbol, args) => (symbol.name(), args.as_slice()),
                     _ => return None,
                 };
-                if self.ctx.is_constructor(head).is_none() {
-                    return None;
-                }
+                self.ctx.is_constructor(head)?;
                 let (_, field_sorts) = guard.constructor(&expected_sort, head)?;
                 if field_sorts.len() != args.len()
                     || stack

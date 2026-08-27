@@ -51,7 +51,7 @@ impl Executor {
         }
 
         if ay_core::misc_cli_flags().debug_cert {
-            eprintln!("CERT/epoch PARKED exec={:p}", self as *const _);
+            eprintln!("CERT/epoch PARKED exec={:p}", std::ptr::from_ref(self));
         }
         Some(ParkedPlainQueryAuthority {
             epoch: self.unsat_query_epoch.take()?,
@@ -85,7 +85,7 @@ impl Executor {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!(
                     "CERT/epoch cleared: named-core restore DECLINED exec={:p} current={} assertions_match={}",
-                    self as *const _,
+                    std::ptr::from_ref(self),
                     parked.epoch.is_current(self),
                     parked.epoch.assertions == self.ctx.assertions,
                 );
@@ -94,7 +94,7 @@ impl Executor {
         }
 
         if ay_core::misc_cli_flags().debug_cert {
-            eprintln!("CERT/epoch RESTORED exec={:p}", self as *const _);
+            eprintln!("CERT/epoch RESTORED exec={:p}", std::ptr::from_ref(self));
         }
         self.unsat_query_epoch = Some(parked.epoch);
         self.proof_problem_assertion_provenance = Some(parked.provenance);
@@ -187,10 +187,26 @@ impl Executor {
     }
 
     /// Named-core solving temporarily widens the assumption slot. Refresh only
-    /// after the outer wrapper restored the exact public scope and only when the
-    /// caller required the translated strict artifact itself.
+    /// after the outer wrapper restored the exact public scope, and only when a
+    /// checked certificate can still change the published verdict (i.e. every
+    /// mode except competition shedding, which publishes a raw UNSAT).
     pub(in crate::executor) fn refresh_internal_certificate_after_named_core_redirect(&mut self) {
-        if self.strict_unsat_presentation_required() {
+        // The gate used to be `strict_unsat_presentation_required()` alone —
+        // "only when the caller required the translated strict artifact
+        // itself". But `certify_unsat_for_publication` is MANDATORY: every
+        // public UNSAT must mint a checked certificate or it is withheld as
+        // `unknown (incomplete self-check-rejected)`, whether or not proofs
+        // were asked for. So a caller that requested NEITHER proofs nor
+        // self-check still needs this rebuild, and without it a named-core
+        // redirect over a mixed BV/LIA query lost its verdict: the redirect's
+        // stripped assertion stack had already made the internal certificate
+        // decline during the solve, leaving the `int2bv` bridge lemma an
+        // uncertified trust step for the funnel to reject.
+        //
+        // Competition shedding is the one mode that publishes a raw UNSAT
+        // without a certificate, so it is also the only mode that gains
+        // nothing here.
+        if self.strict_unsat_presentation_required() || !self.competition_shedding_active() {
             self.refresh_authenticated_bv_lia_internal_certificate_for_publication();
         }
     }

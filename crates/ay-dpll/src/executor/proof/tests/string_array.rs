@@ -171,12 +171,23 @@ const NESTED_ROW_AUXILIARY_SCRIPT: &str = r#"
 "#;
 
 #[test]
-fn nested_row_auxiliary_hole_requires_independent_publication_certificate() {
-    // The private nested-row rescue folds the two authored array assertions to
-    // the array-free residue `false`. Its native proof retains an explicit hole,
-    // so it is not self-certified by the strict proof checker alone. The public
-    // UNSAT funnel may nevertheless publish the correct verdict after its
-    // independent fresh-executor discharge re-decides the exact authored query.
+fn nested_row_auxiliary_refutation_self_certifies_without_the_independent_crutch() {
+    // HISTORY (#implied-forall-ground-inst). The private nested-row rescue
+    // folds the two authored array assertions to the array-free residue
+    // `false`, and its native proof used to retain an explicit hole: the
+    // fused Generic conflict carried the read-over-write content no EUF
+    // promotion could reach, so this test once pinned the fail-closed
+    // compensation (publication only through the independent fresh-executor
+    // discharge, `unsat_proof_self_certified()` false). The certified-EUF
+    // planner's ROW-under-equality bridge (`CcReason::Row` in
+    // `proof_euf_lemma`) closes that hole: the native proof now derives both
+    // reads through strictly validated `arrays_idx`/`ArraySelectStore`
+    // content, so the crutch is no longer consumed. MEASURED via the CLI on
+    // the same script: `unproved_steps=0 foreign_assumes=no trust_free=yes
+    // ay_self_checkable=yes`. (`unsat_proof_self_certified()` stays false on
+    // this best-effort route — it additionally demands the solve-time
+    // `proof_check_ok` marker this route never records — so the pin below is
+    // the strict quality of the retained artifact itself.)
     let commands = parse(NESTED_ROW_AUXILIARY_SCRIPT).unwrap();
     let mut exec = Executor::new();
     exec.set_best_effort_produce_proofs(1_000_000);
@@ -184,8 +195,7 @@ fn nested_row_auxiliary_hole_requires_independent_publication_certificate() {
     assert_eq!(
         outputs,
         vec!["unsat"],
-        "the mandatory publication funnel must independently discharge the \
-         private store-flat hole against the exact authored query; proof={:#?}",
+        "the nested-row refutation must publish; proof={:#?}",
         exec.last_proof.as_ref().map(|proof| &proof.steps)
     );
 
@@ -195,40 +205,45 @@ fn nested_row_auxiliary_hole_requires_independent_publication_certificate() {
         "a certified UNSAT keeps its attributed native proof"
     );
     assert!(
-        exec.last_command_unsat_was_independently_verified(),
-        "the command boundary must record the consumed independent certificate"
+        !exec.last_command_unsat_was_independently_verified(),
+        "the independent-discharge crutch must no longer be consumed for \
+         this refutation"
     );
+    let proof = exec.last_proof.clone().expect("checked above");
+    let quality = exec
+        .check_proof_strict_with_datatypes(&proof)
+        .expect("the row-bridged native proof must pass the strict checker");
     assert!(
-        exec.take_unsat_certificate().is_none(),
-        "the command boundary must consume the one-shot certificate"
-    );
-    assert!(
-        exec.last_lrat_certificate().is_none(),
-        "LRAT for the private reduced CNF must not escape"
-    );
-    assert!(
-        !exec.unsat_proof_self_certified(),
-        "the holey native proof itself must remain honestly non-self-certified"
+        quality.is_complete(),
+        "no trust and no hole may survive: {quality:?}"
     );
 }
 
 #[test]
-fn nested_row_auxiliary_hole_fails_closed_when_alethe_artifact_is_required() {
+fn nested_row_auxiliary_refutation_publishes_under_an_explicit_proof_request() {
+    // Companion to the test above: with `:produce-proofs` set, this exact
+    // script used to fail CLOSED (`unknown`/`SelfCheckRejected`) because the
+    // holey native proof could not satisfy an explicit proof request and
+    // independent query authority is not allowed to. With the hole closed by
+    // the ROW-under-equality bridge the same gate now has a complete strict
+    // artifact to publish, and the printed document must carry no unchecked
+    // rule.
     let input = format!("(set-option :produce-proofs true)\n{NESTED_ROW_AUXILIARY_SCRIPT}");
     let commands = parse(&input).unwrap();
     let mut exec = Executor::new();
-    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unknown"]);
-    assert_eq!(
-        exec.get_reason_unknown(),
-        Some(crate::UnknownReason::SelfCheckRejected)
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    assert_eq!(exec.get_reason_unknown(), None);
+    assert!(
+        exec.last_proof.is_some(),
+        "an explicit proof request must be answered with the artifact"
+    );
+    let text = exec.get_proof();
+    assert!(
+        !text.contains(":rule trust") && !text.contains(":rule hole"),
+        "no unchecked rule may survive the explicit-proof path: {text}"
     );
     assert!(
-        exec.last_proof.is_none(),
-        "the rejected holey presentation must be revoked"
+        text.contains(":rule arrays_idx"),
+        "the nested reads must be certified through the checked array rule: {text}"
     );
-    assert!(
-        exec.take_unsat_certificate().is_none(),
-        "independent query authority cannot satisfy an explicit proof request"
-    );
-    assert!(exec.last_lrat_certificate().is_none());
 }

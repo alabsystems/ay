@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use crate::sat_proof_manager::FragmentPropagationEnvironment;
+use crate::sat_proof_manager::{FragmentContextDerivation, FragmentPropagationEnvironment};
 
 const MAX_SEALED_DERIVATIONS: usize = 4096;
 
@@ -52,9 +52,10 @@ pub(in super::super) fn sealed_propagation_environment(
 }
 
 /// Seal every context-derivation producer hint recorded for this query
-/// (#dt-context-derivation). First-wins per normalized clause; anything that
-/// fails to seal is silently dropped (fail-closed: a missing map entry can
-/// only decline an authentication).
+/// (#dt-context-derivation). Every independently sealed premise set is kept in
+/// record order for its normalized clause; anything that fails to seal is
+/// dropped fail-closed and optionally reported through the shared typed
+/// diagnostic sink (a missing candidate can only decline an authentication).
 pub(in super::super) fn sealed_context_derivations(
     executor: &mut Executor,
 ) -> HashMap<Vec<TermId>, FragmentContextDerivation> {
@@ -64,27 +65,40 @@ pub(in super::super) fn sealed_context_derivations(
     let records = executor.dt_context_conflict_records.records.clone();
     let mut map: HashMap<Vec<TermId>, FragmentContextDerivation> = HashMap::default();
     let mut seal_declines = 0usize;
-    // The sink dedups at record time, so every entry is a distinct clause;
-    // seal them all (the sink's own cap bounds this).
+    // The sink caps both total records and alternatives per normalized clause;
+    // seal every retained candidate in its original order.
     for record in records.iter() {
         let Some(token) = CheckedContextDerivation::seal(executor, record) else {
             seal_declines += 1;
+            crate::executor::probe_cert_reject_raw(|| {
+                let clause: Vec<String> = record
+                    .clause
+                    .iter()
+                    .map(|&term| ay_proof::render_term_canonical(&executor.ctx.terms, term))
+                    .collect();
+                let premises: Vec<String> = record
+                    .premises
+                    .iter()
+                    .map(|&term| ay_proof::render_term_canonical(&executor.ctx.terms, term))
+                    .collect();
+                format!("c context-seal-decline clause={clause:?} premises={premises:?}")
+            });
             continue;
         };
-        let Some((key, derivation)) = token.into_current(executor) else {
+        let Some((key, premises)) = token.into_current(executor) else {
             seal_declines += 1;
             continue;
         };
-        map.entry(key).or_insert(derivation);
+        map.entry(key).or_default().premise_sets.push(premises);
     }
-    if std::env::var("AY_DT_DEBUG").is_ok() {
-        eprintln!(
-            "c context-seal-debug records={} sealed={} declined={}",
+    crate::executor::probe_cert_reject_raw(|| {
+        let sealed_candidates = records.len() - seal_declines;
+        format!(
+            "c context-seal-debug records={} sealed_candidates={sealed_candidates} clauses={} declined={seal_declines}",
             records.len(),
-            map.len(),
-            seal_declines,
-        );
-    }
+            map.len()
+        )
+    });
     map
 }
 

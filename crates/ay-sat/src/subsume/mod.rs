@@ -32,6 +32,7 @@ pub use types::SubsumeStats;
 use types::{Bin, DEFAULT_CHECK_LIMIT};
 pub(crate) use types::{KeptThresholds, SubsumeResult};
 
+use crate::clause::ClauseSignature;
 use crate::clause_arena::ClauseArena;
 use crate::occ_list::OccList;
 
@@ -52,8 +53,18 @@ pub(crate) struct Subsumer {
     round_checks: u64,
     /// Reusable schedule buffer (avoids per-round allocation).
     schedule: Vec<(usize, usize)>,
-    /// Reusable occurrence list buffer (avoids per-round allocation).
-    occs: Vec<Vec<usize>>,
+    /// Pass-local 64-bit clause signatures, parallel to `schedule` (same
+    /// index after the size sort). Rebuilt at the start of every round from
+    /// the scheduled clauses' current literals — the O(1) signature prefilter
+    /// inside the round reads this (candidates by schedule index, subsumers
+    /// via the signature carried in `occs` entries) instead of an always-on
+    /// arena-wide side table, so the table is sized to the round's schedule
+    /// and freed with it rather than costing 570 MB on every 18M-clause load.
+    sched_sigs: Vec<ClauseSignature>,
+    /// Reusable occurrence list buffer (avoids per-round allocation). Each
+    /// entry is `(clause_idx, signature)`: the one-watch connection carries
+    /// the pass-local signature so the subsumer-side prefilter stays O(1).
+    occs: Vec<Vec<(usize, ClauseSignature)>>,
     /// Reusable binary clause table buffer (avoids per-round allocation).
     bins: Vec<Vec<Bin>>,
     /// Per-literal occurrence count in scheduled clauses (CaDiCaL noccs).
@@ -74,6 +85,7 @@ impl Subsumer {
             check_limit: DEFAULT_CHECK_LIMIT,
             round_checks: 0,
             schedule: Vec::new(),
+            sched_sigs: Vec::new(),
             occs: Vec::new(),
             bins: Vec::new(),
             noccs: Vec::new(),

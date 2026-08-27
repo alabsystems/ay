@@ -662,11 +662,20 @@ def run_ay(
     env_posture: dict[str, Any],
     case_dir: Path,
     artifact_root: Path,
+    extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
+    """`extra_args` appends a caller-owned argv fragment to the solve command.
+
+    Added for the joint-search harness, whose measurement axes moved from
+    `AY_MILP_*` environment spellings to engine CLI flags (B38). Optional and
+    defaulted, so every existing caller is byte-identical.
+    """
     run_dir = case_dir / "ay"
     certificate = run_dir / "result.ayc"
     witness = run_dir / "result.sol"
     command = build_ay_command(ay_binary, model, timeout, seed, certificate, witness)
+    if extra_args:
+        command.extend(extra_args)
     process = run_guarded_capture(
         command,
         memlimit_mb=plan.memlimit_mb,

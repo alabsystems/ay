@@ -16,6 +16,18 @@
 //! nominal budget runs well PAST the nominal wall (the backstop governs) and
 //! still fails closed to `unknown` with a truncation reason — never a
 //! finalized `sat`.
+//!
+//! PREMISE UPDATE (#honest-timeout, 2026-08-22). When this pin was written the
+//! backstop was installed for EVERY quantified solve, so "call `set_timeout`
+//! and watch the solve overrun it" was the only way to observe it. It is now
+//! OPT-IN (`Executor::set_quantifier_deadline_backstop`), because a
+//! `set_timeout(60s)` that silently buys a ~240 s wall is not a timeout any
+//! caller can plan around — measured on the `inc_some_list` obligation, a 60 s
+//! budget ran 182-289 s. What this file pins is UNCHANGED — the live-deadline
+//! read, and fail-closed truncation — so the first test now SELECTS the
+//! backstop and keeps its >= 2x lower bound verbatim. The second test pins the
+//! other half of the same contract, which had no coverage at all: with the
+//! backstop left off, the caller's deadline is the wall.
 
 use ay_dpll::UnknownReason;
 use ntest::timeout;
@@ -63,6 +75,8 @@ fn quantified_solve_runs_past_nominal_to_the_backstop() {
     let budget = Duration::from_millis(50);
     let commands = ay_frontend::parse(SELF_TRIGGERING_SMT).expect("valid SMT-LIB input");
     let mut exec = ay_dpll::Executor::new();
+    // #honest-timeout: the backstop is opt-in; this test is ABOUT the backstop.
+    exec.set_quantifier_deadline_backstop(true);
     exec.set_timeout(Some(budget));
 
     let start = Instant::now();
@@ -96,5 +110,61 @@ fn quantified_solve_runs_past_nominal_to_the_backstop() {
         "solve stopped at {elapsed:?} with a {budget:?} nominal budget: a \
          quantified solve must be governed by the 4x backstop (live deadline \
          reads), not the stale nominal deadline"
+    );
+}
+
+/// #honest-timeout: the DEFAULT contract. The same self-triggering fixture,
+/// the same deterministic work that cannot finish, but with the backstop left
+/// OFF — so `set_timeout` is the wall. The solve must fail closed to `unknown`
+/// at (near) the nominal budget, and in particular must NOT reach the 4x
+/// backstop wall the test above pins.
+///
+/// The budget is deliberately larger than the 50 ms above: the bound being
+/// pinned is an UPPER one, and the E-matching round loops poll the deadline at
+/// round granularity, so the budget has to exceed the granularity of the poll
+/// for the overshoot to be attributable. 2 s of deterministic work is far less
+/// than this fixture needs (debug builds: >10 s uncapped), so the run is still
+/// always truncated.
+#[test]
+#[timeout(120000)]
+fn quantified_solve_without_opt_in_stops_at_the_callers_deadline() {
+    let budget = Duration::from_secs(2);
+    let commands = ay_frontend::parse(SELF_TRIGGERING_SMT).expect("valid SMT-LIB input");
+    let mut exec = ay_dpll::Executor::new();
+    assert!(
+        !exec.quantifier_deadline_backstop(),
+        "a fresh executor must not silently relax the caller's timeout"
+    );
+    exec.set_timeout(Some(budget));
+
+    let start = Instant::now();
+    let outputs = exec.execute_all(&commands).expect("execution succeeds");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        outputs,
+        vec!["unknown"],
+        "truncated quantified run must stay unknown"
+    );
+    assert!(
+        matches!(
+            exec.unknown_reason(),
+            Some(
+                UnknownReason::Timeout
+                    | UnknownReason::QuantifierRoundLimit
+                    | UnknownReason::QuantifierUnhandled
+            )
+        ),
+        "truncation reason expected, got {:?}",
+        exec.unknown_reason()
+    );
+    // The bound under test. `budget * 4` is exactly the backstop wall the
+    // opt-in test pins, so this asserts the backstop is genuinely not in force;
+    // the slack below it absorbs deadline-poll granularity and the (bounded,
+    // non-deadline-gated) result finalization that follows the stop.
+    assert!(
+        elapsed < budget * 4,
+        "solve ran {elapsed:?} on a {budget:?} timeout with the quantified \
+         backstop OFF: the caller's deadline must be the wall"
     );
 }

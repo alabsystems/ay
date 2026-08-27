@@ -46,6 +46,51 @@ fn lattice_step(clause: Vec<TermId>, farkas: Option<FarkasAnnotation>) -> ProofS
     }
 }
 
+/// The `ite`-of-integer-constants RANGE sub-schema, end to end through the REAL
+/// strict checker and the REAL printer: the corpus `dillig32_000` clause is
+/// validated, a FORGERY on the same kind is refused, and the wire text is the
+/// honest `hole` with no `:args`.
+#[test]
+fn strict_checker_and_printer_agree_on_the_ite_range_subschema() {
+    let mut terms = TermStore::new();
+    let c = terms.mk_var("C", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let one = terms.mk_int(BigInt::from(1));
+    let condition = terms.mk_eq(c, zero);
+    let ite = terms.mk_ite(condition, one, zero);
+    let ite_lt_zero = terms.mk_lt(ite, zero);
+    let accepted = terms.mk_not(ite_lt_zero);
+    let zero_le_c = terms.mk_le(zero, c);
+    let not_zero_le_c = terms.mk_not(zero_le_c);
+    let step = lattice_step(vec![not_zero_le_c, accepted], None);
+    let mut derived = Vec::new();
+    checker::validate_step(&terms, &mut derived, ProofId(0), &step, true, None)
+        .expect("the ITE-range sub-schema must validate in strict mode");
+
+    // FORGERY: the same kind on `(cl (not (< ITE 1)))`, falsified at C = 1 —
+    // the else-branch makes `ITE = 0 < 1`, so the only literal is false.
+    let ite_lt_one = terms.mk_lt(ite, one);
+    let forged_literal = terms.mk_not(ite_lt_one);
+    let forged = lattice_step(vec![forged_literal], None);
+    let mut derived = Vec::new();
+    let error = checker::validate_step(&terms, &mut derived, ProofId(0), &forged, true, None)
+        .expect_err("a bound INSIDE the branch range must be rejected");
+    assert!(
+        matches!(error, ProofCheckError::InvalidTheoryLemma { .. }),
+        "{error:?}",
+    );
+
+    let printer = AlethePrinter::new(&terms);
+    let text = printer
+        .format_step(&step, ProofId(1))
+        .expect("the lattice gap renders as an honest unproved step");
+    assert_eq!(
+        text,
+        "(step t1 (cl (not (<= 0 C)) (not (< (ite (= C 0) 1 0) 0))) :rule hole)"
+    );
+    assert!(!text.contains(":args") && !text.contains("la_generic"));
+}
+
 #[test]
 fn strict_checker_accepts_the_lattice_gap_and_rejects_a_forged_label() {
     let mut terms = TermStore::new();

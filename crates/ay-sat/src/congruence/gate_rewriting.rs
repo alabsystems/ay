@@ -48,6 +48,155 @@ pub(super) struct GateSignature {
     inputs: SmallVec<[usize; INLINE_GATE_INPUTS]>,
 }
 
+/// Signature index for the congruence fixpoint, plus the reverse map that makes
+/// a gate's entry REMOVABLE.
+///
+/// THE LEAK THIS CLOSES. The table used to be a bare
+/// `HashMap<GateSignature, usize>`, and a gate's entry was removed by
+/// RECOMPUTING its signature from its current inputs under the current
+/// union-find:
+///
+/// ```ignore
+/// let sig = Self::canonicalize(&gate_types[gi], &gate_inputs[gi], uf);
+/// if gate_table.get(&sig) == Some(&gi) { gate_table.remove(&sig); }
+/// ```
+///
+/// A gate is rewritten precisely BECAUSE a merge changed one of its inputs'
+/// representatives — so by the time the removal runs, `canonicalize` produces a
+/// DIFFERENT key from the one the gate was filed under, the lookup misses, and
+/// the old entry is stranded. `reinsert_gate` then files a new one. Net effect:
+/// the table grows by one entry per rewrite, forever, and rewrites are driven by
+/// merges which schedule further merges.
+///
+/// Measured at `b2258ab6` on SAT-COMP 2026 `post-cbmc-aes-ee-r2` — a 33 MB
+/// input that 28 of 31 official solvers solve: 17.6 GB resident and a `c memout`
+/// 8 s in against `--memory 6000`. `--disable congruence` on the same instance
+/// peaks at 705 MB, and a stack sample puts 4607 of 4704 samples inside
+/// `compute_congruence_closure -> rewrite_gate_after_merge`.
+///
+/// (The source comment at the retired `--sat-congruence-memory-bound` guard
+/// records this instance's runaway as "no longer reproducible". It is
+/// reproducible at HEAD. That guard does not catch it either — it is gated on
+/// 200 000 iterations of the fixpoint, and this explodes in fewer.)
+///
+/// WHY EXACT REMOVAL IS SEMANTICS-PRESERVING, not just smaller. Every key the
+/// table can be QUERIED with is produced by [`CongruenceClosure::canonicalize`],
+/// which maps each input through `uf.find` — so a matchable key contains only
+/// CURRENT union-find representatives. A stranded key is stranded exactly
+/// because a merge demoted one of its literals out of representative status, and
+/// the union-find only ever merges further. A stranded key can therefore never
+/// be produced by a later `canonicalize` call, and never matches again. It is
+/// dead weight, and dropping it removes no equivalence the closure would have
+/// found.
+///
+/// It is also FASTER: `remove_gate_signature` no longer canonicalizes at all,
+/// and canonicalization under it was 1400+ of those 4704 samples.
+pub(super) struct GateTable {
+    map: HashMap<GateSignature, usize>,
+    /// The signature each gate is CURRENTLY filed under, or `None` when the gate
+    /// has no entry. Bounded by the gate count — unlike the stranded entries it
+    /// replaces, which were bounded by the rewrite count.
+    ///
+    /// Empty under the legacy arm, which keeps the recompute-and-hope removal.
+    filed_under: Vec<Option<GateSignature>>,
+    exact_removal: bool,
+}
+
+impl GateTable {
+    pub(super) fn new(gate_count: usize, exact_removal: bool) -> Self {
+        Self {
+            map: HashMap::with_capacity(gate_count),
+            filed_under: if exact_removal {
+                vec![None; gate_count]
+            } else {
+                Vec::new()
+            },
+            exact_removal,
+        }
+    }
+
+    pub(super) fn get(&self, sig: &GateSignature) -> Option<usize> {
+        self.map.get(sig).copied()
+    }
+
+    pub(super) fn contains_key(&self, sig: &GateSignature) -> bool {
+        self.map.contains_key(sig)
+    }
+
+    /// Number of live signature entries — the quantity that used to grow
+    /// without bound. Reported by `--sat-mem-probe`.
+    pub(super) fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub(super) fn insert(&mut self, sig: GateSignature, gi: usize) {
+        if self.exact_removal {
+            if let Some(slot) = self.filed_under.get_mut(gi) {
+                *slot = Some(sig.clone());
+            }
+        }
+        self.map.insert(sig, gi);
+    }
+
+    /// Drop `gi`'s entry. `recompute` supplies the legacy arm's guessed key and
+    /// is not called at all under exact removal.
+    pub(super) fn remove_gate(&mut self, gi: usize, recompute: impl FnOnce() -> GateSignature) {
+        if self.exact_removal {
+            if let Some(slot) = self.filed_under.get_mut(gi) {
+                if let Some(sig) = slot.take() {
+                    self.map.remove(&sig);
+                }
+            }
+            return;
+        }
+        let sig = recompute();
+        if self.map.get(&sig) == Some(&gi) {
+            self.map.remove(&sig);
+        }
+    }
+}
+
+/// Append `gi` to a literal's occurrence list, collapsing the list first when it
+/// has doubled since its last collapse.
+///
+/// A gate is re-pushed onto its inputs' occurrence lists on EVERY reinsertion,
+/// and reinsertion happens once per rewrite, so a gate rewritten `n` times
+/// appears `n` times. Nothing reads a repeat: the drain iterates
+/// `mem::take(&mut occs[lit])` and skips dead gates, and rewriting an
+/// already-rewritten gate re-derives the same signature. Collapsing on a
+/// doubling watermark keeps each list at O(gates using that literal) instead of
+/// O(rewrites touching it), at an amortized O(len log len) per doubling.
+///
+/// Gated by `--sat-congruence-bounded-occs` (default OFF): duplicates DO change
+/// how many times `rewrite_gate_after_merge` runs inside one drain, so this is a
+/// scheduling change, not a pure lifetime fix, and it is unmeasured on the
+/// corpus.
+fn push_occurrence(occs: &mut [Vec<usize>], lit: usize, gi: usize) {
+    if occs_are_bounded() {
+        let list = &mut occs[lit];
+        // 64 entries of slack before the first collapse: short lists are the
+        // overwhelming majority and must not pay a sort.
+        if list.len() >= OCCS_COLLAPSE_FLOOR && list.len().is_power_of_two() {
+            list.sort_unstable();
+            list.dedup();
+        }
+    }
+    occs[lit].push(gi);
+}
+
+/// Shortest occurrence list that may be collapsed by [`push_occurrence`].
+const OCCS_COLLAPSE_FLOOR: usize = 64;
+
+fn occs_are_bounded() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| {
+        ay_core::sat_ab_switches()
+            .congruence_bounded_occs
+            .unwrap_or(false)
+    })
+}
+
 impl CongruenceClosure {
     /// Reduce XOR inputs after UF rewriting.
     ///
@@ -393,15 +542,33 @@ impl CongruenceClosure {
             }
         }
 
-        // Gate table: signature -> first gate index with that signature
-        let mut gate_table: HashMap<GateSignature, usize> = HashMap::with_capacity(gate_count);
+        // Gate table: signature -> first gate index with that signature.
+        //
+        // Tri-state `--sat-congruence-exact-gate-table`: `true` keys removal off
+        // the signature the gate was actually filed under; the default restores
+        // the recompute-and-hope removal that strands one entry per rewrite (see
+        // `GateTable`). Both arms live in one binary, so a paired A/B needs no
+        // second build.
+        //
+        // Default OFF, by measurement discipline rather than by preference: the
+        // argument that stranded entries are unmatchable is in `GateTable`'s
+        // docs and holds, but arming it alone did NOT convert the witness it was
+        // derived from (`post-cbmc-aes-ee-r2` still memouts at 4842 MB), so it
+        // has a cost and no demonstrated benefit. Flip it on a paired corpus
+        // A/B, not on the argument.
+        let mut gate_table = GateTable::new(
+            gate_count,
+            ay_core::sat_ab_switches()
+                .congruence_exact_gate_table
+                .unwrap_or(false),
+        );
 
         for gi in 0..gate_count {
             if !gate_alive[gi] {
                 continue;
             }
             let sig = Self::canonicalize(&gate_types[gi], &gate_inputs[gi], uf);
-            if let Some(&existing_gi) = gate_table.get(&sig) {
+            if let Some(existing_gi) = gate_table.get(&sig) {
                 let out_a = uf.find(gate_outputs[existing_gi]);
                 let out_b = uf.find(gate_outputs[gi]);
                 if out_a != out_b {
@@ -498,10 +665,39 @@ impl CongruenceClosure {
             })
         };
         let mut budget_ticks: u64 = 0;
+        // `--sat-mem-probe`: attribute a runaway fixpoint to the container that
+        // is actually growing. Every accumulator below is unbounded in
+        // principle, and the sample profile cannot tell them apart — it only
+        // says "inside rewrite_gate_after_merge". Emitted on a coarse power-of-
+        // two cadence so a healthy closure prints once and a runaway prints a
+        // growth curve.
+        let probe_state = ay_core::misc_cli_flags().sat_mem_probe;
         loop {
             // Poll on a coarse cadence; the call reads a cached limit but the
             // footprint query is a syscall on some platforms.
             budget_ticks = budget_ticks.wrapping_add(1);
+            if probe_state && budget_ticks.is_multiple_of(1 << 12) {
+                let occs_entries: usize = occs.iter().map(Vec::len).sum();
+                let input_entries: usize = gate_inputs.iter().map(SmallVec::len).sum();
+                let xor_rhs: usize = edge_provenance
+                    .iter()
+                    .map(|prov| match prov {
+                        EdgeProvenance::XorMatch { rhs } => rhs.len(),
+                        _ => 0,
+                    })
+                    .sum();
+                eprintln!(
+                    "c mem_probe congruence.loop ticks={budget_ticks} table={} schedule={} \
+                     units_queued={} occs_entries={occs_entries} gate_input_entries={input_entries} \
+                     edges={} xor_rhs={xor_rhs} discovered_units={} footprint={:.1} MB",
+                    gate_table.len(),
+                    schedule.len(),
+                    units_to_propagate.len(),
+                    equivalence_edges.len(),
+                    discovered_units.len(),
+                    ay_sys::current_footprint_bytes() as f64 / 1e6,
+                );
+            }
             // Engage only at the operator's declared limit — never earlier.
             //
             // This threshold is load-bearing and was calibrated by measurement,
@@ -643,12 +839,22 @@ impl CongruenceClosure {
                     )?;
 
                     if gate_alive[gi] {
-                        occs[winner].push(gi);
+                        push_occurrence(&mut occs, winner, gi);
                     }
                 }
             }
         }
 
+        if ay_core::misc_cli_flags().sat_mem_probe {
+            // The quantity the leak grew: entries live in the gate table when
+            // the fixpoint ends, against the gate count it started from.
+            eprintln!(
+                "c mem_probe congruence gates={gate_count} table_entries={} merges={total_merges} \
+                 footprint={:.1} MB",
+                gate_table.len(),
+                ay_sys::current_footprint_bytes() as f64 / 1e6,
+            );
+        }
         if debug_congruence_enabled() {
             let cascade = total_merges.saturating_sub(initial_merges);
             let alive = gate_alive.iter().filter(|&&a| a).count();
@@ -700,13 +906,12 @@ impl CongruenceClosure {
         gi: usize,
         gate_types: &[GateType],
         gate_inputs: &[SmallVec<[usize; 5]>],
-        gate_table: &mut HashMap<GateSignature, usize>,
+        gate_table: &mut GateTable,
         uf: &mut UnionFind,
     ) {
-        let sig = Self::canonicalize(&gate_types[gi], &gate_inputs[gi], uf);
-        if gate_table.get(&sig) == Some(&gi) {
-            gate_table.remove(&sig);
-        }
+        gate_table.remove_gate(gi, || {
+            Self::canonicalize(&gate_types[gi], &gate_inputs[gi], uf)
+        });
     }
 
     /// Reinsert a (possibly simplified) gate into the gate table.
@@ -719,13 +924,13 @@ impl CongruenceClosure {
         gate_alive: &mut [bool],
         uf: &mut UnionFind,
         schedule: &mut VecDeque<(usize, usize, EdgeProvenance)>,
-        gate_table: &mut HashMap<GateSignature, usize>,
+        gate_table: &mut GateTable,
         occs: &mut [Vec<usize>],
         num_lits: usize,
         found_equiv: &mut bool,
     ) {
         let new_sig = Self::canonicalize(&gate_types[gi], &gate_inputs[gi], uf);
-        if let Some(&existing_gi) = gate_table.get(&new_sig) {
+        if let Some(existing_gi) = gate_table.get(&new_sig) {
             let out_a = uf.find(gate_outputs[existing_gi]);
             let out_b = uf.find(gate_outputs[gi]);
             if out_a != out_b {
@@ -751,7 +956,7 @@ impl CongruenceClosure {
             gate_table.insert(new_sig, gi);
             for &inp in &gate_inputs[gi] {
                 if inp < num_lits {
-                    occs[inp].push(gi);
+                    push_occurrence(occs, inp, gi);
                 }
             }
         }
@@ -762,7 +967,7 @@ impl CongruenceClosure {
         target_type: &GateType,
         inputs: &[usize],
         uf: &mut UnionFind,
-        gate_table: &HashMap<GateSignature, usize>,
+        gate_table: &GateTable,
     ) -> bool {
         let sig = Self::canonicalize(target_type, inputs, uf);
         gate_table.contains_key(&sig)

@@ -9,6 +9,8 @@
 
 mod common;
 
+#[path = "group_incremental/bv_congruence_leaks_past_pop_7892.rs"]
+mod bv_congruence_leaks_past_pop_7892;
 #[path = "group_incremental/core_evolution_push_pop_8311.rs"]
 mod core_evolution_push_pop_8311;
 #[path = "group_incremental/dt_lazy_incremental_soundness.rs"]

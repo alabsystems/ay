@@ -18,6 +18,11 @@ use std::sync::Arc;
 impl ChcParser {
     /// Parse a single command
     pub(super) fn parse_command(&mut self) -> ChcResult<()> {
+        // Binder scopes are per-clause. Clearing on ENTRY rather than exit keeps
+        // it correct on the error paths too. This clears only the collision
+        // tracker, never `variables`, so resolution is unchanged.
+        self.end_clause_binder_scope();
+
         self.skip_whitespace_and_comments();
         if self.pos >= self.input.len() {
             return Ok(());
@@ -153,6 +158,10 @@ impl ChcParser {
         self.skip_whitespace_and_comments();
         let sort = self.parse_sort()?;
 
+        // Track separately from `variables` so a quantifier binder can tell a
+        // file-scoped declare-var apart from another binder. Both kinds capture;
+        // both are fixed by renaming the BINDER, never by touching this binding.
+        self.declared_var_names.insert(name.clone());
         self.variables.insert(name, sort);
         Ok(())
     }

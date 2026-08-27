@@ -44,6 +44,7 @@
 use crate::model::{Col, Model, Sense};
 
 mod bounded_setup;
+mod eta_cap_floor;
 
 /// A column's resting place when non-basic.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -508,6 +509,16 @@ pub(crate) static REFAC_REPAIRS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub(crate) static DUAL_POSTCHK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Primal walks abandoned because the factorization refused the ratio test's
+/// pivot and the entering column had NO finite opposite bound to rest on.
+/// Diagnostic only; the disposition is `SimplexStatus::Stopped`.
+pub(crate) static REJECTED_SPIKE_DECLINES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Phase-II `Unbounded` claims refused because every costed column is boxed on
+/// the side its cost points at, so the objective cannot run away.
+/// Diagnostic only; the disposition is `SimplexStatus::Stopped`.
+pub(crate) static BOXED_UNBOUNDED_DECLINES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Dual walks abandoned by the divergence guard (violation bloom).
 pub(crate) static DUAL_BLOOM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -711,7 +722,7 @@ fn record_lane(lane: usize, eta_delta: u64) {
 // "which caller provoked the recovery" is a question the LANEMAP/CALLERMAP
 // census already answers and "how many iterations does recovery eat" is the one
 // this instrument exists for.
-pub(crate) const LEDGER_PHASES: usize = 12;
+pub(crate) const LEDGER_PHASES: usize = 14;
 /// The unattributed default. A solve issued outside every scope lands here; a
 /// large `other` is itself a finding (a phase nobody tagged).
 pub(crate) const PH_OTHER: usize = 0;
@@ -741,12 +752,31 @@ pub(crate) const PH_PUMP: usize = 8;
 pub(crate) const PH_RINS: usize = 9;
 /// The flip-LNS primal heuristic.
 pub(crate) const PH_FLIP_LNS: usize = 10;
-/// RECOVERY: iterations spent re-walking after the engine gave up on a walk it
-/// had already paid for — `rounds`' drift retries (round > 0, each preceded by a
-/// refactorisation), the lazy perturb-retry-and-polish after a `Stopped` walk,
-/// and the chain-distress bundle retry. These are pure re-work: the LP was
-/// already being solved once when they started.
+// RECOVERY IS THREE DIFFERENT THINGS AND USED TO BE ONE NUMBER.
+//
+// Every iteration below is re-work — the LP was already being solved once when
+// the episode started — but the three doors have nothing else in common, and a
+// single `recovery=` token made a non-zero value un-actionable: it could mean
+// the drift check rejected an answer (a NUMERICAL complaint), or a walk cycled
+// on degenerate ties (a DEGENERACY complaint), or a chain-shaped cold walk blew
+// its distress probe (a CRASH-BASIS complaint). They are diagnosed, and fixed,
+// in three different places.
+//
+// It also hid the finding this split was cut for: on mas76 the merged token read
+// `recovery=44546s/0d/23+24p/47i@0.0`, which looks like a rounding artefact until
+// you see that 44,539 of those 44,546 episodes are perturb-retries that ran ZERO
+// iterations, and the 47 iterations belong to the seven that are not.
+/// RECOVERY (drift): `rounds`' re-walks past round 0. A round is only ever
+/// reached because the drift check rejected the previous round's answer, so each
+/// one re-walks an LP already walked, behind a fresh refactorisation.
 pub(crate) const PH_RECOVERY: usize = 11;
+/// RECOVERY (perturb): the lazy perturb-retry-and-polish after a walk came back
+/// `Stopped`. Save the box, nudge the bounds apart, re-walk, restore, polish.
+pub(crate) const PH_RECOVERY_PERTURB: usize = 12;
+/// RECOVERY (chain): the chain-distress bundle retry — a cold eta-path walk on a
+/// chain-shaped LP blew its distress probe, so the bundle armed and the solve
+/// restarted from a fresh triangular crash.
+pub(crate) const PH_RECOVERY_CHAIN: usize = 13;
 pub(crate) const LEDGER_LABELS: [&str; LEDGER_PHASES] = [
     "other",
     "root-lp",
@@ -759,12 +789,14 @@ pub(crate) const LEDGER_LABELS: [&str; LEDGER_PHASES] = [
     "pump",
     "rins",
     "flip-lns",
-    "recovery",
+    "recov-drift",
+    "recov-perturb",
+    "recov-chain",
 ];
 /// `solve_bounded` / `probe_duals` entries charged to each phase, counted at the
-/// phase live ON ENTRY. `recovery` counts EPISODES instead (it never enters a
-/// solve of its own — it re-tags iterations inside somebody else's), which is
-/// the more useful denominator for it anyway.
+/// phase live ON ENTRY. The three `recov-*` phases count EPISODES instead (none
+/// of them enters a solve of its own — each re-tags iterations inside somebody
+/// else's), which is the more useful denominator for them anyway.
 pub(crate) static PHASE_SOLVES: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
     [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
 /// Dual-simplex pivots charged to each phase.
@@ -776,6 +808,26 @@ pub(crate) static PHASE_P1: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
 /// Primal PHASE-II iterations charged to each phase.
 pub(crate) static PHASE_P2: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
     [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
+/// Perturb-retry episodes DECLINED because the caller's work budget was already
+/// spent — the guard in `run`, which is the reason `recov-perturb` reads zero on
+/// instances that used to post tens of thousands of no-op episodes. Reported by
+/// [`iter_ledger_line`] so the skip stays auditable instead of becoming an
+/// invisible absence: "the phase vanished" and "the phase never fired" look
+/// identical in a ledger that only counts what ran.
+///
+/// Bumped UNCONDITIONALLY, not behind the ledger flag, for two reasons. It is
+/// the only thing that can fail when the guard is deleted — node counts,
+/// objectives and the whole test suite are all identical with and without it,
+/// which is precisely the shelf-life problem
+/// `crates/ay-milp/tests/diag_wall_precision.rs` exists to record — so
+/// `perturb_retry_declines_when_the_work_budget_is_already_spent` reads it
+/// directly. And it is free relative to what it replaces: one uncontended
+/// relaxed `fetch_add` on a path that has just avoided two heap allocations and
+/// an O(m·n) `recompute_xb` (mas76: 44,539 bumps against 89,079 allocations not
+/// made), three orders of magnitude below the per-ITERATION `stats::` counters
+/// the pivot loops already carry.
+pub(crate) static PERTURB_RETRY_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 thread_local! {
     /// The solve phase the current thread is running on behalf of (index into
     /// the `PHASE_*` arrays). Set by `PhaseScope`; defaults to `PH_OTHER`.
@@ -801,7 +853,7 @@ fn ledger_phase_is_heuristic(p: usize) -> bool {
 /// worse, "what does RINS cost" becomes unanswerable because RINS' own spend is
 /// scattered across five other phases. So `new` DECLINES to re-tag while a
 /// heuristic phase is live, and a heuristic's number is inclusive of its whole
-/// nested search. The two RE-WORK phases are the deliberate exception and use
+/// nested search. The RE-WORK phases are the deliberate exception and use
 /// [`Self::new_forced`]: "how many iterations go into redoing a walk we already
 /// paid for" is a question worth answering wherever it happens, heuristic
 /// included.
@@ -865,6 +917,12 @@ pub(crate) fn ledger_note_solve() {
 /// is their difference and MUST be 0. A non-zero value means a pivot loop exists
 /// that neither `dual_simplex` nor `loop_phase` owns — the ledger is wrong, and
 /// the line says so rather than quietly under-reporting.
+///
+/// `perturb-skipped` is the one thing here that counts work NOT done: the
+/// perturb-retry episodes the budget guard in `run` declined. It is reported
+/// beside the phases because otherwise the guard's whole effect is a phase that
+/// silently stops appearing, which is indistinguishable from a phase that was
+/// never reachable. See [`PERTURB_RETRY_SKIPPED`].
 #[must_use]
 pub fn iter_ledger_line() -> String {
     use std::sync::atomic::Ordering::Relaxed;
@@ -893,8 +951,9 @@ pub fn iter_ledger_line() -> String {
         return String::new();
     }
     format!(
-        "ITERLEDGER total={sum} engine={engine} unattributed={} | {}",
+        "ITERLEDGER total={sum} engine={engine} unattributed={} perturb-skipped={} | {}",
         engine as i64 - sum as i64,
+        PERTURB_RETRY_SKIPPED.load(Relaxed),
         parts.join(" "),
     )
 }
@@ -1106,6 +1165,19 @@ pub(crate) struct FloatLp {
     /// solves of a WIDE-AND-TALL instance are likewise not pinned (their
     /// answer is a child bound, and the eta path's per-`warm_start` rebuild
     /// is the measured refactor storm) — see `classic_pin` in `solve_bounded`.
+    /// # WHICH SITES THE MEASUREMENTS COVER (audited 2026-08-24)
+    ///
+    /// Eight reads, and only FOUR of them are gates. One is the field's own
+    /// propagation across a row reload, one is a trace-only lane bucket, and
+    /// one is the cache hand-back after a triangular crash — that last is a
+    /// SEMANTICS-PRESERVING guard ("`plain_cold` drops its engine"), not a
+    /// measured lever, and should not be read as one. Of the gates, the
+    /// cold-root LU band and the `solve_bounded`/`classic_pin` pair carry their
+    /// own measurements. The fourth is the `(wide_tall && !plain_cold) ||
+    /// tall_cold_dual` gate in `run`, whose `plain_cold` EXEMPTION for the tall
+    /// branch is the metro claim — the classic path returns `Stopped` there, so
+    /// there is no seed vertex to protect. That claim was taken on the metro
+    /// wcnfs, which are not in this tree; it is not re-derivable here.
     pub(crate) plain_cold: bool,
     /// PER-INSTANCE eager anti-degeneracy (see `eager_perturb_mode`): perturb the box
     /// before the walk, restore before judging — path-only, never the answer. Set by
@@ -1324,6 +1396,40 @@ fn eager_perturb_applies_to(mode: u8, warm_started: bool, cold_stalled: bool) ->
 /// crash-basis phase-I cycling this perturbation answers.
 fn eager_perturb_applies(warm_started: bool, lp: &FloatLp) -> bool {
     eager_perturb_applies_to(eager_perturb_mode(), warm_started, lp.cold_stalled.get())
+}
+
+/// PRIMAL HARRIS TWO-PASS RATIO TEST (`--harris-rt`). 0 = off and DEFAULT.
+///
+/// 0 is not "a cheap approximation of Harris"; it is the historical
+/// single-pass test, reached by a branch that never enters the two-pass code,
+/// so every gate ratchet holds bit-for-bit with the flag absent. See
+/// [`Simplex::harris_ratio_test`] for what 1 and 2 do and what has been
+/// measured about them.
+fn harris_rt_mode() -> u8 {
+    match crate::tune::count_opt(crate::tune::Knob::HarrisRt) {
+        Some(m @ (1 | 2)) => m as u8,
+        _ => 0,
+    }
+}
+
+/// Arguments of [`Simplex::harris_ratio_test`], as a struct because seven
+/// positional `f64`/`bool` parameters is how a caller swaps two of them.
+struct HarrisArgs {
+    /// Direction the entering column moves: `+1` from its lower bound, `-1`
+    /// from its upper.
+    dir: f64,
+    phase1: bool,
+    feas_tol: f64,
+    pivot_tol: f64,
+    /// The candidacy floor on `|alpha|` the single-pass test uses (absolute,
+    /// or relative-to-column-max on wide LPs).
+    piv_floor: f64,
+    /// The entering column's own span — the bound-flip breakpoint, and an
+    /// exact cap on the step. `INFINITY` for a free column.
+    span_cap: f64,
+    /// 1 = two-pass largest-pivot selection, 2 = that plus the positive step
+    /// floor.
+    mode: u8,
 }
 /// FUSED SINGLE-PASS BFRT RATIO TEST (`AY_MILP_FUSED_RT`). The dual ratio test
 /// does two O(cols) passes: a BUILD loop that materialises the breakpoint Vec
@@ -1564,13 +1670,62 @@ fn churn_band_factor() -> f64 {
     0.5
 }
 /// Historical force-everywhere lever for the LU / Forrest-Tomlin engine.
-/// RETIRED: the LU engine auto-engages by shape (`warm_lu_enabled` &&
-/// `wide_tall`/`tall_lu`, plus the node/cold-root LU knobs), and the force
-/// lever's producer never survived the B38 CLI migration — the read here was
-/// an env name nothing sets, i.e. constant `false`. Kept as a function so
-/// the six decision sites keep their shape; a future measurement arm can
+///
+/// # THE LEVER'S PROVENANCE, because five docstrings cite it
+///
+/// It was `AY_MILP_LU=1`, and it WORKED, for exactly one window. (The reads
+/// below are spelled without their quotes on purpose: `retired_names_have_no_
+/// read_sites` scans .rs files for the literal `env::var_os` + quoted `AY_*`
+/// and cannot tell a history note from a live key — it caught this very
+/// docstring on the first run.)
+///
+/// ```text
+///   939184496  2026-07-14  born:  env::var_os of AY_MILP_LU   <- live lever
+///   8875fea71  2026-08-15  B40b:  env::var_os of the string --lu, which is an
+///                                 ENV NAME no command line sets
+///   165cf57db  2026-08-18  wired: false                       <- retired outright
+/// ```
+///
+/// Every measurement the citations below rest on (2026-07-16 w5, 2026-07-27/28
+/// cold-root band) was taken INSIDE that window, so those numbers were taken
+/// with a lever that fired. What broke is the CITATION, not the data: B40b's
+/// decision record for this flag said the force-lever "survives only via a
+/// typed carrier", and the commit instead rewrote the env NAME to the string
+/// `--lu` — an environment variable spelled like a flag, which no command line
+/// ever sets — while textually rewriting `AY_MILP_LU=1` to `--lu` in six
+/// docstrings here, in `milp_sparse_speed`'s recipe, and in `milp_profile`.
+/// The flag `--lu` that those docs now advertise has never, at any commit,
+/// reached this function.
+///
+/// Four gates had no purchase on that: `env_ledger` scans for `AY_*` names and
+/// `"--lu"` is not one; `knob_census` enumerates `Knob` variants and `--lu` is
+/// not one; the quality gate's exact-set baseline lost its `AY_MILP_LU` rows in
+/// the same commit; and `Flags::parse` accepts `--lu` because `milp_profile`
+/// declares it. Hence the rule the census now enforces
+/// (`no_harness_parses_engine_flags_without_applying_them` and
+/// `every_harness_declared_flag_is_dispositioned` in `tests/knob_census.rs`).
+///
+/// RETIRED. The LU engine auto-engages by shape (`warm_lu_enabled` &&
+/// `wide_tall`/`tall_lu`, plus the node/cold-root LU knobs). Kept as a function
+/// so the six decision sites keep their shape; a future measurement arm can
 /// force LU everywhere again by editing this constant or adding a typed
-/// carrier (the phase-2 flag table's "keep-override-only" verdict).
+/// carrier. THE LEVERS THAT DO CARRY TODAY are `--no-tall-lu`, `--no-node-lu`
+/// and `--no-cold-lu` — kill switches, so they select the eta lane, not the LU
+/// one. Measured on `5ebf652ba`, haprp (m=1,048), `ay-milp solve … 60 --trace
+/// --no-emit-cert`, 3 interleaved reps per arm, all OPTIMAL 3673280.681685.
+/// NODES and LUFACT are rep-stable; REFAC IS NOT — an independent re-measure at
+/// load ~40 gave 369/374/369 and 784/789/784 over 3 interleaved reps. An
+/// earlier draft of this comment said "every counter bit-identical across
+/// reps", which is false and is exactly the species of claim this docstring
+/// exists to kill: REFAC is load-coupled, so quote it as a band, not a pin.
+///
+/// ```text
+///   arm             nodes   LUFACT   REFAC
+///   default (LU)      450      649     374
+///   --no-tall-lu      572        0   1,905     <- lane fully off: LUFACT -> 0
+///   --no-node-lu      690      517     789     <- NOT nested: more nodes than
+///                                                 turning the lane off entirely
+/// ```
 fn lu_enabled() -> bool {
     false
 }
@@ -1598,6 +1753,11 @@ fn lp_stats_enabled() -> bool {
 fn no_cold_dual() -> bool {
     // B12: caller-layer switch; the never-set AY_MILP_NO_COLD_DUAL env read is gone.
     crate::tune::on(crate::tune::Knob::NoColdDual)
+}
+
+/// Kill switch for the tall-covering cold-dual rescue; see [`FloatLp::tall_cold_dual`].
+fn no_tall_cold_dual() -> bool {
+    crate::tune::on(crate::tune::Knob::NoTallColdDual)
 }
 
 /// Measurement arm: try the cold dual start on EVERY shape, not just `wide_tall`.
@@ -1842,7 +2002,7 @@ fn cold_lu_max_rows() -> usize {
 ///
 /// The shipped band `[COLD_LU_MIN_ROWS, REFACTOR_TALL_ROWS)` is keyed on `m`,
 /// and `m` does not predict what the FT engine costs. Measured over 39 corpus
-/// models (`--lu`, 60 s, deterministic `LU_FTRAN_REACH`/`LUFACT`
+/// models (`AY_MILP_LU=1`, 60 s, deterministic `LU_FTRAN_REACH`/`LUFACT`
 /// counters), Spearman against ns per FT update per row:
 ///
 /// ```text
@@ -2263,9 +2423,102 @@ pub(crate) mod stats {
     pub(crate) static SOLVE_NANOS: AtomicU64 = AtomicU64::new(0);
     pub(crate) fn bump(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
+        // TEST INSTRUMENT ONLY, and the branch is compiled out of the shipped
+        // build: see [`WORK_LOCAL`]. `bump` is the sole write path to both
+        // counters [`work`] sums, so mirroring here is complete.
+        #[cfg(test)]
+        if std::ptr::eq(c, &DUAL_ITERS) || std::ptr::eq(c, &PRIMAL_ITERS) {
+            WORK_LOCAL.with(|w| w.set(w.get().wrapping_add(1)));
+        }
     }
     pub(crate) fn get(c: &AtomicU64) -> u64 {
         c.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// THIS THREAD's contribution to [`work`] — the instrument a test must
+        /// read when it asserts on a work-clock delta it produced itself.
+        ///
+        /// # Why [`work`] cannot be that instrument
+        ///
+        /// [`work`]'s own docstring already says it: it is "a PROCESS total and
+        /// is never reset, so under an in-process consumer running concurrent
+        /// solves it counts other solves' work as well". libtest IS such a
+        /// consumer — it runs this crate's other ~1,140 tests on other threads
+        /// while any one of them runs — so a test that reads `work()` before and
+        /// after its own bumps measures the whole binary's pivots in that
+        /// interval, not its own. That is wrong in BOTH directions: a foreign
+        /// pivot inflates the delta and fails an honest test, and a foreign
+        /// pivot can equally SUPPLY a delta the test is checking for, which
+        /// would let a mutation that stopped charging pass.
+        ///
+        /// MEASURED, not assumed. 120 byte-faithful replicas of
+        /// [`matches_the_process_clock_when_it_is_the_only_solve`] against the
+        /// `bab::tests::` / `cuts::` / `session::tests::` batch, 45 runs =
+        /// 5,400 invocations: TWO failed, both
+        ///
+        /// ```text
+        /// assertion `left == right` failed
+        ///   left: 5
+        ///  right: 6
+        /// ```
+        ///
+        /// — this thread's five bumps against six on the process clock, i.e. one
+        /// foreign pivot inside the window. 5,400 replicas reading THIS mirror
+        /// instead, in the same runs on the same threads, failed zero times.
+        ///
+        /// Same defect and same fix as `sepstat::GATE_LOCAL` (`759cf08c6`), which
+        /// is the sibling this census found. `#[cfg(test)]` only: the shipped
+        /// [`bump`] is byte-for-byte what it was.
+        ///
+        /// # The rest of the census — CLOSED
+        ///
+        /// This mirror and `sepstat::GATE_LOCAL` were the first two of a class
+        /// of TWENTY-TWO sites. The first hand census said twenty and missed
+        /// two: [`perturb_retry_declines_when_the_work_budget_is_already_spent`]
+        /// in THIS file, and `cuts::the_violation_screen_is_bit_identical`,
+        /// whose `SCREEN_SKIP` is declared by `sepstat`'s `counters!` macro and
+        /// so has no `static` line to grep for. A mechanical scan found the
+        /// second. All twenty-two now read a per-thread mirror;
+        /// see [`crate::local_census`], which generalises exactly this
+        /// mechanism, and `tests/global_counter_census.rs`, which is the gate
+        /// that stops the class coming back.
+        ///
+        /// Two claims the earlier note made are RETRACTED as wrong:
+        ///
+        /// * "a thread-local would be the WRONG instrument for the SIX
+        ///   `ADOPTION_EXCLUDED` sites, because `charge()` latches by
+        ///   `compare_exchange` and the winning worker is often not the
+        ///   asserting thread". True of exactly ONE of the six — `sepstat`'s
+        ///   `concurrent_distinct_rows_…`, which charges on threads IT spawns,
+        ///   and which now sums each worker's OWN mirror. The other five charge
+        ///   on the asserting thread.
+        /// * "the right instrument is `charge()`'s own return value, which
+        ///   three of the six already assert". All SIX already asserted it; the
+        ///   return value is a `bool` and cannot carry the ROW COUNT that four
+        ///   of the six also assert, so it was never sufficient on its own.
+        ///
+        /// And the masking direction was MEASURED rather than argued. Three
+        /// full concurrent lib-suite runs recorded a foreign charge of ZERO in
+        /// every one of the twenty windows — the floors were not in fact being
+        /// supplied by siblings on this suite. With one sibling thread running
+        /// the same warm solve inside the window (`tune::activate_caller` is
+        /// thread-local, so the feature could be killed on the test's thread
+        /// and left live on the sibling's), the process-global spelling of the
+        /// eta-reuse floor PASSED with the feature it guards dead, 3/3, while
+        /// the per-thread spelling failed. The exposure is real; the accident
+        /// that it had not yet fired is not a defence.
+        static WORK_LOCAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// [`work`] restricted to THIS THREAD's charges.
+    ///
+    /// The delta-asserting instrument; see [`WORK_LOCAL`]. [`work`] keeps its
+    /// process-wide meaning and stays the diagnostic/reporting number.
+    #[cfg(test)]
+    pub(crate) fn work_local() -> u64 {
+        WORK_LOCAL.with(std::cell::Cell::get)
     }
 
     /// THE WORK CLOCK. Every simplex iteration this process has run, whoever asked for it.
@@ -2505,6 +2758,15 @@ impl Drop for IterCap {
         let prev = self.0;
         ITER_BUDGET.with(|c| c.set(prev));
     }
+}
+
+/// True when the caller's WORK budget is already spent, i.e. the next
+/// [`spend_iter`] is committed to returning `false` (and, note, to NOT
+/// decrementing, so asking is free of side effects). `u64::MAX` — the unbudgeted
+/// default — is never zero, so an uncapped solve always reads `false`.
+#[inline]
+fn iter_budget_exhausted() -> bool {
+    ITER_BUDGET.with(std::cell::Cell::get) == 0
 }
 
 /// Spend one iteration. `false` once the budget is gone.
@@ -3224,6 +3486,25 @@ impl FloatLp {
     /// anti-degeneracy perturbation, a cold dual-simplex start, and sparse-LU
     /// basis maintenance. The row floor leaves wide-but-short models on the
     /// default path.
+    ///
+    /// # WHICH SITES THE MEASUREMENTS COVER (audited 2026-08-24)
+    ///
+    /// Twelve read sites, and in the 30-instance gate corpus air05 (426 × 7,195)
+    /// is the ONLY instance that satisfies this predicate — verified by shape:
+    /// air03 (124 rows), mod010 (146) and nw04 (36) are wide but fail the
+    /// 200-row floor. So every measurement of this gate is an air05
+    /// measurement, and the honest reading is "air05 likes it", not "the
+    /// set-partitioning class likes it".
+    ///
+    /// Sites and their evidence: the LU-install family (`solve_bounded`'s
+    /// `node_lu`/`classic_pin`, `probe_duals`, the pooled `WarmSolver`) is
+    /// measured; the bloom-cap pair (`8167`, `9918`) is air05's warm re-solve
+    /// 7,244 → 670 dual iterations, both lines shipped together in eb30920ec7;
+    /// the COLD/ROOT `try_cold_dual` gate is air05's root LP 2.16s → 0.37s.
+    /// The WARM-FAILURE `try_cold_dual` gate carries air05's 408-violated-row
+    /// numbers in its comment, but that path did not arm on air05 in 150 s
+    /// runs taken during this audit (its ledger phase was absent) — the
+    /// numbers are not disputed, their REACHABILITY today is unconfirmed.
     pub(crate) fn wide_tall(&self) -> bool {
         self.n >= DEVEX_WIDTH * self.m.max(1) && self.m >= EAGER_PERTURB_MIN_ROWS
     }
@@ -3232,8 +3513,70 @@ impl FloatLp {
     /// warm node and probe solves even when the matrix is not wide. Sparse LU
     /// can reuse a matching basis and absorb updates. This lane changes basis
     /// maintenance, not the LP admission checks or verdict semantics.
+    ///
+    /// # WHICH SITES THE MEASUREMENTS COVER (audited 2026-08-24)
+    ///
+    /// Fifteen read sites. In the 30-instance gate corpus exactly ONE instance
+    /// satisfies this predicate — qiu, 1,192 × 840 — re-verified by shape
+    /// during this audit; ACAS (≥ 1,425 rows) is the other measured member and
+    /// lives outside that corpus. Two evidence families cover almost all of it:
+    /// the qiu family (`dual_churn_band`, the bloom relax, the pooled
+    /// `WarmSolver` lane, `should_perturb_dual`) and the ACAS family
+    /// (`solve_bounded`'s LU-install decision, `verify_after_for`,
+    /// `refactor_cadence`). Both name the instance and both argue inertness
+    /// elsewhere, which is the standard the rest of the crate should meet.
+    ///
+    /// TWO EXCEPTIONS, recorded so they are not mistaken for measured:
+    ///
+    /// * `probe_duals`' `wide_tall() || tall_lu()` gate. Its commit measured
+    ///   air05 (LUFACT −52%, bit-identical) — and air05 is 426 rows, i.e. the
+    ///   `wide_tall` half. The `tall_lu` half of that disjunct rode in on the
+    ///   same line and has never been exercised by that measurement.
+    /// * the FT-adoption ceiling (`ft_max`). Its own commit says the ceiling's
+    ///   premise "could not be checked EVEN IN PRINCIPLE" before it was made
+    ///   reachable, and that making a gate measurable and moving it are
+    ///   different acts. It is still on the first.
+    ///
+    /// Two further reads are FORGONE-COST COUNTERS, not gates: they charge the
+    /// branch already being taken and change no behaviour.
     pub(crate) fn tall_lu(&self) -> bool {
         self.m >= tall_lu_rows() && !no_tall_lu()
+    }
+
+    /// Tall covering/partitioning LPs mirror [`Self::wide_tall`]: metro-style
+    /// set covers have many more rows than columns (39,259 × 15,891 measured).
+    /// Their crash-basis primal walk stopped after ~65k pivots without a root
+    /// bound; cold dual settled the same LP in ~15k. This lane also applies to
+    /// `plain_cold`, because the failed classic path supplies no seed vertex.
+    /// [`Knob::NoTallColdDual`](crate::tune::Knob::NoTallColdDual) disables it.
+    ///
+    /// # WHICH SITES THAT MEASUREMENT COVERS
+    ///
+    /// TWO read sites, and the metro numbers above cover ONE of them: the
+    /// COLD/ROOT gate (`!warm_started`) in `run`. They were taken through
+    /// `diag_float_lp_with` — one cold walk, no ladder — with a `BabSession`
+    /// bound run alongside. They say nothing about the WARM-FAILURE RE-SOLVE
+    /// gate, which 6715ed282 armed on this same predicate under a one-line
+    /// assertion. That second site now carries its own measurement, in its own
+    /// comment, and it is NOT the same result: it is load-bearing for the
+    /// covering class and a net loss on qiu. A reader adding a THIRD site
+    /// inherits neither measurement and must take their own.
+    ///
+    /// REFUTED DISCRIMINATOR, recorded so it is not re-proposed: "every
+    /// structural column is bounded above" (`upper[..n].all(is_finite)`) reads
+    /// like the LP-side shadow of the all-binary covering property this
+    /// predicate is named for, and qiu's MPS supports it — 840 columns, only
+    /// 48 `BOUNDS` entries, so 792 continuous columns are `[0, +inf)` on the
+    /// file. It does not work. Built and measured 2026-08-24: gating the
+    /// warm-failure site on it left qiu's cold-retry phase at 11 solves /
+    /// 100,943 dual pivots, bit-identical to baseline across 3 interleaved
+    /// pairs. The LP this gate reads is not the file — by the time the search
+    /// asks, every column is bounded above (independently confirmed at the
+    /// site: `n=840 finite_up=840 all_boxed_up=true` at all 11 firings). Any
+    /// future covering test must be validated against the LP AT THE SITE, not
+    /// the model on disk.
+    pub(crate) fn tall_cold_dual(&self) -> bool {
+        self.m >= tall_lu_rows() && self.n < self.m && !no_tall_cold_dual()
     }
 
     /// Charge the current top-level solve's first actual FT-adoption
@@ -3255,8 +3598,26 @@ impl FloatLp {
     /// `plain_cold` (see the field's note) pins COLD solves to the eta file
     /// because the root vertex seeds the pump/dive/RINS chain. That pin is
     /// correct policy and wrong at one size class. Measured, 2026-07-27/28,
-    /// 60–120 s caps, `--lu` as the force-lever (deterministic counters
-    /// first, wall indicative — the box was contended):
+    /// 60–120 s caps, `AY_MILP_LU=1` as the force-lever (deterministic counters
+    /// first, wall indicative — the box was contended).
+    ///
+    /// THE LEVER NAME IS LOAD-BEARING AND WAS WRONG HERE FOR TEN DAYS. From
+    /// `8875fea71` (2026-08-15) to this note it read `--lu`, a flag that has
+    /// never at any commit reached `lu_enabled()` — see that function for the
+    /// three-commit provenance. The dates above sit INSIDE the window when
+    /// `AY_MILP_LU=1` was a live env read (`939184496`, 2026-07-14 ..
+    /// `8875fea71`), so the TABLE stands on the lever it names; what did not
+    /// stand was the renamed citation, and an independent auditor downgraded
+    /// the sibling claim in the development design notes
+    /// on exactly that reading.
+    ///
+    /// NOT RE-DERIVABLE ON THIS BOX, recorded so the next reader does not try:
+    /// the band is `m ∈ [3 000, 8 192)` and NO instance in `~/ay-bench/milp`
+    /// (151 manifest entries + 3 unmanifested) or the 30-instance gate corpus
+    /// falls in it — the corpora top out at m = 1 969. Every winner named below
+    /// (nursesched-sprint02, neos-960392, hypothyroid-k1) is absent. The
+    /// nearest live check is the TALL-LU lane one class down; see `lu_enabled`
+    /// for the haprp figures, taken with `--no-tall-lu`, which does carry.
     ///
     /// | m | instance | eta lane | LU lane |
     /// |---|----------|----------|---------|
@@ -3310,12 +3671,34 @@ impl FloatLp {
     ///   contended box: air05 alone spans 374/374/374 vs 2,340 eta rebuilds and
     ///   17 vs 35 nodes across four runs of the IDENTICAL arm, which is why the
     ///   floor is not tuned on truncated instances.
-    /// * ABOVE the ceiling nothing moves, checked rather than assumed: ex9
-    ///   (m = 40,962) 242 vs 243 eta rebuilds with the identical root LP bound
-    ///   9.028183 and `LUFACT count=0` in both arms, and neos-827175
-    ///   (m = 14,187) 371 vs 373 with its triangular crash intact in both —
-    ///   which is the confound the `--lu` force-lever could not avoid.
-    /// * `AY_MILP_LU_VERIFY=1` — refactorize-from-scratch and re-ask after EVERY
+    /// * ABOVE the ceiling nothing moves — RETRACTED, NOT-ESTABLISHED. The
+    ///   bullet read: ex9 (m = 40,962) 242 vs 243 eta rebuilds with the
+    ///   identical root LP bound 9.028183 and `LUFACT count=0` in both arms,
+    ///   and neos-827175 (m = 14,187) 371 vs 373 with its triangular crash
+    ///   intact in both. Those two pairs cannot be what they say they are.
+    ///   `AY_MILP_LU=1` set `lu_enabled()`. State the argument precisely, since
+    ///   an earlier draft over-claimed "EVERY LU-install site is disjunctive on
+    ///   it" and that is FALSE — `simplex.rs`'s own `plain_cold` path installs
+    ///   an `LuCache` under `!lu_enabled()`. What actually holds is enough:
+    ///   `crash_installed` is CONJUNCTIVE on `!lu_enabled()`, so with the lever
+    ///   ON the `solve_bounded` install gate runs unconditionally and
+    ///   `LUFACT count=0` is unreachable; and the comment in `solve_bounded` says in as many
+    ///   words that the same lever "suppresses the crash outright via
+    ///   `!lu_enabled()`" — so it cannot leave neos-827175's crash "intact in
+    ///   both" either. One statement in this file contradicts the other about
+    ///   the same instance. The reading that fits both observables is that the
+    ///   lever was not passed on these two runs, which makes them the SAME ARM
+    ///   twice and the null vacuous by construction (measurement rule R7). It
+    ///   is left retracted rather than re-measured because no instance in
+    ///   `~/ay-bench/milp` (151 manifest + 3 unmanifested) or the 30-instance
+    ///   gate corpus is anywhere near this ceiling — max m = 1,969 — so
+    ///   nothing on this box can settle it. Re-take it, if it is wanted, with
+    ///   `--no-cold-lu` (which carries) and an instance above 8,192 rows.
+    /// * `AY_MILP_LU_VERIFY=1` — RETIRED, and the lever with the same effect
+    ///   today is `--verify-after <n>` (`Knob::VerifyAfter`,
+    ///   `EngineEconomics::with_verify_after`). The result below stands on its
+    ///   own dates; the name does not resolve any more.
+    ///   Refactorize-from-scratch and re-ask after EVERY
     ///   single Forrest–Tomlin update, the strictest cross-check the crate has,
     ///   and in class here because the band sits inside `verify_after_for`'s
     ///   `tall_lu() && m < REFACTOR_TALL_ROWS` gate — reproduces the root LP
@@ -3907,8 +4290,10 @@ impl FloatLp {
         // the identity crash, so the two cannot compose); models whose peel
         // declines — set-partition (air05: the singleton queue never seeds),
         // square-ish, everything else — fall through to exactly the historical
-        // path, and the decline traces say why. The explicit `--lu`
-        // force-lever keeps its meaning (LU path, no crash), as does
+        // path, and the decline traces say why. The historical `AY_MILP_LU=1`
+        // force-lever kept its meaning (LU path, no crash) — but it is RETIRED
+        // (`lu_enabled` is a constant `false`), so no lever reaches this term
+        // today; the crash gate is decided by shape alone. So does
         // `plain_cold`'s cache-drop on success below.
         let crash_installed = warm.is_none()
             && !no_tri_crash()
@@ -3964,7 +4349,7 @@ impl FloatLp {
         //
         // Ordered AFTER the triangular crash on purpose. The crash and the LU
         // operator "cannot compose" (the note above), and the blunt
-        // `--lu` force-lever suppresses the crash outright via
+        // `AY_MILP_LU=1` force-lever suppressed the crash outright via
         // `!lu_enabled()` — which is what made neos-827175 (m=14,187, 10,512/
         // 10,512 equality rows peeled) look like an LU-lane loss when it was a
         // crash loss. This gate never fires when `crash_installed`, so a
@@ -4101,7 +4486,7 @@ impl FloatLp {
                 if deadline.is_none_or(|d| std::time::Instant::now() < d) {
                     // ITERATION LEDGER: the probe walk above already spent its
                     // budget; this retry re-solves the same LP from scratch.
-                    let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY);
+                    let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY_CHAIN);
                     ledger_note_solve();
                     sx.reset(self, lower, upper, false);
                     if !no_tri_crash() {
@@ -5090,7 +5475,8 @@ struct Simplex {
     /// bounds inside `run` — exported on the Candidate so the tree does not pay
     /// for the same verification twice.
     farkas_verified: bool,
-    /// The sparse LU / Forrest–Tomlin basis engine (`--lu`), replacing
+    /// The sparse LU / Forrest–Tomlin basis engine (shape-gated; the
+    /// `AY_MILP_LU=1` force-everywhere lever is retired), replacing
     /// the eta file as the representation of `B^{-1}`. Installed by
     /// `solve_bounded` from the LP's cross-solve cache; advice-lane only, like
     /// everything here: a defect costs speed or tightness, never soundness.
@@ -5154,16 +5540,6 @@ struct Simplex {
     /// ascending-`j` order, with the same first-minimal argmin.
     rt_kind: Vec<u8>,
     d: Vec<f64>,
-    /// Partial-pricing cursor: the column where the next pricing sweep begins
-    /// (cyclic). Persisting it across iterations is what makes sectional
-    /// pricing scan the whole column range over time instead of re-scanning
-    /// the same prefix.
-    price_cursor: usize,
-    /// Candidate-list pricing pool: columns a MAJOR (full) pricing pass found
-    /// improving, re-priced cheaply on MINOR iterations until none improves,
-    /// which forces the next major pass. Cleared on reset; survives rebound
-    /// (a stale pool only hastens a refresh — every use re-prices).
-    price_pool: Vec<u32>,
     /// The pivot lane's cost view: `lp.cost` scaled into the pivot frame
     /// (c'_j = c_j·2^cexp_j; a straight copy when scaling is off). Filled per
     /// `reset`, which also covers the pump's in-place cost mutation on its clone.
@@ -5374,8 +5750,6 @@ impl Simplex {
             pcost: vec![0.0; lp.cols],
             pcost_save: Vec::new(),
             dual_perturb_active: false,
-            price_cursor: 0,
-            price_pool: Vec::new(),
             bp: Vec::with_capacity(64),
             flips: Vec::with_capacity(16),
             wflip: vec![0.0; lp.m],
@@ -5437,11 +5811,8 @@ impl Simplex {
         // own floor — the same storm `refactorize`'s raise kills, seen at the
         // w5 bound-closing nodes: every warm node adopted a 42M-entry file
         // against the 29.9M static cap).
-        if keep_factor && self.factor_live && self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS {
-            let floor = self.etas.entries() + (self.etas.entries() / 4).max(16 * self.m);
-            if floor > self.eta_nnz_cap {
-                self.eta_nnz_cap = floor;
-            }
+        if keep_factor && self.factor_live {
+            self.raise_eta_cap_floor(self.etas.entries());
         }
         // The caller's box is ORIGINAL-frame; the solver runs in the pivot frame.
         // Multiplying by a power of two is exact; ±inf and lo==up are preserved.
@@ -5465,8 +5836,6 @@ impl Simplex {
         // nodes happened to run before it on the same `FloatLp` -- the same rule
         // `eta_rebuilds` states two fields up, for the same reason.
         self.bump_fill_latched = false;
-        self.price_cursor = 0;
-        self.price_pool.clear();
         self.pcost.clear();
         if lp.scaled() {
             // c'_j = c_j·C_j (logical costs are zero either way).
@@ -7149,19 +7518,10 @@ impl Simplex {
         }
         self.eta_nnz = self.etas.entries();
         self.since_refactor = 0;
-        // BIG-LP CAP FLOOR: the nnz trigger exists to bound UPDATE growth, but
-        // a heavy basis can REBUILD past the static cap — then the trigger
-        // refires every `since_refactor >= 5` and the walk becomes a rebuild
-        // storm (measured on the w5 crash walk: 10-12s rebuilds every 5
-        // pivots once the rebuilt file crossed ~30M entries). Keep the cap
-        // above the rebuilt floor so only growth can trigger. Monotone raise,
-        // big LPs only — small LPs never rebuild past their static cap.
-        if self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS {
-            let floor = self.eta_nnz + (self.eta_nnz / 4).max(16 * self.m);
-            if floor > self.eta_nnz_cap {
-                self.eta_nnz_cap = floor;
-            }
-        }
+        // REBUILD CAP FLOOR (see `raise_eta_cap_floor`): the file just rebuilt
+        // is this basis's own floor, and the nnz trigger must fire on GROWTH
+        // above it, never on the rebuild itself.
+        self.raise_eta_cap_floor(self.eta_nnz);
         // The fresh file represents exactly the basis just (re)installed. (The
         // deferral return above deliberately does NOT set this: after a
         // `warm_start` adoption the kept old file represents the PRE-hint basis.)
@@ -7640,7 +8000,7 @@ impl Simplex {
             && self.eta_nnz < self.eta_nnz_cap
         {
             self.chain_gen += 1;
-            ETA_REUSE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::local_census::add_usize(&ETA_REUSE_COUNT, 1);
             return;
         }
         refac_reason(0);
@@ -9995,7 +10355,10 @@ impl Simplex {
                         crate::bab::safe_farkas_proves_empty(lp, &ray, &self.lo, &self.up)
                     };
                     if proven {
-                        DUAL_NOENTER_SHORTCUT[lp.scaled() as usize].fetch_add(1, Relaxed);
+                        crate::local_census::add_usize(
+                            &DUAL_NOENTER_SHORTCUT[lp.scaled() as usize],
+                            1,
+                        );
                         self.farkas = Some(ray);
                         self.farkas_verified = true;
                         lp.note_warm_dual(true);
@@ -10071,44 +10434,119 @@ impl Simplex {
                 self.warm_start(lp, &basis, &at, &lo, &up);
                 self.snap_basis = basis;
                 self.snap_at = at;
-                // WIDE-AND-TALL: restart COLD IN THE DUAL rather than hand the
-                // primal a basis the dual already failed on. This branch is the
-                // best-bound pop whose inherited basis is hundreds of rows from
-                // the child (measured on air05: entry violations of 408 rows
-                // against the healthy child's 1), and the eager-perturbed
-                // primal walk from it is the catastrophic case — one such node
-                // LP ran phase 2 into MAX_ITERS (200,000 iterations, 28.2s,
-                // `xb` numerically diverged) plus a 27,373-iteration phase-I
-                // retry, ~36s for one `Stopped` answer. The cold dual start
-                // solves the same LP in ~3k pivots (~0.4s), deterministically.
-                // ITERATION LEDGER: this IS the in-solve cold retry — the warm
-                // dual ran, failed, and its basis was rolled back to the
-                // parent's, and the walk below restarts from B = -I. Same
-                // phase as the caller-level `warm = None` re-solve, because it
-                // is the same thing happening one frame lower.
+                // Restart cold in the dual after a failed inherited warm basis. On air05,
+                // the best-bound pop entered with 408 violated rows (the child had one):
+                // eager primal hit 200k pivots plus a 27,373-pivot phase-I retry (~36s,
+                // `Stopped`), while cold dual solved it in ~3k pivots (~0.4s).
+                // This is the in-solve cold-retry phase: warm dual failed, rollback restored
+                // the parent's basis, and the walk below restarts from B = -I. Keep gating
+                // before the ledger charge; charging rollback alone previously reported 397
+                // zero-iteration retries on the square-ish corpus.
+                // `cold_dual_all` is a default-off measurement arm for that square corpus,
+                // where the gated path never ran despite a measured 4.87x pivot / 8.2x wall
+                // gap. It distinguishes a gating artefact from an algorithmic deficit.
+                // `lp.tall_cold_dual()` ON THIS LINE IS NOW MEASURED. 6715ed282 added
+                // it under the assertion "tall covering LPs use the same rescue on
+                // warm-failure re-solves"; the numbers in that commit were taken at the
+                // COLD-ROOT site below, and nothing in it exercised this one. Measured
+                // here 2026-08-24 (release, `mps_solve`, presolve on, interleaved,
+                // load-invariant currencies -- iterations per phase from
+                // `--iter-ledger`, allocation counts from `--allocstat`).
+                // ATTRIBUTION CAVEAT: a `cold-retry` ledger line does NOT by itself
+                // prove this site ran. `PH_COLD_RETRY` is charged at three places
+                // (here, bab.rs:24866, bab.rs:24995 -- its own docstring says "both
+                // doors lead here"), and the other door does fire: under
+                // `--no-cold-dual` qiu still reports `cold-retry=1s/0d/1+0p/1i@1.0`.
+                // The 11-solve attribution below was confirmed by a probe AT this
+                // site, not by the phase name.
                 //
-                // The `&&` chain is split so the episode is charged only where
-                // a walk actually happens. Charging it before the gates counted
-                // every ROLLBACK as a cold retry, and on the square-ish corpus
-                // (which is not `wide_tall`, so `try_cold_dual` never runs) the
-                // ledger read `cold-retry=397 solves / 0 iterations` — a phase
-                // that had not run once. Same short-circuit order, so the
-                // default path is unchanged.
-                // MEASUREMENT ARM (`the cold-dual-all knob`, default off, byte-identical
-                // when unset): drop the `wide_tall()` shape gate so the cold dual start is
-                // tried on SQUARE-ISH models too.
+                //   KEEP IT. Synthetic tall set cover, 3,000 x 800 all-binary (the
+                //   predicate's own class; the metro wcnfs are not in this tree, so
+                //   this is a stand-in with the right shape and integrality, NOT the
+                //   original instance). Disarming this disjunct takes the node LPs
+                //   from 109.4 to 31,133.5 iterations per solve -- the warm-failure
+                //   re-solve falls through to a primal walk that grinds ~62k phase-I/II
+                //   pivots per node. Bit-stable over 3 interleaved pairs
+                //   (109.4/109.4/107.8 vs 31,133.5/29,213.5/31,197.5).
+                //   CAVEAT, so nobody over-trusts the constant: the generator's
+                //   seed and density were NOT recorded, so those exact ratios
+                //   are not re-derivable. The MECHANISM was independently
+                //   reproduced by an auditor on their own 3,000 x 800 cover
+                //   (node phase @125.1 armed vs @14,963.5 disarmed, primal
+                //   phase-I 1 -> 29,697), at 120x rather than 285x. Trust the
+                //   sign and the order of magnitude, not the digits. These
+                //   covering runs are also WALL-TRUNCATED (`BOUND`/`FEASIBLE`,
+                //   never `OPTIMAL` at 120s), so read the per-solve ratio,
+                //   which is stable, and not the totals.
                 //
-                // Why this arm exists: the comment above records that on the square-ish
-                // corpus `try_cold_dual` NEVER RUNS — and that is the corpus on which the
-                // campaign's headline LP numbers were taken (iterations ay/gurobi 4.87x
-                // geomean over 111 relaxations, wall 8.2x). So the cold dual start was never
-                // in the measurement that concluded ay "takes 5x too many steps". Six lines
-                // up, the recorded contrast on a single node LP is stark: the primal took
-                // 200,000 iterations / 28.2s and diverged numerically, against ~3k pivots
-                // (~0.4s) deterministically for the cold dual. If that ratio holds anywhere
-                // on the square corpus, the step-count gap is partly a gating artifact
-                // rather than an algorithmic deficit.
-                if (lp.wide_tall() || cold_dual_all()) && !no_cold_dual() {
+                //   IT COSTS qiu, and qiu is not a covering LP. 1,192 x 840, 94.3%
+                //   CONTINUOUS, a capacity==demand network that satisfies the pure
+                //   shape (`m >= TALL_LU_ROWS && n < m`) and nothing else. This site
+                //   spends 11 solves / 100,943 dual pivots = 23.4% of qiu's whole
+                //   simplex bill, and buys 2,831 nodes instead of 3,127: dropping the
+                //   disjunct is -19.4% total iterations and -7.7% allocations for
+                //   +10.5% nodes. Both faces are this one knob, and there is no
+                //   shipped switch that separates them.
+                //
+                //   NO CHEAP DISCRIMINATOR EXISTS YET -- see the refuted
+                //   `boxed_structurals` note on `tall_cold_dual`. Do not re-propose an
+                //   LP-side covering test without validating it on the LP AT THIS SITE.
+                //
+                // CENSUS. Across all 30 `~/ay-bench/milp-gate/instances`, this disjunct
+                // arms on exactly one: qiu (the only instance clearing m >= 1,000 with
+                // n < m). The other 29 are bit-identical with it and without it.
+                //
+                // WHICH GATE POLICES THIS LINE. Both of them, since 2026-08-26 --
+                // and until then NEITHER of the two was a safe citation.
+                // `milp_node_gate.py` excluded qiu BY NAME as run-to-run unstable
+                // while qiu is the only instance where this disjunct arms, so the
+                // ratchet reported "0 fail" at --tier all against a build with the
+                // disjunct disarmed. That was verified, both arms, quiet box: 19
+                // instances, 0 fail, 42.7s. It was structurally blind and was cited
+                // anyway. `corpus_guard.py` DID see it (`FAIL qiu: NODES 2831 ->
+                // 6529 (2.31x, tol 5%)` on a quiet box at load 3.1) but it had no
+                // load precondition, so on a busy box its verdict was not worth
+                // much either.
+                // FIXED: qiu is now a ratchet pin (2,831 / -132.873136947 /
+                // OPTIMAL, tier slow) after 28 completed runs at the shipped
+                // default all agreed, across load 2.5..19.7 and --limit 60/120/300; the
+                // old exclusion was recorded on an older engine (drift
+                // 3,946..4,121 over six runs) that 6715ed282 superseded. The
+                // instability that rationale described now belongs to the DISARMED
+                // config, which is the opposite of a reason to leave qiu ungated.
+                // Interleaved A,B,A,B on ONE binary, quiet box (load 2.9..3.4),
+                // `--limit 300`, one thread:
+                //
+                //     A  shipped default  2831 2831 2831 2831   wall 33.8..34.4s
+                //     B  --no-tall-cold-dual
+                //                         6511 6499 6504        wall 38.2..38.5s
+                //
+                // Across all seven disarmed runs taken: FIVE distinct values in
+                // 6,499..6,529, against ONE value in twenty-eight default runs.
+                //
+                // FOUR identical vs THREE DISTINCT values out of three. Both arms
+                // keep ONE GMICUTS separation digest each (A fc7d711a3895b1ff,
+                // B ade56e208aa70f2c), so the drift is downstream of separation:
+                // the disarmed path grinds a primal walk whose iteration budget is
+                // deadline-shaped, which is precisely the coupling this rescue
+                // removes. Do not re-exclude qiu without re-running that census.
+                //
+                // READ THE DISARMED NUMBER CAREFULLY, INCLUDING HOW TO REPRODUCE
+                // IT. Neither gate can pass an engine flag -- both hard-code
+                // `subprocess.run([solver, mps, str(secs)])` -- so "the same gate
+                // with the rescue disarmed" is NOT runnable as stated. Use a
+                // wrapper script as `--solver` that appends the flag. The number
+                // was produced with the
+                // `--no-tall-cold-dual` CLI switch, which clears `tall_cold_dual()`
+                // for BOTH of its consumers -- this warm-failure disjunct and the
+                // cold-start `tall_cd` below -- so it is a STRICTLY LARGER change
+                // than deleting this one disjunct, and its magnitude is not
+                // comparable with the 3,127 an earlier round measured from a
+                // single-site source edit. What it does establish is the gate
+                // claim, which does not depend on the magnitude: qiu is the only
+                // corpus instance either edit can touch, so a ratchet without qiu
+                // is blind to both.
+                if (lp.wide_tall() || lp.tall_cold_dual() || cold_dual_all()) && !no_cold_dual() {
                     let _ledger_cold = PhaseScope::new_forced(PH_COLD_RETRY);
                     ledger_note_solve();
                     if self.try_cold_dual(lp, deadline) {
@@ -10150,10 +10588,15 @@ impl Simplex {
         // `try_cold_dual`. Success ends the solve outright; failure rolled the
         // crash start back, so the primal path below runs exactly as before.
         let wide_tall = lp.wide_tall();
+        // Tall covering LPs miss `wide_tall` and otherwise grind primal phase I
+        // to `Stopped`. Try dual from the crash basis even under `plain_cold`:
+        // there is no seed vertex to preserve after failure. `try_cold_dual`
+        // still requires primal feasibility and priced-out reduced costs; the
+        // node bound remains the rigorously checked dual value.
+        let tall_cd = lp.tall_cold_dual();
         if !warm_started
-            && wide_tall
-            && !lp.plain_cold // the vertex-seeding solves; see `FloatLp::plain_cold`
             && !no_cold_dual()
+            && ((wide_tall && !lp.plain_cold) || tall_cd) // plain_cold: the vertex-seeding solves; see `FloatLp::plain_cold`
             && self.try_cold_dual(lp, deadline)
         {
             return SimplexStatus::Optimal;
@@ -10233,7 +10676,61 @@ impl Simplex {
         // ITERATION LEDGER: from here to the end of `run` is RECOVERY — the
         // whole walk above already ran and came back `Stopped`, so the perturbed
         // re-walk and the polish that follows it are re-work by definition.
-        let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY);
+        // ...UNLESS THE RETRY CANNOT SPEND AN ITERATION, IN WHICH CASE IT IS THEATRE.
+        //
+        // `Stopped` has several causes and one of them is the CALLER'S WORK
+        // BUDGET (`IterCap`, spent by `spend_iter`). When that is what ended the
+        // walk, the perturbed re-walk below cannot take a single pivot:
+        // `rounds` -> `loop_phase` -> `loop_phase_inner` opens its loop with
+        // `if !spend_iter() { return Stopped }`, and `spend_iter` returns false —
+        // WITHOUT decrementing — the moment the budget is zero. So the episode is
+        // a fixed unconditional bill for a guaranteed `Stopped`: two `Vec<f64>`
+        // clones of the box, an O(cols) `perturb_box`, an O(m·n) `recompute_xb`
+        // on the perturbed box, and two `copy_from_slice` restores.
+        //
+        // IT IS NOT A CORNER CASE — STRONG BRANCHING IS WHERE IT LIVES. One
+        // `IterCap` covers BOTH probes of a pair (see the `PROBE_PAIR_ITERS` call
+        // site in `bab.rs`), so once the down probe has eaten the pair's whole
+        // allowance the up probe starts at zero and every `Stopped` it produces
+        // buys one of these. Measured over the 30-instance gate corpus with
+        // `--iter-ledger`: mas76 44,539 episodes, mod008 6,945, enigma 534,
+        // misc03 374 — these four are ratchet-pinned and reproduce to the unit.
+        // misc07 is ~4.0k but is on the ratchet's `[flaky]` list, as are qiu and
+        // nw04, so their counts MOVE run-to-run (an independent re-measure gave
+        // misc07 4,031, qiu 3, nw04 1 against 4,023 / 5 / 2 here). Quote the
+        // ratio, which is stable, not the flaky members' digits: the corpus-wide
+        // split is ~56,400 futile to 14-18 live. And in
+        // every one of them the budget was ALREADY ZERO on entry, none ever came
+        // back `Optimal`, and the whole family contributed 0 of mas76's
+        // 2,839,237 simplex iterations. mas76's bill for them was 89,078
+        // allocations / 116,157,712 bytes (44,539 x 2 clones x 163 columns x 8),
+        // 0.84% of its allocation count and 4.89% of its allocated bytes;
+        // removing them measured 89,079 / 116,157,752, and mas76's allocation
+        // count is run-to-run DETERMINISTIC (10,609,166 on three reps before,
+        // 10,520,087 on three reps after), so that is signal, not noise.
+        //
+        // THE GUARD IS EXACT, NOT A HEURISTIC. It fires only when the very next
+        // `spend_iter` is already committed to returning false, so a retry that
+        // could take even one pivot still runs — and they do, and they earn
+        // their keep: across the same corpus 18 episodes had budget REMAINING
+        // (air03/gen/khb05250/mod010/qnet1 1 each, mas74/nw04 2, pk1 4, qiu 5),
+        // and mas74's two are worth 22,236 iterations that BOTH end `Optimal`.
+        // The futile:live ratio is 56,415:18. This guard must never cost the 18.
+        //
+        // `self.probe_iters_left == 0` (the chain-distress probe) is deliberately
+        // NOT part of the test. That check sits AFTER `spend_iter` in the loop,
+        // so a walk stopping on it has already spent a unit of a budget the probe
+        // PAIR shares, and folding it in here would hand the second probe a
+        // different allowance. Measured at 0 episodes across the corpus anyway.
+        //
+        // `!self.oom` keeps the pre-existing verdict: a solver that dropped its
+        // inverse must report `OutOfMemory`, and it is the retry's own
+        // `rounds`-declines-then-`if self.oom` path below that produces it.
+        if !self.oom && iter_budget_exhausted() {
+            crate::local_census::add_u64(&PERTURB_RETRY_SKIPPED, 1);
+            return SimplexStatus::Stopped;
+        }
+        let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY_PERTURB);
         ledger_note_solve();
         let (save_lo, save_up) = (self.lo.clone(), self.up.clone());
         self.perturb_box(lp);
@@ -10407,6 +10904,165 @@ impl Simplex {
         status
     }
 
+    /// One basic row's primal breakpoint: the TRUE ratio at which it blocks the
+    /// step, which bound it blocks at, and its own feasibility tolerance in
+    /// SOLVE-frame units. `None` when the row does not block at all.
+    ///
+    /// This is the body of the single-pass ratio test's per-row arm, and it is
+    /// deliberately a separate reader rather than a shared one: the single-pass
+    /// test is the shipped default and stays literally where it was, so no
+    /// refactor of it can move a gate ratchet. The two-pass test needs the same
+    /// breakpoints twice (once relaxed, once true), which is the whole reason
+    /// the second reader exists.
+    #[inline]
+    fn primal_break(
+        &self,
+        lp: &FloatLp,
+        i: usize,
+        a: f64,
+        args: &HarrisArgs,
+    ) -> Option<(f64, bool, f64, f64)> {
+        let bvar = self.basis[i];
+        let cur = self.xb[i];
+        let slope = -a * args.dir;
+        let (lo_b, up_b) = (self.lo[bvar], self.up[bvar]);
+        let ft = args.feas_tol * lp.bmul(bvar);
+        let below = args.phase1 && cur < lo_b - ft;
+        let above = args.phase1 && cur > up_b + ft;
+        let (target, want_upper) = if slope > args.pivot_tol {
+            if below {
+                (lo_b, false)
+            } else if above {
+                return None; // already above and still rising: nothing to hit
+            } else {
+                (up_b, true)
+            }
+        } else if slope < -args.pivot_tol {
+            if above {
+                (up_b, true)
+            } else if below {
+                return None; // already below and still falling: nothing to hit
+            } else {
+                (lo_b, false)
+            }
+        } else {
+            return None;
+        };
+        if !target.is_finite() {
+            return None;
+        }
+        let t = ((target - cur) / slope).max(0.0);
+        Some((t, want_upper, ft, slope.abs()))
+    }
+
+    /// THE HARRIS TWO-PASS RATIO TEST, gated (`--harris-rt`, default 0 = off).
+    ///
+    /// Returns `(step, leaving_row, leaving_to_upper)` with exactly the meaning
+    /// the single-pass test's `(min_t, leave_row, leave_to_upper)` carry, so the
+    /// caller's pivot bookkeeping is untouched.
+    ///
+    /// PASS 1 computes `theta`, the minimum ratio taken against every blocking
+    /// bound RELAXED outward by that basic variable's own feasibility tolerance
+    /// (`ft / |slope|` in step units), capped by the entering column's span.
+    /// PASS 2 selects, among the rows whose TRUE ratio is at most `theta`, the
+    /// largest pivot element `|alpha_i|`.
+    ///
+    /// WHY THAT IS SOUND. Every row `j` skipped in favour of the chosen row `q`
+    /// has `t_j <= t_q <= theta <= t_j + ft_j/|slope_j|`, so it ends the pivot
+    /// at most `ft_j` outside its box — its own feasibility tolerance, the same
+    /// slack `loop_phase_inner`'s phase-I classifier and `primal_feasible`
+    /// already allow. The LEAVING row is snapped exactly onto a bound by the
+    /// caller (`at[leaving]`), so it carries no residual at all, and
+    /// `recompute_xb` re-derives the basics from the basis every
+    /// `REFRESH_EVERY` iterations, so nothing accumulates.
+    ///
+    /// MODE 2 additionally refuses a zero-length step when the band admits a
+    /// positive one: the step is raised to the chosen row's own relaxed ratio,
+    /// never past `theta`. That is the EXPAND idea without EXPAND's expanding
+    /// tolerance — there is no anti-cycling PROOF here, and none is claimed;
+    /// the `bland`/`STALL_ABORT_GRACE`/`MAX_ITERS` backstops are what terminate
+    /// this walk, and Harris is switched OFF at the call site the moment Bland
+    /// engages so Bland's own argument is not weakened.
+    ///
+    /// TIE-BREAKING keeps the single-pass test's rule underneath the pivot
+    /// magnitude: equal `|alpha|` prefers evicting a FIXED basic variable, then
+    /// the smaller basis index. On 0/1 covering data almost every `|alpha|` IS
+    /// tied, so that rule, not the magnitude, is what usually decides.
+    fn harris_ratio_test(&self, lp: &FloatLp, args: HarrisArgs) -> (f64, Option<usize>, bool) {
+        // PASS 1 — the relaxed minimum. Seeded with the span so a bound flip
+        // still caps the band.
+        let mut theta = args.span_cap;
+        for &i in &self.nz {
+            let a = self.alpha[i];
+            if a.abs() <= args.piv_floor {
+                continue;
+            }
+            let Some((t, _, ft, slope_abs)) = self.primal_break(lp, i, a, &args) else {
+                continue;
+            };
+            let relaxed = t + ft / slope_abs;
+            if relaxed < theta {
+                theta = relaxed;
+            }
+        }
+        if !theta.is_finite() {
+            // No blocking row and no finite span: the caller's unbounded arm.
+            return (theta, None, false);
+        }
+
+        // PASS 2 — the largest pivot inside the band.
+        let mut best_abs = 0.0f64;
+        let mut chosen: Option<(usize, f64, bool, f64, f64)> = None;
+        for &i in &self.nz {
+            let a = self.alpha[i];
+            let aabs = a.abs();
+            if aabs <= args.piv_floor {
+                continue;
+            }
+            let Some((t, want_upper, ft, slope_abs)) = self.primal_break(lp, i, a, &args) else {
+                continue;
+            };
+            if t > theta {
+                continue;
+            }
+            let better = match chosen {
+                None => true,
+                Some((prev, ..)) => {
+                    if aabs > best_abs {
+                        true
+                    } else if aabs == best_abs {
+                        let fixed_here = self.lo[self.basis[i]] == self.up[self.basis[i]];
+                        let fixed_prev = self.lo[self.basis[prev]] == self.up[self.basis[prev]];
+                        match (fixed_here, fixed_prev) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => self.basis[i] < self.basis[prev],
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if better {
+                best_abs = aabs;
+                chosen = Some((i, t, want_upper, ft, slope_abs));
+            }
+        }
+
+        let Some((row, t, want_upper, ft, slope_abs)) = chosen else {
+            // Nothing blocks inside the band: the step is the span, and the
+            // caller performs a bound flip exactly as before.
+            return (args.span_cap, None, false);
+        };
+        let step = if args.mode >= 2 {
+            // Never past the relaxed minimum, and never past the span.
+            (t.max(ft / slope_abs)).min(theta).min(args.span_cap)
+        } else {
+            t
+        };
+        (step, Some(row), want_upper)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn loop_phase_inner(
         &mut self,
@@ -10437,6 +11093,10 @@ impl Simplex {
         // columns), air03 (124 / 10,757), mod010 (146 / 2,655), air05 (426 / 7,195) -- against
         // every dense instance here, which sits near 1:1.
         let wide = lp.n >= DEVEX_WIDTH * lp.m.max(1);
+        // PRIMAL Harris two-pass ratio test (`--harris-rt`); 0 = the shipped
+        // single-pass test. Read once per phase, like `wide`: the caller
+        // profile cannot change inside a walk.
+        let harris_rt = harris_rt_mode();
         // `--devex` forces Devex from iteration 0 regardless of shape.
         // The corpus evidence and rejected gate are recorded in
         // `../DEVEX_MEASUREMENT.md`; mixed results keep this a caller-owned lever.
@@ -10581,63 +11241,63 @@ impl Simplex {
             // positive; a free column may go either way.
             let mut entering: Option<(usize, f64)> = None;
             let mut best = 0.0f64;
-            // BIG-LP PRICING ECONOMY. Full pricing walks every column's CSC dot —
-            // O(total nnz) per iteration, ~13ms on the cifar100 w5 window
-            // (26,831 structurals, 7.47M nnz) — and the cold walk there is
-            // 24,399 iterations (measured to completion: Optimal at 1,739s).
+            // FULL PRICING without scattered CSC gathers. A pricing pass walks
+            // every column, so an absent candidate is genuine optimality
+            // evidence; non-Bland passes compute all reduced costs with one
+            // row-major `fill_yta` sweep, while Bland retains its ordered
+            // per-column scan and early exit.
             // Selection is ADVICE (any improving column is a valid pivot); the
-            // OPTIMALITY claim is untouched in every mode below: `entering ==
-            // None` is only ever reached off a candidate-free scan of EVERY
-            // column, and the drift re-ask after it re-checks on a fresh
-            // inverse. Bland mode always runs the full smallest-index scan
-            // (termination argument). Small LPs keep the exact full sweep.
-            // Two economies, chosen by env:
-            // - CANDIDATE-LIST (default for big LPs; --full-pricing
-            //   restores full): a MAJOR full pass harvests the top candidates
-            //   into a pool; MINOR iterations re-price only the pool (~400×
-            //   cheaper) until nothing in it improves, forcing the next major
-            //   pass. Full-scan walk quality at partial-scan cost.
-            // - SECTIONAL (AY_MILP_PARTIAL_PRICING=1): rotating windows;
-            //   MEASURED SPLIT — w2 cold LP 9.1s→5.6s, but w5's walk collapses
-            //   (moved 9,467→118) — kept as a lever, not a default.
-            const PARTIAL_PRICE_MIN_COLS: usize = 8192;
-            const PRICE_SECTION: usize = 2048;
-            const MIN_SECTIONS_WITH_CANDIDATE: usize = 2;
-            const PRICE_POOL_MAX: usize = 64;
-            let big = self.cols >= PARTIAL_PRICE_MIN_COLS;
-            let full_forced =
-                crate::tune::caller_flag(crate::tune::Knob::FullPricing) == Some(true);
-            let sectional = !bland && big && !full_forced && false; // B22: sectional pricing retired (measured-out).
-                                                                    // Pool mode is ALSO measured-out as a default (w2 walk 5,831 →
-                                                                    // 9,978 iterations; w5 walk collapses — phase-1's cb depends on the
-                                                                    // violated SET, which shifts globally each pivot, so any cached
-                                                                    // candidate list goes stale immediately). The shipping default for
-                                                                    // big LPs is the SWEPT full pass below: byte-identical walk, one
-                                                                    // sequential O(nnz) sweep instead of scattered per-column dots.
-            let pool_mode = !bland && big && !full_forced && !sectional && false; // B7: the AY_MILP_POOL_PRICING opt-in is deleted (never shipped on)
-
-            // MINOR iteration: re-price the pool only. A pool column that went
-            // basic/fixed or stopped improving simply doesn't enter; if none
-            // does, fall through to the MAJOR full pass below.
-            if pool_mode && !self.price_pool.is_empty() {
-                for k in 0..self.price_pool.len() {
-                    let jj = self.price_pool[k] as usize;
-                    if self.basic_row[jj].is_some() || self.lo[jj] == self.up[jj] {
-                        continue;
-                    }
-                    let rc = self.reduced_cost(lp, jj, phase1);
-                    let ct = if phase1 {
-                        cost_tol
+            // OPTIMALITY claim is unchanged: `entering == None` is only ever
+            // reached after a candidate-free scan of EVERY column, and the
+            // drift re-ask below repeats that check on a fresh inverse.
+            // ONE row-major sweep replaces every column's scattered CSC dot:
+            // `fill_yta` computes yᵀA sequentially (documented bit-identical
+            // to the per-column gathers), so rc reads become O(1) and the
+            // full pass costs one cache-friendly O(nnz) instead of a
+            // scattered one. Bland keeps per-column dots (it exits early).
+            let swept = !bland;
+            if swept {
+                self.fill_yta(lp);
+            }
+            for jj in 0..self.cols {
+                if self.basic_row[jj].is_some() || self.lo[jj] == self.up[jj] {
+                    continue;
+                }
+                let rc = if swept {
+                    let c = if phase1 { 0.0 } else { self.pcost[jj] };
+                    if jj < lp.n {
+                        c - self.arow[jj]
                     } else {
-                        cost_tol * lp.vmul(jj)
-                    };
-                    let dir = match self.at[jj] {
-                        NbBound::Lower if rc < -ct => 1.0,
-                        NbBound::Upper if rc > ct => -1.0,
-                        NbBound::Zero if rc < -ct => 1.0,
-                        NbBound::Zero if rc > ct => -1.0,
-                        _ => continue,
-                    };
+                        c + self.y[jj - lp.n]
+                    }
+                } else {
+                    self.reduced_cost(lp, jj, phase1)
+                };
+                // Phase-2 reduced costs carry the frame d'_j = d_j·vmul(j);
+                // phase 1's ±1 gradient keeps its reduced costs in the solve
+                // frame, so its entry test stays unframed (selection is
+                // advice — the per-column CLASSIFICATION is correctness).
+                let ct = if phase1 {
+                    cost_tol
+                } else {
+                    cost_tol * lp.vmul(jj)
+                };
+                let dir = match self.at[jj] {
+                    NbBound::Lower if rc < -ct => 1.0,
+                    NbBound::Upper if rc > ct => -1.0,
+                    NbBound::Zero if rc < -ct => 1.0,
+                    NbBound::Zero if rc > ct => -1.0,
+                    _ => 0.0,
+                };
+                if dir != 0.0 {
+                    if bland {
+                        entering = Some((jj, dir));
+                        break;
+                    }
+                    // Devex scores `rc^2 / w`: how far the column will MOVE,
+                    // not how steep it looks. On a degenerate LP the steepest
+                    // column is usually blocked at zero, which is precisely
+                    // why Dantzig re-picks it forever.
                     let score = if devex {
                         rc * rc / self.w[jj].max(1e-12)
                     } else {
@@ -10647,117 +11307,6 @@ impl Simplex {
                         best = score;
                         entering = Some((jj, dir));
                     }
-                }
-            }
-
-            // MAJOR pass (pool mode with an exhausted pool) or the sectional /
-            // full sweep. In pool mode this full pass also rebuilds the pool
-            // with the top candidates by score.
-            if entering.is_none() {
-                // ONE row-major sweep replaces every column's scattered CSC dot:
-                // `fill_yta` computes yᵀA sequentially (documented bit-identical
-                // to the per-column gathers), so rc reads become O(1) and the
-                // full pass costs one cache-friendly O(nnz) instead of a
-                // scattered one. Bland keeps per-column dots (it exits early).
-                let swept = !bland && !sectional;
-                if swept {
-                    self.fill_yta(lp);
-                }
-                let mut pool_new: Vec<(f64, u32)> = Vec::new();
-                let mut sections_with_candidate = 0usize;
-                let mut scanned = 0usize;
-                let mut j = if sectional {
-                    self.price_cursor % self.cols
-                } else {
-                    0
-                };
-                while scanned < self.cols {
-                    let jj = if j >= self.cols { j - self.cols } else { j };
-                    j += 1;
-                    scanned += 1;
-                    let at_section_end = sectional && scanned.is_multiple_of(PRICE_SECTION);
-                    let mut consider = true;
-                    if self.basic_row[jj].is_some() || self.lo[jj] == self.up[jj] {
-                        consider = false;
-                    }
-                    if consider {
-                        let rc = if swept {
-                            let c = if phase1 { 0.0 } else { self.pcost[jj] };
-                            if jj < lp.n {
-                                c - self.arow[jj]
-                            } else {
-                                c + self.y[jj - lp.n]
-                            }
-                        } else {
-                            self.reduced_cost(lp, jj, phase1)
-                        };
-                        // Phase-2 reduced costs carry the frame d'_j = d_j·vmul(j);
-                        // phase 1's ±1 gradient keeps its reduced costs in the solve
-                        // frame, so its entry test stays unframed (selection is
-                        // advice — the per-column CLASSIFICATION is correctness).
-                        let ct = if phase1 {
-                            cost_tol
-                        } else {
-                            cost_tol * lp.vmul(jj)
-                        };
-                        let dir = match self.at[jj] {
-                            NbBound::Lower if rc < -ct => 1.0,
-                            NbBound::Upper if rc > ct => -1.0,
-                            NbBound::Zero if rc < -ct => 1.0,
-                            NbBound::Zero if rc > ct => -1.0,
-                            _ => 0.0,
-                        };
-                        if dir != 0.0 {
-                            if bland {
-                                entering = Some((jj, dir));
-                                break;
-                            }
-                            // Devex scores `rc^2 / w`: how far the column will MOVE,
-                            // not how steep it looks. On a degenerate LP the steepest
-                            // column is usually blocked at zero, which is precisely
-                            // why Dantzig re-picks it forever.
-                            let score = if devex {
-                                rc * rc / self.w[jj].max(1e-12)
-                            } else {
-                                rc.abs()
-                            };
-                            if score > best {
-                                best = score;
-                                entering = Some((jj, dir));
-                            }
-                            if pool_mode {
-                                if pool_new.len() < PRICE_POOL_MAX {
-                                    pool_new.push((score, jj as u32));
-                                } else {
-                                    // Replace the current minimum if this beats it.
-                                    let mut mi = 0;
-                                    for (i, &(s, _)) in pool_new.iter().enumerate() {
-                                        if s < pool_new[mi].0 {
-                                            let _ = s;
-                                            mi = i;
-                                        }
-                                    }
-                                    if score > pool_new[mi].0 {
-                                        pool_new[mi] = (score, jj as u32);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if at_section_end && entering.is_some() {
-                        sections_with_candidate += 1;
-                        if sections_with_candidate >= MIN_SECTIONS_WITH_CANDIDATE {
-                            break;
-                        }
-                    }
-                }
-                if sectional {
-                    // Resume the next sweep where this one stopped looking.
-                    self.price_cursor = (self.price_cursor + scanned) % self.cols;
-                }
-                if pool_mode {
-                    self.price_pool.clear();
-                    self.price_pool.extend(pool_new.iter().map(|&(_, j)| j));
                 }
             }
 
@@ -10856,98 +11405,194 @@ impl Simplex {
                 pivot_tol
             };
 
-            for &i in &self.nz {
-                let a = self.alpha[i];
-                if a.abs() <= piv_floor {
-                    continue;
-                }
-                let bvar = self.basis[i];
-                let cur = self.xb[i];
-                let slope = -a * dir; // d(xb_i)/dt
-                                      // WHICH BOUND DOES THIS BASIC VARIABLE BLOCK THE STEP AT?
-                                      //
-                                      // A variable that is already OUTSIDE a bound and moving FURTHER OUT has no bound
-                                      // left to hit, and must not block at all. This is where phase I was dying. It gave
-                                      // such a variable its violated bound as the target anyway -- so
-                                      // `t = (lo - cur) / slope` came out NEGATIVE, `max(0.0)` clamped it to zero, and
-                                      // the step was blocked at zero by a variable that was never in the way.
-                                      //
-                                      // air03 starts with all 124 equality logicals infeasible, so on essentially every
-                                      // iteration SOME infeasible basic is drifting the wrong way and pinning the step
-                                      // to zero. Measured: 133,512 of 200,000 pivots zero-length, the total infeasibility
-                                      // frozen for 199,950 consecutive iterations. It was not degeneracy, and no pricing
-                                      // rule, ratio-test refinement or bound perturbation could have fixed it -- all
-                                      // three were tried against it and all three failed, because the step was being
-                                      // blocked by a constraint that does not exist.
-                let (lo_b, up_b) = (self.lo[bvar], self.up[bvar]);
-                let ft = feas_tol * lp.bmul(bvar);
-                let below = phase1 && cur < lo_b - ft;
-                let above = phase1 && cur > up_b + ft;
-                let (target, want_upper) = if slope > pivot_tol {
-                    if below {
-                        // Rising back toward feasibility: it stops at the bound it is under, and
-                        // stopping there is what keeps the infeasibility monotone.
-                        (lo_b, false)
-                    } else if above {
-                        continue; // already above and still rising: nothing to hit
-                    } else {
-                        (up_b, true)
+            // HARRIS TWO-PASS (gated; `harris_rt` is 0 by default, and 0 runs the
+            // single-pass test below unchanged). Never while BLAND is engaged:
+            // Bland's termination argument needs the smallest-index LEAVING rule
+            // as well as the smallest-index entering one, and largest-pivot
+            // selection is not that.
+            let harris_mode = if bland { 0 } else { harris_rt };
+            if harris_mode != 0 {
+                let (t, lr, to_upper) = self.harris_ratio_test(
+                    lp,
+                    HarrisArgs {
+                        dir,
+                        phase1,
+                        feas_tol,
+                        pivot_tol,
+                        piv_floor,
+                        span_cap: min_t,
+                        mode: harris_mode,
+                    },
+                );
+                min_t = t;
+                leave_row = lr;
+                leave_to_upper = to_upper;
+            } else {
+                for &i in &self.nz {
+                    let a = self.alpha[i];
+                    if a.abs() <= piv_floor {
+                        continue;
                     }
-                } else if slope < -pivot_tol {
-                    if above {
-                        (up_b, true)
-                    } else if below {
-                        continue; // already below and still falling: nothing to hit
-                    } else {
-                        (lo_b, false)
-                    }
-                } else {
-                    continue;
-                };
-                if !target.is_finite() {
-                    continue;
-                }
-                let t = ((target - cur) / slope).max(0.0);
-                // Strictly-smaller wins. ON A TIE, EVICT A FIXED BASIC VARIABLE FIRST.
-                //
-                // This is the whole of the phase-I failure on air03/air05/mod010/nw04. Those are
-                // equality-row models, and an equality row's LOGICAL is fixed: `lo == up`. The
-                // crash basis is all-logical, so phase I starts with every basic variable fixed.
-                // The moment one reaches its value it is sitting exactly on both its bounds, so
-                // EVERY later pivot that touches it has ratio t = 0 and it blocks — every pivot
-                // after that is degenerate.
-                //
-                // The tie-break decided who leaves by smallest basis index, and a structural
-                // column's index is below a logical's. So it evicted structurals and left the
-                // fixed logicals basic, forever: air03 ran 199,906 consecutive pivots with the
-                // infeasibility frozen at 66.0.
-                //
-                // A fixed variable driven out of the basis never comes back — pricing above will
-                // not enter a column that cannot move — so preferring it is monotone progress,
-                // and there are only `m` of them. Among equally-fixed candidates Bland's
-                // smallest-index rule still decides, so its termination argument is untouched.
-                let fixed_here = self.lo[self.basis[i]] == self.up[self.basis[i]];
-                let better = match leave_row {
-                    None => t < min_t || (t <= min_t && min_t.is_finite()),
-                    Some(prev) => {
-                        if t < min_t {
-                            true
-                        } else if t == min_t {
-                            let fixed_prev = self.lo[self.basis[prev]] == self.up[self.basis[prev]];
-                            match (fixed_here, fixed_prev) {
-                                (true, false) => true,
-                                (false, true) => false,
-                                _ => self.basis[i] < self.basis[prev],
-                            }
+                    let bvar = self.basis[i];
+                    let cur = self.xb[i];
+                    let slope = -a * dir; // d(xb_i)/dt
+                                          // WHICH BOUND DOES THIS BASIC VARIABLE BLOCK THE STEP AT?
+                                          //
+                                          // A variable that is already OUTSIDE a bound and moving FURTHER OUT has no bound
+                                          // left to hit, and must not block at all. This is where phase I was dying. It gave
+                                          // such a variable its violated bound as the target anyway -- so
+                                          // `t = (lo - cur) / slope` came out NEGATIVE, `max(0.0)` clamped it to zero, and
+                                          // the step was blocked at zero by a variable that was never in the way.
+                                          //
+                                          // air03 starts with all 124 equality logicals infeasible, so on essentially every
+                                          // iteration SOME infeasible basic is drifting the wrong way and pinning the step
+                                          // to zero. Measured: 133,512 of 200,000 pivots zero-length, the total infeasibility
+                                          // frozen for 199,950 consecutive iterations. It was not degeneracy, and no pricing
+                                          // rule, ratio-test refinement or bound perturbation could have fixed it -- all
+                                          // three were tried against it and all three failed, because the step was being
+                                          // blocked by a constraint that does not exist.
+                    let (lo_b, up_b) = (self.lo[bvar], self.up[bvar]);
+                    let ft = feas_tol * lp.bmul(bvar);
+                    let below = phase1 && cur < lo_b - ft;
+                    let above = phase1 && cur > up_b + ft;
+                    let (target, want_upper) = if slope > pivot_tol {
+                        if below {
+                            // Rising back toward feasibility: it stops at the bound it is under, and
+                            // stopping there is what keeps the infeasibility monotone.
+                            (lo_b, false)
+                        } else if above {
+                            continue; // already above and still rising: nothing to hit
                         } else {
-                            false
+                            (up_b, true)
                         }
+                    } else if slope < -pivot_tol {
+                        if above {
+                            (up_b, true)
+                        } else if below {
+                            continue; // already below and still falling: nothing to hit
+                        } else {
+                            (lo_b, false)
+                        }
+                    } else {
+                        continue;
+                    };
+                    if !target.is_finite() {
+                        continue;
                     }
-                };
-                if better && t <= min_t {
-                    min_t = t;
-                    leave_row = Some(i);
-                    leave_to_upper = want_upper;
+                    let t = ((target - cur) / slope).max(0.0);
+                    // Strictly-smaller wins. ON A TIE, EVICT A FIXED BASIC VARIABLE FIRST.
+                    //
+                    // This is the whole of the phase-I failure on air03/air05/mod010/nw04. Those are
+                    // equality-row models, and an equality row's LOGICAL is fixed: `lo == up`. The
+                    // crash basis is all-logical, so phase I starts with every basic variable fixed.
+                    // The moment one reaches its value it is sitting exactly on both its bounds, so
+                    // EVERY later pivot that touches it has ratio t = 0 and it blocks — every pivot
+                    // after that is degenerate.
+                    //
+                    // The tie-break decided who leaves by smallest basis index, and a structural
+                    // column's index is below a logical's. So it evicted structurals and left the
+                    // fixed logicals basic, forever: air03 ran 199,906 consecutive pivots with the
+                    // infeasibility frozen at 66.0.
+                    //
+                    // A fixed variable driven out of the basis never comes back — pricing above will
+                    // not enter a column that cannot move — so preferring it is monotone progress,
+                    // and there are only `m` of them. Among equally-fixed candidates Bland's
+                    // smallest-index rule still decides, so its termination argument is untouched.
+                    let fixed_here = self.lo[self.basis[i]] == self.up[self.basis[i]];
+                    let better = match leave_row {
+                        None => t < min_t || (t <= min_t && min_t.is_finite()),
+                        Some(prev) => {
+                            if t < min_t {
+                                true
+                            } else if t == min_t {
+                                let fixed_prev =
+                                    self.lo[self.basis[prev]] == self.up[self.basis[prev]];
+                                match (fixed_here, fixed_prev) {
+                                    (true, false) => true,
+                                    (false, true) => false,
+                                    // A TIE IS DECIDED BY WHAT THE FACTORIZATION CAN
+                                    // ACTUALLY PIVOT ON, NOT BY BASIS INDEX.
+                                    //
+                                    // Rows tying at the same ratio all give the SAME
+                                    // step to the SAME next point. The only thing the
+                                    // choice decides is which pivot the factorization
+                                    // is asked to accept — so deciding it by basis
+                                    // index is deciding it at random, and on a
+                                    // degenerate LP (hundreds of rows tied at t = 0)
+                                    // random regularly means round-off while an O(1)
+                                    // pivot sits in the same tie.
+                                    //
+                                    // THE TWO ADMISSIBILITY TESTS DISAGREE, and that
+                                    // is the defect. This loop admits a row on
+                                    // `|alpha[i]| > pivot_tol` (1e-9). The Forrest
+                                    // -Tomlin update accepts on the pivot IDENTITY
+                                    // `|udiag[stage(i)] · alpha[i]| > UPDATE_PIVOT_TOL`
+                                    // (`LuEngine::ft_pivot_admissible`) — a different
+                                    // quantity. When the ratio test picks a row the
+                                    // update then refuses, the rejected-pivot fallback
+                                    // below runs, and that fallback used to park the
+                                    // entering column on the "other bound" even when
+                                    // there wasn't one.
+                                    //
+                                    // Measured on `hexgrid_opt_ncols_430_lprelax`
+                                    // (8,170 4-regular `G`-rows, 82.97% degenerate,
+                                    // exact optimum 4085/2): 37 spikes refused, 12 of
+                                    // them at t = 0 on pivots of 1.6e-9..2.8e-9 — all
+                                    // admitted by `pivot_tol`, all refused by the
+                                    // update — leaving 11 `[1, +inf)` logicals resting
+                                    // nonbasic on `+inf`, `max|Az - s| = inf`, and a
+                                    // feasible LP reported `PrimalInfeasible`.
+                                    //
+                                    // So ask the factorization, and ask NOTHING ELSE.
+                                    //
+                                    // This deliberately does not also prefer the larger
+                                    // pivot among ties, which is what `--harris-rt`
+                                    // does in its second pass. Largest-pivot is a
+                                    // QUALITY preference with no correctness argument
+                                    // behind it, and it re-orders the walk on every LP
+                                    // that has a tie — measured on the 19-instance node
+                                    // gate it moved 13 pins, p0201 110 -> 1031 nodes
+                                    // (9.37x) and blend2 3,882 -> 13,516 (3.48x), for a
+                                    // defect that only ever fires on a pivot the
+                                    // factorization REFUSES. Admissibility alone is the
+                                    // part that is load-bearing here: it changes the
+                                    // choice only when one candidate is a pivot the
+                                    // update cannot take and the other is not, so on
+                                    // any walk where nothing is refused it is exactly
+                                    // a no-op, and it never changes `min_t`, so it
+                                    // cannot overshoot a bound.
+                                    //
+                                    // NOT UNDER BLAND: Bland's termination argument
+                                    // needs the smallest-index LEAVING rule as well as
+                                    // the smallest-index entering one, and
+                                    // update-admissible is not that. Same carve-out the
+                                    // Harris gate takes.
+                                    _ if bland => self.basis[i] < self.basis[prev],
+                                    _ => {
+                                        let (ok_here, ok_prev) = match self.lu.as_ref() {
+                                            Some(c) => (
+                                                c.eng.ft_pivot_admissible(i, a),
+                                                c.eng.ft_pivot_admissible(prev, self.alpha[prev]),
+                                            ),
+                                            None => (true, true),
+                                        };
+                                        match (ok_here, ok_prev) {
+                                            (true, false) => true,
+                                            (false, true) => false,
+                                            _ => self.basis[i] < self.basis[prev],
+                                        }
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if better && t <= min_t {
+                        min_t = t;
+                        leave_row = Some(i);
+                        leave_to_upper = want_upper;
+                    }
                 }
             }
 
@@ -10955,11 +11600,50 @@ impl Simplex {
                 if phase1 && trace_enabled() {
                     eprintln!("--trace !! simplex Stopped: phase-I ratio test unbounded on col {col} (iter {iter})");
                 }
-                return if phase1 {
-                    SimplexStatus::Stopped
-                } else {
-                    SimplexStatus::Unbounded
-                };
+                if phase1 {
+                    return SimplexStatus::Stopped;
+                }
+                // AN LP WHOSE OBJECTIVE IS BOXED CANNOT BE UNBOUNDED.
+                //
+                // `min_t = inf` says "no basic variable blocks and the entering
+                // column has no far bound". That is a statement about the CURRENT
+                // `alpha` and the CURRENT `xb`, both of which came through an
+                // approximate inverse — so it is evidence, not a proof, and it is
+                // returned here as a hard terminal status with no certificate
+                // object of any kind attached. Nothing downstream can re-derive it
+                // the way a Farkas ray can be re-derived, so the check has to
+                // happen here or nowhere.
+                //
+                // The check that costs nothing: minimizing, a column with `c_j > 0`
+                // is pushed DOWN and needs a finite lower bound, one with `c_j < 0`
+                // is pushed UP and needs a finite upper bound. If every costed
+                // column has the bound its cost points at, then `c·x` is confined
+                // to a finite interval over the box and `Unbounded` is
+                // ARITHMETICALLY IMPOSSIBLE, whatever the inverse says.
+                //
+                // Measured on `hexgrid_opt_ncols_390_lprelax`: every structural
+                // column is `[0, 1]` with `c_j = +1`, so the objective lives in
+                // `[0, 7020]` — and the float lane returned `Unbounded` at 19,058
+                // pivots, reproducibly, on an LP whose true optimum is 1755.
+                //
+                // This is one-sided and cannot suppress a true `Unbounded`: a
+                // genuinely unbounded LP has, by definition, a costed column free
+                // on the side its cost points at, so `bounded` is false for it.
+                let bounded = (0..self.cols).all(|j| {
+                    let c = self.pcost[j];
+                    if c > 0.0 {
+                        self.lo[j].is_finite()
+                    } else if c < 0.0 {
+                        self.up[j].is_finite()
+                    } else {
+                        true
+                    }
+                });
+                if bounded {
+                    BOXED_UNBOUNDED_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return SimplexStatus::Stopped;
+                }
+                return SimplexStatus::Unbounded;
             }
 
             if min_t == 0.0 {
@@ -11041,13 +11725,71 @@ impl Simplex {
                         }
                     };
                     if !lu_ok {
-                        // Refuse to build an eta from a vanishing pivot; treat it
-                        // as a bound flip so the bookkeeping stays consistent.
-                        self.at[col] = match self.at[col] {
-                            NbBound::Lower => NbBound::Upper,
-                            NbBound::Upper => NbBound::Lower,
-                            NbBound::Zero => NbBound::Zero,
+                        // A REJECTED PIVOT IS NOT A BOUND FLIP.
+                        //
+                        // The pivot did not happen, so the entering column has not
+                        // moved anywhere. Flipping it to "the other bound" is only
+                        // meaningful when there IS an opposite FINITE bound. A
+                        // `G`-row logical is `[rhs, +inf)`: flipping it to `Upper`
+                        // parks a NONBASIC column on `+inf`, and `recompute_xb`
+                        // cannot use an infinite nonbasic value — it substitutes
+                        // `0.0`. That silently replaces `row activity >= rhs` with
+                        // `row activity == 0`, i.e. it solves a DIFFERENT LP, and on
+                        // a covering model an infeasible one. Phase I then proves
+                        // the CORRUPTED system empty and returns `PrimalInfeasible`
+                        // for a feasible LP — the verdict survives a refactorization
+                        // (it is a true statement about the corrupted system), which
+                        // is exactly why no Farkas verifier can catch it and why
+                        // widening a tolerance cannot fix it.
+                        //
+                        // Measured on `hexgrid_opt_ncols_430_lprelax` (8,170 4-regular
+                        // `G`-rows, exact optimum 4085/2 = 2042.5): 37 spikes rejected
+                        // by the LU engine, 12 of them on `[1, +inf)` logicals at
+                        // iterations 5,616-5,621 (pivots 1.6e-9..2.8e-9, all admitted
+                        // by `pivot_tol` and all refused by `update_nz`), leaving 11
+                        // logicals resting at `+inf`. `max|Az - s|` at the exit: `inf`.
+                        //
+                        // So flip only where a finite opposite bound exists. Where
+                        // there is none, the column stays where it is: undo the step
+                        // `xb` already took and DECLINE the walk. `Stopped` is the
+                        // same answer `MAX_ITERS` would give and it is always sound;
+                        // solving a different LP is not.
+                        //
+                        // Declining rather than re-asking on a fresh factorization is
+                        // measured, not cautious. Rebuilding here LIVELOCKS: the
+                        // rejection is deterministic in (basis, column, row), and
+                        // `refactorize` SKIPS a rebuild whose `rep_basis` is already
+                        // current, so the state is unchanged and the same row is
+                        // chosen again — 27,022 consecutive spins on
+                        // `hexgrid_opt_ncols_390_lprelax` with the phase-I objective
+                        // frozen at 9.0. The tie-break above is what keeps this branch
+                        // off the critical path; this is the net under it.
+                        let far = match self.at[col] {
+                            NbBound::Lower => self.up[col],
+                            NbBound::Upper => self.lo[col],
+                            NbBound::Zero => f64::INFINITY,
                         };
+                        if far.is_finite() {
+                            self.at[col] = match self.at[col] {
+                                NbBound::Lower => NbBound::Upper,
+                                NbBound::Upper => NbBound::Lower,
+                                NbBound::Zero => NbBound::Zero,
+                            };
+                        } else {
+                            if step != 0.0 {
+                                for &i in &self.nz {
+                                    if self.alpha[i] != 0.0 {
+                                        self.xb[i] += self.alpha[i] * step;
+                                    }
+                                }
+                            }
+                            for &i in &self.nz {
+                                self.alpha[i] = 0.0;
+                            }
+                            REJECTED_SPIKE_DECLINES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return SimplexStatus::Stopped;
+                        }
                     } else {
                         let leaving = self.basis[p];
                         let entering_value = self.nb_value(lp, col) + step;
@@ -11108,17 +11850,16 @@ mod ft_adoption_census_tests {
     /// solve and one copy of its first excluded LP's row count.
     #[test]
     fn multiple_refactorizations_charge_one_top_level_solve() {
-        let _guard = crate::sepstat::adoption_test_guard();
         let mut model = Model::new();
         let x = model.add_col(0.0, 1.0);
         model.add_row(0.0, 1.0, &[(x, 1.0)]);
         model.set_ft_adoption_solve_latch(crate::sepstat::FtAdoptionSolveLatch::new());
         let lp = FloatLp::from_model(&model, &[], Sense::Minimize).expect("tiny census LP");
 
-        let before = crate::sepstat::adoption_forgone();
+        let before = crate::sepstat::adoption_forgone_local();
         assert!(lp.charge_ft_adoption_exclusion());
         assert!(!lp.charge_ft_adoption_exclusion());
-        let after = crate::sepstat::adoption_forgone();
+        let after = crate::sepstat::adoption_forgone_local();
 
         assert_eq!(after.0 - before.0, 1, "one solve was charged twice");
         assert_eq!(
@@ -11193,6 +11934,60 @@ mod warm_solve_mode_tests {
             upper[col.index()] = 1.0;
         }
         (lower, upper)
+    }
+
+    /// THE ONLY THING THAT FAILS IF THE BUDGET GUARD IN `run` IS DELETED.
+    ///
+    /// Removing the guard restores 44,539 no-op perturb-retries on mas76 and
+    /// 56,415 across the gate corpus — and changes NOTHING any other check can
+    /// see: identical node counts, identical objectives, identical statuses,
+    /// identical `ITERLEDGER total`, all four manual gates green, and the whole
+    /// `-p ay-milp` suite passing. Its cost is allocation churn, and nothing in
+    /// the test suite counts allocations. So this test asserts the guard by its
+    /// own counter instead, which is why that counter is not behind a flag.
+    ///
+    /// `>` rather than `== before + 1`: the counter is process-global and other
+    /// tests in this binary run concurrently, so an exact delta would flake.
+    ///
+    /// BE PRECISE ABOUT WHAT THIS PROTECTS, because monotonicity alone does not
+    /// protect much -- six other `IterCap::set(2)` sites in this binary could
+    /// supply the bump. What makes it a real control is that the guard in `run`
+    /// is the ONLY `fetch_add` site for this counter in the crate: DELETE the
+    /// guard and nothing bumps it, so the assertion becomes unsatisfiable and
+    /// the test fails (negative-controlled: stubbed out -> EXIT=101).
+    /// NARROWING the guard rather than deleting it would NOT be caught here.
+    #[test]
+    fn perturb_retry_declines_when_the_work_budget_is_already_spent() {
+        let (_model, lp, fixed, _) = independent_warm_repairs(8);
+        let root = lp.solve(None);
+        assert_eq!(root.status, SimplexStatus::Optimal);
+
+        let (lower, upper) = fixed_box(&lp, &fixed);
+        let before =
+            crate::local_census::Floor::u64_at(&PERTURB_RETRY_SKIPPED, "PERTURB_RETRY_SKIPPED");
+        // A budget of ZERO: `spend_iter` refuses the first pivot, the walk comes
+        // back `Stopped`, and the perturb-retry that follows it could not take a
+        // step even if it perturbed the box.
+        let stopped = {
+            let _cap = IterCap::set(0);
+            lp.solve_bounded_with_mode(
+                &lower,
+                &upper,
+                Some((&root.basis, &root.at)),
+                WarmSolveMode::PrimalAdvice,
+                None,
+            )
+        };
+        assert_eq!(
+            stopped.status,
+            SimplexStatus::Stopped,
+            "a zero work budget must stop the walk, not answer it"
+        );
+        assert!(
+            before.report() > 0,
+            "the perturb-retry must be DECLINED when the work budget is spent, \
+             not paid for and then guaranteed to fail"
+        );
     }
 
     fn changed_basis_slots(before: &Candidate, after: &Candidate) -> usize {
@@ -11599,8 +12394,10 @@ mod cold_root_lu_band_tests {
     /// The dispatch therefore extends an existing lane; it never opens a new one.
     #[test]
     fn the_band_is_contained_in_the_tall_lu_class() {
-        assert!(COLD_LU_MIN_ROWS > TALL_LU_ROWS);
-        assert!(REFACTOR_TALL_ROWS > COLD_LU_MIN_ROWS);
+        const {
+            assert!(COLD_LU_MIN_ROWS > TALL_LU_ROWS);
+            assert!(REFACTOR_TALL_ROWS > COLD_LU_MIN_ROWS);
+        }
     }
 
     /// An empty or inverted window must decline, not admit everything — this is
@@ -12077,15 +12874,54 @@ mod solve_work_frame_tests {
     /// The property that makes this free to validate: on the one-solve-per-process
     /// harness the frame is a no-op, because both clocks start at zero and only this
     /// thread bumps them. Every bump site raises both counters in lockstep.
+    ///
+    /// # The instrument is THIS THREAD's charges, not the process's
+    ///
+    /// This read [`stats::work`] — the process clock — until the census that
+    /// followed `759cf08c6`. "Only this thread bumps them" is exactly the
+    /// premise libtest breaks: it runs the crate's other ~1,140 tests on other
+    /// threads, and `dual_simplex_inner`'s and `loop_phase_inner`'s pivot loops
+    /// bump the same two counters from every one of them that solves an LP.
+    ///
+    /// MEASURED, not argued. 120 byte-faithful replicas of this test against the
+    /// `bab::tests::` / `cuts::` / `session::tests::` batch, 45 runs = 5,400
+    /// invocations, produced two failures —
+    ///
+    /// ```text
+    /// assertion `left == right` failed
+    ///   left: 5
+    ///  right: 6
+    /// ```
+    ///
+    /// — five bumps by this thread against six on the process clock: one foreign
+    /// pivot inside the window. The same 5,400 invocations reading
+    /// [`stats::work_local`] failed zero times.
+    ///
+    /// The false FAIL is the half that gets noticed. The dangerous half is that a
+    /// foreign pivot is indistinguishable from this test's own, so it can also
+    /// SUPPLY the delta being checked and mask a `bump_solve` that stopped
+    /// charging. Reading the per-thread mirror removes both; the assertion is
+    /// otherwise unchanged, and still fails if `bump_solve` stops charging
+    /// (`left: 0 right: 5`) or double-charges (`left: 10 right: 5`) — both
+    /// re-measured live, 3/3.
+    ///
+    /// WHAT IT DOES NOT COVER, stated because an earlier draft claimed more
+    /// than it had: this test drives `stats::bump` DIRECTLY and never executes
+    /// the production pivot sites (`dual_simplex_inner`, `loop_phase_inner`),
+    /// so it cannot see a regression there. That clock drives real
+    /// strong-branching and bound-branching budgets, and the only thing
+    /// guarding those sites is the MANUAL node gate — which does have teeth:
+    /// breaking the lockstep fails 11 of 19 pins (mas76 273,252 -> 824,660
+    /// nodes, qnet1 522 -> 1,598, lseu 1.97x).
     #[test]
     fn matches_the_process_clock_when_it_is_the_only_solve() {
-        let base = stats::work();
+        let base = stats::work_local();
         let _f = stats::SolveWorkFrame::enter();
         for _ in 0..5 {
             stats::bump(&stats::DUAL_ITERS);
             stats::bump_solve();
         }
-        assert_eq!(stats::solve_work(), stats::work() - base);
+        assert_eq!(stats::solve_work(), stats::work_local() - base);
     }
 
     /// A worker thread starts with its own zeroed clock rather than inheriting the
@@ -12262,7 +13098,9 @@ mod refactor_cadence_tests {
         assert_eq!(refactor_every(usize::MAX), REFACTOR_EVERY_TALL);
         // The boundary is `>=`, and it is the same constant the FT-adoption and
         // verify ceilings key on — a gate the census currently ranks second.
-        assert!(REFACTOR_EVERY_TALL > REFACTOR_EVERY);
+        const {
+            assert!(REFACTOR_EVERY_TALL > REFACTOR_EVERY);
+        }
     }
 }
 

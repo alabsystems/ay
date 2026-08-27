@@ -23,6 +23,21 @@ fn sr_driver_accepts_plain_rup_proof() {
     assert!(chk.verify(&cnf.clauses, &proof).is_ok());
 }
 
+#[test]
+fn sr_driver_rejects_reuse_across_formulas() {
+    let unsat = parse_cnf(&b"p cnf 1 2\n1 0\n-1 0\n"[..]).expect("unsat cnf");
+    let mut checker = SrChecker::new(1, true);
+    checker
+        .verify(&unsat.clauses, &[])
+        .expect("contradictory originals are a valid UNSAT instance");
+
+    let sat = parse_cnf(&b"p cnf 1 1\n1 0\n"[..]).expect("sat cnf");
+    assert!(matches!(
+        checker.verify(&sat.clauses, &[]),
+        Err(DratCheckError::CheckerNotFresh)
+    ));
+}
+
 /// An `a`-line whose witness merely repeats the pivot (so the clause is checked
 /// by RUP) is accepted when the clause is genuinely RUP. This exercises the
 /// `AddPr` path and its RUP shortcut.

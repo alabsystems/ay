@@ -33,20 +33,38 @@ impl Solver {
         self.proof_manager.as_ref().map(ProofManager::output)
     }
 
-    /// Get the proof writer mutably (for flushing/inspection without consuming it)
-    pub fn proof_writer_mut(&mut self) -> Option<&mut ProofOutput> {
-        self.proof_manager.as_mut().map(ProofManager::output_mut)
+    /// Flush the attached proof output without exposing mutable format authority.
+    ///
+    /// Returns `Ok(true)` when an output was attached and flushed, or
+    /// `Ok(false)` when the solver has no proof output.
+    ///
+    /// # Errors
+    ///
+    /// Returns the attached writer's I/O error if flushing fails.
+    pub fn flush_proof_writer(&mut self) -> std::io::Result<bool> {
+        let Some(manager) = self.proof_manager.as_mut() else {
+            return Ok(false);
+        };
+        manager.flush()?;
+        Ok(true)
     }
 
-    /// Take the proof writer out of the solver (consumes proof logging capability)
+    /// Detach the proof output from the solver.
+    ///
+    /// Explicit internal LRAT and live clause-trace consumers remain active.
+    /// Detaching the last consumer transitions conservatively to no-proof
+    /// state without restoring a stale pre-proof control snapshot.
     pub fn take_proof_writer(&mut self) -> Option<ProofOutput> {
         self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
-        self.proof_manager.take().map(ProofManager::into_output)
+        self.detach_proof_writer()
     }
 
-    /// Take proof output without consulting ambient artifact-export env vars.
+    /// Detach proof output without consulting ambient artifact-export env vars.
+    ///
+    /// Remaining internal LRAT or clause-trace ownership is preserved exactly
+    /// as by [`Self::take_proof_writer`].
     pub(crate) fn take_proof_writer_without_artifact(&mut self) -> Option<ProofOutput> {
-        self.proof_manager.take().map(ProofManager::into_output)
+        self.detach_proof_writer()
     }
 
     /// Export checker-visible Fmla learned-LRAT dry-run rows to a retained JSON artifact.

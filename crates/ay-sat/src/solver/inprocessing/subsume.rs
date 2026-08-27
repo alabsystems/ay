@@ -4,7 +4,9 @@
 
 //! Forward and self-subsumption.
 
-use super::super::mutate::{DeleteResult, ReasonPolicy, ReplaceResult};
+use super::super::mutate::{
+    DeleteResult, ForwardSubsumptionRetention, ReasonPolicy, ReplaceResult,
+};
 use super::super::*;
 #[cfg(feature = "gpu")]
 use crate::gpu::subsume as gpu_subsume;
@@ -69,6 +71,17 @@ impl Solver {
     /// 5. On actual deletion of an irredundant clause, notify BVE dirty
     ///    tracking with a pre-delete literal snapshot (#7905).
     ///
+    /// Post-condition (debug builds): a clause the delete pipeline declined
+    /// must be explained by one of the retention reasons in
+    /// `ForwardSubsumptionRetention`. Retention itself is always sound —
+    /// subsumption deletion is an optimisation and keeping a clause never
+    /// loses a constraint — so the tripwire is for a retention no guard
+    /// accounts for, not for retention as such. It lives here rather than in
+    /// `subsume()` because all four applier call sites (preprocess cleanup,
+    /// the inprocessing CPU pass, and the GPU and SIMD pre-passes) route
+    /// through this function, and because the version in `subsume()`
+    /// re-derived the guards by hand and drifted out of sync with them.
+    ///
     /// Returns `true` iff the subsumed clause was actually deleted.
     pub(in crate::solver) fn apply_forward_subsumption_deletion(
         &mut self,
@@ -127,8 +140,26 @@ impl Solver {
                         .expect("irredundant subsumed clause snapshot"),
                 );
             }
+            debug_assert!(
+                !self.arena.is_active(subsumed_idx),
+                "BUG: subsume() reported clause {subsumed_idx} deleted but it is still active"
+            );
             true
         } else {
+            // Rare path. `delete_clause_checked` declined; check that one of
+            // the documented guards accounts for it. This replaces a
+            // post-condition in `subsume()` that re-derived the guard set by
+            // hand and asserted `is_reason_clause_marked` alone — which was
+            // three exemptions short (queued theory conflict, LRAT
+            // bookkeeping, and the stopped-transaction refusal), and fired on
+            // legitimate retentions. Retention is sound either way; only an
+            // UNEXPLAINED retention is a bug.
+            debug_assert_ne!(
+                self.classify_forward_subsumption_retention(subsumed_idx),
+                ForwardSubsumptionRetention::Unexplained,
+                "BUG: subsume() left clause {subsumed_idx} active and no guard \
+                 in the deletion pipeline accounts for keeping it"
+            );
             false
         }
     }
@@ -409,28 +440,12 @@ impl Solver {
             }
         }
 
-        // Post-condition: forward-subsumed clauses should either be deleted,
-        // protected as active reason clauses, or retained because their subsumer
-        // died (#6913: irredundant clauses skip deletion when subsumer is dead).
-        #[cfg(debug_assertions)]
-        for &(subsumed_idx, subsumer_idx) in &result.subsumed {
-            if subsumed_idx >= self.arena.len() || !self.arena.is_active(subsumed_idx) {
-                continue;
-            }
-            // If the clause is irredundant and its subsumer is dead, it was
-            // intentionally kept by the #6913 soundness guard above.
-            let is_irredundant = !self.arena.is_learned(subsumed_idx);
-            let subsumer_dead = subsumer_idx >= self.arena.len()
-                || !self.arena.is_active(subsumer_idx)
-                || self.arena.is_dead(subsumer_idx);
-            if is_irredundant && subsumer_dead {
-                continue;
-            }
-            debug_assert!(
-                self.is_reason_clause_marked(subsumed_idx),
-                "BUG: subsume() left clause {subsumed_idx} active without reason protection"
-            );
-        }
+        // The post-condition on retained forward-subsumed clauses now lives in
+        // `apply_forward_subsumption_deletion` (see
+        // `ForwardSubsumptionRetention`), next to the guards it checks, so it
+        // covers every applier call site and cannot drift out of sync with the
+        // guard set again. It used to be re-derived here from a hand-copied
+        // summary of the guards, and that copy was missing three of them.
 
         // CaDiCaL subsume.cpp:590: only reset dirty bits when the round
         // completed all scheduled candidates. Incomplete rounds (effort limit

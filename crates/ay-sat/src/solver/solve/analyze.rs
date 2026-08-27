@@ -319,6 +319,11 @@ impl Solver {
         } else if self.active_branch_heuristic == BranchHeuristic::Chb {
             self.vsids.decay_evsids_dormant();
         }
+        // `OnPeriodicDecay()` (arXiv:2602.20829 Algorithm 1 lines 17-18):
+        // every T=4096 conflicts. Placed beside the reduce check but
+        // deliberately independent of it — the paper's decay clock is
+        // conflicts, not reduction rounds. No-op unless the arm is armed.
+        self.two_stage_periodic_decay_if_due();
         if self.should_reduce_db() {
             self.reduce_db();
         }
@@ -356,7 +361,7 @@ impl Solver {
 
         // IC3-optimized conflict analysis (#8569 Gap 5): use the stripped
         // 1UIP analysis that skips OTFS, tick accounting, clause bumping,
-        // streaming core, JIT processing, and ghost guards. This reduces
+        // streaming support, JIT processing, and ghost guards. This reduces
         // per-conflict overhead by ~50% for IC3's typical tiny conflicts.
         let Some(result) = self.analyze_conflict_ic3(conflict_ref) else {
             // Trail exhaustion guard (#8479).

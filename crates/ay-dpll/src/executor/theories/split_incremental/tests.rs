@@ -450,6 +450,17 @@ fn extra_bound_conflict_batch_preserves_every_pending_clause() {
         SatResult::Sat(model) => model,
         other => panic!("opposite-polarity fixture must be SAT, got {other:?}"),
     };
+    // PRECONDITION, asserted not assumed: "all-false" below is a claim about
+    // the LIVE TRAIL, and any route that declares SAT from a CONSTRUCTED model
+    // (walk, GF probe, support enumerator) leaves the trail empty -- which
+    // makes the batch vacuous rather than failing. A default-on `indep_enum`
+    // did exactly that, and the test reported the misleading "first all-false
+    // extra conflict must remain pending" instead of naming the cause.
+    assert_eq!(
+        solver.trail_len(),
+        3,
+        "precondition: SAT must come from a CDCL trail, not a built model"
+    );
     let conflicts = [
         TheoryConflict::new(vec![
             TheoryLit::new(p, model[0]),

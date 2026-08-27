@@ -328,6 +328,13 @@ const QUANTIFIER_CONSUMER_EXT_EQ_PUSH_POP: &str = r#"
 /// so we verify only the refutation proof (UNSAT) here. The fail-closed
 /// satisfiable check is covered by
 /// `test_quantifier_consumer_ext_eq_tseitin_fails_closed_without_total_model_7956`.
+///
+/// That claim about the helper was FALSE until the helper was fixed: it
+/// returned `Timeout` without reading any output line whenever the interrupt
+/// had fired, so this script's divergent SECOND `check-sat` made the FIRST
+/// one's verdict unobservable. Any assertion here was therefore reading a
+/// timeout, not a refutation. The helper now prefers a verdict the run already
+/// produced, so the comment above describes what actually happens.
 #[test]
 fn test_quantifier_consumer_ext_eq_push_pop_refutation_7956() {
     let result = run_executor_smt_with_timeout(QUANTIFIER_CONSUMER_EXT_EQ_PUSH_POP, 60)

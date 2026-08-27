@@ -26,6 +26,16 @@ raw-pointer-bcp = []
 jit = ["dep:ay-jit"]
 # CLI integration: derives clap::ValueEnum on SatTechnique for --disable flag
 cli = ["dep:clap"]
+# Exactness pin for the incremental relevancy frontier
+# (#relevancy-frontier-incremental): cross-check the incrementally maintained
+# CNF frontier against the original from-scratch clause walk on EVERY engaged
+# decision and assert set equality. The check costs exactly what the
+# incremental frontier saves (O(clauses x literals) per decision), so it is not
+# on by default; a plain `debug_assertions` build already checks a bounded
+# prefix of each solver's engaged decisions (see
+# `solver/relevancy_frontier.rs::DEFAULT_DEBUG_CHECKS`). Turn this on to run
+# the suites with the full invariant.
+relevancy-frontier-invariants = []
 # Lean4 integration tests (#8697): shell out to `lean` to kernel-verify
 # emitted proofs end-to-end. Requires `lean` on PATH.
 lean-integration = []

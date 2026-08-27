@@ -383,7 +383,7 @@ impl ProofManager {
         let lrat_mode = matches!(&output, ProofOutput::Lrat(_));
         let _ = &num_vars;
         let next_lrat_id = match &output {
-            ProofOutput::Drat(_) => 1,
+            ProofOutput::Drat(_) | ProofOutput::Veripb(_) => 1,
             ProofOutput::Lrat(writer) => writer.next_id(),
         };
         let reserved_original_clause_ids = if lrat_mode {
@@ -1745,37 +1745,10 @@ impl ProofManager {
         }
     }
 
-    /// Emit a PR (propagation-redundant) clause addition as a DPR `a`-line
-    /// (`clause… witness… 0`) — the symmetry-breaking lex-leader binary with its
-    /// σ-image witness (#8011).
-    ///
-    /// SOUNDNESS: the internal RUP/RAT `ForwardChecker` CANNOT verify a PR clause,
-    /// so this records the clause as a TrustedTransform with the debug checker (so
-    /// later derived clauses that resolve against it are not spuriously rejected)
-    /// and defers the actual PR verification to the EXTERNAL verified DPR/LPR
-    /// checker (dpr-trim → cake_lpr). PR is a DRAT-family extension; the LRAT/LPR
-    /// emission route is not wired, so this errors out in LRAT mode rather than
-    /// write an unverifiable step (matching `ProofOutput::add_pr`).
-    pub(crate) fn emit_add_pr(
-        &mut self,
-        clause: &[Literal],
-        witness: &[Literal],
-    ) -> io::Result<()> {
-        debug_assert!(
-            !self.lrat_mode,
-            "BUG: PR/LPR emission attempted on the LRAT route (#8011 wires DPR only)"
-        );
-        #[cfg(debug_assertions)]
-        self.checker.add_trusted_transform(clause);
-        self.output.add_pr(clause, witness)
-    }
-
-    /// Emit a symmetry-breaking clause as a DSR `a`-line with its full
-    /// substitution witness σ (#8011 SR route). Like [`Self::emit_add_pr`] this
-    /// registers the clause as a TrustedTransform (the internal RUP/RAT checker
-    /// cannot verify SR) and defers verification to the EXTERNAL `dsr-trim →
-    /// drat/lsr → cake_lpr` chain. SR is a DRAT-family extension; the LSR/LRAT
-    /// route is not wired, so this errors out in LRAT mode.
+    /// Emit a family-specific symmetry clause as a DSR `a`-line. This registers
+    /// the clause as a `TrustedTransform` because the internal RUP/RAT checker
+    /// cannot verify SR, and defers certificate verification to the external
+    /// `dsr-trim → drat/lsr → cake_lpr` chain. The LSR/LRAT route is not wired.
     pub(crate) fn emit_add_sr(
         &mut self,
         clause: &[Literal],
@@ -2552,11 +2525,6 @@ impl ProofManager {
     #[inline]
     pub(crate) fn output(&self) -> &ProofOutput {
         &self.output
-    }
-
-    #[inline]
-    pub(crate) fn output_mut(&mut self) -> &mut ProofOutput {
-        &mut self.output
     }
 
     #[inline]

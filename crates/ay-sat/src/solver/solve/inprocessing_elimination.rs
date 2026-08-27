@@ -874,13 +874,13 @@ impl Solver {
 mod tests {
     use super::*;
     use crate::{
-        ProofOutput, SolverVariant, VariantInput, VariantRouteProfile, VariantStartupPolicy,
+        ProofOutput, SolverVariant, VariantInput, VariantProofMode::Lrat, VariantRouteProfile,
     };
 
     fn official_main_lrat_solver() -> Solver {
-        let input = VariantInput::new(16, 32, true, true)
+        let input = VariantInput::new(16, 32, Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+            .with_startup_policy(crate::VariantStartupPolicy::DisableWarmupWalk);
         let config = SolverVariant::Default.config(input);
         let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
         let mut solver = Solver::with_proof_output(16, proof);
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn non_official_lrat_does_not_use_fast_path() {
-        let config = SolverVariant::Default.config(VariantInput::new(16, 32, true, true));
+        let config = SolverVariant::Default.config(VariantInput::new(16, 32, Lrat));
         let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
         let mut solver = Solver::with_proof_output(16, proof);
         config.apply_to_solver(&mut solver);

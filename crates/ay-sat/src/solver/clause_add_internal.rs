@@ -53,7 +53,7 @@ impl Solver {
     /// registration in `incremental.rs`, which occupies an original-space
     /// LRAT ID. Derived mints must never call this — the whole point is
     /// that the derived IDs the late-original allocator jumps over stay
-    /// unmarked, so streaming-core classification can tell them apart.
+    /// unmarked, so streaming-support classification can tell them apart.
     pub(super) fn record_issued_original_clause_id(&mut self, id: u64) {
         if id == 0 {
             return;
@@ -72,7 +72,7 @@ impl Solver {
     ///
     /// Range membership (`id <= num_originals`) is NOT sufficient: since
     /// b93692341 the late-original allocator jumps past live derived IDs,
-    /// so derived IDs can sit between original IDs. Streaming-core
+    /// so derived IDs can sit between original IDs. Streaming-support
     /// classification must use this per-ID bit on top of the range bound.
     #[inline]
     pub(super) fn is_original_clause_id(&self, id: u64) -> bool {
@@ -284,9 +284,7 @@ impl Solver {
             id
         };
         if !self.cold.clause_ids_disabled {
-            if idx >= self.cold.clause_ids.len() {
-                self.cold.clause_ids.resize(idx + 1, 0);
-            }
+            self.cold.clause_ids_grow_for(idx);
             self.cold.clause_ids[idx] = clause_id;
         }
         if learned && self.cold.bcp_learned_1963_identity_profile {
@@ -296,6 +294,16 @@ impl Solver {
                     .resize(idx + 1, self.num_conflicts);
             }
             self.cold.bcp_learned_clause_birth_conflicts[idx] = self.num_conflicts;
+        }
+        // `OnLearnedClause(c): score(c) <- 1` (arXiv:2602.20829 Algorithm 1).
+        // Hooked at the single clause-creation choke point rather than at the
+        // conflict-analysis learn site, so that learned clauses born elsewhere
+        // — vivification replacements, hyper resolvents, DIP extension clauses
+        // — also start at 1. A clause born at the arena default 0 would be a
+        // stage-2 deletion candidate in its very first reduction, which is the
+        // exact failure mode stage 2 exists to prevent.
+        if learned && self.two_stage_clause_management {
+            self.two_stage_note_learned(idx);
         }
 
         // Record to clause trace and proof manager only when LRAT is enabled.
@@ -314,11 +322,11 @@ impl Solver {
             // against the shared budget so trace-heavy searches (QF_ALIA
             // pointer-safe-5 default mode) can exhaust it and degrade at the
             // next safe point. No budget (explicit proof modes) => no-op.
-            if self.cold.clause_trace.is_some() {
+            if self.has_live_clause_trace() {
                 let units = (literals.len() as u64) * 4 + (resolution_hints.len() as u64) * 8 + 16;
                 let _ = self.charge_proof_bookkeeping(units);
             }
-            if let Some(ref mut trace) = self.cold.clause_trace {
+            if let Some(trace) = self.live_clause_trace_mut() {
                 // #A3: slice API — literals/hints are copied straight into the
                 // trace's shared pools without per-entry Vec allocations.
                 trace.add_clause_with_hint_slices(

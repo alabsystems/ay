@@ -92,6 +92,25 @@ fn simd_vivify_subsumed_candidates_with_threshold(
 }
 
 impl Solver {
+    /// Attribute one `Irredundant`-tier run's share of the aggregate
+    /// vivification counters to the irredundant split (see `VivifyStats`).
+    /// No-op for the learned tiers.
+    #[inline]
+    fn attribute_irred_vivify_delta(&mut self, is_irred: bool, snap: (u64, u64, u64, u64)) {
+        if !is_irred {
+            return;
+        }
+        let stats = &mut self.inproc.vivifier.stats;
+        let examined = stats.clauses_examined.saturating_sub(snap.0);
+        let strengthened = stats.clauses_strengthened.saturating_sub(snap.1);
+        let literals = stats.literals_removed.saturating_sub(snap.2);
+        let deleted = stats.clauses_satisfied.saturating_sub(snap.3);
+        stats.irred_examined = stats.irred_examined.saturating_add(examined);
+        stats.irred_strengthened = stats.irred_strengthened.saturating_add(strengthened);
+        stats.irred_literals_removed = stats.irred_literals_removed.saturating_add(literals);
+        stats.irred_deleted = stats.irred_deleted.saturating_add(deleted);
+    }
+
     pub(super) fn vivify_tier(
         &mut self,
         tier: VivifyTier,
@@ -110,6 +129,19 @@ impl Solver {
             self.suppress_phase_saving = false;
             return VivifyTierRun::default();
         }
+
+        // Irredundant-tier yield split (see `VivifyStats`): the aggregate
+        // counters cannot distinguish "the irredundant tier did nothing" from
+        // "the learned tiers did everything". Snapshot the aggregates here —
+        // before the prefix-subsumption flush, which is also irredundant
+        // removal work — and attribute the delta on every exit path.
+        let is_irred_tier = tier == VivifyTier::Irredundant;
+        let irred_snapshot = (
+            self.inproc.vivifier.stats.clauses_examined,
+            self.inproc.vivifier.stats.clauses_strengthened,
+            self.inproc.vivifier.stats.literals_removed,
+            self.inproc.vivifier.stats.clauses_satisfied,
+        );
 
         let mut candidates: Vec<(usize, i64)> = Vec::new();
         for idx in self.arena.active_indices() {
@@ -457,6 +489,7 @@ impl Solver {
                 if sorted.is_empty() {
                     self.suppress_phase_saving = false;
                     run.conflict = true;
+                    self.attribute_irred_vivify_delta(is_irred_tier, irred_snapshot);
                     return run;
                 }
 
@@ -508,6 +541,7 @@ impl Solver {
                     ReplaceResult::Empty => {
                         self.suppress_phase_saving = false;
                         run.conflict = true;
+                        self.attribute_irred_vivify_delta(is_irred_tier, irred_snapshot);
                         return run;
                     }
                     ReplaceResult::Skipped => {}
@@ -1117,6 +1151,7 @@ impl Solver {
                 ReplaceResult::Empty => {
                     self.suppress_phase_saving = false;
                     run.conflict = true;
+                    self.attribute_irred_vivify_delta(is_irred_tier, irred_snapshot);
                     return run;
                 }
                 ReplaceResult::Skipped => {}
@@ -1201,6 +1236,8 @@ impl Solver {
             self.decision_level, 0,
             "BUG: vivify_tier did not restore decision level to 0"
         );
+
+        self.attribute_irred_vivify_delta(is_irred_tier, irred_snapshot);
 
         run
     }

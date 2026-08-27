@@ -151,6 +151,20 @@ fn produce_models_false_sheds_even_with_a_get_model_present() {
     );
 }
 
+/// An UNTERMINATED trailing form is invisible to the demand scan (the chunker
+/// only emits a command once its parens close). That is safe only because such
+/// a form cannot RUN either. Pin the fact rather than the assumption: the
+/// script still answers `sat`, and no model is printed.
+#[test]
+fn unterminated_trailing_get_model_never_runs() {
+    let out = run(&format!("{SHRINKABLE}(get-model"), &[]);
+    assert_sat(&out);
+    assert!(
+        !out.contains("define-fun"),
+        "an unclosed (get-model must not execute: {out:?}"
+    );
+}
+
 /// Shedding is COSMETICS ONLY. The verdict and the model gate are unchanged:
 /// the same script answers `sat` either way and still reports a confirmed
 /// model-check gate result.
@@ -174,5 +188,34 @@ fn shedding_does_not_disarm_the_model_gate() {
     assert!(
         gate_line(&unread).is_some(),
         "the gate must still report on a shed run: {unread:?}"
+    );
+}
+
+/// A QUOTED command head is the same command. `(|get-model|)` executes and
+/// prints a model in AY (its parser normalizes the bars away before dispatch),
+/// exactly as it does in z3 — so it must register as DEMAND.
+///
+/// The earlier `command_head_symbol` compared the raw head text against the
+/// unquoted spellings, so `|get-model|` missed the lookup and the run shed its
+/// cosmetics while still printing a model. That was verdict-safe — the model is
+/// built, validated and gate-checked regardless, and only the polish differed —
+/// but it contradicted the demand contract.
+///
+/// This pins the contract, not the polish: the quoted spelling must be treated
+/// identically to the bare one.
+#[test]
+fn quoted_get_model_head_counts_as_demand() {
+    let bare = run(&format!("{SHRINKABLE}(get-model)\n"), &[]);
+    let quoted = run(&format!("{SHRINKABLE}(|get-model|)\n"), &[]);
+    assert_sat(&bare);
+    assert_sat(&quoted);
+    assert!(
+        quoted.contains("define-fun"),
+        "(|get-model|) must execute and print a model: {quoted:?}"
+    );
+    assert_eq!(
+        minimization_runs(&quoted),
+        minimization_runs(&bare),
+        "a quoted head is the same command, so it must register the same demand"
     );
 }

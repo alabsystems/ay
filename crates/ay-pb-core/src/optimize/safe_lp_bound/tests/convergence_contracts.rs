@@ -44,7 +44,7 @@ fn transposed_solve_agrees_with_the_primal_form_on_row_heavy_models() {
         for _ in 0..m {
             let mut coeffs: Vec<(usize, f64)> = Vec::new();
             for v in 0..n {
-                if rng.next() % 2 == 0 {
+                if rng.next().is_multiple_of(2) {
                     coeffs.push((v, 1.0 + (rng.next() % 9) as f64));
                 }
             }
@@ -484,7 +484,7 @@ fn transposed_positive_cost_crash_starts_feasible() {
     for _ in 0..m {
         let mut coeffs: Vec<(usize, f64)> = Vec::new();
         for v in 0..n {
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
             }
         }
@@ -534,7 +534,7 @@ fn transposed_negative_cost_crash_starts_feasible() {
     for _ in 0..m {
         let mut coeffs: Vec<(usize, f64)> = Vec::new();
         for v in 0..n {
-            if rng.next() % 3 == 0 {
+            if rng.next().is_multiple_of(3) {
                 coeffs.push((v, 1.0 + (rng.next() % 5) as f64));
             }
         }

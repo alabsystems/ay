@@ -65,9 +65,10 @@ pub(crate) fn relax_lift_enabled() -> bool {
 ///    shifting `v_j = x_j − l_j` where `a_j > 0` and COMPLEMENTING `v_j = u_j − x_j` where
 ///    `a_j < 0`. Both need the relevant bound finite; a column that has neither is refused.
 /// 2. **Classify.** `v_j ∈ {0,1}` (integral column, *integral* bounds, range exactly 1) is a cover
-///    candidate; an integral column with integral bounds and range `2..=`[`RL_MAX_GEN_RANGE`] is a
-///    general integer to be lifted; EVERYTHING ELSE — continuous, wide, fractional-bounded,
-///    negative-lower-bounded — is DROPPED at `v = 0`, which is free because `w_j·v_j ≥ 0`.
+///    candidate; an integral column with integral bounds and range from 2 through
+///    [`RL_MAX_GEN_RANGE`] is a general integer to be lifted; EVERYTHING ELSE — continuous, wide,
+///    fractional-bounded, negative-lower-bounded — is DROPPED at `v = 0`, which is free because
+///    `w_j·v_j ≥ 0`.
 /// 3. **Relax.** Fix each general integer at the face the LP point stands on,
 ///    `t*_k = clamp(⌊v*_k⌋, 0, U_k)`, leaving residual capacity `c' = c − Σ_k w_k·t*_k ≥ 0`.
 ///    Fixing at ZERO instead is what makes the plain-cover families slack here: it hands the

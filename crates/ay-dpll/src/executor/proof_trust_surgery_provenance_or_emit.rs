@@ -10,7 +10,8 @@ use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TheoryLemmaKind};
 use super::proof_trust_surgery_ite::ProvenanceFarkasLemma;
 use super::proof_trust_surgery_provenance::complement_of;
 use super::proof_trust_surgery_provenance_or::{
-    ProvenanceOrConflictPlan, ProvenanceOrIteRefutation, ProvenanceOrPlan, ProvenanceOrRefutation,
+    ProvenanceOrConflictPlan, ProvenanceOrFalseDisjunctPlan, ProvenanceOrIteRefutation,
+    ProvenanceOrPlan, ProvenanceOrRefutation,
 };
 use super::proof_trust_surgery_provenance_or_transfer::{
     ProvenanceOrBridge, ProvenanceOrIteBridge, ProvenanceOrTransferPlan,
@@ -53,7 +54,73 @@ impl Executor {
             ProvenanceOrPlan::ExactTransfer(plan) => {
                 self.emit_provenance_or_transfer(proof, plan, authored_assumes)
             }
+            ProvenanceOrPlan::FalseDisjunct(plan) => {
+                self.emit_provenance_or_false_disjunct(proof, plan, authored_assumes)
+            }
         }
+    }
+
+    /// Derive the target `or` whose folded disjuncts the plan refutes:
+    ///
+    /// ```text
+    /// or                       |- (cl d1 .. dn)          ; from the assume of orig
+    /// la_generic + resolution  |- (cl (not di))          ; one per folded disjunct
+    /// resolution               |- (cl kept..)
+    /// or_neg + resolution      |- (cl goal .. goal)      ; one per kept disjunct
+    /// contraction              |- (cl goal)
+    /// ```
+    fn emit_provenance_or_false_disjunct(
+        &mut self,
+        proof: &mut Proof,
+        plan: &ProvenanceOrFalseDisjunctPlan,
+        authored_assumes: &HashMap<TermId, ProofId>,
+    ) -> Option<ProofId> {
+        let &or_assume = authored_assumes.get(&plan.orig)?;
+        let mut current = proof.add_rule_step(
+            AletheRule::Or,
+            plan.source_disjuncts.clone(),
+            vec![or_assume],
+            Vec::new(),
+        );
+        let mut remaining = plan.source_disjuncts.clone();
+        for elimination in &plan.eliminations {
+            let unit = self.emit_provenance_farkas_refutation(
+                proof,
+                elimination.disjunct,
+                &elimination.lemma,
+                authored_assumes,
+            )?;
+            let position = remaining
+                .iter()
+                .position(|&literal| literal == elimination.disjunct)?;
+            let _ = remaining.remove(position);
+            current = proof.add_resolution(remaining.clone(), elimination.disjunct, current, unit);
+        }
+        if remaining != plan.kept {
+            return None;
+        }
+        for &target in &plan.kept {
+            let blocker = complement_of(&mut self.ctx.terms, target);
+            let link = proof.add_rule_step(
+                AletheRule::OrNeg,
+                vec![plan.goal, blocker],
+                Vec::new(),
+                Vec::new(),
+            );
+            let position = remaining.iter().position(|&literal| literal == target)?;
+            let _ = remaining.remove(position);
+            remaining.push(plan.goal);
+            current = proof.add_resolution(remaining.clone(), target, current, link);
+        }
+        if !remaining.iter().all(|&literal| literal == plan.goal) {
+            return None;
+        }
+        Some(proof.add_rule_step(
+            AletheRule::Contraction,
+            vec![plan.goal],
+            vec![current],
+            Vec::new(),
+        ))
     }
 
     pub(super) fn emit_provenance_or_conflict(

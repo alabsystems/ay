@@ -83,6 +83,7 @@ mod check_loops;
 pub(crate) mod combiner;
 mod combiner_check;
 mod combiner_models;
+mod combiner_uf_congruence;
 mod euf_array_replay;
 mod interface_bridge;
 mod interface_bridge_eval;

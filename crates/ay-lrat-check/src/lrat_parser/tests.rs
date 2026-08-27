@@ -170,7 +170,8 @@ fn test_parse_text_rejects_zero_step_id() {
 #[test]
 fn test_parse_text_rejects_non_monotonic_step_ids() {
     assert!(parse_text_lrat("4 1 0 1 0\n3 2 0 2 0\n").is_err());
-    assert!(parse_text_lrat("4 1 0 1 0\n4 d 1 0\n").is_err());
+    // A second *addition* reusing the previous ID is still non-monotonic.
+    assert!(parse_text_lrat("4 1 0 1 0\n4 2 0 2 0\n").is_err());
 }
 
 #[test]
@@ -356,8 +357,8 @@ fn test_lrat_var_cap_boundary() {
 
 /// decode_binary_lit rejects encoded value 1 (maps to variable 0, invalid DIMACS).
 /// Binary encoding: encoded=1 → var = 1>>1 = 0 → DIMACS variable 0.
-/// Literal::from_dimacs(0) panics ("clause terminator"), so decode_binary_lit
-/// must return Err instead.
+/// `Literal::try_from_dimacs(0)` returns a typed error, and
+/// `decode_binary_lit` must reject the invalid binary value with context.
 #[test]
 fn test_decode_binary_lit_rejects_var_zero() {
     let result = decode_binary_lit(1);

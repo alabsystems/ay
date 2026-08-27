@@ -2,7 +2,10 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::{extract_assume_terms, solve_unsat_and_get_proof};
+use super::{
+    extract_assume_terms, require_carcara_or_skip, run_carcara_trust_free,
+    solve_unsat_and_get_proof,
+};
 use ntest::timeout;
 use std::fmt::Write as _;
 
@@ -57,17 +60,18 @@ fn exported_assume_steps_print_the_problem_assertion_itself() {
          fold image:\n{proof}"
     );
 
-    // Honest-hole family (bvmul by zero, width 32): the lemma legitimately
-    // stays a `hole`, but the assume must still be faithful — the folded
-    // constant's TermId must not carry the `(bvmul x …)` spelling into
-    // either side of the printed equality.
-    let proof = solve_unsat_and_get_proof(
+    // The CEGIS Layer-A family (bvmul by zero, width 32) is now lowered
+    // through Carcara's exact multiplier circuit. The folded constant's
+    // TermId still must not carry the `(bvmul x …)` spelling into either
+    // side of the printed equality.
+    let declarations = "(declare-const x (_ BitVec 32))\n";
+    let problem = format!(
         "(set-logic QF_BV)\n\
-         (declare-const x (_ BitVec 32))\n\
+         {declarations}\
          (assert (not (= (bvmul x #x00000000) #x00000000)))\n\
-         (check-sat)\n",
-        "faithful_assume_bvmul_zero",
+         (check-sat)\n"
     );
+    let proof = solve_unsat_and_get_proof(&problem, "faithful_assume_bvmul_zero");
     let assumes = extract_assume_terms(&proof);
     assert_eq!(
         assumes.len(),
@@ -83,4 +87,55 @@ fn exported_assume_steps_print_the_problem_assertion_itself() {
         assumes[0].starts_with("(not (= (bvmul x "),
         "the assume must keep the authored equality shape:\n{proof}"
     );
+    assert!(
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "the width-32 multiplier identity must be fully checked:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule bitblast_mult"),
+        "the proof must use Carcara's checked multiplier rule:\n{proof}"
+    );
+
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let scope = published_assumption_scope(declarations, &proof);
+    assert!(
+        run_carcara_trust_free(&carcara, "faithful_assume_bvmul_zero", &scope, &proof,),
+        "the exact width-32 proof must verify without allowed trust"
+    );
+}
+
+/// The production CEGIS row uses `x * 0 = 0`, but commutativity and equality
+/// normalization can independently reverse the zero operand and the equality.
+/// Check all four checker-visible forms; the printer must derive each one, not
+/// rely on the source orientation used by the first regression.
+#[test]
+#[timeout(120_000)]
+fn bvmul_zero_operand_and_equality_reversals_are_externally_checked() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    for (label, assertion) in [
+        ("mul_zero_right", "(= (bvmul x #x00) #x00)"),
+        ("mul_zero_left", "(= (bvmul #x00 x) #x00)"),
+        ("mul_zero_eq_reversed", "(= #x00 (bvmul x #x00))"),
+        ("mul_zero_both_reversed", "(= #x00 (bvmul #x00 x))"),
+    ] {
+        let declarations = "(declare-const x (_ BitVec 8))\n";
+        let problem =
+            format!("(set-logic QF_BV)\n{declarations}(assert (not {assertion}))\n(check-sat)\n");
+        let proof = solve_unsat_and_get_proof(&problem, label);
+        assert!(
+            proof.contains(":rule bitblast_mult")
+                && !proof.contains(":rule hole")
+                && !proof.contains(":rule trust"),
+            "{label}: every orientation must use the checked multiplier lowering:\n{proof}"
+        );
+        let scope = published_assumption_scope(declarations, &proof);
+        assert!(
+            run_carcara_trust_free(&carcara, label, &scope, &proof),
+            "{label}: Carcara must verify the exact emitted orientation"
+        );
+    }
 }

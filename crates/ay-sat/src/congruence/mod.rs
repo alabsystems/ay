@@ -103,7 +103,7 @@ pub struct CongruenceStats {
     /// `merge_or_contradict` records the contradicting merge pair as an edge
     /// so the a ≡ … ≡ ¬a cycle is closed for the UNSAT witness unit's RUP
     /// probe, but the pair's "equivalence binaries" degenerate to the
-    /// duplicate-literal units [¬x,¬x]/[x,x] and are never insertable
+    /// duplicate-literal units `[¬x, ¬x]` / `[x, x]` and are never insertable
     /// (duplicate-watch ICE). The contradiction's proof obligation is
     /// discharged by the witness-unit path instead (wf_ff5991a1).
     pub complementary_edges_skipped: u64,

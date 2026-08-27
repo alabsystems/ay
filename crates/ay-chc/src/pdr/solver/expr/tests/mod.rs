@@ -15,6 +15,7 @@ use crate::{ChcExpr, ChcOp, ChcParser, ChcSort, ChcVar, HornClause};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::sync::Arc;
 
+mod case_split;
 mod divisibility;
 mod entry_edge;
 mod interpolation;

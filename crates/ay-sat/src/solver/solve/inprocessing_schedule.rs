@@ -16,6 +16,7 @@
 //! - `inprocessing_round_end`: invariant checks, telemetry, scheduling
 
 use super::super::*;
+use crate::solver::inprocessing::VivifySkipReason;
 
 impl Solver {
     /// Generic inprocessing budget guard shared by the round guard and the
@@ -884,7 +885,29 @@ impl Solver {
         // to 3.9s. Skipping it when over-budget saves ~1.4s per round.
         let vivify_wall_budget_exceeded =
             self.inproc_round_over_budget(round_start, round_start_ticks);
-        let should_vivify = self.should_vivify();
+        // Record WHY a scheduled vivification did or did not run. Without this
+        // the vivify admission rate is invisible: an irredundant tier that is
+        // never admitted looks identical to one that runs and finds nothing.
+        let vivify_skip = self.vivify_skip_reason();
+        {
+            let stats = &mut self.inproc.vivifier.stats;
+            match vivify_skip {
+                None => stats.inproc_admitted = stats.inproc_admitted.saturating_add(1),
+                Some(VivifySkipReason::DisabledFlag) => {
+                    stats.inproc_skip_disabled = stats.inproc_skip_disabled.saturating_add(1);
+                }
+                Some(VivifySkipReason::IntervalNotDue) => {
+                    stats.inproc_skip_interval = stats.inproc_skip_interval.saturating_add(1);
+                }
+                Some(VivifySkipReason::ThresholdDelay) => {
+                    stats.inproc_skip_threshold = stats.inproc_skip_threshold.saturating_add(1);
+                }
+                Some(VivifySkipReason::SmallDenseSkip) => {
+                    stats.inproc_skip_small_dense = stats.inproc_skip_small_dense.saturating_add(1);
+                }
+            }
+        }
+        let should_vivify = vivify_skip.is_none();
         if should_vivify {
             self.stats
                 .record_inprocessing_attempt(DiagnosticPass::Vivify);

@@ -30,34 +30,14 @@ impl SatProofManager<'_> {
         })))
     }
 
+    /// The battery lives in `theory_inference::intrinsic` so this
+    /// emission-time site and the finalize-time residual sweeper
+    /// (`executor::proof::intrinsic_leaf_promotion`) cannot drift apart.
     fn recognize_intrinsic_original_unit(
         &self,
         unit: TermId,
     ) -> Option<(&'static str, TheoryLemmaKind)> {
-        let clause = [unit];
-        if ay_proof::recognize_bool_tautology(self.terms, &clause) {
-            return Some(("bool", TheoryLemmaKind::BoolTautology));
-        }
-        if ay_proof::recognize_arith_clause_tautology(self.terms, &clause) {
-            return Some(("arith", TheoryLemmaKind::ArithClauseTautology));
-        }
-        if ay_proof::recognize_ite_branch_projection(self.terms, &clause) {
-            return Some(("ite", TheoryLemmaKind::IteBranchProjection));
-        }
-        if ay_proof::recognize_euf_congruent(self.terms, &clause) {
-            return Some(("EUF", TheoryLemmaKind::EufCongruent));
-        }
-        if ay_proof::recognize_euf_transitive(self.terms, &clause) {
-            return Some(("EUF", TheoryLemmaKind::EufTransitive));
-        }
-        if ay_proof::recognize_array_guarded_row_expansion(self.terms, &clause) {
-            return Some(("array", TheoryLemmaKind::ArrayGuardedRowExpansion));
-        }
-        // Only Bool-indexed finite carriers are available without the typed
-        // datatype registry. The shared recognizer rejects incomplete,
-        // duplicated, foreign-array, and ill-sorted branch sets.
-        ay_proof::recognize_array_finite_select_expansion(self.terms, &clause)
-            .then_some(("array", TheoryLemmaKind::ArrayFiniteSelectExpansion))
+        crate::theory_inference::intrinsic::recognize_intrinsic_tautology_kind(self.terms, &[unit])
     }
 
     pub(super) fn emit_intrinsic_original_clause(
@@ -74,6 +54,26 @@ impl SatProofManager<'_> {
                 "bool",
                 clause.to_vec(),
                 TheoryLemmaKind::BoolTautology,
+            )));
+        }
+        // Farkas-infeasible arithmetic clauses (`(or (not (<= 5 c)) (not (< c
+        // 5)))` — a CEGQI instantiation of a guarded axiom resolved against
+        // its ground bound) are valid on their own, and the strict checker's
+        // `ArithClauseTautology` arm decides them by exact-rational
+        // Fourier–Motzkin. The unit lane already offers this recognizer;
+        // multi-literal originals never reached it, so a CEGQI-derived UNSAT
+        // whose conflict clause is precisely such a tautology declined
+        // certification and demoted under any proof demand (the deductive-checks
+        // choose.rs `test1` port). Recognizer IS the validator — same battery
+        // position as `theory_inference::intrinsic` (right after bool).
+        if clause.len() >= 2 && ay_proof::recognize_arith_clause_tautology(self.terms, clause) {
+            let (work, bytes) = Self::unit_chain_charge(1, clause.len())?;
+            progress(work, bytes)?;
+            return Ok(Some(Self::add_intrinsic_original_clause(
+                proof,
+                "arith",
+                clause.to_vec(),
+                TheoryLemmaKind::ArithClauseTautology,
             )));
         }
         // Mid-solve DT/EUF conflict clauses have no annotation channel to the

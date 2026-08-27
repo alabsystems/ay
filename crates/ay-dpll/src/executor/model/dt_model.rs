@@ -1879,6 +1879,98 @@ impl Executor {
         r
     }
 
+    /// A sort that (recursively through arrays and datatype fields) carries a
+    /// declared datatype with an ARRAY-sorted constructor field — the
+    /// `Slice{ptr,len,data}` shape (#dt-array-model-census). Rendering such a
+    /// value into a committed array CELL forces the renderer to spell out the
+    /// nested array field, and the per-term spelling cannot see cells observed
+    /// through a CONGRUENT field term (`(dat (select A i))` vs
+    /// `(dat (select A j))` under `i = j`), so the cell fabricates a collapsed
+    /// const-default field the strict arrays oracle then correctly rejects.
+    pub(super) fn sort_carries_array_field_datatype(&self, sort: &Sort) -> bool {
+        fn walk(exec: &Executor, sort: &Sort, visited: &mut Vec<String>) -> bool {
+            let dt_name = match sort {
+                Sort::Array(a) => {
+                    return walk(exec, &a.index_sort, visited)
+                        || walk(exec, &a.element_sort, visited);
+                }
+                Sort::Datatype(dt) => dt.name.clone(),
+                Sort::Uninterpreted(n) => n.clone(),
+                _ => return false,
+            };
+            let Some((_, ctors)) = exec.ctx.datatype_iter().find(|(n, _)| *n == dt_name) else {
+                return false;
+            };
+            if visited.iter().any(|v| v == &dt_name) {
+                return false;
+            }
+            visited.push(dt_name);
+            let ctors: Vec<String> = ctors.to_vec();
+            let hit = ctors.iter().any(|ctor| {
+                exec.ctx
+                    .constructor_selector_info(ctor)
+                    .is_some_and(|fields| {
+                        fields.iter().any(|(_, fsort)| {
+                            matches!(fsort, Sort::Array(_)) || walk(exec, fsort, visited)
+                        })
+                    })
+            });
+            visited.pop();
+            hit
+        }
+        let mut visited = Vec::new();
+        walk(self, sort, &mut visited)
+    }
+
+    /// Whether completing an array of sort `array_sort` into committed cells
+    /// would have to spell out a nested array FIELD that the problem reads
+    /// through a datatype cell of that array (#dt-array-model-census).
+    ///
+    /// This is the exact hazard behind [`Self::sort_carries_array_field_datatype`]:
+    /// the per-term cell renderer spells the nested field from ONE field term,
+    /// so two congruent field reads (`(dat (select A i))` / `(dat (select A j))`
+    /// under `i = j`, observed at DISJOINT inner indices) collapse into a
+    /// fabricated const-default field, and the strict arrays oracle rejects
+    /// the cell-level equality `z = (select A i)` (measured: 62 rejections of
+    /// assertion 1 on the `datatype_array_field_select_congruence_certifies`
+    /// pin, `unknown` instead of the census-certified `sat`). Only an array
+    /// whose datatype cells are actually opened through an array-sorted field
+    /// read is affected; an array of such a sort that is merely compared or
+    /// stored (no nested field read anywhere) has nothing for the renderer to
+    /// mis-spell and keeps its printable completed witness. Callers leave the
+    /// affected arrays UNcompleted so the observation-based census certifies
+    /// them cell-by-cell from the asserted reads.
+    pub(super) fn array_field_datatype_cells_observed(
+        &self,
+        array_sort: &ay_core::ArraySort,
+    ) -> bool {
+        if !self.sort_carries_array_field_datatype(&array_sort.element_sort) {
+            return false;
+        }
+        let terms = &self.ctx.terms;
+        terms.term_ids().any(|field_read| {
+            // `(field (select A idx))` with an ARRAY-sorted field over a
+            // datatype-sorted cell of an array of exactly this sort.
+            let TermData::App(_, args) = terms.get(field_read) else {
+                return false;
+            };
+            if args.len() != 1 || !matches!(terms.sort(field_read), Sort::Array(_)) {
+                return false;
+            }
+            let TermData::App(sym, sel_args) = terms.get(args[0]) else {
+                return false;
+            };
+            // The cell sort is the element sort itself (declared datatypes
+            // surface as `Sort::Uninterpreted(name)` in this term store, so
+            // do not demand `Sort::Datatype` here — `sort_carries_array_field_datatype`
+            // above already resolved the name against the datatype registry).
+            sym.name() == "select"
+                && sel_args.len() == 2
+                && terms.sort(args[0]) == &array_sort.element_sort
+                && matches!(terms.sort(sel_args[0]), Sort::Array(a) if a.as_ref() == array_sort)
+        })
+    }
+
     /// A sort that (recursively through arrays) carries a declared datatype.
     fn census_sort_carries_dt(sort: &Sort, dts: &HashSet<String>) -> bool {
         match sort {

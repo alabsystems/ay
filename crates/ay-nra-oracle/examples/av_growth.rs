@@ -1,10 +1,12 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
 //! INDEPENDENT growth sweep for `mpbq`, written against the facade only.
 //!
 //! Different depths from the lane's harness (irregular, and past every power of
 //! two up to 16,384 = MAX_REFINE_STEPS), a different polynomial family, and a
 //! `select_small` cost probe on the shape where it is supposed to pay.
-
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
 
 use ay_nra::oracle_api::{obq_poly_sign_at, obq_select_small, OBq, OBqInterval};
 use num_bigint::BigInt;
@@ -63,16 +65,7 @@ fn bisect_rat(p: &[BigInt], lo: i64, hi: i64, steps: u32) -> (BigRational, BigRa
     (a, b, us)
 }
 
-fn main() {
-    // x^3 - 2 : the real root is cbrt(2), irrational, in (1, 2). A DIFFERENT
-    // family from the lane's x^2 - 2.
-    let p = vec![
-        BigInt::from(-2),
-        BigInt::zero(),
-        BigInt::zero(),
-        BigInt::one(),
-    ];
-
+fn run_depth_sweep(p: &[BigInt]) {
     println!("=== INDEPENDENT SWEEP: x^3 - 2 on (1, 2), irregular depths ===");
     println!("  depth    k  k==depth  bq bits    bq us   rat us    ratio  agree");
     let depths: [u32; 30] = [
@@ -82,17 +75,17 @@ fn main() {
     let mut worst_ratio = 0f64;
     let mut all_linear = true;
     for d in depths {
-        let (k, bits, bqus) = bisect_bq(&p, 1, 2, d);
-        let (a, b, ratus) = bisect_rat(&p, 1, 2, d);
+        let (k, bits, bqus) = bisect_bq(p, 1, 2, d);
+        let (a, b, ratus) = bisect_rat(p, 1, 2, d);
         // agreement: the dyadic interval must equal the rational one
         let (bqlo, bqhi) = {
             let mut iv =
                 OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0))
                     .unwrap();
-            let s_lo = obq_poly_sign_at(&p, &iv.lo()).unwrap();
+            let s_lo = obq_poly_sign_at(p, &iv.lo()).unwrap();
             for _ in 0..d {
                 let (l, mid, r) = iv.bisect().unwrap();
-                let sm = obq_poly_sign_at(&p, &mid).unwrap();
+                let sm = obq_poly_sign_at(p, &mid).unwrap();
                 iv = if sm == s_lo { r } else { l };
             }
             (
@@ -114,40 +107,42 @@ fn main() {
             worst_ratio = ratio;
         }
         println!(
-            "  {d:>5}  {k:>4}  {:>8}  {bits:>7}  {bqus:>7}  {ratus:>7}  {ratio:>7.1}x  {agree}",
-            linear
+            "  {d:>5}  {k:>4}  {linear:>8}  {bits:>7}  {bqus:>7}  {ratus:>7}  {ratio:>7.1}x  {agree}"
         );
     }
     println!("\n  k == depth at EVERY depth: {all_linear}");
+}
 
-    // --- the long chain: MAX_REFINE_STEPS itself ---------------------------
+fn run_ceiling(p: &[BigInt]) {
     println!("\n=== THE CEILING: 8192 and 16384 bisections (MAX_REFINE_STEPS) ===");
     for d in [8192u32, 16384] {
-        let (k, bits, bqus) = bisect_bq(&p, 1, 2, d);
+        let (k, bits, bqus) = bisect_bq(p, 1, 2, d);
         println!(
             "  depth {d:>6}  k={k:<6} k==depth={:<6} bits={bits:<7} bq {bqus} us",
             k == d
         );
     }
+}
 
-    // --- per-step cost, which is what nlsat's inner loop actually pays -----
+fn run_per_step_cost(p: &[BigInt]) {
     println!("\n=== PER-STEP COST (what an inner loop pays) ===");
     for d in [64u32, 256, 1024, 4096] {
-        let (_, _, bqus) = bisect_bq(&p, 1, 2, d);
+        let (_, _, bqus) = bisect_bq(p, 1, 2, d);
         println!(
             "  {d:>5} steps: {:>8.3} us/step (dyadic)",
             bqus as f64 / d as f64
         );
     }
     for d in [64u32, 256, 1024] {
-        let (_, _, ratus) = bisect_rat(&p, 1, 2, d);
+        let (_, _, ratus) = bisect_rat(p, 1, 2, d);
         println!(
             "  {d:>5} steps: {:>8.3} us/step (BigRational)",
             ratus as f64 / d as f64
         );
     }
+}
 
-    // --- select_small where it is claimed to pay ---------------------------
+fn run_straddle_selection() {
     println!("\n=== select_small on the STRADDLE shape (endpoints carry precision the width does not force) ===");
     for (lk, rk) in [
         (200u32, 100u32),
@@ -172,15 +167,17 @@ fn main() {
             sel.1
         );
     }
+}
 
+fn run_adjacent_selection(p: &[BigInt]) {
     println!("\n=== select_small on a BISECTION-produced (adjacent) interval ===");
     for d in [120u32, 500, 1000] {
         let mut iv =
             OBqInterval::new(&OBq::new(BigInt::from(1), 0), &OBq::new(BigInt::from(2), 0)).unwrap();
-        let s_lo = obq_poly_sign_at(&p, &iv.lo()).unwrap();
+        let s_lo = obq_poly_sign_at(p, &iv.lo()).unwrap();
         for _ in 0..d {
             let (l, mid, r) = iv.bisect().unwrap();
-            let sm = obq_poly_sign_at(&p, &mid).unwrap();
+            let sm = obq_poly_sign_at(p, &mid).unwrap();
             iv = if sm == s_lo { r } else { l };
         }
         let mid = iv.midpoint().unwrap();
@@ -194,4 +191,21 @@ fn main() {
             mid.k() == sel.0.k()
         );
     }
+}
+
+fn main() {
+    // x^3 - 2: the real root is cbrt(2), irrational, in (1, 2). This differs
+    // from the lane harness's x^2 - 2 family.
+    let p = vec![
+        BigInt::from(-2),
+        BigInt::zero(),
+        BigInt::zero(),
+        BigInt::one(),
+    ];
+
+    run_depth_sweep(&p);
+    run_ceiling(&p);
+    run_per_step_cost(&p);
+    run_straddle_selection();
+    run_adjacent_selection(&p);
 }

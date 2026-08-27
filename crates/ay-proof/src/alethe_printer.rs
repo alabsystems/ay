@@ -6,6 +6,8 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+mod bv_mul_zero;
+mod bv_ult_zero;
 #[cfg(test)]
 #[path = "alethe_printer_disequality_split_tests.rs"]
 mod disequality_split_tests;
@@ -15,11 +17,13 @@ mod folded_assume;
 #[cfg(test)]
 #[path = "alethe_printer_ground_eval_tests.rs"]
 mod ground_eval_tests;
+mod promoted_lia;
 #[path = "alethe_printer_resolution_args.rs"]
 mod resolution_args;
 #[path = "alethe_printer/store_permutation.rs"]
 mod store_permutation;
 mod surface_and_pos;
+mod surface_implies_decomposition;
 mod surface_symm;
 mod surface_tokens;
 mod term_format;
@@ -209,7 +213,7 @@ pub enum AlethePrintError {
     /// actually knows. For a Skolem constant that term is the Hilbert choice
     /// `εx. B`, recorded at the mint site
     /// ([`ay_core::SkolemChoice`]) and emitted by
-    /// [`AlethePrinter::skolem_choice_definitions`]. A symbol with no such
+    /// `AlethePrinter::skolem_choice_definitions`. A symbol with no such
     /// provenance has no correct rendering at all, and the exporter DECLINES:
     /// the caller keeps its verdict and writes no file, because a document no
     /// checker can parse is strictly worse than no document.
@@ -2133,59 +2137,6 @@ impl<'a> AlethePrinter<'a> {
         match_pair
     }
 
-    /// Render an independently evaluated ground LIA unit through the exact
-    /// rules implemented by the pinned external checker.
-    ///
-    /// Carcara treats `lia_generic` as an unchecked hole. A positive
-    /// directional equality can use `evaluate` directly. A true ground
-    /// disequality cannot: `evaluate` only concludes `(= term value)`, so spell
-    /// out the checked `evaluate` / `equiv1` / `false` / `resolution` bridge.
-    ///
-    /// The native ground evaluator is the authority here, independently of
-    /// the LIA annotation. The canonical-surface equality is load-bearing: a
-    /// source override that changes what the external checker sees must not
-    /// inherit authority from the internal term DAG.
-    fn format_lia_ground_evaluate(
-        &self,
-        id: ProofId,
-        clause: &[TermId],
-        clause_str: &str,
-    ) -> Option<String> {
-        if clause_str != AlethePrinter::new(self.terms).format_clause(clause) {
-            return None;
-        }
-        if crate::checker::validate_ground_evaluate_for_printer(self.terms, id, clause, 0, &[])
-            .is_ok()
-        {
-            return Some(format!("(step {id} {clause_str} :rule evaluate)"));
-        }
-
-        let [literal] = clause else {
-            return None;
-        };
-        let TermData::Not(equality) = self.terms.get(*literal) else {
-            return None;
-        };
-        let TermData::App(Symbol::Named(operator), operands) = self.terms.get(*equality) else {
-            return None;
-        };
-        if operator != "="
-            || operands.len() != 2
-            || !crate::checker::recognize_ground_evaluate(self.terms, *literal)
-        {
-            return None;
-        }
-
-        let equality = self.format_term(*equality);
-        let literal = self.format_term(*literal);
-        Some(format!(
-            "(step {id}.ev (cl (= {equality} false)) :rule evaluate)\n\
-             (step {id}.q (cl {literal} false) :rule equiv1 :premises ({id}.ev))\n\
-             (step {id}.f (cl (not false)) :rule false)\n\
-             (step {id} {clause_str} :rule resolution :premises ({id}.q {id}.f))"
-        ))
-    }
-
     fn format_theory_lemma(
         &self,
         id: ProofId,
@@ -2206,36 +2157,21 @@ impl<'a> AlethePrinter<'a> {
         if self.arith_disequality_split_is_exactly_lowerable(kind, clause) {
             return self.format_arith_disequality_split(id, clause);
         }
-        // AY's wide BV checker proves binary `bvand` commutativity by building
-        // and replaying a bit-blast/LRAT refutation from this exact live term.
-        // Alethe has no monolithic `bv_bitblast` rule, but it does have the
-        // independently checked `aci_simp` primitive for this same equality.
-        // Lower only the exact printed operand-swap shape; every other internal
-        // BvBitBlast lemma keeps the honest `hole` wire fallback below.
+        // AY replays a bit-blast/LRAT refutation, while Alethe's checked
+        // `aci_simp` covers exactly binary `bvand` operand swaps. Lower only
+        // that shape; every other BvBitBlast lemma keeps the honest hole.
         if matches!(kind, ay_core::TheoryLemmaKind::BvBitBlast) {
             if let Some(text) = self.format_binary_bvand_aci_simp(id, clause) {
                 return Ok(text);
             }
         }
-        // The two bit-vector lemma families whose clauses are exactly
-        // reconstructible from Carcara's own primitives. Both gates re-derive
-        // the shape from the clause itself, so they are equally valid for the
-        // gate-annotated kind, whose clause space is a SUBSET of the plain
-        // one. Everything else keeps the honest `hole` fallback below.
+        // Checked Carcara lowerings re-derive their exact clause and surface
+        // shapes. They are also valid for the gate-annotated subset.
         if matches!(
             kind,
             ay_core::TheoryLemmaKind::BvBitBlast | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
         ) {
-            if let Some(text) = self.format_bv_constant_disequality(id, clause) {
-                return Ok(text);
-            }
-            if let Some(text) = self.format_bv_idempotent_gate_bitblast(id, clause) {
-                return Ok(text);
-            }
-            if let Some(text) = self.format_bv_double_negation_bitblast(id, clause) {
-                return Ok(text);
-            }
-            if let Some(text) = self.format_bv_unsigned_compare_duality(id, clause) {
+            if let Some(text) = self.format_checked_bv_bitblast_lowering(id, clause) {
                 return Ok(text);
             }
         }
@@ -2288,94 +2224,14 @@ impl<'a> AlethePrinter<'a> {
         }
 
         let clause_str = self.format_clause(clause);
-        // One complete-step decision is shared with the publication wire-gap
-        // gate. `lia_generic` is only a checker-recognized placeholder; the
-        // exact clause may instead use checked `evaluate`, or its actual
-        // Farkas certificate may promote it to checked `la_generic`.
         let wire_rule =
             crate::promoted_wire_rule(self.terms, kind, clause, farkas, self.term_overrides);
-        if wire_rule == "evaluate" {
-            return Ok(self
-                .format_lia_ground_evaluate(id, clause, &clause_str)
-                .unwrap_or_else(|| {
-                    // The shared decision and formatter use the same ground
-                    // validator and no surface override. Keep even unexpected
-                    // implementation drift fail-closed.
-                    format!(
-                        "(step {id} {clause_str} :rule {})",
-                        ay_core::UNPROVED_STEP_RULE
-                    )
-                }));
+        if let Some(text) = self.format_promoted_lia_evaluation(id, clause, &clause_str, wire_rule)
+        {
+            return Ok(text);
         }
         if let Some(farkas) = farkas {
-            // WIRE name, not the internal one: a kind the checker does not
-            // implement must print as `hole`, never as an unknown rule name
-            // (which makes the whole document `invalid`). `LraFarkas` passes
-            // through as `la_generic`; `LiaGeneric` reaches that spelling only
-            // through the shared certificate promotion.
-            let rule = wire_rule;
-            // ...and `hole` takes no `:args`, so a kind with coefficients but
-            // no external rule (e.g. `IntBoundLatticeGap`, whose integer
-            // lattice argument Alethe cannot state) drops them rather than
-            // print `hole :args (..)`, which is `invalid`, not `holey`.
-            if rule == ay_core::UNPROVED_STEP_RULE {
-                return Ok(format!("(step {id} {clause_str} :rule {rule})"));
-            }
-            // Alethe `la_generic` coefficients are SIGNED: an equality literal
-            // used in the `rhs - lhs` orientation must print a negative
-            // coefficient, while the internal certificate keeps non-negative
-            // magnitudes and lets the validator search orientations. Resolve
-            // the printed signs from the certificate's own contradicting
-            // combination; certificates without equality literals (unique
-            // orientations) come back bit-identical, and any conflict the
-            // linear model cannot orient keeps the original coefficients.
-            let printed_coefficients: Vec<num_rational::Rational64> = if rule == "la_generic" {
-                let conflict: Vec<ay_core::TheoryLit> = clause
-                    .iter()
-                    .map(|&lit| match self.terms.get(lit) {
-                        TermData::Not(inner) => ay_core::TheoryLit {
-                            term: *inner,
-                            value: true,
-                        },
-                        _ => ay_core::TheoryLit {
-                            term: lit,
-                            value: false,
-                        },
-                    })
-                    .collect();
-                {
-                    // Sign the coefficients against the PRINTED atom orientation
-                    // (what an external checker parses), not the internal term
-                    // orientation — surface-syntax overrides can reorient an
-                    // equality, flipping the sign the checker expects. Start
-                    // from the internal orientation search, then repair the
-                    // equality signs over the printed strings when needed
-                    // (emission-only; kept byte-identical when already valid).
-                    let existing = ay_core::proof_validation::resolve_equality_coefficient_signs(
-                        self.terms, &conflict, farkas,
-                    )
-                    .unwrap_or_else(|| farkas.coefficients.clone());
-                    let printed_atoms: Vec<(String, bool)> = conflict
-                        .iter()
-                        .map(|l| (self.format_term(l.term), l.value))
-                        .collect();
-                    crate::la_generic_signs::resolve_printed_la_generic_coefficients(
-                        &printed_atoms,
-                        &existing,
-                        &farkas.coefficients,
-                    )
-                }
-            } else {
-                farkas.coefficients.clone()
-            };
-            let coeffs: Vec<String> = printed_coefficients.iter().map(format_rational64).collect();
-            return Ok(format!(
-                "(step {} {} :rule {} :args ({}))",
-                id,
-                clause_str,
-                rule,
-                coeffs.join(" ")
-            ));
+            return Ok(self.format_farkas_theory_lemma(id, clause, &clause_str, wire_rule, farkas));
         }
 
         // #8821 fail-loud: la_generic / lia_generic REQUIRE :args (Farkas
@@ -4458,6 +4314,52 @@ impl<'a> AlethePrinter<'a> {
         (left == certified && is_zero(right)) || (right == certified && is_zero(left))
     }
 
+    /// Transport the certified flat ROW theorem onto a packed term whose
+    /// surface override spells the AUTHORED implication `(=> (not guard) row)`
+    /// rather than AY's internal `(or guard row)`.
+    ///
+    /// A composed root (`(assert (not (=> (not (= i j)) row)))`) installs that
+    /// override so every printed step speaks the problem's own syntax, and the
+    /// ROW2 lemma's packed clause term IS that implication. Printing the
+    /// override-free or-term here would conclude a term no downstream premise
+    /// mentions, so the two premise-free implication tautologies carry the flat
+    /// clause across instead:
+    ///
+    ///   implies_neg1: (cl (=> A B) A)
+    ///   implies_neg2: (cl (=> A B) (not B))
+    ///
+    /// Both are checked by the pinned calculus, so the packed conclusion gains
+    /// no authority the flat theorem did not already have. Returns `None`
+    /// unless the printed implication is EXACTLY the certified flat clause —
+    /// one literal as the consequent and the negation of the other as the
+    /// antecedent — so every other surface still fails closed at the caller.
+    fn finish_array_packed_implication(
+        &self,
+        id: ProofId,
+        packed: &str,
+        flat_id: &str,
+        first: &str,
+        second: &str,
+    ) -> Option<String> {
+        let (antecedent, consequent) = split_binary_implies(packed)?;
+        let guard = if consequent == second {
+            first
+        } else if consequent == first {
+            second
+        } else {
+            return None;
+        };
+        if antecedent != format!("(not {guard})") {
+            return None;
+        }
+        Some(format!(
+            "\n(step {id}.i1 (cl {packed} {antecedent}) :rule implies_neg1)\n\
+             (step {id}.i2 (cl {packed} (not {consequent})) :rule implies_neg2)\n\
+             (step {id}.r0 (cl {guard} {packed}) :rule resolution :premises ({flat_id} {id}.i2))\n\
+             (step {id} (cl {packed}) :rule resolution :premises ({id}.r0 {id}.i1))"
+        ))
+    }
+
     /// Restore a unit `(or guard row)` when AY's internally checked array
     /// lemma stores the disjunction as one clause term. The flat theorem is
     /// first derived under `flat_id`; two `or_neg` tautologies then introduce
@@ -4477,6 +4379,12 @@ impl<'a> AlethePrinter<'a> {
         };
         let packed = self.format_term(packed_or);
         let Some(children) = split_application(&packed, "or") else {
+            if let Some(bridge) =
+                self.finish_array_packed_implication(id, &packed, flat_id, first, second)
+            {
+                output.push_str(&bridge);
+                return Ok(output);
+            }
             return Err(AlethePrintError::InvalidArrayStep {
                 id,
                 reason: "packed ROW surface override is no longer an or-term".to_string(),
@@ -4677,8 +4585,50 @@ impl<'a> AlethePrinter<'a> {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<String, AlethePrintError> {
-        crate::checker::validate_fresh_def_bound_for_printer(
-            self.terms, id, clause, premises, args,
+        crate::checker::validate_fresh_definition_for_printer(
+            self.terms,
+            &ay_core::AletheRule::FreshDefBound,
+            id,
+            clause,
+            premises,
+            args,
+        )
+        .map_err(|err| AlethePrintError::InvalidSurfaceStep {
+            id,
+            reason: err.to_string(),
+        })?;
+        let clause_str = self.format_clause(clause);
+        Ok(format!(
+            "(step {id} {clause_str} :rule {})",
+            ay_core::UNPROVED_STEP_RULE
+        ))
+    }
+
+    /// `fresh_def_eq` lowers exactly as `fresh_def_bound` does, and for the
+    /// same two reasons: there is no Alethe rule for a solver introducing a
+    /// symbol and defining it, and the `:args` MUST be dropped because the
+    /// pinned carcara build rejects `hole` arguments outright (turning a
+    /// `holey` document into an `invalid` one — strictly worse than the
+    /// premiseless `trust` this step replaces, which prints the same text).
+    ///
+    /// The near-miss worth naming for THIS rule specifically: `eq_congruent`
+    /// and `refl` are both `=`-shaped and both would render, and both would be
+    /// FALSE claims — `(= d expr)` is not reflexive and is not a congruence of
+    /// anything. `hole` is the only honest wire.
+    fn format_fresh_def_eq(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<String, AlethePrintError> {
+        crate::checker::validate_fresh_definition_for_printer(
+            self.terms,
+            &ay_core::AletheRule::FreshDefEq,
+            id,
+            clause,
+            premises,
+            args,
         )
         .map_err(|err| AlethePrintError::InvalidSurfaceStep {
             id,
@@ -4701,6 +4651,9 @@ impl<'a> AlethePrinter<'a> {
     ) -> Result<String, AlethePrintError> {
         if matches!(rule, ay_core::AletheRule::FreshDefBound) {
             return self.format_fresh_def_bound(id, clause, premises, args);
+        }
+        if matches!(rule, ay_core::AletheRule::FreshDefEq) {
+            return self.format_fresh_def_eq(id, clause, premises, args);
         }
         if matches!(rule, ay_core::AletheRule::Symm) {
             return self.format_surface_symm(id, clause, premises, args);
@@ -5578,134 +5531,6 @@ impl<'a> AlethePrinter<'a> {
         Some(format!(
             "(step {id} (cl {first_lit} {second_lit}) :rule la_generic :args ({args_str}))"
         ))
-    }
-
-    /// Resugar an `or` decomposition whose single assume premise is an
-    /// internal canonical or-term but PRINTS as a right-associated binary
-    /// implication chain.
-    ///
-    /// For `(=> A (=> B C))`, the internal `or` rule concludes
-    /// `{(not A), (not B), C}` from the unit premise. The printed premise is
-    /// not an or-term, so rebuild the same clause with stock Alethe rules:
-    ///
-    /// ```text
-    /// imp0: (cl (not (=> A (=> B C))) (not A) (=> B C))  implies_pos
-    /// imp1: (cl (not (=> B C)) (not B) C)                 implies_pos
-    /// id:   (cl (not A) (not B) C)                        resolution premise,imp0,imp1
-    /// ```
-    ///
-    /// This is deliberately narrower than semantic implication recognition.
-    /// It fires only when all of these agree exactly as multisets and have the
-    /// same arity: the internal or operands, the internal traced clause, the
-    /// printed internal operands, and the literals obtained by flattening the
-    /// printed right-associated implication. The n-ary resolution performs
-    /// the same left-to-right pivot chain without quadratic intermediate
-    /// clauses and retains the original id for every downstream reference.
-    fn resugar_implies_decomposition(
-        &self,
-        id: ProofId,
-        clause: &[TermId],
-        premise: ProofId,
-    ) -> Result<Option<String>, String> {
-        let Some(&source) = self.assume_terms.borrow().get(&premise) else {
-            return Ok(None);
-        };
-        let source_str = self.format_term(source);
-        if split_binary_implies(&source_str).is_none() {
-            if split_application(&source_str, "=>").is_some() {
-                return Err("printed implication premise is not binary".to_string());
-            }
-            return Ok(None);
-        }
-        let TermData::App(Symbol::Named(name), source_disjuncts) = self.terms.get(source) else {
-            return Err("printed implication premise is not an internal or-term".to_string());
-        };
-        if name != "or" || source_disjuncts.len() < 2 || source_disjuncts.len() != clause.len() {
-            return Err("printed implication/internal or arity mismatch".to_string());
-        }
-
-        // Internal gate: the step must decompose this exact assumed or-term,
-        // not merely a same-arity clause that happens to print similarly.
-        let mut sorted_source = source_disjuncts.clone();
-        let mut sorted_clause = clause.to_vec();
-        sorted_source.sort_unstable();
-        sorted_clause.sort_unstable();
-        if sorted_source != sorted_clause {
-            return Err(
-                "or decomposition clause is not the assumed internal disjunct multiset".to_string(),
-            );
-        }
-
-        let mut implication = source_str.clone();
-        let mut links: Vec<(String, String, String)> = Vec::new();
-        let mut flattened: Vec<String> = Vec::new();
-        while let Some((antecedent, consequent)) = split_binary_implies(&implication) {
-            if links.len() >= PRINTED_NESTING_NODE_BUDGET {
-                return Err("printed implication nesting exceeds the printer limit".to_string());
-            }
-            flattened.push(format!("(not {antecedent})"));
-            links.push((implication, antecedent, consequent.clone()));
-            implication = consequent;
-        }
-        if links.is_empty() {
-            return Ok(None);
-        }
-        // `split_binary_implies` also returns `None` for a non-binary `=>`.
-        // Such a node is not an atomic final consequent of the admitted
-        // right-nested binary chain; reject it explicitly instead of treating
-        // the malformed implication application as a leaf.
-        if split_application(&implication, "=>").is_some() {
-            return Err("right-nested printed implication contains a non-binary link".to_string());
-        }
-        flattened.push(implication);
-        if flattened.len() != source_disjuncts.len() {
-            return Err("printed implication/internal or arity mismatch".to_string());
-        }
-
-        // Printed gate: surface overrides may change descendants as well as
-        // the root. Require both the source operands and the traced clause to
-        // be exactly the flattened implication literals, counting repeats.
-        let mut printed_source: Vec<String> = source_disjuncts
-            .iter()
-            .map(|&literal| self.format_term(literal))
-            .collect();
-        let printed_clause: Vec<String> = clause
-            .iter()
-            .map(|&literal| self.format_term(literal))
-            .collect();
-        let mut sorted_printed_clause = printed_clause.clone();
-        let mut sorted_flattened = flattened.clone();
-        printed_source.sort_unstable();
-        sorted_printed_clause.sort_unstable();
-        sorted_flattened.sort_unstable();
-        if printed_source != sorted_flattened || sorted_printed_clause != sorted_flattened {
-            return Err(
-                "printed implication literals do not match the internal source and conclusion"
-                    .to_string(),
-            );
-        }
-
-        let mut out = String::new();
-        let mut resolution_premises = vec![premise.to_string()];
-        for (index, (current, antecedent, consequent)) in links.iter().enumerate() {
-            let implication_id = format!("{id}.imp{index}");
-            let _ = std::fmt::Write::write_fmt(
-                &mut out,
-                format_args!(
-                    "(step {implication_id} (cl (not {current}) (not {antecedent}) {consequent}) :rule implies_pos)\n"
-                ),
-            );
-            resolution_premises.push(implication_id);
-        }
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!(
-                "(step {id} (cl {}) :rule resolution :premises ({}))",
-                printed_clause.join(" "),
-                resolution_premises.join(" ")
-            ),
-        );
-        Ok(Some(out))
     }
 
     /// Resugar an `or` decomposition step (see the call site in
@@ -6714,6 +6539,115 @@ fn walk_subterms(
         }
     }
     false
+}
+
+/// How the surface override channel relates the PRINTED clause to the term DAG.
+///
+/// The evidence-sensitive wire promotions ([`crate::promoted_wire_rule`])
+/// reason about the internal term DAG, while an override changes the text the
+/// external checker reads. What makes a promotion safe is therefore not the
+/// ABSENCE of the channel but its irrelevance HERE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClauseSurfaceAgreement {
+    /// The clause renders byte-identically with and without the channel, so
+    /// the checker reads exactly the text the validators reasoned about.
+    Identical,
+    /// Every override the clause reaches is either the identity spelling or
+    /// the ARGUMENT-REVERSED spelling of its own canonical rendering
+    /// (`(> b a)` where the printer would write `(< a b)`), and at least one
+    /// is the latter. `mk_gt`/`mk_ge` canonicalize `>`/`>=` into `<`/`<=`
+    /// with the arguments swapped, so this is exactly the authored spelling of
+    /// a canonicalized order atom — the printed text is a different byte
+    /// string denoting the SAME atom, not a different formula.
+    OrderReversed,
+    /// The channel changes what the clause says.
+    Divergent,
+}
+
+/// Classify the surface override channel's effect on this exact clause.
+///
+/// Screening the whole document instead — refusing every promotion whenever
+/// any override is installed anywhere — discards checkable evidence for
+/// clauses the channel never touches. A composed authored root installs
+/// overrides for its own spelling, and that alone downgraded independently
+/// checked steps such as `(= (+ 2 3) 5)` to `hole`.
+///
+/// [`ClauseSurfaceAgreement::OrderReversed`] is not a weaker BAR, it is a
+/// weaker EQUALITY: byte-equality is replaced by same-atom equality on the one
+/// relation where AY's own term constructors introduce the difference. It adds
+/// no reliance on any model of the external checker's arithmetic — the same
+/// converse identity is already load-bearing in this file, where
+/// [`surface_order_reversal`] drives the `comp_simplify` congruence bridge.
+///
+/// This is deliberately the ONE classifier: the printer and the publication
+/// wire-gap gate both reach it through `promoted_wire_rule`, so neither can
+/// drift from the other.
+pub(crate) fn clause_surface_agreement(
+    terms: &TermStore,
+    clause: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> ClauseSurfaceAgreement {
+    let Some(overrides) = term_overrides else {
+        return ClauseSurfaceAgreement::Identical;
+    };
+    if overrides.is_empty() {
+        return ClauseSurfaceAgreement::Identical;
+    }
+    // Cheap NECESSARY condition first. `format_term` memoizes only WITHIN one
+    // printer, so rendering a clause through two fresh printers is superlinear
+    // in term size — and this predicate sits on a hot path, because
+    // `proof_has_known_wire_gap` runs it over every stored step. If the channel
+    // maps nothing this clause mentions, the two renderings are identical by
+    // construction and no rendering is needed to know it.
+    let mut stack: Vec<TermId> = clause.to_vec();
+    let mut seen = HashSet::default();
+    let mut reached: Vec<TermId> = Vec::new();
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if overrides.contains_key(&term) {
+            reached.push(term);
+            // An override REPLACES the rendering of its term, so the printer
+            // never recurses past it; neither does this walk.
+            continue;
+        }
+        stack.extend(terms.children(term));
+    }
+    if reached.is_empty() {
+        return ClauseSurfaceAgreement::Identical;
+    }
+    // A reachable entry may still be an IDENTITY spelling. Compare each entry
+    // against its own override-free rendering instead of re-rendering the whole
+    // clause twice: an override that reproduces exactly what its term already
+    // prints cannot change any text mentioning it. One shared printer memoizes
+    // across the walk. This is conservative where it differs — a nested entry
+    // shadowed by an outer one is reported as changed — and conservative here
+    // means withholding the promotion.
+    let printer = AlethePrinter::new(terms);
+    let mut agreement = ClauseSurfaceAgreement::Identical;
+    for term in reached {
+        let Some(surface) = overrides.get(&term) else {
+            return ClauseSurfaceAgreement::Divergent;
+        };
+        let canonical = printer.format_term(term);
+        if *surface == canonical {
+            continue;
+        }
+        // The authored `>`/`>=` spelling of a canonicalized `<`/`<=` atom.
+        // `surface_order_reversal` swaps the two ARGUMENT SUBSTRINGS and maps
+        // the operator to its converse, so a match means the override's
+        // arguments are byte-for-byte the canonical rendering's own arguments
+        // and only the converse spelling differs. It cannot hide a re-spelled
+        // operand, and it cannot cross strictness (`(>= x 0)` reverses to
+        // `(<= 0 x)`, never to `(< 0 x)`).
+        if surface_order_reversal(surface).is_some_and(|reversed| reversed == canonical) {
+            agreement = ClauseSurfaceAgreement::OrderReversed;
+            continue;
+        }
+        return ClauseSurfaceAgreement::Divergent;
+    }
+    agreement
 }
 
 /// Split a surface-override string of the form `(=> A B)` into (`A`, `B`)

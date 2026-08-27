@@ -172,6 +172,7 @@ mod tests {
     use ay_core::{AletheRule, Proof, Sort};
     use ay_frontend::command::Term as FrontendTerm;
 
+    use super::super::assume_classification::SurfaceOverridePolicy;
     use super::{
         live_steps, OrTautologyPlan, ProvenanceSurfaceAudit, TautRoute, MAX_EMITTED_CLAUSE_WIDTH,
         MAX_LIVE_PROOF_EDGES,
@@ -264,6 +265,8 @@ mod tests {
             "and".to_string(),
             vec![FrontendTerm::App("distinct".to_string(), operands)],
         );
-        assert!(executor.classify_assume(term, &parsed, true).is_err());
+        assert!(executor
+            .classify_assume(term, &parsed, SurfaceOverridePolicy::Retained)
+            .is_err());
     }
 }

@@ -2,9 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! End-to-end tests: ay solves a SAT problem, exports the LRAT proof certificate
-//! as a kernel-checked Lean4 file, and (when `lean` is on PATH) invokes the
-//! Lean4 kernel to verify the emitted proof. Part of #8697 Phase 2.
+//! End-to-end tests: ay solves a SAT problem, exports the LRAT certificate as a
+//! self-contained Lean4 checker-acceptance file, and (when `lean` is on PATH)
+//! asks Lean to evaluate that checker. This does not establish checker
+//! soundness; the production CLI uses `write_lean4_verified` for authority.
 //!
 //! The tests in `ay_sat::lean_export` exercise the emitter on hand-crafted
 //! LRAT steps. These tests close the loop by driving the full pipeline:
@@ -41,7 +42,7 @@ p cnf 1 2
 ";
 
 /// Solve the formula, extract the streaming ProofCertificate, and emit a
-/// kernel-checked Lean4 proof into a `Vec<u8>`. Returns the emitted source
+/// self-contained Lean4 checker-acceptance artifact. Returns the emitted source
 /// text (valid UTF-8). Panics if solving doesn't yield UNSAT, or if the proof
 /// certificate is not attached to the result.
 fn solve_and_emit_lean4_kernel(dimacs: &str, label: &str) -> String {

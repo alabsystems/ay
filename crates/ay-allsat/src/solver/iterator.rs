@@ -15,7 +15,7 @@ enum BackendStep {
     Unknown,
 }
 
-fn classify_backend_result(result: ay_sat::VerifiedSatResult) -> BackendStep {
+fn classify_backend_result(result: ay_sat::SolverSatResult) -> BackendStep {
     match result.into_inner() {
         SatResult::Sat(model) => BackendStep::Model(model),
         SatResult::Unsat(_) => BackendStep::Exhausted,

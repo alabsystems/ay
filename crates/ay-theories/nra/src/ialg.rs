@@ -265,36 +265,29 @@ pub(crate) struct AInterval {
     just: Just,
 }
 
-/// The outcome of building something that may legitimately be nothing.
+/// A conclusive interval-bound comparison.
 ///
-/// Distinguishing PROVED-EMPTY from COULD-NOT-DECIDE is the whole point: the
-/// two are returned as `Some(Made::Empty)` and `None` respectively, and no
-/// caller can confuse them the way a bare `Option<AInterval>` would invite.
+/// Outer `None` means comparison failed; an inner `None` proves emptiness. The
+/// wrapper preserves all three outcomes without a bespoke enum or allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Made {
-    /// A non-empty interval.
-    Iv(AInterval),
-    /// Proved empty.
-    Empty,
-}
+#[must_use]
+pub(crate) struct DecidedInterval(Option<AInterval>);
 
-impl AInterval {
-    /// Build an interval, PROVING it non-empty.
+impl DecidedInterval {
+    /// Compare bounds, preserving inconclusive, empty, and non-empty outcomes.
     ///
-    /// Returns `Some(Made::Empty)` when emptiness is proved, `None` when the
-    /// endpoints could not be ordered. An infinite endpoint must be open; a
-    /// closed one is a malformed input and is refused rather than repaired.
-    pub(crate) fn new(
+    /// `None` also refuses a malformed closed infinite endpoint.
+    pub(crate) fn from_bounds(
         lo: AEnd,
         lo_open: bool,
         hi: AEnd,
         hi_open: bool,
         just: Just,
-    ) -> Option<Made> {
+    ) -> Option<Self> {
         if (!lo.is_finite() && !lo_open) || (!hi.is_finite() && !hi_open) {
             return None;
         }
-        let iv = Self {
+        let iv = AInterval {
             lo,
             lo_open,
             hi,
@@ -302,11 +295,18 @@ impl AInterval {
             just,
         };
         if iv.is_proved_empty()? {
-            return Some(Made::Empty);
+            return Some(Self(None));
         }
-        Some(Made::Iv(iv))
+        Some(Self(Some(iv)))
     }
 
+    /// Consume the decision, yielding the interval unless it was proved empty.
+    pub(crate) fn into_interval(self) -> Option<AInterval> {
+        self.0
+    }
+}
+
+impl AInterval {
     /// The whole line, justified by `just`.
     pub(crate) fn full(just: Just) -> Self {
         Self {
@@ -412,7 +412,8 @@ impl AInterval {
     /// The surviving cell is justified by both sides — that union is what a
     /// conflict clause is built from, and dropping either half would produce a
     /// clause that does not entail the conflict.
-    pub(crate) fn intersect(&self, other: &Self) -> Option<Made> {
+    /// `None` is inconclusive; a decided disjoint pair has no interval.
+    pub(crate) fn intersect(&self, other: &Self) -> Option<DecidedInterval> {
         let (lo, lo_open) = match cmp_pos(
             &self.lo,
             lo_delta(self.lo_open),
@@ -431,7 +432,7 @@ impl AInterval {
             Ordering::Greater => (other.hi.clone(), other.hi_open),
             _ => (self.hi.clone(), self.hi_open),
         };
-        Self::new(lo, lo_open, hi, hi_open, self.just.merge(&other.just)?)
+        DecidedInterval::from_bounds(lo, lo_open, hi, hi_open, self.just.merge(&other.just)?)
     }
 
     /// Is there a real number strictly between `self` and `later`, given
@@ -874,7 +875,7 @@ impl IntervalSet {
             }
             let a = &self.ivs[i];
             let b = &other.ivs[j];
-            if let Made::Iv(x) = a.intersect(b)? {
+            if let Some(x) = a.intersect(b)?.into_interval() {
                 if out.len() >= MAX_INTERVALS {
                     return None;
                 }
@@ -1141,21 +1142,11 @@ pub(crate) fn from_sign_condition(
         }
     }
 
-    // The STRONG half: the list is EXACTLY the real roots of `p`, no more and
-    // no fewer. Checking only that it ascends leaves the failure in the unsound
-    // direction, and a verifier measured it: with `p = x^2 - 1` and the root
-    // `-1` dropped, `SignCond::Lt` returns the EMPTY set for a feasible set that
-    // is genuinely `(-1, 1)` — `is_empty()` true, `contains(0)` false. A wrongly
-    // emptied feasible set is a CONFLICT THAT DOES NOT EXIST, which in an MCSAT
-    // search is a wrong `unsat`. A spurious extra root is accepted too.
-    //
-    // The sample-sign check further down cannot see either: it only fires in the
-    // measure-zero case where a dyadic sample lands exactly on a missed root.
-    //
-    // Sturm settles it in one count over an interval containing every root, and
-    // the machinery already exists in this crate (it is what `cmp_anum`'s
-    // equality certificate runs on). Counting is O(deg) sign evaluations, paid
-    // once per construction, against a wrong conflict.
+    // The list must contain exactly the real roots. Ordering alone is unsound:
+    // dropping -1 from x^2 - 1 made `Lt` appear empty instead of `(-1, 1)`, a
+    // nonexistent conflict and potentially wrong UNSAT; padding also passed.
+    // Sampling cannot detect this unless it lands exactly on a missed root.
+    // Count roots once with the existing Sturm machinery and require equality.
     {
         let zp = crate::upoly::ZPoly::from_coeffs(p.to_vec());
         // `normalize_defining` is the same square-free/primitive/positive-lc
@@ -1199,14 +1190,19 @@ pub(crate) fn from_sign_condition(
             return None;
         }
         if cond.accepts(s) {
-            if let Made::Iv(iv) = AInterval::new(lo, true, hi, true, just.clone())? {
+            if let Some(iv) =
+                DecidedInterval::from_bounds(lo, true, hi, true, just.clone())?.into_interval()
+            {
                 cells.push(iv);
             }
         }
         // The closed point cell at root `i`, where the sign is exactly 0.
         if i < roots.len() && cond.accepts(0) {
             let r = AEnd::Fin(roots[i].clone());
-            if let Made::Iv(iv) = AInterval::new(r.clone(), false, r, false, just.clone())? {
+            if let Some(iv) =
+                DecidedInterval::from_bounds(r.clone(), false, r, false, just.clone())?
+                    .into_interval()
+            {
                 cells.push(iv);
             }
         }

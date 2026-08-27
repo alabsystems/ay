@@ -381,7 +381,7 @@ impl DratChecker {
 ///   * `Add`    -> RUP/RAT (delegated to the DRAT engine)
 ///   * `Delete` -> clause deletion
 ///   * `AddPr`  -> PR (partial-assignment witness) **or** SR (substitution
-///     witness) -- both decided by [`DratChecker::sr_redundant_step`].
+///     witness) -- both decided by `DratChecker::sr_redundant_step`.
 ///
 /// PR is the special case of SR whose witness maps only to true/false, so the
 /// single kernel covers DPR/LPR (the `j=0` symmetry binaries) and full DSR.
@@ -431,7 +431,11 @@ impl SrChecker {
         Ok(())
     }
 
-    /// Verify a complete PR/SR (or mixed DRAT) proof against `clauses`.
+    /// Verify a complete PR/SR (or mixed DRAT) proof on a fresh checker.
+    ///
+    /// This bulk API is one-shot. A repeated call fails with
+    /// [`DratCheckError::CheckerNotFresh`] rather than reusing proof state from
+    /// an earlier formula.
     pub fn verify(
         &mut self,
         clauses: &[Vec<Literal>],
@@ -439,11 +443,15 @@ impl SrChecker {
     ) -> Result<(), DratCheckError> {
         use crate::drat_parser::ProofStep;
 
+        self.inner.begin_bulk_verify()?;
         for clause in clauses {
             self.inner.add_original(clause);
         }
         if self.inner.inconsistent {
-            return Ok(());
+            return match self.inner.conclude_unsat() {
+                super::ConcludeResult::Verified => Ok(()),
+                super::ConcludeResult::Failed(reason) => Err(DratCheckError::from(reason)),
+            };
         }
 
         for (i, step) in steps.iter().enumerate() {

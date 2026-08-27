@@ -302,7 +302,7 @@ fn atom_leaf_query_never_refutes_pairwise_distinct_integers() {
     for count in 2..=5_usize {
         let mut terms = TermStore::new();
         let integers: Vec<_> = (0..count)
-            .map(|index| terms.mk_var(&format!("atom_leaf_distinct_{index}"), Sort::Int))
+            .map(|index| terms.mk_var(format!("atom_leaf_distinct_{index}"), Sort::Int))
             .collect();
         let mut roots = Vec::new();
         for (lhs_index, &lhs) in integers.iter().enumerate() {
@@ -313,7 +313,7 @@ fn atom_leaf_query_never_refutes_pairwise_distinct_integers() {
         }
 
         let error = super::authenticate_atom_leaf_bool_bv_unsat_query(&terms, &roots, None)
-            .expect_err("{count} pairwise-distinct integers are satisfiable over Z");
+            .expect_err("pairwise-distinct integers are satisfiable over Z");
         assert!(
             error.is_unsupported_fragment(),
             "pairwise-distinct integers must DECLINE at n={count}, got: {error}"

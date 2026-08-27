@@ -7,8 +7,6 @@
 // "clause emitted, cited conjunction UNSAT" (or nothing); against the injected
 // module it prints a clause whose citation set z3 finds SATISFIABLE.
 
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
-
 use num_bigint::BigInt;
 use num_rational::BigRational as Q;
 use num_traits::Zero;
@@ -81,6 +79,8 @@ fn smt(p: &[BigInt], c: OISignCond) -> String {
 }
 
 fn main() {
+    // #govern: see crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
     // A: P > 0 where P = (x-1)(x-3)(x-5)(x-7)(x-9)(x-11)(x-13)  [7 roots]
     // B: x - 20 < 0                                             [1 root]
     // C: x(x-20) >= 0                                           [2 roots]

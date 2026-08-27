@@ -6,10 +6,12 @@
 //!
 //! Layout per clause: 3 header words + N literal words in a contiguous `Vec<u32>`.
 //! A 3-literal clause = 24 bytes, fitting comfortably in a single cache line.
-//! The 64-bit clause signature (BVE/subsumption bloom filter) lives in the
-//! `signatures` side table, NOT in the hot arena: BCP never reads it, and
-//! keeping it inline made every clause header 8 bytes larger (R2 slimming;
-//! kissat's header is 12 bytes with literals at +12).
+//! The 64-bit clause signature (BVE/subsumption bloom filter) is NOT stored
+//! at all: it is a pure function of the literals, the passes that consume it
+//! at volume build their own pass-local tables (see `Subsumer::sched_sigs`),
+//! and the remaining cold readers recompute on demand via `signature()`.
+//! The always-on `DetHashMap<u32, u64>` side table this replaces cost 570 MB
+//! on an 18M-clause load (32Mi buckets x 17 B) while BCP never read it.
 //! Reference: CaDiCaL `clause.hpp:31-122`, `arena.hpp:56-101`.
 //!
 //! # Direct-Offset Design (Step 2 of #3904)
@@ -94,7 +96,23 @@ pub(crate) const SCOPE_LIM_SHIFT: u32 = 14;
 pub(crate) const SCOPE_LIM_MAX: u16 = 3;
 
 /// Maximum value of the used counter (CaDiCaL internal.hpp:315).
+///
+/// This is the ceiling of the 5-bit `USED_MASK` bitfield and is the OFF-arm
+/// recency flag only. The two-stage clause-management score is a *frequency*
+/// counter and does NOT live here — see `MAX_TWO_STAGE_SCORE`.
 pub(crate) const MAX_USED: u8 = 31;
+
+/// Maximum value of the two-stage clause-management score
+/// (`solver/reduction_two_stage.rs`, arXiv:2602.20829).
+///
+/// The score is a frequency counter (`+1` per clause use, `-1` every `T`
+/// conflicts), so it needs range that the 5-bit `used` bitfield does not have:
+/// with the score packed into `used`, 84% of increments on a real instance
+/// were discarded at the ceiling (measured, `262a226a`: 7,370,546 of 8,727,945
+/// bumps). It therefore lives in the LOW half of header word 1 — the clause
+/// activity slot retired in #5132 — which nothing in production reads for a
+/// live clause, so the wider field costs ZERO extra bytes per clause.
+pub(crate) const MAX_TWO_STAGE_SCORE: u16 = u16::MAX;
 
 /// Arena capacity (in u32 words) above which `Vec`'s doubling is replaced by
 /// bounded-overshoot growth.
@@ -143,16 +161,24 @@ pub(crate) struct ClauseArena {
     /// (shorter) literal count, but the stride must span the original allocation.
     /// Cleared on `compact()`.
     shrink_map: DetHashMap<u32, u16>,
-    /// 64-bit clause signatures keyed by word offset (R2 header slimming).
+    /// Entry count the retired clause-signature side table WOULD have had.
     ///
-    /// Side metadata read only by cold passes (subsumption, BVE backward,
-    /// IC3 clause_subsumes) — BCP never touches it, so it lives outside the
-    /// hot arena. Maintained exactly like the pre-R2 inline signature words:
-    /// written on `add`/`replace`/`refresh_signature`, left in place on
-    /// `delete` (the inline words also survived deletion; no caller reads a
-    /// deleted clause's signature), and rebuilt with remapped offsets on
-    /// `compact_reorder`/`compact` (mirroring `shrink_map`'s GC handling).
-    signatures: DetHashMap<u32, ClauseSignature>,
+    /// The always-on `DetHashMap<u32, ClauseSignature>` signature table was
+    /// removed (570 MB on an 18M-clause load; subsumption/BVE now build
+    /// pass-local tables and cold readers recompute), but its capacity fed
+    /// `memory_bytes()`, which is the byte trigger behind `should_reduce_db`.
+    /// Dropping the charge would shift WHEN reduction fires and therefore the
+    /// search trajectory — the same exposure `accounted_words` pins for the
+    /// word buffer. So this counter tracks exactly what the map's `len()`
+    /// would have been (one entry per `add` since the last compaction — the
+    /// map keyed by offset, `replace` re-wrote existing keys, deletions left
+    /// entries in place, compaction rebuilt with live clauses only) and
+    /// `memory_bytes()` converts it through the hashbrown growth ladder
+    /// (`phantom_signature_table_capacity`) to reproduce the historical
+    /// charge bit-for-bit. Barrier test:
+    /// `phantom_signature_capacity_matches_dethashmap` fails if hashbrown's
+    /// growth policy ever drifts from the ladder.
+    phantom_signature_entries: usize,
     /// Accumulated dead words from deleted clauses. Gates arena compaction:
     /// compact when `dead_words > arena.len() / 4`. Reset on compaction.
     dead_words: usize,
@@ -179,6 +205,24 @@ pub(crate) struct ClauseArena {
     /// Re-seeded from the real capacity on compaction, which rebuilds `words`
     /// through `Vec`'s own growth in every build.
     accounted_words: usize,
+    /// Monotone "the live formula changed under you" counter
+    /// (#relevancy-frontier-incremental).
+    ///
+    /// Bumped by every mutation that can change an EXISTING clause's literal
+    /// set or its liveness — `delete`, `replace`, the garbage/pending-garbage
+    /// flag setters, `compact`/`compact_reorder`, and the `literals_mut` /
+    /// `set_literal` in-place literal writes. It is deliberately NOT bumped by
+    /// `add` (a pure append, detected by the arena word-length watermark) nor
+    /// by `swap_literals` (a permutation inside one clause, which no
+    /// set-valued consumer can observe) — the BCP watch swap goes through
+    /// `swap_literals` and must stay free of invalidation traffic.
+    ///
+    /// Consumers that cache a derived view of the LIVE formula read it as a
+    /// one-word staleness signal: the incremental relevancy frontier
+    /// (`solver/relevancy_frontier.rs`) keeps per-clause true-literal counts
+    /// and literal occurrence lists keyed by arena offset, both of which are
+    /// only valid while existing clauses hold still.
+    formula_epoch: u64,
 }
 
 /// `RawVec::MIN_NON_ZERO_CAP` for a 4-byte element: the floor `Vec` applies to
@@ -197,10 +241,11 @@ impl Clone for ClauseArena {
             learned_offsets: self.learned_offsets.clone(),
             learned_offset_index: self.learned_offset_index.clone(),
             shrink_map: self.shrink_map.clone(),
-            signatures: self.signatures.clone(),
+            phantom_signature_entries: self.phantom_signature_entries,
             dead_words: self.dead_words,
             has_oversized_clause: self.has_oversized_clause,
             accounted_words: self.accounted_words,
+            formula_epoch: self.formula_epoch,
         }
     }
 }
@@ -216,10 +261,11 @@ impl ClauseArena {
             learned_offsets: Vec::new(),
             learned_offset_index: DetHashMap::default(),
             shrink_map: DetHashMap::default(),
-            signatures: DetHashMap::default(),
+            phantom_signature_entries: 0,
             dead_words: 0,
             has_oversized_clause: false,
             accounted_words: 0,
+            formula_epoch: 0,
         }
     }
 
@@ -237,10 +283,11 @@ impl ClauseArena {
             learned_offsets: Vec::with_capacity(clause_hint / 4),
             learned_offset_index: DetHashMap::default(),
             shrink_map: DetHashMap::default(),
-            signatures: DetHashMap::default(),
+            phantom_signature_entries: 0,
             dead_words: 0,
             has_oversized_clause: false,
             accounted_words,
+            formula_epoch: 0,
         }
     }
 
@@ -361,6 +408,45 @@ impl ClauseArena {
         self.words.reserve_exact(want - self.words.len());
     }
 
+    /// Hand back the unused reservation in the literal store and the learned
+    /// index.
+    ///
+    /// `words` grows geometrically while a formula streams in, so it ends a
+    /// bulk load holding up to a full doubling of capacity it will never use
+    /// (662MB on the DtAx lowering of QF_DT/20210312-Bouvier/vlsat3_b99). That
+    /// slack is untouched address space physically, but the counting allocator
+    /// behind `--memory` charges REQUESTED bytes, so it is spent budget either
+    /// way. Call it once the formula is known complete.
+    ///
+    /// Cheap by construction: shrinking a `Vec` is a `realloc` down, which the
+    /// allocator accounts as a plain subtraction and normally satisfies in
+    /// place, so there is no transient holding the old and new buffers at once.
+    /// Only the two flat vectors are touched — the hash side tables
+    /// (`shrink_map`, `learned_offset_index`) would have to rehash every
+    /// entry, which costs more than the slack is worth.
+    ///
+    /// Deliberately does NOT touch `accounted_words`, for the same reason
+    /// [`Self::reserve_clauses`] does not: the clause-DB byte heuristic must
+    /// see `Vec`'s doubling ladder regardless of what is really allocated, or
+    /// the reduction cadence moves and the search trajectory with it. This
+    /// changes only how much address space is held, never what is stored, in
+    /// what order, or when reduction fires.
+    ///
+    /// No-op unless the slack is worth reclaiming, so a small formula never
+    /// pays a realloc for a few kilobytes.
+    pub(crate) fn shrink_words_to_fit(&mut self) {
+        const MIN_RECLAIM_BYTES: usize = 16 << 20;
+        let word_slack = (self.words.capacity() - self.words.len()) * size_of::<u32>();
+        if word_slack >= MIN_RECLAIM_BYTES {
+            self.words.shrink_to_fit();
+        }
+        let learned_slack =
+            (self.learned_offsets.capacity() - self.learned_offsets.len()) * size_of::<usize>();
+        if learned_slack >= MIN_RECLAIM_BYTES {
+            self.learned_offsets.shrink_to_fit();
+        }
+    }
+
     /// Add a new clause. Returns the word offset as `usize`.
     pub(crate) fn add(&mut self, lits: &[Literal], learned: bool) -> usize {
         debug_assert!(!lits.is_empty(), "BUG: ClauseArena::add() with 0 literals");
@@ -402,7 +488,6 @@ impl ClauseArena {
             self.has_oversized_clause = true;
         }
         let stored = &lits[..lit_len as usize];
-        let signature = compute_clause_signature(stored);
         // Grow deliberately rather than letting the pushes below double the
         // arena: exactly `HEADER_WORDS + lit_len` words are written here.
         self.reserve_words(HEADER_WORDS + lit_len as usize);
@@ -410,7 +495,9 @@ impl ClauseArena {
         self.words.push(0u32);
         let flags: u16 = if learned { LEARNED_BIT } else { 0 };
         self.words.push(2u32 | (u32::from(flags) << 16));
-        self.signatures.insert(offset as u32, signature);
+        // The retired signature side table inserted a fresh key per `add`;
+        // keep its would-be `len()` for the memory-heuristic charge.
+        self.phantom_signature_entries += 1;
         for lit in stored {
             self.words.push(lit.0);
         }
@@ -428,6 +515,7 @@ impl ClauseArena {
     #[inline]
     pub(crate) fn delete(&mut self, offset: usize) {
         debug_assert!(offset < self.words.len(), "BUG: delete out of bounds");
+        self.bump_formula_epoch();
         debug_assert!(
             self.lit_len_raw(offset) != 0,
             "BUG: delete on deleted clause"
@@ -462,6 +550,7 @@ impl ClauseArena {
 
     /// Replace a clause's literals in place (clause can only shrink).
     pub(crate) fn replace(&mut self, offset: usize, new_lits: &[Literal]) {
+        self.bump_formula_epoch();
         let current_len = self.lit_len_raw(offset);
         debug_assert!(!new_lits.is_empty(), "BUG: replace with empty literals");
         debug_assert!(
@@ -479,9 +568,7 @@ impl ClauseArena {
             // exactly (current_len - new_len) new dead words.
             self.dead_words += current_len as usize - new_lits.len();
         }
-        let signature = compute_clause_signature(new_lits);
         self.words[offset] = (self.words[offset] & 0xFFFF_0000) | (new_lits.len() as u32);
-        self.signatures.insert(offset as u32, signature);
         let base = offset + HEADER_WORDS;
         for (i, lit) in new_lits.iter().enumerate() {
             self.words[base + i] = lit.0;
@@ -490,13 +577,6 @@ impl ClauseArena {
         let mut f = self.flags(offset);
         f &= !(GARBAGE_BIT | PENDING_GARBAGE_BIT);
         self.set_flags(offset, f);
-    }
-
-    /// Recompute the cached literal signature after in-place literal mutation.
-    #[inline]
-    pub(crate) fn refresh_signature(&mut self, offset: usize) {
-        let signature = compute_clause_signature(self.literals(offset));
-        self.signatures.insert(offset as u32, signature);
     }
 
     /// Accumulated dead words from deleted clauses. Used to gate compaction:
@@ -509,6 +589,25 @@ impl ClauseArena {
     #[inline]
     pub(crate) fn dead_words(&self) -> usize {
         self.dead_words
+    }
+
+    /// The live-formula mutation epoch (see the `formula_epoch` field).
+    ///
+    /// A consumer caching per-offset state re-reads this each time it is used;
+    /// any change means "every existing clause may have moved, shrunk, died or
+    /// come back" and the cache must be rebuilt from `live_indices()`.
+    #[inline]
+    pub(crate) fn formula_epoch(&self) -> u64 {
+        self.formula_epoch
+    }
+
+    /// Record a live-formula mutation. `wrapping_add` is deliberate: a u64 that
+    /// wraps after 1.8e19 mutations cannot collide with a cached value inside
+    /// one process, and never panics under `overflow-checks = true` (which the
+    /// release profile enables).
+    #[inline]
+    pub(crate) fn bump_formula_epoch(&mut self) {
+        self.formula_epoch = self.formula_epoch.wrapping_add(1);
     }
 
     /// Allocated capacity of the arena backing store in u32 words.

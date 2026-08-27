@@ -309,7 +309,7 @@ fn refine_narrows_sqrt2_and_the_step_count_is_pinned_by_the_width() {
         let Refined::Narrowed(got) = out else {
             panic!("sqrt(2) is irrational; no midpoint can hit it");
         };
-        assert!(got.width().cmp_bq(&target) != Ordering::Greater);
+        assert_ne!(got.width().cmp_bq(&target), Ordering::Greater);
         assert!(trace.steps <= trace.bound);
         // The identity the oracle uses: width_end * 2^steps == width_start.
         assert_eq!(got.width().mul_two_pow(trace.steps), iv.width());
@@ -605,63 +605,4 @@ fn the_refine_step_bound_is_sufficient_including_at_equal_bit_lengths() {
     }
 }
 
-/// `select_non_root` must be SYMMETRIC under negation.
-///
-/// It used to start at `closest_to_zero` and step only upward. On a positive
-/// interval that start is the smallest interior integer, so the walk had room;
-/// on a WHOLLY NEGATIVE one it is the largest, so the first step left the
-/// interval and the scan made a SINGLE probe per level instead of the `deg + 1`
-/// its own completeness argument requires.
-///
-/// The polynomial below has its roots exactly at the points probed on
-/// `(-3, -1)`, so the truncated walk returned `None` while `-5/2`, `-11/4`,
-/// `-10/4`, `-9/4` and `-7/4` were all available. The oracle could not see it:
-/// its generator's polynomial is always a degree-3 `(x^2 - d)(x - r)`, which
-/// has far fewer roots than the scan has probe levels, so the single-probe path
-/// never ran out.
-#[test]
-fn select_non_root_is_symmetric_under_negation() {
-    // prod_j (x + 1 + 2^-j) for j = 0..=6 — roots at -1 - 2^-j, i.e. exactly
-    // the dyadic points the scan probes on (-3, -1).
-    let mut neg: Vec<BigInt> = vec![BigInt::from(1)];
-    for j in 0u32..=6 {
-        // factor (x + 1 + 2^-j), scaled by 2^j to stay integral: (2^j x + 2^j + 1)
-        let two_j = BigInt::from(1i64 << j);
-        let f = [&two_j + 1, two_j.clone()];
-        let mut out = vec![BigInt::zero(); neg.len() + 1];
-        for (i, c) in neg.iter().enumerate() {
-            out[i] += c * &f[0];
-            out[i + 1] += c * &f[1];
-        }
-        neg = out;
-    }
-    let iv_neg = BqInterval::new(bq(-3, 0), bq(-1, 0)).expect("lo < hi");
-    let got_neg = select_non_root(&neg, &iv_neg)
-        .expect("interior dyadic non-roots exist (-5/2, -11/4, -9/4, ...)");
-    assert_ne!(
-        poly_sign_at(&neg, &got_neg),
-        Some(0),
-        "answer must not be a root"
-    );
-    assert!(
-        iv_neg.lo().cmp_bq(&got_neg) == Ordering::Less
-            && got_neg.cmp_bq(iv_neg.hi()) == Ordering::Less,
-        "answer must be strictly interior"
-    );
-
-    // The mirrored polynomial on the mirrored interval must also answer. Before
-    // the fix this side succeeded while the negative side declined, and that
-    // asymmetry is the whole finding.
-    let pos: Vec<BigInt> = neg
-        .iter()
-        .enumerate()
-        .map(|(i, c)| if i % 2 == 1 { -c.clone() } else { c.clone() })
-        .collect();
-    let iv_pos = BqInterval::new(bq(1, 0), bq(3, 0)).expect("lo < hi");
-    let got_pos = select_non_root(&pos, &iv_pos).expect("mirror image must also answer");
-    assert_ne!(
-        poly_sign_at(&pos, &got_pos),
-        Some(0),
-        "answer must not be a root"
-    );
-}
+include!("mpbq_tests/selection_symmetry.rs");

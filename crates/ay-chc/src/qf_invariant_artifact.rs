@@ -474,21 +474,14 @@ impl ChcPdrProofRun {
     /// artifact. Every other evidence class returns a typed rejection.
     pub fn quantifier_free_invariant_model_artifact(
         &self,
-        problem: &ChcProblem,
     ) -> Result<ChcProofRunArtifact, ChcQfInvariantModelArtifactError> {
-        let VerifiedChcResult::Safe(invariant) = &self.result else {
+        let VerifiedChcResult::Safe(invariant) = self.result() else {
             return Err(ChcQfInvariantModelArtifactError::new(
                 ChcQfInvariantModelArtifactErrorReason::ResultNotSafe,
                 "only a Safe proof run carries an inductive invariant",
             ));
         };
-        let supplied_problem_hash = normalized_chc_input_sha256(problem);
-        if self.metadata.normalized_input_sha256 != supplied_problem_hash {
-            return Err(ChcQfInvariantModelArtifactError::new(
-                ChcQfInvariantModelArtifactErrorReason::ProblemHashMismatch,
-                "supplied problem does not match the sealed proof-run problem hash",
-            ));
-        }
+        let problem = self.problem();
         encode_qf_invariant_model_artifact(problem, invariant.model())
     }
 }
@@ -644,8 +637,8 @@ mod tests {
         let (problem, model) = fixture();
         let artifact = encode_qf_invariant_model_artifact(&problem, &model)
             .expect("complete QF model should serialize");
-        assert_eq!(artifact.schema, CHC_QF_INVARIANT_MODEL_ARTIFACT_SCHEMA);
-        assert_eq!(artifact.role, CHC_QF_INVARIANT_MODEL_ARTIFACT_ROLE);
+        assert_eq!(artifact.schema(), CHC_QF_INVARIANT_MODEL_ARTIFACT_SCHEMA);
+        assert_eq!(artifact.role(), CHC_QF_INVARIANT_MODEL_ARTIFACT_ROLE);
         let parsed = parse_qf_invariant_model_artifact(&problem, artifact.bytes())
             .expect("solver-owned bytes should parse strictly");
         assert_eq!(parsed.to_smtlib(&problem), model.to_smtlib(&problem));
@@ -779,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn producer_rejects_a_problem_different_from_the_sealed_run() {
+    fn producer_and_parser_remain_bound_to_the_solved_problem() {
         let input = r#"
 (set-logic HORN)
 (declare-fun Inv (Int) Bool)
@@ -795,9 +788,13 @@ mod tests {
 
         let different_problem = ChcParser::parse(&input.replace("(> x 10)", "(> x 11)"))
             .expect("different problem parses");
-        let error = run
-            .quantifier_free_invariant_model_artifact(&different_problem)
-            .expect_err("sealed run cannot be rebound to another problem");
+        let artifact = run
+            .quantifier_free_invariant_model_artifact()
+            .expect("sealed run should emit its own invariant artifact");
+        parse_qf_invariant_model_artifact(run.problem(), artifact.bytes())
+            .expect("artifact must replay against the stored solved problem");
+        let error = parse_qf_invariant_model_artifact(&different_problem, artifact.bytes())
+            .expect_err("artifact cannot replay against another problem");
         assert_eq!(
             error.reason,
             ChcQfInvariantModelArtifactErrorReason::ProblemHashMismatch

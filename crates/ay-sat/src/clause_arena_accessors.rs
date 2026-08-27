@@ -150,6 +150,8 @@ impl ClauseArena {
     #[inline]
     pub(crate) fn mark_garbage_keep_data(&mut self, offset: usize) {
         debug_assert!(offset < self.words.len(), "BUG: mark_garbage out of bounds");
+        // Liveness change: `live_indices()` stops yielding this offset.
+        self.bump_formula_epoch();
         debug_assert!(
             self.lit_len_raw(offset) != 0,
             "BUG: mark_garbage on already-deleted clause"
@@ -163,6 +165,7 @@ impl ClauseArena {
     /// internally through `delete()`, `replace()`, and `mark_garbage_keep_data()`.
     #[cfg(test)]
     pub(crate) fn set_garbage(&mut self, offset: usize, garbage: bool) {
+        self.bump_formula_epoch();
         let mut f = self.flags(offset);
         if garbage {
             f |= GARBAGE_BIT;
@@ -188,6 +191,9 @@ impl ClauseArena {
 
     #[inline]
     pub(crate) fn set_pending_garbage(&mut self, offset: usize, pending: bool) {
+        // Liveness change in BOTH directions: `is_garbage_any` covers the
+        // pending bit, and `mutate.rs` clears it to revive a clause.
+        self.bump_formula_epoch();
         let mut f = self.flags(offset);
         if pending {
             f |= PENDING_GARBAGE_BIT;
@@ -282,6 +288,46 @@ impl ClauseArena {
     pub(crate) fn decay_used(&mut self, offset: usize) {
         let current = self.used(offset);
         self.set_used(offset, current.saturating_sub(1));
+    }
+
+    /// Two-stage clause-management score (arXiv:2602.20829), 16 bits wide.
+    ///
+    /// # Where it lives, and why that is free
+    ///
+    /// The low half of header word 1 — the clause-activity slot retired in
+    /// #5132 (`activity()`/`set_activity()` are `#[cfg(test)]`). For a LIVE
+    /// clause nothing in production reads word 1 at all, so the field costs
+    /// **zero extra bytes per clause**: the arena header stays at
+    /// `HEADER_WORDS == 3`.
+    ///
+    /// Three interactions were checked and hold:
+    ///
+    /// - `delete()` overwrites the whole word with
+    ///   `(current_len << 16) | alloc_len`. Both halves are only ever read
+    ///   back while the clause is dead (`literals_or_deleted`, the arena walk
+    ///   stride, `compact`), and a dead clause has no score.
+    /// - `compact`/`compact_reorder` copy `HEADER_WORDS` verbatim, so the
+    ///   score survives GC and arena relocation unchanged.
+    /// - `replace()` (vivification/OTFS shrink) leaves word 1 alone, so an
+    ///   in-place strengthened clause keeps the score it earned.
+    ///
+    /// The OFF arm never touches this field; `used` remains the 5-bit
+    /// CaDiCaL recency flag it always was.
+    #[inline]
+    pub(crate) fn two_stage_score(&self, offset: usize) -> u16 {
+        (self.words[offset + 1] & 0xFFFF) as u16
+    }
+
+    #[inline]
+    pub(crate) fn set_two_stage_score(&mut self, offset: usize, val: u16) {
+        let w = offset + 1;
+        self.words[w] = (self.words[w] & 0xFFFF_0000) | u32::from(val);
+    }
+
+    #[inline]
+    pub(crate) fn decay_two_stage_score(&mut self, offset: usize) {
+        let current = self.two_stage_score(offset);
+        self.set_two_stage_score(offset, current.saturating_sub(1));
     }
 
     #[cfg(test)]
@@ -438,24 +484,20 @@ impl ClauseArena {
     }
 
     /// 64-bit clause signature (bloom filter over variables+polarity) for
-    /// subsumption/BVE pre-filtering. Lives in the `signatures` side table
-    /// since the R2 header slimming — BCP never reads it, so it is not worth
-    /// 8 bytes in every hot clause header.
+    /// subsumption/BVE pre-filtering, recomputed from the literals on every
+    /// call.
+    ///
+    /// Cold-path accessor only: the always-on signature side table was
+    /// removed (570 MB on an 18M-clause load). The volume consumers do not
+    /// come through here — forward subsumption builds a pass-local table
+    /// sized to its schedule (`Subsumer::sched_sigs`) and BVE backward
+    /// subsumption recomputes over the candidate literals it is already
+    /// touching. The remaining callers (IC3 `clause_subsumes`, tests) are
+    /// per-call cold paths. The signature is a pure function of the literals,
+    /// so this returns exactly what the side table stored.
     #[inline]
     pub(crate) fn signature(&self, offset: usize) -> ClauseSignature {
-        debug_assert!(
-            self.signatures.contains_key(&(offset as u32)),
-            "BUG: signature() on offset {offset} with no side-table entry"
-        );
-        // Every clause offset is produced by `add` (or remapped by compaction),
-        // both of which populate the side table, so the fallback is a
-        // release-mode safety net only. The signature is a pure function of the
-        // literals, so recomputing yields the same value `refresh_signature`
-        // would have stored.
-        self.signatures
-            .get(&(offset as u32))
-            .copied()
-            .unwrap_or_else(|| compute_clause_signature(self.literals(offset)))
+        compute_clause_signature(self.literals(offset))
     }
 
     /// Read the activity slot (header word 1) as f32. Test-only; clause activity
@@ -481,6 +523,7 @@ impl ClauseArena {
     /// Set a single literal by index. Test-only; production uses `literals_mut()`.
     #[cfg(test)]
     pub(crate) fn set_literal(&mut self, offset: usize, idx: usize, lit: Literal) {
+        self.bump_formula_epoch();
         self.words[offset + HEADER_WORDS + idx] = lit.0;
     }
 
@@ -540,6 +583,13 @@ impl ClauseArena {
     /// Zero-copy mutable literal slice. Same justification as `literals()`.
     #[inline]
     pub(crate) fn literals_mut(&mut self, offset: usize) -> &mut [Literal] {
+        // Conservative: the caller gets write access to the literal SET.
+        // (Watch reordering inside BCP goes through `swap_literals`, which is
+        // a permutation and deliberately does NOT bump — that keeps the BCP
+        // hot loop out of the invalidation traffic. The eight `literals_mut`
+        // call sites are all cold: inprocessing, subsumption, var compaction,
+        // clause mutation.)
+        self.bump_formula_epoch();
         let len = self.lit_len_raw(offset) as usize;
         let base = offset + HEADER_WORDS;
         bytemuck::cast_slice_mut(&mut self.words[base..base + len])
@@ -619,10 +669,19 @@ impl ClauseArena {
         let learned_offset_index_cap = self.learned_offset_index.len();
         #[cfg(not(kani))]
         let learned_offset_index_cap = self.learned_offset_index.capacity();
+        // Phantom charge for the RETIRED signature side table. The table is
+        // gone (subsumption/BVE build pass-local tables; cold readers
+        // recompute), but its capacity fed this heuristic, and this heuristic
+        // decides WHEN reduction fires. `phantom_signature_table_capacity`
+        // reproduces the `capacity()` the DetHashMap would report after
+        // `phantom_signature_entries` one-at-a-time inserts, so the trigger
+        // basis — and the search trajectory — do not move. Under `#[cfg(kani)]`
+        // the map was a BTreeMap whose `len()` stood in for capacity; the
+        // entry count reproduces that directly.
         #[cfg(kani)]
-        let signatures_cap = self.signatures.len();
+        let signatures_cap = self.phantom_signature_entries;
         #[cfg(not(kani))]
-        let signatures_cap = self.signatures.capacity();
+        let signatures_cap = phantom_signature_table_capacity(self.phantom_signature_entries);
         let shrink_map_bytes = 56 + shrink_map_cap.saturating_mul(size_of::<(u32, u16)>() + 1);
         // Signature side table (R2 header slimming): one (u32 offset, u64 sig)
         // entry per clause, 16 bytes with alignment padding + 1 control byte.
@@ -633,5 +692,35 @@ impl ClauseArena {
             + learned_offset_index_cap.saturating_mul(size_of::<(usize, usize)>() + 1);
         let fixed_fields = 64;
         words_bytes + shrink_map_bytes + signatures_bytes + learned_index_bytes + fixed_fields
+    }
+}
+
+/// `capacity()` a `DetHashMap` (hashbrown) reports after `len` one-at-a-time
+/// inserts of distinct keys into a `default()`-constructed map.
+///
+/// This is the growth pattern the retired clause-signature side table
+/// followed (`add` inserted a fresh offset key per clause; `replace`/refresh
+/// re-wrote existing keys; compaction rebuilt from empty with one insert per
+/// live clause), so feeding `phantom_signature_entries` through this ladder
+/// reproduces the historical `memory_bytes()` signature charge exactly.
+///
+/// hashbrown's usable capacity per power-of-two bucket count is
+/// `buckets - 1` for 4/8 buckets and `buckets * 7/8` from 16 up, and a full
+/// table doubles its buckets on the next insert — hence the ladder
+/// 0, 3, 7, 14, 28, 56, ... Pinned against the real container by the
+/// `phantom_signature_capacity_matches_dethashmap` barrier test.
+#[cfg(not(kani))]
+pub(crate) fn phantom_signature_table_capacity(len: usize) -> usize {
+    match len {
+        0 => 0,
+        1..=3 => 3,
+        4..=7 => 7,
+        _ => {
+            let mut cap = 14usize;
+            while cap < len {
+                cap *= 2;
+            }
+            cap
+        }
     }
 }

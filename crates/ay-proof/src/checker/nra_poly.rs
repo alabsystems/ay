@@ -849,13 +849,13 @@ pub(crate) fn extract_constraints(
         c.poly.collect_vars(&mut vars, meter)?;
     }
 
-    // ENTAILED range bounds for `bv2nat` opaque leaves: `0 <= bv2nat(x)` and
-    // `bv2nat(x) <= 2^w - 1` hold in EVERY model by the operator's
-    // definition, so adjoining them to the negated-clause system preserves
-    // soundness of the infeasibility check while making width-bound
+    // ENTAILED range bounds for `bv2nat` opaque leaves hold in EVERY model:
+    // `0 <= bv2nat(x)` and `bv2nat(x) <= 2^w - 1`. The global coefficient cap
+    // bounds both endpoints. By operator definition, adjoining these bounds
+    // preserves soundness of the infeasibility check while making width-bound
     // tautologies (`(<= (bv2nat sk) 2^64-1)`, the symbolic Seq index bound)
-    // decidable. Added only for leaves that actually survived into the
-    // constraint system, so the pass costs nothing when no `bv2nat` occurs.
+    // decidable. Add them only for leaves surviving into the constraint system,
+    // so the pass costs nothing when no `bv2nat` occurs.
     let mut range_constraints: Vec<Constraint> = Vec::new();
     for &var in &vars {
         let TermData::App(Symbol::Named(name), args) = terms.get(var) else {
@@ -867,7 +867,7 @@ pub(crate) fn extract_constraints(
         let Sort::BitVec(bv) = terms.sort(args[0]) else {
             continue;
         };
-        if u64::from(bv.width) > u64::try_from(MAX_POLY_COEFF_BITS).unwrap_or(u64::MAX) {
+        if u64::from(bv.width) > MAX_POLY_COEFF_BITS {
             continue;
         }
         meter.charge_ops(bit_scaled(2, u64::from(bv.width)))?;
@@ -892,7 +892,6 @@ pub(crate) fn extract_constraints(
             rel: Rel::Le,
         });
     }
-    let mut constraints = constraints;
     constraints
         .try_reserve(range_constraints.len())
         .map_err(|_| "nra bv2nat range-constraint allocation refused".to_string())?;

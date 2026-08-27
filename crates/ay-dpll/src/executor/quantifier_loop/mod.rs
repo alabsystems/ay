@@ -21,6 +21,7 @@ mod exact_array_negation;
 pub(crate) mod family_classifier;
 mod preprocess;
 mod quantifier_result;
+mod relevance_admit;
 mod skolem_witness;
 mod unsupported_arith;
 // Untrusted projection proposal plus independent semantic/source checking.
@@ -33,13 +34,12 @@ use ay_core::{Sort, TermData, TermId, TermStore};
 
 pub(in crate::executor) use exact_array_negation::ExactArrayNegationEvidence;
 pub(in crate::executor) use family_classifier::write_family_class_statistics;
+use quantifier_result::FiniteExpansionRecord;
 pub(in crate::executor) use quantifier_result::{
     ExactFiniteExpansionEvidence, QuantifierProcessingResult,
 };
 pub(in crate::executor) use result_mapping::CegqiUfRecompletionGrant;
 pub(in crate::executor) use unsupported_arith::unsupported_int_div_mod_mentions_ce_var;
-
-use quantifier_result::FiniteExpansionRecord;
 
 use super::Executor;
 use crate::ematching::{collect_quantifiers, contains_quantifier};
@@ -317,6 +317,58 @@ impl Executor {
     /// This modifies `self.ctx.assertions` in place: E-matching instantiations are added,
     /// CEGQI CE lemmas are appended, and quantified formulas are stripped. The original
     /// assertions are saved in the result for post-solve restoration.
+    /// Drop top-level clauses a sibling assertion already discharges, keeping
+    /// the rewrite only if it leaves no quantifier behind.
+    ///
+    /// Returns whether the problem is now ground. See the call site for why
+    /// this is sound and why it is all-or-nothing.
+    fn discharge_quantified_clauses_entailed_by_siblings(&mut self) -> bool {
+        let asserted: std::collections::HashSet<TermId> =
+            self.ctx.assertions.iter().copied().collect();
+
+        // Decide first, mutate second: the predicate reads `terms` while the
+        // decision is about `assertions`, and both live on `self.ctx`.
+        let keep: Vec<bool> = self
+            .ctx
+            .assertions
+            .iter()
+            .map(|&assertion| {
+                if !contains_quantifier(&self.ctx.terms, assertion) {
+                    return true;
+                }
+                match self.ctx.terms.get(assertion) {
+                    TermData::App(ay_core::Symbol::Named(name), disjuncts) if name == "or" => {
+                        // Entailed exactly when one disjunct is itself asserted.
+                        !disjuncts.iter().any(|d| asserted.contains(d))
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
+
+        if keep.iter().all(|&k| k) {
+            return false;
+        }
+
+        let pre_image = self.ctx.assertions.clone();
+        let mut index = 0;
+        self.ctx.assertions.retain(|_| {
+            let keep_this = keep[index];
+            index += 1;
+            keep_this
+        });
+
+        let now_ground = !self
+            .ctx
+            .assertions
+            .iter()
+            .any(|&a| contains_quantifier(&self.ctx.terms, a));
+        if !now_ground {
+            self.ctx.assertions = pre_image;
+        }
+        now_ground
+    }
+
     pub(in crate::executor) fn process_quantifiers(&mut self) -> QuantifierProcessingResult {
         // Reset the per-check-sat conflict-verification support set. It is
         // rebuilt below from THIS solve's e-matching so a stale root from a
@@ -342,6 +394,32 @@ impl Executor {
             .iter()
             .any(|&a| contains_quantifier(&self.ctx.terms, a));
         if !has_quantifiers {
+            return QuantifierProcessingResult::no_quantifiers();
+        }
+
+        // 1a. Drop quantified top-level clauses that a SIBLING top-level
+        // assertion already discharges, but only when doing so leaves the
+        // problem ground.
+        //
+        // A clause `(or d1 .. dn)` one of whose disjuncts `di` is itself
+        // asserted at top level is entailed by that assertion: every model of
+        // `di` satisfies the clause. Dropping it therefore removes no model
+        // and admits none — the two assertion sets are equisatisfiable in both
+        // directions, so this can manufacture neither a `sat` nor an `unsat`.
+        //
+        // It matters because such a clause can still CARRY a quantifier that
+        // constrains nothing. verification-consumer's ext_eq Tseitin encoding emits
+        // `(or (not ext_eq_N) (forall i. ...))`, and a query that also asserts
+        // the unit `(not ext_eq_N)` — which is exactly what a negated ext_eq
+        // does — leaves that forall vacuous. ay still saw it, judged its Int
+        // binder MBQI-unsafe for indexing an array, and degraded a perfectly
+        // decidable ground problem to `Unknown(QuantifierUnhandled)`.
+        //
+        // Deliberately all-or-nothing: the rewrite is kept only if it removes
+        // the LAST quantifier, because its whole purpose is to reach a ground
+        // decision. If quantifiers remain, the pre-image is restored and every
+        // path below runs byte-identically, so no existing behaviour moves.
+        if self.discharge_quantified_clauses_entailed_by_siblings() {
             return QuantifierProcessingResult::no_quantifiers();
         }
 

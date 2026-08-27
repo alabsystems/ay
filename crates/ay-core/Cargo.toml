@@ -10,6 +10,16 @@ readme.workspace = true
 [features]
 default = []
 cli = ["dep:clap"]
+# Compiles the fixture regenerators in `tests/serde_bignum_golden.rs` and
+# `tests/serde_bignum_parity.rs`. With the feature off they do not exist; with
+# it on they RUN. There is deliberately no environment variable and no
+# `#[ignore]` for this: the repository forbids both. The byte-for-byte gate
+# tests in those files are unconditional either way, so turning this on adds a
+# regenerator, it never removes a check.
+#
+#   cargo test -p ay-core --features regen-serde-fixtures \
+#       --test serde_bignum_golden regenerate_golden_fixture -- --nocapture
+regen-serde-fixtures = []
 
 [dependencies]
 clap = { workspace = true, optional = true }
@@ -27,6 +37,9 @@ ay-sys.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 serial_test.workspace = true
+# Only for tests/serde_bignum_golden.rs, which pins the on-disk encoding of the
+# bignum-bearing proof artifacts. ay-core itself does not depend on serde_json.
+serde_json.workspace = true
 
 [lints]
 workspace = true

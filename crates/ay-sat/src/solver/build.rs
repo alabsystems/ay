@@ -194,6 +194,7 @@ impl Solver {
             num_conflicts: 0,
             num_original_clauses: 0,
             chrono_enabled: true,
+            two_stage_clause_management: false,
             // Ghost literal guard is only needed when chrono-BT can actually fire.
             // Chrono-BT fires when decision_level - jump_level > CHRONO_LEVEL_LIMIT.
             // This requires decision_level > CHRONO_LEVEL_LIMIT, which requires
@@ -272,7 +273,9 @@ impl Solver {
             bucket_queue_active: false,
             domain_restarts: 0,
             relevancy_branching: false,
-            relevancy_buf: Vec::new(),
+            indep_support: Vec::new(),
+            indep_support_frozen: Vec::new(),
+            relevancy_frontier: relevancy_frontier::RelevancyFrontier::default(),
             relevancy_decisions: 0,
             relevancy_hard: false,
             wander_abort_armed: false,

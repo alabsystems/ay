@@ -10,6 +10,8 @@ use ay_core::{
     UNPROVED_STEP_RULE,
 };
 
+use crate::alethe_printer::ClauseSurfaceAgreement;
+
 /// Select the externally meaningful wire rule for one complete theory lemma.
 ///
 /// The pinned Alethe checker recognizes `lia_generic` but treats it as an
@@ -19,12 +21,31 @@ use ay_core::{
 /// annotation proves the clause in the checker's linear fragment and can be
 /// promoted to checked `la_generic`.
 ///
-/// Surface overrides are a hard barrier for both promotions. The validators
-/// reason about the internal term DAG, while an override changes the text the
-/// external checker reads. Refusing promotion whenever that channel is
-/// installed keeps the decision independent of presentation. Both the Alethe
-/// printer and the publication wire-gap gate consume this function with the
-/// same override state; neither may reconstruct the decision from
+/// Surface overrides are a hard barrier for both promotions whenever they
+/// CHANGE WHAT THIS CLAUSE SAYS. The validators reason about the internal term
+/// DAG, while an override changes the text the external checker reads; a
+/// promotion is honest exactly when those two agree, which
+/// [`crate::alethe_printer::clause_surface_agreement`] decides by re-rendering
+/// the clause without the channel.
+///
+/// Screening the whole document instead — refusing whenever the channel is
+/// installed at all — threw away checkable evidence for every clause the
+/// overrides never touched, which is how a composed authored root degraded an
+/// independently checked ground `evaluate` step to `hole`.
+///
+/// [`ClauseSurfaceAgreement::OrderReversed`] is the residual case that byte
+/// comparison over-refused. `TermStore::mk_gt`/`mk_ge` canonicalize an
+/// authored `(> t u)` into `(< u t)`, and the surface channel then re-spells
+/// that atom back to the problem's own `(> t u)` — the SAME atom, printed
+/// converse-first. There is nothing to reconcile semantically, so the Farkas
+/// promotion stands; the `evaluate` lowering is nevertheless withheld, because
+/// `format_lia_ground_evaluate` self-guards on byte-identical clause text and
+/// would silently fall back to a `hole` the gate had already granted. Keeping
+/// that arm on `Identical` is what keeps the two consumers exact.
+///
+/// Both the Alethe printer and the publication wire-gap gate consume THIS
+/// function with the same override state, so the narrowed test cannot drift
+/// between them; neither may reconstruct the decision from
 /// [`TheoryLemmaKind::alethe_wire_rule`] alone.
 #[must_use]
 pub fn promoted_wire_rule<'a>(
@@ -37,10 +58,13 @@ pub fn promoted_wire_rule<'a>(
     if !matches!(kind, TheoryLemmaKind::LiaGeneric) {
         return kind.alethe_wire_rule();
     }
-    if term_overrides.is_some() {
+    let agreement = crate::alethe_printer::clause_surface_agreement(terms, clause, term_overrides);
+    if agreement == ClauseSurfaceAgreement::Divergent {
         return UNPROVED_STEP_RULE;
     }
-    if lia_ground_evaluate_is_supported(terms, clause) {
+    if agreement == ClauseSurfaceAgreement::Identical
+        && lia_ground_evaluate_is_supported(terms, clause)
+    {
         return "evaluate";
     }
     let Some(farkas) = farkas else {
@@ -162,6 +186,133 @@ mod tests {
             ),
             UNPROVED_STEP_RULE,
             "a surface channel blocks the term-only promotion"
+        );
+    }
+
+    /// The AUTHORED spelling of a canonicalized order atom is the same atom.
+    ///
+    /// `mk_gt` interns `(> t u)` as `(< u t)`, and the surface channel then
+    /// re-spells that exact atom back to the problem's own `(> t u)`. Byte
+    /// comparison called that a changed clause and withheld a certificate AY
+    /// had already checked; same-atom comparison does not. Every NEAR miss
+    /// below still withholds it.
+    #[test]
+    fn authored_order_reversal_is_the_same_atom_and_keeps_the_certificate() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("wire_rev_x", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let lower = terms.mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+        let upper = terms.mk_app(Symbol::named("<"), [x, zero], Sort::Bool);
+        let clause = [terms.mk_not_raw(lower), terms.mk_not_raw(upper)];
+        let coefficients = FarkasAnnotation::from_ints(&[1, 1]);
+
+        // `(<= 0 wire_rev_x)` is exactly how `(>= wire_rev_x 0)` is interned.
+        let mut reversed = DetHashMap::default();
+        reversed.insert(lower, "(>= wire_rev_x 0)".to_string());
+        assert_eq!(
+            promoted_wire_rule(
+                &terms,
+                &TheoryLemmaKind::LiaGeneric,
+                &clause,
+                Some(&coefficients),
+                Some(&reversed),
+            ),
+            "la_generic",
+            "the authored converse spelling denotes the validated atom"
+        );
+
+        // Same operator, swapped arguments: a DIFFERENT atom.
+        let mut swapped = DetHashMap::default();
+        swapped.insert(lower, "(<= wire_rev_x 0)".to_string());
+        assert_eq!(
+            promoted_wire_rule(
+                &terms,
+                &TheoryLemmaKind::LiaGeneric,
+                &clause,
+                Some(&coefficients),
+                Some(&swapped),
+            ),
+            UNPROVED_STEP_RULE,
+            "an argument swap without the converse operator is another atom"
+        );
+
+        // Converse operator but the wrong STRICTNESS: `(<= 0 x)` reverses to
+        // `(>= x 0)`, never to `(> x 0)`.
+        let mut strictened = DetHashMap::default();
+        strictened.insert(lower, "(> wire_rev_x 0)".to_string());
+        assert_eq!(
+            promoted_wire_rule(
+                &terms,
+                &TheoryLemmaKind::LiaGeneric,
+                &clause,
+                Some(&coefficients),
+                Some(&strictened),
+            ),
+            UNPROVED_STEP_RULE,
+            "the converse spelling may not change strictness"
+        );
+
+        // Converse operator, converse order, but a RE-SPELLED operand.
+        let mut respelled = DetHashMap::default();
+        respelled.insert(lower, "(>= (+ wire_rev_x 1) 0)".to_string());
+        assert_eq!(
+            promoted_wire_rule(
+                &terms,
+                &TheoryLemmaKind::LiaGeneric,
+                &clause,
+                Some(&coefficients),
+                Some(&respelled),
+            ),
+            UNPROVED_STEP_RULE,
+            "argument reversal may not smuggle a re-spelled operand"
+        );
+    }
+
+    /// The classifier both consumers share, pinned outcome by outcome.
+    ///
+    /// `promoted_wire_rule` reads three distinct answers off this one call —
+    /// `Divergent` withholds everything, `Identical` additionally unlocks the
+    /// ground `evaluate` lowering (whose printer self-guards on byte-identical
+    /// clause text), `OrderReversed` unlocks only the certificate arm — so the
+    /// classifier is pinned directly rather than inferred from a wire name.
+    #[test]
+    fn clause_surface_agreement_separates_identity_reversal_and_divergence() {
+        use crate::alethe_printer::{clause_surface_agreement, ClauseSurfaceAgreement};
+
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("wire_agree_x", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let lower = terms.mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+        let clause = [terms.mk_not_raw(lower)];
+
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, None),
+            ClauseSurfaceAgreement::Identical,
+            "no channel is no change"
+        );
+
+        let mut identity = DetHashMap::default();
+        identity.insert(lower, "(<= 0 wire_agree_x)".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&identity)),
+            ClauseSurfaceAgreement::Identical,
+            "an identity spelling is no change"
+        );
+
+        let mut reversed = DetHashMap::default();
+        reversed.insert(lower, "(>= wire_agree_x 0)".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&reversed)),
+            ClauseSurfaceAgreement::OrderReversed,
+            "the authored converse spelling is the same atom"
+        );
+
+        let mut divergent = DetHashMap::default();
+        divergent.insert(lower, "(>= wire_agree_x 1)".to_string());
+        assert_eq!(
+            clause_surface_agreement(&terms, &clause, Some(&divergent)),
+            ClauseSurfaceAgreement::Divergent,
+            "a changed operand is a changed clause"
         );
     }
 }

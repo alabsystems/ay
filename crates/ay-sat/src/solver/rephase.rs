@@ -45,6 +45,33 @@ pub(super) fn nlogpow4(n: u64) -> u64 {
     ((n as f64) * factor).max(1.0) as u64
 }
 
+/// Active-clause ceiling above which `rephase_walk` declines to run.
+///
+/// Size gate (#shave9): `walk()` setup builds occurrence lists by iterating
+/// ALL active clauses twice — an O(clauses) fixed cost the tick budget does
+/// not cover, paid on EVERY rephase. The startup walk has long had a size gate
+/// (`try_walk`, 5M cap + density exception); the rephase walk had none, so
+/// million-clause incremental MaxSAT parts (protein: 2.5M binary hards) paid a
+/// repeated whole-DB scan for phase hints of marginal value on UNSAT-dominated
+/// core extraction (~3.4% of steady-state runtime profiled). Kissat/CaDiCaL
+/// amortize this differently (persistent occs / strict tick proportionality);
+/// until walk setup is incremental, skip the rephase walk on huge DBs.
+/// Stricter than the startup 5M cap because this cost repeats.
+///
+/// `--sat-large-rephase-walk` (default OFF, resolved into
+/// `cold.large_rephase_walk`) lifts the ceiling to kissat's own bound
+/// (`MAX_WALK_REF`, `walk.c:19-20`) for formulas in the very-large band, where
+/// this cap plus the wholesale rephase disablement in `solve/mod.rs` is what
+/// produces `walk_ms: 0` against kissat's several walks on the same input.
+pub(super) fn rephase_walk_clause_cap(large_rephase_walk: bool) -> usize {
+    const REPHASE_WALK_MAX_ACTIVE_CLAUSES: usize = 2_000_000;
+    if large_rephase_walk {
+        LARGE_REPHASE_WALK_MAX_ACTIVE_CLAUSES
+    } else {
+        REPHASE_WALK_MAX_ACTIVE_CLAUSES
+    }
+}
+
 impl Solver {
     /// Check if rephasing should be triggered based on conflict count.
     #[inline]
@@ -72,6 +99,13 @@ impl Solver {
             self.best_phase.len(),
             self.num_vars
         );
+
+        // A latched walk model is only valid for the rephase call that
+        // produced it: clear at entry so the pure-loop consumption sites
+        // (which read the latch immediately after `rephase()` returns) can
+        // never see a stale model from an earlier — possibly assumption- or
+        // theory-context — rephase.
+        self.cold.rephase_walk_model = None;
 
         // Select strategy based on current mode with independent counters.
         // CaDiCaL: `lim.rephased[stable]++` (rephase.cpp:131).
@@ -339,20 +373,9 @@ impl Solver {
             return 0;
         }
 
-        // Size gate (#shave9): walk() setup builds occurrence lists by
-        // iterating ALL active clauses twice — an O(clauses) fixed cost the
-        // tick budget does not cover, paid on EVERY rephase. The startup walk
-        // has long had a size gate (try_walk, 5M cap + density exception);
-        // the rephase walk had none, so million-clause incremental MaxSAT
-        // parts (protein: 2.5M binary hards) paid a repeated whole-DB scan
-        // for phase hints of marginal value on UNSAT-dominated core
-        // extraction (~3.4% of steady-state runtime profiled). Kissat/CaDiCaL
-        // amortize this differently (persistent occs / strict tick
-        // proportionality); until walk setup is incremental, skip the
-        // rephase walk on huge DBs. Stricter than the startup 5M cap because
-        // this cost repeats.
-        const REPHASE_WALK_MAX_ACTIVE_CLAUSES: usize = 2_000_000;
-        if self.arena.active_clause_count() > REPHASE_WALK_MAX_ACTIVE_CLAUSES {
+        if self.arena.active_clause_count() > rephase_walk_clause_cap(self.cold.large_rephase_walk)
+        {
+            self.stats.rephase_walk_gate_skips += 1;
             return 0;
         }
 
@@ -373,7 +396,8 @@ impl Solver {
         // lists and slows each walk step without proportional quality benefit.
         let filter = crate::walk::WalkFilter::irredundant_only();
 
-        crate::walk::walk(
+        let walk_start = ay_core::time::Instant::now();
+        let walk_sat = crate::walk::walk(
             &self.arena,
             self.num_vars,
             &mut self.phase,
@@ -383,6 +407,41 @@ impl Solver {
             tick_limit,
             filter,
         );
+        self.stats.rephase_walk_runs += 1;
+        self.stats.rephase_walk_ns = self
+            .stats
+            .rephase_walk_ns
+            .saturating_add(walk_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        if walk_sat {
+            self.latch_rephase_walk_model();
+        }
         0
+    }
+
+    /// The rephase walk satisfied EVERY included clause — honor the model
+    /// instead of discarding it (the success bool used to be dropped on the
+    /// floor). Mirrors the startup `try_walk` consumption (solve/mod.rs):
+    /// pre-verify the reconstructed candidate against the full clause DB
+    /// HERE, so a failed candidate silently falls through — routing an
+    /// unverified model into `declare_sat_from_model` would poison the solve
+    /// (`finalize_sat_fail_count`) on verification failure. The verified
+    /// candidate is LATCHED, not declared: `rephase()` also runs inside the
+    /// theory and assumption loops, where a CNF-only model is not a valid
+    /// answer. Only the pure CDCL loops consume the latch, immediately after
+    /// their `rephase()` call — they backtracked to level 0 before
+    /// rephasing, the same safe point the startup walk declares from.
+    fn latch_rephase_walk_model(&mut self) {
+        let candidate = self.get_model_from_phases();
+        let mut reconstructed = candidate.clone();
+        let reconstruction_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inproc.reconstruction.reconstruct(&mut reconstructed);
+        }))
+        .is_ok();
+        if reconstruction_ok && self.verify_model(&reconstructed) {
+            tracing::info!("rephase walk found a verified satisfying model");
+            self.cold.rephase_walk_model = Some(candidate);
+        } else if !reconstruction_ok {
+            tracing::warn!("rephase walk candidate reconstruction panicked");
+        }
     }
 }

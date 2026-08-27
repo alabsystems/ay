@@ -623,6 +623,9 @@ pub(crate) struct Factor {
     /// Pooled scratch: eligible clause indices for the current first-factor
     /// candidate (#rank5 — recycled through quotient-chain level 0).
     eligible_buf: Vec<usize>,
+    /// Pooled scratch: `(sorted-literal signature, position)` pairs for the
+    /// exact-duplicate source dedup in `try_candidate` (#dup-factor-poison).
+    dedup_keys: Vec<([u32; FACTOR_SIZE_LIMIT], u32)>,
     /// Pooled scratch: per-clause dedup marks for matrix extraction (#rank5 —
     /// replaces the O(n^2) `to_delete_set.contains` scan).
     delete_marks: Vec<bool>,
@@ -668,6 +671,7 @@ impl Factor {
             nounted: Vec::new(),
             cand_matches: Vec::new(),
             eligible_buf: Vec::new(),
+            dedup_keys: Vec::new(),
             delete_marks: Vec::new(),
             step_deleted: Vec::new(),
             schedule: std::collections::BinaryHeap::new(),
@@ -954,6 +958,24 @@ impl Factor {
             }
             eligible.push(ci);
         }
+        // Exact-duplicate copies of a clause poison quotient chains
+        // (#dup-factor-poison): `find_next_factor` counts candidate support
+        // once per SOURCE clause, so a duplicated pair fabricates
+        // MIN_FACTOR_MATCHES from what is really one clause and records the
+        // same partner arena index in multiple matrix cells; extraction then
+        // rejects the whole candidate (`to_delete_set.len() !=
+        // expected_delete` in the occ-rescan fallback), and on inputs whose
+        // duplicates touch every productive candidate the pass yields ZERO
+        // (mexam_17_15_2 raw: factor_count 0 vs 526 on a deduped copy;
+        // kissat dedups binaries in preprocessing and never sees this).
+        // Deduplicating the level-0 eligible list fixes counting for the
+        // whole chain: level k>0 entries are the first-recorded partners of
+        // pairwise-distinct sources with pairwise-distinct quotients, hence
+        // pairwise-distinct clauses. Duplicate PARTNERS were already safe
+        // (the NOUNTED mark counts only the first partner per source). The
+        // dropped copies stay untouched in the clause DB and occurrence
+        // lists — this dedups only the candidate's own view.
+        self.dedup_eligible_sources(clause_db, &mut eligible);
         if eligible.len() < MIN_FACTOR_MATCHES {
             self.eligible_buf = eligible;
             return None;
@@ -984,6 +1006,54 @@ impl Factor {
         }
 
         outcome
+    }
+
+    /// Drop all but the first (occurrence-order) copy of each exact-duplicate
+    /// clause from the eligible list (#dup-factor-poison, see the call site
+    /// in `try_candidate`). The signature is the sorted literal-index array,
+    /// exact for widths <= `FACTOR_SIZE_LIMIT` (guaranteed by the eligible
+    /// filter). No ticks are charged: the accounting tracks occurrence-list
+    /// element visits (chain.rs single-pass note) and this only re-reads
+    /// clauses whose occ entries were already charged by the caller; on
+    /// duplicate-free inputs the eligible list is returned unchanged, so
+    /// behavior there is identical.
+    fn dedup_eligible_sources(&mut self, clause_db: &ClauseArena, eligible: &mut Vec<usize>) {
+        if eligible.len() < 2 {
+            return;
+        }
+        let mut keys = std::mem::take(&mut self.dedup_keys);
+        keys.clear();
+        keys.reserve(eligible.len());
+        for (pos, &ci) in eligible.iter().enumerate() {
+            let lits = clause_db.literals(ci);
+            debug_assert!(
+                lits.len() <= FACTOR_SIZE_LIMIT,
+                "BUG: eligible clause wider than FACTOR_SIZE_LIMIT"
+            );
+            let mut key = [u32::MAX; FACTOR_SIZE_LIMIT];
+            let width = lits.len().min(FACTOR_SIZE_LIMIT);
+            for (slot, &lit) in key.iter_mut().zip(lits.iter()) {
+                *slot = lit.index() as u32;
+            }
+            key[..width].sort_unstable();
+            keys.push((key, pos as u32));
+        }
+        // Sort by (signature, position): the first entry of each equal-
+        // signature run is the earliest copy in occurrence order and is kept,
+        // so the surviving list order (and thus partner selection and match
+        // recording downstream) stays deterministic.
+        keys.sort_unstable();
+        let mut dropped = false;
+        for pair in keys.windows(2) {
+            if pair[1].0 == pair[0].0 {
+                eligible[pair[1].1 as usize] = usize::MAX;
+                dropped = true;
+            }
+        }
+        if dropped {
+            eligible.retain(|&ci| ci != usize::MAX);
+        }
+        self.dedup_keys = keys;
     }
 
     /// Pick the best quotient depth from a built chain and extract the

@@ -11,6 +11,28 @@ fn parse_no_error() {
 }
 
 #[test]
+fn success_marker_does_not_mask_failed_process() {
+    let out = "Model checking completed. No error has been found.\n";
+    assert_eq!(
+        parse_tlc_outcome(out, "", Some(1)),
+        TlcOutcome::ExecutionFailed { exit_code: Some(1) }
+    );
+    assert_eq!(
+        parse_tlc_outcome(out, "", None),
+        TlcOutcome::ExecutionFailed { exit_code: None }
+    );
+}
+
+#[test]
+fn explicit_failure_marker_takes_precedence_over_success_marker() {
+    let out = concat!(
+        "Model checking completed. No error has been found.\n",
+        "Error: Deadlock reached.\n",
+    );
+    assert_eq!(parse_tlc_outcome(out, "", Some(0)), TlcOutcome::Deadlock);
+}
+
+#[test]
 fn parse_deadlock() {
     let out = "Error: Deadlock reached.\n";
     assert_eq!(parse_tlc_outcome(out, "", Some(1)), TlcOutcome::Deadlock);

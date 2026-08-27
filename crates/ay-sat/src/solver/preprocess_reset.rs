@@ -495,6 +495,9 @@ impl Solver {
                     }
                 }
                 self.arena = ClauseArena::new();
+                // A fresh arena restarts `formula_epoch` at 0, so the epoch
+                // guard alone cannot see this; drop the frontier cache.
+                self.relevancy_frontier.invalidate();
                 // #inc-rebuild-reasons: the rebuild invalidates EVERY old
                 // arena offset (even preserved learned clauses get new
                 // indices below), but level-0 trail entries can still carry
@@ -524,9 +527,13 @@ impl Solver {
                     let idx = self.arena.add(clause, false);
                     // Assign clause ID unconditionally (#8197, #8069 Phase 2a).
                     if !self.cold.clause_ids_disabled {
-                        if idx >= self.cold.clause_ids.len() {
-                            self.cold.clause_ids.resize(idx + 1, 0);
-                        }
+                        // Split-borrow form: the ledger iteration above holds
+                        // `cold.original_ledger` borrowed.
+                        super::cold::ColdState::grow_clause_ids(
+                            &mut self.cold.clause_ids,
+                            self.cold.clause_ids_reserve_hint,
+                            idx,
+                        );
                         self.cold.clause_ids[idx] = (ordinal as u64) + 1;
                     }
                 }
@@ -561,9 +568,13 @@ impl Solver {
                     let idx = self.arena.add(clause, false);
                     // Assign clause ID unconditionally (#8197, #8069 Phase 2a).
                     if !self.cold.clause_ids_disabled {
-                        if idx >= self.cold.clause_ids.len() {
-                            self.cold.clause_ids.resize(idx + 1, 0);
-                        }
+                        // Split-borrow form: `clause` above borrows
+                        // `cold.original_ledger`.
+                        super::cold::ColdState::grow_clause_ids(
+                            &mut self.cold.clause_ids,
+                            self.cold.clause_ids_reserve_hint,
+                            idx,
+                        );
                         self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
                     }
 
@@ -596,6 +607,11 @@ impl Solver {
         self.conflict.clear(&mut self.var_data);
         self.var_data.fill(VarData::UNASSIGNED);
         self.bump_reason_graph_epoch();
+        // #relevancy-frontier-incremental: the incremental relevancy frontier
+        // folds a PREFIX of the trail; rewriting the trail outside backtrack
+        // invalidates that correspondence, so drop the cache (the next query
+        // rebuilds with the original from-scratch walk).
+        self.relevancy_frontier.invalidate();
         self.trail.clear();
         self.trail_lim.clear();
         self.decision_level = 0;
@@ -1379,9 +1395,7 @@ impl Solver {
                 // Add to arena even though it's unit (for consistency).
                 let idx = self.arena.add(&clause, false);
                 if !self.cold.clause_ids_disabled {
-                    if idx >= self.cold.clause_ids.len() {
-                        self.cold.clause_ids.resize(idx + 1, 0);
-                    }
+                    self.cold.clause_ids_grow_for(idx);
                     self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
                 }
                 continue;
@@ -1402,9 +1416,7 @@ impl Solver {
             let clause_len = clause.len();
             let idx = self.arena.add(&clause, false);
             if !self.cold.clause_ids_disabled {
-                if idx >= self.cold.clause_ids.len() {
-                    self.cold.clause_ids.resize(idx + 1, 0);
-                }
+                self.cold.clause_ids_grow_for(idx);
                 self.cold.clause_ids[idx] = (clause_idx as u64) + 1;
             }
 

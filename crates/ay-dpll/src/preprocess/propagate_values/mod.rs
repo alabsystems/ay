@@ -105,11 +105,45 @@ pub(crate) struct PropagatedEntrySource {
     pub(crate) stamp: u32,
 }
 
+/// One `EqDiffVar` atom fold `atom -> (= d rhs)` licensed by the DEFINITION
+/// `d := definiens` the pass asserted for its fresh symbol (#4751).
+///
+/// This is deliberately NOT a [`PropagatedEntrySource`]. That channel's
+/// license is an asserted defining equality the replay hands back verbatim;
+/// this one's license is a definitional extension over a symbol the problem
+/// never mentions, which the replay has to DERIVE — two `fresh_def_bound`
+/// steps plus a re-validated rational combination. Keeping the two channels
+/// apart is what stops the `PropagateValues` replay (and the c7 sealing lane,
+/// which drains only `rewrites`/`entries`) from ever reading one as the other.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EqDiffVarAtomRecord {
+    /// The AUTHORED equality atom the pass folded.
+    pub(crate) atom: TermId,
+    /// What it folded to: `(= d rhs)` in the term store's own argument order.
+    pub(crate) replacement: TermId,
+    /// The fresh symbol `d`.
+    pub(crate) definiendum: TermId,
+    /// The term the pass defined `d` by.
+    pub(crate) definiens: TermId,
+    /// Stamp, ordered against the `rewrites`/`entries` stamps.
+    pub(crate) stamp: u32,
+}
+
 /// Drained provenance of one solve's `PropagateValues` fixpoint run.
+///
+/// The `eq_diffvar_*` halves are carried here purely so they share the
+/// executor field's lifecycle (cleared per check-sat, saved and restored
+/// across nested-solve rollbacks) and the one stamp counter. They are
+/// consumed by a DIFFERENT lane and are invisible to every existing consumer.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PropagationRecords {
     pub(crate) rewrites: Vec<PropagatedRewriteRecord>,
     pub(crate) entries: Vec<PropagatedEntrySource>,
+    /// `EqDiffVar`'s in-place assertion rewrites, kept OUT of `rewrites` so
+    /// the `PropagateValues` replay's `after -> before` index is unchanged.
+    pub(crate) eq_diffvar_rewrites: Vec<PropagatedRewriteRecord>,
+    /// The atom folds those rewrites are made of.
+    pub(crate) eq_diffvar_atoms: Vec<EqDiffVarAtomRecord>,
 }
 
 /// Hard cap on retained provenance records; overflow withholds ALL records
@@ -138,7 +172,11 @@ impl PropagateValues {
         if self.records_overflowed || rewrites.is_empty() {
             return None;
         }
-        Some(PropagationRecords { rewrites, entries })
+        Some(PropagationRecords {
+            rewrites,
+            entries,
+            ..PropagationRecords::default()
+        })
     }
 
     /// First-wins `expr ↦ source_assertion` index over the harvested entry

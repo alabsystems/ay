@@ -17,6 +17,45 @@ pub(in crate::executor) use super::proof_farkas_synthesis::{
 use super::proof_farkas_validation::certificate_valid_for_blocking_clause;
 use super::proof_surface_syntax::strip_frontend_annotations;
 
+/// Collect every unsimplified equality available to clause reconstruction.
+fn collect_equality_assertions(
+    terms: &TermStore,
+    proof: &Proof,
+    assertions: &[TermId],
+    hidden_equality_assertions: &[TermId],
+) -> Vec<TermId> {
+    let mut equalities: Vec<TermId> = assertions
+        .iter()
+        .copied()
+        .filter(|&term| {
+            matches!(
+                terms.get(term),
+                TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2
+            )
+        })
+        .collect();
+    for &term in hidden_equality_assertions {
+        if !equalities.contains(&term) {
+            equalities.push(term);
+        }
+    }
+    // Deferred postprocessing can preserve equality assumptions that
+    // `ctx.assertions` holds only in simplified form.
+    for step in &proof.steps {
+        if let ProofStep::Assume(term) = step {
+            if !equalities.contains(term)
+                && matches!(
+                    terms.get(*term),
+                    TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2
+                )
+            {
+                equalities.push(*term);
+            }
+        }
+    }
+    equalities
+}
+
 /// Reconstruct missing Farkas coefficients for arithmetic theory lemmas (#6757).
 ///
 /// The post-rewrite promotion pass (`promote_generic_theory_lemma_kinds_after_rewrite`)
@@ -30,46 +69,30 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
     proof: &mut Proof,
     assertions: &[TermId],
     hidden_equality_assertions: &[TermId],
+    // #diagnostic-envelope: post-verdict proof REPAIR under the caller's solve
+    // controls. This is best-effort reconstruction, not a gate: every lemma it
+    // fails to certify is demoted to `Generic`/trust by the caller's
+    // `demote_uncertified_arithmetic_lemmas_to_trust` immediately afterwards,
+    // and a trust step is what makes a proof fail the strict presentation. So
+    // stopping early can only make the published proof LESS certified, never
+    // more — the fail-closed direction.
+    //
+    // MEASURED (`sample`, deductive-checks `datatype_ne_refutation::f_self_neq`, patched
+    // binary, 100% of the working thread): this loop, through
+    // `try_lra_farkas_reconstruction -> LraSolver::register_atom`, is the entire
+    // residual post-verdict cost of that obligation once the checker walks are
+    // bounded.
+    should_stop: &dyn Fn() -> bool,
 ) {
-    // Collect equality assertions for clause unsimplification (#6757).
-    // Combined-theory conflicts may record the linking equality as
-    // `Not(true)` when the assertion was simplified at the SAT level.
-    // The original assertion TermIds in ctx.assertions have the
-    // un-simplified equality.
     let true_id = terms.true_term();
-    let equality_assertions: Vec<TermId> = assertions
-        .iter()
-        .copied()
-        .filter(|&term| {
-            matches!(
-                terms.get(term),
-                TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2
-            )
-        })
-        .collect();
-    let mut equality_assertions = equality_assertions;
-    for &term in hidden_equality_assertions {
-        if !equality_assertions.contains(&term) {
-            equality_assertions.push(term);
-        }
-    }
-    // (#6759) Also scan proof Assume steps for equality terms. In the
-    // with_deferred_postprocessing path, provenance-aware assertions may
-    // include equalities not present in ctx.assertions (which holds
-    // simplified forms).
-    for step in proof.steps.iter() {
-        if let ProofStep::Assume(term) = step {
-            if !equality_assertions.contains(term)
-                && matches!(
-                    terms.get(*term),
-                    TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2
-                )
-            {
-                equality_assertions.push(*term);
-            }
-        }
-    }
+    let equality_assertions =
+        collect_equality_assertions(terms, proof, assertions, hidden_equality_assertions);
 
+    // Poll the caller's controls every `STOP_POLL_LEMMAS` candidate lemmas: one
+    // reconstruction attempt is a whole LRA solve, so this bounds detection
+    // latency to a few attempts without adding a poll to a hot inner loop.
+    const STOP_POLL_LEMMAS: usize = 16;
+    let mut examined: usize = 0;
     for step in &mut proof.steps {
         let ProofStep::TheoryLemma {
             kind,
@@ -83,6 +106,10 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
         if farkas.is_some() {
             continue;
         }
+        if examined.is_multiple_of(STOP_POLL_LEMMAS) && should_stop() {
+            break;
+        }
+        examined += 1;
         // Skip non-arithmetic theory lemma kinds that can never produce
         // Farkas coefficients (BV bit-blasting, pure EUF congruence).
         if matches!(

@@ -139,6 +139,15 @@ pub enum CertificateError {
         /// The column the split names.
         col: usize,
     },
+    /// An optimality certificate's primal witness is not a feasible point of
+    /// the model, or does not attain the claimed value. Without an attained
+    /// value the tree proves only that `value` is a valid BOUND, which is not
+    /// optimality.
+    #[error("optimality witness rejected: {msg}")]
+    WitnessRejected {
+        /// What was wrong with the witness.
+        msg: String,
+    },
     /// A tree certificate's leaf evidence failed under its branch bounds.
     #[error("leaf {index}: {error}")]
     LeafRejected {
@@ -387,8 +396,10 @@ impl OptimalityCertificate {
     /// The fifth hole — type conflation — cannot be closed here: a bound leaf
     /// must never be reachable as a `tree_cert::TreeNode`, because that type's
     /// `Ok(())` MEANS "the model has no feasible point". Keeping this function
-    /// out of `TreeNode` is the fix, and is why no variant was added there.
-    #[cfg(test)]
+    /// out of `TreeNode` is the fix, and is why no variant was added there --
+    /// the shipped consumer is [`crate::opt_cert::OptTreeNode::Dominated`], a
+    /// variant of a SEPARATE tree type whose `Ok(())` means "nothing here beats
+    /// `z_star`", never "nothing here is feasible".
     pub(crate) fn verify_bound_leaf(
         multipliers: &[Multiplier],
         model: &Model,

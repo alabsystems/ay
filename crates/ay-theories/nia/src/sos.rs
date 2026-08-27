@@ -302,91 +302,7 @@ impl core::fmt::Display for SosError {
     }
 }
 
-fn zero() -> BigRational {
-    BigRational::zero()
-}
-fn one() -> BigRational {
-    BigRational::one()
-}
-
-/// Orient a single constraint `p ⋈ 0` to a `g ⋈ 0` normal form with `g ≥ 0`,
-/// `g > 0`, or `g = 0`. Returns `None` for `≠` atoms (a disjunction, not a
-/// single nonnegative/zero atom).
-pub(crate) fn orient(c: &MultiConstraint) -> Option<(MultiPoly, OrientedKind)> {
-    match c.rel {
-        Rel::Ge => Some((c.poly.clone(), OrientedKind::Ge)),
-        Rel::Gt => Some((c.poly.clone(), OrientedKind::Gt)),
-        Rel::Le => Some((c.poly.neg(), OrientedKind::Ge)),
-        Rel::Lt => Some((c.poly.neg(), OrientedKind::Gt)),
-        Rel::Eq => Some((c.poly.clone(), OrientedKind::Eq)),
-        Rel::Ne => None,
-    }
-}
-
-/// Re-derive a certificate term's oriented polynomial and kind from the original
-/// constraints (used by the independent checker).
-fn derive_oriented(
-    origin: CertOrigin,
-    constraints: &[MultiConstraint],
-) -> Result<(MultiPoly, OrientedKind), SosError> {
-    match origin {
-        CertOrigin::Constraint(i) => {
-            let c = constraints.get(i).ok_or(SosError::BadConstraintIndex)?;
-            orient(c).ok_or(SosError::NotOrientable)
-        }
-        CertOrigin::Product(i, j) => {
-            let ci = constraints.get(i).ok_or(SosError::BadConstraintIndex)?;
-            let cj = constraints.get(j).ok_or(SosError::BadConstraintIndex)?;
-            let (gi, ki) = orient(ci).ok_or(SosError::NotOrientable)?;
-            let (gj, kj) = orient(cj).ok_or(SosError::NotOrientable)?;
-            if !ki.is_inequality() || !kj.is_inequality() {
-                return Err(SosError::NotOrientable);
-            }
-            let kind = if ki.is_strict() && kj.is_strict() {
-                OrientedKind::Gt
-            } else {
-                OrientedKind::Ge
-            };
-            Ok((gi.mul(&gj), kind))
-        }
-    }
-}
-
-/// The monomial `basis[a] · basis[b]` as a sorted `Vec<TermId>`.
-fn mono_product(a: &[TermId], b: &[TermId]) -> Vec<TermId> {
-    let mut m = Vec::with_capacity(a.len() + b.len());
-    m.extend_from_slice(a);
-    m.extend_from_slice(b);
-    m.sort_unstable();
-    m
-}
-
-/// Scale every coefficient of a polynomial by a rational.
-fn scale(p: &MultiPoly, k: &BigRational) -> MultiPoly {
-    if k.is_zero() {
-        return MultiPoly::zero();
-    }
-    let mut out = MultiPoly::zero();
-    for (m, c) in &p.terms {
-        out.add_term(m.clone(), c * k);
-    }
-    out
-}
-
-/// Expand `σ0 = basisᵀ Q basis` into a [`MultiPoly`].
-fn sigma0_poly(basis: &[Vec<TermId>], gram: &[Vec<BigRational>]) -> MultiPoly {
-    let mut out = MultiPoly::zero();
-    for (a, ba) in basis.iter().enumerate() {
-        for (b, bb) in basis.iter().enumerate() {
-            let q = &gram[a][b];
-            if q.is_zero() {
-                continue;
-            }
-            out.add_term(mono_product(ba, bb), q.clone());
-        }
-    }
-    out
-}
+include!("sos/certificate_polynomial.rs");
 
 /// Exact rational positive-semidefiniteness test via symmetric Schur-complement
 /// (LDLᵀ-style) elimination. No floating point: every pivot decision is an exact
@@ -924,6 +840,28 @@ fn try_template(
 /// feasible `x` if one exists. Standard two-phase artificial-variable Phase-1
 /// simplex with **Bland's rule** for guaranteed termination; all arithmetic is
 /// exact `BigRational`.
+///
+/// # Cost discipline (#nia-sos-lp-cost)
+///
+/// Every `BigRational` operation here heap-allocates and runs a `BigInt` gcd, so
+/// the two things that decide this routine's wall time are *how many* rational
+/// ops it performs and how many of them are on zeros. Two invariants keep that
+/// count near the algorithmic minimum, and **both are exact algebraic identities,
+/// so the pivot sequence and the returned vector are bit-identical to the naive
+/// formulation**:
+///
+/// 1. **The Phase-1 reduced-cost row is carried, not recomputed.** `d[j]` holds
+///    `rc(j) = c[j] − c_Bᵀ B⁻¹ A_j` and is updated by the same row operation as
+///    the tableau. Recomputing it per pivot (the obvious loop
+///    `for j { for i { if artificial(basis[i]) { rc -= t[i][j] } } }`) costs
+///    `O(m · total)` gcd-reducing subtractions *per pivot* — the same order as the
+///    pivot itself — purely to choose an entering column. Bland's rule reads the
+///    identical values either way, so it selects the identical column.
+/// 2. **Zeros in the pivot row are skipped.** `x − 0·y = x` and `0 / p = 0`, so
+///    the row-update and normalisation loops only touch the nonzero support of
+///    row `l`. Early tableaux are sparse (a column's nonzeros are the monomials
+///    its polynomial actually mentions), and the skipped operations would each
+///    allocate a `BigRational` to add nothing.
 #[allow(clippy::needless_range_loop)] // Tableau pivoting: index into rows/columns is intrinsic.
 fn lp_phase1_feasible(
     mut a: Vec<Vec<BigRational>>,
@@ -958,24 +896,43 @@ fn lp_phase1_feasible(
     // cost[k] = 1 for artificial columns, 0 otherwise (minimize Σ artificials).
     let is_artificial = |k: usize| k >= n;
 
+    // Carried Phase-1 reduced-cost row (invariant 1 above):
+    //   d[j] = cost[j] − Σ_{i : basis[i] artificial} t[i][j].
+    // Every basis slot starts artificial, so the initial sum spans all rows.
+    let mut d: Vec<BigRational> = Vec::with_capacity(total);
+    for j in 0..total {
+        let mut rc = if is_artificial(j) { one() } else { zero() };
+        for i in 0..m {
+            if !t[i][j].is_zero() {
+                rc -= &t[i][j];
+            }
+        }
+        d.push(rc);
+    }
+
+    // Pivot count, reported on the NIA debug channel. It is the number that says
+    // whether this LP is cheap-but-frequent or genuinely degenerate, and it is
+    // what refuted swapping Bland's rule for Dantzig's on the QF_SNIA
+    // symbolic-`mod` family: 22–27 pivots against m = 14 rows is already close to
+    // the floor, so there was no stall for a different entering rule to remove.
+    let mut pivots: usize = 0;
     loop {
         // Bland's rule: entering = smallest-index column with negative reduced
-        // cost. reduced_cost(j) = cost[j] − Σ_i cost[basis[i]] · t[i][j].
+        // cost. `d` already holds those reduced costs.
         let mut entering = None;
         for j in 0..total {
-            let cj = if is_artificial(j) { one() } else { zero() };
-            let mut rc = cj;
-            for i in 0..m {
-                if is_artificial(basis[i]) {
-                    rc -= &t[i][j];
-                }
-            }
-            if rc.is_negative() {
+            if d[j].is_negative() {
                 entering = Some(j);
                 break;
             }
         }
-        let Some(e) = entering else { break };
+        let Some(e) = entering else {
+            if ay_core::debug_channel_active(ay_core::DebugChannel::Nia) {
+                safe_eprintln!("[NIA] SOS LP pivots={pivots} m={m} n={n} total={total}");
+            }
+            break;
+        };
+        pivots += 1;
 
         // Ratio test with Bland tie-break (smallest leaving basis index).
         let mut leave: Option<usize> = None;
@@ -995,17 +952,35 @@ fn lp_phase1_feasible(
         }
         let l = leave?; // no positive pivot ⇒ unbounded (should not occur in Phase 1)
 
-        // Pivot on (l, e).
+        // Pivot on (l, e). Normalise row l, then eliminate column e from every
+        // other row AND from the carried cost row `d`.
         let piv = t[l][e].clone();
-        for j in 0..=total {
-            t[l][j] = &t[l][j] / &piv;
+        if !piv.is_one() {
+            for j in 0..=total {
+                // `0 / piv == 0`: skipping avoids an allocating divide.
+                if !t[l][j].is_zero() {
+                    t[l][j] = &t[l][j] / &piv;
+                }
+            }
         }
+        // Nonzero support of the normalised pivot row (invariant 2 above): every
+        // other index contributes `factor * 0 == 0` to the row update.
+        let nz: Vec<usize> = (0..=total).filter(|&j| !t[l][j].is_zero()).collect();
         for i in 0..m {
             if i != l && !t[i][e].is_zero() {
                 let factor = t[i][e].clone();
-                for j in 0..=total {
-                    let d = &factor * &t[l][j];
-                    t[i][j] -= d;
+                for &j in &nz {
+                    let delta = &factor * &t[l][j];
+                    t[i][j] -= delta;
+                }
+            }
+        }
+        if !d[e].is_zero() {
+            let factor = d[e].clone();
+            for &j in &nz {
+                if j < total {
+                    let delta = &factor * &t[l][j];
+                    d[j] -= delta;
                 }
             }
         }

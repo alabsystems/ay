@@ -143,3 +143,52 @@ fn bvand_zero_corrupted_conflict_is_neither_recognized_nor_strict_checkable() {
         ay_proof::check_proof_strict(&forged, &exec.ctx.terms)
     );
 }
+
+#[test]
+fn test_qf_bv_zero_test_duality_is_strict_checkable() {
+    // The DivZero/NullIfZero guard-carrier shape after the guards were
+    // re-phrased over `bvult`: the intended trap set is `(bvult lhs 1)` while
+    // the emitted x86 `E` condition tests `(= (bvand lhs lhs) 0)`. The
+    // zero-test duality leaf + the `format_bv_ult_one_zero_equiv` printer
+    // lowering must produce a hole-free pseudo-Boolean derivation.
+    let cases = [
+        // pure form
+        "(not (= (bvult x (_ bv1 4)) (= x (_ bv0 4))))",
+        // idempotent-gate form (the real guard-carrier obligation)
+        "(not (= (ite (bvult x (_ bv1 4)) (_ bv1 1) (_ bv0 1)) (ite (= (bvand x x) (_ bv0 4)) (_ bv1 1) (_ bv0 1))))",
+    ];
+    let wide_cases = [
+        // the SAME obligation at the production width, where no small-width
+        // tautology fold applies and the proof enters reconstruction
+        // structurally
+        "(not (= (ite (bvult y (_ bv1 32)) (_ bv1 1) (_ bv0 1)) (ite (= (bvand y y) (_ bv0 32)) (_ bv1 1) (_ bv0 1))))",
+    ];
+    for (body, decl) in cases
+        .iter()
+        .map(|b| (*b, "(declare-const x (_ BitVec 4))"))
+        .chain(wide_cases.iter().map(|b| (*b, "(declare-const y (_ BitVec 32))")))
+    {
+        let input = format!(
+            r#"
+            (set-option :produce-proofs true)
+            (set-logic QF_BV)
+            {decl}
+            (assert {body})
+            (check-sat)
+        "#
+        );
+        let commands = parse(&input).unwrap();
+        let mut exec = Executor::new();
+        let outputs = exec.execute_all(&commands).unwrap();
+        assert_eq!(outputs, vec!["unsat"], "{body} must be UNSAT");
+        let text = exec.get_proof();
+        assert!(
+            !text.contains(":rule hole") && !text.contains(":rule trust"),
+            "{body} must lower hole-free; got:\n{text}"
+        );
+        assert!(
+            text.contains("pbblast_bvult") && text.contains("la_disequality"),
+            "{body} must use the pseudo-Boolean zero-test template; got:\n{text}"
+        );
+    }
+}

@@ -27,13 +27,21 @@ The existing Git-LFS `pre-push` behavior is preserved (chained first).
 ## `pre-push` — MILP node ratchet (step 4)
 
 Then it rebuilds `ay-milp`'s `mps_solve` example and runs
-`scripts/milp_node_gate.py --check --tier all`: nineteen MIPLIB instances, EXACT
+`scripts/milp_node_gate.py --check --tier all`: twenty MIPLIB instances, EXACT
 node counts, objectives and statuses, pinned in `.milp_node_baseline.toml`.
 Models come from `~/ay-bench/milp-gate/instances`, which
 `scripts/milp_gate_corpus.py --build` reconstructs from the sha256s and upstream
 URLs in `.milp_gate_corpus.tsv`.
 
-**Cost:** 46.9 s wall for the whole `--check --tier all` (44.8 s of it solving;
+**Cost: 81.1 s** since 2026-08-26, when `qiu` (~35 s) was added — it is the only
+corpus instance that arms `FloatLp::tall_cold_dual`, so without it this gate
+reported `0 fail` against a build with that disjunct disarmed. Re-measured on
+one quiet box, one binary, both configurations: 42.0 s at nineteen instances,
+81.1 s at twenty. `--tier fast` is unchanged.
+
+The older number below is kept because the 44.8 s breakdown is still the sum of
+the recorded per-instance `wall_s` for those nineteen:
+46.9 s wall for the whole `--check --tier all` (44.8 s of it solving;
 the rest is 19 process starts and 19 MPS parses). Measured on a quiet box,
 aarch64-apple-darwin, release + `target-cpu=native`, `AY_MILP_THREADS=1`. Add a
 release build that is free when warm and ~2m15s cold. `--tier fast`

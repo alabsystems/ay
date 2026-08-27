@@ -1500,24 +1500,7 @@ impl PolyManager {
             return Some(self.mk_const(iu.gcd(&iv)));
         }
 
-        // The variable order the recursion eliminates in: smallest
-        // min-degree first, so the cheap variables are interpolated away
-        // before the expensive one becomes the univariate base case.
-        let mut all: Vec<PVar> = self.vars(u);
-        for x in self.vars(v) {
-            if !all.contains(&x) {
-                all.push(x);
-            }
-        }
-        let mut keyed: Vec<(u32, PVar)> = all
-            .iter()
-            .map(|&x| (self.degree(u, x).min(self.degree(v, x)), x))
-            .collect();
-        keyed.sort_unstable();
-        let vars: Vec<PVar> = keyed.iter().map(|&(_, x)| x).collect();
-        if vars.is_empty() {
-            return None;
-        }
+        let vars = self.mod_gcd_vars(u, v)?;
 
         let (ci_u, pp_u) = self.ic(u);
         let (ci_v, pp_v) = self.ic(v);
@@ -2465,6 +2448,8 @@ impl PolyManager {
     }
 }
 
+include!("polymanager/mod_gcd_support.rs");
+
 // ============================================================================
 // Z_p scalars and polynomials
 // ============================================================================
@@ -2539,7 +2524,7 @@ impl Zp {
     }
     /// Modular inverse by the extended Euclidean algorithm; `None` for `0`.
     fn inv(self, a: u64) -> Option<u64> {
-        if a % self.p == 0 {
+        if a.is_multiple_of(self.p) {
             return None;
         }
         let (mut old_r, mut r) = (a as i128 % self.p as i128, self.p as i128);

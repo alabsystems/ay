@@ -100,10 +100,10 @@ pub(super) fn install_bv_sat_interrupt(
                 let remaining = deadline - now;
                 let handle = std::thread::spawn(move || {
                     let (lock, cvar) = &*stop_clone;
-                    let guard = lock.lock().expect("deadline timer mutex poisoned");
+                    let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     let (guard, _) = cvar
                         .wait_timeout_while(guard, remaining, |stopped| !*stopped)
-                        .expect("deadline timer condvar wait failed");
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if !*guard {
                         flag.store(true, Ordering::Relaxed);
                     }
@@ -728,7 +728,7 @@ impl Executor {
             ) {
                 var_subst
                     .lock()
-                    .expect("variable substitution mutex poisoned during ABV budget setup")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .set_scalar_replacement_node_limit(VAR_SUBST_SCALAR_REPLACEMENT_NODE_LIMIT);
                 self.last_statistics
                     .set_int("smt.abv.variable_subst.scalar_budgeted", 1);
@@ -983,7 +983,7 @@ impl Executor {
         if let Some((ref var_subst, _)) = var_subst {
             let substitutions = var_subst
                 .lock()
-                .expect("variable substitution mutex poisoned during BV extra-root collection");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for &replacement in substitutions.substitutions().values() {
                 array_axiom_extra_roots.push(replacement);
             }
@@ -1615,6 +1615,8 @@ impl Executor {
                 total_vars,
             ));
 
+            self.arm_sat_conflict_budget(&mut solver, 0);
+
             // Use interruptible variant to respect timeout/interrupt (#3381)
             let should_stop = self.make_should_stop();
             let assume_result =
@@ -1759,15 +1761,14 @@ impl Executor {
         // loop to restart from scratch with the new clauses.
         let mut solve_result;
 
+        let mut spent = 0;
+
         if has_delayed_ops {
             let mut ds = delayed_state
                 .take()
                 .expect("delayed_state must exist when has_delayed_ops");
 
-            // First solve: no extension, just the original clauses.
-            let should_stop = self.make_should_stop();
-            let mut current_result = solver.solve_interruptible(should_stop).into_inner();
-            collect_sat_stats!(self, &solver);
+            let mut current_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
 
             // Re-check loop: verify delayed ops and add clauses as needed.
             const MAX_DELAYED_ITERATIONS: u32 = 32;
@@ -1894,9 +1895,8 @@ impl Executor {
                             fresh_solver.add_clause(clause);
                         }
 
-                        let should_stop = self.make_should_stop();
-                        current_result = fresh_solver.solve_interruptible(should_stop).into_inner();
-                        collect_sat_stats!(self, &fresh_solver);
+                        current_result =
+                            self.solve_sat_in_budget_chain(&mut fresh_solver, &mut spent);
                         solver = fresh_solver;
                         // Update total_vars so CEGAR loop doesn't collide.
                         total_vars = total_vars.max(new_total_vars as u32);
@@ -2063,9 +2063,7 @@ impl Executor {
                     fresh.add_clause(clause.clone());
                 }
 
-                let should_stop = self.make_should_stop();
-                current_result = fresh.solve_interruptible(should_stop).into_inner();
-                collect_sat_stats!(self, &fresh);
+                current_result = self.solve_sat_in_budget_chain(&mut fresh, &mut spent);
                 solver = fresh;
                 // Update total_vars so CEGAR loop doesn't collide.
                 total_vars = total_vars.max(new_total as u32);
@@ -2095,9 +2093,7 @@ impl Executor {
                 self.clause_db_bytes_limit,
                 total_vars,
             ));
-            let should_stop = self.make_should_stop();
-            solve_result = solver.solve_interruptible(should_stop).into_inner();
-            collect_sat_stats!(self, &solver);
+            solve_result = self.solve_sat_in_budget_chain(&mut solver, &mut spent);
             self.propagate_bv_unknown_reason(matches!(solve_result, SatResult::Unknown));
         }
 
@@ -2286,7 +2282,7 @@ impl Executor {
 
                 let substitutions = var_subst
                     .lock()
-                    .expect("variable substitution mutex poisoned during BV model recovery");
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let subs: Vec<(TermId, TermId)> = substitutions
                     .substitutions()
                     .iter()

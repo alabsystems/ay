@@ -54,6 +54,7 @@ mod residual;
 mod seq;
 pub mod sets;
 pub mod strings;
+mod unconstrained;
 
 #[cfg(test)]
 mod tests;
@@ -65,6 +66,7 @@ pub use projection::{
     CheckedProjectionImplication, CheckedProjectionUf, ProjectionCertificateRejection,
     ProjectionImplicationCandidate, ProjectionUfCandidate,
 };
+pub use unconstrained::ProvenUnconstrainedKind;
 
 /// Maximum compositional recursion depth before the evaluator fails closed.
 ///
@@ -313,32 +315,6 @@ pub(crate) fn pow2(width: u32) -> BigInt {
 // ===========================================================================
 // The model view the gate reads
 // ===========================================================================
-
-/// The exact theory case for which the evaluator has proved that an
-/// application's result is unconstrained.
-///
-/// This is evidence about the *input*, not permission supplied by a model. The
-/// independent evaluator constructs a variant only after it has evaluated the
-/// relevant operands and positively established the defining condition (a
-/// non-finite IEEE value or an exact zero divisor). A [`ModelView`] receives
-/// the reason only so it can recover an asserted/model-completion choice for
-/// that otherwise uncommitted application. The evaluator still validates the
-/// returned value's result sort before using it.
-///
-/// Generic applications, finite `fp.to_real`, and nonzero division never reach
-/// [`ModelView::proven_unconstrained_app_value`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ProvenUnconstrainedKind {
-    /// `fp.to_real` applied to a NaN or either infinity.
-    FpToRealNonFinite,
-    /// Real division `/` with an exactly zero divisor.
-    RealDivByZero,
-    /// Integer `div` with an exactly zero divisor.
-    IntDivByZero,
-    /// Integer `mod` with an exactly zero divisor.
-    IntModByZero,
-}
 
 /// Read-only access to a model, as seen by the gate.
 ///

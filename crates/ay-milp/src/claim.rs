@@ -28,9 +28,11 @@
 //! > routing must yield a verdict at least as strong AND evidence at least as
 //! > strong as `SolveOpts::with_structure_routing(false)` would have.
 //!
-//! [`may_close`] is that invariant, as one function, on the verdict-ending path.
-//! It is the only thing a new lane's author has to satisfy, and satisfying it
-//! requires no understanding of any of the thirteen certificate formats.
+//! [`may_close`] is that invariant, as one function, on the verdict-ending path
+//! for replay and other floor-declared lanes. Their authors satisfy this
+//! evidence contract without understanding the portfolio's certificate
+//! formats. Typed-certified arms instead have to cross their independently
+//! checked supplemental-proof boundary.
 //!
 //! # Two axes, and why evidence is per CLAIM
 //!
@@ -50,13 +52,14 @@
 
 //! # What this does NOT yet cover, stated plainly
 //!
-//! Four of the verdict-owning lanes declare a floor: `sat_relu`,
-//! `block_angular`, `direct_cnf`, and the PB portfolio's optimisation answers.
-//! The gate caught evidence losses in `sat_relu`, `direct_cnf`, and the PB
-//! portfolio; the block-angular route declares its floor as part of its
-//! initial integration. The rest of the routing prelude still publishes on
-//! its own authority, and the honest reading of that is: the invariant is
-//! ENFORCED where it is declared and ASSUMED everywhere else.
+//! `DECLARED` is the authoritative registry of verdict-owning lanes that
+//! pass through the evidence floor. It includes both route-specific policies
+//! and conservative replay-reduction rows shared by families whose exhaustive
+//! argument has no exported object. Typed-certified arms leave through their
+//! independently checked supplemental-proof gate instead. Any route absent
+//! from both mechanisms still publishes on its own authority, so the honest
+//! reading remains: the invariant is ENFORCED at declared gates and ASSUMED
+//! elsewhere.
 //!
 //! That is not a design position, it is a work boundary, and the two follow-ons
 //! are concrete:
@@ -64,13 +67,13 @@
 //! * add a row here for each remaining lane — most carry typed certificates and
 //!   will clear the floor trivially, which is exactly the cheap outcome a
 //!   registry is for;
-//! * close the SIDE CHANNEL. `cert_io::EmitCtx` still takes thirteen
-//!   `Option<&Certificate>` fields wired straight from `BabSession`, so the
+//! * close the SIDE CHANNEL. `cert_io::EmitCtx` still takes multiple typed
+//!   optional artifact fields wired straight from `BabSession`, so the
 //!   emitter can publish evidence the returned verdict never carried, and
-//!   `Outcome::trust` — which cannot see those fields — will describe a verdict
-//!   backed by a verified single-row DP refutation as "infeasibility with
-//!   neither a Farkas witness nor a tree certificate". Folding them into the
-//!   verdict is what would make the floor unbypassable rather than merely
+//!   `Outcome::evidence_shape` — which intentionally sees only outcome-resident
+//!   fields — reports a verdict backed by a verified single-row DP refutation as
+//!   lacking a Farkas or tree artifact. Folding the side-channel artifacts into
+//!   the verdict is what would make the floor unbypassable rather than merely
 //!   observed. Until then this module is a checked convention, not a proof.
 
 use crate::model::Model;
@@ -168,36 +171,37 @@ impl ClaimKind {
 ///   this cell took three tries to get right, so the wrong answers are recorded
 ///   with it.
 ///
-///   A zero-objective model makes no dual claim worth backing: every feasible
-///   point is optimal and the anchor's own emitter says so — on
+///   A model carrying no objective makes no dual claim worth backing: every
+///   feasible point is optimal and the anchor's own emitter says so — on
 ///   `W1_sat_v16_c39_000000` it writes `evidence dual NONE trivial-optcert`.
 ///   So `Ev::None`, and lanes that answer those models close immediately, which
 ///   is what keeps the ny ReLU class at its measured speed.
 ///
-///   With a real objective the anchor CAN export a checkable
-///   `OptimalityCertificate`, and it does: on the singleton-substitution model
+///   An objective-bearing model — including an explicitly supplied all-zero
+///   objective — lets the anchor export a checkable `OptimalityCertificate`,
+///   and it does: on the singleton-substitution model
 ///   `min x + z  s.t.  x + z = 1, z binary, x free`, the anchor writes
 ///   `evidence dual SUCCINCT optcert` while the routed default writes
 ///   `evidence dual REPLAY pb-portfolio-projection-optimal`. That downgrade is
 ///   present at HEAD, on the DEFAULT path, and it is a SECOND instance of the
 ///   `W1_unsat_v9_c14_000008` defect through a different lane. So `Ev::Succinct`.
 ///
-///   Two rejected drafts, recorded because each looked right: keying on
-///   `Outcome::trust`'s integrality split gives `Ev::None` here, which admits
-///   the downgrade above; keying on it the other way gives `Ev::Replay`, which
-///   would defer all thirteen fast OPTIMAL answers on the W1 corpus to buy
-///   evidence the anchor does not have. `has_objective` is the line the
-///   measurements actually fall on.
-/// * **`Infeasible`** — `Ev::Succinct` when a tree-certificate leaf budget is
-///   armed (`--tree-cert-leaves`, default 256) or a root Farkas row is
-///   reachable; `Ev::Replay` when the budget is switched off, because then the
-///   anchor emits a bare `Infeasible` and a REPLAY lane is not preempting
-///   anything. Confirmed by measurement in both directions: the anchor emits
-///   19,664 SUCCINCT bytes that `verify` accepts at exit 0 on
-///   `W1_unsat_v9_c14_000008`, and `Outcome::trust` calls that pairing
-///   `RimClosed`.
-/// * **`Unbounded`** — `Ev::None`. `Outcome::trust`: "unboundedness is reported
-///   without an exported ray". There is nothing here for a lane to lose.
+///   Two rejected drafts, recorded because each looked right: keying the cap on
+///   a public outcome's shape cannot express which certificate the anchor can
+///   still produce, while a blanket replay assumption would defer all thirteen
+///   fast OPTIMAL answers on the W1 corpus to buy evidence the anchor does not
+///   have. `has_objective` is the line the measurements actually fall on.
+/// * **`Infeasible`** — `Ev::Succinct`. A tree-certificate leaf budget can
+///   provide the artifact (default 256), and independently the post-tree root
+///   relaxation can attach an exact Farkas certificate even when that leaf
+///   budget is zero. This table is an upper bound on what is reachable, not a
+///   prediction for a particular model, so disabling one source cannot lower
+///   the cell while the other remains available. The anchor emits 19,664
+///   SUCCINCT bytes that `verify` accepts at exit 0 on
+///   `W1_unsat_v9_c14_000008`; `Outcome::evidence_shape` marks that pairing
+///   `FieldsPresent`, and `Outcome::check_against` performs the authoritative replay.
+/// * **`Unbounded`** — `Ev::None`. The public outcome has no exported ray, so
+///   there is nothing here for a lane to lose.
 ///
 /// This is an UPPER bound on the anchor, so [`may_close`]'s `floor >= cap` test
 /// is conservative in the sound direction: it can bar a lane that would in fact
@@ -208,8 +212,9 @@ impl ClaimKind {
 /// tree WILL close — only what evidence is structurally on the table if it
 /// does. A lane barred here is not discarded; it is DEFERRED behind the
 /// anchor's bounded first refusal (see [`AnchorFirstRefusal`]), so the cost of
-/// a conservative entry is bounded latency, never a lost verdict.
-pub(crate) fn anchor_cap(model: &Model, opts: &SolveOpts, claim: ClaimKind) -> Ev {
+/// a conservative entry is bounded latency; the raw conclusion is retained
+/// until caller-policy finalization.
+pub(crate) fn anchor_cap(model: &Model, _opts: &SolveOpts, claim: ClaimKind) -> Ev {
     match claim {
         ClaimKind::PointExists => Ev::Witness,
         ClaimKind::NoBetterThan => {
@@ -219,13 +224,7 @@ pub(crate) fn anchor_cap(model: &Model, opts: &SolveOpts, claim: ClaimKind) -> E
                 Ev::None
             }
         }
-        ClaimKind::Infeasible => {
-            if opts.tree_cert_leaves > 0 {
-                Ev::Succinct
-            } else {
-                Ev::Replay
-            }
-        }
+        ClaimKind::Infeasible => Ev::Succinct,
         ClaimKind::Unbounded => Ev::None,
     }
 }
@@ -364,12 +363,55 @@ pub(crate) const BLOCK_ANGULAR: LaneFloor = LaneFloor {
     floor: [Ev::Witness, Ev::Succinct, Ev::None, Ev::None],
 };
 
+/// Exact GF(2) enumeration optimum without an exported dual artifact.
+///
+/// The point is rechecked against the source model. A nontrivial optimality
+/// argument is retained as replay evidence and must stand behind an anchor
+/// certificate. Typed parity refutations use their model-bound artifact and do
+/// not pass through this row.
+pub(crate) const PARITY_OPTIMUM_REPLAY: LaneFloor = LaneFloor {
+    lane: "parity-optimum",
+    floor: [Ev::Witness, Ev::Replay, Ev::None, Ev::None],
+};
+
 /// `direct_cnf` — the layout-independent Boolean-clause route. Same evidence
 /// shape as [`SAT_RELU_FALLBACK`]: a lifted point is re-checked, while a
 /// refutation is a replay claim.
 pub(crate) const DIRECT_CNF: LaneFloor = LaneFloor {
     lane: "direct-cnf",
     floor: [Ev::Witness, Ev::None, Ev::Replay, Ev::None],
+};
+
+/// Exact specialized-PB reduction whose exhaustive argument is not exported.
+///
+/// These routes rebuild the source model in exact arithmetic and re-check any
+/// lifted point, so existence is witnessed. Their infeasibility and dual-bound
+/// arguments remain replay records, however: an internal exhaustive run is not
+/// a model-bound proof object. The shared row is intentionally conservative
+/// enough for every claim this lane can make; typed refutations bypass it only
+/// through an independently verified supplemental-proof policy gate.
+pub(crate) const SPECIALIZED_PB_REPLAY: LaneFloor = LaneFloor {
+    lane: "specialized-pb",
+    floor: [Ev::Witness, Ev::Replay, Ev::Replay, Ev::None],
+};
+
+/// Replay-only Hoffman-master decision after the model-bound network proof
+/// route declined. The master proof is not a source-model artifact.
+pub(crate) const NETWORK_DESIGN_REPLAY: LaneFloor = LaneFloor {
+    lane: "network-design-replay",
+    floor: SPECIALIZED_PB_REPLAY.floor,
+};
+
+/// Open-domain projection decision without a typed residual certificate.
+pub(crate) const OPEN_DOMAIN_REPLAY: LaneFloor = LaneFloor {
+    lane: "open-domain-replay",
+    floor: SPECIALIZED_PB_REPLAY.floor,
+};
+
+/// Hybrid PB/LP optimum without an exported dual-optimality artifact.
+pub(crate) const HYBRID_REPLAY: LaneFloor = LaneFloor {
+    lane: "hybrid-pb-lp-replay",
+    floor: SPECIALIZED_PB_REPLAY.floor,
 };
 
 /// `pb_route::try_solve_production_portfolio` — the bounded exact PB portfolio,
@@ -389,12 +431,12 @@ pub(crate) const DIRECT_CNF: LaneFloor = LaneFloor {
 /// A second copy of the flagship defect, found by the gate rather than by
 /// reading code.
 ///
-/// Its INFEASIBLE answers do not come through this floor — the typed single-row
-/// and multi-row artifacts are published on their own arms and are genuinely
-/// succinct.
+/// Typed single-row and multi-row refutations bypass this floor through their
+/// supplemental-proof gate. A rare bare exhaustion result does use this row
+/// and therefore remains replay evidence.
 pub(crate) const PB_PORTFOLIO: LaneFloor = LaneFloor {
     lane: "pb-portfolio",
-    floor: [Ev::Witness, Ev::Replay, Ev::Succinct, Ev::None],
+    floor: [Ev::Witness, Ev::Replay, Ev::Replay, Ev::None],
 };
 
 /// THE REGISTRY. Every lane that declares a floor appears here, and the
@@ -407,7 +449,12 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
     SAT_RELU_PROOF,
     SAT_RELU_FALLBACK,
     BLOCK_ANGULAR,
+    PARITY_OPTIMUM_REPLAY,
     DIRECT_CNF,
+    SPECIALIZED_PB_REPLAY,
+    NETWORK_DESIGN_REPLAY,
+    OPEN_DOMAIN_REPLAY,
+    HYBRID_REPLAY,
     PB_PORTFOLIO,
 ];
 
@@ -415,8 +462,8 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 // The anchor's bounded first refusal
 // ---------------------------------------------------------------------------
 
-/// How long the anchor gets to try for stronger evidence before a DEFERRED
-/// claim is published instead.
+/// How long the anchor gets to try for stronger evidence before a DEFERRED raw
+/// conclusion becomes the input to caller-policy finalization instead.
 ///
 /// # Why a bound at all, and why this one
 ///
@@ -424,12 +471,13 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 /// whether the anchor can do better on the EVIDENCE axis, and the only honest
 /// answer is to let it try for a while. Two properties make that safe:
 ///
-/// * **The verdict is timing-independent.** Whether or not the anchor finishes,
-///   the answer is the same verdict — the anchor's if it decides, the deferred
-///   claim's if it does not. The wall clock can therefore change only HOW MUCH
-///   PROOF comes back, never WHICH ANSWER. That is the whole determinism story
-///   and it is structural, not a knob — pinned by
-///   `the_verdict_does_not_depend_on_whether_the_floor_deferred`.
+/// * **The raw solver conclusion is retained.** Whether or not the anchor
+///   finishes, an agreeing conclusion survives — the anchor's if it decides,
+///   the deferred lane's if it does not. The caller's certificate policy is
+///   applied after that selection, so strict posture may turn a replay-only
+///   conclusion into `CertificateUnavailable`; timing may change exported
+///   evidence or that policy outcome, but never silently substitute a
+///   contradictory conclusion. This is pinned by the floor/posture tests.
 /// * **The loss is bounded and charged to the right place.** It is capped here,
 ///   not drawn from whatever the caller happened to allow.
 ///
@@ -461,12 +509,14 @@ pub(crate) const DECLARED: &[LaneFloor] = &[
 ///
 /// The cost is stated rather than buried: 4.8x total wall on this corpus,
 /// bought entirely on models the anchor cannot decide at all, where it spends
-/// the ceiling and the deferred refutation is then published unchanged. No
-/// verdict is lost anywhere. A consumer who wants the fast path back has two
-/// principled levers rather than a secret one: `--tree-cert-leaves 0` says "I
-/// do not want a tree certificate", which lowers [`anchor_cap`] and admits the
-/// refutation immediately, and `--anchor-first-refusal-ms` disables
-/// deferral outright.
+/// the ceiling and the deferred refutation is then finalized under the caller's
+/// certificate policy. The raw conclusion is never silently discarded; strict
+/// posture may honestly return `CertificateUnavailable` instead of publishing
+/// replay-only authority. A consumer who wants the fast path back can set
+/// `--anchor-first-refusal-ms 0`, which disables deferral outright.
+/// `--tree-cert-leaves 0` separately disables tree-certificate construction,
+/// but deliberately does not lower [`anchor_cap`] for infeasibility: the root
+/// LP may still supply a succinct Farkas certificate.
 ///
 /// A 2000 ms cap was tried and REJECTED, for a reason worth recording: on
 /// `W1_sat_v91_c217_000008` the anchor returns `INFEASIBLE` with a succinct
@@ -484,15 +534,14 @@ pub(crate) const ANCHOR_FIRST_REFUSAL_CAP: std::time::Duration = std::time::Dura
 /// `0` disables deferral outright, and that degenerate point is the whole
 /// reason the override exists: it turns "the portfolio dominates its fallback"
 /// from a claim about two programs into a property of ONE program with a
-/// parameter, which a differential test can assert per model.
+/// parameter, which a differential test can assert per model. Read it under
+/// the active attempt profile: this is a per-`SolveOpts` setting, never a
+/// process-global first-use choice.
 pub(crate) fn anchor_first_refusal_cap() -> std::time::Duration {
-    static CAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        crate::tune::count_opt(crate::tune::Knob::AnchorFirstRefusalMs)
-            .map_or(ANCHOR_FIRST_REFUSAL_CAP, |ms| {
-                std::time::Duration::from_millis(ms as u64)
-            })
-    })
+    crate::tune::count_opt(crate::tune::Knob::AnchorFirstRefusalMs)
+        .map_or(ANCHOR_FIRST_REFUSAL_CAP, |ms| {
+            std::time::Duration::from_millis(ms as u64)
+        })
 }
 
 /// Nonzero-work floor: below this the anchor cannot even get a root LP away, so
@@ -507,24 +556,29 @@ pub(crate) const ANCHOR_FIRST_REFUSAL_MIN: std::time::Duration =
 /// This is the "Tier C" position, and it is dominance BY CONSTRUCTION rather
 /// than by prediction:
 ///
-/// * if the anchor decides inside its slice, its verdict is published with the
-///   anchor's own (stronger-or-equal) evidence, and the deferred claim rides
-///   along in the replay ledger as corroboration;
-/// * if the anchor does not decide, the deferred claim is published — and the
-///   comparison there is `verdict` against `Unknown` and `Replay` against
-///   `None`, which is dominance on both axes with nothing predicted.
+/// * if the anchor decides inside its slice, its conclusion is selected with
+///   its artifacts and the deferred claim rides along in the replay ledger;
+///   the union is the evidence least upper bound before caller-policy output;
+/// * if the anchor does not decide, the deferred raw conclusion is finalized
+///   under caller certificate policy. Before that policy filter, the comparison
+///   is `verdict` against `Unknown` and `Replay` against `None`, which is
+///   dominance on both axes with nothing predicted.
 ///
-/// There is no third case. In particular there is no case in which the deferred
-/// claim is DISCARDED, which is what the greedy router did in reverse.
+/// There is no third case. In particular the deferred raw conclusion and its
+/// claims are never silently discarded before policy finalization, which is
+/// what the greedy router did in reverse.
 pub(crate) struct Deferred {
     /// The lane that produced it, for the trace and for the disagreement trap.
     pub(crate) lane: &'static str,
-    /// The verdict to publish if the anchor cannot do better.
+    /// The raw conclusion to finalize if the anchor cannot decide.
     pub(crate) outcome: crate::outcome::Outcome,
     /// Replay claims filed by the lane, held here rather than left in the
     /// thread-local ledger so they cannot cross-attribute to the anchor's
     /// verdict if the anchor wins. See [`LaneFrame`].
     pub(crate) replay_claims: Vec<crate::cert_io::ReplayClaim>,
+    /// The exact bounded anchor opportunity selected when this conclusion was
+    /// admitted. Storing it prevents later route work from resetting the cap.
+    pub(crate) first_refusal: AnchorFirstRefusal,
 }
 
 /// The anchor's slice for a deferred claim, and the reason it is a slice.
@@ -535,9 +589,9 @@ pub(crate) struct AnchorFirstRefusal {
 }
 
 impl AnchorFirstRefusal {
-    /// Compute the slice. `None` means "do not defer" — either there is no time
-    /// worth granting, or the caller's deadline is already the binding
-    /// constraint, in which case the anchor simply runs as it always would.
+    /// Compute the slice. `None` means "do not defer": there is no bounded time
+    /// worth granting. In particular, an unrepresentable relative cap with no
+    /// caller deadline cannot become an unlimited anchor attempt.
     pub(crate) fn plan(
         now: std::time::Instant,
         caller_deadline: Option<std::time::Instant>,
@@ -553,11 +607,13 @@ impl AnchorFirstRefusal {
         if cap_duration.is_zero() {
             return None;
         }
-        let cap = now + cap_duration;
-        let until = match caller_deadline {
-            Some(d) if d <= now => return None,
-            Some(d) => d.min(cap),
-            None => cap,
+        let cap = now.checked_add(cap_duration);
+        let until = match (caller_deadline, cap) {
+            (Some(deadline), _) if deadline <= now => return None,
+            (Some(deadline), Some(cap)) => deadline.min(cap),
+            (Some(deadline), None) => deadline,
+            (None, Some(cap)) => cap,
+            (None, None) => return None,
         };
         if until.saturating_duration_since(now) < ANCHOR_FIRST_REFUSAL_MIN {
             return None;
@@ -572,16 +628,16 @@ impl AnchorFirstRefusal {
 
 /// RAII guard around one lane's execution.
 ///
-/// `cert_io::ledger` is a THREAD-LOCAL and
-/// `parity::take_pending_infeasibility_certificate` is a process global. A lane
-/// that files evidence and then declines leaves that evidence sitting where the
-/// NEXT lane's verdict will pick it up. `lattice.rs` already hand-stashes and
-/// restores the ledger for exactly this reason, which is direct evidence that
-/// the channel is live rather than theoretical — and a portfolio that runs more
-/// lanes per solve makes cross-attribution strictly more likely, not less.
+/// `cert_io::ledger` is a THREAD-LOCAL. A lane that files evidence and then
+/// declines leaves that evidence sitting where the NEXT lane's verdict will
+/// pick it up. `lattice.rs` already hand-stashes and restores the ledger for
+/// exactly this reason, which is direct evidence that the channel is live
+/// rather than theoretical — and a portfolio that runs more lanes per solve
+/// makes cross-attribution strictly more likely, not less.
 ///
-/// Entering drains the ledger and holds it; dropping — including on unwind —
-/// restores whatever the caller had and hands back only what THIS lane filed.
+/// Entering drains the ledger and holds it. [`Self::take_lane_claims`] restores
+/// the caller's claims and returns only what THIS lane filed; dropping —
+/// including on unwind — discards the lane's claims and restores the caller's.
 /// A lane's evidence therefore cannot attach to a verdict the lane did not
 /// produce.
 pub(crate) struct LaneFrame {
@@ -696,28 +752,25 @@ mod tests {
         );
     }
 
-    /// Switching the leaf budget off lowers what the anchor can reach, so the
-    /// deferral must lift on its own. This is the gate behaving as a FILTER on
-    /// demanded evidence rather than as a lane switch — the property whose
-    /// absence produced the posture inversion.
+    /// Switching the leaf budget off does not remove the independent root
+    /// Farkas enrichment path, so the conservative reach ceiling stays typed.
     #[test]
-    fn disarming_the_leaf_budget_admits_the_refutation() {
+    fn disarming_the_leaf_budget_keeps_root_farkas_in_the_reach_ceiling() {
         let m = integral_model();
         let opts = SolveOpts::new().with_tree_cert_leaves(0);
-        assert_eq!(anchor_cap(&m, &opts, ClaimKind::Infeasible), Ev::Replay);
+        assert_eq!(anchor_cap(&m, &opts, ClaimKind::Infeasible), Ev::Succinct);
         assert!(
-            may_close(&SAT_RELU_FALLBACK, ClaimKind::Infeasible, &m, &opts),
-            "with no leaf budget the anchor emits a bare Infeasible, so the \
-             replay refutation preempts nothing"
+            !may_close(&SAT_RELU_FALLBACK, ClaimKind::Infeasible, &m, &opts),
+            "a replay refutation must not preempt a reachable root Farkas artifact"
         );
     }
 
-    /// The `NoBetterThan` cell is the one most likely to be got wrong by a
-    /// future author, because an `OptimalityCertificate` EXISTS on integral
-    /// models — it is just checked for non-crossing only, with the gap closed
-    /// by search. Pin both sides.
+    /// The `NoBetterThan` cell follows objective presence: without an objective
+    /// the claim is vacuous, while an objective-bearing integral model can
+    /// export a non-crossing `OptimalityCertificate`. Pin both sides on the
+    /// same integral shape.
     #[test]
-    fn dual_cap_splits_on_integrality_not_on_certificate_presence() {
+    fn dual_cap_splits_on_objective_presence() {
         let opts = SolveOpts::new();
         // No objective: the dual claim is vacuous and the emitter writes
         // `evidence dual NONE`. Lanes close immediately — this is what keeps
@@ -726,7 +779,7 @@ mod tests {
             anchor_cap(&integral_model(), &opts, ClaimKind::NoBetterThan),
             Ev::None,
         );
-        // A real objective: the anchor can export a checkable
+        // An objective: the anchor can export a checkable
         // `OptimalityCertificate`, so a lane whose optimality is an exhaustion
         // argument must stand behind it.
         let mut objective_bearing = integral_model();
@@ -734,6 +787,13 @@ mod tests {
         assert!(objective_bearing.has_objective());
         assert_eq!(
             anchor_cap(&objective_bearing, &opts, ClaimKind::NoBetterThan),
+            Ev::Succinct,
+        );
+        let mut explicit_zero = integral_model();
+        explicit_zero.set_objective(&[], crate::model::Sense::Minimize);
+        assert!(explicit_zero.has_objective());
+        assert_eq!(
+            anchor_cap(&explicit_zero, &opts, ClaimKind::NoBetterThan),
             Ev::Succinct,
         );
         assert!(
@@ -865,106 +925,7 @@ mod tests {
         }
     }
 
-    /// First refusal never extends the caller's budget, and never fires when
-    /// there is no budget worth granting.
-    #[test]
-    fn first_refusal_is_bounded_by_the_caller_and_by_the_model_cap() {
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let cap = ANCHOR_FIRST_REFUSAL_CAP;
-
-        // No caller deadline: the model-derived cap binds.
-        let plan = AnchorFirstRefusal::plan_with_cap(now, None, cap)
-            .expect("unlimited solve gets a slice");
-        assert_eq!(plan.until, now + cap);
-
-        // A tighter caller deadline binds instead. NEVER extended.
-        let tight = now + Duration::from_millis(300);
-        let plan = AnchorFirstRefusal::plan_with_cap(now, Some(tight), cap)
-            .expect("300ms is worth granting");
-        assert_eq!(plan.until, tight);
-
-        // A generous caller deadline does NOT buy a longer slice: speculation
-        // costs O(model), not O(deadline). This is the property whose absence
-        // made markshare_5_0 slower the more time it was given.
-        let generous = now + Duration::from_secs(600);
-        let plan =
-            AnchorFirstRefusal::plan_with_cap(now, Some(generous), cap).expect("plenty of time");
-        assert_eq!(plan.until, now + cap);
-
-        // Already expired, or too small to be worth anything: no deferral.
-        assert!(AnchorFirstRefusal::plan_with_cap(now, Some(now), cap).is_none());
-        assert!(
-            AnchorFirstRefusal::plan_with_cap(now, Some(now + Duration::from_millis(1)), cap)
-                .is_none()
-        );
-    }
-
-    /// THE DEGENERATE POINT. `--anchor-first-refusal-ms` switches
-    /// deferral off, which is what makes the dominance invariant checkable as a
-    /// property of ONE program with a parameter rather than as a claim about
-    /// two programs.
-    #[test]
-    fn a_zero_cap_disables_deferral_entirely() {
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        assert!(AnchorFirstRefusal::plan_with_cap(
-            now,
-            Some(now + Duration::from_secs(600)),
-            Duration::ZERO
-        )
-        .is_none());
-        assert!(AnchorFirstRefusal::plan_with_cap(now, None, Duration::ZERO).is_none());
-    }
-
-    /// `LaneFrame` must not let a declining lane's replay claim attach to
-    /// somebody else's verdict, and must not eat the caller's own pending
-    /// claims either.
-    #[test]
-    fn lane_frame_isolates_a_lanes_ledger_from_the_callers() {
-        fn claim(name: &str) -> crate::cert_io::ReplayClaim {
-            crate::cert_io::ReplayClaim {
-                claim: name.to_owned(),
-                device: "t".to_owned(),
-                method: "t".to_owned(),
-                arithmetic: "exact".to_owned(),
-                nodes_visited: None,
-                node_budget: 0,
-                outcome: "exhausted".to_owned(),
-                nondeterminism: Vec::new(),
-                reproduce: "t".to_owned(),
-                tcb: "t".to_owned(),
-            }
-        }
-        let _drain = crate::cert_io::ledger::take();
-
-        crate::cert_io::ledger::record(claim("caller"));
-        {
-            let frame = LaneFrame::enter();
-            crate::cert_io::ledger::record(claim("lane"));
-            let mine = frame.take_lane_claims();
-            assert_eq!(mine.len(), 1);
-            assert_eq!(mine[0].claim, "lane");
-        }
-        let after = crate::cert_io::ledger::take();
-        assert_eq!(after.len(), 1, "the caller's claim must survive the frame");
-        assert_eq!(after[0].claim, "caller");
-
-        // And a lane that DECLINES (frame dropped without harvest) must leave
-        // nothing behind for the next verdict to inherit.
-        crate::cert_io::ledger::record(claim("caller"));
-        {
-            let _frame = LaneFrame::enter();
-            crate::cert_io::ledger::record(claim("declined-lane"));
-        }
-        let after = crate::cert_io::ledger::take();
-        assert_eq!(
-            after.len(),
-            1,
-            "a declining lane's claim must not survive its frame"
-        );
-        assert_eq!(after[0].claim, "caller");
-    }
+    include!("claim/authority_tests.rs");
 
     /// `Col`/`ColKind` reachability check for `model_has_integrality`, which the
     /// dual cap depends on. Cheap, but the cap is load-bearing.

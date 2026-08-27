@@ -4180,6 +4180,7 @@ impl Executor {
             }
         }
         if let Some((idx, oracle, assertion)) = strict {
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
             self.last_statistics.model_validation_failures += 1;
             self.last_statistics
                 .set_int("model_validation.strict.assertion_index", idx as u64);
@@ -4827,6 +4828,7 @@ impl Executor {
             other => other,
         };
         if let Some((idx, oracle, assertion)) = strict_verdict {
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
                 self.last_rejected_array_assertion = Some(assertion);
@@ -5268,6 +5270,7 @@ impl Executor {
             other => other,
         };
         if let Some((idx, oracle, assertion)) = strict3 {
+            self.note_exact_ite_uf_definition_model_rejection(oracle);
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
                 self.last_rejected_array_assertion = Some(assertion);

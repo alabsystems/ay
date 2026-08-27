@@ -36,8 +36,8 @@ pub(crate) fn collect_assumptions_and_theory_lemmas(
     (assumptions, theory_lemmas)
 }
 
+pub(crate) mod boolean_closure;
 mod trust_closer;
-
 /// Try to derive the empty clause via a th_resolution chain (#340 Phase 0).
 pub(crate) fn try_derive_empty_via_th_resolution(terms: &TermStore, proof: &mut Proof) -> bool {
     let (assumptions, theory_lemmas) = collect_assumptions_and_theory_lemmas(proof);
@@ -660,15 +660,16 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
         })
         .collect();
 
-    // When the proof has no resolvable assumptions (e.g. an array read-over-
-    // write conflict recorded purely as single-literal theory lemmas with no
-    // Assume steps), anchor the trust closer to those theory-lemma conclusions
-    // instead. The lemmas already in the proof are the honest record of the
-    // theory conflict; resolving a trust lemma (whose clause is the negation of
-    // those conclusions) against them structurally derives the empty clause.
-    // This keeps `derive_empty_via_trust_lemma` a guaranteed final fallback for
-    // any proof that contains at least one unit-clause derivation.
-    if assumptions.is_empty() {
+    // #closer-derived-leaf-head. When the proof records no assume-family leaf
+    // at all (e.g. an array read-over-write conflict recorded purely as
+    // single-literal theory lemmas), the closer falls back to those
+    // theory-lemma CONCLUSIONS so the chain still has something to resolve
+    // against. That fallback is kept — but the head it produces is NOT a trust
+    // stub and must never be asserted as one; see the guard on
+    // `trust_closer::add_validated_head` below for the argument and the
+    // measurement.
+    let anchored_on_derived_lemmas = assumptions.is_empty();
+    if anchored_on_derived_lemmas {
         let mut seen: HashMap<TermId, ()> = HashMap::default();
         for (idx, step) in proof.steps.iter().enumerate() {
             if let ProofStep::TheoryLemma { clause, .. } = step {
@@ -681,6 +682,35 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
 
     if assumptions.is_empty() {
         return;
+    }
+
+    // #closer-derived-leaf-head, honest sub-case. A derived leaf whose clause
+    // is the Bool constant `false` needs no head at all: Alethe's own `false`
+    // rule proves `(cl (not false))` and one resolution against that leaf is
+    // the empty clause. Every step of that closure is strict-checkable, so the
+    // route below — which asserts an unproved head — must never be taken when
+    // this one applies.
+    //
+    // Scoped to the derived-leaf route on purpose: the assume-family route
+    // already has a licensed head and is left byte-identical.
+    if anchored_on_derived_lemmas {
+        if let Some(&(false_id, false_term)) = assumptions.iter().find(|&&(_, term)| {
+            matches!(
+                terms.get(term),
+                TermData::Const(ay_core::term::Constant::Bool(false))
+            )
+        }) {
+            let not_false = terms.mk_not_raw(false_term);
+            let tautology =
+                proof.add_rule_step(AletheRule::False, vec![not_false], Vec::new(), Vec::new());
+            proof.add_step(ProofStep::Step {
+                rule: AletheRule::Resolution,
+                clause: Vec::new(),
+                premises: vec![tautology, false_id],
+                args: Vec::new(),
+            });
+            return;
+        }
     }
 
     // #trust-lemma-dup-assume — the SAME term can be collected more than once
@@ -719,7 +749,47 @@ pub(crate) fn derive_empty_via_trust_lemma(terms: &mut TermStore, proof: &mut Pr
         })
         .collect();
 
-    let lemma_id = trust_closer::add_head(terms, proof, &negated_clause);
+    // FAIL CLOSED on a head with no assume-family anchor.
+    //
+    // The head is the claim "these leaves are jointly inconsistent". Over the
+    // assume-family leaves that claim is the solve's own UNSAT verdict about
+    // the recorded problem, so `Generic`/trust is the honest label for it. Over
+    // DERIVED unit `TheoryLemma` conclusions there is no such verdict to
+    // restate: the same proof asserts each of those leaves as theory-valid, a
+    // set of theory-valid clauses holds in every model, and so the head is
+    // FALSE in every model. Emitting it published a REFUTABLE step into the
+    // artifact and left it for a validator not to look at.
+    //
+    // So on that route the closer may only emit a head the CHECKER'S OWN
+    // recognizers re-derive from the clause alone. When none does, it records
+    // the honest shape instead — a terminal empty-clause `trust` step — which
+    // claims exactly what the solve claims and nothing about any theory. That
+    // is strictly weaker than what was published before: the strict checker
+    // rejects it (`TrustStep`), the deferred lane COLLECTS it as an obligation
+    // (`checker::step_validation`), and the only thing that can discharge an
+    // empty trust clause is an independent re-decision of the AUTHORED
+    // assertions (`api::proofs::discharge_trust_clause`'s empty-clause arm, or
+    // the whole-problem re-solve at step (4) of the certification funnel).
+    let lemma_id = if anchored_on_derived_lemmas {
+        let Some(validated) = trust_closer::add_validated_head(terms, proof, &negated_clause)
+        else {
+            // No authority for a head over these leaves. Record the HONEST
+            // shape instead of a false one: a terminal empty-clause `trust`
+            // step, which says "this proof does not derive the empty clause;
+            // the verdict is the solve's own claim". That is a first-class,
+            // already-supported obligation — `checker::step_validation` defers
+            // it into the collected set and `api::proofs::discharge_trust_clause`
+            // has a dedicated arm for the empty clause that re-decides the
+            // AUTHORED assertions independently — so nothing here is accepted
+            // on this proof's say-so, and no refutable clause enters the
+            // artifact.
+            proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+            return;
+        };
+        validated
+    } else {
+        trust_closer::add_head(terms, proof, &negated_clause)
+    };
 
     let mut current_clause = negated_clause;
     let mut current_id = lemma_id;

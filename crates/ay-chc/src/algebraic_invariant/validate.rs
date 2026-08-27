@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-use super::conjoin;
+use super::{conjoin, SynthesisBudget};
 use crate::expr::{maybe_grow_expr_stack, MAX_EXPR_RECURSION_DEPTH};
 use crate::pdr::cube::is_trivial_contradiction;
 use crate::pdr::model::InvariantModel;
@@ -2302,7 +2302,13 @@ fn bool_var_name(expr: &ChcExpr) -> Option<&str> {
 #[allow(dead_code)] // exposed for future test callers
 pub(super) fn validate_model(problem: &ChcProblem, model: &InvariantModel) -> bool {
     matches!(
-        validate_model_with_algebraic_fallback(problem, model, &FxHashSet::default(), false, None,),
+        validate_model_with_algebraic_fallback(
+            problem,
+            model,
+            &FxHashSet::default(),
+            false,
+            &SynthesisBudget::unbounded(),
+        ),
         AlgebraicValidationResult::Valid,
     )
 }
@@ -2313,14 +2319,14 @@ pub(super) fn validate_model_with_algebraic_fallback(
     model: &InvariantModel,
     _algebraic_self_loop_preds: &FxHashSet<PredicateId>,
     verbose: bool,
-    deadline: Option<Instant>,
+    budget: &SynthesisBudget,
 ) -> AlgebraicValidationResult {
     validate_model_with_algebraic_fallback_and_stats(
         problem,
         model,
         _algebraic_self_loop_preds,
         verbose,
-        deadline,
+        budget,
     )
     .0
 }
@@ -2330,12 +2336,12 @@ pub(super) fn validate_model_with_algebraic_fallback_and_stats(
     model: &InvariantModel,
     _algebraic_self_loop_preds: &FxHashSet<PredicateId>,
     verbose: bool,
-    deadline: Option<Instant>,
+    budget: &SynthesisBudget,
 ) -> (AlgebraicValidationResult, AlgebraicValidationStats) {
     let mut smt = problem.make_smt_context();
     let mut stats = AlgebraicValidationStats::default();
     let result =
-        validate_model_with_smt_and_stats(problem, model, verbose, deadline, &mut smt, &mut stats);
+        validate_model_with_smt_and_stats(problem, model, verbose, budget, &mut smt, &mut stats);
     (result, stats)
 }
 
@@ -2350,8 +2356,14 @@ pub(super) fn validate_model_with_forced_results_for_tests(
         smt.push_forced_check_sat_result_for_tests(result);
     }
     let mut stats = AlgebraicValidationStats::default();
-    let result =
-        validate_model_with_smt_and_stats(problem, model, false, None, &mut smt, &mut stats);
+    let result = validate_model_with_smt_and_stats(
+        problem,
+        model,
+        false,
+        &SynthesisBudget::unbounded(),
+        &mut smt,
+        &mut stats,
+    );
     (result, stats)
 }
 
@@ -2359,7 +2371,7 @@ fn validate_model_with_smt_and_stats(
     problem: &ChcProblem,
     model: &InvariantModel,
     verbose: bool,
-    deadline: Option<Instant>,
+    budget: &SynthesisBudget,
     smt: &mut SmtContext,
     stats: &mut AlgebraicValidationStats,
 ) -> AlgebraicValidationResult {
@@ -2367,14 +2379,12 @@ fn validate_model_with_smt_and_stats(
     for clause in problem.clauses() {
         // #8753: bail out if the outer algebraic deadline has elapsed so the
         // adaptive portfolio can hand control to PDR/IMC/TPA/LAWI.
-        if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
-                if verbose {
-                    safe_eprintln!("Algebraic: validation deadline exceeded, bailing out (#8753)");
-                }
-                stats.record_unknown();
-                return AlgebraicValidationResult::DeadlineExceeded;
+        if budget.expired() {
+            if verbose {
+                safe_eprintln!("Algebraic: validation deadline exceeded, bailing out (#8753)");
             }
+            stats.record_unknown();
+            return AlgebraicValidationResult::DeadlineExceeded;
         }
 
         let mut body_conjuncts: Vec<ChcExpr> = Vec::new();
@@ -2447,9 +2457,28 @@ fn validate_model_with_smt_and_stats(
                 <= ALGEBRAIC_FASTPATH_NODE_CAP;
 
         if fastpath_ok
-            && validation_body_syntactically_implies_head(&body_formula, &head_formula, verbose)
+            && validation_body_syntactically_implies_head(
+                &body_formula,
+                &head_formula,
+                verbose,
+                budget,
+            )
         {
             continue;
+        }
+
+        // #9110: the syntactic fast path above declines (returns `false`)
+        // rather than finishing when the budget trips mid-scan, so re-check
+        // here: without this the clause would still pay for `check`
+        // construction and a `simplify_constants` pass over the whole
+        // body-and-negated-head formula before the pre-query check below
+        // noticed. Bailing out yields `DeadlineExceeded`, never a verdict.
+        if budget.expired() {
+            if verbose {
+                safe_eprintln!("Algebraic: validation deadline exceeded in fast path (#9110)");
+            }
+            stats.record_unknown();
+            return AlgebraicValidationResult::DeadlineExceeded;
         }
 
         // Check: body AND NOT(head) is UNSAT
@@ -2464,7 +2493,7 @@ fn validate_model_with_smt_and_stats(
         // the outer deadline is closer). Unbounded `check_sat` was burning the
         // entire CHC wall clock on NIA/LRA dual simplex loops and starving
         // PDR/IMC/TPA/LAWI.
-        let per_query_timeout = match deadline {
+        let per_query_timeout = match budget.deadline() {
             Some(d) => d
                 .saturating_duration_since(Instant::now())
                 .min(ALGEBRAIC_QUERY_TIMEOUT),
@@ -2518,10 +2547,20 @@ fn validate_model_with_smt_and_stats(
     AlgebraicValidationResult::Valid
 }
 
+/// Head conjuncts scanned between two budget polls in
+/// [`validation_body_syntactically_implies_head`].
+///
+/// One iteration already costs a full body scan, so even a stride of 1 would
+/// be lost in the noise; 32 keeps the clock read unmeasurable on short heads
+/// while bounding overshoot to 32 body scans, which the `fastpath_ok` node cap
+/// keeps to a few milliseconds.
+const VALIDATION_FASTPATH_POLL_STRIDE: usize = 32;
+
 fn validation_body_syntactically_implies_head(
     body: &ChcExpr,
     head: &ChcExpr,
     verbose: bool,
+    budget: &SynthesisBudget,
 ) -> bool {
     if matches!(head.simplify_constants(), ChcExpr::Bool(true)) {
         return true;
@@ -2539,7 +2578,31 @@ fn validation_body_syntactically_implies_head(
     collect_guarded_active_diff_implications(body, &mut Vec::new(), &mut implied);
     let active_diff_shape = extract_active_diff_invariant_shape(head);
 
-    for conjunct in head.conjuncts() {
+    for (index, conjunct) in head.conjuncts().into_iter().enumerate() {
+        // #9110: THE budget poll that bounds algebraic validation.
+        //
+        // Each iteration re-scans the whole body, so this loop is Θ(|head| ·
+        // |body|) — on a synthesized interpretation with thousands of
+        // conjuncts it runs for seconds inside ONE iteration of the caller's
+        // per-clause loop, which is why the per-clause poll upstream bounded
+        // nothing. Measured on a 120-variable lockstep problem: 2.024s of a
+        // 2.035s solve was this loop alone, against a 10ms budget.
+        //
+        // SOUNDNESS: tripping returns `false`, i.e. "not syntactically
+        // proven". `false` is the conservative answer — it only DECLINES to
+        // discharge the clause, handing it to the SMT check (and, once the
+        // budget is spent, to `DeadlineExceeded`). It can never accept a
+        // clause the fast path had not actually proven, so an interrupted
+        // scan can lose a proof but never manufacture one.
+        if index % VALIDATION_FASTPATH_POLL_STRIDE == 0 && budget.expired() {
+            if verbose {
+                safe_eprintln!(
+                    "Algebraic: syntactic implication scan hit the budget at head conjunct \
+                     {index}; declining the fast path (#9110)"
+                );
+            }
+            return false;
+        }
         if !validation_body_syntactically_implies_conjunct(
             body,
             conjunct,
@@ -4422,7 +4485,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "constant-delta aliases should preserve compatible linear modular summaries"
         );
     }
@@ -4438,7 +4506,12 @@ mod validation_syntax_tests {
         let head = mod_expr_eq(ChcExpr::sub(ChcExpr::var(a), ChcExpr::var(b)), 2, 0);
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "an exact linear equality should imply the corresponding modular residue"
         );
     }
@@ -4457,7 +4530,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "factor lower bounds should discharge product positivity without NIA SMT"
         );
     }
@@ -4498,7 +4576,7 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(&body, &head, false, &SynthesisBudget::unbounded()),
             "linear equalities should validate through constant-delta aliases even when sign-flipped"
         );
     }
@@ -4539,7 +4617,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "linear inequalities should validate through same-direction constant-delta aliases"
         );
     }
@@ -4576,7 +4659,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "linear inequalities should combine body equalities with a same-direction inequality"
         );
     }
@@ -4738,7 +4826,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &ChcExpr::Bool(false), false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &ChcExpr::Bool(false),
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "syntactically unreachable bodies should validate false-head CHC clauses"
         );
     }
@@ -4762,7 +4855,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &ChcExpr::Bool(false), false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &ChcExpr::Bool(false),
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "conflicting bool-encoded equalities should validate false-head CHC clauses"
         );
     }
@@ -4914,7 +5012,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&ChcExpr::Bool(true), &tautology, false),
+            validation_body_syntactically_implies_head(
+                &ChcExpr::Bool(true),
+                &tautology,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "tautological nested ITE head conjuncts should not fall through to SMT validation"
         );
     }
@@ -4961,7 +5064,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "alias-only transfer equalities should carry interval head conjuncts"
         );
     }
@@ -4985,7 +5093,12 @@ mod validation_syntax_tests {
         let head = ChcExpr::Op(ChcOp::Le, vec![arc(ChcExpr::var(x)), arc(ChcExpr::Int(9))]);
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "body interval facts should discharge implied head bounds without SMT"
         );
     }
@@ -5013,7 +5126,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "a body-implied disjunct should discharge an or-shaped head invariant"
         );
     }
@@ -5057,7 +5175,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "MSB guard for bool-as-bv64 is always false, so the unsigned branch is selected"
         );
     }
@@ -5100,7 +5223,12 @@ mod validation_syntax_tests {
         );
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "Bool variable aliases should normalize model-checker-consumer bool-as-bv64 signed arguments"
         );
     }
@@ -5129,7 +5257,12 @@ mod validation_syntax_tests {
         let head = ChcExpr::Op(ChcOp::Lt, vec![arc(ChcExpr::var(x)), arc(upper_head)]);
 
         assert!(
-            validation_body_syntactically_implies_head(&body, &head, false),
+            validation_body_syntactically_implies_head(
+                &body,
+                &head,
+                false,
+                &SynthesisBudget::unbounded()
+            ),
             "large split constants should canonicalize across commutative spellings"
         );
     }

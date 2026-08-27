@@ -34,7 +34,10 @@ process-scoped host lease for the full campaign. Native Rust harnesses keep a
 ``plan`` CLI reports numeric admission only; a shell campaign must likewise
 hold a ``lease`` sidecar until all planned children have exited. Production
 leases use ``/tmp/ay-oom-guard-<uid>.lock`` regardless of ``TMPDIR`` so every
-campaign for one host user contends on the same RAM-admission lock.
+campaign for one host user contends on the same RAM-admission lock. That lease
+records its owner's pid; a lease whose recorded owner is DEAD is reclaimed and
+logged (see :func:`acquire_harness_lease`), because a leaked lease refuses every
+later run without protecting anything.
 """
 import collections
 import atexit
@@ -479,33 +482,231 @@ def _release_harness_lease():
 atexit.register(_release_harness_lease)
 
 
-def acquire_harness_lease(label="harness", _lock_path=None):
-    """Acquire one host-wide benchmark lease for this process.
+# One human-readable line, so `cat /tmp/ay-oom-guard-<uid>.lock` names the owner
+# during an incident. `label` is free-form and therefore always last. Records
+# written before the staleness check existed carry only `pid=` and `label=`;
+# they still parse, with the extra fields defaulting to "unknown".
+_LEASE_RECORD_MAX_BYTES = 4096
+# How long a would-be reclaimer waits for the serializing reclaim lock before
+# giving up and refusing. Reclaim work is a few syscalls, so this is only ever
+# reached if a reclaimer itself wedged; refusing is the fail-closed answer.
+_LEASE_RECLAIM_WAIT_S = 5.0
 
-    Per-child RSS caps do not protect against two independent harnesses each
-    planning against the full host. Production planning therefore fails closed
-    when another AY harness owns this exclusive lease. Explicit-RAM unit-policy
-    calls skip the lease unless requested.
+
+def _normalize_lease_token(token):
+    """Whitespace-free, comparable form of a process start-time token."""
+    if not token:
+        return "-"
+    return re.sub(r"\s+", "_", token.strip()) or "-"
+
+
+def _harness_lease_record(pid, label):
+    """Render the lease record written by the owner that holds the flock."""
+    identity = _watch_process_identity(pid)
+    start = _normalize_lease_token(identity[1] if identity else None)
+    return f"pid={pid} acquired={int(time.time())} start={start} label={label}\n"
+
+
+def _parse_harness_lease_record(text):
+    """Parse a lease record, or ``None`` when it is absent or malformed.
+
+    ``None`` means "owner unknown", and an unknown owner is NEVER grounds for
+    reclaiming: a harness that has just O_CREATed the file and taken the flock
+    but has not yet written its record is alive and holds the host.
     """
-    global _ACTIVE_HARNESS_LEASE
-    if _ACTIVE_HARNESS_LEASE is not None:
-        raise RuntimeError(
-            "another independently planned benchmark campaign is already active "
-            "in this process; reuse its plan explicitly instead of replanning "
-            "against full host capacity"
-        )
-    if os.name == "nt":
-        raise RuntimeError("aggregate harness coordination requires POSIX flock")
+    line = text.split("\n", 1)[0].strip()
+    if not line:
+        return None
+    tokens = line.split(" ")
+    record = {}
+    for index, token in enumerate(tokens):
+        key, separator, value = token.partition("=")
+        if not separator or not key:
+            return None
+        if key == "label":
+            record["label"] = " ".join([value, *tokens[index + 1:]]).strip()
+            break
+        record[key] = value
+    try:
+        pid = int(record.get("pid", ""))
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    record["pid"] = pid
+    try:
+        record["acquired"] = int(record.get("acquired", 0))
+    except ValueError:
+        record["acquired"] = 0
+    record["start"] = record.get("start") or "-"
+    record["label"] = record.get("label") or "?"
+    return record
+
+
+def _pid_is_alive(pid):
+    """``kill -0`` semantics: False only when the PID provably does not exist."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists; we merely may not signal it.
+        return True
+    except (OverflowError, ValueError, OSError):
+        # Cannot tell. Fail closed — an unmeasurable owner counts as live.
+        return True
+
+
+def _harness_lease_owner_is_alive(record):
+    """Whether the recorded lease owner is still the process that wrote it.
+
+    `kill -0` is the primary test. The recorded start-time token is a strictly
+    additional guard: without it, a dead owner whose PID has been recycled by an
+    unrelated process would keep an abandoned lease "live" forever.
+
+    Every uncertain answer resolves to "alive". Reclaiming a live campaign's
+    lease is the one outcome this guard must never produce, and the cost of the
+    opposite error is one extra refusal that the next attempt clears.
+    """
+    if record is None:
+        return True
+    if not _pid_is_alive(record["pid"]):
+        return False
+    recorded_start = record.get("start", "-")
+    if recorded_start == "-":
+        return True  # legacy record: PID liveness is all we have
+    identity = _watch_process_identity(record["pid"])
+    if identity is None:
+        # `kill -0` just succeeded, so the PID exists; the start-time lookup
+        # merely failed (or the owner exited in between). Either way this is a
+        # measurement failure, not evidence of death.
+        return True
+    if identity[1] is None:
+        return True  # platform exposes no start token; PID liveness only
+    return _normalize_lease_token(identity[1]) == recorded_start
+
+
+def _describe_lease_owner(record):
+    """Owner description for the refusal / reclaim log lines."""
+    if record is None:
+        return "owner record unreadable"
+    age = ""
+    acquired = record.get("acquired", 0)
+    if acquired:
+        age = f" held={max(0, int(time.time()) - acquired)}s"
+    return f"pid={record['pid']} label={record['label']}{age}"
+
+
+def _resolve_harness_lease_path(lock_path):
+    if lock_path is None:
+        return _host_harness_lease_path()
+    # Hidden dependency-injection seam for subprocess tests. Production
+    # callers never override the stable host/user path above.
+    resolved = os.fspath(lock_path)
+    if not os.path.isabs(resolved):
+        raise ValueError("test harness lease path must be absolute")
+    return resolved
+
+
+def _read_lease_record_text(fd):
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, _LEASE_RECORD_MAX_BYTES)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def _reclaim_stale_harness_lease(lock_path, blocked_metadata, label):
+    """Unlink a lease file whose recorded owner is gone. Returns True if it did.
+
+    The kernel releases an flock when its holder dies, so a lease that is STILL
+    held while its recorded owner is gone means an unrelated survivor inherited
+    the descriptor (a forked, never-exec'd descendant, or an orphaned sidecar
+    that outlived its harness). The campaign that planned against host RAM is
+    over, so refusing forever protects nothing — it just wedges every later run
+    (2026-08-24: a leaked lease naming a dead pid made every chc_baseline_compare
+    run refuse before writing evidence, which read as a CHC regression). Only a
+    stale-OWNER lease may be reclaimed; a live owner is still refused.
+
+    Serialized through a sibling reclaim lock so two racing harnesses cannot
+    both unlink and then each flock a different inode, which would admit two
+    campaigns at once — precisely the overcommit this guard exists to prevent.
+    """
     import fcntl
     import stat
-    if _lock_path is None:
-        lock_path = _host_harness_lease_path()
-    else:
-        # Hidden dependency-injection seam for subprocess tests. Production
-        # callers never override the stable host/user path above.
-        lock_path = os.fspath(_lock_path)
-        if not os.path.isabs(lock_path):
-            raise ValueError("test harness lease path must be absolute")
+    reclaim_path = f"{lock_path}.reclaim"
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    guard_fd = os.open(reclaim_path, flags, 0o600)
+    try:
+        guard_metadata = os.fstat(guard_fd)
+        if (not stat.S_ISREG(guard_metadata.st_mode)
+                or guard_metadata.st_uid != os.getuid()):
+            raise RuntimeError(
+                f"unsafe lease reclaim file metadata: {reclaim_path}"
+            )
+        deadline = time.monotonic() + _LEASE_RECLAIM_WAIT_S
+        while True:
+            try:
+                fcntl.flock(guard_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+        # Re-verify everything under the reclaim lock: the file we are about to
+        # unlink must still be the same inode we found blocked, still blocked,
+        # and still owned by a process that is gone.
+        try:
+            check_fd = os.open(
+                lock_path,
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            return False  # another harness already reclaimed it
+        try:
+            current = os.fstat(check_fd)
+            if (current.st_dev, current.st_ino) != (
+                    blocked_metadata.st_dev, blocked_metadata.st_ino):
+                return False  # replaced already; contend for the new inode
+            record = _parse_harness_lease_record(_read_lease_record_text(check_fd))
+            if _harness_lease_owner_is_alive(record):
+                return False
+            try:
+                fcntl.flock(check_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                # The kernel released it in the meantime: nothing is stale on
+                # disk, and the ordinary contention path will now succeed.
+                fcntl.flock(check_fd, fcntl.LOCK_UN)
+                return False
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                return False  # raced with another reclaimer
+        finally:
+            os.close(check_fd)
+    finally:
+        os.close(guard_fd)
+    # Never silently. A reclaim means an earlier campaign leaked its lease, and
+    # the operator needs to see that in the same transcript as the run it let
+    # through.
+    print(
+        f"[oom-guard] {label}: reclaimed the host resource lease {lock_path} — "
+        f"its recorded owner ({_describe_lease_owner(record)}) is gone, so the "
+        "surviving flock belongs to a leaked descriptor, not a live campaign.",
+        file=sys.stderr, flush=True,
+    )
+    return True
+
+
+def _open_harness_lease(lock_path, label, allow_reclaim):
+    import fcntl
+    import stat
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
@@ -519,20 +720,59 @@ def acquire_harness_lease(label="harness", _lock_path=None):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
+            record = _parse_harness_lease_record(_read_lease_record_text(fd))
+            if allow_reclaim and not _harness_lease_owner_is_alive(record):
+                os.close(fd)
+                fd = -1
+                _reclaim_stale_harness_lease(lock_path, metadata, label)
+                # Exactly one reclaim per acquisition: a second refusal is a
+                # real live owner (or a racing reclaimer that won), never an
+                # excuse to keep unlinking.
+                return _open_harness_lease(lock_path, label, allow_reclaim=False)
             raise RuntimeError(
-                "another AY benchmark harness already owns the host resource lease"
+                "another AY benchmark harness already owns the host resource "
+                f"lease ({_describe_lease_owner(record)})"
             ) from error
         lease = os.fdopen(fd, "r+", encoding="utf-8")
         fd = -1
         lease.seek(0)
         lease.truncate()
-        lease.write(f"pid={os.getpid()} label={label}\n")
+        lease.write(_harness_lease_record(os.getpid(), label))
         lease.flush()
-        _ACTIVE_HARNESS_LEASE = lease
         return lease
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def acquire_harness_lease(label="harness", _lock_path=None):
+    """Acquire one host-wide benchmark lease for this process.
+
+    Per-child RSS caps do not protect against two independent harnesses each
+    planning against the full host. Production planning therefore fails closed
+    when another AY harness owns this exclusive lease. Explicit-RAM unit-policy
+    calls skip the lease unless requested.
+
+    A lease whose RECORDED OWNER is dead is reclaimed (and logged — never
+    silently); a lease whose owner is alive is still refused. Age is recorded
+    and reported but deliberately does NOT authorize expiry: legitimate races
+    in this repo run 20+ hours (scripts/chain_uc_lia.sh), so any age threshold
+    short enough to clear a leak is short enough to evict a live campaign.
+    Liveness of the owner is the only safe reclaim authority.
+    """
+    global _ACTIVE_HARNESS_LEASE
+    if _ACTIVE_HARNESS_LEASE is not None:
+        raise RuntimeError(
+            "another independently planned benchmark campaign is already active "
+            "in this process; reuse its plan explicitly instead of replanning "
+            "against full host capacity"
+        )
+    if os.name == "nt":
+        raise RuntimeError("aggregate harness coordination requires POSIX flock")
+    lock_path = _resolve_harness_lease_path(_lock_path)
+    lease = _open_harness_lease(lock_path, label, allow_reclaim=True)
+    _ACTIVE_HARNESS_LEASE = lease
+    return lease
 
 
 def plan_solver_resources(jobs, ram_mb=None, cores=None, headroom_mb=None,

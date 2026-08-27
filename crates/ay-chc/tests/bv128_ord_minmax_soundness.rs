@@ -42,10 +42,7 @@ fn solve(horn: String) -> Option<VerifiedChcResult> {
         let config = AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(20));
         let _ = tx.send(AdaptivePortfolio::new(problem, config).solve());
     });
-    match rx.recv_timeout(Duration::from_secs(45)) {
-        Ok(result) => Some(result),
-        Err(_) => None,
-    }
+    rx.recv_timeout(Duration::from_secs(45)).ok()
 }
 
 /// Wrap a violation condition (the NEGATION of the property under test) into a

@@ -222,11 +222,11 @@ impl ChcProofArtifactDigest {
 #[non_exhaustive]
 pub struct ChcProofRunArtifact {
     /// Artifact payload schema.
-    pub schema: &'static str,
+    schema: &'static str,
     /// Artifact role.
-    pub role: &'static str,
+    role: &'static str,
     /// Content-addressed digest descriptor for the artifact bytes.
-    pub digest: ChcProofArtifactDigest,
+    digest: ChcProofArtifactDigest,
     bytes: Vec<u8>,
 }
 
@@ -240,24 +240,9 @@ impl ChcProofRunArtifact {
         }
     }
 
-    /// Return the concrete artifact bytes emitted by `ay-chc`.
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     /// Consume this artifact and return its concrete bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
-    }
-
-    /// Return the lowercase SHA-256 digest of the artifact bytes.
-    pub fn sha256(&self) -> &str {
-        &self.digest.sha256
-    }
-
-    /// Return the artifact byte length.
-    pub fn byte_len(&self) -> u64 {
-        self.digest.bytes
     }
 }
 
@@ -271,36 +256,16 @@ pub struct ChcProofRunArtifacts {
     /// binding. It is diagnostic metadata, not a serialized invariant and must
     /// never be presented as a replayable PDR model. Safe quantifier-free runs
     /// carry the actual candidate in [`Self::quantifier_free_invariant_model`].
-    pub model: ChcProofRunArtifact,
+    model: ChcProofRunArtifact,
     /// Canonical, bounded serialization of the actual quantifier-free
     /// invariant, present only for a non-empty, complete Safe model.
     ///
     /// Empty acyclic-BMC certificates, quantified ghost-pair certificates,
     /// Unsafe traces, Unknown results, and any model that fails strict
     /// canonical self-replay leave this field absent.
-    pub quantifier_free_invariant_model: Option<ChcProofRunArtifact>,
+    quantifier_free_invariant_model: Option<ChcProofRunArtifact>,
     /// Solver-owned replay transcript artifact.
-    pub replay_transcript: ChcProofRunArtifact,
-}
-
-impl ChcProofRunArtifacts {
-    /// Return the model/counterexample validation artifact bytes.
-    pub fn model_bytes(&self) -> &[u8] {
-        self.model.bytes()
-    }
-
-    /// Return the actual replayable quantifier-free invariant bytes, if this
-    /// proof run belongs to that evidence class.
-    pub fn quantifier_free_invariant_model_bytes(&self) -> Option<&[u8]> {
-        self.quantifier_free_invariant_model
-            .as_ref()
-            .map(ChcProofRunArtifact::bytes)
-    }
-
-    /// Return the replay transcript artifact bytes.
-    pub fn replay_transcript_bytes(&self) -> &[u8] {
-        self.replay_transcript.bytes()
-    }
+    replay_transcript: ChcProofRunArtifact,
 }
 
 /// Reason a supplied pair of proof-run artifacts cannot be accepted.
@@ -991,23 +956,22 @@ impl ChcReplayCheckResult {
     }
 }
 
-/// A native strict certificate recorded for one UNSAT replay obligation.
+/// Native strict-verdict commitments for one UNSAT replay obligation.
 ///
-/// This is the SELF-CONTAINED, no-z3 evidence that an UNSAT replay obligation
-/// was discharged by a real AY-native-verified proof rather than merely a
-/// trusted re-run verdict. `alethe_sha256` binds the rendered Alethe diagnostic
-/// text, which may be honestly holey; it is not an external-checker verdict.
-/// `bundle_sha256` binds the serialized offline-recheckable proof bundle
-/// (the exact bytes `ay_dpll::api::re_check_bundle_strict` re-validates with no
-/// solver run). `verdict` is the in-process strict verdict — always
-/// `"verified"` for a recorded cert, because an obligation whose strict verdict
-/// was `Rejected` (or absent) fails closed and is never recorded here.
+/// This row records that AY's in-process, no-z3 checker verified the
+/// obligation. It retains hashes of the rendered Alethe diagnostic and the
+/// serialized bundle, not their bytes, so it is not standalone/offline proof
+/// evidence. The Alethe text may honestly contain a hole, and deferred-trust
+/// rescue may accept theory steps that the narrower plain
+/// `ay_dpll::api::re_check_bundle_strict` rejects. `verdict` is always
+/// `"verified"`; a rejected or absent in-process verdict fails closed before a
+/// row is recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcObligationStrictCert {
     /// SHA-256 over the rendered Alethe proof text.
     pub alethe_sha256: String,
-    /// SHA-256 over the serialized offline-recheckable proof bundle.
+    /// SHA-256 commitment to the serialized proof-bundle diagnostic.
     pub bundle_sha256: String,
     /// AY-native strict verdict — `"verified"` for any recorded cert.
     pub verdict: String,
@@ -1139,14 +1103,14 @@ impl ChcCheckedReplayObligation {
         }
     }
 
-    /// Attach a native strict certificate to this obligation row.
+    /// Attach native strict-verdict commitments to this obligation row.
     ///
     /// Used for UNSAT obligations discharged via
-    /// `smtlib_strict_unsat_cert_via_executor`: the recorded cert is the
-    /// self-contained (no-z3) evidence that the obligation was verified by an
-    /// AY-native proof, not merely a trusted re-run verdict. The separately
-    /// hashed Alethe text is diagnostic and can disclose unsupported wire rules
-    /// as `hole`.
+    /// `smtlib_strict_unsat_cert_via_executor`: the row records that AY's
+    /// in-process, no-z3 checker verified the obligation rather than merely
+    /// trusting a re-run verdict. It stores only diagnostic hashes, not a
+    /// standalone certificate; the Alethe diagnostic may disclose unsupported
+    /// wire rules as `hole`.
     #[must_use]
     pub(crate) fn with_strict_cert(mut self, cert: ChcObligationStrictCert) -> Self {
         self.strict_cert = Some(cert);
@@ -1907,47 +1871,44 @@ impl std::error::Error for ChcProofEvidenceParseError {}
 
 /// Replay/proof metadata attached to a verified CHC result.
 ///
-/// [`Self::for_result`] produces metadata-only records: the deterministic
-/// normalized input hash and result classification that an external
-/// transcript/replay package must bind to. `Unknown` results are always
-/// marked as non-proof. After a successful post-solve CHECKED replay pass
-/// ([`ChcPdrProofRun::run_checked_replay`]), the crate-internal
-/// [`Self::for_checked_run`] upgrade carries `replayable` statuses plus
-/// transcript/replay/checked-report digests. The Trust full-verifier
-/// admission bit stays fail-closed for everything else — in particular for
-/// any metadata parsed back from JSON.
+/// Crate-internal constructors produce metadata-only records containing the
+/// deterministic normalized input hash and result classification that an
+/// external transcript/replay package must bind to. `Unknown` results are
+/// always marked as non-proof. After a successful post-solve CHECKED replay
+/// pass ([`ChcPdrProofRun::run_checked_replay`]), a crate-internal upgrade
+/// carries `replayable` statuses plus transcript/replay/checked-report
+/// digests. The Trust full-verifier admission bit stays fail-closed for
+/// everything else — in particular for metadata parsed back from JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcProofTranscriptMetadata {
     /// Metadata schema identifier.
-    pub schema: &'static str,
+    schema: &'static str,
     /// Normalized input schema identifier.
-    pub normalized_input_schema: &'static str,
+    normalized_input_schema: &'static str,
     /// SHA-256 of [`normalized_chc_input`], lowercase hex.
-    pub normalized_input_sha256: String,
+    normalized_input_sha256: String,
     /// Byte length of the normalized CHC input.
-    pub normalized_input_bytes: u64,
+    normalized_input_bytes: u64,
     /// Solving engine family that produced the result.
-    pub engine: String,
+    engine: String,
     /// Semantic CHC result: `safe`, `unsafe`, or `unknown`.
-    pub result: String,
+    result: String,
     /// Stable proof classification for consumers.
-    pub proof_status: String,
+    proof_status: String,
     /// True only for validated safe/unsafe evidence.
-    pub accepted_as_proof: bool,
+    accepted_as_proof: bool,
     /// Replay material classification.
-    pub replay_status: String,
+    replay_status: String,
     /// Transcript material classification.
-    pub transcript_status: String,
-    /// True only when this transcript is enough for Trust full-verifier admission.
-    pub trust_full_verifier_admissible: bool,
+    transcript_status: String,
     /// Structured reason when full-verifier admission is denied.
-    pub trust_full_verifier_non_admission_reason: Option<String>,
+    trust_full_verifier_non_admission_reason: Option<String>,
     /// Structured unknown reason when `result == "unknown"`.
-    pub unknown_reason: Option<String>,
+    unknown_reason: Option<String>,
     /// Checked-replay transcript digests. `Some` ONLY for metadata produced
-    /// in-process by [`ChcProofTranscriptMetadata::for_checked_run`] from a
-    /// validated checked replay summary. Deliberately private and NEVER
+    /// in-process by the crate-internal checked-replay upgrade from a validated
+    /// checked replay summary. Deliberately private and NEVER
     /// populated by JSON parsing, so copied or mutated reporting metadata can
     /// never upgrade itself into replay evidence (fail-closed).
     checked_replay: Option<ChcCheckedReplayTranscriptDigests>,
@@ -1955,8 +1916,8 @@ pub struct ChcProofTranscriptMetadata {
 
 /// Digest set carried by a checked (replayable) CHC proof transcript.
 ///
-/// Only constructed by [`ChcProofTranscriptMetadata::for_checked_run`] after
-/// the checked replay summary validated against its evidence manifest.
+/// Only constructed by the crate-internal upgrade after the checked replay
+/// summary validated against its evidence manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChcCheckedReplayTranscriptDigests {
     /// Content address (or on-disk path) of the solver transcript artifact.
@@ -2390,68 +2351,69 @@ impl ChcUnsafeTraceEvidence {
 #[non_exhaustive]
 pub struct ChcProofTranscriptConsumerEvidence {
     /// Evidence schema identifier.
-    pub schema: &'static str,
+    schema: &'static str,
     /// Evidence schema version.
-    pub schema_version: u64,
+    schema_version: u64,
     /// Human-readable verdict label.
-    pub verdict: String,
+    verdict: String,
     /// Stable verdict code: `safe`, `unsafe`, or `unknown`.
-    pub verdict_code: String,
+    verdict_code: String,
     /// Query identity within the normalized CHC problem.
-    pub query_id: String,
+    query_id: String,
     /// False-head query clause index, when present.
-    pub query_clause_index: Option<u64>,
+    query_clause_index: Option<u64>,
     /// Property identity binding the normalized problem hash to the query.
-    pub property_id: String,
+    property_id: String,
     /// SHA-256 over the stable property identity.
-    pub property_sha256: String,
+    property_sha256: String,
     /// Solving backend family reported by the proof run.
-    pub engine: String,
+    engine: String,
     /// Stable backend code for cross-consumer lane comparisons.
-    pub backend_code: String,
+    backend_code: String,
     /// Normalized input schema identifier.
-    pub normalized_input_schema: &'static str,
+    normalized_input_schema: &'static str,
     /// SHA-256 of the normalized CHC input.
-    pub normalized_input_sha256: String,
+    normalized_input_sha256: String,
     /// Byte length of the normalized CHC input.
-    pub normalized_input_bytes: u64,
+    normalized_input_bytes: u64,
     /// Stable proof classification from AY.
-    pub proof_status: String,
+    proof_status: String,
     /// True only when AY's sealed result is validated safe/unsafe evidence.
-    pub accepted_for_consumer: bool,
+    accepted_for_consumer: bool,
     /// Stable rejection code when [`accepted_for_consumer`](Self::accepted_for_consumer) is false.
-    pub consumer_rejection_code: Option<String>,
+    consumer_rejection_code: Option<String>,
     /// True only when the invariant/counterexample model was validated by AY.
-    pub model_validated: bool,
+    model_validated: bool,
     /// Stable model-validation status code.
-    pub model_validation_status: String,
+    model_validation_status: String,
     /// Stable verification-level code for downstream evidence rows.
-    pub verification_level_code: String,
+    verification_level_code: String,
     /// Trust full-verifier admission status code.
-    pub trust_status: String,
+    trust_status: String,
     /// True only when this evidence has checked replay material for Trust admission.
-    pub trust_full_verifier_admissible: bool,
+    trust_full_verifier_admissible: bool,
     /// Structured reason when full-verifier admission is denied.
-    pub trust_full_verifier_non_admission_reason: Option<String>,
+    trust_full_verifier_non_admission_reason: Option<String>,
     /// Replay material classification.
-    pub replay_status: String,
+    replay_status: String,
     /// Transcript material classification.
-    pub transcript_status: String,
+    transcript_status: String,
     /// Structured unknown reason code, if this run is non-proof Unknown.
-    pub unknown_reason_code: Option<String>,
+    unknown_reason_code: Option<String>,
     /// Structured limit code for bounded Unknown exits, if applicable.
-    pub unknown_limit_code: Option<String>,
+    unknown_limit_code: Option<String>,
     /// Deepest BMC depth reached for bounded Unknown exits, if available.
-    pub unknown_depth_reached: Option<u64>,
+    unknown_depth_reached: Option<u64>,
     /// BMC depth limit for bounded Unknown exits, if available.
-    pub unknown_depth_limit: Option<u64>,
+    unknown_depth_limit: Option<u64>,
     /// Concrete trace material for validated unsafe results.
-    pub unsafe_trace: Option<ChcUnsafeTraceEvidence>,
+    unsafe_trace: Option<ChcUnsafeTraceEvidence>,
 }
 
 impl ChcProofTranscriptConsumerEvidence {
     /// Build typed consumer evidence from a sealed CHC/PDR proof run.
-    pub fn for_run(problem: &ChcProblem, run: &ChcPdrProofRun) -> Self {
+    pub(crate) fn for_run(run: &ChcPdrProofRun) -> Self {
+        let problem = run.problem();
         let query_clause_index = chc_query_clause_index(problem).map(usize_to_u64);
         let query_id = query_clause_index
             .map(|index| format!("chc.false_clause.{index}"))
@@ -2724,197 +2686,13 @@ impl ChcProofTranscriptConsumerEvidence {
 /// fail-closed object to feed into an external proof manifest. The metadata is
 /// derived from the exact `ChcProblem` supplied to the solver and the sealed
 /// [`VerifiedChcResult`] returned after validation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 #[must_use = "proof runs must be inspected; Unknown is non-proof evidence"]
 pub struct ChcPdrProofRun {
-    /// Sealed verified result. Safe/Unsafe variants cannot be constructed by
-    /// callers outside this crate.
-    pub result: VerifiedChcResult,
-    /// Deterministic proof/transcript metadata for manifest binding.
-    pub metadata: ChcProofTranscriptMetadata,
-}
-
-impl ChcPdrProofRun {
-    /// Build a proof run from a verified result and the solved CHC problem.
-    pub fn new(problem: &ChcProblem, result: VerifiedChcResult, engine: impl Into<String>) -> Self {
-        let metadata = result.proof_transcript_metadata(problem, engine);
-        Self { result, metadata }
-    }
-
-    /// Returns true only when the verified result is proof-grade Safe/Unsafe
-    /// evidence. Unknown and budget-exhausted runs are explicitly non-proof.
-    pub fn accepted_as_proof(&self) -> bool {
-        matches!(
-            &self.result,
-            VerifiedChcResult::Safe(_) | VerifiedChcResult::Unsafe(_)
-        )
-    }
-
-    /// Build a typed consumer evidence row derived from this sealed proof run.
-    pub fn consumer_evidence(&self, problem: &ChcProblem) -> ChcProofTranscriptConsumerEvidence {
-        ChcProofTranscriptConsumerEvidence::for_run(problem, self)
-    }
-
-    /// Emit the first-class model/counterexample artifact bytes for this proof run.
-    pub fn model_artifact(&self, problem: &ChcProblem) -> ChcProofRunArtifact {
-        let consumer_evidence = self.consumer_evidence(problem);
-        ChcProofRunArtifact::new(
-            CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA,
-            CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE,
-            serde_json::to_vec(&serde_json::json!({
-                "schema": CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA,
-                "schema_version": 1,
-                "role": CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE,
-                "producer": "ay-chc",
-                "consumer_evidence": consumer_evidence.to_json_value(),
-            }))
-            .expect("CHC proof-run model artifact should serialize"),
-        )
-    }
-
-    /// Emit the first-class replay transcript artifact bytes for this proof run.
-    pub fn replay_transcript_artifact(&self) -> ChcProofRunArtifact {
-        ChcProofRunArtifact::new(
-            CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_SCHEMA,
-            CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE,
-            serde_json::to_vec(&serde_json::json!({
-                "schema": CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_SCHEMA,
-                "schema_version": 1,
-                "role": CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE,
-                "producer": "ay-chc",
-                "transcript_metadata": self.metadata.to_json_value(),
-            }))
-            .expect("CHC proof-run replay transcript artifact should serialize"),
-        )
-    }
-
-    /// Emit both first-class artifacts required by native/model-checker-consumer proof handoff.
-    pub fn proof_run_artifacts(&self, problem: &ChcProblem) -> ChcProofRunArtifacts {
-        ChcProofRunArtifacts {
-            model: self.model_artifact(problem),
-            quantifier_free_invariant_model: self
-                .quantifier_free_invariant_model_artifact(problem)
-                .ok(),
-            replay_transcript: self.replay_transcript_artifact(),
-        }
-    }
-
-    /// Validate supplied model artifact bytes against the sealed proof run.
-    pub fn validate_model_artifact_bytes(
-        &self,
-        problem: &ChcProblem,
-        bytes: &[u8],
-    ) -> Result<ChcProofRunArtifact, ChcProofRunArtifactValidationError> {
-        validate_proof_run_artifact_bytes(self.model_artifact(problem), bytes)
-    }
-
-    /// Validate supplied replay transcript artifact bytes against the sealed proof run.
-    pub fn validate_replay_transcript_artifact_bytes(
-        &self,
-        bytes: &[u8],
-    ) -> Result<ChcProofRunArtifact, ChcProofRunArtifactValidationError> {
-        validate_proof_run_artifact_bytes(self.replay_transcript_artifact(), bytes)
-    }
-
-    /// Validate the model/replay artifact pair required by downstream consumers.
-    ///
-    /// This is the paired artifact gate TLA2/MCC can call instead of locally
-    /// composing per-artifact checks. Both artifacts must be present and must
-    /// exactly match the solver-owned bytes for this sealed proof run.
-    pub fn validate_model_replay_artifact_bytes(
-        &self,
-        problem: &ChcProblem,
-        model_bytes: Option<&[u8]>,
-        replay_transcript_bytes: Option<&[u8]>,
-    ) -> Result<ChcProofRunArtifacts, ChcProofRunArtifactBundleValidationError> {
-        let model_bytes = model_bytes.ok_or_else(|| {
-            ChcProofRunArtifactBundleValidationError::new(
-                ChcProofRunArtifactBundleValidationErrorReason::MissingModelArtifactBytes,
-                None,
-            )
-        })?;
-        let replay_transcript_bytes = replay_transcript_bytes.ok_or_else(|| {
-            ChcProofRunArtifactBundleValidationError::new(
-                ChcProofRunArtifactBundleValidationErrorReason::MissingReplayTranscriptArtifactBytes,
-                None,
-            )
-        })?;
-
-        let model = self
-            .validate_model_artifact_bytes(problem, model_bytes)
-            .map_err(|error| {
-                ChcProofRunArtifactBundleValidationError::new(
-                    ChcProofRunArtifactBundleValidationErrorReason::ModelArtifactMismatch,
-                    Some(error),
-                )
-            })?;
-        let replay_transcript = self
-            .validate_replay_transcript_artifact_bytes(replay_transcript_bytes)
-            .map_err(|error| {
-                ChcProofRunArtifactBundleValidationError::new(
-                    ChcProofRunArtifactBundleValidationErrorReason::ReplayTranscriptArtifactMismatch,
-                    Some(error),
-                )
-            })?;
-
-        Ok(ChcProofRunArtifacts {
-            model,
-            quantifier_free_invariant_model: self
-                .quantifier_free_invariant_model_artifact(problem)
-                .ok(),
-            replay_transcript,
-        })
-    }
-
-    /// Build a typed evidence manifest suitable for compiler-verifier callers.
-    ///
-    /// Trust full-verifier admission is derived from the sealed result plus the
-    /// transcript metadata. Current CHC/PDR metadata is intentionally
-    /// metadata-only, so manifests remain non-admissible for full Trust replay
-    /// until checked replay artifacts are emitted.
-    pub fn evidence_manifest(
-        &self,
-        problem: &ChcProblem,
-        options: ChcProofEvidenceOptions,
-        solver: ChcProofSolverIdentity,
-        obligation_id: impl Into<String>,
-    ) -> ChcProofEvidenceManifest {
-        ChcProofEvidenceManifest::for_run(problem, self, options, solver, obligation_id)
-    }
-
-    /// Build a typed evidence manifest with concrete replay/proof artifact
-    /// digests supplied by the caller or CLI.
-    pub fn evidence_manifest_with_replay_evidence(
-        &self,
-        problem: &ChcProblem,
-        options: ChcProofEvidenceOptions,
-        solver: ChcProofSolverIdentity,
-        obligation_id: impl Into<String>,
-        replay_evidence: ChcReplayEvidence,
-    ) -> ChcProofEvidenceManifest {
-        ChcProofEvidenceManifest::for_run_with_replay_evidence(
-            problem,
-            self,
-            options,
-            solver,
-            obligation_id,
-            Some(replay_evidence),
-        )
-    }
-}
-
-fn validate_proof_run_artifact_bytes(
-    expected: ChcProofRunArtifact,
-    bytes: &[u8],
-) -> Result<ChcProofRunArtifact, ChcProofRunArtifactValidationError> {
-    if expected.bytes() == bytes {
-        Ok(expected)
-    } else {
-        Err(ChcProofRunArtifactValidationError::digest_mismatch(
-            &expected, bytes,
-        ))
-    }
+    problem: std::sync::Arc<proof_run::IterativeDropProblem>,
+    result: VerifiedChcResult,
+    metadata: ChcProofTranscriptMetadata,
 }
 
 /// Stable proof-relevant option identity for CHC/PDR evidence manifests.
@@ -4487,23 +4265,22 @@ pub struct ChcProofEvidenceManifest {
 
 impl ChcProofEvidenceManifest {
     fn for_run(
-        problem: &ChcProblem,
         run: &ChcPdrProofRun,
         options: ChcProofEvidenceOptions,
         solver: ChcProofSolverIdentity,
         obligation_id: impl Into<String>,
     ) -> Self {
-        Self::for_run_with_replay_evidence(problem, run, options, solver, obligation_id, None)
+        Self::for_run_with_replay_evidence(run, options, solver, obligation_id, None)
     }
 
     fn for_run_with_replay_evidence(
-        problem: &ChcProblem,
         run: &ChcPdrProofRun,
         options: ChcProofEvidenceOptions,
         solver: ChcProofSolverIdentity,
         obligation_id: impl Into<String>,
         replay_evidence: Option<ChcReplayEvidence>,
     ) -> Self {
+        let problem = run.problem();
         let normalized = normalized_chc_input(problem);
         let problem_sha256 = sha256_hex(normalized.as_bytes());
         let problem_bytes = normalized.len() as u64;
@@ -5056,9 +4833,11 @@ impl ChcProofEvidenceManifest {
     }
 }
 
+type TranscriptMetadataParseResult = Result<ChcProofTranscriptMetadata, ChcProofEvidenceParseError>;
+
 impl ChcProofTranscriptMetadata {
     /// Build metadata for a CHC result and the problem it was solved against.
-    pub fn for_result(
+    pub(crate) fn for_result(
         problem: &ChcProblem,
         result: &VerifiedChcResult,
         engine: impl Into<String>,
@@ -5119,7 +4898,6 @@ impl ChcProofTranscriptMetadata {
             accepted_as_proof,
             replay_status: replay_status.to_string(),
             transcript_status: transcript_status.to_string(),
-            trust_full_verifier_admissible: false,
             trust_full_verifier_non_admission_reason: trust_reason,
             unknown_reason: reason,
             checked_replay: None,
@@ -5180,7 +4958,6 @@ impl ChcProofTranscriptMetadata {
         let mut upgraded = base.clone();
         upgraded.replay_status = "replayable".to_string();
         upgraded.transcript_status = "replayable".to_string();
-        upgraded.trust_full_verifier_admissible = true;
         upgraded.trust_full_verifier_non_admission_reason = None;
         upgraded.checked_replay = Some(ChcCheckedReplayTranscriptDigests {
             transcript_uri,
@@ -5190,11 +4967,6 @@ impl ChcProofTranscriptMetadata {
             summary_identity_sha256: summary.identity_sha256(),
         });
         Some(upgraded)
-    }
-
-    /// Alias used by PDR replay consumers that name the artifact by engine.
-    pub fn pdr_input_sha256(&self) -> &str {
-        &self.normalized_input_sha256
     }
 
     /// Render this metadata as a stable JSON object for report paths.
@@ -5302,7 +5074,7 @@ impl ChcProofTranscriptMetadata {
     }
 
     /// Parse transcript metadata from a manifest/cache snapshot.
-    pub fn from_json_value(value: &serde_json::Value) -> Result<Self, ChcProofEvidenceParseError> {
+    pub(crate) fn from_json_value(value: &serde_json::Value) -> TranscriptMetadataParseResult {
         let mut reasons = Vec::new();
         let Some(object) = value.as_object() else {
             return Err(ChcProofEvidenceParseError::new(vec![
@@ -5356,7 +5128,7 @@ impl ChcProofTranscriptMetadata {
             "transcript_metadata.accepted_as_proof",
             &mut reasons,
         );
-        let trust_full_verifier_admissible = optional_bool_field(
+        let _reported_trust_full_verifier_admissible = optional_bool_field(
             object,
             "trust_full_verifier_admissible",
             "transcript_metadata.trust_full_verifier_admissible",
@@ -5413,7 +5185,6 @@ impl ChcProofTranscriptMetadata {
             accepted_as_proof: accepted_as_proof.expect("accepted flag parsed without reasons"),
             replay_status: replay_status.unwrap_or_else(|| "unknown".to_string()),
             transcript_status: transcript_status.unwrap_or_else(|| "unknown".to_string()),
-            trust_full_verifier_admissible,
             trust_full_verifier_non_admission_reason,
             unknown_reason,
             // Fail-closed: parsed/copied metadata can never carry checked
@@ -5425,20 +5196,6 @@ impl ChcProofTranscriptMetadata {
     /// SHA-256 over the stable transcript identity used by admission keys.
     pub fn identity_sha256(&self) -> String {
         sha256_hex(self.identity_input().as_bytes())
-    }
-
-    /// Whether this transcript can be admitted to the Trust full verifier.
-    ///
-    /// Derived fail-closed instead of trusting the public raw field so copied
-    /// or mutated reporting metadata cannot upgrade itself into replay
-    /// evidence: it is `true` only when this metadata carries the private
-    /// checked-replay digest set, which only
-    /// [`ChcProofTranscriptMetadata::for_checked_run`] can populate — after a
-    /// checked replay summary validated against its evidence manifest. JSON
-    /// parsing always leaves the digest set empty, so deserialized metadata is
-    /// never admissible.
-    pub fn trust_full_verifier_admissible(&self) -> bool {
-        self.checked_replay.is_some()
     }
 
     fn identity_input(&self) -> String {
@@ -5502,7 +5259,7 @@ impl ChcProofTranscriptMetadata {
 
 impl VerifiedChcResult {
     /// Build replay/proof metadata for this result.
-    pub fn proof_transcript_metadata(
+    pub(crate) fn proof_transcript_metadata(
         &self,
         problem: &ChcProblem,
         engine: impl Into<String>,
@@ -7435,7 +7192,9 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+mod proof_run;
 mod replay_check;
+mod sealed_evidence;
 pub use replay_check::ChcCheckedReplayRun;
 
 #[cfg(test)]

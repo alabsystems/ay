@@ -79,7 +79,7 @@ impl Solver {
     /// - Progress reporting and observer notifications
     /// - Lucky phases, walk-based initialization, Jeroslow-Wang phases
     /// - Glucose EMA restart computation
-    /// - Streaming UNSAT core bitmap setup
+    /// - Streaming original-clause support setup
     /// - Cold restart checks
     /// - DIP-ERCL extension variable detection
     /// - Rephasing and lookahead
@@ -97,8 +97,8 @@ impl Solver {
     /// `analyze_and_backtrack_ic3()` and domain BCP dispatch uses
     /// `propagate_bcp_ic3()` when a domain is active above level 0.
     ///
-    /// The method returns `VerifiedAssumeResult` for API consistency.
-    pub fn solve_incremental_ic3(&mut self, assumptions: &[Literal]) -> VerifiedAssumeResult {
+    /// Returns solver-origin data under the restricted semantics above, not a checked proof.
+    pub fn solve_incremental_ic3(&mut self, assumptions: &[Literal]) -> SolverAssumeResult {
         let result = self.solve_incremental_ic3_raw(assumptions);
 
         // Enforce learned clause cap after each solve (#8672).
@@ -120,7 +120,7 @@ impl Solver {
             self.ic3_memory_pressure_reduce();
         }
 
-        VerifiedAssumeResult::from_validated(result)
+        SolverAssumeResult::from_solver_result(result)
     }
 
     /// Raw IC3 incremental solve returning `AssumeResult`.
@@ -413,6 +413,11 @@ impl Solver {
                 // (consumed by the loop-top interrupt check) and reduce the
                 // learned database when its policy fires.
                 self.poll_process_memory_limit();
+                // `OnPeriodicDecay()` (arXiv:2602.20829 Algorithm 1 lines 17-18):
+                // every T=4096 conflicts. Placed beside the reduce check but
+                // deliberately independent of it — the paper's decay clock is
+                // conflicts, not reduction rounds. No-op unless the arm is armed.
+                self.two_stage_periodic_decay_if_due();
                 if self.should_reduce_db() {
                     self.reduce_db();
                 }

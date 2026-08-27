@@ -52,6 +52,44 @@ pub(super) enum ReplaceResult {
     Skipped,
 }
 
+/// Why `delete_clause_checked(idx, ReasonPolicy::Skip)` refused to delete a
+/// forward-subsumed clause.
+///
+/// Retaining a subsumed clause is always SOUND — forward-subsumption deletion
+/// is an optimisation, and keeping a clause never loses a constraint. What this
+/// classification exists for is the tripwire in
+/// `apply_forward_subsumption_deletion`: a retention that none of the
+/// enumerated guards accounts for would mean the deletion pipeline silently
+/// dropped work, and that is worth a panic in a clause-database rewrite.
+///
+/// The variants are exhaustive by construction. With `ReasonPolicy::Skip`,
+/// `delete_clause_checked` reports `Skipped` in exactly two places:
+/// `can_delete_clause` refusing (inactive clause / queued theory conflict /
+/// active reason clause), and the LRAT unit-rederivation bookkeeping not being
+/// ready. Both proof-side paths short-circuit to "ready" when LRAT is off
+/// (`lrat_clause_unit_rederivations_ready_for_delete_with_policy` and
+/// `lrat_rederive_units_referencing_clause_with_policy` each return `true`
+/// immediately on `!cold.lrat_enabled`), so a decline with LRAT off and no
+/// `can_delete_clause` objection has no explanation and trips the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::solver) enum ForwardSubsumptionRetention {
+    /// The clause is an active reason for an assigned literal. This is the
+    /// only case the original `subsume()` post-condition allowed for.
+    ReasonProtected,
+    /// A queued theory conflict owns this `ClauseRef` until the solve loop
+    /// consumes it (#6262). Deleting it would leave
+    /// `take_pending_theory_conflict` dereferencing a dead clause, so
+    /// `can_delete_clause` refuses.
+    TheoryQueued,
+    /// LRAT bookkeeping is not ready: some level-0 unit proof still references
+    /// this clause's ID and cannot be re-derived yet, or a stopped
+    /// preprocessing transaction declined to materialise the level-0 unit
+    /// proofs (`DeleteStopPolicy::Interruptible`). Only reachable with LRAT on.
+    ProofBookkeeping,
+    /// No guard accounts for the retention — the tripwire.
+    Unexplained,
+}
+
 /// Result of adding a new irredundant clause with watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AddResult {
@@ -98,6 +136,36 @@ impl Solver {
             return true;
         }
         matches!(reason_policy, ReasonPolicy::ClearLevel0)
+    }
+
+    /// Classify why `delete_clause_checked(clause_idx, ReasonPolicy::Skip)`
+    /// declined to delete `clause_idx`. See `ForwardSubsumptionRetention`.
+    ///
+    /// Pure: a debug post-condition must not perturb proof state, so this
+    /// deliberately does NOT call the LRAT readiness predicates — they
+    /// materialise proof steps as a side effect, which would make debug and
+    /// release builds emit different proofs. The LRAT case is identified by
+    /// elimination instead, which is exact.
+    pub(super) fn classify_forward_subsumption_retention(
+        &self,
+        clause_idx: usize,
+    ) -> ForwardSubsumptionRetention {
+        if !self.can_delete_clause(clause_idx, ReasonPolicy::Skip) {
+            if self.is_reason_clause_marked(clause_idx) {
+                ForwardSubsumptionRetention::ReasonProtected
+            } else if self.is_pending_theory_conflict_clause(clause_idx) {
+                ForwardSubsumptionRetention::TheoryQueued
+            } else {
+                // `can_delete_clause`'s only other objection is an inactive
+                // clause, and the applier's guard (2) already established
+                // liveness before attempting the delete.
+                ForwardSubsumptionRetention::Unexplained
+            }
+        } else if self.cold.lrat_enabled {
+            ForwardSubsumptionRetention::ProofBookkeeping
+        } else {
+            ForwardSubsumptionRetention::Unexplained
+        }
     }
 
     /// Delete a clause after capturing a literal snapshot for side effects
@@ -306,14 +374,15 @@ impl Solver {
         self.add_clause_watched_impl(lits, false, true)
     }
 
-    /// Add an irredundant clause whose validity is established OUT OF BAND (e.g. a
-    /// DPR PR symmetry lex-leader verified by the external dpr-trim→cake_lpr loop,
-    /// #8011) rather than by an internal RUP/RAT forward check.
+    /// Add an irredundant clause whose validity is established OUT OF BAND (for
+    /// example a family-specific SR symmetry step) rather than by an internal
+    /// RUP/RAT forward check.
     ///
     /// Like [`Self::add_clause_watched`] but with `forward_check_derived = false`,
     /// so the forward DRUP checker treats the clause as a trusted axiom (no RUP
     /// obligation). The caller MUST have already emitted the corresponding trusted
-    /// proof step (`proof_emit_add_pr`) so the proof stream stays complete.
+    /// proof step before insertion so the proof stream stays complete. In no-proof
+    /// mode the caller's checked construction is the trust boundary.
     pub(super) fn add_clause_watched_trusted(&mut self, lits: &mut [Literal]) -> AddResult {
         self.add_clause_watched_impl(lits, false, false)
     }

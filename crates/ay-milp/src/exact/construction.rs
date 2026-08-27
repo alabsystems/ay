@@ -407,6 +407,7 @@ impl ExactLp {
             window_pivots: 0,
             cold_windows: 0,
             census_seq: 0,
+            iters_total: 0,
         })
     }
 }

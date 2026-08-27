@@ -36,7 +36,7 @@ impl QbfSolver {
     /// Collect the set of learned clause indices currently used as reasons
     /// for assigned variables on the trail.
     fn reason_clause_indices(&self) -> HashSet<usize> {
-        let num_original = self.formula.clauses.len();
+        let num_original = self.formula.clauses().len();
         let mut reason_set = HashSet::new();
         for &reason in &self.reasons {
             if let Reason::Propagated(idx) = reason {

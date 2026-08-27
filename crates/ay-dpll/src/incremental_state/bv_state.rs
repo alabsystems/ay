@@ -156,9 +156,12 @@ impl IncrementalBvState {
     /// Drop the persistent SAT solver and all BV/Tseitin caches, but preserve
     /// frontend scope depth so the next check-sat can rebuild the solver stack.
     ///
-    /// Soundness-first fallback for incremental BV-family logics (#7892):
-    /// learned clauses or cached encodings from earlier check-sat calls can
-    /// over-constrain later push/pop scopes and cause false UNSAT.
+    /// This is the FULL teardown, reserved for `reset()` (`(reset)` /
+    /// `(reset-assertions)`), where the assertion set itself is discarded and
+    /// no cached encoding can be reused.
+    ///
+    /// It is deliberately NOT the `pop()` path — see `pop()` for why a scope
+    /// retraction needs no teardown at all.
     pub(crate) fn reset_sat_encoding_for_rebuild(&mut self) {
         self.term_to_bits.clear();
         self.next_bv_var = 1;
@@ -189,14 +192,80 @@ impl IncrementalSubsystem for IncrementalBvState {
         }
     }
 
+    /// Retract one assertion scope WITHOUT destroying any encoding.
+    ///
+    /// SAFE BY CONSTRUCTION, not by teardown. Every clause this subsystem
+    /// installs is in exactly one of two classes:
+    ///
+    /// 1. **Scope-independent, installed globally.** Tseitin definitions, BV
+    ///    circuit clauses, Tseitin↔BV equivalence links, array axioms, EUF and
+    ///    non-BV congruence axioms, BV equality congruence, and delayed-op
+    ///    circuits all go in through `add_clause_global` /
+    ///    `add_offset_clauses_global` (see `bv_incremental.rs`). Each either
+    ///    defines a fresh variable in terms of existing ones — a definitional
+    ///    extension, which removes no model of the user's formula — or is a
+    ///    theory tautology. Neither can over-constrain a later scope.
+    ///    `add_clause_global` also routes them through
+    ///    `OriginalLedger::push_clause_global`, which replays them past
+    ///    `pop_scope` truncation, so they survive a SAT-level pop in the ledger
+    ///    as well as in the arena.
+    ///
+    ///    The mechanical check behind "scope-independent": exactly ONE global
+    ///    generator on this path reads the assertion set at all
+    ///    (`build_bv_eq_congruence_batch`, which takes `&self.ctx.assertions`;
+    ///    every other generator is handed `&[]`), and its output is guarded by
+    ///    the hypothesis literal so it is a tautology too. That guard is #7892's
+    ///    actual root cause — see `bv_encoding::generate_bv_eq_congruence_clauses`
+    ///    and the barrier
+    ///    `bv_eq_congruence_clauses_are_guarded_by_the_hypothesis`. Without it,
+    ///    an equality asserted inside a push leaked its conclusion past the
+    ///    matching pop: a false UNSAT.
+    ///
+    /// 2. **Assertion activation, a unit on the Tseitin root, installed
+    ///    scoped.** At depth 0 that is a permanent unit; at depth d>0
+    ///    `Solver::add_clause` appends the scope selector, making it
+    ///    `[root, +selector_d]`, and the scope is entered by ASSUMING
+    ///    `¬selector_d` (`compose_scope_assumptions`). That is an activation
+    ///    literal in AY's idiom. `Solver::pop` asserts `+selector_d`
+    ///    permanently and garbage-collects the guarded clauses, retracting the
+    ///    activation exactly. Learned clauses are resolvents of installed
+    ///    clauses only — assumptions are decisions, never premises — so they
+    ///    are implied by the global formula and survive legitimately.
+    ///
+    /// Nothing scoped is ever a permanent constraint, so a pop cannot leave an
+    /// over-constraining clause behind, so there is nothing to reset. The
+    /// expensive state — the bit-blast cache (`term_to_bits`), the Tseitin
+    /// variable mapping, the CNF already emitted, and the SAT solver with its
+    /// learned clauses — is kept for the whole session.
+    ///
+    /// Provenance: this is the invariant Bitwuzla 0.8.0 relies on, studied from
+    /// its source (`src/solving_context.cpp` `pop`;
+    /// `src/solver/bv/bv_bitblast_solver.h`, where only the assertion and
+    /// assumption vectors are backtrackable while the bitblaster cache, CNF
+    /// encoder and SAT solver are plain members; and
+    /// `src/solver/solver_engine.cpp`'s `top_level = level == 0` split that
+    /// decides assertion-vs-assumption). Bitwuzla is MIT; the algorithm was
+    /// studied and reimplemented on AY's existing scope-selector machinery. No
+    /// code was copied.
+    ///
+    /// The one thing that DOES have to be retracted is the bookkeeping that
+    /// records where an assertion's activation unit lives: units installed
+    /// deeper than the new frontend depth were just satisfied by `Solver::pop`,
+    /// so they must be re-added on the next check-sat (#2822, the same
+    /// invariant `IncrementalTheoryState::pop` maintains).
+    ///
+    /// Pinned by `incremental_bv_state_pop_keeps_the_bitblast_and_the_solver`
+    /// and `incremental_bv_state_pop_unwinds_one_sat_scope_and_keeps_every_cache`.
     fn pop(&mut self) -> bool {
         if self.scope_depth > 0 {
             self.scope_depth -= 1;
-            // A pop invalidates any learned clauses and scoped activations
-            // derived beneath the new frontend depth. Rebuild from the
-            // surviving assertions on the next check-sat instead of carrying
-            // stale SAT state forward.
-            self.reset_sat_encoding_for_rebuild();
+            if let Some(ref mut sat) = self.persistent_sat {
+                let _ = sat.pop();
+            } else if self.pending_pushes > 0 {
+                self.pending_pushes -= 1;
+            }
+            self.assertion_activation_scope
+                .retain(|_, depth| *depth <= self.scope_depth);
             true
         } else {
             false

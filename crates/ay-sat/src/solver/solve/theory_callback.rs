@@ -174,7 +174,7 @@ impl TheoryCallback for ExtensionCallback<'_> {
             return TheoryPropResult::Continue;
         }
 
-        let result = self.ext.propagate(solver);
+        let mut result = self.ext.propagate(solver);
 
         // #8421: Bump VSIDS activity for theory-conflict-driven variables.
         // Theory atoms in conflicts/propagations should be prioritized in
@@ -183,6 +183,14 @@ impl TheoryCallback for ExtensionCallback<'_> {
         // the bumps apply even when the result is a conflict.
         if !result.bump_vars.is_empty() {
             solver.bump_theory_vars(&result.bump_vars);
+        }
+
+        // Chunked XOR ladders (task #20): the proof-only scaffolding must be
+        // in the proof stream BEFORE any accompanying lemma, reason, or
+        // conflict clause is emitted, or those clauses are not RUP and an
+        // external checker rejects the whole certificate.
+        if !result.proof_script.is_empty() {
+            solver.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
         }
 
         if let Some(conflict) = result.conflict {
@@ -233,17 +241,6 @@ impl TheoryCallback for ExtensionCallback<'_> {
             }
         }
 
-        // Lightweight theory propagations (#4919): directly enqueue on trail
-        // without watch-list overhead. Matches Z3's ctx().assign() pattern.
-        for (clause, propagated) in result.propagations {
-            solver.add_theory_propagation_scoped(clause, propagated);
-        }
-        // Lazy theory propagations (#8467): enqueue on trail with deferred
-        // reason materialization. The full reason clause is only constructed
-        // during conflict analysis when the variable is actually resolved.
-        for (propagated, reason_data) in result.lazy_propagations {
-            solver.add_lazy_theory_propagation(propagated, reason_data);
-        }
         // General theory lemma clauses (conflicts, multi-watch clauses).
         // If add_theory_lemma detects an immediate conflict (all literals
         // false at level > 0), it returns Some(clause_ref) without
@@ -257,6 +254,17 @@ impl TheoryCallback for ExtensionCallback<'_> {
                 return TheoryPropResult::Conflict(clause);
             }
             solver.add_theory_lemma(clause);
+        }
+        // Lightweight theory propagations (#4919): directly enqueue on trail
+        // without watch-list overhead. Matches Z3's ctx().assign() pattern.
+        for (clause, propagated) in result.propagations {
+            solver.add_theory_propagation_scoped(clause, propagated);
+        }
+        // Lazy theory propagations (#8467): enqueue on trail with deferred
+        // reason materialization. The full reason clause is only constructed
+        // during conflict analysis when the variable is actually resolved.
+        for (propagated, reason_data) in result.lazy_propagations {
+            solver.add_lazy_theory_propagation(propagated, reason_data);
         }
         // Theory requested immediate stop (split pending) — hand control
         // back to the outer split loop before SAT search can clear the
@@ -282,31 +290,40 @@ impl TheoryCallback for ExtensionCallback<'_> {
         // atoms on the SAT trail. Calling propagate() unconditionally ensures
         // the theory's check_during_propagate runs even when BCP only
         // propagated boolean encoding variables.
-        let result = self.ext.propagate(solver);
+        let mut result = self.ext.propagate(solver);
 
         if !result.bump_vars.is_empty() {
             solver.bump_theory_vars(&result.bump_vars);
         }
 
+        // Chunked XOR ladders (task #20): scaffolding precedes dependent
+        // clauses in the proof stream (see `propagate` above).
+        if !result.proof_script.is_empty() {
+            solver.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
+        }
+
         if let Some(conflict) = result.conflict {
+            for clause in result.clauses {
+                solver.add_theory_lemma(clause);
+            }
             return TheoryPropResult::Conflict(conflict);
         }
         let has_work = !result.clauses.is_empty()
             || !result.propagations.is_empty()
             || !result.lazy_propagations.is_empty();
 
-        for (clause, propagated) in result.propagations {
-            solver.add_theory_propagation_scoped(clause, propagated);
-        }
-        for (propagated, reason_data) in result.lazy_propagations {
-            solver.add_lazy_theory_propagation(propagated, reason_data);
-        }
         for clause in result.clauses {
             let all_false = clause.iter().all(|lit| solver.lit_val(*lit) < 0);
             if all_false && solver.current_decision_level() > 0 {
                 return TheoryPropResult::Conflict(clause);
             }
             solver.add_theory_lemma(clause);
+        }
+        for (clause, propagated) in result.propagations {
+            solver.add_theory_propagation_scoped(clause, propagated);
+        }
+        for (propagated, reason_data) in result.lazy_propagations {
+            solver.add_lazy_theory_propagation(propagated, reason_data);
         }
         if solver.has_empty_clause() {
             return TheoryPropResult::Conflict(vec![]);

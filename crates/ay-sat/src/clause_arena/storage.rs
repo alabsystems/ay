@@ -209,6 +209,8 @@ impl ClauseArena {
     ///
     /// Reference: CaDiCaL collect.cpp:385-399 (arenatype=3).
     pub(crate) fn compact_reorder(&mut self, order: &[u32]) -> Vec<u32> {
+        // Every offset moves: no per-offset cache survives compaction.
+        self.bump_formula_epoch();
         let mut remap = vec![u32::MAX; self.words.len()];
         let estimated_live = self.active_count * (HEADER_WORDS + 8);
         let mut new_words = Vec::with_capacity(estimated_live);
@@ -218,7 +220,6 @@ impl ClauseArena {
         let mut new_redundant = 0usize;
         let mut new_learned_offsets = Vec::with_capacity(self.learned_offsets.len());
         let mut new_learned_offset_index = DetHashMap::default();
-        let mut new_signatures: DetHashMap<u32, ClauseSignature> = DetHashMap::default();
 
         for &old_off in order {
             let off = old_off as usize;
@@ -236,13 +237,6 @@ impl ClauseArena {
                 self.words.len()
             );
             new_words.extend_from_slice(&self.words[off..end]);
-            // Carry the side-table signature to the clause's new offset.
-            let signature = self
-                .signatures
-                .get(&(off as u32))
-                .copied()
-                .unwrap_or_else(|| compute_clause_signature(self.literals(off)));
-            new_signatures.insert(new_off as u32, signature);
             remap[off] = new_off as u32;
             new_clause_count += 1;
             new_active_count += 1;
@@ -268,7 +262,10 @@ impl ClauseArena {
         self.learned_offsets = new_learned_offsets;
         self.learned_offset_index = new_learned_offset_index;
         self.shrink_map.clear();
-        self.signatures = new_signatures;
+        // The retired signature side table was rebuilt from empty here with
+        // one insert per live clause; keep its would-be `len()` in step for
+        // the memory-heuristic charge (see `phantom_signature_entries`).
+        self.phantom_signature_entries = new_clause_count;
         self.dead_words = 0;
         remap
     }
@@ -357,6 +354,7 @@ impl ClauseArena {
     /// `compact_arena_locality()` in `arena_gc.rs` handles the full remapping.
     #[cfg(test)]
     pub(crate) fn compact(&mut self) -> Vec<(usize, usize)> {
+        self.bump_formula_epoch();
         let mut new_words = Vec::new();
         let mut remapping = Vec::new();
         let mut new_clause_count = 0usize;
@@ -365,7 +363,6 @@ impl ClauseArena {
         let mut new_redundant = 0usize;
         let mut new_learned_offsets = Vec::with_capacity(self.learned_offsets.len());
         let mut new_learned_offset_index = DetHashMap::default();
-        let mut new_signatures: DetHashMap<u32, ClauseSignature> = DetHashMap::default();
         let mut pos = 0;
 
         while pos < self.words.len() {
@@ -383,12 +380,6 @@ impl ClauseArena {
                 // Live clause: copy header + current literals (not dead tail).
                 let new_off = new_words.len();
                 new_words.extend_from_slice(&self.words[pos..pos + HEADER_WORDS + current_len]);
-                let signature = self
-                    .signatures
-                    .get(&(pos as u32))
-                    .copied()
-                    .unwrap_or_else(|| compute_clause_signature(self.literals(pos)));
-                new_signatures.insert(new_off as u32, signature);
                 remapping.push((pos, new_off));
                 new_clause_count += 1;
                 new_active_count += 1;
@@ -417,7 +408,9 @@ impl ClauseArena {
         self.learned_offsets = new_learned_offsets;
         self.learned_offset_index = new_learned_offset_index;
         self.shrink_map.clear();
-        self.signatures = new_signatures;
+        // Keep the retired signature table's would-be `len()` in step (one
+        // insert per live clause on rebuild) for the memory-heuristic charge.
+        self.phantom_signature_entries = new_clause_count;
         self.dead_words = 0;
         remapping
     }

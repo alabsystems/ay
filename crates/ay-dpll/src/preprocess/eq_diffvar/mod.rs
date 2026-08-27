@@ -95,6 +95,21 @@ pub(crate) struct EqDiffVar {
     pub(crate) diff_vars: u64,
     /// Stats: equality atoms rewritten to var-const form.
     pub(crate) rewritten_atoms: u64,
+    /// Proof-facing provenance (#4751): one record per folded atom, carrying
+    /// the definition `d := lin` that licenses the fold. Populated on every
+    /// run; the wiring site keeps it only when a proof tracker is recording.
+    /// A record is a HINT — the replay re-derives the equivalence from the
+    /// definitional bounds and declines on any mismatch.
+    pub(crate) atom_folds: Vec<AtomFold>,
+}
+
+/// One `atom -> (= d rhs)` fold with the definition that licenses it (#4751).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtomFold {
+    pub(crate) atom: TermId,
+    pub(crate) replacement: TermId,
+    pub(crate) definiendum: TermId,
+    pub(crate) definiens: TermId,
 }
 
 impl EqDiffVar {
@@ -104,6 +119,7 @@ impl EqDiffVar {
             fold_map: HashMap::default(),
             diff_vars: 0,
             rewritten_atoms: 0,
+            atom_folds: Vec::new(),
         }
     }
 
@@ -322,6 +338,7 @@ impl EqDiffVar {
         let mut dvar_order: Vec<(CanonKey, TermId)> = Vec::new();
         self.fold_map.clear();
         self.cache.clear();
+        let mut folded_by_dvar: Vec<(TermId, TermId, TermId)> = Vec::new();
         for (atom, key, rhs) in &canon {
             let dvar = match dvar_of.get(key) {
                 Some(&d) => d,
@@ -339,6 +356,7 @@ impl EqDiffVar {
             let rhs_term = terms.mk_int(rhs.clone());
             let replacement = terms.mk_eq_coerce(dvar, rhs_term);
             self.fold_map.insert(*atom, replacement);
+            folded_by_dvar.push((*atom, replacement, dvar));
         }
         if self.fold_map.is_empty() {
             return Vec::new();
@@ -349,13 +367,26 @@ impl EqDiffVar {
             *assertion = self.fold(terms, *assertion);
         }
         let mut defs: Vec<TermId> = Vec::with_capacity(dvar_order.len() * 2);
+        let mut definiens_of: HashMap<TermId, TermId> = HashMap::default();
         for (key, dvar) in &dvar_order {
             let lin = Self::build_lin(terms, key);
+            definiens_of.insert(*dvar, lin);
             // Inequality PAIR, not a unit equality: see module docs (a unit
             // equality is inlined right back by VariableSubstitution).
             defs.push(terms.mk_le(*dvar, lin));
             defs.push(terms.mk_ge(*dvar, lin));
         }
+        self.atom_folds = folded_by_dvar
+            .into_iter()
+            .filter_map(|(atom, replacement, definiendum)| {
+                definiens_of.get(&definiendum).map(|&definiens| AtomFold {
+                    atom,
+                    replacement,
+                    definiendum,
+                    definiens,
+                })
+            })
+            .collect();
         self.diff_vars = dvar_order.len() as u64;
         self.rewritten_atoms = self.fold_map.len() as u64;
         assertions.extend(defs.iter().copied());

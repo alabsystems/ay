@@ -13,6 +13,8 @@ use super::{
     ObjectiveDirection, OptionValue, Result, ScopeFrame, SoftAssertion, SymbolInfo,
 };
 
+mod symbol_registration;
+
 /// Builtin sort names supplied by enabled SMT theories.
 ///
 /// User aliases/declarations with these names would either shadow a theory
@@ -546,9 +548,9 @@ impl Context {
     ///
     /// * outermost scope only (a `pop` could otherwise drop the justifying
     ///   assertion while the macro persisted);
-    /// * plain un-annotated, single-binder `forall` whose body is
-    ///   `(= (f x) rhs)`, with the binder applied exactly and exactly ONE side
-    ///   an `f`-application (wider definitions remain quantified, fail closed);
+    /// * plain un-annotated `forall` whose body is `(= (f x1 … xk) rhs)`
+    ///   with the binder list applied exactly, in order, binder names
+    ///   distinct, and exactly ONE side an `f`-application;
     /// * `f` user-declared, arity and binder sorts matching the declaration,
     ///   not already defined/recursive/datatype-internal, and NOT referenced
     ///   by any existing assertion/soft-assertion/objective (a raw pre-macro
@@ -560,6 +562,27 @@ impl Context {
     /// On adoption the caller re-elaborates the assertion, which the fresh
     /// macro turns into the reflexive tautology — the constraint stays on
     /// the stack with its meaning discharged by construction.
+    ///
+    /// # ARITY IS NOT A SOUNDNESS PARAMETER
+    ///
+    /// 92e37dcf3 narrowed the binder test to `pvars.len() != 1`, which cost
+    /// `sat` on every multi-binder definitional extension — the shape verification-consumer
+    /// emits for sequence accessors, e.g.
+    /// `forall s i. (= (seq_index_logic s i) (select (seq_array s) (+ (seq_offset s) i)))`.
+    /// Refused, the definition stays quantified, the query routes to the AUFLIA
+    /// lazy split loop, and that loop does not converge on this family (see the
+    /// in-tree note at `ay-theories/lia/src/check.rs:962`), so a 2s `sat`
+    /// became a divergence no budget closes.
+    ///
+    /// Every guard above is written over k binders and none reads `pvars.len()`
+    /// except to require the application to match it. Under them,
+    /// `psi AND forall x1..xk. f(x1..xk) = t` is a DEFINITIONAL EXTENSION: `f`
+    /// does not occur in `psi`, so every model of `psi` extends uniquely by
+    /// `f := \x1..xk. t` — total and well-defined precisely because `t` is
+    /// `f`-free — and every model of the conjunction models `psi`.
+    /// Satisfiability is preserved in both directions and the argument never
+    /// mentions k. The distinctness loop is dead code at k=1: the function was
+    /// written for the k-ary case.
     fn try_adopt_definitional_forall(&mut self, term: &ParsedTerm) -> Option<String> {
         use crate::command::Term as PT;
         if !self.scopes.is_empty() {
@@ -568,7 +591,7 @@ impl Context {
         let PT::Forall(pvars, pbody) = term else {
             return None;
         };
-        if pvars.len() != 1 {
+        if pvars.is_empty() {
             return None;
         }
         // Distinct binder names (duplicate binders make the "applied exactly
@@ -759,32 +782,6 @@ impl Context {
         self.register_symbol_with_internal_name(name, term, sort, None);
     }
 
-    fn register_symbol_with_internal_name(
-        &mut self,
-        name: String,
-        term: TermId,
-        sort: Sort,
-        internal_name: Option<String>,
-    ) {
-        let public_sort = super::PublicSort::from_engine(&sort);
-        let info = SymbolInfo::fresh(
-            Some(term),
-            sort,
-            vec![],
-            public_sort,
-            vec![],
-            internal_name,
-            super::DeclarationKind::Uninterpreted,
-        );
-        if self.global_declarations_enabled() {
-            self.propagate_global_symbol_replacement_to_snapshots(&name, &info);
-        } else {
-            self.track_scoped_symbol(&name);
-        }
-        self.symbols.insert(name, info);
-        self.advance_source_revision();
-    }
-
     /// Create and register one native-API constant as a global declaration.
     ///
     /// The caller-visible `name` remains the symbol-table/model/replay key. The
@@ -800,7 +797,17 @@ impl Context {
             let internal_name = ctx.ordinary_source_binding_internal_name(&name);
             let core_name = internal_name.as_deref().unwrap_or(&name).to_string();
             let term = ctx.terms.mk_fresh_named_var(&core_name, sort.clone());
-            ctx.register_symbol_with_internal_name(name, term, sort, internal_name);
+            // The term is allocated HERE, in the same operation that records
+            // its metadata — the coherence that makes this binding eligible
+            // for quantified-output completion defaults (see
+            // `SymbolBindingOrigin::NativeApiDeclaration`).
+            ctx.register_symbol_with_internal_name_and_origin(
+                name,
+                term,
+                sort,
+                internal_name,
+                super::SymbolBindingOrigin::NativeApiDeclaration,
+            );
             term
         })
     }

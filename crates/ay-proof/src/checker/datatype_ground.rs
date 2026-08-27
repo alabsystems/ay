@@ -134,7 +134,7 @@ pub(crate) fn validate_datatype_ground_conflict(
 
 /// Recognize whether `clause` is a valid ground datatype/EUF conflict clause
 /// under the given registries — i.e. whether
-/// [`validate_datatype_ground_conflict`] would accept it. Because it IS the
+/// `validate_datatype_ground_conflict` would accept it. Because it IS the
 /// strict validator, classifier and checker cannot drift.
 #[must_use]
 pub fn recognize_datatype_ground_conflict(
@@ -151,7 +151,9 @@ mod tests {
     use super::*;
     use ay_core::{Sort, Symbol};
 
-    fn registries() -> (Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>) {
+    type Registry = Vec<(String, Vec<String>)>;
+
+    fn registries() -> (Registry, Registry) {
         (
             vec![(
                 "Tower".to_string(),
@@ -311,6 +313,90 @@ mod tests {
         ));
         // And with an empty registry even the registered spelling fails.
         assert!(!recognize_datatype_ground_conflict(&terms, &[l1], &[], &[]));
+    }
+
+    #[test]
+    fn accepts_boolean_branch_implication_elimination() {
+        // The Boolean-consequence premise shape (#dt-context-derivation):
+        // `(cl P (not c) (not B))` where `B = (or (not c) (and P Q))` — the
+        // authored-ITE then-implication. Negated: {¬P, c, B}; or-elimination
+        // under c forces the `and`, whose conjunct P contradicts ¬P.
+        let (decls, sels) = registries();
+        let mut terms = TermStore::new();
+        let tower = Sort::Uninterpreted("Tower".to_string());
+        let x = terms.mk_var("x", tower.clone());
+        let y = terms.mk_var("y", tower.clone());
+        let z = terms.mk_var("z", tower);
+        let c = terms.mk_var("c", Sort::Bool);
+        let p = eq(&mut terms, x, y);
+        let q = eq(&mut terms, y, z);
+        let conjunction = terms.mk_app(Symbol::named("and"), vec![p, q], Sort::Bool);
+        let not_c = terms.mk_not(c);
+        let branch = terms.mk_app(Symbol::named("or"), vec![not_c, conjunction], Sort::Bool);
+        let not_branch = terms.mk_not(branch);
+        let clause = [p, not_c, not_branch];
+        assert!(recognize_datatype_ground_conflict(
+            &terms, &clause, &decls, &sels
+        ));
+        // Without the guard the branch alone decides nothing.
+        assert!(!recognize_datatype_ground_conflict(
+            &terms,
+            &[p, not_branch],
+            &decls,
+            &sels
+        ));
+        // And the else-side dual: `B_else = (or c Q)` with guard FALSE.
+        let branch_else = terms.mk_app(Symbol::named("or"), vec![c, q], Sort::Bool);
+        let not_branch_else = terms.mk_not(branch_else);
+        let clause_else = [q, c, not_branch_else];
+        assert!(recognize_datatype_ground_conflict(
+            &terms,
+            &clause_else,
+            &decls,
+            &sels
+        ));
+    }
+
+    #[test]
+    fn accepts_nested_ite_chain_elimination() {
+        // The blocksworld transition shape: `imp_else = (or c1 (ite c2 P Q))`
+        // with the outer guard FALSE and the inner guard TRUE selects P.
+        // Clause: `(cl P (not (not c1)) (not c2) (not imp_else))` — i.e. the
+        // conjunct follows from {¬c1, c2, imp_else}.
+        let (decls, sels) = registries();
+        let mut terms = TermStore::new();
+        let tower = Sort::Uninterpreted("Tower".to_string());
+        let x = terms.mk_var("x", tower.clone());
+        let y = terms.mk_var("y", tower.clone());
+        let z = terms.mk_var("z", tower);
+        let c1 = terms.mk_var("c1", Sort::Bool);
+        let c2 = terms.mk_var("c2", Sort::Bool);
+        let p = eq(&mut terms, x, y);
+        let q = eq(&mut terms, y, z);
+        let inner = terms.mk_ite(c2, p, q);
+        let imp_else = terms.mk_app(Symbol::named("or"), vec![c1, inner], Sort::Bool);
+        let not_c1 = terms.mk_not(c1);
+        let not_not_c1 = terms.mk_not(not_c1);
+        let not_c2 = terms.mk_not(c2);
+        let not_imp_else = terms.mk_not(imp_else);
+        assert!(recognize_datatype_ground_conflict(
+            &terms,
+            &[p, not_not_c1, not_c2, not_imp_else],
+            &decls,
+            &sels
+        ));
+        // The inner-else dual: with c2 FALSE the chain selects Q.
+        let clause_q = [q, not_not_c1, c2, not_imp_else];
+        assert!(recognize_datatype_ground_conflict(
+            &terms, &clause_q, &decls, &sels
+        ));
+        // Undecided inner guard: nothing selects a branch; fail closed.
+        assert!(!recognize_datatype_ground_conflict(
+            &terms,
+            &[p, not_not_c1, not_imp_else],
+            &decls,
+            &sels
+        ));
     }
 
     #[test]

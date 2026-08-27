@@ -201,7 +201,7 @@ impl Executor {
                 .collect();
             solver.add_clause(lits);
         }
-
+        self.arm_sat_conflict_budget(&mut solver, 0);
         let should_stop = self.make_should_stop();
         let mut result = solver.solve_interruptible(should_stop).into_inner();
         collect_sat_stats!(self, &solver);

@@ -309,6 +309,155 @@ class PlanSolverResourcesTest(unittest.TestCase):
                     if stream is not None:
                         stream.close()
 
+    # A helper that takes the flock on a lease path, writes an arbitrary owner
+    # record into it, and then stays alive holding the descriptor. This is the
+    # shape of the 2026-08-24 leak: the flock outlived the harness that planned
+    # the campaign, so the recorded owner was dead while the lock was still held.
+    _LEASE_HOLDER_SOURCE = (
+        "import fcntl, os, sys\n"
+        "path, record = sys.argv[1], sys.argv[2]\n"
+        "fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "os.ftruncate(fd, 0)\n"
+        "os.write(fd, record.encode())\n"
+        "sys.stdout.write('HELD\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdin.read()\n"
+    )
+
+    @contextlib.contextmanager
+    def _leaked_lease(self, lock_path, record):
+        holder = subprocess.Popen(
+            [sys.executable, "-c", self._LEASE_HOLDER_SOURCE, str(lock_path), record],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # Never read holder.stderr here: the holder stays alive for the
+            # whole test, so reading its pipe to completion would deadlock.
+            ready = holder.stdout.readline()
+            self.assertEqual(ready, b"HELD\n", "lease holder did not take the flock")
+            yield holder
+        finally:
+            if holder.poll() is None:
+                holder.kill()
+                holder.wait(timeout=10)
+            for stream in (holder.stdin, holder.stdout, holder.stderr):
+                if stream is not None:
+                    stream.close()
+
+    @staticmethod
+    def _definitely_dead_pid():
+        """A PID that has been observed to exit, i.e. `kill -0` must fail."""
+        corpse = subprocess.Popen([sys.executable, "-c", "pass"])
+        corpse.wait(timeout=30)
+        return corpse.pid
+
+    def test_lease_with_dead_recorded_owner_is_reclaimed_and_logged(self):
+        # Regression (#32): a leaked /tmp/ay-oom-guard-<uid>.lock naming a DEAD
+        # pid made every later chc_baseline_compare run refuse before writing
+        # evidence, which read as a CHC regression rather than as a stuck lock.
+        dead = self._definitely_dead_pid()
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "stale-owner-host-lease.lock"
+            record = f"pid={dead} label=chc_baseline_compare.py\n"
+            with self._leaked_lease(lock_path, record):
+                self.assertTrue(lock_path.exists())
+                stale_ino = lock_path.stat().st_ino
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    lease = og.acquire_harness_lease(
+                        "reclaim-test", _lock_path=str(lock_path)
+                    )
+                try:
+                    logged = stderr.getvalue()
+                    self.assertIn("reclaimed the host resource lease", logged)
+                    self.assertIn(str(lock_path), logged)
+                    self.assertIn(f"pid={dead}", logged)
+                    self.assertIn("chc_baseline_compare.py", logged)
+                    # A fresh inode, owned by this process, is what makes the
+                    # next run's flock meaningful again.
+                    self.assertNotEqual(lock_path.stat().st_ino, stale_ino)
+                    self.assertIn(
+                        f"pid={os.getpid()}", lock_path.read_text(encoding="utf-8")
+                    )
+                finally:
+                    og._release_harness_lease()
+
+    def test_lease_with_live_recorded_owner_is_still_refused(self):
+        # The guard's purpose is refusing to run a heavy job beside another
+        # campaign. Only stale-OWNER leases may be reclaimed, never a live one.
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "live-owner-host-lease.lock"
+            record = f"pid={os.getpid()} label=live-campaign\n"
+            with self._leaked_lease(lock_path, record):
+                held_ino = lock_path.stat().st_ino
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "already owns the host resource lease"
+                    ):
+                        og.acquire_harness_lease(
+                            "refuse-test", _lock_path=str(lock_path)
+                        )
+                self.assertNotIn("reclaimed", stderr.getvalue())
+                # Not unlinked, not rewritten: the live owner still owns it.
+                self.assertEqual(lock_path.stat().st_ino, held_ino)
+                self.assertIn(
+                    f"pid={os.getpid()} label=live-campaign",
+                    lock_path.read_text(encoding="utf-8"),
+                )
+        self.assertIsNone(og._ACTIVE_HARNESS_LEASE)
+
+    def test_lease_refusal_names_the_owner_it_is_refusing_for(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "named-owner-host-lease.lock"
+            record = f"pid={os.getpid()} acquired=1 label=long-running-race\n"
+            with self._leaked_lease(lock_path, record):
+                with self.assertRaises(RuntimeError) as caught:
+                    og.acquire_harness_lease("named-test", _lock_path=str(lock_path))
+        message = str(caught.exception)
+        self.assertIn(f"pid={os.getpid()}", message)
+        self.assertIn("long-running-race", message)
+        self.assertIn("held=", message)
+
+    def test_unreadable_lease_record_is_never_reclaimed(self):
+        # An owner that has taken the flock but not yet written its record is
+        # alive. "Owner unknown" must fail closed, not reclaim.
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "empty-record-host-lease.lock"
+            with self._leaked_lease(lock_path, ""):
+                held_ino = lock_path.stat().st_ino
+                with self.assertRaisesRegex(
+                    RuntimeError, "already owns the host resource lease"
+                ):
+                    og.acquire_harness_lease("empty-test", _lock_path=str(lock_path))
+                self.assertEqual(lock_path.stat().st_ino, held_ino)
+
+    def test_lease_owner_liveness_rejects_a_recycled_pid(self):
+        record = og._parse_harness_lease_record(
+            f"pid={os.getpid()} acquired=1 start=Some_Other_Boot_Time label=old\n"
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record["pid"], os.getpid())
+        # This PID is alive, but it is not the process that wrote the record.
+        self.assertFalse(og._harness_lease_owner_is_alive(record))
+        current = og._parse_harness_lease_record(
+            og._harness_lease_record(os.getpid(), "self")
+        )
+        self.assertTrue(og._harness_lease_owner_is_alive(current))
+
+    def test_unmeasurable_start_token_counts_the_owner_as_live(self):
+        # `kill -0` already said the PID exists, so a failed start-time lookup
+        # is a measurement failure, not evidence of death. Reclaiming a live
+        # campaign's lease is the one outcome this guard must never produce.
+        record = og._parse_harness_lease_record(
+            f"pid={os.getpid()} acquired=1 start=Recorded_Boot_Time label=live\n"
+        )
+        with mock.patch.object(og, "_watch_process_identity", return_value=None):
+            self.assertTrue(og._harness_lease_owner_is_alive(record))
+
     def test_count_active_rustc_returns_count(self):
         if not Path("/proc").is_dir():
             with self.assertRaisesRegex(RuntimeError, "cannot inspect build processes"):

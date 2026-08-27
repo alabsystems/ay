@@ -4,7 +4,8 @@
 
 //! Exact-query isolation and checked result admission for nested probes.
 
-use ay_core::TermId;
+use ay_core::term::{Symbol, TermData};
+use ay_core::{TermId, TermStore};
 
 use super::{CheckedGroundKind, CheckedGroundScope, CheckedIsolatedMode};
 use crate::ematching::contains_quantifier;
@@ -31,6 +32,78 @@ fn report_unsat_decline(token: Option<&UnsatCertificate>, published: bool, check
              published={published} token={class} checked={checked}"
         )
     });
+}
+
+/// AY's marker for an INTERNALLY MINTED symbol. The frontend rejects it in user
+/// input (`is_reserved_symbol`), so a symbol spelled with this prefix was
+/// minted by AY itself during some solve.
+const INTERNAL_SYMBOL_MARKER: &str = "__ay_";
+
+/// Whether `terms` holds an AY-internal symbol whose NAME may carry a
+/// `TermId`.
+///
+/// # The hazard
+///
+/// Several of AY's internal mints bake a `TermId` INTO THE SYMBOL'S NAME and
+/// parse it back out later. The id then travels as TEXT, where no
+/// [`ay_core::term::RemapTable`], no `Remappable` visitor and no exhaustive
+/// `TermId` walk can see it. `mark_and_compact`'s contract — every external
+/// holder is a root or is remapped — is silently violated, and after a
+/// relabelling the name denotes a DIFFERENT term, or none at all. Every such
+/// mint found by scanning `ay-core`, `ay-frontend` and `ay-dpll` for a symbol
+/// name formatted from a `TermId`:
+///
+///  * `__ay_zerodiv_{op}_{dividend}`, `__ay_symdiv_{kind}_{a}_{b}` —
+///    `executor::mod_div_elim`, decoded by `collect_zero_divisor_vars` and by
+///    `executor::model::div_witness`;
+///  * `__ay_ite_def_{ite}` — `ay_core::term::ite_lifting`, decoded by
+///    `executor::proof::ite_definition_leaf`;
+///  * `__ay_arrflat!{array}_t{index}` — `executor::theories::fp::flatten_reads`;
+///  * `__ay_bv_lia_cong_k{source}_w{width}` — `executor::theories::combined`;
+///  * `__ay_native_replay_unauthenticated_{term}` — `api::solving::native_replay`;
+///  * the `<prefix><label>!{map}` map-domain carriers in
+///    `ay_frontend::elaborate::app::map`, which says outright that the id is
+///    parsed back and that `__ay_` is reserved so nothing can collide with it.
+///
+/// MEASURED, not theorised. Without this veto the `__ay_zerodiv_*` case is a
+/// live panic: `ufbv_fixpoint_premise_forced_unsat::
+/// underspecified_division_in_premise_is_never_refuted` builds a probe whose
+/// arena prunes 131 -> 12 terms while a surviving `__ay_zerodiv_*` name still
+/// spells dividend index 56, `collect_zero_divisor_vars` decodes it, and
+/// `TermStore::get` panics with `index out of bounds: the len is 15 but the
+/// index is 56`. The compacted store is internally consistent at that point
+/// (measured: zero dangling children, zero out-of-range roots) — the dangling
+/// id is the one that travelled as a string.
+///
+/// # Why this test and not a list of those six prefixes
+///
+/// A prefix list is only as good as the next mint that forgets to join it, and
+/// a missed entry does not produce a slow probe — it produces a wrong term
+/// silently substituted for another. The test is instead a property of the
+/// hazard itself: an id baked into a name is SPELLED THERE, so the name
+/// contains its decimal digits. Vetoing every internal symbol whose name
+/// carries a digit therefore covers every present encoder AND every future one,
+/// with no enumeration to keep in step. It also vetoes internal names whose
+/// digits are a plain counter rather than an id (`__ay_sk_x!3`); that costs
+/// speed and nothing else. Digit-FREE internal names (`__ay_dt_depth_List`, the
+/// only one the `inc_some_list` probe carries) cannot be spelling an id and
+/// stay prunable.
+fn carries_name_encoded_term_ids(terms: &TermStore) -> bool {
+    let name_encodes_a_term_id = |name: &str| {
+        name.starts_with(INTERNAL_SYMBOL_MARKER) && name.bytes().any(|byte| byte.is_ascii_digit())
+    };
+    (0..terms.len()).any(|index| {
+        let Ok(raw) = u32::try_from(index) else {
+            return false;
+        };
+        match terms.get(TermId(raw)) {
+            TermData::Var(name, _) => name_encodes_a_term_id(name),
+            TermData::App(Symbol::Named(name) | Symbol::Indexed(name, _), _) => {
+                name_encodes_a_term_id(name)
+            }
+            _ => false,
+        }
+    })
 }
 
 impl Executor {
@@ -103,6 +176,124 @@ impl Executor {
         }
     }
 
+    /// The isolated probe's context: a clone of the enclosing one with the
+    /// outer query stripped and the exact roots installed the native-API way.
+    ///
+    /// Split out of [`Self::checked_isolated_solve`] so the pruned build below
+    /// has an exact, unpruned twin to fall back to.
+    fn isolated_probe_context(&self, assertions: &[TermId]) -> Option<ay_frontend::Context> {
+        let mut probe_ctx = self.ctx.clone();
+        // Strip the outer query before installing exact roots. The nested
+        // proof/source epoch must authenticate this obligation, not objectives,
+        // soft constraints, or named-core provenance from the enclosing query.
+        probe_ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .ok()?;
+        self.install_isolated_probe_roots(&mut probe_ctx, assertions);
+        Some(probe_ctx)
+    }
+
+    /// The same probe context with the cloned arena rebuilt around THIS query.
+    ///
+    /// # Why the clone alone is not enough
+    ///
+    /// The clone is deliberate and stays — a thin re-translate of the roots
+    /// alone leaves deep nested-`ite` obligations `Unknown`, which is the
+    /// documented reason `Context` is `Clone` at all. What must not come with
+    /// it is the enclosing solve's SCRATCH: every quantifier instance, theory
+    /// lemma and proof-planning bridge node the OUTER solve hash-consed into
+    /// the live arena. Nothing asserts them and this obligation cannot reach
+    /// them, but whole-store scans inside the probe still see them, and the
+    /// probe's own completeness ledgers are what those scans feed.
+    ///
+    /// Measured on the `inc_some_list` dual-vocabulary datatype obligation
+    /// (`dt_uf_bridge_congruence::inc_some_list_dual_vocab_obligation_is_unsat`).
+    /// Its 52-root authored ground core reaches this probe carrying an arena of
+    /// **353,363** terms, of which the core reaches **199** — 0.06%. On the
+    /// unpruned clone `solve_with_dt_axioms` failed closed on its deterministic
+    /// budget and the probe answered `Ok(Unknown)`, so the authored-ground-core
+    /// leg declined a refutation the probe can actually reach. On the pruned
+    /// clone the same probe answers `Ok(Unsat(..))` with its build phase sealed
+    /// at 13.9ms. The store size was the cause, not the clock: this leg's wall
+    /// budget was unchanged across both measurements.
+    ///
+    /// # The pruning rule, and why it cannot drop something the probe needs
+    ///
+    /// [`ay_frontend::Context::compact_terms_for_derived_query`] marks from
+    /// EVERY `TermId` the context itself still holds — not from the roots
+    /// alone — plus the `TermStore`-owned pins (`true`, `false`, and every
+    /// entry in `TermStore::names`). Reachability is the real term DAG
+    /// (`TermStore::for_each_child`, which is also what the child-rewrite pass
+    /// uses, so marking and rewriting cannot drift), extended with the
+    /// `:no-pattern` side map. So the survivors include, without this call
+    /// having to enumerate them:
+    ///
+    ///  * the installed roots and their transitive closure, because
+    ///    `install_isolated_probe_roots` ran FIRST — hence the ordering here;
+    ///  * every declared symbol's term, via `Context::symbols`,
+    ///    `Context::overloaded_symbols`, `Context::datatype_member_symbols`
+    ///    and `TermStore::names`, whether or not any root mentions it;
+    ///  * every nullary constructor term, adopted-macro body, named term and
+    ///    scope-frame binding the context still holds.
+    ///
+    /// Anything the probe MINTS later — datatype axioms, quantifier instances,
+    /// skolems, definitional extensions — is interned fresh into the rebuilt
+    /// hash-cons map, so it cannot be a term this pass could have reclaimed.
+    /// Anything the probe RE-ELABORATES (`define-fun` bodies, schematic
+    /// assertions) is a parser AST, not a `TermId`, and re-elaborates into the
+    /// same interned node. What is left over — a node no root reaches and no
+    /// symbol, name, scope or macro names — is unreachable from the probe by
+    /// construction: the probe has no `TermId` of its own (`qpf_probe_executor`
+    /// copies only scalar resource settings), so `probe.ctx` is the ONLY way it
+    /// can name a term.
+    ///
+    /// Survivors keep byte-identical `TermData` and their `TermEntry` stamp;
+    /// only ids move, and they move through the `RemapTable` the same in-place
+    /// relabelling produced. So this cannot change a verdict the probe would
+    /// otherwise reach on the merits, and it cannot let the probe accept
+    /// something it should refuse: the probe still has to publish and
+    /// self-check its own certificate, and the outer authority binding
+    /// (`CheckedGroundScope`) is captured on `self.ctx`, which this never
+    /// touches.
+    ///
+    /// # Fail closed
+    ///
+    /// The rebuild is all-or-nothing: it returns `false` if any held id could
+    /// not be translated, and a partially relabelled context must never be
+    /// solved. This does NOT decline the probe — it rebuilds the exact
+    /// unpruned clone the probe had before this existed and runs that, so a
+    /// query shape whose arena cannot be rebuilt is merely as slow as it
+    /// always was.
+    fn pruned_isolated_probe_context(&self, assertions: &[TermId]) -> Option<ay_frontend::Context> {
+        let mut probe_ctx = self.isolated_probe_context(assertions)?;
+        let before = probe_ctx.terms.len();
+        if carries_name_encoded_term_ids(&probe_ctx.terms) {
+            probe_cert_reject(|| {
+                format!(
+                    "checked-isolated probe arena NOT pruned at {before} terms: \
+                     an AY-internal symbol name may spell a TermId"
+                )
+            });
+            return Some(probe_ctx);
+        }
+        if probe_ctx.compact_terms_for_derived_query() {
+            probe_cert_reject(|| {
+                format!(
+                    "checked-isolated probe arena: {before} -> {} terms",
+                    probe_ctx.terms.len()
+                )
+            });
+            return Some(probe_ctx);
+        }
+        probe_cert_reject(|| {
+            format!(
+                "checked-isolated probe arena rebuild DECLINED at {before} terms; \
+                 falling back to the unpruned clone"
+            )
+        });
+        self.isolated_probe_context(assertions)
+    }
+
     /// One satisfying assignment's concrete values for `targets`, or `None`.
     ///
     /// NO AUTHORITY CROSSES THIS BOUNDARY, BY CONSTRUCTION. Unlike
@@ -138,14 +329,14 @@ impl Executor {
         {
             return None;
         }
-        let mut probe_ctx = self.ctx.clone();
-        if probe_ctx
-            .process_command(&ay_frontend::Command::ResetAssertions)
-            .is_err()
-        {
-            return None;
-        }
-        self.install_isolated_probe_roots(&mut probe_ctx, &assertions);
+        // DELIBERATELY UNPRUNED. Unlike every other probe here, this one
+        // evaluates `targets` — ids minted in the ENCLOSING store — against the
+        // probe's model. Rebuilding the arena relabels ids, so a pruned context
+        // would read those ids as different terms (or out of range). Pruning
+        // this probe needs the remap table applied to `targets`, which
+        // `compact_terms_for_derived_query` does not hand back; until it does,
+        // this site keeps the clone it always had.
+        let probe_ctx = self.isolated_probe_context(&assertions)?;
         let mut probe = self.qpf_probe_executor(probe_ctx, budget_ms);
         probe.original_problem_had_quantifiers = false;
         probe.incremental_mode = false;
@@ -181,17 +372,7 @@ impl Executor {
             return None;
         }
         let scope = CheckedGroundScope::capture(self, &assertions);
-        let mut probe_ctx = self.ctx.clone();
-        // Strip the outer query before installing exact roots. The nested
-        // proof/source epoch must authenticate this obligation, not objectives,
-        // soft constraints, or named-core provenance from the enclosing query.
-        if probe_ctx
-            .process_command(&ay_frontend::Command::ResetAssertions)
-            .is_err()
-        {
-            return None;
-        }
-        self.install_isolated_probe_roots(&mut probe_ctx, &assertions);
+        let probe_ctx = self.pruned_isolated_probe_context(&assertions)?;
         let mut probe = self.qpf_probe_executor(probe_ctx, budget_ms);
         probe.original_problem_had_quantifiers = has_quantifier;
         probe.incremental_mode = false;
@@ -242,3 +423,7 @@ impl Executor {
         Some((scope, outcome?))
     }
 }
+
+#[cfg(test)]
+#[path = "checked_isolated_solve_tests.rs"]
+mod tests;

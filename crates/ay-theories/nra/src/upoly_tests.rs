@@ -210,7 +210,7 @@ fn a_composite_or_out_of_range_modulus_is_refused_not_guessed() {
 #[test]
 fn the_primality_test_agrees_with_trial_division_below_ten_thousand() {
     for n in 0u64..10_000 {
-        let trial = n >= 2 && (2..).take_while(|d| d * d <= n).all(|d| n % d != 0);
+        let trial = n >= 2 && (2..=n.isqrt()).all(|d| !n.is_multiple_of(d));
         assert_eq!(is_prime_u64(n), trial, "n = {n}");
     }
 }
@@ -544,32 +544,4 @@ fn factor_does_not_decline_on_fully_split_input_across_the_old_budget_cliff() {
     }
 }
 
-/// Yun's loop terminates on an input that made a defective version spin forever.
-///
-/// The verifier's injected off-by-one (`d = c_next - b.derivative()` instead of
-/// `b_next.derivative()`) never reduced `b`, so the loop ran without end and
-/// wedged the fuzz driver with no output. A hang is strictly worse than a
-/// decline: the oracle can report a wrong answer and can report a `None`, but
-/// it cannot report a process that never returns. The `i > max_levels` guard
-/// converts that class of bug into a `None`.
-#[test]
-fn yun_terminates_on_the_input_that_span_forever() {
-    // (x-a)(x-b)^2(x-c)^3, the shape the verifier found spinning.
-    let input = ZPoly::from_coeffs(
-        [-2304i64, -384, 512, 56, -39, -2, 1]
-            .iter()
-            .map(|&k| BigInt::from(k))
-            .collect(),
-    );
-    let d = input
-        .square_free_decomposition()
-        .expect("a correct Yun answers this input");
-    // It must also be RIGHT, not merely terminating.
-    let mut prod = ZPoly::from_coeffs(vec![d.c.clone()]);
-    for (f, e) in &d.factors {
-        for _ in 0..*e {
-            prod = prod.mul(f);
-        }
-    }
-    assert_eq!(prod, input, "c * prod f_i^i must equal the input EXACTLY");
-}
+include!("upoly_tests/yun_regression.rs");

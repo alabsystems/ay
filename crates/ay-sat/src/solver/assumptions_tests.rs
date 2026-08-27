@@ -920,9 +920,9 @@ fn test_ic3_assumption_cache_unsat_core_correct() {
     }
 }
 
-/// Test that VerifiedAssumeResult::proof_certificate() returns the certificate (#8209).
+/// Test that SolverAssumeResult::proof_certificate() returns the certificate (#8209).
 #[test]
-fn test_verified_assume_result_proof_certificate_accessor() {
+fn test_solver_assume_result_proof_certificate_accessor() {
     let proof = ProofOutput::lrat_text(Vec::new(), 2);
     let mut solver = Solver::with_proof_output(3, proof);
 
@@ -934,7 +934,7 @@ fn test_verified_assume_result_proof_certificate_accessor() {
     let result = solver.solve_with_assumptions(&[]);
     assert!(result.is_unsat(), "Formula is inherently UNSAT");
 
-    // The proof_certificate() accessor should work through VerifiedAssumeResult.
+    // The proof_certificate() accessor should work through SolverAssumeResult.
     if let Some(cert) = result.proof_certificate() {
         // The certificate should have at least some proof steps.
         let steps = cert.materialize();

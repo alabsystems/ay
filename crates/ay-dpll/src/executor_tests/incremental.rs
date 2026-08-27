@@ -190,8 +190,15 @@ fn test_incremental_bv_multiple_check_sat_same_scope() {
     assert_eq!(outputs, vec!["sat", "sat", "sat"]);
 }
 
+/// RETENTION BARRIER, executor level: a `(pop)` retracts the scope without
+/// destroying the session. The persistent SAT solver, the Tseitin
+/// root-literal map and the bit-blast cache all survive; only the activation
+/// bookkeeping for the popped depth is dropped, because `Solver::pop` already
+/// satisfied those units permanently.
+///
+/// Restoring the `reset_sat_encoding_for_rebuild()` teardown fails this.
 #[test]
-fn test_incremental_bv_pop_invalidates_persistent_sat_until_rebuild() {
+fn test_incremental_bv_pop_keeps_persistent_sat_and_encodings() {
     let input = r#"
         (set-logic QF_BV)
         (declare-const x (_ BitVec 8))
@@ -228,22 +235,43 @@ fn test_incremental_bv_pop_invalidates_persistent_sat_until_rebuild() {
         assert_eq!(state.scope_depth, 0);
         assert_eq!(state.pending_pushes, 0);
         assert!(
-            state.persistent_sat.is_none(),
-            "BV pop should invalidate the stale persistent SAT solver before the next rebuild"
+            state.persistent_sat.is_some(),
+            "BV pop must keep the persistent SAT solver — dropping it discards \
+             every learned clause and forces a full re-encode"
+        );
+        assert_eq!(
+            state.persistent_sat.as_ref().unwrap().scope_depth(),
+            0,
+            "BV pop must unwind exactly one SAT scope"
         );
         assert!(
-            state.encoded_assertions.is_empty(),
-            "BV pop should also clear stale assertion encodings"
+            !state.encoded_assertions.is_empty(),
+            "BV pop must keep the Tseitin root-literal map"
+        );
+        assert!(
+            !state.term_to_bits.is_empty(),
+            "BV pop must keep the bit-blast cache"
         );
         assert!(
             state.assertion_activation_scope.is_empty(),
-            "BV pop should clear activation-scope bookkeeping before rebuild"
+            "activation units installed in the popped scope were satisfied by \
+             Solver::pop, so their bookkeeping must be dropped and re-added on \
+             the next check-sat (#2822)"
         );
     }
 }
 
+/// The anti-duplication invariant this test has always been about, restated
+/// for a session that is never torn down: a pop/push cycle must NOT re-emit
+/// the definitional CNF (which is global and already present), and a repeated
+/// check-sat in the same scope must add nothing at all.
+///
+/// Under the old teardown the second count was a full rebuild that happened to
+/// match; now it is the same clause set, still there. The only growth allowed
+/// across the cycle is scope bookkeeping — `Solver::pop`'s `[+selector]` unit
+/// and the re-added activation unit for the surviving assertion.
 #[test]
-fn test_incremental_bv_recheck_after_pop_rebuilds_once_and_stays_stable() {
+fn test_incremental_bv_recheck_after_pop_does_not_re_emit_the_encoding() {
     let input = r#"
         (set-logic QF_BV)
         (declare-const x (_ BitVec 8))
@@ -269,8 +297,8 @@ fn test_incremental_bv_recheck_after_pop_rebuilds_once_and_stays_stable() {
                 .incremental_bv_state()
                 .expect("incremental BV state should exist after pop");
             assert!(
-                state.persistent_sat.is_none(),
-                "BV pop should defer rebuilding until the next check-sat"
+                state.persistent_sat.is_some(),
+                "BV pop must keep the solver rather than defer a rebuild"
             );
         }
 
@@ -290,13 +318,18 @@ fn test_incremental_bv_recheck_after_pop_rebuilds_once_and_stays_stable() {
     }
 
     assert_eq!(outputs, vec!["sat", "sat", "sat"]);
-    assert_eq!(
-        non_learned_clause_counts[0], non_learned_clause_counts[1],
-        "rebuild after pop should restore the same non-learned BV clause set: {non_learned_clause_counts:?}"
+    // Bounded growth across pop+push: at most the `[+selector]` unit pop
+    // installs and the re-added activation unit. A re-emitted encoding would
+    // blow far past this on a formula with an 8-bit comparator circuit.
+    let cycle_growth = non_learned_clause_counts[1] - non_learned_clause_counts[0];
+    assert!(
+        cycle_growth <= 4,
+        "pop+push must not re-emit the definitional encoding; grew by \
+         {cycle_growth}: {non_learned_clause_counts:?}"
     );
     assert_eq!(
         non_learned_clause_counts[1], non_learned_clause_counts[2],
-        "repeated check-sat in the same rebuilt scope should keep BV clause count stable: {non_learned_clause_counts:?}"
+        "repeated check-sat in the same scope must add nothing: {non_learned_clause_counts:?}"
     );
 }
 

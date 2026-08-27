@@ -108,7 +108,7 @@ pub(crate) fn validate_string_length_lemma(
 /// non-empty, propositional, carrying at least one literal that is a
 /// universally-valid `str.len` theorem.
 ///
-/// This is the EXACT precondition of [`validate_string_length_lemma`], so the
+/// This is the EXACT precondition of `validate_string_length_lemma`, so the
 /// emitter in `ay-dpll` can only tag leaves strict mode will then accept — no
 /// emitter/checker drift. Decision logic lives ONLY in this module.
 #[must_use]

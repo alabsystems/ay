@@ -268,7 +268,7 @@ pub(crate) fn census(root: &Path) -> Vec<Row> {
             };
             let variant = ident_at(&src, i + "Knob::".len());
             let after = src[i + "Knob::".len() + variant.len()..].trim_start();
-            let how = if before.trim_end().ends_with(".with") {
+            let how = if before.trim_end().strip_suffix(".with").is_some() {
                 "with"
             } else if after
                 .strip_prefix(',')

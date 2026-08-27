@@ -107,7 +107,7 @@ pub(crate) fn validate_datatype_acyclic_direct(
 }
 
 /// Declaration-free recognizer (registry-parameterized): `true` exactly when
-/// [`validate_datatype_acyclic_direct`] accepts the clause with these
+/// `validate_datatype_acyclic_direct` accepts the clause with these
 /// registries.
 #[must_use]
 pub fn recognize_datatype_acyclic_direct(

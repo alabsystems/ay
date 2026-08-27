@@ -293,7 +293,10 @@ class TwoClubCampaignSyntaxTest(unittest.TestCase):
         self.assertIn('branch_rule=first', self.source)
         self.assertIn('branch_rule=marked', self.source)
         self.assertIn('--branch "$branch_rule"', self.source)
-        self.assertIn("'--branch first|viol|marked'", self.source)
+        # `marked-min` joined the probe string in 800b0668ed, when the campaign
+        # defaults flipped to LP-off + marked-min; this assertion was not moved
+        # with it. Pinned exactly, so the next mode addition fails here too.
+        self.assertIn("'--branch first|viol|marked|marked-min'", self.source)
         self.assertIn('branch_rule=%s timestamp_utc=', self.source)
 
     def test_planning_and_binary_probe_use_the_private_snapshot(self):
@@ -575,7 +578,7 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
     @staticmethod
     def _envelope(timeout=10.0, memory=512):
         return {
-            "schema": "ay.benchmark-resource-envelope/v1",
+            "schema": "ay.benchmark-resource-envelope/v2",
             "requested_jobs": 2,
             "jobs": 2,
             "memlimit_mb_per_child": memory,
@@ -591,6 +594,8 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
             "checker": "python",
             "checker_jobs": 1,
             "checker_timeout_sec": None,
+            "checker_command": None,
+            "checker_executable": None,
             "solver_command": ["solver", "<instance>"],
             "executable": {"path": "/solver", "size": 1, "sha256": "x"},
             "harness": {"path": "pbcomp_harness.py", "size": 1,
@@ -600,6 +605,17 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
                 ["x.opb"]
             ),
         }
+
+    @staticmethod
+    def _write_result_checker(path):
+        path.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$@\" > \"$AY_TEST_CHECKER_ARGS\"\n"
+            "cat > \"$AY_TEST_CHECKER_STDIN\"\n"
+            "printf 'c   %s\\n' \"$AY_TEST_CHECKER_FINDING\"\n"
+            "printf 's VERIFICATION VERIFIED\\n'\n"
+        )
+        path.chmod(0o755)
 
     def test_validator_accepts_one_complete_envelope(self):
         envelope = self._envelope()
@@ -630,6 +646,24 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
         _actual, issue = pbcomp_harness.validate_result_envelopes([result])
         self.assertIn("partial result set", issue)
 
+    def test_validator_refuses_inexact_ay_checker_command(self):
+        envelope = self._envelope()
+        envelope["checker"] = "ay"
+        envelope["checker_timeout_sec"] = 120
+        envelope["checker_executable"] = {
+            "path": "/ay-pb", "size": 1, "sha256": "checker",
+        }
+        envelope["checker_command"] = [
+            "/ay-pb", "pb", "verify", "<instance>",
+        ]
+        result = pbcomp_harness.Result(
+            "x.opb", "DEC-LIN", "UNSATISFIABLE", None, 1.0, 0,
+            None, False, memlimit_mb=512, nbcore=1, timeout_sec=10.0,
+            resource_envelope=envelope,
+        )
+        _actual, issue = pbcomp_harness.validate_result_envelopes([result])
+        self.assertIn("exact checker command", issue)
+
     def test_checker_rejects_malformed_rows_and_missing_objective(self):
         with tempfile.TemporaryDirectory() as td:
             malformed = Path(td, "malformed.opb")
@@ -649,6 +683,104 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
             )
         self.assertTrue(result[3], result)
         self.assertIn("no o-line", result[5])
+
+    def test_ay_checker_reconstructs_model_only_transcript_and_objective(self):
+        with tempfile.TemporaryDirectory() as td:
+            instance = Path(td, "objective.opb")
+            instance.write_text(
+                "* #variable= 1 #constraint= 0\nmin: +7 x1;\n"
+            )
+            checker = Path(td, "ay-pb")
+            self._write_result_checker(checker)
+            args_capture = Path(td, "args")
+            stdin_capture = Path(td, "stdin")
+            env = dict(
+                os.environ,
+                AY_TEST_CHECKER_ARGS=str(args_capture),
+                AY_TEST_CHECKER_STDIN=str(stdin_capture),
+                AY_TEST_CHECKER_FINDING=(
+                    "objective consistent: claimed = computed = 7"
+                ),
+            )
+            ok, computed, reason = pbcomp_harness.check_solution_via_ay(
+                str(checker), instance, 7, ["x1"], env, 512,
+            )
+            checker_args = args_capture.read_text().splitlines()
+            transcript = stdin_capture.read_text()
+        self.assertTrue(ok, reason)
+        self.assertEqual(computed, 7)
+        self.assertEqual(
+            checker_args,
+            ["pb", "verify", "--no-z3", str(instance)],
+        )
+        self.assertEqual(
+            transcript,
+            "o 7\ns SATISFIABLE\nv x1\n",
+        )
+
+    def test_ay_checker_parses_model_attains_without_o_line(self):
+        with tempfile.TemporaryDirectory() as td:
+            instance = Path(td, "objective.opb")
+            instance.write_text(
+                "* #variable= 1 #constraint= 0\nmin: +7 x1;\n"
+            )
+            checker = Path(td, "ay-pb")
+            self._write_result_checker(checker)
+            args_capture = Path(td, "args")
+            stdin_capture = Path(td, "stdin")
+            env = dict(
+                os.environ,
+                AY_TEST_CHECKER_ARGS=str(args_capture),
+                AY_TEST_CHECKER_STDIN=str(stdin_capture),
+                AY_TEST_CHECKER_FINDING=(
+                    "objective not reported on an `o` line; model attains 7"
+                ),
+            )
+            ok, computed, reason = pbcomp_harness.check_solution_via_ay(
+                str(checker), instance, None, ["x1"], env, 512,
+            )
+            transcript = stdin_capture.read_text()
+        self.assertTrue(ok, reason)
+        self.assertEqual(computed, 7)
+        self.assertEqual(transcript, "s SATISFIABLE\nv x1\n")
+
+    def test_ay_checker_rejects_missing_o_when_objective_is_out_of_range(self):
+        with tempfile.TemporaryDirectory() as td:
+            instance = Path(td, "objective-overflow.opb")
+            instance.write_text(
+                "* #variable= 2 #constraint= 0\n"
+                "min: +170141183460469231731687303715884105727 x1 "
+                "+1 x2;\n"
+            )
+            checker = Path(td, "ay-pb")
+            self._write_result_checker(checker)
+            env = dict(
+                os.environ,
+                AY_TEST_CHECKER_ARGS=str(Path(td, "args")),
+                AY_TEST_CHECKER_STDIN=str(Path(td, "stdin")),
+                AY_TEST_CHECKER_FINDING=(
+                    "objective not reported; model objective is outside the "
+                    "i128 reporting range"
+                ),
+            )
+            result = pbcomp_harness.verify_solver_answer(
+                "/unused/solver", instance, "SATISFIABLE", None,
+                ["x1", "x2"], "ay", env, 512,
+                checker_bin_path=str(checker),
+            )
+        self.assertTrue(result[2], result)
+        self.assertTrue(result[3], result)
+        self.assertIn("no o-line", result[5])
+
+    def test_ay_checker_binary_is_same_or_deterministic_sibling(self):
+        same = pbcomp_harness.derived_pb_checker_binary(
+            "/tmp/ay-pb", {"path": "/resolved/ay-pb"},
+        )
+        sibling = pbcomp_harness.derived_pb_checker_binary(
+            "/tmp/ay", {"path": "/resolved/ay"},
+        )
+        self.assertEqual(same, "/resolved/ay-pb")
+        self.assertEqual(sibling, "/resolved/ay-pb")
 
     def test_watchdog_memout_is_distinct_from_timeout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -709,6 +841,93 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
         self.assertEqual(sidecar["requested_jobs"], 4)
         self.assertEqual(sidecar["jobs"], 2)
         self.assertEqual(sidecar["rss_grace_mb"], 0)
+        self.assertIsNone(sidecar["checker_command"])
+        self.assertIsNone(sidecar["checker_executable"])
+
+    def test_cmd_run_uses_sibling_ay_pb_checker_and_records_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            instances = Path(td, "instances", "OPT-LIN")
+            instances.mkdir(parents=True)
+            instance = Path(instances, "tiny.opb")
+            instance.write_text(
+                "* #variable= 1 #constraint= 0\nmin: +7 x1;\n"
+            )
+            solver = Path(td, "ay")
+            solver.write_text(
+                "#!/bin/sh\n"
+                "test \"$MEMLIMIT\" = 512 || exit 91\n"
+                "test \"$NBCORE\" = 2 || exit 92\n"
+                "printf 'o 7\\ns OPTIMUM FOUND\\nv x1\\n'\n"
+            )
+            solver.chmod(0o755)
+            checker = Path(td, "ay-pb")
+            self._write_result_checker(checker)
+            args_capture = Path(td, "checker-args")
+            stdin_capture = Path(td, "checker-stdin")
+            output = Path(td, "run.jsonl")
+            args = argparse.Namespace(
+                jobs=4, timeout=2.0, limit=0, bin=str(solver),
+                instances=str(Path(td, "instances")), checker="ay",
+                out=str(output), baseline="",
+            )
+            plan = types.SimpleNamespace(jobs=2, memlimit_mb=512, nbcore=2,
+                                         headroom_mb=16000)
+            checker_env = {
+                "AY_TEST_CHECKER_ARGS": str(args_capture),
+                "AY_TEST_CHECKER_STDIN": str(stdin_capture),
+                "AY_TEST_CHECKER_FINDING": (
+                    "objective consistent: claimed = computed = 7"
+                ),
+            }
+            with mock.patch.dict(os.environ, checker_env, clear=False), \
+                 mock.patch.object(pbcomp_harness, "warn_concurrent_build"), \
+                 mock.patch.object(pbcomp_harness, "plan_solver_resources",
+                                   return_value=plan), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = pbcomp_harness.cmd_run(args)
+            record = json.loads(output.read_text())
+            sidecar = json.loads(
+                Path(str(output) + ".resource-envelope.json").read_text()
+            )
+            transcript = stdin_capture.read_text()
+        self.assertEqual(rc, 0)
+        self.assertEqual(record["status"], "OPTIMUM FOUND", record)
+        self.assertTrue(record["verified"], record)
+        self.assertFalse(record["wrong_answer"], record)
+        self.assertEqual(transcript, "o 7\ns SATISFIABLE\nv x1\n")
+        self.assertEqual(
+            sidecar["checker_executable"]["path"], str(checker.resolve())
+        )
+        self.assertTrue(sidecar["checker_executable"]["sha256"])
+        self.assertEqual(
+            sidecar["checker_command"],
+            [str(checker.resolve()), "pb", "verify", "--no-z3",
+             "<instance>"],
+        )
+
+    def test_cmd_run_refuses_missing_sibling_checker_before_planning(self):
+        with tempfile.TemporaryDirectory() as td:
+            instances = Path(td, "instances")
+            instances.mkdir()
+            Path(instances, "tiny.opb").write_text(
+                "* #variable= 1 #constraint= 0\n"
+            )
+            solver = Path(td, "ay")
+            solver.write_text("#!/bin/sh\nexit 0\n")
+            solver.chmod(0o755)
+            args = argparse.Namespace(
+                jobs=1, timeout=2.0, limit=0, bin=str(solver),
+                instances=str(instances), checker="ay",
+                out=str(Path(td, "run.jsonl")), baseline="",
+            )
+            with mock.patch.object(
+                pbcomp_harness, "warn_concurrent_build"
+            ) as warn, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                rc = pbcomp_harness.cmd_run(args)
+        self.assertEqual(rc, 2)
+        warn.assert_not_called()
+        self.assertIn("checker executable unavailable", stderr.getvalue())
 
 
 class ChccompRegressionComparabilityTest(unittest.TestCase):

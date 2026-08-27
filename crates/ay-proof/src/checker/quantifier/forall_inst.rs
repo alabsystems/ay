@@ -7,6 +7,7 @@
 use super::*;
 
 type MatchFrame = (TermId, TermId, HashSet<String>);
+type ForallInstShape<'a> = (&'a [(String, Sort)], TermId, TermId);
 
 fn invalid_forall_inst(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
     invalid_rule(step, "forall_inst", reason)
@@ -215,7 +216,12 @@ fn nested_binder_names(
                 stack.extend([*condition, *then_branch, *else_branch]);
             }
             TermData::Let(..) => return None,
-            _ => {}
+            TermData::Var(..) | TermData::Const(..) => {}
+            // An unknown future `TermData` variant could carry a binder this
+            // scan would then miss. An empty result now AUTHORIZES arguments
+            // spelled like a source binder, so silently skipping an
+            // unrecognized node is no longer safe: fail closed.
+            _ => return None,
         }
     }
     Some(names)
@@ -264,10 +270,17 @@ pub(super) fn matches_single_substitution(
     matches_substitution(terms, pattern, instance, &substitutions, work)
 }
 
+/// An argument is usable when it carries no binder of its own and names no
+/// binder that is still in scope at the substitution sites.
+///
+/// `capturing_binders` is that in-scope subset of the source binders — see
+/// [`checked_substitutions`]. It is EMPTY for a binder-free body, where the
+/// instance cannot contain a binder at all; it is the full source binder set
+/// for every body that does bind something.
 fn argument_is_ground_for(
     terms: &TermStore,
     root: TermId,
-    binder_names: &HashSet<&str>,
+    capturing_binders: &HashSet<&str>,
     work: &mut usize,
 ) -> Option<bool> {
     let mut visited = HashSet::default();
@@ -281,7 +294,9 @@ fn argument_is_ground_for(
         }
         *work += 1;
         match terms.get(term) {
-            TermData::Var(name, _) if binder_names.contains(name.as_str()) => return Some(false),
+            TermData::Var(name, _) if capturing_binders.contains(name.as_str()) => {
+                return Some(false);
+            }
             TermData::Var(..) | TermData::Const(..) => {}
             TermData::Not(inner) => stack.push(*inner),
             TermData::Ite(condition, then_branch, else_branch) => {
@@ -301,7 +316,7 @@ fn decode_forall_inst_shape<'a>(
     clause: &[TermId],
     premise_count: usize,
     args: &[TermId],
-) -> Result<(&'a [(String, Sort)], TermId, TermId), ProofCheckError> {
+) -> Result<ForallInstShape<'a>, ProofCheckError> {
     if premise_count != 0 {
         return Err(invalid_forall_inst(step, "must not have premises"));
     }
@@ -364,6 +379,31 @@ fn checked_substitutions<'a>(
             ),
         )
     })?;
+    // Which binder spellings can an argument's free names actually collide
+    // with? Only the ones still BINDING inside `body`. The source binders are
+    // not: this rule instantiates them away, so in the conclusion they bind
+    // nothing and an argument mentioning one denotes the ambient free symbol
+    // the binder happened to shadow — `(or (not (forall ((x S)) (p x))) (p x))`
+    // is a valid instantiation of `∀x. p x` at the free `x`, and the
+    // substitution lemma needs capture-freedom only with respect to the binders
+    // of `body` itself.
+    //
+    // When `body` carries no binder at all, that is decidable outright.
+    // `nested_binder_names` fails closed on any `let` and collects every
+    // `forall`/`exists` binder reachable through bodies AND trigger groups, so
+    // an empty set means `body` is binder-free; every argument is checked
+    // binder-free just below; and the structural matcher introduces no binder.
+    // The instance is therefore binder-free too, and nothing in it can capture.
+    //
+    // The moment `body` DOES bind something we are in the nested lane, and the
+    // source-binder spelling test stays in force exactly as written: a body
+    // that re-binds a source spelling (`forall x. … forall x. …`) puts that
+    // spelling back in scope over a substitution site.
+    let capturing_binders = if nested_names.is_empty() {
+        HashSet::default()
+    } else {
+        binder_names.clone()
+    };
     let mut substitutions = HashMap::default();
     for ((name, sort), &argument) in bindings.iter().zip(args) {
         if terms.sort(argument) != sort {
@@ -372,10 +412,10 @@ fn checked_substitutions<'a>(
                 "argument sort does not match its positional binder",
             ));
         }
-        if argument_is_ground_for(terms, argument, &binder_names, work) != Some(true) {
+        if argument_is_ground_for(terms, argument, &capturing_binders, work) != Some(true) {
             return Err(invalid_forall_inst(
                 step,
-                "argument is not a bounded ground term for the source binders",
+                "argument carries a binder or let, or names a source binder the body keeps in scope",
             ));
         }
         if argument_has_free_name_in(terms, argument, &nested_names, work) != Some(false) {

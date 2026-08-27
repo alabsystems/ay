@@ -149,8 +149,18 @@ impl Solver {
         );
 
         // (1) Set used to maximum (CaDiCaL: c->used = max_used = 31)
-        self.arena
-            .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        //
+        // Under the two-stage arm this is the conflict-analysis half of
+        // `OnClauseUse(c)` and becomes `score(c) += 1` instead: the paper wants
+        // a cumulative usage FREQUENCY, and saturating to MAX_USED here would
+        // flatten "used once" and "used ten thousand times" into the same
+        // value, which is the whole distinction stage 1 sorts on.
+        if self.two_stage_clause_management {
+            self.two_stage_note_analysis_use(clause_idx);
+        } else {
+            self.arena
+                .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        }
 
         // (2) Recompute glue and promote for learned clauses
         if !self.arena.is_learned(clause_idx) || self.arena.is_empty_clause(clause_idx) {

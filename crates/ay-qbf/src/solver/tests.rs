@@ -80,26 +80,13 @@ fn test_native_malformed_prefix_is_canonicalized_without_panicking() {
         vec![vec![x]],
     );
     assert_eq!(
-        formula.prefix,
-        vec![QuantifierBlock::exists(vec![1])],
+        formula.prefix(),
+        &[QuantifierBlock::exists(vec![1])],
         "the first valid occurrence defines the canonical prefix"
     );
     let mut solver = QbfSolver::new(formula);
 
     assert!(matches!(solver.solve(), QbfResult::Sat(_)));
-}
-
-#[test]
-fn test_solver_recanonicalizes_publicly_mutated_prefix() {
-    let x = Literal::positive(Variable::new(1));
-    let mut formula = QbfFormula::new(1, vec![QuantifierBlock::exists(vec![1])], vec![vec![x]]);
-    formula.prefix = vec![
-        QuantifierBlock::forall(vec![1]),
-        QuantifierBlock::exists(vec![1]),
-    ];
-
-    let mut solver = QbfSolver::new(formula);
-    assert!(matches!(solver.solve(), QbfResult::Unsat(_)));
 }
 
 #[test]
@@ -468,7 +455,7 @@ mod learned_database;
 #[test]
 fn oversized_native_formula_fails_closed_without_dense_allocation() {
     let formula = QbfFormula::new(usize::MAX, Vec::new(), Vec::new());
-    assert_eq!(formula.num_vars, usize::MAX);
+    assert_eq!(formula.num_vars(), usize::MAX);
     assert_eq!(formula.var_level(u32::MAX), 0);
     assert!(formula.is_existential(u32::MAX));
 

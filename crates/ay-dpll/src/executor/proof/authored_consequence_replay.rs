@@ -26,9 +26,12 @@
 //! consists solely of sound consequences of the authored problem, and when the
 //! engine's refutation is real that set is UNSAT on its own. This producer:
 //!
-//! 1. re-solves the consequence set on a SAME-CONTEXT disposable probe
-//!    ([`Executor::checked_same_context_unsat_proof`]) whose own strict
-//!    checker must accept its complete proof over the probe window;
+//! 1. first tries a proof-only ground shortcut: an exact instance plus authored
+//!    literal-valued equality pins is discharged by checked equality
+//!    substitution and closed `evaluate`; otherwise it re-solves the
+//!    consequence set on a SAME-CONTEXT disposable probe
+//!    ([`Executor::checked_same_context_unsat_proof`]) whose own strict checker
+//!    must accept its complete proof over the probe window;
 //! 2. stitches that proof onto authored-scope derivations — each probe
 //!    `assume` is replaced by an authored `assume`, an `and_pos` conjunct
 //!    projection chain, or an `assume`→`forall_inst`→`or`→`resolution`
@@ -46,11 +49,18 @@
 //! fail-closed `unknown` it already was.
 //!
 //! UNSAT-ONLY: no arm of this lane can produce or influence a SAT grant, so
-//! the staged-grant rule does not apply. Kill switch:
-//! `--no-consequence-replay` (see `quant_unit_authority.rs`) disables both
-//! entry points and restores the baseline `unknown`s byte-for-byte.
+//! the staged-grant rule does not apply. `--no-consequence-replay` disables every
+//! entry point and restores the baseline `unknown`s byte-for-byte.
 
 use super::*;
+
+mod ground_pin;
+mod implied_ground_inst;
+mod probe_conjunct;
+mod types;
+
+use types::{AndConjunctClosure, ConsequencePlan};
+pub(in crate::executor) use types::{ImpliedForall, NegatedExistsDual};
 
 /// Authored-scope size beyond which this lane declines.
 const MAX_AUTHORED_ROOTS: usize = 64;
@@ -58,23 +68,108 @@ const MAX_AUTHORED_ROOTS: usize = 64;
 const MAX_CONSEQUENCES: usize = 256;
 /// Cap on recorded instances admitted into the plan.
 const MAX_INSTANCES: usize = 64;
-/// Cap on same-context probe solves per public check-sat. Each attempt is one
-/// bounded ground solve; repeated cascade/certification retries of an
-/// already-declined consequence set must not re-pay it.
+/// Cap on bounded ground probes; retries of a declined set must not re-pay it.
 const MAX_REPLAY_ATTEMPTS: u8 = 2;
-/// Probe solve budget, matching the sealed consequence verifier's budget.
-const PROBE_BUDGET_MS: u64 = 2_000;
+/// Distinct direct ground-pin record sets tried per public query.
+const MAX_DIRECT_REPLAY_ATTEMPTS: u8 = 4;
 /// Node budget for each `and`-conjunct path search.
 const MAX_AND_PATH_WORK: usize = 4_096;
 /// Step budget for the stitched candidate.
 const MAX_PROBE_PROOF_STEPS: usize = 50_000;
 
+/// Shape of the finalized consequence-producing plan.
+///
+/// A negated-exists dual is only source authority for a forall instance, and a
+/// negative Skolem record uses the historical replay budget. Any positive
+/// Skolem record changes the shape; finite-frame replay motivates its extended
+/// allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsequenceReplayPlanShape {
+    Standard,
+    PositiveSkolem,
+}
+
+impl ConsequenceReplayPlanShape {
+    fn classify(plans: &ay_core::kani_compat::DetHashMap<TermId, ConsequencePlan>) -> Self {
+        for plan in plans.values() {
+            match plan {
+                ConsequencePlan::ForallInstance { .. }
+                | ConsequencePlan::NegatedExistsDual { .. }
+                | ConsequencePlan::ImpliedConsequent { .. }
+                | ConsequencePlan::SkolemInstance {
+                    positive: false, ..
+                } => {}
+                ConsequencePlan::SkolemInstance { positive: true, .. } => {
+                    return Self::PositiveSkolem;
+                }
+            }
+        }
+        Self::Standard
+    }
+
+    const fn probe_budget(self) -> ConsequenceReplayProbeBudget {
+        match self {
+            Self::Standard => ConsequenceReplayProbeBudget::TwoSeconds,
+            Self::PositiveSkolem => ConsequenceReplayProbeBudget::FiveSeconds,
+        }
+    }
+}
+
+/// Wall-clock allowance for one disposable consequence-replay solve.
+///
+/// Forall, dual-source, and negative-Skolem plans keep the historical
+/// two-second cap in every presentation posture. The positive-Skolem plan used
+/// by finite-frame replay gets five seconds because that proof can need more
+/// than two seconds in dev/test. Either timeout only declines this producer;
+/// it never grants a verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConsequenceReplayProbeBudget {
+    TwoSeconds,
+    FiveSeconds,
+}
+
+impl ConsequenceReplayProbeBudget {
+    const fn milliseconds(self) -> u64 {
+        match self {
+            Self::TwoSeconds => 2_000,
+            Self::FiveSeconds => 5_000,
+        }
+    }
+}
+
 /// `--trace-cegqi-attr`-gated decline attribution, matching the CEGQI
 /// disambiguation trace this lane feeds. Diagnostic only.
-fn replay_note(message: impl FnOnce() -> String) {
+pub(super) fn replay_note(message: impl FnOnce() -> String) {
     if ay_core::misc_cli_flags().trace_cegqi_attr {
         eprintln!("[consequence-replay] {}", message());
     }
+}
+
+fn collect_consequence_set(
+    terms: &TermStore,
+    derivable_sources: &AndConjunctClosure,
+    instances: &[TermId],
+) -> Option<Vec<TermId>> {
+    let mut consequences = Vec::new();
+    for &conjunct in &derivable_sources.ordered {
+        if consequences.len() > MAX_CONSEQUENCES {
+            return None;
+        }
+        if !crate::ematching::contains_quantifier(terms, conjunct)
+            && !consequences.contains(&conjunct)
+        {
+            consequences.push(conjunct);
+        }
+    }
+    for &instance in instances {
+        if consequences.len() > MAX_CONSEQUENCES {
+            return None;
+        }
+        if !consequences.contains(&instance) {
+            consequences.push(instance);
+        }
+    }
+    (!consequences.is_empty()).then_some(consequences)
 }
 
 impl Executor {
@@ -97,13 +192,31 @@ impl Executor {
     /// lane; the duals carry no authority of their own — each one's authored
     /// `(not (exists ...))` source must be derivable, and the emitted
     /// `qnt_neg_exists` step is re-derived by the strict checker.
+    /// Like [`Self::try_translate_authored_consequence_replay_unsat_with`],
+    /// additionally admitting the CONSEQUENT of an authored implication whose
+    /// antecedent is itself derivable as an instance source
+    /// (see [`ImpliedForall`], #implied-forall-ground-inst). The records carry
+    /// no authority: `consequence_unit` must derive both the implication root
+    /// and its antecedent from the authored scope, the emitted `implies_pos`
+    /// step is re-derived by the strict checker from the implication's own
+    /// structure, and `validate_forall_inst` re-replays every substitution.
+    pub(in crate::executor) fn try_translate_authored_consequence_replay_unsat_with_implied(
+        &mut self,
+        extra_records: &[crate::ematching::ForallInstantiationProvenance],
+        extra_implied: &[ImpliedForall],
+    ) -> bool {
+        let candidate =
+            self.build_authored_consequence_replay_refutation(extra_records, &[], extra_implied);
+        self.install_consequence_replay_candidate(candidate)
+    }
+
     pub(in crate::executor) fn try_translate_authored_consequence_replay_unsat_with_duals(
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
         extra_duals: &[NegatedExistsDual],
     ) -> bool {
         let candidate =
-            self.build_authored_consequence_replay_refutation(extra_records, extra_duals);
+            self.build_authored_consequence_replay_refutation(extra_records, extra_duals, &[]);
         self.install_consequence_replay_candidate(candidate)
     }
 
@@ -117,7 +230,7 @@ impl Executor {
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
     ) -> bool {
-        let candidate = self.build_authored_consequence_replay_refutation(extra_records, &[]);
+        let candidate = self.build_authored_consequence_replay_refutation(extra_records, &[], &[]);
         self.install_consequence_replay_candidate(candidate)
     }
 
@@ -151,6 +264,10 @@ impl Executor {
         // mirroring the ordinary `build_unsat_proof` installation boundary
         // and the `try_translate_*` siblings; a checker disagreement can only
         // decline the translation.
+        let saved_proof_check_result = self.proof_check_result.clone();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_proof_quality = self.last_proof_quality.clone();
+        let saved_statistics = self.last_statistics.clone();
         self.proof_check_result = None;
         self.proof_check_ok = false;
         self.last_proof_quality = None;
@@ -164,13 +281,20 @@ impl Executor {
                         self.proof_check_result
                     )
                 });
-                self.proof_check_result = None;
+                self.proof_check_result = saved_proof_check_result;
+                self.proof_check_ok = saved_proof_check_ok;
+                self.last_proof_quality = saved_proof_quality;
+                self.last_statistics = saved_statistics;
                 return false;
             }
         }
         #[cfg(not(feature = "proof-checker"))]
         if self.self_check() {
             replay_note(|| "decline: self-check without proof-checker feature".into());
+            self.proof_check_result = saved_proof_check_result;
+            self.proof_check_ok = saved_proof_check_ok;
+            self.last_proof_quality = saved_proof_quality;
+            self.last_statistics = saved_statistics;
             return false;
         }
         self.populate_proof_quality_stats(&quality);
@@ -214,7 +338,8 @@ impl Executor {
         if self.check_proof_strict_with_datatypes(proof).is_ok() {
             return;
         }
-        let Some(candidate) = self.build_authored_consequence_replay_refutation(&[], &[]) else {
+        let Some(candidate) = self.build_authored_consequence_replay_refutation(&[], &[], &[])
+        else {
             return;
         };
         let authored = self.exact_concrete_authored_scope();
@@ -236,19 +361,16 @@ impl Executor {
         &mut self,
         extra_records: &[crate::ematching::ForallInstantiationProvenance],
         extra_duals: &[NegatedExistsDual],
+        extra_implied: &[ImpliedForall],
     ) -> Option<Proof> {
         if !crate::quant_unit_authority::consequence_replay_enabled() {
             return None;
         }
         let attempts = self.consequence_replay_attempts.get();
-        if attempts >= MAX_REPLAY_ATTEMPTS {
-            return None;
-        }
         let authored = self.exact_concrete_authored_scope();
         if authored.is_empty() || authored.len() > MAX_AUTHORED_ROOTS {
             return None;
         }
-
         // The checker authorizes an `assume` only for an exact authored root;
         // conjuncts and universals nested under a top-level conjunction are
         // reached by explicit `and_pos` projection instead, so the exported
@@ -268,6 +390,9 @@ impl Executor {
         // consequences, so they never enter the probe's assertion vector.
         let dual_foralls =
             Self::plan_negated_exists_duals(extra_duals, &derivable_sources, &mut instance_plan);
+        // Implication consequents: a SOURCE, never a consequence.
+        let implied_foralls =
+            Self::plan_implied_foralls(extra_implied, &derivable_sources, &mut instance_plan);
 
         let recorded = extra_records
             .iter()
@@ -281,7 +406,9 @@ impl Executor {
             if instances.len() >= MAX_INSTANCES {
                 break;
             }
-            if !(derivable_sources.contains(&quantifier) || dual_foralls.contains(&quantifier))
+            if !(derivable_sources.contains(&quantifier)
+                || dual_foralls.contains(&quantifier)
+                || implied_foralls.contains(&quantifier))
                 || instance == quantifier
                 || crate::ematching::contains_quantifier(&self.ctx.terms, instance)
                 || instance_plan.contains_key(&instance)
@@ -336,28 +463,15 @@ impl Executor {
             return None;
         }
 
-        // Consequence set: quantifier-free authored conjuncts first (in
-        // closure order), then the recorded instances.
-        let mut consequences: Vec<TermId> = Vec::new();
-        for &conjunct in &derivable_sources.ordered {
-            if consequences.len() > MAX_CONSEQUENCES {
-                return None;
-            }
-            if !crate::ematching::contains_quantifier(&self.ctx.terms, conjunct)
-                && !consequences.contains(&conjunct)
-            {
-                consequences.push(conjunct);
-            }
+        // Quantifier-free authored conjuncts first, then recorded instances.
+        let consequences =
+            collect_consequence_set(&self.ctx.terms, &derivable_sources, &instances)?;
+
+        if let candidate @ Some(_) = self.try_distinct_ground_pin(&instance_plan, &instances) {
+            return candidate;
         }
-        for &instance in &instances {
-            if consequences.len() > MAX_CONSEQUENCES {
-                return None;
-            }
-            if !consequences.contains(&instance) {
-                consequences.push(instance);
-            }
-        }
-        if consequences.is_empty() {
+
+        if attempts >= MAX_REPLAY_ATTEMPTS {
             return None;
         }
 
@@ -379,8 +493,9 @@ impl Executor {
         });
         // One attempt is consumed whether or not the probe succeeds.
         self.consequence_replay_attempts.set(attempts + 1);
+        let budget = ConsequenceReplayPlanShape::classify(&instance_plan).probe_budget();
         let Some(probe_proof) =
-            self.checked_same_context_unsat_proof(&consequences, PROBE_BUDGET_MS)
+            self.metered_consequence_replay_probe(&consequences, budget.milliseconds())
         else {
             replay_note(|| {
                 format!(
@@ -425,6 +540,7 @@ impl Executor {
             ConsequencePlan::NegatedExistsDual {
                 not_exists_root, ..
             } => *not_exists_root,
+            ConsequencePlan::ImpliedConsequent { implication, .. } => *implication,
         };
         let source_unit = self.consequence_unit(
             candidate,
@@ -462,6 +578,20 @@ impl Executor {
             ),
             ConsequencePlan::NegatedExistsDual { exists, .. } => Some(
                 Self::add_negated_exists_dual(candidate, source_unit, exists, term),
+            ),
+            ConsequencePlan::ImpliedConsequent {
+                implication,
+                antecedent,
+            } => self.add_implied_consequent_unit(
+                candidate,
+                source_unit,
+                implication,
+                antecedent,
+                term,
+                authored_set,
+                authored,
+                instance_plan,
+                unit_ids,
             ),
         }
     }
@@ -888,335 +1018,5 @@ impl Executor {
     }
 }
 
-/// How one non-authored consequence formula is derived from the authored
-/// scope. Every variant's steps have strict validators; the plan itself
-/// carries no authority.
-#[derive(Clone)]
-enum ConsequencePlan {
-    /// `forall_inst` from a recorded exact instantiation.
-    ForallInstance {
-        quantifier: TermId,
-        binding: Vec<TermId>,
-    },
-    /// The strict `sko_forall` chain from a single-binder Skolemization
-    /// record (positive `exists` or negated `forall` source).
-    SkolemInstance {
-        source: TermId,
-        quantified: TermId,
-        witness: TermId,
-        instance: TermId,
-        positive: bool,
-    },
-    /// The De Morgan dual universal of an authored `(not (exists x⃗ φ))` root:
-    /// `qnt_neg_exists` + one `resolution`, keyed by the dual `forall`.
-    NegatedExistsDual {
-        not_exists_root: TermId,
-        exists: TermId,
-    },
-}
-
-/// One authored `(not (exists ...))` root together with the De Morgan dual
-/// universal it licenses, offered to the consequence-replay stitcher as an
-/// instance SOURCE.
-///
-/// This is a HINT with no authority. The stitcher checks that
-/// `not_exists_root` is derivable from the authored scope, and the strict
-/// `qnt_neg_exists` validator independently re-derives that `forall` is the
-/// exact dual of `exists` (identical binder vector, singly-negated body)
-/// before anything publishes.
-#[derive(Clone, Copy)]
-pub(in crate::executor) struct NegatedExistsDual {
-    /// The authored root, literally `(not E)`.
-    pub not_exists_root: TermId,
-    /// `E = (exists (x⃗) φ)`.
-    pub exists: TermId,
-    /// `F = (forall (x⃗) (not φ))`.
-    pub forall: TermId,
-}
-
-/// Ordered members of the authored `and`-conjunct closure.
-#[derive(Default)]
-struct AndConjunctClosure {
-    members: ay_core::kani_compat::DetHashSet<TermId>,
-    ordered: Vec<TermId>,
-}
-
-impl AndConjunctClosure {
-    fn contains(&self, term: &TermId) -> bool {
-        self.members.contains(term)
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn executor_with_assertions(script: &str) -> Executor {
-        let commands = ay_frontend::parse(script).expect("consequence-replay fixture parses");
-        let mut exec = Executor::new();
-        assert!(
-            exec.execute_all(&commands)
-                .expect("consequence-replay fixture loads")
-                .is_empty(),
-            "fixture must contain declarations and assertions only"
-        );
-        exec
-    }
-
-    /// A guarded-implication universal — the exact shape the flat arithmetic
-    /// `forall_inst` lane's comparison pre-filter refuses — with a recorded
-    /// instance that conflicts with the authored ground facts.
-    fn guarded_conflict_executor() -> Executor {
-        let mut exec = executor_with_assertions(
-            r#"
-                (set-logic LIA)
-                (declare-const a Int)
-                (assert (>= a 5))
-                (assert (forall ((x Int)) (=> (>= x 0) (< x a))))
-            "#,
-        );
-        let forall = exec.ctx.assertions[1];
-        let TermData::Forall(vars, body, _) = exec.ctx.terms.get(forall).clone() else {
-            panic!("fixture asserts a forall");
-        };
-        // The declared constant `a`, robust to comparison normalization.
-        let value = match exec.ctx.terms.get(exec.ctx.assertions[0]).clone() {
-            TermData::App(_, args) => args
-                .iter()
-                .copied()
-                .find(|&arg| matches!(exec.ctx.terms.get(arg), TermData::Var(..)))
-                .expect("fixture ground fact mentions the declared constant"),
-            _ => panic!("fixture ground fact is a comparison"),
-        };
-        let mut subst: ay_core::kani_compat::DetHashMap<String, TermId> =
-            ay_core::kani_compat::DetHashMap::default();
-        subst.insert(vars[0].0.clone(), value);
-        // The EXACT structural substitution the write chokepoints record in
-        // proof mode; folding constructors would be an illegal `forall_inst`
-        // conclusion.
-        let instance = crate::ematching::subst_vars_exact_qf(&mut exec.ctx.terms, body, &subst)
-            .expect("fixture body is quantifier-free");
-        exec.ematching_proof_records
-            .push(crate::executor::EmatchingProofRecord {
-                assertion_index: 1,
-                quantifier: forall,
-                binding: vec![value],
-                instance,
-            });
-        exec
-    }
-
-    #[test]
-    fn translates_recorded_guarded_instance_conflict_to_strict_proof() {
-        let mut exec = guarded_conflict_executor();
-        assert!(
-            exec.try_translate_authored_consequence_replay_unsat(),
-            "the recorded instance at x := a conflicts with (>= a 5) and must translate"
-        );
-        let proof = exec
-            .last_proof
-            .clone()
-            .expect("translation installs last_proof");
-        assert!(
-            proof.steps.iter().any(|step| matches!(
-                step,
-                ProofStep::Step {
-                    rule: AletheRule::ForallInst,
-                    ..
-                }
-            )),
-            "the stitched proof derives the instance via forall_inst"
-        );
-        assert!(exec
-            .check_proof_strict_with_datatypes(&proof)
-            .is_ok_and(|quality| quality.is_complete()));
-        let authored = exec.exact_concrete_authored_scope();
-        assert!(ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &authored).is_ok());
-    }
-
-    #[test]
-    fn attempt_budget_is_enforced() {
-        // GUARD-REMOVAL PROOF (attempt budget): the identical executor
-        // translates with a fresh budget (sibling test); exhausting the
-        // per-check-sat probe budget must decline without touching proof
-        // state. (The the consequence-replay switch kill-switch half lives in the
-        // dedicated single-test binary `consequence_replay_kill_switch.rs` —
-        // env mutation must never race sibling tests in a shared process.)
-        let mut exec = guarded_conflict_executor();
-        exec.consequence_replay_attempts.set(MAX_REPLAY_ATTEMPTS);
-        assert!(
-            !exec.try_translate_authored_consequence_replay_unsat(),
-            "the replay attempt budget must be enforced"
-        );
-        assert!(exec.last_proof.is_none());
-    }
-
-    #[test]
-    fn declines_without_a_recorded_instance() {
-        // GUARD-REMOVAL PROOF: a pure-ground UNSAT problem must not be
-        // re-solved by this lane — no recorded instance, no probe.
-        let mut exec = executor_with_assertions(
-            r#"
-                (set-logic LIA)
-                (declare-const a Int)
-                (assert (>= a 5))
-                (assert (< a 0))
-            "#,
-        );
-        assert!(
-            !exec.try_translate_authored_consequence_replay_unsat(),
-            "no recorded instance: the lane has nothing to add and must decline"
-        );
-        assert_eq!(
-            exec.consequence_replay_attempts.get(),
-            0,
-            "a plan-less decline must not consume a probe attempt"
-        );
-        assert!(exec.last_proof.is_none());
-    }
-
-    /// A negated vacuous-binder universal whose Skolem instance contradicts an
-    /// authored ground fact: the smallest fixture exercising the `sko_forall`
-    /// chain arm end to end.
-    fn skolem_conflict_executor(register_witness: bool) -> Executor {
-        let mut exec = executor_with_assertions(
-            r#"
-                (set-logic UFLIA)
-                (declare-fun p (Int) Bool)
-                (assert (p 7))
-                (assert (not (forall ((x Int)) (p 7))))
-            "#,
-        );
-        let source = exec.ctx.assertions[1];
-        let TermData::Not(quantified) = *exec.ctx.terms.get(source) else {
-            panic!("fixture asserts a negated forall");
-        };
-        let TermData::Forall(_, body, _) = exec.ctx.terms.get(quantified).clone() else {
-            panic!("fixture wraps a forall");
-        };
-        let witness = exec.ctx.terms.mk_fresh_var("ay_sk_replay_test", Sort::Int);
-        if register_witness {
-            let TermData::Var(name, _) = exec.ctx.terms.get(witness).clone() else {
-                panic!("fresh witness is a var");
-            };
-            exec.ctx.terms.mark_skolem_symbol(name);
-        }
-        let asserted = exec.ctx.terms.mk_not_raw(body);
-        exec.skolem_instance_records
-            .push(crate::executor::SkolemInstanceRecord {
-                source,
-                quantified,
-                witness,
-                instance: body,
-                asserted,
-                positive: false,
-            });
-        exec
-    }
-
-    #[test]
-    fn translates_recorded_skolem_instance_conflict_to_strict_proof() {
-        let mut exec = skolem_conflict_executor(true);
-        assert!(
-            exec.try_translate_authored_consequence_replay_unsat(),
-            "the negated-forall Skolem instance contradicts (p 7) and must translate"
-        );
-        let proof = exec
-            .last_proof
-            .clone()
-            .expect("translation installs last_proof");
-        assert!(
-            proof.steps.iter().any(|step| matches!(
-                step,
-                ProofStep::Step {
-                    rule: AletheRule::Skolem,
-                    ..
-                }
-            )),
-            "the stitched proof derives the instance via the sko_forall chain"
-        );
-        assert!(exec
-            .check_proof_strict_with_datatypes(&proof)
-            .is_ok_and(|quality| quality.is_complete()));
-        let authored = exec.exact_concrete_authored_scope();
-        assert!(ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &authored).is_ok());
-    }
-
-    #[test]
-    fn unregistered_skolem_witness_cannot_mint_a_certificate() {
-        // GUARD-REMOVAL PROOF: the strict checker's Skolem-registry authority
-        // is load-bearing — an identical chain over an unregistered witness
-        // must be refused wholesale, leaving proof state untouched.
-        let mut exec = skolem_conflict_executor(false);
-        assert!(
-            !exec.try_translate_authored_consequence_replay_unsat(),
-            "an unregistered witness must fail the sko_forall authority check"
-        );
-        assert!(exec.last_proof.is_none());
-    }
-
-    #[test]
-    fn declines_a_forged_binding_that_breaks_the_substitution() {
-        // The forged instance is NOT the substitution at the recorded binder
-        // value; the strict forall_inst validator must refuse the stitched
-        // candidate, and nothing may install.
-        let mut exec = executor_with_assertions(
-            r#"
-                (set-logic LIA)
-                (declare-const a Int)
-                (assert (>= a 5))
-                (assert (forall ((x Int)) (=> (>= x 0) (< x a))))
-            "#,
-        );
-        let forall = exec.ctx.assertions[1];
-        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
-        let false_term = exec.ctx.terms.false_term();
-        exec.ematching_proof_records
-            .push(crate::executor::EmatchingProofRecord {
-                assertion_index: 1,
-                quantifier: forall,
-                binding: vec![zero],
-                instance: false_term,
-            });
-        assert!(
-            !exec.try_translate_authored_consequence_replay_unsat(),
-            "a forged instance term must be refused by the strict replay"
-        );
-        assert!(exec.last_proof.is_none());
-    }
-
-    #[test]
-    fn satisfiable_consequences_cannot_mint_a_certificate() {
-        // The recorded instance is consistent with the ground facts: the probe
-        // finds no refutation and the producer must decline.
-        let mut exec = executor_with_assertions(
-            r#"
-                (set-logic LIA)
-                (declare-const a Int)
-                (assert (>= a 5))
-                (assert (forall ((x Int)) (=> (>= x 0) (<= 0 (+ x a)))))
-            "#,
-        );
-        let forall = exec.ctx.assertions[1];
-        let TermData::Forall(vars, body, _) = exec.ctx.terms.get(forall).clone() else {
-            panic!("fixture asserts a forall");
-        };
-        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
-        let mut subst: ay_core::kani_compat::DetHashMap<String, TermId> =
-            ay_core::kani_compat::DetHashMap::default();
-        subst.insert(vars[0].0.clone(), zero);
-        let instance = crate::ematching::subst_vars(&mut exec.ctx.terms, body, &subst);
-        exec.ematching_proof_records
-            .push(crate::executor::EmatchingProofRecord {
-                assertion_index: 1,
-                quantifier: forall,
-                binding: vec![zero],
-                instance,
-            });
-        assert!(
-            !exec.try_translate_authored_consequence_replay_unsat(),
-            "a satisfiable consequence set must never mint a refutation"
-        );
-        assert!(exec.last_proof.is_none());
-    }
-}
+mod tests;

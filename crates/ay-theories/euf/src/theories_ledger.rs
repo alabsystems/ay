@@ -84,12 +84,4 @@ pub const KNOBS: &[Knob] = &[
         bucket: Bucket::Tuning,
         read_sites: 1,
     },
-    Knob {
-        // Opt-in guard for the NRA measurement-harness tests (the gate
-        // forbids disabled tests; AY_LIA_HOT_LOOP_ITERS class).
-        name: "AY_NRA_PROFILE",
-        crate_name: "nra",
-        bucket: Bucket::Diagnostic,
-        read_sites: 27,
-    },
 ];

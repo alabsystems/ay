@@ -1127,7 +1127,7 @@ mod tests {
         model.set_objective(&[(retained, 1.0), (open, 1.0)], Sense::Minimize);
 
         let route_start = Instant::now();
-        let deadline = bounded_deadline(Some(route_start + Duration::from_secs(60))).unwrap();
+        let deadline = bounded_deadline(Some(route_start + Duration::from_mins(1))).unwrap();
         let mut backend = EnumeratingBackend::default();
         let decision = try_solve_with_backend(&model, None, deadline, &mut || false, &mut backend);
         assert!(matches!(

@@ -690,11 +690,10 @@ pub(crate) fn refine_to_width(
     }
 
     let mut cur = iv.clone();
-    let mut steps: u32 = 0;
     // `bound + 1` iterations: `bound` bisections plus the final width test.
     // `bound` is `u32` and capped at MAX_REFINE_STEPS, so this cannot be a
     // long-running loop by construction.
-    for _ in 0..=bound {
+    for steps in 0..=bound {
         if cur.width().cmp_bq(target) != Ordering::Greater {
             let end_max_k = cur.max_k();
             return Some((
@@ -708,12 +707,12 @@ pub(crate) fn refine_to_width(
         }
         let (left, mid, right) = cur.bisect()?;
         let s_mid = poly_sign_at(p, &mid)?;
-        steps += 1;
+        let completed_steps = steps + 1;
         if s_mid == 0 {
             return Some((
                 Refined::Exact(mid.clone()),
                 RefineTrace {
-                    steps,
+                    steps: completed_steps,
                     bound,
                     end_max_k: mid.k(),
                 },
@@ -1028,61 +1027,4 @@ pub(crate) fn select_non_root(p: &[BigInt], iv: &BqInterval) -> Option<Bq> {
     None
 }
 
-// ============================================================================
-// BigRational bridge for callers that still speak `Q`
-// ============================================================================
-
-/// The smallest dyadic interval with `k`-bit endpoints that **contains**
-/// `(lo, hi)`: `lo` rounded down and `hi` rounded up onto the `2^-k` grid.
-///
-/// Used to bring an interval produced by the existing `BigRational` isolation
-/// in `univariate.rs` onto the dyadic grid without ever narrowing it, which
-/// would risk dropping the root. `None` if the rounded endpoints collapse
-/// (impossible for `k >= 0` and `lo < hi` unless the inputs were already
-/// equal), or if `lo >= hi`.
-///
-/// # This duplicates something already in the tree, and that was concealed
-///
-/// `icp.rs` has `round_interval_outward` (plus `dyadic_floor` / `dyadic_ceil` /
-/// `dyadic_grid`), which does the same job onto a fixed `2^-ROOT_SCALE_BITS`
-/// grid — and unlike everything in this module, **it is wired into the live ICP
-/// solve path**. This module's own scoping report claimed "inside
-/// `crates/ay-theories/nra/` the count is 2, both in prose"; the real count at
-/// the time was 62, of which 57 are in `icp.rs`. The headline that no dyadic
-/// TYPE existed still holds — `icp.rs` is `BigRational`-valued with no packed
-/// `a/2^k` and no minimal-denominator selection — but the measurement offered as
-/// proof was wrong, and it hid a genuine overlap with wired code.
-///
-/// Consolidating the two is deliberately NOT done here: `icp.rs` is on the
-/// solve path and this module is not wired, so a shared implementation would
-/// have to be introduced by changing live code, which is its own change with
-/// its own before/after.
-pub(crate) fn enclose_rational(lo: &BigRational, hi: &BigRational, k: u32) -> Option<BqInterval> {
-    if lo >= hi {
-        return None;
-    }
-    // The one unguarded resource path in this module, until a verifier pointed
-    // at it: every other entry point bounds its work by a derived quantity
-    // (`MAX_REFINE_STEPS`, `MAX_SELECT_K`), but this one shifted by a
-    // caller-supplied `k` with no ceiling. MEASURED: `k = 2^24` returns in 4 ms
-    // after allocating a 2 MB `BigInt`; `k` near `u32::MAX` would allocate about
-    // 512 MB. Not a hang and not reachable from any caller today, but refusing
-    // is free and the module's stated discipline is that nothing is unbounded.
-    if k > MAX_SELECT_K {
-        return None;
-    }
-    let scale = BigInt::one() << k;
-    let l = (lo.numer() * &scale).div_floor(lo.denom());
-    let h = ceil_div(&(hi.numer() * &scale), hi.denom());
-    BqInterval::new(Bq::new(l, k), Bq::new(h, k))
-}
-
-/// `ceil(n / d)` for `d > 0`.
-fn ceil_div(n: &BigInt, d: &BigInt) -> BigInt {
-    let (q, r) = n.div_rem(d);
-    if r.is_zero() || r.is_negative() {
-        q
-    } else {
-        q + 1
-    }
-}
+include!("mpbq/rational_bridge.rs");

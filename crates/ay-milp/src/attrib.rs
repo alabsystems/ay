@@ -14,6 +14,7 @@
 //! `file:line`, counts how many DISTINCT B&B trees the process runs, and
 //! separates per-node work from per-subsolve setup work.
 
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Master gate. Everything in this module is inert unless set.
@@ -307,7 +308,7 @@ fn dump_solve_totals(calls: u64, nodes: u64) {
     );
     if let Ok(m) = SUBSOLVE_SITES.lock() {
         let mut v: Vec<_> = m.iter().map(|(&k, &e)| (e, k)).collect();
-        v.sort_unstable_by(|a, b| b.0 .1.cmp(&a.0 .1));
+        v.sort_unstable_by_key(|&((_, nanos), _)| Reverse(nanos));
         for ((n, ns), name) in v {
             eprintln!(
                 "attrib   launch {name}: calls={n} wall={:.2}s ({:.2}s/call)",
@@ -331,7 +332,7 @@ fn dump_solve_totals(calls: u64, nodes: u64) {
 fn dump_lp_sites(nodes: u64) {
     if let Ok(m) = SOLVE_SITES.lock() {
         let mut v: Vec<_> = m.iter().map(|(&(f, l), &c)| (c, f, l)).collect();
-        v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        v.sort_unstable_by_key(|&(count, _, _)| Reverse(count));
         let tot: u64 = v.iter().map(|e| e.0).sum();
         eprintln!("attrib LPSITES total={tot} distinct={}", v.len());
         for (c, f, l) in v.iter().take(24) {
@@ -357,7 +358,7 @@ fn dump_separator_stats(nodes: u64) {
         })
         .filter(|e| e.1 > 0)
         .collect();
-    v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    v.sort_unstable_by_key(|&(nanos, _, _, _)| Reverse(nanos));
     eprintln!(
         "attrib CUTROUNDS rounds={} offered={} admitted={} (waste={})",
         CUT_ROUNDS.load(Relaxed),

@@ -415,26 +415,22 @@ pub mod engines {
         config: PdrConfig,
         replay_budget: Duration,
     ) -> ChcResult<ChcPdrProofRun> {
-        let run = solve_pdr_proof(problem.clone(), config)?;
-        Ok(attach_checked_replay(run, &problem, replay_budget))
+        let run = solve_pdr_proof(problem, config)?;
+        Ok(attach_checked_replay(run, replay_budget))
     }
 
     /// Fail-closed helper: swap in checked-replay metadata when the pass
     /// succeeds, otherwise return the metadata-only run unchanged.
-    fn attach_checked_replay(
-        run: ChcPdrProofRun,
-        problem: &ChcProblem,
-        replay_budget: Duration,
-    ) -> ChcPdrProofRun {
+    fn attach_checked_replay(run: ChcPdrProofRun, replay_budget: Duration) -> ChcPdrProofRun {
         if !run.accepted_as_proof() {
             return run;
         }
         let checked = ay_core::catch_ay_panics(
-            AssertUnwindSafe(|| run.run_checked_replay(problem, replay_budget)),
+            AssertUnwindSafe(|| run.run_checked_replay(replay_budget)),
             |reason| Err(ChcError::Internal(reason)),
         );
         match checked {
-            Ok(checked) => checked.proof_run,
+            Ok(checked) => checked.into_proof_run(),
             Err(_) => run,
         }
     }
@@ -494,12 +490,12 @@ pub mod engines {
                 ChcEngineResult::Safe(InvariantModel::default()),
                 ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
             );
-            return ChcPdrProofRun::new(&problem, result, PDR_PROOF_ENGINE_NAME);
+            return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
         }
 
         let raw = PdrSolver::solve_problem(&problem, config.clone());
         let result = validate_pdr_proof_result(&problem, raw, &config);
-        ChcPdrProofRun::new(&problem, result, PDR_PROOF_ENGINE_NAME)
+        ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME)
     }
 
     fn validation_config(base: &PdrConfig) -> PdrConfig {
@@ -633,7 +629,7 @@ pub mod engines {
                 ChcEngineResult::Unknown,
                 ValidationEvidence::FullVerification,
             );
-            return Ok(ChcPdrProofRun::new(&problem, result, PDR_PROOF_ENGINE_NAME));
+            return Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME));
         }
 
         // Re-validated: the full init + transition + query clause check passed
@@ -643,7 +639,7 @@ pub mod engines {
             ChcEngineResult::Safe(model),
             ValidationEvidence::FullVerification,
         );
-        Ok(ChcPdrProofRun::new(&problem, result, PDR_PROOF_ENGINE_NAME))
+        Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME))
     }
 
     fn validate_empty_scalar_acyclic_bmc_certificate(
@@ -1094,8 +1090,8 @@ pub mod engines {
     /// solver-owned validation boundary in AY and gives downstream callers a
     /// [`ChcPdrProofRun`] they can feed directly to
     /// [`ChcPdrProofRun::consumer_evidence`]. In particular, MCC/hardware
-    /// consumers should prefer this over locally pairing [`solve_bmc_only`] with
-    /// [`ChcPdrProofRun::new`].
+    /// consumers should prefer this over solving separately and attempting to
+    /// construct proof metadata outside the sealed run.
     pub fn solve_bmc_proof(
         problem: ChcProblem,
         bmc_config: BmcConfig,
@@ -1118,8 +1114,8 @@ pub mod engines {
         bmc_config: BmcConfig,
         replay_budget: Duration,
     ) -> ChcResult<ChcPdrProofRun> {
-        let run = solve_bmc_proof(problem.clone(), bmc_config)?;
-        Ok(attach_checked_replay(run, &problem, replay_budget))
+        let run = solve_bmc_proof(problem, bmc_config)?;
+        Ok(attach_checked_replay(run, replay_budget))
     }
 
     /// Parse a CHC problem from an SMT-LIB string and run BMC-only evidence mode.
@@ -1134,7 +1130,7 @@ pub mod engines {
     fn solve_bmc_proof_unchecked(problem: ChcProblem, bmc_config: BmcConfig) -> ChcPdrProofRun {
         let adaptive = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::default());
         let result = adaptive.solve_bmc_only(bmc_config);
-        ChcPdrProofRun::new(&problem, result, BMC_PROOF_ENGINE_NAME)
+        ChcPdrProofRun::new(problem, result, BMC_PROOF_ENGINE_NAME)
     }
 }
 

@@ -49,6 +49,13 @@ pub struct DratChecker {
     pub(super) hash_buckets: Vec<Vec<usize>>,
     pub(super) live_clauses: usize,
     pub(super) inconsistent: bool,
+    /// Set permanently after any unchecked cross-crate adapter mutation.
+    /// Diagnostic clients may keep using the clause database, but an
+    /// authoritative proof conclusion must then fail closed.
+    authority_tainted: bool,
+    /// The bulk `verify` API is intentionally one-shot. Reusing a checker would
+    /// otherwise carry clauses or an earlier contradiction into a new problem.
+    bulk_verify_started: bool,
     pub(crate) stats: Stats,
     check_rat: bool,
     /// Marker array indexed by literal code for O(n) tautology/duplicate detection.
@@ -88,8 +95,11 @@ impl DratChecker {
         &self.stats
     }
 
-    /// Conclude the proof as UNSAT. Checks: (1) steps were processed,
-    /// (2) no step failures, (3) empty clause derived.
+    /// Conclude the current formula and derivation as UNSAT.
+    ///
+    /// This requires no failed derivation steps, no unchecked adapter
+    /// mutations, and a derived contradiction. Contradictory original clauses
+    /// therefore need no separate proof step.
     ///
     /// Unlike LRAT, DRAT has no finalization coverage check.
     /// The reference implementation (CaDiCaL checker.cpp) has no explicit
@@ -98,6 +108,9 @@ impl DratChecker {
     pub fn conclude_unsat(&self) -> ConcludeResult {
         if self.stats.failures > 0 {
             return ConcludeResult::Failed(ConcludeFailure::StepFailures);
+        }
+        if self.authority_tainted {
+            return ConcludeResult::Failed(ConcludeFailure::UncheckedAdapterMutation);
         }
         if !self.inconsistent {
             return ConcludeResult::Failed(ConcludeFailure::NoEmptyClause);
@@ -118,6 +131,8 @@ impl DratChecker {
             hash_buckets: vec![Vec::new(); INITIAL_HASH_CAPACITY],
             live_clauses: 0,
             inconsistent: false,
+            authority_tainted: false,
+            bulk_verify_started: false,
             stats: Stats::default(),
             check_rat,
             marks: vec![false; num_vars * 2],
@@ -132,6 +147,21 @@ impl DratChecker {
             prep: false,
             simplify_buf: Vec::new(),
         }
+    }
+
+    /// Start one authoritative bulk verification on pristine checker state.
+    pub(super) fn begin_bulk_verify(&mut self) -> Result<(), DratCheckError> {
+        if self.bulk_verify_started
+            || self.authority_tainted
+            || !self.clauses.is_empty()
+            || !self.trail.is_empty()
+            || self.inconsistent
+            || self.stats != Stats::default()
+        {
+            return Err(DratCheckError::CheckerNotFresh);
+        }
+        self.bulk_verify_started = true;
+        Ok(())
     }
 
     pub(super) fn ensure_capacity(&mut self, var_idx: usize) {
@@ -397,17 +427,26 @@ impl DratChecker {
         var_idx < self.reasons.len() && self.reasons[var_idx] == Some(cidx)
     }
 
-    /// Verify a complete proof against a formula.
+    /// Verify a complete proof against a formula on a fresh checker.
+    ///
+    /// This bulk API is one-shot: reusing a checker could bind retained clauses
+    /// or an earlier contradiction to a different formula, so every later call
+    /// fails closed. Incremental diagnostic users should use the individual
+    /// adapter methods and must not treat that state as proof authority.
     pub fn verify(
         &mut self,
         clauses: &[Vec<Literal>],
         steps: &[ProofStep],
     ) -> Result<(), DratCheckError> {
+        self.begin_bulk_verify()?;
         for clause in clauses {
             self.add_original(clause);
         }
         if self.inconsistent {
-            return Ok(());
+            return match self.conclude_unsat() {
+                ConcludeResult::Verified => Ok(()),
+                ConcludeResult::Failed(reason) => Err(DratCheckError::from(reason)),
+            };
         }
         for (i, step) in steps.iter().enumerate() {
             match step {

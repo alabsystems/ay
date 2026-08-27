@@ -154,10 +154,11 @@ pub(crate) struct FragmentInstanceRootDerivation {
 /// taken from this record — the fragment lane re-derives the widened clause
 /// through the bounded ground refuter and discharges each premise as an
 /// authored assumption.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FragmentContextDerivation {
-    /// Asserted premise terms, in the producer's emission order.
-    pub(crate) premises: Vec<TermId>,
+    /// Alternative premise sets, each independently sealed; consumption
+    /// tries them in order until one discharges.
+    pub(crate) premise_sets: Vec<Vec<TermId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

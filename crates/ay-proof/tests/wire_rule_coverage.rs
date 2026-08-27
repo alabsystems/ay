@@ -303,6 +303,18 @@ fn fixed_rules_in_literal(literal: &RustStringLiteral) -> Vec<(String, usize)> {
                     .bytes()
                     .filter(|byte| *byte == b'\n')
                     .count();
+            // A fixed prefix immediately followed by `{` is a rule name
+            // SPLICED from a fragment (`:rule bitblast_{conn}`). Reading it as
+            // a literal puts a name the checker cannot resolve into the
+            // inventory while hiding the real names from the scan entirely, so
+            // refuse the spelling instead of probing the prefix.
+            assert_ne!(
+                literal.value.as_bytes().get(name_start + name_len),
+                Some(&b'{'),
+                "spliced :rule name at line {line}: `{name}` is a fragment, not a \
+                 wire rule. Spell the complete rule name in the substituted value \
+                 so the wire-rule inventory can read it."
+            );
             rules.push((name, line));
         }
         offset = name_start + name_len;

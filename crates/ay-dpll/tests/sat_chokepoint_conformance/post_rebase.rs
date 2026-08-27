@@ -241,6 +241,16 @@ pub(super) fn assert_authored_entrypoint_allowlist() {
         "crates/ay-dpll/src/executor/quantifier_loop/result_mapping.rs",
         "crates/ay-dpll/src/executor/unsat_cert.rs",
         "crates/ay-dpll/src/executor/check_sat_assuming/nested_publication_tests.rs",
+        // BOUNDARY AUDIT, 2026-08-25. One callsite, `exec.execute_authored(&command)`
+        // at `command_deadline_tests.rs:115`, inside
+        // `#[test] fn control_lifetime_command_publication_restores_deadline_after_
+        // elaboration_error`, asserting `.is_err()` on an undeclared assumption.
+        // It exercises an ERROR path and publishes nothing. The whole file is
+        // `#[test]` items and reaches the build only through
+        // `include!("check_sat/command_deadline_tests.rs")` at `check_sat.rs:5169`,
+        // which sits inside the `#[cfg(test)]` item opened at `check_sat.rs:5030`.
+        // It therefore cannot widen a production authority boundary.
+        "crates/ay-dpll/src/executor/check_sat/command_deadline_tests.rs",
     ];
     for source in sources {
         let relative = source
@@ -288,7 +298,88 @@ fn cfg_test_module_file(workspace: &std::path::Path, relative: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(parent) else {
         return false;
     };
-    normalize_whitespace(&text).contains(&format!("#[cfg(test)] mod {stem};"))
+    if normalize_whitespace(&text).contains(&format!("#[cfg(test)] mod {stem};")) {
+        return true;
+    }
+    // Second mechanism, same guarantee: the parent pulls the file in with
+    // `include!` from a site that lies INSIDE a `#[cfg(test)]` item, so the
+    // file reaches only test builds exactly as a `#[cfg(test)] mod` would.
+    //
+    // Checked POSITIONALLY, never as "the parent mentions cfg(test) somewhere":
+    // a production `include!` in a file that also happens to carry a test module
+    // must still require an explicit audit. Comments are stripped first so a
+    // commented-out attribute cannot open a span.
+    let Some(dir_name) = parent_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    include_site_is_cfg_test(
+        &code_without_comments(&text),
+        &format!("{dir_name}/{stem}.rs"),
+    )
+}
+
+/// True when `include!("<needle>")` appears inside a `#[cfg(test)]` item.
+fn include_site_is_cfg_test(code: &str, needle: &str) -> bool {
+    let Some(site) = code.find(&format!("include!(\"{needle}\")")) else {
+        return false;
+    };
+    cfg_test_spans(code)
+        .into_iter()
+        .any(|(open, close)| site > open && site < close)
+}
+
+/// Byte ranges of every `#[cfg(test)]` item body in `code`, as `(open, close)`
+/// offsets of its outermost braces.
+fn cfg_test_spans(code: &str) -> Vec<(usize, usize)> {
+    const ATTR: &str = "#[cfg(test)]";
+    let bytes = code.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = code[cursor..].find(ATTR) {
+        let attr = cursor + offset;
+        cursor = attr + ATTR.len();
+        let Some(brace) = code[cursor..].find('{') else {
+            break;
+        };
+        let open = cursor + brace;
+        let mut depth = 0usize;
+        for (index, byte) in bytes.iter().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        spans.push((open, index));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    spans
+}
+
+#[test]
+fn cfg_test_include_recognition_is_positional_not_incidental() {
+    // ACCEPTED: the include site is inside the `#[cfg(test)]` item.
+    let inside = "#[cfg(test)]\nmod tests {\n    include!(\"d/f.rs\");\n}\n";
+    assert!(include_site_is_cfg_test(inside, "d/f.rs"));
+
+    // REFUSED: a production include in a file that ALSO carries a test module.
+    // This is the vacuity the positional check exists to prevent.
+    let outside = "include!(\"d/f.rs\");\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+    assert!(
+        !include_site_is_cfg_test(outside, "d/f.rs"),
+        "a production include! must still require an explicit boundary audit"
+    );
+
+    // REFUSED: the include sits after the test item has closed.
+    let after = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\ninclude!(\"d/f.rs\");\n";
+    assert!(!include_site_is_cfg_test(after, "d/f.rs"));
+
+    // REFUSED: a different file's include does not vouch for this one.
+    assert!(!include_site_is_cfg_test(inside, "d/other.rs"));
 }
 
 pub(super) fn assert_funnelled_sat_sources() {
@@ -343,9 +434,9 @@ pub(super) fn assert_funnelled_sat_sources() {
                 "the deferral must be entered only from the plain check-sat \
                  named-core redirect, whose caller is funnelled by check_sat_guarded"
             );
-            src[..arm_start].matches('\n').count()..=src[..arm_end].matches('\n').count()
+            Some(src[..arm_start].matches('\n').count()..=src[..arm_end].matches('\n').count())
         } else {
-            1..=0
+            None
         };
         for (lineno, line) in src.lines().enumerate() {
             if !line.contains("Ok(SolveResult::Sat)") {
@@ -354,7 +445,9 @@ pub(super) fn assert_funnelled_sat_sources() {
             let trimmed = line.trim_start();
             let is_match_arm = line.contains("=>");
             let is_comment = trimmed.starts_with("//") || trimmed.starts_with('*');
-            let is_audited_deferral = deferral_arm_lines.contains(&lineno);
+            let is_audited_deferral = deferral_arm_lines
+                .as_ref()
+                .is_some_and(|lines| lines.contains(&lineno));
             assert!(
                 is_match_arm || is_comment || is_audited_deferral,
                 "{rel}:{} emits a bare `Ok(SolveResult::Sat)` — route every SAT verdict through emit_sat_verdict so the independent + authoritative gates run:\n  {line}",

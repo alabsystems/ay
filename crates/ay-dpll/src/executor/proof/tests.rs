@@ -321,7 +321,9 @@ include!("tests/bv_identity_collapse.rs");
 include!("tests/bv_fp.rs");
 include!("tests/dt_nia.rs");
 include!("tests/farkas.rs");
+mod boolean_closure;
 mod trust_closer_array_retag;
+mod trust_closer_derived_leaf_head;
 
 include!("tests/pruning.rs");
 include!("tests/self_check.rs");
@@ -329,6 +331,7 @@ include!("tests/firewall.rs");
 include!("tests/array_string.rs");
 include!("tests/string_array.rs");
 include!("tests/extensionality.rs");
+include!("tests/extensionality_folded_pair.rs");
 include!("tests/strict_counter.rs");
 mod conjunct_eval;
 mod source_work;

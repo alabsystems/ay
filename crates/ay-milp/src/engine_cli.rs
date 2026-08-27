@@ -2,9 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Typed engine-economics CLI overrides, shared by the `ay-milp` binary and
-//! the measurement-harness example drivers (B38: the harness scripts pass
-//! these flags instead of the retired `AY_MILP_*` env spellings).
+//! Typed engine-economics CLI overrides shared by `ay-milp` and measurement
+//! drivers, replacing the retired `AY_MILP_*` environment spellings.
 
 use crate::{EngineEconomics, SolveOpts};
 
@@ -12,9 +11,8 @@ type BoolBuilder = fn(EngineEconomics, bool) -> EngineEconomics;
 type UsizeBuilder = fn(EngineEconomics, usize) -> EngineEconomics;
 type FloatBuilder = fn(EngineEconomics, f64) -> Result<EngineEconomics, crate::EngineConfigError>;
 
-/// Hand-rolled argument bag (this crate takes no CLI dependency): `--x v` /
-/// `--x=v` for names in `value_flags`, bare `--x` for names in `switch_flags`,
-/// positionals passed through, and anything else REFUSED.
+/// Dependency-free argument bag: known value and switch flags plus positionals;
+/// everything else is refused.
 pub struct Flags {
     pub positional: Vec<String>,
     named: Vec<(String, String)>,
@@ -28,15 +26,10 @@ impl Flags {
     ///
     /// # Why an unknown flag cannot be tolerated
     ///
-    /// This parser is the front door of a MEASUREMENT INSTRUMENT. It used to
-    /// accept any bare `--x` as a switch, so `--devx` (a typo for `--devex`)
-    /// and `--total-nonsense-zz` alike parsed cleanly, set nothing, and the
-    /// run reported its numbers under the flag's name — the A/B measured the
-    /// same arm twice, silently. A VALUE flag with no entry in `value_flags`
-    /// was worse: its value fell through to `positional`, where
-    /// `examples/mps_solve.rs` reads a seed-solution path, so the run died in
-    /// `read seed solution: NotFound` and a harness that swallows stderr
-    /// recorded a MISSING DATUM rather than a misparse.
+    /// This parser fronts a measurement instrument. It formerly accepted an
+    /// unknown switch such as `--devx` as a no-op, silently comparing one arm
+    /// twice. An unknown value flag could instead leak its value into the seed
+    /// path positional and turn a misparse into a missing datum.
     ///
     /// `tests/knob_census.rs` closed the other half (a flag whose knob has no
     /// carrier); this closes the parser half.
@@ -242,10 +235,7 @@ const HAND_ROLLED: &[&str] = &[
     "flip-cap-secs",
     "sym-branch-band",
     "dual-perturb",
-    "cert-grace-secs",
-    "pump-share",
     "setpart-share",
-    "heur-share",
     "bumpdiff-lanes",
     "sym-mode",
     "rins",
@@ -256,6 +246,7 @@ const HAND_ROLLED: &[&str] = &[
     "ng-branch-pct",
     "dual-bypass-mode",
     "eager-perturb-mode",
+    "harris-rt",
     "chain-devex",
     "ft-growth-tol",
 ];
@@ -279,9 +270,75 @@ pub fn applied_flags() -> Vec<&'static str> {
         .collect()
 }
 
+/// Parse `args` against exactly what [`apply`] can carry, plus a surface's own
+/// names — the parse table a MEASUREMENT HARNESS wants.
+///
+/// # The defect this stops
+///
+/// [`VALUE_FLAGS`] is not the harness table. It is the `ay-milp solve`
+/// subcommand's table, and it is a strict superset of [`applied_flags`]: it
+/// also carries the FOURTEEN names only `solve` itself reads (`--emit-cert`,
+/// `--require`, `--threads`, `--seed`, `--format`, `--memory-budget`,
+/// `--opt-tree-secs`, …). Every harness that handed `VALUE_FLAGS` to
+/// [`Flags::parse`] therefore ACCEPTED those fourteen and could honour none of
+/// them, because it is `apply` — not the parser — that turns an accepted name
+/// into a `SolveOpts`.
+///
+/// Measured on `6f45bcf66`, three interleaved reps each, load 57-69 on a
+/// 14-core box (counts and file sizes only, no wall figure load-coupled):
+///
+///   * `cert_probe m 5 --require optimal` printed `require_certificates=0`
+///     and `evidence=witness+uncertified-dual-bound` on 3 of 3, while
+///     `cert_probe m 5 1` — the same setting via the positional the harness
+///     really reads — printed `require_certificates=1` and
+///     `evidence=witness-only` on 3 of 3. The flag did not merely do nothing:
+///     it named one arm and measured the other, on the harness whose entire
+///     purpose is pricing certificate requirements.
+///   * `cert_probe m 5 --emit-cert F` exited 0 and left F ABSENT on 3 of 3,
+///     while `ay-milp solve m 5 --emit-cert F` wrote 11,304 bytes on 3 of 3.
+///
+/// A surface calling this instead gets those names REFUSED by name, with the
+/// nearest known spelling, which is the loud failure the silent one deserved.
+///
+/// # Errors
+///
+/// Whatever [`Flags::parse`] returns: an unknown flag, a value flag with no
+/// value, or a switch given one.
+pub fn parse_applied(
+    args: &[String],
+    own_value_flags: &[&str],
+    own_switch_flags: &[&str],
+) -> Result<Flags, String> {
+    let engine_switches = switch_flags();
+    let mut switches: Vec<&str> = engine_switches.clone();
+    switches.extend(own_switch_flags.iter().copied());
+    // `applied_flags` minus the switch half is the value half — derived, not
+    // restated, so a builder moved between tables cannot leave a name behind
+    // in one list and absent from the other.
+    let mut values: Vec<&str> = applied_flags()
+        .into_iter()
+        .filter(|name| !engine_switches.contains(name))
+        .collect();
+    values.extend(own_value_flags.iter().copied());
+    values.sort_unstable();
+    values.dedup();
+    switches.sort_unstable();
+    switches.dedup();
+    Flags::parse(args, &values, &switches)
+}
+
+/// The `ay-milp solve` subcommand's parse table.
+///
+/// NOT the table for a measurement harness — see [`parse_applied`], which is.
+/// A name belongs here only if `solve` itself reads it or [`apply`] carries it;
+/// `--check-sol` and `--dual-cutoff` were here and satisfied neither, so
+/// `ay-milp solve --dual-cutoff 0.0` parsed cleanly and ran the unflagged arm
+/// (byte-identical stdout and an identical 11,304-byte certificate against no
+/// flag at all, 2 interleaved reps on `6f45bcf66`), while the one harness that
+/// does read the name, `mps_solve`, echoed
+/// `--dual-cutoff: 0.0 (file frame) -> 0 (model frame, obj_scale 1)` on both.
+/// Both now live in `mps_solve`'s own table, so `solve` refuses them by name.
 pub const VALUE_FLAGS: &[&str] = &[
-    "check-sol",
-    "dual-cutoff",
     "kernel-scan-dir",
     "lnp-probe",
     "time-limit",
@@ -293,6 +350,10 @@ pub const VALUE_FLAGS: &[&str] = &[
     "require",
     "emit-cert",
     "emit-cert-max-bytes",
+    "opt-tree-secs",
+    "opt-tree-leaves",
+    "opt-tree-work",
+    "opt-tree-grid",
     "emit-witness",
     "witness-format",
     "format",
@@ -312,6 +373,7 @@ pub const VALUE_FLAGS: &[&str] = &[
     "flip-solve",
     "dual-bypass-mode",
     "eager-perturb-mode",
+    "harris-rt",
     "cuts-per-round",
     "cut-eff-floor",
     "ng-branch-pct",
@@ -400,6 +462,11 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
     ("no-cutoff", EngineEconomics::with_cutoff_stop, false),
     ("no-node-lu", EngineEconomics::with_node_lu, false),
     ("no-tall-lu", EngineEconomics::with_tall_lu, false),
+    (
+        "no-tall-cold-dual",
+        |engine, _| engine.with_tall_cold_dual(crate::TallColdDualMode::Disabled),
+        false,
+    ),
     (
         "no-dual-churn-band",
         EngineEconomics::with_dual_churn_band,
@@ -541,7 +608,6 @@ const BOOL_BUILDERS: &[(&str, BoolBuilder, bool)] = &[
         false,
     ),
     ("no-bump-lu", EngineEconomics::with_bump_lu, false),
-    ("full-pricing", EngineEconomics::with_full_pricing, true),
     ("no-float", EngineEconomics::with_float_lane, false),
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
     // gave their knobs a writer. See `tests/knob_census.rs`.
@@ -671,6 +737,9 @@ const FLOAT_BUILDERS: &[(&str, FloatBuilder)] = &[
     ("splns-stall-secs", EngineEconomics::with_splns_stall_secs),
     ("flip-share", EngineEconomics::with_flip_lns_share),
     ("presolve-share", EngineEconomics::with_presolve_share),
+    ("cert-grace-secs", EngineEconomics::with_cert_grace_secs),
+    ("pump-share", EngineEconomics::with_pump_share),
+    ("heur-share", EngineEconomics::with_heur_share),
     ("diag-cost-perturb", EngineEconomics::with_diag_cost_perturb),
     // CENSUS CARRIERS: flags that parsed but changed nothing until `opts/carriers.rs`
     // gave their knobs a writer. See `tests/knob_census.rs`.
@@ -724,8 +793,7 @@ pub fn apply(flags: &Flags, mut opts: SolveOpts) -> Result<SolveOpts, String> {
             let value = value
                 .parse::<f64>()
                 .map_err(|_| format!("--{flag} needs a number"))?;
-            engine = apply(engine, value)
-                .map_err(|_| format!("--{flag} must be finite and non-negative"))?;
+            engine = apply(engine, value).map_err(|error| format!("--{flag}: {error}"))?;
             touched = true;
         }
     }
@@ -772,10 +840,7 @@ pub fn apply(flags: &Flags, mut opts: SolveOpts) -> Result<SolveOpts, String> {
             EngineEconomics::with_sym_branch_band as fn(EngineEconomics, f64) -> EngineEconomics,
         ),
         ("dual-perturb", EngineEconomics::with_dual_perturb),
-        ("cert-grace-secs", EngineEconomics::with_cert_grace_secs),
-        ("pump-share", EngineEconomics::with_pump_share),
         ("setpart-share", EngineEconomics::with_setpart_share),
-        ("heur-share", EngineEconomics::with_heur_share),
     ] {
         if let Some(value) = flags.get(flag) {
             let v = value
@@ -888,6 +953,15 @@ pub fn apply(flags: &Flags, mut opts: SolveOpts) -> Result<SolveOpts, String> {
         engine = engine
             .with_eager_perturb(mode)
             .map_err(|_| "--eager-perturb-mode must be 0, 1 or 2".to_string())?;
+        touched = true;
+    }
+    if let Some(value) = flags.get("harris-rt") {
+        let mode = value
+            .parse::<usize>()
+            .map_err(|_| "--harris-rt needs an integer".to_string())?;
+        engine = engine
+            .with_harris_rt(mode)
+            .map_err(|_| "--harris-rt must be 0, 1 or 2".to_string())?;
         touched = true;
     }
     if let Some(value) = flags.get("chain-devex") {

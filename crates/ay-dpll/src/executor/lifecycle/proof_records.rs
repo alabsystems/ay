@@ -2,14 +2,39 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use super::super::Executor;
+use super::super::{EmatchingProofRecord, Executor};
+
+pub(in crate::executor) struct ConsequenceReplayState {
+    ematching: Vec<EmatchingProofRecord>,
+    attempts: u8,
+    direct: Option<(u64, u8)>,
+}
 
 impl Executor {
+    pub(in crate::executor) fn take_consequence_replay_state(&mut self) -> ConsequenceReplayState {
+        ConsequenceReplayState {
+            ematching: std::mem::take(&mut self.ematching_proof_records),
+            attempts: self.consequence_replay_attempts.replace(0),
+            direct: self.consequence_replay_direct_state.replace(None),
+        }
+    }
+
+    pub(in crate::executor) fn restore_consequence_replay_state(
+        &mut self,
+        state: ConsequenceReplayState,
+    ) {
+        self.ematching_proof_records = state.ematching;
+        self.consequence_replay_attempts.set(state.attempts);
+        self.consequence_replay_direct_state.set(state.direct);
+    }
+
     pub(in crate::executor) fn clear_preprocessing_proof_records(&mut self) {
         self.quant_expansion_records.clear();
         self.ematching_proof_records.clear();
         self.consequence_replay_attempts.set(0);
+        self.consequence_replay_direct_state.set(None);
         self.negated_exists_ground_inst_attempts.set(0);
+        self.implied_forall_ground_inst_attempts.set(0);
         self.skolem_instance_records.clear();
         self.skolem_witness_records.clear();
         self.bv_mbqi_false_instance_records.clear();
@@ -24,7 +49,7 @@ impl Executor {
                 "CERT/proof-records cleared: propagation entries={} rewrites={} exec={:p}",
                 self.propagated_value_provenance.entries.len(),
                 self.propagated_value_provenance.rewrites.len(),
-                self as *const _,
+                std::ptr::from_ref(self),
             );
         }
         self.propagated_value_provenance = Default::default();

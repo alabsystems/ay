@@ -12,6 +12,20 @@ readme.workspace = true
 name = "ay_proof_common"
 path = "src/lib.rs"
 
+[features]
+# Retained as a no-op for compatibility: it used to select the erasing
+# `requires!`/`ensures!` macros in src/contracts.rs, which are GONE. The crate's
+# contracts are now first-class `#[cfg_attr(deductive_verify, trust::…)]` attributes,
+# so activation is a CFG and a dependency, not a feature:
+#   * `--cfg deductive_verify` makes the attributes present, and
+#   * an external crate with lib name `trust` (the `trust-spec` package) must be
+#     in scope or `trust::requires` does not resolve at all.
+# The manifest stays standalone and the dependency is supplied by an overlay at
+# verification time -- the same arrangement ay-pb documents in
+# the development proof harness A stock build sets
+# neither, so the contracts are inert with zero dependency and zero codegen.
+deductive-contracts = []
+
 [dependencies]
 thiserror = { workspace = true }
 

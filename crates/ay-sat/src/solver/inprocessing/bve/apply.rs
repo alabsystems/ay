@@ -1046,7 +1046,7 @@ mod tests {
     use super::*;
     use crate::{
         bve::EliminationResult, ProofOutput, SatFeatures, SolverVariant, VariantInput,
-        VariantProfilePlan, VariantRouteProfile, VariantStartupPolicy,
+        VariantProfilePlan, VariantProofMode::Lrat, VariantRouteProfile, VariantStartupPolicy,
     };
     use ay_test_support::{build_ay_lrat_checker, BuiltWorkspaceBinary};
     use std::fs;
@@ -1068,7 +1068,7 @@ mod tests {
         let proof = ProofOutput::lrat_text(Vec::<u8>::new(), formula.num_clauses as u64);
         let mut solver = Solver::with_proof_output(formula.num_vars, proof);
         let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
-        let input = VariantInput::new(formula.num_vars, formula.num_clauses, true, true)
+        let input = VariantInput::new(formula.num_vars, formula.num_clauses, Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
@@ -1944,11 +1944,7 @@ mod tests {
             .expect("retained Circuit BVE LRAT plan should validate before mutation");
         solver.defer_proof_deletions = false;
         solver.flush_deferred_proof_deletions();
-        solver
-            .proof_writer_mut()
-            .expect("LRAT proof writer should remain attached")
-            .flush()
-            .expect("flush retained BVE LRAT proof stream");
+        assert!(matches!(solver.flush_proof_writer(), Ok(true)));
 
         assert!(
             !derived_unsat,
@@ -2182,11 +2178,7 @@ mod tests {
             );
         }
 
-        solver
-            .proof_writer_mut()
-            .expect("LRAT proof writer should remain attached")
-            .flush()
-            .expect("flush retained Circuit BVE route proof stream");
+        assert!(matches!(solver.flush_proof_writer(), Ok(true)));
         let proof = solver.take_proof_writer().expect("proof writer").into_vec();
         let proof = String::from_utf8(proof.expect("extract LRAT proof bytes"))
             .expect("Circuit BVE route LRAT proof stream should be UTF-8 text");

@@ -30,11 +30,30 @@
 //! (`len -> 1`) into a recorded quantifier instance below every provenance
 //! seam, and this lemma re-derives the substituted clause from the exact
 //! recorded instance plus the authored defining equalities.
+//!
+//! SECOND ACCEPTANCE LEG — substitution composed with CHECKED GROUND
+//! NORMALIZATION. The ground encoder does not stop at substitution: it also
+//! folds what the substitution made foldable (`(= 1 1)` -> true,
+//! `(not true)` -> false, dropped `or`/`and` identity elements) and
+//! canonicalizes INTEGER comparisons (`(< x 1)` -> `(<= x 0)`). When the
+//! exact parallel walk refuses, the validator re-derives both sides through
+//! an INDEPENDENT normalizer — substitution applied during the walk, every
+//! fold equivalence-preserving over the Int order, comparisons gated on
+//! Int-sorted arguments (a Real-sorted `<` is NOT `<=`-shiftable and stays
+//! structural) — and accepts only when the two normal forms are identical.
+//! Soundness: `Q` then differs from `subst(P)` by equivalences alone, so
+//! the clause implication holds by substitution of equals.
 
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{ProofId, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
+
+mod normalize;
+mod structural;
+
+use normalize::normalize_with_substitution;
+use structural::{is_literal_constant, key_occurs_or_binder, substituted_exactly};
 
 /// Node budget for the combined occurs/parallel walks of one validation.
 const GROUND_SUBST_WALK_BUDGET: usize = 200_000;
@@ -44,99 +63,6 @@ fn invalid(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
         step,
         reason: reason.into(),
     }
-}
-
-/// Whether `term` is a closed literal constant.
-fn is_literal_constant(terms: &TermStore, term: TermId) -> bool {
-    matches!(terms.get(term), TermData::Const(_))
-}
-
-/// Whether any mapped key occurs in `term` (quantifier-free walk; a binder
-/// makes the answer "reject" by reporting an occurrence-like failure at the
-/// caller via the `saw_binder` flag).
-fn key_occurs_or_binder(
-    terms: &TermStore,
-    term: TermId,
-    map: &DetHashMap<TermId, TermId>,
-    budget: &mut usize,
-) -> Result<bool, ()> {
-    let mut stack = vec![term];
-    while let Some(current) = stack.pop() {
-        if *budget == 0 {
-            return Err(());
-        }
-        *budget -= 1;
-        if map.contains_key(&current) {
-            return Ok(true);
-        }
-        match terms.get(current) {
-            TermData::Const(_) | TermData::Var(..) => {}
-            TermData::App(_, args) => stack.extend(args.iter().copied()),
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
-            }
-            // Binders, unexpanded lets, and any future node kind make
-            // substitution non-structural; treat them as an occurrence so the
-            // caller rejects (fail-closed).
-            _ => return Ok(true),
-        }
-    }
-    Ok(false)
-}
-
-/// The parallel walk: `q` must be exactly `p` with every mapped-key
-/// occurrence replaced by its value.
-fn substituted_exactly(
-    terms: &TermStore,
-    p: TermId,
-    q: TermId,
-    map: &DetHashMap<TermId, TermId>,
-    budget: &mut usize,
-) -> Result<bool, ()> {
-    let mut stack = vec![(p, q)];
-    while let Some((p, q)) = stack.pop() {
-        if *budget == 0 {
-            return Err(());
-        }
-        *budget -= 1;
-        if let Some(&value) = map.get(&p) {
-            // Every occurrence of a mapped key must have been replaced.
-            if q != value {
-                return Ok(false);
-            }
-            continue;
-        }
-        if p == q {
-            // Equal-and-unmapped is only exact when no mapped key hides
-            // below (all occurrences must be replaced simultaneously).
-            match key_occurs_or_binder(terms, p, map, budget) {
-                Ok(false) => continue,
-                Ok(true) => return Ok(false),
-                Err(()) => return Err(()),
-            }
-        }
-        match (terms.get(p), terms.get(q)) {
-            (TermData::App(sp, ap), TermData::App(sq, aq)) => {
-                if sp != sq || ap.len() != aq.len() {
-                    return Ok(false);
-                }
-                stack.extend(ap.iter().copied().zip(aq.iter().copied()));
-            }
-            (TermData::Not(ip), TermData::Not(iq)) => stack.push((*ip, *iq)),
-            (TermData::Ite(cp, tp, ep), TermData::Ite(cq, tq, eq_)) => {
-                stack.push((*cp, *cq));
-                stack.push((*tp, *tq));
-                stack.push((*ep, *eq_));
-            }
-            // Distinct leaves the map does not explain, or any binder/let:
-            // not an exact substitution image.
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
 }
 
 /// Strict validation of one `GroundEqualitySubstitution` clause; see the
@@ -216,10 +142,21 @@ pub(crate) fn validate_ground_equality_substitution(
     }
     match substituted_exactly(terms, p, q, &map, &mut budget) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(invalid(
-            step_id,
-            "Q is not the exact simultaneous substitution image of P",
-        )),
+        Ok(false) => {
+            // Second leg: substitution composed with checked ground
+            // normalization (see the module docs for the soundness argument).
+            let empty: DetHashMap<TermId, TermId> = DetHashMap::default();
+            let lhs = normalize_with_substitution(terms, p, &map, &mut budget);
+            let rhs = normalize_with_substitution(terms, q, &empty, &mut budget);
+            match (lhs, rhs) {
+                (Ok(lhs), Ok(rhs)) if lhs == rhs => Ok(()),
+                (Ok(_), Ok(_)) => Err(invalid(
+                    step_id,
+                    "Q is neither the exact substitution image of P nor its checked ground normal form",
+                )),
+                _ => Err(invalid(step_id, "substitution walk budget exhausted")),
+            }
+        }
         Err(()) => Err(invalid(step_id, "substitution walk budget exhausted")),
     }
 }
@@ -233,7 +170,7 @@ pub fn recognize_ground_equality_substitution(terms: &TermStore, clause: &[TermI
 /// `[(not (= k_i v_i)).., (not p), q]` built from `pairs` validate? Runs the
 /// same key/value shape checks, sharpness (every key occurs in `p`), and
 /// parallel substitution walk as the validator, so a `true` here guarantees
-/// the assembled clause passes [`validate_ground_equality_substitution`].
+/// the assembled clause passes `validate_ground_equality_substitution`.
 /// Lets an emitter decide BEFORE minting the negation literals, keeping the
 /// exact-fragment term-store metering exact.
 pub fn ground_substitution_image_matches(
@@ -265,10 +202,16 @@ pub fn ground_substitution_image_matches(
             _ => return false,
         }
     }
-    matches!(
-        substituted_exactly(terms, p, q, &map, &mut budget),
-        Ok(true)
-    )
+    match substituted_exactly(terms, p, q, &map, &mut budget) {
+        Ok(true) => true,
+        Ok(false) => {
+            let empty: DetHashMap<TermId, TermId> = DetHashMap::default();
+            let lhs = normalize_with_substitution(terms, p, &map, &mut budget);
+            let rhs = normalize_with_substitution(terms, q, &empty, &mut budget);
+            matches!((&lhs, &rhs), (Ok(l), Ok(r)) if l == r)
+        }
+        Err(()) => false,
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +226,33 @@ mod tests {
 
     fn eq(terms: &mut TermStore, a: TermId, b: TermId) -> TermId {
         terms.mk_app(Symbol::named("="), [a, b], Sort::Bool)
+    }
+
+    #[test]
+    fn letleak_dn17_shape_normalizes() {
+        let mut terms = store();
+        let len = terms.mk_var("gl_len", Sort::Int);
+        let one = terms.mk_int(BigInt::from(1));
+        let w = terms.mk_var("gl_w", Sort::Int);
+        let x = terms.mk_var("gl_x", Sort::Int);
+        let y = terms.mk_var("gl_y", Sort::Int);
+        let n = terms.mk_app(Symbol::named("bv2nat_stub"), [w], Sort::Int);
+        let lt_len = terms.mk_app(Symbol::named("<"), [n, len], Sort::Bool);
+        let lt_one = terms.mk_app(Symbol::named("<"), [n, one], Sort::Bool);
+        let xy = eq(&mut terms, x, y);
+        let not_xy = terms.mk_not_raw(xy);
+        let len_eq = eq(&mut terms, len, one);
+        let not_len_eq = terms.mk_not_raw(len_eq);
+        let and_p = terms.mk_app(Symbol::named("and"), [lt_len, not_xy], Sort::Bool);
+        let p = terms.mk_app(Symbol::named("or"), [not_len_eq, and_p], Sort::Bool);
+        let fls = terms.mk_bool(false);
+        let and_q = terms.mk_app(Symbol::named("and"), [lt_one, not_xy], Sort::Bool);
+        let q = terms.mk_app(Symbol::named("or"), [fls, and_q], Sort::Bool);
+        let clause = vec![terms.mk_not_raw(len_eq), terms.mk_not_raw(p), q];
+        assert!(
+            recognize_ground_equality_substitution(&terms, &clause),
+            "dn17-shape substitution+normalization must validate"
+        );
     }
 
     #[test]

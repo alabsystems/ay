@@ -251,13 +251,13 @@ pub fn pb_ge(c: &PbConstraint) -> Option<LinConstraint> {
 /// entries (inputs first, then prior derived constraints) by 0-based index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefStep {
-    /// `impliedGe_add`: database[i] + database[j].
+    /// `impliedGe_add`: `database[i] + database[j]`.
     Add(usize, usize),
-    /// `impliedGe_scale`: database[i] * k (k >= 1).
+    /// `impliedGe_scale`: `database[i] * k` (`k >= 1`).
     Scale(usize, i128),
-    /// `impliedGe_division`: ceil-divide database[i] by d (d >= 1).
+    /// `impliedGe_division`: ceil-divide `database[i]` by `d` (`d >= 1`).
     Divide(usize, i128),
-    /// `impliedGe_saturate`: cap every coefficient of database[i] at its degree
+    /// `impliedGe_saturate`: cap every coefficient of `database[i]` at its degree
     /// (only sound when all coefficients and the degree are non-negative).
     Saturate(usize),
 }
@@ -268,7 +268,7 @@ pub enum RefStep {
 pub struct Refutation {
     /// Input constraints, already normalized to `>=` form. These are the AXIOMS
     /// the checker trusts as given (they must come from the instance's original
-    /// constraints — see the builders in [`crate::optimize::gf2_parity`]).
+    /// constraints — see the builders in `crate::optimize::gf2_parity`).
     pub inputs: Vec<LinConstraint>,
     /// Derivation steps, applied in order; each appends one constraint.
     pub steps: Vec<RefStep>,

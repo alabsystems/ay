@@ -146,6 +146,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         let mut _islp_dioph_state = ay_lia::DiophState::default();
         let mut _islp_theory_lemmas: Vec<ay_core::TheoryLemma> = Vec::new();
 
+        // #7956: consecutive theory-conflict rounds whose own SAT search
+        // recorded zero propositional conflicts (see
+        // `MAX_UNPRODUCTIVE_CONFLICT_ROUNDS`).
+        let mut _islp_unproductive_conflict_rounds: usize = 0;
+        let mut _islp_total_unproductive_rounds: usize = 0;
+
         // Split value trends for unbounded oscillation detection
         let mut _islp_last_split_values: $crate::executor::theories::solve_harness::SplitOscillationMap = HashMap::default();
 
@@ -322,6 +328,12 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 let _islp_sat_start = ay_core::time::Instant::now();
                 let sat_result = solver.solve_interruptible(&_islp_should_stop).into_inner();
                 _islp_timing.dpll.sat_solve += _islp_sat_start.elapsed();
+                // #7956: `num_conflicts()` is the PER-SOLVE counter (zeroed on
+                // solve entry by the search-state resets in
+                // ay-sat/src/solver/preprocess_reset.rs:783 and :1241), so read
+                // here it is exactly the propositional conflicts THIS round's
+                // search produced. Must be read before the next `solve()`.
+                let _islp_round_prop_conflicts = solver.num_conflicts();
                 if let Some(r) = solver.last_unknown_reason() {
                     $self.last_unknown_reason = Some($crate::executor::Executor::map_sat_unknown_reason(r));
                 }
@@ -608,6 +620,44 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 _islp_round_props,
                                 _islp_round_pending,
                             );
+                        }
+                        // #7956: unproductive-blocking-clause budget. A theory
+                        // conflict whose round saw zero propositional conflicts
+                        // had none of the accumulated blocking clauses
+                        // falsified; a long RUN of them signals the loop
+                        // enumerating total models. Signature, NOT proof (see
+                        // the constant's calibration record).
+                        // Scoped to the quantifier pipeline, where a ground
+                        // `Unknown` is already expected; takes the loop's
+                        // EXISTING fail-closed `SplitLimit` -> `Unknown` exit.
+                        if $self.quantifier_pipeline_engaged
+                            && matches!(
+                                theory_result,
+                                ay_core::TheoryResult::Unsat(_)
+                                    | ay_core::TheoryResult::UnsatWithFarkas(_)
+                            )
+                        {
+                            if _islp_round_prop_conflicts == 0 {
+                                _islp_unproductive_conflict_rounds += 1;
+                                _islp_total_unproductive_rounds += 1;
+                            } else {
+                                _islp_unproductive_conflict_rounds = 0;
+                            }
+                            if _islp_unproductive_conflict_rounds
+                                >= $crate::executor::theories::MAX_UNPRODUCTIVE_CONFLICT_ROUNDS
+                                || _islp_total_unproductive_rounds
+                                    >= $crate::executor::theories::MAX_TOTAL_UNPRODUCTIVE_ROUNDS
+                            {
+                                pipeline_export_theory_state!(
+                                    theory, $export_theory, $export_expr,
+                                    _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
+                                );
+                                drop(theory);
+                                let _ = solver.pop();
+                                $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
+                                $self.last_result = Some(SolveResult::Unknown);
+                                break 'split_loop Ok(SolveResult::Unknown);
+                            }
                         }
                         pipeline_incremental_split_lazy_dispatch_theory_result!(
                             'split_loop, $self, solver, state,

@@ -154,3 +154,39 @@ fn test_bv_incremental_bitwise_scope() {
     let output = crate::common::solve(smt);
     assert_eq!(results(&output), vec!["sat", "sat", "unsat", "sat"]);
 }
+
+/// A proof snapshot must not detach the persistent SAT trace between checks.
+#[test]
+#[timeout(10_000)]
+fn test_bv_incremental_repeated_unsat_proof_snapshots() {
+    let smt = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_BV)
+        (declare-const x (_ BitVec 8))
+        (push 1)
+        (assert (= x #x01))
+        (assert (= x #x02))
+        (check-sat)
+        (get-proof)
+        (pop 1)
+        (push 1)
+        (assert (= x #x03))
+        (assert (= x #x04))
+        (check-sat)
+        (get-proof)
+        (pop 1)
+    "#;
+    let output = crate::common::solve_vec(smt);
+    assert_eq!(
+        output.len(),
+        4,
+        "expected two verdict/proof pairs: {output:?}"
+    );
+    assert_eq!(output[0].trim(), "unsat");
+    assert_eq!(output[2].trim(), "unsat");
+    for proof in [&output[1], &output[3]] {
+        assert!(!proof.trim().is_empty(), "proof output must not be empty");
+        assert!(!proof.contains("proof is not available"), "{proof}");
+        assert!(!proof.trim_start().starts_with("(error"), "{proof}");
+    }
+}

@@ -599,28 +599,25 @@ fn test_solve_bmc_proof_from_str_unsafe_consumer_evidence_has_assignment_contrac
 
     let run = engines::solve_bmc_proof_from_str(smt2, BmcConfig::default().with_max_depth(2))
         .expect("valid CHC should parse and run BMC evidence mode");
-    let problem = ChcParser::parse(smt2).expect("fixture should parse for evidence");
-
     assert!(
-        run.result.is_unsafe(),
+        run.result().is_unsafe(),
         "BMC proof facade should find Unsafe"
     );
     assert!(run.accepted_as_proof());
-    assert_eq!(run.metadata.engine, "bmc");
+    assert_eq!(run.metadata().engine(), "bmc");
 
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "unsafe");
-    assert_eq!(evidence.backend_code, "ay_chc_bmc");
-    assert!(evidence.accepted_for_consumer);
-    assert!(evidence.model_validated);
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "unsafe");
+    assert_eq!(evidence.backend_code(), "ay_chc_bmc");
+    assert!(evidence.accepted_for_consumer());
+    assert!(evidence.model_validated());
     assert_eq!(
-        evidence.verification_level_code,
+        evidence.verification_level_code(),
         "ay_chc_verified_counterexample"
     );
 
     let trace = evidence
-        .unsafe_trace
-        .as_ref()
+        .unsafe_trace()
         .expect("validated unsafe evidence should carry trace material");
     assert_eq!(trace.status, "validated_counterexample");
     assert_eq!(trace.step_count, 2);
@@ -661,35 +658,36 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
 
     let run = engines::solve_bmc_proof_from_str(smt2, BmcConfig::default().with_max_depth(2))
         .expect("valid CHC should parse and run BMC evidence mode");
-    let problem = ChcParser::parse(smt2).expect("fixture should parse for artifacts");
-
-    let artifacts = run.proof_run_artifacts(&problem);
+    let artifacts = run.proof_run_artifacts();
     assert!(
-        artifacts.quantifier_free_invariant_model.is_none(),
+        artifacts.quantifier_free_invariant_model().is_none(),
         "an Unsafe BMC counterexample is not a QF invariant artifact"
     );
     let qf_error = run
-        .quantifier_free_invariant_model_artifact(&problem)
+        .quantifier_free_invariant_model_artifact()
         .expect_err("an Unsafe run must not serialize as a QF invariant");
     assert_eq!(
         qf_error.reason,
         ChcQfInvariantModelArtifactErrorReason::ResultNotSafe
     );
-    assert_eq!(artifacts.model.schema, CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA);
-    assert_eq!(artifacts.model.role, CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE);
     assert_eq!(
-        artifacts.replay_transcript.schema,
+        artifacts.model().schema(),
+        CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA
+    );
+    assert_eq!(artifacts.model().role(), CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE);
+    assert_eq!(
+        artifacts.replay_transcript().schema(),
         CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_SCHEMA
     );
     assert_eq!(
-        artifacts.replay_transcript.role,
+        artifacts.replay_transcript().role(),
         CHC_PROOF_RUN_REPLAY_TRANSCRIPT_ARTIFACT_ROLE
     );
-    assert!(!artifacts.model.sha256().is_empty());
-    assert!(!artifacts.replay_transcript.sha256().is_empty());
+    assert!(!artifacts.model().sha256().is_empty());
+    assert!(!artifacts.replay_transcript().sha256().is_empty());
 
     let model_json: serde_json::Value =
-        serde_json::from_slice(artifacts.model.bytes()).expect("model artifact JSON envelope");
+        serde_json::from_slice(artifacts.model().bytes()).expect("model artifact JSON envelope");
     assert_eq!(
         model_json["schema"],
         serde_json::json!(CHC_PROOF_RUN_MODEL_ARTIFACT_SCHEMA)
@@ -702,7 +700,7 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
     assert_eq!(model_json["consumer_evidence"]["model_validated"], true);
 
     let replay_json: serde_json::Value =
-        serde_json::from_slice(artifacts.replay_transcript.bytes())
+        serde_json::from_slice(artifacts.replay_transcript().bytes())
             .expect("replay transcript artifact JSON envelope");
     assert_eq!(
         replay_json["schema"],
@@ -714,33 +712,32 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
     );
 
     let validated_model = run
-        .validate_model_artifact_bytes(&problem, artifacts.model.bytes())
+        .validate_model_artifact_bytes(artifacts.model().bytes())
         .expect("emitted model artifact should validate");
     let validated_replay = run
-        .validate_replay_transcript_artifact_bytes(artifacts.replay_transcript.bytes())
+        .validate_replay_transcript_artifact_bytes(artifacts.replay_transcript().bytes())
         .expect("emitted replay transcript artifact should validate");
-    assert_eq!(validated_model.sha256(), artifacts.model.sha256());
+    assert_eq!(validated_model.sha256(), artifacts.model().sha256());
     assert_eq!(
         validated_replay.sha256(),
-        artifacts.replay_transcript.sha256()
+        artifacts.replay_transcript().sha256()
     );
     let validated_pair = run
         .validate_model_replay_artifact_bytes(
-            &problem,
             Some(artifacts.model_bytes()),
             Some(artifacts.replay_transcript_bytes()),
         )
         .expect("emitted model/replay artifact pair should validate");
-    assert_eq!(validated_pair.model.sha256(), artifacts.model.sha256());
+    assert_eq!(validated_pair.model().sha256(), artifacts.model().sha256());
     assert_eq!(
-        validated_pair.replay_transcript.sha256(),
-        artifacts.replay_transcript.sha256()
+        validated_pair.replay_transcript().sha256(),
+        artifacts.replay_transcript().sha256()
     );
 
-    let mut tampered_model = artifacts.model.bytes().to_vec();
+    let mut tampered_model = artifacts.model().bytes().to_vec();
     tampered_model.push(b'\n');
     let error = run
-        .validate_model_artifact_bytes(&problem, &tampered_model)
+        .validate_model_artifact_bytes(&tampered_model)
         .expect_err("tampered model artifact must fail closed");
     assert_eq!(
         error.reason,
@@ -750,11 +747,7 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
     assert_eq!(error.role, CHC_PROOF_RUN_MODEL_ARTIFACT_ROLE);
 
     let missing_model = run
-        .validate_model_replay_artifact_bytes(
-            &problem,
-            None,
-            Some(artifacts.replay_transcript_bytes()),
-        )
+        .validate_model_replay_artifact_bytes(None, Some(artifacts.replay_transcript_bytes()))
         .expect_err("missing model artifact bytes must fail closed");
     assert_eq!(
         missing_model.reason,
@@ -764,14 +757,10 @@ fn test_solve_bmc_proof_from_str_emits_model_replay_artifacts() {
     assert!(missing_model.fail_closed);
     assert!(!missing_model.accepted_for_consumer);
 
-    let mut tampered_replay = artifacts.replay_transcript.bytes().to_vec();
+    let mut tampered_replay = artifacts.replay_transcript().bytes().to_vec();
     tampered_replay.push(b'\n');
     let replay_error = run
-        .validate_model_replay_artifact_bytes(
-            &problem,
-            Some(artifacts.model_bytes()),
-            Some(&tampered_replay),
-        )
+        .validate_model_replay_artifact_bytes(Some(artifacts.model_bytes()), Some(&tampered_replay))
         .expect_err("tampered replay artifact bytes must fail closed");
     assert_eq!(
         replay_error.reason,
@@ -801,30 +790,25 @@ fn test_solve_bmc_proof_from_str_unknown_is_not_consumer_accepted() {
 
     let run = engines::solve_bmc_proof_from_str(smt2, BmcConfig::default().with_max_depth(1))
         .expect("valid CHC should parse and run BMC evidence mode");
-    let problem = ChcParser::parse(smt2).expect("fixture should parse for evidence");
-
     assert!(
-        run.result.is_unknown(),
+        run.result().is_unknown(),
         "bounded BMC search should be Unknown"
     );
     assert!(!run.accepted_as_proof());
-    assert_eq!(run.metadata.engine, "bmc");
+    assert_eq!(run.metadata().engine(), "bmc");
 
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "unknown");
-    assert_eq!(evidence.backend_code, "ay_chc_bmc");
-    assert!(!evidence.accepted_for_consumer);
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "unknown");
+    assert_eq!(evidence.backend_code(), "ay_chc_bmc");
+    assert!(!evidence.accepted_for_consumer());
     assert_eq!(
-        evidence.consumer_rejection_code.as_deref(),
+        evidence.consumer_rejection_code(),
         Some("ay_chc_unknown_bmc_exhausted_search")
     );
-    assert!(!evidence.model_validated);
-    assert_eq!(evidence.verification_level_code, "ay_chc_non_proof");
-    assert_eq!(
-        evidence.unknown_limit_code.as_deref(),
-        Some("bmc_max_depth_reached")
-    );
-    assert!(evidence.unsafe_trace.is_none());
+    assert!(!evidence.model_validated());
+    assert_eq!(evidence.verification_level_code(), "ay_chc_non_proof");
+    assert_eq!(evidence.unknown_limit_code(), Some("bmc_max_depth_reached"));
+    assert!(evidence.unsafe_trace().is_none());
 
     let json = evidence.to_json_value();
     assert_eq!(json["accepted_for_consumer"], false);
@@ -854,47 +838,46 @@ fn test_solve_pdr_proof_from_str_safe_metadata() {
     .expect("valid CHC should parse and solve");
 
     assert!(
-        run.result.is_safe(),
+        run.result().is_safe(),
         "PDR proof should prove safety: {run:?}"
     );
     assert!(run.accepted_as_proof());
-    assert_eq!(run.metadata.engine, "pdr");
-    assert_eq!(run.metadata.result, "safe");
-    assert_eq!(run.metadata.proof_status, "verified-invariant");
-    assert_eq!(run.metadata.pdr_input_sha256().len(), 64);
-    assert!(run.metadata.normalized_input_bytes > 0);
+    assert_eq!(run.metadata().engine(), "pdr");
+    assert_eq!(run.metadata().result(), "safe");
+    assert_eq!(run.metadata().proof_status(), "verified-invariant");
+    assert_eq!(run.metadata().pdr_input_sha256().len(), 64);
+    assert!(run.metadata().normalized_input_bytes() > 0);
 
     let problem = ChcParser::parse(smt2).expect("fixture should parse for evidence");
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "safe");
-    assert_eq!(evidence.backend_code, "ay_chc_pdr");
-    assert!(evidence.accepted_for_consumer);
-    assert!(evidence.model_validated);
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "safe");
+    assert_eq!(evidence.backend_code(), "ay_chc_pdr");
+    assert!(evidence.accepted_for_consumer());
+    assert!(evidence.model_validated());
     assert_eq!(
-        evidence.verification_level_code,
+        evidence.verification_level_code(),
         "ay_chc_verified_invariant"
     );
     assert_eq!(
-        evidence.normalized_input_sha256,
-        run.metadata.normalized_input_sha256
+        evidence.normalized_input_sha256(),
+        run.metadata().normalized_input_sha256()
     );
 
-    let artifacts = run.proof_run_artifacts(&problem);
+    let artifacts = run.proof_run_artifacts();
     let invariant = artifacts
-        .quantifier_free_invariant_model
-        .as_ref()
+        .quantifier_free_invariant_model()
         .expect("a complete Safe PDR run must carry its actual QF invariant");
-    assert_eq!(invariant.schema, CHC_QF_INVARIANT_MODEL_ARTIFACT_SCHEMA);
+    assert_eq!(invariant.schema(), CHC_QF_INVARIANT_MODEL_ARTIFACT_SCHEMA);
     assert_ne!(
         invariant.bytes(),
-        artifacts.model.bytes(),
+        artifacts.model().bytes(),
         "the replayable invariant must be distinct from diagnostic consumer metadata"
     );
     let reparsed = parse_qf_invariant_model_artifact(&problem, invariant.bytes())
         .expect("the solver-owned QF invariant must pass strict canonical parsing");
     assert_eq!(
         reparsed.to_smtlib(&problem),
-        run.result
+        run.result()
             .safe_invariant()
             .expect("Safe run")
             .model()
@@ -947,9 +930,9 @@ fn prove_external_invariant_model_accepts_validated_model() {
         run.accepted_as_proof(),
         "a re-validated invariant must yield an accepted proof run: {run:?}"
     );
-    assert!(run.result.is_safe(), "accepted run must be Safe: {run:?}");
-    assert_eq!(run.metadata.engine, "pdr");
-    assert_eq!(run.metadata.result, "safe");
+    assert!(run.result().is_safe(), "accepted run must be Safe: {run:?}");
+    assert_eq!(run.metadata().engine(), "pdr");
+    assert_eq!(run.metadata().result(), "safe");
 }
 
 /// G2 real-call Step 0 negative control: the re-validation gate is LOAD-BEARING.
@@ -1011,11 +994,11 @@ fn prove_external_invariant_model_rejects_invalid_model() {
         "an unvalidated candidate must NEVER yield an accepted proof run: {run:?}"
     );
     assert!(
-        !run.result.is_safe(),
+        !run.result().is_safe(),
         "a rejected candidate must never be emitted as Safe: {run:?}"
     );
     assert!(
-        run.result.is_unknown(),
+        run.result().is_unknown(),
         "a rejected run should be Unknown: {run:?}"
     );
 }
@@ -1077,7 +1060,7 @@ fn external_model_validation_preserves_nullary_query_predicate() {
         engines::prove_external_invariant_model(problem.clone(), invalid, config.clone())
             .expect("invalid candidate should demote rather than error");
     assert!(!rejected.accepted_as_proof());
-    assert!(rejected.result.is_unknown());
+    assert!(rejected.result().is_unknown());
 
     let mut valid = InvariantModel::new();
     valid.set(
@@ -1108,7 +1091,7 @@ fn external_model_validation_preserves_nullary_query_predicate() {
         "proof-grade PDR must construct an exact-clause model: {run:?}"
     );
     let solved = run
-        .result
+        .result()
         .safe_invariant()
         .expect("accepted proof must carry a Safe invariant")
         .model();
@@ -1129,12 +1112,12 @@ fn external_model_validation_preserves_nullary_query_predicate() {
         "the proof-grade model must satisfy every exact original clause"
     );
     let checked = run
-        .run_checked_replay(&problem, std::time::Duration::from_secs(10))
+        .run_checked_replay(std::time::Duration::from_secs(10))
         .expect("strict replay should discharge the exact nullary-query model");
-    assert!(checked.proof_run.accepted_as_proof());
+    assert!(checked.proof_run().accepted_as_proof());
     assert!(
         checked
-            .summary
+            .summary()
             .obligations
             .iter()
             .all(|obligation| obligation.strict_cert.is_some()),
@@ -1169,7 +1152,7 @@ fn nullary_query_candidate_completion_rejects_reachable_body() {
     let run = engines::solve_pdr_proof(problem, PdrConfig::default())
         .expect("reachable-body solve should not error");
     assert!(
-        !run.result.is_safe(),
+        !run.result().is_safe(),
         "candidate nullary completion must not mint Safe for a reachable body: {run:?}"
     );
 }
@@ -1195,7 +1178,7 @@ fn nullary_query_candidate_completion_rejects_nullary_fact() {
     let run = engines::solve_pdr_proof(problem, PdrConfig::default())
         .expect("nullary-fact solve should not error");
     assert!(
-        !run.result.is_safe(),
+        !run.result().is_safe(),
         "a nullary fact must prevent false candidate completion: {run:?}"
     );
 }
@@ -1220,10 +1203,10 @@ fn nullary_query_candidate_completion_accepts_unsat_constraint_fact() {
     let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
         .expect("UNSAT constraint-fact solve should not error");
     assert!(
-        run.result.is_safe() && run.accepted_as_proof(),
+        run.result().is_safe() && run.accepted_as_proof(),
         "an UNSAT constraint-only definition should validate Safe: {run:?}"
     );
-    run.run_checked_replay(&problem, std::time::Duration::from_secs(10))
+    run.run_checked_replay(std::time::Duration::from_secs(10))
         .expect("strict replay should certify the UNSAT constraint-only definition");
 }
 
@@ -1247,17 +1230,17 @@ fn test_solve_pdr_proof_cancelled_is_non_proof() {
     )
     .expect("valid CHC should parse even when solving is cancelled");
 
-    assert!(run.result.is_unknown(), "cancelled PDR should be Unknown");
+    assert!(run.result().is_unknown(), "cancelled PDR should be Unknown");
     assert!(!run.accepted_as_proof());
-    assert_eq!(run.metadata.result, "unknown");
-    assert_eq!(run.metadata.proof_status, "non-proof");
-    assert_eq!(run.metadata.unknown_reason.as_deref(), Some("inconclusive"));
+    assert_eq!(run.metadata().result(), "unknown");
+    assert_eq!(run.metadata().proof_status(), "non-proof");
+    assert_eq!(run.metadata().unknown_reason(), Some("inconclusive"));
 }
 
 /// Test proof-grade PDR acceptance is derived from the sealed result, not
 /// mutable metadata fields that downstream reporting code may copy around.
 #[test]
-fn test_solve_pdr_proof_acceptance_ignores_tampered_metadata() {
+fn test_solve_pdr_proof_acceptance_ignores_tampered_reporting_json() {
     let smt2 = r#"
 (set-logic HORN)
 (declare-fun Inv (Int) Bool)
@@ -1269,21 +1252,27 @@ fn test_solve_pdr_proof_acceptance_ignores_tampered_metadata() {
     let token = CancellationToken::new();
     token.cancel();
 
-    let mut run = engines::solve_pdr_proof_from_str(
+    let run = engines::solve_pdr_proof_from_str(
         smt2,
         PdrConfig::default().with_cancellation_token(Some(token)),
     )
     .expect("valid CHC should parse even when solving is cancelled");
 
-    assert!(run.result.is_unknown(), "cancelled PDR should be Unknown");
+    assert!(run.result().is_unknown(), "cancelled PDR should be Unknown");
     assert!(!run.accepted_as_proof());
 
-    run.metadata.accepted_as_proof = true;
-    run.metadata.proof_status = "verified-invariant".to_string();
+    let mut detached_json = run.metadata().to_json_value();
+    detached_json["accepted_as_proof"] = serde_json::json!(true);
+    detached_json["proof_status"] = serde_json::json!("verified-invariant");
+    let detached_metadata = ChcProofTranscriptMetadata::from_json_value(&detached_json)
+        .expect("well-typed reporting metadata should parse");
+    assert!(detached_metadata.accepted_as_proof());
+    assert_eq!(detached_metadata.proof_status(), "verified-invariant");
+    assert!(!detached_metadata.trust_full_verifier_admissible());
 
     assert!(
         !run.accepted_as_proof(),
-        "Unknown proof runs must remain fail-closed even if metadata is tampered"
+        "detached metadata mutation must not alter the sealed Unknown run"
     );
 }
 
@@ -1922,10 +1911,10 @@ fn diag_unguarded_compiler_horn_acyclic_bmc_refutes() {
     eprintln!(
         "PDR proof-grade (unguarded) accepted_as_proof={} result_is_safe={}",
         pdr.accepted_as_proof(),
-        matches!(pdr.result, VerifiedChcResult::Safe(_)),
+        matches!(pdr.result(), VerifiedChcResult::Safe(_)),
     );
     assert!(
-        !matches!(pdr.result, VerifiedChcResult::Safe(_)),
+        !matches!(pdr.result(), VerifiedChcResult::Safe(_)),
         "proof-grade solve_pdr_proof must NOT prove the false unguarded property Safe"
     );
 }

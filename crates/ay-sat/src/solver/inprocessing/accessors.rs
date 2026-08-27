@@ -84,14 +84,14 @@ impl Solver {
         if !self.cold.lrat_enabled {
             return;
         }
+        self.assert_can_degrade_proof_bookkeeping();
         self.cold.lrat_enabled = false;
         if let Some(trace) = self.cold.clause_trace.as_mut() {
             trace.mark_proof_work_exhausted();
             trace.clear_entries();
         }
-        // Restore the inprocessing techniques that proof-mode overrides
-        // disabled: with no certificate left to protect, the search should
-        // run at full (--no-proof) power.
+        // With no certificate left, restore controls that proof mode disabled
+        // so search continues at full (--no-proof) power.
         if let Some(pristine) = self.inproc_ctrl_pre_proof.take() {
             self.inproc_ctrl = pristine;
         }

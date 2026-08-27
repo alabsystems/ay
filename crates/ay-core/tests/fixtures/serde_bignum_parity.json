@@ -1,0 +1,985 @@
+{
+  "schema": "ay.serde_bignum_parity.v1",
+  "encode": [
+    {
+      "name": "bigint/zero",
+      "ty": "Constant",
+      "json": "{\"Int\":[0,[]]}",
+      "raw": "Int(0)",
+      "reencoded": "{\"Int\":[0,[]]}",
+      "decoded_raw": "Int(0)"
+    },
+    {
+      "name": "bigint/one",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[1]]}",
+      "raw": "Int(1)",
+      "reencoded": "{\"Int\":[1,[1]]}",
+      "decoded_raw": "Int(1)"
+    },
+    {
+      "name": "bigint/neg_one",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[1]]}",
+      "raw": "Int(-1)",
+      "reencoded": "{\"Int\":[-1,[1]]}",
+      "decoded_raw": "Int(-1)"
+    },
+    {
+      "name": "bigint/u32_max",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[4294967295]]}",
+      "raw": "Int(4294967295)",
+      "reencoded": "{\"Int\":[1,[4294967295]]}",
+      "decoded_raw": "Int(4294967295)"
+    },
+    {
+      "name": "bigint/two_pow_32",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[0,1]]}",
+      "raw": "Int(4294967296)",
+      "reencoded": "{\"Int\":[1,[0,1]]}",
+      "decoded_raw": "Int(4294967296)"
+    },
+    {
+      "name": "bigint/two_pow_64_minus_1",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[4294967295,4294967295]]}",
+      "raw": "Int(18446744073709551615)",
+      "reencoded": "{\"Int\":[1,[4294967295,4294967295]]}",
+      "decoded_raw": "Int(18446744073709551615)"
+    },
+    {
+      "name": "bigint/two_pow_64",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[0,0,1]]}",
+      "raw": "Int(18446744073709551616)",
+      "reencoded": "{\"Int\":[1,[0,0,1]]}",
+      "decoded_raw": "Int(18446744073709551616)"
+    },
+    {
+      "name": "bigint/two_pow_64_plus_1",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[1,0,1]]}",
+      "raw": "Int(18446744073709551617)",
+      "reencoded": "{\"Int\":[1,[1,0,1]]}",
+      "decoded_raw": "Int(18446744073709551617)"
+    },
+    {
+      "name": "bigint/neg_two_pow_64",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[0,0,1]]}",
+      "raw": "Int(-18446744073709551616)",
+      "reencoded": "{\"Int\":[-1,[0,0,1]]}",
+      "decoded_raw": "Int(-18446744073709551616)"
+    },
+    {
+      "name": "bigint/i64_min",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[0,2147483648]]}",
+      "raw": "Int(-9223372036854775808)",
+      "reencoded": "{\"Int\":[-1,[0,2147483648]]}",
+      "decoded_raw": "Int(-9223372036854775808)"
+    },
+    {
+      "name": "bigint/two_pow_128_plus_1",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[1,0,0,0,1]]}",
+      "raw": "Int(340282366920938463463374607431768211457)",
+      "reencoded": "{\"Int\":[1,[1,0,0,0,1]]}",
+      "decoded_raw": "Int(340282366920938463463374607431768211457)"
+    },
+    {
+      "name": "bigint/large_positive",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[1312754386,3279151342,2397638646,1]]}",
+      "raw": "Int(123456789012345678901234567890)",
+      "reencoded": "{\"Int\":[1,[1312754386,3279151342,2397638646,1]]}",
+      "decoded_raw": "Int(123456789012345678901234567890)"
+    },
+    {
+      "name": "bigint/large_negative",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[1312754386,3279151342,2397638646,1]]}",
+      "raw": "Int(-123456789012345678901234567890)",
+      "reencoded": "{\"Int\":[-1,[1312754386,3279151342,2397638646,1]]}",
+      "decoded_raw": "Int(-123456789012345678901234567890)"
+    },
+    {
+      "name": "bigint/x_odd_word_count",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[5,0,3]]}",
+      "raw": "Int(55340232221128654853)",
+      "reencoded": "{\"Int\":[1,[5,0,3]]}",
+      "decoded_raw": "Int(55340232221128654853)"
+    },
+    {
+      "name": "bigint/x_two_pow_96",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[0,0,0,1]]}",
+      "raw": "Int(79228162514264337593543950336)",
+      "reencoded": "{\"Int\":[1,[0,0,0,1]]}",
+      "decoded_raw": "Int(79228162514264337593543950336)"
+    },
+    {
+      "name": "bigint/x_two_pow_63",
+      "ty": "Constant",
+      "json": "{\"Int\":[1,[0,2147483648]]}",
+      "raw": "Int(9223372036854775808)",
+      "reencoded": "{\"Int\":[1,[0,2147483648]]}",
+      "decoded_raw": "Int(9223372036854775808)"
+    },
+    {
+      "name": "bigint/x_neg_u32_max",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[4294967295]]}",
+      "raw": "Int(-4294967295)",
+      "reencoded": "{\"Int\":[-1,[4294967295]]}",
+      "decoded_raw": "Int(-4294967295)"
+    },
+    {
+      "name": "constant/bool_true",
+      "ty": "Constant",
+      "json": "{\"Bool\":true}",
+      "raw": "Bool(true)",
+      "reencoded": "{\"Bool\":true}",
+      "decoded_raw": "Bool(true)"
+    },
+    {
+      "name": "constant/bool_false",
+      "ty": "Constant",
+      "json": "{\"Bool\":false}",
+      "raw": "Bool(false)",
+      "reencoded": "{\"Bool\":false}",
+      "decoded_raw": "Bool(false)"
+    },
+    {
+      "name": "constant/string",
+      "ty": "Constant",
+      "json": "{\"String\":\"hello \\\"world\\\"\"}",
+      "raw": "String(\"hello \\\"world\\\"\")",
+      "reencoded": "{\"String\":\"hello \\\"world\\\"\"}",
+      "decoded_raw": "String(\"hello \\\"world\\\"\")"
+    },
+    {
+      "name": "constant/int_neg",
+      "ty": "Constant",
+      "json": "{\"Int\":[-1,[1,0,1]]}",
+      "raw": "Int(-18446744073709551617)",
+      "reencoded": "{\"Int\":[-1,[1,0,1]]}",
+      "decoded_raw": "Int(-18446744073709551617)"
+    },
+    {
+      "name": "constant/rational_neg_denom_raw",
+      "ty": "Constant",
+      "json": "{\"Rational\":[[1,[3]],[-1,[4]]]}",
+      "raw": "Rational(numer=3 denom=-4)",
+      "reencoded": "{\"Rational\":[[1,[3]],[-1,[4]]]}",
+      "decoded_raw": "Rational(numer=3 denom=-4)"
+    },
+    {
+      "name": "constant/bitvec_zero_width8",
+      "ty": "Constant",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8}}",
+      "raw": "BitVec(value=0 width=8)",
+      "reencoded": "{\"BitVec\":{\"value\":[0,[]],\"width\":8}}",
+      "decoded_raw": "BitVec(value=0 width=8)"
+    },
+    {
+      "name": "constant/bitvec_straddle_width65",
+      "ty": "Constant",
+      "json": "{\"BitVec\":{\"value\":[1,[1,0,1]],\"width\":65}}",
+      "raw": "BitVec(value=18446744073709551617 width=65)",
+      "reencoded": "{\"BitVec\":{\"value\":[1,[1,0,1]],\"width\":65}}",
+      "decoded_raw": "BitVec(value=18446744073709551617 width=65)"
+    },
+    {
+      "name": "constant/x_bitvec_width0",
+      "ty": "Constant",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":0}}",
+      "raw": "BitVec(value=0 width=0)",
+      "reencoded": "{\"BitVec\":{\"value\":[0,[]],\"width\":0}}",
+      "decoded_raw": "BitVec(value=0 width=0)"
+    },
+    {
+      "name": "constant/x_bitvec_width_max",
+      "ty": "Constant",
+      "json": "{\"BitVec\":{\"value\":[1,[1]],\"width\":4294967295}}",
+      "raw": "BitVec(value=1 width=4294967295)",
+      "reencoded": "{\"BitVec\":{\"value\":[1,[1]],\"width\":4294967295}}",
+      "decoded_raw": "BitVec(value=1 width=4294967295)"
+    },
+    {
+      "name": "constant/x_string_empty",
+      "ty": "Constant",
+      "json": "{\"String\":\"\"}",
+      "raw": "String(\"\")",
+      "reencoded": "{\"String\":\"\"}",
+      "decoded_raw": "String(\"\")"
+    },
+    {
+      "name": "constant/x_string_unicode",
+      "ty": "Constant",
+      "json": "{\"String\":\"λ😀\\n\\t\"}",
+      "raw": "String(\"λ😀\\n\\t\")",
+      "reencoded": "{\"String\":\"λ😀\\n\\t\"}",
+      "decoded_raw": "String(\"λ😀\\n\\t\")"
+    },
+    {
+      "name": "bigrational/zero",
+      "ty": "RationalWrapper",
+      "json": "[[0,[]],[1,[1]]]",
+      "raw": "RationalWrapper(numer=0 denom=1)",
+      "reencoded": "[[0,[]],[1,[1]]]",
+      "decoded_raw": "RationalWrapper(numer=0 denom=1)"
+    },
+    {
+      "name": "bigrational/one",
+      "ty": "RationalWrapper",
+      "json": "[[1,[1]],[1,[1]]]",
+      "raw": "RationalWrapper(numer=1 denom=1)",
+      "reencoded": "[[1,[1]],[1,[1]]]",
+      "decoded_raw": "RationalWrapper(numer=1 denom=1)"
+    },
+    {
+      "name": "bigrational/neg_numer",
+      "ty": "RationalWrapper",
+      "json": "[[-1,[3]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=-3 denom=4)",
+      "reencoded": "[[-1,[3]],[1,[4]]]",
+      "decoded_raw": "RationalWrapper(numer=-3 denom=4)"
+    },
+    {
+      "name": "bigrational/neg_denom_normalized",
+      "ty": "RationalWrapper",
+      "json": "[[-1,[3]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=-3 denom=4)",
+      "reencoded": "[[-1,[3]],[1,[4]]]",
+      "decoded_raw": "RationalWrapper(numer=-3 denom=4)"
+    },
+    {
+      "name": "bigrational/neg_denom_raw",
+      "ty": "RationalWrapper",
+      "json": "[[1,[3]],[-1,[4]]]",
+      "raw": "RationalWrapper(numer=3 denom=-4)",
+      "reencoded": "[[1,[3]],[-1,[4]]]",
+      "decoded_raw": "RationalWrapper(numer=3 denom=-4)"
+    },
+    {
+      "name": "bigrational/unreduced_raw",
+      "ty": "RationalWrapper",
+      "json": "[[1,[2]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=2 denom=4)",
+      "reencoded": "[[1,[2]],[1,[4]]]",
+      "decoded_raw": "RationalWrapper(numer=2 denom=4)"
+    },
+    {
+      "name": "bigrational/multilimb",
+      "ty": "RationalWrapper",
+      "json": "[[1,[1,0,1]],[-1,[0,0,2]]]",
+      "raw": "RationalWrapper(numer=18446744073709551617 denom=-36893488147419103232)",
+      "reencoded": "[[1,[1,0,1]],[-1,[0,0,2]]]",
+      "decoded_raw": "RationalWrapper(numer=18446744073709551617 denom=-36893488147419103232)"
+    },
+    {
+      "name": "bigrational/x_both_negative_raw",
+      "ty": "RationalWrapper",
+      "json": "[[-1,[3]],[-1,[4]]]",
+      "raw": "RationalWrapper(numer=-3 denom=-4)",
+      "reencoded": "[[-1,[3]],[-1,[4]]]",
+      "decoded_raw": "RationalWrapper(numer=-3 denom=-4)"
+    },
+    {
+      "name": "bigrational/x_zero_numer_neg_denom_raw",
+      "ty": "RationalWrapper",
+      "json": "[[0,[]],[-1,[1]]]",
+      "raw": "RationalWrapper(numer=0 denom=-1)",
+      "reencoded": "[[0,[]],[-1,[1]]]",
+      "decoded_raw": "RationalWrapper(numer=0 denom=-1)"
+    },
+    {
+      "name": "farkas/empty",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[]}",
+      "raw": "coefficients=[]",
+      "reencoded": "{\"coefficients\":[]}",
+      "decoded_raw": "coefficients=[]"
+    },
+    {
+      "name": "farkas/zero",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[0,1]]}",
+      "raw": "coefficients=[numer=0 denom=1]",
+      "reencoded": "{\"coefficients\":[[0,1]]}",
+      "decoded_raw": "coefficients=[numer=0 denom=1]"
+    },
+    {
+      "name": "farkas/one",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[1,1]]}",
+      "raw": "coefficients=[numer=1 denom=1]",
+      "reencoded": "{\"coefficients\":[[1,1]]}",
+      "decoded_raw": "coefficients=[numer=1 denom=1]"
+    },
+    {
+      "name": "farkas/neg_numer",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[-3,4]]}",
+      "raw": "coefficients=[numer=-3 denom=4]",
+      "reencoded": "{\"coefficients\":[[-3,4]]}",
+      "decoded_raw": "coefficients=[numer=-3 denom=4]"
+    },
+    {
+      "name": "farkas/neg_denom_normalized",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[-3,4]]}",
+      "raw": "coefficients=[numer=-3 denom=4]",
+      "reencoded": "{\"coefficients\":[[-3,4]]}",
+      "decoded_raw": "coefficients=[numer=-3 denom=4]"
+    },
+    {
+      "name": "farkas/neg_denom_raw",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[3,-4]]}",
+      "raw": "coefficients=[numer=3 denom=-4]",
+      "reencoded": "{\"coefficients\":[[3,-4]]}",
+      "decoded_raw": "coefficients=[numer=3 denom=-4]"
+    },
+    {
+      "name": "farkas/unreduced_raw",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[2,4]]}",
+      "raw": "coefficients=[numer=2 denom=4]",
+      "reencoded": "{\"coefficients\":[[2,4]]}",
+      "decoded_raw": "coefficients=[numer=2 denom=4]"
+    },
+    {
+      "name": "farkas/i64_extremes",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[-9223372036854775808,9223372036854775807]]}",
+      "raw": "coefficients=[numer=-9223372036854775808 denom=9223372036854775807]",
+      "reencoded": "{\"coefficients\":[[-9223372036854775808,9223372036854775807]]}",
+      "decoded_raw": "coefficients=[numer=-9223372036854775808 denom=9223372036854775807]"
+    },
+    {
+      "name": "farkas/realistic_vector",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[1,1],[-3,4],[0,1],[7,2]]}",
+      "raw": "coefficients=[numer=1 denom=1, numer=-3 denom=4, numer=0 denom=1, numer=7 denom=2]",
+      "reencoded": "{\"coefficients\":[[1,1],[-3,4],[0,1],[7,2]]}",
+      "decoded_raw": "coefficients=[numer=1 denom=1, numer=-3 denom=4, numer=0 denom=1, numer=7 denom=2]"
+    },
+    {
+      "name": "farkas/x_denom_i64_min",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[1,-9223372036854775808]]}",
+      "raw": "coefficients=[numer=1 denom=-9223372036854775808]",
+      "reencoded": "{\"coefficients\":[[1,-9223372036854775808]]}",
+      "decoded_raw": "coefficients=[numer=1 denom=-9223372036854775808]"
+    },
+    {
+      "name": "farkas/x_both_i64_min",
+      "ty": "FarkasAnnotation",
+      "json": "{\"coefficients\":[[-9223372036854775808,-9223372036854775808]]}",
+      "raw": "coefficients=[numer=-9223372036854775808 denom=-9223372036854775808]",
+      "reencoded": "{\"coefficients\":[[-9223372036854775808,-9223372036854775808]]}",
+      "decoded_raw": "coefficients=[numer=-9223372036854775808 denom=-9223372036854775808]"
+    }
+  ],
+  "decode": [
+    {
+      "name": "decode/bigint/nosign_with_limbs",
+      "ty": "Constant",
+      "note": "sign 0 with limbs: from_biguint CLEARS them",
+      "json": "{\"Int\":[0,[1,2]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(0)",
+        "reencoded": "{\"Int\":[0,[]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/plus_with_empty_limbs",
+      "ty": "Constant",
+      "note": "sign 1, no limbs: sign DEMOTED to 0",
+      "json": "{\"Int\":[1,[]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(0)",
+        "reencoded": "{\"Int\":[0,[]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/trailing_zero_limb",
+      "ty": "Constant",
+      "note": "trailing zero limb trimmed; re-encode != input",
+      "json": "{\"Int\":[-1,[3,0]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(-3)",
+        "reencoded": "{\"Int\":[-1,[3]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/bad_sign",
+      "ty": "Constant",
+      "note": "sign outside {-1,0,1} must be REJECTED",
+      "json": "{\"Int\":[2,[1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10",
+        "message_trimmed": "invalid value: integer `2`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/bigint/limb_overflows_u32",
+      "ty": "Constant",
+      "note": "limb above u32::MAX must be REJECTED",
+      "json": "{\"Int\":[1,[4294967296]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `4294967296`, expected u32 at line 1 column 21",
+        "message_trimmed": "invalid value: integer `4294967296`, expected u32"
+      }
+    },
+    {
+      "name": "decode/bigint/negative_limb",
+      "ty": "Constant",
+      "note": "limbs are unsigned",
+      "json": "{\"Int\":[1,[-1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `-1`, expected u32 at line 1 column 13",
+        "message_trimmed": "invalid value: integer `-1`, expected u32"
+      }
+    },
+    {
+      "name": "decode/rational/unreduced_preserved",
+      "ty": "Constant",
+      "note": "new_raw: 2/4 stays 2/4",
+      "json": "{\"Rational\":[[1,[2]],[1,[4]]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Rational(numer=2 denom=4)",
+        "reencoded": "{\"Rational\":[[1,[2]],[1,[4]]]}"
+      }
+    },
+    {
+      "name": "decode/rational/zero_denominator",
+      "ty": "Constant",
+      "note": "zero denominator REJECTED",
+      "json": "{\"Rational\":[[1,[1]],[0,[]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/bitvec/unknown_field",
+      "ty": "Constant",
+      "note": "deny_unknown_fields: extra key REJECTED",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8,\"extra\":1}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "unknown field `extra`, expected `value` or `width` at line 1 column 43",
+        "message_trimmed": "unknown field `extra`, expected `value` or `width`"
+      }
+    },
+    {
+      "name": "decode/x/order_bad_sign_and_bad_limb",
+      "ty": "Constant",
+      "note": "ORDER: bad sign in elem 0 AND negative limb in elem 1",
+      "json": "{\"Int\":[2,[-1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `2`, expected a sign of -1, 0, or 1 at line 1 column 10",
+        "message_trimmed": "invalid value: integer `2`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/x/order_bad_sign_and_limb_overflow",
+      "ty": "Constant",
+      "note": "ORDER: bad sign AND limb > u32::MAX",
+      "json": "{\"Int\":[3,[4294967296]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `3`, expected a sign of -1, 0, or 1 at line 1 column 10",
+        "message_trimmed": "invalid value: integer `3`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/x/order_numer_bad_sign_and_zero_denom",
+      "ty": "Constant",
+      "note": "ORDER: bad sign in numerator AND zero denominator",
+      "json": "{\"Rational\":[[7,[1]],[0,[]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16",
+        "message_trimmed": "invalid value: integer `7`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/x/order_bad_numer_and_bad_denom",
+      "ty": "Constant",
+      "note": "ORDER: both members malformed",
+      "json": "{\"Rational\":[[7,[1]],[9,[1]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `7`, expected a sign of -1, 0, or 1 at line 1 column 16",
+        "message_trimmed": "invalid value: integer `7`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_missing_width",
+      "ty": "Constant",
+      "note": "MISSING FIELD width",
+      "json": "{\"BitVec\":{\"value\":[0,[]]}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "missing field `width` at line 1 column 26",
+        "message_trimmed": "missing field `width`"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_missing_value",
+      "ty": "Constant",
+      "note": "MISSING FIELD value",
+      "json": "{\"BitVec\":{\"width\":8}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "missing field `value` at line 1 column 21",
+        "message_trimmed": "missing field `value`"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_missing_both",
+      "ty": "Constant",
+      "note": "MISSING both named fields",
+      "json": "{\"BitVec\":{}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "missing field `value` at line 1 column 12",
+        "message_trimmed": "missing field `value`"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_null_value",
+      "ty": "Constant",
+      "note": "null for a bignum field",
+      "json": "{\"BitVec\":{\"value\":null,\"width\":8}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: null, expected a tuple of size 2 at line 1 column 23",
+        "message_trimmed": "invalid type: null, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_field_order_swapped",
+      "ty": "Constant",
+      "note": "named fields out of declaration order: accepted, re-encoded canonically",
+      "json": "{\"BitVec\":{\"width\":8,\"value\":[1,[1]]}}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "BitVec(value=1 width=8)",
+        "reencoded": "{\"BitVec\":{\"value\":[1,[1]],\"width\":8}}"
+      }
+    },
+    {
+      "name": "decode/x/bitvec_duplicate_field",
+      "ty": "Constant",
+      "note": "duplicate named field",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8,\"width\":9}}",
+      "outcome": {
+        "kind": "reject",
+        "message": "duplicate field `width` at line 1 column 43",
+        "message_trimmed": "duplicate field `width`"
+      }
+    },
+    {
+      "name": "decode/x/bigint_tuple_short",
+      "ty": "Constant",
+      "note": "1-element tuple where 2 required",
+      "json": "{\"Int\":[1]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 10",
+        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/bigint_tuple_empty",
+      "ty": "Constant",
+      "note": "empty tuple",
+      "json": "{\"Int\":[]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid length 0, expected a tuple of size 2 at line 1 column 9",
+        "message_trimmed": "invalid length 0, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/bigint_tuple_long",
+      "ty": "Constant",
+      "note": "3-element tuple",
+      "json": "{\"Int\":[1,[1],9]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "trailing characters at line 1 column 15",
+        "message_trimmed": "trailing characters"
+      }
+    },
+    {
+      "name": "decode/x/rational_tuple_short",
+      "ty": "Constant",
+      "note": "ratio with only a numerator",
+      "json": "{\"Rational\":[[1,[1]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 21",
+        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/bigint_limbs_not_seq",
+      "ty": "Constant",
+      "note": "limbs field is a string, not a sequence",
+      "json": "{\"Int\":[1,\"x\"]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: string \"x\", expected a sequence of unsigned 32-bit numbers at line 1 column 13",
+        "message_trimmed": "invalid type: string \"x\", expected a sequence of unsigned 32-bit numbers"
+      }
+    },
+    {
+      "name": "decode/x/bigint_limbs_object",
+      "ty": "Constant",
+      "note": "limbs field is an object",
+      "json": "{\"Int\":[1,{}]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: map, expected a sequence of unsigned 32-bit numbers at line 1 column 10",
+        "message_trimmed": "invalid type: map, expected a sequence of unsigned 32-bit numbers"
+      }
+    },
+    {
+      "name": "decode/x/bigint_sign_is_string",
+      "ty": "Constant",
+      "note": "sign is a string",
+      "json": "{\"Int\":[\"1\",[1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: string \"1\", expected i8 at line 1 column 11",
+        "message_trimmed": "invalid type: string \"1\", expected i8"
+      }
+    },
+    {
+      "name": "decode/x/bigint_sign_is_float",
+      "ty": "Constant",
+      "note": "sign is a float",
+      "json": "{\"Int\":[1.5,[1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: floating point `1.5`, expected i8 at line 1 column 11",
+        "message_trimmed": "invalid type: floating point `1.5`, expected i8"
+      }
+    },
+    {
+      "name": "decode/x/bigint_limb_is_float",
+      "ty": "Constant",
+      "note": "limb is a float",
+      "json": "{\"Int\":[1,[1.5]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: floating point `1.5`, expected u32 at line 1 column 14",
+        "message_trimmed": "invalid type: floating point `1.5`, expected u32"
+      }
+    },
+    {
+      "name": "decode/x/bigint_not_a_seq",
+      "ty": "Constant",
+      "note": "Int payload is a bare integer",
+      "json": "{\"Int\":5}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: integer `5`, expected a tuple of size 2 at line 1 column 8",
+        "message_trimmed": "invalid type: integer `5`, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/rational_denom_neg_sign_empty_limbs",
+      "ty": "Constant",
+      "note": "denom sign -1 with EMPTY limbs normalizes to 0: reject or accept?",
+      "json": "{\"Rational\":[[1,[1]],[-1,[]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/x/rational_denom_zero_limbs",
+      "ty": "Constant",
+      "note": "denom sign 1 with an explicit zero limb",
+      "json": "{\"Rational\":[[1,[1]],[1,[0]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/x/rational_both_negative_raw",
+      "ty": "Constant",
+      "note": "both members negative, unreduced",
+      "json": "{\"Rational\":[[-1,[2]],[-1,[4]]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Rational(numer=-2 denom=-4)",
+        "reencoded": "{\"Rational\":[[-1,[2]],[-1,[4]]]}"
+      }
+    },
+    {
+      "name": "decode/x/unknown_variant",
+      "ty": "Constant",
+      "note": "unknown enum variant",
+      "json": "{\"Nope\":1}",
+      "outcome": {
+        "kind": "reject",
+        "message": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String` at line 1 column 7",
+        "message_trimmed": "unknown variant `Nope`, expected one of `Bool`, `Int`, `Rational`, `BitVec`, `String`"
+      }
+    },
+    {
+      "name": "decode/x/no_variant",
+      "ty": "Constant",
+      "note": "empty object: no variant selected",
+      "json": "{}",
+      "outcome": {
+        "kind": "reject",
+        "message": "expected value at line 1 column 2",
+        "message_trimmed": "expected value"
+      }
+    },
+    {
+      "name": "decode/x/two_variants",
+      "ty": "Constant",
+      "note": "two variants in one object",
+      "json": "{\"Int\":[0,[]],\"Bool\":true}",
+      "outcome": {
+        "kind": "reject",
+        "message": "expected value at line 1 column 13",
+        "message_trimmed": "expected value"
+      }
+    },
+    {
+      "name": "decode/x/bool_ok",
+      "ty": "Constant",
+      "note": "control: an unrelated variant still decodes",
+      "json": "{\"Bool\":true}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Bool(true)",
+        "reencoded": "{\"Bool\":true}"
+      }
+    },
+    {
+      "name": "decode/farkas/unreduced_preserved",
+      "ty": "FarkasAnnotation",
+      "note": "2/4 stays 2/4",
+      "json": "{\"coefficients\":[[2,4]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[numer=2 denom=4]",
+        "reencoded": "{\"coefficients\":[[2,4]]}"
+      }
+    },
+    {
+      "name": "decode/farkas/neg_denom_preserved",
+      "ty": "FarkasAnnotation",
+      "note": "negative denominator survives",
+      "json": "{\"coefficients\":[[3,-4]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[numer=3 denom=-4]",
+        "reencoded": "{\"coefficients\":[[3,-4]]}"
+      }
+    },
+    {
+      "name": "decode/farkas/zero_denominator",
+      "ty": "FarkasAnnotation",
+      "note": "zero denominator REJECTED",
+      "json": "{\"coefficients\":[[1,0]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/farkas/unknown_field",
+      "ty": "FarkasAnnotation",
+      "note": "deny_unknown_fields: extra key REJECTED",
+      "json": "{\"coefficients\":[[1,1]],\"extra\":2}",
+      "outcome": {
+        "kind": "reject",
+        "message": "unknown field `extra`, expected `coefficients` at line 1 column 31",
+        "message_trimmed": "unknown field `extra`, expected `coefficients`"
+      }
+    },
+    {
+      "name": "decode/farkas/numer_overflows_i64",
+      "ty": "FarkasAnnotation",
+      "note": "coefficients are i64",
+      "json": "{\"coefficients\":[[9223372036854775808,1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37",
+        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+      }
+    },
+    {
+      "name": "decode/x/farkas_missing_field",
+      "ty": "FarkasAnnotation",
+      "note": "MISSING FIELD coefficients",
+      "json": "{}",
+      "outcome": {
+        "kind": "reject",
+        "message": "missing field `coefficients` at line 1 column 2",
+        "message_trimmed": "missing field `coefficients`"
+      }
+    },
+    {
+      "name": "decode/x/farkas_null_field",
+      "ty": "FarkasAnnotation",
+      "note": "coefficients is null",
+      "json": "{\"coefficients\":null}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: null, expected a sequence at line 1 column 20",
+        "message_trimmed": "invalid type: null, expected a sequence"
+      }
+    },
+    {
+      "name": "decode/x/farkas_empty_ok",
+      "ty": "FarkasAnnotation",
+      "note": "control: empty vector accepted",
+      "json": "{\"coefficients\":[]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[]",
+        "reencoded": "{\"coefficients\":[]}"
+      }
+    },
+    {
+      "name": "decode/x/farkas_pair_short",
+      "ty": "FarkasAnnotation",
+      "note": "pair with one element",
+      "json": "{\"coefficients\":[[1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid length 1, expected a tuple of size 2 at line 1 column 20",
+        "message_trimmed": "invalid length 1, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/farkas_pair_long",
+      "ty": "FarkasAnnotation",
+      "note": "pair with three elements",
+      "json": "{\"coefficients\":[[1,2,3]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "trailing characters at line 1 column 23",
+        "message_trimmed": "trailing characters"
+      }
+    },
+    {
+      "name": "decode/x/farkas_pair_not_seq",
+      "ty": "FarkasAnnotation",
+      "note": "coefficient is a bare integer",
+      "json": "{\"coefficients\":[1]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: integer `1`, expected a tuple of size 2 at line 1 column 18",
+        "message_trimmed": "invalid type: integer `1`, expected a tuple of size 2"
+      }
+    },
+    {
+      "name": "decode/x/farkas_float_numer",
+      "ty": "FarkasAnnotation",
+      "note": "float numerator",
+      "json": "{\"coefficients\":[[1.5,2]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid type: floating point `1.5`, expected i64 at line 1 column 21",
+        "message_trimmed": "invalid type: floating point `1.5`, expected i64"
+      }
+    },
+    {
+      "name": "decode/x/farkas_denom_overflows_i64",
+      "ty": "FarkasAnnotation",
+      "note": "denominator above i64::MAX",
+      "json": "{\"coefficients\":[[1,9223372036854775808]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 39",
+        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+      }
+    },
+    {
+      "name": "decode/x/farkas_order_overflow_and_zero_denom",
+      "ty": "FarkasAnnotation",
+      "note": "ORDER: numerator overflow AND zero denominator",
+      "json": "{\"coefficients\":[[9223372036854775808,0]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `9223372036854775808`, expected i64 at line 1 column 37",
+        "message_trimmed": "invalid value: integer `9223372036854775808`, expected i64"
+      }
+    },
+    {
+      "name": "decode/x/farkas_order_second_pair_bad",
+      "ty": "FarkasAnnotation",
+      "note": "ORDER: first pair fine, second has a zero denominator",
+      "json": "{\"coefficients\":[[1,2],[3,0]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 29",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/x/farkas_order_zero_denom_then_overflow",
+      "ty": "FarkasAnnotation",
+      "note": "ORDER: zero denominator in pair 1, overflow in pair 2",
+      "json": "{\"coefficients\":[[1,0],[9223372036854775808,1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/x/farkas_denom_i64_min",
+      "ty": "FarkasAnnotation",
+      "note": "denominator i64::MIN",
+      "json": "{\"coefficients\":[[1,-9223372036854775808]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[numer=1 denom=-9223372036854775808]",
+        "reencoded": "{\"coefficients\":[[1,-9223372036854775808]]}"
+      }
+    },
+    {
+      "name": "decode/x/farkas_zero_over_zero",
+      "ty": "FarkasAnnotation",
+      "note": "0/0",
+      "json": "{\"coefficients\":[[0,0]]}",
+      "outcome": {
+        "kind": "reject",
+        "message": "invalid value: integer `0`, expected a ratio with non-zero denominator at line 1 column 23",
+        "message_trimmed": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    }
+  ]
+}

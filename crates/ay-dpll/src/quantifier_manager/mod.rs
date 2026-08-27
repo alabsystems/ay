@@ -89,6 +89,9 @@ pub(crate) struct QuantifierManager {
     /// NOT armed, `demand.active == false`, `run_ematching_round` passes `None` to
     /// the E-matcher and every field is untouched — production is byte-identical.
     demand: DemandLaneState,
+
+    /// Relevance-ranked admission carry queue and observation counters.
+    relevance: RelevanceState,
 }
 
 /// M2+M3 demand-lane state (SHADOW-ONLY). Persists the generation frontier `F`,
@@ -182,6 +185,7 @@ impl QuantifierManager {
             match_state: PersistentMatchState::new(),
             demand_stats: DemandStats::default(),
             demand: DemandLaneState::default(),
+            relevance: RelevanceState::default(),
         }
     }
 
@@ -213,6 +217,7 @@ impl QuantifierManager {
         // arm RE-ARMS it (via `demand_arm`) immediately after this call when the
         // shadow flag is set; a non-shadow solve leaves it inert (byte-identical).
         self.demand = DemandLaneState::default();
+        self.relevance_begin_epoch();
     }
 
     /// Begin a fresh round group WITHIN the current epoch. Resets only the index
@@ -332,19 +337,6 @@ impl QuantifierManager {
         }
 
         result
-    }
-
-    /// Check if there are deferred instantiations waiting.
-    ///
-    /// When `has_deferred()` returns true and solver would return SAT,
-    /// the result should be Unknown instead (Phase B).
-    ///
-    /// M2+M3 (LAW #3, fail-closed): a non-empty demand PARKED queue counts as
-    /// deferred too — a parked-nonempty state must never grant a Sat certificate.
-    /// The fence drain (LAW #2) empties the parked queue before any conclusion, so
-    /// in the normal path this only reflects genuinely-unflushed instances.
-    pub(crate) fn has_deferred(&self) -> bool {
-        !self.deferred.is_empty() || !self.demand.parked.is_empty()
     }
 
     // ---- M2+M3 demand lane (SHADOW-ONLY) --------------------------------------
@@ -561,6 +553,7 @@ impl crate::incremental_state::IncrementalSubsystem for QuantifierManager {
     /// so they can be restored on pop. This prevents state from inner scopes
     /// leaking into outer scopes after pop.
     fn push(&mut self) {
+        self.relevance_clear_carried_at_scope_boundary();
         let (assertion_eqclasses, folded_eq_atoms) = self.match_state.snapshot_eqclasses();
         self.scope_stack.push(QuantifierManagerSnapshot {
             generation_tracker: self.generation_tracker.clone(),
@@ -583,6 +576,7 @@ impl crate::incremental_state::IncrementalSubsystem for QuantifierManager {
     /// accumulated in the popped scope. Returns false on underflow.
     fn pop(&mut self) -> bool {
         if let Some(snapshot) = self.scope_stack.pop() {
+            self.relevance_clear_carried_at_scope_boundary();
             self.generation_tracker = snapshot.generation_tracker;
             self.deferred.truncate(snapshot.deferred_len);
             self.round = snapshot.round;
@@ -630,6 +624,7 @@ impl crate::incremental_state::IncrementalSubsystem for QuantifierManager {
         // here can never affect a verdict).
         self.demand_stats = DemandStats::default();
         self.demand = DemandLaneState::default();
+        self.relevance_reset();
     }
 }
 
@@ -655,6 +650,7 @@ impl QuantifierManager {
         self.match_state.clear();
         self.demand_stats = DemandStats::default();
         self.demand = DemandLaneState::default();
+        self.relevance_reset();
     }
 
     /// Number of (quantifier, binding) keys in the persistent instantiation memo.
@@ -707,5 +703,7 @@ impl QuantifierManager {
     }
 }
 
+mod relevance;
 #[cfg(test)]
 mod tests;
+use relevance::RelevanceState;

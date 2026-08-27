@@ -38,6 +38,20 @@ impl PropagationChainPlanner<'_> {
         if cx.problem_set.contains(&term) {
             return Some(cx.chain.add_assume(term, None));
         }
+        // A definitional bound `EqDiffVar` minted is a base case, not something
+        // to derive (#4751): it is exactly the `fresh_def_bound` step the strict
+        // checker re-validates. Reaching it HERE is what lets a LATER pass's
+        // rewrite of the same bound — `VariableSubstitution` rewrote the
+        // definiens of 105 of 1689 difference variables on `dillig12_m` — be
+        // derived from the minted spelling through the ordinary record bridge,
+        // instead of binding the symbol to a second definiens the checker's
+        // SINGLE DEFINIENS condition would reject. Inert (`None`) for every
+        // other lane.
+        if let Some(&definiendum) = cx.eqdv_definitions.and_then(|index| index.get(&term)) {
+            if let Some(id) = self.plan_fresh_def_bound(cx, term, definiendum) {
+                return Some(id);
+            }
+        }
         let roots = cx.problem_roots.to_vec();
         for root in roots {
             if let Some(id) = self.plan_base_conjunct(cx, root, term) {
@@ -428,6 +442,131 @@ impl PropagationChainPlanner<'_> {
         if let Some(id) = self.plan_or_elimination_bridge(cx, before, before_id, after, stamp) {
             return Some(id);
         }
-        self.plan_and_elimination_bridge(cx, before, before_id, after, stamp)
+        if let Some(id) = self.plan_and_elimination_bridge(cx, before, before_id, after, stamp) {
+            return Some(id);
+        }
+        if let Some(id) =
+            self.plan_ite_condition_elimination_bridge(cx, before, before_id, after, stamp)
+        {
+            return Some(id);
+        }
+        self.plan_flatten_projection_bridge(cx, before, before_id, after)
+    }
+
+    /// 1→N and-flatten projection (#4751): `before` is an `and`-headed
+    /// assertion the preprocessor re-flattened into per-conjunct units and
+    /// `after` is one of its (possibly nested) conjuncts. The record is only
+    /// a hint that the pair is worth trying — the and-path is re-found in the
+    /// term store here, and the derivation is the existing
+    /// `and_pos` + `th_resolution` chain the untouched strict checker
+    /// re-validates, so a record naming a non-conjunct cannot license
+    /// anything (the path search fails and the plan declines to today's
+    /// demotion).
+    fn plan_flatten_projection_bridge(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        before: TermId,
+        before_id: ProofId,
+        after: TermId,
+    ) -> Option<ProofId> {
+        match self.terms.get(before) {
+            TermData::App(Symbol::Named(name), args) if name == "and" && args.len() >= 2 => {}
+            _ => return None,
+        }
+        let AndPath::Found(path) = Self::plan_find_and_path(self.terms, cx, before, after)? else {
+            return None;
+        };
+        if path.is_empty() {
+            return None;
+        }
+        Some(self.plan_emit_and_pos_chain_from(cx, before_id, before, &path))
+    }
+
+    /// Guarded-`ite` arm selection (#4751): `before` is an `(ite c t e)`
+    /// assertion whose CONDITION the recorded pass environment folds to a
+    /// Boolean constant, and `after` is the replay of the selected arm.
+    ///
+    /// Derivation, every step re-validated by the untouched strict checker:
+    ///  * `(cl c)` (condition `true`) or `(cl (not c))` (condition `false`)
+    ///    is derived from authored roots via the ordinary clause planner —
+    ///    the FOLD alone is never taken as authority for the condition;
+    ///  * the premise-free `ite_pos2` / `ite_pos1` tautology plus two
+    ///    resolutions conclude `(cl t)` / `(cl e)`;
+    ///  * if the recorded rewrite also rewrote the selected arm, the standard
+    ///    equality replay bridges `(cl arm)` to `(cl after)`, declining on
+    ///    any mismatch.
+    ///
+    /// Fail-closed: a condition that does not fold to a literal Boolean
+    /// constant, a condition clause the planner cannot root in an authored
+    /// assume, or an arm replay that does not reproduce `after` all decline,
+    /// leaving today's demotion path unchanged.
+    fn plan_ite_condition_elimination_bridge(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        before: TermId,
+        before_id: ProofId,
+        after: TermId,
+        stamp: u32,
+    ) -> Option<ProofId> {
+        let TermData::Ite(condition, then_branch, else_branch) = self.terms.get(before) else {
+            return None;
+        };
+        let (condition, then_branch, else_branch) = (*condition, *then_branch, *else_branch);
+        let EqRes::Changed {
+            to: condition_to, ..
+        } = self.plan_derive_eq(cx, condition, stamp)?
+        else {
+            return None;
+        };
+        let true_term = self.terms.true_term();
+        let false_term = self.terms.false_term();
+        let not_condition = self.terms.mk_not_raw(condition);
+        // ite_pos2: (cl (not (ite c t e)) (not c) t) — selects `t` given `c`.
+        // ite_pos1: (cl (not (ite c t e)) c e)       — selects `e` given `¬c`.
+        let (selected, taut_rule, condition_unit, taut_condition_lit) = if condition_to == true_term
+        {
+            (then_branch, AletheRule::ItePos2, condition, not_condition)
+        } else if condition_to == false_term {
+            (else_branch, AletheRule::ItePos1, not_condition, condition)
+        } else {
+            return None;
+        };
+        cx.spend(4)?;
+        // All recursive derivations FIRST, so no step is emitted unless the
+        // whole bridge succeeds.
+        let condition_id = self.plan_derive_clause(cx, condition_unit)?;
+        let arm_bridge = if selected == after {
+            None
+        } else {
+            match self.plan_derive_eq(cx, selected, stamp)? {
+                EqRes::Changed { to, eq_term, id } if to == after => Some((eq_term, id)),
+                _ => return None,
+            }
+        };
+        let not_ite = self.terms.mk_not_raw(before);
+        let taut = cx.chain.add_rule_step(
+            taut_rule,
+            vec![not_ite, taut_condition_lit, selected],
+            Vec::new(),
+            Vec::new(),
+        );
+        let without_ite = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![taut_condition_lit, selected],
+            vec![taut, before_id],
+            Vec::new(),
+        );
+        let arm_id = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![selected],
+            vec![without_ite, condition_id],
+            Vec::new(),
+        );
+        match arm_bridge {
+            None => Some(arm_id),
+            Some((eq_term, eq_id)) => {
+                Some(self.plan_equiv_bridge(cx, selected, arm_id, after, eq_term, eq_id))
+            }
+        }
     }
 }

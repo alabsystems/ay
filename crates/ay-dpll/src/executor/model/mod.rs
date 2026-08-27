@@ -54,6 +54,7 @@ mod eval_string;
 mod eval_uf;
 mod eval_var;
 mod independent_gate;
+pub(in crate::executor) use independent_gate::probe_budget::QuantifiedGateProbeBudget;
 pub(in crate::executor) use independent_gate::QuantifiedModelConfirmation;
 mod ite_fixup;
 mod ite_fixup_limits;

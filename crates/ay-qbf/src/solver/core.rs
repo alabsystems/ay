@@ -13,14 +13,10 @@ const MATRIX_LITERAL_WORK_PER_NODE: u64 = 64;
 impl QbfSolver {
     /// Create a new QBF solver for the given formula
     pub fn new(formula: QbfFormula) -> Self {
-        // `prefix` is public for native construction. Rebuild the canonical
-        // prefix and its cached metadata in case a caller mutated it after
-        // `QbfFormula::new` returned.
-        let formula = formula.canonicalized();
-        let num_vars = formula.num_vars;
+        let num_vars = formula.num_vars();
         let mut input_valid = num_vars <= MAX_QBF_VARS;
         let mut matrix_variables = HashSet::new();
-        for literal in formula.clauses.iter().flatten() {
+        for literal in formula.clauses().iter().flatten() {
             let variable = literal.variable().id() as usize;
             if variable == 0 || variable > num_vars {
                 input_valid = false;
@@ -32,15 +28,9 @@ impl QbfSolver {
         // Build decision order from quantifier prefix
         let mut decision_order = Vec::with_capacity(matrix_variables.len());
         let mut quantified = HashSet::with_capacity(matrix_variables.len());
-        for block in &formula.prefix {
+        for block in formula.prefix() {
             for &var in &block.variables {
-                // The formula constructor already canonicalizes its prefix.
-                // Keep this guard defensive against future construction paths.
-                if var != 0
-                    && var as usize <= num_vars
-                    && matrix_variables.contains(&var)
-                    && quantified.insert(var)
-                {
+                if matrix_variables.contains(&var) && quantified.insert(var) {
                     decision_order.push(var);
                 }
             }
@@ -148,7 +138,7 @@ impl QbfSolver {
             return QbfResult::Unknown;
         }
         if self.watches.is_empty() {
-            self.watches = vec![Vec::new(); self.formula.num_vars.saturating_mul(2) + 2];
+            self.watches = vec![Vec::new(); self.formula.num_vars().saturating_mul(2) + 2];
             self.init_watches();
         }
         // Apply initial universal reduction
@@ -367,7 +357,7 @@ impl QbfSolver {
     /// every literal inspection to the exact-search work budget.
     fn partial_matrix_value(&self, budget: &mut ExactBudget) -> PartialMatrixValue {
         let mut all_satisfied = true;
-        for clause in &self.formula.clauses {
+        for clause in self.formula.clauses() {
             let mut clause_satisfied = false;
             let mut clause_unresolved = false;
             for &literal in clause {
@@ -397,18 +387,12 @@ impl QbfSolver {
 
     /// Apply universal reduction to all clauses
     fn apply_universal_reduction(&mut self) {
-        let reduced: Vec<Vec<Literal>> = self
-            .formula
-            .clauses
-            .iter()
-            .map(|c| self.formula.universal_reduce(c))
-            .collect();
-        self.formula.clauses = reduced;
+        self.formula.universally_reduce_matrix();
     }
 
     /// Check if any clause is empty
     fn has_empty_clause(&self) -> bool {
-        self.formula.clauses.iter().any(Vec::is_empty) || self.learned.iter().any(Vec::is_empty)
+        self.formula.clauses().iter().any(Vec::is_empty) || self.learned.iter().any(Vec::is_empty)
     }
 
     /// Build Skolem certificate for SAT result

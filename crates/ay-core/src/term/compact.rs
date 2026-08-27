@@ -311,6 +311,24 @@ impl TermStore {
         self.strict_bv_semantics_ok.get_mut().clear();
 
         // Phase 5: remap TermStore-owned pins.
+        //
+        // The synthesis watermark is an INDEX, not a `TermId`, so neither
+        // `RemapTable` nor `Remappable` can carry it and a compaction that
+        // ignored it would leave a boundary pointing into a term universe that
+        // no longer exists. It is recoverable exactly: terms are emitted in
+        // increasing OLD-id order, so every surviving pre-watermark term keeps a
+        // new id below every surviving post-watermark term, and the new boundary
+        // is simply how many pre-watermark terms survived. With that count,
+        // `is_synthesized(new_id)` answers exactly what `is_synthesized(old_id)`
+        // answered for the same term - preserved, not merely fail-open.
+        if let Some(old_watermark) = self.synthesis_watermark {
+            let surviving_original = mapping
+                .iter()
+                .take(old_watermark.min(mapping.len()))
+                .filter(|slot| slot.is_some())
+                .count();
+            self.synthesis_watermark = Some(surviving_original);
+        }
         let remap = RemapTable { mapping };
         if let Some(t) = self.true_term.as_mut() {
             *t = remap.remap(*t);
@@ -330,6 +348,22 @@ impl TermStore {
             // we pinned every named TermId above — but if a caller
             // somehow violates the contract, we silently drop the
             // name rather than dangling.
+        }
+
+        // The `mk_not` memo (`arg -> not(arg)`) is keyed AND valued by `TermId`,
+        // so a compaction that ignored it would answer the next `mk_not` with a
+        // node that is not the negation of its argument — a wrong term, silently,
+        // from a pure builder. `rollback_to` already prunes this map for exactly
+        // that reason (it can only ever reuse a suffix); compaction relabels the
+        // WHOLE arena, so every surviving entry has to move and every reclaimed
+        // one has to go. Relabelling preserves the relation: `TermData` is
+        // byte-identical after the move, so `not(k) == v` still holds of the
+        // images `k'`, `v'`.
+        let old_not_cache = std::mem::take(&mut self.not_cache);
+        for (arg, negated) in old_not_cache {
+            if let (Some(new_arg), Some(new_negated)) = (remap.get(arg), remap.get(negated)) {
+                self.not_cache.insert(new_arg, new_negated);
+            }
         }
 
         let old_no_mbqi = std::mem::take(&mut self.no_mbqi);
@@ -545,6 +579,114 @@ mod tests {
     use crate::sort::Sort;
     use crate::term::{Constant, Symbol, TermData};
     use num_bigint::BigInt;
+
+    /// The `mk_not` memo must move with the arena.
+    ///
+    /// The memo is keyed AND valued by `TermId`, so if compaction left it alone
+    /// the very next `mk_not` would be answered out of a table describing the
+    /// PRE-compaction universe — returning a node that is not the negation of
+    /// its argument. That is a wrong term produced by a pure builder, with no
+    /// checker anywhere in the path, which is why this is a soundness test and
+    /// not a hygiene one. `rollback_to` already prunes the same map.
+    #[test]
+    fn compaction_moves_the_mk_not_memo_with_the_arena() {
+        let mut store = TermStore::new();
+        // Three declared Bools: `mk_var` pins them in `names`, so all three
+        // survive compaction and their memo rows are the ones that can collide
+        // with a relabelled slot.
+        let p = store.mk_var("memo_p", Sort::Bool);
+        let q = store.mk_var("memo_q", Sort::Bool);
+        let _s = store.mk_var("memo_s", Sort::Bool);
+        // Rows that will DIE (their negations are reachable from nothing).
+        let not_p = store.mk_not(p);
+        let not_q = store.mk_not(q);
+        // The row that will LIVE, minted above a gap the compaction closes.
+        let r = store.intern(TermData::App(Symbol::named("r"), vec![p, q]), Sort::Bool);
+        let not_r = store.mk_not(r);
+
+        let before = store.len();
+        let remap = store.mark_and_compact(&[not_r]);
+        assert!(
+            store.len() < before,
+            "the fixture requires reclaimed slots, so ids actually move"
+        );
+        assert!(remap.get(not_p).is_none() && remap.get(not_q).is_none());
+
+        let new_p = remap.remap(p);
+        let new_r = remap.remap(r);
+        let new_not_r = remap.remap(not_r);
+
+        // WHITEBOX: no surviving row may describe the old universe. Either side
+        // out of range is a dangling read; a row whose value is not the negation
+        // of its key is a wrong answer waiting to be served.
+        for (&arg, &negated) in store.not_cache.iter() {
+            assert!(
+                arg.index() < store.len() && negated.index() < store.len(),
+                "memo row {arg:?} -> {negated:?} points outside the compacted arena"
+            );
+            let describes_a_negation = matches!(store.get(negated), TermData::Not(inner) if *inner == arg)
+                || matches!(store.get(arg), TermData::Not(inner) if *inner == negated)
+                || matches!(
+                    (store.get(arg), store.get(negated)),
+                    (
+                        TermData::Const(Constant::Bool(a)),
+                        TermData::Const(Constant::Bool(b))
+                    ) if a != b
+                );
+            assert!(
+                describes_a_negation,
+                "memo row {arg:?} -> {negated:?} no longer describes a negation"
+            );
+        }
+
+        // And the builder itself must answer correctly for both a survivor whose
+        // row was dropped and one whose row moved.
+        let rebuilt_not_p = store.mk_not(new_p);
+        assert_eq!(store.get(rebuilt_not_p), &TermData::Not(new_p));
+        assert_eq!(store.mk_not(new_r), new_not_r);
+        assert_eq!(store.get(new_not_r), &TermData::Not(new_r));
+    }
+
+    /// The synthesis watermark is an INDEX, so compaction must move it too.
+    ///
+    /// Terms are emitted in increasing OLD-id order, so the boundary survives
+    /// exactly: it becomes the number of surviving pre-watermark terms. This
+    /// pins the preserved answer, not merely a fail-open one.
+    #[test]
+    fn compaction_preserves_the_synthesis_watermark_boundary() {
+        let mut store = TermStore::new();
+        let original_a = mk_int_var(&mut store, "orig_a");
+        let original_b = mk_int_var(&mut store, "orig_b");
+        let original_sum = build_add(&mut store, original_a, original_b);
+        // Dead ORIGINAL-side term: reclaimed, and its slot must not be counted
+        // into the new boundary.
+        let _dead_original = store.intern(
+            TermData::App(Symbol::named("dead"), vec![original_a]),
+            Sort::Int,
+        );
+
+        store.set_synthesis_watermark();
+
+        let synthesized = store.intern(
+            TermData::App(Symbol::named("synth"), vec![original_sum]),
+            Sort::Int,
+        );
+        assert!(!store.is_synthesized(original_sum));
+        assert!(store.is_synthesized(synthesized));
+
+        let remap = store.mark_and_compact(&[synthesized]);
+        let new_sum = remap.remap(original_sum);
+        let new_synth = remap.remap(synthesized);
+
+        assert!(
+            !store.is_synthesized(new_sum),
+            "an original-problem term must stay original after compaction"
+        );
+        assert!(
+            store.is_synthesized(new_synth),
+            "a solve-invented term must stay invented after compaction"
+        );
+    }
 
     /// Helper: build an arithmetic term `(+ x y)` returning the root.
     fn build_add(store: &mut TermStore, x: TermId, y: TermId) -> TermId {

@@ -14,6 +14,7 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::TermId;
 
 use super::super::Executor;
+use super::relevance_admit::RelevanceAdmission;
 use crate::ematching::contains_quantifier;
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::features::StaticFeatures;
@@ -26,9 +27,60 @@ pub(in crate::executor) struct EmatchingRefinementRound {
     pub reached_limit: bool,
     pub has_uninstantiated: bool,
     pub instances_created: u64,
+    /// Instances the relevance layer withheld from THIS round (Side B). A
+    /// non-zero value means the round asserted a ranked prefix rather than
+    /// everything the matcher produced, so it is a fraction of a round's work
+    /// and the caller does not charge it against the round budget.
+    pub withheld: usize,
 }
 
 impl Executor {
+    fn refinement_round_assertions(
+        &self,
+        original_assertions: &[TermId],
+        cegqi_ce_lemma_ids: &[TermId],
+    ) -> Vec<TermId> {
+        // Counterexample lemmas are temporary validity-check assumptions, not
+        // authored ground evidence. The setup path keeps this list CE-exclusive,
+        // so exact-root removal cannot hide user input or a sound prior instance.
+        let ce_only: HashSet<TermId> = cegqi_ce_lemma_ids.iter().copied().collect();
+        let mut combined: Vec<TermId> = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .filter(|term| !ce_only.contains(term))
+            .collect();
+        for &assertion in original_assertions {
+            if contains_quantifier(&self.ctx.terms, assertion) && !combined.contains(&assertion) {
+                combined.push(assertion);
+            }
+        }
+        combined
+    }
+
+    fn assert_refinement_admission(
+        &mut self,
+        admission: RelevanceAdmission,
+        existing: &mut HashSet<TermId>,
+    ) -> usize {
+        let mut added = 0;
+        for entry in admission.admitted {
+            let inst = entry.inst;
+            if !existing.insert(inst) {
+                continue;
+            }
+            self.ctx.assertions.push(inst);
+            added += 1;
+            // The tag travels with a carried instance, so a flush registers the
+            // same authenticated support root as its producing round.
+            if entry.support_root {
+                self.push_active_support_axiom(inst);
+            }
+        }
+        added
+    }
+
     /// Dispatch to the appropriate theory solver for the given logic category.
     ///
     /// Must mirror the main dispatch table in `executor.rs` check_sat_internal.
@@ -160,32 +212,21 @@ impl Executor {
                 reached_limit: true,
                 has_uninstantiated: true,
                 instances_created: 0,
+                withheld: 0,
             });
         }
-
         let euf_model_ref = self.last_model.as_ref().and_then(|m| m.euf_model.as_ref());
         euf_model_ref?;
+        // If `not B(ce)` entered the E-matching index, the same universal could
+        // bind to `ce` and manufacture the conflict `B(ce) && not B(ce)`.
+        let combined_assertions =
+            self.refinement_round_assertions(original_assertions, cegqi_ce_lemma_ids);
 
-        // Counterexample lemmas are temporary validity-check assumptions, not
-        // authored ground evidence. If `not B(ce)` enters the E-matching
-        // index, the same universal can bind its variable to `ce` and add
-        // `B(ce)`, manufacturing an UNSAT conflict with its own search
-        // assumption. The setup path keeps this list CE-exclusive by omitting
-        // any TermId that was already a genuine assertion, so exact-root
-        // removal cannot hide user input or a sound prior instance.
-        let ce_only: HashSet<TermId> = cegqi_ce_lemma_ids.iter().copied().collect();
-        let mut combined_assertions: Vec<TermId> = self
-            .ctx
-            .assertions
-            .iter()
-            .copied()
-            .filter(|term| !ce_only.contains(term))
-            .collect();
-        for &a in original_assertions {
-            if contains_quantifier(&self.ctx.terms, a) && !combined_assertions.contains(&a) {
-                combined_assertions.push(a);
-            }
-        }
+        // Side B relevance watermark: the term-store boundary at round entry.
+        // Every subterm minted BY this round has an id at or above it, which is
+        // what makes "does this instance reuse terms the ground solver already
+        // has?" a constant-time test per node.
+        let relevance_watermark = u32::try_from(self.ctx.terms.len()).unwrap_or(u32::MAX);
 
         let qm = self
             .quantifier_manager
@@ -213,31 +254,42 @@ impl Executor {
         );
 
         let mut existing: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
-        let mut added = 0usize;
-        let reached_limit = ematching_result.reached_limit;
+        let mut reached_limit = ematching_result.reached_limit;
         let has_uninstantiated = ematching_result.has_uninstantiated;
         let instances_created = ematching_result.instantiations.len() as u64;
 
-        for inst in ematching_result.instantiations {
-            if !existing.insert(inst) {
-                continue;
-            }
-            self.ctx.assertions.push(inst);
-            added += 1;
-            // Record the sound support-axiom subset for the just-added instance
-            // so subsequent conflict-verification gates in this same ground solve
-            // can reprove conflicts that depend on it (guard (ii) holds: it is
-            // now in ctx.assertions).
-            if ematching_result.unconditional_forall_roots.contains(&inst) {
-                self.push_active_support_axiom(inst);
-            }
+        // Side B (the middle gear): when requested and proof authority permits,
+        // a flooded round is ranked and only its top-K is asserted; the
+        // remainder is carried, not dropped.
+        // Without this the ground solver is re-run over every one of up to
+        // 10 000 fresh conjuncts and the budget dies in the EUF core.
+        let novel: Vec<TermId> = ematching_result
+            .instantiations
+            .into_iter()
+            .filter(|inst| !existing.contains(inst))
+            .collect();
+        let admission = self.relevance_admit_round(
+            novel,
+            &ematching_result.unconditional_forall_roots,
+            relevance_watermark,
+        );
+        if admission.withheld > 0 {
+            // Fail closed for THIS round on top of the carry queue's
+            // `has_deferred`: an incomplete instantiation campaign must never
+            // finalize a `Sat` (the caller routes `reached_limit` to
+            // `Unknown(QuantifierRoundLimit)`).
+            reached_limit = true;
         }
+
+        let withheld = admission.withheld;
+        let added = self.assert_refinement_admission(admission, &mut existing);
 
         Some(EmatchingRefinementRound {
             added,
             reached_limit,
             has_uninstantiated,
             instances_created,
+            withheld,
         })
     }
 }

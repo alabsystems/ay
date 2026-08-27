@@ -29,8 +29,9 @@ const MAX_PINS: usize = 256;
 pub(super) enum PassOutcome {
     /// The query is satisfiable and this staged model was checked against the
     /// residual and pins. It carries no publication authority until the atomic
-    /// model-bound installer consumes it.
-    Certified(Model),
+    /// model-bound installer consumes it. Boxing keeps the common inconclusive
+    /// outcomes compact without weakening this model's affine handoff.
+    Certified(Box<Model>),
     /// Counterexample instances were produced for the next round.
     Refined,
     /// Nothing established; the caller must fail closed.
@@ -38,6 +39,11 @@ pub(super) enum PassOutcome {
 }
 
 impl PassOutcome {
+    /// Preserve affine model ownership while keeping the other outcomes small.
+    pub(super) fn certified(model: Model) -> Self {
+        Self::Certified(Box::new(model))
+    }
+
     /// Trace label. `Debug` on this enum prints the whole staged `Model`, which
     /// is megabytes per certified pass and unreadable in a `--debug-cert` log.
     pub(super) fn label(&self) -> &'static str {

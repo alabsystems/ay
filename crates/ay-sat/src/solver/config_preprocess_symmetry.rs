@@ -4,9 +4,12 @@
 
 //! Root-only symmetry preprocessing.
 
-use super::mutate::AddResult;
+use super::mutate::{AddResult, DeleteResult, ReasonPolicy};
 use super::*;
 use std::collections::BTreeSet;
+
+mod aux_free_sr_route;
+pub(in crate::solver) mod ladder_collapse;
 
 const SYMMETRY_MAX_VARS: usize = 4_096;
 /// Variable ceiling for the CHEAP aux-free-SR / php-matrix route.
@@ -20,33 +23,31 @@ const SYMMETRY_MAX_VARS: usize = 4_096;
 /// 360_625 clauses) was dropped to plain CDCL with `vars 15000 > cap 4096`
 /// despite being exactly the structure this route exists to break.
 ///
-/// Soundness is unaffected by widening it, for the same reason the clause cap
-/// could be widened: a mis-detected matrix only yields a proof the native SR
-/// checker REJECTS, never a false VERIFIED. The clause cap remains the real
-/// cost bound. (B2: the env override is deleted; edit the constant.)
+/// Soundness is unaffected by widening it because the exact structural detector
+/// and family-specific construction do not depend on this ceiling. In no-proof
+/// runs those two components are the trust boundary; on a witnessed DRAT surface
+/// the external SR checker independently audits their output. The clause cap
+/// remains the real cost bound. (B2: edit the constant.)
 const SYMMETRY_DETECTOR_MAX_VARS: usize = 1_000_000;
 /// Clause cap for routes that may invoke the EXPENSIVE backtracking automorphism
 /// finder (`find_composite_generators` / `ir::find_automorphisms`): the composite,
-/// SR-tower, DPR, HHW, and default BreakID routes. The IR finder is node-budget
+/// HHW, and default BreakID routes. The IR finder is node-budget
 /// bounded but its per-node refinement is O(clauses), so it is kept tightly capped
 /// to ensure huge general instances are never slowed by it.
 const SYMMETRY_IR_MAX_CLAUSES: usize = 20_000;
-/// Clause cap for the CHEAP aux-free-SR / php-matrix route
-/// (`detect_php_aux_free_sr`), a single O(clauses) structural scan whose emitted
-/// SR units are gated by the native SR checker (the proof is the gate, not the
-/// detector). It is sub-millisecond even at n=60 (~110k clauses), so it gets a
-/// much larger clause budget than the IR finder; combined with the 4_096 var
-/// ceiling this covers the PHP/coloring family up to ~n=63. Before this split the
-/// shared 20_000-clause cap silently dropped php_50 (63_801 clauses) to plain CDCL
-/// (master-plan G7 "detection cliff"). Soundness is unaffected: a mis-detected
-/// matrix only yields a proof the SR checker REJECTS, never a false VERIFIED.
+/// Clause cap for the CHEAP aux-free-SR family recognizers. They perform bounded
+/// structural recognition rather than IR search, so they get a much larger
+/// clause budget. The recognizers and builders are the soundness boundary when
+/// no proof is requested; on a witnessed DRAT surface `dsr-trim` additionally
+/// checks every emitted step. Before this split the shared 20_000-clause cap
+/// silently dropped php_50 (63_801 clauses) to plain CDCL (master-plan G7
+/// "detection cliff").
 ///
 /// Raised from 200_000 after it was measured excluding real targets: two of the
 /// six official `chnl` instances sit just past it (`chnl-020x101` at 202_202
 /// clauses, `chnl-030x091` at 245_882) and were dropped to plain CDCL, where
-/// they time out, while the four below the cap solve in 67-1337 ms. Since the
-/// route is one linear scan and the proof is the gate, the cap buys nothing at
-/// this size. (B2: the env override is deleted; edit the constant.)
+/// they time out, while the four below the cap solve in 67-1337 ms. The cap is a
+/// resource guard, not a soundness gate. (B2: edit the constant.)
 const SYMMETRY_DETECTOR_MAX_CLAUSES: usize = 1_000_000;
 /// Size guard for the SIGNED IR search. The search itself is node-budgeted, but
 /// building the colored graph and the clause multiset is linear in the formula,
@@ -91,7 +92,7 @@ impl Solver {
                 self.cold.has_been_incremental,
                 self.proof_manager.is_some(),
                 self.cold.lrat_enabled,
-                self.cold.clause_trace.is_some(),
+                self.has_live_clause_trace(),
                 self.num_vars,
                 self.arena.active_clause_count(),
             );
@@ -108,6 +109,34 @@ impl Solver {
                 .skip(crate::symmetry::SymmetrySkipReason::Incremental);
             return (false, false);
         }
+        let proof_surface_active = self.symmetry_proof_surface_active();
+        // The family-specific symmetry proof routes need an actual DRAT
+        // writer. Bare LRAT bookkeeping and clause-trace reconstruction cannot
+        // represent their additions, so neither may be treated as a supported
+        // proof surface merely because proof state is active.
+        let plain_drat_surface_ok = self.proof_manager.is_some()
+            && !self.cold.lrat_enabled
+            && !self.has_live_clause_trace()
+            && crate::proof_capability::symmetry_extended_drat_allowed(
+                crate::proof_capability::ProofMode::Drat,
+            );
+        // SR-WITNESSED emission (aux-free WLOG chains, orbitope staircase)
+        // has one more precondition: the DECLARED external checker must accept
+        // substitution witnesses AND read the surface they are written on.
+        // On the DRAT stream only dsr-trim does (drat-trim and dpr-trim are
+        // both measured to reject the DSR `a`-lines); on the pseudo-Boolean
+        // stream VeriPB does, via `red`. Under any other declaration — or a
+        // checker/format mismatch such as `--proof-format drat --proof-checker
+        // veripb` — these routes skip cleanly to plain CDCL rather than write a
+        // proof the run's own declared checker rejects. HHW is plain RUP/RAT
+        // and is deliberately NOT gated on the declared checker.
+        let veripb_surface = self
+            .proof_manager
+            .as_ref()
+            .is_some_and(|manager| manager.output().is_veripb());
+        let declared_checker_sr_ok =
+            crate::proof_capability::declared_checker_accepts_sr_witnesses(veripb_surface);
+        let witnessed_drat_ok = plain_drat_surface_ok && declared_checker_sr_ok;
 
         // Orbitope route (SAT-COMP 2026): structure-first row-interchangeable
         // at-most-one matrix detection plus orbitopal unit fixing — the
@@ -125,9 +154,10 @@ impl Solver {
         // backtracking IR finder, which this route does not use.
         //
         // The emitted units are satisfiability-preserving but not RUP. They are
-        // no longer confined to non-proof runs: under a proof surface the route
-        // emits each unit as a DSR `a`-line carrying the row-swap σ-witness
-        // (`RowAmoMatrix::sr_steps`), externally verified with `dsr-trim`.
+        // no longer confined to non-proof runs: under a supported DRAT proof
+        // surface the route emits each unit as a DSR `a`-line carrying the
+        // row-swap σ-witness (`RowAmoMatrix::sr_steps`), externally verified
+        // with `dsr-trim`. LRAT and clause-trace surfaces skip this route.
         //
         // Default ON with an explicit `AY_SAT_ORBITOPE=0` opt-out. Previously
         // opt-in via a variable nothing set, so the route never ran outside a
@@ -155,7 +185,21 @@ impl Solver {
             && self.cold.symmetry_oneshot
             && self.cold.symmetry_stats.runs == 1
             && orbitope_fits
+            && (!proof_surface_active || witnessed_drat_ok)
         {
+            // Ladder-collapse pre-pass (adv_gc family): shuffled sequential
+            // at-most-one ladders destroy the syntactic colour symmetry, so
+            // the row-swap gate below rejects the first transposition and the
+            // matrix route finds nothing. Collapsing each strictly recognized
+            // ladder into its pairwise binary closure (plain RUP additions +
+            // deletions, BVE-style model reconstruction) restores the
+            // symmetry the detector needs. Sound standalone — it runs whether
+            // or not the orbitope detection subsequently fires. See
+            // `ladder_collapse` for the recognizer's strictness contract.
+            let (ladder_unsat, ladder_changed) = self.preprocess_symmetry_ladder_collapse();
+            if ladder_unsat {
+                return (true, true);
+            }
             let before = self.cold.symmetry_stats.sb_clauses_added;
             let (unsat, changed) = self.preprocess_symmetry_orbitope();
             let added = self.cold.symmetry_stats.sb_clauses_added - before;
@@ -169,8 +213,8 @@ impl Solver {
                     "ran, found nothing".to_string()
                 },
             );
-            if unsat || changed {
-                return (unsat, changed);
+            if unsat || changed || ladder_changed {
+                return (unsat, changed || ladder_changed);
             }
         } else if orbitope_route && self.cold.symmetry_oneshot && !orbitope_fits {
             // Never drop a route silently (master-plan G7).
@@ -179,6 +223,36 @@ impl Solver {
                 self.num_vars,
                 self.arena.active_clause_count(),
             );
+        } else if orbitope_route
+            && self.cold.symmetry_oneshot
+            && self.cold.symmetry_stats.runs == 1
+            && proof_surface_active
+            && plain_drat_surface_ok
+            && !declared_checker_sr_ok
+        {
+            // Same G7 rule: the declared checker is the ONLY reason the
+            // orbitope route did not run here. Name it so a submission-profile
+            // run reads as a deliberate capability skip, not a lost route.
+            //
+            // Two different reasons land here and the message distinguishes
+            // them, because the fix differs: a checker that cannot consume a
+            // substitution witness at all needs a different DECLARATION, while
+            // a checker that can needs the matching --proof-format. Saying
+            // "does not accept DSR substitution witnesses" about dsr-trim on a
+            // `.pbp` would be false and would send the reader the wrong way.
+            let checker = ay_core::declared_proof_checker();
+            if checker.accepts_sr_witnesses() {
+                safe_eprintln!(
+                    "c symmetry: skipped (orbitope SR): declared proof checker '{}' accepts substitution witnesses but cannot read the emitted proof format (use --proof-format {})",
+                    checker.name(),
+                    if checker.reads_veripb() { "veripb" } else { "drat" },
+                );
+            } else {
+                safe_eprintln!(
+                    "c symmetry: skipped (orbitope SR): declared proof checker '{}' does not accept DSR substitution witnesses",
+                    checker.name(),
+                );
+            }
         }
 
         // The aux-free SR route is certifiable and cheap (one O(clauses)
@@ -220,28 +294,18 @@ impl Solver {
         // literal permutations that may flip polarity — the projection that
         // survives competition polarity shuffling. Like the orbitope units, the
         // emitted lex-leader clauses are satisfiability-preserving rather than
-        // RUP, so they stay off any proof surface for now.
-        // `--sat-signed-symmetry-sr` promotes the route to a certificate-bearing
-        // one: each lex-leader clause is written as a DSR `a`-line witnessed by
-        // the signed automorphism σ, verified externally by
-        // `dsr-trim → drat/lsr → cake_lpr` (a 2026-legal Main Track checker
-        // pipeline). Same proof-surface preconditions as the existing DPR/SR
-        // symmetry routes: a DRAT proof manager, no LRAT, no clause trace.
-        let signed_sr = ay_core::sat_ab_switches().signed_symmetry_sr
-            && self.proof_manager.is_some()
-            && !self.cold.lrat_enabled
-            && self.cold.clause_trace.is_none()
-            && crate::proof_capability::symmetry_pr_proof_allowed(
-                crate::proof_capability::ProofMode::Drat,
-            );
+        // RUP, so they stay off every proof surface. A former signed-SR route
+        // emitted one σ witness per generator, but σ was verified only against
+        // the original formula, not against SBPs emitted for earlier generators;
+        // that does not establish sequential proof composition.
         if signed_route
             && self.cold.symmetry_stats.runs == 1
-            && (!self.symmetry_proof_surface_active() || signed_sr)
+            && !proof_surface_active
             && self.num_vars <= SIGNED_SYMMETRY_MAX_VARS
             && self.arena.active_clause_count() <= SIGNED_SYMMETRY_MAX_CLAUSES
         {
             let before = self.cold.symmetry_stats.sb_clauses_added;
-            let (unsat, changed) = self.preprocess_symmetry_signed(signed_sr);
+            let (unsat, changed) = self.preprocess_symmetry_signed();
             let added = self.cold.symmetry_stats.sb_clauses_added - before;
             self.cold.symmetry_stats.record_route(
                 "signed",
@@ -277,107 +341,41 @@ impl Solver {
         // `symmetry::detector::tests::probe_sbp_drat_rat`. Emitting these as
         // plain DRAT adds therefore yields a proof the checker REJECTS, which is
         // strictly worse than skipping symmetry. A valid DRAT proof needs the
-        // Heule-Hunt-Wetzler (2015) image-and-chain derivation per generator
-        // (and even then composes only across a symmetry tower, not an arbitrary
-        // 96-generator set), or a PR/SR-capable checker.
-        // #8011 step 5: the DPR PR route unclamps symmetry on a *plain DRAT*
-        // proof surface ONLY. The composite path emits the aux-free `j=0`
-        // per-generator lex-leader binaries as DPR `a`-lines (σ-image witness),
-        // which the external dpr-trim→cake_lpr loop verifies — AY's internal
-        // RUP/RAT checker cannot, hence the registry keeps Symmetry clamped and
-        // this is the single sanctioned exception. Requires: composite path on, a
-        // DRAT proof manager attached, and NEITHER LRAT nor a clause-trace surface
-        // active (PR is not wired for those). When this holds we skip the blanket
-        // proof-surface clamp below and take the PR-emitting branch later.
-        // #8011 SR route: --sat-symmetry-sr promotes the DPR PR route to a FULL
-        // SR (substitution-redundancy) route. Instead of emitting only the aux-free
-        // `j=0` binary as DPR and dropping the tower, it emits the WHOLE lex tower
-        // (every `j>0` clause + Tseitin defs) as DSR `a`-lines, each with the full
-        // automorphism substitution σ as witness. σ remaps the current formula
-        // (including prior SBP) onto itself, so the per-generator towers compose.
-        // External verification: emitted .sr → dsr-trim → .drat/.lsr → drat-trim →
-        // .lrat → cake_lpr. Same proof-surface preconditions as the DPR route.
-        let sr_route = ay_core::sat_ab_switches().symmetry_sr;
-        // #8011 AUX-FREE SR route: --sat-symmetry-sr_AUXFREE replaces the
-        // lex-leader SR tower (which carries equal-prefix aux `e_j` whose Tseitin
-        // clauses dsr-trim rejects under a σ-only witness) with a COMPLETE aux-free
-        // SR refutation over the original variables only, for the pigeonhole family
-        // — a faithful port of `third_party/dsr-trim/php/php-sr.c`. It out-solves:
-        // the emitted units make root propagation derive the empty clause.
+        // Heule-Hunt-Wetzler (2015) image-and-chain derivation with an
+        // evolving-formula gate, or a separately proved family-specific SR
+        // construction. A checker format alone does not make per-generator
+        // witnesses compose.
+        // #8011 AUX-FREE SR route: emit a complete family-specific refutation over
+        // original variables only. This replaced the retired generic lex-tower SR
+        // experiment: its single σ witness does not certify a tower after the first
+        // symmetry-breaking clause has changed the active formula.
         //
-        // Default ON with an `--sat-symmetry-sr_AUXFREE=0` opt-out. Unlike the
-        // lex-leader routes this one is externally checkable, so there is no
-        // reason to keep it behind a variable nothing sets.
+        // Default ON with `--sat-no-symmetry-sr-auxfree` as the explicit opt-out.
+        // Unlike plain lex leaders this family-specific route is externally
+        // checkable on its supported proof surface.
         let sr_auxfree_route = sr_auxfree_enabled && !self.cold.symmetry_auxfree_disabled;
         // HHW route (T2): --sat-symmetry-hhw emits, per gate-verified generator,
         // a Heule-Hunt-Wetzler (CADE 2015 §5) image-and-chain DRAT fragment + the
         // leading lex-leader symmetry clause as PLAIN DRAT (RUP/RAT additions +
-        // deletions). Unlike the DPR/SR routes (witnessed `a`-lines checked
-        // externally), every HHW step is verifiable by AY's OWN native
+        // deletions). Every HHW step is verifiable by AY's OWN native
         // RUP/RAT DRAT checker (`ay check drat` / `--verify-proof`) — zero
-        // external dependencies. Same proof-surface preconditions as the DPR
-        // route (DRAT proof manager attached, no LRAT/clause-trace surface).
+        // external dependencies. Requires a DRAT proof manager with no LRAT or
+        // clause-trace surface.
         let hhw_route_enabled = ay_core::sat_ab_switches().symmetry_hhw;
-        // A DRAT proof surface that can carry witnessed `a`-lines.
-        let witnessed_drat_ok = self.proof_manager.is_some()
-            && !self.cold.lrat_enabled
-            && self.cold.clause_trace.is_none()
-            && crate::proof_capability::symmetry_pr_proof_allowed(
-                crate::proof_capability::ProofMode::Drat,
-            );
-        let dpr_pr_route = composite_symmetry && witnessed_drat_ok;
-        // The aux-free SR route does NOT ride on `composite_symmetry`. It was
-        // chained to it only because it shared `dpr_pr_route`'s preconditions,
-        // which made a certifiable route depend on an uncertifiable one's flag —
-        // and since that flag now refuses to run under an unchecked proof, the
-        // chaining actively blocked the good route. Its real requirement is
-        // just: if a proof is being written, it must be a surface that accepts
-        // witnessed additions. With no proof at all the units are still sound
-        // (they are a complete refutation over the original variables), so the
-        // route runs and the emission calls are no-ops.
-        let sr_auxfree_supported = !self.symmetry_proof_surface_active() || witnessed_drat_ok;
-        // --sat-composite-symmetry is documented no-proof-only: the lex-leader
-        // clauses it adds are NOT accompanied by checkable proof steps. Combining
-        // it with proof emission therefore yields an UNSAT whose certificate a
-        // real checker rejects. Measured on SAT-COMP 2026 cb2e8b7f and 965ca988:
-        // both `s UNSATISFIABLE`, both rejected by dpr-trim AND by the SR-capable
-        // dsr-trim ("No UP contradiction for RAT clause 1631" / "... 277"); both
-        // are `s UNKNOWN` without the flag, i.e. solvable ONLY by the uncertified
-        // route.
-        //
-        // The post-solve `--verify-proof` re-check catches this and fails closed
-        // ("SOUNDNESS FAILURE ... rejected by internal checker", exit 1) — but
-        // `--competition` turns that re-check OFF, and competition mode is exactly
-        // how a submission is produced. Without this warning that configuration
-        // writes an unverifiable certificate and reports success in silence, which
-        // is a disqualified submission rather than a visible failure.
-        //
-        // Warn rather than refuse: declining here would change the meaning of an
-        // existing documented flag. The verdict itself is unaffected.
-        // Deliberately keyed on the CONFIGURATION (flag + proof surface), not on
-        // which route is selected: the rejected certificates came from runs where
-        // symmetry RAN and emitted uncheckable steps, while other instances skip
-        // it and merely lose the answer. Both are cases the user needs to see.
-        if composite_symmetry && self.symmetry_proof_surface_active() {
-            use std::sync::Once;
-            static WARNED: Once = Once::new();
-            WARNED.call_once(|| {
-                safe_eprintln!(
-                    "c Warning: --sat-composite-symmetry is active WITH proof emission. \
-                     Composite symmetry breaking is no-proof-only, so any UNSAT it produces \
-                     may carry a certificate that an external checker REJECTS. Re-run without \
-                     --competition to let the internal proof re-check gate the result, or \
-                     unset --sat-composite-symmetry for a certifiable run."
-                );
-            });
-        }
-        // The HHW route shares the DPR route's proof-surface preconditions; it is
-        // additionally gated by its own env flag and the composite path.
-        let hhw_route = hhw_route_enabled && composite_symmetry && dpr_pr_route;
-        let sr_route = sr_route && dpr_pr_route;
+        // The aux-free SR route does not ride on `composite_symmetry`. If a proof
+        // is being written it needs a witnessed DRAT surface AND a declared
+        // checker that consumes DSR witnesses; with no proof the
+        // family-specific construction itself is the trust boundary and emission
+        // calls are no-ops.
+        let sr_auxfree_supported = !proof_surface_active || witnessed_drat_ok;
+        // Composite lex leaders remain available without proof. Under a proof
+        // surface the only general composite route is HHW; the retired DPR and
+        // full-tower SR experiments did not compose across sequential generators.
+        // HHW emits plain RUP/RAT DRAT (no SR witnesses), so it needs only the
+        // DRAT surface, not the dsr-trim declared-checker capability.
+        let hhw_route = hhw_route_enabled && composite_symmetry && plain_drat_surface_ok;
         let sr_auxfree_route = sr_auxfree_route && sr_auxfree_supported;
-        if self.symmetry_proof_surface_active() && !dpr_pr_route && !hhw_route && !sr_auxfree_route
-        {
+        if proof_surface_active && !hhw_route && !sr_auxfree_route {
             // Same G7 rule as the size guard below: never drop to plain CDCL
             // without a trace. This skip used to be SILENT, which made a
             // proof-mode run look like a plain search timeout — the instance
@@ -386,14 +384,15 @@ impl Solver {
             // Name the failing precondition so the cause is one line, not an
             // afternoon of bisecting env flags.
             safe_eprintln!(
-                "c symmetry: skipped (proof surface active): composite={} proof_manager={} lrat={} clause_trace={} pr_allowed={} -> dpr_pr_route={dpr_pr_route} hhw_route={hhw_route}",
+                "c symmetry: skipped (proof surface active): composite={} proof_manager={} lrat={} clause_trace={} extended_drat_allowed={} declared_checker={} accepts_sr_witnesses={declared_checker_sr_ok} hhw_route={hhw_route}",
                 composite_symmetry,
                 self.proof_manager.is_some(),
                 self.cold.lrat_enabled,
-                self.cold.clause_trace.is_some(),
-                crate::proof_capability::symmetry_pr_proof_allowed(
+                self.has_live_clause_trace(),
+                crate::proof_capability::symmetry_extended_drat_allowed(
                     crate::proof_capability::ProofMode::Drat
                 ),
+                ay_core::declared_proof_checker().name(),
             );
             self.cold
                 .symmetry_stats
@@ -407,12 +406,12 @@ impl Solver {
         // silently (master-plan G7: php_50 used to vanish into CDCL with no trace).
         // B2: the AY_SAT_SYMMETRY_DETECTOR_MAX_* env overrides are deleted;
         // the named constants are the single source of truth.
-        let clause_cap = if sr_auxfree_route {
+        let clause_cap = if sr_auxfree_route && !hhw_route {
             SYMMETRY_DETECTOR_MAX_CLAUSES
         } else {
             SYMMETRY_IR_MAX_CLAUSES
         };
-        let var_cap = if sr_auxfree_route {
+        let var_cap = if sr_auxfree_route && !hhw_route {
             SYMMETRY_DETECTOR_MAX_VARS
         } else {
             SYMMETRY_MAX_VARS
@@ -420,7 +419,7 @@ impl Solver {
         let num_vars = self.num_vars;
         let active_clauses = self.arena.active_clause_count();
         if num_vars > var_cap || active_clauses > clause_cap {
-            let route = if sr_auxfree_route {
+            let route = if sr_auxfree_route && !hhw_route {
                 "aux-free-SR"
             } else {
                 "IR"
@@ -478,36 +477,24 @@ impl Solver {
             return (false, changed);
         }
 
-        // #8011 DPR PR route: emit ONLY the aux-free `j=0` per-generator
-        // lex-leader binaries, each as a DPR `a`-line with its σ-image witness.
-        // The aux tower (`j>0` + Tseitin defs) is dropped — it is not single-σ-PR
-        // — so NO aux variables are allocated and the breaking is binary-only.
-        // External verification: emitted .dpr → dpr-trim → .lpr → cake_lpr.
-        // #8011 SR route: emit the FULL lex tower as DSR a-lines with σ witnesses
-        // and KEEP the aux tower (allocate the fresh equal-prefix vars). Each clause
-        // is verified by the external dsr-trim → ... → cake_lpr chain.
-        // #8011 AUX-FREE SR route (php-sr.c port). Emit a COMPLETE refutation as
-        // DSR `a`-lines over the ORIGINAL variables only — no equal-prefix aux, no
-        // lex tower. Each unit is added on the trusted route (verified externally
-        // by dsr-trim, not by the internal RUP checker); the accumulated units make
-        // root propagation derive the empty clause (which the solver emits as the
-        // final `0`). Only fires for the pigeonhole family; otherwise it is a no-op
-        // and the solver proceeds with symmetry off (still sound).
+        // #8011 AUX-FREE SR route (php-sr.c/count_p port): emit a complete
+        // original-variable DSR refutation, with no equal-prefix aux or lex tower.
+        // Each WLOG unit has a single-transposition witness on the trusted route,
+        // externally checked by dsr-trim, not internal RUP. Root propagation derives
+        // the final empty clause; recognized PHP/matching instances fire, others fall through.
         if sr_auxfree_route {
-            let auxfree_steps = crate::symmetry::detector::detect_php_aux_free_sr(&clauses);
+            let (route_kind, auxfree_steps) = aux_free_sr_route::detect(&clauses);
             self.cold.symmetry_stats.record_route(
                 "auxfree-sr",
                 match &auxfree_steps {
-                    Some(v) => format!("php matrix, {} steps", v.len()),
-                    None => "ran, no php matrix".to_string(),
+                    Some(v) => format!("{route_kind}, {} steps", v.len()),
+                    None => "ran, no recognised aux-free family".to_string(),
                 },
             );
             if let Some(steps) = auxfree_steps {
                 let mut changed = false;
                 for lc in steps {
-                    let crate::symmetry::detector::LexClause::Sr { clause, witness } = lc else {
-                        continue;
-                    };
+                    let crate::symmetry::detector::LexClause::Sr { clause, witness } = lc;
                     // Emit the DSR a-line first (records the addition), then add the
                     // unit on the trusted route.
                     if self.proof_emit_add_sr(&clause, &witness).is_err() {
@@ -542,94 +529,35 @@ impl Solver {
             // `test_preprocess_symmetry_adds_binary_order_clause_for_swap_pair`,
             // whose 3-variable formula is not a pigeonhole.
             //
-            // Falling through is only safe because the routes below re-check
-            // the proof surface for themselves; `sr_auxfree_route` widened the
-            // proof-surface gate above, so a proof-mode run that reaches here
-            // must not be allowed into a route that cannot certify.
-            if self.symmetry_proof_surface_active() && !dpr_pr_route && !hhw_route {
+            // The large cap above pays only for structural recognition. Once it
+            // misses, reapply the tight IR cap before falling through; otherwise
+            // default-on aux-free recognition would accidentally authorize the
+            // backtracking finder up to the one-million-variable/clause ceilings.
+            if num_vars > SYMMETRY_MAX_VARS || active_clauses > SYMMETRY_IR_MAX_CLAUSES {
+                if num_vars > SYMMETRY_MAX_VARS {
+                    safe_eprintln!(
+                        "c symmetry: skipped (IR fallback after aux-free miss): vars {num_vars} > cap {SYMMETRY_MAX_VARS}"
+                    );
+                } else {
+                    safe_eprintln!(
+                        "c symmetry: skipped (IR fallback after aux-free miss): clauses {active_clauses} > cap {SYMMETRY_IR_MAX_CLAUSES}"
+                    );
+                }
+                self.cold
+                    .symmetry_stats
+                    .skip(crate::symmetry::SymmetrySkipReason::TooLarge);
+                return (false, false);
+            }
+
+            // Falling through is only safe because the routes below re-check the
+            // proof surface; a proof-mode run that reaches here must not enter a
+            // route without a checker-consumable construction.
+            if proof_surface_active && !hhw_route {
                 self.cold
                     .symmetry_stats
                     .skip(crate::symmetry::SymmetrySkipReason::ProofMode);
                 return (false, false);
             }
-        }
-
-        if sr_route {
-            let fresh_base = self.num_vars as u32;
-            let (tagged, aux) = detector.detect_and_encode_composite_sr(&clauses, fresh_base);
-            if aux > 0 {
-                self.ensure_num_vars(fresh_base as usize + aux as usize);
-            }
-            let existing_clause_counts = crate::symmetry::build_formula_counts(&clauses);
-            let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
-            let mut changed = false;
-            for lc in tagged {
-                let crate::symmetry::detector::LexClause::Sr { clause, witness } = lc else {
-                    continue;
-                };
-                let key = crate::symmetry::canonical_clause_key(&clause);
-                if existing_clause_counts.contains_key(&key) || !seen.insert(key) {
-                    continue;
-                }
-                // Emit the DSR a-line FIRST (records the addition), then add the
-                // clause on the trusted route (verified externally, not by the
-                // internal RUP checker).
-                if self.proof_emit_add_sr(&clause, &witness).is_err() {
-                    break;
-                }
-                let mut lits = clause;
-                match self.add_clause_watched_trusted(&mut lits) {
-                    AddResult::Added(_) | AddResult::Unit(_) => {
-                        changed = true;
-                        self.cold.symmetry_stats.sb_clauses_added =
-                            self.cold.symmetry_stats.sb_clauses_added.saturating_add(1);
-                    }
-                    AddResult::Empty => return (true, true),
-                }
-            }
-            // Aux vars stay internal-only: restore the user-visible var count.
-            self.user_num_vars = user_num_vars_before;
-            return (false, changed);
-        }
-
-        if dpr_pr_route {
-            let fresh_base = self.num_vars as u32;
-            let (tagged, _aux) =
-                detector.detect_and_encode_composite_with_witness(&clauses, fresh_base);
-            // Keep only the PR (j=0 binary) clauses; drop every Aux clause.
-            let existing_clause_counts = crate::symmetry::build_formula_counts(&clauses);
-            let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
-            let mut changed = false;
-            for lc in tagged {
-                let crate::symmetry::detector::LexClause::Pr { clause, witness } = lc else {
-                    continue;
-                };
-                // Dedup against the formula and previously emitted PR binaries.
-                let key = crate::symmetry::canonical_clause_key(&clause);
-                if existing_clause_counts.contains_key(&key) || !seen.insert(key) {
-                    continue;
-                }
-                // Emit the DPR a-line FIRST (so the proof records the addition),
-                // then add the clause to the DB on the trusted route (the PR
-                // clause is verified externally, not by the internal RUP checker).
-                if self.proof_emit_add_pr(&clause, &witness).is_err() {
-                    // Proof I/O failure: stop emitting symmetry; an incomplete
-                    // proof must not be trusted. Leave already-added clauses —
-                    // they are sound, and finalization checks the I/O-error flag.
-                    break;
-                }
-                let mut lits = clause;
-                match self.add_clause_watched_trusted(&mut lits) {
-                    AddResult::Added(_) | AddResult::Unit(_) => {
-                        changed = true;
-                        self.cold.symmetry_stats.sb_clauses_added =
-                            self.cold.symmetry_stats.sb_clauses_added.saturating_add(1);
-                    }
-                    AddResult::Empty => return (true, true),
-                }
-            }
-            // Binary-only: no aux vars allocated, so user_num_vars is unchanged.
-            return (false, changed);
         }
 
         let sbp_clauses = if composite_symmetry {
@@ -711,7 +639,7 @@ impl Solver {
         for sbp in unique_sbps {
             let mut clause = sbp;
             debug_assert!(
-                !self.symmetry_proof_surface_active(),
+                !proof_surface_active,
                 "BUG: symmetry SBP reached a proof/reconstruction surface without \
                  a checker-consumable witness"
             );
@@ -760,7 +688,7 @@ impl Solver {
     /// keeps at least one model per orbit. When σ flips `v` itself the clause
     /// degenerates to the unit `x_v` — the classic "you may assume `v` is true
     /// when flipping it is a symmetry".
-    fn preprocess_symmetry_signed(&mut self, sr_proof: bool) -> (bool, bool) {
+    fn preprocess_symmetry_signed(&mut self) -> (bool, bool) {
         let clauses = self.snapshot_root_irredundant_clauses_for_symmetry();
         if clauses.len() < 2 {
             return (false, false);
@@ -837,25 +765,7 @@ impl Solver {
             if existing.contains_key(&key) || !seen.insert(key) {
                 continue;
             }
-            // On the SR route the clause is certified by σ itself: σ is a
-            // verified automorphism, so it remaps the current formula (including
-            // any symmetry clause added before it) onto itself, and the
-            // per-generator additions compose. The a-line is written BEFORE the
-            // clause joins the database, and the clause then goes in on the
-            // trusted route because AY's internal RUP/RAT checker cannot replay
-            // a substitution witness — `dsr-trim` is the judge.
-            let added = if sr_proof {
-                let witness = crate::symmetry::signed_sr_witness_tokens(&clause, perm);
-                if self.proof_emit_add_sr(&clause, &witness).is_err() {
-                    // Incomplete proof must not be trusted: stop emitting.
-                    // Clauses already added stay — they are sound — and
-                    // finalization checks the I/O-error flag.
-                    break;
-                }
-                self.add_clause_watched_trusted(&mut clause)
-            } else {
-                self.add_clause_watched(&mut clause)
-            };
+            let added = self.add_clause_watched(&mut clause);
             match added {
                 AddResult::Added(_) | AddResult::Unit(_) => {
                     changed = true;
@@ -908,13 +818,13 @@ impl Solver {
         );
 
         // Two emission modes for the SAME units.
-        //
-        // With a proof surface active, each unit must carry the σ-witness that
-        // certifies it (`RowAmoMatrix::sr_steps`), and the units must go out in
-        // that method's column-ascending/row-descending order — a unit's
-        // redundancy depends on the ones already added below it in its column.
-        // Without a proof surface there is nothing to certify against, so the
-        // cheaper row-major `fixing_units` is used unchanged.
+        // With the supported DRAT proof surface active, each unit must carry the
+        // σ-witness that certifies it (`RowAmoMatrix::sr_steps`), and the units
+        // must go out in that method's column-ascending/row-descending order — a
+        // unit's redundancy depends on the ones already added below it in its
+        // column. Without a proof surface there is nothing to serialize, so the
+        // cheaper row-major `fixing_units` is used unchanged. The caller skips
+        // this method for LRAT and clause-trace reconstruction surfaces.
         //
         // Before this split the route was gated off entirely whenever a proof was
         // being written (the `!symmetry_proof_surface_active()` clause at the
@@ -983,6 +893,203 @@ impl Solver {
             }
         }
         (false, changed)
+    }
+
+    /// Ladder-collapse pre-pass: replace every strictly recognized sequential
+    /// at-most-one ladder with the `C(k,2)` pairwise binaries it implies, then
+    /// retire its register variables from search with BVE-style model
+    /// reconstruction. Returns `(unsat, changed)`.
+    ///
+    /// Runs only under the orbitope gate (one-shot, first run, size-capped,
+    /// plain-DRAT-or-no-proof surface). The additions are ordinary RUP derived
+    /// clauses — each binary `(¬x_{σ(i)} ∨ ¬x_{σ(j)})` propagates to a
+    /// conflict through the still-present ladder — and the deletions only
+    /// weaken the formula, so the pass is sound whether or not the orbitope
+    /// detection fires afterwards.
+    ///
+    /// # Model reconstruction (the SAT path)
+    ///
+    /// Register variables are marked eliminated, so a model of the collapsed
+    /// formula assigns them arbitrarily. The witness entries pushed here
+    /// recompute them as the prefix ORs `s_i = x_{σ(1)} ∨ … ∨ x_{σ(i)}` during
+    /// the standard reverse replay ([`crate::reconstruct`]):
+    ///
+    /// * blocks are pushed for `i = k-1` down to `1`, so replay (which
+    ///   reverses the stack) visits `s_1` first and each block sees its
+    ///   predecessor's FINAL value;
+    /// * within a block, the "force false" entries `(¬s_i ∨ ¬x_{σ(j)})` for
+    ///   `j > i` replay first, then the "force true" entries
+    ///   `(¬x_{σ(i)} ∨ s_i)` and `(¬s_{i-1} ∨ s_i)`. The `j > i+1` entries are
+    ///   not formula clauses but implied resolvent-closure clauses (each is
+    ///   the chain resolution of `(¬x_{σ(j)} ∨ ¬s_{j-1})` down to `s_i`);
+    ///   without them a garbage-true register left over from search could
+    ///   survive replay and poison the chain upward, ending with a violated
+    ///   `(¬x_{σ(j)} ∨ ¬s_{j-1})` in the ORIGINAL formula. With them:
+    ///   - if some `x_{σ(t)}` is true (at most one can be, the derived
+    ///     pairwise AMO is part of the collapsed formula the model satisfies),
+    ///     every `s_i` with `i < t` is forced false and every `s_i` with
+    ///     `i ≥ t` is forced true — exactly the prefix OR;
+    ///   - if no base variable is true, no force-false entry fires and the
+    ///     force-true entries only propagate values upward, leaving an
+    ///     upward-closed register assignment that satisfies every ladder
+    ///     clause vacuously.
+    ///
+    /// Every entry's clause is implied by the ORIGINAL formula, and the
+    /// always-on model verification gate (`finalize_sat_model`) remains the
+    /// backstop behind this argument.
+    pub(in crate::solver) fn preprocess_symmetry_ladder_collapse(&mut self) -> (bool, bool) {
+        use crate::proof_manager::ProofAddKind;
+        use ladder_collapse::{
+            detect_ladders, LadderScanInput, LADDER_COLLAPSE_MAX_TOTAL_BINARIES,
+        };
+
+        // Defensive re-check of the caller's surface gate: the derived
+        // binaries are emitted with empty hints, which no LRAT or clause-trace
+        // surface can represent.
+        if self.cold.lrat_enabled || self.has_live_clause_trace() {
+            return (false, false);
+        }
+
+        // Streaming scan: only clean binary clauses are retained; every other
+        // clause merely disqualifies its variables from serving as registers.
+        let mut input = LadderScanInput::new(self.num_vars);
+        for idx in self.arena.active_indices() {
+            if self.arena.is_dead(idx) || self.arena.is_learned(idx) {
+                continue;
+            }
+            let lits = self.arena.literals(idx);
+            let any_assigned = lits.iter().any(|&l| self.lit_value(l).is_some());
+            input.add_clause(idx, lits, any_assigned);
+        }
+        let scan = detect_ladders(&input);
+        if scan.ladders.is_empty() {
+            return (false, false);
+        }
+
+        let mut existing_amo = scan.existing_amo;
+        let mut collapsed = 0usize;
+        let mut derived_added = 0usize;
+        let mut clauses_deleted = 0usize;
+        let mut aux_eliminated = 0usize;
+        let mut budget_skipped = 0usize;
+        for ladder in &scan.ladders {
+            let k = ladder.base.len();
+            // Pairs still missing from the formula, under the global budget.
+            let mut pairs: Vec<(Variable, Variable)> = Vec::with_capacity(k * (k - 1) / 2);
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    let (a, b) = (ladder.base[i], ladder.base[j]);
+                    let key = (a.0.min(b.0), a.0.max(b.0));
+                    if !existing_amo.contains(&key) {
+                        pairs.push((a, b));
+                    }
+                }
+            }
+            if derived_added + pairs.len() > LADDER_COLLAPSE_MAX_TOTAL_BINARIES {
+                budget_skipped += 1;
+                continue;
+            }
+            // 1. Derive the pairwise closure while the ladder clauses are
+            //    still present (each addition is RUP against them).
+            for &(a, b) in &pairs {
+                existing_amo.insert((a.0.min(b.0), a.0.max(b.0)));
+                let mut lits = vec![Literal::negative(a), Literal::negative(b)];
+                let _ = self.proof_emit_add_prechecked(&lits, &[], ProofAddKind::Derived);
+                match self.add_clause_watched(&mut lits) {
+                    AddResult::Added(_) | AddResult::Unit(_) => {
+                        derived_added += 1;
+                        self.cold.symmetry_stats.sb_clauses_added =
+                            self.cold.symmetry_stats.sb_clauses_added.saturating_add(1);
+                    }
+                    AddResult::Empty => return (true, true),
+                }
+            }
+            // 2. Delete the ladder clauses (proof `d` lines + watch removal
+            //    via the uniform deletion entry point).
+            let mut all_deleted = true;
+            for &idx in &ladder.clause_ids {
+                match self.delete_clause_checked(idx, ReasonPolicy::ClearLevel0) {
+                    DeleteResult::Deleted => clauses_deleted += 1,
+                    DeleteResult::Skipped => all_deleted = false,
+                }
+            }
+            debug_assert!(
+                all_deleted,
+                "BUG: ladder-collapse deletion skipped — the recognizer only \
+                 admits unassigned clauses, which cannot be reason-protected"
+            );
+            if !all_deleted {
+                // Unreachable by construction; if it ever fires, keep the
+                // registers active and push no reconstruction. The surviving
+                // clauses still constrain them and the model verification
+                // gate covers the deleted ones (worst case: Unknown, never a
+                // wrong answer).
+                safe_eprintln!(
+                    "c symmetry: ladder-collapse: deletion unexpectedly skipped; \
+                     registers kept active"
+                );
+                continue;
+            }
+            // 3. Reconstruction entries (external index space, like BVE).
+            //    Push order is part of the correctness argument — see the
+            //    method docs.
+            for i in (1..k).rev() {
+                let s_i = ladder.aux[i - 1];
+                let s_pos = self.externalize(Literal::positive(s_i));
+                let s_neg = self.externalize(Literal::negative(s_i));
+                let x_i = self.externalize(Literal::negative(ladder.base[i - 1]));
+                self.inproc
+                    .reconstruction
+                    .push_witness_clause(vec![s_pos], vec![x_i, s_pos]);
+                if i > 1 {
+                    let prev = self.externalize(Literal::negative(ladder.aux[i - 2]));
+                    self.inproc
+                        .reconstruction
+                        .push_witness_clause(vec![s_pos], vec![prev, s_pos]);
+                }
+                for j in (i + 1)..=k {
+                    let x_j = self.externalize(Literal::negative(ladder.base[j - 1]));
+                    self.inproc
+                        .reconstruction
+                        .push_witness_clause(vec![s_neg], vec![s_neg, x_j]);
+                }
+            }
+            // 4. Freeze the base variables (the derived AMO plays the same
+            //    role as the orbitope route's synthesized AMO: task #18
+            //    established that letting BVE resolve such clauses away can
+            //    delete a step the final refutation needs) and retire the
+            //    registers exactly like BVE pivots.
+            for &x in &ladder.base {
+                self.freeze(x);
+            }
+            for &s in &ladder.aux {
+                self.var_lifecycle.mark_eliminated(s.index());
+                self.vsids.remove_from_heap(s);
+                aux_eliminated += 1;
+            }
+            collapsed += 1;
+        }
+        if collapsed > 0 {
+            // Learned clauses mentioning a retired register would let BCP
+            // assign it behind the reconstruction's back (#8482 — same hazard
+            // as BVE, same cure).
+            self.flush_learned_with_eliminated_vars();
+        }
+        self.cold.symmetry_stats.record_route(
+            "ladder-collapse",
+            format!(
+                "{collapsed} of {} ladders collapsed: +{derived_added} binaries, \
+                 -{clauses_deleted} ladder clauses, {aux_eliminated} registers retired\
+                 {}",
+                scan.ladders.len(),
+                if budget_skipped > 0 {
+                    format!(", {budget_skipped} skipped by binary budget")
+                } else {
+                    String::new()
+                },
+            ),
+        );
+        (false, derived_added > 0 || clauses_deleted > 0)
     }
 
     /// HHW (Heule-Hunt-Wetzler) DRAT symmetry-breaking route (T2). For each
@@ -1123,6 +1230,6 @@ impl Solver {
 
     #[inline]
     fn symmetry_proof_surface_active(&self) -> bool {
-        self.proof_manager.is_some() || self.cold.lrat_enabled || self.cold.clause_trace.is_some()
+        self.proof_manager.is_some() || self.cold.lrat_enabled || self.has_live_clause_trace()
     }
 }

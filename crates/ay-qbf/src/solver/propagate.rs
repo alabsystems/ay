@@ -14,8 +14,8 @@ impl QbfSolver {
 
     /// Initialize watches for all original clauses
     pub(super) fn init_watches(&mut self) {
-        for i in 0..self.formula.clauses.len() {
-            let clause = &self.formula.clauses[i];
+        for i in 0..self.formula.clauses().len() {
+            let clause = &self.formula.clauses()[i];
             if clause.len() >= 2 {
                 // Watch first two literals
                 let lit0 = clause[0];
@@ -94,7 +94,7 @@ impl QbfSolver {
                 let clause = if is_learned {
                     &self.learned[clause_idx]
                 } else {
-                    &self.formula.clauses[clause_idx]
+                    &self.formula.clauses()[clause_idx]
                 };
 
                 // Skip deleted (empty) learned clauses — lazy watch cleanup
@@ -126,7 +126,7 @@ impl QbfSolver {
 
                 // No new watch found - do full QBF clause analysis
                 let global_clause_idx = if is_learned {
-                    self.formula.clauses.len() + clause_idx
+                    self.formula.clauses().len() + clause_idx
                 } else {
                     clause_idx
                 };
@@ -157,8 +157,8 @@ impl QbfSolver {
     /// Propagate unit clauses (not covered by 2WL)
     fn propagate_unit_clauses(&mut self) -> Option<usize> {
         // Check original unit clauses
-        for i in 0..self.formula.clauses.len() {
-            let clause = &self.formula.clauses[i];
+        for i in 0..self.formula.clauses().len() {
+            let clause = &self.formula.clauses()[i];
             if clause.len() == 1 {
                 let lit = clause[0];
                 match self.lit_value(lit) {
@@ -187,7 +187,7 @@ impl QbfSolver {
             }
             if clause.len() == 1 {
                 let lit = clause[0];
-                let global_idx = self.formula.clauses.len() + i;
+                let global_idx = self.formula.clauses().len() + i;
                 match self.lit_value(lit) {
                     Assignment::True => {}
                     Assignment::False => return Some(global_idx),

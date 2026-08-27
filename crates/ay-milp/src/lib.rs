@@ -16,9 +16,14 @@
 //!
 //! ## API guarantees
 //!
-//! 1. **No silent wrong values.** Anything unwarranted is
-//!    [`Outcome::Unknown`] with a [`UnknownReason`] — wrong-optimum classes
-//!    are unrepresentable.
+//! 1. **Witnesses are checked before publication.** Session-produced primal
+//!    points, objective values, and attached certificates are re-checked
+//!    against the caller's [`Model`]. A failed check becomes
+//!    [`Outcome::Unknown`] with [`UnknownReason::WitnessRejected`]. This does
+//!    not make every search claim independently certifiable.
+//!    [`Outcome::evidence_shape`] is deliberately non-authoritative;
+//!    [`Outcome::check_against`] returns a sealed [`CheckedOutcome`] only after
+//!    exact validation against a particular model.
 //! 2. **Evidence is data.** [`FarkasCertificate`] / [`OptimalityCertificate`]
 //!    are values with independent `verify(&Model)` that re-checks the exact
 //!    arithmetic with no solver state.
@@ -33,20 +38,21 @@
 //!    stated per claim (`SUCCINCT` / `REPLAY` / `NONE`). The kind is derived
 //!    from the Rust type that is present, never chosen; [`cert_io::check`]
 //!    re-parses the model itself and reserves the word "verified".
-//! 7. **Self-validation is always on.** Every verdict leaves a session through
-//!    `finish` -> `validate_witnesses`, INDEPENDENT of
-//!    [`SolveOpts::require_certificates`]: `check_point`, exact value
-//!    re-derivation, `cert.verify`, a bound-crossing test, and (on a
-//!    continuous model) a dual bound that must MEET the primal. A verdict
-//!    whose own witness does not hold up is withheld as
-//!    [`UnknownReason::WitnessRejected`], never returned.
+//! 7. **Session validation is always on.** Every session exit crosses a
+//!    fail-closed validation boundary; the general path is `finish` ->
+//!    `validate_witnesses`, while typed sibling finalizers enforce the
+//!    corresponding checks. Primal points and objective values are re-derived,
+//!    attached certificates are verified, and bounds may not contradict their
+//!    witnesses. Public or recombined outcomes cross the same kind of boundary
+//!    explicitly through [`Outcome::check_against`].
 //!
 //! ## Solver paths
 //!
 //! [`LpSession`] and continuous [`BabSession`] models use a
-//! Dutertre–de Moura bounded-variable simplex over exact rationals. Their
-//! verdicts are exact and can carry model-level certificates. Integral models
-//! use the native branch-and-bound engine; with the `smt` feature enabled, an
+//! Dutertre–de Moura bounded-variable simplex over exact rationals and can
+//! produce model-level certificates. Integral models use the native
+//! branch-and-bound engine; closing an integrality gap is a search claim unless
+//! a whole-tree artifact covers it. With the `smt` feature enabled, an
 //! in-process ay-dpll lowering provides an exact QF_LRA fallback for binary
 //! columns represented as 0/1 disjunctions.
 
@@ -177,6 +183,7 @@ pub use knobs::{
     DEPRECATED, KNOBS, ROUTED, ZERO_IGNORED,
 };
 mod lattice;
+mod local_census;
 mod lu;
 mod margin;
 #[doc(hidden)]
@@ -233,6 +240,7 @@ pub use scheduling_route::{
     verify_optimality_certificate as verify_single_machine_scheduling_optimality_certificate,
     SingleMachineSchedulingOptimalityCertificate,
 };
+mod opt_cert;
 pub mod sepstat;
 mod session;
 mod simplex;
@@ -254,14 +262,26 @@ pub use cert::{
 pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
 pub use mps::{read_mps, MpsError, MpsProblem};
+pub use opt_cert::{
+    derive_optimality_tree, derive_optimality_tree_reported, verify_optimality_tree_bound,
+    MilpOptimalityCertificate, OptTreeBranch, OptTreeDecline, OptTreeNode, OptTreeReport,
+    OptimalityTreeBudget, OPT_TREE_FLOAT_ITERS_PER_UNIT, OPT_TREE_RIM_BUILD_COST,
+    OPT_TREE_RIM_ITER_COST,
+};
 pub use opts::{
     EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, FlipSolveMode, SolveOpts,
+    TallColdDualMode,
 };
-pub use outcome::{Outcome, Trust, UnknownReason};
+pub use outcome::{CheckedOutcome, EvidenceShape, Outcome, OutcomeCheckError, UnknownReason};
 pub use presolve::{
     AffineAggregationCertificate, AffineAggregationCertificateError, AffineAggregationClaim,
     AffineAggregationInnerProof, AffineAggregationVerification, AffineRecovery,
 };
+/// The SHIPPED continuous float lane, measured directly — the honest
+/// counterpart of the [`diag_float_lp`] scaffold, which is one cold walk with
+/// no ladder and whose status and objective are not solver behaviour.
+#[doc(hidden)]
+pub use session::diag_shipped_float_lp;
 pub use session::{
     AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,

@@ -21,6 +21,10 @@ fn class_specific_semantic_charge(
             checked_mul_usize(payload.work, EUF_IDENTITY_WORK_FACTOR)?,
             checked_mul_usize(payload.bytes, EUF_IDENTITY_BYTE_FACTOR)?,
         ),
+        SemanticChargeClass::ClauseIdentityRoute => clause_identity_route_charge(payload)?,
+        SemanticChargeClass::AndPosShallowMatch => {
+            and_pos_charge::and_pos_shallow_match_charge(payload)?
+        }
         SemanticChargeClass::DatatypeEnumPigeonhole => (
             checked_mul_usize(payload.work.max(payload.unfolded_work), 8)?,
             payload.bytes,
@@ -40,6 +44,60 @@ fn class_specific_semantic_charge(
         SemanticChargeClass::General | SemanticChargeClass::ProgressFarkas => return Ok(None),
     };
     Ok(Some(charge))
+}
+
+/// Exact worst case of the three syntax-only clause-identity validators —
+/// [`crate::checker::reordering::validate_reordering`],
+/// [`crate::checker::boolean_negation::validate_weakening`] and
+/// [`crate::checker::boolean_derived::validate_eq_reflexive`].
+///
+/// Write `n = clause.len() + premise.len()`. Each validator's whole cost is:
+///
+///  * `reordering`: `2n` element copies (`clause.to_vec()`,
+///    `premise.to_vec()`), two `sort_unstable` calls at `<= c*n*log2(n)`
+///    comparisons each, and one `Vec` comparison at `<= n`;
+///  * `weakening`: one length comparison and one prefix slice comparison,
+///    `<= n`;
+///  * `eq_reflexive`: `O(1)` — a unit-clause guard, one `decode_app`, one
+///    `TermId` comparison.
+///
+/// The base per-step payload walk debits one work unit per clause literal, per
+/// argument and per literal of every RESOLVABLE premise clause, and then debits
+/// `roots.len()` a second time, so `payload.work >= 2n`. (A premise the meter
+/// cannot resolve is exactly one `premise_clause` rejects with
+/// `MissingPremise` / `NonPriorPremise` / `PremiseHasNoClause` before the
+/// validator reads a literal, so it is absent from both sides.)
+/// [`comparison_sort_bound`] of `payload.work` therefore dominates every term
+/// above, and [`CLAUSE_IDENTITY_WORK_FACTOR`] copies of it cover two sorts at
+/// `c = 2` plus the three linear passes plus the `O(1)` tail.
+///
+/// Capped by [`replaced_general_product`] so this is a TIGHTENING at every
+/// payload: the cap can only ever select the value the shipped `General` model
+/// already charges, so no proof that fits a caller's envelope today can stop
+/// fitting it, and no charge this class emits is larger than the one it
+/// replaces. The cap binds only where `unfolded_work` is below roughly
+/// `8*log2(work)` — i.e. only for steps whose clause and premise together hold
+/// a few dozen literals, where the modelled work is a few hundred operations
+/// and the charge is byte-identical to today's.
+///
+/// Bytes are left at the `General`/private model (`payload.bytes`), which
+/// already dominates the two `to_vec()` allocations: `push_term_slice` debits
+/// `size_of::<TermId>()` bytes per clause and per premise literal, exactly the
+/// `n * size_of::<TermId>()` those two exact-capacity `Vec`s allocate, and the
+/// DAG walk's own byte charges are on top. Keeping the byte limb where it is
+/// makes this a pure work-side correction that cannot newly refuse on bytes.
+fn clause_identity_route_charge(payload: PayloadStats) -> Result<(usize, usize), ProofCheckError> {
+    let sorts = checked_mul_usize(
+        comparison_sort_bound(payload.work),
+        CLAUSE_IDENTITY_WORK_FACTOR,
+    )?;
+    // The `eq_reflexive` tail is O(1) and a `work = 0` payload must still be
+    // charged for the constant-time guards the validator runs.
+    let modelled = checked_add_usize(sorts, CLAUSE_IDENTITY_WORK_FACTOR)?;
+    Ok((
+        modelled.min(replaced_general_product(payload, 1)),
+        payload.bytes,
+    ))
 }
 
 /// Exact model for [`SemanticChargeClass::TrustKindProgressMetered`].
@@ -73,7 +131,7 @@ fn trust_kind_progress_charge(payload: PayloadStats) -> Result<(usize, usize), P
 /// stop fitting it. Saturation is the conservative direction here — the cap
 /// only ever grows — and it keeps a payload near `usize::MAX` from turning a
 /// cheaper, perfectly representable charge into a refusal.
-fn replaced_general_product(payload: PayloadStats, scale: usize) -> usize {
+pub(super) fn replaced_general_product(payload: PayloadStats, scale: usize) -> usize {
     let named = payload.work.saturating_mul(payload.unfolded_work);
     let paired = payload.unfolded_work.saturating_mul(payload.unfolded_work);
     named.max(paired).saturating_mul(scale)

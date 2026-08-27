@@ -39,6 +39,13 @@ fn validate_theory_core(
         TheoryLemmaKind::EufCongruentPred => {
             validate_euf_congruent_pred(terms, step_id, clause)?;
         }
+        // A congruence-closure EXPLANATION: the hypotheses need not form a
+        // syntactic path, and the conclusion may sit anywhere in the clause.
+        // The validator re-runs the closure itself; the producer's tag names
+        // the rule and carries no authority.
+        TheoryLemmaKind::EufCongruenceExplanation => {
+            validate_euf_congruence_explanation_schemas(terms, step_id, clause, progress)?;
+        }
         TheoryLemmaKind::LraFarkas => {
             lra_farkas::validate_metered(terms, step_id, clause, farkas, progress)?;
         }
@@ -66,16 +73,9 @@ fn validate_theory_core(
         TheoryLemmaKind::SeqExtensionalCompanionContradiction => {
             seq_extensional_companion::validate(terms, step_id, clause)?;
         }
-        // BV bit-blast lemmas: bounded semantic validation (#8820).
-        // The previous checker accepted any non-empty clause, which let a
-        // forged proof label arbitrary Boolean literals as a bit-blast
-        // lemma. `validate_bv_bitblast` enforces:
-        //  - every literal is Boolean-sorted;
-        //  - the clause mentions at least one bitvector sub-term;
-        //  - for `BvBitBlastGate`, the clause references the declared
-        //    operator (`bvand`, `bvadd`, etc.).
-        // Full proof-bitblaster coverage is still future work (#8071), so
-        // strict mode fails closed for unsupported/too-wide clauses.
+        // Bounded bit-blast validation (#8820) requires Boolean literals, BV
+        // content, and each gate's declared operator. Unsupported or too-wide
+        // clauses fail closed pending full proof-bitblaster coverage (#8071).
         TheoryLemmaKind::BvBitBlast => {
             bv_bitblast::validate_bv_bitblast(terms, step_id, clause, None)?;
         }
@@ -101,6 +101,11 @@ fn validate_theory_core(
         // Multipliers AND core re-derived from the clause; no payload.
         TheoryLemmaKind::IntCutLatticeGap => {
             lia::validate_int_cut_lattice_gap(terms, step_id, clause)?;
+        }
+        // Case split AND per-branch certificates re-derived from the clause;
+        // no payload.
+        TheoryLemmaKind::IntGuardedSplitGap => {
+            lia::validate_int_guarded_split_gap(terms, step_id, clause)?;
         }
         TheoryLemmaKind::ArithDisequalitySplit => {
             lia::validate_arith_disequality_split(terms, step_id, clause)?;
@@ -337,4 +342,37 @@ fn validate_theory_arrays_and_strings(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+/// Either sub-schema of `EufCongruenceExplanation`, in a fixed order.
+///
+/// Two DISJOINT sub-schemas share this kind, the way `ArrayRowChain`'s nine
+/// share theirs. (E) is the equality conclusion; (P) is the PREDICATE
+/// conclusion, entered only by a clause carrying a literal that is NOT a
+/// (possibly negated) equality — which is exactly what (E) declines as out of
+/// scope. Neither can take the other's clause, so the order between them
+/// carries no authority; (E) stays first so its population's diagnostics stay
+/// byte-identical.
+///
+/// A `ResourceLimit` from EITHER schema is propagated unchanged rather than
+/// converted into an `InvalidTheoryLemma`: the caller's envelope refusal is a
+/// separate, rescuable class and must never be masked by a shape complaint.
+fn validate_euf_congruence_explanation_schemas(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
+    let equality_schema_error =
+        match validate_euf_congruence_explanation(terms, step_id, clause, progress) {
+            Ok(()) => return Ok(()),
+            Err(ProofCheckError::ResourceLimit) => return Err(ProofCheckError::ResourceLimit),
+            Err(error) => error,
+        };
+    validate_euf_polarity_congruence(terms, step_id, clause, progress).map_err(|polarity_error| {
+        match polarity_error {
+            ProofCheckError::ResourceLimit => ProofCheckError::ResourceLimit,
+            _ => equality_schema_error,
+        }
+    })
 }

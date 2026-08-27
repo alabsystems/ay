@@ -133,7 +133,7 @@ pub fn parse_text_drat(data: &[u8]) -> Result<Vec<ProofStep>, DratParseError> {
                     ),
                 });
             }
-            lits.push(Literal::from_dimacs(val));
+            lits.push(Literal::try_from_dimacs(val)?);
         }
         if !terminated {
             return Err(DratParseError::InvalidText {
@@ -212,7 +212,7 @@ pub fn parse_binary_drat(data: &[u8]) -> Result<Vec<ProofStep>, DratParseError> 
             } else {
                 -(var_i32 + 1)
             };
-            lits.push(Literal::from_dimacs(dimacs));
+            lits.push(Literal::try_from_dimacs(dimacs)?);
         }
 
         if is_delete {

@@ -27,6 +27,23 @@ use bv_lia_source_replay::discharge_source_bv_lia;
 mod bv_int_bridge_schema;
 use bv_int_bridge_schema::discharge_bv_int_bridge_schema;
 
+/// Bail-point probe for [`discharge_trust_clause`], on the existing
+/// `--probe-cert-reject` channel.
+///
+/// The per-clause discharge is a funnel of seven lanes that all return the same
+/// `None`, so a rejection reports which clause failed but never which lane
+/// declined it, nor whether a lane declined on evidence or on a budget — the
+/// distinction this whole investigation turns on. The two nested-solve lanes
+/// therefore also report the wall budget they ACTUALLY spent, which is what
+/// showed their 1000 ms cutoff is never the operative bound (measured 2 ms and
+/// 4 ms; they decline on the depth-0 re-entrancy guard). Lazily formatted; an
+/// unset flag costs one field read.
+fn probe_discharge(message: impl FnOnce() -> String) {
+    if ay_core::misc_cli_flags().probe_cert_reject {
+        eprintln!("--probe-cert-reject: discharge_trust_clause {}", message());
+    }
+}
+
 /// Exported strict-verification verdict for an UNSAT proof artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -411,30 +428,49 @@ pub(crate) fn discharge_trust_clause(
     // Terminal empty trust clause → re-discharge the original problem assertions.
     if clause.is_empty() {
         return match check_bv_assertions_unsat(terms, assertions) {
-            BvStepVerdict::Valid => Some(()),
+            BvStepVerdict::Valid => {
+                probe_discharge(|| "ACCEPT empty-clause bv-assertions-unsat".to_string());
+                Some(())
+            }
             // SAT/Unknown/unmodellable: the UNSAT claim is not independently
             // reproducible. Never accept (fail closed).
-            BvStepVerdict::Invalid { .. } | BvStepVerdict::Unchecked { .. } => None,
+            BvStepVerdict::Invalid { .. } | BvStepVerdict::Unchecked { .. } => {
+                probe_discharge(|| "DECLINE empty-clause bv-assertions-unsat".to_string());
+                None
+            }
         };
     }
 
     match check_bv_clause(terms, clause) {
-        BvStepVerdict::Valid => return Some(()),
+        BvStepVerdict::Valid => {
+            probe_discharge(|| "ACCEPT check_bv_clause".to_string());
+            return Some(());
+        }
         // Invalid: ¬clause is SAT → NOT a BV tautology. Never accept.
-        BvStepVerdict::Invalid { .. } => return None,
+        BvStepVerdict::Invalid { .. } => {
+            probe_discharge(|| "DECLINE check_bv_clause=Invalid".to_string());
+            return None;
+        }
         // Unchecked: the BV checker could not model it; try the array checker.
         BvStepVerdict::Unchecked { .. } => {}
     }
     match check_array_clause(terms, clause) {
-        ArrayStepVerdict::Valid => return Some(()),
+        ArrayStepVerdict::Valid => {
+            probe_discharge(|| "ACCEPT check_array_clause".to_string());
+            return Some(());
+        }
         // Invalid: an independent solve refuted it. Never accept.
-        ArrayStepVerdict::Invalid { .. } => return None,
+        ArrayStepVerdict::Invalid { .. } => {
+            probe_discharge(|| "DECLINE check_array_clause=Invalid".to_string());
+            return None;
+        }
         // Neither specialised checker can MODEL this clause — that is a
         // coverage limit of those checkers, not evidence about the clause.
         ArrayStepVerdict::Skipped | ArrayStepVerdict::Unchecked { .. } => {}
     }
 
     if discharge_source_bv_lia(terms, clause, assertions) {
+        probe_discharge(|| "ACCEPT discharge_source_bv_lia".to_string());
         return Some(());
     }
 
@@ -460,6 +496,7 @@ pub(crate) fn discharge_trust_clause(
     // 36. See `bv_int_bridge_schema` for the derivations and the narrowness
     // pins.
     if discharge_bv_int_bridge_schema(terms, clause, assertions) {
+        probe_discharge(|| "ACCEPT discharge_bv_int_bridge_schema".to_string());
         return Some(());
     }
     let mut arena = terms.clone();
@@ -499,7 +536,18 @@ pub(crate) fn discharge_trust_clause(
         exec.set_deadline(Some(
             ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
         ));
-        if executor_reports_plain_strict_unsat(&mut exec) {
+        let started = std::time::Instant::now();
+        let accepted = executor_reports_plain_strict_unsat(&mut exec);
+        let elapsed = started.elapsed();
+        probe_discharge(|| {
+            format!(
+                "{} entailment-lane (1000ms wall budget) elapsed={}ms unknown.reason={:?}",
+                if accepted { "ACCEPT" } else { "DECLINE" },
+                elapsed.as_millis(),
+                exec.statistics().get_string("unknown.reason"),
+            )
+        });
+        if accepted {
             return Some(());
         }
     }
@@ -533,7 +581,18 @@ pub(crate) fn discharge_trust_clause(
     exec.set_deadline(Some(
         ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
     ));
-    executor_reports_plain_strict_unsat(&mut exec).then_some(())
+    let started = std::time::Instant::now();
+    let accepted = executor_reports_plain_strict_unsat(&mut exec);
+    let elapsed = started.elapsed();
+    probe_discharge(|| {
+        format!(
+            "{} standalone-lane (1000ms wall budget) elapsed={}ms unknown.reason={:?}",
+            if accepted { "ACCEPT" } else { "DECLINE" },
+            elapsed.as_millis(),
+            exec.statistics().get_string("unknown.reason"),
+        )
+    });
+    accepted.then_some(())
 }
 
 /// Evaluate the proof through all three validation levels in a single pass.

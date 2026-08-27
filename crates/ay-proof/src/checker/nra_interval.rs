@@ -55,7 +55,7 @@ use super::ProofCheckError;
 /// constraints over Real/Int terms that the checker's OWN bounded
 /// exact-rational interval propagation refutes.
 ///
-/// This is the EXACT precondition of [`validate_nra_interval_unsat`], so the
+/// This is the EXACT precondition of `validate_nra_interval_unsat`, so the
 /// proof classifier in `ay-dpll` can only assign the kind to lemmas strict
 /// mode will then accept — no classifier/checker drift. All decision logic
 /// lives ONLY in this module and the shared `nra_poly` kernel.

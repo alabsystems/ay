@@ -3,17 +3,24 @@
 
 //! Conformance pin for mandatory public UNSAT certification.
 
-use std::path::PathBuf;
-
 use ay_dpll::api::{Logic, Solver, Sort};
+
+mod conformance_source;
+
+#[path = "unsat_chokepoint_conformance/anchor_inventory.rs"]
+mod anchor_inventory;
 
 #[path = "unsat_chokepoint_conformance/post_rebase.rs"]
 mod post_rebase;
 
-fn read(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+use conformance_source::LogicalModule;
+
+/// The logical module a guard addresses — the named file PLUS its submodule
+/// directory. Every anchor lookup resolves across the whole module and must
+/// resolve exactly once; every region stays inside one file. See
+/// `tests/conformance_source/mod.rs` for why.
+fn module(rel: &str) -> LogicalModule {
+    LogicalModule::load(rel)
 }
 
 #[test]
@@ -87,33 +94,26 @@ fn quantified_ufbv_unsat_is_exactly_certified_or_fails_closed() {
 
 #[test]
 fn token_is_minted_only_after_epoch_and_strict_proof_checks() {
-    let source = read("src/executor/unsat_cert.rs");
-    let bind_source = read("src/executor/unsat_cert/certification_source.rs");
-    post_rebase::assert_certificate_mint_sites(&source, &bind_source);
-    post_rebase::assert_mint_authentication(&source, &bind_source);
+    let unsat = module("src/executor/unsat_cert.rs");
+    post_rebase::assert_certificate_mint_sites(&unsat);
+    post_rebase::assert_mint_authentication(&unsat);
 
-    post_rebase::assert_certificate_consumption(&source);
+    post_rebase::assert_certificate_consumption(&unsat);
 
-    post_rebase::assert_publication_stop_dominance(&source);
+    post_rebase::assert_publication_stop_dominance(&unsat);
 }
 
 #[test]
 fn cli_native_and_text_paths_route_through_unsat_funnel() {
-    let executor = read("src/executor.rs");
+    let executor = module("src/executor.rs");
     assert!(
-        executor
-            .matches("self.certify_unsat_for_publication(sat_result,")
-            .count()
-            >= 2,
+        executor.count("self.certify_unsat_for_publication(sat_result,") >= 2,
         "both SMT-LIB check-sat variants must use the UNSAT funnel"
     );
 
-    let native = read("src/api/solving/check.rs");
+    let native = module("src/api/solving/check.rs");
     assert!(
-        native
-            .matches(".certify_unsat_for_publication(result,")
-            .count()
-            >= 3,
+        native.count(".certify_unsat_for_publication(result,") >= 3,
         "plain, interruptible, and assumption native checks must use the funnel"
     );
     assert!(
@@ -121,38 +121,30 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
             && native.contains("let unsat_certificate = self.executor.take_unsat_certificate();"),
         "the sole native result boundary must consume the one-shot token"
     );
-    let planner = native
-        .find("fn native_publication_controls_at(")
-        .expect("native publication-control planner must exist");
-    let planner_end = native[planner..]
-        .find("fn earliest_optional<")
-        .map(|offset| planner + offset)
-        .expect("native publication-control planner must have a bounded source region");
-    let planner_body = &native[planner..planner_end];
+    let planner = native.region(
+        "fn native_publication_controls_at(",
+        "fn earliest_optional<",
+    );
     assert!(
         native.contains("self.native_publication_controls_at(Instant::now())")
-            && planner_body
-                .contains("let previous_deadline = self.executor.current_solve_deadline();")
-            && planner_body.contains("now.checked_add(timeout)")
-            && planner_body.contains(".executor\n            .timeout()")
-            && planner_body.contains("Self::earliest_optional(")
-            && planner_body.contains("let previous_memory_limit = self.executor.memory_limit();")
-            && planner_body
+            && planner.contains("let previous_deadline = self.executor.current_solve_deadline();")
+            && planner.contains("now.checked_add(timeout)")
+            && planner.contains(".executor\n            .timeout()")
+            && planner.contains("Self::earliest_optional(")
+            && planner.contains("let previous_memory_limit = self.executor.memory_limit();")
+            && planner
                 .contains("Self::earliest_optional(previous_memory_limit, self.memory_limit)"),
         "native publication controls must sample time once and preserve the earliest API, parsed, \
          and pre-existing deadline plus the tightest RSS ceiling"
     );
-    let install_controls = native
-        .find("pub(super) fn install_solve_controls(")
-        .expect("native control installer must exist");
-    let restore_controls = native
-        .find("pub(super) fn restore_solve_controls(")
-        .expect("native control restorer must exist");
-    let classify_controls = native
-        .find("pub(super) fn classify_unknown_reason(")
-        .expect("native control classification must exist");
-    let install_body = &native[install_controls..restore_controls];
-    let restore_body = &native[restore_controls..classify_controls];
+    let install_body = native.region(
+        "pub(super) fn install_solve_controls(",
+        "pub(super) fn restore_solve_controls(",
+    );
+    let restore_body = native.region(
+        "pub(super) fn restore_solve_controls(",
+        "pub(super) fn classify_unknown_reason(",
+    );
     assert!(
         install_body.contains("set_memory_limit(controls.effective_memory_limit)")
             && install_body
@@ -162,53 +154,59 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
         "installation must apply the immutable effective envelope and restoration must recover \
          the executor-owned deadline and RSS settings"
     );
+    // `check-sat-assuming` is the last method of its `impl`, so its region is
+    // bounded by the block's own closing brace rather than by a following
+    // declaration. That is at least as tight as the `#[cfg(test)]` marker it
+    // used to use, and unlike that marker it cannot bind to the wrong site.
     let native_regions = [
         (
-            "fn check_sat_with_authority_origin(",
-            "pub fn check_sat_interruptible<",
+            native.region(
+                "fn check_sat_with_authority_origin(",
+                "pub fn check_sat_interruptible<",
+            ),
             "plain native check-sat",
         ),
         (
-            "fn check_sat_interruptible_with_authority_origin<",
-            "pub fn check_sat_with_timeout(",
+            native.region(
+                "fn check_sat_interruptible_with_authority_origin<",
+                "pub fn check_sat_with_timeout(",
+            ),
             "interruptible native check-sat",
         ),
         (
-            "pub fn check_sat_assuming(",
-            "\n}\n\n#[cfg(test)]",
+            native.region_to_item_end("pub fn check_sat_assuming("),
             "native check-sat-assuming",
         ),
     ];
-    for (start, end, name) in native_regions {
-        let start = native
-            .find(start)
-            .unwrap_or_else(|| panic!("{name} must exist"));
-        let end = native[start..]
-            .find(end)
-            .map(|offset| start + offset)
-            .unwrap_or_else(|| panic!("{name} must have a bounded source region"));
-        let body = &native[start..end];
-        let plan = body
-            .find("let controls = self.native_publication_controls();")
-            .unwrap_or_else(|| panic!("{name} must plan one immutable control envelope"));
-        let preflight = body
-            .find("self.preflight_check(controls)")
-            .unwrap_or_else(|| panic!("{name} must preflight that control envelope"));
-        let install = body
-            .find("self.install_solve_controls(controls);")
-            .unwrap_or_else(|| panic!("{name} must install caller controls"));
-        let certify = body
-            .find("certify_unsat_for_publication(result,")
-            .unwrap_or_else(|| panic!("{name} must certify UNSAT"));
-        let classify = body
-            .find("self.classify_unknown_reason(controls);")
-            .unwrap_or_else(|| panic!("{name} must classify stops from the same envelope"));
-        let admission = body
-            .find("self.finish_verified_result(result)")
-            .unwrap_or_else(|| panic!("{name} must use native token admission"));
-        let restore = body
-            .find("self.restore_solve_controls(controls);")
-            .unwrap_or_else(|| panic!("{name} must restore executor-owned controls"));
+    for (body, name) in native_regions {
+        let plan = body.offset_of(
+            "let controls = self.native_publication_controls();",
+            &format!("{name} must plan one immutable control envelope"),
+        );
+        let preflight = body.offset_of(
+            "self.preflight_check(controls)",
+            &format!("{name} must preflight that control envelope"),
+        );
+        let install = body.offset_of(
+            "self.install_solve_controls(controls);",
+            &format!("{name} must install caller controls"),
+        );
+        let certify = body.offset_of(
+            "certify_unsat_for_publication(result,",
+            &format!("{name} must certify UNSAT"),
+        );
+        let classify = body.offset_of(
+            "self.classify_unknown_reason(controls);",
+            &format!("{name} must classify stops from the same envelope"),
+        );
+        let admission = body.offset_of(
+            "self.finish_verified_result(result)",
+            &format!("{name} must use native token admission"),
+        );
+        let restore = body.offset_of(
+            "self.restore_solve_controls(controls);",
+            &format!("{name} must restore executor-owned controls"),
+        );
         assert!(
             plan < preflight
                 && preflight < install
@@ -220,9 +218,10 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
              certification and token admission, then restore prior executor controls"
         );
         if name == "interruptible native check-sat" {
-            let transaction = body
-                .find(".with_interruptible_publication_controls(")
-                .expect("interruptible publication must have one callback-control transaction");
+            let transaction = body.offset_of(
+                ".with_interruptible_publication_controls(",
+                "interruptible publication must have one callback-control transaction",
+            );
             assert!(
                 install < transaction
                     && transaction < certify
@@ -234,33 +233,32 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
         }
     }
 
-    let optimize = read("src/api/solving/optimize.rs");
-    let optimize_start = optimize
-        .find("pub fn optimize_check(")
-        .expect("native optimization entrypoint must exist");
-    let optimize_end = optimize[optimize_start..]
-        .find("pub fn get_objective_value(")
-        .map(|offset| optimize_start + offset)
-        .expect("native optimization entrypoint must have a bounded source region");
-    let optimize_body = &optimize[optimize_start..optimize_end];
-    let optimize_plan = optimize_body
-        .find("let controls = self.native_publication_controls();")
-        .expect("native optimization must plan one control envelope");
-    let optimize_preflight = optimize_body
-        .find("self.preflight_check(controls)")
-        .expect("native optimization must preflight its control envelope");
-    let optimize_install = optimize_body
-        .find("self.install_solve_controls(controls);")
-        .expect("native optimization must install its control envelope");
-    let optimize_execute = optimize_body
-        .find("self.executor.execute_native_optimization_check_sat()")
-        .expect("native optimization must execute inside its control envelope");
-    let optimize_admit = optimize_body
-        .find("self.finish_verified_result(result)")
-        .expect("native optimization must consume the final result capability");
-    let optimize_restore = optimize_body
-        .find("self.restore_solve_controls(controls);")
-        .expect("native optimization must restore executor-owned controls");
+    let optimize = module("src/api/solving/optimize.rs");
+    let optimize_body = optimize.region("pub fn optimize_check(", "pub fn get_objective_value(");
+    let optimize_plan = optimize_body.offset_of(
+        "let controls = self.native_publication_controls();",
+        "native optimization must plan one control envelope",
+    );
+    let optimize_preflight = optimize_body.offset_of(
+        "self.preflight_check(controls)",
+        "native optimization must preflight its control envelope",
+    );
+    let optimize_install = optimize_body.offset_of(
+        "self.install_solve_controls(controls);",
+        "native optimization must install its control envelope",
+    );
+    let optimize_execute = optimize_body.offset_of(
+        "self.executor.execute_native_optimization_check_sat()",
+        "native optimization must execute inside its control envelope",
+    );
+    let optimize_admit = optimize_body.offset_of(
+        "self.finish_verified_result(result)",
+        "native optimization must consume the final result capability",
+    );
+    let optimize_restore = optimize_body.offset_of(
+        "self.restore_solve_controls(controls);",
+        "native optimization must restore executor-owned controls",
+    );
     assert!(
         optimize_plan < optimize_preflight
             && optimize_preflight < optimize_install
@@ -271,41 +269,41 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
          feasibility checks and final capability admission"
     );
 
-    let maxsmt = read("src/api/solving/maxsmt.rs");
-    let maxsmt_start = maxsmt
-        .find("pub fn check_sat_max(")
-        .expect("native MaxSMT entrypoint must exist");
-    let maxsmt_end = maxsmt[maxsmt_start..]
-        .find("fn decline_maxsmt_definite_on_external_stop(")
-        .map(|offset| maxsmt_start + offset)
-        .expect("native MaxSMT entrypoint must have a bounded source region");
-    let maxsmt_body = &maxsmt[maxsmt_start..maxsmt_end];
-    let maxsmt_plan = maxsmt_body
-        .find("let controls = self.native_publication_controls();")
-        .expect("native MaxSMT must plan one control envelope");
-    let maxsmt_preflight = maxsmt_body
-        .find("self.preflight_check(controls)")
-        .expect("native MaxSMT must preflight its control envelope");
-    let maxsmt_install = maxsmt_body
-        .find("self.install_solve_controls(controls);")
-        .expect("native MaxSMT must install its control envelope");
-    let maxsmt_outcome = maxsmt_body
-        .find("let outcome = (|| -> Result<MaxSmtResult, SolverError>")
-        .expect("native MaxSMT must close all publication paths in one transaction");
-    let maxsmt_optimal = maxsmt_body
-        .find("Ok(MaxSmtResult::optimal(")
-        .expect("native MaxSMT must have an authenticated optimal publication point");
-    let maxsmt_restore = maxsmt_body
-        .find("self.restore_solve_controls(controls);")
-        .expect("native MaxSMT must restore executor-owned controls");
-    let maxsmt_return = maxsmt_body
-        .rfind("\n        outcome")
-        .expect("native MaxSMT must return only after control restoration");
+    let maxsmt = module("src/api/solving/maxsmt.rs");
+    let maxsmt_body = maxsmt.region(
+        "pub fn check_sat_max(",
+        "fn decline_maxsmt_definite_on_external_stop(",
+    );
+    let maxsmt_plan = maxsmt_body.offset_of(
+        "let controls = self.native_publication_controls();",
+        "native MaxSMT must plan one control envelope",
+    );
+    let maxsmt_preflight = maxsmt_body.offset_of(
+        "self.preflight_check(controls)",
+        "native MaxSMT must preflight its control envelope",
+    );
+    let maxsmt_install = maxsmt_body.offset_of(
+        "self.install_solve_controls(controls);",
+        "native MaxSMT must install its control envelope",
+    );
+    let maxsmt_outcome = maxsmt_body.offset_of(
+        "let outcome = (|| -> Result<MaxSmtResult, SolverError>",
+        "native MaxSMT must close all publication paths in one transaction",
+    );
+    let maxsmt_optimal = maxsmt_body.offset_of(
+        "Ok(MaxSmtResult::optimal(",
+        "native MaxSMT must have an authenticated optimal publication point",
+    );
+    let maxsmt_restore = maxsmt_body.offset_of(
+        "self.restore_solve_controls(controls);",
+        "native MaxSMT must restore executor-owned controls",
+    );
+    let maxsmt_return = maxsmt_body.last_offset_of(
+        "\n        outcome",
+        "native MaxSMT must return only after control restoration",
+    );
     assert!(
-        maxsmt_body
-            .matches("decline_maxsmt_definite_on_external_stop(")
-            .count()
-            >= 2
+        maxsmt_body.count("decline_maxsmt_definite_on_external_stop(") >= 2
             && maxsmt_plan < maxsmt_preflight
             && maxsmt_preflight < maxsmt_install
             && maxsmt_install < maxsmt_outcome
@@ -316,7 +314,7 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
          objective authentication, and the final late-stop check"
     );
 
-    let result = read("src/api/types/results.rs");
+    let result = module("src/api/types/results.rs");
     assert!(
         result.contains("pub(crate) fn certified_unsat(")
             && result.contains("certificate: UnsatCertificate")
@@ -327,13 +325,13 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
         "VerifiedSolveResult must have no token-free definite UNSAT constructor"
     );
 
-    let text_admission = read("src/executor/model/sat_emit.rs");
+    let text_admission = module("src/executor/model/sat_emit.rs");
     assert!(
         text_admission.contains("if let Some(certificate) = self.take_unsat_certificate()"),
         "the SMT-LIB text boundary must consume and classify the sealed token"
     );
 
-    let cross_check = read("src/api/solving/cross_check.rs");
+    let cross_check = module("src/api/solving/cross_check.rs");
     assert!(
         cross_check.contains(".execute_authored(&solve_command)")
             && cross_check.contains("run.verification.unsat_proof_strictly_verified")
@@ -345,18 +343,17 @@ fn cli_native_and_text_paths_route_through_unsat_funnel() {
 
 #[test]
 fn deferred_trust_reconfirmation_requires_a_plain_strict_proof() {
-    let proof_api = read("src/api/proofs.rs");
+    let proof_api = module("src/api/proofs.rs");
     post_rebase::assert_proof_api_reconfirmation(&proof_api);
 
-    let unsat = read("src/executor/unsat_cert.rs");
+    let unsat = module("src/executor/unsat_cert.rs");
     post_rebase::assert_whole_problem_reconfirmation(&unsat);
 
     post_rebase::assert_forged_sat_guard(&unsat);
 
-    let check_sat = read("src/executor/check_sat.rs");
-    let normalized = check_sat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let check_sat = module("src/executor/check_sat.rs");
     assert!(
-        normalized.contains(
+        check_sat.normalized_contains(
             "if self.solve_deadline.get().is_none() && self.quantifier_deadline_policy != super::QuantifierDeadlinePolicy::Exact"
         ),
         "Exact reconfirmation policy must preserve an absent inherited deadline instead of installing a private safety wall"
@@ -366,28 +363,27 @@ fn deferred_trust_reconfirmation_requires_a_plain_strict_proof() {
         "the obsolete load-sensitive whole-problem wall budget must stay removed"
     );
 
-    let discharge = unsat
-        .find("fn discharge_trust_steps_for_certification(")
-        .expect("deferred-trust discharge must exist");
-    let publication = unsat[discharge..]
-        .find("pub(crate) fn certify_unsat_for_publication(")
-        .map(|offset| discharge + offset)
-        .expect("UNSAT publication funnel must follow deferred-trust discharge");
-    let discharge_body = &unsat[discharge..publication];
-    let forged_sat = discharge_body
-        .find("if self.redecides_definitive_sat_within(")
-        .expect("forged-SAT guard must run in deferred-trust discharge");
+    let discharge_body = unsat.region(
+        "fn discharge_trust_steps_for_certification(",
+        "pub(crate) fn certify_unsat_for_publication(",
+    );
+    let forged_sat = discharge_body.offset_of(
+        "if self.redecides_definitive_sat_within(",
+        "forged-SAT guard must run in deferred-trust discharge",
+    );
     // `9a9f65d7d proof(dt): authenticate exact typed member signatures` moved
     // this call from `check_proof_collecting_trust_with_context` to the
     // `_with_typed_context` variant, which additionally carries the executor's
     // exact datatype member signatures. Same position in the discharge order,
     // strictly more context authenticated.
-    let collect_trust = discharge_body
-        .find("ay_proof::check_proof_collecting_trust_with_typed_context(")
-        .expect("trust collection must run in deferred-trust discharge");
-    let whole_problem = discharge_body
-        .find("if self.reconfirms_unsat_within(")
-        .expect("whole-problem fallback must run in deferred-trust discharge");
+    let collect_trust = discharge_body.offset_of(
+        "ay_proof::check_proof_collecting_trust_with_typed_context(",
+        "trust collection must run in deferred-trust discharge",
+    );
+    let whole_problem = discharge_body.offset_of(
+        "if self.reconfirms_unsat_within(",
+        "whole-problem fallback must run in deferred-trust discharge",
+    );
     assert!(
         forged_sat < collect_trust && collect_trust < whole_problem,
         "definitive SAT must dominate every deferred-trust acceptance path, and the \
@@ -397,17 +393,20 @@ fn deferred_trust_reconfirmation_requires_a_plain_strict_proof() {
 
 #[test]
 fn pareto_unsat_extension_is_opaque_and_query_scoped() {
-    let optimization = read("src/executor/optimization.rs");
+    let optimization = module("src/executor/optimization.rs");
+    // Bounded to the struct's own declaration: three of these field spellings
+    // also occur on unrelated types in this module, so a whole-module
+    // containment check could be satisfied without this package existing.
+    let package = optimization.region_to_item_end("struct ParetoFrontExhaustionExtension");
     assert!(
-        optimization.contains("struct ParetoFrontExhaustionExtension")
-            && optimization.contains("query_epoch: QueryAuthorityEpoch")
-            && optimization.contains("hard_roots: Box<[TermId]>")
-            && optimization.contains("objectives: Box<[ay_frontend::Objective]>")
+        package.contains("query_epoch: QueryAuthorityEpoch")
+            && package.contains("hard_roots: Box<[TermId]>")
+            && package.contains("objectives: Box<[ay_frontend::Objective]>")
             && optimization.contains("self.declare_pareto_front_exhaustion_extension(exhaustion)"),
         "Pareto exhaustion must pass an opaque exact-query blocker package"
     );
 
-    let unsat = read("src/executor/unsat_cert.rs");
+    let unsat = module("src/executor/unsat_cert.rs");
     assert!(
         unsat.contains("extension: super::optimization::ParetoFrontExhaustionExtension")
             && !unsat.contains(
@@ -419,27 +418,52 @@ fn pareto_unsat_extension_is_opaque_and_query_scoped() {
 
 #[test]
 fn proof_output_opt_out_does_not_disable_internal_certification() {
-    let lifecycle = read("src/executor/lifecycle.rs");
-    let begin = lifecycle
-        .find("pub(crate) fn begin_public_solve(")
-        .expect("public solve lifecycle entry must exist");
-    let mutation = lifecycle[begin..]
-        .find("pub(crate) fn note_api_assertion_mutation")
-        .map(|offset| begin + offset)
-        .expect("public solve entry must have a bounded source region");
-    let body = &lifecycle[begin..mutation];
-    let tracking = body
-        .find("self.proof_tracker.enable();")
-        .expect("public solve must enable mandatory internal proof tracking");
-    let epoch = body
-        .find("self.begin_unsat_query_epoch(&authored_assertions);")
-        .expect("public solve must freeze the UNSAT query epoch");
-    let provenance = body
-        .find("self.install_proof_source_provenance(&authored_assertions);")
-        .expect("public solve must install authored proof provenance");
+    let lifecycle = module("src/executor/lifecycle.rs");
+    // `7d448bb9c3` moved `begin_public_solve` into `lifecycle/public_solve.rs`
+    // AND extracted its proof-posture block into
+    // `configure_public_solve_proof_posture`. Both halves are pinned: the entry
+    // must CALL the posture helper before it freezes the epoch, and the helper
+    // must be the thing that enables the tracker. Bounding the entry by the
+    // next declaration in its own file is tighter than the old
+    // `note_api_assertion_mutation` bound, which spanned three functions.
+    let body = lifecycle.region(
+        "pub(crate) fn begin_public_solve(",
+        "pub(crate) fn begin_external_decision_query(",
+    );
+    let tracking = body.offset_of(
+        "self.configure_public_solve_proof_posture();",
+        "public solve must configure mandatory internal proof tracking",
+    );
+    let epoch = body.offset_of(
+        "self.begin_unsat_query_epoch(&authored_assertions);",
+        "public solve must freeze the UNSAT query epoch",
+    );
+    let provenance = body.offset_of(
+        "self.install_proof_source_provenance(&authored_assertions);",
+        "public solve must install authored proof provenance",
+    );
     assert!(tracking < epoch && epoch < provenance);
 
-    let proof = read("src/executor/proof.rs");
+    let posture = lifecycle.region(
+        "fn configure_public_solve_proof_posture(",
+        "pub(crate) fn begin_public_solve(",
+    );
+    assert!(
+        posture.contains("self.proof_tracker.enable();"),
+        "the posture helper must enable mandatory internal proof tracking"
+    );
+    // The ONLY opt-out is competition shedding (#proof-capability B1), and it
+    // is an explicit branch rather than an absent `enable()`. Pinning both arms
+    // keeps the invariant readable as "tracking on, unless shedding" and stops
+    // a future edit from disabling tracking on some third condition without
+    // this guard noticing.
+    assert!(
+        posture.contains("if self.competition_shedding_active() {")
+            && posture.contains("self.proof_tracker.disable();"),
+        "internal proof tracking may be shed only by the explicit competition opt-out"
+    );
+
+    let proof = module("src/executor/proof.rs");
     assert!(
         proof.contains("if !self.is_producing_proofs()"),
         "mandatory internal tracking must not opt users into `(get-proof)`"

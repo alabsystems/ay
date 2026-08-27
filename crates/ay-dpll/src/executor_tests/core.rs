@@ -10,6 +10,8 @@ use crate::{Executor, UnknownReason};
 use ay_frontend::parse;
 use ay_frontend::sexp::parse_sexp;
 
+mod rlimit_subsolvers;
+
 #[test]
 fn smtlib27_polymorphic_identity_declaration_is_satisfiable() {
     let commands = parse(
@@ -346,10 +348,7 @@ fn test_executor_rlimit_forces_deterministic_resource_limit() {
     assert_eq!(outputs, vec!["unknown", "(:reason-unknown resourceout)"]);
     assert_eq!(exec.unknown_reason(), Some(UnknownReason::ResourceLimit));
 }
-
-/// Pigeonhole SMT text (n pigeons, m holes): UNSAT for n > m, exponentially
-/// hard for resolution, immune to cheap preprocessing — forces real CDCL
-/// search. Shared by the deterministic-budget tests below.
+/// Pigeonhole SMT text: UNSAT for `pigeons > holes` and forces real CDCL search.
 fn pigeonhole_smt(pigeons: u32, holes: u32, options: &str) -> String {
     let mut smt = format!("(set-logic QF_UF)\n{options}");
     for i in 1..=pigeons {

@@ -10,7 +10,9 @@
 
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TermStore};
 
-use crate::checker::{ensure_terminal_empty_clause, validate_step, ProofCheckError};
+use crate::checker::{
+    ensure_terminal_empty_clause, validate_step_with_datatypes_and_progress, ProofCheckError,
+};
 
 /// Partial proof check result for proofs that may contain Hole steps.
 ///
@@ -54,6 +56,35 @@ pub fn check_proof_partial(
     proof: &Proof,
     terms: &TermStore,
 ) -> (PartialProofCheck, Option<ProofCheckError>) {
+    let mut unbounded = |_: usize, _: usize| true;
+    check_proof_partial_with_progress(proof, terms, &mut unbounded)
+}
+
+/// [`check_proof_partial`] under a CALLER-OWNED resource and cancellation
+/// envelope (#diagnostic-envelope).
+///
+/// This is the QUALITY-FREE metered entry point, and it exists so that the two
+/// executor sites which throw the `ProofQuality` away do not pay for it. The
+/// fused `check_proof_partial_with_quality_and_progress` ends with
+/// `quantifier::validate_sko_forall_uniqueness`, a WHOLE-PROOF Skolem walk that
+/// takes no progress meter and that legacy `check_proof_partial` never
+/// performed. Routing a quality-discarding caller through the fused function
+/// therefore ADDS unmetered whole-proof work to the very path the envelope
+/// exists to bound — on `build_unsat_assembly`'s resolution-chain probe, the
+/// hottest walk in the post-verdict lane.
+///
+/// Semantics are otherwise IDENTICAL to [`check_proof_partial`] — same checker,
+/// same step order, same hole handling, same first-error semantics, same
+/// terminal-empty-clause requirement. `validate_step(t, d, i, s, false, None)`
+/// is by definition `validate_step_with_datatypes_and_progress(t, d, i, s,
+/// false, None x7, &mut |_, _| true)` (step_validation.rs), so passing an
+/// always-true meter reproduces the old function exactly; `check_proof_partial`
+/// above now IS that delegation, which is what keeps the two in step.
+pub fn check_proof_partial_with_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> (PartialProofCheck, Option<ProofCheckError>) {
     let mut result = PartialProofCheck {
         total_steps: proof.steps.len() as u32,
         ..Default::default()
@@ -85,13 +116,20 @@ pub fn check_proof_partial(
             continue;
         }
 
-        let step_result = validate_step(
+        let step_result = validate_step_with_datatypes_and_progress(
             terms,
             &mut derived_clauses,
             ProofId(idx as u32),
             step,
             false,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            progress,
         );
 
         match step_result {

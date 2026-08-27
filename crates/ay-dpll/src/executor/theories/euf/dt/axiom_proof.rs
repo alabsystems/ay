@@ -5,6 +5,18 @@
 
 use ay_core::{TermId, TermStore, TheoryLemmaKind};
 
+use crate::executor::Executor;
+
+impl Executor {
+    /// Record a typed injected axiom after strict recognition succeeds.
+    pub(super) fn record_recognized_dt_axiom(&mut self, axiom: TermId, kind: TheoryLemmaKind) {
+        let _ = self
+            .proof_tracker
+            .add_theory_lemma_with_kind(vec![axiom], kind);
+        self.injected_axiom_theory_kinds.insert(axiom, kind);
+    }
+}
+
 /// Classify only when the strict checker's own recognizer accepts the clause.
 /// Specific schemas precede the bounded ground refuter so they retain their
 /// precise kind.

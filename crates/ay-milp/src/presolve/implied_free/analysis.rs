@@ -96,10 +96,11 @@ pub(super) fn validate_analysis_box(
     closure: &[AnalysisBound],
     claimed: &[AnalysisBound],
 ) -> Result<(), AffineAggregationCertificateError> {
-    if closure.len() != claimed.len() || claimed.len() != source.num_cols() {
+    let column_count = source.num_cols();
+    if closure.len() != column_count || claimed.len() != column_count {
         return Err(AffineAggregationCertificateError::AnalysisBox);
     }
-    for column in 0..source.num_cols() {
+    for column in 0..column_count {
         let (source_lower, source_upper) = source.col_bounds(Col(column as u32));
         let source_lower = exact(source_lower);
         let source_upper = exact(source_upper);

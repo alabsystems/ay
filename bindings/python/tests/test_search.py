@@ -30,6 +30,17 @@ def test_search_spec_is_the_stable_safe_schema():
     }
 
 
+def test_table_rejects_an_empty_row_set_during_construction():
+    model = Model("empty table")
+    variable = model.int("x", 0, 1)
+    try:
+        model.table([variable], [])
+    except SearchError as error:
+        assert "at least one allowed tuple" in str(error)
+    else:
+        raise AssertionError("empty table was deferred to native execution")
+
+
 def test_search_solves_4x4_sudoku():
     model = Model("sudoku")
     cell = model.int_grid("cell", 4, 4, 1, 4)

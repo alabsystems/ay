@@ -6,8 +6,6 @@
 //! exceeding `m1`, so exactly ONE candidate is probed per exponent instead of
 //! `deg + 1`. The doc comment's completeness argument assumes `deg + 1`.
 
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
-
 use ay_nra::oracle_api::{obq_select_non_root, OBq, OBqInterval};
 use num_bigint::BigInt;
 use num_rational::BigRational;

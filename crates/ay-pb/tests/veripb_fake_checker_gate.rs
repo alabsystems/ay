@@ -5,7 +5,7 @@
 //! rejection is DEMONSTRATED by running the fake.
 //!
 //! The gates in this workspace all end in some form of "…and VeriPB said so".
-//! That sentence is worth exactly as much as the binary behind it, and four
+//! That sentence is worth exactly as much as the binary behind it, and five
 //! separate binaries that are not proof checkers used to satisfy it:
 //!
 //!   (i)   `verdict-then-exit1.sh` — a REAL checker's verdict, verbatim, then
@@ -19,13 +19,25 @@
 //!         the matching verdict. It "confirms" whatever the caller hoped for,
 //!         so exact-conclusion matching does not touch it; only a probe whose
 //!         proof states a FALSE conclusion does.
+//!   (v)   `comment-verified.sh` — REFUSES the proof (`s NOT VERIFIED`) while
+//!         printing the accepting words in a `c` comment above the verdict, and
+//!         exits 0. It is the only fake here that is caught by NOTHING about
+//!         its verdict or its exit status: both say "refused". It exists
+//!         because `veripb_runner::verify_unsat` decided acceptance with
+//!         `stdout.contains("VERIFIED UNSATISFIABLE")`, so this fake's REFUSAL
+//!         was read as a verification — the one failure mode a verification
+//!         path must never have.
 //!
-//! All four answer `--version` with `veripb 3.0.2`, so the version half of
+//! All five answer `--version` with `veripb 3.0.2`, so the version half of
 //! `ci/veripb.pin` cannot distinguish them either. Behaviour is the only
 //! identity check that works, which is what [`veripb::self_test`] is.
 //!
 //! This suite is the Rust half of the demonstration; `scripts/ci/veripb_fake_checker_gate.sh`
-//! is the shell half and runs the same four fakes through every shell gate.
+//! is the shell half and runs the same five fakes through every shell gate.
+//! The `ay-pb-dev certify-unsat --veripb` surface is covered behaviourally by
+//! `ay_pb_core::veripb_runner`'s own tests (it is compiled only under `dev-tools`)
+//! and structurally by `certify_unsat_cannot_obtain_a_checker_without_self_testing_it`
+//! below, which runs unconditionally.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,11 +47,12 @@ use ay_test_support::veripb::{self, pin, Expect};
 const SUITE: &str = "ay-pb::veripb_fake_checker_gate";
 
 /// (script, needs a real checker to delegate to)
-const FAKES: [(&str, bool); 4] = [
+const FAKES: [(&str, bool); 5] = [
     ("verdict-then-exit1.sh", true),
     ("silent-exit0.sh", false),
     ("always-unsat.sh", false),
     ("parrot.sh", false),
+    ("comment-verified.sh", false),
 ];
 
 fn fake_dir() -> PathBuf {
@@ -211,4 +224,109 @@ fn the_parrot_agrees_with_a_true_claim_and_is_caught_by_a_false_one() {
     );
 
     let _ = fs::remove_dir_all(&scratch);
+}
+
+/// Fake (v) specifically: the SUBSTRING hazard, demonstrated on the committed
+/// artifact rather than asserted.
+///
+/// This fake needs no real checker to be dangerous and none to be caught, so
+/// unlike its four siblings this test runs on a host with no VeriPB installed
+/// — which is exactly where a substring reader would rot unnoticed.
+///
+/// Three facts have to hold together for the fixture to mean anything, and all
+/// three are asserted: it EXITS 0 (so the exit-status half of the acceptance
+/// contract is satisfied and cannot be what rejects it), its verdict line is a
+/// REFUSAL, and its stdout nevertheless carries the exact substring that used
+/// to be the whole acceptance test in
+/// `crates/ay-pb-core/src/veripb_runner.rs`.
+#[cfg(unix)]
+#[test]
+fn a_refusal_that_mentions_the_accepting_words_is_still_a_refusal() {
+    let fake = fake_dir().join("comment-verified.sh");
+    assert!(
+        fake.is_file(),
+        "committed fake checker is missing: {}",
+        fake.display()
+    );
+
+    let opb = "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n";
+    let proof = "pseudo-Boolean proof version 3.0\nf 2 ;\npol 1 2 +;\nrup >= 1 ;\noutput NONE;\nconclusion UNSAT : 4;\nend pseudo-Boolean proof;\n";
+    let run = veripb::run_text(&fake, "comment-verified", opb, proof, &[]);
+
+    assert!(
+        run.exit_ok(),
+        "the fake must exit 0, or the exit-status half of the contract is what \
+         catches it and the substring hazard goes untested: {:?}",
+        run.exit_code()
+    );
+    assert!(
+        run.stdout().contains("VERIFIED UNSATISFIABLE"),
+        "anti-vacuity: the fake must carry the substring that used to be the \
+         whole acceptance test; got {:?}",
+        run.stdout()
+    );
+    assert_eq!(
+        run.verdict(),
+        Some("s NOT VERIFIED"),
+        "the fake's verdict LINE must be a refusal"
+    );
+    assert!(
+        run.is_rejected(),
+        "a refusal that merely mentions the accepting words is a refusal: {}",
+        run.verdict_or_placeholder()
+    );
+    assert!(
+        veripb::self_test(&fake).is_err(),
+        "the self-test battery must reject it too"
+    );
+}
+
+/// `ay-pb-dev certify-unsat --veripb` is the one surface here that takes a
+/// checker PATH FROM THE USER, and it is the surface this suite could not
+/// reach: `ay_pb::veripb_runner` is compiled only under `dev-tools` /
+/// `certified-proof-artifacts`, so the behavioural battery for it lives in
+/// `crates/ay-pb-core/src/veripb_runner.rs`'s own tests
+/// (`self_test_rejects_every_committed_fake_checker`), which run under those
+/// features. What runs HERE, unconditionally, is the structural claim that
+/// makes those tests load-bearing: that the self-test is actually WIRED IN, and
+/// that there is no way to obtain a `CertifyConfig` without passing it.
+///
+/// Measured, before this was wired: `ay-pb-dev certify-unsat trivial-unsat.opb
+/// --veripb ci/fake-checkers/always-unsat.sh` printed
+/// `VERIFICATION CAMPAIGN: 1/1 VERIFIED_UNSATISFIABLE` and exited 0, and
+/// `parrot.sh` did the same. Neither is a proof checker. The sha256 pin saw
+/// nothing wrong, because a pin fixes WHICH bytes ran, not what they do.
+#[test]
+fn certify_unsat_cannot_obtain_a_checker_without_self_testing_it() {
+    let path = pin::repo_root().join("crates/ay-pb/src/bin/dev.rs");
+    let source = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    let start = source
+        .find("fn cert_config(")
+        .expect("dev.rs must still have a cert_config");
+    let body = &source[start..];
+    let probe = body.find("veripb_runner::self_test(").expect(
+        "cert_config must self-test the checker before returning a CertifyConfig. \
+             Without it, ci/fake-checkers/always-unsat.sh and parrot.sh both drive this \
+             command to `VERIFICATION CAMPAIGN: 1/1 VERIFIED_UNSATISFIABLE`, exit 0.",
+    );
+    let build = body
+        .find("Ok(CertifyConfig {")
+        .expect("cert_config must still construct a CertifyConfig");
+    assert!(
+        probe < build,
+        "the self-test must run BEFORE the CertifyConfig is built, not after"
+    );
+
+    // The chokepoint claim. `CertifyConfig` is the only thing `certify_files`
+    // accepts, so if it has exactly one construction site and that site
+    // self-tests, then every certify-* subcommand self-tests. Two matches:
+    // the struct definition and that one site.
+    assert_eq!(
+        source.matches("CertifyConfig {").count(),
+        2,
+        "a second CertifyConfig construction site would be a certification path \
+         that bypasses the self-test"
+    );
 }

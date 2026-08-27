@@ -73,6 +73,20 @@ fn emit_special_optimality(emission: &mut Emission<'_, '_>) -> EmittedClaim {
             "network-design-optimality",
         );
     }
+    // THE GENERAL LANE, LAST AMONG THE SUCCINCT ONES. Every artifact above
+    // recognises a STRUCTURE and, where it fires, produces a smaller and
+    // cheaper-to-check object than a whole split tree. The tree applies to any
+    // branched MILP, so its job is to catch what those miss -- which makes this
+    // lane purely ADDITIVE: no verdict that already shipped succinct dual
+    // evidence has its evidence changed by the tree existing.
+    if let Some(certificate) = emission.ctx.milp_optimality_tree_certificate {
+        return emission.block_claim(
+            "dual",
+            opt_tree_block(&certificate.root),
+            "optimality-tree",
+            "optimality-tree",
+        );
+    }
     dual_claim_from_replay(
         emission.ctx,
         &[

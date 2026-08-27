@@ -121,11 +121,7 @@ fn equality_and_disequality_spellings_preserve_effective_polarity() {
     let farkas = FarkasAnnotation::from_ints(&[1, 1]);
     for disequality in disequalities {
         for positive_equality in positive_equalities {
-            assert_differential(
-                &terms,
-                &[disequality.clone(), positive_equality.clone()],
-                &farkas,
-            );
+            assert_differential(&terms, &[disequality, positive_equality], &farkas);
         }
     }
 }

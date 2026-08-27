@@ -28,15 +28,38 @@ impl Drop for CleanupGuard {
 }
 
 fn temp_paths(stem: &str) -> (PathBuf, PathBuf, CleanupGuard) {
+    temp_paths_with_content(stem, TRIVIAL_UNSAT)
+}
+
+fn temp_paths_with_content(stem: &str, content: &str) -> (PathBuf, PathBuf, CleanupGuard) {
     static FILE_ID: AtomicUsize = AtomicUsize::new(0);
     let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let cnf = std::env::temp_dir().join(format!("ay_verify_proof_{pid}_{stem}_{id}.cnf"));
     let proof = std::env::temp_dir().join(format!("ay_verify_proof_{pid}_{stem}_{id}.drat"));
-    std::fs::write(&cnf, TRIVIAL_UNSAT).expect("write temp cnf");
+    std::fs::write(&cnf, content).expect("write temp cnf");
     let guard = CleanupGuard(vec![cnf.clone(), proof.clone()]);
     (cnf, proof, guard)
 }
+
+/// Two contradictory width-five parity encodings. The width avoids the binary
+/// gate-density exclusion, so the flagged proof route must emit the Gaussian
+/// resolution ladder and the built-in checker must accept the same-run DRAT.
+const XOR_PARITY_UNSAT: &str = include_str!("../../../../benchmarks/sat/unsat/double_parity_5.cnf");
+
+/// GE derives x4=x1; the residual units violate that derived row and force the
+/// nonempty-conflict proof path to emit its pending ladder first.
+const XOR_DERIVED_CONFLICT_UNSAT: &str = "p cnf 4 10\n\
+1 2 -3 0\n1 -2 3 0\n-1 2 3 0\n-1 -2 -3 0\n\
+2 3 -4 0\n2 -3 4 0\n-2 3 4 0\n-2 -3 -4 0\n\
+1 0\n-4 0\n";
+
+/// GE again derives x4=x1. Unit x1 makes the extension propagate x4 with a
+/// derived-row reason; the residual binaries then force both polarities of x5.
+const XOR_DERIVED_REASON_UNSAT: &str = "p cnf 5 11\n\
+1 2 -3 0\n1 -2 3 0\n-1 2 3 0\n-1 -2 -3 0\n\
+2 3 -4 0\n2 -3 4 0\n-2 3 4 0\n-2 -3 -4 0\n\
+1 0\n-4 5 0\n-4 -5 0\n";
 
 fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
@@ -102,6 +125,153 @@ fn test_verify_proof_explicit_on_accepts_valid_proof() {
     assert!(
         !stderr.contains("FAILED"),
         "valid proof should not report FAILED; stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_xor_proof_route_emits_checker_accepted_drat() {
+    let (cnf, proof, _guard) = temp_paths_with_content("xor_route", XOR_PARITY_UNSAT);
+    let output = Command::new(ay_binary())
+        .arg("--verify-proof")
+        .arg("--proof")
+        .arg(&proof)
+        .arg("--sat-xor-proof-route")
+        .arg("true")
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay XOR proof route");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "XOR route did not publish checked UNSAT; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("s UNSATISFIABLE"), "stdout={stdout}");
+    assert!(
+        stderr.contains("components (proof mode)"),
+        "flagged DRAT run did not enter the XOR proof route: {stderr}"
+    );
+    assert!(
+        stderr.contains("verify-proof") && stderr.contains("verified"),
+        "XOR DRAT artifact was not accepted by the proof checker: {stderr}"
+    );
+}
+
+fn assert_xor_route_checker_accepts(stem: &str, content: &str) {
+    let (cnf, proof, _guard) = temp_paths_with_content(stem, content);
+    let output = Command::new(ay_binary())
+        .arg("--verify-proof")
+        .arg("--proof")
+        .arg(&proof)
+        .arg("--sat-xor-proof-route")
+        .arg("true")
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay derived-row XOR proof route");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("s UNSATISFIABLE"), "stdout={stdout}");
+    assert!(
+        stderr.contains("components (proof mode)"),
+        "fixture did not enter XOR proof route: {stderr}"
+    );
+    assert!(
+        stderr.contains("verify-proof") && stderr.contains("verified"),
+        "derived-row DRAT artifact was not checker-accepted: {stderr}"
+    );
+}
+
+#[test]
+fn test_xor_proof_route_checks_derived_nonempty_conflict() {
+    assert_xor_route_checker_accepts("xor_derived_conflict", XOR_DERIVED_CONFLICT_UNSAT);
+}
+
+#[test]
+fn test_xor_proof_route_checks_derived_reason_propagation() {
+    assert_xor_route_checker_accepts("xor_derived_reason", XOR_DERIVED_REASON_UNSAT);
+}
+
+/// The shipped contract for the XOR/GE proof route, both halves of it.
+///
+/// `2b2749dbfa` (the M7 measurement flip, 2026-08-21) made the route default ON
+/// for XOR-eligible DIMACS under DRAT: `xor_proof_route.unwrap_or(true)` in
+/// `crates/ay/src/dimacs/streaming_proof.rs`. This test asserts that default AND
+/// the tri-state opt-out that goes with it, so it fails if either half moves:
+/// flipping the default back breaks the first arm, and breaking
+/// `--sat-xor-proof-route false` breaks the second.
+#[test]
+fn test_xor_proof_route_is_default_on_with_false_opt_out() {
+    let run = |stem: &str, opt_out: bool| {
+        let (cnf, proof, _guard) = temp_paths_with_content(stem, XOR_PARITY_UNSAT);
+        let mut command = Command::new(ay_binary());
+        command.arg("--verify-proof").arg("--proof").arg(&proof);
+        if opt_out {
+            command.arg("--sat-xor-proof-route").arg("false");
+        }
+        let output = command
+            .arg(&cnf)
+            .output()
+            .expect("spawn ay XOR default route");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(
+            output.status.code(),
+            Some(20),
+            "stdout={stdout}; stderr={stderr}"
+        );
+        assert!(stdout.contains("s UNSATISFIABLE"), "stdout={stdout}");
+        assert!(
+            stderr.contains("verify-proof") && stderr.contains("verified"),
+            "stderr={stderr}"
+        );
+        stderr
+    };
+
+    let default_stderr = run("xor_default_on", false);
+    assert!(
+        default_stderr.contains("components (proof mode)"),
+        "the XOR proof route ships ON since 2b2749dbfa, but the default run did \
+         not enter it: {default_stderr}"
+    );
+
+    let opt_out_stderr = run("xor_opt_out", true);
+    assert!(
+        !opt_out_stderr.contains("components (proof mode)"),
+        "--sat-xor-proof-route false must be honored as the opt-out, but the \
+         route still fired: {opt_out_stderr}"
+    );
+}
+
+#[test]
+fn test_xor_proof_flag_keeps_lrat_on_standard_route() {
+    let (cnf, proof, _guard) = temp_paths_with_content("xor_lrat", XOR_PARITY_UNSAT);
+    let output = Command::new(ay_binary())
+        .arg("--verify-proof")
+        .arg("--proof")
+        .arg(&proof)
+        .args(["--proof-format", "lrat"])
+        .arg("--sat-xor-proof-route")
+        .arg("true")
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay LRAT standard route");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stderr.contains("verify-proof") && stderr.contains("verified"));
+    assert!(
+        !stderr.contains("components (proof mode)"),
+        "LRAT incorrectly entered the hintless XOR TrustedTransform route: {stderr}"
     );
 }
 

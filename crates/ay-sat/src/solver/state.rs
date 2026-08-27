@@ -53,6 +53,22 @@ pub struct Solver {
     /// Previously in WARM section, costing an extra cache-line load per
     /// propagation on large formulas where the hot section spans >1 line.
     pub(super) chrono_enabled: bool,
+    /// Whether the LBD-free two-stage clause-management policy is armed
+    /// (arXiv:2602.20829). Default OFF.
+    ///
+    /// HOT section deliberately (#two-stage): under the arm, every BCP
+    /// assignment that is forced by an arena clause performs
+    /// `OnClauseUse(c)` — `score(c) += 1` — via
+    /// `Solver::two_stage_note_bcp_use`, so the predicate is read once per
+    /// propagation. Placing it beside `chrono_enabled` keeps that read on a
+    /// cache line the propagation path already touches; with the arm off the
+    /// cost is one predictable, already-loaded branch.
+    ///
+    /// When set, `used` in the clause arena stops meaning kissat's saturating
+    /// "recently bumped" FLAG and starts meaning the paper's cumulative
+    /// FREQUENCY score. See `solver/reduction_two_stage.rs` for the whole
+    /// policy and for the exact list of semantic differences.
+    pub(super) two_stage_clause_management: bool,
     /// Whether ghost literal guards are needed in conflict analysis (#8466, #8489).
     /// Ghost literals are unassigned variables with stale var_data.level values.
     ///
@@ -426,10 +442,39 @@ pub struct Solver {
     /// split-loop lane via `set_relevancy_branching`; off by default. See
     /// the development design notes.
     pub(super) relevancy_branching: bool,
-    /// Reusable scratch buffer for the relevancy frontier (`relevancy.rs`).
-    /// `relevancy_buf[var_index]` is `true` when the variable is currently
-    /// relevant. Kept on the solver to avoid per-decision allocation.
-    pub(super) relevancy_buf: Vec<bool>,
+    /// Independent-support decision whitelist (`solver/indep_support.rs`).
+    ///
+    /// When non-empty, `pick_next_decision_variable_main` prefers an
+    /// unassigned member of this set before consulting VSIDS/VMTF over the
+    /// whole variable range. Decisions-only, exactly like the relevancy
+    /// frontier and the IC3 domain: BCP, the model gate and the proof
+    /// obligations are untouched, and an EXHAUSTED whitelist falls through to
+    /// unrestricted branching instead of signalling SAT — so a support that
+    /// turns out not to determine every variable costs decisions, never a
+    /// wrong answer. Installed once after preprocessing by
+    /// `install_indep_support`; empty by default.
+    pub(super) indep_support: Vec<u32>,
+    /// Variables `install_indep_support` froze against elimination.
+    ///
+    /// The support is the branching whitelist, so a support variable that BVE
+    /// eliminates takes its slot out of the restriction while leaving every
+    /// variable it determined behind — measured on `xorshift_r14_31`, that
+    /// cost 18 of the 32 seed bits and left the fallback carrying 85% of
+    /// decisions. Freezing keeps the whitelist intact through preprocessing
+    /// and inprocessing. Melted (and re-frozen) on the next install so
+    /// incremental re-solves do not accumulate protection.
+    pub(super) indep_support_frozen: Vec<u32>,
+    /// Incrementally maintained CNF relevancy frontier
+    /// (`relevancy_frontier.rs`, #relevancy-frontier-incremental).
+    ///
+    /// Holds the materialised frontier handed to the decision picker plus the
+    /// per-clause true-literal counts, per-variable unsatisfied-occurrence
+    /// counts and literal occurrence lists that let it be UPDATED on
+    /// assignment / unassignment / clause append instead of rebuilt by an
+    /// O(clauses x literals) walk at every decision. Empty and inert unless the
+    /// relevancy brancher actually engages; every invalidating event falls back
+    /// to the original from-scratch rebuild.
+    pub(super) relevancy_frontier: relevancy_frontier::RelevancyFrontier,
     /// Count of decisions taken under relevancy restriction (observability).
     pub(super) relevancy_decisions: u64,
     /// Relevancy HARD mode (`relevancy.rs`): when `true` (and

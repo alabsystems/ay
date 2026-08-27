@@ -10,6 +10,9 @@ use ay_core::{FarkasAnnotation, TermData, TermId, TermStore, TheoryLemmaKind, Th
 
 use crate::proof_tracker::ProofTracker;
 
+#[path = "funnel_integer.rs"]
+mod integer;
+
 use super::{
     arith_conflict_is_integer, blocking_clause_to_conflict_lits, classify_arith_conflict_kind,
     conflict_all_arith_literals, euf, fp_ground_eval_applies, opaque_arith_farkas_valid,
@@ -222,25 +225,21 @@ fn infer_theory_lemma_kind_in_caller_order(
         // certificate is normalized back to `Generic`/trust by BOTH recorders,
         // and no rational Farkas certificate can exist for this family (its
         // negation is satisfiable over ℚ — `2q >= 1 ∧ 2q <= 1` at `q = 1/2`).
-        // Recognition IS the strict checker's own `validate_int_bound_lattice_gap`
-        // run on exactly this clause in exactly this order, so the classifier
-        // cannot promote a clause the checker will reject. Ordered here and at
-        // the terminal `Generic` below — never ahead of a rational arm — so a
-        // lemma that DOES have a Farkas certificate keeps the externally
-        // checkable `la_generic` wire and only the residual takes the honest
-        // `hole`. The two arms cannot overlap: `synthesize_equality_farkas`,
-        // the only way a `LiaGeneric` here still earns a certificate, needs two
-        // EQUALITY literals, and an equality never parses as an integer bound.
-        if ay_core::proof_validation::recognize_int_bound_lattice_gap(terms, clause) {
-            return TheoryLemmaKind::IntBoundLatticeGap;
+        // Ordered here and at the terminal `Generic` below — never ahead of a
+        // rational arm. See `funnel_integer.rs` for the priority argument and
+        // for how the two certificate-bearing second-chance passes stay ahead.
+        if let Some(kind) = integer::integer_lattice_kind(terms, clause) {
+            return kind;
         }
         return TheoryLemmaKind::LiaGeneric;
     }
     if let Some(kind) = infer_opaque_farkas_kind(terms, &conflict, farkas) {
         return kind;
     }
-    if ay_core::proof_validation::recognize_int_bound_lattice_gap(terms, clause) {
-        return TheoryLemmaKind::IntBoundLatticeGap;
+    // Placed LAST so every established classification keeps its priority and
+    // only the `Generic` residual reaches the payload-free integer arms.
+    if let Some(kind) = integer::integer_lattice_kind(terms, clause) {
+        return kind;
     }
     TheoryLemmaKind::Generic
 }

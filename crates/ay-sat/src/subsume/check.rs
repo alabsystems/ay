@@ -184,6 +184,14 @@ impl Subsumer {
     /// Try to subsume or strengthen candidate clause `c_idx` using the
     /// one-watch occurrence lists and binary clause table.
     ///
+    /// `c_sig`: the candidate's 64-bit clause signature from the pass-local
+    /// `sched_sigs` table (built once per round over the schedule). For D to
+    /// subsume or strengthen C, every variable in D must appear as a variable
+    /// in C (polarity may differ for at most one literal in the strengthening
+    /// case). The variable-level signature check
+    /// `clause_signature_vars_subset` filters non-candidates in O(1) before
+    /// the O(|D|) literal-by-literal `subsume_check`.
+    ///
     /// `subsume_dirty`: per-variable dirty bits (true = variable added since last round).
     ///
     /// Returns: `(subsumer_idx_or_none, flipped)` where flipped is as per `subsume_check`.
@@ -191,19 +199,23 @@ impl Subsumer {
         &mut self,
         c_idx: usize,
         c_lits: &[Literal],
+        c_sig: crate::clause::ClauseSignature,
         subsume_dirty: &[bool],
         clauses: &ClauseArena,
     ) -> (Option<usize>, i32) {
         // Mark candidate clause
         self.mark_clause(c_lits);
 
-        // Pre-compute candidate's 64-bit clause signature for bloom-style
-        // pre-filtering. For D to subsume or strengthen C, every variable in D
-        // must appear as a variable in C (polarity may differ for at most one
-        // literal in the strengthening case). The variable-level signature
-        // check `clause_signature_vars_subset` filters non-candidates in O(1)
-        // before the O(|D|) literal-by-literal `subsume_check`.
-        let c_sig = clauses.signature(c_idx);
+        // Identity barrier for the pass-local signature table: the value
+        // handed in must equal the signature of the candidate's CURRENT
+        // literals — i.e. exactly what the retired always-on side table
+        // (maintained on every add/replace) would have returned here. Fails
+        // if clause literals ever start changing mid-round.
+        debug_assert_eq!(
+            c_sig,
+            crate::clause::compute_clause_signature(c_lits),
+            "pass-local candidate signature stale for clause {c_idx}"
+        );
 
         let mut found_d: Option<usize> = None;
         let mut flipped: i32 = 0;
@@ -264,7 +276,7 @@ impl Subsumer {
                 // Then check longer clauses via one-watch occurrence lists
                 if sign_idx < self.occs.len() {
                     for oi in 0..self.occs[sign_idx].len() {
-                        let d_idx = self.occs[sign_idx][oi];
+                        let (d_idx, d_sig) = self.occs[sign_idx][oi];
                         if d_idx == c_idx {
                             continue;
                         }
@@ -275,14 +287,23 @@ impl Subsumer {
                             continue;
                         }
                         let d_lits = clauses.literals(d_idx);
+                        // Same identity barrier for the subsumer-side copy
+                        // carried in the connection entry.
+                        debug_assert_eq!(
+                            d_sig,
+                            crate::clause::compute_clause_signature(d_lits),
+                            "pass-local connection signature stale for clause {d_idx}"
+                        );
                         if d_lits.len() > c_lits.len() {
                             continue; // D must be <= C in size to subsume C
                         }
                         // 64-bit signature pre-filter: skip D if its variables
                         // are not a subset of C's variables. This avoids the
                         // O(|D|) literal-by-literal subsume_check when the
-                        // bloom filter proves non-containment.
-                        let d_sig = clauses.signature(d_idx);
+                        // bloom filter proves non-containment. `d_sig` is the
+                        // pass-local signature carried in the connection
+                        // entry; literals do not change during the round, so
+                        // it matches D's current literals.
                         if !clause_signature_vars_subset(d_sig, c_sig) {
                             continue;
                         }

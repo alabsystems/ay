@@ -199,6 +199,25 @@ impl Subsumer {
         result.candidates_scheduled = self.schedule.len() as u64;
         self.stats.candidates_scheduled += result.candidates_scheduled;
 
+        // Pass-local signature build, parallel to the (sorted) schedule: one
+        // bulk O(scheduled literals) sweep replaces the retired always-on
+        // arena-wide signature side table. Every signature read inside this
+        // round is over scheduled clauses — candidates directly by schedule
+        // index, subsumers via the copy carried in their `occs`/connection
+        // entry — so this table is exactly the round's working set. Clause
+        // literals do not change during the round (strengthenings are applied
+        // by the caller afterwards; the `lits[2..]` noccs sort below permutes
+        // literals, and the signature is an order-independent OR), so the
+        // values equal what the side table would have returned at read time.
+        // Built AFTER the sort so it never perturbs the sort's equal-key
+        // permutation.
+        self.sched_sigs.clear();
+        self.sched_sigs.extend(
+            self.schedule
+                .iter()
+                .map(|&(_, idx)| compute_clause_signature(clauses.literals(idx))),
+        );
+
         // CaDiCaL subsume.cpp:417-432: per-clause `c->subsume` flag.
         // Count left-overs from a previous incomplete round (clauses that
         // still have the flag set because they were scheduled but never
@@ -279,8 +298,9 @@ impl Subsumer {
             let unit_subsumer_candidate = is_unit_subsumer_candidate(c_lits, &unit_subsumer_vars);
 
             if (c_lits.len() > 2 || unit_subsumer_candidate) && is_candidate {
+                let c_sig = self.sched_sigs[si];
                 let (d_opt, flipped) =
-                    self.try_to_subsume_clause(c_idx, c_lits, subsume_dirty, clauses);
+                    self.try_to_subsume_clause(c_idx, c_lits, c_sig, subsume_dirty, clauses);
 
                 if let Some(d_idx) = d_opt {
                     if flipped == i32::MIN {
@@ -342,7 +362,10 @@ impl Subsumer {
                     });
                 }
             } else if min_size <= SUBSUME_OCC_LIM && li < self.occs.len() {
-                self.occs[li].push(c_idx);
+                // Carry the pass-local signature with the connection so the
+                // subsumer-side prefilter in `try_to_subsume_clause` stays a
+                // single O(1) read.
+                self.occs[li].push((c_idx, self.sched_sigs[si]));
 
                 // Sort non-watched clause literals by ascending noccs (CaDiCaL
                 // subsume.cpp:542). Rare literals first → subsume_check fails

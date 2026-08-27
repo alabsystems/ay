@@ -57,6 +57,19 @@ const GUARDED_BV2NAT_CARRIER_QUERY: &str = r#"
                (not (<= len_a 18446744073709551615))) :named carrier_exclusion_a))
 "#;
 
+const EXACT_BV_CONTRADICTION_QUERY: &str = r#"
+(set-logic QF_BV)
+(declare-const x (_ BitVec 8))
+(assert (= x #x00))
+(assert (= x #x01))
+"#;
+
+const EXACT_BV_SAT_QUERY: &str = r#"
+(set-logic QF_BV)
+(declare-const x (_ BitVec 8))
+(assert (= x #x00))
+"#;
+
 #[cfg(test)]
 fn exact_public_executor(script: &str) -> Executor {
     let commands = ay_frontend::parse(script).expect("exact public fixture must parse");
@@ -349,4 +362,129 @@ fn successful_seq_unknown_discharge_revokes_stale_sat_artifacts() {
         .last_proof_quality
         .as_ref()
         .is_some_and(ay_proof::ProofQuality::is_complete));
+}
+
+#[test]
+fn exact_ite_uf_rejection_notifier_requires_semantic_unsat_of_exact_scope() {
+    let mut sat = exact_public_executor(EXACT_BV_SAT_QUERY);
+    sat.ite_uf_definition_recovery.armed = true;
+    sat.note_exact_ite_uf_definition_model_rejection("ite_uf_definition");
+    assert!(
+        sat.ite_uf_definition_recovery.attempted,
+        "an exact bounded SAT scope reaches the semantic checker"
+    );
+    assert!(
+        !sat.ite_uf_definition_recovery.rejected,
+        "shape alone must not arm the restored-scope recovery"
+    );
+
+    let mut contradiction = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    contradiction.ite_uf_definition_recovery.armed = true;
+    contradiction.note_exact_ite_uf_definition_model_rejection("ite_uf_definition");
+    assert!(contradiction.ite_uf_definition_recovery.attempted);
+    assert!(
+        contradiction.ite_uf_definition_recovery.rejected,
+        "only independently authenticated UNSAT may set the routing marker"
+    );
+
+    let mut foreign_scope = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    foreign_scope
+        .proof_problem_assertion_provenance
+        .as_mut()
+        .expect("the public fixture installs proof provenance")
+        .original_problem_assertions
+        .pop();
+    foreign_scope.ite_uf_definition_recovery.armed = true;
+    foreign_scope.note_exact_ite_uf_definition_model_rejection("ite_uf_definition");
+    assert!(
+        !foreign_scope.ite_uf_definition_recovery.rejected,
+        "proof provenance naming a strict subset of the frozen roots must fail closed"
+    );
+}
+
+#[test]
+fn exact_ite_uf_completion_declines_sat_subset_and_assumption_scopes_atomically() {
+    let mut sat = exact_public_executor(EXACT_BV_SAT_QUERY);
+    sat.last_model = Some(crate::executor::model::Model::empty());
+    sat.last_model_validated = true;
+    sat.last_lrat_certificate = Some(vec![7]);
+    assert!(sat
+        .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
+        .is_unknown());
+    assert!(sat.last_proof.is_none());
+    assert!(sat.last_model.is_some());
+    assert!(sat.last_model_validated);
+    assert_eq!(sat.last_lrat_certificate.as_deref(), Some([7].as_slice()));
+
+    let mut subset = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    subset.ctx.assertions.pop();
+    subset.last_lrat_certificate = Some(vec![11]);
+    assert!(subset
+        .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
+        .is_unknown());
+    assert!(subset.last_proof.is_none());
+    assert_eq!(subset.last_lrat_certificate.as_deref(), Some([11].as_slice()));
+
+    let mut assumed = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    let assumption = assumed.ctx.terms.true_term();
+    assumed.bind_unsat_query_assumptions(&[assumption]);
+    assumed.last_assumptions = Some(vec![assumption]);
+    assert!(assumed
+        .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
+        .is_unknown());
+    assert!(assumed.last_proof.is_none());
+}
+
+#[test]
+fn exact_ite_uf_completion_kill_switch_declines_without_artifacts() {
+    let _guard = ay_core::misc_test_override::set(ay_core::MiscCliFlags {
+        no_consequence_replay: true,
+        ..Default::default()
+    });
+    let mut executor = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    assert!(executor
+        .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
+        .is_unknown());
+    assert!(executor.last_proof.is_none());
+}
+
+#[test]
+fn exact_ite_uf_completion_revokes_every_incompatible_artifact() {
+    let mut executor = exact_public_executor(EXACT_BV_CONTRADICTION_QUERY);
+    executor.last_model = Some(crate::executor::model::Model::empty());
+    executor.last_model_validated = true;
+    executor.last_validation_stats = Some(Default::default());
+    executor.last_lrat_certificate = Some(vec![13]);
+    executor.last_proof_term_overrides = Some(Default::default());
+    executor.last_clause_trace = Some(ay_sat::ClauseTrace::new());
+    executor.last_var_to_term = Some(Default::default());
+    executor.last_trail_provenance = Some(Default::default());
+    executor.last_negations = Some(Default::default());
+    executor.last_clausification_proofs = Some(Vec::new());
+    executor.last_original_clause_theory_proofs = Some(Vec::new());
+    executor.last_bv_drat_self_cert = true;
+    executor.plant_stale_sat_certificate_for_test();
+    executor.plant_stale_checked_sat_refutation_for_test();
+    executor.plant_stale_finite_enum_sidecars_for_test();
+
+    assert!(executor
+        .try_complete_exact_ite_uf_definition_rejection(SolveResult::Unknown)
+        .is_unsat());
+    assert!(executor.last_proof.is_some());
+    assert!(executor.last_model.is_none());
+    assert!(!executor.last_model_validated);
+    assert!(executor.last_validation_stats.is_none());
+    assert!(executor.last_sat_certificate.is_none());
+    assert!(executor.last_lrat_certificate.is_none());
+    assert!(executor.last_proof_term_overrides.is_none());
+    assert!(executor.last_clause_trace.is_none());
+    assert!(executor.last_checked_sat_refutation.is_none());
+    assert!(executor.last_var_to_term.is_none());
+    assert!(executor.last_trail_provenance.is_none());
+    assert!(executor.last_negations.is_none());
+    assert!(executor.last_clausification_proofs.is_none());
+    assert!(executor.last_original_clause_theory_proofs.is_none());
+    assert!(!executor.last_bv_drat_self_cert);
+    assert!(executor.last_finite_enum_pigeonhole.is_none());
+    assert!(executor.last_checked_finite_enum_pigeonhole.is_none());
 }

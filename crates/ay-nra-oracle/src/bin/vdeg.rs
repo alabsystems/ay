@@ -1,8 +1,6 @@
 // Re-measurement of projection degree growth on MY OWN conflict shapes, at
 // irregular sizes, independent of their explain_cost harness.
 
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
-
 use num_bigint::BigInt;
 use std::time::Instant;
 
@@ -46,6 +44,8 @@ fn measure(name: &str, f: &OBiPoly, g: &OBiPoly, indeg: u32) {
 }
 
 fn main() {
+    // #govern: see crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
     println!("A. x^d - y^d  vs  x^d - y^d - 1   (irregular ladder, no doubling)");
     for d in [2u32, 3, 5, 6, 9, 13, 17, 23] {
         let f = build(&[(d, 0, 1), (0, d, -1)]);

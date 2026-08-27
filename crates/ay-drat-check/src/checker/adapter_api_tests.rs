@@ -54,6 +54,11 @@ fn test_set_inconsistent_round_trip() {
     assert!(checker.is_inconsistent());
     checker.set_inconsistent(false);
     assert!(!checker.is_inconsistent());
+    assert_eq!(
+        checker.conclude_unsat(),
+        ConcludeResult::Failed(ConcludeFailure::UncheckedAdapterMutation),
+        "manual inconsistency state must never authorize UNSAT"
+    );
 }
 
 // ─── backtrack_to ───────────────────────────────────────────────────
@@ -86,7 +91,24 @@ fn test_backtrack_to_clears_assignment() {
     );
 }
 
-// ─── lit_value ──────────────────────────────────────────────────────
+// Backtrack authority regression.
+
+#[test]
+fn test_backtrack_to_disables_authoritative_conclusion() {
+    let mut checker = DratChecker::new(1, false);
+    checker.add_original(&[lit(0, true)]);
+    checker.add_original(&[lit(0, false)]);
+    assert!(checker.is_inconsistent());
+
+    checker.backtrack_to(0);
+    assert_eq!(
+        checker.conclude_unsat(),
+        ConcludeResult::Failed(ConcludeFailure::UncheckedAdapterMutation),
+        "diagnostic backtracking must not retain proof authority"
+    );
+}
+
+// Literal value queries.
 
 #[test]
 fn test_lit_value_unassigned_returns_none() {
@@ -137,6 +159,17 @@ fn test_add_trusted_unit_clause_propagates() {
 }
 
 #[test]
+fn test_trusted_empty_clause_cannot_authorize_unsat() {
+    let mut checker = DratChecker::new(0, false);
+    checker.add_trusted(&[]);
+    assert!(checker.is_inconsistent());
+    assert_eq!(
+        checker.conclude_unsat(),
+        ConcludeResult::Failed(ConcludeFailure::UncheckedAdapterMutation)
+    );
+}
+
+#[test]
 fn test_add_trusted_when_inconsistent_is_noop() {
     let mut checker = DratChecker::new(5, false);
     checker.set_inconsistent(true);
@@ -183,5 +216,21 @@ fn test_verify_deletion_only_proof_rejected() {
     assert!(
         result.unwrap_err().to_string().contains("empty clause"),
         "error should mention empty clause"
+    );
+}
+
+#[test]
+fn test_bulk_verify_rejects_checker_reuse_across_formulas() {
+    let mut checker = DratChecker::new(1, false);
+    let unsat = vec![vec![lit(0, true)], vec![lit(0, false)]];
+    checker
+        .verify(&unsat, &[])
+        .expect("contradictory originals are a valid UNSAT instance");
+
+    let sat = vec![vec![lit(0, true)]];
+    assert_eq!(
+        checker.verify(&sat, &[]),
+        Err(DratCheckError::CheckerNotFresh),
+        "the prior formula's contradiction must not authorize a new problem"
     );
 }

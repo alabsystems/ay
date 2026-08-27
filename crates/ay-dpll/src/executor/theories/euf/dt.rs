@@ -10,10 +10,11 @@ use crate::preprocess::PreprocessingPass;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
-use ay_core::{Sort, TermId, TheoryLemmaKind, TheoryLit, TheorySolver};
+use ay_core::{Sort, TermId, TheoryLit, TheorySolver};
 use ay_dt::DtSolver;
 
 mod axiom_proof;
+mod context_derivation;
 mod dt_abandon;
 mod lazy_proof_state;
 
@@ -59,29 +60,6 @@ impl Executor {
             farkas: None,
             lia: None,
         })
-    }
-
-    /// Record injected DT axioms with a typed kind only when the strict
-    /// checker's recognizer accepts the exact unit clause. Context-dependent
-    /// residues remain explicit trust lemmas.
-    fn record_recognized_dt_axiom(&mut self, axiom: TermId, kind: TheoryLemmaKind) {
-        let _ = self
-            .proof_tracker
-            .add_theory_lemma_with_kind(vec![axiom], kind);
-        self.injected_axiom_theory_kinds.insert(axiom, kind);
-    }
-
-    /// Record a #dt-context-derivation producer hint: `clause` is entailed
-    /// by the asserted `premises`. The record grants no authority — sealing
-    /// and the fragment lane independently re-derive the entailment and
-    /// discharge every premise. Capped; overflow and degenerate records are
-    /// silently dropped (a missing hint can only decline an authentication).
-    pub(crate) fn record_dt_context_conflict(
-        &mut self,
-        clause: Vec<TermId>,
-        premises: Vec<TermId>,
-    ) {
-        self.dt_context_conflict_records.record(clause, premises);
     }
 
     fn record_dt_axiom_theory_lemmas(&mut self, axioms: &[TermId]) {
@@ -2472,7 +2450,7 @@ mod rollback_artifact_tests {
 
 #[cfg(test)]
 mod dt_axiom_attribution_tests {
-    use ay_core::ProofStep;
+    use ay_core::{ProofStep, TheoryLemmaKind};
     use ay_frontend::parse;
 
     use super::*;

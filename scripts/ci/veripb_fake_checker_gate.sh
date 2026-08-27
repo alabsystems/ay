@@ -1,18 +1,23 @@
 #!/bin/sh
 # ay-script: veripb-fake-checker-gate
 #
-# Point every VeriPB-backed gate in this repository at four binaries that are
+# Point every VeriPB-backed gate in this repository at five binaries that are
 # NOT proof checkers, and FAIL if any gate passes.
 #
 # This is the executable form of "our proof gates cannot be fooled". Each fake
 # under ci/fake-checkers/ answers `--version` with `veripb 3.0.2`, so the
-# version pin waves all four through; only behaviour separates them from a real
+# version pin waves all five through; only behaviour separates them from a real
 # checker.
 #
 #   (i)   verdict-then-exit1.sh  a REAL checker's verdict, verbatim, then exit 1
 #   (ii)  silent-exit0.sh        prints nothing, exits 0
 #   (iii) always-unsat.sh        `s VERIFIED UNSATISFIABLE` for every input
 #   (iv)  parrot.sh              echoes back whatever the proof itself claims
+#   (v)   comment-verified.sh    REFUSES (`s NOT VERIFIED`), exits 0, and says
+#                                the accepting words in a `c` comment. Only a
+#                                reader that scans stdout for a SUBSTRING
+#                                accepts it -- which veripb_runner::verify_unsat
+#                                did, turning a refusal into a verification.
 #
 # Gates exercised:
 #   * scripts/cert_ci.sh
@@ -20,10 +25,12 @@
 #   * scripts/pb_cert_coverage.sh
 #   * the shared self-test in scripts/lib/veripb_verdict.sh (directly)
 #   * ay-pb-dev certify-unsat --veripb (the CLI surface that takes a checker
-#     path from the user), when the binary is built
+#     path from the user) -- REQUIRED, not conditional: it used to run only
+#     `if [ -x "$DEV" ]`, and nothing here builds that binary, so the one
+#     surface with a user-supplied checker path was the one never checked
 #
 # The Rust half lives in crates/ay-pb/tests/veripb_fake_checker_gate.rs and
-# runs the same four fakes through ay_test_support::veripb::self_test.
+# runs the same five fakes through ay_test_support::veripb::self_test.
 #
 # Usage: scripts/ci/veripb_fake_checker_gate.sh [real-veripb]
 #   The real checker is needed for two reasons: fake (i) delegates to it, and
@@ -60,11 +67,24 @@ fi
 BIN=${AY_PB_BIN:-"$REPO/target/release/ay-pb"}
 [ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN" >&2; exit 2; }
 
+# The certify-unsat surface used to be checked only `if [ -x "$DEV" ]`, and
+# NOTHING in this repository builds ay-pb-dev, so in practice that surface was
+# never checked at all -- a silent skip inside the very script whose job is to
+# prove no gate is vacuous. It is now required, like $BIN above.
+DEV=${AY_PB_DEV_BIN:-"$REPO/target/release/ay-pb-dev"}
+[ -x "$DEV" ] || {
+    echo "ERROR: campaign binary missing: $DEV" >&2
+    echo "       It carries the certify-unsat --veripb surface, which is the one" >&2
+    echo "       that takes a checker path from the user. Build it with:" >&2
+    echo "         cargo build --release -p ay-pb --features dev-tools --bin ay-pb-dev" >&2
+    exit 2
+}
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ay-fake-checker.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 ls "$REPO/benchmarks/pb-comp/test-instances"/*.opb > "$WORK/list.txt"
 
-FAKES="verdict-then-exit1 silent-exit0 always-unsat parrot"
+FAKES="verdict-then-exit1 silent-exit0 always-unsat parrot comment-verified"
 fail=0
 checks=0
 
@@ -108,6 +128,9 @@ must_pass() {
 
 echo "== control: the real checker must still pass every gate"
 must_pass "self-test            [real]" veripb_self_test "$REAL"
+must_pass "ay-pb-dev certify-unsat [real]" "$DEV" certify-unsat \
+    "$REPO/benchmarks/pb-comp/test-instances/trivial-unsat.opb" \
+    --limit 1 --veripb "$REAL"
 must_pass "cert_ci.sh           [real]" env VERIPB_BIN="$REAL" sh "$REPO/scripts/cert_ci.sh"
 must_pass "pb_certified_gate.sh [real]" env VERIPB_BIN="$REAL" sh "$REPO/scripts/ci/pb_certified_gate.sh"
 must_pass "pb_cert_coverage.sh  [real]" bash "$REPO/scripts/pb_cert_coverage.sh" \
@@ -127,12 +150,9 @@ for fake in $FAKES; do
     must_fail "pb_cert_coverage.sh  [$fake]" bash "$REPO/scripts/pb_cert_coverage.sh" \
         "$BIN" "$shim" "$WORK/list.txt" "$WORK/cov-$fake.txt"
 
-    DEV="$REPO/target/release/ay-pb-dev"
-    if [ -x "$DEV" ]; then
-        must_fail "ay-pb-dev certify-unsat [$fake]" "$DEV" certify-unsat \
-            "$REPO/benchmarks/pb-comp/test-instances/trivial-unsat.opb" \
-            --limit 1 --veripb "$shim"
-    fi
+    must_fail "ay-pb-dev certify-unsat [$fake]" "$DEV" certify-unsat \
+        "$REPO/benchmarks/pb-comp/test-instances/trivial-unsat.opb" \
+        --limit 1 --veripb "$shim"
 done
 
 echo
@@ -140,4 +160,4 @@ if [ "$fail" -ne 0 ]; then
     echo "FAKE CHECKER GATE: FAILED — a binary that does not check proofs got through" >&2
     exit 1
 fi
-echo "FAKE CHECKER GATE: PASSED ($checks checks; 4 fakes rejected by every gate, real checker still accepted)"
+echo "FAKE CHECKER GATE: PASSED ($checks checks; 5 fakes rejected by every gate, real checker still accepted)"

@@ -71,15 +71,14 @@ pub(crate) fn workspace_path(relative: impl AsRef<Path>) -> PathBuf {
 /// missing corpus then FAILS instead of quietly passing, so a vacuous run can
 /// never be mistaken for a good end.
 pub(crate) fn corpus_skip_allowed(path: &Path) -> bool {
-    if std::env::var_os("AY_REQUIRE_CORPUS").is_some() {
-        panic!(
-            "AY_REQUIRE_CORPUS is set but the corpus file is missing: {}\n\
-             This run would otherwise PASS VACUOUSLY. If you are bisecting or \
-             attributing, point the worktree at the corpus (symlink \
-             benchmarks/smtcomp) rather than trusting this result.",
-            path.display()
-        );
-    }
+    assert!(
+        std::env::var_os("AY_REQUIRE_CORPUS").is_none(),
+        "AY_REQUIRE_CORPUS is set but the corpus file is missing: {}\n\
+         This run would otherwise PASS VACUOUSLY. If you are bisecting or \
+         attributing, point the worktree at the corpus (symlink \
+         benchmarks/smtcomp) rather than trusting this result.",
+        path.display()
+    );
     true
 }
 
@@ -229,16 +228,37 @@ pub(crate) fn run_executor_smt_with_timeout(smt: &str, timeout_secs: u64) -> Res
     let _ = cancel_tx.send(());
     let _ = timer.join();
 
-    if timed_out {
-        return Ok(SolverOutcome::Timeout);
-    }
+    // A verdict this script ALREADY PRODUCED outranks a later query's timeout.
+    //
+    // This used to `return Timeout` before looking at `outputs` at all, which
+    // silently discarded every decisive line the run had already emitted. On a
+    // multi-`check-sat` script that masks the earlier answers: a divergent
+    // SECOND query made the FIRST one unobservable, so a test asserting on the
+    // first verdict could not tell a genuine answer from a wrong one. Callers
+    // document this helper as returning the FIRST `check-sat` result, and that
+    // is now what it does whenever such a result exists.
+    //
+    // `Timeout` is still reported when it is the honest answer: the interrupt
+    // fired and NO decisive line was produced before it. Note `execute_all`
+    // surrenders its outputs on error, so an interrupted run that errors out
+    // reports `Timeout` rather than an execution failure.
+    let decided = match outputs {
+        Ok(lines) => lines
+            .into_iter()
+            .find(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
+        Err(err) => {
+            if timed_out {
+                return Ok(SolverOutcome::Timeout);
+            }
+            return Err(anyhow!("execution error: {err}"));
+        }
+    };
 
-    let first_line = outputs
-        .map_err(|err| anyhow!("execution error: {err}"))?
-        .into_iter()
-        .find(|line| matches!(line.trim(), "sat" | "unsat" | "unknown"))
-        .unwrap_or_else(|| "unknown".to_string());
-    Ok(SolverOutcome::from_output_line(&first_line))
+    match decided {
+        Some(line) => Ok(SolverOutcome::from_output_line(&line)),
+        None if timed_out => Ok(SolverOutcome::Timeout),
+        None => Ok(SolverOutcome::from_output_line("unknown")),
+    }
 }
 
 pub(crate) fn run_executor_file_with_timeout(

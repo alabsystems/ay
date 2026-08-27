@@ -47,7 +47,7 @@ pub(crate) use bit_blast::BitBlast;
 // in the solve pipeline (so `check-sat`/`get-model` behavior is unchanged).
 pub(crate) use der::Der;
 pub(crate) use distribute_forall::DistributeForall;
-pub(crate) use eq_diffvar::EqDiffVar;
+pub(crate) use eq_diffvar::{AtomFold, EqDiffVar};
 pub(crate) use flatten_and::FlattenAnd;
 pub(crate) use guarded_eq_mining::GuardedEqMining;
 pub(crate) use ite_equality::IteEquality;
@@ -59,7 +59,8 @@ pub(crate) use normalize_eq_bv_concat::NormalizeEqBvConcat;
 // `PreprocessingPass`, deliberately never enrolled in the solve pipeline.
 pub(crate) use propagate_ineqs::PropagateIneqs;
 pub(crate) use propagate_values::{
-    PropagateValues, PropagatedEntrySource, PropagatedRewriteRecord, PropagationRecords,
+    EqDiffVarAtomRecord, PropagateValues, PropagatedEntrySource, PropagatedRewriteRecord,
+    PropagationRecords,
 };
 pub(crate) use qe_light::QeLight;
 pub(crate) use reduce_args::ReduceArgs;

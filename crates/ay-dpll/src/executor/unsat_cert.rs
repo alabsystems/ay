@@ -4,11 +4,10 @@
 
 //! Mandatory UNSAT certification at the public verdict boundary.
 //!
-//! Inner solver lanes return a provisional [`SolveResult::Unsat`].  A public
-//! caller may observe that verdict only after either the finished proof has
-//! passed the strict checker against the exact authored assertion/assumption
-//! query epoch, or a separately sealed exact semantic checker has discharged
-//! its deliberately narrow source fragment against the same immutable epoch.
+//! Inner `Unsat` results are provisional. A public caller may observe one only
+//! after a strict check of the finished proof against the exact authored query
+//! epoch, or after a separately sealed semantic checker discharges its narrow
+//! source fragment against that immutable epoch.
 
 use std::cell::Cell;
 
@@ -21,13 +20,18 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 mod assumption_source;
+mod authored_hypothesis_scope;
+mod certification_policy;
 mod certification_source;
 mod pending_nested_array;
 mod probe;
 mod query_epoch_access;
+mod rm_domain_expansion;
 use certification_source::{CertificationSource, StrictProofPresentationFailure};
 pub(super) use pending_nested_array::PendingNestedArrayBoolBvUnsat;
 pub(in crate::executor) use probe::probe_cert_reject;
+pub(crate) use probe::probe_cert_reject_raw;
+pub(in crate::executor) use rm_domain_expansion::CheckedExactRmDomainExpansionUnsat;
 #[path = "unsat_cert/internal_certificate_scope.rs"]
 mod internal_certificate_scope;
 use super::cert_accounting;
@@ -139,6 +143,7 @@ enum UnsatCertificateKind {
     CheckedExactClosedSentence(CheckedExactClosedSentenceUnsat),
     CheckedExactForallUfGround(CheckedExactForallUfGroundUnsat),
     CheckedExactFiniteExpansion(CheckedExactFiniteExpansionUnsat),
+    CheckedExactRmDomainExpansion(CheckedExactRmDomainExpansionUnsat),
     /// #proof-capability B3 — the competition-mode raw admission carve-out.
     ///
     /// The exact public-query scope is authenticated (same unweakened epoch,
@@ -1668,6 +1673,7 @@ pub(super) enum CommandUnsatAdmission {
     CheckedExactClosedSentence,
     CheckedExactForallUfGround,
     CheckedExactFiniteExpansion,
+    CheckedExactRmDomainExpansion,
     /// #proof-capability B3 — scope-authenticated raw admission under
     /// competition shedding. Deliberately absent from every
     /// `last_command_unsat_was_*_verified` class: it is an admission record,
@@ -1695,6 +1701,9 @@ impl UnsatCertificate {
                 evidence.is_current(executor)
             }
             UnsatCertificateKind::CheckedExactFiniteExpansion(evidence) => {
+                evidence.is_current(executor)
+            }
+            UnsatCertificateKind::CheckedExactRmDomainExpansion(evidence) => {
                 evidence.is_current(executor)
             }
             UnsatCertificateKind::StrictProof(_)
@@ -1731,6 +1740,7 @@ impl UnsatCertificate {
                 | UnsatCertificateKind::CheckedExactClosedSentence(_)
                 | UnsatCertificateKind::CheckedExactForallUfGround(_)
                 | UnsatCertificateKind::CheckedExactFiniteExpansion(_)
+                | UnsatCertificateKind::CheckedExactRmDomainExpansion(_)
         )
     }
 
@@ -1779,6 +1789,9 @@ impl UnsatCertificate {
             }
             UnsatCertificateKind::CheckedExactFiniteExpansion(_) => {
                 CommandUnsatAdmission::CheckedExactFiniteExpansion
+            }
+            UnsatCertificateKind::CheckedExactRmDomainExpansion(_) => {
+                CommandUnsatAdmission::CheckedExactRmDomainExpansion
             }
             UnsatCertificateKind::CompetitionRaw(_) => CommandUnsatAdmission::CompetitionRaw,
         }
@@ -1947,6 +1960,7 @@ impl Executor {
                     | CommandUnsatAdmission::CheckedExactClosedSentence
                     | CommandUnsatAdmission::CheckedExactForallUfGround
                     | CommandUnsatAdmission::CheckedExactFiniteExpansion
+                    | CommandUnsatAdmission::CheckedExactRmDomainExpansion
             )
         )
     }
@@ -1994,48 +2008,6 @@ impl Executor {
     /// `ctx.assertions` participates only as a currentness equality check. This
     /// keeps a later Skolemized or instantiated working window from acquiring
     /// source-level authority by shape coincidence.
-    /// The AUTHORED hard-assertion roots of the current public UNSAT query, for
-    /// callers that will RE-DECIDE a subset of them in isolation.
-    ///
-    /// This keeps every scope conjunct of
-    /// [`Self::exact_plain_hard_unsat_scope_is_current`] that bears on whether
-    /// the verdict rests on authored HARD assertions alone — same epoch, no
-    /// assumptions, no declared extensions or objectives — and deliberately
-    /// drops the two that compare the LIVE working window
-    /// (`epoch.assertions == ctx.assertions` and the matching proof-provenance
-    /// equality).
-    ///
-    /// Dropping them is sound here and only here: those conjuncts exist so a
-    /// Skolemized/instantiated window cannot acquire SOURCE authority by shape
-    /// coincidence, whereas this accessor's callers take no authority from the
-    /// live window at all — they re-solve the authored roots from scratch on a
-    /// disposable executor, and that probe re-binds epoch, source stamp, ordered
-    /// roots, and term snapshot itself. Inside the quantifier loop the window
-    /// has necessarily been rewritten, so requiring equality would make the
-    /// accessor unconditionally `None` exactly where it is needed.
-    pub(in crate::executor) fn authored_hard_unsat_roots_for_isolated_recheck(
-        &self,
-    ) -> Option<Vec<TermId>> {
-        let epoch = self.unsat_query_epoch.as_ref()?;
-        let no_assumptions = epoch
-            .assumptions
-            .as_deref()
-            .is_none_or(<[TermId]>::is_empty);
-        if !(epoch.is_current(self)
-            && no_assumptions
-            && epoch.declared_extension.is_empty()
-            && epoch.declared_extension_entries.is_empty()
-            && epoch.declared_extension_objectives.is_none()
-            && epoch.declared_extension_objective_entries.is_none())
-        {
-            return None;
-        }
-        if self.last_assumptions.iter().flatten().next().is_some() {
-            return None;
-        }
-        Some(epoch.assertions.clone())
-    }
-
     pub(in crate::executor) fn try_authorize_current_query_exact_forall_exists_unsat(
         &self,
     ) -> Option<CheckedExactForallExistsUnsat> {
@@ -2918,29 +2890,6 @@ impl Executor {
         })
     }
 
-    /// Whether an independently certified UNSAT result must also provide a
-    /// translated, checker-accepted authored-scope proof.
-    ///
-    /// Public solves always enable the internal proof tracker so every
-    /// ordinary UNSAT can be certified. That bookkeeping is not a user proof
-    /// request. Conversely, the synthesized default CLI certificate is
-    /// explicitly best-effort and must not turn an independently certified
-    /// semantic verdict into `unknown` merely because an independent lane
-    /// cannot translate its theorem into Alethe. Only an explicit API/CLI proof
-    /// requirement or SMT-LIB `:produce-proofs true` makes the missing
-    /// translation verdict-relevant. Strict verification modes impose the same
-    /// requirement even when proof export itself was not requested.
-    pub(in crate::executor) fn strict_unsat_presentation_required(&self) -> bool {
-        self.proof_artifact_required
-            || self.self_check()
-            || self.verification_level().has_proof_checking()
-            || self.strict_proofs_enabled()
-            || matches!(
-                self.ctx.get_option("produce-proofs"),
-                Some(ay_frontend::OptionValue::Bool(true))
-            )
-    }
-
     /// Publish one of the deliberately narrow, independently checked exact
     /// semantic certificates.
     ///
@@ -3152,7 +3101,7 @@ impl Executor {
         });
         self.last_unsat_certificate = None;
         if ay_core::misc_cli_flags().debug_cert {
-            eprintln!("CERT/epoch BOUND exec={:p}", self as *const _);
+            eprintln!("CERT/epoch BOUND exec={:p}", std::ptr::from_ref(self));
         }
     }
 
@@ -3216,7 +3165,7 @@ impl Executor {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!(
                     "CERT/scope decline: no unsat_query_epoch bound exec={:p}",
-                    self as *const _
+                    std::ptr::from_ref(self)
                 );
             }
             return None;
@@ -3501,10 +3450,8 @@ impl Executor {
         &mut self,
         assumptions: &[TermId],
     ) -> Result<UnsatCertificate, UnsatCertificationError> {
-        // #cert-accounting item 6: an RAII guard, not a pair of calls, so that
-        // EVERY exit of this `?`-heavy function is measured. A dropped guard
-        // can only under-count (it cannot fire twice), and a missed
-        // measurement is a diagnostic gap, never a soundness one.
+        // An RAII guard measures every `?` exit; a missed drop can only
+        // under-count diagnostics, never affect soundness (#cert-accounting 6).
         let _mint_timer = cert_accounting::MintTimer::start(self.query_publication_role.get());
         // Affine handoff: every mint attempt consumes the quarantine token,
         // including scope failures and stronger proof/sidecar wins.
@@ -3519,6 +3466,7 @@ impl Executor {
             epoch,
             assumptions,
         )?;
+        self.probe_unsat_certificate_entry();
         // Read before the lane chain below can consume it (#missing-proof-probe).
         let pending_nested_array_present = pending_nested_array.is_some();
 
@@ -3533,7 +3481,7 @@ impl Executor {
                 // theorem. They are deliberately unavailable when the caller
                 // explicitly requested a translated proof or strict proof
                 // verification: those modes promise that artifact itself.
-                let independently_checked = if self.strict_unsat_presentation_required() {
+                let independently_checked = if self.independent_sidecar_blocked_by_presentation() {
                     None
                 } else if self.checked_sat_refutation_authorizes(epoch, assumptions) {
                     Some(CertificationSource::CheckedSatRefutation)
@@ -3925,11 +3873,8 @@ impl Executor {
         if conflict_limit == Some(0) || decision_limit == Some(0) {
             return false;
         }
-        // #cert-accounting item 6: a WHOLE-PROBLEM re-solve on a fresh
-        // executor, run from inside a certificate mint. Measured on
-        // dillig12_m as 94.1% of all mint cost from only 94 of 1019 mints,
-        // so the mint is cheap EXCEPT when it reaches here. Without a
-        // standing counter that has to be rediscovered by hand.
+        // This whole-problem re-solve accounted for 94.1% of mint cost on
+        // dillig12_m despite only 94/1019 mints reaching it (#cert-accounting 6).
         let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
         let mut exec = Executor::new();
         exec.ctx = self.ctx.clone();
@@ -3945,6 +3890,39 @@ impl Executor {
         // CORRECT `unsat` was published UNCONFIRMED. Sound but over-conservative
         // — `base |= false` implies `base AND A |= false`, never the reverse.
         exec.ctx.assertions = problem.to_vec();
+        // REBUILD THE ARENA AROUND THIS QUERY.
+        //
+        // The clone above is deliberate and stays — a thin re-translate of the
+        // roots leaves deep nested-`ite` obligations `Unknown`, which is why
+        // `Context` is `Clone` at all. What must not come with it is the outer
+        // solve's SCRATCH. Proof planning hash-conses denormalised scaffolding
+        // straight into the live arena (`(not (= x x))`, `(= t true)` from the
+        // reflexive-equality fold bridge); nothing asserts it, but whole-store
+        // scans in the nested solve still see it. Measured on deductive-checks's
+        // `Seq::subrange` side conditions: 3,113 -> 86,108 terms and 0.26s ->
+        // 28.3s, which overran the caller's 30s deadline and published
+        // `Unknown(Timeout)` for an obligation that is provable in a quarter of
+        // a second. No checker ever rejected a step — the residue only ever cost
+        // time, and time is what this accepting gate is spending.
+        //
+        // `compact_terms_for_derived_query` reclaims exactly the terms the
+        // context can no longer NAME, rooted at every `TermId` it still holds
+        // (assertions first, hence the ordering here). Surviving `TermData` is
+        // byte-identical; only ids move, and they move through the `RemapTable`
+        // the same in-place relabelling produced. Nothing crosses a store
+        // boundary and no id is ever authenticated by comparing a slot number
+        // against a length — the rejected shape.
+        //
+        // Fail-closed: a context that could not be fully relabelled is
+        // abandoned, never solved.
+        if !exec.ctx.compact_terms_for_derived_query() {
+            probe_cert_reject(|| {
+                "RECONFIRM(4) DECLINED: derived-query arena rebuild could not \
+                 relabel every held term"
+                    .to_string()
+            });
+            return false;
+        }
         // Mint exact authored-root/proof provenance for the nested obligation.
         // We intentionally run only the PLAIN strict checker below rather than
         // `certify_unsat_for_publication`: this method is itself the
@@ -3968,6 +3946,7 @@ impl Executor {
         exec.set_solve_controls(self.solve_interrupt.clone(), self.solve_deadline.get());
         let trace_rc = ay_core::misc_cli_flags().phase_trace;
         let verdict = exec.check_sat();
+        self.probe_reconfirmation_outcome(&exec, &verdict, problem);
         if !matches!(verdict, Ok(ref result) if result.is_unsat()) {
             if trace_rc {
                 eprintln!("c phase-trace reconfirm DECLINED at re-solve verdict={verdict:?}");
@@ -4182,16 +4161,51 @@ impl Executor {
                 scope.push(extension);
             }
         }
+        let readmitted = self.export_stripped_authored_false();
+        let claimed = |term: &TermId| problem.contains(term) || readmitted == Some(*term);
         debug_assert!(
-            scope.iter().all(|t| problem.contains(t)),
+            scope.iter().all(claimed),
             "the corroboration scope must stay a subset of the strict-proof \
              problem; a term outside it would mean the re-solve is answering a \
              question the publication never claimed"
         );
-        if !scope.iter().all(|t| problem.contains(t)) {
+        if !scope.iter().all(claimed) {
             return problem.to_vec();
         }
         scope
+    }
+
+    /// The Boolean constant `false` when an authored `assert` elaborated onto
+    /// it and the export-surface rule has stripped it from `problem`.
+    ///
+    /// `proof_export_scope_assertions` drops a `false` premise whose PARSED
+    /// surface is not literally `false`, because an external checker matches
+    /// `(assume h false)` against the input text and `(assert (= 0 1))` does
+    /// not spell it. That is a rule about the exported SURFACE, not about
+    /// authorship: elaboration folded a genuinely authored assertion onto the
+    /// canonical constant, and the term is still one of this query's premises.
+    ///
+    /// Left unhandled the strip is a wrong answer, not a missing artifact. On
+    /// `(assert (= 0 1))` plus an E-matched quantifier it removed the only
+    /// contradictory premise from `problem`, the subset guard above then read
+    /// the true authored scope as non-monotone and fell back to `problem`, and
+    /// step (4) re-solved the two SATISFIABLE assertions that remained — so a
+    /// correct ground refutation was withdrawn to `unknown`. Re-admitting the
+    /// constant keeps the scope a SUBSET of the authored problem, which is the
+    /// entire soundness argument for this arm.
+    ///
+    /// Provenance is exact, never `ctx.assertions` membership: only a concrete
+    /// authored `assert` command counts, so a solver-derived or preprocessing
+    /// `false` can never buy itself premise status here.
+    fn export_stripped_authored_false(&self) -> Option<TermId> {
+        if self.boolean_constant_premises_authored().1 {
+            return None;
+        }
+        let false_term = self.ctx.terms.false_term();
+        self.ctx
+            .concrete_authored_assertion_terms()
+            .contains(&false_term)
+            .then_some(false_term)
     }
 
     fn redecides_definitive_sat_within(&self, authored: &[TermId], budget_ms: u64) -> bool {
@@ -4683,6 +4697,82 @@ impl Executor {
         SolveResult::Unknown
     }
 
+    /// Withhold an UNSAT whose refutation the ARTIFACT gate would refuse,
+    /// whenever the caller demanded a proof (#verdict-artifact-premise-split).
+    ///
+    /// The two gates disagreed about what a premise is, and the disagreement
+    /// was silent:
+    ///
+    /// * the VERDICT side runs `ay_proof::check_proof_strict*`, whose
+    ///   `authorize_assumptions` (`ay-proof/src/checker/mod.rs`) EXPANDS the
+    ///   `and`-conjuncts of every problem assertion into its accept set, so a
+    ///   proof that `assume`s a conjunct passes;
+    /// * the ARTIFACT side runs
+    ///   [`ay_proof::validate_reachable_assumes_in_problem_scope`], which
+    ///   demands EXACT membership and has no `and` expansion, so the very same
+    ///   proof is refused with `NonProblemAssume` — the sole production emitter
+    ///   of "preprocessing-derived formulas are not proof authority".
+    ///
+    /// The result was a published `unsat` backed by a document AY itself
+    /// refuses to print. In shape that is indistinguishable from a laundered
+    /// premise, so the verdict must fail closed rather than the exporter
+    /// loosen: the producers already agree — `authored_conjunct_leaf` and
+    /// `rewritten_assertion_bridge` both refuse to assume a conjunct and derive
+    /// it with `and_pos` from an `assume` of the authored ROOT instead, and
+    /// name this exact asymmetry as their reason.
+    ///
+    /// Scoped to `strict_unsat_presentation_required()` — explicit `--proof`,
+    /// SMT-LIB `:produce-proofs`, `:check-proofs-strict`, or self-check. With
+    /// no proof demanded there is no artifact to contradict, and the internal
+    /// checker's entailment-preserving `and` expansion stays exactly as sound
+    /// as it has always been.
+    ///
+    /// Placed beside [`Self::decline_trust_bearing_unsat_under_strict_proofs`]
+    /// and after certification for the same reason: applied to the verdict
+    /// certification is about to publish, it can only ever turn a would-be
+    /// UNSAT into `Unknown`, never relabel a rejection the funnel already made.
+    /// The origin is [`UnknownOrigin::TerminalTrust`] because an `assume` the
+    /// presentation cannot back is exactly what leak-2
+    /// (`unsat_proof_terminal_foreign_assume`) already classifies there — a
+    /// free axiom is as unverified as a `trust` step.
+    fn decline_unexportable_assume_scope_under_proof_demand(
+        &mut self,
+        published: SolveResult,
+    ) -> SolveResult {
+        if !published.is_unsat()
+            || !self.strict_unsat_presentation_required()
+            || self.last_unsat_proof_reconstruction_suppressed
+        {
+            return published;
+        }
+        // `problem_assertions_for_strict_proof` is the SAME scope the verdict
+        // side already claims to check against (the sealed finite-enum scope
+        // for that one canonical proof, the complete authored scope otherwise).
+        // Only the silent `and` expansion is withdrawn here.
+        let unexportable = self.last_proof.as_ref().is_some_and(|proof| {
+            ay_proof::validate_reachable_assumes_in_problem_scope(
+                proof,
+                &self.problem_assertions_for_strict_proof(),
+            )
+            .is_err()
+        });
+        if !unexportable {
+            return published;
+        }
+        probe_cert_reject(|| {
+            "withholding UNSAT: a reachable assume is outside the authored problem scope the \
+             Alethe exporter validates against"
+                .to_string()
+        });
+        self.last_unsat_certificate = None;
+        self.pending_nested_array_bool_bv_unsat = None;
+        if !self.is_producing_proofs() {
+            self.proof_tracker.disable();
+        }
+        self.publish_unknown_from_origin(UnknownOrigin::TerminalTrust);
+        SolveResult::Unknown
+    }
+
     /// The single public UNSAT publication funnel.
     ///
     /// Non-UNSAT results pass through after revoking stale UNSAT authority. A
@@ -4708,6 +4798,7 @@ impl Executor {
         );
         let published = self.certify_unsat_presentation(proposed, assumptions);
         let published = self.decline_trust_bearing_unsat_under_strict_proofs(published);
+        let published = self.decline_unexportable_assume_scope_under_proof_demand(published);
         // Certification can perform the final strict proof check while minting
         // the public capability. Snapshot only after the complete publication
         // funnel so statistics include that authority check on every exit.
@@ -4909,6 +5000,123 @@ mod tests {
                 step: ay_core::ProofId(0)
             }
         ));
+    }
+
+    /// #verdict-artifact-premise-split — the verdict gate must not accept a
+    /// premise the Alethe exporter refuses.
+    ///
+    /// Fixture: authored `(and p r)` and `(not p)`. `p` is an `and`-conjunct,
+    /// never an assertion in its own right, so
+    /// `ay_proof::validate_reachable_assumes_in_problem_scope` refuses an
+    /// `assume` of it — while the internal strict checker's
+    /// `authorize_assumptions` expands `and` arguments and admits it. Three
+    /// rows pin the gate exactly:
+    ///
+    /// 1. no proof demanded  -> the conjunct-assuming proof still publishes;
+    /// 2. proof demanded     -> it is WITHHELD as `Unknown`;
+    /// 3. proof demanded, but the conjunct is DERIVED from an `assume` of the
+    ///    authored root by `and_pos` (the shape
+    ///    `rebuild_finite_enum_pigeonhole_refutation` now emits) -> published.
+    ///
+    /// Row 3 is what makes row 2 a repair rather than a capability loss.
+    #[test]
+    fn conjunct_assume_is_withheld_under_proof_demand_but_its_and_pos_descent_is_not() {
+        fn fixture() -> (Executor, TermId, TermId, TermId) {
+            let mut executor = Executor::new();
+            let p = executor
+                .ctx
+                .terms
+                .mk_var("premise_split_p", ay_core::Sort::Bool);
+            let r = executor
+                .ctx
+                .terms
+                .mk_var("premise_split_r", ay_core::Sort::Bool);
+            let root = executor.ctx.terms.mk_and(vec![p, r]);
+            let not_p = executor.ctx.terms.mk_not_raw(p);
+            executor.ctx.assertions.push(root);
+            executor.ctx.assertions.push(not_p);
+            (executor, p, root, not_p)
+        }
+
+        // The scope really does hold the ROOT and not the conjunct — otherwise
+        // the fixture would prove nothing.
+        let (executor, p, root, not_p) = fixture();
+        let scope = executor.problem_assertions_for_strict_proof();
+        assert!(scope.contains(&root) && scope.contains(&not_p));
+        assert!(
+            !scope.contains(&p),
+            "the fixture must keep `p` a conjunct, never an authored assertion"
+        );
+
+        let mut assumed = Proof::new();
+        let assumed_p = assumed.add_assume(p, None);
+        let assumed_not_p = assumed.add_assume(not_p, None);
+        assumed.add_rule_step(
+            ay_core::AletheRule::Resolution,
+            Vec::new(),
+            vec![assumed_p, assumed_not_p],
+            Vec::new(),
+        );
+        assert!(
+            ay_proof::validate_reachable_assumes_in_problem_scope(&assumed, &scope).is_err(),
+            "the artifact gate must refuse the conjunct assume"
+        );
+
+        // Row 1: no proof demanded, nothing to contradict.
+        let (mut executor, ..) = fixture();
+        executor.last_proof = Some(assumed.clone());
+        assert!(!executor.strict_unsat_presentation_required());
+        assert!(executor
+            .decline_unexportable_assume_scope_under_proof_demand(SolveResult::unsat_for_test())
+            .is_unsat());
+
+        // Row 2: a proof was demanded, so the unbackable verdict is withheld.
+        let (mut executor, ..) = fixture();
+        executor.last_proof = Some(assumed);
+        executor.proof_artifact_required = true;
+        assert!(matches!(
+                executor.decline_unexportable_assume_scope_under_proof_demand(
+                    SolveResult::unsat_for_test()
+                ),
+                SolveResult::Unknown
+            ));
+        assert_eq!(
+            executor.last_unknown_origin,
+            Some(UnknownOrigin::TerminalTrust)
+        );
+
+        // Row 3: the same conclusion, DERIVED from the authored root.
+        let (mut executor, p, root, not_p) = fixture();
+        let not_root = executor.ctx.terms.mk_not_raw(root);
+        let mut derived = Proof::new();
+        let assumed_root = derived.add_assume(root, None);
+        let and_pos = derived.add_rule_step(
+            ay_core::AletheRule::AndPos(0),
+            vec![not_root, p],
+            Vec::new(),
+            vec![root],
+        );
+        let unit_p = derived.add_rule_step(
+            ay_core::AletheRule::ThResolution,
+            vec![p],
+            vec![and_pos, assumed_root],
+            Vec::new(),
+        );
+        let assumed_not_p = derived.add_assume(not_p, None);
+        derived.add_rule_step(
+            ay_core::AletheRule::Resolution,
+            Vec::new(),
+            vec![unit_p, assumed_not_p],
+            Vec::new(),
+        );
+        executor
+            .check_proof_strict_with_datatypes(&derived)
+            .expect("the and_pos descent must strict-check");
+        executor.last_proof = Some(derived);
+        executor.proof_artifact_required = true;
+        assert!(executor
+            .decline_unexportable_assume_scope_under_proof_demand(SolveResult::unsat_for_test())
+            .is_unsat());
     }
 
     /// The trust family proper must stay exactly what it was: the resource
@@ -5455,6 +5663,87 @@ mod tests {
         assert_eq!(
             executor.unknown_reason(),
             Some(UnknownReason::SelfCheckRejected)
+        );
+    }
+
+    /// Mint into the LIVE arena exactly the denormalised scaffolding a
+    /// proof-planning bridge hash-conses there — `(not (= x x))` and
+    /// `(= t true)` — and assert it really is un-folded, so a builder change
+    /// that started folding these would fail the fixture rather than silently
+    /// turn the tests below into no-ops. Nothing asserts these nodes; they are
+    /// residue.
+    fn mint_scaffolding_residue(executor: &mut Executor, subject: TermId) {
+        let terms = &mut executor.ctx.terms;
+        let reflexive = terms.mk_app(Symbol::named("="), [subject, subject], CoreSort::Bool);
+        assert!(
+            matches!(terms.get(reflexive), TermData::App(symbol, args)
+                if symbol.name() == "=" && args.as_slice() == [subject, subject]),
+            "the fixture requires an UN-folded reflexive equality node"
+        );
+        let _negated = terms.mk_not_raw(reflexive);
+        let true_term = terms.true_term();
+        let lifted = terms.mk_app(Symbol::named("="), [reflexive, true_term], CoreSort::Bool);
+        assert!(
+            matches!(terms.get(lifted), TermData::App(symbol, args)
+                if symbol.name() == "=" && args.as_slice() == [reflexive, true_term]),
+            "the fixture requires an UN-folded `(= t true)` node"
+        );
+    }
+
+    /// The derived-query arena rebuild must never turn a SATISFIABLE obligation
+    /// into a reconfirmed UNSAT.
+    ///
+    /// This is the shape an adversary used to sink an EARLIER attempt at this
+    /// fix. That one snapshotted the pre-proof context and authenticated the
+    /// snapshot with `term.index() < snapshot.terms.len()` — a NUMERIC SLOT.
+    /// `TermStore::rollback_to` truncates and recycles ids, so the same index
+    /// denoted a different term in the two stores and the patched build
+    /// reconfirmed a plainly satisfiable obligation as UNSAT.
+    ///
+    /// Nothing in the rebuild crosses a store boundary: the arena is relabelled
+    /// IN PLACE and every held id is translated by the `RemapTable` that same
+    /// relabelling produced. So the scaffolding below can make the nested solve
+    /// cheaper and can never make it accept.
+    #[test]
+    fn derived_query_rebuild_declines_a_satisfiable_obligation_despite_scaffolding() {
+        let mut executor = Executor::new();
+        let p = executor
+            .ctx
+            .terms
+            .mk_var("rebuild_sat_p", ay_core::Sort::Bool);
+        let q = executor
+            .ctx
+            .terms
+            .mk_var("rebuild_sat_q", ay_core::Sort::Bool);
+        let not_q = executor.ctx.terms.mk_not_raw(q);
+        executor.ctx.assertions = vec![p, not_q];
+        mint_scaffolding_residue(&mut executor, p);
+        let caller_arena = executor.ctx.terms.len();
+
+        assert!(!executor.reconfirms_unsat_within(&[p, not_q], WHOLE_PROBLEM_RECONFIRMATION_LIMITS));
+
+        assert_eq!(
+            executor.ctx.terms.len(),
+            caller_arena,
+            "the rebuild must happen on the nested copy, never on the caller's arena"
+        );
+    }
+
+    /// ...and the same rebuild must not cost the lane its accepting answer: a
+    /// genuine contradiction still reconfirms with the same scaffolding present.
+    #[test]
+    fn derived_query_rebuild_still_reconfirms_a_contradiction_with_scaffolding() {
+        let mut executor = Executor::new();
+        let problem = strict_boolean_contradiction(&mut executor);
+        mint_scaffolding_residue(&mut executor, problem[0]);
+        let caller_arena = executor.ctx.terms.len();
+
+        assert!(executor.reconfirms_unsat_within(&problem, WHOLE_PROBLEM_RECONFIRMATION_LIMITS));
+
+        assert_eq!(
+            executor.ctx.terms.len(),
+            caller_arena,
+            "the rebuild must happen on the nested copy, never on the caller's arena"
         );
     }
 
@@ -6671,11 +6960,16 @@ mod tests {
 
             let published = executor.certify_unsat_for_publication(proposed, &[]);
 
-            assert!(
-                published.is_unknown(),
-                "{mode:?} must require the translated strict proof"
+            // Self-check accepts checked truth; artifact/checking modes still
+            // require the translated presentation they promise.
+            let sidecar_admitted = matches!(mode, RequiredProofMode::SelfCheck);
+            assert_eq!(published.is_unsat(), sidecar_admitted, "{mode:?}");
+            assert_eq!(published.is_unknown(), !sidecar_admitted, "{mode:?}");
+            assert_eq!(
+                executor.take_unsat_certificate().is_some(),
+                sidecar_admitted,
+                "{mode:?}"
             );
-            assert!(executor.take_unsat_certificate().is_none());
         }
     }
 

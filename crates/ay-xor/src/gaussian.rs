@@ -3,6 +3,8 @@
 
 //! Gauss-Jordan elimination solver for XOR constraints.
 
+pub(crate) mod chunked_proof;
+
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_sat::{Literal, Variable};
@@ -50,7 +52,7 @@ const MAX_XOR_PROOF_ROW_VARS: usize = 24;
 /// Skipping emission is sound — it only means fewer helper clauses for the
 /// external checker, which fails closed — so the aggregate budget is a pure
 /// safety bound. Sized so the whole trace stays around 100 MB of clause data.
-const MAX_XOR_PROOF_TOTAL_CLAUSES: usize = 1 << 20;
+pub(crate) const MAX_XOR_PROOF_TOTAL_CLAUSES: usize = 1 << 20;
 
 /// Result of a Gaussian elimination step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,29 @@ pub enum GaussResult {
     Conflict(usize),
 }
 
+/// One Gauss-Jordan elimination step recorded for DRAT emission (task #20).
+///
+/// `result = parent_a ^ parent_b`. The parents are SNAPSHOTS taken at the
+/// moment of the row operation; the ladder derivation in
+/// `emit_trace_step_ladder` needs them because a derived row's CNF encoding
+/// is NOT single-step RUP — the cancelled variables (vars(parent_a) n
+/// vars(parent_b)) stay unassigned when one encoding clause is negated, so
+/// the checker must be walked down a resolution ladder instead.
+#[derive(Debug, Clone)]
+struct TraceStep {
+    result: PackedRow,
+    parent_a: PackedRow,
+    parent_b: PackedRow,
+    /// Matrix position of the pivot row (`parent_a`) at the moment of the
+    /// row operation, AFTER any pivot swap. Together with the recorded swap
+    /// events this gives exact row provenance for the chunked proof plan
+    /// (which trace step or original constraint produced each parent) with
+    /// no content matching.
+    pivot_pos: u32,
+    /// Matrix position of the target row (`parent_b` before, `result` after).
+    target_pos: u32,
+}
+
 /// Gauss-Jordan elimination solver for XOR constraints.
 ///
 /// Maintains a matrix in reduced row echelon form and supports incremental
@@ -80,7 +105,7 @@ pub enum GaussResult {
 /// separately in packed bit vectors (`assigned_true_cols`, `unassigned_cols`).
 /// On backtrack, only the assignment state is rolled back -- no matrix copy
 /// is needed. This gives O(k) backtrack cost where k is the number of
-/// unassigned variables, compared to the previous O(n*m) row-copy approach.
+/// unassigned variables, compared to the previous O(n*m) matrix-copy cost.
 ///
 /// This mirrors CryptoMiniSat's `canceling()` flag-based backtrack
 /// (`reference/cryptominisat/src/gaussian.h:208-213`).
@@ -120,7 +145,16 @@ pub struct GaussianSolver {
     /// an XOR operation during elimination. These rows are linear combinations
     /// of the original constraints, and their CNF encodings are RUP-derivable
     /// from the original XOR-encoding clauses.
-    elimination_trace: Vec<PackedRow>,
+    elimination_trace: Vec<TraceStep>,
+    /// Pivot swaps performed by `eliminate()`, as `(pos_a, pos_b, watermark)`
+    /// where `watermark` is `elimination_trace.len()` at swap time. Replayed
+    /// by the chunked proof planner to recover exact row provenance.
+    elimination_swaps: Vec<(u32, u32, u32)>,
+    /// Snapshot of the constraint rows as built by `new()`, captured on the
+    /// first `eliminate()` call before any row operation. Original-row widths
+    /// and contents feed the chunked proof plan (rotation conversion of an
+    /// original row's input CNF encoding into its parity chain).
+    initial_rows: Vec<PackedRow>,
 }
 
 impl GaussianSolver {
@@ -168,6 +202,8 @@ impl GaussianSolver {
             row_watches: vec![[None, None]; num_rows],
             satisfied_rows: vec![false; num_rows],
             elimination_trace: Vec::new(),
+            elimination_swaps: Vec::new(),
+            initial_rows: Vec::new(),
         }
     }
 
@@ -182,6 +218,13 @@ impl GaussianSolver {
         let num_rows = self.rows.len();
         let mut pivot_row_idx = 0;
         self.elimination_trace.clear();
+        self.elimination_swaps.clear();
+        // First call only: `rows` still holds the constraint rows built by
+        // `new()`. A repeated `eliminate()` re-runs on the RREF matrix, so
+        // overwriting the snapshot then would lose original-row identity.
+        if self.initial_rows.is_empty() {
+            self.initial_rows = self.rows.clone();
+        }
 
         for col in 0..self.num_cols {
             // Find pivot: first row with "1" in this column (at or below pivot_row_idx)
@@ -197,6 +240,11 @@ impl GaussianSolver {
                 // Swap pivot row to current position
                 if pivot_idx != pivot_row_idx {
                     self.rows.swap(pivot_idx, pivot_row_idx);
+                    self.elimination_swaps.push((
+                        pivot_idx as u32,
+                        pivot_row_idx as u32,
+                        self.elimination_trace.len() as u32,
+                    ));
                 }
 
                 // Record that this column has a pivot
@@ -208,11 +256,18 @@ impl GaussianSolver {
                     if row_idx != pivot_row_idx && self.rows[row_idx].get(col) {
                         // Need to clone to satisfy borrow checker
                         let pivot_row = self.rows[pivot_row_idx].clone();
+                        let old_target = self.rows[row_idx].clone();
                         self.rows[row_idx].xor_in(&pivot_row);
-                        // Record the intermediate derived row for DRAT proof
-                        // generation (#4533). Each derived row is the XOR of two
-                        // existing rows and its CNF is RUP from the parent rows.
-                        self.elimination_trace.push(self.rows[row_idx].clone());
+                        // Record the derived row WITH its parents for DRAT
+                        // ladder emission (task #20): enc(result) alone is not
+                        // RUP; the ladder over the cancelled pivot column is.
+                        self.elimination_trace.push(TraceStep {
+                            result: self.rows[row_idx].clone(),
+                            parent_a: pivot_row,
+                            parent_b: old_target,
+                            pivot_pos: pivot_row_idx as u32,
+                            target_pos: row_idx as u32,
+                        });
                     }
                 }
 
@@ -582,215 +637,206 @@ impl GaussianSolver {
     // This is the lazy backtrack optimization from issue #8167, porting CMS's
     // `canceling()` pattern.
 
-    /// Generate intermediate proof clauses for DRAT verification (#4533).
+    /// Emit the DRAT resolution ladder for elimination-trace steps from
+    /// `start` onward; returns the clauses and the new trace length for the
+    /// caller's latch (task #20).
     ///
-    /// During Gauss-Jordan elimination, each XOR operation on two rows produces
-    /// a derived row whose CNF encoding is RUP-derivable from the CNF of its
-    /// parent rows. This method returns the CNF encodings of all intermediate
-    /// derived rows recorded during `eliminate()`, in elimination order.
+    /// A derived row `C = A ^ B` cannot be emitted as a bare CNF encoding:
+    /// negating one clause of `enc(C)` leaves the CANCELLED variables
+    /// (`vars(A) n vars(B)`) unassigned, so unit propagation through the
+    /// parent encodings never closes and every external checker rejects the
+    /// addition (measured 2026-08-19: dsr-trim "No UP contradiction for RAT
+    /// clause" on BOTH the empty- and non-empty-conflict paths). Instead each
+    /// step emits a ladder over its cancelled variables `x1..xm`:
     ///
-    /// After emitting the intermediate row CNF, this method also emits a unit
-    /// clause for one variable in the system. This unit clause is RUP from the
-    /// combination of original clauses and intermediate clauses (because the
-    /// system is contradictory, both polarities of any variable are implied).
-    /// The unit clause enables the DRAT checker to derive the empty clause
-    /// via unit propagation.
+    ///   level m: for every wrong-parity assignment over `vars(C)` and EVERY
+    ///            assignment over `x1..xm`, the blocking clause — each is a
+    ///            weakening (superset) of a present `enc(A)`/`enc(B)` clause,
+    ///            so negating it falsifies that clause outright (RUP);
+    ///   level j-1: resolvents of level-j pairs on `x_j` (RUP against level j);
+    ///   level 0: exactly `enc(C)`.
     ///
-    /// For a 2-variable row `xi XOR xj = rhs`, the CNF encoding is:
-    ///   rhs=0: {xi, -xj}, {-xi, xj}  (equivalence)
-    ///   rhs=1: {xi, xj}, {-xi, -xj}  (XOR)
-    pub fn generate_proof_clauses(&self) -> Vec<Vec<Literal>> {
+    /// Parent encodings are always present when a step is emitted: original
+    /// rows are encoded in the input CNF itself (the consumed clause groups),
+    /// and derived parents were emitted by their own earlier ladder (trace
+    /// order). A zero result row with rhs=1 ladders down to the EMPTY clause,
+    /// which is why the empty-conflict path needs no bridging-unit hack.
+    ///
+    /// Returns `None` instead of emitting a partial trace when any remaining
+    /// step exceeds the width or aggregate-clause budget. Callers that remove
+    /// the original XOR clauses must fall back to ordinary SAT solving on
+    /// `None`; silently publishing a predictably rejected certificate is not
+    /// a certified proof route.
+    pub fn generate_proof_clauses_from(&self, start: usize) -> Option<(Vec<Vec<Literal>>, usize)> {
         let mut proof_clauses = Vec::new();
-
-        for row in &self.elimination_trace {
-            if row.is_zero() {
-                // Zero row with rhs=true means 0=1 conflict. We cannot encode
-                // this as CNF (no variables), but the empty clause will be
-                // emitted separately by the solver.
-                continue;
-            }
-            Self::encode_xor_row_to_cnf(row, &self.col_to_var, &mut proof_clauses);
-        }
-
-        // After adding intermediate CNF, the empty clause is not directly
-        // RUP-derivable because the clause set has no unit clauses to start
-        // unit propagation. We emit a unit clause for one variable to bridge
-        // the gap. This unit clause IS RUP because:
-        //   1. The system is contradictory (0=1 row exists)
-        //   2. Negating the unit literal forces unit propagation that reaches
-        //      contradiction through the intermediate + original clauses
-        //
-        // After the unit clause, the empty clause becomes RUP because the
-        // unit literal propagates through the clause set to contradiction.
-        if !proof_clauses.is_empty() {
-            // Pick the first variable from any non-zero RREF row.
-            if let Some(first_var) = self.col_to_var.first().copied() {
-                let var = Variable::new(first_var);
-                proof_clauses.push(vec![Literal::positive(var)]);
+        for step in self.elimination_trace.iter().skip(start) {
+            if !self.emit_trace_step_ladder(step, &mut proof_clauses) {
+                return None;
             }
         }
-
-        proof_clauses
+        Some((proof_clauses, self.elimination_trace.len()))
     }
 
-    /// Encode a single XOR row as CNF clauses, appending to `out`.
+    /// Whether the complete elimination trace fits the certified DRAT ladder
+    /// envelope without allocating the clauses.
+    pub fn has_complete_proof_ladder(&self) -> bool {
+        self.complete_proof_ladder_clause_count().is_some()
+    }
+
+    /// Exact aggregate clause count for a complete certified ladder, or
+    /// `None` when a width, arithmetic, or aggregate budget is exceeded.
+    pub(crate) fn complete_proof_ladder_clause_count(&self) -> Option<usize> {
+        let mut total = 0usize;
+        for step in &self.elimination_trace {
+            let step_clauses = self.proof_ladder_clause_count(step)?;
+            let next_total = total.checked_add(step_clauses)?;
+            if next_total > MAX_XOR_PROOF_TOTAL_CLAUSES {
+                return None;
+            }
+            total = next_total;
+        }
+        Some(total)
+    }
+
+    /// Try whole-trace ladder emission for a certified proof route.
+    pub fn try_generate_complete_proof_clauses(&self) -> Option<Vec<Vec<Literal>>> {
+        self.generate_proof_clauses_from(0)
+            .map(|(clauses, _)| clauses)
+    }
+
+    /// Whole-trace ladder emission (the empty-conflict path).
     ///
-    /// For k variables, generates 2^(k-1) clauses that forbid all assignments
-    /// violating the XOR parity constraint.
-    fn encode_xor_row_to_cnf(row: &PackedRow, col_to_var: &[VarId], out: &mut Vec<Vec<Literal>>) {
-        // Aggregate budget across the whole elimination trace. Without it the
-        // per-row width cap bounds one row and nothing else, and a 180 KB
-        // instance can drive this to tens of gigabytes (see
-        // `MAX_XOR_PROOF_TOTAL_CLAUSES`).
-        if out.len() >= MAX_XOR_PROOF_TOTAL_CLAUSES {
-            return;
+    /// This retains the pre-task-#20 public return type for source
+    /// compatibility. Certified callers should first use
+    /// [`Self::has_complete_proof_ladder`] or call
+    /// [`Self::try_generate_complete_proof_clauses`]; an over-budget trace
+    /// preserves the historical behavior of returning no helper clauses.
+    pub fn generate_proof_clauses(&self) -> Vec<Vec<Literal>> {
+        self.try_generate_complete_proof_clauses()
+            .unwrap_or_default()
+    }
+
+    /// Emit one elimination step's resolution ladder (see
+    /// `generate_proof_clauses_from`). Returns false without modifying `out`
+    /// when a budget would be exceeded.
+    fn emit_trace_step_ladder(&self, step: &TraceStep, out: &mut Vec<Vec<Literal>>) -> bool {
+        let Some(ladder_total) = self.proof_ladder_clause_count(step) else {
+            return false;
+        };
+        if out.len().saturating_add(ladder_total) > MAX_XOR_PROOF_TOTAL_CLAUSES {
+            return false;
         }
-        let vars: Vec<(VarId, usize)> = row
-            .iter_set_bits()
-            .map(|col| (col_to_var[col], col))
+
+        // Columns of the result and the cancelled columns (in both parents).
+        let result_cols: Vec<usize> = (0..self.num_cols).filter(|&c| step.result.get(c)).collect();
+        let cancelled_cols: Vec<usize> = (0..self.num_cols)
+            .filter(|&c| step.parent_a.get(c) && step.parent_b.get(c))
             .collect();
-        let k = vars.len();
-
-        if k == 0 {
-            return;
+        let rhs = step.result.rhs;
+        if ladder_total == 0 {
+            return true;
         }
-
-        if k == 1 {
-            // Unit XOR: xi = rhs -> unit clause {xi} or {-xi}
-            let var = Variable::new(vars[0].0);
-            let lit = if row.rhs {
-                Literal::positive(var)
-            } else {
-                Literal::negative(var)
-            };
-            out.push(vec![lit]);
-            return;
-        }
-
-        if k == 2 {
-            // Binary XOR: xi XOR xj = rhs
-            let var0 = Variable::new(vars[0].0);
-            let var1 = Variable::new(vars[1].0);
-            if row.rhs {
-                // xi XOR xj = 1: {xi, xj}, {-xi, -xj}
-                out.push(vec![Literal::positive(var0), Literal::positive(var1)]);
-                out.push(vec![Literal::negative(var0), Literal::negative(var1)]);
-            } else {
-                // xi XOR xj = 0: {xi, -xj}, {-xi, xj}
-                out.push(vec![Literal::positive(var0), Literal::negative(var1)]);
-                out.push(vec![Literal::negative(var0), Literal::positive(var1)]);
-            }
-            return;
-        }
-
-        // k-variable XOR (k >= 3): generate 2^(k-1) clauses.
-        //
-        // Guard `1usize << k` against shift overflow (UB for k >= 64: debug
-        // panic, release shift-amount mask -> wrong certificate clauses) and the
-        // `2^(k-1)` memory blow-up. Wide rows skip helper emission, which is
-        // sound (the external DRAT checker fails closed). See
-        // `MAX_XOR_PROOF_ROW_VARS`.
-        if k > MAX_XOR_PROOF_ROW_VARS {
-            return;
-        }
-        let total = 1usize << k;
-        for mask in 0..total {
-            // Each mask represents an assignment. If the parity of set bits
-            // does NOT match rhs, it's a forbidden assignment -> generate clause.
-            let ones = mask.count_ones();
-            let parity_matches = (ones % 2 == 1) == row.rhs;
-            if parity_matches {
-                // This assignment satisfies the XOR -- skip it.
-                continue;
-            }
-            // Generate a clause that blocks this forbidden assignment.
-            let clause: Vec<Literal> = vars
-                .iter()
-                .enumerate()
-                .map(|(i, &(var_id, _))| {
-                    let var = Variable::new(var_id);
-                    if (mask >> i) & 1 == 1 {
-                        Literal::negative(var)
-                    } else {
-                        Literal::positive(var)
+        // Wrong-parity assignments over the result columns: parity != rhs.
+        // Represent an assignment as a bitmask over result_cols indices.
+        let n = result_cols.len();
+        for level in (0..=cancelled_cols.len()).rev() {
+            for assign in 0..(1u64 << n) {
+                if ((assign.count_ones() as usize) % 2 == usize::from(rhs)) && n > 0 {
+                    continue; // right parity: not blocked
+                }
+                if n == 0 && !rhs {
+                    continue;
+                }
+                for xassign in 0..(1u64 << level) {
+                    let mut clause = Vec::with_capacity(n + level);
+                    for (bit, &col) in result_cols.iter().enumerate() {
+                        let var = Variable::new(self.col_to_var[col]);
+                        // Block value TRUE with a negative literal.
+                        clause.push(if (assign >> bit) & 1 == 1 {
+                            Literal::negative(var)
+                        } else {
+                            Literal::positive(var)
+                        });
                     }
-                })
-                .collect();
-            out.push(clause);
+                    for (bit, &col) in cancelled_cols.iter().take(level).enumerate() {
+                        let var = Variable::new(self.col_to_var[col]);
+                        clause.push(if (xassign >> bit) & 1 == 1 {
+                            Literal::negative(var)
+                        } else {
+                            Literal::positive(var)
+                        });
+                    }
+                    out.push(clause);
+                }
+            }
         }
+        true
+    }
+
+    /// Exact number of clauses for one resolution ladder, or `None` when its
+    /// widest clause/shift arithmetic is outside the certified envelope.
+    fn proof_ladder_clause_count(&self, step: &TraceStep) -> Option<usize> {
+        let result_len = (0..self.num_cols).filter(|&c| step.result.get(c)).count();
+        let cancelled_len = (0..self.num_cols)
+            .filter(|&c| step.parent_a.get(c) && step.parent_b.get(c))
+            .count();
+        if result_len.checked_add(cancelled_len)? > MAX_XOR_PROOF_ROW_VARS {
+            return None;
+        }
+        let wrong_parity_count = if result_len == 0 {
+            usize::from(step.result.rhs)
+        } else {
+            1usize.checked_shl(u32::try_from(result_len - 1).ok()?)?
+        };
+        let levels = 1usize
+            .checked_shl(u32::try_from(cancelled_len.checked_add(1)?).ok()?)?
+            .checked_sub(1)?;
+        wrong_parity_count.checked_mul(levels)
     }
 }
 
 #[cfg(test)]
 mod proof_clause_encoding_tests {
     use super::*;
-    use crate::packed_row::PackedRow;
 
-    /// `col_to_var[col] = col + 1` (1-indexed VarIds, length `n`).
-    fn col_to_var(n: usize) -> Vec<VarId> {
-        (1..=n as VarId).collect()
-    }
-
-    fn row_with_first_k_set(n: usize, k: usize) -> PackedRow {
-        let mut row = PackedRow::new(n);
-        for col in 0..k {
-            row.set(col, true);
-        }
-        row.rhs = true;
-        row
-    }
-
-    /// Small rows are unaffected by the cap: a `k = 3` XOR row still emits
-    /// exactly `2^(k-1) = 4` clauses, each with `k = 3` literals.
+    /// One real elimination step with two result and two cancelled variables
+    /// emits 2 * (2^3 - 1) ladder clauses and terminates in enc(x0 = x3).
     #[test]
-    fn test_small_row_encoding_unchanged() {
-        let n = 8;
-        let row = row_with_first_k_set(n, 3);
-        let mut out = Vec::new();
-        GaussianSolver::encode_xor_row_to_cnf(&row, &col_to_var(n), &mut out);
-        assert_eq!(out.len(), 4, "k=3 must still emit 2^(k-1)=4 clauses");
-        assert!(
-            out.iter().all(|c| c.len() == 3),
-            "each clause has k=3 literals"
+    fn test_actual_elimination_ladder_count_and_terminal_encoding() {
+        let constraints = vec![
+            XorConstraint::new(vec![0, 1, 2], false),
+            XorConstraint::new(vec![1, 2, 3], false),
+        ];
+        let mut solver = GaussianSolver::new(&constraints);
+        let _ = solver.eliminate();
+        let clauses = solver
+            .try_generate_complete_proof_clauses()
+            .expect("small ladder must fit");
+        assert_eq!(clauses.len(), 14);
+        let x0 = Variable::new(0);
+        let x3 = Variable::new(3);
+        assert_eq!(
+            &clauses[12..],
+            &[
+                vec![Literal::negative(x0), Literal::positive(x3)],
+                vec![Literal::positive(x0), Literal::negative(x3)],
+            ]
         );
     }
 
-    /// A moderate `k = 10` row still emits the full `2^9 = 512` clauses — the
-    /// general encoding path is preserved below the cap.
+    /// A proof route must reject the whole trace before consuming input XOR
+    /// clauses when even one ladder exceeds the certified width envelope.
     #[test]
-    fn test_moderate_row_encoding_unchanged() {
-        let n = 16;
-        let row = row_with_first_k_set(n, 10);
-        let mut out = Vec::new();
-        GaussianSolver::encode_xor_row_to_cnf(&row, &col_to_var(n), &mut out);
-        assert_eq!(out.len(), 1 << 9, "k=10 must emit 2^(k-1)=512 clauses");
-    }
-
-    /// Regression for the `1usize << k` shift-overflow (#4533): a `k = 70` row
-    /// (k >= usize::BITS = 64) must NOT panic and must skip helper emission
-    /// rather than mask the shift and emit a wrong certificate clause set.
-    #[test]
-    fn test_wide_row_skips_without_shift_overflow() {
-        let n = 80;
-        let row = row_with_first_k_set(n, 70);
-        let mut out = Vec::new();
-        // Before the fix this either panicked (debug) or emitted bogus clauses
-        // from `1usize << (70 % 64) = 1usize << 6` (release).
-        GaussianSolver::encode_xor_row_to_cnf(&row, &col_to_var(n), &mut out);
-        assert!(
-            out.is_empty(),
-            "wide row (k=70) must skip helper emission, got {} clauses",
-            out.len()
-        );
-    }
-
-    /// The cap boundary: `k = MAX_XOR_PROOF_ROW_VARS + 1` skips emission.
-    #[test]
-    fn test_just_over_cap_skips() {
-        let n = MAX_XOR_PROOF_ROW_VARS + 4;
-        let row = row_with_first_k_set(n, MAX_XOR_PROOF_ROW_VARS + 1);
-        let mut out = Vec::new();
-        GaussianSolver::encode_xor_row_to_cnf(&row, &col_to_var(n), &mut out);
-        assert!(out.is_empty(), "k = cap+1 must skip helper emission");
+    fn test_complete_ladder_preflight_rejects_wide_elimination_step() {
+        let vars: Vec<VarId> = (0..=MAX_XOR_PROOF_ROW_VARS as VarId).collect();
+        let constraints = vec![
+            XorConstraint::new(vars.clone(), false),
+            XorConstraint::new(vars, true),
+        ];
+        let mut solver = GaussianSolver::new(&constraints);
+        assert!(matches!(solver.eliminate(), GaussResult::Conflict(_)));
+        assert!(!solver.has_complete_proof_ladder());
+        assert!(solver.try_generate_complete_proof_clauses().is_none());
+        assert!(solver.generate_proof_clauses().is_empty());
     }
 }

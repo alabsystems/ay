@@ -224,9 +224,10 @@ impl EufLemmaPlan {
         let mut emitted_lengths = Vec::with_capacity(self.derivs.len());
         let mut refls = HashSet::default();
         for deriv in &self.derivs {
-            let prems = match deriv {
+            let prems: &[EufJust] = match deriv {
                 EufDeriv::Cong { prems, .. } => prems,
                 EufDeriv::Chain { edges, .. } => edges,
+                EufDeriv::RowLeaf { guard, .. } => guard.as_slice(),
             };
             emitted_lengths.push(taut_volume(
                 prems,

@@ -63,7 +63,7 @@ mod array_congruence_tests;
 #[cfg(test)]
 mod array_finite_tests;
 /// Recognize whether `clause` is a strict-checkable (ungated) bit-blast lemma —
-/// i.e. whether [`validate_bv_bitblast`] with no gate annotation would accept it.
+/// i.e. whether `validate_bv_bitblast` with no gate annotation would accept it.
 ///
 /// This is the exact inverse of the validator's semantic checks: the
 /// proof classifier (`ay-dpll`) calls it to upgrade a `Generic`/trust lemma into
@@ -309,7 +309,7 @@ fn eval_ground_bv_constant(terms: &TermStore, term: TermId) -> Option<(u64, u32)
 /// Recognize whether `clause` is a strict-checkable Boolean tautology — every
 /// literal is `Bool`-sorted and the clause is TRUE under every assignment of its
 /// bounded (Bool / small-BV) variables. The exact inverse of
-/// [`validate_bool_tautology`].
+/// `validate_bool_tautology`.
 #[must_use]
 pub fn recognize_bool_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_bool_tautology(terms, ProofId(0), clause).is_ok()
@@ -2496,8 +2496,8 @@ mod multi_literal_clausification_tautology_tests {
     /// Opaque Bool atom the bounded evaluator cannot interpret — forces the
     /// structural path.
     fn opaque_atom(terms: &mut TermStore, name: &str) -> TermId {
-        let x = terms.mk_var(&format!("{name}_x"), Sort::Int);
-        let y = terms.mk_var(&format!("{name}_y"), Sort::Int);
+        let x = terms.mk_var(format!("{name}_x"), Sort::Int);
+        let y = terms.mk_var(format!("{name}_y"), Sort::Int);
         terms.mk_app(Symbol::named("="), vec![x, y], Sort::Bool)
     }
 

@@ -17,7 +17,7 @@ use ay_core::{ProofId, TermData, TermId, TermStore};
 use super::ProofCheckError;
 
 /// Recognize whether `clause` is a valid `(ite c x x) = x` lemma — i.e. whether
-/// [`validate_ite_same`] would accept it. Used by the `ay-dpll` reconstruction
+/// `validate_ite_same` would accept it. Used by the `ay-dpll` reconstruction
 /// to gate its emitted lemma on the exact validator the strict checker runs.
 #[must_use]
 pub fn recognize_ite_same(terms: &TermStore, clause: &[TermId]) -> bool {

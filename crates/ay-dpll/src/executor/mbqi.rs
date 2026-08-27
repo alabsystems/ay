@@ -11978,9 +11978,9 @@ impl Executor {
 
         // The checked interpretation is semantic model data, not executor
         // routing state. Install it into the exact affine model before any
-        // completion or evaluation can observe that model, then extend only
-        // declarations proved absent from the exact checked roots. The sole
-        // SAT publication funnel later seals this already-final object.
+        // completion or evaluation can observe that model, then extend it over
+        // the RESIDUALS this theorem leaves universally free (`I ∪ J`). The
+        // sole SAT publication funnel later seals this already-final object.
         let mut model = Model::empty();
         // This is also the single shape/type/currentness check for witness
         // values: installation admits only scalar literals and recursively
@@ -11988,7 +11988,7 @@ impl Executor {
         // check here avoids a weaker debug-only predicate drifting away from
         // the model's fail-closed production perimeter.
         model.install_certified_const_interps(&self.ctx, witness)?;
-        if !self.complete_quantified_output_model_before_seal(&mut model, roots) {
+        if !self.complete_certified_const_interp_model_before_seal(&mut model, roots) {
             return None;
         }
         self.const_interp_cert_witness_state = Some(

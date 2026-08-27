@@ -79,6 +79,7 @@
 //! query-clause discharge that succeeds under the UF reading also holds for
 //! the real semantics; one that fails merely demotes to unknown.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Duration;
 // The workspace-wide monotonic clock shim (#wasm port): byte-identical to
@@ -568,10 +569,12 @@ pub(crate) enum CataSkip {
 #[derive(Debug, Clone)]
 pub(crate) struct ClauseObligation {
     pub(crate) clause_index: usize,
-    /// Monolithic `θ ∧ ¬(⋀ θ#) ⊨ ⊥` script (diagnostics / dump / tests).
-    /// Not read in production (the discharge gate uses `sub_scripts`); kept
-    /// for the pinned script-shape assertions in `cata_abstract/tests.rs`.
-    #[allow(dead_code)]
+    /// Monolithic `θ ∧ ¬(⋀ θ#) ⊨ ⊥` script. Tried FIRST by the discharge gate
+    /// on NARROW clauses (see `CATA_MONOLITHIC_MAX_SUB_SCRIPTS`) — one SMT
+    /// query for the whole clause instead of one per conjunct — and used by
+    /// the diagnostics dump and the pinned script-shape assertions in
+    /// `cata_abstract/tests.rs`. Anything but `unsat` falls back to
+    /// `sub_scripts`, so the verdict is exactly the per-conjunct one.
     pub(crate) script: String,
     /// Per-conjunct decomposition used by the discharge gate: each entry is
     /// `θ ∧ ¬θ#ᵢ ⊨ ⊥`. Discharged iff EVERY entry is `unsat` (fail-closed).
@@ -626,7 +629,60 @@ pub(crate) struct CataAbstraction {
     layout: FxHashMap<PredicateId, Vec<ArgMap>>,
     /// Original predicate signatures (for model composition).
     original_preds: Vec<(PredicateId, Vec<ChcSort>)>,
+    /// RESUMABLE progress through the obligation gate: the first
+    /// `(obligation index, sub-script index)` not yet discharged `unsat`.
+    ///
+    /// The gate is a property of the ABSTRACTION (`θ ⇒ θ#`), not of any
+    /// candidate model, so every candidate generator at one ladder level faces
+    /// the identical obligations. Before this memo the gate was re-run from
+    /// scratch per candidate and a clock-exhausted attempt threw away every
+    /// sub-query it had already discharged — measured on the equal-shape list
+    /// problem under a loaded 18-way test suite: one attempt discharged 15 of
+    /// 25 sub-queries in 5.28 s, the next re-started at 0 and got 4 more in
+    /// 873 ms, and the level failed having proved 19 of 25 twice over.
+    obligation_cursor: Cell<(usize, usize)>,
+    /// Obligation indices whose monolithic whole-clause attempt already ran and
+    /// did not come back `unsat`: the resumed gate goes straight to the
+    /// per-conjunct split for those instead of re-paying the failed attempt.
+    obligation_mono_tried_upto: Cell<usize>,
+    /// A sub-query came back anything but `unsat` (sat / unknown / parse
+    /// failure / panic / per-query timeout). Fail-closed and FINAL for this
+    /// abstraction: no candidate model at this ladder level can certify past a
+    /// gate that already rejected the abstraction it shares.
+    obligation_refuted: Cell<bool>,
 }
+
+/// Outcome of one (resumable) run of the implication-obligation gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObligationGate {
+    /// EVERY obligation came back `unsat`. The only outcome that certifies.
+    Discharged,
+    /// A sub-query did not come back `unsat`. Fail-closed and final: this
+    /// abstraction can never certify a Safe.
+    Refuted,
+    /// The deadline arrived with obligations left. Neither certified nor
+    /// refuted — the progress made is kept for a later resumed attempt.
+    Exhausted,
+}
+
+/// Clause width (θ# conjunct count) at or below which the gate tries the
+/// MONOLITHIC whole-clause obligation `θ ∧ ¬(⋀ᵢ θ#ᵢ) ⊨ ⊥` before the
+/// per-conjunct split.
+///
+/// The split exists because `¬(⋀ᵢ θ#ᵢ)` is a WIDE disjunction and ay's eager
+/// DPLL(T) enumerates it: a sortedness clause carries 100+ conjuncts and stalls
+/// (>90 s) where each `θ ∧ ¬θ#ᵢ` sub-query is milliseconds. That reasoning is
+/// about WIDE clauses. On the narrow size-family clauses the split instead
+/// multiplies a ~20 ms fixed per-`check-sat` cost by the conjunct count, which
+/// is how the equal-shape list problem's 3 clauses became 25 SMT queries
+/// (measured: 512 ms monolithic-free vs 226 ms monolithic, idle; the ratio
+/// carries straight through the ~15x wall-clock inflation of a loaded parallel
+/// test suite).
+///
+/// Sound either way: the monolithic script IS the clause obligation, so an
+/// `unsat` discharges it exactly; anything else falls back to the per-conjunct
+/// split and the gate's verdict is unchanged.
+const CATA_MONOLITHIC_MAX_SUB_SCRIPTS: usize = 16;
 
 impl CataAbstraction {
     /// Build the abstraction of `problem` under the catamorphism `pool`.
@@ -707,6 +763,9 @@ impl CataAbstraction {
             registry,
             layout,
             original_preds,
+            obligation_cursor: Cell::new((0, 0)),
+            obligation_mono_tried_upto: Cell::new(0),
+            obligation_refuted: Cell::new(false),
         })
     }
 
@@ -763,35 +822,98 @@ impl CataAbstraction {
         per_obligation_budget: Duration,
         deadline: Option<Instant>,
     ) -> bool {
-        for obligation in &self.obligations {
-            // Discharge the conjunctive obligation ONE θ# conjunct at a time.
-            // `θ ⊨ ⋀ᵢ θ#ᵢ ⟺ ∀i. θ ⊨ θ#ᵢ`, so the level is certified iff every
-            // sub-script is `unsat` — identical verdict, but each sub-query
-            // negates a SINGLE conjunct instead of the whole conjunction, so
-            // ay never builds the wide `¬(⋀ᵢ θ#ᵢ)` disjunction whose case-split
-            // blowup stalls the sorted/min recurrence obligations (>90 s vs
-            // z3's <0.1 s). Fail-closed unchanged: any non-`unsat` sub-query, a
-            // deadline overrun, or an empty sub-script list rejects the level.
-            for sub in &obligation.sub_scripts {
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        tracing::debug!(
-                            clause = obligation.clause_index,
-                            "cata: obligation budget exhausted; failing closed"
-                        );
-                        return false;
-                    }
+        self.run_obligation_gate(per_obligation_budget, deadline) == ObligationGate::Discharged
+    }
+
+    /// The implication-obligation gate, resumable and memoized (see
+    /// `obligation_cursor`).
+    ///
+    /// Runs the obligations still outstanding, in order, and returns as soon as
+    /// one is refuted or the deadline arrives. Progress is recorded on `self`,
+    /// so a later call at the SAME ladder level continues where this one
+    /// stopped rather than re-proving what is already proved, and a refutation
+    /// short-circuits every later call.
+    ///
+    /// Fail-closed polarity is unchanged from the pre-memo gate: `Discharged`
+    /// requires a real, fresh `unsat` for every obligation of the abstraction;
+    /// every other outcome withholds.
+    pub(crate) fn run_obligation_gate(
+        &self,
+        per_obligation_budget: Duration,
+        deadline: Option<Instant>,
+    ) -> ObligationGate {
+        if self.obligation_refuted.get() {
+            return ObligationGate::Refuted;
+        }
+        let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+        let (mut clause_index, mut sub_index) = self.obligation_cursor.get();
+        while clause_index < self.obligations.len() {
+            let obligation = &self.obligations[clause_index];
+            // WHOLE-CLAUSE attempt first on narrow clauses: `θ ∧ ¬(⋀ᵢ θ#ᵢ) ⊨ ⊥`
+            // is the clause obligation itself, so one `unsat` discharges every
+            // conjunct at once and skips the fixed per-`check-sat` cost the
+            // split otherwise pays once per conjunct. Anything else falls
+            // through to the per-conjunct split below, so the VERDICT is
+            // exactly the split's. Tried at most once per clause (a failed
+            // attempt is remembered, so a resumed gate does not re-pay it).
+            if sub_index == 0
+                && obligation.sub_scripts.len() <= CATA_MONOLITHIC_MAX_SUB_SCRIPTS
+                && clause_index >= self.obligation_mono_tried_upto.get()
+            {
+                if expired() {
+                    tracing::debug!(
+                        clause = obligation.clause_index,
+                        "cata: obligation budget exhausted; failing closed"
+                    );
+                    return ObligationGate::Exhausted;
                 }
-                if !run_obligation_expect_unsat(sub, per_obligation_budget) {
+                self.obligation_mono_tried_upto.set(clause_index + 1);
+                // `_impl`, not the dumping wrapper: this is a PROBE, not the
+                // gate's rejection. A failed probe is followed by the split,
+                // and it is the split's failure that `--chc-cata-dump-obligations`
+                // should record.
+                if run_obligation_expect_unsat_impl(&obligation.script, per_obligation_budget) {
+                    clause_index += 1;
+                    self.obligation_cursor.set((clause_index, 0));
+                    continue;
+                }
+            }
+            // Per-conjunct split: `θ ⊨ ⋀ᵢ θ#ᵢ ⟺ ∀i. θ ⊨ θ#ᵢ`, so the level is
+            // certified iff every sub-script is `unsat` — identical verdict to
+            // the monolithic form, but each sub-query negates a SINGLE conjunct
+            // instead of the whole conjunction, so ay never builds the wide
+            // `¬(⋀ᵢ θ#ᵢ)` disjunction whose case-split blowup stalls the
+            // sorted/min recurrence obligations (>90 s vs z3's <0.1 s).
+            // Fail-closed unchanged: any non-`unsat` sub-query, a deadline
+            // overrun, or an empty sub-script list rejects the level.
+            while sub_index < obligation.sub_scripts.len() {
+                if expired() {
+                    self.obligation_cursor.set((clause_index, sub_index));
+                    tracing::debug!(
+                        clause = obligation.clause_index,
+                        "cata: obligation budget exhausted; failing closed"
+                    );
+                    return ObligationGate::Exhausted;
+                }
+                if !run_obligation_expect_unsat(
+                    &obligation.sub_scripts[sub_index],
+                    per_obligation_budget,
+                ) {
+                    self.obligation_refuted.set(true);
                     tracing::debug!(
                         clause = obligation.clause_index,
                         "cata: implication obligation NOT discharged; failing closed"
                     );
-                    return false;
+                    return ObligationGate::Refuted;
                 }
+                sub_index += 1;
+                self.obligation_cursor.set((clause_index, sub_index));
             }
+            clause_index += 1;
+            sub_index = 0;
+            self.obligation_cursor.set((clause_index, 0));
         }
-        true
+        ObligationGate::Discharged
     }
 
     /// Compose an abstract LIA model into an original-vocabulary invariant
@@ -1680,122 +1802,7 @@ impl<'a> ClauseCtx<'a> {
 // Catamorphism semantics (recurrences / consequences / min facts)
 // ============================================================================
 
-fn func_app(name: String, sort: ChcSort, args: Vec<ChcExpr>) -> ChcExpr {
-    ChcExpr::FuncApp(name, sort, args.into_iter().map(Arc::new).collect())
-}
-
-/// Universally-true facts about one catamorphism value.
-fn cata_min_facts(kind: &CataKind, value: &ChcExpr, n_ctors: usize) -> Vec<ChcExpr> {
-    match kind {
-        CataKind::Size | CataKind::Height => {
-            vec![ChcExpr::ge(value.clone(), ChcExpr::int(1))]
-        }
-        CataKind::IntSum => Vec::new(),
-        CataKind::CtorCount(_) => vec![ChcExpr::ge(value.clone(), ChcExpr::int(0))],
-        CataKind::RootDisc => vec![
-            ChcExpr::ge(value.clone(), ChcExpr::int(0)),
-            ChcExpr::lt(value.clone(), ChcExpr::int(n_ctors.max(1) as i64)),
-        ],
-        // `min`/`max` have no universally-useful *small* bound: their only
-        // universal fact is `min ≤ SENTINEL` / `max ≥ SENTINEL`, but emitting
-        // that giant constant per tuple (×2 columns) floods the obligation's
-        // LIA+ite search with large-magnitude bounds that make the datatype+UF
-        // executor diverge (measured), for zero invariant value. Withhold it —
-        // dropping a true fact only weakens the abstraction, which is sound.
-        CataKind::Min | CataKind::Max => Vec::new(),
-        // The sortedness fold is Boolean, encoded as `0/1`.
-        CataKind::Sorted => vec![
-            ChcExpr::ge(value.clone(), ChcExpr::int(0)),
-            ChcExpr::le(value.clone(), ChcExpr::int(1)),
-        ],
-    }
-}
-
-/// Nested-`ite` integer minimum of a non-empty term list.
-fn min_expr(mut terms: Vec<ChcExpr>) -> ChcExpr {
-    let mut acc = terms.remove(0);
-    for t in terms {
-        acc = ChcExpr::ite(ChcExpr::le(acc.clone(), t.clone()), acc, t);
-    }
-    acc
-}
-
-/// Nested-`ite` integer maximum of a non-empty term list.
-fn max_expr(mut terms: Vec<ChcExpr>) -> ChcExpr {
-    let mut acc = terms.remove(0);
-    for t in terms {
-        acc = ChcExpr::ite(ChcExpr::ge(acc.clone(), t.clone()), acc, t);
-    }
-    acc
-}
-
-/// Is `expr` a constructor application of an *element-free leaf* — a
-/// constructor with no `Int` and no recursive `Adt` fields (e.g. `nil`)?
-///
-/// Such a subtree is the `+∞`/`-∞` identity of `min`/`max` (and is vacuously
-/// sorted), so it must be EXCLUDED from a parent's `Min`/`Max`/`Sorted`
-/// recurrence rather than folded in through the finite `±1e9` sentinel. Folding
-/// the sentinel in CLAMPS any real element above it: a singleton `[x]` with
-/// `x > sentinel` would be mis-mined (`min = sentinel`) and deemed unsorted
-/// (`x ≤ sentinel` fails) — a spurious model that makes the abstract `insert`
-/// fail to preserve sortedness (Z3 confirmed: with the sentinel the L5 abstract
-/// of the tip2015 sort proofs is `unsat`; excluding the leaf ⇒ `sat`). Exclusion
-/// is EXACT (`min(cons(x,nil)) = min(x, +∞) = x`) so the per-clause obligation
-/// still discharges. Only a STATIC leaf term is excluded — a variable tail's
-/// `min` column is free (never the sentinel literal), so it never clamps.
-fn is_empty_leaf_term(registry: &DtRegistry, expr: &ChcExpr) -> bool {
-    if let ChcExpr::FuncApp(name, sort, _) = expr {
-        if let Some(sort_name) = registry.adt_sort_name(sort) {
-            if let Some(ctor) = registry.ctor(sort_name, name) {
-                return ctor
-                    .fields
-                    .iter()
-                    .all(|f| !matches!(f.kind, FieldKind::Int | FieldKind::Adt(_)));
-            }
-        }
-    }
-    false
-}
-
-/// Ascending-sortedness recurrence RHS shared by [`recurrence_rhs`] and
-/// [`ctor_recurrence`]. `int_head` is the (ADT-free) head element if the
-/// constructor carries one; `rest_mins` / `rest_sorteds` are the `min` and
-/// `sorted` values of the recursive fields. Returns `None` (recurrence
-/// withheld — sound under-constraint) when a head element exists but no `min`
-/// column backs the comparison.
-fn sorted_recurrence_rhs(
-    int_head: Option<ChcExpr>,
-    rest_mins: Option<Vec<ChcExpr>>,
-    rest_sorteds: Vec<ChcExpr>,
-) -> Option<ChcExpr> {
-    // No recursive field ⇒ leaf/empty ⇒ vacuously sorted.
-    if rest_sorteds.is_empty() {
-        return Some(ChcExpr::int(1));
-    }
-    // Every recursive field must itself be sorted (`sorted_i = 1`).
-    let all_sub_sorted = ChcExpr::and_all(
-        rest_sorteds
-            .into_iter()
-            .map(|s| ChcExpr::eq(s, ChcExpr::int(1))),
-    );
-    // Head ≤ min(rest), when the constructor has a head element.
-    let head_ok = match int_head {
-        None => ChcExpr::Bool(true),
-        Some(head) => {
-            let mins = rest_mins?; // need the Min column to express this
-            if mins.is_empty() {
-                ChcExpr::Bool(true)
-            } else {
-                ChcExpr::le(head, min_expr(mins))
-            }
-        }
-    };
-    Some(ChcExpr::ite(
-        ChcExpr::and(head_ok, all_sub_sorted),
-        ChcExpr::int(1),
-        ChcExpr::int(0),
-    ))
-}
+include!("semantics_helpers.rs");
 
 /// Right-hand side of the defining recurrence of `kind` at constructor `ctor`,
 /// with `field_terms[i]` standing for the i-th field value. ADT fields are
@@ -2169,20 +2176,6 @@ fn tester_consequences(
         }
     }
     out
-}
-
-fn sum_exprs(mut terms: Vec<ChcExpr>) -> ChcExpr {
-    match terms.len() {
-        0 => ChcExpr::int(0),
-        1 => terms.remove(0),
-        _ => {
-            let mut acc = terms.remove(0);
-            for term in terms {
-                acc = ChcExpr::add(acc, term);
-            }
-            acc
-        }
-    }
 }
 
 // ============================================================================

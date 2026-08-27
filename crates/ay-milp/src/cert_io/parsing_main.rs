@@ -61,8 +61,8 @@ fn parse_record(
     match fields[0] {
         "%AYC" | "model" | "solver" | "verdict" | "evidence" | "unchecked" | "truncated"
         | "reason" => parse_metadata(&fields, record, line, state),
-        "witness" | "farkas" | "optcert" | "tree" | "affine-aggregation" | "parity-gf2"
-        | "sat-relu-rup" => parse_core_block(lines, line, state),
+        "witness" | "farkas" | "optcert" | "tree" | "opttree" | "affine-aggregation"
+        | "parity-gf2" | "sat-relu-rup" => parse_core_block(lines, line, state),
         "network-design-infeasibility"
         | "network-design-optimality"
         | "block-angular-optimality"

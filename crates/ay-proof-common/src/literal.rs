@@ -2,17 +2,98 @@
 // Standalone literal/variable types for SAT proof checkers.
 // Encoding: positive = 2*var, negative = 2*var + 1. Zero-indexed internally.
 
-#[allow(unused_imports)]
-use crate::contracts::{ensures, requires};
+use thiserror::Error;
+
+/// Failure to construct or convert a proof-checker literal.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LiteralError {
+    /// A zero-indexed variable ID does not fit the packed literal encoding.
+    #[error("variable {id} exceeds the maximum encodable variable {maximum}")]
+    VariableOutOfRange { id: u32, maximum: u32 },
+
+    /// A platform-sized literal index does not fit the `u32` packed encoding.
+    #[error("literal index {index} exceeds the maximum packed index {maximum}")]
+    IndexOutOfRange { index: usize, maximum: u32 },
+
+    /// Zero terminates a DIMACS clause and therefore is not a literal.
+    #[error("DIMACS literal 0 is a clause terminator")]
+    ZeroDimacsLiteral,
+
+    /// A valid internal literal has no signed `i32` DIMACS representation.
+    #[error("DIMACS literal {value} is outside the i32 range")]
+    DimacsOutOfRange { value: i64 },
+}
 
 /// A variable identifier (0-indexed internally).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variable(u32);
 
+// Ties the literal bounds used in this file's `trust::requires` contracts to
+// the constants they are supposed to mirror. A contract predicate cannot name
+// an associated constant (the frontend refuses to lower it -- see
+// `Variable::new`), so the bounds are duplicated as literals; these assertions
+// are what stop that duplication from rotting into a WRONG contract, which
+// would be worse than no contract at all because a precondition is ASSUMED by
+// the prover inside the body. Divergence is a compile error, not a silent
+// unsoundness.
+// Only `MAX_ID` needs guarding. `Literal::from_index`'s bound mirrors
+// `u32::MAX`, which is fixed by the language and cannot drift -- asserting it
+// is a tautology, and clippy says so.
+const _: () = assert!(Variable::MAX_ID == 2_147_483_647);
+
 impl Variable {
+    /// Largest variable ID accepted by the packed [`Literal`] encoding.
+    pub const MAX_ID: u32 = u32::MAX >> 1;
+
+    /// Try to create a variable from a raw zero-indexed identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::VariableOutOfRange`] if `id` exceeds
+    /// [`Self::MAX_ID`].
+    #[inline]
+    pub fn try_new(id: u32) -> Result<Self, LiteralError> {
+        if id <= Self::MAX_ID {
+            Ok(Self(id))
+        } else {
+            Err(LiteralError::VariableOutOfRange {
+                id,
+                maximum: Self::MAX_ID,
+            })
+        }
+    }
+
     /// Create a new variable from a raw 0-indexed identifier.
+    ///
+    /// Prefer [`Self::try_new`] when the identifier comes from an external
+    /// input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` exceeds [`Self::MAX_ID`]. That panic is the whole reason
+    /// this function's panic-freedom obligation is FALSE unconditionally: the
+    /// `# Panics` clause above IS the missing precondition, and the contract
+    /// below is that clause written where a prover can read it.
+    ///
+    /// The bound is spelled as a LITERAL rather than as `Self::MAX_ID`, and
+    /// that is forced, not stylistic. MEASURED on trust-e26541e3: a contract
+    /// predicate naming an associated constant is rejected by the frontend --
+    /// "compiler contract predicate was not lowered into a typed verifier
+    /// formula: unsupported contract predicate expression `id <=
+    /// Variable::MAX_ID`" -- and lands in UNKNOWN, discharging nothing. The
+    /// same precondition written `id <= 2_147_483_647` lowers and PROVES.
+    /// The `const _: ()` assertion above `impl Variable` makes the duplication
+    /// safe: if `MAX_ID` ever changes, this file stops compiling rather than
+    /// silently carrying a contract that no longer matches the assertion it is
+    /// supposed to justify.
     #[inline]
     pub fn new(id: u32) -> Self {
+        assert!(
+            id <= Self::MAX_ID,
+            "variable {id} exceeds Variable::MAX_ID ({})",
+            Self::MAX_ID
+        );
         Self(id)
     }
 
@@ -22,6 +103,7 @@ impl Variable {
         self.0
     }
 
+    /// Get the identifier as an index into a variable-indexed collection.
     #[inline]
     pub fn index(self) -> usize {
         self.0 as usize
@@ -39,36 +121,24 @@ pub struct Literal(u32);
 impl Literal {
     /// Maximum variable index that can be represented without overflow.
     /// Variable indices >= 2^31 would cause the `<< 1` encoding to overflow u32.
-    pub const MAX_VAR: u32 = (1 << 31) - 1;
+    pub const MAX_VAR: u32 = Variable::MAX_ID;
 
     /// Create a positive literal for the given variable.
+    ///
+    /// Postcondition (`result.variable() == var && result.is_positive()`) is
+    /// NOT EXPRESSIBLE — see the note on [`Self::negated`].
     #[inline]
     pub fn positive(var: Variable) -> Self {
-        requires!(var.0 <= Self::MAX_VAR);
-        assert!(
-            var.0 <= Self::MAX_VAR,
-            "variable {} exceeds Literal::MAX_VAR",
-            var.0
-        );
-        let result = Self(var.0 << 1);
-        ensures!(result.variable() == var);
-        ensures!(result.is_positive());
-        result
+        Self(var.0 << 1)
     }
 
     /// Create a negative literal for the given variable.
+    ///
+    /// Postcondition (`result.variable() == var && !result.is_positive()`) is
+    /// NOT EXPRESSIBLE — see the note on [`Self::negated`].
     #[inline]
     pub fn negative(var: Variable) -> Self {
-        requires!(var.0 <= Self::MAX_VAR);
-        assert!(
-            var.0 <= Self::MAX_VAR,
-            "variable {} exceeds Literal::MAX_VAR",
-            var.0
-        );
-        let result = Self((var.0 << 1) | 1);
-        ensures!(result.variable() == var);
-        ensures!(!result.is_positive());
-        result
+        Self((var.0 << 1) | 1)
     }
 
     /// Get the underlying variable.
@@ -84,13 +154,29 @@ impl Literal {
     }
 
     /// Get the negation of this literal.
+    ///
+    /// # The encoding postconditions are not expressible today
+    ///
+    /// The three properties that actually define this operation —
+    /// `result.variable() == self.variable()`,
+    /// `result.is_positive() != self.is_positive()`, and the involution
+    /// `result.negated() == self` — are exactly what the deleted `ensures!`
+    /// macro claimed to state and silently erased. They are STILL unstatable,
+    /// for a different and more precise reason: MEASURED on trust-e26541e3,
+    /// every `result`-and-method postcondition in this file was refused with
+    /// "compiler contract predicate was not lowered into a typed verifier
+    /// formula", landing in UNKNOWN. The lowerable fragment is comparisons of
+    /// PARAMETERS against LITERALS; `result` sugar and method projections parse
+    /// (see the toolchain's tests/ui/contracts/trust-spec-opaque-spec-clauses.rs,
+    /// which is `check-pass` — it proves they PARSE, not that they LOWER) but do
+    /// not reach the solver.
+    ///
+    /// These are not left unchecked. They are PROVED over a bounded range by the
+    /// `model-checker-consumer` harnesses at the bottom of this file, which is why an
+    /// unprovable attribute here would add noise rather than assurance.
     #[inline]
     pub fn negated(self) -> Self {
-        let result = Self(self.0 ^ 1);
-        ensures!(result.variable() == self.variable());
-        ensures!(result.is_positive() != self.is_positive());
-        ensures!(result.negated() == self);
-        result
+        Self(self.0 ^ 1)
     }
 
     /// Index into watch/assignment arrays (2 entries per variable).
@@ -99,52 +185,204 @@ impl Literal {
         self.0 as usize
     }
 
+    /// Get the raw packed `u32` encoding.
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    /// Create a literal from its raw packed `u32` encoding.
+    ///
+    /// Every `u32` is a valid packed literal: its low bit is the polarity and
+    /// the remaining 31 bits identify a variable no larger than [`Self::MAX_VAR`].
+    #[inline]
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Try to create a literal from a platform-sized packed index.
+    ///
+    /// This is the fallible inverse of [`Self::index`] for callers whose index
+    /// did not necessarily originate from a `Literal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::IndexOutOfRange`] if `idx` does not fit the
+    /// packed `u32` encoding.
+    #[inline]
+    pub fn try_from_index(idx: usize) -> Result<Self, LiteralError> {
+        u32::try_from(idx)
+            .map(Self::from_raw)
+            .map_err(|_| LiteralError::IndexOutOfRange {
+                index: idx,
+                maximum: u32::MAX,
+            })
+    }
+
     /// Create a literal from a raw index (inverse of `index()`).
     ///
     /// The index encodes both variable and polarity: `positive = 2*var`,
     /// `negative = 2*var + 1`. This enables zero-cost conversion between
     /// literal types that use the same encoding scheme.
+    /// Prefer [`Self::try_from_index`] unless the index came from
+    /// [`Self::index`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` exceeds `u32::MAX` on a platform where `usize` is wider
+    /// than `u32`.
+    ///
+    /// Spelled as a literal for the reason given on [`Variable::new`]: the
+    /// natural `idx <= u32::MAX as usize` is refused by the frontend (both the
+    /// associated constant AND the cast are unsupported in a contract
+    /// predicate). MEASURED: the literal form does NOT prove this assertion
+    /// either — it moves it from FAILED to runtime-checked, because
+    /// `u32::try_from(idx).is_ok()` in the body is an absent callee whose result
+    /// is havoc'd, so the precondition cannot reach the assertion that consumes
+    /// it. The contract is still worth stating: it is now a real, checked
+    /// precondition at call sites rather than a comment.
     #[inline]
     pub fn from_index(idx: usize) -> Self {
-        Self(idx as u32)
+        assert!(
+            u32::try_from(idx).is_ok(),
+            "literal index {idx} exceeds u32::MAX"
+        );
+        Self::from_raw(idx as u32)
+    }
+
+    /// Try to create a literal from a DIMACS-style signed integer.
+    ///
+    /// Every nonzero `i32` is representable, including `i32::MIN`. Zero is a
+    /// clause terminator rather than a literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::ZeroDimacsLiteral`] if `dimacs` is zero.
+    #[inline]
+    pub fn try_from_dimacs(dimacs: i32) -> Result<Self, LiteralError> {
+        if dimacs == 0 {
+            Err(LiteralError::ZeroDimacsLiteral)
+        } else {
+            Ok(Self::from_nonzero_dimacs(dimacs))
+        }
     }
 
     /// Create a literal from a DIMACS-style signed integer.
     ///
     /// DIMACS variables are 1-indexed. `from_dimacs(3)` → positive literal for
     /// internal variable 2. `from_dimacs(-1)` → negative literal for variable 0.
+    /// Prefer [`Self::try_from_dimacs`] when the value comes from an external
+    /// input.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dimacs` is zero, the DIMACS clause terminator.
     #[inline]
     pub fn from_dimacs(dimacs: i32) -> Self {
-        requires!(dimacs != 0);
         assert_ne!(dimacs, 0, "DIMACS literal 0 is a clause terminator");
-        let var = Variable(dimacs.unsigned_abs() - 1);
-        let result = if dimacs > 0 {
-            Self::positive(var)
-        } else {
-            Self::negative(var)
-        };
-        ensures!(result.is_positive() == (dimacs > 0));
-        result
+        Self::from_nonzero_dimacs(dimacs)
     }
 
-    /// Convert to DIMACS signed integer (inverse of `from_dimacs`).
+    /// The postcondition `result.is_positive() == (dimacs > 0)` is NOT
+    /// EXPRESSIBLE (see [`Self::negated`]); the precondition IS, and it is a
+    /// real one: `precond` obligations are emitted at BOTH call sites
+    /// ([`Self::from_dimacs`] and [`Self::try_from_dimacs`]) and both are
+    /// discharged, so the assumption this body enjoys is paid for, not granted.
+    #[inline]
+    fn from_nonzero_dimacs(dimacs: i32) -> Self {
+        // This computes `dimacs.unsigned_abs() - 1`, respelled so the encoder
+        // keeps the range link. Same class of fix, and the same reason, as
+        // `to_dimacs_i64` below.
+        //
+        // `<i32>::unsigned_abs` is an ABSENT CALLEE to the deductive verifier (its
+        // body is not in the lowered bundle), so its result is havoc'd to a fresh
+        // symbolic and every relation to `dimacs` is lost. The `- 1` was then
+        // encoded as satisfiable at zero. MEASURED 2026-08-26 on the sealed
+        // toolchain: `Variable(dimacs.unsigned_abs() - 1)` reports
+        // `[overflow:sub] FAILED (ay-in-process); counterexample: dimacs = 0`.
+        //
+        // That counterexample is MISLEADING, and reading it as "the precondition
+        // is missing" is a trap I fell into and measured my way out of. Hoisting
+        // the caller's zero-guard into this body does NOT fix it: with the guard
+        // inlined the verifier simply reports `counterexample: _4 = 0, dimacs = 1`
+        // -- it honours `dimacs != 0` and STILL believes the magnitude is zero,
+        // because the havoc'd `unsigned_abs` result is unconstrained no matter
+        // what is known about `dimacs`. The blocker is the absent callee, not the
+        // erased `requires!`. That finding SURVIVES this file's migration to
+        // first-class contracts: `dimacs != 0` is now a real `trust::requires`
+        // the prover reads rather than a macro that expanded to nothing, and the
+        // absent-callee havoc it could not defeat is precisely why the body still
+        // has to avoid `unsigned_abs` rather than lean on the precondition.
+        //
+        // Both branches below are built only from operations the encoder models
+        // directly, so the magnitude stays tied to `dimacs`:
+        //   * `dimacs > 0`  =>  `dimacs >= 1`, so `dimacs - 1` cannot underflow
+        //     and is non-negative, making `as u32` value-preserving.
+        //   * `dimacs < 0`  =>  `!dimacs == |dimacs| - 1` exactly, for EVERY
+        //     negative `i32` including `i32::MIN`, whose absolute value is not
+        //     representable in `i32` at all. Bitwise NOT is total, so this branch
+        //     carries no arithmetic obligation whatsoever.
+        // Verified equal to the old spelling for all four boundaries: 1 -> 0,
+        // i32::MAX -> 2147483646, -1 -> 0, i32::MIN -> 2147483647.
+        if dimacs > 0 {
+            Self::positive(Variable((dimacs - 1) as u32))
+        } else {
+            Self::negative(Variable(!dimacs as u32))
+        }
+    }
+
+    /// Try to convert this literal to a DIMACS signed `i32`.
     ///
-    /// Panics if the variable ID exceeds `i32::MAX - 1` (2_147_483_646),
-    /// which would cause the 1-indexed DIMACS representation to overflow.
-    /// Use `to_dimacs_i64` or the `Display` impl for extension variables
-    /// that may exceed this range.
+    /// Negative [`Self::MAX_VAR`] maps to `i32::MIN`. Positive
+    /// [`Self::MAX_VAR`] is the only valid packed literal outside the signed
+    /// `i32` DIMACS range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::DimacsOutOfRange`] for positive
+    /// [`Self::MAX_VAR`].
+    #[inline]
+    pub fn try_to_dimacs(self) -> Result<i32, LiteralError> {
+        let value = self.to_dimacs_i64();
+        i32::try_from(value).map_err(|_| LiteralError::DimacsOutOfRange { value })
+    }
+
+    /// Convert to a DIMACS signed integer.
+    ///
+    /// This is the inverse of [`Self::from_dimacs`] for every nonzero `i32`,
+    /// including `i32::MIN`.
+    ///
+    /// # Panics
+    ///
+    /// Panics for the positive literal of [`Self::MAX_VAR`], whose DIMACS
+    /// value is `2_147_483_648`. Use [`Self::try_to_dimacs`],
+    /// [`Self::to_dimacs_i64`], or `Display` when extension variables may reach
+    /// this boundary.
+    ///
+    /// NOT EXPRESSIBLE as a `trust::requires` on this toolchain, and left
+    /// unstated rather than approximated. The exact precondition is
+    /// `!(self.is_positive() && self.variable().id() == Literal::MAX_VAR)`:
+    /// `to_dimacs_i64` returns `±(var_id + 1)`, so the positive branch leaves
+    /// `i32` only at `var_id == MAX_VAR` (giving `2_147_483_648`), while the
+    /// negative branch bottoms out at exactly `i32::MIN` for that same `var_id`
+    /// and is always representable. MEASURED on trust-e26541e3: that predicate
+    /// is refused — "unsupported contract predicate expression" — because the
+    /// lowerable fragment is comparisons of PARAMETERS against LITERALS, and
+    /// this condition is irreducibly about `self` through two method calls
+    /// (`is_positive`, `variable().id()`). There is no literal-only rewrite: the
+    /// packed `self.0` field is private to the type but the predicate is
+    /// evaluated as written, and no supported form can reach it. A weaker
+    /// approximation would be a contract the prover ASSUMES, so stating one
+    /// would be worse than stating none. This obligation therefore stays
+    /// honestly FAILED until the frontend lowers field/method projections.
     #[inline]
     pub fn to_dimacs(self) -> i32 {
-        let raw = self.variable().id();
-        let var_1indexed = i32::try_from(raw)
-            .ok()
-            .and_then(|v| v.checked_add(1))
-            .expect("variable ID too large for DIMACS i32 representation");
-        if self.is_positive() {
-            var_1indexed
-        } else {
-            -var_1indexed
-        }
+        let value = self.to_dimacs_i64();
+        assert!(
+            i32::try_from(value).is_ok(),
+            "variable ID too large for DIMACS i32 representation: {value}"
+        );
+        value as i32
     }
 
     /// Convert to DIMACS signed integer as `i64` (never panics).
@@ -198,74 +436,7 @@ impl std::fmt::Display for Literal {
 /// backend), not the standalone `kani` tool. See the
 /// `[[trust-verification-toolchain]]` methodology.
 #[cfg(kani)]
-mod verification {
-    use super::*;
-
-    /// Negation is involutive, swaps polarity, and preserves the variable.
-    #[kani::proof]
-    fn prove_negation_involutive() {
-        let raw: u32 = kani::any();
-        // index = 2*var(+1); bound keeps the encoding well within u32 + tractable.
-        kani::assume(raw < (1 << 22));
-        let lit = Literal::from_index(raw as usize);
-        assert_eq!(lit.negated().negated(), lit);
-        assert_eq!(lit.negated().variable(), lit.variable());
-        assert!(lit.negated().is_positive() != lit.is_positive());
-    }
-
-    /// `positive`/`negative` preserve the variable and set the correct polarity,
-    /// and are exact negations of each other.
-    #[kani::proof]
-    fn prove_variable_polarity_roundtrip() {
-        let v: u32 = kani::any();
-        kani::assume(v <= (1 << 21)); // << MAX_VAR so the `<< 1` stays in range
-        let var = Variable::new(v);
-        let pos = Literal::positive(var);
-        let neg = Literal::negative(var);
-        assert_eq!(pos.variable(), var);
-        assert_eq!(neg.variable(), var);
-        assert!(pos.is_positive());
-        assert!(!neg.is_positive());
-        assert_eq!(pos.negated(), neg);
-        assert_eq!(neg.negated(), pos);
-    }
-
-    /// DIMACS round-trip: `from_dimacs` then `to_dimacs`/`to_dimacs_i64` recovers
-    /// the signed literal exactly, with correct polarity. The soundness-critical
-    /// property for DRAT/LRAT proof parsing.
-    #[kani::proof]
-    fn prove_dimacs_roundtrip() {
-        let d: i32 = kani::any();
-        kani::assume(d != 0);
-        // |d|-1 is the 0-indexed var; bound below MAX_VAR and i32::MAX-1.
-        kani::assume(d > -(1 << 21) && d < (1 << 21));
-        let lit = Literal::from_dimacs(d);
-        assert_eq!(lit.to_dimacs(), d);
-        assert_eq!(lit.to_dimacs_i64(), i64::from(d));
-        assert_eq!(lit.is_positive(), d > 0);
-    }
-
-    /// `from_index` is the exact inverse of `index`.
-    #[kani::proof]
-    fn prove_index_roundtrip() {
-        let raw: u32 = kani::any();
-        kani::assume(raw < (1 << 22));
-        let lit = Literal::from_index(raw as usize);
-        assert_eq!(lit.index(), raw as usize);
-        assert_eq!(Literal::from_index(lit.index()), lit);
-    }
-
-    /// The encoding is injective: distinct variables map to distinct literals.
-    #[kani::proof]
-    fn prove_encoding_injective() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        kani::assume(a <= (1 << 21) && b <= (1 << 21));
-        if Literal::positive(Variable::new(a)) == Literal::positive(Variable::new(b)) {
-            assert_eq!(a, b);
-        }
-    }
-}
+mod verification;
 
 #[cfg(test)]
 #[path = "literal_tests.rs"]

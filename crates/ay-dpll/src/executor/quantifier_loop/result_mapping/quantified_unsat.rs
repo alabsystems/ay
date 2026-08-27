@@ -28,7 +28,7 @@ impl Executor {
         if ay_core::misc_cli_flags().debug_cert {
             eprintln!(
                 "CERT/qsu entry exec={:p} epoch_present={} epoch_current={:?} assumptions_bound={:?}",
-                self as *const _,
+                std::ptr::from_ref(self),
                 self.unsat_query_epoch.is_some(),
                 self.checked_sat_refutation_query_scope().is_some(),
                 self.checked_sat_refutation_query_assumptions().is_some(),
@@ -131,6 +131,15 @@ impl Executor {
                 self.last_unknown_reason = None;
                 return Ok(SolveResult::unsat());
             }
+            // (#implied-forall-ground-inst) The sibling BUILDER for the dual
+            // authored shape — a universal under an implication whose
+            // antecedent is authored. Rationale in that lane's module doc.
+            let implied_inst = self.try_translate_implied_forall_ground_instantiation_unsat();
+            Self::debug_leg(&format_args!("implied_inst={implied_inst}"));
+            if implied_inst {
+                self.last_unknown_reason = None;
+                return Ok(SolveResult::unsat());
+            }
             Self::debug_leg(&format_args!("DOWNGRADE reason={missing_proof_reason:?}"));
             self.clear_cegqi_inner_unsat_artifacts();
             self.last_unknown_reason = Some(missing_proof_reason);
@@ -154,6 +163,7 @@ impl Executor {
 
         let roots = self
             .authored_hard_unsat_roots_for_isolated_recheck()
+            .or_else(|| self.authored_hard_unsat_hypotheses_for_isolated_recheck())
             .unwrap_or_else(|| self.ctx.concrete_authored_assertion_terms());
         let mut ground = 0usize;
         let mut forall = 0usize;
@@ -193,7 +203,17 @@ impl Executor {
     /// funnel already had its chance), or any non-UNSAT probe outcome.
     pub(super) fn authored_ground_core_refutes(&mut self) -> bool {
         let debug = ay_core::misc_cli_flags().debug_cert;
-        let Some(authored) = self.authored_hard_unsat_roots_for_isolated_recheck() else {
+        // (#uc-named-core-ground-scope) The assumption-free accessor first, so
+        // an ordinary `(check-sat)` keeps the exact scope it always had; the
+        // hypothesis accessor is the fallback that keeps a `:produce-unsat-cores`
+        // script — whose named assertions the core redirect relocates INTO the
+        // assumption vector — from losing this leg entirely. Both vectors are
+        // hypotheses of the same query, so the subset entailment below is
+        // unchanged either way.
+        let Some(authored) = self
+            .authored_hard_unsat_roots_for_isolated_recheck()
+            .or_else(|| self.authored_hard_unsat_hypotheses_for_isolated_recheck())
+        else {
             if debug {
                 eprintln!("CERT/ground-core decline: no authored hard scope");
             }

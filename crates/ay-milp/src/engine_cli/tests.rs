@@ -41,6 +41,45 @@ fn a_known_flag_still_lowers_into_the_engine() {
     assert_eq!(opts.engine(), want);
 }
 
+#[test]
+fn deadline_share_flags_use_their_validated_builders() {
+    for (flag, value) in [
+        ("heur-share", "NaN"),
+        ("heur-share", "-0.01"),
+        ("heur-share", "1.01"),
+        ("pump-share", "NaN"),
+        ("pump-share", "-0.01"),
+        ("pump-share", "1.01"),
+        ("root-probe-share", "NaN"),
+        ("root-probe-share", "-0.01"),
+        ("root-probe-share", "1.01"),
+        ("cert-grace-secs", "NaN"),
+        ("cert-grace-secs", "-0.01"),
+        ("cert-grace-secs", "1000000000000001"),
+    ] {
+        let option = format!("--{flag}");
+        let flags = parse(&[option.as_str(), value]).expect("known value flag");
+        assert!(
+            apply(&flags, SolveOpts::new()).is_err(),
+            "--{flag} accepted {value}"
+        );
+    }
+    for (flag, value) in [
+        ("heur-share", "0"),
+        ("heur-share", "1"),
+        ("pump-share", "0"),
+        ("pump-share", "1"),
+        ("root-probe-share", "0"),
+        ("root-probe-share", "1"),
+        ("cert-grace-secs", "0"),
+        ("cert-grace-secs", "1000000000000000"),
+    ] {
+        let option = format!("--{flag}");
+        let flags = parse(&[option.as_str(), value]).expect("known value flag");
+        apply(&flags, SolveOpts::new()).expect("validated boundary must apply");
+    }
+}
+
 /// The refusal for `args`. (`Flags` is not `Debug`, so `expect_err` is
 /// not available; the panic message names the argv instead.)
 fn refusal(args: &[&str]) -> String {

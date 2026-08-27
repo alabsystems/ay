@@ -285,6 +285,33 @@ impl OriginalLedger {
         self.literals.capacity() * size_of::<Literal>() + self.offsets.capacity() * size_of::<u32>()
     }
 
+    /// Hand back the unused reservation in both flat vectors, returning the
+    /// bytes reclaimed.
+    ///
+    /// Same rationale as [`ClauseArena::shrink_words_to_fit`]: the ledger grows
+    /// geometrically as the formula streams in and ends the load holding up to
+    /// a doubling of capacity it will never use (174MB on the DtAx lowering of
+    /// vlsat3_b99), which the counting allocator behind `--memory` charges as
+    /// requested bytes. Only worth doing once the formula is complete.
+    ///
+    /// The returned count is what the caller must add back to
+    /// `Solver::clause_db_memory_bytes`, because [`Self::heap_bytes`] reads the
+    /// REAL capacity and feeds the `should_reduce_db` byte trigger — see
+    /// `ColdState::load_slack_reclaimed_bytes`.
+    pub(crate) fn shrink_to_fit(&mut self) -> usize {
+        const MIN_RECLAIM_BYTES: usize = 16 << 20;
+        let before = self.heap_bytes();
+        let literal_slack = (self.literals.capacity() - self.literals.len()) * size_of::<Literal>();
+        if literal_slack >= MIN_RECLAIM_BYTES {
+            self.literals.shrink_to_fit();
+        }
+        let offset_slack = (self.offsets.capacity() - self.offsets.len()) * size_of::<u32>();
+        if offset_slack >= MIN_RECLAIM_BYTES {
+            self.offsets.shrink_to_fit();
+        }
+        before - self.heap_bytes()
+    }
+
     /// Collect all clauses to Vec<Vec<Literal>> (for tests/debug).
     #[cfg(test)]
     pub(crate) fn to_vec_of_vecs(&self) -> Vec<Vec<Literal>> {
@@ -478,6 +505,11 @@ pub(crate) struct ColdState {
     pub(super) reluctant_ticked_at: u64,
     /// When to next run clause deletion
     pub(super) next_reduce_db: u64,
+    /// Conflict count at which the two-stage clause-management policy runs its
+    /// next `OnPeriodicDecay()` sweep. Only read when
+    /// `Solver::two_stage_clause_management` is set; see
+    /// `solver/reduction_two_stage.rs`.
+    pub(super) two_stage_next_decay: u64,
     /// Total number of clause DB reductions performed.
     /// CaDiCaL: `stats.reductions` (reduce.cpp:216).
     pub(super) num_reductions: u64,
@@ -813,7 +845,22 @@ pub(crate) struct ColdState {
     // LRAT proof support
     /// Clause IDs for LRAT proofs (maps clause index to clause ID)
     /// Original clauses get IDs 1..n, learned clauses get n+1, n+2, etc.
+    ///
+    /// Starts UNALLOCATED: the construction-time `with_capacity` reservation
+    /// is deferred to the first write (`clause_ids_grow_for`), because on the
+    /// no-proof route `set_clause_ids_disabled(true)` lands only after the
+    /// solver is built and the eager reservation charged 162 MB of `--memory`
+    /// budget at load (18 M-clause reference instance) for a vector that is
+    /// never written. Same shape as the OccList size-on-first-use fix.
     pub(super) clause_ids: Vec<u64>,
+    /// Capacity `clause_ids` reserves on its first write — the same
+    /// `clauses_capacity` the retired construction-time `with_capacity` used,
+    /// so the enabled (proof) route sees an identical capacity ladder. Also
+    /// the phantom charge `clause_db_memory_bytes` bills while the vector is
+    /// unallocated, keeping the `should_reduce_db` trigger on its historical
+    /// basis on the disabled route (see `load_slack_reclaimed_bytes` for the
+    /// exposure this guards).
+    pub(super) clause_ids_reserve_hint: usize,
     /// Opt-OUT of maintaining [`Self::clause_ids`].
     ///
     /// `clause_ids` is indexed by ARENA WORD OFFSET rather than by clause, so it
@@ -829,6 +876,26 @@ pub(crate) struct ColdState {
     /// extension-definition logs in factorize/sbva, theory unit promotion, BVE
     /// LRAT candidate preflight, and vivify LRAT standalone validation.
     pub(super) clause_ids_disabled: bool,
+    /// Bytes handed back by load-time slack reclamation, added back to
+    /// `Solver::clause_db_memory_bytes` (#load-slack-reclaim).
+    ///
+    /// `clause_db_memory_bytes` is the byte trigger behind `should_reduce_db`,
+    /// so what it reports decides WHEN reduction fires and therefore the search
+    /// trajectory. Two of its terms — `clause_ids.capacity()` and
+    /// `original_ledger.heap_bytes()` — read REAL capacity, unlike
+    /// `arena.memory_bytes()`, which is pinned to `Vec`'s doubling ladder by
+    /// `ClauseArena::accounted_words` precisely so the allocator cannot move the
+    /// cadence. Shrinking those two at load would therefore shrink the trigger's
+    /// basis and silently change the search.
+    ///
+    /// Holding the reclaimed bytes here and adding them back keeps the trigger
+    /// on exactly its pre-shrink basis while the real allocation drops, so
+    /// `--memory` sees the saving and the search does not move at all.
+    ///
+    /// Conservative if those vectors later grow again (incremental mode): the
+    /// compensation then over-counts slightly, which makes reduction fire a
+    /// touch EARLIER — the safe direction — rather than later.
+    pub(super) load_slack_reclaimed_bytes: usize,
     /// Learned-clause birth conflict count for default-off 19-63 identity profiling.
     pub(super) bcp_learned_clause_birth_conflicts: Vec<u64>,
     /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): per-clause
@@ -885,7 +952,7 @@ pub(crate) struct ColdState {
     /// Since the late-original allocator jumps `next_original_clause_id` past
     /// live derived IDs (`allocate_original_clause_id`, b93692341), the range
     /// `1..=next_original_clause_id-1` may contain derived IDs. Snapshot
-    /// consumers (streaming UNSAT core sizing) read this counter instead: it
+    /// consumers (streaming-support sizing) read this counter instead: it
     /// is bumped only when an ID is actually issued to an original clause.
     pub(super) issued_original_clause_id_max: u64,
     /// Per-clause-ID original marker, indexed by `clause_id - 1` (IDs are
@@ -894,18 +961,17 @@ pub(crate) struct ColdState {
     /// `true` iff that ID was issued to an original (non-derived) clause.
     /// Needed because derived IDs can sit *between* original IDs after the
     /// late-original jump, so `id <= issued_original_clause_id_max` alone no
-    /// longer implies "original". Used by the streaming UNSAT core to keep
-    /// derived antecedents out of the reported original core.
+    /// longer implies "original". Used by streaming support to keep derived
+    /// antecedents out of the reported original-clause set.
     pub(super) original_clause_id_bits: Vec<bool>,
     /// Whether LRAT proof generation is enabled (track resolution chains)
     pub(super) lrat_enabled: bool,
-    /// Whether UNSAT results build a `ProofCertificate` via backward LRAT
-    /// reconstruction. Defaults to `true`. Internal consumers that need
-    /// clause-ID tracking (e.g. `ClauseTrace`) but never read the returned
-    /// certificate can set this to `false` via
-    /// `set_unsat_certificate_enabled` to skip the backward reconstruction
-    /// pass on every UNSAT (`SatResult::Unsat` then carries
-    /// `ProofCertificate::empty()`).
+    /// Whether `enable_lrat` independently owns LRAT bookkeeping.
+    pub(super) internal_lrat_enabled: bool,
+    /// Whether UNSAT builds a `ProofCertificate` via backward LRAT. Defaults
+    /// to `true`. Clause-ID-only consumers such as `ClauseTrace` can disable
+    /// it through `set_unsat_certificate_enabled` to skip reconstruction;
+    /// `SatResult::Unsat` then carries `ProofCertificate::empty()`.
     pub(super) unsat_certificate_enabled: bool,
     /// Whether process-global environment hooks may read or write artifacts.
     /// Bounded in-memory APIs disable this before clause ingestion so their
@@ -1112,20 +1178,20 @@ pub(crate) struct ColdState {
     /// clauses are logical consequences of the consumed originals and do not
     /// require the full LRAT block that SMT theory lemmas need.
     pub(crate) extension_trusted_lemmas: bool,
-    /// Streaming UNSAT core bitmap (#8250).
-    /// Tracks which original clause IDs participated in the proof during
-    /// conflict analysis. Updated incrementally: when an antecedent clause
-    /// used during resolution is an original clause (ID <= num_originals),
-    /// its bit is set. Available immediately at UNSAT without needing to
-    /// walk the proof DAG post-hoc.
+    /// Streaming original-clause support bitmap (#8250).
+    /// Tracks original clause IDs observed during conflict analysis. Updated
+    /// incrementally when resolution visits an original antecedent. This is
+    /// diagnostic support, not a minimality or proof-checker verdict.
+    /// It is available without materializing retained proof steps.
+    /// The public certificate exposes it only as over-approximate support.
     ///
     /// Indexed by `clause_id - 1` (clause IDs are 1-based).
-    /// `None` when streaming core is not active (SAT result or no original
+    /// `None` when streaming support is not active (SAT result or no original
     /// clauses). `Some(bitmap)` when active.
     pub(super) streaming_core: Option<Vec<bool>>,
     /// Number of original clause IDs allocated at solve start.
-    /// Used to bound the streaming_core bitmap and determine whether a
-    /// clause ID refers to an original (input) clause.
+    /// Used to bound the internal streaming-support bitmap and determine
+    /// whether a clause ID refers to an original (input) clause.
     pub(super) streaming_core_num_originals: u64,
     /// O(1) lookup for scope selectors during UNSAT core filtering
     pub(super) scope_selector_set: Vec<bool>,
@@ -1177,6 +1243,19 @@ pub(crate) struct ColdState {
     pub(super) next_rephase: u64,
     /// Route-scoped experiment: skip scheduled rephases while in focused mode.
     pub(super) stable_only_rephase_enabled: bool,
+    /// `--sat-large-rephase-walk` resolved once at solve entry: true only when
+    /// the arm is enabled AND this formula is above
+    /// `VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD`. When true, the very-large
+    /// branch stops disabling rephasing and the rephase-walk clause gate is
+    /// lifted to kissat's own bound, so `walk` can improve saved phases on
+    /// multi-million-clause structured formulas the way `kissat_walk` does.
+    pub(super) large_rephase_walk: bool,
+    /// `--sat-mode-equiticks-large` resolved once at solve entry: true only
+    /// when the arm is enabled AND this formula is above
+    /// `VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD`. Consumed by the `None` arm
+    /// of the `mode_equiticks` resolution in `restart.rs` — an explicit
+    /// `--sat-mode-equiticks <bool>` still wins.
+    pub(super) mode_equiticks_large_band: bool,
     // Flip-based local search state (#8246)
     /// Whether greedy flip-based local search is enabled during rephase.
     /// Disabled by `--disable flip` CLI flag (#8331).
@@ -1215,6 +1294,14 @@ pub(crate) struct ColdState {
     /// `solve_with_assumptions` entry. Polled amortized — never per BCP
     /// step. Fail-closed: an expired deadline can only produce Unknown.
     pub(super) solve_deadline: Option<ay_core::time::Instant>,
+    /// Bit-parallel support enumeration built at startup and parked until
+    /// search has had its head start (`solver/indep_enum.rs`).
+    ///
+    /// The gate structure the enumeration is compiled from only exists before
+    /// BVE, so the build has to happen at startup; RUNNING it there is what
+    /// turned six fast SAT solves into 300 s timeouts, so the built engine
+    /// waits here instead and is given one metered slice of the budget.
+    pub(super) indep_enum_pending: Option<Box<indep_enum::PendingIndepEnum>>,
     /// When `Some(offset)`, watches from the previous solve are still valid
     /// for all clauses below `offset` in the arena. Only clauses at or after
     /// `offset` need watch attachment. Set by `reset_search_state()` case (b)
@@ -1746,6 +1833,17 @@ pub(crate) struct ColdState {
     /// Zero means the baseline has not been captured yet.
     pub(super) ic3_baseline_arena_words: usize,
 
+    /// Verified satisfying model latched by the rephase walk when it
+    /// satisfies EVERY included clause (the success bool used to be
+    /// discarded). Latched only after the candidate passes reconstruction +
+    /// full clause-DB verification (`latch_rephase_walk_model`), and
+    /// consumed ONLY by the pure CDCL loops immediately after their
+    /// `rephase()` call — the same level-0 safe point the startup walk uses
+    /// to declare SAT. Theory and assumption loops never consume it (a CNF
+    /// model ignores assumptions and theory state); `rephase()` clears it at
+    /// entry so a latch can never outlive the rephase call that produced it.
+    pub(super) rephase_walk_model: Option<Vec<bool>>,
+
     // ── Persistent reusable buffers (#8602) ──────────────────────────────
     /// Reusable index buffer for `reduce_db` and related functions.
     /// Avoids per-call `arena.indices().collect::<Vec<usize>>()` allocations
@@ -1805,6 +1903,33 @@ fn ab_stable_ema_gate() -> u64 {
 }
 
 impl ColdState {
+    /// Grow `clause_ids` to cover `idx`, taking the deferred construction
+    /// reservation on the first write.
+    ///
+    /// `reserve_exact` of the hint reproduces exactly the capacity the
+    /// retired `Vec::with_capacity(clauses_capacity)` construction gave, so
+    /// the enabled (proof) route's capacity ladder — and with it the
+    /// `clause_db_memory_bytes` reduce-trigger basis — is unchanged. The
+    /// no-proof route never writes, never reserves, and is billed the same
+    /// bytes as a phantom charge instead (see `clause_ids_reserve_hint`).
+    #[inline]
+    pub(super) fn clause_ids_grow_for(&mut self, idx: usize) {
+        Self::grow_clause_ids(&mut self.clause_ids, self.clause_ids_reserve_hint, idx);
+    }
+
+    /// Split-borrow form of [`Self::clause_ids_grow_for`] for call sites that
+    /// hold another `cold` field borrowed (e.g. iterating the original
+    /// ledger).
+    #[inline]
+    pub(super) fn grow_clause_ids(clause_ids: &mut Vec<u64>, reserve_hint: usize, idx: usize) {
+        if clause_ids.capacity() == 0 && reserve_hint > 0 {
+            clause_ids.reserve_exact(reserve_hint);
+        }
+        if idx >= clause_ids.len() {
+            clause_ids.resize(idx + 1, 0);
+        }
+    }
+
     /// Create the full cold solver tail for `Solver::build`.
     pub(crate) fn new(num_vars: usize, clauses_capacity: usize, lrat_enabled: bool) -> Self {
         Self {
@@ -1866,6 +1991,7 @@ impl ColdState {
             reluctant_countdown: RELUCTANT_INIT,
             reluctant_ticked_at: 0,
             next_reduce_db: FIRST_REDUCE_DB,
+            two_stage_next_decay: reduction_two_stage::TWO_STAGE_DECAY_INTERVAL,
             num_reductions: 0,
             original_clause_boundary: 0,
             last_inprobe_reduction: 0,
@@ -1956,12 +2082,15 @@ impl ColdState {
             compact_next_conflict: 0,
             compact_count: 0,
             freeze_counts: vec![0; num_vars],
-            // Always allocate clause_ids unconditionally (#8069: Phase 2a).
-            // Clause IDs are the foundation for deferred backward proof
-            // reconstruction and must be tracked even when LRAT mode is not
-            // explicitly enabled.
-            clause_ids: Vec::with_capacity(clauses_capacity),
+            // Clause IDs underpin deferred reconstruction, but the
+            // reservation is lazy-on-first-write (`clause_ids_grow_for`): the
+            // no-proof route disables clause_ids right after construction and
+            // must not pay the 162 MB `--memory` charge for an unwritten
+            // vector.
+            clause_ids: Vec::new(),
+            clause_ids_reserve_hint: clauses_capacity,
             clause_ids_disabled: false,
+            load_slack_reclaimed_bytes: 0,
             bcp_learned_clause_birth_conflicts: Vec::new(),
             clause_birth_solve: Vec::new(),
             level0_proof_id: vec![0; num_vars],
@@ -1974,6 +2103,7 @@ impl ColdState {
             issued_original_clause_id_max: 0,
             original_clause_id_bits: Vec::new(),
             lrat_enabled,
+            internal_lrat_enabled: false,
             unsat_certificate_enabled: true,
             ambient_artifacts_enabled: true,
             retain_unsat_certificate: true,
@@ -2031,6 +2161,8 @@ impl ColdState {
             rephase_count_focused: 0,
             next_rephase: REPHASE_INITIAL,
             stable_only_rephase_enabled: false,
+            large_rephase_walk: false,
+            mode_equiticks_large_band: false,
             flip_search_enabled: true,
             flip_last_ticks: 0,
             flip_stats: crate::flip::FlipStats::default(),
@@ -2045,6 +2177,7 @@ impl ColdState {
             preprocess_watches_valid: false,
             preprocess_deadline: None,
             solve_deadline: None,
+            indep_enum_pending: None,
             incremental_watch_boundary: None,
             symmetry_enabled: false, // #8190: CaDiCaL has no symmetry detection; adaptive re-enables for small structured formulas
             symmetry_stats: crate::symmetry::SymmetryStats::default(),
@@ -2142,6 +2275,7 @@ impl ColdState {
             ic3_domain_cache_expanded: Vec::new(),
             ic3_domain_cache_hash: 0,
             ic3_baseline_arena_words: 0,
+            rephase_walk_model: None,
             reduce_indices_buf: Vec::new(),
             reduce_candidates_buf: Vec::new(),
             gc_seen_buf: Vec::new(),

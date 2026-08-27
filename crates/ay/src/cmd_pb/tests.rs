@@ -3,7 +3,7 @@
 
 use super::*;
 
-use ay_test_support::env::{lock_env, ScopedEnvVar};
+use ay_test_support::env::lock_env;
 use std::fs;
 use std::io::{Read, Seek};
 

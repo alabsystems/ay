@@ -8,6 +8,15 @@ use crate::tune::{Knob, Profile, Setting};
 
 use super::{EngineConfigError, EngineEconomics};
 
+/// Whether the tall-covering cold-dual rescue is available to a solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TallColdDualMode {
+    /// Keep the rescue available (the compiled default).
+    Enabled,
+    /// Disable the rescue for this solve.
+    Disabled,
+}
+
 impl EngineEconomics {
     /// Dual-walk anatomy tracing (diagnostic). Default off.
     #[must_use]
@@ -153,6 +162,32 @@ impl EngineEconomics {
         self.eager_perturb
     }
 
+    /// PRIMAL Harris two-pass ratio test: `0` off (the shipped single-pass
+    /// test, byte-for-byte), `1` two-pass largest-pivot selection inside a
+    /// feasibility-tolerance band, `2` that plus the bounded positive step
+    /// floor.
+    ///
+    /// The band is the textbook anti-degeneracy device: pass one computes the
+    /// minimum ratio against every basic bound RELAXED outward by that
+    /// variable's own feasibility tolerance, and pass two picks, among the rows
+    /// whose TRUE ratio is inside that relaxed minimum, the one with the
+    /// largest pivot element. Mode `2` additionally refuses a zero-length step
+    /// when the band admits a positive one — never further than the relaxed
+    /// minimum, so no basic variable leaves its box by more than its own
+    /// feasibility tolerance.
+    pub fn with_harris_rt(mut self, mode: usize) -> Result<Self, EngineConfigError> {
+        if mode > 2 {
+            return Err(EngineConfigError::OutOfRange {
+                knob: Knob::HarrisRt.label(),
+                value: mode as f64,
+                low: 0.0,
+                high: 2.0,
+            });
+        }
+        self.harris_rt = Some(mode);
+        Ok(self)
+    }
+
     /// The float advice lane. Default on; `--no-float` forces every solve down
     /// the exact rational rim.
     ///
@@ -214,6 +249,15 @@ impl EngineEconomics {
         self
     }
 
+    /// Cold dual-simplex start on TALL covering LPs (`m >= TALL_LU_ROWS`,
+    /// `n < m` — the metro / correlation-clustering set-cover shape). Default
+    /// on; see `FloatLp::tall_cold_dual`.
+    #[must_use]
+    pub fn with_tall_cold_dual(mut self, mode: TallColdDualMode) -> Self {
+        self.tall_cold_dual = Some(matches!(mode, TallColdDualMode::Enabled));
+        self
+    }
+
     /// Dual churn band. Default on.
     #[must_use]
     pub fn with_dual_churn_band(mut self, enabled: bool) -> Self {
@@ -257,16 +301,20 @@ impl EngineEconomics {
                 self.chain_preorder.map(|v| Setting::Flag(!v)),
             ),
             (Knob::NoBumpLu, self.bump_lu.map(|v| Setting::Flag(!v))),
-            (Knob::FullPricing, self.full_pricing.map(Setting::Flag)),
             (Knob::DualBypassMode, self.dual_bypass.map(Setting::Count)),
             (
                 Knob::EagerPerturbMode,
                 self.eager_perturb.map(Setting::Count),
             ),
+            (Knob::HarrisRt, self.harris_rt.map(Setting::Count)),
             (Knob::NoFloat, self.float_lane.map(|v| Setting::Flag(!v))),
             (Knob::NoCutoff, self.cutoff_stop.map(|v| Setting::Flag(!v))),
             (Knob::NoNodeLu, self.node_lu.map(|v| Setting::Flag(!v))),
             (Knob::NoTallLu, self.tall_lu.map(|v| Setting::Flag(!v))),
+            (
+                Knob::NoTallColdDual,
+                self.tall_cold_dual.map(|v| Setting::Flag(!v)),
+            ),
             (
                 Knob::NoDualChurnBand,
                 self.dual_churn_band.map(|v| Setting::Flag(!v)),
@@ -333,6 +381,7 @@ mod tests {
             .with_cutoff_stop(false)
             .with_node_lu(false)
             .with_tall_lu(false)
+            .with_tall_cold_dual(TallColdDualMode::Disabled)
             .with_dual_churn_band(false)
             .with_dual_bloom_cap(9);
         let _active = crate::tune::activate_caller(b12.profile());
@@ -350,6 +399,7 @@ mod tests {
             Knob::NoCutoff,
             Knob::NoNodeLu,
             Knob::NoTallLu,
+            Knob::NoTallColdDual,
             Knob::NoDualChurnBand,
         ] {
             assert!(crate::tune::on(knob), "{knob:?}");

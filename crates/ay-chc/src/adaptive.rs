@@ -4286,11 +4286,16 @@ impl AdaptivePortfolio {
             // SMT validation, starving PDR/IMC/TPA/LAWI.
             let alg_budget = algebraic_prestage_budget(&features, self.config.time_budget);
             let alg_deadline = alg_start + alg_budget;
+            // #9110: the pre-strategy observes the adaptive cancellation token
+            // too, so an external `cancellation_handle().cancel()` winds it
+            // down like every other lane instead of running to completion.
+            let alg_cancel = Some(self.cancellation_token.clone());
             let (algebraic_result, algebraic_validation_stats) =
-                crate::algebraic_invariant::try_algebraic_solve_with_deadline_and_stats(
+                crate::algebraic_invariant::try_algebraic_solve_with_budget_and_stats(
                     &self.problem,
                     self.config.verbose,
                     Some(alg_deadline),
+                    alg_cancel.clone(),
                 );
             self.record_lra_affine_original_clause_validation_stats(&algebraic_validation_stats);
             match algebraic_result {
@@ -4359,10 +4364,11 @@ impl AdaptivePortfolio {
                     // #8753: reuse the pre-stage deadline so the BvToInt retry
                     // does not silently extend the algebraic budget.
                     let (algebraic_result, algebraic_validation_stats) =
-                        crate::algebraic_invariant::try_algebraic_solve_with_deadline_and_stats(
+                        crate::algebraic_invariant::try_algebraic_solve_with_budget_and_stats(
                             &bv_to_int_result.problem,
                             self.config.verbose,
                             Some(alg_deadline),
+                            alg_cancel,
                         );
                     self.record_lra_affine_original_clause_validation_stats(
                         &algebraic_validation_stats,

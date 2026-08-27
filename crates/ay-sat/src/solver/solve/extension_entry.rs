@@ -18,12 +18,12 @@ impl Solver {
     pub fn solve_with_preprocessing_extension<E, B>(
         &mut self,
         build_extension: B,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         E: Extension,
         B: FnMut(&[Vec<Literal>]) -> Option<PreparedExtension<E>>,
     {
-        VerifiedSatResult::from_validated(
+        SolverSatResult::from_solver_result(
             self.solve_with_preprocessing_extension_raw(build_extension),
         )
     }
@@ -33,13 +33,13 @@ impl Solver {
         &mut self,
         build_extension: B,
         should_stop: F,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         E: Extension,
         B: FnMut(&[Vec<Literal>]) -> Option<PreparedExtension<E>>,
         F: Fn() -> bool,
     {
-        VerifiedSatResult::from_validated(
+        SolverSatResult::from_solver_result(
             self.solve_interruptible_with_preprocessing_extension_raw(build_extension, should_stop),
         )
     }
@@ -53,8 +53,8 @@ impl Solver {
     ///
     /// This is the recommended way to integrate theory solvers for eager
     /// DPLL(T) where theory propagation happens during SAT search.
-    pub fn solve_with_extension(&mut self, ext: &mut dyn Extension) -> VerifiedSatResult {
-        VerifiedSatResult::from_validated(self.solve_with_extension_raw(ext))
+    pub fn solve_with_extension(&mut self, ext: &mut dyn Extension) -> SolverSatResult {
+        SolverSatResult::from_solver_result(self.solve_with_extension_raw(ext))
     }
 
     /// Solve with a theory extension under a set of assumption literals (#LNS).
@@ -70,8 +70,8 @@ impl Solver {
         &mut self,
         ext: &mut dyn Extension,
         assumptions: &[Literal],
-    ) -> VerifiedSatResult {
-        VerifiedSatResult::from_validated(
+    ) -> SolverSatResult {
+        SolverSatResult::from_solver_result(
             self.solve_with_extension_and_assumptions_raw(ext, assumptions),
         )
     }
@@ -135,11 +135,11 @@ impl Solver {
         &mut self,
         ext: &mut dyn Extension,
         should_stop: F,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         F: Fn() -> bool,
     {
-        VerifiedSatResult::from_validated(
+        SolverSatResult::from_solver_result(
             self.solve_interruptible_with_extension_raw(ext, should_stop),
         )
     }
@@ -157,11 +157,11 @@ impl Solver {
         &mut self,
         ext: &mut dyn Extension,
         should_stop: F,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         F: Fn() -> bool,
     {
-        VerifiedSatResult::from_validated(
+        SolverSatResult::from_solver_result(
             self.continue_solving_with_extension_raw(ext, should_stop),
         )
     }
@@ -171,7 +171,6 @@ impl Solver {
     /// Unlike `continue_solving_with_extension`, this does NOT reset the trail,
     /// flush learned clauses, or rebuild VSIDS state. It simply re-enters the
     /// CDCL loop from the current state with a new should_stop closure.
-    ///
     /// This is safe when:
     /// 1. The prior solve returned Unknown(Interrupted) due to should_stop
     /// 2. No new clauses have been added via add_clause()
@@ -186,11 +185,12 @@ impl Solver {
         &mut self,
         ext: &mut dyn Extension,
         should_stop: F,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         F: Fn() -> bool,
     {
-        VerifiedSatResult::from_validated(self.resume_solving_with_extension_raw(ext, should_stop))
+        let result = self.resume_solving_with_extension_raw(ext, should_stop);
+        SolverSatResult::from_solver_result(result)
     }
 
     /// Internal resume implementation — re-enters CDCL loop without trail reset.
@@ -310,6 +310,11 @@ impl Solver {
         self.conflict.clear(&mut self.var_data);
         self.var_data.fill(VarData::UNASSIGNED);
         self.bump_reason_graph_epoch();
+        // #relevancy-frontier-incremental: the incremental relevancy frontier
+        // folds a PREFIX of the trail; rewriting the trail outside backtrack
+        // invalidates that correspondence, so drop the cache (the next query
+        // rebuilds with the original from-scratch walk).
+        self.relevancy_frontier.invalidate();
         // Clear trail
         self.trail.clear();
         self.trail_lim.clear();
@@ -428,7 +433,7 @@ impl Solver {
         self.num_original_clauses = self.arena.active_clause_count();
         self.cold.original_clause_boundary = self.arena.len();
 
-        // Streaming UNSAT core bitmap (#8250).
+        // Streaming original-clause support (#8250).
         // Issued-original max, not next_original_clause_id - 1: the latter
         // jumps past derived IDs (b93692341 follow-up).
         let num_originals = self.cold.issued_original_clause_id_max;
@@ -878,7 +883,7 @@ impl Solver {
         self.num_original_clauses = self.arena.irredundant_count();
         self.cold.original_clause_boundary = self.arena.len();
 
-        // Initialize streaming UNSAT core bitmap (#8250).
+        // Initialize streaming original-clause support (#8250).
         // Issued-original max, not next_original_clause_id - 1: the latter
         // jumps past derived IDs (b93692341 follow-up).
         let num_originals = self.cold.issued_original_clause_id_max;
@@ -939,7 +944,13 @@ impl Solver {
         ext: &mut dyn Extension,
     ) -> Option<SatResult> {
         ext.init();
-        let result = ext.propagate(self);
+        let mut result = ext.propagate(self);
+
+        // Chunked XOR ladders (task #20): proof-only scaffolding precedes
+        // every dependent lemma/conflict clause in the proof stream.
+        if !result.proof_script.is_empty() {
+            self.apply_extension_proof_script(std::mem::take(&mut result.proof_script));
+        }
 
         // Process additional theory lemma clauses BEFORE handling conflicts (#4533).
         // When the XOR extension detects a 0=1 contradiction, it may include

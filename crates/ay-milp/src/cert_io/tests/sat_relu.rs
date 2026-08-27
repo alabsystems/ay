@@ -13,7 +13,7 @@ pub(super) fn sat_relu_rup_parser_enforces_caps_before_body_allocation() {
         format!("derived_lits={}", MAX_SAT_RELU_RUP_LITERALS + 1),
         format!("hints={}", MAX_SAT_RELU_RUP_HINTS + 1),
     ] {
-        let mut fields = vec![
+        let mut fields = [
             "vars=1".to_owned(),
             "originals=1".to_owned(),
             "steps=1".to_owned(),

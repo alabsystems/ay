@@ -29,7 +29,8 @@ fn make_test_steps() -> Vec<LratStep> {
 
 #[test]
 fn test_proof_certificate_is_deferred_before_materialization() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     assert!(
         cert.is_deferred(),
         "certificate should be deferred before materialization"
@@ -38,7 +39,8 @@ fn test_proof_certificate_is_deferred_before_materialization() {
 
 #[test]
 fn test_proof_certificate_not_deferred_after_materialization() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let _ = cert.materialize();
     assert!(
         !cert.is_deferred(),
@@ -48,7 +50,8 @@ fn test_proof_certificate_not_deferred_after_materialization() {
 
 #[test]
 fn test_proof_certificate_materialize_returns_steps() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let steps = cert.materialize();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0].clause_id, 4);
@@ -63,7 +66,8 @@ fn test_proof_certificate_materialize_returns_steps() {
 
 #[test]
 fn test_proof_certificate_materialize_is_idempotent() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let steps1 = cert.materialize();
     let steps2 = cert.materialize();
     assert_eq!(steps1.len(), steps2.len());
@@ -73,7 +77,8 @@ fn test_proof_certificate_materialize_is_idempotent() {
 
 #[test]
 fn test_proof_certificate_step_count() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     assert_eq!(cert.step_count(), 3);
     // After step_count, no longer deferred
     assert!(!cert.is_deferred());
@@ -81,7 +86,8 @@ fn test_proof_certificate_step_count() {
 
 #[test]
 fn test_proof_certificate_write_lrat_produces_output() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let mut buf = Vec::new();
     cert.write_lrat(&mut buf)
         .expect("write_lrat should succeed");
@@ -106,7 +112,8 @@ fn test_proof_certificate_write_lrat_produces_output() {
 
 #[test]
 fn test_proof_certificate_write_drat_produces_output() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let mut buf = Vec::new();
     cert.write_drat(&mut buf)
         .expect("write_drat should succeed");
@@ -134,9 +141,9 @@ fn test_proof_certificate_empty() {
 }
 
 #[test]
-fn test_proof_certificate_from_lrat_text_materializes_additions() {
+fn test_proof_certificate_from_lrat_text_is_unverified() {
     let lrat = b"3 1 0 1 0\n4 0 3 -2 0\n5 d 3 0\n";
-    let cert = ProofCertificate::from_lrat_text(lrat, true).expect("valid LRAT text");
+    let cert = ProofCertificate::from_lrat_text(lrat).expect("valid LRAT text");
     let steps = cert.materialize();
 
     assert_eq!(steps.len(), 2);
@@ -146,28 +153,57 @@ fn test_proof_certificate_from_lrat_text_materializes_additions() {
     assert_eq!(steps[1].clause_id, 4);
     assert!(steps[1].literals.is_empty());
     assert_eq!(steps[1].hints, vec![3, -2]);
-    assert!(cert.is_complete());
+    assert_eq!(cert.completeness(), ProofCompleteness::NotEstablished);
+    assert!(!cert.is_complete());
 }
 
 #[test]
 fn test_proof_certificate_from_lrat_text_rejects_missing_terminator() {
-    let err = ProofCertificate::from_lrat_text(b"3 1 0 1\n", true)
-        .expect_err("missing final 0 must fail");
+    for malformed in [
+        b"3 1 0 1\n".as_slice(),
+        b"3 1 0".as_slice(),
+        b"3 0".as_slice(),
+    ] {
+        let err = ProofCertificate::from_lrat_text(malformed)
+            .expect_err("missing distinct literal and hint terminators must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn test_proof_certificate_from_lrat_text_validates_deletions() {
+    for malformed in [b"5 d 3".as_slice(), b"5 d nope 0".as_slice()] {
+        let err =
+            ProofCertificate::from_lrat_text(malformed).expect_err("malformed deletion must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn test_proof_certificate_from_lrat_text_rejects_unencodable_literal() {
+    let err = ProofCertificate::from_lrat_text(b"3 -2147483648 0 1 0")
+        .expect_err("i32::MIN has no round-trippable DIMACS literal");
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]
 fn test_proof_certificate_is_complete() {
-    let complete = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let complete =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    assert_eq!(complete.completeness(), ProofCompleteness::Complete);
     assert!(complete.is_complete());
 
-    let incomplete = ProofCertificate::from_backward_result(make_test_steps(), false);
+    let incomplete = ProofCertificate::from_backward_result(
+        make_test_steps(),
+        ProofCompleteness::NotEstablished,
+    );
     assert!(!incomplete.is_complete());
 }
 
 #[test]
 fn test_proof_certificate_debug_format() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     let debug_str = format!("{cert:?}");
     assert!(
         debug_str.contains("materialized: false"),
@@ -196,56 +232,57 @@ fn test_proof_step_from_lrat_step() {
 }
 
 #[test]
-fn test_minimal_core_extracts_original_clause_ids() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    let core = cert.minimal_core();
+fn test_tracked_original_clause_ids_extracts_retained_hints() {
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    let support = cert.tracked_original_clause_ids();
     assert_eq!(
-        core,
+        support,
         vec![1, 2, 3],
-        "minimal core should contain original clause IDs 1, 2, 3"
+        "retained hints should contain original clause IDs 1, 2, 3"
     );
 }
 
 #[test]
-fn test_minimal_core_empty_proof() {
+fn test_tracked_original_clause_ids_empty_proof() {
     let cert = ProofCertificate::empty();
-    let core = cert.minimal_core();
-    assert!(core.is_empty(), "empty proof should yield empty core");
+    let support = cert.tracked_original_clause_ids();
+    assert!(support.is_empty(), "empty proof should yield no support");
 }
 
 #[test]
-fn test_minimal_core_single_step_no_hints() {
+fn test_tracked_original_clause_ids_single_step_no_hints() {
     let steps = vec![LratStep {
         clause_id: 1,
         literals: vec![],
         hints: vec![],
     }];
-    let cert = ProofCertificate::from_backward_result(steps, true);
-    let core = cert.minimal_core();
+    let cert = ProofCertificate::from_backward_result(steps, ProofCompleteness::Complete);
+    let support = cert.tracked_original_clause_ids();
     assert!(
-        core.is_empty(),
-        "proof step with no hints should yield empty core"
+        support.is_empty(),
+        "proof step with no hints should yield no support"
     );
 }
 
 #[test]
-fn test_minimal_core_all_original() {
+fn test_tracked_original_clause_ids_all_original() {
     let steps = vec![LratStep {
         clause_id: 10,
         literals: vec![],
         hints: vec![1i64, 2, 3],
     }];
-    let cert = ProofCertificate::from_backward_result(steps, true);
-    let core = cert.minimal_core();
+    let cert = ProofCertificate::from_backward_result(steps, ProofCompleteness::Complete);
+    let support = cert.tracked_original_clause_ids();
     assert_eq!(
-        core,
+        support,
         vec![1, 2, 3],
         "all hints should be original clause IDs"
     );
 }
 
 #[test]
-fn test_minimal_core_dedup_and_sort() {
+fn test_tracked_original_clause_ids_dedup_and_sort() {
     let steps = vec![
         LratStep {
             clause_id: 10,
@@ -258,78 +295,125 @@ fn test_minimal_core_dedup_and_sort() {
             hints: vec![10i64, 2],
         },
     ];
-    let cert = ProofCertificate::from_backward_result(steps, true);
-    let core = cert.minimal_core();
-    assert_eq!(core, vec![1, 2, 3], "core should be sorted and deduped");
-}
-
-// ── Streaming UNSAT core tests (#8250) ──────────────────────────────
-
-#[test]
-fn test_streaming_core_not_present_by_default() {
-    let cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    assert!(
-        !cert.has_streaming_core(),
-        "default certificate should not have streaming core"
-    );
-}
-
-#[test]
-fn test_streaming_core_overrides_dag_walk() {
-    let mut cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    // DAG walk would produce [1, 2, 3], but streaming core overrides.
-    cert.set_streaming_core(vec![1, 3]);
-    assert!(cert.has_streaming_core());
-    let core = cert.minimal_core();
+    let cert = ProofCertificate::from_backward_result(steps, ProofCompleteness::Complete);
+    let support = cert.tracked_original_clause_ids();
     assert_eq!(
-        core,
-        vec![1, 3],
-        "streaming core should override DAG walk result"
+        support,
+        vec![1, 2, 3],
+        "support should be sorted and deduplicated"
     );
 }
 
 #[test]
-fn test_streaming_core_returns_without_materializing() {
-    let mut cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    cert.set_streaming_core(vec![2, 5]);
+fn test_tracked_original_clause_ids_includes_unreachable_retained_branch() {
+    let steps = vec![
+        LratStep {
+            clause_id: 10,
+            literals: vec![Literal::positive(Variable(0))],
+            hints: vec![1],
+        },
+        LratStep {
+            clause_id: 20,
+            literals: vec![Literal::positive(Variable(1))],
+            hints: vec![2],
+        },
+        LratStep {
+            clause_id: 11,
+            literals: vec![],
+            hints: vec![10],
+        },
+    ];
+    let cert = ProofCertificate::from_backward_result(steps, ProofCompleteness::Complete);
+
+    assert_eq!(cert.tracked_original_clause_ids(), vec![1, 2]);
+}
+
+#[test]
+fn test_tracked_original_clause_ids_does_not_require_terminal_clause() {
+    let steps = vec![LratStep {
+        clause_id: 10,
+        literals: vec![Literal::positive(Variable(0))],
+        hints: vec![7],
+    }];
+    let cert = ProofCertificate::from_backward_result(steps, ProofCompleteness::Complete);
+
+    assert!(cert.is_complete());
+    assert_eq!(cert.tracked_original_clause_ids(), vec![7]);
+}
+
+// ── Streaming support tests (#8250) ──────────────────────────────
+
+#[test]
+fn test_streaming_support_not_present_by_default() {
+    let cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
     assert!(
-        cert.is_deferred(),
-        "proof should still be deferred before minimal_core"
-    );
-    let core = cert.minimal_core();
-    assert_eq!(core, vec![2, 5]);
-    // Streaming core path does NOT materialize the proof
-    assert!(
-        cert.is_deferred(),
-        "streaming core should not trigger materialization"
+        !cert.has_streaming_support(),
+        "default certificate should not have streaming support"
     );
 }
 
 #[test]
-fn test_streaming_core_empty_certificate() {
+fn test_streaming_support_overrides_retained_hints() {
+    let mut cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    // Retained hints would produce [1, 2, 3]. Streaming support can include
+    // additional tracked clauses and overrides that fallback.
+    cert.set_streaming_support(vec![1, 3, 9]);
+    assert!(cert.has_streaming_support());
+    let support = cert.tracked_original_clause_ids();
+    assert_eq!(
+        support,
+        vec![1, 3, 9],
+        "streaming support should override retained-hint support"
+    );
+}
+
+#[test]
+fn test_streaming_support_returns_without_materializing() {
+    let mut cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    cert.set_streaming_support(vec![2, 5]);
+    assert!(
+        cert.is_deferred(),
+        "proof should still be deferred before querying support"
+    );
+    let support = cert.tracked_original_clause_ids();
+    assert_eq!(support, vec![2, 5]);
+    // Streaming support does not materialize the proof.
+    assert!(
+        cert.is_deferred(),
+        "streaming support should not trigger materialization"
+    );
+}
+
+#[test]
+fn test_streaming_support_empty_certificate() {
     let mut cert = ProofCertificate::empty();
-    assert!(!cert.has_streaming_core());
-    cert.set_streaming_core(vec![1]);
-    assert!(cert.has_streaming_core());
-    assert_eq!(cert.minimal_core(), vec![1]);
+    assert!(!cert.has_streaming_support());
+    cert.set_streaming_support(vec![1]);
+    assert!(cert.has_streaming_support());
+    assert_eq!(cert.tracked_original_clause_ids(), vec![1]);
 }
 
 #[test]
-fn test_streaming_core_debug_includes_size() {
-    let mut cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    cert.set_streaming_core(vec![1, 2, 3]);
+fn test_streaming_support_debug_includes_size() {
+    let mut cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    cert.set_streaming_support(vec![1, 2, 3]);
     let debug_str = format!("{cert:?}");
     assert!(
-        debug_str.contains("streaming_core: Some(3)"),
-        "debug should show streaming core size, got: {debug_str}"
+        debug_str.contains("streaming_support: Some(3)"),
+        "debug should show streaming support size, got: {debug_str}"
     );
 }
 
 #[test]
-fn test_streaming_core_clone_preserves() {
-    let mut cert = ProofCertificate::from_backward_result(make_test_steps(), true);
-    cert.set_streaming_core(vec![1, 2]);
+fn test_streaming_support_clone_preserves() {
+    let mut cert =
+        ProofCertificate::from_backward_result(make_test_steps(), ProofCompleteness::Complete);
+    cert.set_streaming_support(vec![1, 2]);
     let cloned = cert.clone();
-    assert!(cloned.has_streaming_core());
-    assert_eq!(cloned.minimal_core(), vec![1, 2]);
+    assert!(cloned.has_streaming_support());
+    assert_eq!(cloned.tracked_original_clause_ids(), vec![1, 2]);
 }

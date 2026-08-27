@@ -4,7 +4,7 @@
 
 //! Current-query quantified-leaf confirmation for SAT restoration.
 
-use super::{contains_quantifier, Duration, Executor, Instant, QuantifiedModelCheck, TermData};
+use super::{contains_quantifier, Executor, QuantifiedModelCheck, TermData};
 
 impl Executor {
     /// Positively certify every quantified leaf in the CURRENT assertion set
@@ -63,12 +63,12 @@ impl Executor {
             return false;
         }
 
-        let saved_deadline = self.solve_deadline.get();
-        let budget = Instant::now() + Duration::from_secs(2);
-        self.set_deadline(match saved_deadline {
-            Some(deadline) if deadline < budget => Some(deadline),
-            _ => Some(budget),
-        });
+        // This is the SECOND quantified-model-gate arm site, and it runs on the
+        // same public `check-sat` as (and BEFORE) the publication gate. Both
+        // therefore draw their wall from ONE query-owned envelope; a fresh
+        // per-arm constant here would let a single query pay the gate's ground
+        // probes twice over.
+        let (arm, saved_deadline) = self.open_quantified_gate_arm();
         let saved_statistics = self.last_statistics.clone();
         self.in_quantified_model_gate = true;
         let confirmed = candidates.into_iter().all(|conjunct| {
@@ -79,7 +79,7 @@ impl Executor {
                 )
         });
         self.in_quantified_model_gate = false;
-        self.set_deadline(saved_deadline);
+        self.close_quantified_gate_arm(arm, saved_deadline);
         self.last_statistics = saved_statistics;
         confirmed
     }

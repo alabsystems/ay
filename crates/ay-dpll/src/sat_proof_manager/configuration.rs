@@ -25,6 +25,12 @@ impl<'a> SatProofManager<'a> {
             step_budget: None,
             dt_registry_data: None,
             context_derivations: None,
+            context_discharge_failures: Default::default(),
+            ground_refuter_memo: Default::default(),
+            context_deep_retry: false,
+            context_premise_budget: 0,
+            dt_unit_kind_memo: Default::default(),
+            equality_neighbour_index: None,
         }
     }
 

@@ -11,14 +11,14 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use ay_drat_check::checker::DratChecker;
 //! use ay_drat_check::drat_parser;
 //!
 //! let cnf = ay_drat_check::cnf_parser::parse_cnf(
-//!     &b"p cnf 2 2\n1 2 0\n-1 -2 0\n"[..],
+//!     &b"p cnf 1 2\n1 0\n-1 0\n"[..],
 //! ).expect("valid CNF");
-//! let proof = drat_parser::parse_drat(b"1 0\n-2 0\n0\n").expect("valid DRAT");
+//! let proof = drat_parser::parse_drat(b"").expect("valid DRAT");
 //! let mut checker = DratChecker::new(cnf.num_vars, true);
 //! let result = checker.verify(&cnf.clauses, &proof);
 //! assert!(result.is_ok());

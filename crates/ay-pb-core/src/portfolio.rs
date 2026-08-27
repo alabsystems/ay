@@ -1401,7 +1401,7 @@ fn solve_optimization_portfolio_with_timings_impl(
 /// the routing in `solve_opb` (which keeps these off the probe-budgeted front-end path
 /// so the upgrade gets the full budget) and by the upgrade itself, so the two never
 /// disagree. `false` for anything linear, too wide (`> SMALL_NLC_EXHAUST_MAX_VARS`), or
-/// whose `2^n * per_leaf_terms` work exceeds [`SMALL_NLC_EXHAUST_MAX_WORK`].
+/// whose `2^n * per_leaf_terms` work exceeds `SMALL_NLC_EXHAUST_MAX_WORK`.
 pub fn small_nlc_exhaustible(instance: &PbInstance, objective: &PbObjective) -> bool {
     if is_linear(instance) {
         return false;
@@ -3173,9 +3173,9 @@ fn clamp_parallel_workers_for_limit(
 /// * LINEAR instances (including WBO reductions, which are linear by
 ///   construction) — the measured default;
 /// * NON-LINEAR (product) OPT instances via their own NLC-safe spec subset
-///   ([`optimization_worker_specs`]), EXCEPT the special shapes the
+///   (`optimization_worker_specs`), EXCEPT the special shapes the
 ///   sequential routing decides instantly / provably
-///   ([`nlc_parallel_eligible`] — unconstrained, small-exhaustible, and the
+///   (`nlc_parallel_eligible` — unconstrained, small-exhaustible, and the
 ///   all-false-zero theorem shape — whose sound product-objective OPTIMUM
 ///   claims the fail-closed parallel reconcile would refuse and thereby
 ///   downgrade).
@@ -3734,7 +3734,7 @@ type OptimizationWorkerRun = Box<
 >;
 
 /// Boxed PRIMAL strategy runner (design §3.2): the same inputs as
-/// [`OptimizationWorkerRun`], except improvements flow through the verdict-free
+/// `OptimizationWorkerRun`, except improvements flow through the verdict-free
 /// [`PrimalSender`] and the return type is `()` — there is no `PbSolution` to
 /// carry a verdict out of the worker. Public (together with [`PrimalSender`]
 /// and [`spawn_primal_optimization_worker`]) so the `tests/trybuild.rs`
@@ -4388,7 +4388,7 @@ pub use crate::optimize::shared_bounds::{GlobalSoundFloor, SharedBounds};
 ///
 /// STRUCTURAL SOUNDNESS BOUNDARY (design §3.2, the worker-return split): this
 /// is the ONLY spawn path for the primal specs (the
-/// [`primal_optimization_label`] set), and its SIGNATURE — not a runtime check
+/// `primal_optimization_label` set), and its SIGNATURE — not a runtime check
 /// — is what makes a primal verdict impossible:
 /// * `run` returns `()`: there is no `PbSolution` to carry an
 ///   `OptimumFound`/`Unsatisfiable` out of the worker; and
@@ -7738,13 +7738,13 @@ fn wbo_sls_worker_enabled() -> bool {
 }
 
 /// Standalone primal SLS over a WBO-reduced PBO instance, with the higher
-/// [`MAX_WBO_SLS_VARS`] variable cap so the soft-relaxation blow-up does not make
+/// `MAX_WBO_SLS_VARS` variable cap so the soft-relaxation blow-up does not make
 /// the SLS decline. Streams every re-verified, strictly-improving feasible
 /// incumbent through `on_improve` (caller maps it back and re-scores against the
 /// ORIGINAL WBO) and returns the best feasible incumbent as `Satisfiable` (or
 /// `Unknown` if none / budget expired).
 ///
-/// Soundness: identical to [`solve_optimization_sls`]. The incremental tracker is
+/// Soundness: identical to `solve_optimization_sls`. The incremental tracker is
 /// advisory; every adopted incumbent is re-verified against ALL reduced-PBO
 /// constraints with `verify_all_constraints` and its objective recomputed exactly
 /// inside the SLS loop AND again here through `sanitize_optimization_incumbent`.
@@ -9609,7 +9609,7 @@ fn strict_optimum_gate_enabled() -> bool {
 /// every optimization verdict passes through before output, so the checked
 /// dual-bound gate covers ALL the OPTIMUM-emitting paths (B&B, native OLL,
 /// max-clique, knapsack DP, ...), not just the ones routed through
-/// [`sanitize_optimization_solution`].
+/// `sanitize_optimization_solution`.
 ///
 /// Soundness model (dual of `proof::refutation_check`, mirror of the
 /// kernel-verified `pb_optimum_eq_of_cut_lower_bound`):

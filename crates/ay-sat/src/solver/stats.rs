@@ -15,6 +15,10 @@ use super::solver_stats::{
 use super::*;
 use crate::guidance::{SatGuidanceFingerprint, SatGuidanceImportDecision};
 
+/// One row of bit-parallel support-enumerator observability, in the order
+/// [`Solver::indep_enum_report`] documents.
+pub type IndepEnumReport = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+
 /// Restart decisions attributed to their primary trigger and current mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RestartAttributionStats {
@@ -686,6 +690,30 @@ impl Solver {
     }
 
     /// Get the number of cold restarts performed (Zhang et al. 2024).
+    /// Restarts that kept at least one trail level, and the total levels kept.
+    ///
+    /// CaDiCaL's `reused` (stats.cpp:517-518). A restart that reuses its prefix
+    /// does not re-make those decisions, so this is a direct input to
+    /// decisions/conflict — the one metric on which AY is consistently behind.
+    pub fn num_trail_reuse_restarts(&self) -> u64 {
+        self.stats.trail_reuse_restarts
+    }
+
+    /// Total decision levels preserved across all restarts.
+    pub fn num_trail_reused_levels(&self) -> u64 {
+        self.stats.trail_reused_levels
+    }
+
+    /// Sum of trail length over all conflicts (divide by conflicts for the mean).
+    pub fn trail_at_conflict_sum(&self) -> u64 {
+        self.stats.trail_at_conflict_sum
+    }
+
+    /// Sum of decision level over all conflicts (divide by conflicts for the mean).
+    pub fn level_at_conflict_sum(&self) -> u64 {
+        self.stats.level_at_conflict_sum
+    }
+
     pub fn num_cold_restarts(&self) -> u64 {
         self.stats.cold_restarts
     }
@@ -753,6 +781,20 @@ impl Solver {
     /// effort-proportional scheduling (vivify, walk, backbone, sweep).
     pub fn total_search_ticks(&self) -> u64 {
         self.search_ticks[0] + self.search_ticks[1]
+    }
+
+    /// Search ticks split by stabilization mode: `(focused, stable)`.
+    ///
+    /// This — not the decision counts — is the mode share that the schedule
+    /// actually budgets: kissat's `update_mode_limit` (`mode.c:69-110`) caps a
+    /// focused phase in CONFLICTS and the following stable phase in exactly the
+    /// TICKS that focused phase burned, so a faithful schedule lands near 50/50
+    /// here. Decisions are a poor proxy because a focused-mode restart on a
+    /// deep trail re-descends thousands of levels, inflating `focused_decs`
+    /// without spending proportionally more search effort.
+    #[must_use]
+    pub fn mode_search_ticks(&self) -> (u64, u64) {
+        (self.search_ticks[0], self.search_ticks[1])
     }
 
     /// Get the number of propagations performed during solving
@@ -1344,6 +1386,36 @@ impl Solver {
         self.stats.learned_reduction_lrat_retained_delete_skips
     }
 
+    /// Two-stage clause management telemetry (arXiv:2602.20829).
+    ///
+    /// Every field can only be written by the two-stage code paths, so a run
+    /// with the arm off reports all zeros, and a run with the arm ON that
+    /// still reports zeros means the flag was accepted but never reached.
+    pub fn two_stage_clause_management_stats(&self) -> solver_stats::TwoStageClauseStats {
+        solver_stats::TwoStageClauseStats {
+            enabled: self.two_stage_clause_management,
+            learned_inits: self.stats.two_stage_learned_inits,
+            bcp_bumps: self.stats.two_stage_bcp_bumps,
+            analysis_bumps: self.stats.two_stage_analysis_bumps,
+            score_saturations: self.stats.two_stage_score_saturations,
+            decay_rounds: self.stats.two_stage_decay_rounds,
+            decay_clauses: self.stats.two_stage_decay_clauses,
+            reduce_rounds: self.stats.two_stage_reduce_rounds,
+            stage1_kept: self.stats.two_stage_stage1_kept,
+            stage2_candidates: self.stats.two_stage_stage2_candidates,
+            stage2_deleted: self.stats.two_stage_stage2_deleted,
+            flushes_absorbed: self.stats.two_stage_flushes_absorbed,
+            score_total: self.stats.two_stage_score_total,
+            score_max: self.stats.two_stage_score_max,
+            score_histogram: self.stats.two_stage_score_hist,
+        }
+    }
+
+    /// Reduce-time score histogram, bucketed `[0, 1, 2-3, 4-7, 8-15, 16-31]`.
+    pub fn two_stage_score_histogram(&self) -> [u64; 8] {
+        self.stats.two_stage_score_hist
+    }
+
     /// Get the number of dirty literals processed by flush_watches (#8101).
     pub fn flush_dirty_lits(&self) -> u64 {
         self.stats.flush_dirty_lits
@@ -1643,9 +1715,68 @@ impl Solver {
         self.stats.lucky_time_ns
     }
 
+    /// Get phase timing: GF(p) linear-system probe wall-clock nanoseconds.
+    pub fn gf_probe_time_ns(&self) -> u64 {
+        self.stats.gf_probe_time_ns
+    }
+
     /// Get phase timing: walk-based phase init wall-clock nanoseconds.
     pub fn walk_time_ns(&self) -> u64 {
         self.stats.walk_time_ns
+    }
+
+    /// In-search rephase-walk observability: `(runs, gate_skips, nanoseconds)`.
+    ///
+    /// `walk_time_ns` above covers the STARTUP walk only, so a formula past
+    /// the startup size gate reports `walk_ms: 0` however many rephase walks
+    /// it ran. These three separate "the walk never ran" from "the walk ran
+    /// and did not pay off".
+    #[must_use]
+    pub fn rephase_walk_report(&self) -> (u64, u64, u64) {
+        (
+            self.stats.rephase_walk_runs,
+            self.stats.rephase_walk_gate_skips,
+            self.stats.rephase_walk_ns,
+        )
+    }
+
+    /// Independent-support brancher observability (`solver/indep_support.rs`):
+    /// `(installed_size, live_size, decidable_vars, gates, rejected_size,
+    /// restricted decisions, fallback decisions, wall nanoseconds)`.
+    #[must_use]
+    pub fn indep_support_report(&self) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.stats.indep_support_installed_size,
+            self.stats.indep_support_size,
+            self.stats.indep_support_decidable_vars,
+            self.stats.indep_support_gates,
+            self.stats.indep_support_rejected_size,
+            self.stats.indep_support_decisions,
+            self.stats.indep_support_fallback_decisions,
+            self.stats.indep_support_time_ns,
+        )
+    }
+
+    /// Bit-parallel support-enumerator observability
+    /// (`solver/indep_enum.rs`): `(support_size, constraints,
+    /// projected_visits, admitted, blocks, assignments, visits, exhausted,
+    /// stalled, verify_failures, budget_exhausted, wall nanoseconds)`.
+    #[must_use]
+    pub fn indep_enum_report(&self) -> IndepEnumReport {
+        (
+            self.stats.indep_enum_support_size,
+            self.stats.indep_enum_constraints,
+            self.stats.indep_enum_projected_visits,
+            self.stats.indep_enum_admitted,
+            self.stats.indep_enum_blocks,
+            self.stats.indep_enum_assignments,
+            self.stats.indep_enum_visits,
+            self.stats.indep_enum_exhausted,
+            self.stats.indep_enum_stalled,
+            self.stats.indep_enum_verify_failures,
+            self.stats.indep_enum_budget_exhausted,
+            self.stats.indep_enum_time_ns,
+        )
     }
 
     /// Get cumulative LBD sum and count for average LBD computation.
@@ -2156,24 +2287,24 @@ impl Solver {
         self.provenance.is_enabled()
     }
 
-    /// Compute UNSAT core provenance breakdown (#8322).
+    /// Summarize provenance for tracked original-clause support (#8322).
     ///
     /// Returns `Some(summary)` when provenance tracking is enabled AND the
-    /// proof certificate contains a non-empty minimal core. The summary
-    /// reports which categories of clauses participated in the proof of
-    /// unsatisfiability.
+    /// proof certificate contains non-empty tracked support. This is diagnostic
+    /// reconstruction metadata: it may over-approximate a terminal refutation
+    /// and is not a checked or minimal UNSAT core.
     ///
-    /// Returns `None` when provenance tracking is disabled or the core is
-    /// empty.
-    pub fn core_provenance_summary(
+    /// Returns `None` when provenance tracking is disabled or the tracked
+    /// support is empty.
+    pub fn tracked_clause_provenance_summary(
         &self,
         certificate: &ProofCertificate,
-    ) -> Option<crate::clause_provenance::CoreProvenanceSummary> {
+    ) -> Option<crate::clause_provenance::TrackedClauseProvenanceSummary> {
         if !self.provenance.is_enabled() {
             return None;
         }
-        let core_ids = certificate.minimal_core();
-        if core_ids.is_empty() {
+        let tracked_ids = certificate.tracked_original_clause_ids();
+        if tracked_ids.is_empty() {
             return None;
         }
         // Build reverse map: clause_id -> arena_index.
@@ -2185,15 +2316,15 @@ impl Solver {
                 id_to_arena.insert(cid, arena_idx);
             }
         }
-        let arena_indices: Vec<usize> = core_ids
+        let arena_indices: Vec<usize> = tracked_ids
             .iter()
             .filter_map(|&cid| id_to_arena.get(&cid).copied())
             .collect();
         let breakdown = self.provenance.breakdown_for_indices(&arena_indices);
         let total_clauses = self.provenance.tracked_count();
-        Some(crate::clause_provenance::CoreProvenanceSummary {
+        Some(crate::clause_provenance::TrackedClauseProvenanceSummary {
             total_clauses,
-            core_clauses: arena_indices.len(),
+            tracked_clauses: arena_indices.len(),
             breakdown,
         })
     }

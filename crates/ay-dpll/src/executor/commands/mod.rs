@@ -801,7 +801,7 @@ impl Executor {
         let saved_clausification_proofs = self.last_clausification_proofs.take();
         let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
-        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
+        let saved_consequence_replay_state = self.take_consequence_replay_state();
         let saved_proof_check_result = self.proof_check_result.take();
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_proof_problem_assertion_provenance =
@@ -831,7 +831,7 @@ impl Executor {
         self.last_clausification_proofs = saved_clausification_proofs;
         self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
         self.quant_expansion_records = saved_quant_expansion_records;
-        self.ematching_proof_records = saved_ematching_proof_records;
+        self.restore_consequence_replay_state(saved_consequence_replay_state);
         self.proof_check_result = saved_proof_check_result;
         self.proof_check_ok = saved_proof_check_ok;
         self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;
@@ -969,7 +969,7 @@ impl Executor {
         let saved_clausification_proofs = self.last_clausification_proofs.take();
         let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
-        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
+        let saved_consequence_replay_state = self.take_consequence_replay_state();
         let saved_proof_check_result = self.proof_check_result.take();
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_proof_problem_assertion_provenance =
@@ -998,7 +998,7 @@ impl Executor {
         self.last_clausification_proofs = saved_clausification_proofs;
         self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
         self.quant_expansion_records = saved_quant_expansion_records;
-        self.ematching_proof_records = saved_ematching_proof_records;
+        self.restore_consequence_replay_state(saved_consequence_replay_state);
         self.proof_check_result = saved_proof_check_result;
         self.proof_check_ok = saved_proof_check_ok;
         self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;

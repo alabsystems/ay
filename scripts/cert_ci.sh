@@ -39,7 +39,7 @@ PIN_FILE="$REPO/ci/veripb.pin"
 [ -r "$PIN_FILE" ] || { echo "ERROR: missing checker pin: $PIN_FILE" >&2; exit 2; }
 . "$PIN_FILE"
 for _required in VERIPB_REPO VERIPB_COMMIT VERIPB_PATCH VERIPB_PATCH_SHA256 \
-                 VERIPB_SOUNDNESS_DIR; do
+                 VERIPB_PATCH2 VERIPB_PATCH2_SHA256 VERIPB_SOUNDNESS_DIR; do
     eval "_value=\${$_required:-}"
     [ -n "$_value" ] || { echo "ERROR: $PIN_FILE does not set $_required" >&2; exit 2; }
 done
@@ -82,11 +82,20 @@ if [ -z "$VERIPB" ]; then
         echo "       file: ${actual_patch_sha:-<unreadable>}" >&2
         exit 2
     fi
+    actual_patch2_sha=$(sha256_file "$REPO/$VERIPB_PATCH2" 2>/dev/null || true)
+    if [ "$actual_patch2_sha" != "$VERIPB_PATCH2_SHA256" ]; then
+        echo "ERROR: $VERIPB_PATCH2 does not match VERIPB_PATCH2_SHA256 in $PIN_FILE" >&2
+        echo "       pin:  $VERIPB_PATCH2_SHA256" >&2
+        echo "       file: ${actual_patch2_sha:-<unreadable>}" >&2
+        exit 2
+    fi
+    # Both patch hashes are in the key: a changed or added patch must rebuild.
     BUILD_ID="${VERIPB_COMMIT}-$(printf '%s' "$VERIPB_PATCH_SHA256" | cut -c1-12)"
+    BUILD_ID="${BUILD_ID}-$(printf '%s' "$VERIPB_PATCH2_SHA256" | cut -c1-12)"
     BUILD_DIR="$CACHE/$BUILD_ID"
     VERIPB="$BUILD_DIR/target/release/veripb"
     if [ ! -x "$VERIPB" ]; then
-        echo "== building pinned checker ($VERIPB_COMMIT + $(basename "$VERIPB_PATCH")) into $BUILD_DIR"
+        echo "== building pinned checker ($VERIPB_COMMIT + $(basename "$VERIPB_PATCH") + $(basename "$VERIPB_PATCH2")) into $BUILD_DIR"
         mkdir -p "$CACHE"
         [ -d "$BUILD_DIR" ] || git clone --quiet "$VERIPB_REPO" "$BUILD_DIR"
         git -C "$BUILD_DIR" checkout --quiet "$VERIPB_COMMIT"
@@ -96,6 +105,7 @@ if [ -z "$VERIPB" ]; then
             exit 2
         }
         git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
+        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH2"
         (cd "$BUILD_DIR" && cargo build --release --quiet)
     fi
 fi
@@ -105,7 +115,8 @@ echo "checker: $("$VERIPB" --version 2>&1 | head -1 || echo "$VERIPB")"
 veripb_require_self_test "$VERIPB"
 # ...and that it is a CORRECT one. The self-test battery alone does not
 # establish that: published VeriPB 3.0.2 passes all six of its probes and still
-# contradicts the truth on all six fixtures below.
+# contradicts the truth on all TWENTY-TWO fixtures below (twenty-two fixtures
+# covering the twenty-one known wrong-verdict defects).
 veripb_require_soundness "$VERIPB" "$REPO/$VERIPB_SOUNDNESS_DIR"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ay-cert-ci.XXXXXX")

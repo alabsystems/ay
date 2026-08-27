@@ -2,110 +2,54 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! End-to-end regression for the differential oracle, driven through the real
-//! libz3.
+//! CLI regressions that do not guess a machine-specific reference library.
 //!
-//! Everything here needs the reference dylib, so the whole file no-ops (with a
-//! printed notice) on a machine that does not have it — the oracle is a
-//! development tool, not a build dependency. Where the dylib IS present, this
-//! keeps four properties standing:
+//! Live verification is deliberately explicit. Run the binary with a trusted
+//! path, for example:
 //!
-//!   1. `probe` — the z3 binding still behaves the way the checks assume
-//!      (root isolation, sign evaluation, and the `psc_0 == Res` mapping).
-//!   2. `golden` — z3's own transliterated tests still pass, live.
-//!   3. `selftest` — every check still DETECTS a corrupted AY answer. Without
-//!      this, a future refactor could quietly turn a check into a no-op and
-//!      the campaign would keep reporting a clean run.
-//!   4. `fuzz` — a short campaign still finds nothing.
+//! ```text
+//! ay-nra-oracle probe --z3 /path/to/libz3
+//! ay-nra-oracle golden --heavy --z3 /path/to/libz3
+//! ay-nra-oracle selftest --seed 11 --cases 1600 --z3 /path/to/libz3
+//! ay-nra-oracle fuzz --seed 424242 --cases 1200 --progress 0 --z3 /path/to/libz3
+//! ```
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 
-/// Resolve the reference libz3 the same way the oracle binary does:
-/// `AY_NRA_ORACLE_Z3` wins, else `$HOME/ay/reference/z3/5.0.0/bin/libz3.dylib`.
-///
-/// This was an absolute path with a username baked into it, so the whole
-/// z3-backed suite silently skipped on every machine but one — including this
-/// one — and it leaked a personal home directory into the public snapshot.
-fn z3_dylib() -> PathBuf {
-    match std::env::var("AY_NRA_ORACLE_Z3") {
-        Ok(path) if !path.is_empty() => PathBuf::from(path),
-        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join("ay/reference/z3/5.0.0/bin/libz3.dylib"),
-    }
+fn oracle(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ay-nra-oracle"))
+        .args(args)
+        .output()
+        .expect("oracle binary runs")
 }
 
-fn oracle(args: &[&str]) -> Option<std::process::Output> {
-    let dylib = z3_dylib();
-    if !dylib.exists() {
-        eprintln!(
-            "skipping: reference libz3 not present at {}",
-            dylib.display()
-        );
-        return None;
-    }
-    Some(
-        Command::new(env!("CARGO_BIN_EXE_ay-nra-oracle"))
-            .args(args)
-            .output()
-            .expect("oracle binary runs"),
-    )
-}
-
-fn run_ok(args: &[&str]) {
-    let Some(out) = oracle(args) else { return };
+#[test]
+fn path_free_golden_fixtures_run_without_z3() {
+    let out = oracle(&["golden", "--no-z3"]);
     assert!(
         out.status.success(),
-        "`{}` failed ({:?})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        args.join(" "),
-        out.status.code(),
+        "path-free golden failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-}
-
-#[test]
-fn z3_binding_behaves_as_the_checks_assume() {
-    run_ok(&["probe"]);
-}
-
-#[test]
-fn transliterated_z3_golden_tests_pass_live() {
-    run_ok(&["golden", "--heavy"]);
-}
-
-#[test]
-fn every_check_detects_a_corrupted_ay_answer() {
-    let args = ["selftest", "--seed", "11", "--cases", "1600"];
-    let Some(out) = oracle(&args) else { return };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "a check went blind — a clean campaign would prove nothing for it\n{stdout}"
-    );
-    assert!(
-        !stdout.contains("BLIND") && !stdout.contains("NEVER RAN"),
-        "{stdout}"
-    );
-}
-
-#[test]
-fn short_campaign_finds_no_divergence() {
-    let args = [
-        "fuzz",
-        "--seed",
-        "424242",
-        "--cases",
-        "1200",
-        "--progress",
-        "0",
-    ];
-    let Some(out) = oracle(&args) else { return };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "the oracle reported a divergence:\n{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(stdout.contains("DIVERGENCES          0"), "{stdout}");
+}
+
+#[test]
+fn reference_modes_require_an_explicit_z3_path() {
+    for command in ["probe", "fuzz", "repro", "selftest", "dbg"] {
+        let out = oracle(&[command]);
+        assert_eq!(out.status.code(), Some(64), "{command} unexpectedly ran");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("requires --z3 PATH"),
+            "unexpected {command} diagnostic: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn an_explicit_unloadable_reference_is_a_fatal_error() {
+    let out = oracle(&["probe", "--z3", "/definitely/not/a/reference/libz3.so"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not load the reference libz3"));
 }

@@ -533,6 +533,8 @@ impl Executor {
         }
 
         let mut seen_instantiations: HashSet<TermId> = HashSet::default();
+        let mut refinement_provenance: Vec<crate::ematching::ForallInstantiationProvenance> =
+            Vec::new();
 
         // Empty model for the model-less refute-only mode below: evaluating a
         // ground instance against it constant-folds fully-interpreted subterms
@@ -790,7 +792,11 @@ impl Executor {
                         &binding,
                         ground_body,
                         &empty_model,
-                        (&mut seen_instantiations, &mut new_instantiations),
+                        (
+                            &mut seen_instantiations,
+                            &mut new_instantiations,
+                            &mut refinement_provenance,
+                        ),
                     ) {
                         all_satisfied = false;
                     }
@@ -875,6 +881,14 @@ impl Executor {
                     continue;
                 }
                 Ok(SolveResult::Unsat(_)) => {
+                    // Publish instance provenance for the refutation being
+                    // returned, AFTER the re-solve: a nested solve clears the
+                    // preprocessing proof records, so publishing earlier
+                    // loses them. The ground re-solve decided against these
+                    // instances, so the proof layer must be able to derive
+                    // each from its authored quantifier — same UNSAT-exit
+                    // contract as the generic MBQI path.
+                    self.mbqi_refinement_instance_records = refinement_provenance.clone();
                     return Some(Ok(SolveResult::unsat()));
                 }
                 other => {

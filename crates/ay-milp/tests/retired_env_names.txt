@@ -1,6 +1,6 @@
-# Names whose READ SITES batches B6-B11 of the env-flag retirement deleted,
-# still mentioned by the comments that document what replaced them. One name
-# per line. Kept OUT of Rust source deliberately: the exact-set quality gate
+# Names whose READ SITES were retired, including names still mentioned by the
+# comments that document what replaced them. One name per line. Kept OUT of
+# Rust source deliberately: the exact-set quality gate
 # treats every quoted AY_* literal in a .rs file as a live key site, and these
 # are documentation, not keys. See env_ledger.rs::RETIRED_IN_COMMENTS.
 AY_DIAG_COST_PERTURB
@@ -29,6 +29,7 @@ AY_MILP_FLIP_NZ
 AY_MILP_FLIP_REACH
 AY_MILP_FLIP_STALL
 AY_MILP_FT_GROWTH_TOL
+AY_MILP_FULL_PRICING
 AY_MILP_FUSED_RT_DEFER
 AY_MILP_GUB_MEAS_EVERY
 AY_MILP_GUB_SB_ITERS
@@ -38,6 +39,7 @@ AY_MILP_ITER_PROFILE
 AY_MILP_LATTICE_THREADS
 AY_MILP_LB_CAP
 AY_MILP_LB_LEN
+AY_MILP_LU
 AY_MILP_LU_REFACTOR
 AY_MILP_LU_VERIFY
 AY_MILP_MARGIN_ROW
@@ -132,6 +134,7 @@ AY_MILP_SEED_SOL
 AY_MILP_SEP_SCREEN_EXPLAIN
 AY_MILP_SETPART_BUDGET
 AY_MILP_SINGLETON_DIAG
+AY_MILP_SMT
 AY_MILP_SMT_MIN_BUDGET
 AY_MILP_SOLVE_DBG
 AY_MILP_SPLNS_BUDGET

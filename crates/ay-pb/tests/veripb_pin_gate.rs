@@ -8,8 +8,10 @@
 //! checker. These tests name it:
 //!
 //! * the resolved checker reports the version pinned in `ci/veripb.pin`, and
-//! * it REJECTS all six committed formula/proof pairs on which published
-//!   VeriPB 3.0.2 returns a verdict that contradicts the truth.
+//! * it REJECTS all twenty-two committed formula/proof pairs on which published
+//!   VeriPB 3.0.2 returns a verdict that contradicts the truth. Twenty-two pairs
+//!   cover twenty-one defects: defect 7 (normalization wrapping) has two
+//!   manifestations whose wrong verdicts point in opposite directions.
 //!
 //! The second half is the one that matters. A checker with those bugs prints
 //! `s VERIFIED UNSATISFIABLE` for satisfiable formulas in two proof lines — so
@@ -62,8 +64,9 @@ fn pinned_checker_rejects_every_known_wrong_verdict_fixture() {
     let fixtures = pin::soundness_fixtures();
     assert_eq!(
         fixtures.len(),
-        6,
-        "six wrong-verdict bugs are pinned; the manifest lists {}",
+        22,
+        "twenty-one wrong-verdict defects are pinned across twenty-two fixtures; \
+         the manifest lists {}",
         fixtures.len()
     );
 
@@ -73,10 +76,10 @@ fn pinned_checker_rejects_every_known_wrong_verdict_fixture() {
             &checker,
             &fixture.formula,
             &fixture.proof,
-            // The fixture manifest carries the formula-format flag. One of the
-            // six is a DIMACS CNF, so the flag must come from the manifest and
-            // not from `run`'s `--opb` default — two format flags would leave
-            // the choice up to the argument parser.
+            // The fixture manifest carries the formula-format flag. One of them
+            // is a DIMACS CNF, so the flag must come from the manifest and not
+            // from `run`'s `--opb` default — two format flags would leave the
+            // choice up to the argument parser.
             &[fixture.flag.as_str()],
         );
         if !run.is_rejected() {

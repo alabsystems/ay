@@ -32,13 +32,52 @@ impl PropagationChainPlanner<'_> {
         result
     }
 
+    /// The `EqDiffVar` atom-fold channel (#4751), consulted BEFORE the value
+    /// channel. Its license is a DEFINITIONAL EXTENSION over a fresh symbol
+    /// rather than an asserted equality, so it cannot be spelled as an
+    /// `entry_by_expr` hit — see `eq_diffvar_bridge` for the derivation and
+    /// its soundness argument.
+    ///
+    /// The ORDER is load-bearing and stamp-guarded. Top-level unit
+    /// propagation runs BEFORE `EqDiffVar` and harvests `atom |-> false` for
+    /// every disjunct it deletes, so an atom the two passes share is in both
+    /// channels; replaying the `EqDiffVar` rewrite through the value channel
+    /// reconstructs `(not false)` where the pass wrote `(not (= d 0))` and
+    /// the whole assertion declines (measured: the sole residue on the
+    /// pass's own guarded fixture). The stamp guard is what makes taking
+    /// this arm first safe in the other direction — a unit-propagation
+    /// rewrite is replayed at the EARLIER stamp, where this arm is inert.
+    /// Declining fails the plan rather than reporting `Unchanged`: the pass
+    /// demonstrably DID rewrite this atom, so a chain that cannot state the
+    /// rewrite cannot reach the recorded `after` either. The channel is
+    /// `None` for every other lane, which is what keeps them byte-identical.
+    ///
+    /// `Some(result)` means this channel OWNS the term and the caller must
+    /// return `result`; `None` means it does not apply and the value channel
+    /// gets its turn.
+    fn plan_eq_diffvar_arm(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        t: TermId,
+        stamp: u32,
+    ) -> Option<Option<EqRes>> {
+        let &plan = cx
+            .eqdv_by_atom
+            .and_then(|atoms| atoms.get(&t))
+            .filter(|plan| plan.stamp <= stamp)?;
+        Some(self.plan_eq_diffvar_atom_equivalence(cx, t, plan))
+    }
+
     fn plan_derive_eq_inner(
         &mut self,
         cx: &mut PlanCx<'_>,
         t: TermId,
         stamp: u32,
     ) -> Option<EqRes> {
-        // Direct substitution first (mirrors `rewrite`).
+        if let Some(result) = self.plan_eq_diffvar_arm(cx, t, stamp) {
+            return result;
+        }
+        // Direct substitution next (mirrors `rewrite`).
         if let Some(&(value, source, entry_stamp)) = cx.entry_by_expr.get(&t) {
             if entry_stamp <= stamp {
                 // A unit-propagation entry (#4751) is licensed by a bare unit
@@ -110,14 +149,7 @@ impl PropagationChainPlanner<'_> {
                 }
             },
             TermData::Ite(condition, then_branch, else_branch) => {
-                let unchanged = [condition, then_branch, else_branch].into_iter().try_fold(
-                    true,
-                    |acc, child| match self.plan_derive_eq(cx, child, stamp)? {
-                        EqRes::Unchanged => Some(acc),
-                        EqRes::Changed { .. } => Some(false),
-                    },
-                )?;
-                unchanged.then_some(EqRes::Unchanged)
+                self.plan_ite_arm(cx, t, stamp, [condition, then_branch, else_branch])
             }
             TermData::App(symbol, args) => self.plan_derive_app_eq(cx, t, stamp, symbol, args),
             // Future TermData variants: fail the plan (fail-closed).
@@ -563,6 +595,17 @@ impl PropagationChainPlanner<'_> {
                 })
                 .or_else(|| {
                     self.plan_eq_refl_fold(cx, term, folded, symbol, args, new_args, child_results)
+                })
+                .or_else(|| {
+                    self.plan_connective_reorder_fold(
+                        cx,
+                        term,
+                        folded,
+                        symbol,
+                        args,
+                        new_args,
+                        child_results,
+                    )
                 }),
         }
     }
@@ -597,7 +640,7 @@ impl PropagationChainPlanner<'_> {
         FoldShape::Collapsing
     }
 
-    fn congruence_premises(
+    pub(super) fn congruence_premises(
         args: &[TermId],
         child_results: &[EqRes],
         target_args: &[TermId],
@@ -647,9 +690,7 @@ impl PropagationChainPlanner<'_> {
         // Congruence reaches the raw rebuilt spelling; symmetry and
         // transitivity bridge its canonical equality argument order.
         let premises = Self::congruence_premises(args, child_results, new_args)?;
-        let rebuilt = self
-            .terms
-            .mk_app(symbol.clone(), new_args.to_vec(), Sort::Bool);
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, Sort::Bool);
         if rebuilt == term || rebuilt == folded {
             return None;
         }
@@ -795,7 +836,7 @@ impl PropagationChainPlanner<'_> {
         child_results: &[EqRes],
     ) -> Option<(TermId, ProofId)> {
         let sort = self.terms.sort(term).clone();
-        let rebuilt = self.terms.mk_app(symbol.clone(), new_args.to_vec(), sort);
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, sort);
         if rebuilt == term
             || rebuilt == folded
             || !new_args
@@ -880,9 +921,7 @@ impl PropagationChainPlanner<'_> {
             return None;
         }
         cx.spend(12)?;
-        let rebuilt = self
-            .terms
-            .mk_app(symbol.clone(), new_args.to_vec(), Sort::Bool);
+        let rebuilt = self.terms.mk_app(symbol.clone(), new_args, Sort::Bool);
         if rebuilt == term || rebuilt == folded {
             return None;
         }

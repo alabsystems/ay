@@ -138,32 +138,48 @@ const PROOF_CAPABILITY_REGISTRY: &[ProofCapability] = &[
     ProofCapability::new(ProofTransform::Symmetry, false, false),
 ];
 
-/// The single soundness chokepoint for unclamping symmetry breaking under a
-/// proof: symmetry SBP lex clauses are PR (propagation-redundant), NOT RAT, so
-/// the registry keeps [`ProofTransform::Symmetry`] clamped for plain DRAT/LRAT
-/// (RUP/RAT) proofs. This predicate is the ONLY place that may re-enable it, and
-/// only when BOTH hold:
-///   1. a DPR (PR) proof is actually being emitted for the SBP lex clauses (the
-///      σ-image witness `a`-lines, see `symmetry::detector` and `proof::drat::add_pr`),
-///      and
-///   2. that DPR proof is verified by the external trust anchor (cake_lpr).
+/// Whether a proof surface can carry one of the explicitly supported symmetry
+/// proof routes.
 ///
-/// This is now ENABLED for the DRAT route only (#8011 step 5): the symmetry
-/// preprocessor emits the aux-free `j=0` per-generator lex-leader binaries as DPR
-/// `a`-lines carrying the σ-image witness (see
-/// `solver::proof_emit::proof_emit_add_pr` and `symmetry::detector`). Those DPR
-/// proofs are NOT verified by AY's internal RUP/RAT checker — they are elaborated
-/// by the vendored `dpr-trim` (DPR→LPR) and verified by the external trust anchor
-/// `cake_lpr`. A wrong PR accept is a false UNSAT (disqualification), so the
-/// soundness guarantee rests on that external check, never on AY's emission.
-///
-/// The aux tower (`j>0` clauses + equal-prefix Tseitin definitions) is NOT
-/// single-σ-PR, so the emitter DROPS it: only the binary `j=0` clauses are added
-/// and proved. The LRAT/LPR direct route is not wired, so this stays `false` for
-/// LRAT — that submission path is unaffected and remains fully RUP/RAT-checkable.
-pub(crate) fn symmetry_pr_proof_allowed(mode: ProofMode) -> bool {
-    // PR/DPR is a DRAT-family extension; the LRAT (LPR) route is not wired yet.
+/// The generic DPR and full-tower SR experiments were retired because their
+/// per-generator witnesses did not compose against earlier symmetry breakers.
+/// The remaining exceptions are family-specific aux-free and orbitope SR steps,
+/// plus HHW's plain-DRAT image-and-chain construction. All are wired through a
+/// clause-stream writer (the DRAT writer, or the VeriPB writer which serializes
+/// the same steps as `red`/`rup`); LRAT and clause-trace reconstruction remain
+/// clamped because neither can represent a witnessed addition.
+pub(crate) fn symmetry_extended_drat_allowed(mode: ProofMode) -> bool {
     matches!(mode, ProofMode::Drat)
+}
+
+/// Whether the DECLARED external checker (CLI `--proof-checker`, default
+/// dsr-trim) will verify an SR-witnessed step written on the live proof
+/// surface.
+///
+/// [`symmetry_extended_drat_allowed`] answers "is this proof SURFACE one the
+/// symmetry proof routes support"; this answers the orthogonal capability
+/// question "will the checker the run is declared against actually verify an
+/// SR-witnessed step". It has two halves, and BOTH must hold:
+///
+///  1. the checker accepts substitution witnesses at all. Measured 2026-08-24
+///     on php_11_8's orbitope staircase proof: dsr-trim `s VERIFIED UNSAT`;
+///     drat-trim AND dpr-trim `s NOT VERIFIED`. VeriPB accepts them via `red`
+///     (measured same day on php_sudoku_p15_h14, 91 witnessed steps,
+///     `s VERIFIED UNSATISFIABLE` under the pinned checker of `ci/veripb.pin`).
+///  2. the checker reads the format actually being emitted. `dsr-trim` reads
+///     the DRAT-family stream and VeriPB reads `.pbp`; neither can read the
+///     other. `veripb_surface` is the live [`crate::proof::ProofOutput`] kind,
+///     so `--proof-format drat --proof-checker veripb` and
+///     `--proof-format veripb --proof-checker dsr-trim` both clamp.
+///
+/// A SAT-COMP submission declares its checker up front and a rejected UNSAT
+/// proof is disqualifying, so under any mismatched declaration the
+/// SR-witnessed routes (aux-free WLOG chains, orbitope staircase) skip cleanly
+/// to plain CDCL — the same shape as the LRAT/clause-trace clamps. HHW and the
+/// other witness-free routes emit plain RUP/RAT and are NOT gated by this.
+pub(crate) fn declared_checker_accepts_sr_witnesses(veripb_surface: bool) -> bool {
+    let checker = ay_core::declared_proof_checker();
+    checker.accepts_sr_witnesses() && checker.reads_veripb() == veripb_surface
 }
 
 pub(crate) fn transform_allowed(mode: ProofMode, transform: ProofTransform) -> bool {
@@ -186,10 +202,9 @@ pub(crate) fn transform_allowed(mode: ProofMode, transform: ProofTransform) -> b
             transform,
             ProofTransform::Decompose | ProofTransform::Congruence
         )
+        && ay_core::sat_ab_switches().no_drat_subst
     {
-        if ay_core::sat_ab_switches().no_drat_subst {
-            return false;
-        }
+        return false;
     }
     PROOF_CAPABILITY_REGISTRY
         .iter()

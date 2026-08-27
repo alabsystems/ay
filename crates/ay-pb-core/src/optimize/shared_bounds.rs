@@ -38,7 +38,7 @@
 //!   the `tests/ui/shared_bounds_lb_requires_audited_source.rs` compile-fail.
 //! * The `ub == lb` OPTIMUM upgrade decision NEVER combines a `Relaxed`-read
 //!   `ub` with a separately-read incumbent: it LOCKS the incumbent slot
-//!   ([`SharedBounds::locked_incumbent`]), THEN reads `lb`, then RE-VERIFIES
+//!   (`SharedBounds::locked_incumbent`), THEN reads `lb`, then RE-VERIFIES
 //!   the locked model from raw bits (S3 ordering, design §3.1); see
 //!   `portfolio::shared_bounds_optimum_upgrade`.
 //! * The bus deliberately carries NO publish counter / epoch. Change
@@ -79,7 +79,7 @@ static REPORTED_DUAL_GLOBAL: AtomicI64 = AtomicI64::new(LB_ABSENT);
 
 /// Publishes a REPORTING-ONLY dual bound. Monotone (keeps the max); returns
 /// whether it raised the value. Rejected on i64 overflow. See
-/// [`REPORTED_DUAL_GLOBAL`] for why this cannot affect soundness.
+/// `REPORTED_DUAL_GLOBAL` for why this cannot affect soundness.
 pub fn publish_reported_dual_global(value: i128) -> bool {
     let Ok(value64) = i64::try_from(value) else {
         return false;

@@ -116,6 +116,39 @@ fn int_bounds_tautology_publishes_exact_unit_farkas_surface() {
     );
 }
 
+/// Alethe has NO rule for a congruence-closure explanation, so the emitted
+/// document must carry the honest `hole` — never `eq_transitive` (whose
+/// checker-side schema this clause does not meet, which would take the
+/// document from `holey` to `invalid`) and never the internal name.
+#[test]
+fn euf_congruence_explanation_prints_the_honest_hole() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("bare_a", Sort::Int);
+    let b = terms.mk_var("bare_b", Sort::Int);
+    let fa = terms.mk_app(Symbol::named("f"), vec![a], Sort::Int);
+    let fb = terms.mk_app(Symbol::named("f"), vec![b], Sort::Int);
+    let eq_ab = terms.mk_app(Symbol::named("="), vec![a, b], Sort::Bool);
+    let hypothesis = terms.mk_not_raw(eq_ab);
+    let conclusion = terms.mk_app(Symbol::named("="), vec![fa, fb], Sort::Bool);
+    // The conclusion FIRST — the recorded order this kind exists to accept.
+    let step = ProofStep::TheoryLemma {
+        theory: "EUF".to_string(),
+        clause: vec![conclusion, hypothesis],
+        farkas: None,
+        kind: TheoryLemmaKind::EufCongruenceExplanation,
+        lia: None,
+    };
+    let printer = AlethePrinter::new(&terms);
+    let text = printer
+        .format_step(&step, ProofId(1))
+        .expect("a congruence explanation renders as an honest unproved step");
+    assert_eq!(
+        text,
+        "(step t1 (cl (= (f bare_a) (f bare_b)) (not (= bare_a bare_b))) :rule hole)"
+    );
+    assert!(!text.contains("eq_transitive") && !text.contains("euf_congruence_explanation"));
+}
+
 /// The general invariant, over EVERY kind rather than the one that regressed:
 /// whatever a theory lemma publishes, it is never a rule the bare step cannot
 /// back. A kind that refuses to print at all (missing Farkas annotation, an
@@ -175,6 +208,7 @@ fn every_theory_lemma_kind() -> Vec<TheoryLemmaKind> {
         TheoryLemmaKind::EufReflexive,
         TheoryLemmaKind::EufCongruent,
         TheoryLemmaKind::EufCongruentPred,
+        TheoryLemmaKind::EufCongruenceExplanation,
         TheoryLemmaKind::LraFarkas,
         TheoryLemmaKind::LiaGeneric,
         TheoryLemmaKind::LiaModRange,

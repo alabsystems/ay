@@ -5,7 +5,7 @@
 
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_sat::{Literal, PreparedExtension, Variable};
+use ay_sat::{Literal, PreparedExtension, Solver, Variable};
 
 use crate::extension::XorExtension;
 use crate::finder::XorFinder;
@@ -242,6 +242,14 @@ pub fn preprocess_clauses_with_stats(
 ///
 /// The solve result (Sat with model, Unsat, or Unknown)
 ///
+/// # Preprocessing policy
+///
+/// XOR extraction transfers ownership of exact source-clause positions to the
+/// extension. This helper therefore disables the SAT solver's independent
+/// initial preprocessor, which could rewrite those positions before the
+/// extension transaction commits. When XOR extraction declines, the fallback
+/// is ordinary CDCL without that optional initial simplification.
+///
 /// # Example
 ///
 /// ```
@@ -271,13 +279,8 @@ pub fn preprocess_clauses_with_stats(
 pub fn solve_with_xor_detection(
     num_vars: usize,
     clauses: &[Vec<Literal>],
-) -> ay_sat::VerifiedSatResult {
-    use ay_sat::Solver;
-
-    let mut solver = Solver::new(num_vars);
-    for clause in clauses {
-        solver.add_clause(clause.clone());
-    }
+) -> ay_sat::SolverSatResult {
+    let mut solver = source_stable_solver(num_vars, clauses);
 
     solver.solve_with_preprocessing_extension::<XorExtension, _>(|active_clauses| {
         let total = active_clauses.len();
@@ -290,8 +293,8 @@ pub fn solve_with_xor_detection(
 /// Result of XOR-aware solving with statistics
 #[derive(Debug)]
 pub struct XorSatResult {
-    /// The solve result (verified by the SAT solver's validation pipeline)
-    pub result: ay_sat::VerifiedSatResult,
+    /// The solver-origin result. See [`ay_sat::SolverSatResult`] for authority scope.
+    pub result: ay_sat::SolverSatResult,
     /// Preprocessing statistics
     pub stats: XorPreprocessStats,
 }
@@ -299,16 +302,11 @@ pub struct XorSatResult {
 /// Solve with XOR detection and return statistics.
 ///
 /// This is like `solve_with_xor_detection` but also returns statistics
-/// about the XOR detection phase.
+/// about the XOR detection phase. It uses the same source-stable preprocessing
+/// policy documented by [`solve_with_xor_detection`].
 pub fn solve_with_xor_detection_stats(num_vars: usize, clauses: &[Vec<Literal>]) -> XorSatResult {
-    use ay_sat::Solver;
-
     let mut stats = XorPreprocessStats::default();
-
-    let mut solver = Solver::new(num_vars);
-    for clause in clauses {
-        solver.add_clause(clause.clone());
-    }
+    let mut solver = source_stable_solver(num_vars, clauses);
 
     let result = solver.solve_with_preprocessing_extension::<XorExtension, _>(|active_clauses| {
         let total = active_clauses.len();
@@ -325,6 +323,19 @@ pub fn solve_with_xor_detection_stats(num_vars: usize, clauses: &[Vec<Literal>])
     });
 
     XorSatResult { result, stats }
+}
+
+/// Build the private solver used by the XOR convenience entry points.
+///
+/// The configuration is deliberately local: global SAT callers keep their
+/// ordinary preprocessing policy.
+fn source_stable_solver(num_vars: usize, clauses: &[Vec<Literal>]) -> Solver {
+    let mut solver = Solver::new(num_vars);
+    solver.set_preprocess_enabled(false);
+    for clause in clauses {
+        solver.add_clause(clause.clone());
+    }
+    solver
 }
 
 pub(crate) fn build_prepared_extension(

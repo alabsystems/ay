@@ -1,3 +1,7 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
 //! Unit tests for `super` (dimacs.rs).
 //! Extracted verbatim to keep the production module readable.
 
@@ -14,8 +18,8 @@ use super::{
     owned_dimacs_proof_write_failure_flag, proof_output_writer,
     publish_dimacs_descriptor_noreplace, read_published_dimacs_proof, remove_owned_dimacs_proof,
     rename_dimacs_noreplace, retain_published_dimacs_proof, seal_owned_dimacs_proof,
-    DimacsPublicationInvalidation, DimacsUnsatPublicationTransaction, RetainedDimacsPublication,
-    SolverDimacsProofWriter, DIMACS_PROOF_STAGING_PREFIX,
+    DimacsProofRequirement, DimacsPublicationInvalidation, DimacsUnsatPublicationTransaction,
+    RetainedDimacsPublication, SolverDimacsProofWriter, DIMACS_PROOF_STAGING_PREFIX,
 };
 use super::{
     checked_lrat_original_clause_count, clique_n2_k10_original_order_witness,
@@ -28,6 +32,7 @@ use super::{
     read_authenticated_dimacs_source, sha256_digest, should_enable_xor_extension,
     variant_input_for_dimacs, variant_input_for_dimacs_route, verification_skip_is_acceptable,
     AuthenticatedLeanSnapshot, DenseCliquePhpProofRouteAdmissionResult, DimacsInputSource,
+    DimacsProofPosture, DimacsRouteContext, OfficialMainRoute, StartupPhaseInit,
     CLIQUE_N2_K10_CLAUSE_FINGERPRINT, CLIQUE_N2_K10_EXPECTED_CHECKER_AUDIT_STATS,
     DIMACS_MODEL_LINE_LIMIT, DIMACS_TIMEOUT_EXIT_CODE, PHP_FUNCTIONAL_5_4_CLAUSE_FINGERPRINT,
     SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENABLED_KEY,
@@ -167,8 +172,8 @@ use super::{
 };
 use crate::{stats_output, ProofConfig, ProofFormat, TIMED_OUT, VERDICT_PRINTED};
 use ay_sat::{
-    Literal, ProofOutput, SatResult, Solver as SatSolver, SolverVariant, Variable,
-    VariantRouteProfile, VariantStartupPolicy,
+    Literal, ProofOutput, SatResult, Solver as SatSolver, SolverVariant, Variable, VariantInput,
+    VariantProofMode, VariantRouteProfile, VariantStartupPolicy,
 };
 use ay_test_support::env::{lock_env, ScopedEnvVar};
 use std::io::{BufWriter, Write as _};
@@ -182,6 +187,34 @@ fn render_dimacs_sat_model_for_test(model: &[bool]) -> String {
     emit_dimacs_sat_model_to_writer(model, &mut output)
         .expect("DIMACS SAT model rendering should succeed");
     String::from_utf8(output).expect("DIMACS SAT model rendering should be UTF-8")
+}
+
+fn lrat_output_input(variant: SolverVariant) -> VariantInput {
+    variant_input_for_dimacs(variant, 180, 3_160, DimacsProofPosture::LratOutput)
+}
+
+fn internal_lrat_input() -> VariantInput {
+    variant_input_for_dimacs(
+        SolverVariant::Default,
+        180,
+        3_160,
+        DimacsProofPosture::InternalLrat,
+    )
+}
+
+fn lrat_route_input(
+    variant: SolverVariant,
+    proof: DimacsProofPosture,
+    official_main: OfficialMainRoute,
+    startup_phase_init: StartupPhaseInit,
+) -> VariantInput {
+    variant_input_for_dimacs_route(
+        variant,
+        32,
+        96,
+        proof,
+        DimacsRouteContext::new(official_main, startup_phase_init),
+    )
 }
 
 #[test]
@@ -269,201 +302,8 @@ fn make_clauses_mixed(
     clauses
 }
 
-#[test]
-fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
-    // B75: the lever is a typed SAT switch; unit tests scope it through the
-    // consumer test seam (the misc_test_override idiom B41 established here).
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
-
-    let default_input =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert!(
-        !default_input.dense_mutex_focused_restart_gate_experiment,
-        "dense-mutex focused restart route must be default-off"
-    );
-
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        dense_mutex_focused_restart_gate: true,
-        ..Default::default()
-    });
-    let requested_input =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert!(
-        requested_input.dense_mutex_focused_restart_gate_experiment,
-        "--sat-dense-mutex-focused-restart-gate should record the focused restart route request"
-    );
-}
-
-#[test]
-fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
-
-    let default_input =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert!(
-        !default_input.dense_clique_mab_branch_experiment,
-        "dense-clique MAB branch route must be default-off"
-    );
-
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        dense_clique_mab_branch: true,
-        ..Default::default()
-    });
-    let requested_input =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert!(
-        requested_input.dense_clique_mab_branch_experiment,
-        "--sat-dense-clique-mab-branch should record the dense-clique MAB branch route request"
-    );
-}
-
-#[test]
-fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
-    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
-
-    let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-
-    assert_eq!(
-        input.route_profile,
-        VariantRouteProfile::OfficialSatCompMainLrat
-    );
-    assert!(
-        !input.bve_lrat_scout_route,
-        "Main/LRAT BVE scout route switch must be default-off"
-    );
-}
-
-#[test]
-fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        bve_lrat_scout_route: true,
-        ..Default::default()
-    });
-    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
-
-    let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert_eq!(
-        official.route_profile,
-        VariantRouteProfile::OfficialSatCompMainLrat
-    );
-    assert!(
-        official.bve_lrat_scout_route,
-        "--sat-bve-lrat-scout-route should request the official Main/LRAT BVE scout route"
-    );
-
-    let non_official = variant_input_for_dimacs_route(
-        SolverVariant::Default,
-        180,
-        3_160,
-        true,
-        true,
-        true,
-        false,
-        false,
-    );
-    assert_eq!(non_official.route_profile, VariantRouteProfile::Standard);
-    assert!(
-        !non_official.bve_lrat_scout_route,
-        "route helper must keep the BVE scout flag off without the official wrapper shape"
-    );
-
-    let internal_lrat_export =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, false);
-    assert_eq!(
-        internal_lrat_export.route_profile,
-        VariantRouteProfile::Standard
-    );
-    assert!(
-        !internal_lrat_export.bve_lrat_scout_route,
-        "switch must not enable the route for internal LRAT export without LRAT output"
-    );
-
-    let aggressive =
-        variant_input_for_dimacs(SolverVariant::Aggressive, 180, 3_160, true, true, true);
-    assert_eq!(aggressive.route_profile, VariantRouteProfile::Standard);
-    assert!(
-        !aggressive.bve_lrat_scout_route,
-        "switch must not enable the route outside default variant"
-    );
-}
-
-#[test]
-fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off() {
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
-    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
-
-    let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-
-    assert_eq!(
-        input.route_profile,
-        VariantRouteProfile::OfficialSatCompMainLrat
-    );
-    assert!(
-        !input.fmla_decompose_lrat_preflight_route,
-        "Main/LRAT Fmla decompose preflight route switch must be default-off"
-    );
-}
-
-#[test]
-fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only() {
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        fmla_decompose_lrat_preflight_route: true,
-        ..Default::default()
-    });
-    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
-
-    let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
-    assert_eq!(
-        official.route_profile,
-        VariantRouteProfile::OfficialSatCompMainLrat
-    );
-    assert!(
-        official.fmla_decompose_lrat_preflight_route,
-        "--sat-fmla-decompose-lrat-preflight-route should request the Main/LRAT preflight route"
-    );
-
-    let non_official = variant_input_for_dimacs_route(
-        SolverVariant::Default,
-        180,
-        3_160,
-        true,
-        true,
-        true,
-        false,
-        false,
-    );
-    assert_eq!(non_official.route_profile, VariantRouteProfile::Standard);
-    assert!(
-        !non_official.fmla_decompose_lrat_preflight_route,
-        "route helper must keep the Fmla preflight flag off without official wrapper shape"
-    );
-
-    let internal_lrat_export =
-        variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, false);
-    assert_eq!(
-        internal_lrat_export.route_profile,
-        VariantRouteProfile::Standard
-    );
-    assert!(
-        !internal_lrat_export.fmla_decompose_lrat_preflight_route,
-        "switch must not enable the route for internal LRAT export without LRAT output"
-    );
-
-    let aggressive =
-        variant_input_for_dimacs(SolverVariant::Aggressive, 180, 3_160, true, true, true);
-    assert_eq!(aggressive.route_profile, VariantRouteProfile::Standard);
-    assert!(
-        !aggressive.fmla_decompose_lrat_preflight_route,
-        "switch must not enable the route outside default variant"
-    );
-}
+// Textual inclusion preserves the original `dimacs::tests::*` names.
+include!("tests/variant_routing_switches.rs");
 
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
@@ -989,60 +829,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
     );
 }
 
-#[test]
-fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
-    // M3 default flip (2026-08-19): the #9084 cooldown ships ON; the tri-state
-    // switch's `false` arm is the opt-out. Mirrors the M2 rescue gate above.
-    let _lock = lock_env();
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
-
-    let mut solver = SatSolver::new(1);
-    configure_dimacs_solver(
-        &mut solver,
-        stats_output::StatsConfig {
-            human: false,
-            json: false,
-        },
-    );
-    assert!(
-        solver.inprocessing_yield_rescue_backbone_cooldown_enabled(),
-        "the #9084 yield-rescue backbone cooldown ships default-on (M3)"
-    );
-
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        yield_rescue_backbone_cooldown: Some(false),
-        ..Default::default()
-    });
-    let mut solver = SatSolver::new(1);
-    configure_dimacs_solver(
-        &mut solver,
-        stats_output::StatsConfig {
-            human: false,
-            json: false,
-        },
-    );
-    assert!(
-        !solver.inprocessing_yield_rescue_backbone_cooldown_enabled(),
-        "--sat-yield-rescue-backbone-cooldown false must opt out of the M3 default"
-    );
-
-    let _g = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
-        yield_rescue_backbone_cooldown: Some(true),
-        ..Default::default()
-    });
-    let mut solver = SatSolver::new(1);
-    configure_dimacs_solver(
-        &mut solver,
-        stats_output::StatsConfig {
-            human: false,
-            json: false,
-        },
-    );
-    assert!(
-        solver.inprocessing_yield_rescue_backbone_cooldown_enabled(),
-        "--sat-yield-rescue-backbone-cooldown true should keep the #9084 cooldown enabled"
-    );
-}
+include!("tests/yield_rescue_backbone_cooldown.rs");
 
 #[test]
 fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate() {
@@ -3376,23 +3163,19 @@ fn test_satcomp_dimacs_timeout_exit_code_is_unknown_success() {
 
 #[test]
 fn test_official_main_default_lrat_route_disables_startup_phase_init() {
-    let input = variant_input_for_dimacs_route(
+    let input = lrat_route_input(
         SolverVariant::Default,
-        32,
-        96,
-        true,
-        true,
-        true,
-        true,
-        false,
+        DimacsProofPosture::LratOutput,
+        OfficialMainRoute::Regular,
+        StartupPhaseInit::Default,
     );
 
     assert_eq!(
-        input.startup_policy,
+        input.startup_policy(),
         VariantStartupPolicy::DisableWarmupWalk
     );
     assert_eq!(
-        input.route_profile,
+        input.route_profile(),
         VariantRouteProfile::OfficialSatCompMainLrat
     );
     let config = SolverVariant::Default.config(input);
@@ -3408,19 +3191,15 @@ fn test_official_main_default_lrat_route_disables_startup_phase_init() {
 
 #[test]
 fn test_non_official_default_lrat_route_preserves_startup_phase_init() {
-    let input = variant_input_for_dimacs_route(
+    let input = lrat_route_input(
         SolverVariant::Default,
-        32,
-        96,
-        true,
-        true,
-        true,
-        false,
-        false,
+        DimacsProofPosture::LratOutput,
+        OfficialMainRoute::Other,
+        StartupPhaseInit::Default,
     );
 
-    assert_eq!(input.startup_policy, VariantStartupPolicy::Preserve);
-    assert_eq!(input.route_profile, VariantRouteProfile::Standard);
+    assert_eq!(input.startup_policy(), VariantStartupPolicy::Preserve);
+    assert_eq!(input.route_profile(), VariantRouteProfile::Standard);
     let config = SolverVariant::Default.config(input);
     assert!(config.features.walk, "non-official LRAT keeps walk");
     assert!(config.features.warmup, "non-official LRAT keeps warmup");
@@ -3428,20 +3207,16 @@ fn test_non_official_default_lrat_route_preserves_startup_phase_init() {
 
 #[test]
 fn test_explicit_startup_phase_init_preserves_official_route() {
-    let input = variant_input_for_dimacs_route(
+    let input = lrat_route_input(
         SolverVariant::Default,
-        32,
-        96,
-        true,
-        true,
-        true,
-        true,
-        true,
+        DimacsProofPosture::LratOutput,
+        OfficialMainRoute::Regular,
+        StartupPhaseInit::Explicit,
     );
 
-    assert_eq!(input.startup_policy, VariantStartupPolicy::Preserve);
+    assert_eq!(input.startup_policy(), VariantStartupPolicy::Preserve);
     assert_eq!(
-        input.route_profile,
+        input.route_profile(),
         VariantRouteProfile::OfficialSatCompMainLrat
     );
     let config = SolverVariant::Default.config(input);
@@ -3455,35 +3230,27 @@ fn test_explicit_startup_phase_init_preserves_official_route() {
 
 #[test]
 fn test_official_route_policy_requires_default_lrat_output() {
-    let aggressive = variant_input_for_dimacs_route(
+    let aggressive = lrat_route_input(
         SolverVariant::Aggressive,
-        32,
-        96,
-        true,
-        true,
-        true,
-        true,
-        false,
+        DimacsProofPosture::LratOutput,
+        OfficialMainRoute::Regular,
+        StartupPhaseInit::Default,
     );
-    assert_eq!(aggressive.startup_policy, VariantStartupPolicy::Preserve);
-    assert_eq!(aggressive.route_profile, VariantRouteProfile::Standard);
+    assert_eq!(aggressive.startup_policy(), VariantStartupPolicy::Preserve);
+    assert_eq!(aggressive.route_profile(), VariantRouteProfile::Standard);
 
-    let internal_lrat_export = variant_input_for_dimacs_route(
+    let internal_lrat_export = lrat_route_input(
         SolverVariant::Default,
-        32,
-        96,
-        true,
-        true,
-        false,
-        true,
-        false,
+        DimacsProofPosture::InternalLrat,
+        OfficialMainRoute::Regular,
+        StartupPhaseInit::Default,
     );
     assert_eq!(
-        internal_lrat_export.startup_policy,
+        internal_lrat_export.startup_policy(),
         VariantStartupPolicy::Preserve
     );
     assert_eq!(
-        internal_lrat_export.route_profile,
+        internal_lrat_export.route_profile(),
         VariantRouteProfile::Standard
     );
 }
@@ -3780,11 +3547,11 @@ fn private_dimacs_staging_debris_bytes(parent: &Path) -> Vec<Vec<u8>> {
 fn retained_test_transaction(
     proof: &ProofConfig,
     published: super::PublishedDimacsProof,
-    optional: bool,
+    requirement: DimacsProofRequirement,
 ) -> DimacsUnsatPublicationTransaction {
     let retained = retain_published_dimacs_proof(&proof.path, published, proof.binary)
         .expect("retain proof authority");
-    DimacsUnsatPublicationTransaction::new(retained, None, optional)
+    DimacsUnsatPublicationTransaction::new(retained, None, requirement)
 }
 
 #[cfg(target_os = "linux")]
@@ -4273,7 +4040,8 @@ fn concurrent_synthesized_default_loser_cannot_replace_winner_status() {
     winner.flush().expect("flush winner proof");
     drop(winner);
     let published = seal_owned_dimacs_proof(&proof.path).expect("seal winner proof");
-    let mut publication = retained_test_transaction(&proof, published, false);
+    let mut publication =
+        retained_test_transaction(&proof, published, DimacsProofRequirement::Required);
     mark_synthesized_default_dimacs_proof_current(&proof, published, &mut publication)
         .expect("publish winner status");
     publication.validate().expect("validate winner transaction");
@@ -4312,7 +4080,8 @@ fn late_status_collision_removes_only_the_owned_proof_generation() {
     let status_path = dimacs_proof_status_path(&proof.path);
     std::fs::write(&status_path, b"raced unrelated status\n").expect("plant status collision");
 
-    let mut publication = retained_test_transaction(&proof, published, false);
+    let mut publication =
+        retained_test_transaction(&proof, published, DimacsProofRequirement::Required);
     mark_synthesized_default_dimacs_proof_current(&proof, published, &mut publication)
         .expect_err("status publication must not clobber the raced file");
     publication.invalidate_exact();
@@ -4408,8 +4177,11 @@ fn status_failure_cleans_retained_artifact_without_touching_replacement() {
     .expect("retain artifact authority");
     let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
         .expect("retain proof authority");
-    let mut publication =
-        DimacsUnsatPublicationTransaction::new(retained_proof, Some(retained_artifact), false);
+    let mut publication = DimacsUnsatPublicationTransaction::new(
+        retained_proof,
+        Some(retained_artifact),
+        DimacsProofRequirement::Required,
+    );
     let status_path = dimacs_proof_status_path(&proof.path);
     std::fs::write(&status_path, b"unrelated raced status\n").expect("plant status replacement");
 
@@ -4475,7 +4247,10 @@ fn status_lock_cleanup_preserves_a_raced_replacement() {
 #[cfg(target_os = "linux")]
 #[test]
 fn retained_proof_replacement_invalidates_exact_inode_for_both_policies() {
-    for optional in [false, true] {
+    for requirement in [
+        DimacsProofRequirement::Required,
+        DimacsProofRequirement::Optional,
+    ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_path = dir.path().join("proof.drat");
         let displaced = dir.path().join("displaced-owned-proof.drat");
@@ -4485,18 +4260,21 @@ fn retained_proof_replacement_invalidates_exact_inode_for_both_policies() {
             binary: false,
             artifact_path: None,
             is_temp: false,
-            synthesized_default: optional,
+            synthesized_default: requirement.is_optional(),
             format_was_explicit: false,
         };
-        let mut output = if optional {
-            create_configured_dimacs_proof_file(&proof).expect("reserve optional proof")
-        } else {
-            create_owned_dimacs_proof_file(&proof.path).expect("reserve required proof")
+        let mut output = match requirement {
+            DimacsProofRequirement::Optional => {
+                create_configured_dimacs_proof_file(&proof).expect("reserve optional proof")
+            }
+            DimacsProofRequirement::Required => {
+                create_owned_dimacs_proof_file(&proof.path).expect("reserve required proof")
+            }
         };
         output.write_all(b"0\n").expect("write proof");
         drop(output);
         let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
-        let transaction = retained_test_transaction(&proof, published, optional);
+        let transaction = retained_test_transaction(&proof, published, requirement);
         let mut authority = super::AuthorizedDimacsUnsatPublication {
             publication: Some(transaction),
             temp_proof_path: None,
@@ -4505,11 +4283,11 @@ fn retained_proof_replacement_invalidates_exact_inode_for_both_policies() {
         std::fs::rename(&proof_path, &displaced).expect("displace owned proof");
         std::fs::write(&proof_path, b"unrelated proof replacement\n")
             .expect("plant proof replacement");
-        let (reported_optional, reason) = authority
+        let error = authority
             .validate_before_verdict()
             .expect_err("replacement must revoke proof authority");
-        assert_eq!(reported_optional, optional);
-        assert!(reason.contains("lost namespace authority"));
+        assert_eq!(error.requirement, requirement);
+        assert!(error.reason.contains("lost namespace authority"));
         assert_eq!(
             std::fs::read(&proof_path).expect("read proof replacement"),
             b"unrelated proof replacement\n"
@@ -4545,7 +4323,8 @@ fn retained_status_replacement_invalidates_proof_and_exact_marker() {
     output.write_all(b"0\n").expect("write proof");
     drop(output);
     let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
-    let mut transaction = retained_test_transaction(&proof, published, false);
+    let mut transaction =
+        retained_test_transaction(&proof, published, DimacsProofRequirement::Required);
     mark_synthesized_default_dimacs_proof_current(&proof, published, &mut transaction)
         .expect("publish current marker");
     let mut authority = super::AuthorizedDimacsUnsatPublication {
@@ -4556,10 +4335,10 @@ fn retained_status_replacement_invalidates_proof_and_exact_marker() {
     std::fs::rename(&status_path, &displaced_status).expect("displace owned status");
     std::fs::write(&status_path, b"unrelated status replacement\n")
         .expect("plant status replacement");
-    let (optional, _) = authority
+    let error = authority
         .validate_before_verdict()
         .expect_err("replacement must revoke status authority");
-    assert!(!optional);
+    assert_eq!(error.requirement, DimacsProofRequirement::Required);
     assert_eq!(
         std::fs::read(&status_path).expect("read status replacement"),
         b"unrelated status replacement\n"
@@ -4620,8 +4399,11 @@ fn retained_artifact_replacement_invalidates_proof_and_exact_artifact() {
     .expect("retain artifact authority");
     let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
         .expect("retain proof authority");
-    let transaction =
-        DimacsUnsatPublicationTransaction::new(retained_proof, Some(retained_artifact), false);
+    let transaction = DimacsUnsatPublicationTransaction::new(
+        retained_proof,
+        Some(retained_artifact),
+        DimacsProofRequirement::Required,
+    );
     let mut authority = super::AuthorizedDimacsUnsatPublication {
         publication: Some(transaction),
         temp_proof_path: None,
@@ -4667,7 +4449,8 @@ fn temporary_proof_stays_valid_until_verdict_then_preserves_replacement() {
     output.write_all(b"0\n").expect("write proof");
     drop(output);
     let published = seal_owned_dimacs_proof(&proof.path).expect("seal temp proof");
-    let transaction = retained_test_transaction(&proof, published, false);
+    let transaction =
+        retained_test_transaction(&proof, published, DimacsProofRequirement::Required);
     let mut authority = super::AuthorizedDimacsUnsatPublication {
         publication: Some(transaction),
         temp_proof_path: Some(proof.path.clone()),

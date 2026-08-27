@@ -22,7 +22,10 @@
 //! never sees a candidate, the erasure runs, and the document becomes
 //! `(step t0 (cl) :rule hole)`. Downstream that costs the VERDICT: an explicit
 //! `:produce-proofs` request cannot be satisfied by independent query
-//! authority (see `nested_row_auxiliary_hole_fails_closed_when_alethe_artifact_is_required`),
+//! authority (that rule is pinned today by
+//! `nested_row_auxiliary_refutation_publishes_under_an_explicit_proof_request`,
+//! whose script once failed closed for exactly this reason until the
+//! ROW-under-equality bridge closed its hole),
 //! so the mandatory certification funnel rejects the presentation by name and
 //! `certify_unsat_for_publication` withdraws a correct UNSAT to `unknown`.
 //!

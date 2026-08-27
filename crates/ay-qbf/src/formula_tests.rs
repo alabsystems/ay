@@ -32,10 +32,69 @@ fn test_qbf_formula_var_info() {
 }
 
 #[test]
+fn accessors_and_prefix_cache_share_canonical_state() {
+    let x1 = Literal::positive(Variable::new(1));
+    let x2 = Literal::positive(Variable::new(2));
+    let not_x2 = Literal::negative(Variable::new(2));
+    let formula = QbfFormula::new(
+        3,
+        vec![
+            QuantifierBlock::exists(vec![0, 2, 4]),
+            QuantifierBlock::forall(vec![2, 1]),
+            QuantifierBlock::exists(vec![0, 4]),
+        ],
+        vec![vec![x1, x1], vec![x2, not_x2], Vec::new()],
+    );
+
+    assert_eq!(formula.num_vars(), 3);
+    assert_eq!(
+        formula.prefix(),
+        &[
+            QuantifierBlock::exists(vec![2]),
+            QuantifierBlock::forall(vec![1]),
+        ]
+    );
+    assert_eq!(formula.clauses(), &[vec![x1], Vec::new()]);
+    assert_eq!(formula.var_level(2), 0);
+    assert!(formula.is_existential(2));
+    assert_eq!(formula.var_level(1), 1);
+    assert!(formula.is_universal(1));
+    assert_eq!(formula.var_level(3), 0);
+    assert!(formula.is_existential(3));
+
+    let debug = format!("{formula:?}");
+    assert!(!debug.contains("var_levels"));
+    assert!(!debug.contains("var_quantifiers"));
+
+    let prefix_ptr = formula.prefix().as_ptr();
+    let clauses_ptr = formula.clauses().as_ptr();
+    let (num_vars, prefix, clauses) = formula.into_parts();
+    assert_eq!(num_vars, 3);
+    assert!(std::ptr::eq(prefix.as_ptr(), prefix_ptr));
+    assert!(std::ptr::eq(clauses.as_ptr(), clauses_ptr));
+}
+
+#[test]
+fn oversized_formula_looks_up_explicit_prefix_metadata_without_dense_caches() {
+    let formula = QbfFormula::new(
+        MAX_QBF_VARS + 1,
+        vec![
+            QuantifierBlock::exists(vec![1]),
+            QuantifierBlock::forall(vec![2]),
+        ],
+        Vec::new(),
+    );
+
+    assert_eq!(formula.var_level(2), 1);
+    assert_eq!(formula.var_quantifier(2), Quantifier::Forall);
+    assert!(formula.is_universal(2));
+}
+
+#[test]
 fn test_universal_reduction() {
     // ∃x₁∀x₂∃x₃. (x₁ ∨ x₂ ∨ x₃)
-    // After universal reduction: (x₁ ∨ x₃) because x₂ is at level 1,
-    // which is < max existential level 2, so x₂ stays
+    // Universal reduction leaves the clause unchanged because x₂ is at level
+    // 1, which is below the maximum existential level 2.
     let prefix = vec![
         QuantifierBlock::exists(vec![1]),
         QuantifierBlock::forall(vec![2]),
@@ -68,10 +127,7 @@ fn test_universal_reduction() {
     ];
     let reduced2 = formula2.universal_reduce(&clause2);
 
-    // x₂ at level 1 >= max_exist_level=0, so x₂ removed? No wait...
-    // max_exist_level for x₁ is 0, x₂ is at level 1
-    // We remove universal literals with level >= max_exist_level
-    // So x₂ (level 1) >= 0 should be removed
+    // x₂ is deeper than the only existential literal and is removed.
     assert_eq!(reduced2.len(), 1);
     assert_eq!(reduced2[0], Literal::positive(Variable::new(1)));
 }

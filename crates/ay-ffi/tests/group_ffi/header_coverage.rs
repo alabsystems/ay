@@ -378,7 +378,12 @@ fn test_string_accessors_capi() {
         let mut minor = 0;
         let mut build = 0;
         let mut revision = 0;
-        Z3_get_version(&mut major, &mut minor, &mut build, &mut revision);
+        Z3_get_version(
+            &raw mut major,
+            &raw mut minor,
+            &raw mut build,
+            &raw mut revision,
+        );
         assert_eq!((major, minor, build, revision), (5, 0, 0, 0));
         let ver = Z3_get_full_version();
         assert!(!ver.is_null());

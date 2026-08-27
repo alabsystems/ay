@@ -275,7 +275,7 @@ fn test_factor_then_bve_lrat_rejects_unproved_extension_surface() {
 /// proof-safe route is enabled.
 #[test]
 fn test_official_main_lrat_public_route_does_not_run_factor_or_bve_on_factor_surface() {
-    use crate::proof::ProofOutput;
+    use crate::{proof::ProofOutput, VariantProofMode::Lrat};
     use crate::{SolverVariant, VariantInput, VariantRouteProfile, VariantStartupPolicy};
 
     let pos = |i: u32| Literal::positive(Variable(i));
@@ -294,7 +294,7 @@ fn test_official_main_lrat_public_route_does_not_run_factor_or_bve_on_factor_sur
     ];
 
     let original_var_count = 7;
-    let input = VariantInput::new(original_var_count, clauses.len(), true, true)
+    let input = VariantInput::new(original_var_count, clauses.len(), Lrat)
         .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
         .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
     let config = SolverVariant::Default.config(input);
@@ -2591,11 +2591,11 @@ fn clause_trace_late_theory_axiom_does_not_reuse_derived_id() {
 
 /// Follow-up to b93692341: the late-original allocator jumps
 /// `next_original_clause_id` past live derived IDs, so a derived ID can sit
-/// inside `1..=num_originals`. The streaming UNSAT core must classify by the
+/// inside `1..=num_originals`. Streaming support must classify by the
 /// per-ID original marker, not by range membership — a derived clause used as
-/// a level-0 reason must NOT appear in the reported original core.
+/// a level-0 reason must not appear in reported original-clause support.
 #[test]
-fn streaming_core_excludes_derived_id_below_late_original() {
+fn streaming_support_excludes_derived_id_below_late_original() {
     let u = Literal::positive(Variable(0));
     let w = Literal::positive(Variable(1));
     let d = Literal::positive(Variable(2));
@@ -2608,7 +2608,7 @@ fn streaming_core_excludes_derived_id_below_late_original() {
 
     // Derived clause (resolvent of IDs 2 and 3) mints a derived ID from
     // next_clause_id. During level-0 propagation of u it fires in u's watch
-    // pass and becomes d's reason, so it enters the streaming-core walk.
+    // pass and becomes d's reason, so it enters the streaming-support walk.
     let learned = solver.add_learned_clause(vec![u.negated(), d], 1, &[2, 3]);
     let derived_id = solver.clause_id(learned);
     assert_eq!(derived_id, 4, "derived ID must follow the three originals");
@@ -2646,20 +2646,20 @@ fn streaming_core_excludes_derived_id_below_late_original() {
     match solver.solve().into_inner() {
         SatResult::Unsat(cert) => {
             assert!(
-                cert.has_streaming_core(),
-                "level-0 UNSAT with originals must produce a streaming core"
+                cert.has_streaming_support(),
+                "level-0 derivation with originals must produce streaming support"
             );
-            let core = cert.minimal_core();
-            assert!(!core.is_empty(), "streaming core must be non-empty");
+            let support = cert.tracked_original_clause_ids();
+            assert!(!support.is_empty(), "streaming support must be non-empty");
             assert!(
-                !core.contains(&derived_id),
-                "derived clause ID {derived_id} classified as original core member: {core:?}"
+                !support.contains(&derived_id),
+                "derived clause ID {derived_id} classified as original support: {support:?}"
             );
             let originals = [1, 2, 3, late1, late2];
-            for &id in &core {
+            for &id in &support {
                 assert!(
                     originals.contains(&id),
-                    "core ID {id} is not an original clause ID: {core:?}"
+                    "support ID {id} is not an original clause ID: {support:?}"
                 );
             }
         }

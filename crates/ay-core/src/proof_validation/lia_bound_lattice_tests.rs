@@ -25,6 +25,8 @@ use crate::{Sort, TermId, TermStore};
 
 #[path = "lia_bound_lattice_accept_tests.rs"]
 mod accepts;
+#[path = "lia_bound_lattice_ite_range_tests.rs"]
+mod ite_range;
 #[path = "lia_bound_lattice_sweep_tests.rs"]
 mod sweeps;
 
@@ -334,10 +336,11 @@ fn rejects_variable_free_form_without_panicking() {
         "a variable-free difference form carries no lattice and must be rejected",
     );
     for x in -20..=20i64 {
-        assert!(
-            !(x + 5 <= x + 1) && (x + 1 <= x + 5),
-            "clause is false at x={x}"
-        );
+        let lower_side = x + 5;
+        let upper_side = x + 1;
+        let lower_holds = lower_side <= upper_side;
+        let upper_holds = upper_side <= lower_side;
+        assert!(!lower_holds && upper_holds, "clause is false at x={x}");
     }
 }
 

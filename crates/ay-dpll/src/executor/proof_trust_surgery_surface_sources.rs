@@ -331,6 +331,25 @@ impl ProvenanceSurfaceAudit {
         if self.source_registrations.contains(&registration) {
             return true;
         }
+        // Native-API root (`api/solving/assertions.rs` sentinel): the
+        // assertion has NO parsed surface, so the canonical rendering IS the
+        // printed spelling and no override may be registered — registering
+        // one would print the sentinel string. Same doctrine as
+        // `proof_original_rebuild::is_api_placeholder`. Alias flows derive an
+        // alias spelling FROM the parsed surface, which does not exist here;
+        // they stay fail-closed.
+        if alias == canonical && crate::executor::proof_original_rebuild::is_api_placeholder(parsed)
+        {
+            if !self.native_sources.contains(&canonical)
+                && self.native_sources.len() >= MAX_AUDITED_TERMS
+            {
+                self.overflowed = true;
+                return false;
+            }
+            self.native_sources.insert(canonical);
+            self.source_registrations.insert(registration);
+            return true;
+        }
         let Some(canonical_work) =
             crate::executor::proof_surface_syntax::surface_override_collection_work(
                 &ctx.terms, canonical,

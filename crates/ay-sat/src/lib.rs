@@ -154,8 +154,8 @@ pub mod feature_flags {
 /// binary-clause flag in a *separate* bit (bit 32 of a `u64` clause word, see
 /// `watched::BINARY_FLAG`), so the flag no longer aliases the offset and the
 /// whole 32-bit offset space is addressable (#9670). The arena must still stay
-/// strictly below [`MAX_ARENA_WORDS`] so that `u32::MAX` remains reserved as the
-/// "dead" sentinel used by the clause-relocation remap table.
+/// below [`arena_limits::MAX_ARENA_WORDS`]. This leaves `u32::MAX` as the "dead"
+/// sentinel used by the clause-relocation remap table.
 pub mod arena_limits {
     /// `u32` header words stored before the literals of each clause in the arena.
     /// Mirrors `clause_arena::HEADER_WORDS`.
@@ -330,7 +330,7 @@ impl Default for InprocessingFeatureProfile {
 
 // -- Public API: types used by downstream crates and integration tests --
 pub use adaptive::adjust_features_for_instance;
-pub use clause_provenance::{ClauseProvenance, CoreProvenanceSummary};
+pub use clause_provenance::{ClauseProvenance, TrackedClauseProvenanceSummary};
 pub use clause_trace::{
     ClauseTrace, ClauseTraceEntry, ClauseTraceEntryRef, HintOmission, HintOmissionStats,
     TraceEntries, TraceEntriesIter,
@@ -351,7 +351,7 @@ pub use decision_trace::{
 pub use dimacs::{parse_str as parse_dimacs, DimacsError, DimacsFormula};
 pub use er_proof::{ErDefinition, ErObligationKind, ErProducer, ErProofLog};
 pub use extension::{
-    ExtCheckResult, ExtPropagateResult, Extension, PreparedExtension, SolverContext,
+    ExtCheckResult, ExtProofStep, ExtPropagateResult, Extension, PreparedExtension, SolverContext,
 };
 pub use features::{InstanceClass, SatFeatureAccumulator, SatFeatures};
 pub use guidance::{
@@ -362,8 +362,8 @@ pub use literal::{Literal, SignedClause, Variable};
 pub use mab::{BranchHeuristic, BranchHeuristicStats, BranchSelectorMode};
 pub use portfolio::PortfolioSolver;
 pub use preprocess_transaction::PreprocessTransactionStats;
-pub use proof::{DratWriter, LratWriter, ProofOutput, MAX_LRAT_ORIGINAL_CLAUSES};
-pub use proof_certificate::{ProofCertificate, ProofStep};
+pub use proof::{DratWriter, LratWriter, ProofOutput, VeripbWriter, MAX_LRAT_ORIGINAL_CLAUSES};
+pub use proof_certificate::{ProofCertificate, ProofCompleteness, ProofStep};
 pub use resolution_dag::{
     prove_unsat_resolution_dag, prove_unsat_resolution_dag_with_limits,
     solve_resolution_dag_with_limits, ResolutionDag, ResolutionDagError, ResolutionProofError,
@@ -376,9 +376,9 @@ pub use resolution_validate::{
 };
 pub use solver::{
     AssumeResult, BcpLongScanStats, BcpSavedPosStats, DecomposeLratPreflightStats, FactorStats,
-    LookaheadStats, LratMaterializationStats, RephaseAttributionStats, RestartAttributionStats,
-    SatResult, SatUnknownReason, SetSolutionError, Solver, TheoryPropResult, VarAssignmentKind,
-    VerifiedAssumeResult, VerifiedSatResult,
+    IndepEnumReport, LookaheadStats, LratMaterializationStats, RephaseAttributionStats,
+    RestartAttributionStats, SatResult, SatUnknownReason, SetSolutionError, Solver,
+    SolverAssumeResult, SolverSatResult, TheoryPropResult, VarAssignmentKind,
 };
 pub use symmetry::SymmetryReport;
 pub use technique::SatTechnique;
@@ -388,7 +388,8 @@ pub use tla_traceable::TlaTraceable;
 pub use unsat_cert::{prove_cnf_unsat_dimacs, CnfCertError};
 pub use variant::{
     SolverVariant, VariantBranchPolicy, VariantConfig, VariantHotPathConfig, VariantInput,
-    VariantProfilePlan, VariantRestartPolicy, VariantRouteProfile, VariantStartupPolicy,
+    VariantProfilePlan, VariantProofMode, VariantRestartPolicy, VariantRouteProfile,
+    VariantStartupPolicy,
 };
 pub use watched::ClauseRef;
 

@@ -38,7 +38,7 @@
 //!
 //! The shell gates enforce the identical contract, including the identical
 //! self-test battery, from `scripts/lib/veripb_verdict.sh`. Both are exercised
-//! against the same four committed fakes (`ci/fake-checkers/`), so a binary
+//! against the same five committed fakes (`ci/fake-checkers/`), so a binary
 //! cannot pass one surface by failing the other.
 
 use std::fmt;
@@ -98,12 +98,15 @@ fn known_build_locations() -> Vec<PathBuf> {
 
 /// Cache-key contract shared with `scripts/ci/pb_certified_gate.sh`.
 ///
-/// The patch is part of the checker identity, so a changed patch must not
-/// silently reuse a binary built from the same upstream commit.
+/// EVERY patch is part of the checker identity, so a changed or added patch
+/// must not silently reuse a binary built from the same upstream commit. Both
+/// prefixes are in the key for that reason.
 fn pinned_build_id() -> String {
     let patch_sha = pin::patch_sha256();
     let patch_prefix = patch_sha.get(..12).unwrap_or(patch_sha);
-    format!("{}-{patch_prefix}", pin::commit())
+    let patch2_sha = pin::patch2_sha256();
+    let patch2_prefix = patch2_sha.get(..12).unwrap_or(patch2_sha);
+    format!("{}-{patch_prefix}-{patch2_prefix}", pin::commit())
 }
 
 fn path_lookup() -> Option<PathBuf> {
@@ -531,35 +534,50 @@ pub fn run_text(
     run
 }
 
+// ---------------------------------------------------------- probe fixtures
+//
+// PUBLIC BECAUSE THEY MUST NOT BE RE-INVENTED. This crate is a DEV-dependency
+// everywhere, so a production module that has to self-test a checker before
+// trusting it — `ay_pb_core::veripb_runner::self_test`, which runs its probes
+// through its own `verify_unsat` rather than through this module's `run` —
+// cannot call [`self_test`] and must hold the probe text itself. Exporting the
+// bytes here keeps that a COPY OF ONE FIXTURE SET rather than a second,
+// divergent battery: `veripb_runner`'s unit tests assert its constants are
+// byte-identical to these, so a change on either side turns the other red.
+//
+// `scripts/lib/veripb_verdict.sh` carries the same text a third time (it must:
+// a POSIX shell gate cannot link Rust). That copy is pinned by
+// `crates/ay-pb-core/src/veripb_runner.rs`'s `self_test_fixtures_match_the_shell_battery`.
+
 /// An unsatisfiable formula: `x1 >= 1` and `-x1 >= 0`.
-const SELF_TEST_UNSAT_OPB: &str = "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n";
+pub const SELF_TEST_UNSAT_OPB: &str = "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n";
 /// A valid refutation of it.
-const SELF_TEST_GOOD_UNSAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 2 ;\npol 1 2 +;\nrup >= 1 ;\noutput NONE;\nconclusion UNSAT : 4;\nend pseudo-Boolean proof;\n";
+pub const SELF_TEST_GOOD_UNSAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 2 ;\npol 1 2 +;\nrup >= 1 ;\noutput NONE;\nconclusion UNSAT : 4;\nend pseudo-Boolean proof;\n";
 /// A well-formed proof over the same formula that derives and concludes NOTHING.
 /// Real VeriPB answers `s VERIFIED NO CONCLUSION` and exits 0.
-const SELF_TEST_NO_CONCLUSION_PBP: &str = "pseudo-Boolean proof version 3.0\nf 2 ;\noutput NONE;\nconclusion NONE;\nend pseudo-Boolean proof;\n";
+pub const SELF_TEST_NO_CONCLUSION_PBP: &str = "pseudo-Boolean proof version 3.0\nf 2 ;\noutput NONE;\nconclusion NONE;\nend pseudo-Boolean proof;\n";
 /// A SATISFIABLE formula: `x1 + x2 >= 1`.
-const SELF_TEST_SAT_OPB: &str = "* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n";
+pub const SELF_TEST_SAT_OPB: &str = "* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n";
 /// A genuine solution of it.
-const SELF_TEST_GOOD_SAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion SAT : x1 ~x2;\nend pseudo-Boolean proof;\n";
+pub const SELF_TEST_GOOD_SAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion SAT : x1 ~x2;\nend pseudo-Boolean proof;\n";
 /// A LIE about it: claims UNSAT, citing a satisfiable input row as the
 /// contradiction.
-const SELF_TEST_FALSE_UNSAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion UNSAT : 1;\nend pseudo-Boolean proof;\n";
+pub const SELF_TEST_FALSE_UNSAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion UNSAT : 1;\nend pseudo-Boolean proof;\n";
 /// A different LIE about it: claims SAT with an assignment that FALSIFIES the
 /// only constraint. Structurally identical to a true SAT certificate, so a
 /// checker that merely restates the proof's own claim cannot tell them apart.
-const SELF_TEST_FALSE_SAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion SAT : ~x1 ~x2;\nend pseudo-Boolean proof;\n";
+pub const SELF_TEST_FALSE_SAT_PBP: &str = "pseudo-Boolean proof version 3.0\nf 1 ;\noutput NONE;\nconclusion SAT : ~x1 ~x2;\nend pseudo-Boolean proof;\n";
 /// Not a proof at all.
-const SELF_TEST_GARBAGE_PBP: &str = "this file is not a pseudo-Boolean proof\n";
+pub const SELF_TEST_GARBAGE_PBP: &str = "this file is not a pseudo-Boolean proof\n";
 
 /// Prove that `checker` really is a proof checker.
 ///
-/// Six probes. Each of the four fakes committed under `ci/fake-checkers/`
+/// Six probes. Each of the five fakes committed under `ci/fake-checkers/`
 /// passes some of them; none passes all six:
 ///
 /// | probe | requirement | catches |
 /// | --- | --- | --- |
-/// | `good-unsat` | verify a valid refutation, exit 0 | `/usr/bin/true`, `/usr/bin/false`, `silent-exit0.sh`, and `verdict-then-exit1.sh` (right verdict, exit 1) |
+/// | `good-unsat` | verify a valid refutation, exit 0 | `/usr/bin/true`, `/usr/bin/false`, `silent-exit0.sh`, `verdict-then-exit1.sh` (right verdict, exit 1), and `comment-verified.sh` (refuses on the verdict line while a `c` comment says otherwise) |
 /// | `good-sat` | verify a valid solution, exit 0 | `always-unsat.sh` and anything else printing one fixed verdict |
 /// | `false-unsat` | reject a proof claiming UNSAT for a satisfiable formula | `always-unsat.sh`, `parrot.sh` |
 /// | `false-sat` | reject a proof claiming SAT with a falsifying assignment | `parrot.sh` — this is the probe that a checker which just restates the proof's own conclusion cannot survive |
@@ -714,10 +732,20 @@ pub fn require_checker(suite: &str) -> Option<PathBuf> {
 /// file) cannot disagree — there is no second copy to update.
 ///
 /// Why a pin at all: "VeriPB accepted it" is only evidence if you can say WHICH
-/// VeriPB. Published 3.0.2 has six confirmed wrong-verdict bugs; a checker
-/// carrying them will happily print `s VERIFIED UNSATISFIABLE` for a satisfiable
-/// formula. [`soundness_fixtures`] is the behavioural half of the pin: any
-/// checker AY trusts must refuse all six, and that is asserted, not assumed.
+/// VeriPB. Published 3.0.2 has TWENTY-ONE confirmed wrong-verdict defects; a
+/// checker carrying them will happily print `s VERIFIED UNSATISFIABLE` for a
+/// satisfiable formula — and for defect 10 (propagation slack in the row's own
+/// width), defect 11 (a `pbc` subproof fabricating a database proofgoal) and
+/// defect 14 (order auxiliary variables that are not order-private) it does so
+/// from a handful of proof lines against ANY formula, so at an unpatched pin no
+/// UNSAT verdict is evidence of anything. [`soundness_fixtures`] is the
+/// behavioural half of the pin: any checker AY trusts must refuse all TWENTY-TWO
+/// fixtures, and that is asserted, not assumed. Twenty-two fixtures for
+/// twenty-one defects: defect 7 (normalization wrapping) has two opposite
+/// manifestations.
+///
+/// The pin names TWO patch files ([`patch`] and [`patch2`]); both are part of
+/// the checker's identity and both are in the build-cache key.
 pub mod pin {
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -781,6 +809,26 @@ pub mod pin {
     #[must_use]
     pub fn patch_sha256() -> &'static str {
         require("VERIPB_PATCH_SHA256")
+    }
+
+    /// Repo-relative path of the SECOND patch, applied on top of [`patch`].
+    ///
+    /// It exists as a separate file on purpose: [`patch`] is byte-verifiable
+    /// against the private fork, and folding a locally written fix into it would
+    /// destroy that property. This one is written here and may be edited here.
+    /// See the prose in `ci/veripb.pin`.
+    #[must_use]
+    pub fn patch2() -> &'static str {
+        require("VERIPB_PATCH2")
+    }
+
+    /// Expected SHA-256 of [`patch2`], the fix for the ninth and tenth
+    /// wrong-verdict defects (`pol` addition wrapping the cancellation
+    /// subtraction, and the propagator computing its slack in the row's own
+    /// integer width).
+    #[must_use]
+    pub fn patch2_sha256() -> &'static str {
+        require("VERIPB_PATCH2_SHA256")
     }
 
     /// Workspace root, derived from this crate's manifest directory.
@@ -918,30 +966,50 @@ pub mod pin {
                 64,
                 "patch sha256 must be 64 hex chars"
             );
+            assert_eq!(
+                patch2_sha256().len(),
+                64,
+                "patch2 sha256 must be 64 hex chars"
+            );
+            assert_ne!(
+                patch_sha256(),
+                patch2_sha256(),
+                "the two patches must be different files"
+            );
             assert!(!version().is_empty());
         }
 
         #[test]
-        fn the_pinned_patch_matches_its_recorded_hash() {
+        fn the_pinned_patches_match_their_recorded_hashes() {
             use sha2::{Digest, Sha256};
-            let path = repo_root().join(patch());
-            let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-                panic!("pinned patch {} unreadable: {error}", path.display())
-            });
-            let digest = format!("{:x}", Sha256::digest(&bytes));
-            assert_eq!(
-                digest,
-                patch_sha256(),
-                "{} does not match VERIPB_PATCH_SHA256 in {PIN_PATH}. The patch is part of \
-                 the checker's identity — update both together.",
-                path.display()
-            );
+            for (path, expected, key) in [
+                (patch(), patch_sha256(), "VERIPB_PATCH_SHA256"),
+                (patch2(), patch2_sha256(), "VERIPB_PATCH2_SHA256"),
+            ] {
+                let path = repo_root().join(path);
+                let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+                    panic!("pinned patch {} unreadable: {error}", path.display())
+                });
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                assert_eq!(
+                    digest,
+                    expected,
+                    "{} does not match {key} in {PIN_PATH}. The patches are part of \
+                     the checker's identity — update both together.",
+                    path.display()
+                );
+            }
         }
 
         #[test]
-        fn all_six_soundness_fixtures_are_present_on_disk() {
+        fn all_twenty_two_soundness_fixtures_are_present_on_disk() {
             let fixtures = soundness_fixtures();
-            assert_eq!(fixtures.len(), 6, "six known wrong-verdict bugs are pinned");
+            assert_eq!(
+                fixtures.len(),
+                22,
+                "twenty-one known wrong-verdict defects are pinned, covered by \
+                 twenty-two fixtures (defect 7 has two opposite manifestations)"
+            );
             for fixture in fixtures {
                 assert!(
                     fixture.formula.is_file(),
@@ -966,7 +1034,12 @@ mod tests {
     fn pinned_cache_key_matches_the_shell_gate_contract() {
         assert_eq!(
             pinned_build_id(),
-            format!("{}-{}", pin::commit(), &pin::patch_sha256()[..12])
+            format!(
+                "{}-{}-{}",
+                pin::commit(),
+                &pin::patch_sha256()[..12],
+                &pin::patch2_sha256()[..12]
+            )
         );
     }
 

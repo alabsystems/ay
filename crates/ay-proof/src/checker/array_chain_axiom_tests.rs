@@ -100,3 +100,10 @@ mod row_chain_stores;
 mod same_index_store_value;
 mod store_permutation;
 mod store_permutation_read_through;
+
+// The constant-index skip is a sub-schema of `ArrayRowChain`, so its battery
+// lives with the rest of the chain tests. It is registered here rather than in
+// `checker/tests.rs` because that file is pinned at its exact length by the
+// quality gate's file-size baseline.
+#[path = "array_chain_const_index_tests.rs"]
+mod array_chain_const_index_tests;

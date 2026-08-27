@@ -23,7 +23,7 @@
   "matrix_source": {
    "suite": "sat-main-2026-official-mirror",
    "track": "main",
-   "proof_format": "drat",
+   "proof_format": "veripb",
    "jobs": 1,
    "wrong_answer_budget": 0,
    "proof_failure_budget": 0,
@@ -97,8 +97,8 @@
   "main_track_contract": {
    "profile_id": "regular",
    "track": "main",
-   "proof_format": "drat",
-   "proof_checker": "drat-trim",
+   "proof_format": "veripb",
+   "proof_checker": "veripb",
    "sat_model_format": "dimacs-v-lines",
    "jobs": 1,
    "timeout_seconds": 5000,
@@ -114,7 +114,7 @@
    "solver_names": [],
    "submitted_variant_count": 0,
    "ai_disclosure_class": "unconfirmed",
-   "proof_checker": "drat-trim",
+   "proof_checker": "veripb",
    "system_description_status": "draft"
   },
   "required_evidence": [
@@ -143,8 +143,9 @@
   ]
  },
  "defaults": {
-  "proof_format": "drat",
-  "proof_checker": "drat-trim",
+  "$comment": "DECLARED CHECKER = veripb, PROOF FORMAT = veripb (2026-08-25). VeriPB is on the official SAT-COMP 2026 checker menu (output.html: dpr-trim / gratgen / veripb) and its `red` (redundance-based strengthening) rule takes a substitution witness natively, which is exactly the SR side condition AY's symmetry routes discharge. That is the whole reason for the switch: under the previous dpr-trim declaration the `--proof-checker` capability gate clamped the SR-witnessed routes (orbitope staircase, the five aux-free WLOG families, adv_gc's downstream units) to plain CDCL, because dpr-trim and drat-trim are BOTH measured to return `s NOT VERIFIED` on a DSR substitution witness (php_11_8's staircase proof, 2026-08-24) — costing the whole symmetry bucket, ~56 instances, and turning php_sudoku_p15_h14 from `s VERIFIED UNSAT` into `s UNKNOWN`. Declaring VeriPB is the same legality with the bucket restored: same menu, and every SR-witnessed step is representable. The pair is LOAD-BEARING and must move together — the checker gate matches the declared checker against the LIVE proof surface, so `--proof-format drat --proof-checker veripb` clamps just as hard (VeriPB cannot read a DRAT stream at all). VeriPB parses the DIMACS CNF directly (variable i is x<i>, clause = sum of literals >= 1), so no OPB companion file is emitted or needed; the checker invocation is `veripb --cnf <instance>.cnf <output_dir>/proof.out`. WHICH VeriPB: every AY verification claim is made against the pinned build ci/veripb.pin names (upstream 4bb10c2c + patches 0001/0002), gated by 22 must-reject fixtures — stock 3.0.2 has 21 known wrong-verdict defects. See competition/checker_description.txt section 2 for what that does and does not mean for a submission the organizers check with their own build.",
+  "proof_format": "veripb",
+  "proof_checker": "veripb",
   "sat_model_format": "dimacs-v-lines",
   "wrong_answer_budget": 0,
   "proof_failure_budget": 0,
@@ -181,8 +182,8 @@
    "requirements": {
     "unsat_proof": {
      "required": true,
-     "format": "drat",
-     "checker": "drat-trim",
+     "format": "veripb",
+     "checker": "veripb",
      "path_template": "$2/proof.out"
     },
     "sat_model": {
@@ -249,8 +250,8 @@
    "requirements": {
     "unsat_proof": {
      "required": true,
-     "format": "drat",
-     "checker": "drat-trim",
+     "format": "veripb",
+     "checker": "veripb",
      "path_template": "$2/proof.out"
     },
     "sat_model": {
@@ -324,8 +325,8 @@
    "requirements": {
     "unsat_proof": {
      "required": true,
-     "format": "drat",
-     "checker": "drat-trim",
+     "format": "veripb",
+     "checker": "veripb",
      "path_template": "$2/proof.out"
     },
     "sat_model": {
@@ -400,8 +401,8 @@
    "requirements": {
     "unsat_proof": {
      "required": true,
-     "format": "drat",
-     "checker": "drat-trim",
+     "format": "veripb",
+     "checker": "veripb",
      "path_template": "$2/proof.out"
     },
     "sat_model": {
@@ -477,8 +478,8 @@
    "requirements": {
     "unsat_proof": {
      "required": true,
-     "format": "drat",
-     "checker": "drat-trim",
+     "format": "veripb",
+     "checker": "veripb",
      "path_template": "$2/proof.out"
     },
     "sat_model": {

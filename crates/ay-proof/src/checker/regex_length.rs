@@ -97,7 +97,7 @@ pub(crate) fn validate_regex_length_lower_bound(
 
 /// Recognize a clause the strict `RegexLengthLowerBound` validator will accept.
 ///
-/// This is the EXACT precondition of [`validate_regex_length_lower_bound`], so
+/// This is the EXACT precondition of `validate_regex_length_lower_bound`, so
 /// a producer can only tag clauses strict mode will then accept.
 #[must_use]
 pub fn recognize_regex_length_lower_bound(terms: &TermStore, clause: &[TermId]) -> bool {

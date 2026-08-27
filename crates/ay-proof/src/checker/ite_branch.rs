@@ -123,7 +123,7 @@ pub(crate) fn validate_ite_branch_projection(
 }
 
 /// Declaration-free recognizer: `true` exactly when
-/// [`validate_ite_branch_projection`] accepts the clause.
+/// `validate_ite_branch_projection` accepts the clause.
 #[must_use]
 pub fn recognize_ite_branch_projection(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_ite_branch_projection(terms, ProofId(0), clause).is_ok()
@@ -382,7 +382,7 @@ fn validate_three_literal_guarded_row(terms: &TermStore, literals: &[TermId]) ->
 }
 
 /// Declaration-free recognizer: `true` exactly when
-/// [`validate_array_guarded_row_expansion`] accepts the clause.
+/// `validate_array_guarded_row_expansion` accepts the clause.
 #[must_use]
 pub fn recognize_array_guarded_row_expansion(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_array_guarded_row_expansion(terms, ProofId(0), clause).is_ok()

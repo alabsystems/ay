@@ -11,6 +11,8 @@
 
 use std::path::PathBuf;
 
+mod conformance_source;
+
 #[path = "sat_chokepoint_conformance/post_rebase.rs"]
 mod post_rebase;
 
@@ -1387,18 +1389,17 @@ fn unbounded_lex_prefix_never_fabricates_suffix_optima() {
         "native and SMT-LIB objective readers must reject unavailable suffix values"
     );
 
-    let lifecycle = read("src/executor/lifecycle.rs");
-    let invalidation_start = lifecycle
-        .find("pub(super) fn invalidate_last_check_result(&mut self)")
-        .expect("lifecycle must define canonical query-artifact invalidation");
-    let invalidation_end = lifecycle[invalidation_start..]
-        .find("pub(in crate::executor) fn clear_quantified_sat_authority(&mut self)")
-        .map(|offset| invalidation_start + offset)
-        .expect("canonical invalidation must precede quantified-authority clearing");
-    let invalidation = &lifecycle[invalidation_start..invalidation_end];
-    let reset = &lifecycle[lifecycle
-        .find("pub fn reset(&mut self)")
-        .expect("lifecycle must define direct reset")..];
+    // `7d448bb9c3` split `Executor::new` into `lifecycle/new_stack_guarded_expr.rs`,
+    // so the field initializers below left `lifecycle.rs`. Addressing the LOGICAL
+    // module (parent file plus submodule directory) keeps this guard pointed at the
+    // code it guards; both region endpoints still resolve inside `lifecycle.rs`, so
+    // the region itself is unchanged. See `tests/conformance_source/mod.rs`.
+    let lifecycle = conformance_source::LogicalModule::load("src/executor/lifecycle.rs");
+    let invalidation = lifecycle.region(
+        "pub(super) fn invalidate_last_check_result(&mut self)",
+        "pub(in crate::executor) fn clear_quantified_sat_authority(&mut self)",
+    );
+    let reset = lifecycle.region_to_item_end("pub fn reset(&mut self)");
     assert!(
         invalidation.contains("self.unavailable_objectives.clear();")
             && reset.contains("self.invalidate_last_check_result();")
@@ -1463,18 +1464,17 @@ fn epsilon_outcome_requires_twin_proofs_and_never_fabricates_scalars() {
     );
 
     // State lifecycle: initialized and cleared with every query artefact.
-    let lifecycle = read("src/executor/lifecycle.rs");
-    let invalidation_start = lifecycle
-        .find("pub(super) fn invalidate_last_check_result(&mut self)")
-        .expect("lifecycle must define canonical query-artifact invalidation");
-    let invalidation_end = lifecycle[invalidation_start..]
-        .find("pub(in crate::executor) fn clear_quantified_sat_authority(&mut self)")
-        .map(|offset| invalidation_start + offset)
-        .expect("canonical invalidation must precede quantified-authority clearing");
-    let invalidation = &lifecycle[invalidation_start..invalidation_end];
-    let reset = &lifecycle[lifecycle
-        .find("pub fn reset(&mut self)")
-        .expect("lifecycle must define direct reset")..];
+    // `7d448bb9c3` split `Executor::new` into `lifecycle/new_stack_guarded_expr.rs`,
+    // so the field initializers below left `lifecycle.rs`. Addressing the LOGICAL
+    // module (parent file plus submodule directory) keeps this guard pointed at the
+    // code it guards; both region endpoints still resolve inside `lifecycle.rs`, so
+    // the region itself is unchanged. See `tests/conformance_source/mod.rs`.
+    let lifecycle = conformance_source::LogicalModule::load("src/executor/lifecycle.rs");
+    let invalidation = lifecycle.region(
+        "pub(super) fn invalidate_last_check_result(&mut self)",
+        "pub(in crate::executor) fn clear_quantified_sat_authority(&mut self)",
+    );
+    let reset = lifecycle.region_to_item_end("pub fn reset(&mut self)");
     assert!(
         invalidation.contains("self.infinitesimal_objectives.clear();")
             && reset.contains("self.invalidate_last_check_result();")

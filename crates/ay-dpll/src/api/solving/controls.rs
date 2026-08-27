@@ -74,19 +74,39 @@ impl Solver {
 
     /// Set a timeout for check_sat calls.
     ///
-    /// GROUND (quantifier-free) solves treat this as the nominal wall-clock
-    /// deadline. QUANTIFIED solves (#quantifier-determinism) terminate
-    /// primarily on the engine's DETERMINISTIC instantiation budgets
-    /// (E-matching round/instance caps, interleaved/CEGQI/MBQI round caps) so
-    /// that identical inputs produce identical verdicts regardless of machine
-    /// speed or CPU load; for those solves the timeout acts as a far-out
-    /// hang-protection BACKSTOP (remaining budget scaled by a small factor,
-    /// capped — see `Executor::install_quantifier_deadline_backstop`), so a
-    /// quantified check-sat may run moderately past the nominal timeout before
-    /// failing closed to `Unknown`. A zero or already-expired timeout still
-    /// stops immediately on both paths.
+    /// #honest-timeout: this is a BOUND. GROUND and QUANTIFIED solves alike
+    /// stop at the deadline and fail closed to `Unknown`; a zero or
+    /// already-expired timeout stops immediately.
+    ///
+    /// It used to be advisory on quantified solves: #quantifier-determinism
+    /// relaxed the deadline into a far-out hang-protection BACKSTOP (remaining
+    /// budget x 4, capped at +3 min) so that termination was decided by the
+    /// engine's DETERMINISTIC instantiation budgets (E-matching round/instance
+    /// caps, interleaved/CEGQI/MBQI round caps) rather than by machine speed —
+    /// which meant a 60 s timeout could buy a ~240 s wall with nothing in the
+    /// API saying so. That determinism is a real capability and is preserved,
+    /// but it is now the caller's explicit choice:
+    /// [`Self::set_quantifier_deadline_backstop`].
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
+    }
+
+    /// Opt in to the quantified wall-clock BACKSTOP (off by default).
+    ///
+    /// When enabled, a `check-sat` whose assertions contain a quantifier
+    /// relaxes the deadline installed from [`Self::set_timeout`] to
+    /// `deadline + min(3 x remaining, 3 min)`, so the engine's deterministic
+    /// instantiation budgets decide when to stop and a verdict cannot flip
+    /// `unsat` <-> `unknown` with CPU load. In exchange such a solve may run up
+    /// to 4x the requested timeout. Ground solves are unaffected either way.
+    pub fn set_quantifier_deadline_backstop(&mut self, enabled: bool) {
+        self.executor.set_quantifier_deadline_backstop(enabled);
+    }
+
+    /// Whether the quantified wall-clock backstop is enabled.
+    #[must_use]
+    pub fn quantifier_deadline_backstop(&self) -> bool {
+        self.executor.quantifier_deadline_backstop()
     }
 
     /// Get the current timeout setting

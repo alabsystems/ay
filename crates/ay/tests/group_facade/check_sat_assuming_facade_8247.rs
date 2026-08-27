@@ -139,8 +139,8 @@ fn test_smt_proof_certificate_from_assumptions() {
         SolveResult::Unsat(cert) => {
             // SmtProofCertificate is accessible through the facade
             let _cert: SmtProofCertificate = cert;
-            // minimal_core() is available
-            let _core = _cert.minimal_core();
+            // Diagnostic original-clause support is available.
+            let _support = _cert.tracked_original_clause_ids();
         }
         _ => panic!("expected Unsat variant"),
     }

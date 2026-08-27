@@ -1075,9 +1075,27 @@ impl Executor {
                 // Restricted to a USER-DECLARED symbol head so lambda,
                 // as-array, map and every future array constructor keep the
                 // original exclusion.
+                //
+                // A datatype SELECTOR application is NOT such a leaf, even
+                // though the selector is a declared symbol: `(dat (select A
+                // i))` denotes the `dat` field of whatever datatype value
+                // `(select A i)` holds, so its interpretation is FIXED by
+                // that value, not free. Completing it here as an independent
+                // base array fabricates one interpretation per syntactic
+                // read — `(dat (select A i))` and `(dat (select A j))` under
+                // `i = j` receive two DIFFERENT free arrays, the field
+                // arrays of one cell disagree, and the independent gate
+                // refuses the datatype equality `z = (select A i)` the
+                // census had certified (measured on the
+                // `datatype_array_field_select_congruence_certifies` pin:
+                // `sat` -> `unknown`, "Datatype vs Uninterpreted" /
+                // "model does not pin this leaf"). A selector read resolves
+                // through its subject's datatype value (the census /
+                // `datatype_leaf` route) exactly as before 93efdc1f1.
                 TermData::App(sym, _)
                     if mode.completes_missing_default()
-                        && self.ctx.symbol_info_by_identity(sym.name()).is_some() =>
+                        && self.ctx.symbol_info_by_identity(sym.name()).is_some()
+                        && !self.is_datatype_selector_symbol(sym.name()) =>
                 {
                     self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
                 }
@@ -1087,6 +1105,13 @@ impl Executor {
                 }
             }
         })
+    }
+
+    /// Whether `name` is a selector of some declared datatype constructor.
+    pub(super) fn is_datatype_selector_symbol(&self, name: &str) -> bool {
+        self.ctx
+            .ctor_selectors_iter()
+            .any(|(_, selectors)| selectors.iter().any(|selector| selector == name))
     }
 
     /// Base (non-`store`-chain) interpretation of an array term: the
@@ -2026,33 +2051,7 @@ mod array_store_order_tests {
 }
 
 #[cfg(test)]
-mod gate_fp_format_tests {
-    use ay_core::Sort;
-    use ay_model_check::ModelValue;
-
-    use super::Executor;
-
-    #[test]
-    fn exact_fp_gate_value_round_trips_as_an_smt_fp_literal() {
-        let exec = Executor::new();
-        let value = ModelValue::FloatingPoint {
-            sign: false,
-            exponent: 16,
-            significand: 256,
-            exponent_bits: 5,
-            significand_bits: 11,
-        };
-        assert_eq!(
-            exec.format_gate_model_value(&value, &Sort::FloatingPoint(5, 11)),
-            Some("(fp #b0 #b10000 #b0100000000)".to_string())
-        );
-        assert_eq!(
-            exec.format_gate_model_value(&value, &Sort::FloatingPoint(8, 24)),
-            None,
-            "a mismatched carrier sort must fail closed"
-        );
-    }
-}
+mod gate_fp_format_tests;
 
 #[cfg(test)]
 mod sequence_table_provenance_tests {

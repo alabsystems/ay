@@ -4,6 +4,16 @@
 
 use super::*;
 
+pub(super) struct ClaimReportSeal {
+    _private: (),
+}
+
+impl ClaimReportSeal {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 pub(super) fn check_claims(
     certificate: &Certificate,
     model: &Model,
@@ -14,19 +24,21 @@ pub(super) fn check_claims(
     let mut reports = Vec::new();
     for claim in &certificate.claims {
         let (verified, detail) = check_claim(certificate, model, claimed_value, affine, claim);
-        if !verified {
+        let report = ClaimReport::new(
+            ClaimReportSeal::new(),
+            claim.name.clone(),
+            claim.kind,
+            verified,
+            detail,
+        );
+        if !report.is_verified() {
             state.demote(if claim.kind == EvidenceKind::Succinct {
                 CheckStatus::Refuted
             } else {
                 CheckStatus::Unverified
             });
         }
-        reports.push(ClaimReport {
-            name: claim.name.clone(),
-            kind: claim.kind,
-            verified,
-            detail,
-        });
+        reports.push(report);
     }
     reports
 }
@@ -100,4 +112,24 @@ fn none_detail(claim: &ParsedClaim) -> (bool, String) {
         false,
         format!("NOT VERIFIED — no evidence of any kind was exported{why}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_and_none_reports_cannot_become_verified() {
+        for kind in [EvidenceKind::Replay, EvidenceKind::None] {
+            let report = ClaimReport::new(
+                ClaimReportSeal::new(),
+                "claim".to_owned(),
+                kind,
+                true,
+                "unchecked".to_owned(),
+            );
+            assert!(!report.is_verified());
+            assert_eq!(report.standing(), ClaimStanding::Unbacked);
+        }
+    }
 }

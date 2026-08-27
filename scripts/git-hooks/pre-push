@@ -2,8 +2,9 @@
 # ay-script: pre-push-hook
 # In-tree pre-push hook: enforce zero active first-party Python test skips, run
 # the SMT soundness-differential gate, and re-measure the MILP node ratchet
-# before every push. This opt-in local coverage supplements the repository's
-# GitHub Actions checks.
+# before every push. This repo has NO GitHub Actions (owner policy); this opt-in
+# local coverage supplements the checked-in `ay gate solver` and
+# `publish/publish.sh check ay --check` that maintainers run by hand.
 #
 # INSTALL (the owner installs it; it is never forced):
 #     git config core.hooksPath scripts/git-hooks
@@ -20,12 +21,12 @@
 # gate that gets uninstalled:
 #
 #     cargo build --release -p ay-milp --example mps_solve   0s warm, ~2m15s cold
-#     milp_node_gate.py --check --tier all                   46.9s, 19 instances
+#     milp_node_gate.py --check --tier all                   ~77s, 20 instances
 #                                                            (44.8s solving, the
 #                                                             rest process start
 #                                                             + MPS parse)
 #
-# `--tier all`, not `--tier fast` (7.2s, 14 instances). The five extra instances
+# `--tier all`, not `--tier fast` (7.0s, 14 instances). The six extra instances
 # cost 37.6s of solving and buy pk1 (274,435 nodes) and mas76 (273,252) — the two largest
 # trees in the corpus and the only two big enough for a node-economy regression to
 # show up in them first. A push already pays for a build and the SMT gate; 47s more
@@ -110,7 +111,7 @@ done
 python3 "$REPO_ROOT/scripts/milp_node_gate.py" --check --tier all
 rc=$?
 case $rc in
-  0) echo "pre-push: MILP node ratchet PASSED (19 instances, exact)." ;;
+  0) echo "pre-push: MILP node ratchet PASSED (20 instances, exact)." ;;
   1) echo ""
      echo "pre-push: BLOCKED — a pinned node count, objective or status moved."
      echo "          If the change is INTENDED, ratchet it deliberately in the same commit:"

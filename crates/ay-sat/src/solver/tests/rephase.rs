@@ -209,6 +209,7 @@ fn test_best_rephase_uses_target_phase_for_missing_best_phase() {
     assert_eq!(stats.direct_changed_phases, 3);
 }
 
+mod large_band_arms;
 mod mode_schedules;
 // ========================================================================
 // Full Sequence Trace Tests
@@ -426,6 +427,41 @@ fn test_is_best_return_value_correctness() {
 // ========================================================================
 // NLOG3N Scheduling Function
 // ========================================================================
+
+/// A successful rephase walk (every included clause satisfied) must latch a
+/// verified model instead of discarding the success bool. All-positive
+/// binaries make walk() succeed immediately (unset phases default all-true),
+/// and stable-schedule slot 3 is Walk: O, I, (B, W, O, B, W, I)^w.
+#[test]
+fn test_rephase_walk_latches_verified_model() {
+    let mut solver = Solver::new(4);
+    for clause in [[1, 2], [2, 3], [3, 4]] {
+        let lits: Vec<Literal> = clause.iter().map(|&d| Literal::from_dimacs(d)).collect();
+        assert!(solver.add_clause(lits));
+    }
+    assert!(solver.phase_init.walk_enabled);
+    assert!(!solver.apply_stable_rephase_schedule(3));
+    let model = solver
+        .cold
+        .rephase_walk_model
+        .clone()
+        .expect("successful rephase walk must latch its model");
+    assert_eq!(model, vec![true; 4]);
+    assert!(solver.verify_model(&model));
+}
+
+/// `rephase()` must clear any previously latched walk model at entry so the
+/// pure-loop consumption sites can never observe a stale latch (e.g. one set
+/// during an assumption-context rephase). Walk-disabled slot 0 is Flip — no
+/// walk runs, so the latch must vanish purely from the entry clear.
+#[test]
+fn test_rephase_entry_clears_stale_walk_latch() {
+    let mut solver = Solver::new(4);
+    solver.set_walk_enabled(false);
+    solver.cold.rephase_walk_model = Some(vec![true; 4]);
+    solver.rephase();
+    assert!(solver.cold.rephase_walk_model.is_none());
+}
 
 /// Verify the NLOG3N scaling function produces expected values.
 #[test]

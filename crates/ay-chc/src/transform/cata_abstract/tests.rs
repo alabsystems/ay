@@ -10,101 +10,7 @@ use std::time::Duration;
 use super::*;
 use crate::{ChcDtConstructor, ChcDtSelector};
 
-/// Recursive `Lst = nil | cons(hd: Int, tl: Lst)`; the recursive tail field is
-/// an `Uninterpreted("Lst")` self-reference, exactly as the parser leaves it.
-fn list_sort() -> ChcSort {
-    ChcSort::Datatype {
-        name: "Lst".to_string(),
-        constructors: Arc::new(vec![
-            ChcDtConstructor {
-                name: "nil".to_string(),
-                selectors: vec![],
-            },
-            ChcDtConstructor {
-                name: "cons".to_string(),
-                selectors: vec![
-                    ChcDtSelector {
-                        name: "hd".to_string(),
-                        sort: ChcSort::Int,
-                    },
-                    ChcDtSelector {
-                        name: "tl".to_string(),
-                        sort: ChcSort::Uninterpreted("Lst".to_string()),
-                    },
-                ],
-            },
-        ]),
-    }
-}
-
-fn lst_var(name: &str) -> ChcVar {
-    ChcVar::new(name, list_sort())
-}
-
-fn nil() -> ChcExpr {
-    ChcExpr::FuncApp("nil".to_string(), list_sort(), vec![])
-}
-
-fn cons(hd: ChcExpr, tl: ChcExpr) -> ChcExpr {
-    ChcExpr::FuncApp(
-        "cons".to_string(),
-        list_sort(),
-        vec![Arc::new(hd), Arc::new(tl)],
-    )
-}
-
-/// `R(x, y)` relating equal-shape lists:
-///   x = nil ∧ y = nil                     ⇒ R(x, y)
-///   R(x, y) ∧ x' = cons(a,x) ∧ y' = cons(b,y) ⇒ R(x', y')
-///   R(x, y) ∧ x = nil ∧ y = cons(c, d)    ⇒ false          (SAFE)
-fn equal_shape_problem() -> ChcProblem {
-    let mut problem = ChcProblem::new();
-    let r = problem.declare_predicate("R", vec![list_sort(), list_sort()]);
-
-    let x = lst_var("x");
-    let y = lst_var("y");
-    let xp = lst_var("xp");
-    let yp = lst_var("yp");
-    let a = ChcVar::new("a", ChcSort::Int);
-    let b = ChcVar::new("b", ChcSort::Int);
-    let c = ChcVar::new("c", ChcSort::Int);
-    let d = lst_var("d");
-
-    problem.add_clause(HornClause::new(
-        ClauseBody::constraint(ChcExpr::and(
-            ChcExpr::eq(ChcExpr::var(x.clone()), nil()),
-            ChcExpr::eq(ChcExpr::var(y.clone()), nil()),
-        )),
-        ClauseHead::Predicate(r, vec![ChcExpr::var(x.clone()), ChcExpr::var(y.clone())]),
-    ));
-    problem.add_clause(HornClause::new(
-        ClauseBody::new(
-            vec![(r, vec![ChcExpr::var(x.clone()), ChcExpr::var(y.clone())])],
-            Some(ChcExpr::and(
-                ChcExpr::eq(
-                    ChcExpr::var(xp.clone()),
-                    cons(ChcExpr::var(a), ChcExpr::var(x.clone())),
-                ),
-                ChcExpr::eq(
-                    ChcExpr::var(yp.clone()),
-                    cons(ChcExpr::var(b), ChcExpr::var(y.clone())),
-                ),
-            )),
-        ),
-        ClauseHead::Predicate(r, vec![ChcExpr::var(xp), ChcExpr::var(yp)]),
-    ));
-    problem.add_clause(HornClause::new(
-        ClauseBody::new(
-            vec![(r, vec![ChcExpr::var(x.clone()), ChcExpr::var(y.clone())])],
-            Some(ChcExpr::and(
-                ChcExpr::eq(ChcExpr::var(x), nil()),
-                ChcExpr::eq(ChcExpr::var(y), cons(ChcExpr::var(c), ChcExpr::var(d))),
-            )),
-        ),
-        ClauseHead::False,
-    ));
-    problem
-}
+include!("tests/fixtures.rs");
 
 #[test]
 fn ladder_is_nonempty_for_recursive_list_problem() {
@@ -187,6 +93,74 @@ fn obligations_discharge_with_full_pool() {
     assert!(
         abstraction.discharge_obligations(Duration::from_secs(8), None),
         "full-pool obligations must discharge unsat"
+    );
+}
+
+/// EQUIVALENCE PIN for the monolithic-first discharge: whenever the gate
+/// certifies an abstraction, EVERY per-conjunct sub-obligation is independently
+/// `unsat` too. The whole-clause script `θ ∧ ¬(⋀ᵢ θ#ᵢ) ⊨ ⊥` is the clause
+/// obligation itself, so this must hold by construction — the pin is here so a
+/// future change to either script shape cannot silently let the fast path
+/// certify something the per-conjunct gate would reject.
+#[test]
+fn monolithic_discharge_agrees_with_every_sub_obligation() {
+    let problem = equal_shape_problem();
+    let pool = vec![CataKind::Size, CataKind::RootDisc];
+    let abstraction = CataAbstraction::build(&problem, &pool).expect("abstraction applies");
+    assert!(
+        abstraction.discharge_obligations(Duration::from_secs(5), None),
+        "gate must certify this abstraction"
+    );
+    for obligation in &abstraction.obligations {
+        for (i, sub) in obligation.sub_scripts.iter().enumerate() {
+            assert!(
+                run_obligation_expect_unsat(sub, Duration::from_secs(5)),
+                "clause {} sub-obligation {i} is not unsat, but the gate certified the \
+                 abstraction: {sub}",
+                obligation.clause_index
+            );
+        }
+    }
+}
+
+/// The gate is RESUMABLE: an attempt cut short by its deadline reports
+/// `Exhausted` (never `Discharged`), keeps the obligations it already proved,
+/// and a later attempt finishes from there rather than re-proving them.
+#[test]
+fn obligation_gate_resumes_after_an_exhausted_attempt() {
+    let problem = equal_shape_problem();
+    let pool = vec![CataKind::Size, CataKind::RootDisc];
+    let abstraction = CataAbstraction::build(&problem, &pool).expect("abstraction applies");
+
+    // A deadline already in the past: no sub-query can run, so the gate must
+    // withhold — the fail-closed polarity an exhausted attempt must keep.
+    let now = Instant::now();
+    let past = match now.checked_sub(Duration::from_secs(1)) {
+        Some(past) => past,
+        None => now,
+    };
+    assert_eq!(
+        abstraction.run_obligation_gate(Duration::from_secs(5), Some(past)),
+        ObligationGate::Exhausted,
+        "an expired deadline must withhold, never certify"
+    );
+    assert!(
+        !abstraction.discharge_obligations(Duration::from_millis(1), Some(past)),
+        "discharge_obligations must report an exhausted gate as NOT discharged"
+    );
+
+    // With real time available the same abstraction certifies, and every
+    // obligation is then marked done.
+    assert_eq!(
+        abstraction.run_obligation_gate(Duration::from_secs(5), None),
+        ObligationGate::Discharged,
+        "the resumed gate must finish the outstanding obligations"
+    );
+    // A repeat run is answered from the memo: still Discharged, no new queries.
+    assert_eq!(
+        abstraction.run_obligation_gate(Duration::from_secs(5), Some(past)),
+        ObligationGate::Discharged,
+        "a fully discharged gate stays discharged without re-running queries"
     );
 }
 

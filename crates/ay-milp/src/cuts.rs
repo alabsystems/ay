@@ -1918,7 +1918,7 @@ pub(crate) fn cover_ext_rounds() -> usize {
 /// grows ~20x on the cut-laden degenerate relaxation and the share-based budget spends it
 /// (interleaved pairs: 17.5s base vs 29.9s with the extension; EXT off on the same binary
 /// reproduces base). Until SB probe pricing on cut-heavy LPs is fixed, the extension buys
-/// bound, not wall. `AY_MILP_MIR_EXT_ROUNDS=40` re-enables for that work.
+/// bound, not wall. Historical measurements used a 40-round extension arm for that work.
 ///
 /// 2026-07-15 — SB PROBE PRICING FIXED, AND IT WAS NOT ENOUGH. The limited-iteration probe
 /// (`PROBE_DUAL_ITERS`, bab.rs: 25 dual pivots per probe, early-stopped duals certify the
@@ -1933,7 +1933,7 @@ pub(crate) fn cover_ext_rounds() -> usize {
 /// no probe budget at which the cuts pay in wall. What is left is not probe pricing — it is
 /// that CHEAP probes carry no ranking signal on a degenerate LP (degeneracy-aware seeding, or
 /// cheaper node LPs on cut rows, are the next levers). The extension still buys bound, not
-/// wall; `AY_MILP_MIR_EXT_ROUNDS=40` re-enables for that work.
+/// wall; historical measurements used the same 40-round extension arm for that work.
 ///
 /// 2026-07-16 — RE-MEASURED AFTER THE DUAL OBJECTIVE CUTOFF SHIPPED, STILL NET-NEGATIVE. The
 /// cutoff cut the extension run's absolute wall almost in half (23.5s -> 14.2s) — but the
@@ -1951,27 +1951,27 @@ pub(crate) fn mir_ext_rounds() -> usize {
     MAX_MIR_EXT_ROUNDS
 }
 
-/// The MIR extension rounds a MIXED-INTEGER-KNAPSACK / MIXING model earns even though the
+/// The MIR extension rounds a mixed-integer-knapsack model earns even though the
 /// global default (`MAX_MIR_EXT_ROUNDS`) ships at 0. The default is 0 because on qnet1 —
 /// a degenerate equality-flow relaxation — the extended rounds buy bound the strong-branch
 /// pricing then confiscates in WALL (see the note above `MAX_MIR_EXT_ROUNDS`). That
-/// confiscation is specific to that structure; it does NOT occur on the mik/mixing shape,
+/// confiscation is specific to that structure; it does NOT occur on the MIK shape,
 /// where the family closes the dual gap that single-row MIR saturates weak on at the root
 /// (measured on mik-250-20-75-4: rigorous dual −54936 → −53702 over 60s). Gated by
 /// [`is_mixed_integer_knapsack`], which every home-corpus instance fails, so the extension
 /// stays off — and the 16 stay bit-identical — everywhere it does not pay.
 const MIK_MIR_EXT_ROUNDS: usize = 50;
 
-/// The MIR extension round cap for a mixed-integer-knapsack model (see `MIK_MIR_EXT_ROUNDS`),
-/// overridable by `AY_MILP_MIK_MIR_EXT_ROUNDS` for measurement. A backstop, not a budget —
-/// the extension self-terminates the round the family stops moving the bound materially.
+/// The fixed MIR extension round cap for a mixed-integer-knapsack model (see
+/// `MIK_MIR_EXT_ROUNDS`). A backstop, not a budget — the extension self-terminates the round the
+/// family stops moving the bound materially.
 pub(crate) fn mik_mir_ext_rounds() -> usize {
     MIK_MIR_EXT_ROUNDS
 }
 
-/// A MIXED-INTEGER KNAPSACK / MIXING model: every constraint an upper-bounded knapsack
+/// A mixed-integer-knapsack model: every constraint is an upper-bounded knapsack
 /// (`Σ a·x ≤ b`, no equality or `≥` row), at least one continuous "capacity" column and
-/// at least one integral (general-integer OR binary) column, and — the mixing signature —
+/// at least one integral (general-integer OR binary) column, and — the shared-capacity signature —
 /// a continuous column SHARED across many rows. mik-* is the archetype: mik-250-20-75-4 has
 /// 20 continuous columns each shared across ~76 of 195 knapsack rows, and 250 integer columns
 /// that all carry an upper bound of 1 (so they load as `Binary`). This is the structure where
@@ -1986,7 +1986,7 @@ pub(crate) fn mik_mir_ext_rounds() -> usize {
 /// an equality or `≥` row and so fails it; the only all-`≤` home instance, p0201, has ZERO
 /// continuous columns (`has_cont` false). The 3 prior wins (b-ball, enlight*) and the 6 ext
 /// OPTIMALs all carry `E`/`G` rows too. So the corpus stays bit-identical — the gate fires ONLY on
-/// the mik/mixing shape.
+/// the MIK shape.
 pub(crate) fn is_mixed_integer_knapsack(model: &Model) -> bool {
     // The f64 matrix is advice only when an exact-rational side store is present.
     // This structural gate would otherwise classify the proxy model and arm cut
@@ -2009,14 +2009,14 @@ pub(crate) fn is_mixed_integer_knapsack(model: &Model) -> bool {
             // model loads them as `Binary`, not `Integer`. The old `has_gen_int` requirement
             // therefore NEVER fired on the instance this gate was written for — the extension was
             // dead on real mik. What the rounding needs is any INTEGRAL column, binary or general;
-            // the mixing/knapsack strength does not depend on the integers having range > 1.
+            // the knapsack strength does not depend on the integers having range > 1.
             //
             // SAFETY (the gate stays narrow because the ALL-`≤` test below is the real
             // discriminator): among the 16 home instances only p0201 is all-`≤`, and p0201 has
             // ZERO continuous columns (`has_cont` false), so it still fails here; every other home
             // instance carries an equality or `≥` row. The 3 prior wins (b-ball, enlight*) and the
             // 6 ext OPTIMALs all carry `E`/`G` rows too. So this widening is bit-identical on the
-            // whole corpus — it changes ONLY the mik/mixing shape, which is its entire purpose.
+            // whole corpus — it changes ONLY the MIK shape, which is its entire purpose.
             ColKind::Integer | ColKind::Binary => has_int = true,
         }
     }
@@ -2038,7 +2038,7 @@ pub(crate) fn is_mixed_integer_knapsack(model: &Model) -> bool {
             }
         }
     }
-    // The mixing signature: a continuous column shared across many rows.
+    // The shared-capacity signature: a continuous column used across many rows.
     cont_rowcount.iter().any(|&n| n >= 10)
 }
 
@@ -2046,11 +2046,11 @@ pub(crate) fn is_mixed_integer_knapsack(model: &Model) -> bool {
 mod mik_gate_tests {
     use super::*;
 
-    /// The mixed-integer-knapsack gate must FIRE on the mik/mixing shape and must NOT fire on
+    /// The mixed-integer-knapsack gate must FIRE on the MIK shape and must NOT fire on
     /// any shape a home instance has -- it arms extra MIR rounds, so a false positive would
     /// change one of the 16's proven values (the whole gate exists to keep them bit-identical).
     #[test]
-    fn mik_gate_selects_mixing_and_rejects_home_shapes() {
+    fn mik_gate_selects_extended_mir_and_rejects_home_shapes() {
         // mik shape: all `<=` rows, a continuous capacity column shared across many rows,
         // general-integer columns for the rounding.
         {
@@ -2064,7 +2064,7 @@ mod mik_gate_tests {
                 }
                 m.add_row(f64::NEG_INFINITY, 20.0, &terms); // <= knapsack, shares `s`
             }
-            assert!(is_mixed_integer_knapsack(&m), "mik/mixing shape must fire");
+            assert!(is_mixed_integer_knapsack(&m), "MIK shape must fire");
         }
         // Equality-flow shape (qnet1/rout/dcmulti/gen/blend2 all carry equality rows): reject.
         {
@@ -2120,7 +2120,7 @@ mod mik_gate_tests {
                 "pure-binary mixed knapsack (the real mik shape) must fire"
             );
         }
-        // Continuous column NOT shared across rows (no mixing signature): reject.
+        // Continuous column NOT shared across rows (no shared-capacity signature): reject.
         {
             let mut m = Model::new();
             let ys: Vec<Col> = (0..12).map(|_| m.add_int_col(0.0, 5.0)).collect();
@@ -2134,7 +2134,7 @@ mod mik_gate_tests {
             }
             assert!(
                 !is_mixed_integer_knapsack(&m),
-                "unshared continuous columns: no mixing signature, reject"
+                "unshared continuous columns: no shared-capacity signature, reject"
             );
         }
     }
@@ -2156,8 +2156,19 @@ mod mik_gate_tests {
 /// fixed-charge network's switch binary lives ONLY in its VUB row (rout, khb05250, qiu — the
 /// capacity/conservation rows carry no binary), and qnet1's VUB'd columns are INTEGER, so
 /// none of them can satisfy "a ≥3-term row contains both the VUB'd continuous column and its
-/// switch". Measured on the corpus this gate is therefore inert; on the safenlp captures it
-/// counts 112/112 pairs.
+/// switch". On the safenlp captures the pair test counts 112/112.
+///
+/// The confirming row must belong to one pair. The former "any row mentioning both"
+/// test let one dense fixed-charge row confirm every pair: `gen`'s one 582-term row
+/// confirmed 432/432 pairs, while real safenlp rows each confirmed one (99–112/99–112).
+/// `rout` similarly had 155 apparent confirmations in 38–46-term aggregates and zero
+/// one-pair confirmations. Requiring at most one VUB pair per confirming row expresses
+/// the diagram above directly; no numeric threshold or tolerance is involved.
+///
+/// The false positive cost `gen` 30% wall (0.519s → 0.675s) on an identical nine-node
+/// tree: MIR rows grew 214 → 1,945, rounds 4 → 7, simplex iterations 10,285 → 18,090,
+/// and allocations 4.66M → 8.82M for only 0.37 more root bound. The corrected gate
+/// restores four solves / 10,285 iterations and retains every real capture pair.
 ///
 /// What the gate arms (all in `add_root_cuts`):
 ///   * `separate_mir_agg` in EVERY MIR-class round — the family that closes this class's
@@ -2193,26 +2204,36 @@ pub(crate) fn is_bigm_indicator(model: &Model) -> bool {
     if pair_of.len() < BIGM_MIN_PAIRS {
         return false;
     }
-    // A pair is CONFIRMED when some ≥3-term row names both members.
+    // A pair is CONFIRMED by its OWN big-M row: a ≥3-term row that names both members and
+    // names EXACTLY ONE of the pairs. A row naming two or more is an aggregate over several
+    // indicators, not any one indicator's big-M row — see the table in this function's doc for
+    // what admitting those cost.
     let mut confirmed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for r in 0..nrows {
         let (coeffs, _, _) = model.row(Row(r as u32));
         if coeffs.len() < 3 {
             continue;
         }
+        let mut sole: Option<usize> = None;
         for &(c, a) in coeffs {
             if a == 0.0 {
                 continue;
             }
             let y = c as usize;
-            if confirmed.contains(&y) {
+            let Some(&z) = pair_of.get(&y) else {
+                continue;
+            };
+            if !coeffs.iter().any(|&(c2, a2)| c2 as usize == z && a2 != 0.0) {
                 continue;
             }
-            if let Some(&z) = pair_of.get(&y) {
-                if coeffs.iter().any(|&(c2, a2)| c2 as usize == z && a2 != 0.0) {
-                    confirmed.insert(y);
-                }
+            if sole.is_some() {
+                sole = None; // a second pair in the same row: an aggregate, not a big-M row
+                break;
             }
+            sole = Some(y);
+        }
+        if let Some(y) = sole {
+            confirmed.insert(y);
         }
         if confirmed.len() >= pair_of.len() {
             break;
@@ -2247,55 +2268,7 @@ pub(crate) fn bigm_mir_ext_cuts_per_round() -> usize {
 
 #[cfg(test)]
 mod bigm_gate_tests {
-    use super::*;
-
-    /// Build one indicator neuron: pre-activation x in [l, u] (free column), output
-    /// y in [0, u], switch z binary, rows `y − u·z <= 0` and `−x + y + |l|·z <= |l|`.
-    fn add_neuron(m: &mut Model, l: f64, u: f64) -> (Col, Col, Col) {
-        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
-        let y = m.add_col(0.0, u);
-        let z = m.add_binary_col();
-        m.add_row(f64::NEG_INFINITY, 0.0, &[(y, 1.0), (z, -u)]);
-        m.add_row(f64::NEG_INFINITY, -l, &[(x, -1.0), (y, 1.0), (z, -l)]);
-        (x, y, z)
-    }
-
-    #[test]
-    fn bigm_gate_fires_on_the_indicator_shape_and_not_on_fixed_charge() {
-        // The safenlp shape in miniature: BIGM_MIN_PAIRS paired ReLU neurons.
-        let mut m = Model::new();
-        for _ in 0..BIGM_MIN_PAIRS {
-            add_neuron(&mut m, -0.5, 0.75);
-        }
-        assert!(
-            is_bigm_indicator(&m),
-            "paired big-M indicator rows must fire the gate"
-        );
-
-        // Fixed-charge shape (rout/khb05250): VUB rows exist, but no wider row ever
-        // names the switch binary — the capacity row is over the flows alone.
-        let mut fc = Model::new();
-        let mut flows = Vec::new();
-        for _ in 0..BIGM_MIN_PAIRS {
-            let x = fc.add_col(0.0, f64::INFINITY);
-            let z = fc.add_binary_col();
-            fc.add_row(f64::NEG_INFINITY, 0.0, &[(x, 1.0), (z, -40.0)]);
-            flows.push(x);
-        }
-        let cap: Vec<(Col, f64)> = flows.iter().map(|&x| (x, 1.0)).collect();
-        fc.add_row(f64::NEG_INFINITY, 100.0, &cap);
-        assert!(
-            !is_bigm_indicator(&fc),
-            "a fixed-charge network (no row naming both y and z) must NOT fire"
-        );
-
-        // Below the pair floor: never fires, however clean the pairs.
-        let mut tiny = Model::new();
-        for _ in 0..(BIGM_MIN_PAIRS - 1) {
-            add_neuron(&mut tiny, -0.5, 0.75);
-        }
-        assert!(!is_bigm_indicator(&tiny), "under the pair floor: inert");
-    }
+    include!("cuts/bigm_gate_tests.rs");
 }
 
 /// How many MIR-class rows one EXTENSION round may adopt -- its own budget, like the aggregated
@@ -2359,8 +2332,8 @@ fn knap_dbg() -> bool {
 /// This exists because the stage-two gate is unreachable on the instance the family was written
 /// for: `add_root_cuts` enters stage two only when `fresh.is_empty()`, and on qnet1 plain MIR
 /// separates four cuts in every one of its 21 extended rounds, so the aggregation walk had
-/// literally never executed there (traced: zero `mir_agg` lines under
-/// `AY_MILP_MIR_EXT_ROUNDS=40`).
+/// literally never executed there (traced: zero `mir_agg` lines in the historical 40-round
+/// run).
 ///
 /// DEFAULT-OFF, and the reason is measured, not cautionary — see the campaign note on
 /// `separate_mir_agg`. Off, every call site is skipped before any model scan, so the corpus is
@@ -3359,7 +3332,7 @@ const MIR_AGG_MAX_EVALS: usize = 1024;
 ///
 /// Stage two is reached only when the PLAIN family dries up mid-round (see the `fresh.is_empty()`
 /// gate in `add_root_cuts`). On qnet1 the plain family never dries up, so this separator has
-/// never actually run there: `AY_MILP_MIR_EXT_ROUNDS=40` climbs to 15,465 over 21 rounds with
+/// never actually run there: the historical 40-round arm climbed to 15,465 over 21 rounds with
 /// ZERO `mir_agg` evals (traced). `the mir-agg-root knob` admits it into every root round the
 /// MIR-class families separate in, so the family can be measured against the root bound directly.
 /// DEFAULT-OFF: see [`mir_agg_root`] for the measured verdict.
@@ -3668,421 +3641,6 @@ pub(crate) fn separate_mir_agg(model: &Model, x: &[f64], n_rows: usize, budget: 
 
 mod mir_chain;
 pub(crate) use mir_chain::separate_mir_chain_agg;
-
-// ---------------------------------------------------------------------------------------------
-// GÜNLÜK–POCHET MIXING CUTS, from the shared lower-bounding continuous of a mixing set.
-// ---------------------------------------------------------------------------------------------
-
-/// One usable mixing row `Σ_j a_ij x_j − Σ_{k∈K_i} s_k <= b_i`, split into its structural (integer)
-/// terms and the continuous columns that lower-bound it (members of `S`).
-struct MixRow {
-    /// Right-hand side `b_i`, exact.
-    b: BigRational,
-    /// `(col, a_ij)` for the structural (non-continuous) columns, exact.
-    int_terms: Vec<(usize, BigRational)>,
-    /// The continuous columns present with coefficient in `[−1, 0]` — the `s_k` that `S` covers.
-    cont_cols: Vec<usize>,
-}
-
-/// GÜNLÜK–POCHET MIXING INEQUALITIES on the shared lower-bounding continuous of a mixed-integer
-/// knapsack ("mixing") set — the ONE family that structurally reaches past the rank-1 single-row
-/// MIR closure that `separate_mir`/`separate_strongcg` saturate on mik-* instances.
-///
-/// # The set, and why single-row MIR cannot close it
-///
-/// The mik/mixing rows are `Σ_j a_ij x_j − Σ_{k∈K_i} s_k <= b_i`, `a,b` integer, `x >= 0` integer,
-/// `s_k >= 0` continuous. Let `S := Σ_{k∈C} s_k` over the shared continuous columns. Each row gives
-/// `Σ_{k∈K_i} s_k >= Σ_j a_ij x_j − b_i =: ρ_i(x)`, and since the other `s_k >= 0`,
-///
-/// ```text
-///   S  >=  Σ_{k∈K_i} s_k  >=  ρ_i(x)      for EVERY row i,   and   S >= 0,
-/// ```
-///
-/// so the feasible set projects onto the MIXING SET `M = {(S,x): S >= ρ_i(x) ∀i, S >= 0}`, with
-/// `ρ_i` integer-valued on integer `x`. Single-row MIR rounds each `S >= ρ_i(x)` in ISOLATION; the
-/// mik dual gap is exactly the facets that COUPLE many rows through the shared `S`, which no single
-/// δ and no number of rounds of the single-row family can express (measured: the mik dual saturates
-/// well short of the optimum). Row AGGREGATION cannot form them either — cancelling a shared `−1`
-/// continuous between two `<=` rows needs a NEGATIVE multiplier, which flips the `<=` sense.
-///
-/// # The cut (Günlük–Pochet type-I), derived so it is SOUND by construction
-///
-/// Scale a chosen row set by `δ > 0`: `β_i = b_i/δ`, and since `x_j >= 0`,
-/// `Σ_j (a_ij/δ) x_j >= Σ_j ⌊a_ij/δ⌋ x_j =: G_i(x)` (an integer). So `S/δ >= G_i(x) − β_i`, i.e.
-/// with `z_i := G_i(x) − ⌊β_i⌋ ∈ Z` and `μ_i := β_i − ⌊β_i⌋ ∈ (0,1)`,
-///
-/// ```text
-///   t := S/δ >= 0,      t >= z_i − μ_i     for each row i.
-/// ```
-///
-/// Order a subset `T = {t_1..t_r}` by INCREASING `μ` (`0 < μ_{t_1} <= … <= μ_{t_r} < 1`,
-/// `μ_{t_{r+1}} := 1`). After mapping `t >= z_i - μ_i` to the canonical
-/// Günlük–Pochet form, the type-I mixing inequality is
-///
-/// ```text
-///   t  >=  Σ_{l=1}^r (μ_{t_{l+1}} − μ_{t_l}) · z_{t_l}
-/// ```
-///
-/// is valid for `M` (Günlük–Pochet 2001) — the telescoping weights `μ_{t_{l+1}} − μ_{t_l}` are `>= 0`
-/// exactly because `μ` is sorted INCREASING, which is the load-bearing invariant a weak
-/// implementation gets wrong. Multiplying by `δ` and substituting `G_i, z_i` back gives the stored
-/// cut
-///
-/// ```text
-///   Σ_{k∈S} s_k  −  δ Σ_l (μ_{l+1} − μ_l) Σ_j ⌊a_{t_l,j}/δ⌋ x_j  >=  − δ Σ_l (μ_{l+1} − μ_l) ⌊β_{t_l}⌋,
-/// ```
-///
-/// a `>=` cut valid for `M ⊇` the projection of the MILP feasible set, so it removes only
-/// FRACTIONAL points. Every coefficient is exact `BigRational`; the `f64` cut has its right-hand
-/// side RELAXED DOWN by the rounding damage (`Σ |ĉ_j − c_j| · max|x_j|`) so it is IMPLIED by the
-/// exact one. `mixing_cuts_never_remove_an_integer_point` brute-forces the guarantee.
-///
-/// The production call site gates on `is_mixed_integer_knapsack` — the same gate the extended MIR
-/// rounds are armed by, which excludes every one of the 16 home instances — and this function
-/// Checks local signatures; see `cuts/mixing_history.md`. Exact-side-store models fail closed.
-pub(crate) fn separate_mixing(model: &Model, x: &[f64], n_rows: usize, budget: usize) -> Vec<Cut> {
-    if budget == 0 || false || model.has_inexact_coeffs() {
-        return Vec::new();
-    }
-    // NOTE ON THE GATE. The corpus-identity guarantee comes from the CALL SITE, which only invokes
-    // this on `is_mixed_integer_knapsack(model)` — the ORIGINAL model. We cannot re-check that here
-    // because the caller passes the WORKING model (`work`), which by the extension rounds has
-    // accumulated `>=` cut rows and would fail the "every constraint is `<=`" test. So the internal
-    // guard is the MIXING SIGNATURE detected directly on the `<=` rows below (a continuous column
-    // shared across many of them), which tolerates the added cut rows.
-    let n_rows = n_rows.min(model.num_rows());
-    let ncols = model.num_cols();
-    let is_cont = |j: usize| matches!(model.col_kind(Col(j as u32)), ColKind::Continuous);
-    // C: continuous columns with lower bound >= 0 (all the derivation needs of `s_k` is `s_k >= 0`).
-    let cont_ok: Vec<bool> = (0..ncols)
-        .map(|j| is_cont(j) && model.col_bounds(Col(j as u32)).0 >= 0.0)
-        .collect();
-
-    let mut rows: Vec<MixRow> = Vec::new();
-    for r in 0..n_rows {
-        let (coeffs, lb, ub) = model.row(Row(r as u32));
-        if lb.is_finite() || !ub.is_finite() {
-            continue; // must be a pure `<=` knapsack row
-        }
-        let mut ok = true;
-        let mut cont_cols: Vec<usize> = Vec::new();
-        let mut int_terms: Vec<(usize, BigRational)> = Vec::new();
-        for &(c, a) in coeffs {
-            if a == 0.0 {
-                continue;
-            }
-            let cj = c as usize;
-            if is_cont(cj) {
-                // A continuous member of `S`: must be in C and LOWER-BOUND the row (coeff ∈ [−1,0]),
-                // so `S >= Σ_{k∈row} (−a_ik) s_k >= ρ_i(x)` holds.
-                if !cont_ok[cj] || !(-1.0..=0.0).contains(&a) {
-                    ok = false;
-                    break;
-                }
-                cont_cols.push(cj);
-            } else {
-                // A structural column: the `Σ(a/δ)x >= Σ⌊a/δ⌋x` relaxation needs `x_j >= 0`.
-                if model.col_bounds(Col(c)).0 < 0.0 {
-                    ok = false;
-                    break;
-                }
-                let Some(av) = exact(a) else {
-                    ok = false;
-                    break;
-                };
-                int_terms.push((cj, av));
-            }
-        }
-        if !ok || cont_cols.is_empty() || int_terms.is_empty() {
-            continue;
-        }
-        let Some(b) = exact(ub) else {
-            continue;
-        };
-        rows.push(MixRow {
-            b,
-            int_terms,
-            cont_cols,
-        });
-    }
-    if crate::debug_flags::milp_debug_flags().trace {
-        eprintln!(
-            "--trace   mixing ENTER: {} usable rows of {} (ncols {})",
-            rows.len(),
-            n_rows,
-            ncols
-        );
-    }
-    if rows.len() < 2 {
-        return Vec::new(); // a mixing cut needs a multi-row set to beat single-row MIR
-    }
-    // The MIXING SIGNATURE, checked on the `<=` rows we kept (so it survives the added cut rows in
-    // `work`): a continuous column shared across many rows — the same discriminator
-    // `is_mixed_integer_knapsack` uses, which excludes every home instance.
-    {
-        let mut cont_rowcount: std::collections::HashMap<usize, u32> =
-            std::collections::HashMap::new();
-        for row in &rows {
-            for &k in &row.cont_cols {
-                *cont_rowcount.entry(k).or_insert(0) += 1;
-            }
-        }
-        if !cont_rowcount.values().any(|&n| n >= 10) {
-            return Vec::new();
-        }
-    }
-
-    // The divisor scan, the same shape as `best_over_deltas`: δ = 1 does nothing here (`b_i` integer
-    // ⇒ `β_i` integer ⇒ `μ_i = 0`), so the useful scalings are the structural coefficient
-    // magnitudes (and their doublings), which is where `b_i/δ` lands fractional and the floors
-    // couple across rows.
-    let deltas = mixing_deltas(&rows);
-    let mut cand: Vec<Cut> = Vec::new();
-    for delta in &deltas {
-        if let Some(cut) = mixing_from_rows(model, x, &rows, delta) {
-            cand.push(cut);
-        }
-    }
-    cand.sort_by(|a, b| {
-        efficacy(b, x)
-            .partial_cmp(&efficacy(a, x))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    if crate::debug_flags::milp_debug_flags().trace {
-        eprintln!(
-            "--trace   mixing: {} rows, {} deltas, {} candidates, best efficacy {:.4}, kept {}",
-            rows.len(),
-            deltas.len(),
-            cand.len(),
-            cand.first().map(|c| efficacy(c, x)).unwrap_or(0.0),
-            cand.len().min(budget)
-        );
-    }
-    cand.truncate(budget);
-    cand
-}
-
-/// The divisor list for the mixing scan: distinct structural coefficient magnitudes across the
-/// mixing rows plus their doublings, capped. `best_over_deltas` keys the single-row family on the
-/// SAME magnitudes; the mixing cut reuses them to couple rows the single-row family rounds alone.
-fn mixing_deltas(rows: &[MixRow]) -> Vec<BigRational> {
-    const MIX_MAX_DELTAS: usize = 64;
-    let cap = MIX_MAX_DELTAS.max(1);
-    let mut mags: Vec<BigRational> = Vec::new();
-    for row in rows {
-        for (_, a) in &row.int_terms {
-            let m = a.abs();
-            if !m.is_zero() {
-                mags.push(m);
-            }
-        }
-    }
-    mags.sort();
-    mags.dedup();
-    // Keep an even spread of the distinct magnitudes when there are more than the cap allows, so a
-    // single dense band of coefficients cannot crowd out the rest of the range.
-    let mut out: Vec<BigRational> = if mags.len() <= cap {
-        mags
-    } else {
-        let step = mags.len() as f64 / cap as f64;
-        (0..cap)
-            .map(|k| mags[((k as f64) * step) as usize].clone())
-            .collect()
-    };
-    // ...and the doublings of the smallest few, the other half of the c-MIR family (`best_over_deltas`
-    // does the same): dividing by `2δ` lands the right-hand side on a different fraction.
-    let two = BigRational::from_integer(2.into());
-    let base = out.len().min(8);
-    for k in 0..base {
-        let d = &out[k] * &two;
-        if !out.contains(&d) {
-            out.push(d);
-        }
-    }
-    out
-}
-
-/// Build the single deepest Günlük–Pochet type-I mixing cut for one divisor `δ`, selecting the
-/// violated ordered row subset by a dynamic program over the μ-sorted candidates. Returns `None`
-/// when no violated multi-row cut exists for this `δ`.
-fn mixing_from_rows(model: &Model, x: &[f64], rows: &[MixRow], delta: &BigRational) -> Option<Cut> {
-    if delta.is_zero() || delta.is_negative() {
-        return None;
-    }
-
-    // Per-row mixing data at this δ. `mu = frac(b_i/δ) ∈ (0,1)`; `floors[j] = ⌊a_ij/δ⌋`;
-    // `z_f = Σ ⌊a/δ⌋ x_j − ⌊β_i⌋` is the value of the integer variable `z_i` at the LP point.
-    struct Cand<'a> {
-        mu: BigRational,
-        mu_f: f64,
-        z_f: f64,
-        floor_beta: BigRational,
-        floors: Vec<(usize, BigRational)>,
-        cont_cols: &'a [usize],
-    }
-    let mut cs: Vec<Cand<'_>> = Vec::new();
-    for row in rows {
-        let beta = &row.b / delta;
-        let fb = beta.floor();
-        let mu = &beta - &fb;
-        if mu.is_zero() {
-            continue; // integer β: no fractionality, nothing for this row to contribute
-        }
-        let mut floors: Vec<(usize, BigRational)> = Vec::with_capacity(row.int_terms.len());
-        let mut z_f = -to_f64(&fb);
-        for (j, a) in &row.int_terms {
-            let fa = (a / delta).floor();
-            if !fa.is_zero() {
-                z_f += to_f64(&fa) * x.get(*j).copied().unwrap_or(0.0);
-                floors.push((*j, fa));
-            }
-        }
-        cs.push(Cand {
-            mu_f: to_f64(&mu),
-            mu,
-            z_f,
-            floor_beta: fb,
-            floors,
-            cont_cols: &row.cont_cols,
-        });
-    }
-    if cs.len() < 2 {
-        return None;
-    }
-    // Sort by μ INCREASING — the Günlük–Pochet ordering. Mapping our `t >= z_i − μ_i` onto the
-    // canonical mixing set `s + Z_i >= B_i` (with `Z_i = −z_i`, `B_i = −μ_i`) gives fractionalities
-    // `f_i = 1 − μ_i`, and GP sorts by DECREASING `f`, i.e. INCREASING `μ`. Ties by z broken
-    // deterministically so the cut is reproducible.
-    cs.sort_by(|a, b| {
-        a.mu.cmp(&b.mu).then(
-            b.z_f
-                .partial_cmp(&a.z_f)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    });
-
-    // Pick the ordered subset maximizing the cut's LHS value `V = Σ_l (μ_{p_{l+1}} − μ_{p_l}) z_{p_l}`
-    // with the sentinel `μ_{p_{r+1}} := 1` (so the LARGEST-μ row carries weight `1 − μ_{p_r}` and
-    // the earlier ones `μ_{p_{l+1}} − μ_{p_l} >= 0`). Adding row `i` after `j` (`μ_j <= μ_i`) changes
-    // the running value by exactly `(1 − μ_i)(z_i − z_j)` — a clean DP over the μ-sorted list where
-    // `dp[i]` is the best `V` for a chain ENDING at i (its z carrying the sentinel weight `1 − μ_i`).
-    let rmax = 8.max(2);
-    let n = cs.len();
-    let mut dp = vec![f64::NEG_INFINITY; n];
-    let mut pred = vec![usize::MAX; n];
-    let mut sz = vec![1usize; n];
-    let mut best: (f64, usize) = (f64::NEG_INFINITY, usize::MAX);
-    for i in 0..n {
-        let g_i = 1.0 - cs[i].mu_f; // the sentinel weight `1 − μ_i` of i as the chain's last row
-        dp[i] = g_i * cs[i].z_f; // i chosen alone
-        pred[i] = usize::MAX;
-        sz[i] = 1;
-        for j in 0..i {
-            if sz[j] >= rmax {
-                continue;
-            }
-            let v = dp[j] + g_i * (cs[i].z_f - cs[j].z_f);
-            if v > dp[i] {
-                dp[i] = v;
-                pred[i] = j;
-                sz[i] = sz[j] + 1;
-            }
-        }
-        // Only multi-row chains are new strength; a singleton mixing cut is dominated by MIR.
-        if sz[i] >= 2 && dp[i] > best.0 {
-            best = (dp[i], i);
-        }
-    }
-    if best.1 == usize::MAX {
-        return None;
-    }
-
-    // Reconstruct the chain in increasing-μ order `p_1..p_r`.
-    let mut chain: Vec<usize> = Vec::new();
-    let mut i = best.1;
-    while i != usize::MAX {
-        chain.push(i);
-        i = pred[i];
-    }
-    chain.reverse();
-
-    // Assemble the exact cut  Σ_{k∈S} s_k − δ Σ_l w_l Σ_j ⌊a/δ⌋ x_j  >=  − δ Σ_l w_l ⌊β_l⌋,
-    // with w_l = μ_{[l+1]} − μ_{[l]} (μ_{[r+1]} = 1).
-    let mut sset: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    let mut xc: std::collections::BTreeMap<usize, BigRational> = std::collections::BTreeMap::new();
-    let mut rhs = BigRational::zero();
-    for (l, &ci) in chain.iter().enumerate() {
-        for &k in cs[ci].cont_cols {
-            sset.insert(k);
-        }
-        let mu_next = if l + 1 < chain.len() {
-            cs[chain[l + 1]].mu.clone()
-        } else {
-            BigRational::one() // sentinel μ_{p_{r+1}} := 1
-        };
-        let w = &mu_next - &cs[ci].mu; // >= 0 by the increasing-μ order (last row: 1 − μ)
-        if w.is_zero() {
-            continue;
-        }
-        let wd = delta * &w; // δ · w_l
-        for (j, fa) in &cs[ci].floors {
-            *xc.entry(*j).or_insert_with(BigRational::zero) -= &wd * fa;
-        }
-        rhs -= &wd * &cs[ci].floor_beta;
-    }
-    if sset.is_empty() {
-        return None;
-    }
-
-    // Down to f64, paying the rounding damage into the right-hand side so the stored cut is IMPLIED
-    // by the exact one. The `s_k` coefficients are exactly `1.0` (representable), so only the
-    // structural terms can damage.
-    let mut out: Vec<(Col, f64)> = Vec::with_capacity(sset.len() + xc.len());
-    for &k in &sset {
-        out.push((Col(k as u32), 1.0));
-    }
-    let mut damage = BigRational::zero();
-    for (j, c) in &xc {
-        if c.is_zero() {
-            continue;
-        }
-        let col = Col(*j as u32);
-        // A `>=` store, so an unbounded-but-signed column rounds outward for free; see
-        // `coef_to_f64`.
-        let (cf, cost) = coef_to_f64(model, col, c, CutSide::Ge)?;
-        damage += cost;
-        if cf != 0.0 {
-            out.push((col, cf));
-        }
-    }
-    // A `>=` cut: relax the right-hand side DOWNWARD by the damage, then nudge it down once more so
-    // the f64 conversion cannot tighten it (same convention as the GMI `>=` store).
-    let relaxed = &rhs - &damage;
-    let mut lb = to_f64(&relaxed);
-    if !lb.is_finite() {
-        return None;
-    }
-    lb -= lb.abs().mul_add(f64::EPSILON, f64::MIN_POSITIVE);
-
-    // Refuse absurd numbers exactly as `mir_round` does — a row the LP cannot be conditioned around
-    // is a wrecked basis, not a cut.
-    let hi = out.iter().map(|&(_, a)| a.abs()).fold(0.0f64, f64::max);
-    let lo = out
-        .iter()
-        .map(|&(_, a)| a.abs())
-        .filter(|&a| a > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    if hi > MAX_CUT_COEFF || lb.abs() > MAX_CUT_COEFF || hi / lo > MAX_CUT_DYNAMISM {
-        return None;
-    }
-
-    let cut = Cut {
-        coeffs: out,
-        lb,
-        ub: f64::INFINITY,
-    };
-    clears_min_violation(&cut, x).then_some(cut)
-}
 
 /// A REAL CUT LOOP WAS RUN, AND IT SETTLES THE QUESTION. Two facts, both measured on rout.
 ///
@@ -5613,7 +5171,7 @@ fn next_up(v: f64) -> f64 {
 /// inferred at each call site.
 #[derive(Clone, Copy)]
 enum CutSide {
-    /// `Σ c·x >= lb`, i.e. `Cut { lb, ub: f64::INFINITY }` -- GMI and mixing store this way.
+    /// `Σ c·x >= lb`, i.e. `Cut { lb, ub: f64::INFINITY }` -- GMI stores this way.
     Ge,
     /// `Σ c·x <= ub`, i.e. `Cut { lb: f64::NEG_INFINITY, ub }` -- MIR, strong CG and the
     /// aggregated tableau MIR store this way.
@@ -6739,259 +6297,6 @@ mod mir_tests {
         );
     }
 
-    /// A model with an exact-rational side store must be declined before the
-    /// separator reads any f64 proxy row. The exact control keeps this guard
-    /// non-vacuous: the same proxy matrix separates before an override exists.
-    #[test]
-    fn mixing_fails_closed_on_exact_side_store_models() {
-        let mut m = Model::new();
-        let s = m.add_col(0.0, 20.0);
-        let y = m.add_int_col(0.0, 3.0);
-        let mut rows = Vec::new();
-        for r in 0..12 {
-            let (row, proxy_ub) = if r % 2 == 0 {
-                (
-                    m.add_row(f64::NEG_INFINITY, 1.0, &[(s, -1.0), (y, 3.0)]),
-                    1_i64,
-                )
-            } else {
-                (
-                    m.add_row(f64::NEG_INFINITY, 2.0, &[(s, -1.0), (y, 4.0)]),
-                    2_i64,
-                )
-            };
-            rows.push((row, proxy_ub));
-        }
-        m.set_objective(&[(y, 1.0)], Sense::Minimize);
-        let x = vec![1.25, 0.75];
-        assert!(
-            !separate_mixing(&m, &x, m.num_rows(), 8).is_empty(),
-            "the exact proxy-matrix control must separate"
-        );
-
-        // 1 + 2^-53 rounds to the stored f64 proxy 1.0. The true row is
-        // marginally looser, so a cut proved only from the proxy is not licensed.
-        let eps = BigRational::new(1_i64.into(), 9_007_199_254_740_992_i64.into());
-        for (row, proxy_ub) in rows {
-            let true_ub = BigRational::from_integer(proxy_ub.into()) + &eps;
-            m.record_inexact_row_bound(row, false, true_ub);
-        }
-        assert!(m.has_inexact_coeffs());
-        assert!(!is_mixed_integer_knapsack(&m));
-        assert!(
-            separate_mixing(&m, &x, m.num_rows(), 8).is_empty(),
-            "mixing must fail closed instead of cutting the f64 proxy model"
-        );
-    }
-
-    /// Exercise the full structural domain admitted by the separator: signed
-    /// integer coefficients, continuous coefficients throughout `[−1, 0]`, and
-    /// differing continuous subsets. Every integer point uses `s0` alone to
-    /// construct an exactly feasible continuous completion; every separated cut
-    /// must retain it.
-    #[test]
-    fn mixing_cuts_cover_signed_weighted_and_subset_rows() {
-        const U: i64 = 3;
-        const SCAP: f64 = 256.0;
-        let mut m = Model::new();
-        let s: Vec<Col> = (0..3).map(|_| m.add_col(0.0, SCAP)).collect();
-        let y: Vec<Col> = (0..3).map(|_| m.add_int_col(0.0, U as f64)).collect();
-        let specs = [
-            ([1.0, 0.0, 0.0], [3.0, 0.0, 0.0], 1.0),
-            ([1.0, 0.0, 0.0], [4.0, 0.0, 0.0], 2.0),
-            ([0.5, 0.25, 0.0], [-2.0, 3.0, 0.0], -1.0),
-            ([0.25, 0.0, 1.0], [5.0, -1.0, 2.0], 2.0),
-            ([0.75, 0.5, 0.0], [-3.0, 0.0, 4.0], 0.0),
-            ([1.0, 0.0, 0.25], [2.0, -2.0, 5.0], 3.0),
-            ([0.5, 0.75, 0.0], [1.0, 4.0, -1.0], 1.0),
-            ([0.25, 0.0, 0.5], [-1.0, 5.0, 3.0], -2.0),
-            ([1.0, 0.25, 0.25], [4.0, -3.0, 1.0], 4.0),
-            ([0.75, 0.0, 0.5], [3.0, 2.0, -2.0], 0.0),
-            ([0.5, 1.0, 0.0], [-2.0, 1.0, 5.0], 2.0),
-            ([0.25, 0.5, 1.0], [5.0, -1.0, -3.0], -1.0),
-        ];
-        for (sw, ya, b) in specs {
-            let mut terms = Vec::new();
-            for k in 0..s.len() {
-                if sw[k] != 0.0 {
-                    terms.push((s[k], -sw[k]));
-                }
-            }
-            for j in 0..y.len() {
-                if ya[j] != 0.0 {
-                    terms.push((y[j], ya[j]));
-                }
-            }
-            m.add_row(f64::NEG_INFINITY, b, &terms);
-        }
-        m.set_objective(&[(y[0], 1.0)], Sense::Minimize);
-
-        // The first two rows expose the deterministic violated chain s0 >= 2*y0.
-        let x = vec![1.25, 0.0, 0.0, 0.75, 0.0, 0.0];
-        let cuts = separate_mixing(&m, &x, m.num_rows(), 8);
-        assert!(!cuts.is_empty(), "the broad structural guard is vacuous");
-
-        for code in 0..(U + 1).pow(y.len() as u32) {
-            let mut t = code;
-            let mut p = vec![0.0f64; s.len() + y.len()];
-            for &yc in &y {
-                p[yc.index()] = (t % (U + 1)) as f64;
-                t /= U + 1;
-            }
-            // Every row includes s0 with weight sw[0] > 0. Set the optional
-            // continuous columns to zero and choose the least s0 that satisfies
-            // all rows under that completion.
-            let mut s0 = 0.0f64;
-            for (sw, ya, b) in specs {
-                let rho: f64 = (0..y.len()).map(|j| ya[j] * p[y[j].index()]).sum::<f64>() - b;
-                s0 = s0.max(rho / sw[0]);
-            }
-            assert!(s0 <= SCAP);
-            p[s[0].index()] = s0;
-
-            for (sw, ya, b) in specs {
-                let act = (0..s.len()).map(|k| -sw[k] * p[s[k].index()]).sum::<f64>()
-                    + (0..y.len()).map(|j| ya[j] * p[y[j].index()]).sum::<f64>();
-                assert!(act <= b + 1e-9, "constructed completion is infeasible");
-            }
-            for cut in &cuts {
-                let act: f64 = cut
-                    .coeffs
-                    .iter()
-                    .map(|&(col, cf)| cf * p[col.index()])
-                    .sum();
-                assert!(
-                    act >= cut.lb - 1e-6,
-                    "mixing cut deleted signed/weighted feasible point {p:?}: {act} < {}",
-                    cut.lb
-                );
-            }
-        }
-    }
-
-    /// THE MIXING FAMILY OWES THE SAME GUARANTEE, and its own failure modes are the two invariants
-    /// the derivation leans on: the ordered subset MUST be sorted by INCREASING `μ` (a wrong order
-    /// makes a telescoping weight `μ_{l+1} − μ_l` NEGATIVE and the cut invalid), and the aggregate
-    /// continuous `S` must genuinely lower-bound `ρ_i(x)` for every row it is built from (so the
-    /// continuous coefficients must be in `[−1,0]` and `S` the sum of `s_k >= 0`).
-    ///
-    /// Random mixing sets carrying exactly that structure — a handful of shared continuous columns
-    /// with coefficient `−1` across many `<=` knapsack rows over small integer columns — with every
-    /// integer point enumerated and the continuous columns pinned to the MINIMAL feasible `S` (the
-    /// binding case for a `>=` cut whose continuous coefficients are all `+1`). If any cut deleted a
-    /// feasible integer point, this catches it.
-    #[test]
-    fn mixing_cuts_never_remove_an_integer_point() {
-        let mut seed = 0x31C1_2026_u64;
-        let mut rnd = || {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            (seed >> 33) as i64
-        };
-        const U: i64 = 3; // integer column range [0, U]
-        const NROWS: usize = 12; // >= 10 so `is_mixed_integer_knapsack` fires
-        const NY: usize = 3; // integer columns
-        const NS: usize = 2; // shared continuous columns
-        const SCAP: f64 = 60.0; // continuous upper bound (>= any achievable S)
-        let mut total_cuts = 0usize;
-
-        for case in 0..400 {
-            let mut m = Model::new();
-            // Continuous columns first, then integer — the mixing separator sums the continuous
-            // that lower-bound the rows into `S`.
-            let s: Vec<Col> = (0..NS).map(|_| m.add_col(0.0, SCAP)).collect();
-            let y: Vec<Col> = (0..NY).map(|_| m.add_int_col(0.0, U as f64)).collect();
-            let ncols = NS + NY;
-
-            // Each row: `Σ_j a_ij y_j − Σ_k s_k <= b_i`, `a` small positive, `b` a small constant so
-            // `ρ_i(y) = Σ a y − b` is sometimes positive (a non-trivial mixing set).
-            let mut rows: Vec<(Vec<f64>, f64)> = Vec::new(); // (dense coeffs over all cols, rhs)
-            for _ in 0..NROWS {
-                let mut dense = vec![0.0f64; ncols];
-                for sc in &s {
-                    dense[sc.index()] = -1.0;
-                }
-                let mut terms: Vec<(Col, f64)> = s.iter().map(|&c| (c, -1.0)).collect();
-                for (jj, &yc) in y.iter().enumerate() {
-                    let a = (1 + rnd().rem_euclid(5)) as f64;
-                    dense[yc.index()] = a;
-                    terms.push((yc, a));
-                    let _ = jj;
-                }
-                let b = rnd().rem_euclid(9) as f64;
-                m.add_row(f64::NEG_INFINITY, b, &terms);
-                rows.push((dense, b));
-            }
-            m.set_objective(&[(y[0], 1.0)], Sense::Minimize);
-
-            // Separate from a point with the continuous columns pinned LOW (so `S* = 0` and any
-            // cut with a positive right-hand side value is violated) and the integers fractional.
-            let mut x = vec![0.0f64; ncols];
-            for &yc in &y {
-                x[yc.index()] = rnd().rem_euclid(U * 10) as f64 / 10.0;
-            }
-            let cuts = separate_mixing(&m, &x, m.num_rows(), 8);
-            total_cuts += cuts.len();
-            if cuts.is_empty() {
-                continue;
-            }
-
-            // Enumerate every integer y; pin the continuous columns to the MINIMAL feasible S.
-            for code in 0..(U + 1).pow(NY as u32) {
-                let mut t = code;
-                let mut p = vec![0.0f64; ncols];
-                for &yc in &y {
-                    p[yc.index()] = (t % (U + 1)) as f64;
-                    t /= U + 1;
-                }
-                // Minimal feasible S = max(0, max_i ρ_i(y)); split across the continuous columns.
-                let mut s_min = 0.0f64;
-                for (dense, b) in &rows {
-                    let rho: f64 = y
-                        .iter()
-                        .map(|&yc| dense[yc.index()] * p[yc.index()])
-                        .sum::<f64>()
-                        - *b;
-                    s_min = s_min.max(rho);
-                }
-                if s_min > SCAP * NS as f64 {
-                    continue; // not representable within the continuous box: skip
-                }
-                let mut rem = s_min;
-                for &sc in &s {
-                    let v = rem.min(SCAP);
-                    p[sc.index()] = v;
-                    rem -= v;
-                }
-                // Confirm the point is feasible for every row (it is, by construction of s_min).
-                let feasible = rows.iter().all(|(dense, b)| {
-                    let act: f64 = (0..ncols).map(|k| dense[k] * p[k]).sum();
-                    act <= *b + 1e-7
-                });
-                if !feasible {
-                    continue;
-                }
-                for cut in &cuts {
-                    let act: f64 = cut
-                        .coeffs
-                        .iter()
-                        .map(|&(col, cf)| cf * p[col.index()])
-                        .sum();
-                    assert!(
-                        act >= cut.lb - 1e-6,
-                        "case {case}: a mixing cut deleted the feasible point {p:?} -- \
-                         activity {act} < lb {}",
-                        cut.lb
-                    );
-                }
-            }
-        }
-        // A guard that never sees a cut guards nothing.
-        assert!(
-            total_cuts > 0,
-            "no mixing cut was ever separated: the guard is vacuous"
-        );
-    }
-
     /// THE VIOLATION SCREEN CHANGES NOTHING IT RETURNS.
     ///
     /// `best_over_deltas` skips exact-rational derivations the `f64` screen can prove cannot end up
@@ -7092,12 +6397,17 @@ mod mir_tests {
             }
             // ...and the screen must actually be DOING something on this family of models, or the
             // equality above is the equality of two identical code paths.
-            let before = crate::sepstat::SCREEN_SKIP.load(std::sync::atomic::Ordering::Relaxed);
+            // THIS THREAD's skips, not the binary's: `SCREEN_SKIP` is a
+            // process-global that every concurrently-running separation test
+            // also charges, and a sibling's skip would satisfy the
+            // `seen_skips > 0` guard below whether or not the screen under
+            // test skipped anything. See `crate::local_census`.
+            let before = crate::local_census::local_u64(&crate::sepstat::SCREEN_SKIP);
             screen_scope(true, || {
                 separate_mir(&m, &x, m.num_rows(), cuts_per_round());
             });
-            seen_skips += (crate::sepstat::SCREEN_SKIP.load(std::sync::atomic::Ordering::Relaxed)
-                - before) as usize;
+            seen_skips +=
+                (crate::local_census::local_u64(&crate::sepstat::SCREEN_SKIP) - before) as usize;
         }
         assert!(
             seen_cuts > 0,
@@ -7594,6 +6904,16 @@ fn flow_cover_from_row(
     // (`keep_back`) so it is stated over the model's own columns.
     let mut b = exact(rhs)?;
 
+    // A shift must not manufacture capacity on a conservation row. At `b = 0`,
+    // `λ = Σ_C m_j ≥ m_k`, so every switch payment vanishes and the cut is the
+    // source row (rout: 370 covers, best violation 0). Shifting instead measures
+    // against `rhs − Σ a_j·bound_j`; blend2's far-offset column then created all
+    // five of its flow covers and grew the tree 3,882 → 9,070 nodes.
+    // Keep the historical no-shift rule exactly on zero-RHS rows. Nonzero-capacity
+    // rows retain the widening (77% of newly admitted safenlp derivations). This is
+    // an exact zero/nonzero classification, not a tolerance.
+    let zero_capacity = b.is_zero();
+
     struct Arc {
         j: usize,
         y: usize,
@@ -7611,6 +6931,12 @@ fn flow_cover_from_row(
             continue;
         }
         let (lo, up) = model.col_bounds(Col(c));
+        // The zero-capacity guard, stated exactly as the pre-widening rule stated it: on a row
+        // whose own right-hand side is zero, ANY column needing a shift or a complement refuses
+        // the whole row. (An in-arc below already demands `lo == 0.0`, so this never rejects one.)
+        if zero_capacity && lo != 0.0 {
+            return None;
+        }
         // An in-arc: a candidate for the cover. It needs the plain `x >= 0` domain the cover
         // argument is written for, and a real switch.
         if a.is_positive() && lo == 0.0 {
@@ -8003,6 +7329,8 @@ mod flow_cover_tests {
              and this guard proves nothing"
         );
     }
+
+    include!("cuts/flow_cover_zero_capacity_test.rs");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -12346,10 +11674,7 @@ mod shape_gate_tests {
 
     #[test]
     fn the_narrow_budget_is_strictly_wider_than_the_flat_default() {
-        assert!(
-            NARROW_CUTS_PER_ROUND > MAX_CUTS_PER_ROUND,
-            "the gate only means anything if narrow models get MORE cuts than the flat default"
-        );
+        const { assert!(NARROW_CUTS_PER_ROUND > MAX_CUTS_PER_ROUND) }
     }
 
     /// The gate moves the two regimes in OPPOSITE directions, and that is the whole point: the
@@ -12358,11 +11683,12 @@ mod shape_gate_tests {
     /// half of the measurement.
     #[test]
     fn the_two_regimes_straddle_the_flat_default() {
-        assert!(
-            WIDE_CUTS_PER_ROUND < MAX_CUTS_PER_ROUND
-                && MAX_CUTS_PER_ROUND < NARROW_CUTS_PER_ROUND,
-            "expected wide {WIDE_CUTS_PER_ROUND} < flat {MAX_CUTS_PER_ROUND} < narrow {NARROW_CUTS_PER_ROUND}"
-        );
+        const {
+            assert!(
+                WIDE_CUTS_PER_ROUND < MAX_CUTS_PER_ROUND
+                    && MAX_CUTS_PER_ROUND < NARROW_CUTS_PER_ROUND
+            );
+        }
     }
 
     /// Wide models keep a MINIMAL cut stream rather than none. `cpr=0` measured as a statistical
@@ -12370,10 +11696,7 @@ mod shape_gate_tests {
     /// change; if someone later drops this to zero they should do it on evidence, not by drift.
     #[test]
     fn the_wide_budget_still_separates_something() {
-        assert!(
-            WIDE_CUTS_PER_ROUND > 0,
-            "wide models keep one cut per round; zero ties it on this corpus but disables              separation outright, which the corpus cannot justify"
-        );
+        const { assert!(WIDE_CUTS_PER_ROUND > 0) }
     }
 }
 

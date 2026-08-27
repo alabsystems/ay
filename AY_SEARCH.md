@@ -181,7 +181,9 @@ console.log(solution.get(worker), result.objective); // gpu 3
 ```
 
 `Solution.values` contains decoded values and `Solution.rawValues` contains the
-integer representation. Node solving is synchronous and one-shot today.
+integer representation. JavaScript inputs and decoded outputs must fit
+`Number.isSafeInteger`; use the Rust or Python API when the full signed-64-bit
+SearchSpec range is required. Node solving is synchronous and one-shot today.
 
 ### Rust
 

@@ -15,9 +15,9 @@ mod profile;
 
 pub use config::EngineConfigError;
 use config::{checked, MAX_KNOB_SECS};
+pub use dual_simplex::TallColdDualMode;
 
 /// Per-solve engine search economics.
-///
 /// # What this is for
 ///
 /// Every knob here was reachable only through a process-global `AY_MILP_*`
@@ -45,22 +45,17 @@ use config::{checked, MAX_KNOB_SECS};
 ///
 /// # Soundness class
 ///
-/// No setting here can make a reported value, bound, verdict or certificate
-/// *wrong*. None of them is consulted when a bound is admitted: every verdict
-/// still rests on the exact certificate path, so what a setting changes is
-/// which incumbent the search finds, how fast it gets there, and therefore how
-/// much it manages to prove inside a budget.
+/// These settings steer search without bypassing session point, value, or
+/// certificate checks. They can change which incumbent or bound is reached and
+/// whether a tree closes inside the budget. Some claims — notably integral
+/// optimality, uncertified infeasibility, unboundedness, and standalone bounds —
+/// are not complete exported proofs. [`crate::Outcome::evidence_shape`] only
+/// reports required fields; [`crate::Outcome::check_against`] validates those
+/// fields and refuses search-only claims.
 ///
-/// One documented exception, and it is the reason it is settable:
-/// [`with_lattice`](Self::with_lattice) governs a lane that can return
-/// `Optimal { cert: None }` — a sound value with no exportable evidence. A
-/// consumer that consumes optimal values as rigorous bounds should either
-/// disable that lane or, better,
-/// [`with_require_certificates`](SolveOpts::with_require_certificates), which
-/// degrades exactly that outcome to `Unknown { CertificateUnavailable }`.
-///
-/// (Classifying the *rest* of the engine's switchable heuristics this way is a
-/// separate, larger piece of work; see §M2 of the same document.)
+/// [`with_lattice`](Self::with_lattice) can return `Optimal { cert: None }`.
+/// Requiring certificates rejects defined shapes missing their artifact; it
+/// neither proves an artifact nor closes an integral branch-and-bound tree.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[non_exhaustive]
 pub struct EngineEconomics {
@@ -106,6 +101,7 @@ pub struct EngineEconomics {
     cutoff_stop: Option<bool>,
     node_lu: Option<bool>,
     tall_lu: Option<bool>,
+    tall_cold_dual: Option<bool>,
     dual_churn_band: Option<bool>,
     dual_bloom_cap: Option<usize>,
     flowcover_agg: Option<bool>,
@@ -151,9 +147,9 @@ pub struct EngineEconomics {
     chain_shape: Option<bool>,
     chain_preorder: Option<bool>,
     bump_lu: Option<bool>,
-    full_pricing: Option<bool>,
     dual_bypass: Option<usize>,
     eager_perturb: Option<usize>,
+    harris_rt: Option<usize>,
     float_lane: Option<bool>,
     mir_knap: Option<bool>,
     bound_branch: Option<bool>,
@@ -766,10 +762,19 @@ pub enum FixedAssignmentTreeWarmStart {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SolveOpts {
-    /// Hard wall-clock deadline. Checked inside solve loops; expiry yields
-    /// `Outcome::Unknown { reason: Timeout }`, never a partial verdict.
+    /// Absolute wall-clock search deadline. Checked inside solve loops; expiry
+    /// stops new search work. The solver may retain a checked `Feasible`
+    /// incumbent or rigorous `Bound` from completed progress, and otherwise
+    /// returns `Outcome::Unknown { reason: Timeout }`. A bounded post-verdict
+    /// certificate-enrichment pass may run beyond this search horizon, so this
+    /// is not a strict call-return deadline.
     pub deadline: Option<Instant>,
-    /// Per-solve time limit; combines with `deadline` (the earlier wins).
+    /// Per-solve search duration; combines with `deadline` (the earlier wins).
+    /// It also sizes bounded post-verdict certificate enrichment, so it remains
+    /// visible after the search deadline is pinned and is not a strict
+    /// call-return wall. A duration that cannot be represented relative to the
+    /// solve start is normalized to no duration cap; an explicit `deadline`
+    /// still applies.
     pub time_limit: Option<Duration>,
     /// Per-node time limit for a warm LP attempt in branch-and-bound. When the
     /// limit expires, the node discards its warm-start hint and retries cold
@@ -786,10 +791,10 @@ pub struct SolveOpts {
     /// Seed for randomized heuristics (unused while `determinism` holds all
     /// current lanes fixed; reserved for the native engine).
     pub seed: u64,
-    /// When true, a verdict whose certificate cannot be produced degrades to
-    /// `Outcome::Unknown { reason: CertificateUnavailable }` instead of being
-    /// reported bare. Off by default: bare verdicts from the exact lanes are
-    /// sound, just unevidenced.
+    /// When true, a certificate-bearing outcome shape missing its required
+    /// artifact degrades to `Outcome::Unknown { reason: CertificateUnavailable }`.
+    /// This availability policy neither validates public outcome fields nor
+    /// makes every surviving claim independently checkable.
     pub require_certificates: bool,
     /// Admit the exact STRUCTURE-RECOGNITION routes (PB projection, direct
     /// CNF, SAT/ReLU recovery, network design, open-domain, hybrid PB/LP) on
@@ -798,10 +803,11 @@ pub struct SolveOpts {
     /// This exists so the native branch-and-bound lane — the only lane that
     /// emits a root `FarkasCertificate` or a whole-tree
     /// [`crate::MilpInfeasibilityCertificate`] — stays reachable and testable
-    /// on models a routed lane would otherwise claim first. Turning it off
-    /// never changes a verdict, only which engine (and therefore which proof
-    /// SHAPE) produces it. `SolveOpts::with_structure_routing(false)` forces it off
-    /// process-wide for A/B measurement.
+    /// on models a routed lane would otherwise claim first. Turning it off can
+    /// change solved-versus-timeout status and evidence shape because native
+    /// search may not decide every model a specialized lane does; it must not
+    /// change soundness. `SolveOpts::with_structure_routing(false)` exposes the
+    /// native fallback for A/B measurement on that solve/session.
     pub structure_routing: bool,
     /// Bytes the branch-and-bound may RETAIN in its open node set (the
     /// dominant memory at scale: parked warm-start bases). Crossing half the
@@ -881,14 +887,17 @@ impl SolveOpts {
         Self::default()
     }
 
-    /// Set a hard wall-clock deadline.
+    /// Set the absolute search deadline described by [`Self::deadline`].
+    /// Bounded post-verdict certificate enrichment may extend call-return time.
     #[must_use]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
         self
     }
 
-    /// Set a per-solve time limit.
+    /// Set the search duration described by [`Self::time_limit`]. It also sizes
+    /// bounded post-verdict certificate enrichment. An unrepresentable relative
+    /// deadline is normalized as documented on that field.
     #[must_use]
     pub fn with_time_limit(mut self, limit: Duration) -> Self {
         self.time_limit = Some(limit);
@@ -926,7 +935,10 @@ impl SolveOpts {
         self
     }
 
-    /// Require certificates on certificate-bearing verdicts.
+    /// Require artifacts on outcome shapes that define a certificate requirement.
+    ///
+    /// This is availability policy, not proof: [`crate::EvidenceShape::FieldsPresent`]
+    /// still must pass [`crate::Outcome::check_against`] before it is authoritative.
     #[must_use]
     pub fn with_require_certificates(mut self, require: bool) -> Self {
         self.require_certificates = require;
@@ -1090,11 +1102,12 @@ impl SolveOpts {
         self.ft_adoption_solve_latch = None;
     }
 
-    /// The effective deadline as of `now`: the earlier of `deadline` and
-    /// `now + time_limit`.
+    /// The effective deadline as of `now`: the earlier of `deadline` and a
+    /// representable `now + time_limit`. An overflowing relative limit means
+    /// no duration cap; it does not suppress an explicit absolute deadline.
     #[must_use]
     pub fn effective_deadline(&self, now: Instant) -> Option<Instant> {
-        let from_limit = self.time_limit.map(|l| now + l);
+        let from_limit = self.time_limit.and_then(|limit| now.checked_add(limit));
         match (self.deadline, from_limit) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1105,6 +1118,8 @@ impl SolveOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("opts/deadline_tests.rs");
 
     #[test]
     fn engine_economics_default_to_no_opinion() {
@@ -1135,7 +1150,7 @@ mod tests {
             .with_saturation_stop_floor(Duration::from_secs(15))
             .with_saturation_stop_multiplier(1.5)?
             .with_bloom_cap_relaxation(false)
-            .with_flip_lns_cap(Duration::from_secs(900))
+            .with_flip_lns_cap(Duration::from_mins(15))
             .with_flip_lns_share(0.25)?
             .with_warm_lu(true)
             .with_presolve_share(0.02)?
@@ -1151,7 +1166,7 @@ mod tests {
         );
         assert_eq!(engine.saturation_stop_multiplier(), Some(1.5));
         assert_eq!(engine.bloom_cap_relaxation(), Some(false));
-        assert_eq!(engine.flip_lns_cap(), Some(Duration::from_secs(900)));
+        assert_eq!(engine.flip_lns_cap(), Some(Duration::from_mins(15)));
         assert_eq!(engine.flip_lns_share(), Some(0.25));
         assert_eq!(engine.warm_lu(), Some(true));
         assert_eq!(engine.presolve_share(), Some(0.02));
@@ -1291,7 +1306,7 @@ mod tests {
                     .with_saturation_stop_floor(Duration::from_secs(15))
                     .with_saturation_stop_multiplier(1.5)?
                     .with_bloom_cap_relaxation(false)
-                    .with_flip_lns_cap(Duration::from_secs(900))
+                    .with_flip_lns_cap(Duration::from_mins(15))
                     .with_flip_lns_share(0.25)?
                     .with_warm_lu(true)
                     .with_presolve_share(0.02)?
@@ -1333,34 +1348,6 @@ mod tests {
             default.engine().cuts(),
             None,
             "building a configured sibling must not mutate the original options"
-        );
-    }
-
-    #[test]
-    fn node_warm_time_limit_defaults_off() {
-        assert_eq!(SolveOpts::new().node_warm_time_limit, None);
-    }
-
-    #[test]
-    fn node_warm_time_limit_builder_normalizes_zero_and_none() {
-        let finite = Duration::from_millis(250);
-        assert_eq!(
-            SolveOpts::new()
-                .with_node_warm_time_limit(Some(finite))
-                .node_warm_time_limit,
-            Some(finite)
-        );
-        assert_eq!(
-            SolveOpts::new()
-                .with_node_warm_time_limit(Some(Duration::ZERO))
-                .node_warm_time_limit,
-            None
-        );
-        assert_eq!(
-            SolveOpts::new()
-                .with_node_warm_time_limit(None)
-                .node_warm_time_limit,
-            None
         );
     }
 

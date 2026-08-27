@@ -112,19 +112,32 @@ pub fn get_process_memory_limit() -> usize {
 /// Returns `false` if no limit is set (limit == 0) or if measurement fails.
 /// This is cheap to call (single syscall, no subprocess).
 ///
-/// Two signals are consulted against the same limit, and the process is
-/// considered over-budget if **either** trips:
+/// The signals are consulted in preference order against the same limit
+/// (see [`memory_signals_exceed`] for the pinned policy):
 ///
-/// 1. **Live heap bytes** ([`current_live_bytes`]): exact and instantaneous
-///    when a [`CountingAllocator`] is installed (the `ay` binary installs one).
-///    A single bulk allocation (e.g. a 40 GB `Vec`/`Box`) is reflected the
-///    moment it lands — this is the signal that the OOM-causing burst trips
-///    *before* `getrusage` peak RSS catches up. 0 when no counting allocator
-///    is installed (library consumers), in which case only signal 2 applies.
-/// 2. **Peak RSS** ([`current_rss_bytes`]): the OS's view via `getrusage`.
-///    Always available, but lags fast allocation bursts.
+/// 1. **Physical footprint** ([`current_footprint_bytes`]): what the machine
+///    actually holds for this process (macOS `phys_footprint` = resident +
+///    compressed + swapped, the jetsam metric; Linux current resident). This
+///    is the PREFERRED signal, and when it is available it is the only one
+///    consulted: allocator live-bytes count reserved-but-untouched capacity,
+///    which overshot physical use by ~20-25% on the .xz giants (live-bytes
+///    peak in (5700,6175] MB while physical settled at 4.79 GB) and aborted
+///    runs the physical budget allowed.
+/// 2. **Live heap bytes** ([`current_live_bytes`]), fallback when no
+///    footprint API exists: exact and instantaneous when a
+///    [`CountingAllocator`] is installed (the `ay` binary installs one); 0
+///    for library consumers, in which case only signal 3 applies.
+/// 3. **Peak RSS** ([`current_rss_bytes`]): the OS's view via `getrusage`.
+///    Always available, but a peak — it can over-trip long after a past
+///    high-water mark; last resort only.
 ///
-/// Both fire at 95% of the limit to leave headroom for graceful cleanup.
+/// All fire at 95% of the limit to leave headroom for graceful cleanup.
+///
+/// Burst protection does NOT live here: the allocator's hard ceiling
+/// ([`arm_hard_memory_ceiling`], enforced synchronously in [`add_live_bytes`]
+/// on exact live bytes) is what refuses the growth no checkpoint ever saw —
+/// e.g. the 82.75 GB SmallVec runaway class — and it deliberately keeps the
+/// live-bytes signal.
 pub fn process_memory_exceeded() -> bool {
     process_memory_exceeded_at_percent(95)
 }
@@ -158,31 +171,49 @@ pub fn process_memory_exceeded_at_percent(percent: usize) -> bool {
     // Trigger at `percent`% of limit (95% for the hard guard; lower for
     // pre-allocation backpressure) to leave headroom for graceful cleanup.
     let threshold = limit.saturating_mul(percent) / 100;
-    // Signal 1: live heap bytes — exact, instantaneous, no syscall. Catches a
-    // bulk allocation burst before the OS RSS reading reflects it.
-    let live = current_live_bytes();
-    if live > threshold {
-        return true;
-    }
-    // Signal 2: CURRENT physical footprint — the preferred OS signal.
-    // macOS: `task_info` phys_footprint (resident + compressed + swapped, the
-    // jetsam metric — the only signal that sees compressor-backed growth,
-    // which is how a 263 GB runaway hid behind a ~16 GB RSS reading);
-    // Linux: current resident from /proc/self/statm. Both are LIVE ledgers
-    // that decrease when memory is freed, which is essential in a LONG-LIVED
-    // host (a compiler verifying many functions, a test harness running
-    // thousands of cases): a peak-based reading would latch the first
-    // high-water mark forever and permanently degrade every later solve to
-    // Unknown after one hungry-but-cancelled attempt.
-    let footprint = current_footprint_bytes();
+    memory_signals_exceed(
+        threshold,
+        current_footprint_bytes(),
+        current_live_bytes(),
+        current_rss_bytes(),
+    )
+}
+
+/// The advisory's signal-preference policy, pure so it is pinned by tests.
+///
+/// Signal 1: CURRENT physical footprint — the preferred OS signal, and when
+/// available the ONLY one consulted.
+/// macOS: `task_info` phys_footprint (resident + compressed + swapped, the
+/// jetsam metric — the only signal that sees compressor-backed growth,
+/// which is how a 263 GB runaway hid behind a ~16 GB RSS reading);
+/// Linux: current resident from /proc/self/statm. Both are LIVE ledgers
+/// that decrease when memory is freed, which is essential in a LONG-LIVED
+/// host (a compiler verifying many functions, a test harness running
+/// thousands of cases): a peak-based reading would latch the first
+/// high-water mark forever and permanently degrade every later solve to
+/// Unknown after one hungry-but-cancelled attempt.
+///
+/// Allocator live-bytes deliberately CANNOT trip the advisory when a
+/// footprint reading exists: live bytes count reserved-but-untouched
+/// capacity, measured ~20-25% above physical on the .xz giants, and aborted
+/// runs the physical budget allowed. Bursts between checkpoints are the hard
+/// ceiling's job ([`add_live_bytes`]), which keeps exact live bytes.
+///
+/// Signal 2 (fallback, platforms with no footprint API): live heap bytes —
+/// exact, instantaneous, no syscall; 0 when no [`CountingAllocator`] is
+/// installed.
+///
+/// Signal 3 (last resort): peak RSS via `getrusage`. Conservative — never
+/// under-reports, but as a PEAK it can over-trip long after a past
+/// high-water mark.
+#[inline]
+fn memory_signals_exceed(threshold: usize, footprint: usize, live: usize, rss: usize) -> bool {
     if footprint > 0 {
         return footprint > threshold;
     }
-    // Signal 3 (fallback, platforms with no footprint API): peak RSS via
-    // `getrusage`. Conservative — never under-reports, but as a PEAK it can
-    // over-trip long after a past high-water mark; acceptable only as the
-    // last-resort signal.
-    let rss = current_rss_bytes();
+    if live > threshold {
+        return true;
+    }
     rss > 0 && rss > threshold
 }
 
@@ -563,6 +594,43 @@ pub fn current_rss_bytes() -> usize {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn current_rss_bytes() -> usize {
     0
+}
+
+/// CPU time the CALLING THREAD has consumed since it started, as the kernel
+/// accounts it (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
+///
+/// Unlike a wall-clock `Instant`, this clock does not advance while the thread
+/// is descheduled. A budget expressed in it therefore measures the work a lane
+/// did, not the scheduler's mood: a 2 ms slice stays a 2 ms slice when sixteen
+/// test threads share fourteen cores, where the same slice on the wall clock
+/// was observed consumed by a single 3-4 ms preemption stall with the lane's
+/// own work still under 0.4 ms (`ay-milp/src/session.rs::probe_arm`, which
+/// reads this clock around each attempt to tell a robbed slice from a spent one).
+///
+/// Cost: one `thread_info`/`clock_gettime` syscall, about 1 µs on macOS —
+/// roughly fifty times an `Instant::now()`. Poll it behind a cheaper wall-clock
+/// gate, never unconditionally in a hot loop.
+///
+/// `None` when the platform has no per-thread CPU clock or the call fails;
+/// callers fall back to wall time.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn thread_cpu_time() -> Option<std::time::Duration> {
+    // SAFETY: `libc::timespec` is plain old data; zero-init is a valid value
+    // before `clock_gettime` overwrites every field.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: `ts` is valid writable memory for the duration of the call.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    if ret != 0 {
+        return None;
+    }
+    let secs = u64::try_from(ts.tv_sec).ok()?;
+    let nanos = u32::try_from(ts.tv_nsec).ok()?;
+    Some(std::time::Duration::new(secs, nanos))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn thread_cpu_time() -> Option<std::time::Duration> {
+    None
 }
 
 /// Returns the process's physical memory footprint in bytes: resident pages

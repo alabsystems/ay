@@ -34,7 +34,7 @@ impl R {
         lo + (self.next() % ((hi - lo + 1) as u64)) as i64
     }
     fn chance(&mut self, k: u64) -> bool {
-        self.next() % k == 0
+        self.next().is_multiple_of(k)
     }
 }
 

@@ -240,6 +240,16 @@ impl Executor {
             .set_float(stat_name, started_at.elapsed().as_secs_f64());
     }
 
+    /// Accumulate seconds into a phase-time statistic (pure observation).
+    ///
+    /// Unlike [`Self::record_phase_duration`] this ADDS, so a phase entered many
+    /// times — an E-matching round, an interleaved ground re-solve — reports its
+    /// total share of the budget rather than only its last visit.
+    pub(in crate::executor) fn add_phase_seconds(&mut self, stat_name: &str, seconds: f64) {
+        let total = self.last_statistics.get_float(stat_name).unwrap_or(0.0) + seconds;
+        self.last_statistics.set_float(stat_name, total);
+    }
+
     fn default_unknown_phase_and_cost(reason: UnknownReason) -> (&'static str, &'static str) {
         match reason {
             UnknownReason::Timeout => ("search-control", "deadline"),
@@ -674,7 +684,7 @@ impl Executor {
             self.last_statistics
                 .set_int("smt.bv_lia_bridge.pre_quantifier_runs", 1);
             let bridge_result = self.solve_bv_lia_bridge()?;
-            if bridge_result.is_unsat() {
+            if bridge_result.is_unsat() || self.ite_uf_definition_recovery.ready() {
                 // Restore the scope-tracked assertion vector (the bridge may
                 // have rewritten it in place) before the early exit.
                 self.ctx.assertions = scope_tracked_assertions;
@@ -683,8 +693,7 @@ impl Executor {
             self.last_unknown_reason = saved_unknown_reason;
         }
 
-        // Quantifier preprocessing: E-matching, CEGQI, promote-unsat, assertion filtering.
-        // Reads last_model.euf_model for congruence-aware E-matching, then clears it.
+        // Quantifier preprocessing reads and then clears last_model.euf_model.
         self.set_active_solve_phase("quantifier-preprocess", "quantifier-instantiation");
         let quantifier_started_at = Instant::now();
         let has_quantified_assertions = self
@@ -815,6 +824,7 @@ impl Executor {
         if has_quantified_assertions && self.produce_proofs_enabled() {
             self.prepass_reachability.deep_qe_internal_tracker_on += 1;
         }
+        self.maybe_adopt_qe_alternation_route(has_quantified_assertions);
         if has_quantified_assertions && self.deep_qe_retry_armed {
             self.prepass_reachability.deep_qe_entered += 1;
             if crate::executor::qe_prepass::deep_qe(
@@ -844,35 +854,24 @@ impl Executor {
         // over-degrade a genuine SAT or touch a `∀x∃y.P` alternation (body has a
         // quantifier ⇒ excluded) or an array-extensionality universal (free array
         // symbol ⇒ excluded). Gated on the presence of quantified assertions.
-        // This semantic precheck proves falsity with a disposable model probe,
-        // but it does not yet translate the concrete witness into the outer
-        // proof.  In proof-authorized solves, let the ordinary instantiation
-        // pipeline derive the same witness from the authored `forall` instead.
+        // In proof mode this precheck is compiled parked behind a typed,
+        // test-only seam until translation preserves the authored surface form.
+        // Non-proof solves retain the original precheck unchanged.
         //
         // TWO PASSES, STRICTLY ADDITIVE (#closed-universal-authored-scope).
-        // Pass 1 runs against the AUTHORED window; pass 2 is the historical
-        // pass against the live, preprocessed one.
+        // Pass 1 uses the AUTHORED assertion window. The publishable certificate
+        // requires its refuted `forall` to be an authored top-level conjunct and
+        // `ctx.assertions` to equal the epoch's authored roots
+        // (`exact_plain_hard_unsat_scope_is_current`). Running after in-place
+        // preprocessing would make that authority check decline, leaving only an
+        // untranslated skolem result that proof publication maps to `unknown`.
         //
-        // Why the authored window has to come first: the only PUBLISHABLE
-        // outcome of this precheck is the exact closed-forall certificate, and
-        // that certificate requires the refuted `forall` to be an authored
-        // top-level conjunct AND `ctx.assertions` to still equal the epoch's
-        // authored roots (`exact_plain_hard_unsat_scope_is_current`). By the
-        // time control reaches here, several in-place passes have rewritten
-        // `ctx.assertions`, so the equality fails and the certificate declines
-        // however good the witness is — leaving only the untranslated skolem
-        // lane, which `translated_unsat_proof_required` then degrades to
-        // `unknown`. The precheck's theorem is a statement about the AUTHORED
-        // problem ("an authored top-level conjunct is unconditionally false"),
-        // so running it there is also the more faithful reading, not a
-        // convenience.
-        //
-        // Pass 2 is retained verbatim so no refutation this precheck used to
-        // find can be lost: a universal that only the preprocessed window
-        // exposes is still refuted there, and still publishes exactly what it
-        // published before (a verdict-only UNSAT on a disposable solve, or the
-        // fail-closed `unknown` on a public one).
-        if has_quantified_assertions && !self.is_producing_proofs() {
+        // Pass 2 uses the live, preprocessed window and is retained verbatim so
+        // no historical refutation is lost. It may find a universal exposed only
+        // by preprocessing, but its authority is unchanged: a disposable solve
+        // can return verdict-only UNSAT, while a public proof solve without an
+        // authored-scope translation fails closed to `unknown`.
+        if has_quantified_assertions && self.closed_universal_precheck_armed() {
             let working_assertions =
                 std::mem::replace(&mut self.ctx.assertions, scope_tracked_assertions.clone());
             let (authored_category, _) = self.detect_logic_category(&self.ctx.assertions);
@@ -914,11 +913,8 @@ impl Executor {
         if pre_quantifier_features.has_arrays {
             self.add_quantified_array_extensionality_equalities();
         }
-        // M1 demand-campaign SHADOW family classifier: snapshot the positive
-        // top-level foralls the E-matcher is about to see (post fold/simplify, before
-        // `process_quantifiers` strips them). READ ONLY — introduces no terms; the
-        // classification below feeds only statistics, never a decision. Skipped
-        // entirely on ground problems (no walk overhead when there are no foralls).
+        // Snapshot post-fold positive top-level foralls for stable demand-family statistics.
+        // This read-only walk precedes quantifier stripping and skips ground problems.
         let classifier_foralls = if has_quantified_assertions {
             self.collect_classifiable_foralls()
         } else {
@@ -1016,37 +1012,8 @@ impl Executor {
 
         let mut qr = self.process_quantifiers();
         self.record_phase_duration("phase.quantifier_preprocess.seconds", quantifier_started_at);
-        // Populate E-matching statistics from quantifier processing (#8614).
-        self.last_statistics.ematching_rounds_completed = qr.ematching_rounds_completed;
-        self.last_statistics.ematching_instances_created = qr.ematching_instances_created;
-        // M0' demand-campaign instrumentation: surface the pure-observation
-        // `quantifier.demand.*` counters accumulated on the quantifier manager
-        // during `process_quantifiers`. Read-only; never influences any decision.
-        // Cloning first ends the immutable borrow of `quantifier_manager` before
-        // `last_statistics` is borrowed mutably.
-        let demand_stats = self
-            .quantifier_manager
-            .as_ref()
-            .map(crate::quantifier_manager::QuantifierManager::demand_stats_clone);
-        if let Some(demand_stats) = demand_stats {
-            demand_stats.write_statistics(&mut self.last_statistics);
-            // M1 shadow classification: tag the M0' per-family tallies with the
-            // demand-campaign family class and surface the per-class population +
-            // activity counts. Pure observation; `classify_quantifier_families`
-            // reads only the term store.
-            let classes = self.classify_quantifier_families(&classifier_foralls);
-            crate::executor::quantifier_loop::write_family_class_statistics(
-                &demand_stats,
-                &classes,
-                &mut self.last_statistics,
-            );
-        }
-        // M2+M3 demand-lane counters (SHADOW-ONLY; inert on production — the writer
-        // is a no-op unless the lane was armed): frontier, parked/flushed tallies,
-        // fence drains, DT resume depth.
-        if let Some(qm) = self.quantifier_manager.as_ref() {
-            qm.demand_write_statistics(&mut self.last_statistics);
-        }
+        let classifier_classes =
+            self.record_quantifier_processing_statistics(&qr, &classifier_foralls);
         self.last_model = None;
 
         self.set_active_solve_phase("logic-detection", "logic-category");
@@ -1127,6 +1094,7 @@ impl Executor {
             let result = Ok(SolveResult::Unknown);
             let quantifier_loop_restores = qr.original_assertions.is_some();
             let mapped = self.map_quantifier_result(result, qr, category);
+            self.refresh_quantifier_campaign_statistics(&classifier_classes);
             if !quantifier_loop_restores {
                 self.ctx.assertions = scope_tracked_assertions;
             }
@@ -1321,6 +1289,7 @@ impl Executor {
         if !quantifier_loop_restores {
             self.ctx.assertions = scope_tracked_assertions;
         }
+        self.refresh_quantifier_campaign_statistics(&classifier_classes);
         if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
             saved_quantified_incremental_state.take()
         {
@@ -1603,6 +1572,7 @@ impl Executor {
         let result = stacker::maybe_grow(EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE, || {
             self.check_sat_guarded(projection_authority)
         });
+        self.ite_uf_definition_recovery.clear();
         self.restore_timeout_deadline_after_call(previous_deadline);
         self.record_z3_resource_statistics(solve_started_at);
         let mut result = result.and_then(|result| {
@@ -2287,6 +2257,8 @@ impl Executor {
         &mut self,
         projection_authority: Option<AuthoredPlainHardQueryPermit>,
     ) -> Result<SolveResult> {
+        let authored_plain = projection_authority.is_some();
+        self.begin_exact_ite_uf_definition_recovery(authored_plain);
         self.clear_active_solve_phase();
         // D1 lazy-extensionality shadow: reset the per-solve EAGER witness log
         // before any array axioms are emitted for this check-sat.
@@ -2380,25 +2352,8 @@ impl Executor {
         self.cegar_pending_lemma = None;
         self.cegar_emitted_lemmas.clear();
 
-        // The constructive quantified path shares every public preflight and
-        // per-solve reset above and every internal-state reset below. Checking
-        // authority before these resets would let model/proof/substitution state
-        // from an earlier query leak into the emitted witness even though the
-        // source/query epoch itself was fresh.
-        if let Some(evidence) = self.try_authorize_current_query_exact_forall_uf_ground_unsat() {
-            // This theorem is established directly from the immutable authored
-            // roots before quantifier preprocessing can replace them.  Reset
-            // solve-local artifacts only after the sealed evidence exists;
-            // emission repeats its complete epoch/root/entry/snapshot audit.
-            if self.prepare_check_sat_internal_state() {
-                self.finalize_array_ext_shadow();
-                self.finalize_unknown_diagnostics();
-                return Ok(SolveResult::Unknown);
-            }
-            let result = self.emit_checked_exact_forall_uf_ground_unsat(evidence);
-            self.finalize_array_ext_shadow();
-            self.finalize_unknown_diagnostics();
-            return Ok(result);
+        if let Some(result) = self.try_presolve_exact_semantic_unsat() {
+            return result;
         }
         if let Some(permit) = projection_authority {
             if self.prepare_check_sat_internal_state() {
@@ -2533,6 +2488,7 @@ impl Executor {
         if super::uflia_model_repair::uflia_model_repair_enabled()
             && result == SolveResult::Unknown
             && self.uflia_congruence_gate_rejected
+            && !self.ite_uf_definition_recovery.ready()
             && !self.uflia_model_repair_done
             && !matches!(self.last_unknown_reason, Some(UnknownReason::Timeout))
             && !self.solve_deadline.expired()
@@ -2556,6 +2512,7 @@ impl Executor {
         // exhausted budget never spends a second solve.
         if result == SolveResult::Unknown
             && self.uflia_congruence_gate_rejected
+            && !self.ite_uf_definition_recovery.ready()
             && !self.uflia_congruence_retry_done
             && !matches!(self.last_unknown_reason, Some(UnknownReason::Timeout))
             && !self.solve_deadline.expired()
@@ -2738,16 +2695,14 @@ impl Executor {
         // self-check still makes the final proof-authority decision below.
         // Every non-exact query is returned byte-for-byte unchanged.
         let result = self.try_complete_authenticated_seq_extensional_result(result);
+        let result = self.complete_exact_ite_uf_definition_recovery(result, authored_plain);
 
         // Fail-closed self-check for UNSAT: AY may only emit `unsat` when it
-        // produced a refutation proof that its OWN internal checker fully
-        // verified — every step checked, no trust/`Hole` steps, no checker
-        // error. If AY cannot certify the refutation itself, it degrades to a
-        // sound `unknown` rather than assert an unsat it cannot prove. This is
-        // the UNSAT half of "AY checks its own answers": together with the SAT
+        // produced a refutation its OWN checker fully verified: every step,
+        // no trust/`Hole`, no checker error. Failure degrades to sound `unknown`
+        // rather than assert an unsat it cannot prove. Together with the SAT
         // model-certification gate above (independent model gate is SAT-only),
-        // no `sat`/`unsat` AY emits under `--self-check` is unverified by AY
-        // itself. (#self-check-unsat)
+        // no `sat`/`unsat` emitted under `--self-check` is unverified. (#self-check-unsat)
         // BV DRAT self-cert exception: a pure-QF_BV UNSAT that emitted a
         // native-checkable bit-blast DRAT for THIS solve may pass this Alethe
         // gate. The outer `check_sat` boundary finalizes the matching CNF and
@@ -2758,6 +2713,7 @@ impl Executor {
             && result.is_unsat()
             && !self.unsat_proof_self_certified()
             && !bv_drat_self_cert
+            && !self.checked_refutation_satisfies_self_check()
         {
             self.last_unknown_reason = Some(UnknownReason::SelfCheckRejected);
             self.record_model_validation_unknown_diagnostic(
@@ -2870,6 +2826,7 @@ impl Executor {
     /// Passing `None` clears any previously installed deadline.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.solve_deadline.set(deadline);
+        self.certification_deadline.set(deadline);
     }
 
     /// Return the currently installed absolute solve deadline.
@@ -2890,10 +2847,35 @@ impl Executor {
         self.quantifier_deadline_policy = policy;
     }
 
+    /// Opt in to (or back out of) the quantified wall-clock BACKSTOP.
+    ///
+    /// OFF by default: `set_timeout(d)` bounds the whole `check-sat`, quantified
+    /// or not. Turning it on restores the #quantifier-determinism behaviour —
+    /// once a quantified solve engages, the nominal deadline is relaxed to
+    /// `deadline + min(3 x remaining, 3 min)` so the engine's DETERMINISTIC
+    /// instantiation budgets, not the machine's speed, decide when to stop, and
+    /// a verdict cannot flip Verified <-> Unknown with CPU load. The cost is a
+    /// wall of up to 4x the caller's budget, which is why it is the caller's
+    /// call to make. Reset to OFF by `Executor::reset`.
+    pub fn set_quantifier_deadline_backstop(&mut self, enabled: bool) {
+        self.quantifier_deadline_backstop_opt_in = enabled;
+    }
+
+    /// Whether the quantified wall-clock backstop is enabled for this executor.
+    #[must_use]
+    pub fn quantifier_deadline_backstop(&self) -> bool {
+        self.quantifier_deadline_backstop_opt_in
+    }
+
     /// Set a relative timeout for subsequent executor solve commands.
     ///
     /// The timeout is converted into a fresh deadline at each `check-sat` or
     /// `check-sat-assuming` call. Passing `None` clears the timeout.
+    ///
+    /// #honest-timeout: this is a BOUND, on ground and quantified solves alike.
+    /// It used to be advisory on quantified solves — the
+    /// #quantifier-determinism backstop silently relaxed it to up to 4x — which
+    /// is now opt-in via [`Self::set_quantifier_deadline_backstop`].
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
@@ -2912,6 +2894,7 @@ impl Executor {
     ) {
         self.solve_interrupt = interrupt;
         self.solve_deadline.set(deadline);
+        self.certification_deadline.set(deadline);
     }
 
     /// Clear solve controls after a check-sat call completes.
@@ -2919,6 +2902,7 @@ impl Executor {
     pub(crate) fn clear_solve_controls(&mut self) {
         self.solve_interrupt = None;
         self.solve_deadline.set(None);
+        self.certification_deadline.set(None);
     }
 
     fn earliest_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
@@ -2941,15 +2925,29 @@ impl Executor {
     /// nominal deadline live at the command layer ensures post-solve UNSAT
     /// certification uses the caller's remaining time and never starts a fresh
     /// relative-timeout window.
-    pub(super) fn install_command_publication_deadline(&mut self) -> Option<Instant> {
-        let previous_deadline = self.solve_deadline.get();
+    pub(super) fn install_command_publication_deadline(
+        &mut self,
+    ) -> (Option<Instant>, Option<Instant>) {
+        let previous_deadlines = (self.solve_deadline.get(), self.certification_deadline.get());
         if self.timeout.is_some() {
-            self.solve_deadline.set(Self::earliest_deadline(
-                previous_deadline,
-                self.timeout_deadline_from_now(),
-            ));
+            let command_deadline =
+                Self::earliest_deadline(previous_deadlines.0, self.timeout_deadline_from_now());
+            self.solve_deadline.set(command_deadline);
+            // This is the outer COMMAND deadline, not a search lane's later
+            // narrowing. Checked-refutation certification may spend this
+            // envelope but must still honor a relative timeout that is tighter
+            // than a persistent caller deadline.
+            self.certification_deadline.set(command_deadline);
         }
-        previous_deadline
+        previous_deadlines
+    }
+
+    pub(super) fn restore_command_publication_deadline_after_call(
+        &mut self,
+        previous_deadlines: (Option<Instant>, Option<Instant>),
+    ) {
+        self.solve_deadline.set(previous_deadlines.0);
+        self.certification_deadline.set(previous_deadlines.1);
     }
 
     pub(super) fn install_timeout_deadline_for_call(&mut self) -> Option<Instant> {
@@ -3078,6 +3076,15 @@ impl Executor {
         /// simply too hard, and the fail-closed Unknown is the right result.
         const QUANTIFIED_BACKSTOP_MAX_EXTRA: Duration = Duration::from_mins(3);
 
+        // #honest-timeout: OPT-IN. Without it the caller's `set_timeout` is the
+        // wall, full stop. This is the whole gate — the mechanism below is
+        // unchanged, and a caller that wants load-independent quantified
+        // verdicts turns it on with `set_quantifier_deadline_backstop(true)`.
+        // Rationale for the flip, and for keeping the mechanism, is recorded on
+        // `Executor::quantifier_deadline_backstop_opt_in`.
+        if !self.quantifier_deadline_backstop_opt_in {
+            return;
+        }
         if self.quantifier_deadline_policy == super::QuantifierDeadlinePolicy::Exact
             || self.quantifier_deadline_backstop_installed
         {
@@ -3293,6 +3300,61 @@ impl Executor {
     // Internal check-sat (logic routing)
     // ========================================================================
 
+    /// The pre-solve exact semantic theorems, in priority order.
+    ///
+    /// The constructive quantified path shares every public preflight and
+    /// per-solve reset of `check_sat_guarded` and every internal-state reset
+    /// after it. Checking authority before those resets would let
+    /// model/proof/substitution state from an earlier query leak into the
+    /// emitted witness even though the source/query epoch itself was fresh —
+    /// hence this sits exactly where it does in the caller.
+    ///
+    /// Both theorems are established directly from the immutable authored roots
+    /// before quantifier preprocessing can replace them.  Reset solve-local
+    /// artifacts only after sealed evidence exists; emission repeats its
+    /// complete epoch/root/entry/snapshot audit.
+    ///
+    /// The RoundingMode arm (#P0.2 Pass C certification) is second because it
+    /// is the newer and narrower claim.  Declining it costs one read-only
+    /// carrier scan; only a query whose declared RM constants actually reach an
+    /// FP rounding-mode operand slot ever pays for a branch refutation.
+    fn try_presolve_exact_semantic_unsat(&mut self) -> Option<Result<SolveResult>> {
+        use crate::executor::unsat_cert::{
+            CheckedExactForallUfGroundUnsat, CheckedExactRmDomainExpansionUnsat,
+        };
+        enum Sealed {
+            ForallUfGround(CheckedExactForallUfGroundUnsat),
+            RmDomainExpansion(CheckedExactRmDomainExpansionUnsat),
+        }
+        let sealed = if let Some(evidence) =
+            self.try_authorize_current_query_exact_forall_uf_ground_unsat()
+        {
+            Sealed::ForallUfGround(evidence)
+        } else if let Some(evidence) =
+            self.try_authorize_current_query_exact_rm_domain_expansion_unsat()
+        {
+            Sealed::RmDomainExpansion(evidence)
+        } else {
+            return None;
+        };
+        if self.prepare_check_sat_internal_state() {
+            self.finalize_array_ext_shadow();
+            self.finalize_unknown_diagnostics();
+            return Some(Ok(SolveResult::Unknown));
+        }
+        let result = match sealed {
+            Sealed::ForallUfGround(evidence) => {
+                self.emit_checked_exact_forall_uf_ground_unsat(evidence)
+            }
+            Sealed::RmDomainExpansion(evidence) => {
+                self.emit_checked_exact_rm_domain_expansion_unsat(evidence)
+            }
+        };
+        self.finalize_array_ext_shadow();
+        self.finalize_unknown_diagnostics();
+        Some(Ok(result))
+    }
+
     /// Clear all per-solve internal state before either the ordinary search or
     /// the independently checked constructive projection lane runs.
     ///
@@ -3353,6 +3415,7 @@ impl Executor {
         self.bypass_string_tautology_guard = false;
         self.slia_accepted_unknown = false;
         self.array_axiom_scope = None;
+        self.array_axiom_dead_skolems.clear();
         self.row_seeded_terms.clear();
         self.defer_model_validation = false;
         self.defer_counterexample_minimization = false;
@@ -3886,6 +3949,11 @@ impl Executor {
 
                     // Restore original assertions
                     self.ctx.assertions = original_assertions;
+                    // Whether the Unknown-rescue arm above had to PARK the
+                    // outer authority. When it did not, the authority was never
+                    // touched and is simply current again now that the stack is
+                    // restored — see the refresh gate below.
+                    let parked_outer_authority = parked_plain_query_authority.is_some();
                     let restored_plain_query_authority =
                         if let Some(parked) = parked_plain_query_authority {
                             // Restoration re-authenticates epoch, source, term
@@ -3904,7 +3972,33 @@ impl Executor {
                     // Set the term-to-name mapping AFTER check_sat_assuming
                     // (which clears it as part of its own state reset).
                     self.last_core_term_to_name = Some(term_to_name);
-                    if restored_plain_query_authority
+                    // The post-redirect internal-certificate refresh was
+                    // reachable ONLY through the Unknown-rescue arm's
+                    // park/restore. A named-core redirect that answered UNSAT
+                    // DIRECTLY never parked anything, so `restored_...` was
+                    // false and the refresh never ran — the redirect's stripped
+                    // assertion stack had already made
+                    // `authenticated_authored_roots_for_internal_certificate`
+                    // decline during the solve, so the BV/LIA `int2bv` bridge
+                    // lemma stayed an uncertified `hole` and every consumer
+                    // that requires a self-checked refutation published
+                    // `unknown (incomplete self-check-rejected)` for a query it
+                    // had just refuted. That made a DIAGNOSTIC option
+                    // (`:produce-unsat-cores` together with `:named`
+                    // assertions) change the VERDICT: byte-identical problems
+                    // answered `unsat` without it.
+                    //
+                    // Fail-closed by construction — this only re-runs the
+                    // rebuild at a point where the authored stack is restored.
+                    // The rebuild it calls re-authenticates the epoch, the
+                    // source provenance and the exact root alignment,
+                    // independently replays the candidate, and preserves an
+                    // already-complete proof byte-identically. Nothing here can
+                    // mint a certificate the ordinary (non-core) path would not
+                    // also mint.
+                    let internal_certificate_authority_current =
+                        restored_plain_query_authority || !parked_outer_authority;
+                    if internal_certificate_authority_current
                         && matches!(result, Ok(ref verdict) if verdict.is_unsat())
                     {
                         // This exact event — not every later UNSAT
@@ -4171,6 +4265,7 @@ impl Executor {
                         Ok(SolveResult::Unknown)
                             if !self.incremental_mode
                                 && !self.original_problem_had_quantifiers
+                                && !self.ite_uf_definition_recovery.ready()
                                 && !matches!(
                                     self.last_unknown_reason,
                                     Some(UnknownReason::Timeout)
@@ -4772,51 +4867,6 @@ impl Executor {
         self.last_unknown_reason = Some(UnknownReason::UnsupportedArithmetic);
     }
 
-    /// Rewrite each assertion that is a Bool-valued `(ite c t e)` — or a
-    /// top-level `(and ...)` conjunct that is one — into the logically-identical
-    /// `(and (=> c t) (=> (not c) e))`. See the call site in
-    /// `check_sat_internal` (#A1-arr-lia561). The rewrite is semantically exact;
-    /// it only changes the Boolean structure handed to the solver, never the
-    /// formula's models.
-    fn rewrite_assertion_bool_ites(&mut self) {
-        let asserts = self.ctx.assertions.clone();
-        let mut changed = false;
-        let new_asserts: Vec<TermId> = asserts
-            .iter()
-            .map(|&a| match self.ctx.terms.get(a).clone() {
-                TermData::Ite(c, t, e) => {
-                    changed = true;
-                    self.bool_ite_to_and_implies(c, t, e)
-                }
-                TermData::App(sym, args) if sym.name() == "and" => {
-                    let mut conj_changed = false;
-                    let new_args: Vec<TermId> = args
-                        .iter()
-                        .map(|&x| {
-                            if let TermData::Ite(c, t, e) = self.ctx.terms.get(x).clone() {
-                                conj_changed = true;
-                                self.bool_ite_to_and_implies(c, t, e)
-                            } else {
-                                x
-                            }
-                        })
-                        .collect();
-                    if conj_changed {
-                        changed = true;
-                        self.ctx.terms.mk_and(new_args)
-                    } else {
-                        a
-                    }
-                }
-                _ => a,
-            })
-            .collect();
-        if changed {
-            self.record_named_assert_rewrites(&asserts, &new_asserts);
-            self.ctx.assertions = new_asserts;
-        }
-    }
-
     /// Record positional rewrite provenance for the named-core machinery
     /// (#uc-named-provenance). ONLY per-assertion semantically-EXACT passes
     /// may call this (see the `named_assert_rewrites` field docs): the label
@@ -4842,15 +4892,11 @@ impl Executor {
             self.named_assert_rewrites.insert(new, root);
         }
     }
+}
 
-    /// Build `(and (=> c t) (=> (not c) e))` for a Bool-valued ITE.
-    fn bool_ite_to_and_implies(&mut self, c: TermId, t: TermId, e: TermId) -> TermId {
-        let not_c = self.ctx.terms.mk_not(c);
-        let imp_then = self.ctx.terms.mk_implies(c, t);
-        let imp_else = self.ctx.terms.mk_implies(not_c, e);
-        self.ctx.terms.mk_and(vec![imp_then, imp_else])
-    }
+include!("check_sat/bool_ite_branch_hints.rs");
 
+impl Executor {
     /// Push `select`/`store` through an ARRAY-VALUED `ite`:
     ///   `(select (ite c A B) i)`  -> `(ite c (select A i) (select B i))`
     ///   `(store  (ite c A B) i v)` -> `(ite c (store A i v) (store B i v))`
@@ -5037,6 +5083,7 @@ mod quantifier_determinism_tests {
         let mut exec = Executor::new();
         let nominal = Instant::now() + Duration::from_secs(10);
         exec.set_deadline(Some(nominal));
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         let extended = exec
             .solve_deadline
@@ -5054,8 +5101,39 @@ mod quantifier_determinism_tests {
         );
         // One-shot per call: a second install must not compound.
         let after_first = exec.solve_deadline.get();
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         assert_eq!(exec.solve_deadline.get(), after_first);
+    }
+
+    #[test]
+    fn quantifier_deadline_backstop_is_opt_in_and_off_by_default() {
+        // #honest-timeout: the DEFAULT is that the caller's deadline is the
+        // wall. Without `set_quantifier_deadline_backstop(true)` the install is
+        // a no-op — no extension, and the one-shot marker is not consumed, so
+        // nothing downstream can mistake this for "a backstop is in force".
+        let mut exec = Executor::new();
+        assert!(
+            !exec.quantifier_deadline_backstop(),
+            "the quantified backstop must be OFF for a fresh executor"
+        );
+        let nominal = Instant::now() + Duration::from_secs(10);
+        exec.set_deadline(Some(nominal));
+        exec.install_quantifier_deadline_backstop();
+        assert_eq!(
+            exec.solve_deadline.get(),
+            Some(nominal),
+            "an un-opted-in caller's deadline must be left exactly as installed"
+        );
+        assert!(
+            !exec.quantifier_deadline_backstop_installed,
+            "no backstop was installed, so the one-shot marker must stay clear"
+        );
+        // Opting back out after opting in restores the exact wall.
+        exec.set_quantifier_deadline_backstop(true);
+        exec.set_quantifier_deadline_backstop(false);
+        exec.install_quantifier_deadline_backstop();
+        assert_eq!(exec.solve_deadline.get(), Some(nominal));
     }
 
     #[test]
@@ -5063,6 +5141,7 @@ mod quantifier_determinism_tests {
         let mut exec = Executor::new();
         let nominal = Instant::now() + Duration::from_mins(5);
         exec.set_deadline(Some(nominal));
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         let extra = exec
             .solve_deadline
@@ -5087,11 +5166,13 @@ mod quantifier_determinism_tests {
             .checked_sub(Duration::from_millis(50))
             .expect("50 milliseconds must fit before the current test instant");
         exec.set_deadline(Some(past));
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         assert_eq!(exec.solve_deadline.get(), Some(past));
         // Absent deadline stays absent.
         let mut exec2 = Executor::new();
         exec2.set_deadline(None);
+        exec2.set_quantifier_deadline_backstop(true);
         exec2.install_quantifier_deadline_backstop();
         assert_eq!(exec2.solve_deadline.get(), None);
     }
@@ -5102,6 +5183,7 @@ mod quantifier_determinism_tests {
         let nominal = Instant::now() + Duration::from_secs(10);
         exec.set_deadline(Some(nominal));
         exec.set_quantifier_deadline_policy(super::super::QuantifierDeadlinePolicy::Exact);
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         assert_eq!(exec.solve_deadline.get(), Some(nominal));
         assert!(
@@ -5121,6 +5203,8 @@ mod quantifier_determinism_tests {
         assert_eq!(previous, None);
         assert_eq!(exec.solve_deadline.get(), None);
     }
+
+    include!("check_sat/command_deadline_tests.rs");
 
     #[test]
     fn control_lifetime_interruptible_publication_keeps_watchdog_and_restores_controls() {
@@ -5234,6 +5318,7 @@ mod quantifier_determinism_tests {
         exec.set_deadline(Some(nominal));
         // Built BEFORE the backstop install, polled after it.
         let stop = exec.make_should_stop();
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop(); // 4x => backstop ~= +400ms
         std::thread::sleep(Duration::from_millis(180)); // past nominal, well before backstop
         assert!(
@@ -5255,6 +5340,7 @@ mod quantifier_determinism_tests {
         let mut exec = Executor::new();
         let outer = Instant::now() + Duration::from_mins(1);
         exec.set_deadline(Some(outer));
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         let stop = exec.make_should_stop();
         // Tight sub-deadline already expired: a live-reading closure must stop
@@ -5333,78 +5419,6 @@ mod quantifier_determinism_tests {
         );
     }
 
-    /// Load a small quantified+ground mixed assertion set (no check-sat).
-    fn load_quantified_mix(exec: &mut Executor) {
-        let commands = ay_frontend::parse(
-            "(set-logic UFLIA)\
-             (declare-fun f (Int) Int)\
-             (declare-const a Int)\
-             (assert (forall ((x Int)) (>= (f x) 0)))\
-             (assert (> a 0))",
-        )
-        .expect("test input must parse");
-        exec.execute_all(&commands)
-            .expect("setup commands must run");
-    }
-
-    #[test]
-    fn control_lifetime_command_publication_preserves_one_nominal_deadline() {
-        let mut exec = Executor::new();
-        load_quantified_mix(&mut exec);
-        exec.set_timeout(Some(Duration::from_secs(10)));
-
-        let before_command = exec.install_command_publication_deadline();
-        assert_eq!(before_command, None);
-        let nominal = exec
-            .solve_deadline
-            .get()
-            .expect("the command scope must install its absolute deadline");
-
-        // The nested solve may temporarily relax a quantified deadline, but
-        // must restore the exact command value before publication begins.
-        let before_solve = exec.install_timeout_deadline_for_call();
-        assert_eq!(before_solve, Some(nominal));
-        assert!(
-            exec.solve_deadline
-                .get()
-                .is_some_and(|deadline| deadline > nominal),
-            "the fixture must exercise quantified deadline relaxation"
-        );
-        exec.restore_timeout_deadline_after_call(before_solve);
-        assert_eq!(
-            exec.solve_deadline.get(),
-            Some(nominal),
-            "certification must inherit the original absolute deadline, not a renewed timeout"
-        );
-
-        exec.restore_timeout_deadline_after_call(before_command);
-        assert_eq!(
-            exec.solve_deadline.get(),
-            None,
-            "the complete command scope must restore its predecessor"
-        );
-    }
-
-    #[test]
-    fn control_lifetime_command_publication_restores_deadline_after_elaboration_error() {
-        let mut exec = Executor::new();
-        exec.set_timeout(Some(Duration::from_secs(10)));
-        let command = ay_frontend::parse("(check-sat-assuming (undeclared_symbol))")
-            .expect("the malformed query is syntactically valid")
-            .pop()
-            .expect("one command must parse");
-
-        assert!(
-            exec.execute_authored(&command).is_err(),
-            "an undeclared assumption must fail elaboration"
-        );
-        assert_eq!(
-            exec.solve_deadline.get(),
-            None,
-            "an error path must not leak the command publication deadline"
-        );
-    }
-
     #[test]
     fn ground_entry_backstop_extends_at_install_for_quantified_mix() {
         // #ground-determinism (task #26 item 2): a MIXED ground+quantified
@@ -5414,6 +5428,9 @@ mod quantifier_determinism_tests {
         // install runs (which early-returns on an expired deadline).
         let mut exec = Executor::new();
         load_quantified_mix(&mut exec);
+        // #honest-timeout: the entry install is what this test is about, and it
+        // is now opt-in.
+        exec.set_quantifier_deadline_backstop(true);
         exec.set_timeout(Some(Duration::from_secs(10)));
         let prev = exec.install_timeout_deadline_for_call();
         assert_eq!(prev, None, "no deadline was installed before the call");
@@ -5433,6 +5450,7 @@ mod quantifier_determinism_tests {
         );
         // The later quantified-entry install must be a no-op (one-shot).
         let after_entry = exec.solve_deadline.get();
+        exec.set_quantifier_deadline_backstop(true);
         exec.install_quantifier_deadline_backstop();
         assert_eq!(exec.solve_deadline.get(), after_entry);
         // Per-call restore unwinds everything.

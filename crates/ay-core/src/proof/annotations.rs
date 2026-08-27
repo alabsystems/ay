@@ -37,6 +37,12 @@ use serde::{Deserialize, Serialize};
 pub struct FarkasAnnotation {
     /// Farkas coefficients for each constraint in the conflict
     /// Indexed by position in the clause (same order as `clause` field)
+    ///
+    /// `Rational64 = Ratio<i64>` loses its own `Serialize`/`Deserialize` when
+    /// the `num-rational/serde` feature is off, so the codec is supplied
+    /// locally. It does NOT widen what this struct accepts —
+    /// `deny_unknown_fields` above is untouched.
+    #[serde(with = "crate::serde_bignum::rational64_vec")]
     pub coefficients: Vec<Rational64>,
 }
 

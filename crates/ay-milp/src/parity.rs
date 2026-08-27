@@ -919,6 +919,13 @@ fn finish(
     }
 }
 
+/// Force this module's cached env accessor at solve entry, so a consumer that
+/// rewrites its environment between window solves cannot race it. Called from
+/// `bab::prime_env_all`.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,11 +1180,4 @@ mod tests {
         m2.set_objective(&[(a, 1.0)], Sense::Minimize);
         assert!(try_solve(&m2, deadline()).is_none());
     }
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

@@ -19,6 +19,9 @@
 
 use super::*;
 use ay_core::{FarkasAnnotation, Sort, TermStore, TheoryLemmaKind};
+
+#[path = "alethe_printer_int_guarded_split_diseq_tests.rs"]
+mod guarded_split_diseq;
 use num_bigint::BigInt;
 use num_rational::Rational64;
 

@@ -230,8 +230,8 @@ impl SymmetryDetector {
     /// Public accessor for the gate-checkable automorphism generators, used by
     /// the HHW DRAT symmetry-breaking route (`--sat-symmetry-hhw`) which builds
     /// a per-generator Heule-Hunt-Wetzler image-and-chain proof fragment rather
-    /// than a lex-leader/PR/SR encoding. Returns the SAME generator set the
-    /// composite/DPR/SR routes consume.
+    /// than emitting a bare lex leader. Returns the same generator set as the
+    /// no-proof composite route.
     pub(crate) fn find_generators(
         &self,
         clauses: &[Vec<Literal>],
@@ -241,10 +241,8 @@ impl SymmetryDetector {
 
     /// Shared generator-finding core for the composite-symmetry path: IR
     /// automorphism finder (primary) with the backtracking closure finder as a
-    /// fallback. Both `detect_and_encode_composite` (plain clauses) and
-    /// `detect_and_encode_composite_with_witness` (PR-tagged clauses) consume the
-    /// SAME generators, so the live no-proof path and the DPR proof path emit lex
-    /// leaders for an identical generator set.
+    /// fallback. The no-proof composite route and the HHW proof route consume
+    /// this same gate-verified generator set.
     fn find_composite_generators(
         &self,
         clauses: &[Vec<Literal>],
@@ -279,69 +277,6 @@ impl SymmetryDetector {
             );
         }
         generators
-    }
-
-    /// PR-emitting variant of [`Self::detect_and_encode_composite`]: emits the
-    /// SAME per-generator lex-leader clauses for the SAME generators, but tags each
-    /// one as [`LexClause::Pr`] (the aux-free `j=0` binary, with its σ-image
-    /// witness) or [`LexClause::Aux`] (the `j>0` tower clauses + Tseitin defs that
-    /// are NOT single-σ-PR — see [`encode_perm_lex_leader_with_witness`]).
-    ///
-    /// On the DPR proof route the caller emits ONLY the [`LexClause::Pr`] binaries
-    /// (as DPR `a`-lines with the σ witness) and DROPS the [`LexClause::Aux`]
-    /// clauses entirely; binary-only per-generator symmetry breaking is still
-    /// satisfiability-preserving (each `(x_{w_0} ∨ ¬x_{σ⁻¹(w_0)})` is the
-    /// 2-orbit lex-leader of a verified automorphism). Returns
-    /// `(tagged_clauses, aux_allocated)`; the caller must `ensure_num_vars` for the
-    /// aux it actually keeps (none, when it drops the Aux clauses).
-    pub(crate) fn detect_and_encode_composite_with_witness(
-        &self,
-        clauses: &[Vec<Literal>],
-        fresh_base: u32,
-    ) -> (Vec<LexClause>, u32) {
-        let generators = self.find_composite_generators(clauses);
-        let mut out: Vec<LexClause> = Vec::new();
-        let mut next = fresh_base;
-        for g in &generators {
-            let (tagged, aux) = encode_perm_lex_leader_with_witness(g, next);
-            next = next.saturating_add(aux);
-            out.extend(tagged);
-        }
-        (out, next - fresh_base)
-    }
-
-    /// SR-emitting variant of [`Self::detect_and_encode_composite_with_witness`]:
-    /// emits the SAME per-generator lex-leader clauses for the SAME generators, but
-    /// tags EVERY clause (the full lex tower, not just the aux-free `j=0` binary) as
-    /// [`LexClause::Sr`] with the full automorphism substitution σ as witness
-    /// (#8011 SR route).
-    ///
-    /// The generators are emitted in BreakID-style **tower order** (sorted by the
-    /// minimum variable in each generator's support) so that each generator's lex
-    /// tower is added on top of a formula that already contains the lower
-    /// generators' SBP. Because the SR witness σ is a substitution, the SR
-    /// redundancy check applies σ to the CURRENT formula — including the
-    /// already-added SBP of the lower generators — and σ (a verified automorphism)
-    /// maps that augmented formula onto itself, so the towers compose. Returns
-    /// `(tagged_clauses, aux_allocated)`; the caller MUST `ensure_num_vars` for the
-    /// allocated aux because the SR route KEEPS the whole tower.
-    pub(crate) fn detect_and_encode_composite_sr(
-        &self,
-        clauses: &[Vec<Literal>],
-        fresh_base: u32,
-    ) -> (Vec<LexClause>, u32) {
-        let mut generators = self.find_composite_generators(clauses);
-        // Tower order: emit generators whose support starts lower first, so each
-        // SR step resolves against the already-added lower-generator SBP.
-        generators.sort_by_key(|g| g.keys().next().map(|v| v.0).unwrap_or(u32::MAX));
-        let mut out: Vec<LexClause> = Vec::new();
-        let mut next = fresh_base;
-        for g in &generators {
-            let (tagged, aux) = encode_perm_lex_leader_sr(g, next);
-            next = next.saturating_add(aux);
-            out.extend(tagged);
-        }
-        (out, next - fresh_base)
     }
 }
 
@@ -661,53 +596,28 @@ fn encode_perm_lex_leader(
     (clauses, next - fresh_base)
 }
 
-/// A single emitted lex-leader clause tagged with how it can be certified in a
-/// PR/DPR proof (the witness-threading half of the #8011 work).
+/// One family-specific substitution-redundancy proof step.
+///
+/// This type carries the DSR wire data only; constructing it does not by itself
+/// certify redundancy. Each producer must establish its own ordered construction,
+/// and proof-mode callers emit the result for independent SR checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LexClause {
-    /// An aux-free lex clause (every literal lies in `σ`'s support) certifiable as
-    /// PR with the σ-image witness `w = σ(¬C)`. `witness` is the partial-assignment
-    /// witness as literals; it always contains `clause[0]` (the chosen pivot), so a
-    /// DPR `a`-line `clause… witness… 0` is well-formed.
-    Pr {
-        clause: Vec<Literal>,
-        witness: Vec<Literal>,
-    },
-    /// A clause carrying a fresh equal-prefix aux variable `e_j` (the lex clause for
-    /// position `j > 0`, or an `e_j ↔ prefix-equal` Tseitin definition). `σ` does
-    /// not constrain `e_j`, so the σ-image construction does NOT certify it; it must
-    /// be emitted on the RAT/blocked route. This is exactly the part of the
-    /// multi-position lex tower that does not compose under single-σ PR (#8011).
-    Aux { clause: Vec<Literal> },
-    /// An SR (substitution-redundant) tower clause certifiable under the full
-    /// automorphism substitution σ (#8011 SR route). `witness` is the DSR
-    /// witness-token stream that follows `clause` on the `a`-line: it begins by
-    /// repeating the pivot `clause[0]` (the 2nd pivot occurrence opens the PR part
-    /// `pivot↦⊤`, the 3rd opens the substitution part), then carries σ as
-    /// literal↦literal pairs. Unlike [`LexClause::Pr`] this certifies the WHOLE lex
-    /// tower (including the `j>0` clauses and Tseitin defs) under the same σ:
-    /// because σ is a verified automorphism it remaps the formula — including any
-    /// previously added SBP — onto itself, so the tower composes (Codel-Avigad-Heule
-    /// FMCAD 2024). Verified externally by `dsr-trim → drat/lsr → cake_lpr`.
+    /// A clause and its DSR witness-token stream. The witness begins by repeating
+    /// `clause[0]`; its remaining layout is producer-specific.
     Sr {
         clause: Vec<Literal>,
         witness: Vec<Literal>,
     },
 }
 
-/// Build the DSR witness-token stream for SR clause `clause` under the
-/// automorphism substitution `perm` (var↦var). The returned vector is the witness
-/// portion of the `a`-line (it is written after `clause`, before the terminating
-/// `0`): `[pivot, pivot, k₁ v₁, k₂ v₂, …]` where `pivot = clause[0]`.
-///
-/// Layout (see `dsr-trim`'s `parse_sr_clause_and_witness`): the SECOND occurrence
-/// of the pivot opens the witness PR part (forcing `pivot↦⊤`, which satisfies the
-/// added clause); the THIRD occurrence is the separator opening the substitution
-/// part, which lists σ as positive-literal `from to` pairs. The pivot's own
-/// variable is omitted from the pairs (it is already pinned to ⊤ in the PR part,
-/// and "only the pivot may map to itself"); identity mappings (`k == v`) are
-/// skipped as well.
-fn sr_witness_tokens(clause: &[Literal], perm: &BTreeMap<Variable, Variable>) -> Vec<Literal> {
+/// Reproduce the retired generic lex-tower witness for the negative checker
+/// regression below. Production routes must not call this helper.
+#[cfg(test)]
+fn rejected_test_sr_witness_tokens(
+    clause: &[Literal],
+    perm: &BTreeMap<Variable, Variable>,
+) -> Vec<Literal> {
     let pivot = clause[0];
     let pivot_var = pivot.variable();
     let mut witness = vec![pivot, pivot];
@@ -721,18 +631,10 @@ fn sr_witness_tokens(clause: &[Literal], perm: &BTreeMap<Variable, Variable>) ->
     witness
 }
 
-/// SR variant of [`encode_perm_lex_leader_with_witness`]: emits the SAME full lex
-/// tower (the `j=0` binary, every `j>0` lex clause, and all Tseitin equal-prefix
-/// definitions — identical literals and aux allocation) but tags EVERY clause as
-/// [`LexClause::Sr`] with the full automorphism substitution σ as its DSR witness.
-///
-/// This is the #8011 SR fix: where the DPR route kept only the aux-free `j=0`
-/// binary (single-σ PR) and DROPPED the rest, the SR witness is a SUBSTITUTION, so
-/// σ certifies the whole tower at once — applying σ to the current formula
-/// (including previously added SBP) maps it onto itself, so the per-generator
-/// towers compose. Returns `(tagged_clauses, aux_allocated)` with the same
-/// `aux_allocated` count as [`encode_perm_lex_leader`].
-fn encode_perm_lex_leader_sr(
+/// Build the deliberately rejected generic tower used only by the native-checker
+/// regression. The live route was retired because these steps do not compose.
+#[cfg(test)]
+fn encode_rejected_test_lex_tower_sr(
     perm: &BTreeMap<Variable, Variable>,
     fresh_base: u32,
 ) -> (Vec<LexClause>, u32) {
@@ -740,7 +642,7 @@ fn encode_perm_lex_leader_sr(
     let out = plain
         .into_iter()
         .map(|clause| {
-            let witness = sr_witness_tokens(&clause, perm);
+            let witness = rejected_test_sr_witness_tokens(&clause, perm);
             LexClause::Sr { clause, witness }
         })
         .collect();
@@ -751,13 +653,11 @@ fn encode_perm_lex_leader_sr(
 /// reference generator `third_party/dsr-trim/php/php-sr.c` (Heule/Codel), driven
 /// off the detected pigeonhole matrix instead of a hard-coded hole count.
 ///
-/// WHY THIS EXISTS (the #8011 SR blocker). The lex-leader SR route
-/// ([`encode_perm_lex_leader_sr`]) emits, per generator, a lex tower that carries
-/// fresh equal-prefix aux variables `e_j`. The `e_j` Tseitin definition clauses
-/// are NOT redundant under a σ-only substitution witness (σ never touches `e_j`),
-/// so `dsr-trim` rejects them ("No UP contradiction for RAT clause"). The fix is
-/// to abandon lex-leaders and instead emit a COMPLETE refutation over the
-/// ORIGINAL variables only — exactly what php-sr.c does.
+/// WHY THIS EXISTS (the #8011 SR blocker). A generic lex tower is not certified by
+/// one σ witness per clause after earlier additions change the active formula;
+/// the native negative regression at the end of this file pins that boundary.
+/// This route instead emits a COMPLETE refutation over the ORIGINAL variables —
+/// exactly what php-sr.c does.
 ///
 /// THE CONSTRUCTION (per hole `h`, in tower order `h = 0 … H-2`):
 ///   * For `p = P-1` down to `h+1`, the SR unit `(¬x_{p,h})` ("pigeon p is not in
@@ -779,9 +679,10 @@ fn encode_perm_lex_leader_sr(
 /// the empty clause follows by plain unit propagation (the SOLVER derives and
 /// emits it — it is not part of the returned steps).
 ///
-/// Returns `None` when `clauses` is not a pure pigeonhole matrix. SOUNDNESS: when
-/// `Some`, every emitted clause is SR/RAT-redundant by construction; a mis-detected
-/// matrix can only yield a proof `dsr-trim` REJECTS, never a false VERIFIED.
+/// Returns `None` when `clauses` is not a supported matrix. SOUNDNESS: exact
+/// structural recognition and the ordered family construction establish every
+/// returned step. That is the trust boundary in no-proof mode; `dsr-trim`
+/// independently checks the same steps when a certificate is requested.
 ///
 /// Each returned [`LexClause::Sr`] carries the full DSR witness token stream
 /// (already beginning with the repeated pivot `clause[0]`), so the caller writes it
@@ -1032,146 +933,10 @@ fn detect_php_matrix(clauses: &[Vec<Literal>]) -> Option<Vec<Vec<Variable>>> {
         .collect::<Option<Vec<Vec<Variable>>>>()
 }
 
-/// Build the aux-free SR refutation steps from a recognised pigeonhole matrix
-/// `M[row][col]` (`P = M.len()` pigeons, `H = M[0].len()` holes, `P = H + 1`).
-/// Mirrors the loop structure and witness layout of php-sr.c verbatim. The empty
-/// clause is intentionally NOT emitted here — it follows by root unit propagation
-/// once the caller has added these units, and the solver emits it.
-fn build_php_aux_free_sr(matrix: &[Vec<Variable>]) -> Vec<LexClause> {
-    let p = matrix.len(); // P = H + 1 pigeons (rows 0..=H)
-    let h = matrix.first().map_or(0, Vec::len); // H holes (cols 0..H-1)
-    let mut out: Vec<LexClause> = Vec::new();
-    if p < 3 || h < 2 || p < h + 1 {
-        return out; // see detect_php_matrix: P >= H + 1, untruncated
-    }
-
-    for hole in 0..h - 1 {
-        // SR units (¬x_{p,h}) for p = P-1 down to hole+1, each witnessed by the
-        // pigeon-swap (pigeon p-1 ↔ pigeon p) over holes j > hole.
-        for pig in ((hole + 1)..=(p - 1)).rev() {
-            let v1 = matrix[pig][hole];
-            let v2 = matrix[pig - 1][hole];
-            let clause = vec![Literal::negative(v1)];
-            // Witness token stream: [pivot, PR-assignment…, pivot(separator),
-            // substitution pairs…]. The PR part puts pigeon p-1 into hole h; the
-            // substitution swaps pigeons p-1 and p in every later hole.
-            let mut witness = vec![
-                Literal::negative(v1), // 2nd pivot occurrence: opens the PR part
-                Literal::positive(v2), // PR assignment x_{p-1,h} = 1
-                Literal::negative(v1), // 3rd pivot occurrence: separator
-            ];
-            for (&v3, &v4) in matrix[pig - 1][(hole + 1)..h]
-                .iter()
-                .zip(&matrix[pig][(hole + 1)..h])
-            {
-                // σ(v3) = v4, σ(v4) = v3 (swap the two pigeons in hole j).
-                witness.push(Literal::positive(v3));
-                witness.push(Literal::positive(v4));
-                witness.push(Literal::positive(v4));
-                witness.push(Literal::positive(v3));
-            }
-            out.push(LexClause::Sr { clause, witness });
-        }
-
-        // RAT unit (x_{h,h}): pigeon `hole` occupies hole `hole`.
-        let diag = matrix[hole][hole];
-        out.push(LexClause::Sr {
-            clause: vec![Literal::positive(diag)],
-            witness: vec![Literal::positive(diag)],
-        });
-
-        // RAT units (¬x_{h,j}) for j > hole: pigeon `hole` is in no later hole.
-        for &v in &matrix[hole][(hole + 1)..h] {
-            out.push(LexClause::Sr {
-                clause: vec![Literal::negative(v)],
-                witness: vec![Literal::negative(v)],
-            });
-        }
-    }
-    out
-}
-
-/// Witness-threading variant of [`encode_perm_lex_leader`]: emits the SAME clauses
-/// (identical literals and aux allocation) but tags each one with its PR
-/// certifiability and, for the aux-free clauses, the σ-image PR witness.
-///
-/// For lex clause `C` with negation `α = ¬C`, the PR witness is `w = σ(α)`: apply
-/// `σ` literal-wise to the negated original-variable literals of `C`. Concretely
-/// the position-`j` clause `(… ∨ x_{w_j} ∨ ¬x_{σ⁻¹(w_j)})` yields
-/// `w = {¬x_{σ(w_j)},  x_{w_j}}`, which satisfies `C` via `x_{w_j}` and witnesses
-/// the RUP entailments because `σ` is a verified automorphism (see
-/// [`permutation_preserves_formula`] and the PR contract in
-/// `ay_proof_common::contracts`). Only `j = 0` (the binary `(x_{w_0} ∨ ¬x_{σ⁻¹(w_0)})`)
-/// is aux-free and PR-certifiable; every later position carries `e_j` and is
-/// returned as [`LexClause::Aux`].
-///
-/// `perm` MUST have passed [`permutation_preserves_formula`]. Returns
-/// `(tagged_clauses, aux_allocated)` with the same `aux_allocated` count as
-/// [`encode_perm_lex_leader`].
-fn encode_perm_lex_leader_with_witness(
-    perm: &BTreeMap<Variable, Variable>,
-    fresh_base: u32,
-) -> (Vec<LexClause>, u32) {
-    let mut out: Vec<LexClause> = Vec::new();
-    let mut next = fresh_base;
-    let support: Vec<Variable> = perm.keys().copied().collect();
-    if support.is_empty() {
-        return (out, 0);
-    }
-    let mut inv: BTreeMap<Variable, Variable> = BTreeMap::new();
-    for (k, v) in perm {
-        inv.insert(*v, *k);
-    }
-    if inv.len() != perm.len() || !perm.keys().all(|k| inv.contains_key(k)) {
-        return (out, 0);
-    }
-    let n = support.len();
-    let mut e_prev: Option<Variable> = None;
-    for (j, &xj) in support.iter().enumerate() {
-        let yj = *inv
-            .get(&xj)
-            .expect("support is closed under perm (a permutation of itself)");
-        match e_prev {
-            None => {
-                // j == 0: aux-free binary clause (x_{w_0} ∨ ¬x_{σ⁻¹(w_0)}).
-                let clause = vec![Literal::positive(xj), Literal::negative(yj)];
-                // σ-image witness w = σ(¬C). ¬C = {¬x_{w_0}, x_{σ⁻¹(w_0)}}.
-                //   σ(¬x_{w_0})       = ¬x_{σ(w_0)}
-                //   σ(x_{σ⁻¹(w_0)})   =  x_{w_0}        (pivot — satisfies C)
-                let s_xj = *perm.get(&xj).expect("xj in support");
-                let witness = vec![Literal::positive(xj), Literal::negative(s_xj)];
-                debug_assert!(
-                    witness.contains(&clause[0]),
-                    "PR witness must contain the clause pivot (DPR a-line well-formedness)"
-                );
-                out.push(LexClause::Pr { clause, witness });
-            }
-            Some(e) => {
-                // j > 0: carries the fresh aux e_j → not σ-certifiable (#8011).
-                out.push(LexClause::Aux {
-                    clause: vec![
-                        Literal::negative(e),
-                        Literal::positive(xj),
-                        Literal::negative(yj),
-                    ],
-                });
-            }
-        }
-        if j + 1 < n {
-            let e_next = Variable(next);
-            next = next.saturating_add(1);
-            // The e_{j+1} ↔ prefix-equal Tseitin definition clauses are fresh-aux
-            // definitions, emitted on the RAT/blocked route.
-            let mut def: Vec<Vec<Literal>> = Vec::new();
-            emit_eq_prefix_def(&mut def, e_next, e_prev, xj, yj);
-            for clause in def {
-                out.push(LexClause::Aux { clause });
-            }
-            e_prev = Some(e_next);
-        }
-    }
-    (out, next - fresh_base)
-}
+include!("detector/aux_free_sr.rs");
+include!("detector/phased_colouring_aux_free_sr.rs");
+include!("detector/clique_colouring_aux_free_sr.rs");
+include!("detector/relativized_php_aux_free_sr.rs");
 
 /// Check whether swapping `pair.lhs <-> pair.rhs` in every clause preserves
 /// the formula as a multiset of canonical clause keys.
@@ -1660,74 +1425,6 @@ mod interrupt_tests;
 mod tests {
     use super::*;
     use crate::{Literal, Variable};
-
-    /// The witness-threading encoder must emit byte-for-byte the SAME clauses as
-    /// the base encoder (same literals, same aux allocation), and the σ-image PR
-    /// witness on the aux-free `j=0` clause must satisfy that clause and contain
-    /// only support variables.
-    #[test]
-    fn test_encode_perm_lex_leader_witness_matches_base_and_witness_is_sound() {
-        // A clean 3-cycle automorphism σ = (0 1 2) on variables {0,1,2}.
-        let mut perm: BTreeMap<Variable, Variable> = BTreeMap::new();
-        perm.insert(Variable(0), Variable(1));
-        perm.insert(Variable(1), Variable(2));
-        perm.insert(Variable(2), Variable(0));
-        let fresh_base = 10u32;
-
-        let (base_clauses, base_aux) = encode_perm_lex_leader(&perm, fresh_base);
-        let (tagged, tagged_aux) = encode_perm_lex_leader_with_witness(&perm, fresh_base);
-
-        assert_eq!(
-            base_aux, tagged_aux,
-            "aux allocation must match base encoder"
-        );
-        let tagged_clauses: Vec<Vec<Literal>> = tagged
-            .iter()
-            .map(|t| match t {
-                LexClause::Pr { clause, .. } => clause.clone(),
-                LexClause::Aux { clause } => clause.clone(),
-                LexClause::Sr { clause, .. } => clause.clone(),
-            })
-            .collect();
-        assert_eq!(
-            base_clauses, tagged_clauses,
-            "witness encoder must emit identical clauses to the base encoder"
-        );
-
-        // Exactly the j=0 clause is PR-certifiable; the rest carry aux.
-        let pr: Vec<&LexClause> = tagged
-            .iter()
-            .filter(|t| matches!(t, LexClause::Pr { .. }))
-            .collect();
-        assert_eq!(
-            pr.len(),
-            1,
-            "only the aux-free j=0 lex clause is PR-certifiable"
-        );
-
-        if let LexClause::Pr { clause, witness } = pr[0] {
-            // j=0: support sorted ascending → w_0 = var 0, σ⁻¹(0)=2 → C=(x0 ∨ ¬x2).
-            assert_eq!(
-                clause,
-                &vec![
-                    Literal::positive(Variable(0)),
-                    Literal::negative(Variable(2))
-                ]
-            );
-            // w = σ(¬C) = {x0, ¬x_{σ(0)}} = {x0, ¬x1}.
-            assert_eq!(
-                witness,
-                &vec![
-                    Literal::positive(Variable(0)),
-                    Literal::negative(Variable(1))
-                ]
-            );
-            // Witness satisfies the clause via the shared pivot x0.
-            assert!(clause.iter().any(|c| witness.contains(c)));
-        } else {
-            unreachable!();
-        }
-    }
 
     /// The #17 verification gate must accept a COMPOSITE permutation symmetry
     /// (the kind clique/coloring/PHP instances have) and REJECT the single swaps
@@ -2323,9 +2020,7 @@ mod tests {
         // hole 0: SR units for pigeon 2 then 1, then diagonal V0, then ¬V1.
         assert_eq!(steps.len(), 4, "two SR units + diagonal + one off-diagonal");
         for lc in &steps {
-            let LexClause::Sr { clause, witness } = lc else {
-                panic!("aux-free route emits only LexClause::Sr");
-            };
+            let LexClause::Sr { clause, witness } = lc;
             assert!(!clause.is_empty());
             assert_eq!(
                 witness.first(),
@@ -2340,9 +2035,7 @@ mod tests {
 
         // First step = (¬V4), witnessed by swap(pigeon1↔pigeon2): PR part puts
         // pigeon 1 into hole 0 (V2), substitution swaps them in hole 1 (V3↔V5).
-        let LexClause::Sr { clause, witness } = &steps[0] else {
-            unreachable!()
-        };
+        let LexClause::Sr { clause, witness } = &steps[0];
         assert_eq!(clause, &vec![Literal::negative(Variable(4))]);
         assert_eq!(
             witness,
@@ -2358,9 +2051,7 @@ mod tests {
         );
 
         // Diagonal and off-diagonal are pivot-only PR units.
-        let LexClause::Sr { clause, witness } = &steps[2] else {
-            unreachable!()
-        };
+        let LexClause::Sr { clause, witness } = &steps[2];
         assert_eq!(clause, &vec![Literal::positive(Variable(0))]);
         assert_eq!(witness, &vec![Literal::positive(Variable(0))]);
     }
@@ -2405,6 +2096,504 @@ mod tests {
         assert!(detect_php_aux_free_sr(&incomplete).is_none());
     }
 
+    include!("detector/matching_incidence_tests.rs");
+
+    /// Phase-flipped clique-colouring fixture (`homer` shape): `components`
+    /// disjoint K_m cliques sharing `colours` colour classes, with variable
+    /// `((component·m + vertex)·colours + colour)` and the per-variable phase
+    /// `positive iff index % 3 != 0`.
+    fn phased_colouring_clauses(m: usize, colours: usize, components: usize) -> Vec<Vec<Literal>> {
+        let var = |o: usize, w: usize, j: usize| Variable(((o * m + w) * colours + j) as u32);
+        let phase = |v: Variable| {
+            if v.0 % 3 == 0 {
+                Literal::negative(v)
+            } else {
+                Literal::positive(v)
+            }
+        };
+        let mut clauses = Vec::new();
+        for o in 0..components {
+            for w in 0..m {
+                clauses.push((0..colours).map(|j| phase(var(o, w, j))).collect());
+            }
+        }
+        for o in 0..components {
+            for j in 0..colours {
+                for w1 in 0..m {
+                    for w2 in (w1 + 1)..m {
+                        clauses.push(vec![
+                            phase(var(o, w1, j)).negated(),
+                            phase(var(o, w2, j)).negated(),
+                        ]);
+                    }
+                }
+            }
+        }
+        clauses
+    }
+
+    /// Task #17: the phase-flipped clique-colouring family (`homer`) is
+    /// recognised, the chain has the verified colour-diagonal shape with
+    /// phase-signed substitution images, and near-misses are rejected.
+    #[test]
+    fn phased_colouring_aux_free_sr_recognises_homer_shape_and_rejects_near_misses() {
+        // Two disjoint K_4 with 3 colours: 66-step homer chain scaled down to
+        // C(C+1)/2 = 6 steps on the first component.
+        let clauses = phased_colouring_clauses(4, 3, 2);
+        let steps = detect_phased_colouring_aux_free_sr(&clauses)
+            .expect("two disjoint phased K_4 over 3 colours must be recognised");
+        assert_eq!(steps.len(), 6, "C(C-1)/2 WLOG units + C diagonal RATs");
+        for step in &steps {
+            let LexClause::Sr { clause, witness } = step;
+            assert_eq!(clause.len(), 1);
+            assert_eq!(witness[0], clause[0], "witness must open with the pivot");
+        }
+
+        // First step pinned exactly: unit ¬x[0][1] through the phase map (var 1
+        // has positive phase), PR {x[0][1]=0, x[0][0]=1} (var 0 phase-negative),
+        // σ = colour transposition (0 1) on rows 1..3 with signed images
+        // (vars 3, 6, 9 are phase-negative; 4, 7, 10 phase-positive).
+        let LexClause::Sr { clause, witness } = &steps[0];
+        assert_eq!(clause, &vec![Literal::negative(Variable(1))]);
+        assert_eq!(
+            witness,
+            &vec![
+                Literal::negative(Variable(1)), // pivot (opens the PR part)
+                Literal::negative(Variable(0)), // PR: x[0][0] = 1 is ¬phase·v0
+                Literal::negative(Variable(1)), // pivot (separator)
+                Literal::positive(Variable(3)), // σ(v3) = -v4 (phase product -1)
+                Literal::negative(Variable(4)),
+                Literal::positive(Variable(4)), // σ(v4) = -v3
+                Literal::negative(Variable(3)),
+                Literal::positive(Variable(6)),
+                Literal::negative(Variable(7)),
+                Literal::positive(Variable(7)),
+                Literal::negative(Variable(6)),
+                Literal::positive(Variable(9)),
+                Literal::negative(Variable(10)),
+                Literal::positive(Variable(10)),
+                Literal::negative(Variable(9)),
+            ]
+        );
+
+        // Near-miss: as many colours as vertices (K_3 over 3 colours is SAT).
+        assert!(detect_phased_colouring_aux_free_sr(&phased_colouring_clauses(3, 3, 2)).is_none());
+        // Near-miss: one missing AMO binary (a colour class stops being a clique).
+        let mut incomplete = phased_colouring_clauses(4, 3, 2);
+        incomplete.pop();
+        assert!(detect_phased_colouring_aux_free_sr(&incomplete).is_none());
+        // Near-miss: one binary literal breaks the phase normalization.
+        let mut misphased = phased_colouring_clauses(4, 3, 2);
+        let last = misphased.len() - 1;
+        misphased[last][0] = misphased[last][0].negated();
+        assert!(detect_phased_colouring_aux_free_sr(&misphased).is_none());
+        // Near-miss: a cross-component binary merges two colour classes, so the
+        // chosen group's classes no longer live entirely inside it.
+        let mut bridged = phased_colouring_clauses(4, 3, 2);
+        bridged.push(vec![
+            Literal::positive(Variable(0)),  // ¬phase of v0 (component 0)
+            Literal::negative(Variable(13)), // ¬phase of v13 (component 1)
+        ]);
+        assert!(detect_phased_colouring_aux_free_sr(&bridged).is_none());
+    }
+
+    /// Clique-colouring fixture (`clqcl_n_k_{k-1}` shape): dense variable ids
+    /// `q[i][v] = i·n + v`, `x[v][j] = k·n + v·(k-1) + j`, edge variables in
+    /// first-use order of the mixed-ternary loops.
+    fn clique_colouring_clauses(n: usize, k: usize) -> Vec<Vec<Literal>> {
+        let c = k - 1;
+        let qv = |i: usize, v: usize| Variable((i * n + v) as u32);
+        let xv = |v: usize, j: usize| Variable((k * n + v * c + j) as u32);
+        let mut edge_ids = BTreeMap::new();
+        let mut next = (k * n + n * c) as u32;
+        let mut ev = |u: usize, v: usize| -> Variable {
+            let key = (u.min(v), u.max(v));
+            *edge_ids.entry(key).or_insert_with(|| {
+                let var = Variable(next);
+                next += 1;
+                var
+            })
+        };
+        let mut clauses: Vec<Vec<Literal>> = Vec::new();
+        for i in 0..k {
+            clauses.push((0..n).map(|v| Literal::positive(qv(i, v))).collect());
+        }
+        for v in 0..n {
+            clauses.push((0..c).map(|j| Literal::positive(xv(v, j))).collect());
+        }
+        for i in 0..k {
+            for u in 0..n {
+                for v in (u + 1)..n {
+                    clauses.push(vec![
+                        Literal::negative(qv(i, u)),
+                        Literal::negative(qv(i, v)),
+                    ]);
+                }
+            }
+        }
+        for v in 0..n {
+            for i in 0..k {
+                for j in (i + 1)..k {
+                    clauses.push(vec![
+                        Literal::negative(qv(i, v)),
+                        Literal::negative(qv(j, v)),
+                    ]);
+                }
+            }
+        }
+        for v in 0..n {
+            for a in 0..c {
+                for b in (a + 1)..c {
+                    clauses.push(vec![
+                        Literal::negative(xv(v, a)),
+                        Literal::negative(xv(v, b)),
+                    ]);
+                }
+            }
+        }
+        for i in 0..k {
+            for j in (i + 1)..k {
+                for u in 0..n {
+                    for v in 0..n {
+                        if u != v {
+                            clauses.push(vec![
+                                Literal::negative(qv(i, u)),
+                                Literal::negative(qv(j, v)),
+                                Literal::positive(ev(u, v)),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+        for u in 0..n {
+            for v in (u + 1)..n {
+                for j in 0..c {
+                    clauses.push(vec![
+                        Literal::negative(ev(u, v)),
+                        Literal::negative(xv(u, j)),
+                        Literal::negative(xv(v, j)),
+                    ]);
+                }
+            }
+        }
+        clauses
+    }
+
+    /// Task #17: the clique-plus-colouring family (`clqcl`) is recognised, the
+    /// chain has the verified Phase Q / edge units / Phase X shape with the
+    /// vertex transposition applied to all three variable groups, and
+    /// near-misses are rejected.
+    #[test]
+    fn clique_colouring_aux_free_sr_recognises_clqcl_and_rejects_near_misses() {
+        // clqcl_4_3_2 scaled down from the corpus pair: 15 steps.
+        let clauses = clique_colouring_clauses(4, 3);
+        let steps =
+            detect_clique_colouring_aux_free_sr(&clauses).expect("clqcl_4_3_2 must be recognised");
+        assert_eq!(steps.len(), 15, "9 Phase-Q + 3 edge units + 3 Phase-X");
+        for step in &steps {
+            let LexClause::Sr { clause, witness } = step;
+            assert_eq!(clause.len(), 1);
+            assert_eq!(witness[0], clause[0], "witness must open with the pivot");
+        }
+
+        // First step pinned exactly: unit ¬q[0][1], PR {q[0][1]=0, q[0][0]=1},
+        // σ = vertex transposition (0 1) applied to the q rows 1..2, both
+        // colours' x variables of x-rows 0/1, and the edges to vertices 2, 3.
+        let LexClause::Sr { clause, witness } = &steps[0];
+        assert_eq!(clause, &vec![Literal::negative(Variable(1))]);
+        assert_eq!(
+            witness,
+            &vec![
+                Literal::negative(Variable(1)), // pivot (opens the PR part)
+                Literal::positive(Variable(0)), // PR: q[0][0] = 1
+                Literal::negative(Variable(1)), // pivot (separator)
+                Literal::positive(Variable(4)), // q[1][0] ↔ q[1][1]
+                Literal::positive(Variable(5)),
+                Literal::positive(Variable(5)),
+                Literal::positive(Variable(4)),
+                Literal::positive(Variable(8)), // q[2][0] ↔ q[2][1]
+                Literal::positive(Variable(9)),
+                Literal::positive(Variable(9)),
+                Literal::positive(Variable(8)),
+                Literal::positive(Variable(12)), // x[0][0] ↔ x[1][0]
+                Literal::positive(Variable(14)),
+                Literal::positive(Variable(14)),
+                Literal::positive(Variable(12)),
+                Literal::positive(Variable(13)), // x[0][1] ↔ x[1][1]
+                Literal::positive(Variable(15)),
+                Literal::positive(Variable(15)),
+                Literal::positive(Variable(13)),
+                Literal::positive(Variable(21)), // e(0,2) ↔ e(1,2)
+                Literal::positive(Variable(23)),
+                Literal::positive(Variable(23)),
+                Literal::positive(Variable(21)),
+                Literal::positive(Variable(22)), // e(0,3) ↔ e(1,3)
+                Literal::positive(Variable(24)),
+                Literal::positive(Variable(24)),
+                Literal::positive(Variable(22)),
+            ]
+        );
+
+        // Near-miss: a missing negative ternary breaks the exact family count.
+        let mut incomplete = clique_colouring_clauses(4, 3);
+        incomplete.pop();
+        assert!(detect_clique_colouring_aux_free_sr(&incomplete).is_none());
+        // Near-miss: one mixed ternary asserting the WRONG edge variable makes
+        // that edge's vertex pair inconsistent.
+        let mut crossed = clique_colouring_clauses(4, 3);
+        let wrong = crossed
+            .iter_mut()
+            .find(|cl| cl.len() == 3 && cl.iter().filter(|l| l.is_positive()).count() == 1)
+            .expect("fixture has mixed ternaries");
+        *wrong.last_mut().expect("ternary") = Literal::positive(Variable(25));
+        assert!(detect_clique_colouring_aux_free_sr(&crossed).is_none());
+        // Near-miss: a stray unit clause is outside every family.
+        let mut stray = clique_colouring_clauses(4, 3);
+        stray.push(vec![Literal::positive(Variable(0))]);
+        assert!(detect_clique_colouring_aux_free_sr(&stray).is_none());
+        // Near-miss: an extra position row breaks k = c + 1.
+        let mut extra = clique_colouring_clauses(4, 3);
+        extra.push((0..4).map(|v| Literal::positive(Variable(v))).collect());
+        assert!(detect_clique_colouring_aux_free_sr(&extra).is_none());
+    }
+
+    /// Relativized-pigeonhole fixture (`rphp_pN_rN` shape): dense variable ids
+    /// `u[i][j] = i·n + j`, `y_j = n² + j`, `v[j][l] = n² + n + j·(n-1) + l`.
+    fn relativized_php_clauses(n: usize) -> Vec<Vec<Literal>> {
+        let uv = |i: usize, j: usize| Variable((i * n + j) as u32);
+        let yv = |j: usize| Variable((n * n + j) as u32);
+        let vv = |j: usize, l: usize| Variable((n * n + n + j * (n - 1) + l) as u32);
+        let mut clauses: Vec<Vec<Literal>> = Vec::new();
+        for i in 0..n {
+            clauses.push((0..n).map(|j| Literal::positive(uv(i, j))).collect());
+        }
+        for j in 0..n {
+            let mut row = vec![Literal::negative(yv(j))];
+            row.extend((0..n - 1).map(|l| Literal::positive(vv(j, l))));
+            clauses.push(row);
+        }
+        for i in 0..n {
+            for j in 0..n {
+                clauses.push(vec![Literal::negative(uv(i, j)), Literal::positive(yv(j))]);
+            }
+        }
+        for j in 0..n {
+            for i1 in 0..n {
+                for i2 in (i1 + 1)..n {
+                    clauses.push(vec![
+                        Literal::negative(uv(i1, j)),
+                        Literal::negative(uv(i2, j)),
+                    ]);
+                }
+            }
+        }
+        for j1 in 0..n {
+            for j2 in (j1 + 1)..n {
+                for l in 0..n - 1 {
+                    clauses.push(vec![
+                        Literal::negative(yv(j1)),
+                        Literal::negative(yv(j2)),
+                        Literal::negative(vv(j1, l)),
+                        Literal::negative(vv(j2, l)),
+                    ]);
+                }
+            }
+        }
+        clauses
+    }
+
+    /// Task #17: the relativized pigeonhole family (`rphp`) is recognised, the
+    /// chain has the verified Phase 1 / guard units / Phase 2 shape with the
+    /// resource transposition covering u, y AND v, and near-misses are
+    /// rejected.
+    #[test]
+    fn relativized_php_aux_free_sr_recognises_rphp_and_rejects_near_misses() {
+        // rphp_p3_r3 scaled down from rphp_p25_r25: 12 steps.
+        let clauses = relativized_php_clauses(3);
+        let steps =
+            detect_relativized_php_aux_free_sr(&clauses).expect("rphp_p3_r3 must be recognised");
+        assert_eq!(steps.len(), 12, "6 Phase-1 + 3 guard units + 3 Phase-2");
+        for step in &steps {
+            let LexClause::Sr { clause, witness } = step;
+            assert_eq!(clause.len(), 1);
+            assert_eq!(witness[0], clause[0], "witness must open with the pivot");
+        }
+
+        // First step pinned exactly: unit ¬u[0][1], PR {u[0][1]=0, u[0][0]=1},
+        // σ = resource transposition (0 1) on the u columns of pigeons 1..2,
+        // the guard pair y_0 ↔ y_1 and the hole-aligned v rows 0/1.
+        let LexClause::Sr { clause, witness } = &steps[0];
+        assert_eq!(clause, &vec![Literal::negative(Variable(1))]);
+        assert_eq!(
+            witness,
+            &vec![
+                Literal::negative(Variable(1)), // pivot (opens the PR part)
+                Literal::positive(Variable(0)), // PR: u[0][0] = 1
+                Literal::negative(Variable(1)), // pivot (separator)
+                Literal::positive(Variable(3)), // u[1][0] ↔ u[1][1]
+                Literal::positive(Variable(4)),
+                Literal::positive(Variable(4)),
+                Literal::positive(Variable(3)),
+                Literal::positive(Variable(6)), // u[2][0] ↔ u[2][1]
+                Literal::positive(Variable(7)),
+                Literal::positive(Variable(7)),
+                Literal::positive(Variable(6)),
+                Literal::positive(Variable(9)), // y_0 ↔ y_1
+                Literal::positive(Variable(10)),
+                Literal::positive(Variable(10)),
+                Literal::positive(Variable(9)),
+                Literal::positive(Variable(12)), // v[0][0] ↔ v[1][0]
+                Literal::positive(Variable(14)),
+                Literal::positive(Variable(14)),
+                Literal::positive(Variable(12)),
+                Literal::positive(Variable(13)), // v[0][1] ↔ v[1][1]
+                Literal::positive(Variable(15)),
+                Literal::positive(Variable(15)),
+                Literal::positive(Variable(13)),
+            ]
+        );
+
+        // Near-miss: a quaternary with the WRONG guard for its v variables.
+        let mut misguarded = relativized_php_clauses(3);
+        let quad = misguarded
+            .iter_mut()
+            .find(|cl| cl.len() == 4)
+            .expect("fixture has quaternaries");
+        quad[1] = Literal::negative(Variable(11)); // y_2 guards a (0,1) pair
+        assert!(detect_relativized_php_aux_free_sr(&misguarded).is_none());
+        // Near-miss: a missing activation binary breaks the N² coverage.
+        let mut unactivated = relativized_php_clauses(3);
+        let idx = unactivated
+            .iter()
+            .position(|cl| cl.len() == 2 && cl.iter().filter(|l| l.is_positive()).count() == 1)
+            .expect("fixture has activation binaries");
+        unactivated.remove(idx);
+        assert!(detect_relativized_php_aux_free_sr(&unactivated).is_none());
+        // Near-miss: a stray all-negative ternary is outside every family.
+        let mut stray = relativized_php_clauses(3);
+        stray.push(vec![
+            Literal::negative(Variable(0)),
+            Literal::negative(Variable(4)),
+            Literal::negative(Variable(8)),
+        ]);
+        assert!(detect_relativized_php_aux_free_sr(&stray).is_none());
+        // Near-miss: a missing quaternary breaks the exact hole-AMO count.
+        let mut incomplete = relativized_php_clauses(3);
+        incomplete.pop();
+        assert!(detect_relativized_php_aux_free_sr(&incomplete).is_none());
+    }
+
+    /// r = 3 matching fixture (`count_p3` shape): the complete 3-uniform
+    /// hypergraph on `n` points, variable ids in lexicographic triple order,
+    /// one ALO group per point, and the within-group AMO binaries with one
+    /// copy PER membership (pairs of triples sharing two points appear twice
+    /// — the multiset the real `count_p3_M19` emits).
+    fn rmatching_triples_clauses(n: usize) -> Vec<Vec<Literal>> {
+        let mut groups: Vec<Vec<Variable>> = vec![Vec::new(); n];
+        let mut idx = 0u32;
+        for a in 0..n {
+            for b in (a + 1)..n {
+                for c in (b + 1)..n {
+                    for p in [a, b, c] {
+                        groups[p].push(Variable(idx));
+                    }
+                    idx += 1;
+                }
+            }
+        }
+        let mut clauses: Vec<Vec<Literal>> = Vec::new();
+        for g in &groups {
+            clauses.push(g.iter().map(|&v| Literal::positive(v)).collect());
+        }
+        for g in &groups {
+            for x in 0..g.len() {
+                for y in (x + 1)..g.len() {
+                    clauses.push(vec![Literal::negative(g[x]), Literal::negative(g[y])]);
+                }
+            }
+        }
+        clauses
+    }
+
+    /// Task #17/#4: the r-uniform matching generalization recognises the
+    /// 3-uniform K_7 incidence, the chain generalizes the validated r = 2
+    /// shape (involution witnesses over the alive r-sets), and near-misses
+    /// are rejected. The r = 2 behaviour is pinned by the existing
+    /// `matching_aux_free_sr_*` tests, which run against the same entry point.
+    #[test]
+    fn rmatching_aux_free_sr_recognises_k7_triples_and_rejects_near_misses() {
+        let clauses = rmatching_triples_clauses(7);
+        let steps =
+            detect_matching_aux_free_sr(&clauses).expect("3-uniform K_7 must be recognised");
+        assert_eq!(steps.len(), 18, "(C(6,2)-1)+1 then (C(3,2)-1)+1 fixings");
+        for step in &steps {
+            let LexClause::Sr { clause, witness } = step;
+            assert_eq!(clause.len(), 1);
+            assert_eq!(witness[0], clause[0], "witness must open with the pivot");
+        }
+
+        // First step pinned exactly: unit ¬x_{0,5,6} (descending candidates),
+        // PR {x_{0,5,6}=0, x_{0,1,2}=1}, σ = the involution (1 5)(2 6) acting
+        // on the alive triples without point 0 — eight 2-cycles, each listed
+        // once at its lexicographically first member.
+        let LexClause::Sr { clause, witness } = &steps[0];
+        assert_eq!(clause, &vec![Literal::negative(Variable(14))]);
+        let pair = |a: u32, b: u32| {
+            [
+                Literal::positive(Variable(a)),
+                Literal::positive(Variable(b)),
+                Literal::positive(Variable(b)),
+                Literal::positive(Variable(a)),
+            ]
+        };
+        let mut expected = vec![
+            Literal::negative(Variable(14)), // pivot (opens the PR part)
+            Literal::positive(Variable(0)),  // PR: x_{0,1,2} = 1
+            Literal::negative(Variable(14)), // pivot (separator)
+        ];
+        for (a, b) in [
+            (15, 33), // {1,2,3} ↔ {3,5,6}
+            (16, 34), // {1,2,4} ↔ {4,5,6}
+            (17, 24), // {1,2,5} ↔ {1,5,6}
+            (18, 30), // {1,2,6} ↔ {2,5,6}
+            (19, 31), // {1,3,4} ↔ {3,4,5}
+            (21, 26), // {1,3,6} ↔ {2,3,5}
+            (23, 28), // {1,4,6} ↔ {2,4,5}
+            (25, 32), // {2,3,4} ↔ {3,4,6}
+        ] {
+            expected.extend(pair(a, b));
+        }
+        assert_eq!(witness, &expected);
+
+        // Near-miss: n divisible by r is SAT-shaped (3-uniform K_9).
+        assert!(detect_matching_aux_free_sr(&rmatching_triples_clauses(9)).is_none());
+        // Near-miss: a mixed binary is outside the pre-filter's two shapes.
+        let mut strayed = rmatching_triples_clauses(7);
+        strayed.push(vec![
+            Literal::positive(Variable(0)),
+            Literal::negative(Variable(1)),
+        ]);
+        assert!(detect_matching_aux_free_sr(&strayed).is_none());
+        // Near-miss: right TOTAL count, wrong multiplicities — one copy of the
+        // doubly-shared pair {0,1} replaced by a second copy of the
+        // singly-shared pair {0,9} over-decrements the latter's balance.
+        let mut lopsided = rmatching_triples_clauses(7);
+        let target = vec![
+            Literal::negative(Variable(0)),
+            Literal::negative(Variable(1)),
+        ];
+        let idx = lopsided
+            .iter()
+            .position(|cl| *cl == target)
+            .expect("fixture has the {0,1} AMO");
+        lopsided[idx] = vec![
+            Literal::negative(Variable(0)),
+            Literal::negative(Variable(9)),
+        ];
+        assert!(detect_matching_aux_free_sr(&lopsided).is_none());
+    }
+
     // ===== #8011 / T2c: native-checker boundary of GENERIC lex-leader SR =====
     //
     // FINDING (this harness reproduces it natively). AY's generic per-generator
@@ -2444,7 +2633,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         let fresh_base = max_orig + 1;
-        let (tower, aux) = encode_perm_lex_leader_sr(perm, fresh_base);
+        let (tower, aux) = encode_rejected_test_lex_tower_sr(perm, fresh_base);
         let num_vars = (fresh_base + aux) as usize + 1;
         let dc_f: Vec<Vec<ay_drat_check::literal::Literal>> = f
             .iter()
@@ -2453,9 +2642,7 @@ mod tests {
         let steps: Vec<ProofStep> = tower
             .iter()
             .map(|lc| {
-                let LexClause::Sr { clause, witness } = lc else {
-                    unreachable!()
-                };
+                let LexClause::Sr { clause, witness } = lc;
                 ProofStep::AddPr {
                     clause: clause.iter().map(|&l| to_dc(l)).collect(),
                     witness: witness.iter().map(|&l| to_dc(l)).collect(),

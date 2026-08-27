@@ -83,6 +83,10 @@ pub(in crate::executor) struct ProvenanceSurfaceAudit {
     suppressed_overrides: HashSet<TermId>,
     farkas_lemmas: Vec<(Vec<TermId>, FarkasAnnotation)>,
     source_registrations: HashSet<(TermId, TermId, bool, bool)>,
+    /// Canonical roots registered through the native-API carve-out: the
+    /// parsed surface is the `NATIVE_API_ASSERTION_PLACEHOLDER` sentinel, so
+    /// no override exists and the canonical rendering is the printed form.
+    native_sources: HashSet<TermId>,
     source_indices: HashMap<TermId, Option<usize>>,
     source_identity: Option<(usize, usize)>,
     farkas_rows: usize,
@@ -93,6 +97,12 @@ pub(in crate::executor) struct ProvenanceSurfaceAudit {
 }
 
 impl ProvenanceSurfaceAudit {
+    /// Whether `canonical` was registered through the native-API carve-out
+    /// (no parsed surface; canonical rendering is the printed form).
+    pub(in crate::executor) fn source_is_native(&self, canonical: TermId) -> bool {
+        self.native_sources.contains(&canonical)
+    }
+
     /// Whether any bounded collection overflowed; an overflowed audit must
     /// fail closed in every consumer.
     pub(in crate::executor) fn is_overflowed(&self) -> bool {

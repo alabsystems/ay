@@ -60,13 +60,10 @@ fn metadata_marks_unknown_budget_as_non_proof() {
     );
 
     let metadata = result.proof_transcript_metadata(&problem, "pdr");
-    assert_eq!(metadata.result, "unknown");
-    assert_eq!(metadata.proof_status, "non-proof");
-    assert!(!metadata.accepted_as_proof);
-    assert_eq!(
-        metadata.unknown_reason.as_deref(),
-        Some("bmc_budget_exhausted")
-    );
+    assert_eq!(metadata.result(), "unknown");
+    assert_eq!(metadata.proof_status(), "non-proof");
+    assert!(!metadata.accepted_as_proof());
+    assert_eq!(metadata.unknown_reason(), Some("bmc_budget_exhausted"));
 
     let json = metadata.to_json_value();
     assert_eq!(json["accepted_as_proof"], false);
@@ -89,16 +86,16 @@ fn metadata_marks_verified_safe_as_proof_evidence() {
     );
 
     let metadata = result.proof_transcript_metadata(&problem, "pdr");
-    assert_eq!(metadata.result, "safe");
-    assert_eq!(metadata.proof_status, "verified-invariant");
-    assert!(metadata.accepted_as_proof);
-    assert!(!metadata.trust_full_verifier_admissible);
+    assert_eq!(metadata.result(), "safe");
+    assert_eq!(metadata.proof_status(), "verified-invariant");
+    assert!(metadata.accepted_as_proof());
+    assert!(!metadata.trust_full_verifier_admissible());
     assert_eq!(
-        metadata.trust_full_verifier_non_admission_reason.as_deref(),
+        metadata.trust_full_verifier_non_admission_reason(),
         Some("metadata_only_missing_checked_replay_artifacts")
     );
     assert_eq!(metadata.pdr_input_sha256().len(), 64);
-    assert!(metadata.normalized_input_bytes > 0);
+    assert!(metadata.normalized_input_bytes() > 0);
 }
 
 #[test]
@@ -118,34 +115,28 @@ fn consumer_evidence_marks_unknown_fail_closed_with_limit_codes() {
             max_depth: 10,
         },
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
 
-    let evidence = run.consumer_evidence(&problem);
+    let evidence = run.consumer_evidence();
     assert_eq!(
-        evidence.schema,
+        evidence.schema(),
         CHC_PROOF_TRANSCRIPT_CONSUMER_EVIDENCE_SCHEMA
     );
-    assert_eq!(evidence.verdict_code, "unknown");
-    assert_eq!(evidence.backend_code, "ay_chc_pdr");
-    assert!(!evidence.accepted_for_consumer);
+    assert_eq!(evidence.verdict_code(), "unknown");
+    assert_eq!(evidence.backend_code(), "ay_chc_pdr");
+    assert!(!evidence.accepted_for_consumer());
     assert_eq!(
-        evidence.consumer_rejection_code.as_deref(),
+        evidence.consumer_rejection_code(),
         Some("ay_chc_unknown_bmc_budget_exhausted")
     );
-    assert!(!evidence.model_validated);
-    assert_eq!(evidence.model_validation_status, "not_validated");
-    assert_eq!(evidence.verification_level_code, "ay_chc_non_proof");
-    assert_eq!(
-        evidence.unknown_reason_code.as_deref(),
-        Some("bmc_budget_exhausted")
-    );
-    assert_eq!(
-        evidence.unknown_limit_code.as_deref(),
-        Some("bmc_budget_exhausted")
-    );
-    assert_eq!(evidence.unknown_depth_reached, Some(2));
-    assert_eq!(evidence.unknown_depth_limit, Some(10));
-    assert_eq!(evidence.query_clause_index, Some(1));
+    assert!(!evidence.model_validated());
+    assert_eq!(evidence.model_validation_status(), "not_validated");
+    assert_eq!(evidence.verification_level_code(), "ay_chc_non_proof");
+    assert_eq!(evidence.unknown_reason_code(), Some("bmc_budget_exhausted"));
+    assert_eq!(evidence.unknown_limit_code(), Some("bmc_budget_exhausted"));
+    assert_eq!(evidence.unknown_depth_reached(), Some(2));
+    assert_eq!(evidence.unknown_depth_limit(), Some(10));
+    assert_eq!(evidence.query_clause_index(), Some(1));
 
     let json = evidence.to_json_value();
     assert_eq!(json["accepted_for_consumer"], false);
@@ -192,27 +183,26 @@ fn consumer_evidence_carries_validated_unsafe_trace_assignments() {
         ])),
         ValidationEvidence::CounterexampleVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "portfolio");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "portfolio");
 
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "unsafe");
-    assert_eq!(evidence.backend_code, "ay_chc_portfolio");
-    assert!(evidence.accepted_for_consumer);
-    assert!(evidence.model_validated);
-    assert_eq!(evidence.model_validation_status, "validated");
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "unsafe");
+    assert_eq!(evidence.backend_code(), "ay_chc_portfolio");
+    assert!(evidence.accepted_for_consumer());
+    assert!(evidence.model_validated());
+    assert_eq!(evidence.model_validation_status(), "validated");
     assert_eq!(
-        evidence.verification_level_code,
+        evidence.verification_level_code(),
         "ay_chc_verified_counterexample"
     );
-    assert_eq!(evidence.proof_status, "verified-counterexample");
-    assert!(!evidence.trust_full_verifier_admissible);
-    assert_eq!(evidence.replay_status, "replay-artifacts-required");
-    assert_eq!(evidence.transcript_status, "metadata-only");
-    assert_eq!(evidence.query_clause_index, Some(2));
+    assert_eq!(evidence.proof_status(), "verified-counterexample");
+    assert!(!evidence.trust_full_verifier_admissible());
+    assert_eq!(evidence.replay_status(), "replay-artifacts-required");
+    assert_eq!(evidence.transcript_status(), "metadata-only");
+    assert_eq!(evidence.query_clause_index(), Some(2));
 
     let trace = evidence
-        .unsafe_trace
-        .as_ref()
+        .unsafe_trace()
         .expect("unsafe evidence should carry a trace");
     assert_eq!(trace.status, "validated_counterexample");
     assert_eq!(trace.step_count, 2);
@@ -292,15 +282,14 @@ fn consumer_evidence_carries_bmc_concrete_trace_predicate_arguments() {
         .expect("canonical BMC trace assignments should replay");
     assert_eq!(replay_obligations.len(), 1);
 
-    let run = ChcPdrProofRun::new(&problem, result, "bmc");
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "unsafe");
-    assert!(evidence.accepted_for_consumer);
-    assert!(evidence.model_validated);
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "unsafe");
+    assert!(evidence.accepted_for_consumer());
+    assert!(evidence.model_validated());
 
     let trace = evidence
-        .unsafe_trace
-        .as_ref()
+        .unsafe_trace()
         .expect("unsafe BMC evidence should carry concrete trace material");
     assert_eq!(trace.status, "validated_counterexample");
     assert_eq!(trace.step_count, 2);
@@ -339,8 +328,8 @@ fn bmc_trace_assignment_completeness_accepts_expected_shape() {
     );
     let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
         .solve_bmc_only(BmcConfig::default().with_max_depth(2));
-    let run = ChcPdrProofRun::new(&problem, result, "bmc");
-    let evidence = run.consumer_evidence(&problem);
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
+    let evidence = run.consumer_evidence();
 
     let report = evidence.bmc_unsafe_trace_assignment_completeness(2, 1);
     assert_eq!(
@@ -385,7 +374,7 @@ fn bmc_trace_assignment_completeness_rejects_missing_and_incomplete_trace() {
 "#,
     );
     let safe_run = ChcPdrProofRun::new(
-        &problem,
+        problem.clone(),
         VerifiedChcResult::from_validated(
             ChcEngineResult::Safe(InvariantModel::new()),
             ValidationEvidence::FullVerification,
@@ -393,7 +382,7 @@ fn bmc_trace_assignment_completeness_rejects_missing_and_incomplete_trace() {
         "pdr",
     );
     let missing = safe_run
-        .consumer_evidence(&problem)
+        .consumer_evidence()
         .bmc_unsafe_trace_assignment_completeness(1, 1);
     assert_eq!(
         missing.status,
@@ -409,7 +398,7 @@ fn bmc_trace_assignment_completeness_rejects_missing_and_incomplete_trace() {
 
     let predicate = problem.predicates()[0].id;
     let unsafe_run = ChcPdrProofRun::new(
-        &problem,
+        problem.clone(),
         VerifiedChcResult::from_validated(
             ChcEngineResult::Unsafe(Counterexample::new(vec![CounterexampleStep::new(
                 predicate,
@@ -420,7 +409,7 @@ fn bmc_trace_assignment_completeness_rejects_missing_and_incomplete_trace() {
         "bmc",
     );
     let incomplete = unsafe_run
-        .consumer_evidence(&problem)
+        .consumer_evidence()
         .bmc_unsafe_trace_assignment_completeness(1, 1);
     assert_eq!(
         incomplete.reason,
@@ -447,7 +436,7 @@ fn bmc_trace_assignment_completeness_rejects_bad_assignment_encodings() {
     );
     let predicate = problem.predicates()[0].id;
     let run = ChcPdrProofRun::new(
-        &problem,
+        problem.clone(),
         VerifiedChcResult::from_validated(
             ChcEngineResult::Unsafe(Counterexample::new(vec![CounterexampleStep::new(
                 predicate,
@@ -457,7 +446,7 @@ fn bmc_trace_assignment_completeness_rejects_bad_assignment_encodings() {
         ),
         "bmc",
     );
-    let mut evidence = run.consumer_evidence(&problem);
+    let mut evidence = run.consumer_evidence();
 
     let trace = evidence
         .unsafe_trace
@@ -578,15 +567,14 @@ fn consumer_evidence_carries_btor2_bv_bmc_trace_predicate_arguments() {
         .expect("canonical BV BMC trace assignments should replay");
     assert_eq!(replay_obligations.len(), 1);
 
-    let run = ChcPdrProofRun::new(&problem, result, "bmc");
-    let evidence = run.consumer_evidence(&problem);
-    assert_eq!(evidence.verdict_code, "unsafe");
-    assert!(evidence.accepted_for_consumer);
-    assert!(evidence.model_validated);
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
+    let evidence = run.consumer_evidence();
+    assert_eq!(evidence.verdict_code(), "unsafe");
+    assert!(evidence.accepted_for_consumer());
+    assert!(evidence.model_validated());
 
     let trace = evidence
-        .unsafe_trace
-        .as_ref()
+        .unsafe_trace()
         .expect("unsafe BV BMC evidence should carry concrete trace material");
     assert_eq!(trace.status, "validated_counterexample");
     assert_eq!(trace.step_count, 4);
@@ -672,7 +660,7 @@ fn evidence_manifest_rejects_metadata_only_trust_admission() {
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(
         &PdrConfig::default()
             .with_max_frames(8)
@@ -683,12 +671,7 @@ fn evidence_manifest_rejects_metadata_only_trust_admission() {
         .with_solver_binary_sha256(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         );
-    let manifest = run.evidence_manifest(
-        &problem,
-        options.clone(),
-        solver.clone(),
-        "trust:test:obligation",
-    );
+    let manifest = run.evidence_manifest(options.clone(), solver.clone(), "trust:test:obligation");
     let json = manifest.to_json_value();
 
     assert!(run.accepted_as_proof());
@@ -708,13 +691,13 @@ fn evidence_manifest_rejects_metadata_only_trust_admission() {
     );
     assert_eq!(manifest.admission_key_sha256().len(), 64);
 
-    let mut tampered_run = run.clone();
-    tampered_run.metadata.trust_full_verifier_admissible = true;
-    let tampered_manifest =
-        tampered_run.evidence_manifest(&problem, options, solver, "trust:test:obligation");
-    assert!(!tampered_manifest.trust_full_verifier_admissible());
+    let mut tampered_json = run.metadata().to_json_value();
+    tampered_json["trust_full_verifier_admissible"] = serde_json::json!(true);
+    let parsed = ChcProofTranscriptMetadata::from_json_value(&tampered_json)
+        .expect("well-typed reporting metadata should parse");
+    assert!(!parsed.trust_full_verifier_admissible());
     assert_eq!(
-        tampered_run.metadata.to_json_value()["trust_full_verifier_admissible"],
+        parsed.to_json_value()["trust_full_verifier_admissible"],
         serde_json::json!(false)
     );
 }
@@ -876,7 +859,7 @@ where
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -892,7 +875,7 @@ where
         "verified-invariant",
     );
     mutate_evidence(&mut evidence);
-    run.evidence_manifest_with_replay_evidence(&problem, options, solver, obligation_id, evidence)
+    run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence)
 }
 
 fn admitted_safe_manifest(obligation_id: &str) -> ChcProofEvidenceManifest {
@@ -916,7 +899,7 @@ fn admission_key_is_stable_when_replay_artifact_paths_change() {
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -947,19 +930,13 @@ fn admission_key_is_stable_when_replay_artifact_paths_change() {
     );
 
     let first_manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
         options.clone(),
         solver.clone(),
         obligation_id,
         first_evidence,
     );
-    let second_manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        second_evidence,
-    );
+    let second_manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, second_evidence);
 
     assert_eq!(
         first_manifest.admission_key_sha256(),
@@ -1062,7 +1039,7 @@ fn checked_replay_summary_admits_when_manifest_binding_and_artifacts_match() {
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -1078,13 +1055,8 @@ fn checked_replay_summary_admits_when_manifest_binding_and_artifacts_match() {
         "safe",
         "verified-invariant",
     );
-    let manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        evidence,
-    );
+    let manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let precheck_key = manifest.admission_key_sha256();
     let summary = checked_summary_for_manifest(&manifest);
     assert!(manifest
@@ -1571,7 +1543,7 @@ fn checked_replay_summary_admits_unsafe_trace_validity_binding() {
         ])),
         ValidationEvidence::CounterexampleVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -1580,13 +1552,8 @@ fn checked_replay_summary_admits_unsafe_trace_validity_binding() {
         );
     let obligation_id = "trust:checked:unsafe-trace";
     let evidence = unsafe_trace_replay_evidence(&problem, &options, &solver, obligation_id);
-    let manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        evidence,
-    );
+    let manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let summary = checked_summary_for_manifest(&manifest);
 
     assert!(manifest
@@ -1637,7 +1604,7 @@ fn passed_manifest_replay_builder_consumes_unsafe_trace_validity_report() {
         ])),
         ValidationEvidence::CounterexampleVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -1647,13 +1614,8 @@ fn passed_manifest_replay_builder_consumes_unsafe_trace_validity_report() {
     let obligation_id = "trust:checked:unsafe-report-builder";
     let mut evidence = unsafe_trace_replay_evidence(&problem, &options, &solver, obligation_id);
     evidence.replay_report = None;
-    let manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        evidence,
-    );
+    let manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
 
     let json = manifest.to_json_value();
     assert_eq!(json["artifacts"]["replay_report"]["status"], "missing");
@@ -1771,7 +1733,7 @@ fn checked_replay_summary_rejects_unsafe_without_trace_validity() {
         ])),
         ValidationEvidence::CounterexampleVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -1780,13 +1742,8 @@ fn checked_replay_summary_rejects_unsafe_without_trace_validity() {
         );
     let obligation_id = "trust:checked:unsafe-missing-trace";
     let evidence = unsafe_trace_replay_evidence(&problem, &options, &solver, obligation_id);
-    let manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        evidence,
-    );
+    let manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let mut summary = checked_summary_for_manifest(&manifest);
     summary.obligations[0].kind = ChcReplayObligationKind::Safety;
 
@@ -1819,7 +1776,7 @@ fn checked_replay_summary_rejects_stale_manifest_and_artifact_bindings() {
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -1835,13 +1792,8 @@ fn checked_replay_summary_rejects_stale_manifest_and_artifact_bindings() {
         "safe",
         "verified-invariant",
     );
-    let manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
-        options,
-        solver,
-        obligation_id,
-        evidence,
-    );
+    let manifest =
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
     let mut summary = checked_summary_for_manifest(&manifest);
     summary.manifest_binding.options_sha256 =
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
@@ -2290,7 +2242,7 @@ fn admission_rejects_stale_or_mismatched_replay_evidence() {
         ChcEngineResult::Safe(InvariantModel::new()),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
     let options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
     let solver = ChcProofSolverIdentity::new("pdr")
         .with_ay_revision("rev-a")
@@ -2324,14 +2276,13 @@ fn admission_rejects_stale_or_mismatched_replay_evidence() {
     );
 
     let matching_manifest = run.evidence_manifest_with_replay_evidence(
-        &problem,
         options.clone(),
         solver.clone(),
         obligation_id,
         matching,
     );
     let stale_manifest =
-        run.evidence_manifest_with_replay_evidence(&problem, options, solver, obligation_id, stale);
+        run.evidence_manifest_with_replay_evidence(options, solver, obligation_id, stale);
 
     assert_ne!(
         matching_manifest.admission_key_sha256(),
@@ -2398,11 +2349,13 @@ fn admission_key_changes_with_problem_options_solver_and_transcript() {
 (check-sat)
 "#,
     );
-    let result = VerifiedChcResult::from_validated(
-        ChcEngineResult::Safe(InvariantModel::new()),
-        ValidationEvidence::FullVerification,
-    );
-    let base_run = ChcPdrProofRun::new(&first_problem, result.clone(), "pdr");
+    let fresh_result = || {
+        VerifiedChcResult::from_validated(
+            ChcEngineResult::Safe(InvariantModel::new()),
+            ValidationEvidence::FullVerification,
+        )
+    };
+    let base_run = ChcPdrProofRun::new(first_problem.clone(), fresh_result(), "pdr");
     let base_options = ChcProofEvidenceOptions::pdr_strict(
         &PdrConfig::default()
             .with_max_frames(8)
@@ -2415,17 +2368,15 @@ fn admission_key_changes_with_problem_options_solver_and_transcript() {
         );
     let base = base_run
         .evidence_manifest(
-            &first_problem,
             base_options.clone(),
             base_solver.clone(),
             "caller:obligation",
         )
         .admission_key_sha256();
 
-    let changed_problem_run = ChcPdrProofRun::new(&second_problem, result.clone(), "pdr");
+    let changed_problem_run = ChcPdrProofRun::new(second_problem, fresh_result(), "pdr");
     let changed_problem = changed_problem_run
         .evidence_manifest(
-            &second_problem,
             base_options.clone(),
             base_solver.clone(),
             "caller:obligation",
@@ -2436,35 +2387,19 @@ fn admission_key_changes_with_problem_options_solver_and_transcript() {
     let mut changed_options = base_options.clone();
     changed_options.max_frames += 1;
     let changed_options_key = base_run
-        .evidence_manifest(
-            &first_problem,
-            changed_options,
-            base_solver.clone(),
-            "caller:obligation",
-        )
+        .evidence_manifest(changed_options, base_solver.clone(), "caller:obligation")
         .admission_key_sha256();
     assert_ne!(base, changed_options_key);
 
     let changed_solver = base_solver.clone().with_ay_revision("rev-b");
     let changed_solver_key = base_run
-        .evidence_manifest(
-            &first_problem,
-            base_options.clone(),
-            changed_solver,
-            "caller:obligation",
-        )
+        .evidence_manifest(base_options.clone(), changed_solver, "caller:obligation")
         .admission_key_sha256();
     assert_ne!(base, changed_solver_key);
 
-    let mut tampered_transcript = base_run.clone();
-    tampered_transcript.metadata.transcript_status = "tampered".to_string();
-    let changed_transcript_key = tampered_transcript
-        .evidence_manifest(
-            &first_problem,
-            base_options,
-            base_solver,
-            "caller:obligation",
-        )
+    let changed_transcript = ChcPdrProofRun::new(first_problem, fresh_result(), "pdr-alternate");
+    let changed_transcript_key = changed_transcript
+        .evidence_manifest(base_options, base_solver, "caller:obligation")
         .admission_key_sha256();
     assert_ne!(base, changed_transcript_key);
 }

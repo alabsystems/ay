@@ -115,8 +115,7 @@ pub(crate) enum Knob {
     /// Forrest–Tomlin growth tolerance override (refactorization trigger).
     FtGrowthTol,
 
-    // B12 knobs: the dual-simplex engine lanes, same contract as the B11
-    // block above (no env spelling; caller > policy > compiled default).
+    // B12 dual-simplex lanes: no env spelling; caller > policy > compiled default.
     /// Dual-walk anatomy tracing (diagnostic; hot loop pays one bool per walk).
     DualAnatomy,
     /// Pivot count after which the walk re-verifies the basis factorization.
@@ -147,13 +146,14 @@ pub(crate) enum Knob {
     NoNodeLu,
     /// Disable the tall LU gate.
     NoTallLu,
+    /// Disable cold dual-simplex on tall covering LPs (`m > n`).
+    NoTallColdDual,
     /// Disable the dual churn band.
     NoDualChurnBand,
     /// Override the dual bloom cap.
     DualBloomCap,
 
-    // B13 knobs: the branch-and-bound layer (cut families, LNS heuristics,
-    // branching modes), same contract (no env spelling).
+    // B13: branch-and-bound knobs (cut families, LNS, branching); no env spellings.
     /// Disable the aggregated flow-cover side pool.
     NoFlowcoverAgg,
     /// Disable the general-integer GMI extension rounds.
@@ -245,12 +245,14 @@ pub(crate) enum Knob {
     NoChainPreorder,
     /// Disable the BUMP-LU base factor inside refactorize.
     NoBumpLu,
-    /// Force full pricing on big LPs (opt-in measurement lever).
-    FullPricing,
     /// Dual-bypass mode: 0 never, 1 adaptive (default), 2 force.
     DualBypassMode,
     /// Eager-perturb mode: 0 off, 1 armed-on-stall (default), 2 all walks.
     EagerPerturbMode,
+    /// PRIMAL Harris two-pass ratio test: 0 off (the default, and the
+    /// byte-identical single-pass path), 1 two-pass largest-pivot selection,
+    /// 2 two-pass plus the bounded positive step floor (EXPAND-style).
+    HarrisRt,
     /// Disable the knapsack-form complementation search in MIR/strong-CG row
     /// preparation (`with_mir_knap(true)` forces it beyond a moved default).
     NoMirKnap,

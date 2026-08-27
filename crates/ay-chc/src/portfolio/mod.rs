@@ -125,11 +125,19 @@ impl PortfolioSolver {
         // #8753: cap the algebraic pre-strategy at 3s so validation cannot
         // consume the full portfolio wall clock on NIA/LRA dual simplex loops.
         let alg_deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(3);
+        // #9110: hand the pre-strategy the portfolio's cancellation token as
+        // well as the deadline. The prepass used to sit entirely outside the
+        // cancellation scope, so an embedding driver's
+        // `cancellation_handle().cancel_after(..)` bought nothing — arming it
+        // measurably made a 341s cell WORSE (343s), because the timer ran and
+        // nothing observed it.
+        let alg_cancel = Some(self.cancellation_token.clone());
         // Phase 1: try on original problem (works for Int-sorted CHC).
-        match crate::algebraic_invariant::try_algebraic_solve_with_deadline(
+        match crate::algebraic_invariant::try_algebraic_solve_with_budget(
             &self.original_problem,
             self.config.verbose,
             Some(alg_deadline),
+            alg_cancel.clone(),
         ) {
             AlgebraicResult::Safe(model) => {
                 if self.config.verbose {
@@ -164,10 +172,11 @@ impl PortfolioSolver {
         if problem_contains_recursive_bv_sorts(&self.original_problem) {
             let bv_to_int_problem = self.bv_to_int_for_algebraic();
             // #8753: share the pre-strategy deadline with the BvToInt retry.
-            match crate::algebraic_invariant::try_algebraic_solve_with_deadline(
+            match crate::algebraic_invariant::try_algebraic_solve_with_budget(
                 &bv_to_int_problem,
                 self.config.verbose,
                 Some(alg_deadline),
+                alg_cancel,
             ) {
                 AlgebraicResult::Safe(model) => {
                     if self.config.verbose {

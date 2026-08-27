@@ -24,8 +24,15 @@ pub struct CnfFormulaWithIds {
 
 /// Shared DIMACS CNF parsing core.
 ///
-/// Parses the standard DIMACS CNF format and calls `emit_clause` for each
-/// complete clause. Returns the declared variable count.
+/// Parses the standard DIMACS CNF format and calls `emit_clause(id, clause)` for
+/// each complete clause, where `id` is the sequential 1-indexed clause ID.
+/// Returns the declared variable count.
+///
+/// Clause numbering lives HERE rather than in the caller's closure on purpose.
+/// It is the only scope that can refuse an over-long file, so it is the only
+/// scope where the counter's bound is visible to the verifier; a closure that
+/// returns `()` cannot reject anything. Callers that do not need IDs ignore the
+/// first argument.
 /// Backstop on the *actual* number of distinct variables (the highest variable
 /// index that appears). The proof checkers size dense per-variable arrays from
 /// the returned count, and dense numbering makes those arrays O(max index), so a
@@ -34,17 +41,37 @@ pub struct CnfFormulaWithIds {
 /// Mirrors `ay_sat::dimacs_core::MAX_DIMACS_VARS`.
 const MAX_CNF_VARS: usize = 1 << 28;
 
+/// Backstop on the number of clauses, and the bound that makes clause-ID
+/// generation provably overflow-free.
+///
+/// Clause IDs are 1-indexed `u64`s handed to LRAT checkers, which use them to map
+/// proof hints back to original clauses. Refusing past this bound is what keeps
+/// the `+ 1` in [`parse_cnf_core`] in range: without a visible ceiling the
+/// verifier has no relation between the loop trip count and the input length, so
+/// the monotone counter is satisfiable at `u64::MAX` (MEASURED 2026-08-26:
+/// `[overflow:add] FAILED (ay-in-process); counterexample:
+/// _1*.1*#e_s0_t = 18446744073709551615`).
+///
+/// The ceiling is enforced by ERRORING, never by saturating. Saturating would
+/// keep the arithmetic in range while silently issuing DUPLICATE clause IDs, and
+/// a duplicate ID is a wrong answer for an LRAT checker rather than a refusal --
+/// the same reason `MAX_CNF_VARS` refuses instead of clamping. Reaching it needs
+/// 4.29 billion clauses, each requiring at least a terminating `0` byte, so no
+/// input this checker can accept is affected.
+const MAX_CNF_CLAUSES: u64 = 1 << 32;
+
 /// Returns the *content-driven* variable count: one past the maximum variable
 /// index that actually appears, independent of the declared header.
 fn parse_cnf_core(
     reader: impl Read,
-    mut emit_clause: impl FnMut(Vec<Literal>),
+    mut emit_clause: impl FnMut(u64, Vec<Literal>),
 ) -> Result<usize, ParseError> {
     let reader = BufReader::new(reader);
     let mut declared_num_vars = 0;
     let mut actual_num_vars = 0;
     let mut header_seen = false;
     let mut current_clause: Vec<Literal> = Vec::new();
+    let mut clause_count: u64 = 0;
 
     for line in reader.lines() {
         let line = line.map_err(ParseError::from)?;
@@ -90,7 +117,16 @@ fn parse_cnf_core(
                 detail: format!("bad literal '{token}': {e}"),
             })?;
             if val == 0 {
-                emit_clause(std::mem::take(&mut current_clause));
+                // Guard and increment sit in the same body deliberately: the
+                // ceiling is what makes `+ 1` provable, and a bound stated in a
+                // different function is a bound the encoder cannot use.
+                if clause_count >= MAX_CNF_CLAUSES {
+                    return Err(ParseError::TooManyClauses {
+                        maximum: MAX_CNF_CLAUSES,
+                    });
+                }
+                clause_count += 1;
+                emit_clause(clause_count, std::mem::take(&mut current_clause));
             } else {
                 let var = val.unsigned_abs() as usize;
                 if var > declared_num_vars {
@@ -110,13 +146,19 @@ fn parse_cnf_core(
                         ),
                     });
                 }
-                current_clause.push(Literal::from_dimacs(val));
+                current_clause.push(Literal::try_from_dimacs(val)?);
             }
         }
     }
     // Handle trailing clause without terminating 0.
     if !current_clause.is_empty() {
-        emit_clause(current_clause);
+        if clause_count >= MAX_CNF_CLAUSES {
+            return Err(ParseError::TooManyClauses {
+                maximum: MAX_CNF_CLAUSES,
+            });
+        }
+        clause_count += 1;
+        emit_clause(clause_count, current_clause);
     }
     Ok(actual_num_vars)
 }
@@ -129,7 +171,7 @@ fn parse_cnf_core(
 /// - Clause lines are space-separated signed integers terminated by 0
 pub fn parse_cnf(reader: impl Read) -> Result<CnfFormula, ParseError> {
     let mut clauses = Vec::new();
-    let num_vars = parse_cnf_core(reader, |clause| clauses.push(clause))?;
+    let num_vars = parse_cnf_core(reader, |_id, clause| clauses.push(clause))?;
     Ok(CnfFormula { num_vars, clauses })
 }
 
@@ -140,11 +182,11 @@ pub fn parse_cnf(reader: impl Read) -> Result<CnfFormula, ParseError> {
 /// hint IDs back to specific original clauses.
 pub fn parse_cnf_with_ids(reader: impl Read) -> Result<CnfFormulaWithIds, ParseError> {
     let mut clauses = Vec::new();
-    let mut clause_id: u64 = 1;
-    let num_vars = parse_cnf_core(reader, |clause| {
-        clauses.push((clause_id, clause));
-        clause_id += 1;
-    })?;
+    // The counter used to live here, as `clause_id += 1` on a `u64` the verifier
+    // could not bound. It now comes from `parse_cnf_core`, which owns the ceiling
+    // that makes it provable. Identical IDs (1, 2, 3, ...) for every input this
+    // parser accepts.
+    let num_vars = parse_cnf_core(reader, |id, clause| clauses.push((id, clause)))?;
     Ok(CnfFormulaWithIds { num_vars, clauses })
 }
 

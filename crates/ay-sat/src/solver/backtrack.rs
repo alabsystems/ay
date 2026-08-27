@@ -6,6 +6,8 @@
 
 use super::*;
 
+mod ic3;
+
 impl Solver {
     /// Backtrack to the given level with phase saving and target/best updates.
     ///
@@ -63,11 +65,47 @@ impl Solver {
             return;
         }
 
+        // #relevancy-frontier-incremental: the incremental relevancy frontier
+        // folds a PREFIX of the trail into its counters. Backtracking both
+        // unassigns literals and COMPACTS the trail (chrono keeps out-of-order
+        // lower-level literals), so this pass does two things for it: fold out
+        // every literal that was folded in and is now unassigned, and count how
+        // many folded literals SURVIVE. Compaction preserves trail order, so
+        // the survivors are exactly the new folded prefix.
+        //
+        // `begin_unassign_fold` — NOT a bare `synced_len` read — is what opens
+        // the fold: the frontier's occurrence lists are keyed by arena WORD
+        // OFFSET, and an epoch-bumping clause-DB mutation (reduce_db deletion,
+        // `replace` strengthening, and above all `compact_arena_locality`,
+        // which rewrites the arena SHORTER with every offset moved) can land
+        // between the query that synced the cache and this backtrack. It
+        // re-checks the epoch and the arena watermarks exactly as `sync` does
+        // and returns `None` — having dropped the cache, so the next query
+        // rebuilds — rather than let the fold walk offsets that no longer
+        // denote the clauses they were recorded for. `None` is also the usual
+        // case (relevancy is off by default), and costs one load.
+        let frontier_open = self.relevancy_frontier.begin_unassign_fold(
+            self.arena.formula_epoch(),
+            self.arena.len(),
+            self.arena.num_clauses(),
+        );
+        // Whether the fold ran at all — i.e. whether there is incremental state
+        // for the exactness pin at the bottom of this function to check.
+        #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+        let frontier_folded = frontier_open.is_some();
+        let frontier_synced = frontier_open.unwrap_or(0);
+        // Seeded below from `assigned_limit`: the compaction loop starts there,
+        // so every folded trail entry BELOW it survives untouched.
+        let mut frontier_kept;
+        let mut frontier =
+            (frontier_synced > 0).then(|| std::mem::take(&mut self.relevancy_frontier));
+
         let assigned_limit = if target_level == 0 {
             0
         } else {
             self.trail_lim[target_level as usize - 1]
         };
+        frontier_kept = frontier_synced.min(assigned_limit);
         // CaDiCaL backtrack.cpp:52: assigned_limit within trail bounds
         debug_assert!(
             assigned_limit <= self.trail.len(),
@@ -175,6 +213,9 @@ impl Solver {
                                 if write_pos != read_pos {
                                     self.trail[write_pos] = lit;
                                 }
+                                if read_pos < frontier_synced {
+                                    frontier_kept += 1;
+                                }
                                 write_pos += 1;
                                 true
                             } else {
@@ -205,6 +246,14 @@ impl Solver {
                     let base = var.index() * 2;
                     ay_prefetch::val_set(&mut self.vals, base, 0);
                     ay_prefetch::val_set(&mut self.vals, base + 1, 0);
+                    // Fold the unassignment out of the incremental relevancy
+                    // frontier AFTER vals[] is cleared, so the variable reads as
+                    // unassigned when it re-enters the frontier.
+                    if read_pos < frontier_synced {
+                        if let Some(frontier) = frontier.as_mut() {
+                            frontier.fold_unassign(self, lit);
+                        }
+                    }
                     // CaDiCaL backtrack.cpp:10-30: unassign() only clears vals,
                     // pushes to VSIDS heap, and updates VMTF queue. It does NOT
                     // clear reason, trail_pos, or unit_proof_id. Stale values for
@@ -246,11 +295,18 @@ impl Solver {
                     self.trail[write_pos] = lit;
                 }
                 self.var_data[var.index()].trail_pos = write_pos as u32;
+                if read_pos < frontier_synced {
+                    frontier_kept += 1;
+                }
                 write_pos += 1;
             }
             read_pos += 1;
         }
 
+        if let Some(mut frontier) = frontier {
+            frontier.set_synced_len(frontier_kept);
+            self.relevancy_frontier = frontier;
+        }
         self.trail.truncate(write_pos);
         self.trail_lim.truncate(target_level as usize);
         self.decision_level = target_level;
@@ -287,112 +343,15 @@ impl Solver {
         // cheap since backtrack is not on the BCP hot path (#8100).
         self.invalidate_reason_clause_marks();
         self.debug_assert_backtrack_postconditions(target_level);
-    }
-
-    /// IC3-optimized backtrack (#8569): stripped-down backtrack for IC3 mode.
-    ///
-    /// Compared to the standard `backtrack()`, this version skips:
-    /// - Target/best phase updates (IC3 uses forced phases via set_phase;
-    ///   target/best phases are never consumed by pick_phase)
-    /// - Phase saving per variable (IC3 uses forced phases)
-    /// - LSCB lambda reimplication (chrono is disabled in IC3 mode)
-    /// - VMTF on-unassign updates (IC3 uses VSIDS/bucket queue only)
-    ///
-    /// Keeps: vals[] clearing, VSIDS heap reinsertion, bucket queue
-    /// reinsertion for domain variables, trail compaction, reason mark
-    /// invalidation, postcondition checks.
-    ///
-    /// REQUIRES: ic3_mode is set, chrono_enabled is false
-    /// ENSURES: same postconditions as backtrack()
-    pub(super) fn backtrack_ic3(&mut self, target_level: u32) {
-        debug_assert!(
-            self.cold.ic3_mode,
-            "BUG: backtrack_ic3 called without ic3_mode"
-        );
-        debug_assert!(
-            !self.chrono_enabled,
-            "BUG: backtrack_ic3 called with chrono_enabled"
-        );
-        debug_assert!(
-            target_level <= self.decision_level,
-            "BUG: backtrack_ic3 to level {target_level} > decision_level {}",
-            self.decision_level
-        );
-
-        // No target/best phase updates: IC3 uses forced phases.
-
-        if self.decision_level <= target_level {
-            return;
+        // #relevancy-frontier-incremental: EXACTNESS PIN, at the one moment a
+        // fold-time desync is still observable. `sync()` rebuilds from scratch
+        // on any epoch move, so a query-time check alone cannot see corruption
+        // an unassignment fold inflicted after a clause-DB mutation — the
+        // rebuild erases it first. This runs between the fold and any rebuild.
+        #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+        if frontier_folded {
+            self.debug_assert_relevancy_frontier_exact_after_fold();
         }
-
-        let assigned_limit = if target_level == 0 {
-            0
-        } else {
-            self.trail_lim[target_level as usize - 1]
-        };
-        debug_assert!(
-            assigned_limit <= self.trail.len(),
-            "BUG: assigned_limit ({assigned_limit}) > trail.len() ({})",
-            self.trail.len(),
-        );
-
-        let next_level_start = self.trail_lim[target_level as usize];
-
-        let mut write_pos = assigned_limit;
-        let mut read_pos = assigned_limit;
-
-        while read_pos < self.trail.len() {
-            let lit = self.trail[read_pos];
-            let var = lit.variable();
-            let var_level = self.var_data[var.index()].level;
-
-            if var_level > target_level {
-                // No phase saving: IC3 uses forced phases.
-                // No LSCB lambda reimplication: chrono disabled.
-
-                // Clear vals[].
-                let base = var.index() * 2;
-                ay_prefetch::val_set(&mut self.vals, base, 0);
-                ay_prefetch::val_set(&mut self.vals, base + 1, 0);
-                // Clear lambda (defense-in-depth; always None when chrono off).
-                self.lambda[var.index()] = None;
-
-                if self.var_lifecycle.is_removed(var.index()) {
-                    read_pos += 1;
-                    continue;
-                }
-
-                // VSIDS heap reinsertion (needed for decision making).
-                self.vsids.insert_into_heap(var);
-                // No vmtf_on_unassign: IC3 uses VSIDS/bucket queue only.
-
-                // Bucket-queue reinsertion for domain variables (#8476).
-                if self.bucket_queue_active && !self.vsids.bucket_queue_contains(var) {
-                    if let Some(ref domain) = self.active_domain {
-                        if var.index() < domain.len() && domain[var.index()] {
-                            self.vsids.bucket_queue_insert(var);
-                        }
-                    }
-                }
-            } else {
-                if write_pos != read_pos {
-                    self.trail[write_pos] = lit;
-                }
-                self.var_data[var.index()].trail_pos = write_pos as u32;
-                write_pos += 1;
-            }
-            read_pos += 1;
-        }
-
-        self.trail.truncate(write_pos);
-        self.trail_lim.truncate(target_level as usize);
-        self.decision_level = target_level;
-
-        let next_level_start = next_level_start.min(write_pos);
-        self.qhead = self.qhead.min(next_level_start);
-        self.no_conflict_until = self.no_conflict_until.min(next_level_start);
-        self.invalidate_reason_clause_marks();
-        self.debug_assert_backtrack_postconditions(target_level);
     }
 
     /// ENSURES: backtrack postconditions (TLA+ TypeInvariant mirror).

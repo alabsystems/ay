@@ -14,8 +14,10 @@ conflicts (UNSAT <-> SAT) are surfaced immediately.
 
 Solution checking has two backends:
   * python (default): a self-contained OPB/WBO evaluator in this file.
-  * ay:               shells out to `ay pb verify` (authoritative; uses the
-                      solver's own evaluator). Use once that subcommand exists.
+  * ay:               shells out to the sibling `ay-pb pb verify` result
+                      checker under the same resource envelope. The checker is
+                      derived from `--bin` (`ay-pb` itself, or a sibling of the
+                      main `ay` binary) and must exist before the sweep starts.
 
 Core budgeting: the solver's parallel portfolio sizes its worker pool from the
 NBCORE environment variable (competition convention). With --jobs N > 1, N
@@ -522,9 +524,28 @@ def instance_set_digest(instances) -> str:
     return digest.hexdigest()
 
 
-def make_resource_envelope(args, instances, requested_jobs, plan) -> dict:
+def derived_pb_checker_binary(solver_command: str,
+                              solver_executable: dict) -> str:
+    """Resolve the deterministic `ay-pb` checker paired with a solver."""
+    solver_path = Path(solver_executable["path"])
+    command_name = Path(solver_command).name.lower()
+    if command_name in ("ay-pb", "ay-pb.exe"):
+        return str(solver_path)
+    checker_name = "ay-pb.exe" if solver_path.suffix.lower() == ".exe" \
+        else "ay-pb"
+    return str(solver_path.with_name(checker_name))
+
+
+def make_resource_envelope(args, instances, requested_jobs, plan,
+                           solver_executable, checker_executable) -> dict:
+    checker_command = None
+    if checker_executable is not None:
+        checker_command = [
+            checker_executable["path"], "pb", "verify", "--no-z3",
+            "<instance>",
+        ]
     return {
-        "schema": "ay.benchmark-resource-envelope/v1",
+        "schema": "ay.benchmark-resource-envelope/v2",
         "requested_jobs": requested_jobs,
         "jobs": plan.jobs,
         "memlimit_mb_per_child": plan.memlimit_mb,
@@ -541,9 +562,11 @@ def make_resource_envelope(args, instances, requested_jobs, plan) -> dict:
         "checker": args.checker,
         "checker_jobs": 1,
         "checker_timeout_sec": 120 if args.checker == "ay" else None,
+        "checker_command": checker_command,
+        "checker_executable": checker_executable,
         "solver_command": ["<binary>", "pb", "solve", "<instance>",
                            "--timeout", str(int(args.timeout * 1000))],
-        "executable": executable_provenance(args.bin),
+        "executable": solver_executable,
         "harness": executable_provenance(__file__),
         "instance_count": len(instances),
         "instance_set_sha256": instance_set_digest(instances),
@@ -570,12 +593,15 @@ def validate_result_envelopes(results):
         "nbcore_per_child", "headroom_mb", "memory_enforcement",
         "rss_grace_mb", "timeout_sec", "parent_wall_timeout_sec",
         "timeout_enforcement", "solver_env", "capture", "checker",
-        "checker_jobs", "checker_timeout_sec", "solver_command",
-        "executable", "harness", "instance_count", "instance_set_sha256",
+        "checker_jobs", "checker_timeout_sec", "checker_command",
+        "checker_executable", "solver_command", "executable", "harness",
+        "instance_count", "instance_set_sha256",
     }
     missing = sorted(required - set(envelope))
     if missing:
         return None, f"resource envelope is incomplete (missing {missing})"
+    if envelope["schema"] != "ay.benchmark-resource-envelope/v2":
+        return None, f"unsupported resource envelope schema: {envelope['schema']}"
     if len(results) != envelope["instance_count"]:
         return None, (f"partial result set ({len(results)}/"
                       f"{envelope['instance_count']} records)")
@@ -588,6 +614,19 @@ def validate_result_envelopes(results):
         provenance = envelope.get(field)
         if not isinstance(provenance, dict) or not provenance.get("sha256"):
             return None, f"resource envelope lacks {field} provenance"
+    if envelope["checker"] == "ay":
+        provenance = envelope.get("checker_executable")
+        if not isinstance(provenance, dict) or not provenance.get("sha256"):
+            return None, "resource envelope lacks checker executable provenance"
+        command = envelope.get("checker_command")
+        expected_command = [
+            provenance["path"], "pb", "verify", "--no-z3", "<instance>",
+        ]
+        if command != expected_command:
+            return None, "resource envelope lacks the exact checker command"
+    elif envelope["checker_command"] is not None or \
+            envelope["checker_executable"] is not None:
+        return None, "python checker envelope must not claim an executable"
     for result in results:
         if result.memlimit_mb != envelope["memlimit_mb_per_child"]:
             return None, "record memory field disagrees with its envelope"
@@ -599,7 +638,8 @@ def validate_result_envelopes(results):
 
 
 def verify_solver_answer(bin_path, inst_path, status, best_obj, v_tokens,
-                         checker, child_env, memlimit_mb):
+                         checker, child_env, memlimit_mb,
+                         checker_bin_path=None):
     """Verify one answer while no other parent-side instance is retained."""
     try:
         inst = parse_instance(inst_path)
@@ -621,8 +661,14 @@ def verify_solver_answer(bin_path, inst_path, status, best_obj, v_tokens,
     note = (f"v-line missing {missing}/{inst.n_vars} variables (DQ risk)"
             if incomplete else "")
     if checker == "ay":
+        if checker_bin_path is None:
+            solver_executable = executable_provenance(bin_path)
+            checker_bin_path = derived_pb_checker_binary(
+                bin_path, solver_executable,
+            )
         ok, computed_obj, reason = check_solution_via_ay(
-            bin_path, inst_path, v_tokens, child_env, memlimit_mb,
+            checker_bin_path, inst_path, best_obj, v_tokens, child_env,
+            memlimit_mb,
         )
     else:
         ok, computed_obj, reason = check_solution(inst, assign)
@@ -637,7 +683,7 @@ def verify_solver_answer(bin_path, inst_path, status, best_obj, v_tokens,
     if not ok:
         return (category, status, False, True, incomplete,
                 f"INVALID ASSIGNMENT: {reason}")
-    if computed_obj is not None and best_obj is None:
+    if inst.objective is not None and best_obj is None:
         return (category, status, True, True, incomplete,
                 "objective-bearing answer has no o-line")
     if (best_obj is not None and computed_obj is not None and
@@ -651,7 +697,8 @@ def verify_solver_answer(bin_path, inst_path, status, best_obj, v_tokens,
 def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
             grace_s: float = 5.0, env: Optional[dict] = None,
             memlimit_mb: int = 0, nbcore: int = 1,
-            resource_envelope: Optional[dict] = None) -> Result:
+            resource_envelope: Optional[dict] = None,
+            checker_bin_path=None) -> Result:
     if memlimit_mb <= 0 or nbcore <= 0:
         raise ValueError("PB-COMP run requires positive memory and core budgets")
     category = detect_category(inst_path, None)
@@ -736,6 +783,7 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
                         checker,
                         child_env,
                         memlimit_mb,
+                        checker_bin_path,
                     )
                 del v_tokens
             err = stream_tail(stderr)
@@ -757,10 +805,16 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
                   memout=guard.breached, timed_out=timed_out)
 
 
-def check_solution_via_ay(bin_path, inst_path, v_tokens, env, memlimit_mb):
-    """Run the optional AY checker under the same exact process envelope."""
+def check_solution_via_ay(checker_bin_path, inst_path, best_obj, v_tokens,
+                          env, memlimit_mb):
+    """Run model-only verification under the same exact process envelope."""
     with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as solution:
-        solution.write(" ".join(v_tokens))
+        if best_obj is not None:
+            solution.write(f"o {best_obj}\n")
+        # This harness checks a model and its reported objective, not an
+        # OPTIMUM/UNSAT proof. Ask the result checker for exactly that authority.
+        solution.write("s SATISFIABLE\n")
+        solution.write("v " + " ".join(v_tokens) + "\n")
         solution.seek(0)
         with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
                                     errors="replace") as stdout:
@@ -768,8 +822,8 @@ def check_solution_via_ay(bin_path, inst_path, v_tokens, env, memlimit_mb):
                                         errors="replace") as stderr:
                 try:
                     proc, guard = guarded_popen(
-                        [bin_path, "pb", "verify", str(inst_path),
-                         "--solution", "-"],
+                        [checker_bin_path, "pb", "verify", "--no-z3",
+                         str(inst_path)],
                         memlimit_mb, label="pbcomp_harness.py[verify]",
                         grace_mb=0,
                         stdin=solution,
@@ -807,9 +861,14 @@ def check_solution_via_ay(bin_path, inst_path, v_tokens, env, memlimit_mb):
                 message = ""
                 for line in stdout:
                     message = (message + line)[-200:]
-                    match = re.search(r"objective[=:]\s*(-?\d+)", line)
-                    if match:
-                        objective = int(match.group(1))
+                    for pattern in (
+                        r"\bcomputed\s*=\s*(-?\d+)\b",
+                        r"\bmodel attains\s+(-?\d+)\b",
+                    ):
+                        match = re.search(pattern, line)
+                        if match:
+                            objective = int(match.group(1))
+                            break
                 if returncode == 0:
                     return True, objective, ""
                 return False, None, message.strip() or stream_tail(stderr) or \
@@ -879,6 +938,22 @@ def cmd_run(args):
     if not instances:
         print(f"no .opb/.wbo instances under {inst_dir}", file=sys.stderr)
         return 1
+    solver_executable = executable_provenance(args.bin)
+    if not solver_executable.get("sha256"):
+        print("solver executable unavailable: " +
+              solver_executable["path"], file=sys.stderr)
+        return 2
+    checker_bin_path = None
+    checker_executable = None
+    if args.checker == "ay":
+        checker_bin_path = derived_pb_checker_binary(
+            args.bin, solver_executable,
+        )
+        checker_executable = executable_provenance(checker_bin_path)
+        if not checker_executable.get("sha256"):
+            print("AY PB checker executable unavailable: " +
+                  checker_executable["path"], file=sys.stderr)
+            return 2
     # OOM guard (scripts/_oom_guard.py; 2026-06-19 / 2026-07-11 watchdog
     # panics): refuse to sweep concurrently with a cargo build (that exact
     # combination caused both panics; a warning was not enough), cap jobs to a
@@ -905,12 +980,9 @@ def cmd_run(args):
     nbcore_desc = env["NBCORE"]
     memlimit_desc = env["MEMLIMIT"]
     resource_envelope = make_resource_envelope(
-        args, instances, requested_jobs, plan,
+        args, instances, requested_jobs, plan, solver_executable,
+        checker_executable,
     )
-    if not resource_envelope["executable"].get("sha256"):
-        print("solver executable unavailable: " +
-              resource_envelope["executable"]["path"], file=sys.stderr)
-        return 2
     # Envelope honesty: the MEMLIMIT env is enforced only by ay-pb-lineage
     # binaries; the default `ay pb solve` ignores it, so the rss watchdog in
     # run_one is what actually enforces the envelope for every child.
@@ -933,7 +1005,8 @@ def cmd_run(args):
             ex.submit(run_one, bin_path, p, args.timeout, args.checker,
                       env=env, memlimit_mb=plan.memlimit_mb,
                       nbcore=plan.nbcore,
-                      resource_envelope=resource_envelope): p
+                      resource_envelope=resource_envelope,
+                      checker_bin_path=checker_bin_path): p
             for p in instances
         }
         with out_path.open("w") as fh:

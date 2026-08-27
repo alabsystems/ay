@@ -160,9 +160,9 @@ pub(crate) enum CheckCommand {
     /// Verify a PR/SR (DPR/DSR) proof against a DIMACS CNF formula using the
     /// NATIVE Rust PR/SR checker (no external binary on the trust path).
     ///
-    /// Handles both the partial-assignment witness (PR/DPR, the `j=0` lex-leader
-    /// SBP / LPR fragment) and the full substitution witness (SR/DSR symmetry
-    /// proofs AY emits via `DratWriter::add_sr`). The single trusted kernel
+    /// Handles both partial-assignment PR/DPR witnesses and the family-specific
+    /// partial-assignment/substitution streams in SR/DSR proofs emitted through
+    /// `DratWriter::add_sr`. The single trusted kernel
     /// `ay_drat_check::SrChecker` re-derives every redundancy by reverse unit
     /// propagation, so a corrupted witness is caught (it cannot yield a false
     /// VERIFIED). Outputs "s VERIFIED" (exit 0) or "s NOT VERIFIED" (exit 1).

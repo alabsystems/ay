@@ -281,45 +281,40 @@ impl Solver {
         Ok(id)
     }
 
-    /// Emit a symmetry-breaking lex-leader binary as a DPR PR `a`-line
-    /// (`clause… witness… 0`) with its σ-image witness (#8011).
+    /// Apply an extension's proof-only script (chunked XOR ladders, task #20).
     ///
-    /// Used ONLY on the DPR proof route, gated by
-    /// `proof_capability::symmetry_pr_proof_allowed`, for the aux-free `j=0`
-    /// per-generator binary clauses. The forward `ForwardChecker` (RUP/RAT) cannot
-    /// verify PR, so the clause is registered there and in the proof manager as a
-    /// TrustedTransform; the external verified DPR/LPR checker (dpr-trim →
-    /// cake_lpr) is the trust anchor for these steps. No-op (and no clause emitted)
-    /// when no proof manager is attached.
-    pub(crate) fn proof_emit_add_pr(
+    /// Each step reaches the proof stream verbatim and NEVER touches the
+    /// clause database: chunked XOR scaffolding references fresh extension
+    /// variables above `num_vars` that must not participate in search or
+    /// reach a model. Literal order is preserved because RAT additions
+    /// (chain-definition clauses) carry their pivot as the FIRST literal.
+    /// The internal forward checker registers additions as trusted
+    /// transforms — like the SR symmetry route, the external verified chain
+    /// (`dsr-trim`) is the certificate-mode trust anchor for these steps.
+    pub(crate) fn apply_extension_proof_script(
         &mut self,
-        clause: &[Literal],
-        witness: &[Literal],
-    ) -> io::Result<()> {
-        #[cfg(debug_assertions)]
-        self.assert_proof_mode_stable();
-
-        // Keep the forward DRUP checker's clause DB in sync without demanding a
-        // RUP/RAT proof for the PR clause (verified externally).
-        if let Some(ref mut checker) = self.cold.forward_checker {
-            checker.add_trusted_transform(clause);
+        script: Vec<crate::extension::ExtProofStep>,
+    ) {
+        for step in script {
+            match step {
+                crate::extension::ExtProofStep::Add(clause) => {
+                    let _ = self.proof_emit_add(&clause, &[], ProofAddKind::TrustedTransform);
+                }
+                crate::extension::ExtProofStep::Delete(clause) => {
+                    let _ = self.proof_emit_delete(&clause, 0);
+                }
+            }
         }
-
-        if let Some(ref mut manager) = self.proof_manager {
-            manager.emit_add_pr(clause, witness)?;
-        }
-        Ok(())
     }
 
-    /// Emit a symmetry-breaking clause as a DSR `a`-line with its full substitution
-    /// witness σ (#8011 SR route).
+    /// Emit a family-specific symmetry step as a DSR `a`-line.
     ///
-    /// Used on the SR proof route for the FULL lex-leader tower (the aux-free
-    /// `j=0` binaries AND the `j>0` tower clauses + Tseitin defs), each justified
-    /// under the same automorphism substitution σ. The forward RUP/RAT checker
-    /// cannot verify SR, so the clause is registered as a TrustedTransform; the
-    /// external verified chain (`dsr-trim → drat/lsr → cake_lpr`) is the trust
-    /// anchor. No-op (and no clause emitted) when no proof manager is attached.
+    /// Live callers are the separately justified aux-free PHP/matching and
+    /// orbitope constructions. The forward RUP/RAT checker cannot verify SR, so
+    /// the clause is registered as a `TrustedTransform`; the external verified
+    /// chain (`dsr-trim → drat/lsr → cake_lpr`) is the certificate-mode trust
+    /// anchor. No-op when no proof manager is attached; in that mode soundness
+    /// rests on the family recognizer and constructor before trusted insertion.
     pub(crate) fn proof_emit_add_sr(
         &mut self,
         clause: &[Literal],
@@ -327,6 +322,21 @@ impl Solver {
     ) -> io::Result<()> {
         #[cfg(debug_assertions)]
         self.assert_proof_mode_stable();
+
+        // Defense in depth behind the route gate in
+        // `config_preprocess_symmetry`: a live proof surface may only receive
+        // an SR-witnessed step when the DECLARED checker can verify it on THIS
+        // surface — dsr-trim on the DRAT stream (drat-trim and dpr-trim are
+        // measured to reject those `a`-lines), VeriPB on the `.pbp` stream.
+        debug_assert!(
+            self.proof_manager.as_ref().is_none_or(|manager| {
+                crate::proof_capability::declared_checker_accepts_sr_witnesses(
+                    manager.output().is_veripb(),
+                )
+            }),
+            "BUG: SR-witnessed emission reached a live proof surface whose declared \
+             checker rejects substitution witnesses on that surface"
+        );
 
         if let Some(ref mut checker) = self.cold.forward_checker {
             checker.add_trusted_transform(clause);

@@ -4,7 +4,7 @@
 
 //! Fail-closed handling for `eq_transitive` surface forms.
 
-use ay_core::{AletheRule, Proof, ProofStep, TermData, TheoryLemmaKind};
+use ay_core::{AletheRule, Proof, ProofStep, TermData, TermId, TheoryLemmaKind};
 
 use super::super::Executor;
 
@@ -37,14 +37,7 @@ impl Executor {
             else {
                 continue;
             };
-            let unrenderable = clause.iter().any(|&literal| {
-                matches!(self.ctx.terms.get(literal), TermData::Not(_))
-                    && overrides.get(&literal).is_some_and(|surface| {
-                        let surface = surface.trim_start();
-                        !surface.starts_with("(not ") && !surface.starts_with("(distinct ")
-                    })
-            });
-            if unrenderable {
+            if Self::eq_transitive_clause_is_unrenderable(&self.ctx.terms, overrides, clause) {
                 *step = ProofStep::Step {
                     rule: AletheRule::Hole,
                     clause: clause.clone(),
@@ -53,5 +46,27 @@ impl Executor {
                 };
             }
         }
+    }
+
+    /// Whether an installed surface override makes a `(not (= ..))` hypothesis
+    /// of this clause unprintable as `eq_transitive`.
+    ///
+    /// Shared so the demotion above and the producers that MINT an
+    /// `EufTransitive` leaf decide it identically. A producer that promotes a
+    /// clause this predicate rejects would only be handing the demotion a
+    /// `hole` — trading a rescuable `trust` rejection for a hard one — so the
+    /// producers consult it and decline instead.
+    pub(in crate::executor) fn eq_transitive_clause_is_unrenderable(
+        terms: &ay_core::TermStore,
+        overrides: &ay_core::kani_compat::DetHashMap<TermId, String>,
+        clause: &[TermId],
+    ) -> bool {
+        clause.iter().any(|&literal| {
+            matches!(terms.get(literal), TermData::Not(_))
+                && overrides.get(&literal).is_some_and(|surface| {
+                    let surface = surface.trim_start();
+                    !surface.starts_with("(not ") && !surface.starts_with("(distinct ")
+                })
+        })
     }
 }

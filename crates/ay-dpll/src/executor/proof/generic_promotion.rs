@@ -82,6 +82,23 @@ impl Executor {
                 }
                 continue;
             }
+            // A POSITIONAL certificate outranks a payload-free integer kind.
+            // `synthesize_equality_farkas` turns `(cl (not (= t c1))
+            // (not (= t c2)))` into `LiaGeneric` + coefficients the exporter
+            // may render as the pinned calculus's own `la_generic`, while
+            // `IntGuardedSplitGap` renders as an honest `hole` — and the
+            // guarded split ALSO refutes that clause (two equality rows,
+            // ground residue `0 = c1 - c2`). Ask the certificate route first
+            // so the split can only ever take the residual.
+            if matches!(inferred, TheoryLemmaKind::IntGuardedSplitGap) && farkas.is_none() {
+                if let Some(synth) =
+                    crate::executor::proof_farkas::synthesize_equality_farkas(terms, clause)
+                {
+                    *farkas = Some(synth);
+                    *kind = TheoryLemmaKind::LiaGeneric;
+                    continue;
+                }
+            }
             if !inferred.is_trust() {
                 if let Some(reordered) = reordered {
                     // The funnel enforces literal-set equality, so only the

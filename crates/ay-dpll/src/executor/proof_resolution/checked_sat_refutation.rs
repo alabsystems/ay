@@ -23,6 +23,9 @@
 
 mod builder;
 mod derivation_evidence;
+mod metering;
+
+use metering::*;
 
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Proof, ProofId, ProofStep, TermData, TermId, TermStore, TheoryLit};
@@ -42,216 +45,11 @@ use std::sync::Arc;
 
 use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::sat_proof_manager::{
-    ExactOriginalProofError, ExactOriginalProofFragment, FragmentContextDerivation, SatProofManager,
+    ExactOriginalProofError, ExactOriginalProofFragment, SatProofManager,
 };
 use crate::verification::ConflictSemanticVerifyMemo;
-use derivation_evidence::{
-    sealed_context_derivations, sealed_fragment_derivation_maps, sealed_instance_root_derivations,
-    sealed_propagation_environment,
-};
 #[cfg(test)]
 use derivation_evidence::{CheckedInstanceDerivation, CheckedSkolemDerivation};
-
-/// Hard resource envelope for the independent positive-RUP replay.
-///
-/// These are deliberately written at the production call site rather than
-/// inherited implicitly from `Default`: changing a library default cannot
-/// silently widen the mandatory verdict gate.
-fn validation_limits(executor: &Executor) -> ResolutionValidationLimits {
-    ResolutionValidationLimits {
-        deadline: executor.solve_deadline.get(),
-        max_original_clauses: 2_000_000,
-        max_original_literals: 16_000_000,
-        max_derived_steps: 2_000_000,
-        max_derived_literals: 16_000_000,
-        max_hints: 32_000_000,
-        max_work: 250_000_000,
-        max_bytes: 512 * 1024 * 1024,
-    }
-}
-
-/// One aggregate resource/control meter for every accepting phase after SAT
-/// search. It resumes from conversion/replay usage rather than granting proof
-/// reconstruction, strict authentication, and composition fresh allowances.
-struct CheckedRefutationMeter {
-    limits: ResolutionValidationLimits,
-    interrupt: Option<Arc<AtomicBool>>,
-    memory_limit: Option<usize>,
-    work: u64,
-    bytes: usize,
-}
-
-/// Read-only projection shared by ordinary test evidence and production's
-/// premise-carrying evidence.  Crucially, this trait is private: it cannot be
-/// used to erase the unit premises from a checked result outside this module.
-trait CheckedResolutionEvidence {
-    fn dag(&self) -> &ResolutionDag;
-    fn original_mappings(&self) -> &[ClauseTraceOriginalMapping];
-    fn validation_work(&self) -> u64;
-    fn retained_bytes(&self) -> usize;
-}
-
-impl CheckedResolutionEvidence for ValidatedClauseTraceResolution {
-    fn dag(&self) -> &ResolutionDag {
-        self.dag()
-    }
-
-    fn original_mappings(&self) -> &[ClauseTraceOriginalMapping] {
-        self.original_mappings()
-    }
-
-    fn validation_work(&self) -> u64 {
-        self.validation_work()
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.retained_bytes()
-    }
-}
-
-impl CheckedResolutionEvidence for ValidatedPremisedClauseTraceResolution {
-    fn dag(&self) -> &ResolutionDag {
-        self.dag()
-    }
-
-    fn original_mappings(&self) -> &[ClauseTraceOriginalMapping] {
-        self.original_mappings()
-    }
-
-    fn validation_work(&self) -> u64 {
-        self.validation_work()
-    }
-
-    fn retained_bytes(&self) -> usize {
-        self.retained_bytes()
-    }
-}
-
-impl CheckedRefutationMeter {
-    fn new(
-        limits: ResolutionValidationLimits,
-        interrupt: Option<Arc<AtomicBool>>,
-        memory_limit: Option<usize>,
-    ) -> Result<Self, ResolutionValidationError> {
-        let mut meter = Self {
-            limits,
-            interrupt,
-            memory_limit,
-            work: 0,
-            bytes: 0,
-        };
-        meter.charge(0, 0)?;
-        Ok(meter)
-    }
-
-    #[cfg(test)]
-    fn resume<E: CheckedResolutionEvidence>(
-        limits: ResolutionValidationLimits,
-        interrupt: Option<Arc<AtomicBool>>,
-        memory_limit: Option<usize>,
-        validated: &E,
-    ) -> Result<Self, ResolutionValidationError> {
-        let mut meter = Self::new(limits, interrupt, memory_limit)?;
-        meter.absorb_validation(validated)?;
-        Ok(meter)
-    }
-
-    fn remaining_validation_limits(
-        &self,
-    ) -> Result<ResolutionValidationLimits, ResolutionValidationError> {
-        self.check_controls()?;
-        let mut remaining = self.limits.clone();
-        remaining.max_work = remaining.max_work.checked_sub(self.work).ok_or(
-            ResolutionValidationError::AccountingOverflow {
-                resource: ResolutionValidationResource::Work,
-            },
-        )?;
-        remaining.max_bytes = remaining.max_bytes.checked_sub(self.bytes).ok_or(
-            ResolutionValidationError::AccountingOverflow {
-                resource: ResolutionValidationResource::Bytes,
-            },
-        )?;
-        Ok(remaining)
-    }
-
-    fn absorb_validation<E: CheckedResolutionEvidence>(
-        &mut self,
-        validated: &E,
-    ) -> Result<(), ResolutionValidationError> {
-        let work = usize::try_from(validated.validation_work()).map_err(|_| {
-            ResolutionValidationError::AccountingOverflow {
-                resource: ResolutionValidationResource::Work,
-            }
-        })?;
-        self.charge(work, validated.retained_bytes())
-    }
-
-    #[cfg(test)]
-    fn unbounded() -> Self {
-        Self {
-            limits: ResolutionValidationLimits::unbounded(),
-            interrupt: None,
-            memory_limit: None,
-            work: 0,
-            bytes: 0,
-        }
-    }
-
-    fn charge(&mut self, work: usize, bytes: usize) -> Result<(), ResolutionValidationError> {
-        self.check_controls()?;
-        let work =
-            u64::try_from(work).map_err(|_| ResolutionValidationError::AccountingOverflow {
-                resource: ResolutionValidationResource::Work,
-            })?;
-        self.work =
-            self.work
-                .checked_add(work)
-                .ok_or(ResolutionValidationError::AccountingOverflow {
-                    resource: ResolutionValidationResource::Work,
-                })?;
-        if self.work > self.limits.max_work {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: u128::from(self.limits.max_work),
-                actual: u128::from(self.work),
-            });
-        }
-        self.bytes =
-            self.bytes
-                .checked_add(bytes)
-                .ok_or(ResolutionValidationError::AccountingOverflow {
-                    resource: ResolutionValidationResource::Bytes,
-                })?;
-        if self.bytes > self.limits.max_bytes {
-            return Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Bytes,
-                limit: self.limits.max_bytes as u128,
-                actual: self.bytes as u128,
-            });
-        }
-        self.check_controls()
-    }
-
-    fn check_controls(&self) -> Result<(), ResolutionValidationError> {
-        if self
-            .limits
-            .deadline
-            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
-        {
-            return Err(ResolutionValidationError::DeadlineExceeded);
-        }
-        if self
-            .interrupt
-            .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            || crate::memory::memory_exceeded(self.memory_limit)
-            || ay_sys::process_memory_exceeded()
-        {
-            return Err(ResolutionValidationError::Cancelled);
-        }
-        Ok(())
-    }
-}
 
 fn checked_resource_add(
     lhs: usize,
@@ -838,6 +636,20 @@ impl CheckedSatRefutation {
     }
 }
 
+#[cfg(test)]
+impl Executor {
+    pub(in crate::executor) fn plant_stale_checked_sat_refutation_for_test(&mut self) {
+        self.last_checked_sat_refutation = Some(CheckedSatRefutation {
+            query_epoch: self.query_authority_epoch.clone(),
+            source_context_stamp: self.ctx.source_context_stamp(),
+            ordered_authored_roots: self.ctx.assertions.clone().into_boxed_slice(),
+            ordered_assumptions: Box::new([]),
+            original_clause_count: 1,
+            derived_step_count: 1,
+        });
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CheckedSatRefutationError {
     #[error("checked SAT refutation resource envelope failed: {0}")]
@@ -1221,17 +1033,339 @@ impl Executor {
         let Some(assumptions) = self.checked_sat_refutation_query_assumptions() else {
             return false;
         };
-        self.last_checked_sat_refutation
+        let authorized = self
+            .last_checked_sat_refutation
             .as_ref()
             .is_some_and(|checked| {
                 checked.is_current_for(&query_epoch, &source_context_stamp, roots, assumptions)
-            })
+            });
+        if !authorized && ay_core::misc_cli_flags().debug_cert {
+            match self.last_checked_sat_refutation.as_ref() {
+                None => eprintln!("CERT/authorize: no minted sidecar"),
+                Some(checked) => eprintln!(
+                    "CERT/authorize MISMATCH: epoch_ok={} stamp_ok={} roots_ok={} (sidecar {} vs query {}) assumptions_ok={} ({} vs {})",
+                    checked.query_epoch.is_same_epoch(&query_epoch),
+                    checked.source_context_stamp == source_context_stamp,
+                    checked.ordered_authored_roots.as_ref() == roots,
+                    checked.ordered_authored_roots.len(),
+                    roots.len(),
+                    checked.ordered_assumptions.as_ref() == assumptions,
+                    checked.ordered_assumptions.len(),
+                    assumptions.len(),
+                ),
+            }
+        }
+        authorized
     }
 
     /// Rebuild the checked SAT-refutation sidecar from the current immutable
     /// proof bundle. Any missing or rejected evidence clears the prior token.
+    /// #dt-value-flow (#dt-context-derivation): compose constructor VALUES
+    /// through the sealed step equations and record one hint per composed
+    /// value fact.
+    ///
+    /// The residual certification premises are tower-state facts
+    /// (`is-stack`, emptiness, identity across a step) whose truth flows
+    /// from WHICH values the towers hold at each step. The step equations
+    /// themselves are already sealed hints (`(= s^{k+1}!f (rest s^k!f))`,
+    /// identities, `(stack …)` pushes); what is missing is the composed
+    /// value `(= s^{k+1}!f V)` with `V` constructor-headed, which lets the
+    /// ground refuter evaluate testers by projection and the transport
+    /// lanes walk to it. Composition:
+    ///
+    /// * seed: every asserted or sealed single-equality whose one side is a
+    ///   registered-constructor application anchors that side's value;
+    /// * step: for a sealed single-equality `(= A B)`, `A`'s value is `B`
+    ///   itself when `B` is constructor-headed, the anchored value of `B`,
+    ///   or the field-`i` projection of `B = sel_i(X)` through `X`'s
+    ///   anchored constructor value.
+    ///
+    /// Each composed fact records with MINIMAL premises — the step equation
+    /// plus the prior value equality — so discharge chains recursively
+    /// through earlier compositions down to asserted anchors. Every hint is
+    /// re-derived by the ground refuter at sealing (congruence + selector
+    /// projection close exactly these), and a hint for an arm that did NOT
+    /// hold simply never discharges: candidates are capped, fail-closed.
+    pub(in crate::executor) fn record_value_flow_composition_hints(&mut self) {
+        use ay_core::kani_compat::{DetHashMap, DetHashSet};
+        const MAX_ROUNDS: usize = 12;
+        const MAX_VALUES_PER_SUBJECT: usize = 10;
+        const MAX_NEW_RECORDS: usize = 4096;
+
+        // Selector name -> (constructor name, field index, field count).
+        let mut selector_index: DetHashMap<String, (String, usize, usize)> = DetHashMap::default();
+        for (ctor, selectors) in self.ctx.ctor_selectors_iter() {
+            for (index, selector) in selectors.iter().enumerate() {
+                selector_index
+                    .entry(selector.clone())
+                    .or_insert_with(|| (ctor.clone(), index, selectors.len()));
+            }
+        }
+        if selector_index.is_empty() && self.ctx.datatype_iter().next().is_none() {
+            return;
+        }
+        let ctor_headed =
+            |terms: &TermStore, term: TermId, ctx: &ay_frontend::Context| match terms.get(term) {
+                TermData::App(symbol, _) => ctx.is_constructor(symbol.name()).is_some(),
+                TermData::Var(name, _) => ctx.is_constructor(name).is_some(),
+                _ => false,
+            };
+
+        // Candidate step equations: every sealed single-equality clause plus
+        // every asserted equality.
+        let mut equations: Vec<TermId> = Vec::new();
+        let mut seen_equations: DetHashSet<TermId> = DetHashSet::default();
+        for record in &self.dt_context_conflict_records.records {
+            if let [clause_term] = record.clause.as_slice() {
+                if seen_equations.insert(*clause_term) {
+                    equations.push(*clause_term);
+                }
+            }
+        }
+        for &assertion in &self.ctx.assertions {
+            if seen_equations.insert(assertion) {
+                equations.push(assertion);
+            }
+        }
+
+        // Value environment: subject -> [(value, establishing eq term)].
+        let mut environment: DetHashMap<TermId, Vec<(TermId, TermId)>> = DetHashMap::default();
+        let push_value = |environment: &mut DetHashMap<TermId, Vec<(TermId, TermId)>>,
+                          subject: TermId,
+                          value: TermId,
+                          via: TermId| {
+            let entry = environment.entry(subject).or_default();
+            if entry.len() < MAX_VALUES_PER_SUBJECT
+                && !entry.iter().any(|&(existing, _)| existing == value)
+            {
+                entry.push((value, via));
+                true
+            } else {
+                false
+            }
+        };
+
+        // Seed anchors.
+        for &equation in &equations {
+            let TermData::App(symbol, args) = self.ctx.terms.get(equation) else {
+                continue;
+            };
+            if symbol.name() != "=" || args.len() != 2 {
+                continue;
+            }
+            let (left, right) = (args[0], args[1]);
+            for (subject, value) in [(left, right), (right, left)] {
+                if !ctor_headed(&self.ctx.terms, subject, &self.ctx)
+                    && ctor_headed(&self.ctx.terms, value, &self.ctx)
+                {
+                    push_value(&mut environment, subject, value, equation);
+                }
+            }
+        }
+
+        // Iterate composition to a bounded fixpoint, recording new facts.
+        let mut recorded = 0usize;
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for &equation in &equations {
+                if recorded >= MAX_NEW_RECORDS {
+                    return;
+                }
+                let TermData::App(symbol, args) = self.ctx.terms.get(equation) else {
+                    continue;
+                };
+                if symbol.name() != "=" || args.len() != 2 {
+                    continue;
+                }
+                let (first, second) = (args[0], args[1]);
+                for (target, source) in [(first, second), (second, first)] {
+                    if ctor_headed(&self.ctx.terms, target, &self.ctx) {
+                        continue;
+                    }
+                    // Candidate values for `source`, each with the premises
+                    // that establish it beyond the step equation itself.
+                    let mut candidates: Vec<(TermId, Vec<TermId>)> = Vec::new();
+                    if let Some(values) = environment.get(&source) {
+                        for &(value, via) in values {
+                            if via != equation {
+                                candidates.push((value, vec![via]));
+                            }
+                        }
+                    }
+                    // Selector projection through an anchored value.
+                    if let TermData::App(sel_symbol, sel_args) = self.ctx.terms.get(source).clone()
+                    {
+                        if let ([inner], Some((ctor, field, arity))) = (
+                            sel_args.as_slice(),
+                            selector_index.get(sel_symbol.name()).cloned(),
+                        ) {
+                            if let Some(values) = environment.get(inner) {
+                                for &(value, via) in values.clone().iter() {
+                                    let TermData::App(value_symbol, value_args) =
+                                        self.ctx.terms.get(value)
+                                    else {
+                                        continue;
+                                    };
+                                    if value_symbol.name() == ctor
+                                        && value_args.len() == arity
+                                        && field < value_args.len()
+                                    {
+                                        candidates.push((value_args[field], vec![via]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (value, mut premises) in candidates {
+                        if !ctor_headed(&self.ctx.terms, value, &self.ctx) {
+                            continue;
+                        }
+                        if self.ctx.terms.sort(target) != self.ctx.terms.sort(value) {
+                            continue;
+                        }
+                        let value_equation = self.ctx.terms.mk_eq(target, value);
+                        if !push_value(&mut environment, target, value, value_equation) {
+                            continue;
+                        }
+                        premises.push(equation);
+                        premises.dedup();
+                        // The composed fact may coincide with an existing
+                        // equation (then it needs no record of its own).
+                        if premises.iter().any(|&p| p == value_equation) {
+                            continue;
+                        }
+                        self.dt_context_conflict_records
+                            .record(vec![value_equation], premises);
+                        recorded += 1;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if ay_core::misc_cli_flags().probe_cert_reject {
+            let anchored: usize = environment.len();
+            eprintln!(
+                "c value-flow-debug equations={} subjects={anchored} recorded={recorded}",
+                equations.len()
+            );
+            for (subject, values) in environment.iter() {
+                let rendered = ay_proof::render_term_canonical(&self.ctx.terms, *subject);
+                if rendered.contains("____") && !rendered.contains('(') {
+                    eprintln!(
+                        "c value-flow-debug subject={rendered} values={}",
+                        values.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// #dt-context-derivation: record one hint per level-0 propagated fact
+    /// of the persistent solver's CURRENT trail, decoding clause/binary
+    /// reasons exactly like the mid-solve walk (Tseitin aux variables are
+    /// resolved through their own level-0 reasons). Records grant no
+    /// authority — sealing re-derives every entailment.
+    pub(in crate::executor) fn record_certification_level0_hints(&mut self) {
+        use ay_sat::SolverContext;
+        const MAX_WALK: usize = 8192;
+        const FLATTEN_BUDGET: usize = 64;
+        let mut collected: Vec<(TermId, Vec<TermId>)> = Vec::new();
+        {
+            let Some(state) = self.incr_theory_state.as_ref() else {
+                return;
+            };
+            let Some(solver) = state.persistent_sat.as_ref() else {
+                return;
+            };
+            let Some(var_to_term) = self.last_var_to_term.as_ref() else {
+                return;
+            };
+            let Some(negations) = self.last_negations.as_ref() else {
+                return;
+            };
+            let fact_of = |literal: Literal| -> Option<TermId> {
+                let atom = *var_to_term.get(&(literal.variable().index() as u32))?;
+                if literal.is_positive() {
+                    Some(atom)
+                } else {
+                    negations.get(&atom).copied()
+                }
+            };
+            for (walked, &literal) in solver.trail().iter().enumerate() {
+                if walked >= MAX_WALK
+                    || SolverContext::var_level(solver, literal.variable()) != Some(0)
+                {
+                    break;
+                }
+                let Some(side) = SolverContext::var_reason_side(solver, literal.variable()) else {
+                    continue;
+                };
+                if side.is_empty() {
+                    continue;
+                }
+                let Some(fact) = fact_of(literal) else {
+                    continue;
+                };
+                let mut side_facts: Vec<TermId> = Vec::new();
+                let mut work = side;
+                let mut budget = FLATTEN_BUDGET;
+                let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+                let mut complete = true;
+                while let Some(side_literal) = work.pop() {
+                    if budget == 0 {
+                        complete = false;
+                        break;
+                    }
+                    budget -= 1;
+                    let key = (side_literal.variable().index() as u64) * 2
+                        + u64::from(side_literal.is_positive());
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if let Some(side_fact) = fact_of(side_literal.negated()) {
+                        if side_fact != fact && !side_facts.contains(&side_fact) {
+                            side_facts.push(side_fact);
+                        }
+                        continue;
+                    }
+                    let aux = side_literal.negated();
+                    if SolverContext::var_level(solver, aux.variable()) != Some(0) {
+                        complete = false;
+                        break;
+                    }
+                    let Some(aux_side) = SolverContext::var_reason_side(solver, aux.variable())
+                    else {
+                        complete = false;
+                        break;
+                    };
+                    work.extend(aux_side);
+                }
+                if complete && !side_facts.is_empty() {
+                    collected.push((fact, side_facts));
+                }
+            }
+        }
+        for (fact, premises) in collected {
+            self.dt_context_conflict_records
+                .record(vec![fact], premises);
+        }
+    }
+
     pub(in crate::executor) fn refresh_checked_sat_refutation(&mut self) {
         self.last_checked_sat_refutation = None;
+        // #dt-context-derivation: final level-0 hint sweep. Mid-solve hint
+        // walks are timing-dependent — a fact that reached level 0 AFTER the
+        // last recorded conflict has no hint. The persistent solver's
+        // level-0 trail at refutation time is the definitive fact set; walk
+        // it once through the same reason decoding before sealing.
+        self.record_certification_level0_hints();
+        // #dt-value-flow: compose per-step constructor values through the
+        // sealed step equations so tester/emptiness premises gain evaluable
+        // anchors (see `record_value_flow_composition_hints`).
+        self.record_value_flow_composition_hints();
         match CheckedSatRefutation::build(self) {
             Ok(checked) => {
                 crate::executor::unsat_cert::probe_cert_reject(|| {
@@ -1241,6 +1375,13 @@ impl Executor {
             }
             Err(error) => {
                 tracing::debug!(%error, "checked SAT refutation unavailable");
+                // Name every decline under the probe carrier: post-
+                // authentication stages (composition, deferred discharge,
+                // strict re-check, resources) were invisible once the
+                // census reached zero.
+                crate::executor::unsat_cert::probe_cert_reject(|| {
+                    format!("checked SAT refutation DECLINED: {error}")
+                });
                 // Bounded opt-in diagnostics: an unauthenticated original is
                 // reported WITH its rendered terms — the gate that refused it
                 // is otherwise unobservable outside this crate, and the term
@@ -1510,358 +1651,7 @@ mod tests {
         assert_eq!(executor.ctx.assertions, vec![proposition]);
     }
 
-    #[test]
-    fn fired_interrupt_cancels_trace_conversion_before_sidecar_refresh() {
-        let (mut executor, proposition, _) = contradictory_unit_executor();
-        // The successful solve has already consumed its large clause-trace
-        // payload after minting the sidecar. Install a fresh, solver-stamped
-        // candidate so this regression reaches the conversion boundary whose
-        // caller-control propagation it exercises.
-        let mut sat = ay_sat::Solver::new(1);
-        sat.enable_clause_trace();
-        sat.add_clause(vec![Literal::positive(Variable::new(0))]);
-        sat.add_clause(vec![Literal::negative(Variable::new(0))]);
-        assert!(sat.solve().into_inner().is_unsat());
-        executor.last_clause_trace = sat.take_clause_trace();
-        let mut var_to_term = HashMap::default();
-        var_to_term.insert(0, proposition);
-        executor.last_var_to_term = Some(var_to_term);
-        executor.set_interrupt(Arc::new(AtomicBool::new(true)));
-
-        let error = CheckedSatRefutation::build(&mut executor)
-            .expect_err("a fired caller interrupt must reject SAT-refutation conversion");
-        assert!(
-            matches!(
-                error,
-                CheckedSatRefutationError::CertificationResource(
-                    ResolutionValidationError::Cancelled
-                )
-            ),
-            "unexpected checked-refutation cancellation error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn post_replay_phases_share_work_and_byte_allowances() {
-        let mut trace = ClauseTrace::new();
-        trace.add_clause(41, vec![Literal::positive(Variable::new(0))], true);
-        trace.add_clause(7, vec![Literal::negative(Variable::new(0))], true);
-        trace.add_clause_with_hints(90, Vec::new(), false, vec![41, 7]);
-        let validated =
-            validate_clause_trace_resolution(&trace, 1, &ResolutionValidationLimits::unbounded())
-                .expect("two contrary units have a checked refutation");
-
-        let mut work_limits = ResolutionValidationLimits::unbounded();
-        work_limits.max_work = validated.validation_work();
-        let mut work_meter = CheckedRefutationMeter::resume(work_limits, None, None, &validated)
-            .expect("the exact already-consumed work fits");
-        assert!(matches!(
-            work_meter.charge(1, 0),
-            Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                ..
-            })
-        ));
-
-        let mut byte_limits = ResolutionValidationLimits::unbounded();
-        byte_limits.max_bytes = validated.retained_bytes();
-        let mut byte_meter = CheckedRefutationMeter::resume(byte_limits, None, None, &validated)
-            .expect("the exact retained trace payload fits");
-        assert!(matches!(
-            byte_meter.charge(0, 1),
-            Err(ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Bytes,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn post_replay_phase_observes_inherited_interrupt() {
-        let mut trace = ClauseTrace::new();
-        trace.add_clause(41, vec![Literal::positive(Variable::new(0))], true);
-        trace.add_clause(7, vec![Literal::negative(Variable::new(0))], true);
-        trace.add_clause_with_hints(90, Vec::new(), false, vec![41, 7]);
-        let validated =
-            validate_clause_trace_resolution(&trace, 1, &ResolutionValidationLimits::unbounded())
-                .expect("two contrary units have a checked refutation");
-        let fired = Arc::new(AtomicBool::new(true));
-
-        assert!(matches!(
-            CheckedRefutationMeter::resume(
-                ResolutionValidationLimits::unbounded(),
-                Some(fired),
-                None,
-                &validated,
-            ),
-            Err(ResolutionValidationError::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn composition_normalization_is_precharged_before_allocation_and_sort() {
-        let clause: Vec<TermId> = (0..4096).rev().map(TermId).collect();
-        let mut meter = CheckedRefutationMeter::unbounded();
-        meter.limits.max_work = 1000;
-
-        let error = normalize_clause_metered(&clause, &mut meter)
-            .expect_err("a wide normalization must consume the aggregate work allowance");
-        assert!(matches!(
-            error,
-            ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Work,
-                limit: 1000,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn authored_root_copy_is_precharged_before_allocation() {
-        let roots = [TermId(0), TermId(1)];
-        let mut meter = CheckedRefutationMeter::unbounded();
-        meter.limits.max_bytes = size_of::<TermId>();
-
-        let error = metered_term_id_copy(&roots, &mut meter)
-            .expect_err("the retained root copy must consume the aggregate byte allowance");
-        assert!(matches!(
-            error,
-            ResolutionValidationError::LimitExceeded {
-                resource: ResolutionValidationResource::Bytes,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn exact_assumption_mapping_preserves_order_polarity_and_fails_on_ambiguity() {
-        let mut terms = TermStore::new();
-        let proposition = terms.mk_var("mapped_p", Sort::Bool);
-        let not_proposition = terms.mk_not_raw(proposition);
-        let mut map = HashMap::default();
-        map.insert(0, proposition);
-        let literals = exact_assumption_sat_literals(
-            &[not_proposition, proposition],
-            &map,
-            &terms,
-            1,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect("both polarities have one exact SAT mapping");
-        assert_eq!(
-            literals,
-            vec![
-                Literal::negative(Variable::new(0)),
-                Literal::positive(Variable::new(0)),
-            ]
-        );
-
-        map.insert(1, proposition);
-        let error = exact_assumption_sat_literals(
-            &[proposition],
-            &map,
-            &terms,
-            2,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect_err("two SAT variables for one assumption are not exact authority");
-        assert!(matches!(
-            error,
-            CheckedSatRefutationError::AmbiguousAssumptionMapping {
-                assumption_index: 0,
-                assumption,
-            } if assumption == proposition
-        ));
-    }
-
-    #[test]
-    fn generic_premise_requires_exact_positive_semantic_memo_entry() {
-        let mut terms = TermStore::new();
-        let proposition = terms.mk_var("semantic_generic_p", Sort::Bool);
-        let mut proof = Proof::new();
-        let generic =
-            proof.add_theory_lemma_with_kind("theory", vec![proposition], TheoryLemmaKind::Generic);
-
-        let authenticate = || {
-            ay_proof::authenticate_premise_clauses_with_deferred_generic_theory_and_progress(
-                &proof,
-                &terms,
-                None,
-                None,
-                &[],
-                &mut |_, _| true,
-            )
-            .expect("the proof kernel must separate the Generic obligation")
-        };
-
-        let key = vec![TheoryLit::new(proposition, false)];
-        let mut rejected_memo = ConflictSemanticVerifyMemo::default();
-        rejected_memo.insert(key.clone(), false);
-        let error = SemanticallyCompletedPremiseClauses::complete(
-            authenticate(),
-            &rejected_memo,
-            &terms,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect_err("a memoized semantic rejection is not premise authority");
-        assert!(matches!(
-            error,
-            CheckedSatRefutationError::DeferredGenericNotSemanticallyVerified { step }
-                if step == generic
-        ));
-
-        let mut accepted_memo = ConflictSemanticVerifyMemo::default();
-        accepted_memo.insert(key, true);
-        let completed = SemanticallyCompletedPremiseClauses::complete(
-            authenticate(),
-            &accepted_memo,
-            &terms,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect("the exact current semantic verifier verdict discharges the obligation");
-        assert_eq!(completed.clause(generic), Some([proposition].as_slice()));
-    }
-
-    #[test]
-    fn mismatched_same_id_trace_and_fragment_are_rejected() {
-        let mut terms = TermStore::new();
-        let q = terms.mk_var("q", Sort::Bool);
-        let not_q = terms.mk_not_raw(q);
-
-        let mut trace_a = ClauseTrace::new();
-        trace_a.add_clause(5, vec![Literal::positive(Variable::new(0))], true);
-        trace_a.add_clause(9, vec![Literal::negative(Variable::new(0))], true);
-        trace_a.add_clause_with_hints(12, Vec::new(), false, vec![5, 9]);
-        let validated_a = validate_clause_trace_resolution(
-            &trace_a,
-            1,
-            &ResolutionValidationLimits {
-                deadline: None,
-                max_original_clauses: 8,
-                max_original_literals: 8,
-                max_derived_steps: 8,
-                max_derived_literals: 8,
-                max_hints: 8,
-                max_work: 128,
-                max_bytes: 64 * 1024,
-            },
-        )
-        .expect("trace A is structurally valid");
-
-        let mut trace_b = ClauseTrace::new();
-        trace_b.add_clause(5, vec![Literal::positive(Variable::new(1))], true);
-        trace_b.add_clause(9, vec![Literal::negative(Variable::new(1))], true);
-        trace_b.add_clause_with_hints(12, Vec::new(), false, vec![5, 9]);
-        let mut map_b = HashMap::default();
-        map_b.insert(1, q);
-        let fragment_b = SatProofManager::new(&map_b, &mut terms)
-            .build_exact_original_proof_fragment(&trace_b, &[q, not_q])
-            .expect("trace B units have exact authored authority");
-        let authenticated_b =
-            ay_proof::authenticate_premise_clauses_with_deferred_generic_theory_and_progress(
-                fragment_b.proof(),
-                &terms,
-                None,
-                None,
-                &[q, not_q],
-                &mut |_, _| true,
-            )
-            .expect("trace B fragment is strictly authenticated");
-        let authenticated_b = SemanticallyCompletedPremiseClauses::complete(
-            authenticated_b,
-            &ConflictSemanticVerifyMemo::default(),
-            &terms,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect("trace B fragment has no deferred Generic premise");
-
-        let error = verify_exact_composition(
-            &validated_a,
-            &fragment_b,
-            &authenticated_b,
-            None,
-            &map_b,
-            &[],
-            &mut terms,
-            &mut CheckedRefutationMeter::unbounded(),
-        )
-        .expect_err("same stable IDs cannot join evidence from different traces");
-        assert!(matches!(
-            error,
-            CheckedSatRefutationError::BindingSourceMismatch { trace_id: 5 }
-        ));
-    }
-
-    #[test]
-    fn checked_sidecar_is_independent_of_an_unrequested_alethe_presentation() {
-        let (mut accepted, _, _) = contradictory_unit_executor();
-        let mut trust_proof = Proof::new();
-        trust_proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-        accepted.last_proof = Some(trust_proof);
-        let result = accepted.certify_unsat_for_publication(SolveResult::unsat(), &[]);
-        assert!(result.is_unsat());
-        assert!(accepted.admit_command_solve_result(result).is_unsat());
-        assert!(!accepted.last_command_unsat_was_strictly_verified());
-        assert!(accepted.last_command_unsat_was_independently_verified());
-        assert!(!accepted.last_command_unsat_was_exact_semantically_verified());
-
-        let (mut malformed, _, _) = contradictory_unit_executor();
-        malformed.last_proof = Some(Proof::new());
-        let result = malformed.certify_unsat_for_publication(SolveResult::unsat(), &[]);
-        assert!(result.is_unsat());
-        assert!(malformed.admit_command_solve_result(result).is_unsat());
-        assert!(!malformed.last_command_unsat_was_strictly_verified());
-        assert!(malformed.last_command_unsat_was_independently_verified());
-        assert!(!malformed.last_command_unsat_was_exact_semantically_verified());
-
-        // An explicit proof request promises that the Alethe presentation
-        // itself checks. The same independent theorem cannot satisfy that
-        // stronger artifact contract when the presentation is malformed.
-        let (mut required, _, _) = contradictory_unit_executor();
-        required.set_produce_proofs(true);
-        required.last_proof = Some(Proof::new());
-        let result = required.certify_unsat_for_publication(SolveResult::unsat(), &[]);
-        assert!(result.is_unknown());
-        assert!(required.take_unsat_certificate().is_none());
-    }
-
-    #[test]
-    fn changed_source_stamp_retires_checked_sidecar() {
-        let (mut executor, _, _) = contradictory_unit_executor();
-        let mut trust_proof = Proof::new();
-        trust_proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
-        executor.last_proof = Some(trust_proof);
-
-        executor
-            .ctx
-            .process_command(&Command::Push(1))
-            .expect("direct frontend mutation succeeds");
-        let result = executor.certify_unsat_for_publication(SolveResult::unsat(), &[]);
-        assert!(result.is_unknown());
-        assert!(executor.take_unsat_certificate().is_none());
-    }
-
-    #[test]
-    fn missing_authoritative_namespace_and_nonempty_assumptions_decline() {
-        let (mut unstamped, _) = unstamped_contradictory_unit_executor();
-        unstamped.refresh_checked_sat_refutation();
-        assert!(unstamped.last_checked_sat_refutation.is_none());
-
-        let (mut assuming, proposition) = unstamped_contradictory_unit_executor();
-        assuming.bind_unsat_query_assumptions(&[proposition]);
-        assuming.refresh_checked_sat_refutation();
-        assert!(assuming.last_checked_sat_refutation.is_none());
-    }
-
-    #[test]
-    fn finite_replay_limits_remain_explicit() {
-        let executor = Executor::new();
-        let limits = validation_limits(&executor);
-        assert!(limits.max_original_clauses < usize::MAX);
-        assert!(limits.max_derived_steps < usize::MAX);
-        assert!(limits.max_work < u64::MAX);
-        assert!(limits.max_bytes < usize::MAX);
-    }
+    include!("checked_sat_refutation/resource_tests.rs");
 
     mod instance_authority_tests;
 }

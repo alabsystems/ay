@@ -13,13 +13,14 @@
 //! O(model x DAG). On `inv_Newton` that walk was the minimizer's hottest frame.
 //!
 //! Dependence is reachability in the TERM STORE, which is immutable while
-//! minimization runs (only model VALUES move), and the `bv_model` key set is
-//! invariant across a pass (candidates overwrite, remove and restore existing
-//! keys, never add one). So one walk per compound term yields the whole
-//! relation and each attempt becomes a hash lookup. `try_bv_candidates` keeps a
-//! debug-build assertion that the indexed set still equals the original full
-//! scan, so a future violation of either invariant fails loudly instead of
-//! silently under-invalidating the cache.
+//! minimization runs (only model VALUES move). The `bv_model` key set can only
+//! shrink across a pass: a successful candidate deliberately leaves a compound
+//! absent when the evaluator cannot recompute it, but candidates never add a
+//! new key. So one walk per initial compound yields a structural superset of
+//! the live relation and each attempt becomes a hash lookup intersected with
+//! the current cache. `try_bv_candidates` keeps a debug-build assertion that
+//! this live indexed set still equals the original full scan, so a future
+//! violation fails loudly instead of silently under-invalidating the cache.
 
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::{TermData, TermId};
@@ -163,13 +164,12 @@ impl Executor {
     }
 
     /// Debug-build differential oracle for one lookup: the indexed dependents of
-    /// `leaf` must equal what the original full `term_mentions` scan finds.
+    /// `leaf` still present in the live cache must equal what the original full
+    /// `term_mentions` scan finds.
     #[cfg(debug_assertions)]
     fn assert_bv_dependents_match_full_scan(&self, leaf: TermId, indexed: &[TermId]) {
-        let oracle: DetHashSet<TermId> = self
-            .last_model
-            .as_ref()
-            .and_then(|m| m.bv_model.as_ref())
+        let bv = self.last_model.as_ref().and_then(|m| m.bv_model.as_ref());
+        let oracle: DetHashSet<TermId> = bv
             .map(|bv| {
                 bv.values
                     .iter()
@@ -182,11 +182,15 @@ impl Executor {
                     .collect()
             })
             .unwrap_or_default();
-        let fast: DetHashSet<TermId> = indexed.iter().copied().collect();
+        let fast: DetHashSet<TermId> = indexed
+            .iter()
+            .copied()
+            .filter(|t| bv.is_some_and(|bv| bv.values.contains_key(t)))
+            .collect();
         debug_assert_eq!(
             fast, oracle,
             "BvDependentIndex diverged from the full term_mentions scan \
-             (term store mutated mid-minimization, or a bv_model key appeared?)"
+             (term store mutated mid-minimization, or a live bv_model key appeared?)"
         );
     }
 }

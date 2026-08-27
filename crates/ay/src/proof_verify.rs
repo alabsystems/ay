@@ -86,6 +86,14 @@ fn verify_proof_bytes(
                      (use --proof-format drat or lrat to enable --verify-proof)"
                 .to_string(),
         },
+        // No pseudo-Boolean checker lives in-tree; a `.pbp` is checked by the
+        // external `veripb instance.cnf proof.pbp`, which is the declared
+        // checker for this format.
+        ProofFormat::Veripb => VerifyOutcome::Skipped {
+            reason: "VeriPB proof format is checked externally by `veripb <cnf> <proof.pbp>` \
+                     (use --proof-format drat or lrat to enable --verify-proof)"
+                .to_string(),
+        },
     }
 }
 

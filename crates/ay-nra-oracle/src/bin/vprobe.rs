@@ -1,9 +1,13 @@
-// Fail-open + liveness probe. Feeds `explain` inputs it cannot decide, or
-// degenerate ones the in-tree oracle's generator can never build, and reports
-// what comes back. A permissive answer on an undecidable input is a soundness
-// defect even when no test catches it.
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
 
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
+//! Fail-open and liveness probes for the explanation API.
+//!
+//! Feeds `explain` inputs it cannot decide, or degenerate ones the in-tree
+//! oracle's generator can never build, and reports what comes back. A
+//! permissive answer on an undecidable input is a soundness defect even when
+//! no test catches it.
 
 use num_bigint::BigInt;
 use num_rational::BigRational as Q;
@@ -48,7 +52,7 @@ fn sqrt_d(d: i64) -> Option<ODyadicAnum> {
     ODyadicAnum::from_poly_interval(&ints(&[-d, 0, 1]), &iv)
 }
 
-fn main() {
+fn probe_degenerate_polynomials() {
     println!("=== A. degenerate polynomials (the in-tree generator never builds these) ===");
     // zero polynomial
     show(
@@ -92,7 +96,9 @@ fn main() {
          clause_is_valid([]) = Some(false))",
         oexplain_clause_is_falsified(&[], &[])
     );
+}
 
+fn probe_duplicate_literal_ids() {
     println!("\n=== B. the same literal id cited twice with CONTRADICTORY polys ===");
     let dup = vec![
         lit(7, &[0, 1], OISignCond::Lt, vec![rat(0)]),
@@ -109,7 +115,9 @@ fn main() {
         ),
         None => println!("  explain_univariate -> None"),
     }
+}
 
+fn probe_wrong_root_lists() {
     println!("\n=== C. WRONG root lists (fail-open in the precondition) ===");
     // (x-1)(x-3) < 0 is satisfiable on (1,3). Drop a root -> must refuse.
     let p = [3i64, -4, 1];
@@ -145,7 +153,9 @@ fn main() {
         "  empty root list for a poly that HAS roots",
         oexplain_clause_is_valid(&[lit(1, &p, OISignCond::Lt, vec![])]),
     );
+}
 
+fn probe_repeated_roots() {
     println!("\n=== D. non-squarefree / repeated roots ===");
     // (x-2)^2 <= 0 : satisfiable only at x=2.  (x-2)^2 < 0 : unsat.
     let sq = [4i64, -4, 1];
@@ -178,7 +188,9 @@ fn main() {
             lit(2, &cu, OISignCond::Lt, vec![rat(2)]),
         ]),
     );
+}
 
+fn probe_strict_boundaries() {
     println!("\n=== E. STRICT vs NON-STRICT boundary (the shape a checker gets wrong) ===");
     for (c0, c1, expect) in [
         (OISignCond::Ge, OISignCond::Le, "sat at 0 -> NOT valid"),
@@ -194,7 +206,9 @@ fn main() {
             ]),
         );
     }
+}
 
+fn probe_irrational_boundaries() {
     println!("\n=== F. IRRATIONAL boundary: x^2-2 >= 0 AND x^2-2 <= 0 (sat at sqrt2) ===");
     if let Some(s2) = sqrt_d(2) {
         let neg = ODyadicAnum::from_poly_interval(
@@ -251,7 +265,9 @@ fn main() {
             ]),
         );
     }
+}
 
+fn probe_near_coincident_roots() {
     println!("\n=== G. LIVENESS: near-coincident irrational roots (ladder exhaustion) ===");
     // x^2 - 2  and  (N^2)x^2 - 2N^2 - 1  : roots sqrt2 and sqrt(2 + 1/N^2).
     for e in [10u32, 40, 80, 130, 200] {
@@ -290,7 +306,9 @@ fn main() {
         ]);
         println!("  roots separated by ~2^-{e}: {:?} in {:?}", r, t.elapsed());
     }
+}
 
+fn probe_liveness_ceilings() {
     println!("\n=== H. LIVENESS / ceilings ===");
     let base = lit(1, &[0, 1], OISignCond::Lt, vec![rat(0)]);
     for n in [63usize, 64, 65, 200] {
@@ -359,7 +377,9 @@ fn main() {
         "  1 poly with 120 distinct roots (UNDER the ceiling): {r:?} in {:?}",
         t.elapsed()
     );
+}
 
+fn probe_minimize_budget() {
     println!("\n=== I. MINIMIZE_BUDGET / big producer run ===");
     // 40 literals, x - k > 0 for k = 0..19 and x - k < 0 for k = 0..19 -> conflict
     let mut many: Vec<OExplainLit> = Vec::new();
@@ -379,7 +399,9 @@ fn main() {
         ),
         None => println!("  40 literals -> None in {:?}", t.elapsed()),
     }
+}
 
+fn probe_auxiliary_entries() {
     println!("\n=== J. countermodel / relevant_pairs / project degenerate ===");
     let two_sat = vec![
         lit(1, &[0, 1], OISignCond::Gt, vec![rat(0)]),
@@ -410,4 +432,19 @@ fn main() {
         "  project(1 poly, no pairs)   = {:?}",
         oexplain_project(&[bp], &[]).is_some()
     );
+}
+
+fn main() {
+    // #govern: see crates/ay-sys/src/govern.rs.
+    ay_sys::govern::arm();
+    probe_degenerate_polynomials();
+    probe_duplicate_literal_ids();
+    probe_wrong_root_lists();
+    probe_repeated_roots();
+    probe_strict_boundaries();
+    probe_irrational_boundaries();
+    probe_near_coincident_roots();
+    probe_liveness_ceilings();
+    probe_minimize_budget();
+    probe_auxiliary_entries();
 }

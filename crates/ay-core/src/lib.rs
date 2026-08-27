@@ -49,6 +49,7 @@ pub mod nonlinear;
 pub mod panic_utils;
 pub(crate) mod proof;
 pub mod proof_validation;
+pub mod serde_bignum;
 pub(crate) mod smtlib;
 pub(crate) mod sort;
 pub mod term;
@@ -58,15 +59,16 @@ pub(crate) mod tseitin;
 pub mod verification;
 
 pub use debug_channel::{
-    chc_debug_env_flags, claim_trace_file, debug_channel_active, misc_cli_flags,
-    misc_test_override, release_trace_file, sat_ab_switches, sat_ab_test_override,
+    chc_debug_env_flags, claim_trace_file, debug_channel_active, declared_proof_checker,
+    misc_cli_flags, misc_test_override, release_trace_file, sat_ab_switches, sat_ab_test_override,
     sat_debug_env_flags, sat_disable_flags, set_global_chc_debug_env_flags,
-    set_global_debug_config, set_global_misc_cli_flags, set_global_misc_cli_flags_with,
-    set_global_sat_ab_switches, set_global_sat_debug_env_flags, set_global_sat_disable_flags,
-    set_global_theory_disable_flags, set_global_trace_config, set_global_trace_path_cache,
-    theory_disable_flags, trace_config, trace_file_available, trace_path_cache, ChcDebugEnvFlags,
-    DebugChannel, DebugConfig, MiscCliFlags, ProofFormat, SatAbSwitches, SatDebugEnvFlags,
-    SatDisableFlags, TheoryDisableFlags, TraceConfig, TracePathCache,
+    set_global_debug_config, set_global_declared_proof_checker, set_global_misc_cli_flags,
+    set_global_misc_cli_flags_with, set_global_sat_ab_switches, set_global_sat_debug_env_flags,
+    set_global_sat_disable_flags, set_global_theory_disable_flags, set_global_trace_config,
+    set_global_trace_path_cache, theory_disable_flags, trace_config, trace_file_available,
+    trace_path_cache, ChcDebugEnvFlags, DebugChannel, DebugConfig, DeclaredProofChecker,
+    MiscCliFlags, ProofFormat, SatAbSwitches, SatDebugEnvFlags, SatDisableFlags,
+    TheoryDisableFlags, TraceConfig, TracePathCache,
 };
 pub use math::extended_gcd_bigint;
 pub use memory_pressure::{

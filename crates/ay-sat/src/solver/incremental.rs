@@ -111,7 +111,7 @@ impl Solver {
                         self.cold.next_clause_id = axiom_id + 1;
                     }
                     // The axiom occupies an original-space LRAT ID; record it
-                    // so streaming-core snapshots keep covering it.
+                    // so streaming-support snapshots keep covering it.
                     self.record_issued_original_clause_id(axiom_id);
                 }
             }
@@ -809,13 +809,10 @@ impl Solver {
     /// unnecessary for IC3 queries, reducing per-query overhead from ~200us
     /// to <20us:
     ///
-    /// This is the supported production entry point for IC3/PDR frame
-    /// solvers. Call it once while constructing the frame solver: either
-    /// immediately after `Solver::new()` and before adding clauses, or after
-    /// installing permanent transition/frame clauses but before the first IC3
-    /// query. The mode persists for the solver lifetime; do not re-enable
-    /// preprocessing, proof logging, chronological backtracking, or
-    /// inprocessing after selecting this profile.
+    /// This is the supported IC3/PDR frame-solver entry point. Call it once,
+    /// either after `Solver::new()` and before clauses, or after permanent
+    /// transition/frame clauses but before the first query. The mode persists;
+    /// do not re-enable preprocessing, proof logging, chrono, or inprocessing.
     ///
     /// - **Inprocessing**: All techniques disabled (vivify, subsume, probe,
     ///   BCE, transred, sweep, condition, decompose, factor, sbva, congruence,
@@ -823,7 +820,8 @@ impl Solver {
     ///   and can run after `push()` for variables introduced in the active
     ///   scope (#8503).
     /// - **Preprocessing**: Disabled. IC3 queries are too small to benefit.
-    /// - **LRAT proofs**: Disabled. IC3 doesn't need proof certificates.
+    /// - **Proof state**: No output, internal LRAT, trace/tombstone, bookkeeping
+    ///   budget, or backward-proof limit/failure may remain attached.
     /// - **Chronological backtracking**: Disabled. Non-chrono BT is optimal
     ///   for the shallow decision trees in IC3 queries.
     /// - **DIP-ERCL**: Disabled. Extension variables add overhead for tiny
@@ -851,7 +849,12 @@ impl Solver {
     /// achieves <10us per query by having no broad inprocessing, zero proofs,
     /// and minimal per-solve reset. AY keeps the scoped-BVE exception for
     /// push/pop IC3/PDR queries.
+    ///
+    /// # Panics
+    ///
+    /// Panics before mutation if any attached or retained proof state remains.
     pub fn set_ic3_mode(&mut self) {
+        self.assert_can_enter_ic3_mode();
         self.cold.ic3_mode = true;
 
         // Disable all inprocessing (Gap 7).
@@ -859,10 +862,6 @@ impl Solver {
 
         // Disable preprocessing (Gap 7 supplement).
         self.cold.preprocess_enabled = false;
-
-        // Disable LRAT proof logging (Gap 5 supplement — simplifies conflict
-        // analysis by removing resolution chain collection).
-        self.cold.lrat_enabled = false;
 
         // Scoped BVE (#8503): keep only BVE enabled in the IC3 profile. The
         // IC3 solve loop still guards the call with `has_scoped_bve()`, so

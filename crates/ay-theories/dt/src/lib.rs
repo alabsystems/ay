@@ -229,7 +229,7 @@ pub struct DtSolver<'a> {
     buf_oc_tester_edges: HashMap<(TermId, TermId), TermId>,
 }
 
-impl<'a> DtSolver<'a> {
+impl DtSolver<'_> {
     /// Find an unconstrained DT term and suggest a case-split tester atom (#8539).
     ///
     /// Scans DT-sorted terms for equivalence classes that have:
@@ -244,8 +244,7 @@ impl<'a> DtSolver<'a> {
     ///
     /// Reference: Z3 `theory_datatype::mk_split()` and `final_check_eh()`.
     fn find_case_split(&mut self) -> Option<(TermId, bool)> {
-        // Collect DT terms whose equivalence class has no constructor.
-        // Uses persistent buffer to avoid per-call allocation.
+        // Collect into the persistent buffer to avoid per-call allocation.
         // Stores (term_id, index_into_dt_terms_values) — we look up dt_name later.
         self.buf_unconstrained.clear();
         let dt_term_entries: Vec<(TermId, String)> =

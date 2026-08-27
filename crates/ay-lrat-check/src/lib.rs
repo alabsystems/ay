@@ -10,15 +10,18 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```
 //! use ay_lrat_check::checker::LratChecker;
 //! use ay_lrat_check::lrat_parser;
 //!
-//! let cnf = ay_lrat_check::dimacs::parse_cnf_with_ids(&b"p cnf 2 2\n1 2 0\n-1 2 0\n"[..]).expect("valid CNF");
-//! let proof = lrat_parser::parse_text_lrat("3 2 0 1 2 0\n").expect("valid LRAT");
+//! let cnf = ay_lrat_check::dimacs::parse_cnf_with_ids(
+//!     &b"p cnf 1 2\n1 0\n-1 0\n"[..],
+//! )
+//! .expect("valid CNF");
+//! let proof = lrat_parser::parse_text_lrat("3 0 1 2 0\n").expect("valid LRAT");
 //! let mut checker = LratChecker::new(cnf.num_vars);
 //! for (id, clause) in &cnf.clauses {
-//!     checker.add_original(*id, clause);
+//!     assert!(checker.add_original(*id, clause));
 //! }
 //! assert!(checker.verify_proof(&proof));
 //! ```

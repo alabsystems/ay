@@ -54,7 +54,7 @@ impl Executor {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!(
                     "CERT/epoch cleared: bind stale (not current) exec={:p}",
-                    self as *const _
+                    std::ptr::from_ref(self)
                 );
             }
             self.unsat_query_epoch = None;
@@ -79,7 +79,7 @@ impl Executor {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!(
                     "CERT/epoch cleared: bind retire (assumption change) exec={:p}",
-                    self as *const _
+                    std::ptr::from_ref(self)
                 );
             }
             self.unsat_query_epoch = None;
@@ -138,7 +138,7 @@ impl Executor {
             if ay_core::misc_cli_flags().debug_cert {
                 eprintln!(
                     "CERT/epoch cleared: literal-false-source retire exec={:p}",
-                    self as *const _
+                    std::ptr::from_ref(self)
                 );
             }
             self.unsat_query_epoch = None;

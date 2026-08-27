@@ -1081,7 +1081,7 @@ pub(crate) fn record_var_map_provenance(site: &str, solver: &ay_sat::Solver, map
     if let Ok(mut fh) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let line = format!(
             "VAR_COUNTS site={site} map_len={} user_num_vars={} num_vars={} scope_depth={}\n",
@@ -1109,7 +1109,7 @@ pub(crate) fn record_var_map_provenance_trace(
     if let Ok(mut fh) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         let line = format!(
             "VAR_COUNTS site={site} map_len={} trace_entries={}\n",

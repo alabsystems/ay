@@ -2,52 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Native branch-and-bound: the MILP lane (P2).
-//!
-//! Until now a binary model left `ay-milp` through the `smt` lane — a lowering
-//! onto ay-dpll's CDCL(T). That is a general-purpose SMT search being asked to
-//! do a MILP solver's job, and it shows. This is the MILP solver: LP relaxations
-//! from the float simplex, branching on fractional integer columns, and pruning
-//! against an incumbent.
-//!
-//! ## Every prune is exact, or it does not happen
-//!
-//! Pruning is the one place a branch-and-bound can silently lose the optimum, so
-//! nothing here prunes on a float. The bound that closes a subtree comes from
-//! **weak duality applied in exact rationals**:
-//!
-//! ```text
-//!   c·x  =  y·(Ax) + (c − Aᵀy)·x  =  y·s + d·x
-//!        >=  Σ_r min(y_r·lb_r, y_r·ub_r)  +  Σ_j min(d_j·l_j, d_j·u_j)
-//! ```
-//!
-//! The crucial property is that this holds for **any** `y` whatsoever — dual
-//! feasibility is not required. So the float simplex's duals are rounded to
-//! exact rationals (`f64 -> BigRational` is lossless), `d = c − Aᵀy` is computed
-//! exactly, and the resulting number is a *rigorous* lower bound on everything in
-//! that subtree. A bad `y` yields a weak bound and costs search; it cannot cut
-//! off a solution. This is the Neumaier–Shcherbina safe-bounding idea with the
-//! error analysis replaced by exact arithmetic, and it costs one pass over the
-//! non-zeros rather than a factorization.
-//!
-//! Everything else is fail-closed in the same spirit: a float `Infeasible` is a
-//! numerical opinion, so an apparently-infeasible node is re-solved on the exact
-//! rim before it is discarded; and an incumbent is only accepted after its point
-//! is re-checked against the model exactly, integrality included.
-//!
-//! ## What this lane is NOT yet
-//!
-//! It has no cuts, no presolve, and no strong branching, so it is not
-//! HiGHS-competitive at scale: it solves a 20-binary knapsack in 0.06s (HiGHS
-//! agrees on the optimum) and does not finish a 40-binary one inside a minute
-//! (HiGHS is instant). What it IS, is a MILP solver — the lane it replaces, the
-//! ay-dpll `smt` lowering, answers `unknown` on that same 20-binary instance
-//! after 300 seconds. Cuts and presolve are P3.
-//!
-//! Known incompleteness: when the relaxation is unbounded, the MILP is unbounded
-//! only if it is FEASIBLE, and if the integer-feasibility probe cannot settle
-//! that, this returns `Unknown` rather than guessing `Unbounded` the way most
-//! solvers do (Gurobi's INF_OR_UNBD conflates the two).
+#![doc = include_str!("bab/module_docs.md")]
 
 use std::mem::size_of;
 use std::num::NonZeroUsize;
@@ -66,10 +21,19 @@ use crate::outcome::{Outcome, UnknownReason};
 use crate::simplex::{Candidate, FloatLp, NbBound, SimplexStatus, WarmSolveMode};
 
 mod affine;
+mod diagnostic_seed;
 mod hybrid_history;
 mod mas74_class;
 mod pump_iteration_budget;
+mod root_formulation;
+mod root_frontier;
 mod root_prepared_relaxation;
+mod root_search;
+mod search_bootstrap;
+mod search_controls;
+mod search_finalize;
+mod search_runtime;
+mod solve_attempt;
 
 use hybrid_history::{CountDeps, HybridHist, HybridView};
 use pump_iteration_budget::pump_iter_cap;
@@ -78,6 +42,8 @@ use root_prepared_relaxation::ROOT_PREPARED_CONSUMED;
 use root_prepared_relaxation::{
     prepare_root_relaxation, revalidate_prepared_relaxation, root_node, PreparedNodeRelaxation,
 };
+use search_controls::{MIXED_LEVER_ARM_NODES, PROP_RETIRE_WINDOW};
+use search_runtime::BALL_USELESS_MIN;
 
 /// Fractionality below which a float relaxation counts as integral. Only ever
 /// used to DECIDE (branch here? try an incumbent?) — the resulting point is
@@ -2333,7 +2299,7 @@ fn leaf_reserved_deadline(
 /// Returns whether this call is the one that released (for the trace line).
 fn release_finalize_reserve(
     armed: bool,
-    reserve_params: &mut Option<(Instant, Duration, Duration)>,
+    reserve_params: &mut Option<search_bootstrap::FinalizeReservePlan>,
     deadline: &mut Option<Instant>,
     reserved_deadline: &mut Option<Instant>,
     full_deadline: Option<Instant>,
@@ -5440,7 +5406,7 @@ fn push_children(
         if !orbital.is_empty() {
             s.branches_hit += 1;
             s.fixes_made += orbital.len();
-            SYM_FIXES_TOTAL.fetch_add(orbital.len(), std::sync::atomic::Ordering::Relaxed);
+            crate::local_census::add_usize(&SYM_FIXES_TOTAL, orbital.len());
             capture.poison();
         } else if crate::debug_flags::milp_debug_flags().sym_debug {
             static SYM_DEBUG_LEFT: std::sync::atomic::AtomicIsize =
@@ -6140,38 +6106,6 @@ fn odd_cycle_enabled(
     clique_on && !explicitly_disabled && (explicitly_enabled || wide_set_partition)
 }
 
-/// Resolve the mixing-cut feature gates with kill-switch precedence.
-///
-/// Mixing is opt-in because, on the only model where the separator fires, its
-/// cuts crowd out stronger rows and leave a weaker root relaxation. Keeping
-/// this policy pure makes the default and rollback contract testable without
-/// mutating process-global environment variables.
-fn mixing_enabled(explicitly_enabled: bool, explicitly_disabled: bool) -> bool {
-    explicitly_enabled && !explicitly_disabled
-}
-
-/// Separate opt-in mixing cuts only when the ORIGINAL root model has the
-/// complete mixed-integer-knapsack signature. `work` accumulates cut rows as
-/// the loop advances, so re-running the whole-model predicate on it would
-/// spuriously switch the family off; checking only the separator's local row
-/// signature, on the other hand, would spuriously switch it on for models that
-/// also carry equality or `>=` rows. Keeping both models explicit makes the
-/// gate stable across rounds. The separator retains `AY_MILP_NO_MIXING` and
-/// exact-proxy fail-closed checks as defense in depth.
-fn separate_mixing_for_root_shape(
-    enabled: bool,
-    root: &Model,
-    work: &Model,
-    x: &[f64],
-    n_rows: usize,
-    budget: usize,
-) -> Vec<crate::cuts::Cut> {
-    if !enabled || !crate::cuts::is_mixed_integer_knapsack(root) {
-        return Vec::new();
-    }
-    crate::cuts::separate_mixing(work, x, n_rows, budget)
-}
-
 /// Parse a finite, nonnegative test setting.
 #[cfg(test)]
 fn finite_nonnegative_setting(raw: Option<&str>, default: f64) -> f64 {
@@ -6702,9 +6636,6 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
         // bytes are unchanged, only its ownership is.
         return model;
     }
-    // B22: the AY_MILP_MIXING opt-in is retired (measured net-negative on
-    // its only firing class); the auto-arm argument stays false.
-    let mixing_on = mixing_enabled(false, false);
     // Read once for the root loop. Invalid/non-finite spellings retain the
     // measured default; a negative spelling is the intuitive disabled value.
     //
@@ -7093,16 +7024,19 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     // the one expensive separator, per the khb05250 measurement above), and so does the
     // cover family: a MIR-bought round keeps its historical separation set — covers pay
     // for their OWN extension (see `cover_ext_on` below).
-    // The MIR extension is OFF by default (`MAX_MIR_EXT_ROUNDS = 0`), re-armable by env, and —
-    // NEW — armed automatically on the MIXED-INTEGER-KNAPSACK / MIXING structure, where the
-    // extended rounds close a dual gap single-row MIR saturates weak on and the qnet1-class wall
-    // regression that keeps it off by default does not occur. The gate excludes every home
-    // instance (see `is_mixed_integer_knapsack`), so this is bit-identical on the 16.
-    // THE BIG-M INDICATOR SHAPE (W-safenlp-1): computed once for the whole loop. It arms the
-    // aggregated-MIR family per round, the MIR extension, and the wider extension budget below
-    // — see `cuts::is_bigm_indicator` for the shape, the discriminator against fixed-charge,
-    // and the measured closure (0.220 → 2.80 of safenlp_ruarobot_1181_margin's 4.32 root gap).
+    // The general MIR extension is OFF by default (`MAX_MIR_EXT_ROUNDS = 0`), while narrow
+    // structural gates arm it automatically. On the MIXED-INTEGER-KNAPSACK structure, the extended
+    // rounds close a dual gap single-row MIR saturates weak on and the qnet1-class wall regression
+    // that keeps it off by default does not occur. This structural classifier is retained solely
+    // for MIR scheduling; the retired mixing-cut separator is not involved. The gate excludes
+    // every home instance (see `is_mixed_integer_knapsack`), so this is bit-identical on the 16.
+    // The big-M indicator gate arms aggregated MIR, extra rounds, and their wider budget; see
+    // `cuts::is_bigm_indicator` for its fixed-charge discriminator and measured root closure.
     let bigm_shape = crate::cuts::is_bigm_indicator(&model);
+    // Keep the gate observable: its former untraced false positive on `gen` survived for days.
+    if trace_cuts() {
+        eprintln!("--trace   gates: bigm={bigm_shape}");
+    }
     let mir_ext_rounds_eff = crate::cuts::mir_ext_rounds()
         .max(if crate::cuts::is_mixed_integer_knapsack(&model) {
             crate::cuts::mik_mir_ext_rounds()
@@ -7114,9 +7048,7 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
         } else {
             0
         });
-    // The extension budget the shape earns (see `cuts::bigm_mir_ext_cuts_per_round`): an
-    // extension round's whole cost here is one cheap LP re-solve, and the class's closure
-    // comes from cut VOLUME — 4/round was measured to leave 1.5 of the 2.8 on the table.
+    // This shape earns volume: 4 cuts/round left 1.5 of its 2.8 measured closure unused.
     let mir_ext_budget = if bigm_shape {
         crate::cuts::bigm_mir_ext_cuts_per_round()
     } else {
@@ -7549,25 +7481,6 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
                 crate::cuts::separate_strongcg(&work, &cand.values, model.num_rows(), mir_budget)
             }));
             fam_stamp("strongcg", fresh.len());
-            // GÜNLÜK–POCHET MIXING -- the multi-row family aggregation cannot form on the
-            // shared-continuous mixing set (mik-*). Sound + brute-force-tested, but now OPT-IN
-            // (`AY_MILP_MIXING=1`), DEFAULT-OFF. MEASURED NET-NEGATIVE on its only firing instance
-            // (mik): the cuts are violation-greedy-selected and CROWD OUT stronger cuts, so the
-            // root cut loop terminates earlier at a WORSE bound (270 rows -> -29424 vs no-mixing's
-            // 276 rows -> -28646, MIN so higher=tighter) and the tree dual bound is worse at every
-            // matched node count. Self-gates on the mixing signature, so it was already a no-op off
-            // the mik shape (home corpus bit-identical either way). Kept in the tree as a correct,
-            // tested cut family to build on (a per-round-cap / better cut-selection fix could revive
-            // it -- see `milp-exact-reader-and-corpus`).
-            fresh.extend(separate_mixing_for_root_shape(
-                mixing_on,
-                &model,
-                &work,
-                &cand.values,
-                model.num_rows(),
-                mir_budget,
-            ));
-            fam_stamp("mixing", fresh.len());
             // MIR ON AGGREGATES -- stage-two extension rounds ONLY (see `separate_mir_agg` and
             // the stage-two gate at the top of the loop: the family the journal measured
             // harmful under violation selection is re-admitted exclusively as the second wind
@@ -7582,18 +7495,6 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
                         mir_ext_budget,
                     )
                 }));
-                // GÜNLÜK–POCHET MIXING -- OPT-IN (`AY_MILP_MIXING=1`), DEFAULT-OFF: measured
-                // net-negative on mik (crowds out stronger cuts, terminates the root loop earlier at
-                // a worse bound). The original-model gate remains stable while `work` accumulates
-                // cut rows. See the every-round site above for the full rationale.
-                fresh.extend(separate_mixing_for_root_shape(
-                    mixing_on,
-                    &model,
-                    &work,
-                    &cand.values,
-                    model.num_rows(),
-                    crate::cuts::mir_ext_cuts_per_round(),
-                ));
             }
             // ...and the SAME family admitted to EVERY MIR-class round, under
             // `the mir-agg-root knob`. The stage-two gate above is unreachable on the instance
@@ -7867,17 +7768,6 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
             fresh.extend(crate::cuts::sep_wall_scope(mir_wall, || {
                 crate::cuts::separate_mir_agg(&work, &cand.values, model.num_rows(), mir_ext_budget)
             }));
-            // ...and the mixing family with it -- OPT-IN (`AY_MILP_MIXING=1`), DEFAULT-OFF:
-            // measured net-negative on mik (see the every-round site above). The wrapper keeps the
-            // original-model signature and explicit kill switch authoritative.
-            fresh.extend(separate_mixing_for_root_shape(
-                mixing_on,
-                &model,
-                &work,
-                &cand.values,
-                model.num_rows(),
-                crate::cuts::mir_ext_cuts_per_round(),
-            ));
             mir_tag.resize(fresh.len(), true);
         }
         // Sparsify before they go anywhere near the LP -- see `Cut::clean`. The raw rows make each
@@ -12052,7 +11942,7 @@ const HEUR_STALL_SECS: f64 = 0.75;
 /// (expensive-failure) model that fails 0.75-3.0s THEN lands AND needs that landing more than the
 /// dive can supply — none in corpus or documented; the 4.0-vs-1.0 window protects nothing measured.
 /// A more aggressive `0.5` additionally reclaims misc07 (-15%) but cuts models landing at restart
-/// ~3+, so 1.0 is the conservative ship. `AY_MILP_PUMP_BARREN_MULT` overrides (4.0 restores prior).
+/// ~3+, so the fixed 1.0 multiplier is the conservative ship; there is no runtime override.
 const PUMP_BARREN_MULT: f64 = 1.0;
 
 /// Consecutive never-landed restarts with no MATERIAL (>1%) drop in the best integer-infeasibility
@@ -12099,7 +11989,7 @@ const ENDGAME_RADII: [(f64, f64); 3] = [(8.0, 0.30), (14.0, 0.50), (24.0, 1.0)];
 /// pinned share is an A/B escape hatch that bypasses the work cap; asking for the value alone
 /// cannot tell those apart.
 fn pump_share_override() -> Option<f64> {
-    crate::tune::real_opt(crate::tune::Knob::PumpShare)
+    crate::tune::real_opt(crate::tune::Knob::PumpShare).filter(|share| (0.0..=1.0).contains(share))
 }
 const PUMP_SHARE: f64 = 0.6;
 
@@ -12137,8 +12027,8 @@ const PUMP_FLOOR_SECS: f64 = 0.25;
 /// (The floor while NOTHING HAS EVER LANDED is deliberately NOT a constant of its own: it is
 /// `barren_mult * HEUR_STALL_SECS`, the barren gate's own allowance, so this cap can never stop
 /// a first-point search that today's gates would have let continue. That exemption is the air05
-/// set-partition lesson — see `HEUR_STALL_SECS` — and tying the two to one expression keeps them
-/// in lockstep, including under `AY_MILP_PUMP_BARREN_MULT`.)
+/// set-partition lesson — see `HEUR_STALL_SECS` — and tying the two to the fixed
+/// `PUMP_BARREN_MULT` expression keeps them in lockstep.)
 fn pump_work_mult() -> f64 {
     // B6: the AY_MILP_PUMP_WORK_MULT env override is deleted.
     PUMP_WORK_MULT
@@ -12149,7 +12039,9 @@ fn pump_work_mult() -> f64 {
 /// landing exists, the barren gate's own allowance while none does).
 fn pump_window(root_lp: Duration, remaining: Duration, floor_secs: f64) -> Duration {
     let pinned = pump_share_override();
-    let share_budget = remaining.mul_f64(pinned.unwrap_or(PUMP_SHARE));
+    let share_budget = remaining
+        .mul_f64(pinned.unwrap_or(PUMP_SHARE))
+        .min(remaining);
     if pinned.is_some() {
         // Explicit A/B escape: an operator-set share bypasses the work cap entirely and
         // restores the pre-cap behaviour byte-for-byte, exactly as `setpart_time_share()`
@@ -12173,38 +12065,6 @@ const SUBMIP_TIME: Duration = Duration::from_secs(2);
 /// Ruin-and-recreate kicks per RINS call. A kick costs a couple of exact row sweeps and a
 /// swap climb — no LP solves — so a batch of them is cheaper than one pump iteration was.
 const RR_KICKS: usize = 16;
-/// Elite pool size. The pool exists because one incumbent is one TRAJECTORY: the measured
-/// pump-vs-sub-MIP A/B showed each sampler plateauing on a different local optimum reached
-/// by luck of its own path (257 vs 247 on the 80-binary bench), and the escape both times
-/// was a (point, face) pair the single trajectory never visited. Crossover faces between
-/// elites multiply the pairs a run gets to visit.
-const ELITE_POOL: usize = 6;
-
-/// The elite pool: the best few distinct feasible points seen, in minimize-frame order.
-/// Every entry has passed the same exact feasibility checks as an incumbent.
-struct Elites {
-    pool: Vec<(Vec<BigRational>, BigRational)>,
-}
-
-impl Elites {
-    fn new() -> Self {
-        Self { pool: Vec::new() }
-    }
-
-    /// Insert a feasible point with its minimize-frame value; keeps the pool sorted
-    /// best-first, distinct, and capped.
-    fn insert(&mut self, point: &[BigRational], val: &BigRational) {
-        if self.pool.iter().any(|(p, _)| p == point) {
-            return;
-        }
-        let at = self.pool.partition_point(|(_, v)| v < val);
-        if at >= ELITE_POOL {
-            return;
-        }
-        self.pool.insert(at, (point.to_vec(), val.clone()));
-        self.pool.truncate(ELITE_POOL);
-    }
-}
 /// Run RINS this often. It costs several LP solves, so it must not run at every node — but the
 /// incumbent it improves is what every subsequent bound prunes against.
 ///
@@ -15394,17 +15254,12 @@ impl Drop for RensGuard {
     }
 }
 
-/// `partner`: a second elite point. When present, the neighbourhood is the CROSSOVER face —
-/// fix every integer column where the incumbent and the partner agree — instead of the
-/// relaxation-agreement face. The incumbent lies inside either face (every fixing is to its
-/// own value), so the seeded sub-solve below stays valid in both modes.
 #[allow(clippy::too_many_arguments)]
 fn rins(
     model: &Model,
     ints: &[usize],
     relaxation: &[f64],
     incumbent: &[BigRational],
-    partner: Option<&[BigRational]>,
     node_lo: &[f64],
     node_up: &[f64],
     deadline: Option<Instant>,
@@ -15527,17 +15382,14 @@ fn rins(
     let mut ball: Option<(Vec<(Col, f64)>, f64)> = None;
     let mut fixed = 0usize;
     match level {
-        // The RINS face: fix every column the incumbent and the relaxation (or the
-        // crossover partner) agree on. The pump arm (2) searches the same face.
+        // The RINS face: fix every column where the incumbent and relaxation
+        // agree. The pump arm (2) searches the same face.
         0 | 2 => {
             for &j in ints {
                 let Some(inc) = incumbent.get(j).and_then(num_traits::ToPrimitive::to_f64) else {
                     continue;
                 };
-                let agrees = match partner {
-                    Some(p) => p.get(j) == incumbent.get(j),
-                    None => (relaxation[j] - inc).abs() <= 1e-6,
-                };
+                let agrees = (relaxation[j] - inc).abs() <= 1e-6;
                 if agrees {
                     let v = inc.round().clamp(lo[j], up[j]);
                     lo[j] = v;
@@ -16012,7 +15864,6 @@ fn diversified_rins_sweep(
     relax: &[f64],
     cost: &[f64],
     incumbent: &mut (Vec<BigRational>, BigRational),
-    elites: &mut Elites,
     deadline: Instant,
     salt0: u64,
     trace: bool,
@@ -16197,7 +16048,6 @@ fn diversified_rins_sweep(
             continue;
         }
         let v = min_val(&p);
-        elites.insert(&p, &v);
         if v < incumbent.1 {
             if trace {
                 eprintln!(
@@ -19498,12 +19348,78 @@ pub fn diag_presolve(model: &Model, secs: f64) -> String {
     }
 }
 
+/// The self-labelling prefix every [`diag_float_lp`] emission carries.
+///
+/// WHY IT IS A PREFIX AND NOT A HEADER LINE. This scaffold has produced two
+/// wrong conclusions that each survived an independent audit, because the
+/// auditor re-ran the same instrument and got the same wrong answer:
+///
+/// * the caller-layer knobs were inert on this lane, so pricing A/Bs run
+///   through it measured the compiled default under the flag's name (that half
+///   is why [`diag_float_lp_with`] exists); and
+/// * the lane itself is not the one a solve runs, so a `Stopped` here was read
+///   as "the solver is numerically lost on this model" when the shipped path
+///   (`session::continuous_float_first_optimum`) answers the same LP.
+///
+/// A banner printed on its own line does not travel: what gets pasted into a
+/// report is the ONE line with the number on it. So the disclaimer rides on
+/// that line, ahead of the number, and it names what the lane does NOT do
+/// instead of merely calling itself a diagnostic.
+///
+/// It also reports whether any caller KNOB IS SET, so a run that passed
+/// `--devex` and reads back `caller-knobs=NONE` can see that its flag reached
+/// nothing rather than believing the number under the flag's name.
+///
+/// Read that token precisely: it is `caller_profile().is_empty()`, i.e. "did
+/// this run set any knob", NOT "is a caller frame installed". The two come
+/// apart, and the difference matters on the exact path this banner exists to
+/// protect: `ay-milp diag lp-only` DOES install a frame (via
+/// `diag_float_lp_with`, repaired in `0a26e32fc`) and still prints
+/// `caller-knobs=NONE` when invoked with no flags. Reading that as "the frame
+/// is inert here" would re-open the very defect that commit closed.
+///
+/// The token set is chosen so that no existing consumer's parse can see it: it
+/// contains neither `status=` (`examples/wcnf_lp.rs` splits on that) nor
+/// `obj(min-form)=` (`margin::diag_margin_reframe_with` splits on that), and it
+/// is a PREFIX, so `scripts/milp_w0.py`'s `re.search` for
+/// `diag_float_lp: status=` still matches. `ROOTCLOSURE` is deliberately left
+/// alone — its consumer tests the line with `startswith`.
+fn scaffold_banner() -> String {
+    let knobs = if crate::tune::caller_profile().is_empty() {
+        "caller-knobs=NONE"
+    } else {
+        "caller-knobs=applied"
+    };
+    format!(
+        "[SCAFFOLD-NOT-SOLVER: ONE COLD WALK; no float-lane ladder; no eager-perturb retry; \
+         no exact certification; not the lane a solve runs. Quote the iteration counters, never \
+         the verdict or the objective. For the shipped lane's answer run \
+         `ay-milp diag shipped-lp`. {knobs}]"
+    )
+}
+
 /// TEMPORARY MEASUREMENT SCAFFOLD (not a shipped API): solve the model's LP
 /// relaxation once, COLD, in the float lane alone, and report the iteration
 /// economics — the primal/dual split, degenerate-step and objective-moving
 /// counts, refactorization spend. `--lp-stats` adds one `LPSTAT` line
 /// per phase. This is the air05 root-LP instrument: HiGHS answers the same LP
 /// in ~1,510 iterations, and this measures where ours go.
+///
+/// # ITERATION ECONOMICS ONLY — the status and the objective are NOT verdicts
+///
+/// What this walk is NOT is the lane a solve runs. The shipped continuous entry
+/// (`session::continuous_float_first_optimum`) sets `plain_cold` unconditionally,
+/// and when the plain walk declines it retries on a FRESH [`FloatLp`] with
+/// `eager_perturb`, then adjudicates the resulting basis in exact arithmetic.
+/// This function does none of that: `plain_cold` is off unless
+/// `--diag-plain-cold` is given, there is no retry, and nothing is certified.
+/// A `Stopped` here is therefore a statement about one cold walk, not about the
+/// solver — and a `Stopped` walk's `obj(min-form)` is wherever the clock fell,
+/// not a bound.
+///
+/// Every line this function emits says so, in [`scaffold_banner`]. Do not
+/// remove that prefix to make output tidier: it is the only thing standing
+/// between this instrument and a third manufactured finding.
 pub fn diag_float_lp(model: &Model, secs: f64) -> String {
     use crate::simplex::stats;
     let objective: Vec<(u32, f64)> = (0..model.num_cols())
@@ -19512,7 +19428,10 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
         .collect();
     let sense = model.sense();
     let Some(mut lp) = FloatLp::from_model(model, &objective, sense) else {
-        return "diag_float_lp: model cannot be lowered".to_string();
+        return format!(
+            "{} diag_float_lp: model cannot be lowered",
+            scaffold_banner()
+        );
     };
     // `--diag-plain-cold` selects the search's classic-eta/crash lane instead
     // of the diagnostic's cold-LU lane.
@@ -19559,7 +19478,10 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
                 _ => sb += v,
             }
         }
-        eprintln!("VERTEX obj={obj:.6} cols={n} frac={nfrac} sum_bin={sb:.4} sum_cont={sc:.4} hist={buckets:?}");
+        eprintln!(
+            "{} VERTEX obj={obj:.6} cols={n} frac={nfrac} sum_bin={sb:.4} sum_cont={sc:.4} hist={buckets:?}",
+            scaffold_banner()
+        );
         let mut tight = 0usize;
         let mut loose = 0usize;
         for r in 0..model.num_rows() {
@@ -19578,13 +19500,19 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
             }
         }
         eprintln!(
-            "VERTEX tight_ge_rows={tight} loose_ge_rows={loose} total_rows={}",
+            "{} VERTEX tight_ge_rows={tight} loose_ge_rows={loose} total_rows={}",
+            scaffold_banner(),
             model.num_rows()
         );
     }
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "diag_float_lp: status={:?} obj(min-form)={obj:.6} wall={wall:.3}s primal={} (degen={} flips={} moved={}) dual={} (degen={}) refac={} ({:.2}s, {} repairs)",
+        // `wall={wall:.6}` — see the twin emission in `session::diag_shipped_float_lp`
+        // for why the third decimal was not free. This is the exact field
+        // `scripts/milp_w0.py::run_ay_lp` returns and `cmd_lp` divides by Gurobi's
+        // time, and at three decimals a sub-millisecond LP reported `0.000s`.
+        "{} diag_float_lp: status={:?} obj(min-form)={obj:.6} wall={wall:.6}s primal={} (degen={} flips={} moved={}) dual={} (degen={}) refac={} ({:.2}s, {} repairs)",
+        scaffold_banner(),
         cand.status,
         stats::get(&stats::PRIMAL_ITERS) - p0,
         stats::get(&stats::PRIMAL_DEGEN) - dg0,
@@ -19599,6 +19527,13 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
 }
 
 /// Run [`diag_float_lp`] under the caller profile carried by `opts`.
+///
+/// This closes ONE of the two hazards: engine flags now reach the walk, and the
+/// banner reads `caller-knobs=applied` instead of `caller-knobs=NONE`. It does
+/// NOT make the walk the shipped lane — the whole of [`diag_float_lp`]'s
+/// "iteration economics only" note still applies, which is why the banner is
+/// emitted from there rather than from here. The shipped lane's own answer is
+/// [`crate::diag_shipped_float_lp`].
 pub fn diag_float_lp_with(model: &Model, secs: f64, opts: &SolveOpts) -> String {
     let _tuned = crate::tune::activate_caller(opts.engine().profile());
     diag_float_lp(model, secs)
@@ -20891,24 +20826,13 @@ pub(crate) fn solve_milp_shared_binary_prefix(
     )
 }
 
-/// Margin optimization with proof-at-interruption replay, over an OPTIONAL
-/// shared binary prefix.
+/// Margin optimization with proof-at-interruption replay over an optional
+/// shared binary prefix. `target` belongs to the original feasibility model.
 ///
-/// `target` belongs to the original feasibility model. The reframed search's
-/// global bound may only trigger replay against that model.
-///
-/// # Why `split_cols` may be empty
-///
-/// This entry used to assert a NONEMPTY prefix, because the only caller was
-/// the explicit `check_marked_margin_shared_binary_prefix` API. The prefix and
-/// the proof target are independent, though: everything the target drives —
-/// the finalize reserve (`FinalizeReplayObligation::MarkedMarginPrefix`), the
-/// live preview at the first quiescent boundary, the terminal
-/// `finalize_margin_cover` — keys on `margin_proof_target.is_some()` and never
-/// on the prefix. Tying them together is what left `MarginMode::Auto` unable
-/// to reach the crossing machinery at all: the session's empty-prefix dispatch
-/// silently dropped the target, so `strictly_excludes` and both cover paths
-/// were dead code on the lane every model that arrives as a FILE takes.
+/// Prefix partitioning and proof replay are independent: the target itself
+/// drives capture, preview, and final cover. Accepting an empty prefix keeps
+/// those threshold-crossing proofs live for the ordinary `MarginMode::Auto`
+/// lane as well as the explicit shared-prefix API.
 pub(crate) fn solve_milp_margin_proof(
     model: &Model,
     opts: &SolveOpts,
@@ -21043,6 +20967,8 @@ fn solve_milp_advised_with_prefix(
     margin_proof_target: Option<&crate::margin::MarginProofTarget<'_>>,
     target_fsb_prefix: Option<TargetFsbPrefixRequest<'_>>,
 ) -> Outcome {
+    let attempt_options = solve_attempt::SolveAttemptOptions::at_entry(opts, Instant::now());
+    let opts = attempt_options.options();
     // The caller's typed search economics (`SolveOpts::with_engine`) become
     // active HERE, at the true top of the user's solve, and are restored on the
     // way out. Everything below — including the lattice detector immediately
@@ -21062,21 +20988,10 @@ fn solve_milp_advised_with_prefix(
     // And every lazily-cached environment read, forced NOW rather than whenever the
     // solve path first happens to reach it. See `prime_env_all`.
     prime_env_all();
-    // THE ENTRY BUDGET, read ONCE, before anything below has spent any of it.
-    //
-    // Only the tree-certificate harvest (`harvest_tree_cert_by_resolve`) reads
-    // it, and it reads it for one reason: `SolveOpts::time_limit` is a DURATION
-    // and `effective_deadline(now)` turns it into an instant relative to
-    // WHENEVER IT IS ASKED, so a second solve handed the same `opts` starts a
-    // FRESH clock. That is the exact defect `BabSession::check_with_shared_binary_prefix`
-    // pins its own deadline to avoid (air03: a 10 s limit ran past two minutes
-    // because branch-and-bound and the smt lane each took 10), and the one
-    // 2a2738cfd had just finished paying for on the certificate lane
-    // (misc05inf overran a 30 s limit by 17% reserving room for an artifact).
-    // Pinning it here means the harvest's re-solve spends what is LEFT of the
-    // caller's budget, never a second copy of it. `None` (no limit at all) stays
-    // `None`: an unlimited solve is not given an invented one.
-    let entry_deadline = opts.effective_deadline(Instant::now());
+    // Every phase and nested retry inherits the same absolute entry budget.
+    // Unlimited attempts retain `None`; repeated top-level calls materialize a
+    // fresh deadline from the caller's unchanged duration.
+    let entry_deadline = opts.deadline;
     // The empty public path is intentionally allocation- and behavior-free.
     // Invalid-only advice also collapses back to that path, including its
     // duplicate-column presolve trajectory.
@@ -21120,59 +21035,23 @@ fn solve_milp_advised_with_prefix(
     // Keep the diagnostic file seed dark there too: even parsing/completing it
     // would create a second independently-prepared solve before the one-root
     // frontier. The historical empty-prefix diagnostic path is unchanged.
-    let diag_seed = opts.seed_solution_file.as_ref().and_then(|path| {
-        if !shared_binary_prefix.is_empty() {
-            return None;
-        }
-        let text = std::fs::read_to_string(path).ok()?;
-        let n = model.num_cols();
-        // Pin ONLY the integer columns to their rounded values; a float dump of the
-        // continuous flows is not a rational that satisfies an equality row, so re-derive
-        // them exactly by solving the pinned model. The result is the true completion.
-        let mut fixed = model.clone();
-        for line in text.lines() {
-            let mut it = line.split_whitespace();
-            if let (Some(j), Some(v)) = (it.next(), it.next()) {
-                if let (Ok(j), Ok(v)) = (j.parse::<usize>(), v.parse::<f64>()) {
-                    if j < n {
-                        let c = Col(j as u32);
-                        if model.col_kind(c).is_integral() {
-                            fixed.fix_col(c, v.round());
-                        }
-                    }
+    let diag_seed =
+        opts.seed_solution_file.as_ref().and_then(|path| {
+            match diagnostic_seed::load(model, opts, shared_binary_prefix, path)? {
+                diagnostic_seed::LoadResult::Accepted(point, min_v) => {
+                    eprintln!("seed-solution-file: seeded incumbent accepted (min-frame {min_v})");
+                    Some((point, min_v))
+                }
+                diagnostic_seed::LoadResult::CompletionFailed => {
+                    eprintln!("seed-solution-file: pinned completion failed, ignoring");
+                    None
+                }
+                diagnostic_seed::LoadResult::Infeasible => {
+                    eprintln!("seed-solution-file: completed seed is INFEASIBLE, ignoring");
+                    None
                 }
             }
-        }
-        let done = solve_milp_in(&fixed, opts, SearchMode::FULL, None, &[], &[], &[]);
-        let pt = match done {
-            Outcome::Optimal { model_values, .. } | Outcome::Feasible { model_values, .. }
-                if model_values.len() == n =>
-            {
-                model_values
-            }
-            _ => {
-                eprintln!("seed-solution-file: pinned completion failed, ignoring");
-                return None;
-            }
-        };
-        if model.check_point(&pt).is_err() {
-            eprintln!("seed-solution-file: completed seed is INFEASIBLE, ignoring");
-            return None;
-        }
-        let mut v = BigRational::zero();
-        for j in 0..n {
-            let c = model.obj_coeff(Col(j as u32));
-            if c != 0.0 {
-                v += exact(c)? * &pt[j];
-            }
-        }
-        let min_v = match model.sense() {
-            Sense::Minimize => v,
-            Sense::Maximize => -v,
-        };
-        eprintln!("seed-solution-file: seeded incumbent accepted (min-frame {min_v})");
-        Some((pt, min_v))
-    });
+        });
     // MEASUREMENT LEVER (`--dfs`, default off): force depth-first node selection
     // on the user's solve, to A/B the enumeration profile on deep pure-integer
     // trees (pk1-class). Never fires without the flag.
@@ -21578,19 +21457,16 @@ pub(crate) fn solve_milp_seeded(
     branch_hints: &[Col],
     root_probe_shortlist: &[Col],
 ) -> Outcome {
-    // The seeded path reaches `solve_milp_in` directly when the seed survives
-    // `check_point`, so it needs its own activation: without it a seeded solve
-    // would silently ignore the caller's engine settings while an unseeded one
-    // honoured them. (The unseeded fallback below re-enters
-    // `solve_milp_advised` and activates again; the inner frame inherits this
-    // one, so the settings are identical either way.)
+    let attempt_options = solve_attempt::SolveAttemptOptions::at_entry(opts, Instant::now());
+    let opts = attempt_options.options();
+    // A surviving seed reaches the inner driver directly, so this top-level
+    // entry owns the tuning frame; the unseeded re-entry inherits it.
     let _tuned = crate::tune::activate_caller(opts.engine().profile());
     // Same pairing as `solve_milp_advised_with_prefix`: the seeded entry is a
     // top-level solve too, and the unseeded fallback below re-enters that function,
     // whose frame then nests and correctly does not rebase.
     let _work_frame = crate::simplex::stats::SolveWorkFrame::enter();
-    // And every lazily-cached environment read, forced NOW rather than whenever the
-    // solve path first happens to reach it. See `prime_env_all`.
+    // Force every lazy environment read at the same entry boundary.
     prime_env_all();
     // CLAUSE A. The structural devices run BEFORE the seed is looked at, exactly
     // as they do on the unseeded entry. A seed is data the search consumes, never
@@ -22654,6 +22530,43 @@ impl Drop for NestedSolveStamp {
     }
 }
 
+struct IncumbentSeed {
+    values: Vec<BigRational>,
+    minimized_value: BigRational,
+}
+
+impl From<(Vec<BigRational>, BigRational)> for IncumbentSeed {
+    fn from((values, minimized_value): (Vec<BigRational>, BigRational)) -> Self {
+        Self {
+            values,
+            minimized_value,
+        }
+    }
+}
+
+struct BranchAdvice<'a> {
+    hints: &'a [Col],
+    root_probe_shortlist: &'a [Col],
+    shared_binary_prefix: &'a [Col],
+}
+
+enum MarginProofRequest<'a> {
+    None,
+    Marked {
+        target: &'a crate::margin::MarginProofTarget<'a>,
+        target_fsb_prefix: Option<TargetFsbPrefixRequest<'a>>,
+    },
+}
+
+struct MilpSolveRequest<'a> {
+    model: &'a Model,
+    opts: &'a SolveOpts,
+    mode: SearchMode,
+    seed: Option<IncumbentSeed>,
+    branch: BranchAdvice<'a>,
+    margin_proof: MarginProofRequest<'a>,
+}
+
 fn solve_milp_in(
     model: &Model,
     opts: &SolveOpts,
@@ -22663,17 +22576,18 @@ fn solve_milp_in(
     root_probe_shortlist: &[Col],
     shared_binary_prefix: &[Col],
 ) -> Outcome {
-    solve_milp_in_impl(
+    solve_milp_in_impl(MilpSolveRequest {
         model,
         opts,
         mode,
-        seed,
-        branch_hints,
-        root_probe_shortlist,
-        shared_binary_prefix,
-        None,
-        None,
-    )
+        seed: seed.map(IncumbentSeed::from),
+        branch: BranchAdvice {
+            hints: branch_hints,
+            root_probe_shortlist,
+            shared_binary_prefix,
+        },
+        margin_proof: MarginProofRequest::None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22688,34 +22602,48 @@ fn solve_milp_in_with_margin_proof(
     margin_proof_target: &crate::margin::MarginProofTarget<'_>,
     target_fsb_prefix: Option<TargetFsbPrefixRequest<'_>>,
 ) -> Outcome {
-    solve_milp_in_impl(
+    solve_milp_in_impl(MilpSolveRequest {
+        model,
+        opts,
+        mode,
+        seed: seed.map(IncumbentSeed::from),
+        branch: BranchAdvice {
+            hints: branch_hints,
+            root_probe_shortlist,
+            shared_binary_prefix,
+        },
+        margin_proof: MarginProofRequest::Marked {
+            target: margin_proof_target,
+            target_fsb_prefix,
+        },
+    })
+}
+
+fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
+    let MilpSolveRequest {
         model,
         opts,
         mode,
         seed,
-        branch_hints,
-        root_probe_shortlist,
-        shared_binary_prefix,
-        Some(margin_proof_target),
-        target_fsb_prefix,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn solve_milp_in_impl(
-    model: &Model,
-    opts: &SolveOpts,
-    mode: SearchMode,
-    seed: Option<(Vec<BigRational>, BigRational)>,
-    branch_hints: &[Col],
-    root_probe_shortlist: &[Col],
-    shared_binary_prefix: &[Col],
-    margin_proof_target: Option<&crate::margin::MarginProofTarget<'_>>,
-    target_fsb_prefix: Option<TargetFsbPrefixRequest<'_>>,
-) -> Outcome {
+        branch:
+            BranchAdvice {
+                hints: branch_hints,
+                root_probe_shortlist,
+                shared_binary_prefix,
+            },
+        margin_proof,
+    } = request;
+    let seed = seed.map(|seed| (seed.values, seed.minimized_value));
+    let (margin_proof_target, target_fsb_prefix) = match margin_proof {
+        MarginProofRequest::None => (None, None),
+        MarginProofRequest::Marked {
+            target,
+            target_fsb_prefix,
+        } => (Some(target), target_fsb_prefix),
+    };
     #[cfg(test)]
     if !shared_binary_prefix.is_empty() && mode.depth == 0 && !mode.cheap && !mode.projected {
-        SHARED_PREFIX_SOLVE_ENTRIES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::local_census::add_usize(&SHARED_PREFIX_SOLVE_ENTRIES_TOTAL, 1);
     }
     // The frame every exported certificate must verify in: THIS call's model,
     // before presolve tightening and root cuts (the same convention as the
@@ -22743,617 +22671,103 @@ fn solve_milp_in_impl(
         } else {
             0
         });
-    // Strengthen the formulation before building any tree. Cover cuts are valid
-    // for the model — they remove FRACTIONAL points, never integer ones — so the
-    // integer optimum is untouched, every bound derived from the cut model is
-    // still a bound for the original, and any point feasible for the cut model is
-    // feasible for the original. Each cut's cover condition is re-proved in exact
-    // rationals inside `cuts::separate` before it is admitted; a float that
-    // proposes a non-cover is dropped, not trusted.
-    // FIRST: read off the bounds the rows already imply.
-    //
-    // Not an optimisation -- a precondition. Every bound this search computes is a box-minimum
-    // over the columns, and a column that is unbounded in the direction its reduced cost points
-    // contributes -inf, which makes the node's bound vanish entirely. Real models are full of
-    // continuous columns written `[0, inf)` because nobody had to say otherwise, and a node with
-    // no bound cannot be pruned and is explored FIRST. Propagating the bounds is what turns the
-    // tree back into a search. (Tightening cannot remove a feasible point -- the bounds are
-    // IMPLIED by the rows -- so the optimum, and every witness, is untouched.)
-    let _t_pre = Instant::now();
-    // FORGONE COST. `SearchMode::cheap`'s own doc enumerates what it strips ("skip root
-    // cuts, one pump restart, minimal strong branching") and presolve is NOT in the
-    // list — while the comment directly above insists the skipped pass is "not an
-    // optimisation -- a precondition". There is no knob that turns presolve back on for
-    // a cheap sub-solve, so the excluded branch cannot be A/B'd today.
-    //
-    // READ THE CENSUS WITH CARE: it mixes two populations. For the rins/endgame
-    // producers the parent's presolve ALREADY ran (the sub-MIP is built from the cut
-    // model, which is the tightened one), so the forgone capability is RE-propagation
-    // under the sub-MIP's new fixings, not first propagation. For the
-    // `solve_milp_seeded` producer the model may genuinely be un-presolved.
-    // The explicit --no-presolve arm is deliberately NOT charged: that is a
-    // user action, not a gate.
-    if mode.cheap {
-        crate::sepstat::gate_charge(
-            crate::sepstat::GATE_CHEAP_PRESOLVE,
-            (0..model.num_cols())
-                .map(|j| {
-                    let (l, u) = model.col_bounds(Col(j as u32));
-                    u64::from(!l.is_finite()) + u64::from(!u.is_finite())
-                })
-                .sum::<u64>(),
-        );
-    }
-    let _attrib_ar_pre = crate::attrib::AllocRegion::new(0);
-    let tightened =
-        if mode.cheap || crate::tune::caller_flag(crate::tune::Knob::NoPresolve) == Some(true) {
-            model.clone()
-        } else {
-            // Hand presolve a SHARE of the budget, not the whole thing (see PRESOLVE_SHARE). Computed
-            // exactly like add_root_cuts (bab.rs:724): a fraction of the remaining wall clock. A short
-            // deadline yields weaker-but-valid partial bounds, never a wrong one — soundness is by
-            // construction, the cap only trades bound tightness for tree budget.
-            let presolve_deadline = opts.effective_deadline(Instant::now()).map(|d| {
-                let now = Instant::now();
-                let share = crate::tune::real(crate::tune::Knob::PresolveShare, PRESOLVE_SHARE);
-                now + d.saturating_duration_since(now).mul_f64(share)
-            });
-            match crate::presolve::tighten_bounds(model, presolve_deadline) {
-                // Presolve's propagation proof has no exportable witness (and no
-                // tree): the session's root-LP enrichment is the certificate
-                // chance for this verdict.
-                crate::presolve::Presolved::Infeasible => {
-                    return Outcome::Infeasible {
-                        cert: None,
-                        tree_cert: None,
-                    }
-                }
-                crate::presolve::Presolved::Tightened(m) => *m,
-            }
+    let root_formulation =
+        match root_formulation::prepare_root_formulation(root_formulation::RootFormulationRequest {
+            model,
+            opts,
+            mode,
+            shared_binary_prefix,
+            capture: &mut capture,
+            attribution_started: _attrib_t0,
+        }) {
+            Ok(root_formulation) => root_formulation,
+            Err(error) => return error.into_outcome(),
         };
-    // W4 ROOT PROBING (`crate::probe`). Tentatively fix each candidate binary and re-run the
-    // SAME exact rational propagation the base presolve uses. A branch proven
-    // exact-INFEASIBLE forces the opposite value — sound domain reduction the base presolve
-    // provably cannot find, because it never tentatively pins a column. A binary that the fix
-    // collapses to a point yields an implication over two binaries, which is a valid clique
-    // row. Neither product can remove a feasible point (`probe.rs`'s brute-force tests), and
-    // both are discharged through the proven exact primitive — never a float, never the LP.
-    //
-    // THE HARDNESS GATE, which is what the plan records as the reason probing did not land:
-    // probing costs up to two exact propagations PER BINARY, and on a model the base presolve
-    // has already reduced to nothing it buys nothing for that price — measured net-negative
-    // without a gate. So it runs only where the price is proportionate: a binary population
-    // big enough to be worth searching, small enough that the pass is a rounding error against
-    // the wall, and a deadline share it cannot exceed. Outside the window the model is handed
-    // on untouched, which is byte-identical to not having probed.
-    let tightened = if root_probe_wanted(&tightened, &mode) {
-        let cfg = crate::probe::ProbeCfg {
-            cap: crate::tune::count_opt(crate::tune::Knob::RootProbeCap).unwrap_or(ROOT_PROBE_CAP),
-            clique_cap: crate::tune::count_opt(crate::tune::Knob::RootProbeCliqueCap).unwrap_or(0),
-            use_lp_rank: crate::tune::caller_flag(crate::tune::Knob::RootProbeNoLpRank)
-                != Some(true),
-        };
-        let probe_deadline = opts.effective_deadline(Instant::now()).map(|d| {
-            let now = Instant::now();
-            let share = crate::tune::real_opt(crate::tune::Knob::RootProbeShare)
-                .unwrap_or(ROOT_PROBE_SHARE);
-            now + d.saturating_duration_since(now).mul_f64(share)
-        });
-        match crate::probe::root_probe(&tightened, probe_deadline, cfg) {
-            // Same evidence status as presolve's own infeasibility: a propagation proof with
-            // no exportable witness and no tree.
-            crate::probe::RootProbe::Infeasible => {
-                return Outcome::Infeasible {
-                    cert: None,
-                    tree_cert: None,
-                }
-            }
-            crate::probe::RootProbe::Probed {
-                model: m,
-                forced,
-                cliques,
-                probes,
-            } => {
-                if crate::debug_flags::milp_debug_flags().trace {
-                    eprintln!(
-                        "--trace root probe: {probes} binaries probed, {forced} forced, {cliques} cliques"
-                    );
-                }
-                *m
-            }
-        }
-    } else {
-        tightened
-    };
-    // MARKET-SPLIT PROFILE (see `market_split_shape`): depth-first order, no root cut loop,
-    // no root-heuristic budget — each measured individually on the shape (pk1: best-first
-    // floods 28k open nodes and dies early at FEASIBLE 14; the full profile proves OPTIMAL 11).
-    // Detected on the TIGHTENED model once; nested sub-solves re-detect on their own models.
-    let ms_shape = !mode.cheap && market_split_shape(&tightened);
-    // PURE GENERAL-INTEGER PROFILE (see `pure_general_integer_shape`): the gen-ip family (every
-    // column a general integer) is leaf-starved under best-bound exactly like market-split, and
-    // wants the same depth-first engine. Detected on the TIGHTENED model, user's full solve only
-    // (cheap/nested sub-solves are already throughput devices). `--no-gi-dfs` reverts to
-    // best-bound for A/B. NO home instance matches the shape, so the corpus stays byte-identical.
-    let gi_shape = !mode.cheap
-        && crate::tune::caller_flag(crate::tune::Knob::NoGiDfs).map_or(true, |no| !no)
-        && pure_general_integer_shape(&tightened);
-    let mode = SearchMode {
-        dfs: mode.dfs || ms_shape || gi_shape,
-        ..mode
-    };
-    let proof_first_prefix = mode.prefix_workers > 0 && !shared_binary_prefix.is_empty();
-    // Dive-side order for the whole solve (see `child_order`): the pure general-integer
-    // DFS class dives the round-up child first to reach good leaves sooner; every other
-    // model keeps the historical `Lp`. Computed once — read at every `push_children`.
-    let child_ord = child_order(gi_shape, ms_shape);
-    drop(_attrib_ar_pre);
-    let _t_cuts = Instant::now();
-    // A cheap solve skips separation entirely: its exact `B^T` solves are a fixed
-    // cost the sub-MIP profile exists to avoid. A PROJECTED re-solve skips it too:
-    // every cut row its parent adopted is already IN the projected model (rows fold,
-    // they are not re-derived), and re-separating on top of them was measured pure
-    // overhead (nw04: 2.0-3.0s per restart). Market-split skips it by measurement:
-    // every family closes ~nothing there (Gurobi proves pk1 with ZERO cuts).
-    // SYMMETRY DETECTION (symmetry.rs; exploitation journal at push_children).
-    // Runs on the TIGHTENED model, BEFORE root cuts: a verified automorphism of
-    // this frame maps its integer-feasible set to itself, and every later cut
-    // row admits every integer-feasible point (the cut lane's license), so cut
-    // rows need not — and deliberately do not — participate in the row
-    // permutation. User's full solve only: a cheap/nested sub-search would pay
-    // the detection as pure fixed cost. Self-gating: a model with no verified
-    // generator solves BIT-IDENTICALLY to a build without this call (detection
-    // is read-only and `sym = None` adds nothing to any node).
-    //
-    // Exploitation mode (`--sym-mode`): `orbital` (default — per-node orbital
-    // fixing, journal at push_children), `rows` (static lex-leader
-    // first-difference rows, license at `Symmetry::breaking_rows`), `off` (or
-    // the `AY_MILP_NO_SYM` alias). The modes are NOT composable — see the
-    // incompatibility note at `breaking_rows`. MEASURED (60s corpus A/B,
-    // 2026-07-17): orbital proves misc07 in 9.5s where the baseline returns
-    // FEASIBLE 3050 at 60s and rows needs 23.4s; p0201/blend2 faster; rout's
-    // 60s incumbent 1087 vs baseline 1171; qiu/mas74/markshare1 IDENTICAL to
-    // baseline (the fixing barely fires there and never perturbs the
-    // heuristic timeline). `rows` is kept as an A/B lane but NOT the default:
-    // its model augmentation disturbs flip-LNS basins — qiu's 60s incumbent
-    // degraded from -128.47 to -115.25, through the FEAS gate.
-    // B39b: `--sym-mode orbital|rows|off` (caller-layer; unset = orbital).
-    let sym_mode = match crate::tune::count_opt(crate::tune::Knob::SymMode) {
-        Some(1) => "rows",
-        Some(2) => "off",
-        _ => "orbital",
-    };
-    let sym_off = sym_mode == "off" || crate::tune::on(crate::tune::Knob::NoSym);
-    let sym_gate = mode.depth == 0 && !mode.cheap && !mode.no_sym && !sym_off;
-    // SYMMETRY-ENABLING DUAL PIN (license at `symmetry::dual_pin_dominated`):
-    // dominated zero-objective continuous columns are pinned to their free
-    // bound BEFORE detection, because a live dominated column hides block
-    // symmetry from exact comparison (noswot's x128: coefficients 2/3/4 across
-    // the three rows of otherwise-identical units). The pin preserves the
-    // optimum value, feasibility, every witness, and every rigorous dual
-    // bound — but not literal box exhaustiveness, so it poisons the capture
-    // (fail-closed, exactly like the orbital fixes; the tree-cert retry below
-    // re-solves without it). Gated with detection: a solve that will not
-    // exploit symmetry keeps its model untouched.
-    let mut sym_pins = 0usize;
-    let tightened = if sym_gate {
-        let mut t = tightened;
-        sym_pins = crate::symmetry::dual_pin_dominated(&mut t);
-        if sym_pins > 0 {
-            capture.poison();
-            if crate::debug_flags::milp_debug_flags().trace {
-                eprintln!("--trace symmetry: dual-pinned {sym_pins} dominated columns");
-            }
-        }
-        t
-    } else {
-        tightened
-    };
-    let mut sym: Option<crate::symmetry::Symmetry> = if sym_gate {
-        let _t_sym = Instant::now();
-        let s = crate::symmetry::detect(&tightened);
-        if crate::debug_flags::milp_debug_flags().trace {
-            match &s {
-                    Some(s) => eprintln!(
-                        "--trace symmetry: {} verified generators (moved cols per gen: {:?}) in {:.3}s; orbitopes {:?} (k x m); stab_group={}",
-                        s.gens.len(),
-                        s.gens.iter().take(8).map(|g| 2 * g.pairs.len()).collect::<Vec<_>>(),
-                        _t_sym.elapsed().as_secs_f64(),
-                        s.orbitopes
-                            .iter()
-                            .map(|o| (o.blocks.len(), o.blocks[0].len()))
-                            .collect::<Vec<_>>(),
-                        s.stab_group_size(),
-                    ),
-                    None => eprintln!(
-                        "--trace symmetry: none detected in {:.3}s",
-                        _t_sym.elapsed().as_secs_f64()
-                    ),
-                }
-        }
-        s
-    } else {
-        None
-    };
-    // SET-PARTITION / GUB (Ryan-Foster) BRANCHING (journal at `set_partition_supports`
-    // / `gub_split` / `push_gub_children`). Armed only on the dominant set-partition
-    // shape AND when no symmetry was detected (the two child-construction paths are
-    // kept disjoint). When armed it replaces the single-column pseudocost pick with a
-    // whole-GUB-row split, which moves BOTH child bounds decisively on pure
-    // set-partitioning — a valid, exhaustive disjunction, so verdict-neutral.
-    // Direct AMO inequalities deliberately do not enter this overlapping cover.
-    let gub_supports: Option<Vec<Vec<usize>>> = if mode.cheap {
-        None // finders stay on throughput
-    } else if sym.is_some() {
-        // FORGONE COST. The justification for this arm is a statement about code
-        // structure ("the two child-construction paths are kept disjoint") with no cost
-        // or benefit claim — and set-partitioning models are exactly the family most
-        // likely to BE symmetric, i.e. the intersection where the rule was designed to
-        // pay. The finder is HOISTED (not called twice) so the GUB_MIN_ROWS census is
-        // not billed a phantom hit, and charged only when a shape actually existed, so
-        // the hits column stays meaningful.
-        if let Some(sup) = set_partition_supports(model) {
-            crate::sepstat::gate_charge(
-                crate::sepstat::GATE_GUB_SYM_DISARM,
-                sup.iter().filter(|c| c.len() >= 2).count() as u64,
-            );
-        }
-        None // symmetry owns its child construction
-    } else {
-        // Where the set-partition shape arms GUB, optionally ALSO offer conflict-graph
-        // cliques (merged from overlapping partition/packing rows) as extra branchable
-        // supports — a wider at-most-one set fixes more columns per child than any
-        // single model row. Additive and verdict-neutral (`conflict_cliques`), but
-        // DEFAULT OFF (the gub-clique knob): it showed no corpus node-count win, so
-        // it returns empty unless armed, keeping the shipped tree byte-identical to
-        // round 1 everywhere.
-        set_partition_supports(model).map(|mut sup| {
-            sup.extend(conflict_cliques(model));
-            sup
-        })
-    };
-    let gub_on = gub_branch_on(gub_supports.is_some(), sym.is_some());
-    if gub_on && crate::debug_flags::milp_debug_flags().trace {
-        eprintln!(
-            "--trace gub-branch: armed ({} branchable clique/partition supports)",
-            gub_supports
-                .as_ref()
-                .map_or(0, |s| s.iter().filter(|c| c.len() >= 2).count())
-        );
-    }
-
-    // DIRECT AMO MULTIWAY BRANCHING. Default dark: the production tree stays
-    // on the measured 17,028-node basis baseline unless explicitly armed with
-    // `the amo-multiway knob`. Unlike the rejected overlapping cover, this
-    // branch partitions a unit-packing row into the all-zero case and exactly
-    // one child for every still-open member. Equality rows remain owned by the
-    // legacy GUB path above. Dynamic orbitopes own a per-node position sequence
-    // that this structural branch cannot yet extend, so fail closed whenever
-    // that state is live.
-    let amo_multiway_requested =
-        crate::tune::caller_flag(crate::tune::Knob::AmoMultiway) == Some(true);
-    // Dynamic orbitopes may re-sort interchangeable blocks when a NEW
-    // position enters their per-node sequence. A multiway child fixes several
-    // cells while cloning that sequence unchanged, violating the dynamic
-    // lane's invariant that every earlier branch bound on an orbitope cell is
-    // represented in the sequence. `rows` mode consumes `sym` and never runs
-    // dynamic propagation, so it does not need this exclusion. Evaluate this
-    // only for the opt-in arm; the production-default GUB path above remains
-    // byte-identical.
-    let dynamic_orbitope_amo_conflict = amo_multiway_requested
-        && dynamic_orbitope_blocks_gub(
-            sym_mode,
-            crate::tune::caller_flag(crate::tune::Knob::OrbitopeDyn) == Some(true),
-            sym.as_ref().is_some_and(|s| !s.orbitopes.is_empty()),
-        );
-    let amo_rows = if mode.cheap || !amo_multiway_requested || dynamic_orbitope_amo_conflict {
-        Vec::new()
-    } else {
-        crate::cardinality_branch::unit_amo_rows(model)
-            .into_iter()
-            .filter(|amo| {
-                let (_, lb, ub) = model.row(Row(amo.row as u32));
-                model
-                    .row_lb_exact(amo.row, lb)
-                    .zip(model.row_ub_exact(amo.row, ub))
-                    .is_none_or(|(true_lb, true_ub)| true_lb != true_ub)
-            })
-            .collect::<Vec<_>>()
-    };
-    let amo_multiway_on =
-        amo_multiway_branch_on(!amo_rows.is_empty(), dynamic_orbitope_amo_conflict);
-    if amo_multiway_requested
-        && dynamic_orbitope_amo_conflict
-        && crate::debug_flags::milp_debug_flags().trace
-    {
-        eprintln!("--trace amo-multiway: declined (dynamic orbitope owns branch state)");
-    }
-    if amo_multiway_on && crate::debug_flags::milp_debug_flags().trace {
-        eprintln!(
-            "--trace amo-multiway: armed ({} exact AMO inequalities)",
-            amo_rows.len()
-        );
-    }
-    // `rows` mode: append the symmetry-breaking rows to the model itself and
-    // retire the per-node machinery for this solve. The whole-tree capture is
-    // poisoned up front: its claims would be about the AUGMENTED model and
-    // could not re-derive in the caller's frame (fail-closed either way; this
-    // just makes it explicit). Verdict semantics are unchanged — the rows
-    // preserve feasibility and the optimum value, and any witness found is
-    // feasible for the caller's model because rows only restrict.
-    let mut sym_rows_added = false;
-    let tightened = if sym.is_some() && sym_mode == "rows" {
-        let s = sym.take().expect("checked is_some");
-        let sb = s.breaking_rows();
-        let mut aug = tightened;
-        for &(c, gc) in &sb {
-            let (c, gc) = (
-                aug.col_at(c as usize).expect("verified column"),
-                aug.col_at(gc as usize).expect("verified column"),
-            );
-            aug.add_row(0.0, f64::INFINITY, &[(c, 1.0), (gc, -1.0)]);
-        }
-        if crate::debug_flags::milp_debug_flags().trace {
-            eprintln!(
-                "--trace symmetry: added {} lex-leader rows (rows mode)",
-                sb.len()
-            );
-        }
-        SYM_ROWS_TOTAL.fetch_add(sb.len(), std::sync::atomic::Ordering::Relaxed);
-        sym_rows_added = true;
-        capture.poison();
-        aug
-    } else {
-        tightened
-    };
-    // LATTICE-BOTTLENECK OBJECTIVE GRANULE, read from the PRE-CUT model: cut rows carry
-    // the objective column with fractional coefficients (GMI), which would obscure the
-    // clean VUB shape the rule needs — but cuts are valid for every integer-feasible
-    // point, so they never lower the integer optimum of `x_o` below the lattice value the
-    // pre-cut VUBs give. Computing the granule here, before cuts, is both correct and the
-    // only place the clean structure is visible. `None` on every model but the bottleneck
-    // shape, so this is byte-identical elsewhere.
-    let bottleneck_gran = bottleneck_granularity(&tightened);
-    if bottleneck_gran.is_some() && crate::debug_flags::milp_debug_flags().trace {
-        eprintln!("--trace lattice-bottleneck objective granule = {bottleneck_gran:?}");
-    }
-    let _attrib_ar_cuts = crate::attrib::AllocRegion::new(1);
-    let cut_model = if mode.cheap || mode.projected || ms_shape || proof_first_prefix {
-        tightened
-    } else {
-        // LEVER A copy-elision: MOVE `tightened` into the cut builder instead of
-        // borrowing it. Previously the borrow kept `tightened` alive for the whole
-        // tree search alongside the returned `cut_model` — a redundant full f64
-        // matrix copy at the root-LP peak. Both branches now consume `tightened`
-        // (the `if` already moved it), so nothing after this reads it. Byte-identical.
-        add_root_cuts_rounds(tightened, opts, mode.cut_rounds)
-    };
-    drop(_attrib_ar_cuts);
-    if crate::debug_flags::milp_debug_flags().trace {
-        eprintln!(
-            "--trace presolve took {:.2}s; root cuts took {:.2}s",
-            _t_cuts.duration_since(_t_pre).as_secs_f64(),
-            _t_cuts.elapsed().as_secs_f64()
-        );
-    }
-    // ATTRIBUTION: charge this tree's pre-node-loop setup (presolve + root-cut
-    // rounds) to the root vs sub-MIP bucket. Measurement only.
-    if crate::attrib::on() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (setup, rootcut) = (
-            _attrib_t0.elapsed().as_nanos() as u64,
-            _t_cuts.elapsed().as_nanos() as u64,
-        );
-        if mode.depth == 0 {
-            crate::attrib::SETUP_NANOS_ROOT.fetch_add(setup, Relaxed);
-            crate::attrib::ROOTCUT_NANOS_ROOT.fetch_add(rootcut, Relaxed);
-        } else {
-            crate::attrib::SETUP_NANOS_SUB.fetch_add(setup, Relaxed);
-            crate::attrib::ROOTCUT_NANOS_SUB.fetch_add(rootcut, Relaxed);
-        }
-    }
+    let root_formulation::RootFormulation {
+        model: cut_model,
+        mode,
+        market,
+        proof_first_workers,
+        child_order: child_ord,
+        symmetry: mut sym,
+        symmetry_pins: sym_pins,
+        symmetry_rows_added: sym_rows_added,
+        gub_supports,
+        gub_enabled: gub_on,
+        amo_rows,
+        amo_requested: amo_multiway_requested,
+        amo_enabled: amo_multiway_on,
+        bottleneck_granularity: bottleneck_gran,
+        work_started: _t_pre,
+    } = root_formulation;
+    let ms_shape = market.is_split();
+    let proof_first_prefix = proof_first_workers.is_some();
     let model = &cut_model;
-    let ints = integer_cols(model);
-    // Presolve/root cuts preserve column identity. Top-level hinted solves
-    // bypass duplicate-column merging, while every column-changing nested
-    // projection passes an empty slice, so these ranks remain in exactly the
-    // caller's insertion-order frame.
-    let branch_hint_ranks = branch_hint_ranks(model.num_cols(), branch_hints);
-    // Per-column integrality flags for the orbitopal propagator's strict-tail
-    // rule (built once; the propagator runs per node).
-    let col_integral: Vec<bool> = (0..model.num_cols())
-        .map(|j| model.col_kind(Col(j as u32)).is_integral())
-        .collect();
-    // A/B lane for orbitope-aligned branching (journal at the override site).
-    let orbitope_branch_on =
-        crate::tune::caller_flag(crate::tune::Knob::OrbitopeBranch) == Some(true);
-    // DYNAMIC ORBITOPAL FIXING lane (`the orbitope-dyn knob`, license journal
-    // at `symmetry::Symmetry::propagate_orbitopes_dyn`): propagate each
-    // orbitope's lex order relative to the BRANCHING ORDER TAKEN instead of
-    // the static root order. `1` = dynamic, `0`/unset = static (the two are
-    // not composable — exactly one lane runs). Models without an assembled
-    // orbitope are bit-identical either way (the flag gates dead code).
-    if let Some(s) = sym.as_mut() {
-        s.dyn_lane = !s.orbitopes.is_empty()
-            && crate::tune::caller_flag(crate::tune::Knob::OrbitopeDyn) == Some(true);
-    }
-    // A/B experiment lanes (journals at their sites): joint orbitope x row
-    // propagation fixpoint, and branching that completes the dynamic
-    // sequence's open positions before opening new ones.
-    let orbitope_ilv = crate::tune::caller_flag(crate::tune::Knob::OrbitopeIlv) == Some(true);
-    let orbitope_branch_dyn =
-        crate::tune::caller_flag(crate::tune::Knob::OrbitopeBranchDyn) == Some(true);
-    // MS-BRANCH PRECOMPUTE (see `MsBranch`): the equality block's integral terms, one
-    // Vec per row as `(rhs, [(col, a)])`, plus the static per-column weight
-    // `Σ_rows |a|`. Selection data only — read at the branch pick, never by a prune.
-    let ms_branch = if ms_shape {
-        ms_branch_rule()
-    } else {
-        MsBranch::Pc
-    };
-    let ms_block: Vec<(f64, Vec<(usize, f64)>)> = if ms_branch != MsBranch::Pc {
-        market_split_rows(model)
-            .iter()
-            .map(|&r| {
-                let (coeffs, lb, _) = model.row(Row(r));
-                let terms: Vec<(usize, f64)> = coeffs
-                    .iter()
-                    .filter(|&&(c, _)| model.col_kind(Col(c)).is_integral())
-                    .map(|&(c, a)| (c as usize, a))
-                    .collect();
-                (lb, terms)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let ms_w: Vec<f64> = {
-        let mut w = vec![
-            0.0f64;
-            if ms_block.is_empty() {
-                0
-            } else {
-                model.num_cols()
-            }
-        ];
-        for (_, terms) in &ms_block {
-            for &(c, a) in terms {
-                w[c] += a.abs();
-            }
-        }
-        w
-    };
-    // Column-major mirror of the block (`[(ms-row-index, a)]` per column), so the
-    // per-node critical-row score is O(block rows) per candidate, not O(block nnz).
-    let ms_cols: Vec<Vec<(usize, f64)>> = {
-        let mut cols = vec![Vec::new(); ms_w.len()];
-        for (ri, (_, terms)) in ms_block.iter().enumerate() {
-            for &(c, a) in terms {
-                cols[c].push((ri, a));
-            }
-        }
-        cols
-    };
-    let objective: Vec<(u32, f64)> = (0..model.num_cols())
-        .map(|j| (j as u32, model.obj_coeff(Col(j as u32))))
-        .filter(|&(_, a)| a != 0.0)
-        .collect();
-    let sense = model.sense();
-    // Shared by every live and terminal frontier-bound comparison. Use the
-    // exact side-store rather than reconstructing a parser-owned rational from
-    // its f64 proxy: marked-margin strictness is a caller-frame statement.
-    let model_offset = model.obj_offset_exact();
-    // Detailed design and measurements: see `bab/incoming_feature_history.md`.
-    //
-    // TWO WAYS IN, AND THE SECOND ONE WAS MISSING. `--node-cut-slots <k>` opts
-    // in and sizes the block in one act. `--node-cuts` is the switch whose NAME
-    // says "separate cuts below the root" — it has a builder, a field and a
-    // profile line, and until this read existed `Knob::NodeCuts` was written by
-    // `opts/profile.rs` and read by NOTHING. It was the mirror image of the
-    // reader-without-writer defect `tests/knob_census.rs` gates: a flag that
-    // parses, validates, lowers into the profile and changes no behaviour. It
-    // now means what it says, and takes the structural slot count.
-    let node_cuts_opted_in = crate::tune::count_opt(crate::tune::Knob::NodeCutSlots).is_some()
-        || crate::tune::caller_flag(crate::tune::Knob::NodeCuts) == Some(true);
-    let slot_k = if mode.cheap || proof_first_prefix || !node_cuts_opted_in || false {
-        0 // proof-first and sub-MIP finders skip optional separation entirely
-    } else {
-        cut_slot_count(model)
-    };
-    let mut aug_model = model.clone();
-    for _ in 0..slot_k {
-        aug_model.add_row(f64::NEG_INFINITY, f64::INFINITY, &[]);
-    }
-    let Some(mut lp) = FloatLp::from_model(&aug_model, &objective, sense) else {
-        return Outcome::Unknown {
-            reason: UnknownReason::SolverIncomplete {
-                detail: "model cannot be lowered to the float lane".to_owned(),
-            },
-        };
-    };
-    apply_bab_lp_opts(&mut lp, opts);
-    // The search's own LP (and every heuristic clone of it) keeps the classic
-    // cold path: its root vertex SEEDS the pump/dive/RINS chain, and which
-    // optimal vertex comes back is an answer, not just a speed — see
-    // `FloatLp::plain_cold`.
-    lp.plain_cold = true;
-    let caller_deadline = opts.effective_deadline(Instant::now());
-    let caller_has_deadline = caller_deadline.is_some();
-    let full_deadline = match (caller_deadline, mode.deadline) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
-    // When tree-certificate capture is armed, reserve a slice of
-    // the caller budget for `TreeCapture::finalize` (per-leaf caller-frame
-    // re-derivation + the emission self-verify). Without it the search spends
-    // the whole budget and finalization always lands on the deadline-expired
-    // fail-closed path.
-    // The SEARCH gets `deadline − reserve`; finalize gets `reserve` and is bounded by
-    // the caller deadline as well (`finalize_deadline`), so the caller's total budget
-    // still bounds the whole call — no overshoot regression against the deadline-obedience
-    // work. Reserve: 15% of the remaining budget, clamped to [200ms, 5s]. Only when
-    // capture is armed; otherwise the search deadline is byte-identical to before.
-    // `deadline` is the RESERVED search deadline used by the root suite and the
-    // heuristics (byte-identical to before); `search_floor` is the wider budget the
-    // TREE runs to while it is leaf-starved. When capture is disarmed they are equal
-    // (no reserve at all). See `finalize_reserve_split` for the arithmetic + invariant.
-    // Dense fixed-charge / routing regime (rout): auto-arm fixed-charge-aware
-    // branching (`fc_mode` below) and the small finalize reserve. Computed once from
-    // the model; the env `AY_MILP_FC` overrides the branching arm either way.
-    let fc_dense = fixed_charge_density(model) >= FIXED_CHARGE_DENSE_GATE;
-    // `reserve_params = (d, reserve, floor)` when a reserve is in force: `d` the caller
-    // deadline, `reserve` the FULL leaf-bearing hold-back (the historical value), `floor`
-    // the leaf-starved minimum. A marked-margin prefix instead keeps `floor == reserve`:
-    // its pre-seated regions already owe original-frame replay at zero integral leaves.
-    // The leaf pull-back below sizes ordinary captures between these two — see
-    // `leaf_reserved_deadline`.
-    let reserve_params: Option<(Instant, Duration, Duration)> = match full_deadline {
-        Some(d) if capture.is_armed() => {
-            let now = Instant::now();
-            let remaining = d.saturating_duration_since(now);
-            let obligation = if margin_proof_target.is_some() {
-                FinalizeReplayObligation::MarkedMarginPrefix
-            } else {
-                FinalizeReplayObligation::CapturedLeaves
-            };
-            let (reserve, floor) =
-                finalize_reserve_split_for(remaining, ms_shape || fc_dense, obligation);
-            // Never invert: a budget below the reserve keeps the full deadline
-            // (finalize will fail closed exactly as before).
-            (remaining > reserve * 2).then_some((d, reserve, floor))
-        }
-        _ => None,
-    };
-    // The slice finalize was PROMISED, kept separately from `reserve_params` because the
-    // release below clears those the moment the capture dies. `None` = no reserve was ever
-    // in force, and finalize keeps the whole remaining budget exactly as it always did.
-    // See `finalize_deadline` for what it is spent on.
-    let finalize_reserve: Option<Duration> = reserve_params.map(|(_, reserve, _)| reserve);
-    // Live marked-margin replay is allowed only when a caller deadline
-    // actually produced a distinct finalize reserve. This is hoisted out of
-    // the node loop so ordinary and no-reserve solves pay no frontier/replay
-    // work.
-    let margin_live_preview_enabled = live_margin_preview_enabled(
-        caller_has_deadline,
-        finalize_reserve,
-        margin_proof_target.is_some(),
+    let search_bootstrap::BranchMetadata {
+        ints,
+        hint_ranks: branch_hint_ranks,
+        col_integral,
+        orbitope_branch: orbitope_branch_on,
+        orbitope_interleave: orbitope_ilv,
+        orbitope_dynamic_branch: orbitope_branch_dyn,
+    } = search_bootstrap::branch_metadata(model, branch_hints, &mut sym);
+    let search_bootstrap::MarketBranching {
+        rule: ms_branch,
+        rows: ms_block,
+        weights: ms_w,
+        columns: ms_cols,
+    } = search_bootstrap::market_branching(
+        model,
+        if ms_shape {
+            search_bootstrap::MarketClass::Split
+        } else {
+            search_bootstrap::MarketClass::General
+        },
     );
-    // MUTABLE because the reserve is RELEASED the moment the capture can no longer produce
-    // the artifact it is being held for — see `release_finalize_reserve` and its call site
-    // in the node loop. One-way: `TreeCapture` never re-arms, so this only ever goes
-    // `Some -> None`.
-    let mut reserve_params = reserve_params;
-    let (deadline_init, search_floor) = match reserve_params {
-        // `floor <= reserve` (invariant), so `d - floor >= d - reserve`:
-        // `search_floor >= deadline`. A marked-margin prefix deliberately has equality
-        // here because its replay obligations already exist at zero integral leaves.
-        Some((d, reserve, floor)) => (
-            Some(d.checked_sub(reserve).unwrap()),
-            Some(d.checked_sub(floor).unwrap()),
-        ),
-        None => (full_deadline, full_deadline),
+    let search_bootstrap::LpBootstrap {
+        objective,
+        sense,
+        model_offset,
+        slot_count: slot_k,
+        augmented_model: mut aug_model,
+        mut lp,
+    } = match search_bootstrap::build_lp(
+        model,
+        opts,
+        mode,
+        if proof_first_prefix {
+            search_bootstrap::NodeCutPolicy::ProofFirst
+        } else {
+            search_bootstrap::NodeCutPolicy::Eligible
+        },
+    ) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => return error.into_outcome(),
     };
-    let mut deadline = deadline_init;
+    // Anchor the caller's duration before the potentially O(nnz) fixed-charge
+    // density scan, preserving the solve's original wall-budget boundary.
+    let caller_deadline = opts.effective_deadline(Instant::now());
+    let fc_dense = fixed_charge_density(model) >= FIXED_CHARGE_DENSE_GATE;
+    let replay = if margin_proof_target.is_some() {
+        FinalizeReplayObligation::MarkedMarginPrefix
+    } else {
+        FinalizeReplayObligation::CapturedLeaves
+    };
+    let search_bootstrap::DeadlinePlan {
+        full: full_deadline,
+        finalize_reserve,
+        live_margin_preview: margin_live_preview_enabled,
+        reserve: mut reserve_params,
+        search_floor,
+        search: mut deadline,
+    } = search_bootstrap::plan_deadlines(search_bootstrap::DeadlineRequest {
+        caller_deadline,
+        mode,
+        capture: &capture,
+        market_split: ms_shape,
+        fixed_charge_dense: fc_dense,
+        replay,
+    });
 
     // Everything below is in the MINIMIZE frame (`lp.cost` already carries the
     // negation for a Maximize model); the sign is undone once, at the end.
@@ -23386,161 +22800,55 @@ fn solve_milp_in_impl(
     // model row `slot_row0 + s`, logical column `slot_col0 + s`. `slot_born[s]` is the
     // node count when the slot's current cut landed (`None` = free); eviction recycles
     // the stalest slot whose slack is basic at the node being cut.
-    let slot_row0 = model.num_rows();
-    let slot_col0 = lp.n + slot_row0;
-    // LIFTED ODD HOLES AT THE NODE — OPT-IN ONLY. On air05 the root cuts saturate at ~25 976 and the
-    // DUAL bound is carried by the tree, but separating the shortest-odd-walk facets at EVERY node is
-    // a measured loss (throughput 118 → 28 nodes, dual 26169 → 26074): the Dijkstra is too dear per
-    // node. Left behind `AY_MILP_ODD_CYCLE` for experimentation; the default path is root-only.
-    let node_odd_cycle_on = crate::tune::on(crate::tune::Knob::OddCycle)
-        && !crate::tune::on(crate::tune::Knob::NoOddCycle);
-    let mut slot_born: Vec<Option<usize>> = vec![None; slot_k];
-    // Aging state (2026-07-17 redesign): consecutive separation checks at which the
-    // slot's cut was NOT binding (slack basic at the checked node's optimum). A cut
-    // that sits idle through `cut_age_streak` consecutive checks is evicted outright —
-    // its row zeroed and bounds freed — rather than waiting for a new cut to want the
-    // slot. Sound to do without a re-solve: eviction only fires on slots whose slack
-    // is basic at the CURRENT node's optimum, so the row's dual is identically zero
-    // there, no reduced cost changes, and `cand` remains optimal for the relaxed LP;
-    // any bound banked while the cut was loaded stays valid (the cut is still a true
-    // statement about the model — only the LP stopped carrying it).
-    let mut slot_streak: Vec<u32> = vec![0; slot_k];
-    // LOCAL-CUT state (redesign point d, `the node-cut-local knob`): slot `s` holds a cut
-    // valid ONLY inside the box it was derived on — `Some((deviations, cut_lb, cut_ub))`
-    // stores the deriving node's column bounds that DEVIATE from the root box (at
-    // derivation time), plus the cut's row bounds. The LP row carries the cut's
-    // COEFFICIENTS with free (±inf) row bounds — globally it constrains nothing, and
-    // every rigorous consumer clamps a free-side dual to 0 — while ACTIVATION happens
-    // per node: after `materialise`, a node whose box lies inside every stored
-    // deviation gets the cut's bounds written into ITS OWN box vectors only
-    // (`node_lower/node_upper[slot_col0+s]`), never into the root's. Soundness: the
-    // bound-substituted MIR derivation is valid for every box inside the derivation
-    // box; a node passes the subset test exactly when its box is such a box (root
-    // bounds only ever TIGHTEN, so columns not stored as deviations stay inside the
-    // derivation box automatically). Bounds banked at an activated node bound that
-    // node's SUBTREE, whose boxes are subsets — the same license.
-    let mut slot_local: Vec<Option<(Vec<(usize, f64, f64)>, f64, f64)>> = vec![None; slot_k];
-    let mut local_slots_live: usize = 0;
     // The OPEN CONTINUOUS columns — an infinite bound side the presolve could not
     // close (the model's rows alone do not bound them; only the objective does).
     // `reduced_cost_fix` caps them once an incumbent exists, and the closure
     // cascade (`close_bounds_via_rows`) propagates each fresh cap through the
     // rows. Empty on every fully-boxed model: the whole device costs nothing there.
-    let conts_open: Vec<usize> = (0..lp.n)
-        .filter(|&j| !model.col_kind(Col(j as u32)).is_integral())
-        .filter(|&j| !lp.lower[j].is_finite() || !lp.upper[j].is_finite())
-        .collect();
-    let open_sides = |lo: &[f64], up: &[f64]| -> usize {
-        conts_open
-            .iter()
-            .map(|&j| usize::from(!lo[j].is_finite()) + usize::from(!up[j].is_finite()))
-            .sum()
-    };
-    let mut cont_open_sides = open_sides(&lp.lower, &lp.upper);
+    let conts_open = search_bootstrap::open_continuous_columns(model, &lp);
+    let mut cont_open_sides = search_bootstrap::open_sides(&conts_open, &lp.lower, &lp.upper);
     // The VUB map never changes inside a tree (cuts land in SLOTS, not in `model`);
     // scanning it per separation round was most of the round's bill.
-    let node_vubs = if slot_k > 0 {
-        crate::cuts::node_vubs(model)
-    } else {
-        crate::cuts::Vubs::new()
-    };
-    // Cadence floor: compiled default, with a measurement/guard-test override read ONCE
-    // per solve (never inside the node loop — the hoisting doctrine).
-    //
-    // B6 NOTE: these three env reads deliberately SURVIVE the make-constant
-    // batch. The poisoned-cut soundness guards (`node_cut_guard_*` below) steer
-    // them to make tiny brute-forceable models exercise the cut engine at all;
-    // with the reads deleted the guards pass VACUOUSLY -- "a guard the bug
-    // cannot fail is vacuous", as their own comment puts it. They convert to
-    // typed test-visible options in the batch that threads options through
-    // solve_milp_in_impl, not to constants.
-    let cut_every_min = crate::tune::count_opt(crate::tune::Knob::NodeCutEvery)
-        .filter(|&v| v > 0)
-        .unwrap_or(NODE_CUT_EVERY_MIN);
-    let cut_batch = crate::tune::count_opt(crate::tune::Knob::NodeCutBatch)
-        .filter(|&v| v > 0)
-        .unwrap_or(NODE_CUT_BATCH);
-    let cut_min_age =
-        crate::tune::count_opt(crate::tune::Knob::NodeCutAge).unwrap_or(NODE_CUT_MIN_AGE);
-    // The 2026-07-17 redesign's three knobs (see the consts): shallow depth cap,
-    // admission epsilon, and the idle-streak eviction threshold. Read once per solve.
-    let cut_depth_max: u32 = NODE_CUT_DEPTH_MAX;
-    let cut_eps: f64 = NODE_CUT_EPS;
-    let cut_age_streak: u32 = NODE_CUT_AGE_STREAK;
-    // LOCAL bound-substituted MIR on the node box (redesign point d) — opt-in lever.
-    let cut_local = crate::tune::caller_flag(crate::tune::Knob::NodeCutLocal) == Some(true);
-    // Per-visit GMI re-separation rounds: after a round ADMITS cuts, the node's vertex
-    // moved, and the new basis exposes new tableau cuts — the root-loop shape, carried
-    // into the shallow tree. Each extra round runs GMI-only (the vertex families) and
-    // stops the moment a round admits nothing.
-    let gmi_node_rounds: usize = 1;
-    // Guard-test override: separate WITHOUT waiting for an incumbent. The production gate
-    // (incumbent-first) structurally masks an unsound cut on any model whose heuristics find
-    // the optimum before the tree does — which is every model small enough to brute-force —
-    // so the guard test exercises the machinery eagerly, where a bad cut loses verdicts loudly.
-    let cut_eager = crate::tune::caller_flag(crate::tune::Knob::NodeCutEager) == Some(true);
-    // PLATEAU-VERTEX GMI (rout lane): derive Gomory mixed-integer cuts from the CURRENT
-    // node's basis — exact tableau (`separate_gmi`, bit 1), the float-BTRAN tableau-MIR
-    // (`separate_mir_tableau`, bit 2), and/or dual-aggregate MIR (`separate_mir_dual_agg`,
-    // bit 4) — into the same slot block. The derivation is GLOBALLY valid in the tree's own
-    // root frame BY CONSTRUCTION: `lp.lower`/`lp.upper` are the LP's root-frame bounds
-    // (`solve_bounded` takes node boxes as arguments and never writes them back), so every
-    // nonbasic is shifted to a root-frame bound, and a branched column resting on a bound the
-    // root frame does not have fails closed (`exact(±inf)` → row skipped). Cadence is its own
-    // (node-denominated), so the MIR round's dry-backoff cannot silence it.
-    //
-    // MEASURED VERDICT (2026-07-16, rout, seeded, 20s, baseline dual bound 1044.58 @ ~20k
-    // nodes): OPT-IN and staying so. The HYPOTHESIS half confirmed — exact GMI at bound-owning
-    // plateau vertices SEPARATES where the root loop was exhausted (violations 0.02-0.57 in
-    // ~1/3 of rounds; derivation is CHEAP at plain node bases, 0.01-0.03s a round, against the
-    // root loop's 1.94-16.36s, whose bill was cut-row bit-growth) and landed cuts lift the
-    // deriving node's own re-solve ~20x more than the node-MIR family (1.3 vs 0.06 a write).
-    // The TRANSFER half refuted — a plateau cut is vertex-specific: of the slots written, 0-1
-    // in 6 are BINDING at subsequent bound-owning vertices (`bind=` trace), the frontier's
-    // per-node bound at matched node counts does not improve, and the carried rows plus
-    // derivation time price every configuration tried below the cut-free baseline at 20s
-    // (16 slots/every-500/nnz-200: 1039.5; 8/128/60: 1039.3; 16/16/uncapped: 1033.6, node
-    // throughput 5x down; sparse post-`clean`: 1040.6). Dual-aggregate MIR (bit 4) separates
-    // NOTHING at the plateau (96/96 rounds dry). A ~9k-node frontier at ~1k nodes/s cannot be
-    // lifted one vertex at a time; rout's plateau is the frontier's cardinality, not a missing
-    // local cut. Kept exact, guarded (`node_gmi_cuts_preserve_the_optimum`), behind the opt-in.
-    let node_gmi: u32 = crate::tune::count_opt(crate::tune::Knob::NodeGmi)
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(0);
-    let gmi_only = false;
-    let gmi_every: usize = crate::tune::count_opt(crate::tune::Knob::NodeGmiEvery)
-        .filter(|&v| v > 0)
-        .unwrap_or(500);
-    // Only cut at a node whose LP objective sits within this margin of the weakest open
-    // bound — the vertex that OWNS the global bound is the one whose fractional structure
-    // the root never saw.
-    let gmi_owner_margin: f64 =
-        crate::tune::real_opt(crate::tune::Knob::NodeGmiMargin).unwrap_or(1.0);
-    let cut_nnz: usize = NODE_CUT_NNZ;
-    // Rows per GMI visit. Derivation at a PLAIN node basis is cheap (measured 0.01-0.03s a
-    // round on rout against the root loop's 1.94s — the root's bill was cut-row bit-growth,
-    // not the back-solve), and most derived rows lose their violation to the root-frame
-    // bound shift, so the visit asks for many and lets the violation filter choose.
-    let gmi_budget: usize = 12;
-    let mut next_gmi_node = gmi_every;
-    let mut gmi_rounds = 0usize;
-    let mut gmi_derived = 0usize;
-    let mut gmi_kept = 0usize;
-    let mut t_gmi = Duration::ZERO;
-    let mut cut_every = cut_every_min;
-    let mut next_cut_node = cut_every_min;
-    let mut node_cut_writes = 0usize;
-    let mut node_cut_rounds = 0usize;
-    let mut node_cut_dry = 0usize;
-    let mut node_cut_evict = 0usize;
-    // Cuts that separated but FAILED the admission trial (bound moved < eps): the
-    // number that adjudicates the 2026-07-16 diagnosis. High rejected/writes says the
-    // old engine was indeed admitting freight that never moved the bound.
-    let mut node_cut_rej = 0usize;
-    let mut t_sep = Duration::ZERO;
-    let mut t_sep_derive = Duration::ZERO;
-    let mut t_sep_swap = Duration::ZERO;
-    let mut node_cut_gain = 0.0f64;
+    let search_controls::NodeCutState {
+        slot_row0,
+        slot_col0,
+        odd_cycle: node_odd_cycle_on,
+        mut slot_born,
+        mut slot_streak,
+        mut slot_local,
+        mut local_slots_live,
+        vubs: node_vubs,
+        batch: cut_batch,
+        min_age: cut_min_age,
+        depth_max: cut_depth_max,
+        epsilon: cut_eps,
+        age_streak: cut_age_streak,
+        local: cut_local,
+        gmi_node_rounds,
+        eager: cut_eager,
+        gmi: node_gmi,
+        gmi_only,
+        gmi_every,
+        gmi_owner_margin,
+        nnz: cut_nnz,
+        gmi_budget,
+        mut next_gmi_node,
+        mut gmi_rounds,
+        mut gmi_derived,
+        mut gmi_kept,
+        gmi_time: mut t_gmi,
+        every: mut cut_every,
+        next_node: mut next_cut_node,
+        writes: mut node_cut_writes,
+        rounds: mut node_cut_rounds,
+        dry: mut node_cut_dry,
+        evictions: mut node_cut_evict,
+        rejected: mut node_cut_rej,
+        separation_time: mut t_sep,
+        derive_time: mut t_sep_derive,
+        swap_time: mut t_sep_swap,
+        gain: mut node_cut_gain,
+    } = search_controls::node_cut_state(model, &lp, slot_k);
     // BEST-BOUND node selection.
     //
     // Pure DFS is good at FINDING the optimum and bad at PROVING it, and proving is what
@@ -23562,657 +22870,142 @@ fn solve_milp_in_impl(
     // measured-optimal engine — and sub-MIP finders) are throughput devices, and every
     // per-node inference dollar there was measured against the throughput it costs
     // (pk1 all-on: proof at 21.5s LOST outright). Env overrides force either way.
-    let lever_default = !mode.cheap && !mode.dfs && mixed_model_gate(model);
-    // ARMING DELAY for the mixed-model levers: they pay on the diagnosis's big trees
-    // (rout/noswot/misc07 run 10k-500k nodes) and TAX tiny ones — the post-campaign
-    // portfolio caught gt2 (pure general-int, ~600-node pristine proof in 0.04s) losing
-    // its proof outright to a prop x plateau interaction, and khb05250/dcmulti (sub-1s,
-    // <1k-node proofs) paying 5-8x wall for zero benefit. A model that closes inside
-    // its first MIXED_LEVER_ARM_NODES nodes never sees the levers at all; a tree still
-    // open past it is exactly the regime they were measured on.
-    const MIXED_LEVER_ARM_NODES: usize = 1_024;
-    let mut prop_on =
-        crate::tune::caller_flag(crate::tune::Knob::NodeProp).unwrap_or(lever_default);
-    // MEASUREMENT LEVER (default = MIXED_LEVER_ARM_NODES, byte-identical when
-    // unset): lower the branch-row propagation arm so the cascade fires from the
-    // root on small trees that never reach node 1,024. Used to A/B set-partition
-    // inference on air05 (pure-binary, prop_on forced via --node-prop).
-    let prop_arm: usize = MIXED_LEVER_ARM_NODES;
-    // ZERO-YIELD RETIREMENT for the branch-row propagation (the ACAS diff-leaf
-    // throughput cliff, 2026-07-17). Propagation pays in PRUNES; what it costs is
-    // not its own arithmetic (bounded, microseconds) but WARM-START LOCALITY: the
-    // cascade tightens a different set of column bounds at every node, so each
-    // node's LP box differs from the previously solved one in dozens of entries
-    // instead of one branch bound, and the warm dual walk pays for every one of
-    // them. Measured on the k=124 ACAS diff leaf (1,608 rows, trivial LP): the
-    // moment the lever armed at node 1,024, near-warm solves (box-dist 1-3,
-    // ~110 dual iters) VANISHED outright — zero such solves for the rest of the
-    // run — and every node LP became a far adoption (dist 32+, 300-950 iters,
-    // ~10 LU factors each). Node throughput fell 53/s -> 9/s at exactly node
-    // 1,024, with prop's own prune counter at ZERO all run: all cost, no yield.
-    // So: a lever that has run PROP_RETIRE_WINDOW armed nodes without a single
-    // prune is retired for the rest of the search. The regimes it was measured
-    // on prune essentially immediately (noswot: 7,927 prop prunes, ~13% of
-    // armed children — the odds of 96 consecutive silent nodes there are
-    // ~1e-6), so retirement never fires where the lever earns its keep.
-    const PROP_RETIRE_WINDOW: usize = 96;
-    let mut prop_barren = 0usize;
-    let feas_class = feasibility_conflict_class(model, &mode);
-    // Box no-good widening (`farkas_conflict_box`) and its deeper store: same
-    // structural gate, separately overridable for A/B (`--ng-box/1`).
-    // `feas_class` joins the default because it is the STORE the class's whole
-    // conflict lane reads from: arming `ng_up` over an empty store is a no-op.
-    let ng_box =
-        crate::tune::caller_flag(crate::tune::Knob::NgBox).unwrap_or(lever_default || feas_class);
-    // THE IMPLICATION CLASS (the noswot lever's structural gate): an assembled
-    // orbitope on a mixed model under the mixed-lever default. This is the
-    // exact class the SCIP ablation was measured on — lex fixings that need an
-    // implication frame to compound through — and it keeps every other model
-    // byte-identical: misc07/mas76 fail the mixed gate, p0201/air03 the
-    // orbitope one, sub-solves never detect symmetry (depth-0 gate). Of the
-    // corpus, {noswot, gen, qiu} are in class. `with_impl_lane(false)` kills,
-    // `=1`/`force` forces everywhere (measurement lever).
-    let impl_class = lever_default && sym.as_ref().is_some_and(|s| !s.orbitopes.is_empty());
-    // FORGONE COST. `impl_on == false` skips `mine_implications` entirely, installs an
-    // empty ImplTable, and kills the implication × row joint fixpoint — a standard MIP
-    // reduction (SCIP mines an implication graph on every model) made conditional on an
-    // ASSEMBLED ORBITOPE. The doc's claim is an inventory of who is excluded and a
-    // "keeps every other model byte-identical", never a measurement that arming them
-    // would lose. Source set copied EXACTLY from `mine_implications`, and the charge is
-    // skipped (rather than charged 0) outside the miner's own IMPL_MAX_SRC_BINS band so
-    // the hits column keeps meaning.
-    if lever_default && !impl_class {
-        let bins = (0..model.num_cols())
-            .filter(|&j| {
-                model.col_kind(Col(j as u32)).is_integral()
-                    && root_lower[j] == 0.0
-                    && root_upper[j] == 1.0
-            })
-            .count();
-        if bins > 0 && bins <= IMPL_MAX_SRC_BINS {
-            crate::sepstat::gate_charge(crate::sepstat::GATE_IMPL_ORBITOPE, bins as u64);
-        }
-    }
-    let impl_on = match crate::tune::caller_flag(crate::tune::Knob::ImplLane) {
-        Some(forced) => forced,
-        None => impl_class,
-    };
-    // NODE-PROPAGATION CASCADE CAPS (2026-07-18 node-propagation fixpoint arm).
-    // The branch-row cascade's default caps (192 sweeps / 64-column worklist)
-    // TRUNCATE the fixpoint before closure on dense VUB models: measured on rout
-    // (556 cols, 240 of 291 rows are 2-nnz variable bounds) the default caps drop
-    // 659k tightened columns off the worklist and truncate the sweep budget 24k
-    // times, so a `y=0` fixing never cascades to closure through the continuous
-    // side. Reaching (near-)closure tightens the node boxes the in-tree RINS pulls
-    // ride (`cand.values`), and THAT is what lets the primal land rout's 1077.56.
-    //
-    // ⚠ THE "0/30 -> 23/30 (~77%) proved @60s" HEADLINE THIS COMMENT USED TO CARRY
-    // WAS MEASURED AGAINST A SUPERSEDED BASELINE and is withdrawn. `053f340c7`'s own
-    // commit message already said so, under the word HONEST: the headline was taken
-    // against the pre-sweep-then-prove `e640f072`, and rout "already proves 10/10
-    // deterministically on main via the endgame split" at the time. The in-source
-    // quote kept the number and dropped the caveat, so it read as a capability this
-    // cap raise CREATED rather than one it kept (what it actually bought there was
-    // 4/4 held with two runs faster, ~46s -> 34.5-34.9s, and the seeded 9,817 ->
-    // 9,481 node trim). What is true TODAY, re-measured at 60s serial on this revision
-    // (2026-07-31, 30 consecutive runs, same binary): rout proves OPTIMAL 1077.56
-    // DETERMINISTICALLY — 30/30, 17,616 nodes on EVERY run, 14.45-15.22s wall —
-    // and it is deterministic precisely because the proof lands with three quarters
-    // of the budget unspent, so no deadline-sensitive policy is in play. The
-    // dependency on these caps is unchanged and still real; a proof rate is the
-    // wrong shape of claim for this instance today, and quoting one invites the
-    // next reader to treat a lost proof as bad luck.
-    // (Between 053f340c7 and now the proof was lost entirely and recovered: see
-    // `symmetry_branch_band_setting` and `simplex::eager_perturb_mode`.)
-    // The deterministic seeded proof is a clean win: 9,817 -> 9,481 nodes, neutral
-    // wall (~10.4s). But full-cascade closure is a NET LOSS
-    // where an assembled orbitope frame ALREADY carries the node propagation —
-    // noswot loses its 34s proof outright at these caps (FEASIBLE @90s). So the
-    // raise is gated to the CASCADE-PRIMARY regime: a mixed model under the lever
-    // default with NO implication frame (`!impl_class`). Blast radius on the
-    // corpus is rout alone — blend2/qnet1/gt2 prove before the caps bind, gen/qiu
-    // never arm the cascade, and every impl_class / pure-binary / DFS model keeps
-    // the 192/64 defaults bit-identically. B6 RETIRED the AY_MILP_PROP_SWEEPS /
-    // AY_MILP_PROP_QUEUE env overrides this note used to offer for A/B; the caps
-    // are the literals below and nothing reads them from the environment. Set once
-    // at depth 0 (a global the inert sub-solves inherit harmlessly).
-    // The TALL class (`tall_lu` — the ACAS diff-leaf's 1,608-row regime) is
-    // EXCLUDED by row count: there node-prop already retires after 96 barren nodes
-    // (the warm-locality cliff), and the raised caps would just make those
-    // pre-retirement nodes dearer.
-    //
-    // THE 1_200 BELOW IS A STANDALONE CONSTANT, NOT A MIRROR. This note claimed to
-    // mirror `simplex::TALL_LU_ROWS`; that claim was struck because it is false.
-    // Both were 1,200 when it was written; 6cb957cde moved the simplex floor to
-    // 1,000 (qiu's 1,192-row basis into the LU lane, an LP-speed change) and this
-    // literal did not follow.
-    // That is exactly the silent drift the flag decision table cited when it refused
-    // an env override on a class-defining threshold — the drift arrived anyway, from
-    // a plain edit. It is INERT on the measured corpus: the only instance in the
-    // [1_000, 1_200) gap is qiu, and per the paragraph above gen/qiu never arm the
-    // cascade at all; rout (291) is far below either number. Re-tracking the two is
-    // therefore a BEHAVIOUR change with no corpus evidence behind it — do not
-    // "tidy" this into `TALL_LU_ROWS` without an A/B that moves something.
-    if mode.depth == 0 {
-        let cascade_primary = lever_default && !impl_class && model.num_rows() < 1_200;
-        let (ds, dq) = if cascade_primary {
-            (512usize, model.num_cols().max(PROP_MAX_QUEUE))
+    let search_controls::PropagationState {
+        default_class: lever_default,
+        enabled: mut prop_on,
+        arm_node: prop_arm,
+        barren_nodes: mut prop_barren,
+        feasibility_class: feas_class,
+        widen_nogoods: ng_box,
+        implication_class: impl_class,
+        implication_policy,
+        column_rows: prop_col_rows,
+        pruned: mut node_prop_pruned,
+    } = search_controls::propagation_state(search_controls::PropagationRequest {
+        model,
+        mode,
+        symmetry: sym.as_ref(),
+        root_lower: &root_lower,
+        root_upper: &root_upper,
+    });
+    let impl_on = implication_policy.enabled();
+    let search_controls::FixedChargeState {
+        mode: fc_mode,
+        continuous: fc_cont,
+    } = search_controls::fixed_charge_state(search_controls::FixedChargeRequest {
+        model,
+        integers: &ints,
+        root_lower: &root_lower,
+        root_upper: &root_upper,
+        column_rows: &prop_col_rows,
+        class: if fc_dense {
+            search_controls::FixedChargeClass::Dense
         } else {
-            (PROP_MAX_SWEEPS, PROP_MAX_QUEUE)
-        };
-        set_prop_caps(ds, dq);
-    }
-    let prop_col_rows: Vec<Vec<u32>> = if prop_on || impl_on {
-        let mut m2r: Vec<Vec<u32>> = vec![Vec::new(); model.num_cols()];
-        for r in 0..model.num_rows() {
-            let (coeffs, _, _) = model.row(Row(r as u32));
-            for &(c, _) in coeffs {
-                m2r[c as usize].push(r as u32);
-            }
-        }
-        m2r
-    } else {
-        Vec::new()
-    };
-    let mut node_prop_pruned = 0usize;
-    // FIXED-CHARGE-AWARE BRANCHING (AY_MILP_FC; measurement lever, default OFF).
-    // On a fixed-charge / routing model, a binary switch `y` (arc open) gates
-    // continuous flow via big-M rows (`flow - M*y <= 0`). Branching on the `y`
-    // that gates the MOST currently-carried flow splits the fractional flow
-    // decisively — a routing-specific rule, not generic most-fractional /
-    // pseudocost. SELECTION ONLY: this reorders branch candidates; both children
-    // still cover the node's box, every prune stays exactly adjudicated, and the
-    // branching direction is never touched. So it cannot change any verdict on
-    // any instance — it is gated behind an env var purely so the 13-prover
-    // trajectories stay byte-identical while we measure it on rout.
-    //
-    // `fc_cont[j]` = the continuous columns that share a row with binary column
-    // `j` (the flow it gates), deduped. Carried flow at a node is
-    // `Σ_c fc_cont[j] |x_c|` on the current LP point. Built once; every node box
-    // is a subset of the root so the adjacency never goes stale.
-    // AUTO-ARM mode 3 in the dense fixed-charge regime (`fc_dense`); env overrides.
-    // Mode 3 = pseudocost * (1 + gated-flow): keeps pseudocost's quality signal but
-    // breaks its ties toward the arc-open switch that actually splits the fractional
-    // routing flow, so both child bounds move instead of whack-a-moling one vertex of
-    // rout's degenerate optimal face. SELECTION ONLY -> can never change a verdict.
-    // B13: caller-layer mode (with_fc_mode, 0..=3, builder-validated); the
-    // never-set AY_MILP_FC env read is gone. No opinion keeps the fc_dense
-    // auto-arm.
-    let fc_mode: u8 = match crate::tune::count_opt(crate::tune::Knob::FcMode) {
-        Some(m @ 0..=3) => m as u8,
-        _ => {
-            if fc_dense {
-                3
-            } else {
-                0
-            }
-        }
-    };
-    let fc_cont: Vec<Vec<u32>> = if fc_mode != 0 {
-        // Column->rows adjacency (reuse prop's if present, else build local).
-        let owned;
-        let c2r: &[Vec<u32>] = if !prop_col_rows.is_empty() {
-            &prop_col_rows
-        } else {
-            let mut m2r: Vec<Vec<u32>> = vec![Vec::new(); model.num_cols()];
-            for r in 0..model.num_rows() {
-                let (coeffs, _, _) = model.row(Row(r as u32));
-                for &(c, _) in coeffs {
-                    m2r[c as usize].push(r as u32);
-                }
-            }
-            owned = m2r;
-            &owned
-        };
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); model.num_cols()];
-        let mut seen = vec![u32::MAX; model.num_cols()];
-        for &j in &ints {
-            let (l, u) = (root_lower[j], root_upper[j]);
-            let is_bin = model.col_kind(Col(j as u32)).is_integral() && l == 0.0 && u == 1.0;
-            if !is_bin {
-                continue;
-            }
-            for &r in &c2r[j] {
-                let (coeffs, _, _) = model.row(Row(r));
-                for &(c, _) in coeffs {
-                    if !model.col_kind(Col(c)).is_integral() && seen[c as usize] != j as u32 {
-                        seen[c as usize] = j as u32;
-                        adj[j].push(c);
-                    }
-                }
-            }
-        }
-        adj
-    } else {
-        Vec::new()
-    };
-    if fc_mode != 0 && crate::debug_flags::milp_debug_flags().trace {
-        let gated: usize = fc_cont.iter().filter(|v| !v.is_empty()).count();
-        let flows: usize = fc_cont.iter().map(|v| v.len()).sum();
-        eprintln!(
-            "--trace fixed-charge branching mode={fc_mode} (auto={fc_dense}): {gated} binaries gate {flows} flow-column couplings"
-        );
-    }
-    // Mine the implication table (license and caps at `ImplTable`). Runs once,
-    // before the tree, on the INITIAL root box — every node box is a subset of
-    // it for the whole run, so the table never goes stale. Count-capped only
-    // (never wall-clock: the table must be a function of the model alone or
-    // node counts stop being deterministic).
-    let impl_table: ImplTable = if impl_on {
-        let t = mine_implications(model, &prop_col_rows, &root_lower, &root_upper);
-        if crate::debug_flags::milp_debug_flags().trace {
-            let bin_tgts = t
-                .ents
-                .iter()
-                .filter(|&&(c, _, _)| {
-                    model.col_kind(Col(c)).is_integral()
-                        && root_lower[c as usize] == 0.0
-                        && root_upper[c as usize] <= 1.0
-                })
-                .count();
-            eprintln!(
-                "--trace implications: {} sources, {} entries ({} binary-target) mined",
-                t.srcs.len(),
-                t.ents.len(),
-                bin_tgts
-            );
-        }
-        t
-    } else {
-        ImplTable {
-            srcs: Vec::new(),
-            ents: Vec::new(),
-        }
-    };
-    let mut impl_fired = 0usize;
-    let mut impl_pruned = 0usize;
-    // Reused scratch for the joint fixpoint's changed-column dedupe.
-    let mut impl_changed: Vec<usize> = Vec::new();
-    let mut impl_seen: Vec<bool> = vec![false; model.num_cols()];
-    // OBJECTIVE-CUTOFF ROW propagation (license at `propagate_cutoff_row`):
-    // Implication-lane propagation is killable via `--no-impl-cut`; terms use minimize frame.
-    // `propagate_cutoff_row` self-gates off objectives denser than 64 terms
-    // (the row-propagation density rule).
-    let impl_cut_on =
-        impl_on && crate::tune::caller_flag(crate::tune::Knob::NoImplCut).map_or(true, |no| !no);
-    // Attribution kill for the TABLE pass alone (`--no-impl-tab`): the
-    // cutoff row keeps running, the mined implications do not fire.
-    let impl_tab_on = crate::tune::caller_flag(crate::tune::Knob::NoImplTab).map_or(true, |no| !no);
-    let obj_terms: Vec<(usize, f64)> = if impl_cut_on {
-        (0..lp.n)
-            .filter(|&j| lp.cost[j] != 0.0)
-            .map(|j| (j, lp.cost[j]))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    // Cutoff cache: (incumbent value as nearest-f64, rigorous outward cutoff).
-    let mut cut_cache: Option<(f64, f64)> = None;
-    let mut cutoff_prop_pruned = 0usize;
-    // Arming node for the joint fixpoint: the mixed-lever delay, overridable
-    // ONLY for the brute-force guard tests (whose trees never reach 1,024
-    // nodes; a guard whose device never fires is vacuous). Read once.
-    let impl_arm: usize =
-        crate::tune::count_opt(crate::tune::Knob::ImplArm).unwrap_or(MIXED_LEVER_ARM_NODES);
-    let mut stack: std::collections::BinaryHeap<Node> = std::collections::BinaryHeap::new();
-    // The PLUNGE stack. Best-bound alone is a disaster: it always walks to the weakest
-    // bound, which is the shallowest frontier, so it never reaches a LEAF — and with no
-    // leaf there is no better incumbent, with no incumbent there is no pruning, and with no
-    // pruning the open set explodes. Measured on 80 binaries: 731,000 nodes visited, ZERO
-    // leaves, 216 prunes, and 730,567 nodes sitting open in the heap.
-    //
-    // So: pick the node best-bound says is holding the proof open, then DIVE from it
-    // depth-first until it yields a leaf or dies. One child goes on the dive stack (the one
-    // the relaxation is leaning toward, which is where solutions live), the other into the
-    // heap. The dive supplies incumbents; the heap decides where to dive next.
-    let mut dive: Vec<Node> = Vec::new();
-    // The exact objective, in the minimize frame the search runs in.
-    let minimize_obj: Vec<(u32, Rational)> = {
-        let mut v: Vec<(u32, Rational)> = (0..lp.n)
-            .filter(|&j| lp.cost[j] != 0.0)
-            .filter_map(|j| exact(lp.cost[j]).map(|c| (j as u32, Rational::from_big(c))))
-            .collect();
-        v.sort_unstable_by_key(|&(c, _)| c);
-        v
-    };
-    // The GRANULARITY of the objective, when it has one: if every column carrying an objective
-    // coefficient is integral, then every integer point's objective is a multiple of the gcd of
-    // those coefficients. A subtree whose bound is 156.2 can then hold nothing better than the
-    // next multiple up, and a whole band of nodes the raw LP bound could not close shut at once.
-    //
-    // It is a GRANULARITY and not a yes/no "are they whole numbers", because the MPS reader may
-    // have scaled the model, and a scaled objective's coefficients are whole numbers divided by a
-    // power of two. That does not weaken the argument in the slightest -- it just means the step
-    // is 1/8 rather than 1 -- but asking "is it an integer" throws the prune away entirely.
-    // The integral-objective granule (from the cut model — cuts add no equality rows, so
-    // it is unaffected) OR, for a continuous single-column lattice bottleneck, the pre-cut
-    // granule. At most one is ever `Some` (the bottleneck gate requires a continuous sole
-    // objective column, which the integral path rejects), so `.or` is unambiguous.
-    let obj_gran = objective_granularity(model).or_else(|| bottleneck_gran.clone());
-    let gran_f: Option<f64> = obj_gran.as_ref().map(to_f64).filter(|g| *g > 0.0);
-    // THE FEASIBILITY-OBJECTIVE (y = 0) CLOSURE. Weak duality holds for ANY dual
-    // vector, including y = 0, where a node's bound degenerates to
-    // Σ_j min(c_j·x_j over the box) — no LP, no duals, exact. On an ALL-ZERO
-    // objective every term is exactly 0 whatever the box, so EVERY node of the
-    // tree is bounded below by exactly 0 — and 0 is also the exact value of any
-    // incumbent (the incumbent's value is computed over the same all-zero
-    // `lp.cost`), so the whole open set is fathomed the moment one lands: the
-    // prune below fires at `bound >= best`, i.e. at equality. Without this, the
-    // OPTIMAL claim on a feasibility MILP was structurally unreachable: float
-    // node bounds sit a rounding-dust epsilon BELOW zero (w5's journaled root
-    // bound was ≈ −6e-294 — near-zero dual dust through `safe_bound`'s error
-    // intervals, then converted losslessly to a ~309-digit-denominator
-    // rational), the all-zero objective has no granule to round the dust away
-    // with (`objective_granularity` returns None on a costless model), and
-    // `b >= best` misses by −ε forever. The journaled 7,316.5s w5 run ground
-    // 30–42M-entry node rebuilds and exact leaf re-certifications behind a
-    // long-verified incumbent and still shipped only FEASIBLE(sat) with a
-    // 6e-294 gap when the deadline hit. Scoped to the exactly-costless case on
-    // purpose: on a nonzero objective the y = 0 bound is the box-corner bound,
-    // which almost never prunes but would cost an exact-rational scan per
-    // solve (nested sub-solves included) — every model with a real objective
-    // solves byte-identically to a build without this flag.
-    let zero_objective = (0..lp.n).all(|j| lp.cost[j] == 0.0);
-    let mut unbounded = false;
-    let mut nodes = 0usize;
-    // Trace/accounting only: initial fixed-prefix regions actually admitted to
-    // the common node loop. A full first sweep reaches `2^k`; a short deadline
-    // may honestly report fewer. Restarts can revisit regions, so this is an
-    // entry count rather than a false uniqueness claim.
-    let mut shared_prefix_region_entries = 0usize;
-    // MEASUREMENT-ONLY node cap (load-invariant branching A/B). `with_max_nodes(N)`
-    // stops the tree after N processed nodes and returns the interrupted-but-valid
-    // Feasible/dual-bound outcome (identical exit path to the deadline stop, so the
-    // dual bound stays rigorous and no verdict is changed — an early stop can only
-    // withhold Optimal, never assert one). Unset in every normal solve.
-    let measure_node_cap: Option<usize> = crate::tune::count_opt(crate::tune::Knob::MaxNodes);
-    // AN EXTERNAL DUAL BOUND, DELIVERED AS A CUTOFF INSTEAD OF AS A ROW.
-    // `the dual-cutoff knob=<value>`, in THE MODEL'S OWN OBJECTIVE FRAME — the same units
-    // `Outcome::Optimal { value }` reports, offset included. That is NOT in general the frame
-    // of the file the model was read from: `read_mps` multiplies the objective by `obj_scale`
-    // to make its coefficients exactly representable, so a bound quoted from a file, a
-    // published optimum or another solver has to be mapped in (`examples/mps_solve.rs` does
-    // it, and getting it wrong made gt2 return "OPTIMAL 126223" against a true 21166).
-    // Measurement instrument, default-off, top-level tree only.
-    //
-    // WHY IT EXISTS. Handing ay Gurobi's own root bound AS A ROW (45 instances,
-    // control-armed) drove the median root deficit 5.046% -> 0.000% and still made the
-    // tree 1.720x BIGGER and proved 5 FEWER instances; the vacuous-row control (a bound
-    // exactly tight at ay's own root LP, so it binds and perturbs identically but carries
-    // no information) accounted for 1.209x of that on its own. A row changes the LP
-    // relaxation, hence which optimal VERTEX is reached, hence every branching decision
-    // downstream. So the row experiment could not separate the pruning power of a better
-    // bound from the perturbation of its delivery mechanism. This knob delivers the same
-    // number with no row: no LP is touched, no vertex moves, no branching decision changes.
-    //
-    // WHAT IT CAN DO, EXACTLY. Every node's subproblem is a RESTRICTION of the original,
-    // so node optimum >= global optimum >= L: flooring any node bound at L is valid. But
-    // the floor can only ever FIRE globally — the prune is `bound >= incumbent`, and
-    // L >= incumbent >= optimum >= L forces equality — so the entire content of an
-    // external dual bound, applied as a cutoff, is "stop the moment the incumbent reaches
-    // L". That is the one check in the node loop, and it fathoms the whole open set at
-    // once instead of popping it node by node to say the same thing.
-    //
-    // WHAT IT IS WORTH, MEASURED (the development design notes).
-    // With Gurobi's bound: 48 instances, 240s sequential — geomean 0.366x nodes over the 24
-    // both-proved, pooled 6,776,632 -> 1,290,882, NOT ONE tree bigger, +3 verdicts / -0. So
-    // the row form WAS confounded by its delivery: the same number costs 4.70x more nodes as
-    // a row than as a cutoff. But the whole gain splits on one line — bound == optimum:
-    // 0.221x over 16; bound < optimum: 1.0000x over 8, EXACTLY, every one (khb05250 13->13,
-    // mas76 909,442->909,442, pk1 357,727->357,727). The step function above is the reason,
-    // and it is why this is an instrument and not a feature: ay's OWN best reachable root
-    // bound — best of the default cut loop and AY_MILP_MIR_EXT_ROUNDS=50 — equals the
-    // optimum on 0 of 48 (median closure 2.07% against Gurobi's 42.44%), and injecting it
-    // here reproduces arm A's tree NODE-FOR-NODE on 14 of 14. gr4x6 closes 98.6% of its root
-    // gap and converts zero nodes. The last 1.4% is the entire value of the lane.
-    //
-    // ⚠ SOUNDNESS, AND THE ASYMMETRY WITH THE ROW FORM. An invalid row makes the LP
-    // INFEASIBLE — loud. An invalid cutoff silently deletes the optimum and ships a wrong
-    // OPTIMAL — quiet. Nothing here can validate L, so the guards are structural: off
-    // unless set, `depth == 0` only (a nested sub-MIP may carry a different objective
-    // frame entirely), never on a costless objective, and the capture is poisoned so no
-    // certificate is ever exported from a tree that was closed on someone else's number.
-    let dual_cutoff: Option<BigRational> = (mode.depth == 0 && !zero_objective)
-        .then(|| crate::tune::real_opt(crate::tune::Knob::DualCutoff))
-        .flatten()
-        .and_then(exact)
-        .map(|v| {
-            // Into the internal MINIMIZE frame with the offset stripped — the exact
-            // inverse of the `framed_tree_bound` map every reported bound goes out through.
-            let off = exact(model.objective_offset()).unwrap_or_else(BigRational::zero);
-            match sense {
-                Sense::Minimize => v - off,
-                Sense::Maximize => off - v,
-            }
-        });
-    // Selection-only symmetry controls are solve configuration, not mutable
-    // per-node state. Read them once so an external environment mutation cannot
-    // change the search policy halfway through a tree. A band of 0 keeps only
-    // score ties; 1 admits every nonnegative score. Invalid/non-finite values
-    // retain the measured default.
-    let sym_branch_on = crate::tune::caller_flag(crate::tune::Knob::SymBranch).unwrap_or(true);
-    let sym_branch_band =
-        symmetry_branch_band_setting(crate::tune::real_opt(crate::tune::Knob::SymBranchBand));
-    let mut elites = Elites::new();
-    // FARKAS BOX NO-GOODS (session-scale conflict learning). When a node is exactly
-    // proven empty by a Farkas ray, emptiness transfers to every SUBSET of the proven
-    // box (monotone under shrinking), so each no-good stores the deviating bounds
-    // `(col, lo, up)` of a rigorously-closed box and prunes any node whose own bounds
-    // sit inside all of them (see `farkas_conflict_box` for the license and the greedy
-    // widening). On MIXED models (`prop_on`) the box is greedily widened toward the
-    // root, so one conflict fathoms whole families of siblings; on pure-binary models
-    // the stored boxes are exactly the historical fixing sets (branching on a 0/1 box
-    // fixes the column, and the widening is gated off), so the check — subset ⟺
-    // equality for a `(v, v)` entry — reproduces the old path bit-identically.
-    // No LP rows are touched (adding rows mid-tree is the measured warm-start
-    // landmine), so this buys node-count only.
-    let mut nogoods: Vec<Vec<(usize, f64, f64)>> = Vec::new();
-    let mut ng_pruned = 0usize;
-    let mut ng_skipped_long = 0usize;
-    // Diagnostics only (trace line): wall spent in the subset scan.
-    let mut ng_check_time = Duration::ZERO;
-    // Admission-time subsumption (mixed store only; see the store site).
-    // `AY_MILP_NG_SUB=0` kills. `ng_gen` mirrors `nogoods` with admission
-    // stamps so oldest-eviction survives removals.
-    let ng_sub = true; // B22: retired; admission subsumption stays on.
-    let mut ng_gen: Vec<u64> = Vec::new();
-    let mut ng_next_gen: u64 = 0;
-    let mut ng_sub_dropped = 0usize;
-    let mut ng_sub_removed = 0usize;
-    // Per-box tag, parallel to `nogoods` (see `ng_admit` / `NG_TAG_*`): who
-    // proved the box and what it claims. Read ONLY at admission
-    // (license-aware subsumption + the propagation slot budget); every firing
-    // consumer was audited safe under the weaker bound license (block comment
-    // at `PC_MAX_DEVS`).
-    let mut ng_lic: Vec<u8> = Vec::new();
-    // Per-box ACTIVITY, parallel to `nogoods` (bumped at the check sites on
-    // fire/unit-fix, consumed only by the class-budget eviction in
-    // `ng_admit` — see `lb_act_on`/`pc_act_on`).
-    let mut ng_act: Vec<u32> = Vec::new();
-    // Detailed design and measurements: see `bab/incoming_feature_history.md`.
-    let ng_up = match crate::tune::caller_flag(crate::tune::Knob::NgUp) {
-        Some(forced) => forced,
-        None => ng_box && (lp.tall_lu() || impl_class || feas_class),
-    };
-    let mut ng_up_fixed = 0usize;
-    let mut ng_up_pruned = 0usize;
-    // Diagnostics: which stored lengths actually FIRE (prune) or UNIT-FIX,
-    // bucketed as the stored-length histogram — the admission economics.
-    let mut ng_fire_len = [0usize; 5];
-    let mut ng_fix_len = [0usize; 5];
-    // NOGOOD-GUIDED BRANCHING TIE-BREAK (Lever B; `--ng-branch-pct`).
-    // During the UP scan, a column open in a 2-OPEN nogood is one branch away
-    // from a unit fire: branching it makes the entry hold in one child and the
-    // surviving open entry fires there. The per-node 2-open counts act as a
-    // VSIDS-shaped SECONDARY key at the branch pick: among candidates whose
-    // pseudocost score is within `band` of the chosen pick's, the highest
-    // 2-open count wins. COLUMN CHOICE ONLY — branching DIRECTION is never
-    // touched (the journaled landmine: every deterministic direction
-    // preference destroyed ladder proofs), and the gate rides `ng_up` — the
-    // tall-LU class plus, now, `feas_class`, so every ladder/corpus trajectory
-    // with a real objective is still byte-identical.
-    // `--ng-branch-pct` kills, `=<pct>` overrides the band.
-    let ng_branch_band: f64 = match crate::tune::real_opt(crate::tune::Knob::NgBranchPct) {
-        Some(p) => p / 100.0,
-        None if ng_up => 0.25,
-        None => 0.0,
-    };
-    let mut ng2_cnt: Vec<u32> = Vec::new(); // sized lazily at first use (n+m)
-    let mut ng2_touch: Vec<usize> = Vec::new();
-    // #vsids conflict-driven branching. Per-column activity, bumped when a column
-    // is named in a Farkas/propagation CONFLICT, decayed periodically; branch on
-    // the highest activity. SOUND: branching only changes the tree/path, never the
-    // verdict (every bound is re-verified exactly). Sized lazily (n+m) at the
-    // first bump.
-    //
-    // DEFAULT-ON FOR `feas_class` ONLY, and the sentence that used to describe
-    // this lever's regime is the reason: it is "active only when
-    // incumbent.is_none() — the no-incumbent UNSAT decision-MIP regime where the
-    // constant objective makes pseudocost gains ~0 and the pick degenerates to
-    // most-fractional". That regime IS the objective-≡0 feasibility class: a
-    // constant objective is what `feas_class` tests for, and on the UNSAT half of
-    // the class no incumbent ever exists, so the runtime guard at the pick site
-    // never turns it off. Off-class the default is unchanged (off) — a model with
-    // a real objective has real pseudocost gains and this key would displace them.
-    // `--vsids` is the off arm, any other value forces it on everywhere.
-    let vsids_on = crate::tune::caller_flag(crate::tune::Knob::Vsids).unwrap_or(feas_class);
-    let mut vsids: Vec<f64> = Vec::new();
-    let mut ng_branch_switched = 0usize;
-    // PROPAGATION-CONFLICT LEARNING (the named lever; license + design at
-    // `PC_MAX_DEVS`). Default-on exactly where the joint fixpoint's prune
-    // sites exist (`impl_on` — the implication class); every other model has
-    // no propagation-prune sites armed and stays byte-identical.
-    // `with_prop_conflict(false)` kills, `true` forces the learner even
-    // where the implication lane is off (measurement lever: the entry-prop
-    // prune site still learns there).
-    //
-    // `feas_class` joins the default, and the "measurement lever" clause above is
-    // exactly the argument: the ENTRY-PROP prune site learns without any
-    // implication lane, and on an objective-≡0 decision MILP that site is where
-    // essentially every fathom happens, because a fathom cannot come from a dual
-    // bound that is permanently 0. Learning nothing there is learning nothing at all.
-    let pc_on = match crate::tune::caller_flag(crate::tune::Knob::PropConflict) {
-        Some(forced) => forced,
-        None => impl_on || feas_class,
-    };
-    // Flood control (measured; journaled at `NG_TAG_FARKAS`): propagation
-    // boxes are admitted only up to `pc_len_cap` entries long (short boxes
-    // are the ones that transfer; long ones are path descriptions that bill
-    // the UP scan forever) and only into `pc_cap` slots of the store.
-    // `AY_MILP_PC_LEN` / `AY_MILP_PC_CAP` override for A/B.
-    let pc_len_cap: usize = 8;
-    // Default 128, measured on noswot (60s wall, 3+ samples per point): the
-    // response is NON-MONOTONE with a cliff — 64/96 lose the proof outright
-    // (@60s dual −42; replacement churn evicts the boxes carrying the drain),
-    // 128 proves in 34.2-34.4s, 192/256/512 in 40-41s. LANDMINE: do not
-    // "safely" shrink this below 128.
-    let pc_cap: usize = 128;
-    // LP-BOUND CONFLICT LEARNING (the named lever; license + certificate
-    // walk at `bound_conflict_box`): a node pruned by `bound >= best` learns
-    // a transfer box from its own Neumaier-Shcherbina certificate.
-    //
-    // DEFAULT OFF — the lever is a MEASURED MISS on every corpus anatomy
-    // (2026-07-18, same-box back-to-back A/B, license machinery all sound:
-    // 0 failed final checks across ~30k licensed boxes):
-    //   * rout: bound prunes are structurally RARE at 60s (26-39 learnable
-    //     events; the frontier sits 27 units below the incumbent, and a
-    //     bound-licensed box can never say anything below the incumbent —
-    //     the plateau is LP-throughput-bound, not prune-starved);
-    //   * noswot: 252k learnable events, 16k admissions — the boxes' UP
-    //     fixes (4.7M) reshape the knife-edge pc/impl tree and the proof
-    //     went 34s -> 65s (redundant with the cutoff row's own propagation,
-    //     at store-churn prices; class-respecting subsumption alone did not
-    //     save it);
-    //   * mas76 forced: the boxes FIRE (9.9k subset prunes) and the tree
-    //     still GREW 656k -> 995k nodes / 16.2s -> 24s (with the ng-fire
-    //     pseudocost feed; 28s without): the subset prune saves a cheap
-    //     warm LP and costs the brancher its gain signal;
-    //   * pk1 forced: 16.6s -> 17.9s; misc07 forced: neutral; ACAS: no
-    //     incumbent ever exists on the UNSAT trees, the lever cannot arm.
-    // `with_lb_conflict(1)` enables it on the mixed-store class
-    // (`ng_box`), `=2`/`force` everywhere (measurement levers for future
-    // anatomies — e.g. a model whose bound prunes gate DEEP subtrees behind
-    // cheap certificates); `with_lb_arm` overrides the arming node.
-    let lb_on = match crate::tune::count_opt(crate::tune::Knob::LbConflict) {
-        Some(1) => ng_box,
-        Some(2) => true,
-        _ => false,
-    };
-    let lb_arm: usize =
-        crate::tune::count_opt(crate::tune::Knob::LbArm).unwrap_or(MIXED_LEVER_ARM_NODES);
-    // Flood control (the propagation lever's run-killing lesson, and this
-    // class arrives at bound-prune rate — the highest-rate learn site in the
-    // engine): own slot budget (a compiled constant), own admit length
-    // (a compiled constant), STRICT admission by default (`with_lb_strict(false)`
-    // admits unrelaxed boxes for A/B — an unrelaxed box is the node's own
-    // path: it covers only the just-pruned subtree, can never fire again,
-    // and bills the check scan forever), and activity/age hybrid eviction
-    // within the class (`lb_act_on`).
-    // B18: compiled constants (the LB length/cap env overrides nothing set
-    // are retired; both size live-in-test code under passing soundness
-    // regression tests).
-    const LB_MAX_LEN: usize = 8;
-    const LB_CAP: usize = 128;
-    let lb_len_cap: usize = LB_MAX_LEN;
-    let lb_cap: usize = LB_CAP;
-    let lb_strict = crate::tune::caller_flag(crate::tune::Knob::LbStrict).unwrap_or(true);
-    let mut lb_attempts = 0usize;
-    let mut lb_stored = 0usize;
-    let mut lb_relaxed = 0usize;
-    let mut lb_unrelaxed = 0usize;
-    let mut lb_failed = 0usize;
-    let mut lb_long = 0usize;
-    let mut lb_time = Duration::ZERO;
-    let mut pc_scratch: Option<PcScratch> = pc_on.then(|| PcScratch::new(lp.n));
-    let mut pc_attempts = 0usize;
-    let mut pc_stored = 0usize;
-    let mut pc_stored_bound = 0usize;
-    let mut pc_minimized = 0usize;
-    let mut pc_failed = 0usize;
-    let mut pc_long = 0usize;
-    let mut pc_time = Duration::ZERO;
-    // Next slot the mixed store overwrites once full (the recency ring at the
-    // store site; the pure-binary path never reads this).
-    let mut ng_ring = 0usize;
-    const NOGOOD_MAX_LEN: usize = 16;
-    const NOGOOD_CAP: usize = 256;
-    // The mixed-model tier: minimized conflicts are short (the greedy keeps only the
-    // bounds the certificate leans on), so the length cap can afford to be looser, and
-    // the store deeper — the check short-circuits on the first non-matching entry, so
-    // its per-node price stays a few comparisons per stored conflict.
-    const NOGOOD_MAX_LEN_MIXED: usize = 32;
-    const NOGOOD_CAP_MIXED: usize = 1024;
-    // The TALL-CLASS tier (`lp.tall_lu()`, the same floor that scopes node-prop
-    // retirement and the warm-dual bypass: every ladder/corpus instance sits
-    // below it). On the ACAS diff-leaf enumeration trees the 1,024/32 store is
-    // the measured binding constraint — pinned at cap with 10,085 conflicts
-    // skipped as too long in the 900s journal run — while the class is
-    // memory-cheap (2.4K cols) and, with unit propagation writing ~9 extra
-    // fixings into every leaf box, conflict supports are structurally longer.
-    // Deeper + looser admits everything the greedy produces (skipped-long -> 0
-    // at 96) for ~0.2s of scan per 60s. Corpus regimes keep 1,024/32 verbatim.
-    const NOGOOD_MAX_LEN_TALL: usize = 96;
-    const NOGOOD_CAP_TALL: usize = 8_192;
-    let (ng_max_len, ng_cap) = if ng_box {
-        let tall = lp.tall_lu();
-        // Measurement overrides (A/B levers, default = shipped constants):
-        // `AY_MILP_NG_CAP=<n>` ring capacity, `AY_MILP_NG_LEN=<n>` admit length.
-        // B25: the A/B lever envs are retired; the shipped class constants
-        // are the values.
-        let cap = if tall {
-            NOGOOD_CAP_TALL
-        } else {
-            NOGOOD_CAP_MIXED
-        };
-        let len = if tall {
-            NOGOOD_MAX_LEN_TALL
-        } else {
-            NOGOOD_MAX_LEN_MIXED
-        };
-        (len, cap)
-    } else {
-        (NOGOOD_MAX_LEN, NOGOOD_CAP)
-    };
+            search_controls::FixedChargeClass::Ordinary
+        },
+    });
+    let search_controls::ImplicationState {
+        table: impl_table,
+        fired: mut impl_fired,
+        pruned: mut impl_pruned,
+        changed: mut impl_changed,
+        seen: mut impl_seen,
+        cutoff_enabled: impl_cut_on,
+        table_enabled: impl_tab_on,
+        objective_terms: obj_terms,
+        cutoff_cache: mut cut_cache,
+        cutoff_pruned: mut cutoff_prop_pruned,
+        arm_node: impl_arm,
+    } = search_controls::implication_state(search_controls::ImplicationRequest {
+        model,
+        lp: &lp,
+        root_lower: &root_lower,
+        root_upper: &root_upper,
+        column_rows: &prop_col_rows,
+        policy: implication_policy,
+    });
+    let search_runtime::FrontierState {
+        heap: mut stack,
+        mut dive,
+        minimize_objective: minimize_obj,
+        objective_granularity: obj_gran,
+        granularity_float: gran_f,
+        zero_objective,
+        mut unbounded,
+        mut nodes,
+        shared_prefix_entries: mut shared_prefix_region_entries,
+        measurement_node_cap: measure_node_cap,
+        dual_cutoff,
+        symmetry_branch: sym_branch_on,
+        symmetry_branch_band: sym_branch_band,
+    } = search_runtime::frontier_state(search_runtime::FrontierRequest {
+        model,
+        lp: &lp,
+        mode,
+        sense,
+        bottleneck_granularity: bottleneck_gran.as_ref(),
+    });
+    let ng_sub = true;
+    let search_runtime::NogoodState {
+        boxes: mut nogoods,
+        pruned: mut ng_pruned,
+        skipped_long: mut ng_skipped_long,
+        check_time: mut ng_check_time,
+        generations: mut ng_gen,
+        next_generation: mut ng_next_gen,
+        subsumed_dropped: mut ng_sub_dropped,
+        subsumed_removed: mut ng_sub_removed,
+        licenses: mut ng_lic,
+        activity: mut ng_act,
+        upward_enabled: ng_up,
+        upward_fixed: mut ng_up_fixed,
+        upward_pruned: mut ng_up_pruned,
+        fire_lengths: mut ng_fire_len,
+        fix_lengths: mut ng_fix_len,
+        branch_band: ng_branch_band,
+        two_open_counts: mut ng2_cnt,
+        two_open_touched: mut ng2_touch,
+        vsids_enabled: vsids_on,
+        mut vsids,
+        branch_switched: mut ng_branch_switched,
+        ring: mut ng_ring,
+        max_len: ng_max_len,
+        capacity: ng_cap,
+    } = search_runtime::nogood_state(search_runtime::NogoodRequest {
+        lp: &lp,
+        widen_boxes: ng_box,
+        implication_class: impl_class,
+        feasibility_class: feas_class,
+    });
+    let search_runtime::LearnerState {
+        propagation_len_cap: pc_len_cap,
+        propagation_capacity: pc_cap,
+        lower_bound_enabled: lb_on,
+        lower_bound_arm: lb_arm,
+        lower_bound_len_cap: lb_len_cap,
+        lower_bound_capacity: lb_cap,
+        lower_bound_strict: lb_strict,
+        lower_bound_attempts: mut lb_attempts,
+        lower_bound_stored: mut lb_stored,
+        lower_bound_relaxed: mut lb_relaxed,
+        lower_bound_unrelaxed: mut lb_unrelaxed,
+        lower_bound_failed: mut lb_failed,
+        lower_bound_long: mut lb_long,
+        lower_bound_time: mut lb_time,
+        propagation_scratch: mut pc_scratch,
+        propagation_attempts: mut pc_attempts,
+        propagation_stored: mut pc_stored,
+        propagation_stored_bound: mut pc_stored_bound,
+        propagation_minimized: mut pc_minimized,
+        propagation_failed: mut pc_failed,
+        propagation_long: mut pc_long,
+        propagation_time: mut pc_time,
+    } = search_runtime::learner_state(search_runtime::LearnerRequest {
+        lp: &lp,
+        widen_boxes: ng_box,
+        implications_enabled: impl_on,
+        feasibility_class: feas_class,
+    });
     // Consecutive improvement-free RINS rounds — the neighbourhood ladder's rung.
     let mut rins_stall: u64 = 0;
     // Consecutive RINS pulls taken with NO NEW INFORMATION — the wide-gap dry-ladder
@@ -24277,7 +23070,6 @@ fn solve_milp_in_impl(
     // ball that improves sets ball_wins and disarms the verdict for good.
     let mut ball_attempts: u32 = 0;
     let mut ball_wins: u32 = 0;
-    const BALL_USELESS_MIN: u32 = 3;
     // Evaluated ONCE (an env read per rins round would be pure overhead, and on a proof
     // instance the ladder fires thousands of times).
     let knap_verdict_on = knap_dry_verdict();
@@ -24343,1086 +23135,115 @@ fn solve_milp_in_impl(
     let mem_budget = opts.memory_budget;
     let trace = crate::debug_flags::milp_debug_flags().trace;
     if trace {
-        if let (Some(_), Some((_, reserve, floor))) = (margin_proof_target, reserve_params) {
+        if let (Some(_), Some(plan)) = (margin_proof_target, reserve_params) {
             eprintln!(
                 "--trace finalize-reserve: marked-margin prefix keeps \
                  full replay reserve {:.3}s (floor {:.3}s)",
-                reserve.as_secs_f64(),
-                floor.as_secs_f64()
+                plan.duration.as_secs_f64(),
+                plan.search_floor.as_secs_f64()
             );
         }
     }
 
-    // Seed an incumbent from the root relaxation before branching, so the very
-    // first bound has something to be compared against.
-    //
-    // The root solve is kept: reduced-cost fixing is re-run against it every time the incumbent
-    // improves, and it needs the root's duals and basis to do that.
-    let _t_root = Instant::now();
+    let root_primal_policy = root_search::RootPrimalPolicy {
+        market: if ms_shape {
+            root_search::RootMarketPolicy::Split
+        } else {
+            root_search::RootMarketPolicy::General
+        },
+        suite: if proof_first_prefix {
+            root_search::RootSuitePolicy::ProofFirstPrefix
+        } else {
+            root_search::RootSuitePolicy::Enabled
+        },
+    };
+    let root_trace = if trace {
+        root_search::RootTrace::Enabled
+    } else {
+        root_search::RootTrace::Disabled
+    };
+    let root_execution_policy = root_search::RootExecutionPolicy {
+        scope: if mode.depth == 0 {
+            root_search::RootScope::TopLevel
+        } else {
+            root_search::RootScope::Nested
+        },
+        cost: if mode.cheap {
+            root_search::RootCostProfile::Cheap
+        } else {
+            root_search::RootCostProfile::Full
+        },
+        projection: if mode.projected {
+            root_search::RootProjection::Projected
+        } else {
+            root_search::RootProjection::Original
+        },
+    };
     #[cfg(test)]
     if !shared_binary_prefix.is_empty() && mode.depth == 0 && !mode.cheap && !mode.projected {
-        SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::local_census::add_usize(&SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL, 1);
     }
-    // Iteration ledger (`--iter-ledger`): the initial cold root LP.
-    let _root_lp_work_before = crate::simplex::stats::solve_work();
-    let root = {
-        let _ledger = crate::simplex::PhaseScope::new(crate::simplex::PH_ROOT_LP);
-        lp.solve_bounded(&lp.lower.clone(), &lp.upper.clone(), None, deadline)
+    let root = match root_search::prepare_root_search(root_search::RootSearchRequest {
+        frame: root_search::RootSolveFrame {
+            caller_model,
+            model,
+            lp: &lp,
+            integer_columns: &ints,
+            minimize_objective: &minimize_obj,
+            sense,
+            deadline,
+            work_started: _t_pre,
+        },
+        state: root_search::RootPrimalState {
+            root_lower: &mut root_lower,
+            root_upper: &mut root_upper,
+            open_continuous: &conts_open,
+            open_continuous_sides: &mut cont_open_sides,
+            symmetry: &mut sym,
+            incumbent: &mut incumbent,
+            next_rins: &mut next_rins,
+        },
+        policy: root_search::RootSearchPolicy {
+            execution: root_execution_policy,
+            primal: root_primal_policy,
+            trace: root_trace,
+        },
+    }) {
+        Ok(root) => root,
+        Err(limit) => return limit.into_outcome(),
     };
-    // THE ROOT LP IN ITERATIONS — the deterministic twin of `root_lp` below, and the unit
-    // `pump_iter_cap` is denominated in. Unlike the wall reading this is identical on a busy
-    // box and an idle one, which is what makes the pump's spend reproducible.
-    let root_lp_iters = crate::simplex::stats::solve_work().saturating_sub(_root_lp_work_before);
-    // OBSERVED ROOT WORK — presolve + root cut rounds + the root LP solve, i.e. everything the
-    // solver has actually PAID on this model before a single heuristic runs. It is the cheapest
-    // difficulty proxy available at the root and the only one that is a property of the MODEL
-    // rather than of the caller's time limit. Traced so the budget question can be audited.
-    let root_work = _t_pre.elapsed();
-    // THE ROOT LP ALONE — the pump's dimensionally correct unit (see `PUMP_WORK_MULT`). Taken
-    // here, immediately after the `root` binding, so it excludes everything downstream and,
-    // unlike `root_work`, contains no term budgeted from the caller's deadline.
-    let root_lp = _t_root.elapsed();
-    {
-        // (The timer used to START here — after the solve — so every trace read
-        // "root LP in 0.00s" while the solve itself cost minutes at w5 scale.)
-        if trace {
-            eprintln!(
-                "--trace root LP: {:?} in {:.2}s bound={:.6} (mat/rhs/cost scale = {:?})",
-                root.status,
-                _t_root.elapsed().as_secs_f64(),
-                (0..lp.n).map(|j| lp.cost[j] * root.values[j]).sum::<f64>(),
-                lp.scale_for_trace()
-            );
-            eprintln!(
-                "--trace root work (presolve+cuts+root LP) = {:.2}s",
-                root_work.as_secs_f64()
-            );
-        }
-        // ROOT MEMORY DECLINE: the root LP's factorization would have exhausted
-        // memory (fill over `the lu-max-fill-nnz knob`). Give up gracefully
-        // BEFORE building the tree — the whole point of the lever is to ATTEMPT
-        // a huge NN-verification MILP and report `Unknown{MemoryLimit}` rather
-        // than crash the box. (Interior-node declines need no special case: the
-        // pervasive `!= Optimal` / `_ => None` handling already treats them as
-        // undisproved-and-unbounded, i.e. like `Stopped` — fail-closed.)
-        if root.status == SimplexStatus::OutOfMemory {
-            return Outcome::Unknown {
-                reason: UnknownReason::MemoryLimit,
-            };
-        }
-        if root.status == SimplexStatus::Optimal {
-            // Dive first; fall back to the crude rounding if the dive runs aground.
-            // The pump first: it reaches a feasible point on the models a dive cannot. Run it
-            // SEVERAL times — it is a randomised search and where it lands depends entirely on
-            // where its perturbations threw it, so one run is one sample. Each landing is then
-            // climbed greedily and the best kept. Fall back to the dive, then to a rounding.
-            //
-            // THE HEURISTICS GET A SLICE OF THE CLOCK, NOT ALL OF IT. Each of the twelve pump
-            // restarts is a sequence of LP solves, and it was handed the caller's whole deadline;
-            // on air03 (10,757 columns) a single restart swallowed the entire budget and the tree
-            // got exactly ONE node. A heuristic that spends the whole limit and hands back nothing
-            // is worse than no heuristic at all, because the search it starved would at least have
-            // been searching.
-            let share = crate::tune::real_opt(crate::tune::Knob::HeurShare)
-                // Market-split: the DFS leaf descent finds the incumbents (16->15->14->12->11
-                // on pk1) and every pump/RINS second is a tree second lost — measured 24.3s
-                // with the ladder vs 21.1s without.
-                .unwrap_or(if ms_shape { 0.0 } else { ROOT_HEURISTIC_SHARE });
-            let heur_deadline = deadline.map(|d| {
-                let now = Instant::now();
-                let left = d.saturating_duration_since(now);
-                now + left.mul_f64(share)
-            });
-            // AND THE PUMP GETS A SLICE OF *THAT*, NOT ALL OF IT.
-            //
-            // The pump runs first and the dive is its fallback -- and a fallback that is never
-            // reached is not a fallback. The pump took the WHOLE heuristic budget, so on a model it
-            // cannot crack it spent every millisecond and returned nothing, and the dive was then
-            // called with a deadline already in the past and died on its first LP ("dive died at
-            // step 0: Stopped", 3 iterations, 0.01s). air05 -- pure set partitioning, 426 equality
-            // rows, 7,195 binaries -- found NO feasible point at 20s, at 60s, or at 120s, and that
-            // is why: the heuristic that might have found one never ran.
-            //
-            // AND THAT SLICE IS CAPPED IN THE MODEL'S OWN UNITS. The share above is denominated
-            // in the CALLER'S REMAINING WALL and in nothing about the model, so at a 120s limit
-            // it hands out 21.6s of pump allowance to a model whose whole heuristic appetite is
-            // under a second — and the phase treats a budget as a TARGET, spending it ~1:1 until
-            // the model's appetite runs out. `pump_window` caps it at `PUMP_WORK_MULT x root_lp`
-            // (see that constant for the measurements). It is a `min`, so it can never grant more
-            // than before; and while nothing has EVER landed the floor is the barren gate's own
-            // allowance, so the air05 first-point exemption survives intact.
-            // B6: the AY_MILP_PUMP_BARREN_MULT env override is deleted.
-            let barren_mult = PUMP_BARREN_MULT;
-            // Both deadlines are anchored at the SAME instant, so they differ only in their floor.
-            let pump_anchor = Instant::now();
-            let pump_deadline_for = |floor_secs: f64| {
-                heur_deadline.map(|d| {
-                    pump_anchor
-                        + pump_window(
-                            root_lp,
-                            d.saturating_duration_since(pump_anchor),
-                            floor_secs,
-                        )
-                })
-            };
-            let pump_deadline_landed = pump_deadline_for(PUMP_FLOOR_SECS);
-            let pump_deadline_virgin = pump_deadline_for(barren_mult * HEUR_STALL_SECS);
-            let heur_expired = |landed: bool| {
-                let d = if landed {
-                    pump_deadline_landed
-                } else {
-                    pump_deadline_virgin
-                };
-                d.is_some_and(|d| Instant::now() >= d)
-            };
-            let _t_heur = Instant::now();
-            let mut seed: Option<Vec<BigRational>> = None;
-            let mut seed_val: Option<BigRational> = None;
-            // Inside a RENS sub-search the pump is exactly the algorithm that already failed on the
-            // full model; that budget belongs to the branching. Inside a RINS face it is nearly free
-            // (most columns are pinned) and it was the old RINS's whole search -- the nested tree is
-            // here to beat it, not to forgo it.
-            // A PROJECTED re-solve arrives seeded with its parent tree's post-leaf incumbent;
-            // the root suite re-sampling from a fresh root LP was measured to land WORSE than
-            // that seed on every observed restart (nw04, air03), at ~1s a restart. The RINS
-            // cadence pulls and root reduced-cost fixing below still run — they are the
-            // productive devices on a projected model.
-            let skip_root_suite = proof_first_prefix || (mode.projected && incumbent.is_some());
-            // THE PUMP NEVER LANDS ON WIDE-TALL SET PARTITIONING — measured on air05 at every
-            // budget (20s/60s/120s: zero landings, ever — see the block comment above; at a 130s
-            // run two failed attempts burned 20.1s before the constructor cracked the cover in
-            // 0.2s). Rounding a fractional exact-cover vertex breaks dozens of `Σx = 1` rows at
-            // once and the pump's projection cannot repair them; the CONSTRUCTOR below is the
-            // device for this class. So hand it the pump's share outright. The gate is the same
-            // structure test the LNS runs (partition incidence, tolerant of admitted cut rows)
-            // on the same wide-tall floor as the eager-perturb/cold-dual bundle — air03 (124
-            // partition rows) and nw04 (36) sit below it and keep their measured pump paths.
-            let wide_tall_sp = || {
-                model.num_cols() >= 10 * model.num_rows()
-                    && model.num_rows() >= 200
-                    && set_partition_incidence(model).is_some_and(|sp| sp.sp_rows >= 200)
-            };
-            // `--pump-restarts` overrides the allowance outright (0 skips
-            // the pump): on the cifar100 windows the pump has never landed once
-            // (w2 and w5, every measured run) while a single w5 attempt costs
-            // 655–939s — budget the terminal salvage/refinement chain needs.
-            let pump_env: Option<usize> = crate::tune::count_opt(crate::tune::Knob::PumpRestarts);
-            let pump_restarts = if let Some(n) = pump_env {
-                n
-            } else if in_rens() || skip_root_suite {
-                0
-            } else if mode.cheap {
-                4
-            } else if wide_tall_sp() {
-                0
-            } else {
-                PUMP_RESTARTS
-            };
-            // Stop restarting when the lottery goes cold: three consecutive LANDINGS that
-            // beat nothing mean the pump has shown its basin. Failed attempts do not count
-            // — failures cluster in the early perturbations, and charging them the
-            // allowance had a 70x52 root seed out at -33 where the full suite reaches
-            // -240. On small instances this still halves the root suite; where restarts
-            // keep improving it spends the full allowance exactly as before.
-            //
-            // AND STOP ON THE STALL CLOCK. The landing counter is blind to what a restart
-            // COSTS: on air03 each one is ~2s of wide-LP solves, so "three fruitless
-            // landings" is 6.3s of a share the tree wanted back (see `HEUR_STALL_SECS`).
-            // Once a landing exists, `last_gain` dates the newest strictly-better one; a
-            // running attempt inherits it as a deadline so a restart cannot outlive the
-            // stall it is already in. Before the first landing the STALL clock cannot bind
-            // (there is nothing to be stale relative to) — that is the air03 hole, where the
-            // one and only attempt ran to `pump_deadline` and nothing else. It is now bounded
-            // by `pump_deadline_virgin`, the work cap floored at the barren gate's allowance.
-            let mut pump_stale = 0usize;
-            let mut last_gain: Option<Instant> = None;
-            let mut prev_attempt = Duration::ZERO;
-            let mut expensive_fails = 0usize;
-            // Cumulative spend on FAILED attempts while nothing has EVER landed.
-            // The stall clock only arms after a landing and the per-attempt cost
-            // gate needs one failure >= 4x the stall — a lottery of ~1.5s
-            // failures on a model with no feasible point (the UNSAT regime:
-            // ACAS diff leaves) slipped between the two and ran all its
-            // restarts (7 x 1.44s = 10.1s of a 60s budget finding nothing).
-            // Once the failures alone have cost 4x the stall clock with no
-            // landing at all, the basin has spoken. On models where the pump
-            // lands (the ladder, the corpus feasibility instances) the counter
-            // resets on the first landing path and this gate never fires;
-            // milliseconds-scale failures never accumulate to it either.
-            let mut failed_spend = Duration::ZERO;
-            let stall = Duration::from_secs_f64(HEUR_STALL_SECS);
-            // STUCK-PROGRESS give-up (catches the CHEAP-failure never-land class the wall-clock
-            // barren gate misses — misc07: 0.06s/restart, never reaches the barren time). Tracks the
-            // smallest integer-infeasibility any restart reached: a pump PROGRESSING toward a (maybe
-            // late) landing drives it down; a STUCK pump plateaus. `frac_stale` consecutive restarts
-            // with no MATERIAL (>1%) improvement, and nothing ever landed, means the basin is dry.
-            let frac_stale_limit = PUMP_FRAC_STALE;
-            let mut frac_stale = 0usize;
-            let mut best_frac_global = f64::INFINITY;
-            // THE WORK-DENOMINATED CEILING uses `pump_iteration_budget::PUMP_ITER_MULT`. Read at
-            // every restart, so attempt 0 runs and the pump keeps its first-point search
-            // and the DIVE keeps its fallback, which the wall-clock window did not deliver
-            // because on a small model its floor granted 10-70 root-LP-equivalents.
-            let pump_iter_budget = pump_iter_cap(root_lp_iters);
-            let pump_work_start = crate::simplex::stats::solve_work();
-            let pump_spent = || crate::simplex::stats::solve_work() - pump_work_start;
-            for attempt in 0..pump_restarts {
-                let stalled = last_gain.is_some_and(|t| t.elapsed() >= stall);
-                let barren = last_gain.is_none()
-                    && seed_val.is_none()
-                    && failed_spend.as_secs_f64() >= barren_mult * HEUR_STALL_SECS;
-                let frac_stuck = seed_val.is_none() && frac_stale >= frac_stale_limit;
-                let out_of_work = pump_iter_budget.is_some_and(|cap| pump_spent() >= cap);
-                if out_of_work && trace {
-                    eprintln!(
-                        "--trace   pump work cap: {} iters spent >= {} ({:.1}x root LP {root_lp_iters}) at attempt {attempt}",
-                        pump_spent(),
-                        pump_iter_budget.unwrap_or(0),
-                        pump_iter_budget.unwrap_or(0) as f64 / (root_lp_iters.max(1)) as f64,
-                    );
-                }
-                if heur_expired(last_gain.is_some())
-                    || pump_stale >= 3
-                    || stalled
-                    || barren
-                    || frac_stuck
-                    || out_of_work
-                {
-                    break;
-                }
-                // A restart priced above the grace it has left cannot LAND inside it — the
-                // attempt deadline below would cut it mid-flight and the truncated LP work
-                // is pure burn (air03: 0.75s of wide-LP solves for a guaranteed nothing).
-                // The price of a restart is what the previous one cost; before the first
-                // landing nothing is projected, exactly as nothing is capped.
-                if let Some(t) = last_gain {
-                    if prev_attempt > (t + stall).saturating_duration_since(Instant::now()) {
-                        break;
-                    }
-                }
-                let attempt_deadline = match last_gain {
-                    Some(t) => Some(pump_deadline_landed.map_or(t + stall, |d| d.min(t + stall))),
-                    None => pump_deadline_virgin,
-                };
-                // Rank the landings by their greedy fill, then swap-climb only the WINNER.
-                // Climbing all twelve was tried: it costs 60 binaries 1.0s -> 2.6s and finds
-                // nothing better. The swap search is the expensive part and one good starting
-                // point is enough for it.
-                let t_attempt = Instant::now();
-                let mut restart_frac = f64::INFINITY;
-                let landed = feasibility_pump(
-                    model,
-                    &lp,
-                    &ints,
-                    attempt,
-                    attempt_deadline,
-                    &mut restart_frac,
-                )
-                .and_then(|p| improve(model, &ints, &p, attempt_deadline));
-                prev_attempt = t_attempt.elapsed();
-                // Progress bookkeeping for `frac_stuck`: a MATERIAL (>1%) drop in the best
-                // infeasibility resets the stall; a plateau advances it. (A landed restart makes
-                // `seed_val` Some, so `frac_stuck` stands down regardless of what this does.)
-                if restart_frac.is_finite()
-                    && restart_frac < best_frac_global - best_frac_global.abs() * 0.01 - 1e-9
-                {
-                    best_frac_global = restart_frac;
-                    frac_stale = 0;
-                } else {
-                    best_frac_global = best_frac_global.min(restart_frac);
-                    frac_stale += 1;
-                }
-                let Some(p) = landed else {
-                    failed_spend += prev_attempt;
-                    if trace {
-                        eprintln!(
-                            "--trace   pump attempt {attempt}: FAILED (at {:.2}s)",
-                            _t_heur.elapsed().as_secs_f64()
-                        );
-                    }
-                    // EXPENSIVE failures end the lottery. The stall clock above only arms
-                    // after a LANDING, so a model where the pump never lands pays every
-                    // restart in full: the cifar100 w2 window burned 89.5s on five straight
-                    // ~17s failures at a 600s budget while the dive (its fallback) settles
-                    // the model in seconds. A COST gate distinguishes that from the small
-                    // corpus, where failures are milliseconds and early ones are normal
-                    // (a count gate here had a 70x52 seed out at -33 against -240): two
-                    // consecutive failures each pricier than 4x the stall clock mean the
-                    // perturbation lottery is not affordable on this model.
-                    if prev_attempt.as_secs_f64() >= 4.0 * HEUR_STALL_SECS {
-                        expensive_fails += 1;
-                        // One CATASTROPHIC failure ends it outright: a single
-                        // failed restart on the cifar100 w5 window costs ~655s
-                        // (measured) — waiting for a second confirmation would
-                        // burn a third of a large budget re-learning the same
-                        // fact. The 2-strike rule stays for the merely-pricey
-                        // (seconds-scale) failures where one sample is noise.
-                        if expensive_fails >= 2
-                            || prev_attempt.as_secs_f64() >= 20.0 * HEUR_STALL_SECS
-                        {
-                            break;
-                        }
-                    } else {
-                        expensive_fails = 0;
-                    }
-                    continue;
-                };
-                expensive_fails = 0;
-                let mut v = BigRational::zero();
-                for j in 0..lp.n {
-                    if lp.cost[j] != 0.0 {
-                        if let Some(c) = exact(lp.cost[j]) {
-                            v += c * &p[j];
-                        }
-                    }
-                }
-                if trace {
-                    eprintln!(
-                        "--trace   pump attempt {attempt}: landed {v} (at {:.2}s)",
-                        _t_heur.elapsed().as_secs_f64()
-                    );
-                }
-                if seed_val.as_ref().is_none_or(|b| v < *b) {
-                    seed_val = Some(v);
-                    seed = Some(p);
-                    pump_stale = 0;
-                    last_gain = Some(Instant::now());
-                } else {
-                    pump_stale += 1;
-                }
-            }
-            // Climb the best landing with 1-for-1 swaps. The greedy fill can only ADD columns,
-            // so it stops the moment nothing more fits — even when trading a cheap column for
-            // an expensive one would fit and pay. That trade is most of the remaining distance.
-            // RENS FIRST WHEN THE PUMP CAME BACK EMPTY -- see `rens`. The relaxation's own
-            // neighbourhood costs no incumbent to describe, which is exactly the case the pump and
-            // the dive both fail on.
-            // SET-PARTITION CONSTRUCTION when the LP-based heuristics come up empty. It self-gates
-            // (returns None on any non-set-partition model), so it costs nothing where it does not
-            // apply, and it is the one thing that can crack an exact-cover feasibility problem like
-            // air05, which the pump/jump/dive cannot.
-            // The constructor self-gates (instant None on any non-set-partition model), and on a
-            // set-partition model it is the ONLY heuristic that finds a feasible point, so give it a
-            // real window rather than the sliver the pump left. Node-budgeted so it cannot run away
-            // — and that node budget, not the caller's clock, is what should decide when it stops:
-            // see `setpart_window`.
-            let seed = seed.or_else(|| {
-                if skip_root_suite {
-                    return None;
-                }
-                let mut _sp_window = Duration::ZERO;
-                let sp_dl = deadline.map(|d| {
-                    let now = Instant::now();
-                    _sp_window = setpart_window(root_work, d.saturating_duration_since(now));
-                    now + _sp_window
-                });
-                let r = set_partition_construct(model, &root.values, 0xA1_05, sp_dl);
-                if crate::debug_flags::milp_debug_flags().trace {
-                    eprintln!(
-                        "--trace   set-partition construct: found={} (window {:.2}s from root work {:.2}s)",
-                        r.is_some(),
-                        _sp_window.as_secs_f64(),
-                        root_work.as_secs_f64(),
-                    );
-                }
-                r
-            });
-            let seed = seed.or_else(|| {
-                if skip_root_suite {
-                    return None;
-                }
-                rens(model, &lp, &ints, &root.values, &root.duals, heur_deadline)
-            });
-            if trace {
-                eprintln!(
-                    "--trace   pump+rens done (at {:.2}s)",
-                    _t_heur.elapsed().as_secs_f64()
-                );
-            }
-            let seed = seed
-                .map(|p| {
-                    let p = swap_improve(model, &ints, p, heur_deadline);
-                    if trace {
-                        eprintln!(
-                            "--trace   seed swap_improve done (at {:.2}s)",
-                            _t_heur.elapsed().as_secs_f64()
-                        );
-                    }
-                    p
-                })
-                .or_else(|| {
-                    if skip_root_suite {
-                        return None;
-                    }
-                    dive_for_incumbent(
-                        model,
-                        &lp,
-                        &ints,
-                        &minimize_obj,
-                        &lp.lower,
-                        &lp.upper,
-                        Some((root.basis.as_slice(), root.at.as_slice())),
-                        heur_deadline,
-                        deadline,
-                    )
-                })
-                .or_else(|| {
-                    if skip_root_suite {
-                        return None;
-                    }
-                    round_to_incumbent(model, &ints, &root.values)
-                });
-            // SET-PARTITION LNS — ruin-and-recreate the cover toward the LP optimum. The
-            // constructor/pump only produce a FEASIBLE cover; on a pure set-partition model this
-            // is the lever that turns it into a GOOD one (air05: ~34,700 -> near the 26,374
-            // optimum). It self-gates (instant `None` off set-partition models, so the corpus is
-            // untouched) and runs only at the true root, never inside a RENS/RINS sub-search.
-            let seed = seed.map(|p| {
-                if mode.depth == 0 && !in_rens() && !crate::tune::on(crate::tune::Knob::NoSplns) {
-                    // THE BIG SHARE IS FOR MODELS WHOSE TREE CANNOT USE THE TIME. On the wide-tall
-                    // class (air05: 600ms node LPs, tens of nodes per minute) the LNS is the only
-                    // lever and 80% is right. On a fast-tree set partitioning (nw04: 0.2s node
-                    // LPs, proof in ~9s) the same share hands 18s to a zero-gain pass and LOSES a
-                    // proof the tree already owns (measured: OPTIMAL 9.8s -> FEASIBLE 20.04s).
-                    let wide_tall =
-                        model.num_cols() >= 10 * model.num_rows() && model.num_rows() >= 200;
-                    let share = if wide_tall {
-                        SPLNS_TIME_SHARE
-                    } else {
-                        SPLNS_TIME_SHARE_FAST_TREE
-                    };
-                    let lns_dl = deadline.map(|d| {
-                        let now = Instant::now();
-                        let rem = d.saturating_duration_since(now);
-                        let mut window = rem.mul_f64(share);
-                        // WIDE-TALL: reserve a minimum absolute slice for the TREE. The 0.8 share is
-                        // tuned for LONG timeouts where the region descent ratchets the cover
-                        // (air05 @60s: -> 26,469 over ~21s). On a SHORT timeout that descent never
-                        // pays — its gains all land in the LP-support polish's first ~3s — so the
-                        // rest of the share is handed to a zero-gain walk while the tree, the only
-                        // lever that raises the dual bound, is starved. Returning a fixed slice
-                        // helps the short horizon and is inert on the long one (see the const).
-                        if wide_tall {
-                            let reserve = Duration::from_secs_f64(SPLNS_WIDE_TREE_RESERVE_SECS);
-                            window = window.min(rem.saturating_sub(reserve));
-                            // ABSOLUTE cap on the wide-tall LNS window. The extended-stall walk
-                            // (see set_partition_improve / SPLNS_WIDE_STALL_SECS) now uses its
-                            // window to ratchet the cover far below the old 15s-stall plateau
-                            // (air05: 27298 -> ~26583), but that window must not consume the whole
-                            // 0.8 share and
-                            // starve the TREE — the only lever that lifts the dual bound and PROVES
-                            // optimality. Measured: air05 seeded from t=0 proves in ~723s, so the
-                            // tree needs ~750s+; capping the walk at an absolute slice a safe margin
-                            // above its diminishing-returns point cedes the rest to the tree. Inert
-                            // on short budgets (share·rem < cap), so measurement runs and every
-                            // non-wide-tall model are untouched.
-                            let cap = Duration::from_secs_f64(SPLNS_WIDE_ABS_CAP_SECS);
-                            window = window.min(cap);
-                        }
-                        now + window
-                    });
-                    // Root reduced costs (float advice, pool selection only — see the polish):
-                    // d_j = c_j - y·A_j against the root LP's duals, in the LP's scaled frame.
-                    let rc: Vec<f64> = (0..lp.n)
-                        .map(|j| {
-                            let mut d = lp.cost[j];
-                            for (r, a) in lp.column(j) {
-                                d -= a * root.duals.get(r).copied().unwrap_or(0.0);
-                            }
-                            d
-                        })
-                        .collect();
-                    if let Some(better) = set_partition_improve(
-                        model,
-                        &root.values,
-                        &rc,
-                        &root.duals,
-                        &p,
-                        0x5A17_C0DE,
-                        lns_dl,
-                    ) {
-                        if trace {
-                            eprintln!(
-                                "--trace   setpart LNS improved seed (at {:.2}s)",
-                                _t_heur.elapsed().as_secs_f64()
-                            );
-                        }
-                        return better;
-                    }
-                }
-                p
-            });
-            // FLIP LNS — re-optimise the flow after every switch flip, the primal a fixed-charge
-            // network needs. Self-gates off any model without the `x ≤ u·y` shape and few switches
-            // (see `flip_lns`), so the corpus outside the fixed-charge instances is untouched; runs
-            // only at the true root, never inside a nested RENS/RINS search.
-            let seed = seed.map(|p| {
-                // ...and only on a WIDE root gap. flip_lns is a wide-gap device: it
-                // re-optimises flows to escape LP-blind switch basins (qiu's root gap is
-                // ~600%). On a model whose root cuts already close the gap (khb05250:
-                // 98.5% closed, proof = 15 nodes) the LNS cannot beat the tree and its
-                // 120-kick stall window just burns the share — measured 0.51s -> 4.5s on
-                // khb, 0.54 -> 1.0s on dcmulti, for zero incumbent gain on either. The trigger
-                // (below) is the device's documented beneficiary floor.
-                let seed_val_f = {
-                    let mut v = 0.0f64;
-                    for j in 0..lp.n {
-                        if lp.cost[j] != 0.0 {
-                            v += lp.cost[j] * to_f64(&p[j]);
-                        }
-                    }
-                    v
-                };
-                let root_bound_f: f64 = (0..lp.n).map(|j| lp.cost[j] * root.values[j]).sum();
-                // The trigger is the device's DOCUMENTED beneficiary floor, not a hair above
-                // zero. flip_lns escapes LP-blind switch basins where the frozen-flow heuristic
-                // lands CATASTROPHICALLY far from the bound (qiu ~600%); its measured
-                // beneficiaries all sit at rel_gaps >= 8%. The old 0.02 trigger left a 2-8% dead
-                // zone that caught non-beneficiaries whose pump incumbent is ALREADY near the
-                // bound — dcmulti at 6.33% (incumbent within ~4.6% of the true optimum), where
-                // the tree proves OPTIMAL in 0.4s / 1245 nodes and the 330-kick walk just burns
-                // ~1.7s re-finding a worse point. A 7% floor sits below the documented
-                // beneficiary boundary (a 1% margin under qiu/rout's >= 8%) and above the
-                // already-good-incumbent regime, so every measured win keeps flip_lns and only
-                // the near-solved models it never helped are handed straight to the tree.
-                let gap_wide = (seed_val_f - root_bound_f) > 0.07 * (1.0 + seed_val_f.abs());
-                // RETIRED AS A DEFAULT (2026-08-10). flip-LNS now runs only when asked for
-                // explicitly, because an iteration ledger showed it was the single largest
-                // consumer of simplex work on the corpus's worst instance while making that
-                // instance's tree BIGGER:
-                //
-                //   qiu: 206,148 of 762,048 simplex iterations (27.1%) were flip-LNS, ~11.5s --
-                //        more than 3x Gurobi's ENTIRE 3.692s runtime on the same model.
-                //
-                // Full corpus, serial, idle, best-of-3 on the noisy instances:
-                //   qiu     44.554s / 6223 nodes -> 34.333s / 5760 nodes   -10.221s (1.30x)
-                //   misc07   5.507s / 7839       ->  5.464s / 7534         better
-                //   13 of 17 instances byte-identical; mas76 +0.112s and qnet1 +0.027s are at
-                //   IDENTICAL node counts, i.e. noise. No objective changed anywhere.
-                //   TOTAL 105.164s -> 95.051s  (-10.113s, 9.6%)
-                //
-                // qiu improves on nodes AND pivots together, which is not an incumbent-luck
-                // signature: the heuristic was doing negative work there, not trading bound for
-                // wall. The `gap_wide` beneficiary gate above was fitted when flip-LNS still
-                // paid; it no longer selects a model where it does.
-                //
-                // Setting an explicit flip share restores it (see the gate below).
-                // `AY_MILP_NO_FLIP_LNS` is kept and still suppresses it, so every A/B arm ever
-                // measured through that name keeps its meaning.
-                // Both reads sit BEHIND the cheap structural tests, so the solve path pays a
-                // getenv only on a depth-0 wide-gap node that would have run flip-LNS anyway --
-                // the live-read surface does not grow.
-                // OPT-IN THROUGH ITS OWN EXISTING SHARE KNOB. Retiring the default needed a
-                // restore arm, and adding a new env name would have grown the live-read surface
-                // the ledger guards. `--flip-share` was already read here through the typed
-                // `tune` layer, so gating on an EXPLICIT share costs zero new reads and says the
-                // right thing: flip-LNS now runs only when its time share is asked for by name.
-                let share_env: Option<f64> = crate::tune::real_opt(crate::tune::Knob::FlipShare);
-                if mode.depth == 0 && !in_rens() && gap_wide && share_env.is_some() {
-                    let share: f64 = share_env.unwrap_or(FLIP_LNS_TIME_SHARE);
-                    // tall_lu: the flip-LNS kick loop reaches the optimum incumbent at a fixed
-                    // wall-time (LU lane ~6.4s, eta lane ~16s), after which the 0.75 fractional
-                    // window is pure dry polish that starves the tree (the only lever that lifts
-                    // the dual bound). Cap the window at an ABSOLUTE slice a safe margin above
-                    // that reach and cede the rest to the tree. The cap is lane-specific because
-                    // the eta primal's kicks are ~2× the LU lane's. An explicit --flip-share
-                    // opts back into the pure fraction (no cap) on either lane.
-                    let cap_secs: Option<f64> = if share_env.is_none() && lp.tall_lu() {
-                        let lane_default = if crate::simplex::warm_lu_enabled() {
-                            FLIP_LNS_WARM_TALL_CAP_SECS
-                        } else {
-                            FLIP_LNS_TALL_CAP_SECS
-                        };
-                        Some(crate::tune::real(
-                            crate::tune::Knob::FlipCapSecs,
-                            lane_default,
-                        ))
-                    } else {
-                        None
-                    };
-                    let lns_dl = deadline.map(|d| {
-                        let now = Instant::now();
-                        let mut window = d.saturating_duration_since(now).mul_f64(share);
-                        if let Some(c) = cap_secs {
-                            window = window.min(Duration::from_secs_f64(c));
-                        }
-                        now + window
-                    });
-                    if let Some(better) =
-                        flip_lns(model, &lp, &ints, &minimize_obj, &p, lns_dl, deadline)
-                    {
-                        if trace {
-                            eprintln!(
-                                "--trace   flip-LNS improved seed (at {:.2}s)",
-                                _t_heur.elapsed().as_secs_f64()
-                            );
-                        }
-                        return better;
-                    }
-                }
-                p
-            });
-            // MARKET-SHARE PRIMAL WALK — the dedicated primal for the slack-objective equality
-            // family (see `market_share_walk`). Self-gates on `market_share_structure` (measured:
-            // fires on exactly markshare1/pk1 across the corpus, silent everywhere else), runs
-            // only at the true root of a full solve, and only a `check_point`-verified point that
-            // strictly beats the suite's seed displaces it. Iteration-budgeted (deterministic);
-            // the overall deadline can only abort it early.
-            let seed = {
-                let walked = if !skip_root_suite
-                    && mode.depth == 0
-                    && !mode.cheap
-                    && !mode.projected
-                    && !in_rens()
-                    && !crate::tune::on(crate::tune::Knob::NoMsWalk)
-                {
-                    market_share_walk(model, seed.as_deref(), deadline)
-                } else {
-                    None
-                };
-                match walked {
-                    Some(p) => {
-                        if trace {
-                            eprintln!(
-                                "--trace   market-share walk displaced the seed (at {:.2}s)",
-                                _t_heur.elapsed().as_secs_f64()
-                            );
-                        }
-                        Some(p)
-                    }
-                    None => seed,
-                }
-            };
-            // THE ROOT-SUITE BELT. Every incumbent the TREE finds is `check_point`-verified
-            // before it is believed; the root-heuristic seed was the one path that skipped
-            // the check and went straight into `incumbent` (and `elites`). A heuristic bug
-            // then poisons the whole solve: the tree prunes against a value nothing feasible
-            // attains and exits "Optimal" with an infeasible witness (the session's witness
-            // gate downgrades that to Unknown — fail-closed, but the solve is forfeit).
-            // Checking against `model` (the cut model) is the same license the leaf path
-            // uses: its column-bound check keeps the point inside the presolved box, where
-            // the coefficient-tightened rows' integer-equivalence argument lives, so passing
-            // here implies feasibility for the caller's model too.
-            let seed = seed.filter(|p| {
-                let ok = model.check_point(p).is_ok();
-                if !ok && trace {
-                    eprintln!("--trace !! root heuristic seed REJECTED by check_point — dropped");
-                }
-                ok
-            });
-            if let Some(p) = seed {
-                let mut v = BigRational::zero();
-                for j in 0..lp.n {
-                    if lp.cost[j] != 0.0 {
-                        if let Some(c) = exact(lp.cost[j]) {
-                            v += c * &p[j];
-                        }
-                    }
-                }
-                // The swap climb strictly improving the pump's best landing is a GAIN —
-                // the stall clock below must not read a productive climb as a dead phase.
-                if seed_val.as_ref().is_some_and(|b| v < *b) {
-                    last_gain = Some(Instant::now());
-                }
-                if trace {
-                    eprintln!(
-                        "--trace root heuristic incumbent = {v} (in {:.2}s)",
-                        _t_heur.elapsed().as_secs_f64()
-                    );
-                }
-                // A seeded incumbent (the nested-RINS caller's) is only displaced by
-                // something strictly better.
-                if mode.depth == 0 {
-                    elites.insert(&p, &v);
-                }
-                if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
-                    incumbent = Some((p, v));
-                }
-            } else if trace {
-                eprintln!(
-                    "--trace root heuristic found nothing (in {:.2}s)",
-                    _t_heur.elapsed().as_secs_f64()
-                );
-            }
-
-            // One feasibility-jump pass from the root incumbent before any tree exists:
-            // 10^5 weighted flips cost less than a single pump restart, and a stronger
-            // root incumbent feeds the reduced-cost fixing below and every prune after.
-            //
-            // The CHEAP profile pays a sliver of it: this block is a fixed cost of every
-            // nested sub-solve, and at 400k moves plus an uncapped swap-climb it was most
-            // of what a 256-node RINS probe cost (measured 0.52s total against 0.05s of
-            // sub-tree simplex). The probe's job is a quick landing, not a polish.
-            //
-            // A STALLED phase skips it, and a fresh one PRICES it with the same clock: the
-            // pass runs inside the phase's one stall-grace from its last gain. `last_gain`
-            // going grey means the pump's landings, the climb, and the restarts have all
-            // stopped paying; a 400k-move walk plus an uncapped swap-climb from that same
-            // stalled point is more of the same at a dearer price (mod010: 3.5s here,
-            // improving nothing, on a phase whose last gain was at 0.11s; air03: 14.5s of
-            // fruitless walking, because the walk's per-move cost scales with the model
-            // and the move budget does not know that). The walk returns THE MOMENT it
-            // finds an exact improving point, so the cap only ever cuts walking that has
-            // not paid. A seed that arrived through rens/the dive/set-partition never
-            // armed the clock, and a suite that is still improving reads as fresh — both
-            // run the pass exactly as before.
-            let phase_stalled = last_gain.is_some_and(|t| t.elapsed() >= stall);
-            if phase_stalled && trace {
-                eprintln!(
-                    "--trace   root phase stalled ({:.2}s since last gain) — skipping FJ pass (at {:.2}s)",
-                    last_gain.map_or(0.0, |t| t.elapsed().as_secs_f64()),
-                    _t_heur.elapsed().as_secs_f64()
-                );
-            }
-            let fj_deadline = match last_gain {
-                Some(t) => Some(
-                    heur_deadline
-                        .or(deadline)
-                        .map_or(t + stall, |d| d.min(t + stall)),
-                ),
-                None => heur_deadline.or(deadline),
-            };
-            // BARREN-TAIL CAP (see `fj_polish_cap`). The walk+climb returns the moment it finds an
-            // improving point, so bounding the pass to a short budget only trims polish that is not
-            // paying — the `fj_skip_gap` gate above catches only the TIGHT-gap case, and misses the
-            // wide-gap-but-barren instances (qnet1: gap 17.2%, yet the RENS-optimal incumbent leaves
-            // the walk nothing to find, ~1.5s wasted per call). Verdict-neutral: the polish never
-            // moves the bound. Home corpus verdict+objective+incumbent identical; qnet1 −37%.
-            let fj_cap = fj_polish_cap();
-            let fj_deadline = if fj_cap > 0.0 {
-                let capped = Instant::now() + Duration::from_secs_f64(fj_cap);
-                Some(fj_deadline.map_or(capped, |d| d.min(capped)))
-            } else {
-                fj_deadline
-            };
-            // ROOT-GAP GATE ON THE FJ POLISH. The pass is a 400k-move weighted walk plus an
-            // uncapped swap-climb whose PER-MOVE cost scales with the model (air03: 0.76s on a
-            // 10k-column set-partitioning root). Its only product is a cheaper incumbent — it
-            // never touches the bound, so skipping it leaves reduced-cost fixing and the tree
-            // BIT-IDENTICAL. When the incumbent is already within a hair of the post-cut root
-            // dual bound the walk has almost no room to pay: on air03 the gap is 0.2% and the
-            // pass finds nothing across the whole 0.76s, then the 3-node tree closes the same
-            // 0.2% anyway. The gate skips the polish once (incumbent - root_bound) drops below a
-            // relative floor; the tree still proves optimality, so this is VERDICT-NEUTRAL for
-            // any model the tree would close from that incumbent. Default floor 0.5% (see
-            // `fj_skip_gap`); `AY_MILP_FJ_SKIP_GAP=0` restores the always-polish behaviour.
-            let fj_gap_tight = incumbent.as_ref().is_some_and(|(_, v0)| {
-                let skip_gap = fj_skip_gap();
-                if skip_gap <= 0.0 {
-                    return false;
-                }
-                let v0_f = to_f64(v0);
-                let root_bound_f: f64 = (0..lp.n).map(|j| lp.cost[j] * root.values[j]).sum();
-                (v0_f - root_bound_f) <= skip_gap * (1.0 + v0_f.abs())
-            });
-            if fj_gap_tight && trace {
-                eprintln!(
-                    "--trace   root gap already tight — skipping FJ polish (at {:.2}s)",
-                    _t_heur.elapsed().as_secs_f64()
-                );
-            }
-            if let Some((p0, v0)) = incumbent
-                .clone()
-                .filter(|_| !phase_stalled && !skip_root_suite && !fj_gap_tight)
-            {
-                let model_v = match sense {
-                    Sense::Minimize => v0.clone(),
-                    Sense::Maximize => -v0.clone(),
-                };
-                let fj_moves = if mode.cheap { 60_000 } else { 400_000 };
-                if let Some(p) = feasibility_jump(
-                    model,
-                    &ints,
-                    &p0,
-                    &root_lower,
-                    &root_upper,
-                    &model_v,
-                    7,
-                    fj_moves,
-                    fj_deadline,
-                )
-                .map(|p| {
-                    if mode.cheap {
-                        p
-                    } else {
-                        swap_improve(model, &ints, p, fj_deadline)
-                    }
-                }) {
-                    let mut v = BigRational::zero();
-                    for j in 0..lp.n {
-                        if lp.cost[j] != 0.0 {
-                            if let Some(c) = exact(lp.cost[j]) {
-                                v += c * &p[j];
-                            }
-                        }
-                    }
-                    if v < v0 {
-                        if trace {
-                            eprintln!("--trace root feasibility-jump incumbent = {v}");
-                        }
-                        incumbent = Some((p, v));
-                    }
-                }
-                if trace {
-                    eprintln!(
-                        "--trace   root FJ pass done (at {:.2}s)",
-                        _t_heur.elapsed().as_secs_f64()
-                    );
-                }
-            }
-
-            // WIDE ROOT GAP => the ladder fires from node one instead of waiting
-            // out the first 20k-node cadence interval. The dedicated root-neighbourhood
-            // experiment showed what early sub-solves are worth (80x60 seeds at 60s:
-            // 267/218/264 -> 294/243/264) and what they cost when the tree would have
-            // proven quickly (70x52 10s -> 28s) — so the trigger is the same gap signal
-            // the cadence uses, and the cadence's own tree-bound gate shuts the fast
-            // firing off as the bound tightens.
-            //
-            // NO ROOT INCUMBENT AT ALL is the widest gap there is, so it arms the fast
-            // path too (`is_none_or`): the pull itself still waits for the first in-tree
-            // landing (the rins gate needs an incumbent to center on), but it must not
-            // then ALSO wait out the 20k-node cadence. Measured on rout: the node-dive
-            // lands 1244.7 at 4.1s, and the first ladder pull — the device that walks
-            // it down — sat idle until nodes=20,000 at 24s of a 60s wall.
-            let root_gap_wide = incumbent.as_ref().is_none_or(|(_, inc)| {
-                let mut rc_scratch: Vec<(f64, f64)> = vec![(0.0, 0.0); lp.n];
-                safe_bound(&lp, &root.duals, &root_lower, &root_upper, &mut rc_scratch).is_none_or(
-                    |l| {
-                        let inc_f = to_f64(inc);
-                        inc_f - l > 0.05 * (1.0 + inc_f.abs())
-                    },
-                )
-            });
-            if trace {
-                if let Some((_, inc)) = &incumbent {
-                    let mut rc_scratch: Vec<(f64, f64)> = vec![(0.0, 0.0); lp.n];
-                    if let Some(l) =
-                        safe_bound(&lp, &root.duals, &root_lower, &root_upper, &mut rc_scratch)
-                    {
-                        let inc_f = to_f64(inc);
-                        eprintln!(
-                            "--trace root gap = {:.1}% (inc {inc_f}, bound {l:.1})",
-                            100.0 * (inc_f - l) / (1.0 + inc_f.abs())
-                        );
-                    }
-                }
-            }
-            // ...but NOT on the big-M indicator shape (W-safenlp-1's verification economy).
-            // A margin/verification race there is DUAL-BOUND-bound: any incumbent above the
-            // threshold settles nothing, and its root gap is structurally wide (the encoding
-            // puts the LP bound far below every integer point), so this emergency-primal
-            // trigger fired permanently and the ledger billed RINS 43% of ALL simplex
-            // iterations (405k of 937k on safenlp_ruarobot_1181_margin @60s) against a tree
-            // that is the only proof device. The shape keeps the tuned cadence instead.
-            if root_gap_wide && !crate::cuts::is_bigm_indicator(caller_model) {
-                next_rins = 1;
-            }
-
-            // REDUCED-COST FIXING. Take the root bound L and an incumbent z*. A
-            // non-basic column at a bound costs its reduced cost `d_j` to move off
-            // it, so if `L + d_j > z*` no optimal solution can move it — and it is
-            // not a branching candidate at all, it is a CONSTANT. On a knapsack this
-            // deletes a large fraction of the columns before the tree even starts.
-            //
-            // It is done rigorously: `L` is the Neumaier-Shcherbina lower bound and
-            // `d_j` is taken at the pessimistic end of its error interval, so a
-            // column is only fixed when the arithmetic cannot be wrong about it.
-            // Snapshot for orbital pin propagation (`Symmetry::propagate_pins`):
-            // the fixing's license is derived in THIS box, and the transfer needs it.
-            let sym_pre = sym
-                .as_ref()
-                .map(|_| (root_lower.clone(), root_upper.clone()));
-            let fixed = reduced_cost_fix(
-                &lp,
-                &root,
-                &mut root_lower,
-                &mut root_upper,
-                &ints,
-                &conts_open,
-                incumbent.as_ref().map(|(_, v)| v),
-            );
-            if trace && fixed > 0 {
-                eprintln!("--trace reduced-cost fixing pinned {fixed} columns");
-            }
-            if fixed > 0 {
-                if let (Some(s), Some((pl, pu))) = (sym.as_ref(), &sym_pre) {
-                    let moved = s.propagate_pins(pl, pu, &mut root_lower, &mut root_upper);
-                    if trace && moved > 0 {
-                        eprintln!("--trace orbital pin propagation moved {moved} root bounds");
-                    }
-                }
-            }
-            // A fresh cap on a previously-open continuous column can imply bounds
-            // for whole families of others — cascade it through the rows.
-            // FORGONE COST. `close_bounds_via_rows` is `presolve::tighten_bounds` re-run
-            // on the rc-fixed box, and it writes EVERY strict improvement, not only
-            // closed sides — so it can pin further binaries. Gating it on an open
-            // CONTINUOUS side having closed means rc-fixing that pins boxed integers or
-            // binaries (every pure-binary instance) never cascades. `mine_implications`
-            // covers part of this and only partly: it is built ONCE on the INITIAL root
-            // box, i.e. strictly before this fixing; it is binary-only; it is capped
-            // (IMPL_MAX_SRC_BINS/PER_SRC/TOTAL); and it is directed f64, not exact.
-            if fixed > 0
-                && (conts_open.is_empty()
-                    || open_sides(&root_lower, &root_upper) >= cont_open_sides)
-            {
-                crate::sepstat::gate_charge(crate::sepstat::GATE_CUTOFF_CLOSURE, fixed as u64);
-            }
-            if fixed > 0 && !conts_open.is_empty() {
-                let now_open = open_sides(&root_lower, &root_upper);
-                if now_open < cont_open_sides {
-                    let closed =
-                        close_bounds_via_rows(model, &mut root_lower, &mut root_upper, deadline);
-                    cont_open_sides = open_sides(&root_lower, &root_upper);
-                    if trace {
-                        eprintln!(
-                            "--trace cutoff closure: {closed} more bound sides closed ({cont_open_sides} still open)"
-                        );
-                    }
-                }
-            }
-        }
-    }
-    // An explicit marked-margin candidate request may replace the caller's
-    // four-column fallback only HERE: the ordinary target root, cuts,
-    // heuristics, incumbent, and reduced-cost tightening have already run, and
-    // the complete frontier has not yet been built. A decline leaves this
-    // exact slice untouched. The selected array is owned for the remainder of
-    // the search because restarts rebuild the same complete partition.
-    let selected_shared_binary_prefix = target_fsb_prefix_or_fallback(
-        caller_model,
-        &lp,
-        &root,
-        &root_lower,
-        &root_upper,
-        shared_binary_prefix,
-        target_fsb_prefix,
-        deadline,
-        trace,
+    let prefix_preparation = proof_first_workers.map_or(
+        root_frontier::PrefixPreparation::Canonical,
+        root_frontier::PrefixPreparation::ProofFirst,
     );
-    let shared_binary_prefix = selected_shared_binary_prefix
-        .as_ref()
-        .map_or(shared_binary_prefix, |prefix| &prefix[..]);
-
-    // The root floor, kept for the GLOBAL claim as well as for the root node's
-    // `cover` (see the two branches below, and `tree_bound`'s floor at the end
-    // of the search). It survives the root node being popped, which is exactly
-    // when the tree's own min-over-open-nodes stops seeing it.
-    let root_floor_global: Option<std::sync::Arc<BigRational>>;
-    if shared_binary_prefix.is_empty() {
-        // Detailed proof-floor rationale: see `bab/incoming_feature_history.md`.
-        let root_floor = if crate::tune::caller_flag(crate::tune::Knob::NoRootFloor) == Some(true) {
-            None
-        } else {
-            let raw = {
-                let mut rc_scratch: Vec<(f64, f64)> = vec![(0.0, 0.0); lp.n];
-                safe_bound_reason(&lp, &root.duals, &root_lower, &root_upper, &mut rc_scratch)
-            };
-            let b = raw.ok().and_then(exact).map(|b| {
-                obj_gran
-                    .as_ref()
-                    .map_or_else(|| b.clone(), |g| round_up_to(&b, g))
-            });
-            if trace {
-                // ⚠ NOT `f64::NAN` (audit must-fix). This line used to render an
-                // absent bound as `NaN`, which reads as arithmetic that went wrong
-                // rather than as the deliberate decline it is — and cost one
-                // investigation its first day chasing a NaN that never existed.
-                let shown = match (&b, &raw) {
-                    (Some(v), _) => format!("{}", to_f64(v)),
-                    (None, Err(e)) => format!("{e}"),
-                    (None, Ok(_)) => "declined(inexact conversion)".to_string(),
-                };
-                // The implied-corner census rides along ONLY when that opt-in lane
-                // ran (default off, so normally absent): "tried" is how many open
-                // sides it was asked about and "closed" how many it actually shut.
-                // A mechanism that never fires has to say so in the trace rather
-                // than be inferred from an unchanged bound — which is exactly how
-                // it was measured dead.
-                let tried = IMPLIED_CORNER_TRIED.load(std::sync::atomic::Ordering::Relaxed);
-                let census = if tried == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        "; implied-corner tried={tried} closed={}",
-                        IMPLIED_CORNER_FOUND.load(std::sync::atomic::Ordering::Relaxed)
-                    )
-                };
-                eprintln!(
-                    "--trace root node floor = {shown} (root status {:?}){census}",
-                    root.status
-                );
-            }
-            b
-        };
-        let root_floor = root_floor.map(std::sync::Arc::new);
-        root_floor_global = root_floor.clone();
-        let root_prepared = prepare_root_relaxation(&lp, &root, &root_lower, &root_upper);
-        stack.push(root_node(root_floor, root_prepared, capture.root()));
-    } else {
-        // ONE root candidate seeds every fixed-prefix region. Its dual gives a
-        // rigorous bound for each narrower box; its basis is immutable shared
-        // advice. The common `pc`, no-good store, incumbent, and FloatLp below
-        // then mature across all regions instead of restarting 16 sessions.
-        let (frontier, shared_root_raw) = shared_binary_prefix_frontier(
-            shared_binary_prefix,
-            &lp,
-            &root,
-            &root_lower,
-            &root_upper,
-            obj_gran.as_ref(),
-            &mut capture,
-        );
-        // The SAME number the frontier hands every leaf as its `bound` — one
-        // `safe_bound` over the root dual and the root box, rounded on the
-        // objective granularity. The leaves start out floored by it; their
-        // descendants do not, which is what the global floor below repairs.
-        // `the no-root-floor knob` deliberately does not reach here: the frontier
-        // hands this number to every leaf's `bound` regardless of it, so there is
-        // no unfloored arm on this path for the knob to restore.
-        root_floor_global = shared_root_raw
-            .and_then(exact)
-            .map(|b| {
-                obj_gran
-                    .as_ref()
-                    .map_or_else(|| b.clone(), |g| round_up_to(&b, g))
-            })
-            .map(std::sync::Arc::new);
-        let frontier = if proof_first_prefix {
-            prepare_shared_binary_prefix_relaxations(
-                &lp,
-                &root,
-                &root_lower,
-                &root_upper,
-                frontier,
-                mode.prefix_workers,
-                deadline,
-                mem_budget,
-                &mut capture,
-                trace,
-            )
-        } else {
-            frontier
-        };
-        let seeded = frontier.len();
-        // `dive` is LIFO; reverse canonical leaves so assignment 0 is consumed
-        // first. This ordering is explicit and independent of BinaryHeap ties.
-        for node in frontier.into_iter().rev() {
-            open_bytes += node_bytes(&node, n_plus_m);
-            dive.push(node);
-        }
-        if trace {
-            let cols: Vec<usize> = shared_binary_prefix.iter().map(|c| c.index()).collect();
-            eprintln!(
-                "--trace shared-prefix frontier: cols={cols:?} \
-                 complete_leaves={} live_leaves={seeded} root_preparations=1 \
-                 shared_root_bound={}",
-                1usize << shared_binary_prefix.len(),
-                shared_root_raw.map_or_else(|| "none".to_string(), |v| format!("{v:.6}")),
-            );
-        }
-    }
+    let prepared_root_frontier =
+        root_frontier::prepare_root_frontier(root_frontier::RootFrontierRequest {
+            frame: root_frontier::RootFrame {
+                caller_model,
+                lp: &lp,
+                candidate: &root,
+                lower: &root_lower,
+                upper: &root_upper,
+                objective_granularity: obj_gran.as_ref(),
+            },
+            storage: root_frontier::FrontierStorage {
+                heap: &mut stack,
+                dive: &mut dive,
+                capture: &mut capture,
+                open_bytes: &mut open_bytes,
+                node_basis_width: n_plus_m,
+                memory_budget: mem_budget,
+            },
+            prefix: root_frontier::PrefixRequest {
+                fallback: shared_binary_prefix,
+                target: target_fsb_prefix,
+                preparation: prefix_preparation,
+            },
+            deadline,
+            trace: root_trace,
+        });
+    let shared_binary_prefix = prepared_root_frontier.prefix();
+    let root_floor_global = prepared_root_frontier.global_floor();
     let mut pruned = 0usize;
     let mut leaves = 0usize;
     let mut rim_calls = 0usize;
@@ -25897,7 +23718,7 @@ fn solve_milp_in_impl(
                         lost_subtree,
                         lost_bank.as_ref(),
                         restart_bank.as_ref(),
-                        root_floor_global.as_deref(),
+                        root_floor_global,
                         apply_tree_floor,
                         zero_objective,
                         sense,
@@ -26066,12 +23887,14 @@ fn solve_milp_in_impl(
                     // FORGONE COST — mirror of the pre-tree site.
                     if n > 0
                         && (conts_open.is_empty()
-                            || open_sides(&root_lower, &root_upper) >= cont_open_sides)
+                            || search_bootstrap::open_sides(&conts_open, &root_lower, &root_upper)
+                                >= cont_open_sides)
                     {
                         crate::sepstat::gate_charge(crate::sepstat::GATE_CUTOFF_CLOSURE, n as u64);
                     }
                     if n > 0 && !conts_open.is_empty() {
-                        let now_open = open_sides(&root_lower, &root_upper);
+                        let now_open =
+                            search_bootstrap::open_sides(&conts_open, &root_lower, &root_upper);
                         if now_open < cont_open_sides {
                             let closed = close_bounds_via_rows(
                                 model,
@@ -26079,7 +23902,8 @@ fn solve_milp_in_impl(
                                 &mut root_upper,
                                 deadline,
                             );
-                            cont_open_sides = open_sides(&root_lower, &root_upper);
+                            cont_open_sides =
+                                search_bootstrap::open_sides(&conts_open, &root_lower, &root_upper);
                             if trace {
                                 eprintln!(
                                     "--trace cutoff closure: {closed} more bound sides closed ({cont_open_sides} still open)"
@@ -26363,13 +24187,13 @@ fn solve_milp_in_impl(
                         capture.poison();
                         pruned += 1;
                         orbitope_pruned += 1;
-                        SYM_ORBITOPE_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::local_census::add_usize(&SYM_ORBITOPE_TOTAL, 1);
                         capture.close(node.cap);
                         continue;
                     }
                     Ok(0) => {}
                     Ok(nred) => {
-                        SYM_ORBITOPE_TOTAL.fetch_add(nred, std::sync::atomic::Ordering::Relaxed);
+                        crate::local_census::add_usize(&SYM_ORBITOPE_TOTAL, nred);
                         use std::sync::Arc;
                         capture.poison();
                         for j2 in 0..lp.n {
@@ -27037,48 +24861,49 @@ fn solve_milp_in_impl(
         let warm_time_limit = warm.as_ref().and(opts.node_warm_time_limit);
         let warm_deadline = node_warm_deadline(warm_time_limit, Instant::now(), deadline);
         let mut continued_prepared = false;
-        // ALLOCATION CENSUS: covers BOTH lp lanes below — the prepared
-        // proof-continuation solve and the plain `solve_bounded` — so the
-        // NodeLp region stays comparable to the pre-`prepared` measurement.
-        let _acen_lp = crate::acensus::Scope::new(crate::acensus::Region::Lp);
-        // ATTRIBUTION (measurement only, gated): allocations charged to the
-        // node's own primary LP solve.
-        let _attrib_ar_lp = crate::attrib::AllocRegion::new(2);
-        let mut cand = match prepared {
-            Some(prepared) => {
-                prepared_used += 1;
-                #[cfg(test)]
-                if node.depth == 0 {
-                    ROOT_PREPARED_CONSUMED.with(|n| n.set(n.get() + 1));
+        let mut cand = {
+            // ALLOCATION CENSUS: covers BOTH LP lanes below — the prepared
+            // proof-continuation solve and plain `solve_bounded` — and ends
+            // before the following node bookkeeping.
+            let _acen_lp = crate::acensus::Scope::new(crate::acensus::Region::Lp);
+            // ATTRIBUTION (measurement only, gated): allocations charged to
+            // the node's own primary LP solve over the same lexical region.
+            let _attrib_ar_lp = crate::attrib::AllocRegion::new(2);
+            match prepared {
+                Some(prepared) => {
+                    prepared_used += 1;
+                    #[cfg(test)]
+                    if node.depth == 0 {
+                        ROOT_PREPARED_CONSUMED.with(|n| n.set(n.get() + 1));
+                    }
+                    if prepared.candidate.status == SimplexStatus::Stopped {
+                        // The owned worker's local slice deliberately retained its
+                        // phase-I progress. Continue that exact basis through the
+                        // typed proof-bearing primal lane; do not replay the root
+                        // warm-dual attempt that the prefix work already replaced.
+                        prepared_continued += 1;
+                        continued_prepared = true;
+                        lp.solve_bounded_with_mode(
+                            &node_lower,
+                            &node_upper,
+                            Some((
+                                prepared.candidate.basis.as_slice(),
+                                prepared.candidate.at.as_slice(),
+                            )),
+                            WarmSolveMode::PrimalProofContinuation,
+                            deadline,
+                        )
+                    } else {
+                        // A direct prepared answer does not enter `solve_bounded`,
+                        // so consume/reset the one-shot cutoff explicitly rather
+                        // than leaking this node's incumbent into the next solve.
+                        lp.cutoff.set(f64::INFINITY);
+                        prepared.candidate
+                    }
                 }
-                if prepared.candidate.status == SimplexStatus::Stopped {
-                    // The owned worker's local slice deliberately retained its
-                    // phase-I progress. Continue that exact basis through the
-                    // typed proof-bearing primal lane; do not replay the root
-                    // warm-dual attempt that the prefix work already replaced.
-                    prepared_continued += 1;
-                    continued_prepared = true;
-                    lp.solve_bounded_with_mode(
-                        &node_lower,
-                        &node_upper,
-                        Some((
-                            prepared.candidate.basis.as_slice(),
-                            prepared.candidate.at.as_slice(),
-                        )),
-                        WarmSolveMode::PrimalProofContinuation,
-                        deadline,
-                    )
-                } else {
-                    // A direct prepared answer does not enter `solve_bounded`,
-                    // so consume/reset the one-shot cutoff explicitly rather
-                    // than leaking this node's incumbent into the next solve.
-                    lp.cutoff.set(f64::INFINITY);
-                    prepared.candidate
-                }
+                None => lp.solve_bounded(&node_lower, &node_upper, warm, warm_deadline),
             }
-            None => lp.solve_bounded(&node_lower, &node_upper, warm, warm_deadline),
         };
-        drop(_acen_lp);
         crate::acensus::mark(8);
         t_simplex += _t0.elapsed();
         if trace {
@@ -27509,8 +25334,7 @@ fn solve_milp_in_impl(
                         // cheapest terms and PAYS for each out of the RHS, so the survivor is
                         // implied by the exact cut (never tighter) and still violated.
                         g.retain_mut(|c| c.clean(model, nx, 0.5));
-                        NODE_GMI_CUTS_TOTAL
-                            .fetch_add(g.len(), std::sync::atomic::Ordering::Relaxed);
+                        crate::local_census::add_usize(&NODE_GMI_CUTS_TOTAL, g.len());
                         gmi_rounds += 1;
                         gmi_derived += g.len();
                         if trace {
@@ -27789,8 +25613,7 @@ fn solve_milp_in_impl(
                             if is_local {
                                 local_active_here = true;
                             }
-                            NODE_CUT_WRITES_TOTAL
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::local_census::add_usize(&NODE_CUT_WRITES_TOTAL, 1);
                             if decided {
                                 break; // node pruned/empty: nothing left to cut here
                             }
@@ -28501,7 +26324,6 @@ fn solve_milp_in_impl(
                                 t_start.elapsed().as_secs_f64()
                             );
                         }
-                        elites.insert(&p, &v);
                         incumbent = Some((p, v));
                         rins_stall = 0;
                     }
@@ -28666,11 +26488,6 @@ fn solve_milp_in_impl(
             t_heur += _t_h.elapsed();
         }
 
-        // Every other call uses a CROSSOVER face instead — agreement between the incumbent and
-        // a rotating elite — because one incumbent is one trajectory, and the measured A/Bs
-        // showed each single-trajectory sampler plateauing on its own lucky local optimum.
-        // Only the user's solve runs it — a sub-MIP inside a sub-MIP is the recursion this
-        // depth guard exists to forbid.
         // THE ENDGAME: stalled late in the budget with a wide gap, the tree was never
         // going to close — commit everything that remains to one full-profile
         // local-branching ball around the incumbent. Fired once.
@@ -28817,7 +26634,6 @@ fn solve_milp_in_impl(
                             &root.values,
                             &lp.cost,
                             &mut inc,
-                            &mut elites,
                             d_sweep,
                             // A FIXED salt (not the node count): the draw sequence must not be
                             // a function of how far the pace-varying tree happened to walk by
@@ -28889,7 +26705,6 @@ fn solve_milp_in_impl(
                                     }
                                 }
                             }
-                            elites.insert(&p, &v);
                             if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                                 if trace {
                                     eprintln!(
@@ -28947,7 +26762,6 @@ fn solve_milp_in_impl(
                                         }
                                     }
                                 }
-                                elites.insert(&p, &v);
                                 if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                                     if trace {
                                         eprintln!(
@@ -28968,7 +26782,6 @@ fn solve_milp_in_impl(
                                 &ints,
                                 &cand.values,
                                 &inc,
-                                None,
                                 &root_lower,
                                 &root_upper,
                                 deadline,
@@ -28986,7 +26799,6 @@ fn solve_milp_in_impl(
                                         }
                                     }
                                 }
-                                elites.insert(&p, &v);
                                 if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                                     if trace {
                                         eprintln!(
@@ -29060,7 +26872,6 @@ fn solve_milp_in_impl(
                                             }
                                         }
                                     }
-                                    elites.insert(&p, &v);
                                     if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                                         if trace {
                                             eprintln!(
@@ -29146,17 +26957,6 @@ fn solve_milp_in_impl(
         }
         if mode.depth == 0 && (nodes >= next_rins || rins_rescue) {
             if let Some((inc, _)) = incumbent.clone() {
-                let round = nodes / rins_cadence;
-                // Crossover faces are env-gated: with a value-only pool the elites collapse
-                // into one basin and the crossover face degenerates, and the calls it takes
-                // from relaxation-RINS cost more than the diversity bought (80x60: 247 -> 241).
-                let partner: Option<Vec<BigRational>> =
-                    if false && !round.is_multiple_of(2) && elites.pool.len() >= 2 {
-                        let idx = 1 + (round / 2) % (elites.pool.len() - 1);
-                        Some(elites.pool[idx].0.clone())
-                    } else {
-                        None
-                    };
                 let mut improved = false;
                 // A SLOW TREE re-prices every arm: node LPs at ~50 dual iterations
                 // mean a full-model sub-solve burns seconds before it has even
@@ -29266,7 +27066,6 @@ fn solve_milp_in_impl(
                         &ints,
                         &cand.values,
                         &inc,
-                        partner.as_deref(),
                         &root_lower,
                         &root_upper,
                         deadline,
@@ -29282,7 +27081,6 @@ fn solve_milp_in_impl(
                                 }
                             }
                         }
-                        elites.insert(&p, &v);
                         if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                             if trace {
                                 eprintln!("--trace incumbent(rins) = {v} at nodes={nodes}");
@@ -29330,7 +27128,6 @@ fn solve_milp_in_impl(
                             &ints,
                             &cand.values,
                             &inc2,
-                            None,
                             &root_lower,
                             &root_upper,
                             deadline,
@@ -29348,7 +27145,6 @@ fn solve_milp_in_impl(
                                 }
                             }
                         }
-                        elites.insert(&p, &v);
                         if incumbent.as_ref().is_some_and(|(_, b)| v >= *b) {
                             break; // dry: the chain is drained
                         }
@@ -29519,7 +27315,7 @@ fn solve_milp_in_impl(
                     // out-of-class models can hold leftover dive entries (a
                     // disengaged plateau drain), and their restart behavior
                     // must stay byte-identical.
-                    && !(drought_class && !dive.is_empty())
+                    && (!drought_class || dive.is_empty())
                 {
                     restart_inc = incumbent.as_ref().map(|(_, v)| v.clone());
                     let mut floor: Option<BigRational> = incumbent.as_ref().map(|(_, v)| v.clone());
@@ -29667,8 +27463,7 @@ fn solve_milp_in_impl(
                     let restart_pull = |stag: u64,
                                         salt: u64,
                                         incumbent: &mut Option<(Vec<BigRational>, BigRational)>,
-                                        rins_stall: &mut u64,
-                                        elites: &mut Elites|
+                                        rins_stall: &mut u64|
                      -> bool {
                         let Some((inc, _)) = incumbent.clone() else {
                             return false;
@@ -29678,7 +27473,6 @@ fn solve_milp_in_impl(
                             &ints,
                             &cand.values,
                             &inc,
-                            None,
                             &root_lower,
                             &root_upper,
                             deadline,
@@ -29696,7 +27490,6 @@ fn solve_milp_in_impl(
                                 }
                             }
                         }
-                        elites.insert(&p, &v);
                         if incumbent.as_ref().is_none_or(|(_, b)| v < *b) {
                             if trace {
                                 eprintln!("--trace incumbent(restart-root) = {v} at nodes={nodes}");
@@ -29716,7 +27509,6 @@ fn solve_milp_in_impl(
                             (nodes as u64 ^ 0x5eed).wrapping_add(link.wrapping_mul(0xA5A5)),
                             &mut incumbent,
                             &mut rins_stall,
-                            &mut elites,
                         ) {
                             break;
                         }
@@ -29726,7 +27518,6 @@ fn solve_milp_in_impl(
                         nodes as u64 ^ (0x5eed << 3),
                         &mut incumbent,
                         &mut rins_stall,
-                        &mut elites,
                     );
                 }
             }
@@ -30084,7 +27875,7 @@ fn solve_milp_in_impl(
             // the switch gates, so the branch splits a large fractional flow instead
             // of an arbitrary degenerate vertex column. Pseudocost is the secondary
             // key so non-gated columns and exact ties still order sensibly.
-            MsBranch::Pc | MsBranch::Wpc if fc_mode != 0 => {
+            MsBranch::Pc | MsBranch::Wpc if fc_mode.enabled() => {
                 let carried = |j: usize| -> f64 {
                     fc_cont.get(j).map_or(0.0, |cs| {
                         cs.iter().map(|&c| cand.values[c as usize].abs()).sum()
@@ -30094,11 +27885,7 @@ fn solve_milp_in_impl(
                     let frac = v - v.floor();
                     let fmin = frac.min(1.0 - frac);
                     let flow = carried(j);
-                    match fc_mode {
-                        1 => fmin * flow,
-                        2 => fmin * (flow + model.obj_coeff(Col(j as u32)).abs()),
-                        _ => pc * (1.0 + flow), // mode 3: pseudocost scaled by gated flow
-                    }
+                    fc_mode.score(fmin, flow, pc, model.obj_coeff(Col(j as u32)).abs())
                 };
                 cands
                     .iter()
@@ -30328,7 +28115,7 @@ fn solve_milp_in_impl(
                         let (down, up, spent) = probe_pair(&mut sb_rc, j, v);
                         sb_work += spent;
                         bb_pairs += 1;
-                        BB_PAIRS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::local_census::add_usize(&BB_PAIRS_TOTAL, 1);
                         let frac = v - v.floor();
                         if let Some(d) = down {
                             pc.record(j, frac, false, (round(d) - pc_parent).max(0.0));
@@ -30362,7 +28149,7 @@ fn solve_milp_in_impl(
                         sb_work += spent;
                         bb_pairs += 1;
                         bb_reprobes += 1;
-                        BB_PAIRS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::local_census::add_usize(&BB_PAIRS_TOTAL, 1);
                         let frac = v - v.floor();
                         if let Some(d) = d2 {
                             pc.record(j, frac, false, (round(d) - pc_parent).max(0.0));
@@ -30584,9 +28371,12 @@ fn solve_milp_in_impl(
             // (leaves only grow) and bounded by the historical `reserved_deadline`, so a
             // leaf-heavy tree is byte-identical.
             deadline = match reserve_params {
-                Some((d, reserve, floor)) => {
-                    Some(leaf_reserved_deadline(d, reserve, floor, leaves))
-                }
+                Some(plan) => Some(leaf_reserved_deadline(
+                    plan.deadline,
+                    plan.duration,
+                    plan.search_floor,
+                    leaves,
+                )),
                 None => reserved_deadline,
             };
             // A LEAF IS WORTH A CLEAN BASIS.
@@ -30929,9 +28719,6 @@ fn solve_milp_in_impl(
                     }
                 }
             }
-            if mode.depth == 0 {
-                elites.insert(&values, &minimized);
-            }
             let better = incumbent.as_ref().is_none_or(|(_, best)| minimized < *best);
             if better {
                 if trace {
@@ -31033,7 +28820,7 @@ fn solve_milp_in_impl(
                 if added > 0 {
                     node_rc_nodes += 1;
                     node_rc_cols += added;
-                    NODE_RC_FIXES_TOTAL.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+                    crate::local_census::add_usize(&NODE_RC_FIXES_TOTAL, added);
                 }
             }
         }
@@ -31363,7 +29150,16 @@ fn solve_milp_in_impl(
         }
         use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
-            "--trace PHASE total={:.1}s node_lp={:.1}s mat={:.2}s sb={:.1}s heur={:.1}s bound={:.1}s(rational {:.3}s x{}) farkas={:.1}s rim={:.1}s | exact_point {:.1}s in {} calls",
+            // FULL PRECISION, for the same reason the two diag `wall=` fields were
+            // raised to `{:.6}` (see `tests/diag_wall_precision.rs`): this line is a
+            // wall a harness DIVIDES — `total` against the process wall to attribute
+            // work outside the tree, `node_lp` against `total` to attribute work
+            // outside the node LP. At one decimal every instance that proves in under
+            // ~0.5s reported `total=0.0s`/`node_lp=0.0s`, so the attribution read as
+            // "100% of the wall is outside the tree" on exactly the short-running
+            // instances an aggregate nodes/s figure is computed over. Same consumer
+            // rule as the diag lanes: any wall a harness may divide is full precision.
+            "--trace PHASE total={:.6}s node_lp={:.6}s mat={:.6}s sb={:.6}s heur={:.6}s bound={:.6}s(rational {:.6}s x{}) farkas={:.6}s rim={:.6}s | exact_point {:.6}s in {} calls",
             t_start.elapsed().as_secs_f64(),
             t_simplex.as_secs_f64(),
             t_mat.as_secs_f64(),
@@ -31569,7 +29365,8 @@ fn solve_milp_in_impl(
             );
         }
         eprintln!(
-            "--trace TIME simplex={:.2}s exact_bound={:.2}s farkas={:.2}s strongbranch={:.2}s rim={:.2}s",
+            // Full precision for the same consumer reason as `--trace PHASE` above.
+            "--trace TIME simplex={:.6}s exact_bound={:.6}s farkas={:.6}s strongbranch={:.6}s rim={:.6}s",
             t_simplex.as_secs_f64(),
             t_bound.as_secs_f64(),
             t_farkas.as_secs_f64(),
@@ -31703,14 +29500,11 @@ fn solve_milp_in_impl(
     }
     // Non-vacuity handles for the unit-propagation soundness guard (test-only
     // readers; never read by the search).
-    NG_UP_EVENTS_TOTAL.fetch_add(
-        ng_up_fixed + ng_up_pruned,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    NG_STORED_TOTAL.fetch_add(nogoods.len(), std::sync::atomic::Ordering::Relaxed);
-    IMPL_EVENTS_TOTAL.fetch_add(
+    crate::local_census::add_usize(&NG_UP_EVENTS_TOTAL, ng_up_fixed + ng_up_pruned);
+    crate::local_census::add_usize(&NG_STORED_TOTAL, nogoods.len());
+    crate::local_census::add_usize(
+        &IMPL_EVENTS_TOTAL,
         impl_fired + impl_pruned + cutoff_prop_pruned,
-        std::sync::atomic::Ordering::Relaxed,
     );
     if trace && (mode.depth > 0 || !nogoods.is_empty() || ng_skipped_long > 0) {
         // Stored-length histogram: 1-4 / 5-8 / 9-16 / 17-32 / 33+.
@@ -31749,7 +29543,7 @@ fn solve_milp_in_impl(
             eprintln!("--trace ng-branch: band={ng_branch_band:.2} switched={ng_branch_switched}");
         }
     }
-    PC_STORED_TOTAL.fetch_add(pc_stored, std::sync::atomic::Ordering::Relaxed);
+    crate::local_census::add_usize(&PC_STORED_TOTAL, pc_stored);
     if trace && pc_attempts > 0 {
         eprintln!(
             "--trace prop-conflict: attempts={pc_attempts} stored={pc_stored} \
@@ -31759,7 +29553,7 @@ fn solve_milp_in_impl(
             mode.depth
         );
     }
-    LB_STORED_TOTAL.fetch_add(lb_stored, std::sync::atomic::Ordering::Relaxed);
+    crate::local_census::add_usize(&LB_STORED_TOTAL, lb_stored);
     if trace && lb_attempts > 0 {
         eprintln!(
             "--trace lp-bound-conflict: attempts={lb_attempts} stored={lb_stored} \
@@ -31818,326 +29612,86 @@ fn solve_milp_in_impl(
             sweeps as f64 / calls.max(1) as f64
         );
     }
-    if unbounded {
-        // An unbounded relaxation makes the MILP unbounded ONLY IF the MILP is
-        // feasible — for rational data a feasible integer program with an
-        // unbounded relaxation really is unbounded, but an INFEASIBLE one is not,
-        // and reporting `Unbounded` for it would be a wrong verdict. Most solvers
-        // conflate the two (Gurobi's INF_OR_UNBD); we do not. So ask the question
-        // the conflation skips: is there an integer-feasible point at all?
-        let mut probe = model.clone();
-        probe.set_objective(&[], Sense::Minimize);
-        // The probe's tree certificate is stripped below regardless (wrong
-        // frame), so never pay capture/finalize for it.
-        let probe_opts = opts.clone().with_tree_cert_leaves(0);
-        return match solve_milp(&probe, &probe_opts) {
-            Outcome::Optimal { .. } | Outcome::Feasible { .. } => Outcome::Unbounded,
-            // The probe is built from THIS solve's presolved+cut model, so a
-            // tree certificate captured inside it verifies against that frame,
-            // not the caller's: strip it (fail closed). The root `cert` is
-            // never populated by `solve_milp` itself, so nothing real is lost.
-            Outcome::Infeasible { cert, .. } => Outcome::Infeasible {
-                cert,
-                tree_cert: None,
-            },
-            _ => Outcome::Unknown {
-                reason: UnknownReason::SolverIncomplete {
-                    detail: "unbounded relaxation, but integer feasibility undecided".to_owned(),
-                },
-            },
-        };
-    }
-
-    // One shared exact aggregation serves BOTH the live marked-margin stop and
-    // this terminal report. At loop exit there is no in-flight current node;
-    // every deadline/cap exit put it back in `stack`. The helper includes the
-    // incumbent, dive, heap, dropped-node bank, restart bank, incumbent-licensed
-    // root floor, zero-objective floor, and exact caller-frame sense/offset.
-    let exact_tree_bound = exact_frontier_bound(
-        None,
-        &dive,
-        &stack,
-        incumbent.as_ref().map(|(_, value)| value),
-        lost_subtree,
-        lost_bank.as_ref(),
-        restart_bank.as_ref(),
-        root_floor_global.as_deref(),
-        apply_tree_floor,
-        zero_objective,
-        sense,
-        &model_offset,
+    let symmetry_engaged = sym_rows_added
+        || sym_pins > 0
+        || sym.as_ref().is_some_and(|symmetry| {
+            symmetry.fixes_made > 0
+                || symmetry.orbitope_reductions > 0
+                || symmetry.orbitope_cutoffs > 0
+        });
+    let symmetry_retry = search_finalize::SymmetryRetry::classify(
+        mode,
+        opts,
+        deadline,
+        symmetry_engaged,
+        search_finalize::RetryAdvice {
+            branch_hints,
+            root_probe_shortlist,
+            shared_binary_prefix,
+        },
     );
-    let tree_bound = exact_tree_bound
-        .as_ref()
-        .map(|bound| bound.internal.clone());
-    let framed_tree_bound = exact_tree_bound.map(|bound| bound.framed);
-    if trace {
-        // Printed for EVERY interrupted outcome (the incumbent arm below re-prints it
-        // offset-adjusted): the no-incumbent trajectory is invisible without it.
-        //
-        // The root floor is echoed HERE, not only at its own `root node floor`
-        // line, because that line is printed by every nested solve too (RINS
-        // sub-MIPs, projection restarts) and the outermost one prints FIRST —
-        // so a log reader pairing "the last floor" with "the last tree bound"
-        // pairs numbers from two different frames. This one is this solve's.
-        if let Some(tb) = &tree_bound {
-            eprintln!(
-                "--trace tree bound (minimize frame) = {:.6} (root floor {})",
-                to_f64(tb),
-                root_floor_global
-                    .as_ref()
-                    .map_or_else(|| "none".to_string(), |f| format!("{:.6}", to_f64(f)))
-            );
-        }
-    }
-    // Whether a no-incumbent interrupted tree may report its bound (below).
-    // `the no-tree-bound-outcome knob` restores the prior `Unknown`, which is
-    // the A/B arm this change was measured on.
-    let report_tree_bound = !zero_objective
-        && crate::tune::caller_flag(crate::tune::Knob::NoTreeBoundOutcome) != Some(true);
-
-    // MARKED-MARGIN PROOF AT THE TERMINAL QUIESCENT BOUNDARY. This is not
-    // restricted to interruption: a fully exhausted finite optimum can be the
-    // first strict threshold crossing too. `exact_frontier_bound` has already
-    // applied the same lost-subtree/root-floor rules as the live path, and the
-    // number remains only an economics trigger. Missing coverage, capture
-    // poisoning, replay failure, or deadline expiry yields no proof and falls
-    // through to the ordinary Bound/Feasible/Unknown/Optimal construction.
-    let margin_tree_cert = match (margin_proof_target, framed_tree_bound.as_ref()) {
-        (Some(target), Some(bound)) if capture.is_armed() => {
-            margin_bound_checks += 1;
-            if target.strictly_excludes(bound) {
-                margin_bound_crossings += 1;
-                if trace {
-                    eprintln!(
-                        "--trace marked-margin-bound-stop phase=terminal \
-                         bound={:.12} nodes={nodes} frontier={} replay=finalize-begin",
-                        to_f64(bound),
-                        dive.len() + stack.len(),
-                    );
-                }
-                let cert = capture.finalize_margin_cover(
-                    target.proof_model(),
-                    finalize_deadline(full_deadline, finalize_reserve, Instant::now()),
-                );
-                if cert.is_none() {
-                    margin_bound_replay_failures += 1;
-                    if trace {
-                        eprintln!(
-                            "--trace marked-margin-bound-stop phase=terminal \
-                             bound={:.12} nodes={nodes} frontier={} \
-                             replay=finalize-failed-fallthrough",
-                            to_f64(bound),
-                            dive.len() + stack.len(),
-                        );
-                    }
-                }
-                cert
+    search_finalize::finalize_search(search_finalize::FinalizationRequest {
+        frame: search_finalize::FinalizationFrame {
+            caller_model,
+            search_model: model,
+            opts,
+            sense,
+            model_offset,
+            symmetry_retry,
+        },
+        frontier: search_finalize::FrontierConclusion {
+            dive: &dive,
+            heap: &stack,
+            incumbent,
+            lost_subtree,
+            lost_bank: lost_bank.as_ref(),
+            restart_bank: restart_bank.as_ref(),
+            root_floor: root_floor_global,
+            floor_policy: if apply_tree_floor {
+                search_finalize::TreeFloorPolicy::Apply
             } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    if let Some(tree_cert) = margin_tree_cert {
-        debug_assert!(tree_cert
-            .verify(
-                margin_proof_target
-                    .expect("margin proof requires a target")
-                    .proof_model()
-            )
-            .is_ok());
-        if trace {
-            eprintln!(
-                "--trace marked-margin-bound-stop phase=terminal \
-                 replay=finalize-verified checks={margin_bound_checks} \
-                 crossings={margin_bound_crossings} failures={margin_bound_replay_failures}"
-            );
-        }
-        return Outcome::Infeasible {
-            cert: None,
-            tree_cert: Some(tree_cert),
-        };
-    }
-    if trace && margin_proof_target.is_some() {
-        eprintln!(
-            "--trace marked-margin-bound-stop phase=fallthrough \
-             checks={margin_bound_checks} crossings={margin_bound_crossings} \
-             failures={margin_bound_replay_failures} \
-             live_preview_enabled={margin_live_preview_enabled} \
-             live_preview_attempted={margin_live_preview_attempted} capture_armed={}",
-            capture.is_armed()
-        );
-    }
-
-    let out = match incumbent {
-        Some((values, minimized)) => {
-            let value = match sense {
-                Sense::Minimize => minimized,
-                Sense::Maximize => -minimized,
-            };
-            let offset = model_offset;
-            if incomplete {
-                // A real point, but the tree was not exhausted, so "optimal" is
-                // no longer a claim we own. The open set's weakest bound still is.
-                let dual_bound = framed_tree_bound;
-                if trace {
-                    if let Some(db) = &dual_bound {
-                        eprintln!("--trace interrupted: dual bound = {db}");
-                    }
-                }
-                Outcome::Feasible {
-                    model_values: values,
-                    incumbent_only: true,
-                    dual_bound,
-                }
-            } else {
-                // The dual evidence for a MILP optimum is in general the tree of
-                // leaf certificates (`MilpInfeasibilityCertificate`, still to
-                // come); an LP certificate would only bound the relaxation, so
-                // claiming one would be claiming more than we hold. The ONE case
-                // where the full claim IS in hand is the costless (feasibility)
-                // objective: the EMPTY multiplier combination proves
-                // `0·x >= 0` over every feasible point — `combine([])` is
-                // identically zero, so `OptimalityCertificate::verify` checks
-                // the exact identity `0 == objective − bound` with objective
-                // empty and bound 0. Guarded on the CALLER frame too (presolve
-                // never rewrites costs today, but the certificate's licence
-                // must not depend on that), it is the exact root bound as
-                // independently checkable data, meeting the incumbent's exact
-                // 0 with a gap of exactly zero.
-                let cert = if zero_objective
-                    && (0..caller_model.num_cols())
-                        .all(|j| caller_model.obj_coeff(Col(j as u32)) == 0.0)
-                {
-                    Some(crate::cert::OptimalityCertificate {
-                        sense,
-                        objective: Vec::new(),
-                        bound: BigRational::zero(),
-                        multipliers: Vec::new(),
-                    })
-                } else {
-                    None
-                };
-                Outcome::Optimal {
-                    value: value + offset,
-                    model_values: values,
-                    cert,
-                }
-            }
-        }
-        // NO INCUMBENT, TREE INTERRUPTED. The search found no point, so there is
-        // no primal claim — but the open set's weakest bound is the SAME rigorous
-        // object the `Feasible` arm above has always shipped, computed by the same
-        // lines, and until now it was computed and then dropped on the floor. A
-        // dual bound is a verdict-grade answer on its own ("the optimum is no
-        // better than B"), so report it instead of `Unknown`, which asserts
-        // nothing at all.
-        //
-        // The claim is rigorous by exactly the argument at `tree_bound` above:
-        // every node bound is Neumaier–Shcherbina-corrected or exact, a
-        // deadline/cap stop leaves the open set whole, and any node that lost its
-        // subtree without proof already forced `tree_bound = None`. So this
-        // FAILS CLOSED — no bound in hand, no `Bound` outcome, and the original
-        // `Unknown` (with its reason) ships unchanged.
-        //
-        // One exclusion: a zero-objective (feasibility) model, whose bound is the
-        // trivial 0 that the `zero_objective` floor above manufactures for every
-        // such tree. That number is true but content-free — it says nothing about
-        // the feasibility question actually asked — and reporting it would mask a
-        // genuine "no verdict" from callers that branch on `is_unknown` (the smt
-        // fallback in `session.rs` is one). Feasibility solves keep `Unknown`.
-        None if timed_out => match framed_tree_bound {
-            Some(dual_bound) if report_tree_bound => Outcome::Bound {
-                dual_bound,
-                rigorous: true,
+                search_finalize::TreeFloorPolicy::Ignore
             },
-            _ => Outcome::Unknown {
-                reason: UnknownReason::Timeout,
+            objective: if zero_objective {
+                search_finalize::ObjectiveClass::Feasibility
+            } else {
+                search_finalize::ObjectiveClass::Costed
+            },
+            termination: if timed_out {
+                search_finalize::SearchTermination::TimedOut
+            } else if incomplete {
+                search_finalize::SearchTermination::Incomplete
+            } else {
+                search_finalize::SearchTermination::Exhausted
+            },
+            relaxation: if unbounded {
+                search_finalize::RelaxationConclusion::Unbounded
+            } else {
+                search_finalize::RelaxationConclusion::Bounded
             },
         },
-        None if incomplete => match framed_tree_bound {
-            Some(dual_bound) if report_tree_bound => Outcome::Bound {
-                dual_bound,
-                rigorous: true,
-            },
-            _ => Outcome::Unknown {
-                reason: UnknownReason::SolverIncomplete {
-                    detail: "branch-and-bound could not settle every node".to_owned(),
-                },
-            },
+        margin: search_finalize::MarginFinalization {
+            target: margin_proof_target,
+            live_preview_enabled: margin_live_preview_enabled,
+            live_preview_attempted: margin_live_preview_attempted,
+            bound_checks: margin_bound_checks,
+            bound_crossings: margin_bound_crossings,
+            replay_failures: margin_bound_replay_failures,
         },
-        // Every leaf was proven empty on the exact rim. Export the tree as a
-        // caller-frame `MilpInfeasibilityCertificate` when the capture is
-        // whole and every leaf re-derives within the remaining deadline;
-        // otherwise the verdict ships exactly as before, without evidence.
-        None => {
-            // Finalize runs to the CALLER's own deadline, with `finalize_reserve` handed
-            // down as the per-leaf exact-rim slice rather than used as the whole ceiling —
-            // see `terminal_finalize_deadline` and `tree_cert::FinalizeBudget` for the two
-            // measured trees that separate "one rim solve that will never close" from "a
-            // 244-leaf tree that finalizes in 41 s", and for why both stay fail-closed.
-            let mut tree_cert = capture.finalize(
-                caller_model,
-                terminal_finalize_deadline(full_deadline),
-                finalize_reserve,
-            );
-            // THE TREE-CERTIFICATE RETRY. Symmetry handling poisons the capture
-            // (its tree is exhaustive only up to symmetry; rows mode's tree is
-            // about the augmented model), so an Infeasible verdict on a
-            // symmetric model would ship without the artifact requested via
-            // `tree_cert_leaves`. The verdict itself is settled and sound; what is
-            // missing is EVIDENCE in the caller's literal frame. So re-solve
-            // the caller's model once with symmetry disabled (`no_sym`) and
-            // take THAT tree's certificate — the retry claims nothing the
-            // first solve did not (its verdict is only consulted to harvest
-            // the cert; any non-Infeasible retry outcome, e.g. a deadline
-            // Unknown, just leaves `tree_cert: None`, fail-closed). Gated so
-            // it fires only where symmetry actually engaged and a cert was
-            // wanted; feasible solves — the common case — never pay it.
-            let sym_engaged = sym_rows_added
-                || sym_pins > 0
-                || sym.as_ref().is_some_and(|s| {
-                    s.fixes_made > 0 || s.orbitope_reductions > 0 || s.orbitope_cutoffs > 0
-                });
-            if tree_cert.is_none()
-                && sym_engaged
-                && opts.tree_cert_leaves > 0
-                && mode.depth == 0
-                && !mode.cheap
-                && !mode.projected
-                && !mode.no_sym
-                && deadline.is_none_or(|d| Instant::now() < d)
-            {
-                let retry_mode = SearchMode {
-                    no_sym: true,
-                    ..mode
-                };
-                if let Outcome::Infeasible { tree_cert: tc, .. } = solve_milp_in(
-                    caller_model,
-                    opts,
-                    retry_mode,
-                    None,
-                    branch_hints,
-                    root_probe_shortlist,
-                    shared_binary_prefix,
-                ) {
-                    tree_cert = tc;
-                }
+        certificate: search_finalize::CertificateFinalization {
+            capture,
+            full_deadline,
+            finalize_reserve,
+        },
+        trace: if trace {
+            search_finalize::FinalizeTrace::Enabled {
+                nodes,
+                started: finalize_t0,
             }
-            if trace {
-                eprintln!(
-                    "--trace finalize: outcome built at +{:.2}s",
-                    finalize_t0.elapsed().as_secs_f64()
-                );
-            }
-            Outcome::Infeasible {
-                cert: None,
-                tree_cert,
-            }
-        }
-    };
-    out
+        } else {
+            search_finalize::FinalizeTrace::Disabled
+        },
+    })
 }
 
 #[cfg(test)]
@@ -32155,6 +29709,12 @@ mod tests {
     mod root_prepared_relaxation_tests;
 
     mod shadow_control_tests;
+
+    fn zero_heur(engine: &crate::EngineEconomics) -> crate::EngineEconomics {
+        (*engine)
+            .with_heur_share(0.0)
+            .expect("zero is a valid heuristic share")
+    }
 
     // ---- CLAUSE A: THE STRUCTURAL PROLOGUE HAS NO BYPASS ----
     //
@@ -32754,7 +30314,6 @@ mod tests {
 
     #[test]
     fn rebuilt_rens_and_projected_rins_submodels_keep_top_level_frame() {
-        let _guard = crate::sepstat::adoption_test_guard();
         let _env_lock = lock_env();
         let mut parent = Model::new();
         let fixed = parent.add_binary_col();
@@ -32788,13 +30347,13 @@ mod tests {
             .check_point(&point)
             .expect("RENS point lifts to the parent");
 
-        let before = crate::sepstat::adoption_forgone();
+        let before = crate::sepstat::adoption_forgone_local();
         assert!(projected_latch.charge(37));
         assert!(
             !latch.charge(101),
             "rebuilt RENS and projected RINS split one top-level frame"
         );
-        let after = crate::sepstat::adoption_forgone();
+        let after = crate::sepstat::adoption_forgone_local();
         assert_eq!(after.0 - before.0, 1);
         assert_eq!(after.1 - before.1, 37);
     }
@@ -32872,8 +30431,6 @@ mod tests {
     /// zero rows, and a tree that verifies directly against the caller model.
     #[test]
     fn serial_shared_prefix_has_one_root_even_when_symmetry_would_retry_for_a_tree() {
-        use std::sync::atomic::Ordering::Relaxed;
-
         let _env_lock = lock_env();
         // B39b: rows-mode symmetry + no heuristic share ride the engine
         // profile chained onto this test's opts below.
@@ -32893,8 +30450,7 @@ mod tests {
             .with_tree_cert_leaves(64)
             .with_require_certificates(true)
             .with_engine(
-                crate::EngineEconomics::new()
-                    .with_heur_share(0.0)
+                zero_heur(&crate::EngineEconomics::new())
                     .with_sym_mode(1)
                     .expect("rows in domain"),
             );
@@ -32903,9 +30459,15 @@ mod tests {
         // engine profile itself; this direct-call test activates it for the
         // whole scope.
         let _tuned = crate::tune::activate_caller(opts.engine().profile());
-        let entries_before = SHARED_PREFIX_SOLVE_ENTRIES_TOTAL.load(Relaxed);
-        let roots_before = SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL.load(Relaxed);
-        let rows_before = SYM_ROWS_TOTAL.load(Relaxed);
+        let entries_before = crate::local_census::Floor::usize_at(
+            &SHARED_PREFIX_SOLVE_ENTRIES_TOTAL,
+            "SHARED_PREFIX_SOLVE_ENTRIES_TOTAL",
+        );
+        let roots_before = crate::local_census::Floor::usize_at(
+            &SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL,
+            "SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL",
+        );
+        let rows_before = crate::local_census::Floor::usize_at(&SYM_ROWS_TOTAL, "SYM_ROWS_TOTAL");
         let old_mode = solve_milp_in(
             &model,
             &opts,
@@ -32929,23 +30491,29 @@ mod tests {
             .verify(&model)
             .expect("the negative-control retry must harvest caller-frame evidence");
         assert!(
-            SYM_ROWS_TOTAL.load(Relaxed) > rows_before,
+            rows_before.report() > 0,
             "negative control never engaged symmetry, so it proves nothing"
         );
         assert_eq!(
-            SHARED_PREFIX_SOLVE_ENTRIES_TOTAL.load(Relaxed) - entries_before,
+            entries_before.report(),
             2,
             "the old mode must expose the hidden symmetry certificate retry"
         );
         assert_eq!(
-            SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL.load(Relaxed) - roots_before,
+            roots_before.report(),
             2,
             "each old-mode solve entry must prepare its own root"
         );
 
-        let entries_before = SHARED_PREFIX_SOLVE_ENTRIES_TOTAL.load(Relaxed);
-        let roots_before = SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL.load(Relaxed);
-        let rows_before = SYM_ROWS_TOTAL.load(Relaxed);
+        let entries_before = crate::local_census::Floor::usize_at(
+            &SHARED_PREFIX_SOLVE_ENTRIES_TOTAL,
+            "SHARED_PREFIX_SOLVE_ENTRIES_TOTAL",
+        );
+        let roots_before = crate::local_census::Floor::usize_at(
+            &SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL,
+            "SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL",
+        );
+        let rows_before = crate::local_census::Floor::usize_at(&SYM_ROWS_TOTAL, "SYM_ROWS_TOTAL");
         let outcome = solve_milp_shared_binary_prefix(&model, &opts, &prefix, &[], &[]);
         let tree = match outcome {
             Outcome::Infeasible {
@@ -32957,18 +30525,18 @@ mod tests {
         tree.verify(&model)
             .expect("the one-root tree must verify in the caller frame");
         assert_eq!(
-            SHARED_PREFIX_SOLVE_ENTRIES_TOTAL.load(Relaxed) - entries_before,
+            entries_before.report(),
             1,
             "the admitted serial prefix must enter exactly one top-level solve"
         );
         assert_eq!(
-            SHARED_PREFIX_ROOT_PREPARATIONS_TOTAL.load(Relaxed) - roots_before,
+            roots_before.report(),
             1,
             "the admitted serial prefix must prepare exactly one root"
         );
         assert_eq!(
-            SYM_ROWS_TOTAL.load(Relaxed),
-            rows_before,
+            rows_before.report(),
+            0,
             "serial prefix symmetry must be dark from the first root"
         );
     }
@@ -33168,11 +30736,18 @@ mod tests {
         let full = now + Duration::from_secs(30);
         let reserve = Duration::from_secs(5);
         let floor = Duration::from_millis(200);
+        let Some(reserved_deadline) = full.checked_sub(reserve) else {
+            panic!("30s test deadline must exceed its 5s reserve");
+        };
         let fresh = || {
             (
-                Some((full, reserve, floor)),
-                Some(full - reserve),
-                Some(full - reserve),
+                Some(search_bootstrap::FinalizeReservePlan {
+                    deadline: full,
+                    duration: reserve,
+                    search_floor: floor,
+                }),
+                Some(reserved_deadline),
+                Some(reserved_deadline),
             )
         };
 
@@ -33185,9 +30760,16 @@ mod tests {
             &mut reserved,
             Some(full)
         ));
-        assert_eq!(params, Some((full, reserve, floor)));
-        assert_eq!(deadline, Some(full - reserve));
-        assert_eq!(reserved, Some(full - reserve));
+        assert_eq!(
+            params,
+            Some(search_bootstrap::FinalizeReservePlan {
+                deadline: full,
+                duration: reserve,
+                search_floor: floor,
+            })
+        );
+        assert_eq!(deadline, Some(reserved_deadline));
+        assert_eq!(reserved, Some(reserved_deadline));
 
         // POISONED: the whole hold-back comes back, and `reserved_deadline` with it —
         // otherwise the next integral leaf pulls the search straight back to `d - reserve`.
@@ -33258,7 +30840,7 @@ mod tests {
     #[test]
     fn terminal_finalize_gets_the_callers_wall_not_the_reserve() {
         let now = Instant::now();
-        let far = now + Duration::from_secs(120);
+        let far = now + Duration::from_mins(2);
         assert_eq!(
             terminal_finalize_deadline(Some(far)),
             Some(far),
@@ -33995,68 +31577,6 @@ mod tests {
         assert!(!odd_cycle_enabled(true, true, true, true));
     }
 
-    #[test]
-    fn mixing_is_opt_in_and_kill_switch_dominates() {
-        assert!(!mixing_enabled(false, false), "mixing defaults off");
-        assert!(
-            mixing_enabled(true, false),
-            "the explicit opt-in enables mixing"
-        );
-        assert!(!mixing_enabled(false, true));
-        assert!(
-            !mixing_enabled(true, true),
-            "the kill switch must dominate the opt-in"
-        );
-    }
-
-    /// The root-loop wrapper, not merely the separator's local row scan, owns
-    /// the production mixing-family gate. A model with twelve perfectly usable
-    /// mixing rows plus one equality row fails the whole-model MIK signature:
-    /// the raw separator can cut it, but the production call site must not.
-    #[test]
-    fn mixing_callsite_requires_the_original_model_mik_gate() {
-        let build = |with_equality: bool| {
-            let mut m = Model::new();
-            let s = m.add_col(0.0, 20.0);
-            let y = m.add_int_col(0.0, 3.0);
-            for r in 0..12 {
-                if r % 2 == 0 {
-                    m.add_row(f64::NEG_INFINITY, 1.0, &[(s, -1.0), (y, 3.0)]);
-                } else {
-                    m.add_row(f64::NEG_INFINITY, 2.0, &[(s, -1.0), (y, 4.0)]);
-                }
-            }
-            if with_equality {
-                m.add_row(0.0, 0.0, &[(y, 1.0)]);
-            }
-            m.set_objective(&[(y, 1.0)], Sense::Minimize);
-            (m, vec![1.25, 0.75])
-        };
-
-        let (mik, x) = build(false);
-        assert!(crate::cuts::is_mixed_integer_knapsack(&mik));
-        assert!(
-            !separate_mixing_for_root_shape(true, &mik, &mik, &x, mik.num_rows(), 8).is_empty(),
-            "the positive call-site control must exercise the mixing separator"
-        );
-        assert!(
-            separate_mixing_for_root_shape(false, &mik, &mik, &x, mik.num_rows(), 8).is_empty(),
-            "a valid MIK model must still decline mixing without the explicit opt-in"
-        );
-
-        let (not_mik, x) = build(true);
-        assert!(!crate::cuts::is_mixed_integer_knapsack(&not_mik));
-        assert!(
-            !crate::cuts::separate_mixing(&not_mik, &x, not_mik.num_rows(), 8).is_empty(),
-            "the local row signature must be non-vacuous in the negative control"
-        );
-        assert!(
-            separate_mixing_for_root_shape(true, &not_mik, &not_mik, &x, not_mik.num_rows(), 8)
-                .is_empty(),
-            "an equality-row model must not receive opt-in mixing cuts"
-        );
-    }
-
     /// BRUTE-FORCE GUARD for the propagation-conflict transfer boxes (license
     /// at `PC_MAX_DEVS`): whatever box `prop_conflict_learn` returns, its
     /// stored claim must hold EXACTLY — with a cutoff, no integer-feasible
@@ -34231,14 +31751,12 @@ mod tests {
     /// `PC_STORED_TOTAL`: at least one solve must actually store a box.
     #[test]
     fn prop_conflict_learning_preserves_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         let _env_lock = lock_env();
-        let stored_before = PC_STORED_TOTAL.load(Relaxed);
+        let stored_before =
+            crate::local_census::Floor::usize_at(&PC_STORED_TOTAL, "PC_STORED_TOTAL");
         // B38/B39b/B49/B50: every lever rides the per-solve engine profile.
         let nc_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_cuts(false)
-                .with_heur_share(0.0)
+            zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                 .with_ng_up(true)
                 .with_prop_conflict(true)
                 .with_impl_lane(true)
@@ -34346,7 +31864,7 @@ mod tests {
         }
         // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
-            PC_STORED_TOTAL.load(Relaxed) > stored_before,
+            stored_before.report() > 0,
             "guard is vacuous: no solve ever stored a propagation-conflict box"
         );
     }
@@ -34524,14 +32042,12 @@ mod tests {
     /// infeasible. Non-vacuous via `LB_STORED_TOTAL`.
     #[test]
     fn lb_conflict_learning_preserves_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         let _env_lock = lock_env();
-        let stored_before = LB_STORED_TOTAL.load(Relaxed);
+        let stored_before =
+            crate::local_census::Floor::usize_at(&LB_STORED_TOTAL, "LB_STORED_TOTAL");
         // B38/B39b/B49/B50: every lever rides the per-solve engine profile.
         let nc_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_cuts(false)
-                .with_heur_share(0.0)
+            zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                 .with_ng_up(true)
                 .with_lb_conflict(2)
                 .with_lb_arm(0)
@@ -34634,7 +32150,7 @@ mod tests {
         }
         // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
-            LB_STORED_TOTAL.load(Relaxed) > stored_before,
+            stored_before.report() > 0,
             "guard is vacuous: no solve ever stored an LP-bound conflict box"
         );
     }
@@ -34909,18 +32425,15 @@ mod tests {
     fn nogood_unit_propagation_preserves_the_optimum() {
         // B39b/B49: zero heuristic share + forced ng-up ride the per-solve
         // engine profile.
-        let hs_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_heur_share(0.0)
-                .with_ng_up(true),
-        );
-        use std::sync::atomic::Ordering::Relaxed;
+        let hs_opts = SolveOpts::new()
+            .with_engine(zero_heur(&crate::EngineEconomics::new()).with_ng_up(true));
         // Forced ng-up reshapes trees process-wide while active: hold the same
         // lock the symmetry guard holds so its non-vacuity counters cannot be
         // starved by trees reshaped under forced unit propagation (and vice
         // versa).
         let _env_lock = lock_env();
-        let stored_before = NG_STORED_TOTAL.load(Relaxed);
+        let stored_before =
+            crate::local_census::Floor::usize_at(&NG_STORED_TOTAL, "NG_STORED_TOTAL");
         let mut seed = 0x0A17_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -35005,7 +32518,7 @@ mod tests {
         }
         // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
-            NG_STORED_TOTAL.load(Relaxed) > stored_before,
+            stored_before.report() > 0,
             "guard is vacuous: no solve ever learned a no-good"
         );
     }
@@ -35043,9 +32556,11 @@ mod tests {
     #[test]
     fn scaled_noenter_shortcut_matches_phase1_verdict() {
         use crate::simplex::{SimplexStatus, DUAL_NOENTER_SHORTCUT};
-        use std::sync::atomic::Ordering::Relaxed;
         let _g = lock_env();
-        let fires_before = DUAL_NOENTER_SHORTCUT[1].load(Relaxed);
+        let fires_before = crate::local_census::Floor::usize_at(
+            &DUAL_NOENTER_SHORTCUT[1],
+            "DUAL_NOENTER_SHORTCUT[1]",
+        );
         let mut seed = 0xF00D_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -35151,7 +32666,7 @@ mod tests {
                 checked_farkas += 1;
             }
         }
-        let fires = DUAL_NOENTER_SHORTCUT[1].load(Relaxed) - fires_before;
+        let fires = fires_before.report();
         assert!(
             infeasible_cases > 0,
             "generator never produced an infeasible child"
@@ -35183,10 +32698,10 @@ mod tests {
     /// workspace env lock, `lock_env`).
     #[test]
     fn symmetry_handling_preserves_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         let _env_lock = lock_env();
-        let fixes_before = SYM_FIXES_TOTAL.load(Relaxed);
-        let rows_before = SYM_ROWS_TOTAL.load(Relaxed);
+        let fixes_before =
+            crate::local_census::Floor::usize_at(&SYM_FIXES_TOTAL, "SYM_FIXES_TOTAL");
+        let rows_before = crate::local_census::Floor::usize_at(&SYM_ROWS_TOTAL, "SYM_ROWS_TOTAL");
         // The tree must be the finder, or the fixing under guard never runs:
         // at this size the root suite + cuts settle most cases at node 1.
         // B38/B39b: cuts-off + zero heuristic share ride the per-solve
@@ -35214,9 +32729,7 @@ mod tests {
             // B39b: the mode rides a per-arm engine profile chained onto the
             // base nc_opts; STAB_ORBIT keeps its env identity (own verdict).
             let arm_opts = SolveOpts::new().with_engine(
-                crate::EngineEconomics::new()
-                    .with_cuts(false)
-                    .with_heur_share(0.0)
+                zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                     .with_sym_mode(mode)
                     .expect("mode in domain"),
             );
@@ -35378,11 +32891,10 @@ mod tests {
         // block plus block-symmetric coupling rows. Mixed kinds route the
         // component to the static lex lane (the measured default), so this
         // phase is the end-to-end guard that lane preserves the optimum.
-        let orbitope_before = SYM_ORBITOPE_TOTAL.load(Relaxed);
+        let orbitope_before =
+            crate::local_census::Floor::usize_at(&SYM_ORBITOPE_TOTAL, "SYM_ORBITOPE_TOTAL");
         let arm_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_cuts(false)
-                .with_heur_share(0.0)
+            zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                 .with_sym_mode(0)
                 .expect("orbital in domain"),
         );
@@ -35509,9 +33021,7 @@ mod tests {
         // B39b: orbital mode rides the engine profile; ORBITOPE_DYN keeps
         // its env identity (own verdict).
         let arm_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_cuts(false)
-                .with_heur_share(0.0)
+            zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                 .with_sym_mode(0)
                 .expect("orbital in domain"),
         );
@@ -35638,15 +33148,15 @@ mod tests {
         // `_heur_share` / `_no_cuts` / `_sym_branch` restore at end of scope,
         // still under `_env_lock`.
         assert!(
-            SYM_FIXES_TOTAL.load(Relaxed) > fixes_before,
+            fixes_before.report() > 0,
             "non-vacuity: orbital fixing never fired on the symmetric corpus"
         );
         assert!(
-            SYM_ROWS_TOTAL.load(Relaxed) > rows_before,
+            rows_before.report() > 0,
             "non-vacuity: rows mode never added a lex-leader row"
         );
         assert!(
-            SYM_ORBITOPE_TOTAL.load(Relaxed) > orbitope_before,
+            orbitope_before.report() > 0,
             "non-vacuity: the orbitope lane never fired on the mixed-kind corpus"
         );
     }
@@ -35762,7 +33272,10 @@ mod tests {
         );
         // At 60 s the tree reserve is the binding term, but it is still STRICTLY MORE
         // than the old half-share -- that difference is the air05 UNKNOWN -> FEASIBLE.
-        assert_eq!(w60, secs(47.0) - secs(SETPART_TREE_RESERVE_SECS));
+        assert_eq!(
+            w60,
+            secs(47.0).saturating_sub(secs(SETPART_TREE_RESERVE_SECS))
+        );
         assert!(w60 > secs(47.0).mul_f64(SETPART_TIME_SHARE));
 
         // (2) difficulty-proportionality: the cheap root earns a far smaller window.
@@ -35833,7 +33346,7 @@ mod tests {
 
         // (3) difficulty-proportionality: qiu's 0.38s root LP earns 3x more than air03's.
         let qiu = pump_window(secs(0.38), secs(120.0), PUMP_FLOOR_SECS);
-        assert!(qiu > w120 * 3 - secs(0.01) && qiu > secs(1.0));
+        assert!(qiu > (w120 * 3).saturating_sub(secs(0.01)) && qiu > secs(1.0));
 
         // (4) the virgin floor is exactly the barren gate's allowance, so a model whose root
         // LP is instant still gets every restart the barren gate would have allowed.
@@ -35856,15 +33369,15 @@ mod tests {
         );
     }
 
-    /// The A/B escape hatch must restore the old pure share byte-for-byte, and the work
-    /// multiplier override is untrusted process input: `f64` parses NaN and infinities that
-    /// `Duration::mul_f64` panics on, so they must fall back to the default policy.
+    /// The A/B escape hatch must restore the old pure share byte-for-byte. Invalid internal
+    /// profiles must fall back to the default and no share may extend the governing window.
     #[test]
-    fn pump_share_override_bypasses_the_work_cap_and_mult_rejects_nonfinite() {
+    fn pump_share_override_is_unit_bounded_and_falls_back_safely() {
         let secs = Duration::from_secs_f64;
         let root_lp = secs(0.12);
         let remaining = secs(120.0);
-        assert!(pump_window(root_lp, remaining, PUMP_FLOOR_SECS) < secs(1.0));
+        let default = pump_window(root_lp, remaining, PUMP_FLOOR_SECS);
+        assert!(default < secs(1.0));
         {
             // An operator-pinned share bypasses the cap entirely: the
             // pre-cap behaviour (B39b: `--pump-share`).
@@ -35877,10 +33390,24 @@ mod tests {
                 remaining.mul_f64(0.6)
             );
         }
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
+            let _active = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+                crate::tune::Knob::PumpShare,
+                crate::tune::Setting::Real(invalid),
+            ));
+            assert_eq!(pump_window(root_lp, remaining, PUMP_FLOOR_SECS), default);
+        }
+        for (share, expected) in [(0.0, Duration::ZERO), (1.0, remaining)] {
+            let _active = crate::tune::activate_caller(crate::tune::Profile::EMPTY.with(
+                crate::tune::Knob::PumpShare,
+                crate::tune::Setting::Real(share),
+            ));
+            assert_eq!(pump_window(root_lp, remaining, PUMP_FLOOR_SECS), expected);
+        }
         // B6: pump_work_mult is env-free; assert the constant directly and keep
         // the duration-arithmetic non-panic check.
         assert_eq!(pump_work_mult(), PUMP_WORK_MULT);
-        let _ = pump_window(root_lp, remaining, PUMP_FLOOR_SECS);
+        assert!(pump_window(root_lp, remaining, PUMP_FLOOR_SECS) <= remaining);
     }
 
     /// The A/B override is untrusted process input. In particular, Rust's
@@ -35892,7 +33419,7 @@ mod tests {
     #[test]
     fn setpart_share_override_accepts_only_finite_unit_interval() {
         let root_work = Duration::from_secs(2);
-        let remaining = Duration::from_secs(60);
+        let remaining = Duration::from_mins(1);
         let default = setpart_window(root_work, remaining);
 
         // B39b: the override is a typed caller Real; the Setting domain plus
@@ -36267,9 +33794,7 @@ mod tests {
     #[test]
     fn node_cut_slots_preserve_the_optimum() {
         // B39b: zero heuristic share rides the per-solve engine profile.
-        let hs_opts =
-            SolveOpts::new().with_engine(crate::EngineEconomics::new().with_heur_share(0.0));
-        use std::sync::atomic::Ordering::Relaxed;
+        let hs_opts = SolveOpts::new().with_engine(zero_heur(&crate::EngineEconomics::new()));
         // Serialize the process-global cut levers behind the one env choke
         // point; the guards below restore on scope exit (also on panic).
         let _env_lock = lock_env();
@@ -36302,7 +33827,8 @@ mod tests {
         // cannot return a wrong OPTIMAL however poisoned its pruning is — the tree itself must be
         // the finder for cut soundness to be observable end-to-end. (Correctness-neutral: the
         // share only budgets a heuristic; verdicts never depend on it.)
-        let writes_before = NODE_CUT_WRITES_TOTAL.load(Relaxed);
+        let writes_before =
+            crate::local_census::Floor::usize_at(&NODE_CUT_WRITES_TOTAL, "NODE_CUT_WRITES_TOTAL");
         let mut seed = 0x5107_2026_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -36410,7 +33936,7 @@ mod tests {
             solved >= 20,
             "corpus degenerate: only {solved} feasible cases"
         );
-        let writes = NODE_CUT_WRITES_TOTAL.load(Relaxed) - writes_before;
+        let writes = writes_before.report();
         assert!(
             writes > 0,
             "no cut ever landed in a slot: the guard is vacuous"
@@ -36432,7 +33958,6 @@ mod tests {
     /// shared slot-write counter must both move.
     #[test]
     fn node_gmi_cuts_preserve_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         // Serialize the process-global cut levers behind the one env choke
         // point; the guards below restore on scope exit (also on panic).
         let _env_lock = lock_env();
@@ -36462,8 +33987,10 @@ mod tests {
                     crate::tune::Setting::Real(1e18),
                 ),
         );
-        let writes_before = NODE_CUT_WRITES_TOTAL.load(Relaxed);
-        let gmi_before = NODE_GMI_CUTS_TOTAL.load(Relaxed);
+        let writes_before =
+            crate::local_census::Floor::usize_at(&NODE_CUT_WRITES_TOTAL, "NODE_CUT_WRITES_TOTAL");
+        let gmi_before =
+            crate::local_census::Floor::usize_at(&NODE_GMI_CUTS_TOTAL, "NODE_GMI_CUTS_TOTAL");
         let mut seed = 0x51A7_2026_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -36563,11 +34090,11 @@ mod tests {
             "corpus degenerate: only {solved} feasible cases"
         );
         assert!(
-            NODE_GMI_CUTS_TOTAL.load(Relaxed) - gmi_before > 0,
+            gmi_before.report() > 0,
             "no node-GMI cut ever survived derivation: the guard is vacuous"
         );
         assert!(
-            NODE_CUT_WRITES_TOTAL.load(Relaxed) - writes_before > 0,
+            writes_before.report() > 0,
             "no cut ever landed in a slot: the guard is vacuous"
         );
     }
@@ -36593,20 +34120,17 @@ mod tests {
     /// by +10 (fails case 15).
     #[test]
     fn bound_branching_inherited_bounds_preserve_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         // B37: the opt-in gate rides the per-solve engine profile. The env
         // lock stays: neighbors still export value knobs (e.g. MAX_NODES)
         // through ScopedEnvVar, and this test's 20 solves must not see them.
         let _env_lock = lock_env();
-        let bb_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_bound_branch(true)
-                .with_heur_share(0.0),
-        );
+        let bb_opts = SolveOpts::new().with_engine(zero_heur(
+            &crate::EngineEconomics::new().with_bound_branch(true),
+        ));
         // The tree must be the finder: models this small are cracked by the root
         // heuristics before a node runs, and a search that already holds the optimum
         // cannot lose a verdict to a wrong inherited bound.
-        let pairs_before = BB_PAIRS_TOTAL.load(Relaxed);
+        let pairs_before = crate::local_census::Floor::usize_at(&BB_PAIRS_TOTAL, "BB_PAIRS_TOTAL");
         let mut seed = 0xB0B0_2026_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -36742,7 +34266,7 @@ mod tests {
             solved >= 15,
             "corpus degenerate: only {solved} feasible cases"
         );
-        let pairs = BB_PAIRS_TOTAL.load(Relaxed) - pairs_before;
+        let pairs = pairs_before.report();
         assert!(
             pairs > 0,
             "no probe pair ever ran: the gate never fired and the guard is vacuous"
@@ -36766,9 +34290,7 @@ mod tests {
     #[test]
     fn node_rc_fixing_never_deletes_the_optimum() {
         // B39b: zero heuristic share rides the per-solve engine profile.
-        let hs_opts =
-            SolveOpts::new().with_engine(crate::EngineEconomics::new().with_heur_share(0.0));
-        use std::sync::atomic::Ordering::Relaxed;
+        let hs_opts = SolveOpts::new().with_engine(zero_heur(&crate::EngineEconomics::new()));
         // Serialize the process-global levers behind the one env choke point;
         // the guards below restore on scope exit (also on panic).
         let _env_lock = lock_env();
@@ -36776,7 +34298,8 @@ mod tests {
             crate::tune::Profile::EMPTY
                 .with(crate::tune::Knob::NodeRc, crate::tune::Setting::Flag(true)),
         );
-        let fixes_before = NODE_RC_FIXES_TOTAL.load(Relaxed);
+        let fixes_before =
+            crate::local_census::Floor::usize_at(&NODE_RC_FIXES_TOTAL, "NODE_RC_FIXES_TOTAL");
         let mut seed = 0x0DE5_C0DE_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -36910,7 +34433,7 @@ mod tests {
             solved >= 15,
             "corpus degenerate: only {solved} feasible cases"
         );
-        let fixes = NODE_RC_FIXES_TOTAL.load(Relaxed) - fixes_before;
+        let fixes = fixes_before.report();
         assert!(
             fixes > 0,
             "no node-scope fix was ever appended: the guard is vacuous"
@@ -37219,11 +34742,14 @@ mod tests {
         let initial_search_floor = full_deadline
             .checked_sub(floor)
             .expect("15s margin budget exceeds its reserve");
-        assert_eq!(initial_search_floor, full_deadline - reserve2250);
+        let Some(expected_search_floor) = full_deadline.checked_sub(reserve2250) else {
+            panic!("15s margin budget must exceed its 2250ms reserve");
+        };
+        assert_eq!(initial_search_floor, expected_search_floor);
         for leaves in [0, 1, 8, 500, usize::MAX] {
             assert_eq!(
                 leaf_reserved_deadline(full_deadline, reserve, floor, leaves),
-                full_deadline - reserve2250,
+                expected_search_floor,
                 "leaf count {leaves} must not discount an open prefix replay"
             );
         }
@@ -38328,7 +35854,6 @@ mod tests {
     /// (verified by hand-desyncing `factor_live` during development).
     #[test]
     fn cross_solve_eta_reuse_matches_a_fresh_solve() {
-        use std::sync::atomic::Ordering::Relaxed;
         // min -x - 2y over x+y <= 4, x-y >= -2, x,y in [0,3]: optimum (1,3) = -7;
         // with y <= 2 (the child box) it moves to (2,2) = -6.
         let mut m = Model::new();
@@ -38342,13 +35867,16 @@ mod tests {
         let a = lp.solve_bounded(&lp.lower, &lp.upper, None, None);
         assert_eq!(a.status, SimplexStatus::Optimal, "root solve must settle");
 
-        let before = crate::simplex::ETA_REUSE_COUNT.load(Relaxed);
+        let before = crate::local_census::Floor::usize_at(
+            &crate::simplex::ETA_REUSE_COUNT,
+            "ETA_REUSE_COUNT",
+        );
         let mut up2 = lp.upper.clone();
         up2[1] = 2.0; // the child's tightened bound
         let b = lp.solve_bounded(&lp.lower, &up2, Some((&a.basis, &a.at)), None);
         assert_eq!(b.status, SimplexStatus::Optimal, "warm child must settle");
         assert!(
-            crate::simplex::ETA_REUSE_COUNT.load(Relaxed) > before,
+            before.report() > 0,
             "the reuse skip never fired: the guard is vacuous"
         );
 
@@ -40513,21 +38041,10 @@ mod tests {
         // 0,1 — so the `0`-rung pins 2,3 (to 1) and frees 0,1, whose sub-MIP drops both to 0.
         let relax = vec![0.0f64, 0.0, 1.0, 1.0];
         let cost = vec![1.0f64; 4];
-        let mut elites = Elites::new();
 
         let start = incumbent.1.clone();
         let deadline = Instant::now() + Duration::from_secs(2);
-        diversified_rins_sweep(
-            &m,
-            &ints,
-            &relax,
-            &cost,
-            &mut incumbent,
-            &mut elites,
-            deadline,
-            0,
-            false,
-        );
+        diversified_rins_sweep(&m, &ints, &relax, &cost, &mut incumbent, deadline, 0, false);
 
         // Fail-closed: the returned point is exactly feasible for the model.
         assert!(
@@ -40969,7 +38486,10 @@ mod tests {
         assert!(0.2 * best_s < thr);
         // An equal-scoring candidate is still reconsidered: the rule stays a
         // tiebreak, it is not switched off.
-        assert!(!(best_s < thr));
+        assert!(matches!(
+            best_s.partial_cmp(&thr),
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+        ));
         // ...and the historical wide band admits everything non-negative.
         let wide = symmetry_branch_band_setting(Some(1.0));
         assert_eq!(best_s * (1.0 - wide), 0.0);
@@ -41031,14 +38551,12 @@ mod tests {
     /// Non-vacuity: `IMPL_EVENTS_TOTAL` must move across the corpus.
     #[test]
     fn implication_layer_preserves_the_optimum() {
-        use std::sync::atomic::Ordering::Relaxed;
         let _env_lock = lock_env();
-        let events_before = IMPL_EVENTS_TOTAL.load(Relaxed);
+        let events_before =
+            crate::local_census::Floor::usize_at(&IMPL_EVENTS_TOTAL, "IMPL_EVENTS_TOTAL");
         // B38/B39b/B50: every lever rides the per-solve engine profile.
         let nc_opts = SolveOpts::new().with_engine(
-            crate::EngineEconomics::new()
-                .with_cuts(false)
-                .with_heur_share(0.0)
+            zero_heur(&crate::EngineEconomics::new().with_cuts(false))
                 .with_impl_lane(true)
                 .with_impl_arm(1),
         );
@@ -41048,8 +38566,7 @@ mod tests {
             (seed >> 33) as i64
         };
         for case in 0..30 {
-            let nb = 6usize;
-            let ni = 3usize;
+            let (nb, ni) = (6usize, 3usize);
             let mut m = Model::new();
             let ys: Vec<Col> = (0..nb).map(|_| m.add_binary_col()).collect();
             let ws: Vec<Col> = (0..ni).map(|_| m.add_int_col(0.0, 3.0)).collect();
@@ -41126,7 +38643,7 @@ mod tests {
         }
         // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
-            IMPL_EVENTS_TOTAL.load(Relaxed) > events_before,
+            events_before.report() > 0,
             "guard is vacuous: the implication layer never fired"
         );
     }
@@ -41148,7 +38665,7 @@ mod tests {
         let a = |i: usize, j: usize| -> f64 {
             f64::from(((j as u32 * 7919 + i as u32 * 104_729) % 97) + 3)
         };
-        let star = |j: usize| -> bool { (j * 37 + 11) % 3 == 0 };
+        let star = |j: usize| -> bool { (j * 37 + 11).is_multiple_of(3) };
         for i in 0..6 {
             let row: Vec<(Col, f64)> = (0..n).map(|j| (xs[j], a(i, j))).collect();
             let b: f64 = (0..n).filter(|&j| star(j)).map(|j| a(i, j)).sum();

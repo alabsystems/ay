@@ -552,6 +552,16 @@ impl Solver {
     /// higher glue is deleted first, with size as tiebreak. Activity plays no
     /// role -- per Audemard & Simon (IJCAI'09), LBD alone is the best predictor
     /// of learned clause quality.
+    ///
+    /// THAT LAST SENTENCE IS A CLAIM, NOT A FACT, and it is the claim that
+    /// Cai/Zhang/Shi/Tao/Xu, *Rethinking Clause Management for CDCL SAT
+    /// Solvers* (arXiv:2602.20829, 3rd place Main and Main UNSAT 2026) attacks
+    /// head-on: where the instance has no meaningful decision-level structure,
+    /// LBD degenerates into a proxy for clause length and stops predicting
+    /// anything. `--sat-two-stage-clause-management true` swaps this whole
+    /// LBD-ranked policy for their LBD-free two-stage one — see
+    /// `solver/reduction_two_stage.rs`. It is default OFF pending a full-corpus
+    /// paired A/B; while it is off, every line below is exactly as it was.
     pub(super) fn reduce_db(&mut self) {
         // Queue ownership is stronger than reduction pressure. The final
         // popped conflict may reduce normally once no tail references remain.
@@ -564,15 +574,29 @@ impl Solver {
             return;
         }
         self.cold.num_reductions += 1;
+        self.mem_probe_report("reduce.pre");
         self.ensure_reason_clause_marks_current();
 
-        let flush = self.flushing();
+        let two_stage = self.two_stage_clause_management;
+        // The flush SCHEDULE is unchanged either way (`flush_due` still drives
+        // the geometric backoff at the bottom of this function). Under the
+        // two-stage arm the flush PATH is not taken: CaDiCaL's "delete every
+        // unused clause regardless of tier" has no counterpart in the paper,
+        // and its `used >= MAX_USED - 1` tier gate would mean something
+        // different once `used` is a cumulative score. A due flush therefore
+        // runs `TwoStageReduction` instead, and says so in a counter.
+        let flush_due = self.flushing();
+        let flush = flush_due && !two_stage;
         let explicit_reduce_pressure = self.explicit_reduce_pressure();
         if flush {
             self.set_diagnostic_pass(DiagnosticPass::Flush);
             self.cold.num_flushes += 1;
         } else {
             self.set_diagnostic_pass(DiagnosticPass::Reduce);
+            if flush_due {
+                self.cold.num_flushes += 1;
+                self.stats.two_stage_flushes_absorbed += 1;
+            }
         }
 
         // (#8356) Guardless JIT invalidation: if the compiled formula was
@@ -584,7 +608,7 @@ impl Solver {
         // propagating using deleted clause offsets as reasons, corrupting the
         // trail with stale ClauseRefs.
 
-        self.mark_satisfied_clauses_as_garbage(flush || explicit_reduce_pressure);
+        self.mark_satisfied_clauses_as_garbage(flush_due || explicit_reduce_pressure);
 
         if flush {
             // Aggressive flush path (CaDiCaL reduce.cpp:34-58)
@@ -661,6 +685,11 @@ impl Solver {
             let mut retention_kept_steps = 0u64;
             let mut retention_skipped_no_pressure = 0u64;
             let mut retention_lrat_retained_delete_skips = 0u64;
+            // Two-stage policy reachability counters. Only the two-stage
+            // branch below can make these non-zero.
+            let mut stage1_kept = 0u64;
+            let mut stage2_candidates = 0u64;
+            let mut stage2_deleted = 0u64;
 
             // Reuse persistent buffer and enumerate learned clauses from the
             // arena's learned-clause index instead of walking the full mixed arena.
@@ -690,15 +719,28 @@ impl Solver {
 
                 // CaDiCaL reduce.cpp:109-111: save used BEFORE decrement,
                 // check against pre-decrement value for tier protection.
-                let used = self.arena.used(idx);
-                self.arena.decay_used(idx);
+                //
+                // Under the two-stage arm the retention key is the paper's
+                // cumulative score, which lives in its own 16-bit arena slot
+                // (`two_stage_score`) and NOT in `used` — the 5-bit field
+                // truncated 84% of its increments. Its decay is
+                // conflict-periodic (`two_stage_periodic_decay_if_due`, every
+                // T conflicts), so decaying here as well would be a SECOND
+                // decay on a different clock. Read the score, do not touch it.
+                let retention_score: u16 = if two_stage {
+                    self.arena.two_stage_score(idx)
+                } else {
+                    let used = self.arena.used(idx);
+                    self.arena.decay_used(idx);
+                    u16::from(used)
+                };
 
                 // CaDiCaL reduce.cpp:116-120: hyper resolvents (HBR/HTR)
                 // have one-round lifetime. If unused, delete immediately;
                 // otherwise keep but never enter the sort pool.
                 if self.arena.is_hyper(idx) {
                     debug_assert!(self.arena.len_of(idx) <= 3);
-                    if used == 0 {
+                    if retention_score == 0 {
                         let delete_result =
                             self.delete_clause_unchecked(idx, mutate::ReasonPolicy::Skip);
                         if delete_result == mutate::DeleteResult::Deleted {
@@ -711,6 +753,22 @@ impl Solver {
                         }
                     } else {
                         hyper_kept += 1;
+                    }
+                    continue;
+                }
+
+                let size = self.arena.len_of(idx) as u32;
+                if two_stage {
+                    // TwoStageReduction (arXiv:2602.20829 Algorithm 1). Reads
+                    // no LBD at all: neither the permanent low-glue protection
+                    // nor the Core/Tier1/Tier2 gates below run. IC3 blocking
+                    // lemmas keep their explicit `is_ic3_lemma` protection
+                    // above, which is what incremental soundness rests on.
+                    if self.two_stage_classify_candidate(idx, retention_score, size) {
+                        stage1_kept += 1;
+                        usage_protected += 1;
+                    } else {
+                        stage2_candidates += 1;
                     }
                     continue;
                 }
@@ -729,7 +787,11 @@ impl Solver {
                         // CaDiCaL reduce.cpp:112: Core clauses with any recent
                         // usage are protected. Unused Core (used=0) become
                         // deletion candidates — prevents unbounded Core growth.
-                        if used > 0 {
+                        //
+                        // Only reachable on the OFF arm (the two-stage branch
+                        // above `continue`s), so `retention_score` here is the
+                        // 5-bit `used` recency flag, pre-decrement.
+                        if retention_score > 0 {
                             usage_protected += 1;
                             continue;
                         }
@@ -738,7 +800,7 @@ impl Solver {
                         // CaDiCaL reduce.cpp:114: Tier1 requires very recent
                         // usage (bumped in the current reduce interval) to
                         // survive. Less aggressive than Core (any usage).
-                        if used >= crate::clause_arena::MAX_USED - 1 {
+                        if retention_score >= u16::from(crate::clause_arena::MAX_USED - 1) {
                             usage_protected += 1;
                             continue;
                         }
@@ -750,7 +812,6 @@ impl Solver {
                 }
 
                 let glue = self.arena.lbd(idx);
-                let size = self.arena.len_of(idx) as u32;
                 let mut rank = reduce_candidate_rank(glue, size);
                 let mut pressure_adjusted = false;
                 let mut pressure_retained = false;
@@ -813,7 +874,17 @@ impl Solver {
             // useful structural information), while later reductions should be
             // more aggressive (the DB contains many stale clauses from
             // earlier search phases).
-            let fraction = self.reduce_delete_permille() as f64 / 1000.0;
+            // Stage 2 deletes the leading `percent` of the score-0 residue
+            // with the paper's own bounds (0.50 -> 0.90); the OFF arm keeps
+            // AY's raised 0.75 -> 0.90 over the post-tier pool. Same curve,
+            // different domain and different floor — see
+            // `reduction_two_stage::TWO_STAGE_LOW_PERMILLE`.
+            let permille = if two_stage {
+                reduction_two_stage::two_stage_delete_permille(self.cold.num_reductions)
+            } else {
+                self.reduce_delete_permille()
+            };
+            let fraction = permille as f64 / 1000.0;
             let num_to_delete =
                 ((self.cold.reduce_candidates_buf.len() as f64) * fraction) as usize;
 
@@ -888,6 +959,9 @@ impl Solver {
                 let delete_result = self.delete_clause_unchecked(idx, mutate::ReasonPolicy::Skip);
                 if delete_result == mutate::DeleteResult::Deleted {
                     deleted += 1;
+                    if two_stage {
+                        stage2_deleted += 1;
+                    }
                     if pressure_adjusted {
                         pressure_deleted += 1;
                         pressure_deleted_steps =
@@ -951,6 +1025,12 @@ impl Solver {
             self.stats.learned_reduction_lrat_retained_delete_skips += lrat_retained_delete_skips;
             self.stats.learned_reduction_hyper_deleted += hyper_deleted;
             self.stats.learned_reduction_hyper_kept += hyper_kept;
+            if two_stage {
+                self.stats.two_stage_reduce_rounds += 1;
+                self.stats.two_stage_stage1_kept += stage1_kept;
+                self.stats.two_stage_stage2_candidates += stage2_candidates;
+                self.stats.two_stage_stage2_deleted += stage2_deleted;
+            }
             self.stats.learned_1963_pressure_reduction_candidates += pressure_candidates;
             self.stats
                 .learned_1963_pressure_reduction_pressure_candidates +=
@@ -1096,8 +1176,11 @@ impl Solver {
             self.num_conflicts
         );
 
-        // Update flush schedule (CaDiCaL reduce.cpp:261-268)
-        if flush {
+        // Update flush schedule (CaDiCaL reduce.cpp:261-268). Keyed to
+        // `flush_due`, not `flush`: under the two-stage arm the flush path is
+        // skipped but its schedule must still advance, or `flushing()` would
+        // latch true forever.
+        if flush_due {
             self.cold.flush_inc = self.cold.flush_inc.saturating_mul(FLUSH_FACTOR);
             self.cold.next_flush = self.num_conflicts.saturating_add(self.cold.flush_inc);
         }
@@ -1106,5 +1189,6 @@ impl Solver {
         if self.num_conflicts >= self.tiers.next_recompute_tier {
             self.recompute_tier();
         }
+        self.mem_probe_report("reduce.post");
     }
 }

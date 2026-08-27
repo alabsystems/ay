@@ -333,9 +333,9 @@ fn zero_memory_declines_even_a_zero_nnz_projection() {
     let (_, post) = aggregate_implied_free_equalities(&model, None, None)
         .expect("the unlimited fixture itself is reducible");
     assert!(post.widen(&[], None, Some(0)).is_none());
-    assert!(post
-        .widen(&[], Some(Instant::now() - Duration::from_millis(1)), None,)
-        .is_none());
+    let now = Instant::now();
+    let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
+    assert!(post.widen(&[], Some(expired), None).is_none());
 }
 
 #[test]
@@ -474,6 +474,7 @@ fn inexact_float_objective_fold_is_declined() {
 fn expired_deadline_declines_without_partial_output() {
     let mut model = Model::new();
     model.add_int_col(1.0, 1.0);
-    let deadline = Instant::now() - Duration::from_millis(1);
+    let now = Instant::now();
+    let deadline = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
     assert!(aggregate_implied_free_equalities(&model, Some(deadline), None).is_none());
 }

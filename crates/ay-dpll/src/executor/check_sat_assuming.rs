@@ -504,8 +504,7 @@ impl Executor {
         result
     }
 
-    /// Per-check reset shared by `check-sat-assuming` and the unsat-core minimization pass's
-    /// scoped subset re-solves (#uc-core-minimize).
+    /// Per-check reset for `check-sat-assuming` and unsat-core subset re-solves (#uc-core-minimize).
     ///
     /// FACTORED OUT for the minimization loop: `solve_scoped_assumptions`
     /// assumes it runs right after this reset (the rescue calls it exactly
@@ -526,6 +525,7 @@ impl Executor {
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
         self.last_clause_trace = None;
+        self.report_checked_refutation_clear("reset_solve_session_state");
         self.last_checked_sat_refutation = None;
         self.pending_nested_array_bool_bv_unsat = None;
         self.last_var_to_term = None;
@@ -567,6 +567,7 @@ impl Executor {
         self.clear_quantified_sat_authority();
         self.ho_seq_unfold_array_free_unsat = false;
         self.array_axiom_scope = None;
+        self.array_axiom_dead_skolems.clear();
         self.row_seeded_terms.clear();
         self.proof_check_result = None;
     }

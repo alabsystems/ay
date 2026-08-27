@@ -15,7 +15,7 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{CnfClause, Sort, TermId};
 use ay_fp::FpModel;
 use ay_lra::LraModel;
-use ay_sat::{SatResult, Solver as SatSolver};
+use ay_sat::SatResult;
 
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::features::StaticFeatures;
@@ -28,6 +28,9 @@ use super::to_real::{
     rational_to_f64, rewrite_fp_to_real_for_model, rewrite_fp_to_real_with_vars, FpEncoding,
     FpRefinementStep, FpToRealSite, MixedSubproblemResult,
 };
+
+#[path = "to_real_solve/sat_instance.rs"]
+mod sat_instance;
 
 impl Executor {
     /// Solve FP formulas containing `fp.to_real` via refinement loop (#6241).
@@ -69,10 +72,10 @@ impl Executor {
             );
             Ok(SolveResult::Unknown)
         };
-
+        // Bound the entire fresh-solver chain by the shared `:rlimit` allowance.
+        let mut spent = 0;
         // Real-guided pre-solve (#6241): solve the Real side first to find what
-        // value fp.to_real needs to produce. If the target is exactly representable
-        // as an FP value, try it directly — this solves many cases in O(1).
+        // value fp.to_real must produce, then try an exactly representable target.
         let presolve_target = self.compute_real_guided_fp_target(
             &fp_assertions,
             &mixed_assertions,
@@ -81,7 +84,8 @@ impl Executor {
             var_offset,
         );
         if let Some(ref target_clauses) = presolve_target {
-            let fp_result = self.solve_fp_sat_instance(&base_clauses, target_clauses, total_vars);
+            let fp_result =
+                self.solve_fp_sat(&base_clauses, target_clauses, total_vars, &mut spent);
             if let SatResult::Sat(ref sat_model) = fp_result {
                 let fp_model = Self::extract_fp_model_from_bits(
                     sat_model,
@@ -105,7 +109,6 @@ impl Executor {
                 }
             }
         }
-
         // Hybrid refinement (#6241): exact-value blocking first, binade after threshold
         const MAX_REFINEMENTS: usize = 64;
         const EXACT_PER_BINADE: usize = 4;
@@ -115,7 +118,7 @@ impl Executor {
 
         for _round in 0..MAX_REFINEMENTS {
             let fp_result =
-                self.solve_fp_sat_instance(&base_clauses, &blocking_clauses, total_vars);
+                self.solve_fp_sat(&base_clauses, &blocking_clauses, total_vars, &mut spent);
             match fp_result {
                 SatResult::Unsat(_) | SatResult::Unknown => {
                     // Binade blocking may exclude valid values: downgrade to Unknown (#6241)
@@ -171,39 +174,6 @@ impl Executor {
             }
         }
         self.store_unknown_or_unsat(SatResult::Unknown, &tseitin_result)
-    }
-
-    /// Build and solve a SAT instance from base + blocking clauses.
-    fn solve_fp_sat_instance(
-        &mut self,
-        base_clauses: &[CnfClause],
-        blocking_clauses: &[CnfClause],
-        total_vars: usize,
-    ) -> SatResult {
-        let mut solver = SatSolver::new(total_vars);
-        self.apply_random_seed_to_sat(&mut solver);
-        self.apply_progress_to_sat(&mut solver);
-        solver.set_congruence_enabled(false);
-        // Adaptive reorder gate for large FP instances (#8118).
-        if total_vars > 50_000 {
-            solver.set_reorder_enabled(false);
-        }
-        if let Some(seed) = self.random_seed {
-            solver.set_random_seed(seed);
-        }
-        for clause in base_clauses.iter().chain(blocking_clauses.iter()) {
-            let lits: Vec<ay_sat::Literal> = clause
-                .literals()
-                .iter()
-                .map(|&lit| crate::cnf_lit_to_sat(lit))
-                .collect();
-            solver.add_clause(lits);
-        }
-
-        let should_stop = self.make_should_stop();
-        let result = solver.solve_interruptible(should_stop).into_inner();
-        collect_sat_stats!(self, &solver);
-        result
     }
 
     /// Store an Unknown or Unsat result via solve_and_store_model_full.

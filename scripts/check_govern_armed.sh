@@ -46,6 +46,45 @@ if [ ! -s "$rows_file" ]; then
   exit 1
 fi
 
+# Resolve the file that actually defines `fn main` for a bin target, following
+# `include!("...")` from the target's own source.
+#
+# WHY: three bin targets in ay-nra-oracle are assembled with `include!`, so the
+# path cargo reports (`src/bin/av.rs`) contains no `fn main` at all. The awk
+# below then found nothing and printed "first statement of main is: <none>" —
+# indistinguishable from "found main, forgot to arm", and unfixable by editing
+# the file the message names. Any include!-structured binary was permanently
+# unverifiable by this gate.
+_main_file() {
+  python3 - "$1" <<'PYEOF'
+import re, sys
+from pathlib import Path
+
+MAIN = re.compile(r"^\s*(pub\s+)?fn\s+main\s*\(", re.M)
+INCLUDE = re.compile(r'include!\s*\(\s*"([^"]+)"\s*\)')
+
+start = Path(sys.argv[1])
+seen: set[Path] = set()
+queue = [start]
+while queue:
+    path = queue.pop(0)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        continue
+    if resolved in seen or not resolved.is_file():
+        continue
+    seen.add(resolved)
+    text = resolved.read_text(errors="replace")
+    if MAIN.search(text):
+        print(resolved)
+        break
+    # Breadth-first so a shallow definition wins; bounded by `seen`.
+    for rel in INCLUDE.findall(text):
+        queue.append(resolved.parent / rel)
+PYEOF
+}
+
 bad=0 ok=0 exempt=0
 while IFS=$'\t' read -r name src; do
   [ -n "$name" ] || continue
@@ -64,6 +103,16 @@ while IFS=$'\t' read -r name src; do
     bad=$((bad + 1)); continue
   fi
 
+  # `fn main` may live in an `include!`d file; find the one that defines it.
+  main_src="$(_main_file "$src")"
+  if [ -z "$main_src" ]; then
+    echo "check_govern_armed: NO MAIN FOUND  $name  ($src)" >&2
+    echo "        no \`fn main\` in that file or anything it include!s." >&2
+    echo "        This is a gate failure, not an arming failure: the bound" >&2
+    echo "        cannot be verified for this target at all." >&2
+    bad=$((bad + 1)); continue
+  fi
+
   # The call must be the first executable statement of main -- arm() re-execs,
   # so anything before it is discarded work, and it calls set_var, which is only
   # sound while single-threaded. Take the first non-blank, non-comment line of
@@ -78,13 +127,13 @@ while IFS=$'\t' read -r name src; do
       print line
       exit
     }
-  ' "$src")"
+  ' "$main_src")"
 
   case "$first" in
     *"govern::arm()"*)
       ok=$((ok + 1)) ;;
     *)
-      echo "check_govern_armed: UNARMED  $name  ($src)" >&2
+      echo "check_govern_armed: UNARMED  $name  ($main_src)" >&2
       echo "        first statement of main is: ${first:-<none>}" >&2
       echo "        expected: ay_sys::govern::arm();" >&2
       bad=$((bad + 1)) ;;

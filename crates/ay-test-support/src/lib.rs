@@ -3987,7 +3987,6 @@ mod tests {
             .expect("write outer workspace fixture");
         run_git(outer.path(), &["add", "Cargo.toml", ".cargo/config.toml"]);
         run_git(outer.path(), &["commit", "--quiet", "-m", "fixture"]);
-
         // An INDEPENDENT repository nested under the outer checkout: the outer
         // config is tracked, but by a foreign repository, so it must remain
         // outside the source trust boundary.
@@ -3995,10 +3994,8 @@ mod tests {
         std::fs::create_dir(&inner).expect("create inner repository directory");
         run_git(&inner, &["init", "--quiet"]);
         run_git(&inner, &["config", "user.name", "AY Tests"]);
-        run_git(
-            &inner,
-            &["config", "user.email", "ay-tests@example.invalid"],
-        );
+        let email = "ay-tests@example.invalid";
+        run_git(&inner, &["config", "user.email", email]);
         std::fs::write(inner.join("Cargo.toml"), b"[workspace]\n")
             .expect("write inner workspace fixture");
         run_git(&inner, &["add", "Cargo.toml"]);

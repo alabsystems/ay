@@ -19,6 +19,9 @@ use ay_core::{
 use ay_sat::Literal;
 use std::cell::{Cell, RefCell};
 
+mod support;
+pub(super) use support::{BoundRefinementHandoff, ProofContext};
+
 /// Sentinel for "no node" in the skip-assigned free-list (`u32::MAX`). No seed
 /// position can equal this because [`build_unassigned_freelist_state`] enforces
 /// that `seed_index.len()` leaves this value reserved.
@@ -77,8 +80,6 @@ pub(super) fn build_unassigned_freelist_state(
 }
 
 use crate::diagnostic_trace::DpllDiagnosticWriter;
-use crate::executor::BoundRefinementReplayKey;
-use crate::proof_tracker::ProofTracker;
 use crate::DpllEagerStats;
 
 use super::NativeTheoryPropagationDispatch;
@@ -228,13 +229,6 @@ impl CachedExtensionData {
 
         self.last_full_rebuild_num_vars = current_var_count;
     }
-}
-
-pub(super) enum BoundRefinementHandoff<'a> {
-    FinalCheckOnly,
-    StopAndReplayInline {
-        known_replays: &'a HashSet<BoundRefinementReplayKey>,
-    },
 }
 
 /// Wrapper that adapts a TheorySolver to the Extension trait for eager DPLL(T)
@@ -639,9 +633,4 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// for quantifier-free / non-datatype problems, so the eager verification
     /// path is byte-identical to before.
     pub(super) support_axioms: Vec<ay_core::TheoryLit>,
-}
-
-pub(super) struct ProofContext<'a> {
-    pub(super) tracker: &'a mut ProofTracker,
-    pub(super) negations: &'a HashMap<TermId, TermId>,
 }

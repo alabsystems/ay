@@ -96,7 +96,108 @@ pub struct IntBoundLatticeGap {
 /// checker that must re-validate it.
 #[must_use]
 pub fn recognize_int_bound_lattice_gap(terms: &TermStore, clause: &[TermId]) -> bool {
-    int_bound_lattice_gap_core(terms, clause).is_some()
+    int_bound_lattice_gap_core(terms, clause).is_some() || ite_constant_range_gap(terms, clause)
+}
+
+/// Largest number of literals the ITE-range scan reads, and the deepest `not`
+/// nesting it will unwrap. Both only ever REJECT.
+const MAX_ITE_RANGE_LITERALS: usize = 96;
+const MAX_ITE_RANGE_NOT_DEPTH: usize = 8;
+
+/// `[lo, hi]` when `term` is an `ite` whose BOTH branches are integer
+/// constants, so the term's value set is `{k1, k2}` in every structure.
+///
+/// The condition is on the branches alone; the `ite` CONDITION is not read at
+/// all, and no case analysis is performed. That is what makes the bound
+/// unconditional rather than a claim about which branch is taken.
+fn ite_constant_range(terms: &TermStore, term: TermId) -> Option<(BigInt, BigInt)> {
+    use crate::term::TermData;
+    let TermData::Ite(_, then_branch, else_branch) = terms.get(term) else {
+        return None;
+    };
+    let (then_branch, else_branch) = (*then_branch, *else_branch);
+    let value = |branch: TermId| match terms.get(branch) {
+        TermData::Const(crate::Constant::Int(n)) => Some(n.clone()),
+        _ => None,
+    };
+    let (a, b) = (value(then_branch)?, value(else_branch)?);
+    Some(if a <= b { (a, b) } else { (b, a) })
+}
+
+/// Recognize a clause made valid by ONE literal whose bound on an
+/// `ite`-of-integer-constants atom is already outside that atom's VALUE RANGE.
+///
+/// # The argument
+///
+/// A literal that is a (possibly repeatedly negated) integer comparison
+/// contributes, when the literal is FALSE, exactly the row
+/// [`super::lia::parse_int_comparison_row`] returns for the atom at the truth
+/// value the negation PARITY forces. Take a literal whose row constrains the
+/// canonical form `L = 1·A` for an atom `A = (ite c k1 k2)` with `k1, k2`
+/// integer constants. `A` denotes `k1` or `k2` in EVERY structure, so
+/// `lo <= L <= hi` for `lo = min(k1,k2)`, `hi = max(k1,k2)` — unconditionally,
+/// with no case analysis and no reading of `c`. If the row is an UPPER bound
+/// below `lo`, or a LOWER bound above `hi`, the clause's negation forces `L`
+/// out of its own range and is unsatisfiable, so the clause is a tautology.
+///
+/// Everything else is fail-closed: `parse_int_comparison_row` already refuses a
+/// non-`Int` sort, a non-integral coefficient and a non-comparison atom; a form
+/// that is not a SINGLE atom at coefficient exactly `1` is skipped (a scaled or
+/// mixed form would need the scaled range, which this rule deliberately does
+/// not compute); an `ite` with a non-constant branch is skipped; and both work
+/// bounds above only reject.
+///
+/// The measured population is the `dillig32_000` / `half_true_modif_m_000`
+/// CHC family, whose conflicts carry `(not (< (ite (= C 0) 1 0) 0))` and
+/// `(not (not (<= 0 (ite (= C 0) 1 0))))`. `parse_linear_expr` normalizes the
+/// `ite` to an unconstrained opaque atom — sound, but it loses exactly the fact
+/// that makes those clauses valid, which is why the lattice search above finds
+/// no group with both bounds.
+fn ite_constant_range_gap(terms: &TermStore, clause: &[TermId]) -> bool {
+    use crate::term::TermData;
+    use num_traits::One;
+    if clause.len() > MAX_ITE_RANGE_LITERALS {
+        return false;
+    }
+    for &literal in clause {
+        // Negation PARITY, not one wrapper: the literal is FALSE exactly when
+        // its atom takes the value the parity forces, which is the same
+        // blocking-row contract `parse_int_bound` states for a single `not`.
+        let mut atom = literal;
+        let mut asserted = false;
+        let mut depth = 0usize;
+        while let TermData::Not(inner) = terms.get(atom) {
+            atom = *inner;
+            asserted = !asserted;
+            depth += 1;
+            if depth > MAX_ITE_RANGE_NOT_DEPTH {
+                return false;
+            }
+        }
+        let Some((coeffs, is_upper, value)) =
+            super::lia::parse_int_comparison_row(terms, atom, asserted)
+        else {
+            continue;
+        };
+        let mut entries = coeffs.iter();
+        let (Some((&form_atom, coefficient)), None) = (entries.next(), entries.next()) else {
+            continue;
+        };
+        if !coefficient.is_one() {
+            continue;
+        }
+        let Some((lo, hi)) = ite_constant_range(terms, form_atom) else {
+            continue;
+        };
+        if is_upper {
+            if value < lo {
+                return true;
+            }
+        } else if value > hi {
+            return true;
+        }
+    }
+    false
 }
 
 /// The witnessing core of [`recognize_int_bound_lattice_gap`], or `None` when

@@ -82,13 +82,13 @@ fn lu_solve_stats() -> bool {
     *B.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
-/// Kill switch for the Forrest–Tomlin update's bounds-check-elided fast loops
-/// (`AY_MILP_NO_FT_FAST`). Off (env set) => take the safe checked path, the
-/// exact pre-change arithmetic. Both branches run the SAME float ops in the SAME
-/// order — the unchecked form only drops bounds checks on indices that are
-/// provably `< m` (stage ids, and `stage_pos`/`urows` column ids are all stage
-/// ids in `0..m` by construction; `w`/`v` are resized to `m`), so it is
-/// byte-identical, not a numeric change. An A/B toggle in one binary.
+// Kill switch for the Forrest–Tomlin update's bounds-check-elided fast loops
+// (`AY_MILP_NO_FT_FAST`). Off (env set) => take the safe checked path, the
+// exact pre-change arithmetic. Both branches run the SAME float ops in the SAME
+// order — the unchecked form only drops bounds checks on indices that are
+// provably `< m` (stage ids, and `stage_pos`/`urows` column ids are all stage
+// ids in `0..m` by construction; `w`/`v` are resized to `m`), so it is
+// byte-identical, not a numeric change. An A/B toggle in one binary.
 // B11: the FT/FTRAN/countsort A/B switches moved off never-set env vars onto
 // the typed caller layer (`EngineEconomics`), read once per `LuEngine`
 // construction into struct fields — per-pivot sites must not pay a lookup,
@@ -204,39 +204,39 @@ fn spike_arm() -> SpikeArm {
 /// other, so it is 60 s-cap contention noise, not the change.
 const SPIKE_SPARSE_MARGIN: usize = 2;
 
-/// Kill switch for the DENSE `ftran`'s bounds-check-elided sweeps
-/// (`AY_MILP_NO_FTRAN_FAST`). Off (env set) => take the safe checked path, the
-/// exact pre-change arithmetic. This is the dense triangular solve the dual
-/// simplex runs TWICE per pivot on the LU lane — the steepest-edge τ = B⁻¹ρ and
-/// the long-step flip aggregate wflip = B⁻¹Σδ — where the RHS closes near-dense
-/// and the sparse `ftran_nz` is a loss (see `tau_nz_enabled`/`flip_nz_enabled`).
-/// Both branches run the SAME float ops in the SAME order; the unchecked form
-/// only drops bounds checks on indices provably `< m` — `row_stage`, `stage_pos`
-/// and `uorder` are permutations of `0..m`, `lcols`/`urows`/`etas` entries are
-/// stage ids in `0..m` by construction, `udiag` has length `m`, and `x`/`w` are
-/// length `m` — so it is byte-identical, not a numeric change. Same discipline
-/// (and the same debug_asserts) as `apply_inverse_parts`.
+// Kill switch for the DENSE `ftran`'s bounds-check-elided sweeps
+// (`AY_MILP_NO_FTRAN_FAST`). Off (env set) => take the safe checked path, the
+// exact pre-change arithmetic. This is the dense triangular solve the dual
+// simplex runs TWICE per pivot on the LU lane — the steepest-edge τ = B⁻¹ρ and
+// the long-step flip aggregate wflip = B⁻¹Σδ — where the RHS closes near-dense
+// and the sparse `ftran_nz` is a loss (see `tau_nz_enabled`/`flip_nz_enabled`).
+// Both branches run the SAME float ops in the SAME order; the unchecked form
+// only drops bounds checks on indices provably `< m` — `row_stage`, `stage_pos`
+// and `uorder` are permutations of `0..m`, `lcols`/`urows`/`etas` entries are
+// stage ids in `0..m` by construction, `udiag` has length `m`, and `x`/`w` are
+// length `m` — so it is byte-identical, not a numeric change. Same discipline
+// (and the same debug_asserts) as `apply_inverse_parts`.
 
-/// Kill switch for the SPARSE `ftran_nz`'s bounds-check-elided reach + sweep
-/// loops (`AY_MILP_NO_FTRANNZ_FAST`). Off (env set) => take the safe checked
-/// path, the exact pre-change arithmetic. This is the PRIMARY pivot-column solve
-/// α = B⁻¹·a_q the dual simplex runs ONCE PER PIVOT on the LU lane (the biggest
-/// FTRAN by nnz — its support is `alpha_nnz`), plus the flip aggregate and the
-/// duplicate-column admissibility solve. Both branches run the SAME float ops in
-/// the SAME order over the SAME reach set (`count_sort_by` yields a unique order
-/// either way); the unchecked form only drops bounds checks on indices provably
-/// `< m` — `row_stage`/`stage_pos` are permutations of `0..m`, `lcols`/`urows`/
-/// `ucols`/`etas` entries and the reach are all stage ids in `0..m` by
-/// construction, `udiag`/`visit`/`w` have length `m`, and `x.len() == m`. So it
-/// is byte-identical, not a numeric change. Same discipline (and the same
-/// debug_asserts) as `ftran`'s `ftran_fast` path.
+// Kill switch for the SPARSE `ftran_nz`'s bounds-check-elided reach + sweep
+// loops (`AY_MILP_NO_FTRANNZ_FAST`). Off (env set) => take the safe checked
+// path, the exact pre-change arithmetic. This is the PRIMARY pivot-column solve
+// α = B⁻¹·a_q the dual simplex runs ONCE PER PIVOT on the LU lane (the biggest
+// FTRAN by nnz — its support is `alpha_nnz`), plus the flip aggregate and the
+// duplicate-column admissibility solve. Both branches run the SAME float ops in
+// the SAME order over the SAME reach set (`count_sort_by` yields a unique order
+// either way); the unchecked form only drops bounds checks on indices provably
+// `< m` — `row_stage`/`stage_pos` are permutations of `0..m`, `lcols`/`urows`/
+// `ucols`/`etas` entries and the reach are all stage ids in `0..m` by
+// construction, `udiag`/`visit`/`w` have length `m`, and `x.len() == m`. So it
+// is byte-identical, not a numeric change. Same discipline (and the same
+// debug_asserts) as `ftran`'s `ftran_fast` path.
 
-/// Kill switch for the O(m) counting sort of the sparse-solve reach set
-/// (`AY_MILP_NO_COUNTSORT`). Off (env set) => always take the comparison sort,
-/// which is the exact pre-change path — so this is an A/B toggle in one binary.
-/// The two branches produce the SAME order (the reach holds distinct stage ids
-/// and the key is injective into `[0, m)`, so the sorted order is unique), so
-/// the numeric solve loops that consume `reach` are byte-identical either way.
+// Kill switch for the O(m) counting sort of the sparse-solve reach set
+// (`AY_MILP_NO_COUNTSORT`). Off (env set) => always take the comparison sort,
+// which is the exact pre-change path — so this is an A/B toggle in one binary.
+// The two branches produce the SAME order (the reach holds distinct stage ids
+// and the key is injective into `[0, m)`, so the sorted order is unique), so
+// the numeric solve loops that consume `reach` are byte-identical either way.
 
 /// Sort `reach` — a set of DISTINCT stage ids, each `< m` — ascending (or
 /// descending) by `key`, an INJECTIVE map into `[0, m)` (`upos`/`stage` are
@@ -646,6 +646,35 @@ impl LuEngine {
         self.etas.clear();
         self.eta_nnz = 0;
         self.n_updates = 0;
+    }
+
+    /// Would `update_nz` accept a pivot at `leaving_pos` with this `alpha`?
+    ///
+    /// This is the O(1) half of `update_nz`'s own admissibility test —
+    /// literally the Forrest-Tomlin pivot identity `d = udiag[t] · alpha[p]`
+    /// against `UPDATE_PIVOT_TOL`, evaluated without touching the spike — so a
+    /// caller can ASK BEFORE IT COMMITS instead of finding out after it has
+    /// already stepped.
+    ///
+    /// # Why the caller needs this
+    ///
+    /// The simplex ratio test admits a leaving row on `|alpha[p]| > pivot_tol`.
+    /// That is NOT the same test: the factorization scales `alpha[p]` by the
+    /// U-diagonal of the stage that position was eliminated at, so a pivot the
+    /// ratio test likes can be one the update cannot represent. The two
+    /// disagreeing is what produced a WRONG ANSWER on
+    /// `hexgrid_opt_ncols_430_lprelax` — see the tie-break in
+    /// `loop_phase_inner` and the rejected-pivot fallback below it.
+    ///
+    /// The LATE growth guard (`|d| >= ft_rel_pivot_tol(vmax) · vmax`) is not
+    /// predicted here: it needs the built spike. So this is a filter, not a
+    /// guarantee, and the caller must still handle a rejection.
+    pub(crate) fn ft_pivot_admissible(&self, leaving_pos: usize, alpha_p: f64) -> bool {
+        if leaving_pos >= self.m {
+            return false;
+        }
+        let d = self.udiag[self.pos_stage[leaving_pos]] * alpha_p;
+        d.is_finite() && d.abs() > UPDATE_PIVOT_TOL
     }
 
     /// Total fill of the representation: L off-diagonals, U diagonal +
@@ -2376,6 +2405,38 @@ impl LuEngine {
     }
 }
 
+/// Force every lazily-cached environment read in this module to happen NOW.
+///
+/// # The race this closes
+///
+/// `tune.rs` states the property the crate is supposed to have: *"The environment
+/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
+/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
+/// of the crate: 8 accessors here cache their value in a `OnceLock` and call
+/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
+/// happens to reach them — at an arbitrary point, on an arbitrary thread.
+///
+/// That is the exact hazard `EngineEconomics` was built to remove.
+/// the development design notes records the consumer's mitigation:
+/// it *"rewrites the same constant values before every window solve"*, so a
+/// `set_var` on one thread can land while another thread is mid-solve taking its
+/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
+/// is `unsafe` in edition 2024.
+///
+/// Priming collapses those windows into ONE, at solve entry, before any worker is
+/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
+/// It only moves *when* they are read, from "scattered across the solve" to "once,
+/// at a point the caller controls".
+pub(crate) fn prime_env() {
+    // (B11: the FT/FTRAN/countsort switches are no longer OnceLock-cached
+    // env reads — they live on the caller layer and in LuEngine fields; the
+    // growth tolerance stays primed below.)
+    let _ = ft_growth_tol_override();
+    let _ = lu_max_fill_nnz();
+    let _ = lu_solve_stats();
+    let _ = spike_arm();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3344,9 +3405,9 @@ mod tests {
             let phase2 = accepted >= 60;
             // Phase 2 pins the arm and flips it by hand; phase 1 leaves
             // `spike_force` at its production `None` and lets the gate decide.
-            let probe = !phase2 && attempts % 2 == 1;
+            let probe = !phase2 && !attempts.is_multiple_of(2);
             if phase2 {
-                mixed.force_spike_arm(Some(attempts % 2 == 0));
+                mixed.force_spike_arm(Some(attempts.is_multiple_of(2)));
             }
             let p = rng.below(m);
             let cand = block_sparse_col(blk, p, &mut rng);
@@ -3432,7 +3493,7 @@ mod tests {
             let mut ys = b.clone();
             dense_ref.btran(&mut ys);
             assert_eq!(ym, ys, "btran differs after {accepted} updates");
-            if accepted % 10 == 0 {
+            if accepted.is_multiple_of(10) {
                 let mut fresh = LuEngine::new(m);
                 fresh.factor(&refs(&cols)).expect("fresh factor");
                 let mut want = b;
@@ -3994,7 +4055,7 @@ mod tests {
                     let mut rhs = vec![0.0f64; m];
                     let mut rhs_sparse = vec![0.0f64; m];
                     let mut nz = Vec::new();
-                    for _ in 0..(1 + rng.below(5)) {
+                    for _ in 0..=rng.below(5) {
                         let r = rng.below(m);
                         if rhs[r] == 0.0 {
                             let v = 0.25 + rng.f();
@@ -4021,7 +4082,7 @@ mod tests {
 
                     let mut cost = vec![0.0f64; m];
                     let mut cnz = Vec::new();
-                    for _ in 0..(1 + rng.below(4)) {
+                    for _ in 0..=rng.below(4) {
                         let p = rng.below(m);
                         if cost[p] == 0.0 {
                             cost[p] = 0.25 + rng.f();
@@ -4068,7 +4129,7 @@ mod tests {
             }
             cols = trial_cols;
             accepted += 1;
-            if accepted % 10 == 0 {
+            if accepted.is_multiple_of(10) {
                 check_all(
                     &mut eng,
                     &cols,
@@ -4100,36 +4161,4 @@ mod tests {
         assert_eq!(ftran_before, ftran_after, "rejected update changed FTRAN");
         assert_eq!(btran_before, btran_after, "rejected update changed BTRAN");
     }
-}
-
-/// Force every lazily-cached environment read in this module to happen NOW.
-///
-/// # The race this closes
-///
-/// `tune.rs` states the property the crate is supposed to have: *"The environment
-/// layer is read **once**, into `EnvSnapshot`, and never again — so no accessor on
-/// the solve path touches `std::env`."* That is true of the `tune` layer and FALSE
-/// of the crate: 8 accessors here cache their value in a `OnceLock` and call
-/// `env::var` **lazily**, inside `get_or_init`, the first time the solve path
-/// happens to reach them — at an arbitrary point, on an arbitrary thread.
-///
-/// That is the exact hazard `EngineEconomics` was built to remove.
-/// the development design notes records the consumer's mitigation:
-/// it *"rewrites the same constant values before every window solve"*, so a
-/// `set_var` on one thread can land while another thread is mid-solve taking its
-/// first `getenv` here. `std::env::set_var` racing a concurrent `getenv` is why it
-/// is `unsafe` in edition 2024.
-///
-/// Priming collapses those windows into ONE, at solve entry, before any worker is
-/// spawned. It changes no value: the same `OnceLock`s resolve to the same bytes.
-/// It only moves *when* they are read, from "scattered across the solve" to "once,
-/// at a point the caller controls".
-pub(crate) fn prime_env() {
-    // (B11: the FT/FTRAN/countsort switches are no longer OnceLock-cached
-    // env reads — they live on the caller layer and in LuEngine fields; the
-    // growth tolerance stays primed below.)
-    let _ = ft_growth_tol_override();
-    let _ = lu_max_fill_nnz();
-    let _ = lu_solve_stats();
-    let _ = spike_arm();
 }

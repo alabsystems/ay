@@ -96,7 +96,7 @@ impl SinzCardinalityEncoding {
 ///
 /// `lits` are DIMACS signed literals (1-based). Requires `k >= 1`,
 /// `k <= lits.len()`, and a non-empty `lits`. This mirrors the cardinality case
-/// of [`crate::encoding`]'s `encode_sequential_counter` exactly (so the produced
+/// of `crate::encoding`'s `encode_sequential_counter` exactly (so the produced
 /// clauses match the solver's encoding), but takes an explicit `aux_base` and
 /// reports the aux range for proof introduction.
 ///
@@ -166,13 +166,13 @@ pub fn encode_sinz_cardinality(lits: &[i32], k: usize, aux_base: u32) -> SinzCar
 /// positive coefficients. Requires `coeffs.len() == lits.len()`, a non-empty
 /// input, all `coeffs[i] >= 1`, and `rhs >= 1`. The caller must have already
 /// handled the trivial always-SAT / always-UNSAT cases (matching the contract of
-/// [`crate::encoding`]'s `encode_sequential_counter`).
+/// `crate::encoding`'s `encode_sequential_counter`).
 ///
 /// The register `r(i, j)` (0-indexed `j` for weight level `j + 1`) means "the
 /// accumulated weight from the first `i + 1` terms is `>= j + 1`". There are
 /// `n * rhs` aux registers (`r` row-major: `r(i, j) = aux_base + i*rhs + j`).
 ///
-/// This mirrors [`crate::encoding`]'s `encode_sequential_counter` **clause for
+/// This mirrors `crate::encoding`'s `encode_sequential_counter` **clause for
 /// clause and in the same order** (so the produced clauses match exactly what the
 /// solver emits), but takes an explicit `aux_base` and reports the aux range for
 /// proof introduction. The cardinality case (`coeffs` all 1) reduces to the same

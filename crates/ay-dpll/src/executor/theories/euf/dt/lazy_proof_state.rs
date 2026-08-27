@@ -18,6 +18,8 @@ pub(super) struct DtLazyProofState {
     problem_assertions: Option<super::super::super::solve_harness::ProofProblemAssertionProvenance>,
     quant_expansions: Vec<QuantExpansionRecord>,
     ematching: Vec<EmatchingProofRecord>,
+    consequence_replay_attempts: u8,
+    consequence_replay_direct_state: Option<(u64, u8)>,
     skolem_instances: Vec<SkolemInstanceRecord>,
     skolem_witnesses: Vec<SkolemWitnessRecord>,
     bv_mbqi_false_instances: Vec<BvMbqiFalseInstanceRecord>,
@@ -36,6 +38,8 @@ impl DtLazyProofState {
             problem_assertions: executor.proof_problem_assertion_provenance.clone(),
             quant_expansions: executor.quant_expansion_records.clone(),
             ematching: executor.ematching_proof_records.clone(),
+            consequence_replay_attempts: executor.consequence_replay_attempts.get(),
+            consequence_replay_direct_state: executor.consequence_replay_direct_state.get(),
             skolem_instances: executor.skolem_instance_records.clone(),
             skolem_witnesses: executor.skolem_witness_records.clone(),
             bv_mbqi_false_instances: executor.bv_mbqi_false_instance_records.clone(),
@@ -53,6 +57,12 @@ impl DtLazyProofState {
         executor.proof_problem_assertion_provenance = self.problem_assertions;
         executor.quant_expansion_records = self.quant_expansions;
         executor.ematching_proof_records = self.ematching;
+        executor
+            .consequence_replay_attempts
+            .set(self.consequence_replay_attempts);
+        executor
+            .consequence_replay_direct_state
+            .set(self.consequence_replay_direct_state);
         executor.skolem_instance_records = self.skolem_instances;
         executor.skolem_witness_records = self.skolem_witnesses;
         executor.bv_mbqi_false_instance_records = self.bv_mbqi_false_instances;

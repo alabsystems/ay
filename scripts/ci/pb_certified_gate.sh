@@ -16,17 +16,22 @@
 #                silently certify newer sources, and shared-target worktrees
 #                cannot trigger a rebuild before every manifest row.
 #   2. PIN       resolve the checker named by ci/veripb.pin (build it from the
-#                pinned upstream commit + pinned patch if we do not have it),
+#                pinned upstream commit + both pinned patches if we do not have it),
 #                and refuse to proceed if its --version disagrees with the pin.
+#                2b builds and tests `veripb-core-proved`, the proved kernel the
+#                pinned patch now carries. It is a workspace member NOTHING
+#                depends on, so `cargo build --bin veripb` would never compile
+#                it and it would rot unnoticed. See the phase body for exactly
+#                what that does and does not establish.
 #   3. SELFTEST  prove the resolved binary is a proof checker at all, with the
 #                shared six-probe battery in scripts/lib/veripb_verdict.sh. A
 #                version string is trivially forgeable — every fake checker in
 #                ci/fake-checkers/ answers `--version` with `veripb 3.0.2` —
 #                so the pin's version half cannot be the only identity check.
-#   4. SOUNDNESS make the checker prove it is worth trusting: six committed
-#                formula/proof pairs on which published VeriPB 3.0.2 returns a
-#                verdict that contradicts the truth must all be REJECTED.
-#                ~0.1s. Without this, phase 6 could be green against a checker
+#   4. SOUNDNESS make the checker prove it is worth trusting: twenty-two committed
+#                formula/proof pairs, covering all twenty-one known wrong-verdict
+#                defects of published VeriPB 3.0.2, must all be REJECTED.
+#                ~0.03s. Without this, phase 6 could be green against a checker
 #                that says VERIFIED UNSATISFIABLE for satisfiable input.
 #   5. DRIFT     the reviewed workflow copy and the installed one must agree.
 #   6. CERT      for every manifest row: run AY with --proof, require the
@@ -71,7 +76,8 @@ PIN_FILE=ci/veripb.pin
 . "./$PIN_FILE"
 
 for required in VERIPB_REPO VERIPB_COMMIT VERIPB_VERSION VERIPB_PATCH \
-                VERIPB_PATCH_SHA256 VERIPB_SOUNDNESS_DIR VERIPB_CERT_MANIFEST; do
+                VERIPB_PATCH_SHA256 VERIPB_PATCH2 VERIPB_PATCH2_SHA256 \
+                VERIPB_SOUNDNESS_DIR VERIPB_CERT_MANIFEST; do
     eval "value=\${$required:-}"
     [ -n "$value" ] || { echo "ERROR: $PIN_FILE does not define $required" >&2; exit 2; }
 done
@@ -186,13 +192,27 @@ if [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
     exit 2
 fi
 
+# The second patch is as much a part of the checker's identity as the first, so
+# it is hashed under the same rule. It is a SEPARATE file because the first one
+# is byte-verifiable against the private fork and a locally written fix folded
+# into it would destroy that property; see the prose in ci/veripb.pin.
+actual_patch2_sha=$(sha256_file "$VERIPB_PATCH2" 2>/dev/null || true)
+if [ "$actual_patch2_sha" != "$VERIPB_PATCH2_SHA256" ]; then
+    echo "ERROR: $VERIPB_PATCH2 does not match VERIPB_PATCH2_SHA256 in $PIN_FILE" >&2
+    echo "       pin:  $VERIPB_PATCH2_SHA256" >&2
+    echo "       file: ${actual_patch2_sha:-<could not hash>}" >&2
+    echo "       The patch defines what the trusted checker IS. Update both together." >&2
+    exit 2
+fi
+
 CACHE=${VERIPB_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"}
-# Cache key covers the commit AND the patch: repatching must rebuild.
+# Cache key covers the commit AND EVERY patch: repatching must rebuild.
 BUILD_ID="${VERIPB_COMMIT}-$(printf '%s' "$VERIPB_PATCH_SHA256" | cut -c1-12)"
+BUILD_ID="${BUILD_ID}-$(printf '%s' "$VERIPB_PATCH2_SHA256" | cut -c1-12)"
 BUILD_DIR="$CACHE/$BUILD_ID"
 
 CHECKER=${VERIPB_BIN:-}
-PROVENANCE="${VERIPB_COMMIT} + $(basename "$VERIPB_PATCH")"
+PROVENANCE="${VERIPB_COMMIT} + $(basename "$VERIPB_PATCH") + $(basename "$VERIPB_PATCH2")"
 if [ -n "$CHECKER" ]; then
     [ -x "$CHECKER" ] || { echo "ERROR: VERIPB_BIN='$CHECKER' is not executable" >&2; exit 2; }
     # Provenance is UNVERIFIED here: we did not build this binary, so the pin
@@ -213,6 +233,7 @@ else
             exit 2
         }
         git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
+        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH2"
         ( cd "$BUILD_DIR" && cargo build --release --quiet --bin veripb )
     else
         echo "   reusing cached pinned build $BUILD_DIR"
@@ -227,6 +248,75 @@ if [ "$reported" != "$VERIPB_VERSION" ]; then
     exit 2
 fi
 echo "   checker: $CHECKER (veripb $reported; $PROVENANCE)"
+
+# ------------------------------------------------- phase 2b: proved kernel
+# The pinned patch carries `veripb-core-proved`, a Clean-proved kernel for the
+# arithmetic of seven checking rules (add, multiply, divide, saturate, literal
+# axiom, weaken, and the RUP-to-UNSAT reduction), plus the width guards that
+# re-certify every machine-width value against unbounded Int.
+#
+# READ THIS BEFORE CITING IT. The crate is a workspace MEMBER THAT NOTHING
+# DEPENDS ON. `cargo build --bin veripb` does not compile it and the shipped
+# binary contains none of its symbols, so it decides NO verdict. Nothing in
+# phases 3-6 gets more trustworthy because this phase is green.
+#
+# What this phase is for is narrower and still worth having: an artifact that
+# no build touches is an artifact that rots, and this repo has repeatedly found
+# gates that were green because they were running nothing. So the kernel is
+# compiled and its tests are run on every gate invocation, and the "it is an
+# island" claim above is MEASURED rather than asserted.
+#
+# What it deliberately does NOT do is run `clean check` on the proof itself.
+# The Clean toolchain is a local unreleased build, not something CI can obtain
+# or pin by hash, and as committed the kernel checks 102/105 (the DIVIDE rule,
+# the RUP bridge and one arithmetic lemma fail to elaborate). Adding a proof
+# check that cannot run, or one weakened to accept 102/105, would be worse than
+# having none. Until the toolchain is pinnable AND the file checks clean, this
+# gate makes no claim about the proof — only about the crate.
+echo "== phase 2b/6: proved kernel (veripb-core-proved) builds and its tests pass"
+if [ -n "${VERIPB_BIN:-}" ]; then
+    echo "   SKIPPED: VERIPB_BIN supplied a prebuilt checker, so there is no"
+    echo "   pinned source tree here to build the kernel from. The kernel is"
+    echo "   not part of the binary either way; phases 3-6 are unaffected."
+elif [ ! -d "$BUILD_DIR/veripb-core-proved" ]; then
+    note_fail "[proved-core] $BUILD_DIR/veripb-core-proved is missing — the pinned patch should have created it"
+else
+    if ( cd "$BUILD_DIR" && cargo build --release --quiet -p veripb-core-proved ); then
+        echo "   built     veripb-core-proved"
+    else
+        note_fail "[proved-core] veripb-core-proved failed to COMPILE from the pinned patch"
+    fi
+    # island_sync (proof text in the Rust trust surface matches clean/veripb_kernel.lean)
+    # and width_guards (the machine-width re-certification the kernel's checked
+    # variants describe), plus the crate's own unit tests.
+    if ( cd "$BUILD_DIR" && cargo test --release --quiet -p veripb-core-proved ); then
+        echo "   tested    veripb-core-proved (unit + island_sync + width_guards)"
+    else
+        note_fail "[proved-core] veripb-core-proved test suite FAILED"
+    fi
+    # The island claim, measured. If this fires, someone wired the kernel into
+    # the checker for real — that is GOOD NEWS, and the honest response is to
+    # update this phase and ci/veripb.pin to say so, not to delete the check.
+    if command -v strings >/dev/null 2>&1; then
+        kernel_syms=$(strings -a "$CHECKER" 2>/dev/null | grep -c 'core_proved\|VeriPbCore' || true)
+        control_syms=$(strings -a "$CHECKER" 2>/dev/null | grep -c 'veripb_checker\|veripb_propagator' || true)
+        # `grep -c` exits 1 on zero matches; the `|| true` above keeps `set -e`
+        # happy, and these defaults keep an empty capture from making `-eq`
+        # explode. A broken scan must degrade to "prove nothing", never to a
+        # silent pass of the assertion below.
+        kernel_syms=${kernel_syms:-0}
+        control_syms=${control_syms:-0}
+        if [ "$control_syms" -eq 0 ]; then
+            echo "   NOTE: symbol scan found no veripb_checker/veripb_propagator either,"
+            echo "   so it proves nothing here; skipping the linkage assertion."
+        elif [ "$kernel_syms" -eq 0 ]; then
+            echo "   linkage   0 kernel symbols in the shipped binary (control: $control_syms checker symbols)"
+            echo "             — confirms the kernel decides no verdict, as documented"
+        else
+            note_fail "[proved-core] the shipped checker now references the proved kernel ($kernel_syms symbols), but ci/veripb.pin and ci/veripb-soundness/README.md still say it is an unused island. Update them — the docs, not this check, are what is stale."
+        fi
+    fi
+fi
 
 # ----------------------------------------------------------- phase 3: selftest
 # The version string above proves nothing on its own: every script in
@@ -261,8 +351,13 @@ while IFS='	' read -r dir flag formula proof truth wrong; do
         echo "     move the pin onto it." >&2
     fi
 done < "$VERIPB_SOUNDNESS_DIR/expected.tsv"
-[ "$soundness_rows" -eq 6 ] || note_fail \
-    "[soundness] expected 6 fixtures, read $soundness_rows from $VERIPB_SOUNDNESS_DIR/expected.tsv"
+# TWENTY-ONE defects, TWENTY-TWO fixtures: defect 7 (normalization wrapping) has
+# two manifestations with opposite wrong verdicts, so it needs two pairs. If you
+# change this number, change ci/veripb.pin and ci/veripb-soundness/README.md
+# with it — a count that drifts turns this gate red on bookkeeping instead of
+# on a regression, which trains people to edit the number rather than read it.
+[ "$soundness_rows" -eq 22 ] || note_fail \
+    "[soundness] expected 22 fixtures, read $soundness_rows from $VERIPB_SOUNDNESS_DIR/expected.tsv"
 
 # -------------------------------------------------------- phase 5: job drift
 # The reviewed workflow and the installed one must be the same bytes; otherwise

@@ -2163,3 +2163,160 @@ fn test_should_reduce_db_uses_composite_memory_8672() {
         );
     }
 }
+
+/// Load-time slack reclamation must not move the reduce-DB byte trigger.
+///
+/// THE BARRIER for #load-slack-reclaim. `clause_db_memory_bytes` decides WHEN
+/// `should_reduce_db` fires, and two of its terms — `clause_ids.capacity()` and
+/// `original_ledger.heap_bytes()` — read REAL capacity, unlike the arena's
+/// pinned `accounted_words`. Shrinking those at load without adding the
+/// reclaimed bytes back shrinks the trigger's basis, so reduction fires at
+/// different conflict counts and the search trajectory diverges. Every verdict
+/// stays correct, so no other test in the suite would notice.
+///
+/// Delete the `+ self.cold.load_slack_reclaimed_bytes` term in
+/// `clause_db_memory_bytes` and this test fails.
+#[test]
+fn load_slack_reclamation_does_not_move_the_reduce_db_trigger() {
+    let mut solver = Solver::new(16);
+    let v: Vec<Variable> = (0..16u32).map(Variable).collect();
+    for i in 0..8 {
+        let a = v[(i * 2) % v.len()];
+        let b = v[(i * 2 + 1) % v.len()];
+        solver.add_clause_db(&[Literal::positive(a), Literal::negative(b)], false);
+    }
+
+    // Slack well past the 16MB reclamation floor (2M u64 entries).
+    solver.cold.clause_ids.reserve_exact(3_000_000);
+    let cap_before = solver.cold.clause_ids.capacity();
+    let billed_before = solver.clause_db_memory_bytes();
+    assert!(
+        (cap_before - solver.cold.clause_ids.len()) * size_of::<u64>() >= 16 << 20,
+        "precondition: clause_ids slack must exceed the reclamation floor"
+    );
+
+    solver.reclaim_load_time_slack(0);
+
+    assert!(
+        solver.cold.clause_ids.capacity() < cap_before,
+        "real capacity must actually be handed back: {cap_before} -> {}",
+        solver.cold.clause_ids.capacity()
+    );
+    assert!(
+        solver.cold.load_slack_reclaimed_bytes > 0,
+        "the reclaimed bytes must be recorded for compensation"
+    );
+    assert_eq!(
+        solver.clause_db_memory_bytes(),
+        billed_before,
+        "the reduce-DB byte trigger must be bit-identical across reclamation, \
+         or the reduction cadence — and with it the search — moves"
+    );
+}
+
+/// `clause_ids` defers its construction reservation to the first write
+/// (#lazy-clause-ids): while disabled (the no-proof route) the vector stays
+/// unallocated so `--memory` is never charged, but `clause_db_memory_bytes`
+/// must keep billing the deferred hint as a phantom — the historical trigger
+/// basis included the eager reservation, and dropping it would move the
+/// reduce-DB cadence. On the first write the reservation lands at exactly the
+/// hint, reproducing the retired `with_capacity` capacity ladder.
+#[test]
+fn clause_ids_reservation_is_lazy_and_trigger_basis_is_preserved() {
+    let solver = Solver::with_clause_hint(64, 32);
+    let hint = solver.cold.clause_ids_reserve_hint;
+    assert!(
+        hint > 0,
+        "precondition: the clause hint must produce a hint"
+    );
+    assert_eq!(
+        solver.cold.clause_ids.capacity(),
+        0,
+        "construction must not allocate clause_ids"
+    );
+    // The phantom charge stands in for the deferred reservation.
+    let billed_unallocated = solver.clause_db_memory_bytes();
+
+    let mut solver2 = Solver::with_clause_hint(64, 32);
+    solver2.cold.clause_ids_grow_for(0);
+    assert_eq!(
+        solver2.cold.clause_ids.capacity(),
+        hint,
+        "first write must take exactly the deferred reservation"
+    );
+    assert_eq!(
+        solver2.clause_db_memory_bytes(),
+        billed_unallocated,
+        "taking the deferred reservation must not move the trigger basis"
+    );
+}
+
+/// The clause-DB byte ceiling derived from a `--memory` budget (B77).
+///
+/// Before this existed, `max_clause_db_bytes` was `None` on every DIMACS route,
+/// so `--memory` bounded a CNF run only by aborting it: the advisory tripped at
+/// 95% of the budget and the watchdog published `c memout`. These pin the
+/// derivation, because getting the share or the floor wrong is the difference
+/// between backpressure and a byte trigger that fires on every conflict for
+/// nothing.
+#[test]
+fn clause_db_budget_takes_a_share_of_the_process_limit() {
+    let mut solver = Solver::new(64);
+    assert_eq!(
+        solver.cold.max_clause_db_bytes, None,
+        "precondition: the byte ceiling starts unset"
+    );
+
+    let limit = 6000 * 1024 * 1024;
+    let installed = solver
+        .arm_clause_db_budget_from_process_limit(limit)
+        .expect("a positive budget must install a ceiling");
+
+    assert_eq!(
+        installed,
+        limit / 100 * memory_budget::CLAUSE_DB_BUDGET_PERCENT,
+        "a small formula must take exactly the configured share"
+    );
+    assert_eq!(solver.cold.max_clause_db_bytes, Some(installed));
+    assert!(
+        installed < limit,
+        "the clause DB may never claim the whole process budget: the \
+         per-variable arrays, the proof writer and allocator slack are charged \
+         against the same number"
+    );
+}
+
+#[test]
+fn clause_db_budget_is_inert_without_a_process_limit() {
+    let mut solver = Solver::new(64);
+    assert_eq!(solver.arm_clause_db_budget_from_process_limit(0), None);
+    assert_eq!(
+        solver.cold.max_clause_db_bytes, None,
+        "an unset budget must leave the engine exactly as it was — library \
+         consumers and uncapped runs must not acquire a ceiling"
+    );
+}
+
+/// A budget share BELOW what the original formula already costs must not
+/// produce a ceiling the solver is already over: `should_reduce_db` would then
+/// return true on every conflict, and no amount of reduction could clear it,
+/// because the irredundant arena and the original ledger are not reducible.
+#[test]
+fn clause_db_budget_floors_at_the_loaded_formula_plus_headroom() {
+    let mut solver = Solver::new(64);
+    let loaded = solver.clause_db_memory_bytes();
+
+    let installed = solver
+        .arm_clause_db_budget_from_process_limit(1024)
+        .expect("a positive budget must install a ceiling");
+
+    assert_eq!(
+        installed,
+        loaded + memory_budget::CLAUSE_DB_MIN_LEARNED_HEADROOM_BYTES,
+        "an absurd budget must fall back to the loaded formula plus headroom"
+    );
+    assert!(
+        solver.clause_db_memory_bytes() < installed,
+        "the solver must not start out already over its own ceiling"
+    );
+}

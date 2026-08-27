@@ -33,14 +33,22 @@ type StrictValidationArtifacts = (ProofQuality, DerivedClauses, DeferredGenericC
 #[path = "quality/authentication_payload.rs"]
 mod authentication_payload;
 mod farkas_meter;
+mod problem_assumptions;
 mod semantic_payload;
+mod step_semantic_charge;
 use authentication_payload::meter_authentication_payload;
+use problem_assumptions::validate_problem_assumptions_metered;
+use step_semantic_charge::{
+    is_clause_identity_route, is_euf_identity_route, strict_semantic_charge,
+};
 #[path = "quality/term_cost_memo.rs"]
 mod term_cost_memo;
 #[cfg(test)]
 use term_cost_memo::TERM_COST_MEMO_POLL_INTERVAL;
 use term_cost_memo::{unfolded_work_memoized, TermCostMemo};
 
+#[path = "quality/and_pos_charge.rs"]
+mod and_pos_charge;
 #[path = "quality/semantic_charge.rs"]
 mod semantic_charge;
 use semantic_charge::semantic_validator_charge;
@@ -350,6 +358,44 @@ pub fn check_proof_partial_with_quality(
     Option<ProofQuality>,
     Option<ProofCheckError>,
 ) {
+    let mut unbounded = |_: usize, _: usize| true;
+    check_proof_partial_with_quality_and_progress(proof, terms, &mut unbounded)
+}
+
+/// [`check_proof_partial_with_quality`] under a CALLER-OWNED resource and
+/// cancellation envelope (#proof-tax, #diagnostic-envelope).
+///
+/// WHY THIS EXISTS. The mandatory UNSAT certification gate
+/// (`check_proof_strict_with_typed_context_and_progress`) has always run under
+/// the caller's envelope, so a raised interrupt, a passed solve deadline or a
+/// breached memory limit stops it. The DIAGNOSTIC walk that runs beside it —
+/// this one, whose output feeds `--self-check` bookkeeping and
+/// `(get-info :all-statistics)` and can never make a verdict MORE accepting —
+/// had no envelope at all: every path bottomed out in
+/// `validate_step_with_datatypes`, which hardcodes `|_, _| true`. On a
+/// triangular resolution proof (measured from deductive-checks's datatype+quantifier
+/// encoding: 126,548 steps, 393,087,456 clause literals, widest clause 28,026)
+/// that unmetered walk ran for 474.565 s and then 481.779 s while the caller's
+/// 30 s budget and its 130 s hang watchdog were already expired — neither could
+/// reach it, because nothing on this path polls anything.
+///
+/// The refusal is `ProofCheckError::ResourceLimit`, which every caller already
+/// treats as "this proof was not checked". That is fail-closed in the only
+/// direction that matters: it can withdraw a self-certification, never grant
+/// one.
+///
+/// Semantics are otherwise IDENTICAL to [`check_proof_partial_with_quality`] —
+/// same checker, same step order, same hole handling, same first-error
+/// semantics — and passing an always-true meter reproduces it exactly.
+pub fn check_proof_partial_with_quality_and_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> (
+    PartialProofCheck,
+    Option<ProofQuality>,
+    Option<ProofCheckError>,
+) {
     let mut result = PartialProofCheck {
         total_steps: proof.steps.len() as u32,
         ..Default::default()
@@ -384,13 +430,20 @@ pub fn check_proof_partial_with_quality(
             continue;
         }
 
-        match validate_step(
+        match validate_step_with_datatypes_and_progress(
             terms,
             &mut derived_clauses,
             ProofId(idx as u32),
             step,
             false,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            progress,
         ) {
             Ok(()) => result.checked_steps += 1,
             Err(e) => return (result, None, Some(e)),
@@ -402,7 +455,14 @@ pub fn check_proof_partial_with_quality(
         return (result, None, Some(e));
     }
 
-    let quality = (result.skipped_hole_steps == 0).then_some(quality);
+    // FIDELITY to the legacy pair: `check_proof_with_quality` runs the
+    // Skolem/forall uniqueness check before it returns, and a failure there
+    // made the executor's quality slot `None` while leaving
+    // `check_proof_partial`'s own verdict untouched (it never ran that check).
+    // Reproduce both halves exactly.
+    let quality = (result.skipped_hole_steps == 0
+        && quantifier::validate_sko_forall_uniqueness(proof, terms).is_ok())
+    .then_some(quality);
     (result, quality, None)
 }
 
@@ -1212,84 +1272,6 @@ fn charge_step_payload_walks(
     Ok(order_variables)
 }
 
-fn validate_problem_assumptions_metered(
-    proof: &Proof,
-    terms: &TermStore,
-    problem_assertions: &[TermId],
-    progress: &mut dyn FnMut(usize, usize) -> bool,
-) -> Result<(), ProofCheckError> {
-    let mut allowed = DetHashSet::default();
-    let mut stack = Vec::new();
-    for &assertion in problem_assertions {
-        charge_progress(
-            progress,
-            1,
-            checked_add_usize(checked_mul_usize(size_of::<TermId>(), 2)?, 32)?,
-        )?;
-        if allowed.insert(assertion) {
-            stack.push(assertion);
-        }
-    }
-
-    // Boolean-ITE closure members (#ite-expansion-authority): parity with the
-    // unmetered `checker::validate_problem_assumptions`. The executor's
-    // `rewrite_assertion_bool_ites` pass asserts the branch implications of a
-    // top-level Bool ITE; an assume of one of those forms is an ENTAILED
-    // premise, re-derived here from the SUPPLIED problem terms through the
-    // shared structural matcher — nothing producer-side is trusted. Without
-    // this arm the production strict paths (which all run the METERED
-    // validator) rejected exactly the assumes the fragment's
-    // #ite-expansion-authority lane emits.
-    let mut authored_bool_ites: Vec<(TermId, TermId, TermId)> = Vec::new();
-    while let Some(term) = stack.pop() {
-        charge_progress(progress, 1, 0)?;
-        match terms.get(term) {
-            TermData::Ite(cond, then_term, else_term) => {
-                charge_progress(progress, 1, checked_mul_usize(size_of::<TermId>(), 3)?)?;
-                authored_bool_ites.push((*cond, *then_term, *else_term));
-            }
-            TermData::App(Symbol::Named(name), args) if name == "and" => {
-                for &arg in args {
-                    // Charge before the hash-set insertion and possible stack
-                    // growth. Duplicate conjunct edges are deliberately
-                    // charged as work too.
-                    charge_progress(
-                        progress,
-                        1,
-                        checked_add_usize(checked_mul_usize(size_of::<TermId>(), 2)?, 32)?,
-                    )?;
-                    if allowed.insert(arg) {
-                        stack.push(arg);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for (index, step) in proof.steps.iter().enumerate() {
-        charge_progress(progress, 1, 0)?;
-        if let ProofStep::Assume(term) = step {
-            if !allowed.contains(term) {
-                // The matcher walk is bounded by the assumed term's or-arity
-                // times the ITE list; charge one unit per candidate ITE.
-                charge_progress(progress, authored_bool_ites.len().max(1), 0)?;
-                if !crate::checker::assumed_is_authored_bool_ite_consequence(
-                    terms,
-                    *term,
-                    &authored_bool_ites,
-                ) {
-                    return Err(ProofCheckError::UnauthorizedAssumption {
-                        step: ProofId(index as u32),
-                        term: *term,
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn ext_diff_registry_charge(
     proof: &Proof,
     terms: &TermStore,
@@ -1360,7 +1342,7 @@ fn fresh_def_registry_charge(
         if matches!(
             step,
             ProofStep::Step {
-                rule: AletheRule::FreshDefBound,
+                rule: AletheRule::FreshDefBound | AletheRule::FreshDefEq,
                 ..
             }
         ) {
@@ -1497,6 +1479,43 @@ enum SemanticChargeClass {
     /// square of a store-chain's internal sharing and withheld correctly decided
     /// `storecomm` UNSAT results as `unknown`. See [`EUF_IDENTITY_WORK_FACTOR`].
     EufIdentityRoute,
+    /// The syntax-only CLAUSE-IDENTITY family — `reordering`, `weakening` and
+    /// `eq_reflexive`. Each validator reads CLAUSE LITERALS as opaque
+    /// `TermId`s and never descends into one:
+    ///
+    ///  * `reordering` ([`crate::checker::reordering::validate_reordering`]):
+    ///    one premise-arity guard, `clause.to_vec()` and `premise.to_vec()`,
+    ///    one `sort_unstable` each, and one `Vec` comparison;
+    ///  * `weakening`
+    ///    ([`crate::checker::boolean_negation::validate_weakening`]): one
+    ///    premise-arity guard, one length comparison and one prefix slice
+    ///    comparison;
+    ///  * `eq_reflexive`
+    ///    ([`crate::checker::boolean_derived::validate_eq_reflexive`]): a
+    ///    unit-clause guard, one `decode_app` of the single literal, and one
+    ///    `TermId` comparison of its two arguments — all `O(1)`.
+    ///
+    /// None of the three reads a subterm, so their worst case is a comparison
+    /// sort over the step's clause plus its premise clause — every literal of
+    /// which the base payload walk has already counted. The `General`
+    /// `unfolded_work^2` product bills them the SQUARE of the TREE-unfolded
+    /// payload instead, which on a shared `store` chain is astronomically
+    /// larger than the DAG the sort actually ranges over.
+    ///
+    /// Measured on `smt/QF_AUFLIA/storeinv_nf_size7.smt2` with
+    /// `--probe-strict-check`, over the proof the congruence-lowering pass
+    /// rebuilds and then asks the MANDATORY gate to certify: the 45
+    /// `reordering` and 9 `weakening` steps whose charge cleared the probe's
+    /// 1_000_000 reporting floor precharge **3_685_418_580** and
+    /// **594_853_732** work units respectively — together 12.2x the whole
+    /// 350_000_000 envelope — for a combined DAG payload of 91_825 nodes. The
+    /// check refused with `budget: work 343617891+103266260 of 350000000`, and
+    /// the pass had to REVERT all 57 already-derivable lemma replacements to
+    /// keep the file's `unsat` published. With this class the same file
+    /// certifies, its 57 `euf_congruence_explanation` lemmas lower, and its
+    /// `hole`-printing steps fall 101 -> 44.
+    /// See [`CLAUSE_IDENTITY_WORK_FACTOR`].
+    ClauseIdentityRoute,
     /// `TheoryLemmaKind::BoolTautology`, whose validator is the exhaustive
     /// bounded Bool/BV evaluator in [`crate::checker::bv_bitblast`].
     ///
@@ -1529,6 +1548,12 @@ enum SemanticChargeClass {
     /// the whole envelope for a step that performs a few hundred integer
     /// comparisons.
     UnorderedClauseMatch,
+    /// `AletheRule::AndPos(i)` on a step whose two negation matchers are
+    /// STRUCTURALLY UNABLE to recurse. The decision, the measurement that
+    /// motivated it and the charge are all in [`and_pos_charge`]; the class is
+    /// deliberately NOT a claim about the `and_pos` RULE, which reaches the same
+    /// unmemoized De Morgan recursion `and_neg` does.
+    AndPosShallowMatch,
     /// A TRUST-KIND theory lemma (`TheoryLemmaKind::is_trust()`, today exactly
     /// `Generic`), whose strict route has NO unmodelled cost at all.
     ///
@@ -1606,6 +1631,43 @@ const EUF_IDENTITY_WORK_FACTOR: usize = 8;
 /// `O(premises)` entries of a `TermId` plus small control words; four times the
 /// step's DAG payload bytes dominates it.
 const EUF_IDENTITY_BYTE_FACTOR: usize = 4;
+
+/// Work factor for [`SemanticChargeClass::ClauseIdentityRoute`], applied to a
+/// comparison-sort bound over the step's DAG payload `work` (NOT the
+/// tree-unfolded payload).
+///
+/// Write `n` for the number of literals the widest of the three validators
+/// touches — `clause.len() + premise.len()`. The base payload walk pushes the
+/// clause, the args and EVERY resolvable premise clause through
+/// `push_term_slice`, which debits one work unit per literal, and then debits
+/// `roots.len()` again in the walk's second phase, so `payload.work >= 2n`
+/// holds for every step this class can see (a premise the meter cannot resolve
+/// is one `premise_clause` rejects before the validator reads a literal, so it
+/// contributes to neither side).
+///
+/// `reordering` is the worst of the three: two `to_vec()` clones (`<= n`
+/// element copies), two `sort_unstable` calls (`<= c * n * log2(n)`
+/// comparisons for the standard `O(n log n)` worst case) and one `Vec`
+/// comparison (`<= n`). With `n <= payload.work`, every one of those terms is
+/// bounded by [`comparison_sort_bound`] of `payload.work`, which is itself
+/// `>= work >= 2n`. Eight copies therefore cover two sorts at `c = 2` plus the
+/// three linear passes with room to spare, and the charge stays LINEARITHMIC
+/// in the step's real DAG payload — so a genuinely wide clause still grows its
+/// charge and is still refused once the DAG behind it is large enough.
+const CLAUSE_IDENTITY_WORK_FACTOR: usize = 8;
+
+/// `n * (floor(log2(n)) + 2)`, saturating — an upper bound on `n + n*log2(n)`,
+/// and hence on the comparison count of one `O(n log n)` comparison sort over
+/// `n` elements up to the constant folded into
+/// [`CLAUSE_IDENTITY_WORK_FACTOR`].
+///
+/// `usize::BITS - n.leading_zeros()` is `floor(log2(n)) + 1` for `n >= 1`, so
+/// the multiplier is at least `log2(n) + 1` there and the product is at least
+/// `n`; `n = 0` maps to `0`, which is correct — there is nothing to sort.
+fn comparison_sort_bound(n: usize) -> usize {
+    let bits = (usize::BITS - n.leading_zeros()) as usize;
+    n.saturating_mul(bits.saturating_add(1))
+}
 
 /// Saturating second factor for [`SemanticChargeClass::BoundedAssignmentEval`].
 ///
@@ -1699,16 +1761,7 @@ fn datatype_registry_charge(
     Ok((work, bytes))
 }
 
-fn step_clause_len(step: &ProofStep) -> usize {
-    match step {
-        ProofStep::Assume(_) => 1,
-        ProofStep::Resolution { clause, .. }
-        | ProofStep::TheoryLemma { clause, .. }
-        | ProofStep::Step { clause, .. } => clause.len(),
-        ProofStep::Anchor { .. } => 0,
-        _ => 0,
-    }
-}
+include!("quality/step_clause_len.rs");
 
 fn prior_clause_len(derived_clauses: &[Option<Vec<TermId>>], premise: ProofId) -> Option<usize> {
     derived_clauses
@@ -1879,9 +1932,8 @@ fn drup_charge(
     ))
 }
 
-/// Pick the charge model for `step`. Every non-`General` class either
-/// replaces the general recursive-tree estimate with a route-specific meter or
-/// identifies a private allocation path charged dynamically by the checker.
+/// Pick the charge model. Non-`General` classes use a route-specific meter or
+/// identify a private allocation path charged dynamically by the checker.
 fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> SemanticChargeClass {
     if matches!(
         step,
@@ -1917,6 +1969,9 @@ fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> Semantic
     if is_euf_identity_route(step) {
         return SemanticChargeClass::EufIdentityRoute;
     }
+    if is_clause_identity_route(step) {
+        return SemanticChargeClass::ClauseIdentityRoute;
+    }
     if matches!(
         step,
         ProofStep::TheoryLemma {
@@ -1935,6 +1990,9 @@ fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> Semantic
     ) {
         return SemanticChargeClass::UnorderedClauseMatch;
     }
+    if and_pos_charge::is_and_pos_shallow_match(step, terms) {
+        return SemanticChargeClass::AndPosShallowMatch;
+    }
     // Placed LAST so every kind with its own modelled route above keeps it;
     // only the trust-kind fallthrough reaches here.
     if matches!(step, ProofStep::TheoryLemma { kind, .. } if kind.is_trust()) {
@@ -1943,83 +2001,11 @@ fn select_semantic_charge_class(step: &ProofStep, terms: &TermStore) -> Semantic
     SemanticChargeClass::General
 }
 
-/// Recognize the EUF identity/congruence family whose strict validators are
-/// bounded by the step's reachable DAG (no descent into argument subterms), in
-/// BOTH its Alethe-step and theory-lemma spellings. Kept as a conservative
-/// allowlist: any rule NOT proven `TermId`-identity bounded stays `General` and
-/// keeps the conservative tree-unfolded charge.
-fn is_euf_identity_route(step: &ProofStep) -> bool {
-    match step {
-        ProofStep::Step {
-            rule:
-                AletheRule::Refl
-                | AletheRule::Symm
-                | AletheRule::Trans
-                | AletheRule::Cong
-                | AletheRule::EqTransitive
-                | AletheRule::EqCongruent
-                | AletheRule::EqCongruentPred,
-            ..
-        } => true,
-        ProofStep::TheoryLemma {
-            kind:
-                TheoryLemmaKind::EufReflexive
-                | TheoryLemmaKind::EufTransitive
-                | TheoryLemmaKind::EufCongruent
-                | TheoryLemmaKind::EufCongruentPred,
-            ..
-        } => true,
-        _ => false,
-    }
-}
-
-fn strict_semantic_charge(
-    step: &ProofStep,
-    semantic_payload: PayloadStats,
-    semantic_class: SemanticChargeClass,
-) -> Result<(usize, usize), ProofCheckError> {
-    // `ArrayRowChain` AND `ArrayStorePermutation` meter their ACTUAL validation
-    // work through the strict-check progress callback inside their validators
-    // ([`crate::checker::validate_array_row_chain`] /
-    // [`crate::checker::validate_array_store_permutation`]) — the same
-    // (0,0)-precharge-then-debit-actual pattern `ResolutionRoute`/`Generic`
-    // lemmas use — so they take NO up-front semantic precharge here. The former
-    // `ArrayClauseSchema` precharge (`~8 * unfolded_work^2`) is quadratic in the
-    // step's unfolded payload, hence QUARTIC in the store-chain length for the
-    // store-commutativity clause shape (whose `O(P^2)` index-pair literal count
-    // makes `unfolded_work` itself `Θ(P^2)`); it over-charged the common
-    // genuinely-`O(L + P^2)` shape and withheld a correctly decided `storecomm`
-    // UNSAT. Both validators now debit a tight `O(L + P^2)` bound per node/pair
-    // and fail closed on an adversarial clause.
-    if matches!(
-        step,
-        ProofStep::TheoryLemma {
-            kind: TheoryLemmaKind::ArrayRowChain | TheoryLemmaKind::ArrayStorePermutation,
-            ..
-        }
-    ) {
-        Ok((0, 0))
-    } else if matches!(
-        step,
-        ProofStep::Step {
-            rule: AletheRule::Hole | AletheRule::Trust,
-            ..
-        }
-    ) {
-        // A hole/trust step has NO semantic validator to reserve for: the
-        // strict checker rejects it in O(1) with the typed
-        // `HoleStep`/`TrustStep` refusal, and the non-strict lanes skip it.
-        // Billing the General tree-unfolded estimate here charged a single
-        // 1000-literal hole 285M+ work — exhausting the whole envelope and
-        // masking the TYPED refusal (`ResourceLimit` instead of `HoleStep`),
-        // which starves every downstream repair lane keyed on that reason.
-        // The structural per-step charge in `strict_step_charge` still
-        // applies, so an adversarial million-hole document remains bounded.
-        Ok((0, 0))
-    } else {
-        semantic_validator_charge(step, semantic_payload, semantic_class)
-    }
-}
+/// Recognize syntax-only EUF identity/congruence routes in both Alethe-step and
+/// theory-lemma spellings whose strict validators are reachable-DAG bounded,
+/// without descending into argument subterms. This grants no proof authority:
+/// unproven `TermId`-identity bounds stay `General` with tree-unfolded charge;
+/// add routes only when their strict validator has an equivalent DAG bound.
 
 fn strict_step_charge(
     terms: &TermStore,

@@ -31,10 +31,33 @@
 //!
 //! Proofs: an enumeration `unsat` has no single reconstructable certificate
 //! (the per-branch traces attest substituted problems), so the proof/trace
-//! state is WIPED on the unsat return — the CLI then takes its honest
+//! ARTIFACT state is WIPED on the unsat return — the CLI then takes its honest
 //! "no proof certificate emitted" degrade, and `--strict-proofs` /
 //! self-check refuse the uncertified verdict rather than trusting a bogus
 //! one.
+//!
+//! ARTIFACT STATE ONLY. `proof_problem_assertion_provenance` used to be wiped
+//! alongside it, and it is NOT artifact state — it is the binding between the
+//! proof machinery and the authored assertion epoch. Wiping it made a
+//! MISSING-ARTIFACT condition surface as `AssertionEpochMismatch` ("the UNSAT
+//! proof provenance is not bound to the authored assertion epoch"), an
+//! authority-FORGERY-shaped error, so a benign gap and a real forgery shared
+//! one message. Worse, that binding is a conjunct of
+//! `exact_plain_hard_unsat_scope_is_current`, so dropping it also foreclosed
+//! the EXACT-SEMANTIC lane — the one lane that can actually certify this
+//! expansion. What the unsat return wipes now is exactly the state a
+//! reconstructed proof would read, and the residual certification failure is
+//! `MissingProof`, which names the truth.
+//!
+//! Certification: the verdict itself is recovered on a separate, independent
+//! lane. `Executor::try_authorize_current_query_exact_rm_domain_expansion_unsat`
+//! (executor/unsat_cert/rm_domain_expansion.rs) re-derives the same finite
+//! expansion from the immutable public-query roots and mints
+//! `CheckedExactRmDomainExpansion` when every one of the 5^k branches is
+//! refuted — elementarily by a folded `false` conjunct, or by an independently
+//! CERTIFIED probe. It runs BEFORE this enumeration and takes nothing from it,
+//! so this lane keeps its fail-closed contract unchanged for every shape the
+//! certificate declines.
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
@@ -206,8 +229,8 @@ impl Executor {
         // now holds only the LAST branch's session — reconstructing a
         // certificate from it would attest the wrong (substituted) problem.
         // Wipe it so the CLI takes its honest "no proof certificate emitted"
-        // degrade (and `--strict-proofs` / self-check refuse the uncertified
-        // verdict) instead of emitting a bogus certificate.
+        // degrade instead of emitting a bogus certificate. ARTIFACT STATE ONLY
+        // — see the module header on the authored-epoch proof provenance.
         self.last_proof = None;
         self.clear_finite_enum_proof_state();
         self.last_lrat_certificate = None;
@@ -215,11 +238,11 @@ impl Executor {
         self.last_proof_quality = None;
         self.last_clause_trace = None;
         self.last_checked_sat_refutation = None;
+        self.pending_nested_array_bool_bv_unsat = None;
         self.last_var_to_term = None;
         self.last_trail_provenance = None;
         self.last_clausification_proofs = None;
         self.last_original_clause_theory_proofs = None;
-        self.proof_problem_assertion_provenance = None;
         self.proof_tracker.reset_session();
         self.last_unknown_reason = None;
         Ok(Some(SolveResult::unsat()))

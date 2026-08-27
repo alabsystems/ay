@@ -160,7 +160,7 @@ impl ExtDimacsFormula {
     }
 
     /// Checked solve for formulas created directly through the public fields.
-    pub fn try_solve(self) -> Result<ay_sat::VerifiedSatResult, ExtDimacsError> {
+    pub fn try_solve(self) -> Result<ay_sat::SolverSatResult, ExtDimacsError> {
         let (mut solver, xor_ext) = self.try_into_solver_with_xor()?;
 
         Ok(match xor_ext {
@@ -182,7 +182,7 @@ impl ExtDimacsFormula {
     /// Panics before allocating if a directly constructed formula exceeds the
     /// supported dense-variable limit. Prefer [`Self::try_solve`] for native
     /// formulas that have not passed through [`parse_ext_dimacs`].
-    pub fn solve(self) -> ay_sat::VerifiedSatResult {
+    pub fn solve(self) -> ay_sat::SolverSatResult {
         self.try_solve()
             .expect("extended DIMACS formula exceeds supported solver limits")
     }
@@ -456,12 +456,12 @@ pub fn write_ext_dimacs<W: std::io::Write>(
 /// Convenience function to parse and solve in one step.
 pub fn solve_ext_dimacs<R: std::io::Read>(
     reader: R,
-) -> Result<ay_sat::VerifiedSatResult, ExtDimacsError> {
+) -> Result<ay_sat::SolverSatResult, ExtDimacsError> {
     let formula = parse_ext_dimacs(reader)?;
     formula.try_solve()
 }
 
 /// Solve an extended DIMACS formula from a string.
-pub fn solve_ext_dimacs_str(input: &str) -> Result<ay_sat::VerifiedSatResult, ExtDimacsError> {
+pub fn solve_ext_dimacs_str(input: &str) -> Result<ay_sat::SolverSatResult, ExtDimacsError> {
     solve_ext_dimacs(input.as_bytes())
 }

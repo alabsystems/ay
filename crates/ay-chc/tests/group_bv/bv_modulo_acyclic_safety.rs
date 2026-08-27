@@ -71,9 +71,9 @@ fn acyclic_bv_modulo_unreachable_arm_proves_safe() {
         .expect("lane_select modulo CHC parses and runs");
 
     assert!(
-        matches!(run.result, VerifiedChcResult::Safe(_)),
+        matches!(run.result(), VerifiedChcResult::Safe(_)),
         "acyclic BV-modulo unreachable arm (n%3 ∈ {{0,1,2}}) must prove SAFE \
          (Executor budget reserved for bvurem); got {:?}",
-        run.result
+        run.result()
     );
 }

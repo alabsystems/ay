@@ -15,6 +15,8 @@ mod auflia_gate_select_model_a1;
 mod construction_stats_6364;
 #[path = "group_executor/dt_derived_unit_lemmas_certified.rs"]
 mod dt_derived_unit_lemmas_certified;
+#[path = "group_executor/dt_ground_conflict_strict_publication.rs"]
+mod dt_ground_conflict_strict_publication;
 #[path = "group_executor/eager_batch_signal_6503.rs"]
 mod eager_batch_signal_6503;
 #[path = "group_executor/empty_assertions_gap_a_7912.rs"]

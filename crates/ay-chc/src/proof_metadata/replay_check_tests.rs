@@ -100,41 +100,7 @@ fn route_b_native_proof_admission(metadata: &serde_json::Value) -> Result<(), &'
     Ok(())
 }
 
-fn assert_checked_run_invariants(checked: &super::ChcCheckedReplayRun) {
-    assert!(checked.manifest.trust_full_verifier_admissible());
-    assert_eq!(
-        checked.manifest.cache_admission_status(),
-        "admit-checked-proof-evidence"
-    );
-    let metadata = &checked.proof_run.metadata;
-    assert!(metadata.trust_full_verifier_admissible());
-    assert_eq!(metadata.replay_status, "replayable");
-    assert_eq!(metadata.transcript_status, "replayable");
-    assert!(metadata.trust_full_verifier_non_admission_reason.is_none());
-
-    let digests = metadata
-        .checked_replay
-        .as_ref()
-        .expect("checked metadata should carry the private digest set");
-    assert!(is_lower_sha256(&digests.transcript_sha256));
-    assert!(is_lower_sha256(&digests.replay_log_sha256));
-    assert!(is_lower_sha256(&digests.checked_report_sha256));
-    assert_eq!(
-        digests.checked_report_sha256,
-        sha256_hex(&checked.checked_report_bytes)
-    );
-    assert_eq!(
-        digests.replay_log_sha256,
-        sha256_hex(&checked.replay_log_bytes)
-    );
-    if let Some(run_log_bytes) = &checked.run_log_bytes {
-        assert_eq!(digests.transcript_sha256, sha256_hex(run_log_bytes));
-    }
-    assert_eq!(
-        digests.summary_identity_sha256,
-        checked.summary.identity_sha256()
-    );
-}
+include!("replay_check_tests/checked_run_assertions.rs");
 
 #[test]
 fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
@@ -150,10 +116,10 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
     let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
         .expect("PDR proof run should not error");
     assert!(run.accepted_as_proof(), "fixture should prove safe");
-    assert_eq!(run.metadata.result, "safe");
+    assert_eq!(run.metadata().result(), "safe");
 
     let checked = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect("checked replay should pass on a verified safe proof");
     assert_checked_run_invariants(&checked);
 
@@ -162,10 +128,10 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
     // that it was discharged by a REAL Alethe-verified proof, not a trusted
     // re-run verdict.
     assert!(
-        !checked.summary.obligations.is_empty(),
+        !checked.summary().obligations.is_empty(),
         "safe PDR proof should have replay obligations"
     );
-    for obligation in &checked.summary.obligations {
+    for obligation in &checked.summary().obligations {
         assert_ne!(obligation.kind, ChcReplayObligationKind::TraceValidity);
         let cert = obligation.strict_cert.as_ref().unwrap_or_else(|| {
             panic!(
@@ -180,17 +146,17 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
 
     // The strict-cert-bearing summary must round-trip through JSON with a
     // stable identity (the strict cert is part of the obligation identity).
-    let summary_json = checked.summary.to_json_value();
+    let summary_json = checked.summary().to_json_value();
     let reparsed = ChcCheckedReplaySummary::from_json_value(&summary_json)
         .expect("strict-cert summary JSON should re-parse");
-    assert_eq!(reparsed.obligations, checked.summary.obligations);
+    assert_eq!(reparsed.obligations, checked.summary().obligations);
     assert_eq!(
         reparsed.identity_sha256(),
-        checked.summary.identity_sha256()
+        checked.summary().identity_sha256()
     );
 
     // The upgraded transcript JSON must clear model-checker-consumer's Route-B gate.
-    let json = checked.proof_run.metadata.to_json_value();
+    let json = checked.proof_run().metadata().to_json_value();
     assert_eq!(route_b_native_proof_admission(&json), Ok(()));
     assert_eq!(json["trust_full_verifier_admissible"], true);
     assert_eq!(
@@ -199,7 +165,7 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
     );
 
     // The metadata-only baseline is rejected with exactly the wishlist symptom.
-    let baseline = run.metadata.to_json_value();
+    let baseline = run.metadata().to_json_value();
     assert_eq!(
         route_b_native_proof_admission(&baseline),
         Err("replay_not_replayable")
@@ -224,7 +190,7 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
     let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
         .expect("acyclic proof run should not error");
     assert!(run.accepted_as_proof(), "acyclic fixture should prove safe");
-    let VerifiedChcResult::Safe(inv) = &run.result else {
+    let VerifiedChcResult::Safe(inv) = run.result() else {
         panic!("acyclic fixture should be safe");
     };
     assert!(
@@ -233,13 +199,13 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
     );
 
     let checked = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect("checked replay should pass on the acyclic-exhaustion certificate");
     assert_checked_run_invariants(&checked);
     assert!(
-        !checked.summary.obligations.is_empty()
+        !checked.summary().obligations.is_empty()
             && checked
-                .summary
+                .summary()
                 .obligations
                 .iter()
                 .all(|obligation| obligation.kind == ChcReplayObligationKind::Safety),
@@ -247,14 +213,14 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
     );
     // Synthesized safety obligations are UNSAT obligations discharged by the
     // native strict-Alethe self-check, so each carries a verified strict cert.
-    for obligation in &checked.summary.obligations {
+    for obligation in &checked.summary().obligations {
         let cert = obligation
             .strict_cert
             .as_ref()
             .expect("acyclic-exhaustion safety obligation must carry a strict-Alethe cert");
         assert_eq!(cert.verdict, "verified");
     }
-    let json = checked.proof_run.metadata.to_json_value();
+    let json = checked.proof_run().metadata().to_json_value();
     assert_eq!(route_b_native_proof_admission(&json), Ok(()));
 
     // Direct unit check on the synthesized obligation query.
@@ -299,7 +265,7 @@ fn checked_replay_admits_acyclic_query_cone_with_dead_end_cycle() {
         run.accepted_as_proof(),
         "acyclic query cone should prove safe"
     );
-    let VerifiedChcResult::Safe(inv) = &run.result else {
+    let VerifiedChcResult::Safe(inv) = run.result() else {
         panic!("dead-end-cycle fixture should be Safe");
     };
     assert!(
@@ -317,16 +283,16 @@ fn checked_replay_admits_acyclic_query_cone_with_dead_end_cycle() {
     assert!(
         raw_obligations[0]
             .smtlib
-            .contains(&run.metadata.normalized_input_sha256),
+            .contains(run.metadata().normalized_input_sha256()),
         "replay obligation must retain the original normalized-input binding"
     );
 
     let checked = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect("strict replay should reproduce the dead-end strip");
     assert_checked_run_invariants(&checked);
-    assert_eq!(checked.summary.obligations.len(), 1);
-    let obligation = &checked.summary.obligations[0];
+    assert_eq!(checked.summary().obligations.len(), 1);
+    let obligation = &checked.summary().obligations[0];
     assert!(
         obligation.strict_cert.is_some(),
         "the stripped expansion must still receive a strict UNSAT certificate"
@@ -389,10 +355,9 @@ fn dead_end_strip_does_not_hide_reachable_error() {
         ChcEngineResult::Safe(InvariantModel::default()),
         ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: 3 },
     );
-    let run = ChcPdrProofRun::new(&problem, result, "bmc");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
     assert!(
-        run.run_checked_replay(&problem, REPLAY_TEST_BUDGET)
-            .is_err(),
+        run.run_checked_replay(REPLAY_TEST_BUDGET).is_err(),
         "reachable error must fail the strict checked-replay gate"
     );
 }
@@ -411,25 +376,25 @@ fn checked_replay_validates_unsafe_trace() {
     let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
         .solve_bmc_only(BmcConfig::default().with_max_depth(2));
     assert!(result.is_unsafe(), "BMC fixture should produce Unsafe");
-    let run = ChcPdrProofRun::new(&problem, result, "bmc");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
 
     let checked = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect("checked replay should validate the unsafe trace");
     assert_checked_run_invariants(&checked);
-    assert_eq!(checked.summary.verdict, "unsafe");
-    assert_eq!(checked.summary.obligations.len(), 1);
+    assert_eq!(checked.summary().verdict, "unsafe");
+    assert_eq!(checked.summary().obligations.len(), 1);
     assert_eq!(
-        checked.summary.obligations[0].kind,
+        checked.summary().obligations[0].kind,
         ChcReplayObligationKind::TraceValidity
     );
     // A trace-validity (SAT-witness) obligation has no UNSAT proof, so it
     // carries no strict-Alethe cert — it stays on the trusted ground-eval path.
-    assert!(checked.summary.obligations[0].strict_cert.is_none());
+    assert!(checked.summary().obligations[0].strict_cert.is_none());
 
     // Route B admits SAFE proofs only; a checked unsafe transcript is still
     // rejected there (by result), never by replayability.
-    let json = checked.proof_run.metadata.to_json_value();
+    let json = checked.proof_run().metadata().to_json_value();
     assert_eq!(
         route_b_native_proof_admission(&json),
         Err("non_safe_result")
@@ -452,15 +417,12 @@ fn checked_replay_fails_closed_on_zero_budget_and_keeps_metadata_only() {
         .expect("acyclic proof run should not error");
     assert!(run.accepted_as_proof());
 
-    assert!(run.run_checked_replay(&problem, Duration::ZERO).is_err());
+    assert!(run.run_checked_replay(Duration::ZERO).is_err());
 
-    // The degrading entry point returns the metadata-only transcript, which
-    // Route B rejects with exactly the wishlist symptom.
-    let metadata = run
-        .result
-        .checked_proof_transcript_metadata(&problem, "pdr", Duration::ZERO);
+    // A failed replay cannot mutate the sealed metadata-only run.
+    let metadata = run.metadata();
     assert!(!metadata.trust_full_verifier_admissible());
-    assert_eq!(metadata.replay_status, "replay-artifacts-required");
+    assert_eq!(metadata.replay_status(), "replay-artifacts-required");
     assert_eq!(
         route_b_native_proof_admission(&metadata.to_json_value()),
         Err("replay_not_replayable")
@@ -493,10 +455,10 @@ fn checked_replay_rejects_model_that_does_not_discharge_safety() {
         ChcEngineResult::Safe(model),
         ValidationEvidence::FullVerification,
     );
-    let run = ChcPdrProofRun::new(&problem, result, "pdr");
+    let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
 
     let error = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect_err("non-discharging model must fail the checked replay");
     // A safety obligation is an UNSAT obligation now discharged by the native
     // strict-Alethe self-check. A bogus model makes it replay SAT, so no UNSAT
@@ -508,9 +470,7 @@ fn checked_replay_rejects_model_that_does_not_discharge_safety() {
         "failure should name the non-discharging strict obligation: {error}"
     );
 
-    let metadata =
-        run.result
-            .checked_proof_transcript_metadata(&problem, "pdr", REPLAY_TEST_BUDGET);
+    let metadata = run.metadata();
     assert!(!metadata.trust_full_verifier_admissible());
     assert_eq!(
         route_b_native_proof_admission(&metadata.to_json_value()),
@@ -533,9 +493,9 @@ fn parsed_checked_transcript_metadata_is_never_admissible() {
     let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
         .expect("acyclic proof run should not error");
     let checked = run
-        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect("checked replay should pass");
-    let json = checked.proof_run.metadata.to_json_value();
+    let json = checked.proof_run().metadata().to_json_value();
     assert_eq!(json["trust_full_verifier_admissible"], true);
 
     // A JSON round-trip (i.e. any copied/cached transcript) must fail closed:
@@ -543,7 +503,7 @@ fn parsed_checked_transcript_metadata_is_never_admissible() {
     let parsed = ChcProofTranscriptMetadata::from_json_value(&json)
         .expect("checked transcript JSON should parse");
     assert!(!parsed.trust_full_verifier_admissible());
-    assert_eq!(parsed.replay_status, "replayable");
+    assert_eq!(parsed.replay_status(), "replayable");
     assert_eq!(
         parsed.to_json_value()["trust_full_verifier_admissible"],
         false
@@ -551,6 +511,6 @@ fn parsed_checked_transcript_metadata_is_never_admissible() {
     // Identity stays stable across the round-trip (admission-key stability).
     assert_eq!(
         parsed.identity_sha256(),
-        checked.proof_run.metadata.identity_sha256()
+        checked.proof_run().metadata().identity_sha256()
     );
 }

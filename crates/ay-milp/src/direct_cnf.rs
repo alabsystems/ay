@@ -324,6 +324,11 @@ fn trace_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
+/// Prime this cached accessor from `bab::prime_env_all` before window solves rewrite the environment.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,7 +528,9 @@ mod tests {
     #[test]
     fn expired_deadline_is_a_typed_decline() {
         let model = Model::new();
-        let deadline = Instant::now() - Duration::from_millis(1);
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
         assert!(matches!(
             admit(&model, Some(deadline)),
             DirectCnfAdmission::Declined(DirectCnfDecline::Deadline)
@@ -644,11 +651,4 @@ mod tests {
             assert_eq!(native.is_infeasible(), !expect_sat);
         }
     }
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

@@ -34,6 +34,14 @@ pub(super) enum NativeTheoryPropagationDispatch {
 }
 
 impl NativeTheoryPropagationDispatch {
+    pub(super) fn disabled<T: TheorySolver>(theory: &T, theory_atom_count: usize) -> Self {
+        Self::evaluate(
+            theory.native_theory_propagation_profile(),
+            theory_atom_count,
+            NativeTheoryPropagationControl::Disabled,
+        )
+    }
+
     pub(super) fn evaluate(
         profile: NativeTheoryPropagationProfile,
         theory_atom_count: usize,

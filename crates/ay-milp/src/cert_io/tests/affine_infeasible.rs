@@ -77,6 +77,7 @@ fn emit_infeasible_affine(
             network_design_infeasibility_certificate: None,
             network_design_optimality_certificate: None,
             block_angular_optimality_certificate: None,
+            milp_optimality_tree_certificate: None,
             single_machine_scheduling_optimality_certificate: None,
             single_row_dp_infeasibility_certificate: None,
             multi_row_bdd_infeasibility_certificate: None,
@@ -109,7 +110,7 @@ pub(super) fn affine_farkas_wire_checks_in_the_rebuilt_reduced_frame() {
     assert!(wire.contains("evidence infeasible SUCCINCT affine-aggregation"));
     assert!(wire.contains("inner farkas"));
     let report = check(&wire, AFFINE_INFEASIBLE_MPS);
-    assert_eq!(report.status, CheckStatus::Verified, "{:?}", report.notes);
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     assert_eq!(
         report.claims_in(ClaimStanding::Verified),
         vec!["infeasible"]
@@ -121,7 +122,7 @@ pub(super) fn affine_tree_wire_checks_in_the_rebuilt_reduced_frame() {
     let wire = emit_infeasible_affine(&problem, &certificate);
     assert!(wire.contains("inner tree"));
     assert_eq!(
-        check(&wire, AFFINE_INFEASIBLE_MPS).status,
+        check(&wire, AFFINE_INFEASIBLE_MPS).status(),
         CheckStatus::Verified
     );
 }

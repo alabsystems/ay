@@ -17,7 +17,7 @@ struct Validator<'terms, 'decls> {
     ctor_selectors: SelectorDecls<'decls>,
 }
 
-impl<'terms, 'decls> Validator<'terms, 'decls> {
+impl<'decls> Validator<'_, 'decls> {
     fn selector_list(&self, constructor: &str) -> Option<&'decls [String]> {
         self.ctor_selectors
             .iter()
@@ -195,7 +195,7 @@ impl<'terms, 'decls> Validator<'terms, 'decls> {
             else {
                 continue;
             };
-            if x_selector == y_selector && selectors.iter().any(|name| *name == x_selector) {
+            if x_selector == y_selector && selectors.contains(&x_selector) {
                 return Some(x_selector);
             }
         }

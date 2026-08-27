@@ -281,9 +281,8 @@ fn coef_to_f64_rounds_the_way_the_stored_side_needs() {
 /// The model carries one integer column unbounded ABOVE (`lo = 0`) and one unbounded BELOW
 /// (`up = 0`), each pinned to a finite range by a ROW rather than by its column bounds — which
 /// is what leaves them unbounded to the separators while keeping the feasible set enumerable.
-/// Every family that shares the emitter is separated on the same models: the `>=` stores (GMI,
-/// mixing) and the `<=` stores (MIR, strong CG, aggregated MIR, tableau MIR, dual-aggregate
-/// MIR).
+/// Every active family that shares the emitter is separated on the same models: the `>=` GMI
+/// store and the `<=` stores (MIR, strong CG, aggregated MIR, tableau MIR, dual-aggregate MIR).
 ///
 /// NEGATIVE CONTROL, run and recorded — BOTH directions, because a guard that cannot fail
 /// proves nothing:
@@ -359,7 +358,6 @@ fn cuts_never_remove_an_integer_point_with_an_unbounded_column() {
         let x: Vec<f64> = cand.values[..n].to_vec();
 
         let mut cuts = separate_gmi(&m, &lp, &cand, None, m.num_rows(), m.num_cols());
-        cuts.extend(separate_mixing(&m, &x, m.num_rows(), 8));
         cuts.extend(separate_mir(&m, &x, m.num_rows(), 8));
         cuts.extend(separate_strongcg(&m, &x, m.num_rows(), 8));
         cuts.extend(separate_mir_agg(&m, &x, m.num_rows(), 8));

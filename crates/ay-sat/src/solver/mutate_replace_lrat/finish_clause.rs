@@ -37,19 +37,19 @@ impl Solver {
         // Update the clause with reordered literals
         self.drain_pending_garbage_mark(clause_idx);
         self.stats.clear_bcp_learned_1963_blocker_cert(clause_idx);
-        self.arena.replace(clause_idx, &reordered);
+        self.arena.replace(clause_idx, reordered);
         if let Some(ref mut gc_occ) = self.gc_occ {
-            gc_occ.add_clause(clause_idx, &reordered);
+            gc_occ.add_clause(clause_idx, reordered);
         }
         self.arena.set_saved_pos(clause_idx, 2);
         self.cold.clause_db_changes += 1; // BVE dual-signal fixpoint guard (#3416)
         if was_irredundant {
-            self.mark_factor_candidates_dirty_clause(&reordered);
+            self.mark_factor_candidates_dirty_clause(reordered);
         }
 
         // Online witness check: shrunken/replaced clauses must remain satisfied
         // by the solution witness. CaDiCaL parity: check_solution_on_shrunken_clause.
-        self.check_solution_on_replaced_clause(&reordered);
+        self.check_solution_on_replaced_clause(reordered);
 
         // Add new watches based on new clause size
         if let Some((lit0, lit1)) = watched {

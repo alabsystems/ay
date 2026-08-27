@@ -225,20 +225,48 @@ impl FtAdoptionSolveLatch {
         {
             return false;
         }
-        ADOPTION_EXCLUDED.fetch_add(1, Ordering::Relaxed);
-        ADOPTION_EXCLUDED_ROWS.fetch_add(rows, Ordering::Relaxed);
+        crate::local_census::add_u64(&ADOPTION_EXCLUDED, 1);
+        crate::local_census::add_u64(&ADOPTION_EXCLUDED_ROWS, rows);
         true
     }
 }
 
-/// Serialize tests that assert deltas of the process-global census.
+// THE ADOPTION TEST MUTEX IS GONE, AND ITS ABSENCE IS THE POINT.
+//
+// Six tests used to take an `adoption_test_guard()` before asserting deltas of
+// `ADOPTION_EXCLUDED`/`ADOPTION_EXCLUDED_ROWS`. It serialised only the tests
+// that TOOK it — the other ~1,440 in this binary ran alongside them regardless
+// — so it was never the defence it looked like. What it did do was hide the
+// question: with the six mutually excluded, nobody asked whether reading a
+// process-global counter was the right instrument in the first place.
+//
+// It is: `charge` now routes through `crate::local_census`, so each thread has
+// a mirror of its own charges and every one of the six asserts on THAT. A
+// mutex on top of a per-thread instrument protects nothing, and leaving it
+// standing would leave the next reader believing a defence exists where one
+// does not. Removed on the same reasoning that removed it from the
+// efficacy-floor census in `759cf08c6`.
+
+/// `(excluded top-level solves, first-excluded LP rows)` charged BY THIS
+/// THREAD.
+///
+/// The delta-asserting instrument for the FT-adoption census; see
+/// [`crate::local_census`]. [`adoption_forgone`] keeps its process-wide
+/// meaning and stays the `--trace` reporting number.
+///
+/// NOTE THE THREAD. `charge` latches by compare-exchange, so in the
+/// multi-worker shape the winner is whichever thread got there first — this
+/// reads the CALLER's charges, which is the right number only when the caller
+/// is the charging thread. `sepstat`'s own concurrent test deliberately
+/// charges on spawned workers and reads this from each of them; see the note
+/// there.
 #[cfg(test)]
-pub(crate) fn adoption_test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    GUARD
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+#[must_use]
+pub(crate) fn adoption_forgone_local() -> (u64, u64) {
+    (
+        crate::local_census::local_u64(&ADOPTION_EXCLUDED),
+        crate::local_census::local_u64(&ADOPTION_EXCLUDED_ROWS),
+    )
 }
 
 /// `(excluded top-level solves, first-excluded LP rows)` since process start.
@@ -256,11 +284,9 @@ mod adoption_latch_tests {
 
     #[test]
     fn concurrent_distinct_rows_have_one_winner_and_charge_its_rows() {
-        let _guard = adoption_test_guard();
         let latch = FtAdoptionSolveLatch::new();
         let rows = [11_u64, 23, 47, 89];
         let barrier = Arc::new(std::sync::Barrier::new(rows.len()));
-        let before = adoption_forgone();
 
         let results = std::thread::scope(|scope| {
             let handles: Vec<_> = rows
@@ -270,7 +296,13 @@ mod adoption_latch_tests {
                     let barrier = Arc::clone(&barrier);
                     scope.spawn(move || {
                         barrier.wait();
-                        (row, latch.charge(row))
+                        let won = latch.charge(row);
+                        // THIS worker's own charge. `charge` latches by
+                        // compare-exchange, so the thread that charges is
+                        // whichever got there first — reading the mirror on
+                        // the ASSERTING thread would read zero. Each worker
+                        // reads its own and the test sums them.
+                        (row, won, adoption_forgone_local())
                     })
                 })
                 .collect();
@@ -281,15 +313,18 @@ mod adoption_latch_tests {
         });
         let winners: Vec<_> = results
             .iter()
-            .filter_map(|&(rows, won)| won.then_some(rows))
+            .filter_map(|&(rows, won, _)| won.then_some(rows))
             .collect();
-        let after = adoption_forgone();
+        // The four workers' OWN charges, summed. Every charge this test causes
+        // is on one of them, and no other thread's charge is in here.
+        let charged = results.iter().fold((0_u64, 0_u64), |acc, &(_, _, own)| {
+            (acc.0 + own.0, acc.1 + own.1)
+        });
 
         assert_eq!(winners.len(), 1, "exactly one worker must win the latch");
-        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(charged.0, 1);
         assert_eq!(
-            after.1 - before.1,
-            winners[0],
+            charged.1, winners[0],
             "the census must retain the winning first-exclusion row count"
         );
     }
@@ -309,17 +344,24 @@ pub fn on() -> bool {
     *ON.get_or_init(|| crate::tune::caller_flag(crate::tune::Knob::Sepstat) == Some(true))
 }
 
+/// Charge one hit to a `--sepstat` census counter.
+///
+/// `&'static` because the charge is also mirrored per-thread in test builds
+/// and the mirror is keyed by the counter's ADDRESS — see
+/// [`crate::local_census`]. Every caller passes a `static` from the
+/// `counters!` block above, so this costs nothing.
 #[inline]
-pub fn bump(c: &AtomicU64) {
+pub fn bump(c: &'static AtomicU64) {
     if on() {
-        c.fetch_add(1, Ordering::Relaxed);
+        crate::local_census::add_u64(c, 1);
     }
 }
 
+/// [`bump`] by `n`.
 #[inline]
-pub fn add(c: &AtomicU64, n: u64) {
+pub fn add(c: &'static AtomicU64, n: u64) {
     if on() {
-        c.fetch_add(n, Ordering::Relaxed);
+        crate::local_census::add_u64(c, n);
     }
 }
 
@@ -513,6 +555,31 @@ thread_local! {
         const { std::cell::RefCell::new([false; NGATES]) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// THIS THREAD's own `(hits, cost)` per gate — the instrument a test must
+    /// read when it asserts on what IT charged.
+    ///
+    /// # Why the global counters cannot be that instrument
+    ///
+    /// [`GATE_COSTS`]/[`GATE_HITS`] are process-global and every solve in the
+    /// binary adds to them. A test that reads them before and after its own
+    /// call is measuring "what this process charged in that interval", which is
+    /// its own charge PLUS whatever the other tests libtest happened to be
+    /// running on other threads at that moment. That is wrong in BOTH
+    /// directions: a sibling charge inflates the delta and fails an honest
+    /// test, and a sibling charge also SUPPLIES a delta the test was checking
+    /// for, so a mutation that stopped charging could be masked into a pass.
+    /// The second is the dangerous one — it makes the assertion vacuous exactly
+    /// when it is needed.
+    ///
+    /// libtest gives each test its own thread, so a per-thread mirror is the
+    /// same number with the other tests removed. It is `#[cfg(test)]` only:
+    /// the shipped `gate_charge` is byte-for-byte what it was.
+    static GATE_LOCAL: std::cell::RefCell<[(u64, u64); NGATES]> =
+        const { std::cell::RefCell::new([(0, 0); NGATES]) };
+}
+
 /// Start a top-level solve's gate population accounting. Called from
 /// `bab::prime_env_all`, which already runs once per top-level solve.
 pub(crate) fn begin_solve() {
@@ -525,6 +592,13 @@ pub fn gate_charge(site: usize, cost: u64) {
     if let (Some(c), Some(h)) = (GATE_COSTS.get(site), GATE_HITS.get(site)) {
         c.fetch_add(cost, Ordering::Relaxed);
         h.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        GATE_LOCAL.with(|local| {
+            if let Some(entry) = local.borrow_mut().get_mut(site) {
+                entry.0 += 1;
+                entry.1 += cost;
+            }
+        });
         let first = GATE_SEEN.with(|s| {
             let mut s = s.borrow_mut();
             match s.get_mut(site) {
@@ -543,7 +617,19 @@ pub fn gate_charge(site: usize, cost: u64) {
     }
 }
 
-/// `(hits, summed cost)` for `site`.
+/// `(hits, summed cost)` charged to `site` BY THIS THREAD.
+///
+/// The delta-asserting instrument. See [`GATE_LOCAL`] for why the global
+/// counters below are not one.
+#[cfg(test)]
+pub(crate) fn gate_read_local(site: usize) -> (u64, u64) {
+    GATE_LOCAL.with(|local| local.borrow().get(site).copied().unwrap_or((0, 0)))
+}
+
+/// `(hits, summed cost)` for `site`, summed over the whole process.
+///
+/// This is the REPORTING number — what a sweep prints at the end. It is not a
+/// test instrument: see [`gate_read_local`].
 #[must_use]
 pub fn gate_read(site: usize) -> (u64, u64) {
     match (GATE_HITS.get(site), GATE_COSTS.get(site)) {

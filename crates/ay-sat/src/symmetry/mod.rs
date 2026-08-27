@@ -67,31 +67,6 @@ pub(crate) fn canonical_clause_key(clause: &[Literal]) -> Vec<u32> {
     key
 }
 
-/// DSR witness token stream certifying `clause` under the literal permutation
-/// `perm`, in the same on-wire shape as
-/// [`detector::sr_witness_tokens`](detector): the pivot repeated twice (the
-/// second occurrence opens the PR part `pivot ↦ ⊤`, the third the substitution
-/// part), then σ as literal↦literal pairs.
-///
-/// A signed automorphism is *already* a literal↦literal map, so it needs no
-/// encoding gymnastics to become a DSR substitution — the sign flips ride along
-/// in the literal tokens.
-pub(crate) fn signed_sr_witness_tokens(
-    clause: &[Literal],
-    perm: &BTreeMap<Literal, Literal>,
-) -> Vec<Literal> {
-    let pivot = clause[0];
-    let mut witness = vec![pivot, pivot];
-    for (from, to) in perm {
-        if from == to || from.variable() == pivot.variable() {
-            continue;
-        }
-        witness.push(*from);
-        witness.push(*to);
-    }
-    witness
-}
-
 /// Check that a LITERAL permutation maps the clause multiset onto itself.
 ///
 /// Unlike [`detector::permutation_preserves_formula`], `perm` may flip signs, so

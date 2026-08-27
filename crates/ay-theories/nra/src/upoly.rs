@@ -622,7 +622,7 @@ impl Zp {
     /// makes both the multiplication and the primality test exact; see
     /// [`MAX_MODULUS`].
     pub(crate) fn new(p: u64) -> Option<Self> {
-        if p < 2 || p >= MAX_MODULUS || !is_prime_u64(p) {
+        if !(2..MAX_MODULUS).contains(&p) || !is_prime_u64(p) {
             return None;
         }
         Some(Self {
@@ -1249,7 +1249,7 @@ struct DetRng {
 
 impl DetRng {
     fn seeded(p: u64, coeffs: &[u64]) -> Self {
-        let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ p.wrapping_mul(0x1000_0000_1B3);
+        let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ p.wrapping_mul(0x0100_0000_01B3);
         for &c in coeffs {
             h ^= c.wrapping_add(0x9E37_79B9_7F4A_7C15);
             h = h.rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -1275,75 +1275,4 @@ impl DetRng {
     }
 }
 
-/// Deterministic Miller-Rabin for `u64`.
-///
-/// The base set `{2,3,5,7,11,13,17,19,23,29,31,37}` is proven to give no
-/// composite strong pseudoprimes below `3.317 * 10^24`, which covers the whole
-/// `u64` range. So this is a decision procedure, not a probabilistic test.
-pub(crate) fn is_prime_u64(n: u64) -> bool {
-    if n < 2 {
-        return false;
-    }
-    for p in [2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        if n == p {
-            return true;
-        }
-        if n % p == 0 {
-            return false;
-        }
-    }
-    let mut d = n - 1;
-    let mut r = 0u32;
-    while d % 2 == 0 {
-        d /= 2;
-        r += 1;
-    }
-    'outer: for a in [2u128, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
-        let mut x = mod_pow_u128(a, u128::from(d), u128::from(n));
-        if x == 1 || x == u128::from(n) - 1 {
-            continue;
-        }
-        for _ in 1..r {
-            x = (x * x) % u128::from(n);
-            if x == u128::from(n) - 1 {
-                continue 'outer;
-            }
-        }
-        return false;
-    }
-    true
-}
-
-fn mod_pow_u128(mut base: u128, mut e: u128, m: u128) -> u128 {
-    let mut acc = 1u128;
-    base %= m;
-    while e > 0 {
-        if e & 1 == 1 {
-            acc = (acc * base) % m;
-        }
-        base = (base * base) % m;
-        e >>= 1;
-    }
-    acc
-}
-
-/// The distinct prime divisors of `n` by trial division. `n` is a polynomial
-/// degree, so it is small.
-fn distinct_prime_divisors(n: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut m = n;
-    let mut d = 2usize;
-    while d * d <= m {
-        if m % d == 0 {
-            out.push(d);
-            while m % d == 0 {
-                m /= d;
-            }
-        }
-        d += 1;
-    }
-    if m > 1 {
-        out.push(m);
-    }
-    out
-}
+include!("upoly/primality.rs");

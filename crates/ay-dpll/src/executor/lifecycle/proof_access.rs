@@ -6,6 +6,35 @@ use super::Executor;
 use ay_core::Proof;
 
 impl Executor {
+    /// Enable mandatory, unbudgeted proof collection without recording an
+    /// explicit translated-artifact demand.
+    ///
+    /// Self-check requires independently verified UNSAT truth, while exported
+    /// Alethe is a separate presentation contract. Routing self-check through
+    /// [`Self::set_produce_proofs`] would set `proof_artifact_required` and
+    /// reject independent certification lanes that already proved the result.
+    /// An explicit proof request still makes the artifact mandatory regardless
+    /// of call order.
+    pub fn set_mandatory_proof_collection(&mut self) {
+        self.proof_output_requested = true;
+        self.proof_tracker.enable();
+        self.ctx.set_retain_parsed_assertions(true);
+        self.proof_reconstruction_step_budget = None;
+    }
+
+    /// Whether an epoch/source/roots/assumptions-bound SAT sidecar supplies
+    /// self-check's independently verified refutation authority.
+    pub(in crate::executor) fn checked_refutation_satisfies_self_check(&self) -> bool {
+        self.checked_sat_refutation_authorizes_current_query()
+    }
+
+    /// Emit bounded diagnostics before retiring a checked SAT sidecar.
+    pub(in crate::executor) fn report_checked_refutation_clear(&self, boundary: &str) {
+        if ay_core::misc_cli_flags().debug_cert && self.last_checked_sat_refutation.is_some() {
+            eprintln!("CERT/sidecar cleared by {boundary} exec={self:p}");
+        }
+    }
+
     /// Proof from the last UNSAT result.
     ///
     /// Returns `None` unless proof output was requested when the last UNSAT solve
@@ -26,6 +55,14 @@ impl Executor {
         } else {
             None
         }
+    }
+
+    /// Test-only view of the native certificate retained for mandatory
+    /// internal publication checking. Unlike [`Self::last_proof`], this does
+    /// not pretend an unrequested proof is part of the public artifact surface.
+    #[cfg(test)]
+    pub(crate) fn retained_internal_proof_for_test(&self) -> Option<&Proof> {
+        self.last_proof.as_ref()
     }
 
     /// Why the last refutation carries no derivation, when it carries none.

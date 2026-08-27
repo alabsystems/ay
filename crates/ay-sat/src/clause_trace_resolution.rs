@@ -623,34 +623,7 @@ fn synthesis_scratch_bytes_from_capacities(
 
 include!("clause_trace_resolution/preflight.rs");
 
-fn reserve_exact<T>(
-    values: &mut Vec<T>,
-    count: usize,
-    resource: ResolutionValidationResource,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<(), ResolutionValidationError> {
-    meter.check_controls()?;
-    values
-        .try_reserve_exact(count)
-        .map_err(|_| ResolutionValidationError::AllocationFailed { resource })?;
-    meter.check_controls()
-}
-
-fn copy_slice_bounded<T: Copy>(
-    values: &[T],
-    resource: ResolutionValidationResource,
-    meter: &mut ConversionMeter<'_>,
-) -> Result<Vec<T>, ResolutionValidationError> {
-    let mut copy = Vec::new();
-    reserve_exact(&mut copy, values.len(), resource, meter)?;
-    for chunk in values.chunks(CONTROL_POLL_INTERVAL) {
-        meter.check_controls()?;
-        meter.charge(chunk.len())?;
-        copy.extend_from_slice(chunk);
-    }
-    meter.check_controls()?;
-    Ok(copy)
-}
+include!("clause_trace_resolution/bounded_copy.rs");
 
 enum TerminalHintScan {
     Satisfied,

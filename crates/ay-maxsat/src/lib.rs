@@ -40,7 +40,7 @@
 //!
 //! ## Algorithm
 //!
-//! The engine (see [`crate::oll`] internals) is a core-guided OLL solver in
+//! The engine (see `crate::oll` internals) is a core-guided OLL solver in
 //! the style of the top exact solvers of recent MaxSAT Evaluations, running
 //! on one persistent incremental [`ay_sat`] solver:
 //!

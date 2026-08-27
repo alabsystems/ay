@@ -126,9 +126,10 @@ impl QP {
             let f = &r.0[dr] / &lc;
             r = r.sub(&o.scale(&f).shift(dr - dq));
             // guard against non-termination from a bug
-            if r.deg().map_or(false, |x| x >= dr) {
-                panic!("rem did not reduce degree");
-            }
+            assert!(
+                r.deg().is_none_or(|degree| degree < dr),
+                "rem did not reduce degree"
+            );
         }
     }
     fn gcd(&self, o: &Self) -> Self {
@@ -298,9 +299,7 @@ fn isolate(p: &QP) -> Vec<(BigInt, BigInt, u32)> {
             return out;
         }
         k += 1;
-        if k > 8 {
-            panic!("isolation failed");
-        }
+        assert!(k <= 8, "isolation failed");
     }
 }
 
@@ -1023,189 +1022,5 @@ fn av_liveness_and_bound() {
     assert!(violations.is_empty());
 }
 
-// ===========================================================================
-// A/B BEHAVIOURAL EQUIVALENCE DUMP + ladder-exercise proof
-// ===========================================================================
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-    fn range(&mut self, lo: i64, hi: i64) -> i64 {
-        lo + (self.next() % ((hi - lo + 1) as u64)) as i64
-    }
-}
-
-/// Every case this run touches, as `tag | verdict | sep_bits | bound | steps`.
-/// Verdict/sep_bits/bound must be IDENTICAL between the two builds; `steps` is
-/// the quantity the change is allowed to move.
-#[test]
-fn av_dump_verdicts() {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    let mut wrong: Vec<String> = Vec::new();
-    let mut n = 0usize;
-    let mut with_bisection = 0usize;
-    let mut total_steps: u64 = 0;
-
-    let mut emit = |out: &mut String, tag: String, a: &Num, b: &Num| {
-        let (Some(aa), Some(bb)) = (a.to_ay(), b.to_ay()) else {
-            let _ = writeln!(out, "{tag} | NOCELL");
-            return (false, 0u64);
-        };
-        match aa.cmp_anum_traced(&bb) {
-            None => {
-                let _ = writeln!(out, "{tag} | DECLINED");
-                (false, 0)
-            }
-            Some((o, tr)) => {
-                let _ = writeln!(
-                    out,
-                    "{tag} | {o:?} | sep={:?} | bound={} | cert={} | steps={}/{}",
-                    tr.sep_bits, tr.bound, tr.equal_by_certificate, tr.steps_a, tr.steps_b
-                );
-                (
-                    tr.steps_a > 0 || tr.steps_b > 0,
-                    u64::from(tr.steps_a) + u64::from(tr.steps_b),
-                )
-            }
-        }
-    };
-
-    // --- deterministic random integer polynomials, random root pairs -------
-    let mut rng = Rng(0x5eed_1234_abcd_0001);
-    let mut built: Vec<(String, Num)> = Vec::new();
-    let mut tries = 0;
-    while built.len() < 90 && tries < 4000 {
-        tries += 1;
-        let deg = 1 + usize::try_from(rng.below(4)).unwrap();
-        let mut c: Vec<BigInt> = (0..=deg)
-            .map(|_| BigInt::from(rng.range(-12, 12)))
-            .collect();
-        if c[deg].is_zero() {
-            c[deg] = BigInt::one();
-        }
-        if c.iter().all(num_traits::Zero::is_zero) {
-            continue;
-        }
-        let qp = QP::from_ints(&c);
-        if qp.deg().map_or(true, |d| d < 1) {
-            continue;
-        }
-        let ivs = std::panic::catch_unwind(|| isolate(&qp));
-        let Ok(ivs) = ivs else { continue };
-        for (i, (lo, hi, k)) in ivs.iter().enumerate() {
-            let nm = Num {
-                p: c.clone(),
-                lo: (lo.clone(), *k),
-                hi: (hi.clone(), *k),
-            };
-            if nm.to_ay().is_some() {
-                built.push((format!("rand{}[{i}]{:?}", built.len(), c), nm));
-            }
-        }
-    }
-    for i in 0..built.len() {
-        for j in 0..built.len() {
-            let (ta, a) = &built[i];
-            let (tb, b) = &built[j];
-            n += 1;
-            let (bis, st) = emit(&mut out, format!("R {ta} vs {tb}"), a, b);
-            if bis {
-                with_bisection += 1;
-            }
-            total_steps += st;
-            // independent model, every single one
-            if let (Some(aa), Some(bb)) = (a.to_ay(), b.to_ay()) {
-                if let Some(o) = aa.cmp_anum(&bb) {
-                    let m = model_cmp(a, b);
-                    if o != m {
-                        wrong.push(format!("{ta} vs {tb}: AY {o:?} vs MODEL {m:?}"));
-                    }
-                }
-            }
-        }
-    }
-
-    // --- the close families, with traces ---------------------------------
-    for nb in 0..=60u32 {
-        for s in [1i64, -1] {
-            let (Some(a), Some(b)) = (num_of(p_sqrt2(), 1), num_of(p_sqrt2_eps(nb, s), 1)) else {
-                continue;
-            };
-            n += 1;
-            let (bis, st) = emit(
-                &mut out,
-                format!("C sqrt2 vs eps(2^-{},{s})", 2 * nb),
-                &a,
-                &b,
-            );
-            if bis {
-                with_bisection += 1;
-            }
-            total_steps += st;
-            if let (Some(aa), Some(bb)) = (a.to_ay(), b.to_ay()) {
-                if let Some(o) = aa.cmp_anum(&bb) {
-                    let m = model_cmp(&a, &b);
-                    if o != m {
-                        wrong.push(format!("close nb={nb} s={s}: AY {o:?} vs MODEL {m:?}"));
-                    }
-                }
-            }
-        }
-    }
-
-    // --- sign_of_poly verdicts, same dump --------------------------------
-    let sa = num_of(p_sqrt2(), 1).unwrap();
-    let saa = sa.to_ay().unwrap();
-    for nb in 0..=60u32 {
-        for s in [1i64, -1, 7] {
-            let qq = p_sqrt2_eps(nb, s);
-            n += 1;
-            match saa.sign_of_poly_traced(&qq) {
-                None => {
-                    let _ = writeln!(out, "S nb={nb} s={s} | DECLINED");
-                }
-                Some((v, tr)) => {
-                    let _ = writeln!(
-                        out,
-                        "S nb={nb} s={s} | {v} | sep={:?} | bound={} | steps={}",
-                        tr.sep_bits, tr.bound, tr.steps_a
-                    );
-                    if tr.steps_a > 0 {
-                        with_bisection += 1;
-                    }
-                    total_steps += u64::from(tr.steps_a);
-                    let model = if s > 0 { -1 } else { 1 };
-                    if v != model {
-                        wrong.push(format!("sign nb={nb} s={s}: AY {v} vs MODEL {model}"));
-                    }
-                }
-            }
-        }
-    }
-
-    let path = std::env::var("AV_DUMP").unwrap_or_else(|_| "/tmp/av_dump.txt".to_string());
-    std::fs::write(&path, &out).expect("write dump");
-    println!(
-        "[dump] cases={n} lines={} with_bisection={with_bisection} total_steps={total_steps} wrong={} -> {path}",
-        out.lines().count(),
-        wrong.len()
-    );
-    for w in wrong.iter().take(40) {
-        println!("  WRONG: {w}");
-    }
-    assert!(n >= 3000, "anti-vacuity: only {n} cases");
-    assert!(
-        with_bisection >= 100,
-        "LADDER NOT EXERCISED: only {with_bisection} cases performed any bisection"
-    );
-    assert!(wrong.is_empty());
-}
+#[cfg(test)]
+include!("av_adversarial/dump_verdicts.rs");

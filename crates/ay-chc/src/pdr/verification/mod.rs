@@ -457,92 +457,7 @@ fn array_sat_cross_check_result(
 }
 
 #[cfg(test)]
-mod ground_witness_eval_tests {
-    use super::*;
-
-    /// Fully-ground swaparray-shaped query: div + const-array/store
-    /// disequality must evaluate to true (the FM2b override witness).
-    #[test]
-    fn ground_query_decides_fully_ground_array_diseq_with_div() {
-        let div = ChcExpr::Op(
-            ChcOp::Div,
-            vec![
-                ChcExpr::add(
-                    ChcExpr::Int(4),
-                    ChcExpr::mul(ChcExpr::Int(-1), ChcExpr::Int(0)),
-                )
-                .into(),
-                ChcExpr::Int(4).into(),
-            ],
-        );
-        let arr1 = ChcExpr::const_array(ChcSort::Int, ChcExpr::Int(1));
-        let arr2 = ChcExpr::store(
-            ChcExpr::const_array(ChcSort::Int, ChcExpr::Int(0)),
-            ChcExpr::Int(5),
-            ChcExpr::Int(1),
-        );
-        let query = ChcExpr::and_all([
-            ChcExpr::le(ChcExpr::Int(1), div),
-            ChcExpr::le(ChcExpr::Int(0), ChcExpr::Int(0)),
-            ChcExpr::not(ChcExpr::eq(arr1, arr2)),
-        ]);
-        assert!(
-            ground_query_witness_evaluates_true(&query),
-            "fully ground array+div query must evaluate to true"
-        );
-    }
-
-    /// Bindings-based query: `I = const-array(1) ∧ J = store(...) ∧ I ≠ J`
-    /// must evaluate to true after substitution.
-    #[test]
-    fn ground_query_decides_bound_array_diseq() {
-        let arr_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
-        let i = ChcVar::new("I", arr_sort.clone());
-        let j = ChcVar::new("J", arr_sort);
-        let arr1 = ChcExpr::const_array(ChcSort::Int, ChcExpr::Int(1));
-        let arr2 = ChcExpr::store(
-            ChcExpr::const_array(ChcSort::Int, ChcExpr::Int(0)),
-            ChcExpr::Int(5),
-            ChcExpr::Int(1),
-        );
-        let query = ChcExpr::and_all([
-            ChcExpr::eq(ChcExpr::var(i.clone()), arr1),
-            ChcExpr::eq(ChcExpr::var(j.clone()), arr2),
-            ChcExpr::not(ChcExpr::eq(ChcExpr::var(i), ChcExpr::var(j))),
-        ]);
-        assert!(
-            ground_query_witness_evaluates_true(&query),
-            "bound array disequality query must evaluate to true"
-        );
-    }
-
-    /// A genuinely false ground query must NOT be overridden.
-    #[test]
-    fn ground_query_rejects_false_ground_query() {
-        let query = ChcExpr::and_all([
-            ChcExpr::le(ChcExpr::Int(1), ChcExpr::Int(0)),
-            ChcExpr::Bool(true),
-        ]);
-        assert!(
-            !ground_query_witness_evaluates_true(&query),
-            "false ground query must not be overridden"
-        );
-    }
-
-    /// Conflicting duplicate bindings degrade to false (no override).
-    #[test]
-    fn ground_query_rejects_conflicting_bindings() {
-        let x = ChcVar::new("x", ChcSort::Int);
-        let query = ChcExpr::and_all([
-            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::Int(1)),
-            ChcExpr::eq(ChcExpr::var(x), ChcExpr::Int(2)),
-        ]);
-        assert!(
-            !ground_query_witness_evaluates_true(&query),
-            "conflicting bindings must not be overridden"
-        );
-    }
-}
+mod ground_witness_eval_tests;
 
 #[cfg(test)]
 mod array_cross_check_tests {
@@ -566,6 +481,62 @@ mod array_cross_check_tests {
         assert_eq!(
             array_sat_cross_check_result(&mut smt, &query, false, "test"),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod case_split_budget_tests {
+    use super::*;
+
+    /// `try_verification_case_split` must bound the WHOLE split by `timeout`,
+    /// not just each check inside it.
+    ///
+    /// `smt.scoped_check_timeout` is a PER-CHECK bound, and
+    /// `check_sat_with_ite_case_split` issues one check per leaf, so without a
+    /// wall-clock deadline the bound multiplies by the leaf count. Measured on
+    /// the extra-small-lia corpus at a 20 s adaptive budget before the fix:
+    /// 7 of 250 calls ran past their `timeout`, worst 680 ms against 200 ms.
+    /// Every caller derives `timeout` from the remainder of the enclosing
+    /// per-clause verification budget, so the multiplier is exactly how that
+    /// budget is exceeded.
+    ///
+    /// The recursion already polls the thread SMT deadline; this asserts the
+    /// deadline is ARMED, which is what makes those polls enforce `timeout`.
+    #[test]
+    fn verification_case_split_arms_the_thread_smt_deadline() {
+        let x = ChcVar::new("x", ChcSort::Int);
+        // ITE-bearing so the recursion actually runs (and so the pre-split
+        // reaches `check_sat_with_ite_case_split_recursive`, where the
+        // observation is recorded).
+        let query = ChcExpr::eq(
+            ChcExpr::var(x.clone()),
+            ChcExpr::ite(
+                ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::Int(0)),
+                ChcExpr::Int(1),
+                ChcExpr::Int(2),
+            ),
+        );
+        let mut smt = SmtContext::new();
+        let timeout = std::time::Duration::from_millis(250);
+
+        assert!(
+            crate::smt::deadline::smt_deadline_remaining().is_none(),
+            "test must start with no ambient thread SMT deadline"
+        );
+        PdrSolver::reset_case_split_deadline_observation_for_tests();
+        let _ = PdrSolver::try_verification_case_split(&mut smt, false, &query, timeout);
+
+        let observed = PdrSolver::observed_case_split_deadline_for_tests()
+            .expect("case-split recursion must run under a thread SMT deadline");
+        assert!(
+            observed <= timeout,
+            "thread SMT deadline inside the split must not exceed the requested \
+             {timeout:?}; observed {observed:?}"
+        );
+        assert!(
+            crate::smt::deadline::smt_deadline_remaining().is_none(),
+            "the split's deadline scope must be released when it returns"
         );
     }
 }

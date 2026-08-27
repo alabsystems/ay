@@ -77,6 +77,33 @@ impl Executor {
         // `proof_fresh_def` for the admission test and `ay_proof`'s
         // `FreshDefRegistry` for the soundness argument the checker re-runs.
         self.promote_fresh_definitional_bounds(proof, &extended_assertions);
+        // (#4751) Derive the assertions `EqDiffVar` REWROTE — the residual the
+        // promotion above correctly declines, because a rewritten assertion is
+        // not a definition. It runs here, after both the demotion and the
+        // promotion, for two reasons the lane's own module docs give in full:
+        // the checker decides freshness against the finished `assume` set, and
+        // a definiens already bound by a promoted step must be ADOPTED rather
+        // than competed with. Its own Gate-2 reverts the whole lane if the
+        // checker's `FreshDefRegistry` declines the result.
+        self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
+        // #rewritten-assertion-bridge — the same repair for the assertions
+        // `VariableSubstitution` rewrote, which carry no `EqDiffVar` record and
+        // no fresh definiendum: DERIVE the rewrite from the authored
+        // assertions, by congruence. See `proof/rewritten_assertion_bridge`.
+        self.derive_rewritten_assertions_by_congruence(proof, &extended_assertions);
+        // #rewritten-nonequality-bridge — the same repair for a rewritten
+        // assertion whose goal is not a binary `=`.
+        self.derive_rewritten_nonequality_assertions(proof, &extended_assertions);
+        // #authored-conjunct-leaf — a leaf that IS a conjunct of an authored
+        // assertion; `and_pos`, not congruence. See the lane's module docs.
+        self.derive_authored_conjunct_leaves(proof, &extended_assertions);
+        // #minted-definition-leaf — a leaf over a FRESH symbol the proof never
+        // defines. It runs LAST: the checker decides freshness against the
+        // finished `assume` set. See the lane's module docs for Gate 2.
+        self.derive_leaves_over_minted_definitions(proof, &extended_assertions);
+        // #conjunct-decomposition-leaf, then #ite-definition-leaf; same rule.
+        self.derive_conjunctwise_decomposed_leaves(proof, &extended_assertions);
+        self.derive_ite_definition_guard_leaves(proof, &extended_assertions);
         // Last resort: rebuild from the original assertions only. Failure keeps
         // the existing proof unchanged.
         self.rebuild_trust_leaf_proof_from_original_assertions(proof);

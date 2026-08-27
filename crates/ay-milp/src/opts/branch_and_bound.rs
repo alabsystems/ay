@@ -6,7 +6,7 @@
 
 use crate::tune::Knob;
 
-use super::{checked, EngineConfigError, EngineEconomics};
+use super::{checked, EngineConfigError, EngineEconomics, MAX_KNOB_SECS};
 
 impl EngineEconomics {
     /// GUB/SOS1 branching. Default on (auto-armed on supports).
@@ -99,13 +99,6 @@ impl EngineEconomics {
     #[must_use]
     pub fn with_dense_gmi_lu(mut self, enabled: bool) -> Self {
         self.dense_gmi_lu = Some(enabled);
-        self
-    }
-
-    /// Full pricing forced on big LPs. Default OFF (swept partial default).
-    #[must_use]
-    pub fn with_full_pricing(mut self, enabled: bool) -> Self {
-        self.full_pricing = Some(enabled);
         self
     }
 
@@ -328,10 +321,14 @@ impl EngineEconomics {
     }
 
     /// Certificate grace budget in seconds; `0` selects uncapped (B39).
-    #[must_use]
-    pub fn with_cert_grace_secs(mut self, secs: f64) -> Self {
-        self.cert_grace_secs = Some(secs);
-        self
+    ///
+    /// # Errors
+    ///
+    /// [`EngineConfigError`] unless `secs` is finite and in
+    /// `[0, MAX_KNOB_SECS]`.
+    pub fn with_cert_grace_secs(mut self, secs: f64) -> Result<Self, EngineConfigError> {
+        self.cert_grace_secs = Some(checked(Knob::CertGraceSecs, secs, 0.0, MAX_KNOB_SECS)?);
+        Ok(self)
     }
 
     /// Anchor first-refusal window in milliseconds; `0` disables deferral
@@ -357,11 +354,15 @@ impl EngineEconomics {
         self
     }
 
-    /// Pin the feasibility-pump share (bypasses the work cap; B39b).
-    #[must_use]
-    pub fn with_pump_share(mut self, share: f64) -> Self {
-        self.pump_share = Some(share);
-        self
+    /// Pin the feasibility-pump share in `[0, 1]` (bypasses the work cap;
+    /// B39b).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineConfigError`] unless `share` is finite and in `[0, 1]`.
+    pub fn with_pump_share(mut self, share: f64) -> Result<Self, EngineConfigError> {
+        self.pump_share = Some(checked(Knob::PumpShare, share, 0.0, 1.0)?);
+        Ok(self)
     }
 
     /// Pin the set-partition constructor share in `[0, 1]` (B39b).
@@ -400,11 +401,15 @@ impl EngineEconomics {
         Ok(self)
     }
 
-    /// Pin the root heuristic share (B39b; unset = shape-dependent default).
-    #[must_use]
-    pub fn with_heur_share(mut self, share: f64) -> Self {
-        self.heur_share = Some(share);
-        self
+    /// Pin the root heuristic share in `[0, 1]` (B39b; unset =
+    /// shape-dependent default).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineConfigError`] unless `share` is finite and in `[0, 1]`.
+    pub fn with_heur_share(mut self, share: f64) -> Result<Self, EngineConfigError> {
+        self.heur_share = Some(checked(Knob::HeurShare, share, 0.0, 1.0)?);
+        Ok(self)
     }
 
     /// Strong-branching reliability threshold force (B39c).
@@ -880,43 +885,4 @@ impl EngineEconomics {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn b13_switches_reach_the_profile_with_the_single_inversion() {
-        use crate::tune::Knob;
-        // B13 spot checks: one of each carrier shape in the bab layer, plus
-        // the one dual-role builder (odd-cycle force vs disable are distinct
-        // knobs behind one positive-sense builder).
-        let engine = EngineEconomics::default()
-            .with_clique(false)
-            .with_odd_cycle(true)
-            .with_submip_best_bound(true)
-            .with_prop_sweeps(11)
-            .with_splns_stall_secs(2.5)
-            .expect("finite non-negative stall")
-            .with_fc_mode(2)
-            .expect("mode 2 in domain");
-        let _active = crate::tune::activate_caller(engine.profile());
-        assert!(crate::tune::on(Knob::NoClique));
-        assert!(crate::tune::on(Knob::OddCycle));
-        assert!(!crate::tune::on(Knob::NoOddCycle));
-        assert!(crate::tune::on(Knob::SubmipBb));
-        assert_eq!(crate::tune::count(Knob::PropSweeps, 3), 11);
-        assert_eq!(crate::tune::real_opt(Knob::SplnsStall), Some(2.5));
-        assert_eq!(crate::tune::count_opt(Knob::FcMode), Some(2));
-        assert!(EngineEconomics::default().with_fc_mode(4).is_err());
-        assert!(
-            EngineEconomics::default()
-                .with_odd_cycle(false)
-                .profile()
-                .is_empty()
-                == false
-        );
-        // And the env layer is not a party to these knobs at all.
-        for knob in [Knob::NoClique, Knob::FcMode] {
-            assert_eq!(knob.env(), None, "{knob:?} must have no env spelling");
-        }
-    }
-}
+mod tests;

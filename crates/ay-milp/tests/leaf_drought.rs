@@ -106,6 +106,7 @@ fn run_arm(drought_dive: usize) -> f64 {
             EngineEconomics::new()
                 .with_max_nodes(6_000)
                 .with_heur_share(0.0)
+                .expect("zero is a valid heuristic share")
                 .with_rins_every(1_000_000)
                 .with_drought_dive(drought_dive),
         );

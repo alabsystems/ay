@@ -241,10 +241,10 @@ impl Solver {
     }
 
     /// Solve the formula
-    pub fn solve(&mut self) -> VerifiedSatResult {
+    pub fn solve(&mut self) -> SolverSatResult {
         let result = self.solve_raw();
         self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
-        VerifiedSatResult::from_validated(result)
+        SolverSatResult::from_solver_result(result)
     }
 
     /// Internal solve returning raw `SatResult`.
@@ -301,13 +301,13 @@ impl Solver {
     ///
     /// This is useful for parallel portfolio solving where multiple solvers run
     /// concurrently and can be stopped when one finds a solution.
-    pub fn solve_interruptible<F>(&mut self, should_stop: F) -> VerifiedSatResult
+    pub fn solve_interruptible<F>(&mut self, should_stop: F) -> SolverSatResult
     where
         F: Fn() -> bool,
     {
         let result = self.solve_interruptible_raw(should_stop);
         self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
-        VerifiedSatResult::from_validated(result)
+        SolverSatResult::from_solver_result(result)
     }
 
     /// Interruptible solve without ambient environment-driven artifact export.
@@ -318,11 +318,11 @@ impl Solver {
     pub(crate) fn solve_interruptible_without_artifact<F>(
         &mut self,
         should_stop: F,
-    ) -> VerifiedSatResult
+    ) -> SolverSatResult
     where
         F: Fn() -> bool,
     {
-        VerifiedSatResult::from_validated(self.solve_interruptible_raw(should_stop))
+        SolverSatResult::from_solver_result(self.solve_interruptible_raw(should_stop))
     }
 
     /// Internal interruptible solve returning raw `SatResult`.
@@ -383,10 +383,10 @@ impl Solver {
     /// in incremental solving with push/pop.
     ///
     /// When scope selectors are empty, falls back to normal solving.
-    pub fn solve_with_phase_hints(&mut self, phase_hints: &dyn Extension) -> VerifiedSatResult {
+    pub fn solve_with_phase_hints(&mut self, phase_hints: &dyn Extension) -> SolverSatResult {
         let result = self.solve_with_phase_hints_raw(phase_hints);
         self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
-        VerifiedSatResult::from_validated(result)
+        SolverSatResult::from_solver_result(result)
     }
 
     /// Internal phase-hint solve returning raw `SatResult`.
@@ -485,7 +485,7 @@ impl Solver {
         self.cold.original_clause_boundary = self.arena.len();
         self.install_and_apply_sat_whole_loop_guard_at_solver_start();
 
-        // Initialize streaming UNSAT core bitmap (#8250).
+        // Initialize streaming original-clause support (#8250).
         // Sized to cover all original clause IDs (1-based: ID 1..=N).
         // Each conflict analysis marks original antecedent clause IDs,
         // so the core is available immediately at UNSAT.
@@ -593,6 +593,72 @@ impl Solver {
         if let Some(reason) = self.solve_stop_reason(&should_stop) {
             return self.declare_unknown_with_reason(reason);
         }
+
+        // GF(p) one-hot linear-system probe (gf_probe.rs): constructively
+        // solve the SAT-COMP "bare-numeric" family (one-hot triples + mod-p
+        // linear equations as forbidden tuples) by structural detection +
+        // dense Gaussian elimination, BEFORE the walk and BEFORE
+        // preprocessing — BVE freely eliminates the one-hot scaffolding
+        // (every variable has exactly one positive occurrence), so only the
+        // pristine clause DB exposes the structure. Off-family cost is ~zero:
+        // strict detection bails at the first mixed-polarity clause. Any
+        // constructed model is verified against every active clause and then
+        // re-verified by the model gate; the probe never claims UNSAT.
+        // Opt-out: --sat-gf-probe false.
+        //
+        // No unconditional post-probe stop-check: a bailed probe falls
+        // straight through to preprocessing, whose own checks fire
+        // immediately — an extra callback poll here would shift the
+        // calibrated stop-count sequence of interruptible solves.
+        if let Some(result) = self.try_gf_linear_probe_at_startup() {
+            if let Some(reason) = self.solve_stop_reason(&should_stop) {
+                return self.declare_unknown_with_reason(reason);
+            }
+            return result;
+        }
+
+        // Bit-parallel independent-support ENUMERATION (solver/indep_enum.rs):
+        // when the formula has a tiny independent support (<= 40 variables
+        // that functionally determine every other variable), enumerate that
+        // support exhaustively with 4096 candidate assignments packed one per
+        // bit of a machine word and unit-propagated simultaneously. This is
+        // the route that cracks the `xorshift` family, which CDCL cannot touch
+        // (the 2026 winner solved 0/11 at 5000 s).
+        //
+        // BUILT here and only here — the gate structure it is compiled from is
+        // resolved away by BVE — but deliberately NOT RUN here. It is a probe,
+        // and running it at startup let it own the whole budget: six SAT
+        // instances the gate admits for exactly the same structural reasons
+        // (`simon-r20-0` and friends, solved by CDCL in 0.15-186 s) became
+        // 300 s timeouts. The built engine is parked and gets one metered
+        // slice AFTER search has had its head start
+        // (`search_with_parked_indep_enum`). Admission is unchanged: a
+        // support-size bound plus a projected-visit work bound, so off-family
+        // instances pay two integer comparisons; a surviving column is
+        // verified against the original clause ledger; an exhausted support
+        // space is NEVER reported as UNSAT. Opt-out: `--sat-indep-enum false`.
+        //
+        // No stop-check after it, for the reason the GF probe documents above:
+        // parking is bounded work that falls straight through to
+        // preprocessing, whose own checks fire immediately, and an extra
+        // callback poll here would shift the calibrated stop-count sequence of
+        // interruptible solves.
+        self.prepare_indep_enum_at_startup();
+
+        // Independent-support branching (solver/indep_support.rs): recover the
+        // Tseitin gate definitions and compute the variable set that
+        // functionally determines every other variable, then restrict CDCL
+        // decisions to it. This MUST run before preprocessing — BVE eliminates
+        // 563 of 1773 variables and resolves away 3625 clauses on the target
+        // family, so the gate structure the support is read from only exists
+        // here (kissat-sup analyses the same pristine snapshot,
+        // `kissat_indepsup_clone`'s `origin_clauses`).
+        //
+        // Decision-order only: an exhausted whitelist falls through to
+        // unrestricted branching rather than signalling SAT, so this can never
+        // change a verdict or invalidate a proof. Default-off; opt in with
+        // `--sat-indep-support true`.
+        self.install_indep_support();
 
         // Run initial preprocessing (BVE, probing, subsumption)
         // This can eliminate variables and simplify clauses before CDCL
@@ -830,6 +896,20 @@ impl Solver {
         //   produces a larger base increment for future phases.
         //
         // Only applied when mode_lock is None (not overridden by caller).
+        //
+        // `--sat-large-rephase-walk` (default OFF) is resolved here, once per
+        // solve, so the hot rephase path reads a plain bool. It only ever
+        // arms inside the very-large band the two walk gates live in.
+        //
+        // `--sat-mode-equiticks-large` is resolved the same way: the equal-
+        // effort stable tick budget, restricted to the very-large band the
+        // global `--sat-mode-equiticks` A/B never covered.
+        let very_large = self.num_original_clauses > VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD;
+        let switches = ay_core::sat_ab_switches();
+        self.cold.large_rephase_walk =
+            very_large && switches.large_rephase_walk.unwrap_or_default();
+        self.cold.mode_equiticks_large_band =
+            very_large && switches.mode_equiticks_large.unwrap_or_default();
         if self.cold.mode_lock == cold::ModeLock::None && LARGE_FORMULA_STABLE_PHASE_SCALE {
             if self.num_original_clauses > VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD {
                 // Large structured formula (>1M clauses, #8655/#8448): start in
@@ -944,7 +1024,13 @@ impl Solver {
                 // target-phase saving with no rephase disturbance is optimal
                 // for BMC: the solver progressively discovers satisfying
                 // polarities and preserves them via the target phase array.
-                if self.cold.rephase_enabled {
+                //
+                // `--sat-large-rephase-walk` keeps rephasing on in this band:
+                // disabling it is also what silences `walk` (the rephase walk
+                // is the only in-search caller), which is the divergence from
+                // kissat — kissat rephases in stable mode on formulas of any
+                // size and reaches the 'W' slots of its {B,W,I,B,W,O} cycle.
+                if self.cold.rephase_enabled && !self.cold.large_rephase_walk {
                     tracing::info!(
                         clauses = self.num_original_clauses,
                         "disabling rephasing for large structured formula (#8655)"
@@ -1168,10 +1254,60 @@ impl Solver {
         // Cost: O(total_literals), negligible even on 4M-clause formulas (~10ms).
         self.init_jw_phases();
 
+        // Independent-support branching (solver/indep_support.rs): drop the
+        // whitelist members preprocessing retired. The support itself was
+        // computed at preprocessing ENTRY, on the pristine Tseitin structure.
+        self.retire_indep_support_eliminations();
+
         let t0 = ay_core::time::Instant::now();
-        let result = self.cdcl_loop_pure(should_stop);
-        self.stats.search_time_ns = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let probe_ns_before = self.stats.indep_enum_time_ns;
+        let result = self.search_with_parked_indep_enum(should_stop);
+        // The parked enumeration's slice runs inside that call; bill it to the
+        // probe, not to search, so `search_time_ns` still measures search.
+        let probe_ns = self.stats.indep_enum_time_ns - probe_ns_before;
+        self.stats.search_time_ns =
+            (t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64).saturating_sub(probe_ns);
         result
+    }
+
+    /// Run CDCL with the parked support enumeration scheduled around it:
+    /// search first for its head start, then one metered enumeration slice,
+    /// then search again with whatever budget is left
+    /// (`solver/indep_enum.rs`).
+    ///
+    /// With nothing parked — the whole corpus outside the admitted family —
+    /// this is exactly `cdcl_loop_pure` and costs one `Option` check.
+    fn search_with_parked_indep_enum<F>(&mut self, should_stop: F) -> SatResult
+    where
+        F: Fn() -> bool,
+    {
+        let Some(head_start_until) = self.indep_enum_head_start_until() else {
+            return self.cdcl_loop_pure(should_stop);
+        };
+        let head_start_stop = || should_stop() || ay_core::time::Instant::now() >= head_start_until;
+        let searched = self.cdcl_loop_pure(&head_start_stop);
+        // A verdict, or a stop the CALLER asked for (interrupt, deadline,
+        // resource budget), ends the solve exactly as it would have without
+        // the probe.
+        if !matches!(searched, SatResult::Unknown)
+            || self.cold.last_unknown_reason != Some(SatUnknownReason::Interrupted)
+            || self.solve_stop_reason(&should_stop).is_some()
+        {
+            self.cold.indep_enum_pending = None;
+            return searched;
+        }
+        // Head start over and search is still going: hand the enumeration its
+        // slice. It never claims UNSAT, so the only outcomes are a verified
+        // model or a fall-through.
+        if let Some(result) = self.run_parked_indep_enum() {
+            return result;
+        }
+        if let Some(reason) = self.solve_stop_reason(&should_stop) {
+            return self.declare_unknown_with_reason(reason);
+        }
+        self.cold.last_unknown_reason = None;
+        self.cold.last_unknown_detail = None;
+        self.cdcl_loop_pure(should_stop)
     }
 }
 

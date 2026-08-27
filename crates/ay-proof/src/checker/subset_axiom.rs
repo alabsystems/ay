@@ -875,8 +875,8 @@ pub(crate) fn validate_subset_ground_eval(
 /// Producers call this instead of re-implementing the schema, so there is
 /// exactly one description of what qualifies and it lives on the checking
 /// side. A `Some` answer is a hint only: the returned kind is re-validated by
-/// [`validate_subset_reflexive`] / [`validate_subset_element_instance`] /
-/// [`validate_subset_transitive`] / [`validate_subset_ground_eval`] when the
+/// `validate_subset_reflexive` / `validate_subset_element_instance` /
+/// `validate_subset_transitive` / `validate_subset_ground_eval` when the
 /// proof is checked, so a matcher bug can cost completeness but cannot admit
 /// an unchecked clause.
 #[must_use]

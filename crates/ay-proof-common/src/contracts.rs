@@ -2,37 +2,93 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-// Dual-compilation contract stubs for VerifierConsumer verification.
+// Contract vocabulary for VerifierConsumer verification.
 //
-// Under vanilla rustc (default): macros expand to nothing.
-// Under VerifierConsumer with deductive-contracts: macros expand to nothing TODAY,
-// but Phase 2 will replace them with real deductive_contract_macros attributes
-// that the -Zverify pass picks up for VC generation.
+// PHASE 2 HAS SHIPPED, AND THIS MODULE NO LONGER STUBS IT OUT.
+//
+// This file used to define `requires!`/`ensures!`/`invariant!`/`decreases!` as
+// `macro_rules!` that expanded to `{}`, with a header promising that "Phase 2
+// will replace them with real deductive_contract_macros attributes". Phase 2 landed in the
+// compiler and this crate had simply not moved. The erasing macros are gone;
+// the crate now carries FIRST-CLASS compiler contracts, in the same
+// `` form already used by `ay-pb-core`
+// (src/eval.rs, src/portfolio.rs) and `ay-dpll`.
+//
+// HOW THE FIRST-CLASS FORM RESOLVES (verified against the toolchain source,
+// rustc_resolve/src/macros.rs:806-866 and :1404-1424). `#[trust::requires(..)]`
+// and `#[trust::ensures(..)]` are replaced, after name resolution and before
+// expansion, by the compiler-owned builtins `trust_contracts_requires` /
+// `trust_contracts_ensures`, so the verifier sees the ORIGINAL payload. Three
+// conditions must ALL hold or the attribute is not a contract:
+//
+//   1. verification is enabled (`sess.trust_verification_enabled()`);
+//   2. `cfg(deductive_verify)` holds, or the `cfg_attr` never fires. NOTE: this cfg
+//      is NOT something a build passes in. The compiler injects it ITSELF
+//      whenever verification is on (rustc_session/src/config/cfg.rs:210-212),
+//      attributes are unconditionally present under the verifier — there is
+//      no "verified build that quietly skips the contracts";
+//   3. an EXTERNAL crate whose *lib* name is `trust` is in scope, supplying
+//      crate-root `requires`/`ensures` attribute proc macros — that is the
+//      `trust-spec` package. The resolver keys on the RESOLVED def, not the
+//      literal path, so renames and `use` aliases all work; but with no such
+//      crate the path does not resolve at all.
+//
+// Conditions 2 and 3 together have a sharp consequence worth stating plainly,
+// because it cost a red lane to discover: a verified compile of this crate
+// WITHOUT the `trust` crate does not silently skip the contracts, it FAILS with
+// E0433 `cannot find module or crate `trust``. The contracts are fail-closed,
+// never fail-open. That is why the committed manifest stays standalone and the
+// dependency is supplied by an OVERLAY at verification time — the arrangement
+// the development proof harness documents for
+// `ay-pb`, and which `scripts/ci/trust_verification_ratchet_gate.sh` now
+// implements by building `trust-spec` into the lane and passing `--extern
+// trust=…`. Under stock rustc there is no verification, hence no
+// `cfg(deductive_verify)`, hence no attribute, no dependency and zero codegen.
+//
+// WHAT THE SPEC LANGUAGE SUPPORTS — AND THE TRAP, WHICH IS THAT PARSING AND
+// LOWERING ARE DIFFERENT QUESTIONS. A payload that is a plain typeable boolean
+// expression over the parameters keeps upstream's typed contract lowering. A
+// payload using spec-only vocabulary — `result`, `old(..)`, `forall`, `exists`,
+// `==>` — is OPAQUE: span-only verifier metadata that bypasses name resolution
+// and typeck (see tests/ui/contracts/trust-spec-opaque-spec-clauses.rs in the
+// toolchain tree). It is very easy to read that UI test as a menu of what the
+// prover understands. IT IS NOT. That test is `check-pass`: it establishes only
+// that those forms PARSE.
+//
+// MEASURED on trust-e26541e3, by writing each form and reading the verdict, the
+// fragment that actually LOWERS INTO A VERIFIER FORMULA is far narrower —
+// comparisons of PARAMETERS against LITERALS, and conjunctions of those:
+//
+//     requires(dimacs != 0)              LOWERS, and PROVES the body's assert
+//     requires(id <= 2_147_483_647)      LOWERS, and PROVES the body's assert
+//     requires(id <= Variable::MAX_ID)   REFUSED — associated constant
+//     requires(idx <= u32::MAX as usize) REFUSED — associated constant AND cast
+//     ensures(result.variable() == var)  REFUSED — `result` and method calls
+//
+// A refused predicate does not fail closed into an error; it is reported as
+// "compiler contract predicate was not lowered into a typed verifier formula:
+// unsupported contract predicate expression `…`" and lands in UNKNOWN,
+// discharging nothing. Importantly it is also not ASSUMED — no
+// `assumption:requires` obligation is emitted for it — so a refused contract is
+// inert rather than dangerous. It is still worth avoiding: it adds an UNKNOWN
+// that looks like a verifier weakness when it is really a frontend gap. Where
+// this crate could not express a condition in the lowerable fragment it says so
+// at the definition (see `literal::Literal::to_dimacs` and
+// `literal::Literal::negated`) instead of shipping an approximation, because a
+// precondition that DOES lower is assumed inside the body, so a wrong one is
+// worse than none.
+//
+// WHAT IS NOT AVAILABLE, AND WHY THERE IS NO REPLACEMENT HERE FOR TWO OF THE
+// FOUR OLD MACROS. The resolver maps EXACTLY `requires` and `ensures`. The
+// `trust-spec` crate also exports `invariant`, but nothing maps it to a
+// builtin, so it stays a passthrough no-op — i.e. it would erase, which is the
+// defect this change exists to remove. There is no `decreases` attribute at
+// all. Loop invariants and termination measures therefore have NO first-class
+// spelling today; `leb128::read_u32`/`read_u64` still carry `termination`
+// obligations in the UNKNOWN class for that reason. Writing an erasing
+// `invariant!` back would not state them — it would only look like it did.
 //
 // See the development design notes
-
-#[allow(unused_macros)]
-macro_rules! requires {
-    ($($tt:tt)*) => {};
-}
-
-#[allow(unused_macros)]
-macro_rules! ensures {
-    ($($tt:tt)*) => {};
-}
-
-#[allow(unused_macros)]
-macro_rules! invariant {
-    ($($tt:tt)*) => {};
-}
-
-#[allow(unused_macros)]
-macro_rules! decreases {
-    ($($tt:tt)*) => {};
-}
-
-#[allow(unused_imports)]
-pub(crate) use {decreases, ensures, invariant, requires};
 
 // ---------------------------------------------------------------------------
 // Propagation-redundancy (PR) functional contract — shared documentation anchor

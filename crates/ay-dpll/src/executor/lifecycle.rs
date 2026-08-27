@@ -9,7 +9,8 @@ mod finite_array_sat;
 mod proof_access;
 mod proof_records;
 mod public_solve;
-
+mod resource_options;
+include!("lifecycle/new_stack_guarded_expr.rs");
 /// Reconstruction step budget installed when a quantified public query arms
 /// the proof trace under competition shedding (#quantified-trace-arming;
 /// `--no-quantified-shedding-yield` is the kill switch).
@@ -134,9 +135,8 @@ impl Executor {
 
     /// Clear all query artefacts produced by the last check-sat call.
     ///
-    /// This mirrors SMT-LIB solver behavior: after assertion-stack mutations,
-    /// `get-model`, `get-proof`, and unsat-core/assumption queries are no
-    /// longer valid until the next check-sat.
+    /// After assertion-stack mutation, model/proof/core queries remain invalid
+    /// until the next check-sat, matching SMT-LIB solver behavior.
     pub(super) fn invalidate_last_check_result(&mut self) {
         self.last_result = None;
         self.last_model = None;
@@ -151,7 +151,7 @@ impl Executor {
         if ay_core::misc_cli_flags().debug_cert && self.unsat_query_epoch.is_some() {
             eprintln!(
                 "CERT/epoch cleared: lifecycle reset (had epoch) exec={:p}\n{}",
-                self as *const _,
+                std::ptr::from_ref(self),
                 std::backtrace::Backtrace::force_capture()
             );
         }
@@ -177,6 +177,7 @@ impl Executor {
         self.last_unknown_reason = None;
         self.last_unknown_origin = None;
         self.last_clause_trace = None;
+        self.report_checked_refutation_clear("invalidate_last_check_result");
         self.last_checked_sat_refutation = None;
         self.last_negations = None;
         self.last_lrat_certificate = None;
@@ -334,243 +335,7 @@ impl Executor {
 
     /// Body of [`Executor::new`], called only through the stack guard above.
     fn new_stack_guarded() -> Self {
-        Self {
-            ctx: Context::new(),
-            query_authority_epoch: QueryAuthorityEpoch::fresh(),
-            #[cfg(test)]
-            last_authored_query_authority_seen: false,
-            string_lemma_kinds_all_valid: true, // No string lemma lowered yet.
-            bool_arg_orphan_index: ay_core::kani_compat::DetHashMap::default(),
-            qfax_budget_multiplier: 1,
-            qfax_refinement_clause: None,
-            last_rejected_array_assertion: None,
-            qfax_retry_done: false,
-            arm_uflia_congruence_repair: false,
-            split_eager_wander_abort: false,
-            split_eager_relevancy_hard: false,
-            split_lazy_relevancy_hard: false,
-            split_lazy_detour_conflict_budget: None,
-            uflia_congruence_lane: false,
-            uflia_congruence_gate_rejected: false,
-            uflia_congruence_retry_done: false,
-            uflia_repair_candidates: Vec::new(),
-            uflia_repair_conflict_tables: Vec::new(),
-            uflia_model_repair_done: false,
-            uflia_repair_detour_direct: false,
-            uflia_repair_eager_direct: false,
-            dt_lazy_auflia_eager_arm: false,
-            bv_subst_lane: false,
-            bv_subst_model_rejected: false,
-            bv_subst_retry_done: false,
-            bv_subst_retry_disable_preprocess: false,
-            corroborating_nonstring_seq_unsat: false,
-            last_result: None,
-            last_model: None,
-            active_support_axioms: Vec::new(),
-            conflict_semantic_verify_memo: Default::default(),
-            prop_semantic_verify_memo: Default::default(),
-            last_assumptions: None,
-            last_assumption_core: None,
-            last_core_term_to_name: None,
-            named_assert_rewrites: Default::default(),
-            last_proof: None,
-            last_unsat_proof_reconstruction_suppressed: false,
-            proof_source_work: Default::default(),
-            quantified_proof_translation_incomplete: false,
-            deep_qe_retry_armed: false,
-            quantified_trace_retry_armed: false,
-            prepass_reachability: PrepassReachability::default(),
-            last_lrat_certificate: None,
-            last_proof_term_overrides: None,
-            proof_problem_assertion_provenance: None,
-            quant_expansion_records: Vec::new(),
-            ematching_proof_records: Vec::new(),
-            consequence_replay_attempts: Cell::new(0),
-            negated_exists_ground_inst_attempts: Cell::new(0),
-            skolem_instance_records: Vec::new(),
-            skolem_witness_records: Vec::new(),
-            bv_mbqi_false_instance_records: Vec::new(),
-            mbqi_refinement_instance_records: Vec::new(),
-            ground_conflict_decomp_meters: Default::default(),
-            qpf_premise_forced_instance_records: Vec::new(),
-            dt_context_conflict_records: Default::default(),
-            propagated_value_provenance: Default::default(),
-            last_proof_rebuild_originals: Vec::new(),
-            last_proof_decline: None,
-            last_proof_quality: None,
-            strict_check_invocations: Cell::new(0),
-            strict_check_steps_validated: Cell::new(0),
-            query_publication_role: Cell::new(QueryPublicationRole::default()),
-            decision_command_depth: Cell::new(0),
-            last_unknown_reason: None,
-            unsafe_partial_quantifier_unknown: false,
-            last_unknown_origin: None,
-            last_statistics: Statistics::default(),
-            debug_ufbv: false,
-            incremental_mode: false,
-            lia_incremental_eager_override: None,
-            lra_incremental_eager_override: None,
-            lra_inc_engine_override: None,
-            lra_persist_sat_active: false,
-            no_lra_theory_propagation: false,
-            incr_bv_state: None,
-            incr_theory_state: None,
-            counterexample_style: crate::CounterexampleStyle::default(),
-            proof_tracker: crate::proof_tracker::ProofTracker::new(),
-            proof_checkpoint_budget: Default::default(),
-            proof_output_requested: false,
-            proof_artifact_required: false,
-            proof_reconstruction_step_budget: None,
-            last_clause_trace: None,
-            last_var_to_term: None,
-            last_checked_sat_refutation: None,
-            last_finite_enum_pigeonhole: None,
-            last_checked_finite_enum_pigeonhole: None,
-            last_trail_provenance: None,
-            last_clausification_proofs: None,
-            last_original_clause_theory_proofs: None,
-            injected_axiom_theory_kinds: Default::default(),
-            quantifier_manager: None,
-            learned_clause_limit: None,
-            clause_db_bytes_limit: None,
-            resource_limit: None,
-            decision_limit: None,
-            ground_budget_enabled: true,
-            memory_limit: None,
-            solve_interrupt: None,
-            #[cfg(test)]
-            test_force_non_bv_congruence_bail: false,
-            in_alternation_validation: false,
-            in_closed_universal_precheck: false,
-            in_quantified_model_gate: false,
-            quantified_model_confirmation: None,
-            dt_cert_grant_active: false,
-            dt_cert_query_grant: None,
-            finite_table_cert_grant_active: false,
-            const_interp_cert_grant_active: false,
-            mbqi_sat_cert_grant_active: false,
-            mbqi_sat_cert_query_grant: None,
-            cegqi_uf_recompletion_grant: None,
-            finite_table_cert_witness_state: None,
-            const_interp_cert_witness_state: None,
-            finite_model_lane: Default::default(),
-            solve_deadline: SolveDeadlineCell::new(),
-            quantifier_deadline_backstop_installed: false,
-            quantifier_deadline_policy: QuantifierDeadlinePolicy::RelaxToBackstop,
-            quantifier_pipeline_engaged: false,
-            active_solve_phase: None,
-            active_solve_cost_center: None,
-            timeout: None,
-            pivot_enum_depth: 0,
-            mod_div_or_branch_rescue_depth: 0,
-            post_split_verify_depth: 0,
-            lra_in_assignment_recheck: false,
-            final_lia_resolve_disabled: false,
-            proof_check_result: None,
-            proof_check_ok: false,
-            pending_sat_unknown_reason: None,
-            verification_level: VerificationLevel::from_state(false),
-            self_check: false,
-            competition_mode: false,
-            last_bv_drat_self_cert: false,
-            dt_array_injectivity_gate_bypass: false,
-            last_degrade_was_datatype_array: false,
-            dt_pre_lift_assertions: Vec::new(),
-            dt_lazy_splits: None,
-            defer_model_validation: false,
-            bv_quantifier_full_domain_proof: false,
-            bv_quantifier_full_domain_pending_evidence: None,
-            bv_quantifier_full_domain_query_grant: None,
-            defer_counterexample_minimization: false,
-            last_model_validated: false,
-            last_sat_certificate: None,
-            last_unsat_certificate: None,
-            pending_nested_array_bool_bv_unsat: None,
-            last_command_unsat_admission: None,
-            unsat_query_epoch: None,
-            cegar_pending_lemma: None,
-            cegar_rounds_remaining: 0,
-            cegar_emitted_lemmas: HashSet::default(),
-            last_validation_stats: None,
-            model_validation_delegated_assertions: HashSet::default(),
-            dt_solver_added_axiom_terms: HashSet::default(),
-            skip_model_eval: false,
-            read_pin_repair_done: false,
-            nra_algebraic_model: Default::default(),
-            dt_theory_model: None,
-            dt_validation_wants_egraph: false,
-            dt_egraph_assignment: std::cell::RefCell::new(None),
-            dt_egraph_building: Cell::new(false),
-            array_def_index: std::cell::RefCell::new(None),
-            div_witness_index_cache: Default::default(),
-            select_by_array_index: std::cell::RefCell::new((0, Default::default())),
-            required_terms_index: std::cell::RefCell::new(None),
-            recorded_var_substitutions: HashMap::default(),
-            original_problem_had_quantifiers: false,
-            quantified_query_defeats_shedding: false,
-            sat_validated_by_mod_div_or_branch: false,
-            nested_array_row_reduction_unsat: false,
-            ho_seq_unfold_array_free_unsat: false,
-            in_nested_array_residue_probe: false,
-            residue_probe_failures: 0,
-            bypass_string_tautology_guard: false,
-            slia_accepted_unknown: false,
-            w7_defs: None,
-            w7_int_defs: HashMap::default(),
-            w4_work_deadline: Cell::new(None),
-            self_check_authored_assertions: None,
-            independent_gate_authored_assertions: None,
-            array_axiom_scope: None,
-            row_seeded_terms: HashSet::default(),
-            array_default_epsilon_by_sort: HashMap::default(),
-            array_default_diag_by_sort: HashMap::default(),
-            cached_store_eqs: Vec::new(),
-            store_eq_scan_hwm: 0,
-            cached_select_indices_by_array: HashMap::default(),
-            select_index_scan_hwm: 0,
-            last_negations: None,
-            random_seed: None,
-            ematching_round_limit: None,
-            progress_enabled: false,
-            progress_json_path: None,
-            aggressive_model_minimize: false,
-            model_output_shed: false,
-            #[cfg(test)]
-            last_applied_sat_random_seed: Cell::new(None),
-            #[cfg(test)]
-            last_applied_dpll_random_seed: Cell::new(None),
-            #[cfg(test)]
-            last_oll_core_rounds: Cell::new(0),
-            #[cfg(test)]
-            forced_maxsmt_exact_cost: Cell::new(None),
-            #[cfg(test)]
-            forced_maxsmt_oll_core_anomaly: Cell::new(false),
-            #[cfg(test)]
-            forced_maxsmt_post_emit_soft_flip: Cell::new(false),
-            #[cfg(test)]
-            forced_optimization_post_emit_objective_flip: Cell::new(false),
-            #[cfg(test)]
-            last_diff_logic_decided: Cell::new(false),
-            lemma_persistence: false,
-            lemma_cache: lemma_cache::LemmaCache::new(),
-            unbounded_objectives: HashMap::default(),
-            infinitesimal_objectives: HashMap::default(),
-            unavailable_objectives: HashSet::default(),
-            objective_certificates: HashMap::default(),
-            last_soft_cost: None,
-            last_soft_cost_optimal: true,
-            last_soft_violations: None,
-            finite_objective_values: HashMap::default(),
-            pareto_state: None,
-            array_ext_shadow: ArrayExtShadow::default(),
-            array_ext_witness_cache: ArrayExtWitnessCache::default(),
-            finite_array_expansion: FiniteArrayExpansionLedger::default(),
-            // Debug-only AUFLIA shadow and demand overrides are off by default.
-            #[cfg(debug_assertions)]
-            auflia_persistent_shadow: false,
-            #[cfg(debug_assertions)]
-            demand_force_eager: false,
-        }
+        new_stack_guarded_expr!()
     }
 
     /// Enable/disable the M-A2 lazy-persistent-combiner SHADOW arm
@@ -1417,6 +1182,10 @@ impl Executor {
         self.bypass_string_tautology_guard = false;
         self.slia_accepted_unknown = false;
         self.array_axiom_scope = None;
+        self.array_axiom_dead_skolems.clear();
+        // `ctx` (and its TermStore) was replaced wholesale above: term ids
+        // restart, so the epoch mark must restart with them.
+        self.assertion_epoch_terms_len = 0;
         self.row_seeded_terms.clear();
         self.array_default_epsilon_by_sort.clear();
         self.array_default_diag_by_sort.clear();
@@ -1426,8 +1195,10 @@ impl Executor {
         self.select_index_scan_hwm = 0;
         self.solve_interrupt = None;
         self.solve_deadline.set(None);
+        self.certification_deadline.set(None);
         self.quantifier_deadline_backstop_installed = false;
         self.quantifier_deadline_policy = QuantifierDeadlinePolicy::RelaxToBackstop;
+        self.quantifier_deadline_backstop_opt_in = false;
         self.quantifier_pipeline_engaged = false;
         self.lemma_cache.clear();
         for_each_incremental_subsystem!(reset self);
@@ -1470,31 +1241,7 @@ mod result_rejection_tests {
         );
     }
 
-    #[test]
-    fn direct_reset_revokes_every_query_artifact() {
-        let mut executor = Executor::new();
-        let old_term = executor.ctx.terms.true_term();
-        assert_eq!(
-            executor
-                .emit_sat_verdict(SolveResult::Sat, &[])
-                .expect("mint a checked SAT certificate"),
-            SolveResult::Sat
-        );
-        executor.last_result = Some(SolveResult::Sat);
-        executor.last_model = Some(Model::empty());
-        executor.last_lrat_certificate = Some(vec![1]);
-        executor.last_proof_rebuild_originals.push(old_term);
-        executor.pareto_state = Some(optimization::ParetoState::default());
-
-        executor.reset();
-
-        assert!(executor.last_result.is_none());
-        assert!(executor.last_model.is_none());
-        assert!(executor.last_sat_certificate.is_none());
-        assert!(executor.last_lrat_certificate.is_none());
-        assert!(executor.last_proof_rebuild_originals.is_empty());
-        assert!(executor.pareto_state.is_none());
-    }
+    include!("lifecycle/reset_tests.rs");
 
     #[test]
     fn rejecting_unsat_clears_certificates_and_canonicalizes_followup_queries() {

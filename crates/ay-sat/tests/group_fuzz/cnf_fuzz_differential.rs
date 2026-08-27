@@ -847,3 +847,147 @@ fn fuzz_kissat_oracle_500() {
         "Expected at least 200 formulas cross-validated, got {tested}"
     );
 }
+
+// =============================================================================
+// Relevancy frontier (#relevancy-frontier-incremental)
+// =============================================================================
+
+/// Deterministic xorshift 3-SAT generator for the relevancy arm.
+///
+/// `generate_random_3sat` above draws from an LCG through `% n` and
+/// `is_multiple_of(2)` — the two places an LCG is weakest — so its low bits are
+/// nearly periodic and its clause polarities strictly alternate. The formulas
+/// that come out are structurally easy: a 12-formula sweep at 180-260 variables
+/// and ratio 4.4 finished in 0.83 s having never reached a single clause-DB
+/// reduction, let alone the arena compaction this arm needs. Xorshift plus a
+/// distinct-variable rejection gives genuine phase-transition 3-SAT at the same
+/// sizes, which refutes in tens of thousands of conflicts.
+fn generate_hard_3sat(num_vars: usize, num_clauses: usize, seed: u64) -> Vec<Vec<Literal>> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut clauses = Vec::with_capacity(num_clauses);
+    for _ in 0..num_clauses {
+        let mut clause: Vec<Literal> = Vec::with_capacity(3);
+        while clause.len() < 3 {
+            let v = Variable::new((next() % num_vars as u64) as u32);
+            if clause.iter().any(|l| l.variable() == v) {
+                continue;
+            }
+            clause.push(if next().is_multiple_of(2) {
+                Literal::positive(v)
+            } else {
+                Literal::negative(v)
+            });
+        }
+        clauses.push(clause);
+    }
+    clauses
+}
+
+/// Fuzz the INCREMENTAL relevancy frontier against unrestricted branching, on
+/// formulas large enough that the clause DB actually MUTATES under it.
+///
+/// The rest of this file leaves `relevancy_branching` off, so nothing here used
+/// to touch `solver/relevancy_frontier.rs` at all — running the fuzz group with
+/// `--features relevancy-frontier-invariants` asserted nothing. This arm turns
+/// the frontier on HARD (engaged on every decision, skipping the wander
+/// trip-wire) so both of its exactness pins fire: the query-time set-equality
+/// check, and the post-unassignment-fold check that is the only one able to see
+/// a fold over a clause DB that moved (`reduce_db` deletions, `replace`
+/// strengthening, and `compact_arena_locality`, which rewrites the arena
+/// SHORTER with every offset moved).
+///
+/// Sizing is the point, and so is the generator (see `generate_hard_3sat`):
+/// 180-250 variables at ratio 4.35 refutes in tens of thousands of conflicts,
+/// which is what it takes to reach the first clause-DB reduction and the arena
+/// compaction that follows it. The test asserts that at least one formula in
+/// the sweep actually compacted, so it cannot quietly stop covering that class.
+///
+/// Relevancy gates DECISIONS only, so it can never flip SAT<->UNSAT; it may
+/// legitimately return `unknown` (the empty-frontier SAT signal is re-verified
+/// by the always-on model gate), so only a FLIPPED verdict is a failure.
+#[test]
+fn fuzz_relevancy_frontier_vs_unrestricted() {
+    let mut tested = 0;
+    let mut unknowns = 0;
+    let mut compactions = 0u64;
+    let mut relevancy_decisions = 0u64;
+    let mut conflicts = 0u64;
+    let mut disagreements = Vec::new();
+
+    for i in 0..8u64 {
+        let nv = 180 + 10 * i as usize;
+        let clauses = generate_hard_3sat(nv, (nv as f64 * 4.35) as usize, 0x5EED_0000 + i);
+
+        let mut solver = Solver::new(nv);
+        solver.set_relevancy_branching(true);
+        solver.set_relevancy_hard(true);
+        for clause in &clauses {
+            solver.add_clause(clause.clone());
+        }
+        let result_rel = solver.solve().into_inner();
+        if let SatResult::Sat(ref model) = result_rel {
+            assert!(
+                verify_model(&clauses, model),
+                "[relevancy] SAT model does not satisfy original clauses (formula #{i}, nv={nv})"
+            );
+        }
+        compactions += solver.num_arena_compactions();
+        relevancy_decisions += solver.relevancy_decisions();
+        conflicts += solver.num_conflicts();
+
+        let result_plain = solve_with_config(nv, &clauses, |_| {}, "unrestricted");
+
+        let v_rel = Verdict::from_result(&result_rel);
+        let v_plain = Verdict::from_result(&result_plain);
+
+        if v_plain == Verdict::Unknown {
+            continue;
+        }
+        if v_rel == Verdict::Unknown {
+            // Allowed: relevancy can degrade to unknown, never to a wrong verdict.
+            unknowns += 1;
+            continue;
+        }
+
+        tested += 1;
+        if v_rel != v_plain {
+            let saved = save_failing_formula(nv, &clauses, "relevancy", 0x5EED_0000, i as usize);
+            disagreements.push(format!(
+                "formula #{i} (nv={nv}, nc={}): relevancy={v_rel}, unrestricted={v_plain}\n  saved: {}",
+                clauses.len(),
+                saved.display(),
+            ));
+        }
+    }
+
+    eprintln!(
+        "fuzz_relevancy_frontier_vs_unrestricted: {tested} tested, {unknowns} relevancy-unknown, \
+         {conflicts} conflicts, {compactions} arena compactions, {relevancy_decisions} relevancy \
+         decisions, {} disagreements",
+        disagreements.len()
+    );
+    assert!(
+        disagreements.is_empty(),
+        "Relevancy frontier soundness failures:\n{}",
+        disagreements.join("\n")
+    );
+    assert!(
+        tested >= 4,
+        "Expected at least 8 comparable formulas, got {tested}"
+    );
+    assert!(
+        relevancy_decisions > 0,
+        "the relevancy frontier never engaged, so nothing was folded"
+    );
+    assert!(
+        compactions > 0,
+        "no formula in this sweep compacted the arena, so it no longer covers the \
+         fold-over-a-moved-formula class this arm exists for"
+    );
+}

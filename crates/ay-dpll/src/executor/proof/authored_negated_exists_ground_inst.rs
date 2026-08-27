@@ -270,7 +270,7 @@ impl Executor {
     /// EXCLUDING under binders — review measured that `ground_instantiation_candidates` has no `Forall`/`Exists` arm (`_ => {}`), so it never descends and can never return a term containing a `Var`. The `term_avoids_names` filter below is therefore a NO-OP on every input it can receive, kept as a guard against a future arm being added, not as an active filter. Consequence: `+zero` and `16.0`, which occur only inside the existential body, are NEVER proposed as instantiation terms — on this shape every interesting constant
     /// (`+zero`, the bound `16.0`) occurs only inside the existential body —
     /// minus anything mentioning a bound name.
-    fn ground_witnesses_for_sort(
+    pub(super) fn ground_witnesses_for_sort(
         &self,
         authored: &[TermId],
         sort: &Sort,
@@ -296,7 +296,7 @@ impl Executor {
     /// possible, so it fails closed by leaving the scan incomplete only after
     /// the work cap, which can at worst admit a candidate the strict
     /// `forall_inst` validator then refuses.
-    fn authored_binder_names(
+    pub(super) fn authored_binder_names(
         &self,
         authored: &[TermId],
     ) -> ay_core::kani_compat::DetHashSet<String> {
@@ -327,7 +327,7 @@ impl Executor {
 
     /// Whether `term` mentions no variable named in `names` and contains no
     /// binder of its own. Conservative: an exhausted scan answers `false`.
-    fn term_avoids_names(
+    pub(super) fn term_avoids_names(
         &self,
         term: TermId,
         names: &ay_core::kani_compat::DetHashSet<String>,
@@ -362,7 +362,7 @@ impl Executor {
 /// candidate across every position come before the mixed ones, because the
 /// diagonal is what closes the shapes this lane exists for. Never yields more
 /// than `limit` tuples.
-fn bounded_tuples(per_binder: &[Vec<TermId>], limit: usize) -> Vec<Vec<TermId>> {
+pub(super) fn bounded_tuples(per_binder: &[Vec<TermId>], limit: usize) -> Vec<Vec<TermId>> {
     let mut out: Vec<Vec<TermId>> = Vec::new();
     if per_binder.is_empty() || limit == 0 {
         return out;

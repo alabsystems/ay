@@ -1508,7 +1508,6 @@ mod tests {
             "full-control-cube mixed row missing: pool size {}",
             quals.len()
         );
-
         // Pair row: b0 ∨ b1 ∨ (a4 = a5) — the 3-literal mixed shape.
         let want_pair = ChcExpr::or_all([
             ctrl[0].clone(),
@@ -1519,7 +1518,6 @@ mod tests {
             quals.iter().any(|e| *e == want_pair),
             "2-control-literal mixed row missing"
         );
-
         // Signed variant present too (¬b0 ∨ b1 ∨ (a4 = a5)).
         let want_signed = ChcExpr::or_all([
             ChcExpr::not(ctrl[0].clone()),
@@ -1535,9 +1533,10 @@ mod tests {
     /// The mixed-class kill switch is honored through the carrier.
     #[test]
     fn mixed_kill_switch_carrier() {
-        let mut switches = ChcAbSwitches::default();
-        switches.qual_mixed = false;
-        let off = TestOverride::set(switches);
+        let off = TestOverride::set(ChcAbSwitches {
+            qual_mixed: false,
+            ..ChcAbSwitches::default()
+        });
         assert!(!qual_mixed_enabled());
         drop(off);
         assert!(qual_mixed_enabled());
@@ -1546,9 +1545,10 @@ mod tests {
     /// The whole-pass kill switch is honored through the carrier.
     #[test]
     fn kill_switch_carrier() {
-        let mut switches = ChcAbSwitches::default();
-        switches.qual_mine = false;
-        let off = TestOverride::set(switches);
+        let off = TestOverride::set(ChcAbSwitches {
+            qual_mine: false,
+            ..ChcAbSwitches::default()
+        });
         assert!(!qual_mine_enabled());
         drop(off);
         assert!(qual_mine_enabled());

@@ -290,7 +290,7 @@ fn refinement_preserves_the_invariant_and_narrows() {
     let target = Bq::inv_two_pow(20);
     let r = a.refine(&target).unwrap();
     let c = r.cell().unwrap();
-    assert!(c.interval().width().cmp_bq(&target) != Ordering::Greater);
+    assert_ne!(c.interval().width().cmp_bq(&target), Ordering::Greater);
     // Still the same number.
     assert_eq!(a.cmp_anum(&r), Some(Ordering::Equal));
     // Still isolating: re-running the constructor on the narrowed data accepts.

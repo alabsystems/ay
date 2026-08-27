@@ -17,7 +17,7 @@
 //!
 //! # Why this file does not solve anything
 //!
-//! The nineteen pinned models are MIPLIB files. This repository contains seven
+//! The twenty pinned models are MIPLIB files. This repository contains seven
 //! `.mps` files in total, all tiny fixtures, and shipping MIPLIB into the tree
 //! is not on the table — so `cargo test -p ay-milp` can never measure them.
 //! The measurement lane is `scripts/milp_node_gate.py --check --corpus DIR`,
@@ -32,10 +32,10 @@
 //!
 //! It gates the RATCHET FILE, which is the part that decays silently:
 //!
-//! * the pinned set is **exactly** the deterministic nineteen — an instance
+//! * the pinned set is **exactly** the deterministic twenty — an instance
 //!   cannot be quietly dropped to make a red gate go green, and a new one
 //!   cannot be added without a decision;
-//! * none of the five **budget-coupled** instances is smuggled in, because a
+//! * none of the four **budget-coupled** instances is smuggled in, because a
 //!   gate that flakes gets muted and a muted gate is worse than none;
 //! * the four instances the old standing gate pinned are all still there, so
 //!   the new gate strictly widens the old one rather than replacing it;
@@ -61,7 +61,7 @@ fn ratchet_path() -> PathBuf {
 /// point is that deleting a pin has to fail somewhere.
 const DETERMINISTIC: &[&str] = &[
     "air03", "blend2", "dcmulti", "enigma", "gt2", "lseu", "mas76", "misc03", "mod008", "mod010",
-    "p0033", "p0201", "p0282", "p0548", "pk1", "qnet1", "rout", "stein27", "stein45",
+    "p0033", "p0201", "p0282", "p0548", "pk1", "qiu", "qnet1", "rout", "stein27", "stein45",
 ];
 
 /// The instances that MOVE run-to-run at a fixed configuration on a quiet box,
@@ -69,7 +69,17 @@ const DETERMINISTIC: &[&str] = &[
 /// bounded (measured spread 30.4% over five repeats); `nw04` is budget-coupled
 /// at short limits and already fooled one round by agreeing across two quiet
 /// runs before moving.
-const NEVER_GATE: &[&str] = &["mas74", "misc07", "nw04", "p2756", "qiu"];
+///
+/// `qiu` LEFT THIS LIST on 2026-08-26, and it is the only name that ever has.
+/// Its exclusion was recorded on an older engine (drift 3,946..4,121 over six
+/// runs; `6715ed282` later took it 4,121 -> 2,831). Re-measured at the current
+/// default: 28 completed runs, all 2,831 nodes / -132.873136947 / OPTIMAL / one
+/// GMI separation digest, across load 2.5..19.7 and across `--limit` 60/120/300.
+/// It had to move, because qiu is the ONLY corpus instance that arms
+/// `FloatLp::tall_cold_dual`, so while it sat here the ratchet reported `0 fail`
+/// against a build with that disjunct disarmed. Moving a name OUT of this list
+/// costs a measured determinism campaign; moving one IN costs an observation.
+const NEVER_GATE: &[&str] = &["mas74", "misc07", "nw04", "p2756"];
 
 /// The four the standing gate pinned before this file existed. The new gate
 /// must be a superset: a wider gate that dropped one of the originals would be
@@ -266,8 +276,8 @@ fn every_pin_is_well_formed() {
         );
         let wall = p.wall_s.unwrap_or_else(|| panic!("{name}: no `wall_s`"));
         assert!(wall >= 0.0 && wall.is_finite(), "{name}: bad wall {wall}");
-        // The tier split is a COST claim the script's header quotes (7.2s for
-        // the fast lane, 44.8s for all nineteen). Keep it honest: a `fast`
+        // The tier split is a COST claim the script's header quotes (7.0s for
+        // the fast lane, 73.6-81.1s for all twenty). Keep it honest: a `fast`
         // instance that takes ten seconds silently turns the pre-merge lane into
         // the nightly one, and the slowest fast instance today is blend2 at
         // 1.6s, so this bound has real margin and still binds.
@@ -377,10 +387,10 @@ fn every_pinned_and_flaky_instance_has_a_manifest_row() {
 fn the_ratchet_reader_rejects_a_malformed_file() {
     let good = parse(
         "# comment\n[[instance]]\nname = \"gt2\"\nnodes = 4954\nobj = 21166.0\n\
-         status = \"OPTIMAL\"\ntier = \"fast\"\nwall_s = 0.165\n[flaky]\nqiu = \"moves\"\n",
+         status = \"OPTIMAL\"\ntier = \"fast\"\nwall_s = 0.165\n[flaky]\nmisc07 = \"moves\"\n",
     );
     assert_eq!(good.instances["gt2"].nodes, Some(4954));
-    assert_eq!(good.flaky["qiu"], "moves");
+    assert_eq!(good.flaky["misc07"], "moves");
     let doubled = std::panic::catch_unwind(|| {
         parse("[[instance]]\nname = \"gt2\"\nnodes = 1\n[[instance]]\nname = \"gt2\"\nnodes = 2\n");
     });

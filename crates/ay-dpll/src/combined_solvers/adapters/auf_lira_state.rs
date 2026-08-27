@@ -10,7 +10,7 @@ use ay_lra::LraSolver;
 
 use super::auf_lira::AufLiraSolver;
 
-impl<'a> AufLiraSolver<'a> {
+impl AufLiraSolver<'_> {
     pub(crate) fn take_learned_state(
         &mut self,
     ) -> (Vec<ay_lia::StoredCut>, HashSet<ay_lia::HnfCutKey>) {

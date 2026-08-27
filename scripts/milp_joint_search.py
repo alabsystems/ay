@@ -99,6 +99,11 @@ from _oom_guard import (  # noqa: E402
 class CoordinateValue:
     name: str
     env: tuple[tuple[str, str], ...]
+    # B38's own instruction, implemented: the retired knobs are CLI-only now, so
+    # an axis carries the exact argv fragment it appends rather than an env
+    # spelling. Defaulted so every existing `CoordinateValue(name, ())` is
+    # unchanged.
+    cli: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, str]:
         return dict(self.env)
@@ -109,9 +114,13 @@ class JointConfig:
     config_id: str
     coordinates: tuple[tuple[str, str], ...]
     env: tuple[tuple[str, str], ...]
+    cli: tuple[str, ...] = ()
 
     def env_dict(self) -> dict[str, str]:
         return dict(self.env)
+
+    def cli_args(self) -> list[str]:
+        return list(self.cli)
 
     def coordinate_dict(self) -> dict[str, str]:
         return dict(self.coordinates)
@@ -147,17 +156,76 @@ RETIRED_ENV_NAMES: frozenset[str] = frozenset({
     "AY_MILP_NO_PRESOLVE_SCOUT",
 })
 
+# RESTORED 2026-08-25 through the CLI carrier B38 named. The four axes and their
+# 4/3/3/4 shape are the pre-B38 ones recovered verbatim from 074a2525bb^; only
+# the CARRIER changed, from `AY_MILP_*` env spellings to the shared engine CLI
+# flags that replaced them one-for-one:
+#
+#   AY_MILP_GMI_ROUNDS          -> --gmi-rounds N
+#   AY_MILP_ROOT_CUTS_PER_ROUND -> --root-cuts-per-round N
+#   AY_MILP_CUT_TOPK            -> --cut-topk N
+#   AY_MILP_SB_REL/CANDS/TOTAL  -> --sb-rel N / --sb-cands N / --sb-total N
+#   AY_MILP_NO_DUALFIX          -> --no-dualfix
+#   AY_MILP_NO_PRESOLVE         -> --no-presolve
+#   AY_MILP_NO_PRESOLVE_SCOUT   -> --no-presolve-scout
+#
+# Every one is a live flag: the value flags are in engine_cli.rs VALUE_FLAGS and
+# the three switches in its switch table, and that module REFUSES an unknown
+# flag rather than measuring under one that does nothing — so a misspelling here
+# fails the run instead of silently flattening an axis.
+#
+# The `env` tuple stays EMPTY on every value. That is the point of the carrier
+# swap, and `config_environment` still fails closed on RETIRED_ENV_NAMES, so a
+# retired spelling cannot come back through this table.
 COORDINATES: tuple[tuple[str, tuple[CoordinateValue, ...]], ...] = (
+    (
+        "cuts",
+        (
+            CoordinateValue("default", ()),
+            CoordinateValue("gmi-1", (), ("--gmi-rounds", "1")),
+            CoordinateValue("gmi-5", (), ("--gmi-rounds", "5")),
+            CoordinateValue("gmi-10", (), ("--gmi-rounds", "10")),
+        ),
+    ),
+    (
+        "cut-selection-budget",
+        (
+            CoordinateValue("default", ()),
+            CoordinateValue(
+                "top8-budget16",
+                (),
+                ("--root-cuts-per-round", "16", "--cut-topk", "8"),
+            ),
+            CoordinateValue(
+                "top24-budget40",
+                (),
+                ("--root-cuts-per-round", "40", "--cut-topk", "24"),
+            ),
+        ),
+    ),
     (
         "branching",
         (
             CoordinateValue("default", ()),
+            CoordinateValue(
+                "economy",
+                (),
+                ("--sb-rel", "2", "--sb-cands", "8", "--sb-total", "600"),
+            ),
+            CoordinateValue(
+                "thorough",
+                (),
+                ("--sb-rel", "8", "--sb-cands", "24", "--sb-total", "6000"),
+            ),
         ),
     ),
     (
         "structural-presolve",
         (
             CoordinateValue("default", ()),
+            CoordinateValue("exact-no-scout", (), ("--no-presolve-scout",)),
+            CoordinateValue("no-dualfix", (), ("--no-dualfix",)),
+            CoordinateValue("off", (), ("--no-presolve",)),
         ),
     ),
 )
@@ -189,13 +257,26 @@ def build_grid(
             for (coordinate_name, _), value in zip(coordinates, choices)
         )
         env: dict[str, str] = {}
+        cli: list[str] = []
+        seen_flags: set[str] = set()
         for value in choices:
             for key, setting in value.env:
                 if key in env:
                     raise ValueError(f"coordinates overlap on {key}")
                 env[key] = setting
+            # Same overlap rule as env, on the flag NAME: two axes must not both
+            # set --gmi-rounds, or the last one silently wins and the grid
+            # measures fewer arms than its config_id claims.
+            for token in value.cli:
+                if token.startswith("--"):
+                    if token in seen_flags:
+                        raise ValueError(f"coordinates overlap on {token}")
+                    seen_flags.add(token)
+            cli.extend(value.cli)
         config_id = "__".join(f"{name}={value}" for name, value in pairs)
-        grid.append(JointConfig(config_id, pairs, tuple(sorted(env.items()))))
+        grid.append(
+            JointConfig(config_id, pairs, tuple(sorted(env.items())), tuple(cli))
+        )
     ids = [config.config_id for config in grid]
     if len(ids) != len(set(ids)):
         raise ValueError("configuration ids are not unique")
@@ -217,6 +298,9 @@ def serialized_grid() -> list[dict[str, Any]]:
             "config_id": config.config_id,
             "coordinates": config.coordinate_dict(),
             "environment": config.env_dict(),
+            # The arm is now carried in argv, so GRID_SHA256 must cover it or the
+            # grid hash would be identical across four different `cuts` arms.
+            "cli": list(config.cli),
         }
         for config in GRID
     ]
@@ -593,6 +677,21 @@ def index_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]
     return indexed
 
 
+def config_cli_args(config_id: str) -> list[str]:
+    """The argv fragment this arm appends to the solver command.
+
+    The sibling of `config_environment`, and load-bearing in the same way: since
+    B38 the axes are carried in argv rather than the environment, so a run that
+    drops this is a run of the BASELINE wearing another arm's config_id.
+    """
+    if config_id == BASELINE_ID:
+        return []
+    config = GRID_BY_ID.get(config_id)
+    if config is None:
+        raise ValueError(f"unknown configuration {config_id!r}")
+    return config.cli_args()
+
+
 def config_environment(config_id: str) -> dict[str, str]:
     if config_id == BASELINE_ID:
         return {}
@@ -808,6 +907,14 @@ def validate_run_semantics(
             sorted(expected_config.items())
         ):
             raise ValueError(f"run {key!r} configuration environment was altered")
+        # Same authority as the environment check above: since the axes moved to
+        # argv, a record whose argv fragment disagrees with the grid is evidence
+        # from a different arm than the one it is filed under. Records written
+        # before this field existed carry no arm at all, so they are only
+        # accepted when the arm is genuinely empty (baseline / all-default).
+        expected_cli = config_cli_args(config_id)
+        if record.get("configuration_cli", []) != expected_cli:
+            raise ValueError(f"run {key!r} configuration CLI arguments were altered")
         if record.get("model_sha256") != instance.get("sha256"):
             raise ValueError(f"run {key!r} model digest disagrees with the header")
         if record.get("reference") != instance["reference"]:
@@ -1476,6 +1583,7 @@ def run_node_screen_ay(
     env_posture: dict[str, Any],
     case_dir: Path,
     artifact_root: Path,
+    config_cli: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run node screening with no solver-internal wall deadline.
 
@@ -1493,6 +1601,11 @@ def run_node_screen_ay(
     )
     time_index = command.index("--time-limit")
     del command[time_index : time_index + 2]
+    # The arm itself. Appended AFTER the --time-limit excision so that index
+    # arithmetic can never land inside the arm's own flags, and last overall so
+    # the fragment stays contiguous and verbatim in the recorded argv.
+    if config_cli:
+        command.extend(config_cli)
     process = evidence.run_guarded_capture(
         command,
         memlimit_mb=plan.memlimit_mb,
@@ -1523,6 +1636,7 @@ def run_one(
     model_identity: dict[str, Any],
     config_id: str,
     config_env: dict[str, str],
+    config_cli: list[str],
     ay_binary: Path,
     node_cap: int,
     solver_limit: float,
@@ -1557,6 +1671,7 @@ def run_one(
             env_posture,
             case_dir,
             artifact_root,
+            config_cli,
         )
         if metric == NODE_METRIC
         else evidence.run_ay(
@@ -1570,6 +1685,7 @@ def run_one(
             env_posture,
             case_dir,
             artifact_root,
+            config_cli,
         )
     )
     evidence.check_ay_evidence(
@@ -1605,6 +1721,7 @@ def run_one(
         "name": item["name"],
         "config_id": config_id,
         "configuration_environment": dict(sorted(config_env.items())),
+        "configuration_cli": list(config_cli),
         "model_sha256": model_identity["sha256"],
         "reference": reference,
         "pair_order": pair_order,
@@ -2235,6 +2352,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             model_identity=model_by_name[name],
             config_id=config_id,
             config_env=config_environment(config_id),
+            config_cli=config_cli_args(config_id),
             ay_binary=ay_binary,
             node_cap=args.node_cap,
             solver_limit=args.time_limit,

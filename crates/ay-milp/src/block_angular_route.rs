@@ -5373,7 +5373,7 @@ mod tests {
     #[test]
     fn batched_resource_polls_preserve_exact_hooks_and_local_limits() {
         let deadline = Instant::now()
-            .checked_add(Duration::from_secs(60))
+            .checked_add(Duration::from_mins(1))
             .expect("near deadline");
         let mut work = WorkMeter::new(Some(deadline));
         work.charge_terms(WALL_TERM_POLL_STRIDE - 1)
@@ -6540,18 +6540,17 @@ mod tests {
         let values = vec![BigRational::zero(); model.num_cols()];
         let mut work = WorkMeter::with_test_deadline_after(600);
         let mut decline = None;
-        let mut bounded = |units| match work.charge_terms(units) {
-            Ok(()) => true,
-            Err(reason) => {
-                decline.get_or_insert(reason);
-                false
-            }
-        };
-        assert!(matches!(
-            model.check_point_with_work(&values, &mut bounded),
-            Err(crate::PointViolation::ResourceLimit)
-        ));
-        drop(bounded);
+        {
+            let mut bounded = |units| match work.charge_terms(units) {
+                Ok(()) => true,
+                Err(reason) => {
+                    decline.get_or_insert(reason);
+                    false
+                }
+            };
+            let result = model.check_point_with_work(&values, &mut bounded);
+            assert!(matches!(result, Err(crate::PointViolation::ResourceLimit)));
+        }
         assert_eq!(decline, Some(Decline::Deadline));
         assert!(
             work.terms < values.len(),
@@ -6997,7 +6996,7 @@ mod tests {
 
     #[test]
     fn speculative_deadline_reserves_native_time() {
-        let outer = Instant::now() + Duration::from_secs(60);
+        let outer = Instant::now() + Duration::from_mins(1);
         let (recognition, route) = route_deadlines(Some(outer)).expect("positive route slice");
         assert!(recognition <= route);
         assert!(recognition <= Instant::now() + RECOGNITION_WALL_CAP);

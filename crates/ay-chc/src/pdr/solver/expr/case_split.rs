@@ -4,38 +4,29 @@
 
 //! ITE and OR case-splitting for SMT queries that return Unknown.
 //!
-//! When the SMT solver returns Unknown on queries with ITE, OR, or disequality
+//! When the SMT solver returns Unknown on queries with OR or disequality
 //! structure, these helpers split the query into simpler cases and check each
 //! independently. This recovers definitive SAT/UNSAT results from queries that
 //! would otherwise stall.
+//!
+//! ITE structure is handled the other way round: an ITE-bearing query is
+//! case-split BEFORE it is sent to the solver, because the ITE form is the one
+//! the internal DPLL(T) loop reliably fails on (it spends its whole internal
+//! slice there before the executor fallback answers), while the two branches
+//! are ordinary theory queries. See
+//! `PdrSolver::check_sat_with_ite_case_split_recursive`.
 
 use super::super::PdrSolver;
 use crate::smt::{SmtContext, SmtResult};
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+mod timeout_observation;
 use std::sync::Arc;
 
 #[cfg(test)]
-const NO_CASE_SPLIT_TIMEOUT_OBSERVED_MS: u64 = u64::MAX;
-#[cfg(test)]
-static LAST_CASE_SPLIT_TIMEOUT_MS: AtomicU64 = AtomicU64::new(NO_CASE_SPLIT_TIMEOUT_OBSERVED_MS);
-
-#[cfg(test)]
-fn record_case_split_timeout_for_tests(timeout: Option<std::time::Duration>) {
-    let encoded = match timeout {
-        Some(timeout) => u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX - 1),
-        None => NO_CASE_SPLIT_TIMEOUT_OBSERVED_MS,
-    };
-    LAST_CASE_SPLIT_TIMEOUT_MS.store(encoded, Ordering::Relaxed);
-}
+use timeout_observation::record_case_split_timeout_for_tests;
 
 impl PdrSolver {
-    #[cfg(test)]
-    pub(in crate::pdr::solver) fn reset_case_split_timeout_observation_for_tests() {
-        LAST_CASE_SPLIT_TIMEOUT_MS.store(NO_CASE_SPLIT_TIMEOUT_OBSERVED_MS, Ordering::Relaxed);
-    }
-
     /// Extract OR cases from a constraint for case-splitting.
     ///
     /// Given a constraint like `(and guard (or case1 case2))`, this returns
@@ -318,6 +309,66 @@ impl PdrSolver {
             return (SmtResult::Unknown, None);
         }
 
+        // ITE-BEFORE-QUERY. An ITE-bearing query is decided by deciding both of
+        // its branches: `F[ite(c,t,e)] ≡ (F[t] ∧ c) ∨ (F[e] ∧ ¬c)`, so both
+        // branches UNSAT ⟺ the query is UNSAT. Doing that split BEFORE the
+        // direct check (instead of only as an Unknown-recovery afterwards) is
+        // a pure ordering change, and it matters because the direct check on
+        // the ITE form is the shape the internal DPLL(T) loop does not decide:
+        // it spends its whole internal slice (`check_sat`'s `min(2s,
+        // budget/4)`) on such a query before the executor fallback answers it,
+        // whereas each branch is an ordinary theory query.
+        // Measured on `dillig12_m_000.smt2`: inside one portfolio PDR engine's
+        // ~2.25s solve budget, three ITE-bearing queries cost 0.57-0.64s apiece
+        // (1.8s of the 2.25s) — each exactly one internal slice plus a few ms
+        // of executor — while ITE-free queries of the same size decided in
+        // ~0ms. A fourth then found the thread SMT deadline already spent, so
+        // BOTH of its case-split branches short-circuited on
+        // `smt_deadline_expired()` and the query came back Unknown — which made
+        // `is_self_inductive_blocking` reject a lemma that is in fact
+        // self-inductive, and cost the engine its cheap safety proof.
+        //
+        // Conservative by construction: all-branches-UNSAT returns immediately.
+        // A SAT branch or Unknown first falls through to the original direct check;
+        // if that remains Unknown, the retained split model and exact branch query
+        // are returned to callers such as cube extraction.
+        let ite_cases = if depth < max_depth {
+            Self::split_ite_cases_anywhere(query)
+        } else {
+            None
+        };
+        let ite_attempted = ite_cases.is_some();
+        let mut ite_sat: Option<(SmtResult, Option<ChcExpr>)> = None;
+        if let Some(cases) = ite_cases {
+            if verbose && depth == 0 {
+                safe_eprintln!("  ITE present; case-splitting before the SMT query");
+            }
+            let mut any_unknown = false;
+            for case_query in cases {
+                let (case_result, sat_query) = Self::check_sat_with_ite_case_split_recursive(
+                    smt,
+                    verbose,
+                    &case_query,
+                    depth + 1,
+                    max_depth,
+                );
+                match case_result {
+                    SmtResult::Sat(model) => {
+                        ite_sat = Some((SmtResult::Sat(model), sat_query.or(Some(case_query))));
+                        break;
+                    }
+                    SmtResult::Unsat
+                    | SmtResult::UnsatWithCore(_)
+                    | SmtResult::UnsatWithFarkas(_) => {}
+                    SmtResult::Unknown => any_unknown = true,
+                }
+            }
+            if ite_sat.is_none() && !any_unknown {
+                // Every branch UNSAT ⇒ the whole query is UNSAT.
+                return (SmtResult::Unsat, None);
+            }
+        }
+
         smt.reset();
         let result = if let Some(timeout) = smt.current_timeout() {
             smt.check_sat_with_timeout(query, timeout)
@@ -328,12 +379,27 @@ impl PdrSolver {
             return (result, None);
         }
 
+        // A SAT branch found by the pre-split still decides the query (the
+        // branch implies it), which is exactly what the old post-Unknown ITE
+        // split returned here.
+        if let Some(sat) = ite_sat {
+            return sat;
+        }
+
         // Depth limit reached - cannot split further
         if depth >= max_depth {
             return (SmtResult::Unknown, None);
         }
 
-        // Prefer splitting ITEs. If none are present, fall back to:
+        // The ITE split was already attempted above; when it could not decide
+        // the query there is nothing further to try (this matches the previous
+        // control flow, which reached the OR/DISEQ fallbacks only when the
+        // query had no ITE at all).
+        if ite_attempted {
+            return (SmtResult::Unknown, None);
+        }
+
+        // No ITE present. Fall back to:
         // - splitting a single OR under top-level conjuncts (common in CHC encodings)
         // - splitting a single disequality (not (= a b)) into (< a b) / (> a b)
         //
@@ -342,28 +408,25 @@ impl PdrSolver {
         const MAX_OR_SPLIT_CASES: usize = 8;
         const MAX_DISEQ_SPLIT_CANDIDATES: usize = 4;
 
-        let (split_kind, split_cases) =
-            if let Some([then_case, else_case]) = Self::split_ite_cases_anywhere(query) {
-                ("ITE", vec![then_case, else_case])
+        let (split_kind, split_cases) = {
+            let or_cases = Self::extract_or_cases_from_constraint(query);
+            if or_cases.len() > 1 && or_cases.len() <= MAX_OR_SPLIT_CASES {
+                ("OR", or_cases)
             } else {
-                let or_cases = Self::extract_or_cases_from_constraint(query);
-                if or_cases.len() > 1 && or_cases.len() <= MAX_OR_SPLIT_CASES {
-                    ("OR", or_cases)
-                } else {
-                    let diseqs = Self::extract_disequalities(query);
-                    if diseqs.is_empty() || diseqs.len() > MAX_DISEQ_SPLIT_CANDIDATES {
-                        return (SmtResult::Unknown, None);
-                    }
-                    let (lhs, rhs) = &diseqs[0];
-                    (
-                        "DISEQ",
-                        vec![
-                            query.replace_diseq(lhs, rhs, ChcExpr::lt(lhs.clone(), rhs.clone())),
-                            query.replace_diseq(lhs, rhs, ChcExpr::gt(lhs.clone(), rhs.clone())),
-                        ],
-                    )
+                let diseqs = Self::extract_disequalities(query);
+                if diseqs.is_empty() || diseqs.len() > MAX_DISEQ_SPLIT_CANDIDATES {
+                    return (SmtResult::Unknown, None);
                 }
-            };
+                let (lhs, rhs) = &diseqs[0];
+                (
+                    "DISEQ",
+                    vec![
+                        query.replace_diseq(lhs, rhs, ChcExpr::lt(lhs.clone(), rhs.clone())),
+                        query.replace_diseq(lhs, rhs, ChcExpr::gt(lhs.clone(), rhs.clone())),
+                    ],
+                )
+            }
+        };
 
         if verbose && depth == 0 {
             safe_eprintln!("  SMT returned Unknown; trying {split_kind} case-split");
@@ -398,7 +461,7 @@ impl PdrSolver {
     /// Find an ITE expression in an equality context: (= var (ite cond then else))
     pub(in crate::pdr::solver) fn find_ite_equality(
         expr: &ChcExpr,
-    ) -> Option<(String, ChcExpr, ChcExpr, ChcExpr)> {
+    ) -> Option<(ChcVar, ChcExpr, ChcExpr, ChcExpr)> {
         match expr {
             ChcExpr::Op(ChcOp::And, args) => {
                 for arg in args {
@@ -414,7 +477,7 @@ impl PdrSolver {
                     if let ChcExpr::Op(ChcOp::Ite, ite_args) = args[1].as_ref() {
                         if ite_args.len() == 3 {
                             return Some((
-                                v.name.clone(),
+                                v.clone(),
                                 ite_args[0].as_ref().clone(),
                                 ite_args[1].as_ref().clone(),
                                 ite_args[2].as_ref().clone(),
@@ -427,7 +490,7 @@ impl PdrSolver {
                     if let ChcExpr::Op(ChcOp::Ite, ite_args) = args[0].as_ref() {
                         if ite_args.len() == 3 {
                             return Some((
-                                v.name.clone(),
+                                v.clone(),
                                 ite_args[0].as_ref().clone(),
                                 ite_args[1].as_ref().clone(),
                                 ite_args[2].as_ref().clone(),
@@ -444,16 +507,13 @@ impl PdrSolver {
     /// Substitute ITE with a specific branch and add the condition as a conjunct.
     pub(in crate::pdr::solver) fn substitute_ite_case(
         constraint: &ChcExpr,
-        var: &str,
+        var: &ChcVar,
         value: &ChcExpr,
         cond: &ChcExpr,
         is_then: bool,
     ) -> ChcExpr {
         // Build the replacement equality: (= var value)
-        let value_eq = ChcExpr::eq(
-            ChcExpr::Var(ChcVar::new(var.to_string(), ChcSort::Int)),
-            value.clone(),
-        );
+        let value_eq = ChcExpr::eq(ChcExpr::Var(var.clone()), value.clone());
 
         // Build the condition: cond (for then) or (not cond) (for else)
         let cond_constraint = if is_then {
@@ -470,7 +530,7 @@ impl PdrSolver {
     /// Replace the ITE equality for a variable with a new equality.
     pub(in crate::pdr::solver) fn replace_ite_equality_with(
         expr: &ChcExpr,
-        var: &str,
+        var: &ChcVar,
         replacement: &ChcExpr,
     ) -> ChcExpr {
         crate::expr::maybe_grow_expr_stack(|| match expr {
@@ -484,8 +544,8 @@ impl PdrSolver {
             ChcExpr::Op(ChcOp::Eq, args) if args.len() == 2 => {
                 // Check if this is the ITE equality for the variable
                 let is_target = match (args[0].as_ref(), args[1].as_ref()) {
-                    (ChcExpr::Var(v), ChcExpr::Op(ChcOp::Ite, _)) => v.name == var,
-                    (ChcExpr::Op(ChcOp::Ite, _), ChcExpr::Var(v)) => v.name == var,
+                    (ChcExpr::Var(v), ChcExpr::Op(ChcOp::Ite, _)) => v == var,
+                    (ChcExpr::Op(ChcOp::Ite, _), ChcExpr::Var(v)) => v == var,
                     _ => false,
                 };
                 if is_target {

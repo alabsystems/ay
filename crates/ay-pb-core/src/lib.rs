@@ -344,5 +344,6 @@ pub use types::{
     PbRel, PbTerm, WboInstance,
 };
 pub use verify::{
-    parse_solver_output, verify, OptimalityCheck, SolverOutput, VerifyReport, Z3Mode,
+    parse_solver_output, verify, OptimalityCheck, SolverOutput, UnverifiedReason,
+    VerificationFailure, VerificationVerdict, VerifyReport, Z3Mode,
 };

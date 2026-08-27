@@ -34,11 +34,6 @@ pub fn parse_tlc_outcome(stdout: &str, stderr: &str, exit_code: Option<i32>) -> 
         combined.to_string()
     };
 
-    // Success marker.
-    if text.contains("Model checking completed. No error has been found.") {
-        return TlcOutcome::NoError;
-    }
-
     // Common failure markers (ordered by specificity).
 
     // Deadlock
@@ -112,6 +107,11 @@ pub fn parse_tlc_outcome(stdout: &str, stderr: &str, exit_code: Option<i32>) -> 
 
     if exit_code != Some(0) {
         return TlcOutcome::ExecutionFailed { exit_code };
+    }
+
+    // Accept success only from exit 0; wrappers can retain output before crashing.
+    if text.contains("Model checking completed. No error has been found.") {
+        return TlcOutcome::NoError;
     }
 
     TlcOutcome::Unknown { exit_code }

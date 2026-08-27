@@ -286,6 +286,61 @@ impl LiaSolver<'_> {
             });
         };
         let mut probe = self.build_conflict_probe(literals, &[]);
+
+        // #shared-eq-zero-core: ask the STRONGEST question FIRST — are the
+        // conflict literals infeasible with NO shared equality asserted at all?
+        // The scan below deliberately never asks it ("the check comes AFTER the
+        // first add, never before"), so a conflict that needs no shared-equality
+        // reason could only be discovered by asserting every candidate and
+        // failing — which lands the caller on the full-closure
+        // over-approximation, the very clause this probe exists to avoid.
+        //
+        // That is not a corner case, and the reason it is not is that the probe
+        // is NOT monotone in the asserted set: LIA gates its finite-domain CSP
+        // search on `shared_equalities` being EMPTY (`FINITE_DOMAIN_SKIPS`), so
+        // a probe holding one shared equality can answer `Sat`/`NeedSplit`
+        // where the SAME literals with none answer `Unsat`. Measured on the
+        // `inc_some_list` dual-vocabulary obligation
+        // (#dt-uf-bridge-congruence): the empty probe refutes 135/135
+        // augmentations, while the scan then asserts a 224-equality closure one
+        // at a time — ~232 full LIA checks apiece, 82 s of a 233 s solve, never
+        // reproducing the infeasibility — and hands back the whole closure. The
+        // emitted clause grows from the simplex's ~6 literals to 120-624, i.e.
+        // essentially the entire interface assignment, and CDCL degenerates
+        // into model enumeration (#7956). With the zero-core check the same
+        // solve emits at most 19 literals per conflict and the augmentation
+        // costs 26 ms in total.
+        //
+        // SOUNDNESS is the scan's own acceptance rule, unchanged and applied to
+        // the strongest subset: the empty set is RETURNED only after an actual
+        // probe check re-derives UNSAT from `literals` alone, never by
+        // inference from a recursion invariant. Contract 2 ("never empty")
+        // exists because #probe-qx can INFER an empty core from invariants that
+        // rest on partial `Unknown` answers; a directly PROVEN empty core
+        // carries the same authority as any proven singleton and yields the
+        // strongest sound clause available — exactly the negation of the
+        // conflict the theory already published.
+        //
+        // The CERTIFICATE rule below is untouched and its retention on this
+        // path is BETTER justified than on the pre-existing one, not worse.
+        // The #8147 hazard the drop-on-append rule guards is a certificate
+        // whose LITERAL SET is an incomplete explanation (the simplex builder
+        // missed pivoted-away shared-equality slack reasons), so
+        // `minimize_farkas_conflict`'s zero-coefficient strip could delete a
+        // load-bearing literal. This exit is reached only after a FRESH solver
+        // re-derives the infeasibility from those literals with no shared
+        // equality asserted at all — a direct proof that the literal set is a
+        // complete explanation, which is exactly what #8147 could not assume.
+        if !self.should_timeout() {
+            probe_checks += 1;
+            if probe_verdict_is_unsat(&probe.check()) {
+                probe_stats_record(probe_checks, true, 0);
+                record_hint(&[]);
+                PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
+                return Some(Vec::new());
+            }
+        }
+
         // Size guards: a hint as large as the whole candidate order proves
         // nothing the scan would not, and a large hint both weakens the
         // emitted clause (every member's reasons are appended) and makes the

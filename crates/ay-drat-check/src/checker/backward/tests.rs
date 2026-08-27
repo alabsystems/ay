@@ -28,7 +28,7 @@ fn test_backward_simple_proof() {
 }
 
 #[test]
-fn test_backward_checker_reuse_preserves_lazy_step_indexing() {
+fn test_backward_checker_rejects_reuse_across_formulas() {
     let clauses = vec![
         vec![lit(0, true), lit(1, true)],
         vec![lit(0, false), lit(1, true)],
@@ -44,7 +44,11 @@ fn test_backward_checker_reuse_preserves_lazy_step_indexing() {
     let mut checker = BackwardChecker::new(2, false);
 
     assert!(checker.verify(&clauses, &steps).is_ok());
-    assert!(checker.verify(&clauses, &steps).is_ok());
+    let sat = vec![vec![lit(0, true)]];
+    assert!(matches!(
+        checker.verify(&sat, &[]),
+        Err(crate::error::DratCheckError::CheckerNotFresh)
+    ));
 }
 
 #[test]

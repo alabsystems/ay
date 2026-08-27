@@ -688,14 +688,14 @@ impl RealAlgebraicValue {
         None
     }
 
-    /// z3 `root-obj` rendering of the value, or `None` when no derived
-    /// defining polynomial could be computed (callers fail closed) or when the
-    /// value is exactly rational (`Some(Err(rational))`-style is avoided —
-    /// use [`Self::to_number_for_output`] for the rational case).
+    /// z3 `root-obj` rendering. Certified rationals return `None`; an
+    /// unrepresentable non-identity also returns `None`; a declined identity
+    /// retains its exact stored defining polynomial and root index.
     pub fn to_smtlib(&self) -> Option<String> {
-        match self.to_number_for_output()? {
-            RealScalar::Rational(_) => None,
-            RealScalar::Algebraic(v) => Some(v.alpha.to_smtlib()),
+        match self.to_number_for_output() {
+            Some(RealScalar::Rational(_)) => None,
+            Some(RealScalar::Algebraic(v)) => Some(v.alpha.to_smtlib()),
+            None => self.is_identity().then(|| self.alpha.to_smtlib()),
         }
     }
 

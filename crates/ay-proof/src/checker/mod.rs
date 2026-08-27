@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
-
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod ite_premise;
 pub use ite_premise::assumed_is_authored_bool_ite_consequence;
@@ -12,10 +11,10 @@ pub(crate) use array_axiom::{
     RowChainEnd, RowChainPath,
 };
 pub use array_axiom::{
-    recognize_array_extensionality, recognize_array_extensionality_chain,
-    recognize_array_select_store, recognize_array_theory_lemma,
-    recognize_array_theory_lemma_with_typed_context, recognize_folded_array_extensionality,
-    ExtDiffRegistry,
+    ite_eval::recognize_array_row_chain_ite_eval, recognize_array_extensionality,
+    recognize_array_extensionality_chain, recognize_array_select_store,
+    recognize_array_theory_lemma, recognize_array_theory_lemma_with_typed_context,
+    recognize_folded_array_extensionality, ExtDiffRegistry,
 };
 mod array_finite;
 pub use array_finite::{
@@ -25,6 +24,7 @@ pub use array_finite::{
     recognize_array_finite_select_expansion_with_typed_context,
 };
 mod boolean;
+pub(crate) mod boolean_and_pos_shape;
 mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
@@ -61,8 +61,13 @@ pub use euf::{
     recognize_euf_congruent, recognize_euf_congruent_pred, recognize_euf_reflexive,
     recognize_euf_transitive,
 };
+mod euf_congruence_explanation;
+pub use euf_congruence_explanation::recognize_euf_congruence_explanation;
+mod euf_polarity_congruence;
+pub use euf_polarity_congruence::recognize_euf_polarity_congruence;
 mod euf_step_rules;
 mod fresh_def;
+mod fresh_def_dispatch;
 pub use fresh_def::FreshDefRegistry;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
@@ -82,6 +87,7 @@ mod order_ite;
 pub(crate) use order_ite::assignment_count as order_ite_assignment_count;
 pub use order_ite::recognize_order_ite_tautology;
 mod regex_empty;
+mod reordering;
 pub use regex_empty::recognize_regex_intersect_empty;
 mod regex_length;
 pub use regex_length::{recognize_regex_length_lower_bound, regex_min_length};
@@ -136,6 +142,8 @@ use ay_core::{
     TheoryLemmaKind,
 };
 use euf::{validate_euf_congruent, validate_euf_congruent_pred, validate_euf_transitive};
+use euf_congruence_explanation::validate_euf_congruence_explanation;
+use euf_polarity_congruence::validate_euf_polarity_congruence;
 pub(crate) use euf_step_rules::validate_symm;
 use euf_step_rules::{validate_cong, validate_refl, validate_trans};
 #[cfg(test)]
@@ -148,211 +156,36 @@ pub use string_word_identity::{
     recognize_string_concat_cancellation, recognize_string_containment_identity,
     recognize_string_ground_factor_conflict,
 };
-use thiserror::Error;
-/// Validation failure returned by [`check_proof`].
-#[derive(Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProofCheckError {
-    /// A caller-owned aggregate proof-validation resource envelope refused a
-    /// charge: the check needs more work or bytes than the caller reserved.
-    ///
-    /// This is a CALIBRATION verdict. The proof may be perfectly checkable; the
-    /// envelope simply is not wide enough, and the remedy lives in the charge
-    /// model or the envelope constant.
-    #[error("proof validation resource envelope exhausted")]
-    ResourceLimit,
-    /// The caller asked the check to stop: interrupt, solve deadline, or memory
-    /// ceiling.
-    ///
-    /// Kept SEPARATE from [`ProofCheckError::ResourceLimit`] because the two
-    /// have opposite remedies and mandatory certification degrades the verdict
-    /// for either one. Collapsing them made every downgrade look like a
-    /// calibration problem even when the caller had simply run out of time.
-    #[error("proof validation cancelled by the caller (interrupt, deadline, or memory limit)")]
-    Cancelled,
-    /// The proof has no steps.
-    #[error("proof is empty")]
-    EmptyProof,
-    /// A serialized proof bundle carried an unrecognized schema tag (a version
-    /// skew that could mis-decode); the bundle is rejected rather than trusted.
-    #[error("proof bundle schema mismatch: expected {expected}, found {found}")]
-    BundleSchemaMismatch {
-        /// The schema tag this build understands.
-        expected: String,
-        /// The schema tag found in the bundle.
-        found: String,
-    },
-    /// A serialized proof bundle violated the structural invariants required
-    /// before its untrusted term/proof tables can be indexed safely.
-    #[error("malformed proof bundle: {reason}")]
-    MalformedProofBundle {
-        /// Description of the first rejected structural invariant.
-        reason: String,
-    },
-    /// The exact datatype constructor/selector/tester signature table was
-    /// missing, incomplete, internally inconsistent, or contradicted a term.
-    #[error("invalid typed datatype signature context: {reason}")]
-    InvalidDatatypeSignatureContext {
-        /// Description of the first rejected context invariant.
-        reason: String,
-    },
-    /// A context-bound proof used a free assumption outside the supplied
-    /// problem obligation.
-    #[error("step {step} assumes term {term} outside the supplied problem obligation")]
-    UnauthorizedAssumption {
-        /// The unauthorized `Assume` step.
-        step: ProofId,
-        /// The term admitted as an unsupported hypothesis.
-        term: TermId,
-    },
-    /// The proof has steps but none of them produce a clause.
-    #[error("proof has no clause-producing steps")]
-    NoClauseProducingSteps,
-    /// A premise index is outside the proof range.
-    #[error("step {step} references missing premise {premise}")]
-    MissingPremise {
-        /// Step containing the invalid premise reference.
-        step: ProofId,
-        /// Referenced premise ID.
-        premise: ProofId,
-    },
-    /// A premise points to the current step or a future step.
-    #[error("step {step} references non-prior premise {premise}")]
-    NonPriorPremise {
-        /// Step containing the invalid premise reference.
-        step: ProofId,
-        /// Referenced premise ID.
-        premise: ProofId,
-    },
-    /// A premise points to an anchor (no clause).
-    #[error("step {step} premise {premise} does not produce a clause")]
-    PremiseHasNoClause {
-        /// Step containing the invalid premise reference.
-        step: ProofId,
-        /// Referenced premise ID.
-        premise: ProofId,
-    },
-    /// A resolution-style step does not match its premises.
-    #[error("step {step} has invalid {rule} derivation")]
-    InvalidResolution {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rule name (`resolution` or `th_resolution`).
-        rule: String,
-    },
-    /// A DRUP step is not reverse-unit-propagation valid.
-    #[error("step {step} has invalid drup derivation")]
-    InvalidDrup {
-        /// Invalid step ID.
-        step: ProofId,
-    },
-    /// Hole steps are placeholders and are never valid final proofs.
-    #[error("step {step} uses unsupported hole rule")]
-    HoleStep {
-        /// Invalid step ID.
-        step: ProofId,
-    },
-    /// The step's premise count cannot denote a resolution at all. Arity 2 is
-    /// checked binarily and arity > 2 as a left-to-right chain
-    /// (#dt-premise-binding), so this now fires only for 0 or 1 premises.
-    #[error("step {step} uses {rule} with unsupported premise count {premise_count}")]
-    UnsupportedResolutionArity {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rule name.
-        rule: String,
-        /// Number of premises provided by the step.
-        premise_count: usize,
-    },
-    /// A `resolution` / `th_resolution` step carries `:args`, but they are not
-    /// a well-formed Alethe pivot list.
-    ///
-    /// Alethe's argument-directed resolution takes a `(pivot, polarity)` PAIR
-    /// per link, i.e. `2 * (premises - 1)` arguments, with each polarity a
-    /// Boolean constant. carcara 1.1.0 routes any non-empty `:args` to that
-    /// checker and rejects the step outright when the count is wrong
-    /// (`expected 4 arguments, got 1`), so accepting a malformed list here is
-    /// exactly how AY would ship a proof carcara refuses. Distinct from
-    /// [`Self::InvalidResolution`] so the diagnostic names the count carcara
-    /// will demand instead of reporting a pivot search that never ran.
-    #[error(
-        "step {step} uses {rule} with malformed :args \
-         (expected {expected} pivot/polarity terms for {premise_count} premises, got {got})"
-    )]
-    MalformedResolutionArgs {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rule name (`resolution` or `th_resolution`).
-        rule: String,
-        /// Number of premises the step lists.
-        premise_count: usize,
-        /// Required argument count (`2 * (premise_count - 1)`).
-        expected: usize,
-        /// Argument count actually supplied.
-        got: usize,
-    },
-    /// The terminal clause-producing step must derive the empty clause.
-    #[error("final clause-producing step {step} is not the empty clause")]
-    FinalClauseNotEmpty {
-        /// Final clause-producing step ID.
-        step: ProofId,
-    },
-    /// Trust steps are unverified and rejected in strict mode.
-    #[error("step {step} uses unverified trust rule")]
-    TrustStep {
-        /// Invalid step ID.
-        step: ProofId,
-    },
-    /// A generic Alethe rule lacks semantic validation and is rejected in strict mode.
-    #[error("step {step} uses unvalidated rule {rule} in strict mode")]
-    UnvalidatedRule {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rule name.
-        rule: String,
-    },
-    /// Theory lemmas without a strict-mode semantic validator are rejected.
-    #[error("step {step} uses unsupported theory lemma kind {kind:?} in strict mode")]
-    UnsupportedTheoryLemmaKind {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rejected theory lemma kind.
-        kind: TheoryLemmaKind,
-    },
-    /// A theory lemma failed strict semantic validation.
-    #[error("step {step} has invalid theory lemma: {reason}")]
-    InvalidTheoryLemma {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Semantic validation failure detail.
-        reason: String,
-    },
-    /// A Boolean tautology or clausification rule failed structural validation.
-    #[error("step {step} has invalid {rule} rule: {reason}")]
-    InvalidBooleanRule {
-        /// Invalid step ID.
-        step: ProofId,
-        /// Rule name.
-        rule: String,
-        /// Validation failure detail.
-        reason: String,
-    },
-    /// Strict proof mode rejects proofs containing any trust steps (#8076).
-    ///
-    /// When `produce-proofs` is enabled with strict proof mode, every theory
-    /// must produce proper proof rules instead of falling back to `trust`.
-    /// The reason string identifies which theory lemma kinds triggered the
-    /// trust fallback.
-    #[error("{reason}")]
-    StrictProofModeTrust {
-        /// Description of which trust steps were found and their sources.
-        reason: String,
-    },
-}
+mod error;
+pub use error::ProofCheckError;
 
 /// Validate proof structure: premise linkage, resolution, DRUP, and terminal empty clause.
 /// Theory lemmas and trust-style rules are treated as axioms in this mode.
 pub fn check_proof(proof: &Proof, terms: &TermStore) -> Result<(), ProofCheckError> {
+    let mut unbounded = |_: usize, _: usize| true;
+    check_proof_with_progress(proof, terms, &mut unbounded)
+}
+
+/// [`check_proof`] under a CALLER-OWNED resource and cancellation envelope
+/// (#diagnostic-envelope).
+///
+/// The executor uses [`check_proof`] as a whole-proof REVERT GATE around proof
+/// surgery ("if the rebuilt proof does not check, put the original back"). That
+/// gate had no envelope: it bottoms out in `validate_step_with_datatypes`, whose
+/// meter is hardcoded to `|_, _| true`, so neither an interrupt, nor an expired
+/// solve deadline, nor a memory limit could stop it. MEASURED on deductive-checks's
+/// `datatype_ne_refutation` obligation, a 126,548-step / 393,087,456-literal
+/// triangular resolution proof held this gate for minutes at a time with every
+/// stop signal already raised.
+///
+/// A refusal is `ProofCheckError::ResourceLimit`, i.e. an `Err` — and an `Err`
+/// is exactly what every revert gate already reverts on. Fail-closed: the
+/// surgery is discarded and the original proof stands.
+pub fn check_proof_with_progress(
+    proof: &Proof,
+    terms: &TermStore,
+    progress: &mut dyn FnMut(usize, usize) -> bool,
+) -> Result<(), ProofCheckError> {
     if proof.steps.is_empty() {
         return Err(ProofCheckError::EmptyProof);
     }
@@ -365,13 +198,20 @@ pub fn check_proof(proof: &Proof, terms: &TermStore) -> Result<(), ProofCheckErr
 
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
     for (idx, step) in proof.steps.iter().enumerate() {
-        validate_step(
+        validate_step_with_datatypes_and_progress(
             terms,
             &mut derived_clauses,
             ProofId(idx as u32),
             step,
             false,
             None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            progress,
         )?;
     }
 
@@ -582,68 +422,56 @@ pub(crate) fn validate_problem_assumptions(
 /// Crate-internal re-export of the diff-witness introduction shape check for
 /// the Alethe printer, so a malformed introduction is a typed print error
 /// rather than a silently-rendered comment.
-/// Validate one `fresh_def_bound` step and return the clause it derives.
+/// Validate one fresh-definition step (`fresh_def_bound` or `fresh_def_eq`)
+/// and return the clause it derives.
 ///
-/// A `fresh_def_bound` is a DEFINITION, not an inference: it asserts one bound
-/// of `d = lin` for a symbol `d` the problem never mentions. Its clause is NOT
-/// a tautology, so unlike every theory-lemma kind it cannot be certified from
-/// the clause alone; what makes it sound is whole-proof provenance (`d` fresh,
-/// ONE definiens, no introduced symbol inside any definiens, matching sorts),
-/// enforced once in [`FreshDefRegistry::collect`]. Without that registry there
-/// is nothing to check against, so strict mode rejects; non-strict mode admits
-/// the clause exactly as it admits `trust`.
+/// A fresh-definition step is a DEFINITION, not an inference: it asserts one
+/// bound of `d = lin`, or the equality `d = lin` outright, for a symbol `d` the
+/// problem never mentions. Its clause is NOT a tautology, so unlike every
+/// theory-lemma kind it cannot be certified from the clause alone; what makes
+/// it sound is whole-proof provenance (`d` fresh, ONE definiens ACROSS BOTH
+/// RULES, no introduced symbol inside any definiens, matching sorts), enforced
+/// once in [`FreshDefRegistry::collect`]. Without that registry there is
+/// nothing to check against, so strict mode rejects; non-strict mode admits the
+/// clause exactly as it admits `trust`.
+///
+/// Non-strict mode never reaches this function: its caller returns the clause
+/// exactly as it does for `trust`.
 ///
 /// # Errors
 ///
-/// Returns [`ProofCheckError::InvalidTheoryLemma`] when strict mode has no
-/// registry, or when the registry declines this step.
-fn validate_fresh_def_bound_step(
+/// Returns [`ProofCheckError::InvalidTheoryLemma`] when there is no registry,
+/// when the rule is not a fresh-definition rule, or when the registry declines
+/// this step.
+fn validate_fresh_definition_step(
     terms: &TermStore,
+    rule: &AletheRule,
     step_id: ProofId,
     clause: &[TermId],
     premises: &[ProofId],
     args: &[TermId],
-    strict: bool,
     fresh_defs: Option<&FreshDefRegistry>,
 ) -> Result<Vec<TermId>, ProofCheckError> {
-    if !strict {
-        return Ok(clause.to_vec());
-    }
     let registry = fresh_defs.ok_or_else(|| ProofCheckError::InvalidTheoryLemma {
         step: step_id,
-        reason: "a fresh-definition bound needs the whole-proof provenance registry this \
-                 checker entry point does not build"
+        reason: "a fresh definition needs the whole-proof provenance registry this checker \
+                 entry point does not build"
             .to_string(),
     })?;
-    registry
-        .validate_bound(terms, step_id, clause, premises, args)
-        .map(|atom| vec![atom])
+    match rule {
+        AletheRule::FreshDefBound => {
+            registry.validate_bound(terms, step_id, clause, premises, args)
+        }
+        AletheRule::FreshDefEq => registry.validate_eq(terms, step_id, clause, premises, args),
+        other => Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!("`{}` is not a fresh-definition rule", other.name()),
+        }),
+    }
+    .map(|atom| vec![atom])
 }
 
-/// Printer-side shape gate for a `fresh_def_bound` step.
-///
-/// The printer emits this step's CLAUSE, so a malformed step must decline
-/// rather than reach the wire. Only the local shape is decided here; the
-/// whole-proof provenance is the strict checker's job and is not re-run for
-/// printing (the printer never claims the step is proved — it prints `hole`).
-///
-/// # Errors
-///
-/// Returns [`ProofCheckError::InvalidTheoryLemma`] when the step is malformed.
-pub(crate) fn validate_fresh_def_bound_for_printer(
-    terms: &TermStore,
-    step_id: ProofId,
-    clause: &[TermId],
-    premises: &[ProofId],
-    args: &[TermId],
-) -> Result<(), ProofCheckError> {
-    ay_core::proof_validation::recognize_fresh_def_bound(terms, clause, premises.len(), args)
-        .map(|_| ())
-        .map_err(|error| ProofCheckError::InvalidTheoryLemma {
-            step: step_id,
-            reason: error.to_string(),
-        })
-}
+pub(crate) use fresh_def_dispatch::validate_fresh_definition_for_printer;
 
 pub(crate) fn validate_ext_diff_intro_for_printer(
     terms: &TermStore,
@@ -668,15 +496,12 @@ include!("step_validation.rs");
 include!("theory_lemma_dispatch.rs");
 include!("theory_lemma_dispatch_extended.rs");
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
-
-#[cfg(test)]
 #[path = "fresh_def_tests.rs"]
 mod fresh_def_tests;
-// DRIFT-PROOF name-authority lint: every operator spelling a strict validator
-// keys on must be one `ay-frontend` guarantees denotes the native theory
-// operator. See the module docs for the bug class it kills.
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+// DRIFT-PROOF native-operator lint; see the module docs for the bug class.
 #[cfg(test)]
 #[path = "name_authority_tests.rs"]
 mod name_authority_tests;
@@ -699,9 +524,8 @@ fn validate_theory_lemma(
     ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
     datatype_member_signatures: Option<&[DatatypeMemberSignature]>,
     ext_diff: Option<&ExtDiffRegistry>,
-    // Problem-derived registry of sets asserted empty. `None` keeps
-    // `TheoryLemmaKind::SetCardEmptyByAssertion` fail-closed, exactly as a
-    // `None` `ext_diff` does for array extensionality.
+    // Problem-derived empty-set registry. `None` keeps `SetCardEmptyByAssertion`
+    // fail-closed, exactly as a `None` `ext_diff` does for extensionality.
     empty_sets: Option<&EmptySetRegistry>,
     // When `Some` AND a strict trust-kind (`Generic`) theory lemma is encountered,
     // the lemma is DEFERRED (its clause collected for independent re-discharge)
@@ -720,6 +544,7 @@ fn validate_theory_lemma(
                     | TheoryLemmaKind::EufReflexive
                     | TheoryLemmaKind::EufCongruent
                     | TheoryLemmaKind::EufCongruentPred
+                    | TheoryLemmaKind::EufCongruenceExplanation
                     | TheoryLemmaKind::DatatypeDistinct
                     | TheoryLemmaKind::DatatypeEnumPigeonhole
                     | TheoryLemmaKind::DatatypeSelectorProject
@@ -934,6 +759,12 @@ fn validate_generic_step(
         }
         AletheRule::Weakening if strict => {
             boolean_negation::validate_weakening(terms, step_id, clause, &premise_clauses)?;
+        }
+        // Clause permutation. Sound because an Alethe clause IS a disjunction
+        // and `or` is commutative; see `reordering` for the argument and for
+        // why the premise-arity guard is the soundness-critical half.
+        AletheRule::Reordering if strict => {
+            reordering::validate_reordering(terms, step_id, clause, &premise_clauses)?;
         }
         AletheRule::Refl if strict => {
             validate_refl(terms, step_id, clause)?;

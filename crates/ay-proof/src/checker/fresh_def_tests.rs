@@ -23,6 +23,8 @@ use num_bigint::BigInt;
 use super::fresh_def::FreshDefRegistry;
 use super::ProofCheckError;
 
+#[path = "fresh_def_eq_tests.rs"]
+mod eq;
 #[path = "fresh_def_strict_tests.rs"]
 mod strict;
 #[path = "fresh_def_sweep_tests.rs"]

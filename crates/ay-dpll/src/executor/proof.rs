@@ -11,6 +11,7 @@ mod authored_cascade;
 mod authored_collection_subset;
 mod authored_congruence;
 mod authored_conjunct_eval;
+mod authored_conjunct_leaf;
 mod authored_consequence_replay;
 mod authored_datatype;
 mod authored_divisibility;
@@ -23,6 +24,7 @@ mod authored_forall_witness;
 mod authored_guarded_linear;
 mod authored_helpers;
 mod authored_linear;
+mod authored_linear_subset;
 mod authored_negated_exists;
 mod authored_negated_exists_ground_inst;
 mod authored_nested_forall;
@@ -30,16 +32,29 @@ mod authored_nested_forall_search;
 mod authored_store_permutation;
 mod authored_string_length;
 mod authored_string_word_identity;
+mod build_unsat_assembly;
+mod build_unsat_finalize;
 mod bv_bitblast_collapse;
+mod bv_identity_promotion;
 mod bvand_commutative_congruence;
 mod check;
 mod collection_axiom_promotion;
+mod congruence_explanation;
+mod congruence_explanation_repack;
+mod conjunct_decomposition_leaf;
+mod conjunct_decomposition_leaf_fragment;
+mod consequence_replay_budget;
 mod contextual_array_row2;
 mod decline;
 mod double_negation;
 mod emission_budget;
 mod eq_transitive_surface;
+mod euf_congruence_finalize;
 mod exact_array_row2;
+mod exact_authored_affine_euf_refutation;
+mod exact_authored_bv_refutation;
+mod exact_authored_conjunct_refutation;
+mod exact_authored_false_refutation;
 mod extensionality_surface;
 mod false_source;
 mod finite_enum;
@@ -48,10 +63,22 @@ mod finite_enum_surface;
 mod finite_enum_tests;
 mod finite_select_surface;
 mod generic_promotion;
+mod intrinsic_leaf_promotion;
+mod ite_definition_leaf;
+mod ite_definition_leaf_fragment;
 mod ite_guard_promotion;
+mod la_disequality_split;
 mod lane_policy;
 mod lifecycle;
+mod minted_definition_leaf;
+mod minted_definition_leaf_fragment;
+mod minted_definition_leaf_mint;
+mod packed_boolean_tautology;
+mod packed_euf_reordering;
 mod reconstruction_fallbacks;
+mod rewritten_assertion_bridge;
+mod rewritten_assertion_bridge_fragment;
+mod rewritten_nonequality_bridge;
 mod surface_bv_rebuild;
 mod terminal_trust;
 
@@ -69,12 +96,11 @@ use ay_frontend::command::{
     Constant as FrontendConstant, Index as FrontendIndex, Term as FrontendTerm,
 };
 use ay_frontend::{Command, CommandResult, OptionValue};
-#[cfg(not(feature = "proof-checker"))]
-use ay_proof::{check_proof_partial, PartialProofCheck};
 use ay_proof::{export_alethe_with_problem_scope_and_overrides, AlethePrintError};
 use bvand_commutative_congruence::add_bvand_commutative_congruence_proof;
 pub use decline::ProofDeclineMechanism;
 use emission_budget::DEFAULT_ALETHE_EMISSION_WORK_BUDGET;
+use euf_congruence_finalize::finalize_euf_congruence_split;
 use num_bigint::BigInt;
 use surface_bv_rebuild::{
     build_bv_atom_pterm, build_bv_const, build_bv_pterm, build_qfbv_ite_pterm,
@@ -85,1868 +111,11 @@ use surface_bv_rebuild::{
 use crate::executor_types::SolveResult;
 
 use super::Executor;
+pub(in crate::executor) use consequence_replay_budget::ConsequenceReplayProbeBudget;
 pub(in crate::executor) use finite_enum::CheckedFiniteEnumPigeonholeProof;
 use finite_enum::MAX_RENDER_WORK as MAX_FINITE_ENUM_RENDER_WORK;
 
 impl Executor {
-    /// Build a proof for UNSAT result
-    ///
-    /// Creates an Alethe-compatible proof with assumptions for each assertion
-    /// and a final step deriving the empty clause.
-    pub(super) fn build_unsat_proof(&mut self) {
-        // A checked SAT sidecar authorizes one immutable trace/mapping/query bundle.
-        // Retire any prior candidate before inspecting it, including on suppressed exits.
-        //
-        // ...but ONLY when there IS a current bundle to inspect
-        // (#checked-sat-sidecar-second-call). This method is NOT idempotent: it `take()`s
-        // `last_clause_trace`, `last_var_to_term`, and `last_negations`, so a second call on the same
-        // query arrives with the trace already consumed. Retiring
-        // unconditionally then destroyed the sidecar the FIRST call had
-        // correctly minted and could not re-mint it, and the certification
-        // funnel fell through to the Alethe presentation, which on the DT
-        // lanes is a `Generic` trust stub that strict mode rejects. Measured on
-        // QF_DT `vlsat3_b83`: "no SAT clause trace is available" printed TWICE,
-        // and a correct `unsat` published as `unknown`.
-        //
-        // Keeping it is not weaker. The sidecar carries its own authority and
-        // is checked at USE by `is_current_for` against the query epoch, the
-        // frontend source stamp, the ordered roots and the ordered assumption
-        // slice, so a sidecar that no longer denotes this query is rejected
-        // there regardless of what happens here.
-        if self.last_clause_trace.is_some() {
-            self.last_checked_sat_refutation = None;
-        }
-        if self.last_unsat_proof_reconstruction_suppressed {
-            self.clear_finite_enum_proof_state();
-            return;
-        }
-        // `build_unsat_proof` consumes its generic SAT trace, so callers may
-        // invoke it twice for one query. Preserve an already checked bounded
-        // proof only when the sealed capability still authenticates the exact
-        // stored canonical proof.
-        if self.current_checked_finite_enum_proof().is_some() {
-            return;
-        }
-        self.last_checked_finite_enum_pigeonhole = None;
-        // The sealed path is an exception only to the existing oversized-
-        // source poison. Bounded queries retain the ordinary reconstruction
-        // path (including its broader accepted finite-enum source shapes).
-        if let Some(mechanism) = self.proof_source_decline() {
-            if self.last_finite_enum_pigeonhole.is_some()
-                && self.try_install_bounded_finite_enum_pigeonhole_proof()
-            {
-                return;
-            }
-            self.install_uncertifiable_proof_poison(mechanism);
-            return;
-        }
-        if self.last_clause_trace.is_some() {
-            self.refresh_checked_sat_refutation();
-        }
-        let mut proof = if self.proof_tracker.num_steps() > 0 {
-            let mut tracker_proof = self.proof_tracker.take_proof();
-            // (#7913 Phase C) When LIA preprocessing substituted variables,
-            // the tracker's Assume terms may be degenerate (e.g. `true`,
-            // `false`) rather than the original user assertions. This happens
-            // when VariableSubstitution replaces `(= x 3)` -> `(= 3 3)` ->
-            // `true`, making the SAT solver see trivial constants instead of
-            // the original equality atoms. Detect this by checking if ALL
-            // assume terms are boolean constants, and if so replace them with
-            // the original problem assertions.
-            let true_id = self.ctx.terms.true_term();
-            let false_id = self.ctx.terms.false_term();
-            let assume_terms: Vec<TermId> = tracker_proof
-                .steps
-                .iter()
-                .filter_map(|s| match s {
-                    ProofStep::Assume(t) => Some(*t),
-                    _ => None,
-                })
-                .collect();
-            let all_degenerate = !assume_terms.is_empty()
-                && assume_terms.iter().all(|t| *t == true_id || *t == false_id);
-            if all_degenerate {
-                let original_assertions = self.proof_original_problem_assertions();
-                if !original_assertions.is_empty() {
-                    let non_assume_steps: Vec<_> = tracker_proof
-                        .steps
-                        .into_iter()
-                        .filter(|s| !matches!(s, ProofStep::Assume(_)))
-                        .collect();
-                    tracker_proof = Proof::new();
-                    for (idx, assertion) in original_assertions.into_iter().enumerate() {
-                        tracker_proof.add_assume(assertion, Some(format!("h{idx}")));
-                    }
-                    for step in non_assume_steps {
-                        tracker_proof.add_step(step);
-                    }
-                }
-            }
-            tracker_proof
-        } else {
-            let mut proof = Proof::new();
-            let problem_assertions = self.proof_problem_assertions();
-            let mut assertions = if problem_assertions.is_empty() {
-                self.proof_original_problem_assertions()
-            } else {
-                problem_assertions
-            };
-            // (#h10/b22) check-sat-assuming holds the assumptions in
-            // `last_assumptions`, not in `ctx.assertions`. When the UNSAT verdict
-            // comes from a trivial fold of contradictory assumptions (e.g. two
-            // `(= x ..)` BV equalities) the SAT solver records no clause-level
-            // conflict, so the proof reconstructs with no Assume leaves at all and
-            // every empty-clause strategy fails, yielding an empty proof. Seed the
-            // assumptions as Assume steps so the contradictory-assumption /
-            // trust-lemma fallbacks can close the proof.
-            if let Some(assumptions) = self.last_assumptions.clone() {
-                for assumption in assumptions {
-                    if !assertions.contains(&assumption) {
-                        assertions.push(assumption);
-                    }
-                }
-            }
-            for (idx, assertion) in assertions.into_iter().enumerate() {
-                proof.add_assume(assertion, Some(format!("h{idx}")));
-            }
-            proof
-        };
-
-        // Capture the SAT-level LRAT bytes before SAT proof reconstruction
-        // consumes `last_clause_trace`. This is best-effort: traces with
-        // truncation or non-contiguous original clause IDs do not export a
-        // standalone LRAT certificate.
-        self.last_lrat_certificate = self
-            .last_clause_trace
-            .as_ref()
-            .and_then(clause_trace_to_lrat_bytes);
-
-        // Decompose single Generic/trust theory lemmas for combined real
-        // conflicts into EUF + arithmetic bridge pairs (#6756 Packet 2).
-        // Must run BEFORE ensure_empty_clause_derivation so the two-lemma
-        // closer (Packet 3) can find both lemmas.
-        Self::decompose_combined_real_conflict_lemmas(&mut self.ctx.terms, &mut proof);
-
-        // Build initial empty clause derivation (pre-rewrite).
-        self.ensure_empty_clause_derivation(&mut proof);
-
-        let hidden_equality_assertions = self.collect_hidden_problem_equality_assertions();
-
-        // Reconstruct missing Farkas coefficients for arithmetic theory lemmas
-        // (#6757). Must run AFTER ensure_empty_clause_derivation (which may
-        // create new TheoryLemma steps via SAT resolution reconstruction) but
-        // BEFORE apply_input_syntax_rewrites_to_proof (which can simplify
-        // linking equalities like `(= (select a 0) x)` to `true`, destroying
-        // the constraint that makes the conjunction infeasible for Farkas).
-        self.reconstruct_missing_farkas_and_demote(&mut proof, &hidden_equality_assertions);
-
-        if !crate::executor::proof_resolution::proof_structure_is_well_formed(&proof) {
-            tracing::warn!("proof contains dangling premise IDs before rewrite");
-        }
-        self.apply_input_syntax_rewrites_to_proof(&mut proof);
-
-        // Rewriting changes arithmetic rows and can merge literals. Transport
-        // preserves a positional certificate only when rebinding plus exact
-        // replay succeeds; this whole-proof sanitation is the final authority
-        // boundary for any annotation created outside that chokepoint. Clear
-        // and demote stale certificates before attempting reconstruction on the
-        // final syntax (#6757).
-        self.sanitize_rewritten_farkas_and_demote(&mut proof);
-
-        // Post-rewrite promotion (#6756): theory lemmas that were classified as
-        // Generic before surface-syntax rewrites may now have clause terms that
-        // match a more specific kind (e.g., LIA integer equality after array
-        // select/store rewriting). Re-infer the kind from the rewritten clause.
-        // #trust->0 C3: supply the datatype registries so DT shapes promote too.
-        let c3_dt_data = crate::theory_inference::dt_funnel_registry_data(&self.ctx);
-        let c3_dt = c3_dt_data
-            .as_ref()
-            .map(crate::theory_inference::DatatypeRegistries::from_data);
-        Self::promote_generic_theory_lemma_kinds_after_rewrite(
-            &self.ctx.terms,
-            &mut proof,
-            c3_dt.as_ref(),
-        );
-        // Post-rewrite Farkas for lemmas just promoted from Generic (#6756).
-        // Note: may fail for combined-theory clauses where rewriting simplified
-        // linking equalities; the pre-rewrite pass above is primary.
-        self.reconstruct_missing_farkas_and_demote(&mut proof, &hidden_equality_assertions);
-
-        // Term rewriting can merge distinct auxiliary variables into the same
-        // surface term, invalidating pre-rewrite resolution chains. Strip
-        // stale resolution steps and rebuild from the rewritten proof.
-        if !Self::proof_derives_valid_empty_clause(&self.ctx.terms, &proof) {
-            crate::executor::proof_resolution::strip_resolution_steps(&mut proof);
-            self.ensure_empty_clause_derivation(&mut proof);
-            // Reconstruct Farkas for any trust lemmas created by rebuild (#6757).
-            self.reconstruct_missing_farkas_and_demote(&mut proof, &hidden_equality_assertions);
-        }
-
-        // More than one subsystem may close the same solve. In particular, a
-        // quantified-instance producer can derive an authored `forall_inst`
-        // refutation before the ground solver later appends a weaker
-        // `Assume(instance) + trust` contradiction. Selecting the last empty
-        // clause would discard the certified proof and retain the foreign
-        // assumption. Prefer the first dependency cone that the independent
-        // strict checker accepts; bounded failure falls back to the historical
-        // final-empty selection and therefore remains fail closed.
-        const MAX_STRICT_EMPTY_CANDIDATES: usize = 32;
-        let empty_clause_roots: Vec<usize> = proof
-            .steps
-            .iter()
-            .enumerate()
-            .filter_map(|(index, step)| match step {
-                ProofStep::Resolution { clause, .. } | ProofStep::Step { clause, .. }
-                    if clause.is_empty() =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            })
-            .collect();
-        let mut selected_strict_root = false;
-        if empty_clause_roots.len() > 1 {
-            for target in empty_clause_roots
-                .iter()
-                .copied()
-                .take(MAX_STRICT_EMPTY_CANDIDATES)
-            {
-                let mut candidate = proof.clone();
-                if crate::executor::proof_resolution::prune_to_empty_clause_derivation_at(
-                    &mut candidate,
-                    target,
-                ) {
-                    match self.check_proof_strict_with_datatypes(&candidate) {
-                        Ok(_) => {
-                            proof = candidate;
-                            selected_strict_root = true;
-                            break;
-                        }
-                        Err(error) if ay_core::misc_cli_flags().trace_cegqi_attr => {
-                            eprintln!(
-                                "[quant-proof] empty root {target} strict selection declined: {error}"
-                            );
-                            for (index, step) in candidate.steps.iter().take(64).enumerate() {
-                                eprintln!("[quant-proof] candidate[{index}] = {step:?}");
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-        }
-        if !selected_strict_root {
-            crate::executor::proof_resolution::prune_to_empty_clause_derivation(&mut proof);
-        }
-
-        // RoundingMode finite-domain certification. The core represents
-        // SMT-LIB's built-in five-element sort as uninterpreted and injects its
-        // domain axioms before solving. SAT reconstruction can surface those
-        // roots either as Generic theory lemmas or as premiseless `trust`
-        // leaves. Promote only exact instances accepted by the proof checker's
-        // own five-mode recognizer; every other generated leaf remains trust.
-        self.rebuild_finite_enum_pigeonhole_refutation(&mut proof);
-        // The generic rebuild gets one ownership-checked opportunity. Do not
-        // retain a potentially large detector graph beside the final proof.
-        self.clear_finite_enum_proof_state();
-        self.rebuild_rounding_mode_pigeonhole_refutation(&mut proof);
-        Self::promote_rounding_mode_domain_lemmas(&self.ctx.terms, &mut proof);
-
-        // Contextual ROW2 repair (#trust-count→0): the eager array lane can
-        // record the context-dependent unit `select(store(a,i,v),j)=select(a,j)`
-        // and let SAT use the separate `i≠j` assertion.  A unit ROW2 equality
-        // is not a theorem.  Rebuild the load-bearing proof from the two original
-        // assertions with the self-contained guarded ROW2 clause before any
-        // quality/strictness decisions are made.
-        self.promote_contextual_array_row2_lemmas(&mut proof);
-        self.replace_with_exact_authored_array_row2_refutation(&mut proof);
-
-        // Datatype constructor-distinctness promotion (#8419 / trust_count→0).
-        // The live conflict classifier emits `(not (= C1(..) C2(..)))` for
-        // distinct constructors as Generic/trust because it does not carry the
-        // datatype registry. Now — on the pruned, load-bearing proof, with the
-        // elaboration context's declarations available — promote the confirmed
-        // distinctness lemmas to the strict-checkable `DatatypeDistinct` kind so
-        // the strict checker validates them and the terminal-trust gate no
-        // longer downgrades these UNSATs to unknown. Mirrors the existing
-        // `promote_generic_theory_lemma_kinds_after_rewrite` pass.
-        self.promote_datatype_distinct_lemmas(&mut proof);
-
-        // Integer-divisibility promotion (#trust-count→0): a linear conflict that
-        // is RATIONALLY satisfiable but INTEGER-infeasible (`2y = 7`: gcd 2 ∤ 7)
-        // is missed by Farkas reconstruction (rational) and, in a nonlinear
-        // context, emitted as `Generic`/trust. Promote each such single-literal
-        // lemma the checker's own recognizer confirms to the strict-checkable
-        // `LiaGeneric` + `Divisibility`. SOUND: the recognizer IS the strict
-        // checker's `validate_divisibility` (gcd test with an integer-sort guard),
-        // so a promoted step is independently re-validated; non-matching lemmas
-        // stay trust. No verdict change — the lemma is already a valid tautology.
-        Self::promote_lia_divisibility_lemmas(&self.ctx.terms, &mut proof);
-
-        // FP classification promotion (#trust-count→0): re-tag a Generic/trust FP
-        // classification/identity lemma to the strict-checkable `FpClassification`
-        // kind iff the checker's own recognizer confirms it (exhaustive bounded
-        // exact-IEEE evaluation). SOUND + fail-closed; see method.
-        Self::promote_fp_classification_lemmas(&self.ctx.terms, &mut proof);
-
-        // FP forward-error promotion (#trust-count→0): re-tag the Generic/trust
-        // lemma that closes a forward-error refutation (negated input facts +
-        // negated rounding-error goal) to the strict-checkable `FpForwardError`
-        // kind iff the checker's own analytic recognizer confirms it (full
-        // exact-rational re-derivation of the enclosure/error propagation).
-        // SOUND + fail-closed; see method.
-        Self::promote_fp_forward_error_lemmas(&self.ctx.terms, &mut proof);
-
-        // RoundingMode finite-domain proof promotion. The solve path injects
-        // exact five-value distinctness/coverage axioms because the core stores
-        // `RoundingMode` as an uninterpreted sort. Those formulas are FP-theory
-        // theorems, not authored assumptions. Promote only units accepted by
-        // the strict checker's exact schema recognizer; malformed or partial
-        // lookalikes remain trust/unauthorized and fail closed.
-        Self::promote_fp_rounding_mode_domain_axioms(&self.ctx.terms, &mut proof);
-
-        // Packed propositional clauses introduced by top-level connective
-        // flattening are generated tautologies, not authored assumptions.
-        // Promote only units accepted by the strict checker's structural
-        // complement/and-projection recognizer. This is deliberately separate
-        // from the RM-domain rule: one certifies Boolean clausification, the
-        // other certifies the fixed IEEE domain.
-        Self::promote_bool_tautology_leaves(&self.ctx.terms, &mut proof);
-
-        // str.len length-axiom promotion (#selfcert-strlen): the solver injects
-        // universally-valid str.len theorems (concat-length sum, empty↔zero,
-        // non-negativity, constant/equal length, containment bounds) during
-        // QF_SLIA/QF_S preprocessing. Being no authored premise, they surfaced as
-        // foreign `assume` leaves the #8821 provenance gate rejected, degrading a
-        // correct UNSAT to `unknown`. Re-tag each such leaf as the strict
-        // checker's independently re-derived `StringLengthLemma` rule; malformed
-        // lookalikes stay `assume` and fail closed.
-        Self::promote_string_length_lemma_axioms(&self.ctx.terms, &mut proof);
-
-        // Array read-over-write collapse (#trust-count→0): an assertion that is
-        // the negation of a ROW1 instance folds to `false` during elaboration,
-        // degenerating the UNSAT proof to a single empty-clause `trust` step.
-        // Reconstruct the assume + strict-checkable `ArraySelectStore` lemma +
-        // resolution from the parsed assertion. SOUND + fail-closed; see method.
-        self.promote_array_row_collapse(&mut proof);
-        self.promote_array_row_value_mismatch(&mut proof);
-
-        // Datatype selector-projection collapse (#trust-count→0): an assertion
-        // `(not (= (sel_i (C a..)) a_i))` folds to `false` during elaboration,
-        // degenerating the proof to a single empty-clause trust step.
-        // Reconstruct assume + strict-checkable `DatatypeSelectorProject` lemma +
-        // resolution from the parsed assertion. SOUND + fail-closed; see method.
-        self.promote_dt_selector_collapse(&mut proof);
-
-        self.promote_reflexive_collapse_family(&mut proof);
-
-        // Bitvector identity collapse (#trust-count→0): a small-width BV assertion
-        // `(not (= (OP a b) c))` whose equality is a bounded tautology folds to
-        // `false`, degenerating the proof to a single empty-clause trust step.
-        // Reconstruct assume + strict-checkable `BvBitBlast` lemma (re-validated
-        // by exhaustive bounded evaluation) + resolution. SOUND + fail-closed;
-        // see method.
-        self.promote_bv_identity_collapse(&mut proof);
-
-        // Linear-arithmetic identity collapse (#trust-count→0): an integer
-        // assertion `(not (= L R))` whose equality is a linear tautology (e.g.
-        // `(* x 0) = 0`) folds to `false`, degenerating the proof to a single
-        // empty-clause trust step. Reconstruct assume + strict-checkable
-        // `LiaGeneric`/`LinearIdentity` lemma + resolution. SOUND + fail-closed;
-        // see method.
-        self.promote_nia_linear_identity_collapse(&mut proof);
-
-        // Euclidean `mod` range collapse (#trust-count→0): an authored
-        // equality such as `(= (mod x 3) 4)` is rejected by the LIA encoder
-        // before a checkable range certificate survives, leaving a trust-backed
-        // terminal derivation. Rebuild the exact authored equality plus a
-        // strict-checkable `LiaModRange` theorem. The checker independently
-        // requires a non-zero constant divisor and an out-of-range constant
-        // remainder.
-        self.promote_lia_mod_range_collapse(&mut proof);
-
-        // If-then-else identical-branches collapse (#trust-count→0): an assertion
-        // `(not (= (ite c x x) x))` folds to `false`, degenerating the proof to a
-        // single empty-clause trust step. Reconstruct assume + strict-checkable
-        // `IteSame` lemma (raw `mk_ite_raw` keeps the ite) + resolution. SOUND +
-        // fail-closed; see method.
-        self.promote_ite_same_collapse(&mut proof);
-
-        // Boolean tautology collapse (#trust-count→0): a propositional
-        // contradiction assertion (e.g. `(not (= (not (not p)) p))`) folds to
-        // `false`, degenerating the proof to a single empty-clause trust step.
-        // Run this general bounded fallback after the more specific IteSame
-        // reconstruction so the latter retains its dedicated certificate and
-        // Lean firewall artifact. Reconstruct assume(A) + strict-checkable
-        // `BoolTautology` lemma `(not A)` (re-validated by exhaustive bounded
-        // evaluation) + resolution. SOUND + fail-closed; see method.
-        self.promote_bool_tautology_collapse(&mut proof);
-
-        // BV bit-blast whole-proof collapse (C5): a QF_BV UNSAT established
-        // through the eager bit-blast + SAT lane whose reconstructed proof
-        // degenerated to the single empty-clause `trust` step (and that none
-        // of the specific collapse promotions above could reconstruct).
-        // Faithfully rebuild every parsed assertion, then prefer an internal
-        // `BvBitBlast` lemma only when the checker independently recognizes
-        // the joint-negation clause and the assembled proof replays strict-
-        // complete. The Alethe printer still lowers this general lemma to an
-        // attributed `hole`: carcara's BV support requires cvc5's `@bbterm`
-        // convention, which ay's blaster does not produce.
-        // If either gate declines, preserve real `assume`s plus ONE attributed
-        // `hole` for the exact joint negation/closing chain. Every checkable
-        // step remains valid, and the unchecked gap remains explicit.
-        // Fail-closed: fires only on the degenerate shape, only when EVERY
-        // assertion faithfully rebuilds inside the QF_BV bool/BV fragment
-        // (per-node raw-application guards), and only when BV content is
-        // present. The strict gate rejects the fallback hole while accepting
-        // the independently checked `BvBitBlast` candidate.
-        self.rescue_bv_bitblast_collapse(&mut proof);
-
-        // NIA pin-substitution collapse (#trust-count→0): the residual trust step
-        // in pinned-multiplication infeasibility. After divisibility promotion the
-        // proof is trust(= k (* v c)) + divisibility(¬…) + resolution; the trust
-        // step derives the substituted equation from (= (* a b) k) ∧ (= a c).
-        // Reconstruct it as assume + eq_congruent + LinearIdentity bridge +
-        // eq_transitive + resolution. MUST run after promote_lia_divisibility_lemmas
-        // (the detection keys on step[1] already being LiaGeneric/Divisibility) and
-        // is orthogonal to split_euf_congruence_lemmas (that pass rewrites trust
-        // *TheoryLemma*s; this trust step is a *Step*). SOUND + fail-closed with a
-        // whole-proof check_proof_strict revert gate; see method.
-        self.promote_nia_pin_substitution(&mut proof);
-
-        // EUF fused-congruence split (#trust-count→0): the congruence closure
-        // emits `a=b ∧ b=c → f(a)=f(c)` as ONE `trust` lemma; split it into a
-        // checker-validated `eq_transitive` + `eq_congruent` + their resolution
-        // so the proof carries no trust step here. Fail-safe: only fires on the
-        // recognized unary-congruence-over-chain shape, reproduces the original
-        // clause exactly, and leaves any other lemma untouched.
-        Self::split_euf_congruence_lemmas(
-            &mut self.ctx.terms,
-            &mut proof,
-            &self.ground_conflict_decomp_meters,
-        );
-
-        // General certified EUF-leaf promotion. Unlike the all-or-nothing
-        // original-assertion surgery, this replaces only individually
-        // recognized Generic EUF leaves and preserves every Assume verbatim.
-        // That keeps independent proof obligations separate: an unrelated
-        // preprocessing-authority gap remains visible, while the EUF clause
-        // itself carries eq_congruent/eq_transitive/eq_congruent_pred plus an
-        // explicit weakening for unused conflict literals. Atomic strict
-        // validation prevents partial promotion from masking any other trust.
-        // Authenticated array-extensionality leaves are deferred: the EUF pass
-        // promotes them only on its strict clone; the final pass stays below.
-        // Boolean-ITE guard-clause rebuild (#ite-guard-promotion): an
-        // asserted Shannon-lifted `(ite c A B)` — the recorded update-axiom
-        // instance shape the consequence-replay probe re-solves — is
-        // clausified into the two guard clauses, whose assumes the demotion
-        // pass exported as premiseless `trust` steps. Re-derive each
-        // recognized guard clause from its authored root with
-        // `ite1`/`ite2`/`eq_symmetric` steps the strict checker re-validates;
-        // each chain is strict-checked in isolation before it may replace its
-        // leaf, and a declined chain leaves the `trust` step byte-identical.
-        // MUST run before `promote_certified_generic_euf_leaves`: that pass's
-        // whole-proof atomic gate reverts while these trust leaves remain,
-        // and this pass's output is what lets it commit. This is what lets
-        // the same-context probe certify frame-quantifier UNSAT (#mbqi-completeness Q2).
-        self.promote_shannon_ite_guard_trust_leaves(&mut proof);
-
-        self.promote_bool_finite_select_expansion_surface(&mut proof);
-        self.promote_certified_generic_euf_leaves(&mut proof);
-
-        // Shadowed-store equality expansion: the eager array fixpoint uses the
-        // compact, solve-friendly theorem
-        //
-        //   store(store(a,i,v),j,x) = store(store(a,i,w),j,x)
-        //     -> i=j OR v=w.
-        //
-        // It is a derived theorem, not a primitive ROW rule.  Replace only the
-        // exact Generic schema with a strict proof composed from equality
-        // congruence, ROW1/ROW2, transitivity, and resolution.  This runs after
-        // the generic EUF splitter so the whole-proof strict/revert gate is not
-        // defeated by another congruence lemma that the preceding pass can
-        // already discharge.
-        self.split_shadowed_store_equality_lemmas(&mut proof);
-
-        // Array extensionality certification (#ext-diff-cert). The eager array
-        // lane INJECTS the Skolemized extensionality axiom
-        // `(= a b) ∨ ¬(= (select a k) (select b k))` as an assertion; being no
-        // problem premise, it ended up either demoted to `trust` or rejected at
-        // export as a non-problem `assume`, and the `--self-check` gate degraded
-        // the whole (correct) UNSAT to `unknown`.
-        //
-        // The clause is NOT a tautology, so it cannot simply be relabelled a
-        // theory lemma. This pass instead records the WITNESS PROVENANCE as
-        // proof content — an `array_ext_diff_intro` step binding `k` to the
-        // pair it was minted for — which `ay-proof` then independently checks
-        // (bound once, not self-referential, and FRESH against the problem's
-        // own symbols). This second, idempotent call runs last: it appends steps
-        // that must survive every prune and matches the axiom in whichever shape
-        // the passes above left it. Fail-closed; see `proof_array_ext`.
-        self.promote_array_extensionality_axioms(&mut proof);
-
-        // Final RM authority boundary. Late proof surgery may retain the
-        // solver's weakened six-term conflict clause even after the injected
-        // domain/Boolean assumptions above were individually certified. The
-        // exact checker recognizes its load-bearing literal only when it is the
-        // complete K6 pairwise-distinct negation over the five-value RM domain.
-        // Re-run the same producer/checker predicate here, after every surgery;
-        // malformed, partial, or wrong-sort conflicts remain Generic and fail
-        // strict validation.
-        Self::promote_fp_rounding_mode_domain_axioms(&self.ctx.terms, &mut proof);
-
-        // Final str.len length-axiom boundary (#selfcert-strlen): mirror the RM
-        // boundary above — a late collapse/rebuild pass can re-materialize an
-        // injected length axiom as an `assume` leaf, so re-run the promotion here,
-        // after every surgery and immediately before proof validation, so no
-        // certified length theorem is left as a foreign assume.
-        Self::promote_string_length_lemma_axioms(&self.ctx.terms, &mut proof);
-
-        // Generic BV conflicts are promoted only after the strict checker's
-        // own semantic recognizer produces and replays a bit-blast/LRAT
-        // refutation of the exact clause. This covers both the small exhaustive
-        // lane and scalable width-32 identities while leaving SAT, unsupported,
-        // or unsurfaceable clauses Generic (and therefore fail-closed).
-        Self::promote_semantically_checked_bv_lemmas(&self.ctx.terms, &mut proof);
-
-        // Exact authored `false` premise (#verification-consumer-proof-assert-authority).
-        //
-        // A native consumer can legitimately assert the Boolean constant
-        // `false` after independently simplifying an obligation.  SAT proof
-        // reconstruction used to keep exploring unrelated theory conflicts in
-        // that case, leaving Generic/trust leaves on the terminal path even
-        // though the problem itself already contains the empty contradiction.
-        // Replace that defective detour with the smallest strict proof, but
-        // ONLY when the exact canonical `false` TermId is present in the
-        // independently assembled authored premise scope.  The replacement is
-        // committed only after the strict checker validates every step and the
-        // premise authorization against that same scope.
-        self.replace_with_exact_authored_false_refutation(&mut proof);
-        self.run_authored_replacement_cascade(&mut proof);
-
-        self.run_arithmetic_reconstruction_fallbacks(&mut proof);
-
-        // Some native certificate kinds are intentionally not surfaceable on
-        // the pinned Alethe wire (for example `BvLiaTautology`). They are
-        // valid internal certificates, but must not suppress an authored-root
-        // reconstruction that can produce a fully checkable document. Give
-        // the conjunction planner one final opportunity after the internal
-        // fallback; its atomic commit gate still requires a complete strict
-        // proof over the exact authored scope.
-        if self.proof_has_known_wire_gap(&proof) {
-            self.replace_with_exact_authored_conjunct_refutation(&mut proof, RepairEntry::Check);
-        }
-        false_source::demote_unattributed_assumed_false(self, &mut proof);
-        self.demote_unrenderable_eq_transitive_lemmas(&mut proof);
-        // Proof validation (#4393): validates all non-Hole steps via partial
-        // checker. Replaces the old check_proof + Hole-skip pattern that skipped
-        // entire proofs when ANY Hole step was present.
-        #[cfg(feature = "proof-checker")]
-        self.run_internal_proof_check(&proof);
-        #[cfg(not(feature = "proof-checker"))]
-        {
-            if self.strict_proofs_enabled() {
-                // Strict mode without proof-checker feature: use the strict
-                // checker with datatype-distinctness validation (#8419).
-                match self.check_proof_strict_with_datatypes(&proof) {
-                    Ok(_quality) => {
-                        let total = proof.steps.len() as u32;
-                        self.proof_check_result = Some(PartialProofCheck {
-                            checked_steps: total,
-                            skipped_hole_steps: 0,
-                            total_steps: total,
-                        });
-                    }
-                    Err(e) => {
-                        let total = proof.steps.len() as u32;
-                        self.proof_check_result = Some(PartialProofCheck {
-                            checked_steps: total,
-                            skipped_hole_steps: 0,
-                            total_steps: total,
-                        });
-                        tracing::error!(
-                            error = %e,
-                            total_steps = total,
-                            "strict proof checker rejected UNSAT proof"
-                        );
-                    }
-                }
-            } else {
-                let (partial, error) = check_proof_partial(&proof, &self.ctx.terms);
-                self.proof_check_result = Some(partial.clone());
-                if let Some(ref e) = error {
-                    tracing::error!(
-                        error = %e,
-                        result = %partial,
-                        "internal proof checker rejected UNSAT proof"
-                    );
-                }
-            }
-        }
-
-        // Proof quality metrics (#4176, #4420).
-        let quality = self.validate_and_measure_proof(&proof);
-        if let Some(ref q) = quality {
-            self.populate_proof_quality_stats(q);
-        }
-        self.last_proof_quality = quality;
-
-        // Postcondition contracts (#4642): proof built successfully.
-        debug_assert!(
-            !proof.steps.is_empty(),
-            "BUG: build_unsat_proof produced an empty proof"
-        );
-        debug_assert!(
-            Self::proof_derives_empty_clause(&proof),
-            "BUG: build_unsat_proof produced a proof that does not derive the empty clause"
-        );
-        #[cfg(feature = "proof-checker")]
-        debug_assert!(
-            self.proof_check_result.is_some(),
-            "BUG: build_unsat_proof did not run internal proof checker"
-        );
-
-        self.promote_final_collection_axioms(&mut proof);
-
-        self.last_proof = Some(proof);
-    }
-
-    /// Replace an arbitrary UNSAT derivation with the canonical proof from an
-    /// exact authored `false` premise.
-    ///
-    /// This is deliberately an identity test against the strict checker's
-    /// authored problem scope.  A normalized term that happens to fold to
-    /// `false`, a solver-injected `false`, or any non-Boolean lookalike cannot
-    /// authorize the rewrite.  The candidate is checked atomically before it
-    /// replaces the original proof, so a checker/printer rule mismatch fails
-    /// closed and leaves the original (possibly trust-bearing) proof visible.
-    fn replace_with_exact_authored_false_refutation(&mut self, proof: &mut Proof) {
-        let false_term = self.ctx.terms.false_term();
-        // A canonical `false` TermId is not enough: elaboration also maps any
-        // authored contradiction (for example `x - x <= -1`) to that same
-        // identifier. The shared premise-authority gate admits only exact
-        // literal-false assertion or assumption provenance.
-        if !self.boolean_constant_premises_authored().1
-            || !matches!(
-                self.ctx.terms.get(false_term),
-                TermData::Const(Constant::Bool(false))
-            )
-        {
-            return;
-        }
-
-        // Alethe's `false` rule proves `(not false)`.  Resolve that tautology
-        // against the exact authored `false` assumption to obtain the empty
-        // clause.  No trust/hole/theory shortcut participates.
-        let not_false = self.ctx.terms.mk_not_raw(false_term);
-        let mut candidate = Proof::new();
-        let premise = candidate.add_assume(false_term, Some("exact_authored_false".to_string()));
-        let tautology =
-            candidate.add_rule_step(AletheRule::False, vec![not_false], Vec::new(), Vec::new());
-        candidate.add_resolution(Vec::new(), false_term, premise, tautology);
-
-        if self.check_proof_strict_with_datatypes(&candidate).is_ok() {
-            *proof = candidate;
-        }
-    }
-
-    /// Rebuild a trust-bearing refutation directly from one exact authored
-    /// conjunction.
-    ///
-    /// Native API consumers commonly submit a theorem as one negated
-    /// implication. Canonical Boolean elaboration turns
-    /// `not (A -> C)` into an `and` whose leaves are the antecedent facts and
-    /// `not C`; solver preprocessing then reasons over those leaves.  A leaf is
-    /// not itself an authored assertion, so retaining it as an `Assume` or
-    /// relabelling it as `trust` is invalid.  This reconstruction instead:
-    ///
-    /// 1. assumes only the immutable authored root;
-    /// 2. derives every leaf with checked `and_pos` + resolution steps; and
-    /// 3. proves the contradiction with reconstructed Farkas, an exportable
-    ///    congruence/linear-identity chain, or strict EUF transitivity.
-    ///
-    /// Every candidate is atomically replayed by the strict checker and its
-    /// sole assumption is independently checked against the exact source scope.
-    fn replace_with_exact_authored_conjunct_refutation(
-        &mut self,
-        proof: &mut Proof,
-        entry: RepairEntry,
-    ) {
-        if entry == RepairEntry::Check && self.authored_cascade_publishable(proof) {
-            return;
-        }
-        fn collect_leaves(
-            terms: &TermStore,
-            term: TermId,
-            path: &mut Vec<u32>,
-            leaves: &mut Vec<(TermId, Vec<u32>)>,
-            include_root: bool,
-        ) {
-            if let TermData::App(Symbol::Named(name), args) = terms.get(term) {
-                if name == "and" {
-                    for (position, &child) in args.iter().enumerate() {
-                        path.push(position as u32);
-                        collect_leaves(terms, child, path, leaves, true);
-                        path.pop();
-                    }
-                    return;
-                }
-            }
-            if include_root || !path.is_empty() {
-                leaves.push((term, path.clone()));
-            }
-        }
-        // Route tags cannot collide with an `and` operand index: the source
-        // audit bounds every authored connective far below `u32::MAX`.
-        const NEGATED_IMPLIES_ANTECEDENT: u32 = u32::MAX;
-        const NEGATED_IMPLIES_CONSEQUENT: u32 = u32::MAX - 1;
-
-        fn derive_leaf(
-            terms: &mut TermStore,
-            proof: &mut Proof,
-            root_assume: ProofId,
-            root: TermId,
-            path: &[u32],
-        ) -> Option<ProofId> {
-            let mut current_id = root_assume;
-            let mut current_term = root;
-            let mut positions = path;
-
-            // Stable authored provenance now preserves the exact
-            // `not (=> A B)` root instead of authorizing its elaborated
-            // `(and A (not B))` surrogate. Derive the two components with the
-            // native Alethe implication rules, then continue ordinary
-            // `and_pos` projection inside A. No generated surrogate is ever
-            // assumed.
-            if let Some((&route, rest)) = positions.split_first() {
-                if matches!(
-                    route,
-                    NEGATED_IMPLIES_ANTECEDENT | NEGATED_IMPLIES_CONSEQUENT
-                ) {
-                    let TermData::Not(implication) = terms.get(root).clone() else {
-                        return None;
-                    };
-                    let TermData::App(Symbol::Named(operator), args) =
-                        terms.get(implication).clone()
-                    else {
-                        return None;
-                    };
-                    if operator != "=>" || args.len() != 2 {
-                        return None;
-                    }
-                    let component = if route == NEGATED_IMPLIES_ANTECEDENT {
-                        args[0]
-                    } else {
-                        terms.mk_not_raw(args[1])
-                    };
-                    let rule = if route == NEGATED_IMPLIES_ANTECEDENT {
-                        AletheRule::ImpliesNeg1
-                    } else {
-                        AletheRule::ImpliesNeg2
-                    };
-                    let projection = proof.add_rule_step(
-                        rule,
-                        vec![implication, component],
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    current_id =
-                        proof.add_resolution(vec![component], implication, projection, root_assume);
-                    current_term = component;
-                    positions = rest;
-                    if route == NEGATED_IMPLIES_CONSEQUENT && !positions.is_empty() {
-                        return None;
-                    }
-                }
-            }
-
-            for &position in positions {
-                let TermData::App(Symbol::Named(name), args) = terms.get(current_term) else {
-                    return None;
-                };
-                if name != "and" {
-                    return None;
-                }
-                let child = *args.get(position as usize)?;
-                let not_parent = terms.mk_not_raw(current_term);
-                let projection = proof.add_rule_step(
-                    AletheRule::AndPos(position),
-                    vec![not_parent, child],
-                    Vec::new(),
-                    vec![current_term],
-                );
-                current_id =
-                    proof.add_resolution(vec![child], current_term, projection, current_id);
-                current_term = child;
-            }
-            Some(current_id)
-        }
-
-        /// Build the exportable affine-equality proof used by concrete
-        /// arithmetic goals such as `x=2 ∧ y=3 ∧ x+y≠5`.
-        ///
-        /// A single internal Farkas certificate can validate this conflict by
-        /// case-splitting the disequality.  Alethe `la_generic`, however, has
-        /// only one signed linear combination and cannot encode both branches.
-        /// Keep internal and exported proof authority aligned by composing
-        /// ordinary checkable rules instead:
-        ///
-        /// * `eq_congruent` transports the authored argument equalities through
-        ///   the arithmetic application;
-        /// * `LinearIdentity` evaluates the resulting constant affine term;
-        /// * `eq_transitive` connects those equalities to the authored goal.
-        ///
-        /// Recognition is deliberately narrow.  Every application argument
-        /// must have its own positive equality leaf, and the constant bridge
-        /// must pass the checker's exact linear-identity recognizer.
-        fn build_affine_equality_refutation(
-            terms: &mut TermStore,
-            root: TermId,
-            leaves: &[(TermId, Vec<u32>)],
-        ) -> Option<Proof> {
-            for (goal_index, &(goal_leaf, ref goal_path)) in leaves.iter().enumerate() {
-                let TermData::Not(goal_eq) = terms.get(goal_leaf) else {
-                    continue;
-                };
-                let goal_eq = *goal_eq;
-                let Some((goal_lhs, goal_rhs)) = decode_eq_local(terms, goal_eq) else {
-                    continue;
-                };
-
-                for (source_app, target) in [(goal_lhs, goal_rhs), (goal_rhs, goal_lhs)] {
-                    if !matches!(terms.sort(source_app), Sort::Int)
-                        || !matches!(terms.sort(target), Sort::Int)
-                    {
-                        continue;
-                    }
-                    let TermData::App(source_symbol, source_args) = terms.get(source_app).clone()
-                    else {
-                        continue;
-                    };
-                    if source_args.is_empty() {
-                        continue;
-                    }
-
-                    let mut premise_indices = Vec::with_capacity(source_args.len());
-                    let mut premise_equalities = Vec::with_capacity(source_args.len());
-                    let mut replacement_args = Vec::with_capacity(source_args.len());
-                    let mut complete = true;
-                    for source_arg in source_args {
-                        let matched =
-                            leaves
-                                .iter()
-                                .enumerate()
-                                .find_map(|(leaf_index, &(leaf, _))| {
-                                    if leaf_index == goal_index
-                                        || premise_indices.contains(&leaf_index)
-                                        || matches!(terms.get(leaf), TermData::Not(_))
-                                    {
-                                        return None;
-                                    }
-                                    let (lhs, rhs) = decode_eq_local(terms, leaf)?;
-                                    if lhs == source_arg
-                                        && terms.sort(rhs) == terms.sort(source_arg)
-                                    {
-                                        Some((leaf_index, leaf, rhs))
-                                    } else if rhs == source_arg
-                                        && terms.sort(lhs) == terms.sort(source_arg)
-                                    {
-                                        Some((leaf_index, leaf, lhs))
-                                    } else {
-                                        None
-                                    }
-                                });
-                        let Some((leaf_index, equality, replacement)) = matched else {
-                            complete = false;
-                            break;
-                        };
-                        premise_indices.push(leaf_index);
-                        premise_equalities.push(equality);
-                        replacement_args.push(replacement);
-                    }
-                    if !complete {
-                        continue;
-                    }
-
-                    let app_sort = terms.sort(source_app).clone();
-                    let replacement_app =
-                        terms.mk_app(source_symbol.clone(), replacement_args, app_sort);
-                    if replacement_app == source_app {
-                        continue;
-                    }
-                    let congruence_eq = terms.mk_app(
-                        Symbol::named("="),
-                        [source_app, replacement_app],
-                        Sort::Bool,
-                    );
-                    let identity_eq =
-                        terms.mk_app(Symbol::named("="), [replacement_app, target], Sort::Bool);
-                    if !ay_core::proof_validation::recognize_lia_linear_identity(
-                        terms,
-                        &[identity_eq],
-                    ) {
-                        continue;
-                    }
-
-                    let mut candidate = Proof::new();
-                    let root_assume = candidate.add_assume(root, None);
-                    let mut premise_units = Vec::with_capacity(premise_indices.len());
-                    for &leaf_index in &premise_indices {
-                        let unit = derive_leaf(
-                            terms,
-                            &mut candidate,
-                            root_assume,
-                            root,
-                            &leaves[leaf_index].1,
-                        )?;
-                        premise_units.push(unit);
-                    }
-                    let goal_unit =
-                        derive_leaf(terms, &mut candidate, root_assume, root, goal_path)?;
-
-                    let mut congruence_clause = Vec::with_capacity(premise_equalities.len() + 1);
-                    for &equality in &premise_equalities {
-                        congruence_clause.push(terms.mk_not_raw(equality));
-                    }
-                    congruence_clause.push(congruence_eq);
-                    let mut congruence_unit = candidate.add_rule_step(
-                        AletheRule::EqCongruent,
-                        congruence_clause.clone(),
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    let mut residual = congruence_clause;
-                    for (&equality, &unit) in premise_equalities.iter().zip(premise_units.iter()) {
-                        let negated = terms.mk_not_raw(equality);
-                        let position = residual.iter().position(|&lit| lit == negated)?;
-                        let _ = residual.remove(position);
-                        congruence_unit = candidate.add_resolution(
-                            residual.clone(),
-                            equality,
-                            congruence_unit,
-                            unit,
-                        );
-                    }
-                    if residual != [congruence_eq] {
-                        continue;
-                    }
-
-                    let identity = candidate.add_step(ProofStep::TheoryLemma {
-                        theory: "LIA".to_string(),
-                        clause: vec![identity_eq],
-                        farkas: Some(FarkasAnnotation::new(vec![num_rational::Rational64::from(
-                            1,
-                        )])),
-                        kind: TheoryLemmaKind::LiaGeneric,
-                        lia: Some(ay_core::LiaAnnotation::LinearIdentity),
-                    });
-                    let not_congruence = terms.mk_not_raw(congruence_eq);
-                    let not_identity = terms.mk_not_raw(identity_eq);
-                    let transitivity = candidate.add_rule_step(
-                        AletheRule::EqTransitive,
-                        vec![not_congruence, not_identity, goal_eq],
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    let goal_from_congruence = candidate.add_resolution(
-                        vec![not_identity, goal_eq],
-                        congruence_eq,
-                        transitivity,
-                        congruence_unit,
-                    );
-                    let goal = candidate.add_resolution(
-                        vec![goal_eq],
-                        identity_eq,
-                        goal_from_congruence,
-                        identity,
-                    );
-                    candidate.add_resolution(Vec::new(), goal_eq, goal, goal_unit);
-                    return Some(candidate);
-                }
-            }
-            None
-        }
-
-        const MAX_AUTHORED_CONJUNCTS: usize = 64;
-        let authored = self.exact_concrete_authored_scope();
-        let parsed_assertions = self.ctx.assertions_parsed().to_vec();
-        let original_assertions = self.proof_original_problem_assertions();
-        for &root in &authored {
-            let mut leaves = Vec::new();
-            let root_shape = self.ctx.terms.get(root).clone();
-            if let TermData::Not(implication) = root_shape {
-                if let TermData::App(Symbol::Named(operator), args) =
-                    self.ctx.terms.get(implication).clone()
-                {
-                    if operator == "=>" && args.len() == 2 {
-                        let mut antecedent_leaves = Vec::new();
-                        collect_leaves(
-                            &self.ctx.terms,
-                            args[0],
-                            &mut Vec::new(),
-                            &mut antecedent_leaves,
-                            true,
-                        );
-                        for (leaf, mut path) in antecedent_leaves {
-                            path.insert(0, NEGATED_IMPLIES_ANTECEDENT);
-                            leaves.push((leaf, path));
-                        }
-                        let not_consequent = self.ctx.terms.mk_not_raw(args[1]);
-                        leaves.push((not_consequent, vec![NEGATED_IMPLIES_CONSEQUENT]));
-                    }
-                }
-            }
-            if leaves.is_empty() {
-                collect_leaves(&self.ctx.terms, root, &mut Vec::new(), &mut leaves, false);
-            }
-            if leaves.len() < 2 || leaves.len() > MAX_AUTHORED_CONJUNCTS {
-                continue;
-            }
-
-            let mut blocking_clause = Vec::with_capacity(leaves.len());
-            let mut pivots = Vec::with_capacity(leaves.len());
-            for &(leaf, _) in &leaves {
-                match self.ctx.terms.get(leaf).clone() {
-                    TermData::Not(inner) => {
-                        blocking_clause.push(inner);
-                        pivots.push(inner);
-                    }
-                    _ => {
-                        blocking_clause.push(self.ctx.terms.mk_not_raw(leaf));
-                        pivots.push(leaf);
-                    }
-                }
-            }
-
-            if let Some(candidate) =
-                build_affine_equality_refutation(&mut self.ctx.terms, root, &leaves)
-            {
-                if self.commit_if_strictly_checked(proof, candidate, &authored) {
-                    self.restore_authored_root_surface_after_conjunct_rebuild(
-                        root,
-                        &original_assertions,
-                        &parsed_assertions,
-                    );
-                    return;
-                }
-            }
-
-            let mut theory_candidates = Vec::new();
-            let mut farkas = None;
-            let mut kind = TheoryLemmaKind::Generic;
-            if super::proof_farkas::try_lra_farkas_reconstruction(
-                &self.ctx.terms,
-                &blocking_clause,
-                &mut farkas,
-                &mut kind,
-            ) && !kind.is_trust()
-            {
-                // A rational Farkas contradiction is valid for both Real and
-                // Int domains. Use the strict Farkas rule directly; the LIA
-                // annotations describe integer-only arguments and are neither
-                // needed nor appropriate for this rational certificate.
-                theory_candidates.push((TheoryLemmaKind::LraFarkas, farkas, None));
-            }
-            // EUF equality transitivity is an Alethe rule rather than a
-            // TheoryLemma kind. The strict checker decides whether this exact
-            // blocking clause is a valid chain; non-EUF lookalikes fail closed.
-            theory_candidates.push((
-                TheoryLemmaKind::Generic,
-                None,
-                Some(AletheRule::EqTransitive),
-            ));
-
-            for (kind, farkas, boolean_rule) in theory_candidates {
-                let mut candidate = Proof::new();
-                let root_assume = candidate.add_assume(root, None);
-                let mut leaf_units = Vec::with_capacity(leaves.len());
-                let mut derivation_failed = false;
-                for (_, path) in &leaves {
-                    let Some(unit) =
-                        derive_leaf(&mut self.ctx.terms, &mut candidate, root_assume, root, path)
-                    else {
-                        derivation_failed = true;
-                        break;
-                    };
-                    leaf_units.push(unit);
-                }
-                if derivation_failed {
-                    continue;
-                }
-
-                let mut current = if let Some(rule) = boolean_rule {
-                    candidate.add_rule_step(rule, blocking_clause.clone(), Vec::new(), Vec::new())
-                } else {
-                    candidate.add_step(ProofStep::TheoryLemma {
-                        theory: "LIA".to_string(),
-                        clause: blocking_clause.clone(),
-                        farkas,
-                        kind,
-                        lia: None,
-                    })
-                };
-                let mut residual = blocking_clause.clone();
-                for ((&pivot, &(leaf, _)), &leaf_unit) in
-                    pivots.iter().zip(leaves.iter()).zip(leaf_units.iter())
-                {
-                    let complement = if matches!(self.ctx.terms.get(leaf), TermData::Not(_)) {
-                        pivot
-                    } else {
-                        self.ctx.terms.mk_not_raw(leaf)
-                    };
-                    let Some(position) = residual.iter().position(|&lit| lit == complement) else {
-                        derivation_failed = true;
-                        break;
-                    };
-                    let _ = residual.remove(position);
-                    current = candidate.add_resolution(residual.clone(), pivot, current, leaf_unit);
-                }
-                if derivation_failed || !residual.is_empty() {
-                    continue;
-                }
-                if self.commit_if_strictly_checked(proof, candidate, &authored) {
-                    self.restore_authored_root_surface_after_conjunct_rebuild(
-                        root,
-                        &original_assertions,
-                        &parsed_assertions,
-                    );
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Restore only the exact authored spelling of the assumed root after the
-    /// canonical conjunction reconstruction has passed its strict commit
-    /// gate. Derived operands keep their checker-validated canonical spelling;
-    /// the root override affects the `assume` line and the negative gate in
-    /// `and_pos`, which the Alethe printer validates as exact complements.
-    fn restore_authored_root_surface_after_conjunct_rebuild(
-        &mut self,
-        root: TermId,
-        originals: &[TermId],
-        parsed: &[FrontendTerm],
-    ) {
-        if !super::proof_surface_syntax::surface_override_roots_have_bounded_work(
-            &self.ctx.terms,
-            [root],
-        ) {
-            return;
-        }
-        let Some(index) = originals.iter().position(|&term| term == root) else {
-            return;
-        };
-        let Some(source) = parsed.get(index) else {
-            return;
-        };
-        let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
-        if !super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
-            return;
-        }
-        super::proof_surface_syntax::collect_root_surface_term_override(
-            &mut self.ctx,
-            root,
-            source,
-            &mut overrides,
-        );
-        if !super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
-            return;
-        }
-        self.last_proof_term_overrides = Some(overrides);
-    }
-
-    /// Rebuild the exact mixed LIA/EUF value-conflict lane from authored
-    /// premises.
-    ///
-    /// A common UFLIA refutation is lost when arithmetic preprocessing derives
-    /// an argument equality before EUF closes a value conflict:
-    ///
-    /// `a + b = c, b = 0, f(a) = v, f(c) != v`.
-    ///
-    /// Reconstruct it as a checked composition: Farkas derives each needed
-    /// argument equality, `eq_congruent` transports the application, and
-    /// `eq_transitive` transports the known value. Only exact immutable roots
-    /// are assumed, and the whole candidate is replayed strictly before use.
-    fn replace_with_exact_authored_affine_euf_refutation(&mut self, proof: &mut Proof) {
-        const MAX_AUTHORED_ROOTS: usize = 64;
-        const MAX_ARITH_ROOTS: usize = 12;
-
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
-            return;
-        }
-        let authored = self.exact_concrete_authored_scope();
-        if authored.is_empty() || authored.len() > MAX_AUTHORED_ROOTS {
-            return;
-        }
-
-        fn is_pure_linear_term(terms: &TermStore, term: TermId) -> bool {
-            if !matches!(terms.sort(term), Sort::Int | Sort::Real) {
-                return false;
-            }
-            match terms.get(term) {
-                TermData::Const(_) | TermData::Var(..) => true,
-                TermData::App(Symbol::Named(operator), args) => match operator.as_str() {
-                    "+" | "-" | "*" => args.iter().all(|&arg| is_pure_linear_term(terms, arg)),
-                    _ => args.is_empty(),
-                },
-                _ => false,
-            }
-        }
-
-        fn is_pure_linear_literal(terms: &TermStore, literal: TermId) -> bool {
-            let atom = match terms.get(literal) {
-                TermData::Not(inner) => *inner,
-                _ => literal,
-            };
-            let TermData::App(Symbol::Named(operator), args) = terms.get(atom) else {
-                return false;
-            };
-            args.len() == 2
-                && matches!(operator.as_str(), "=" | "<" | "<=" | ">" | ">=")
-                && terms.sort(args[0]) == terms.sort(args[1])
-                && is_pure_linear_term(terms, args[0])
-                && is_pure_linear_term(terms, args[1])
-        }
-
-        fn assume_exact(
-            candidate: &mut Proof,
-            assumptions: &mut Vec<(TermId, ProofId)>,
-            term: TermId,
-        ) -> ProofId {
-            if let Some((_, id)) = assumptions.iter().find(|(existing, _)| *existing == term) {
-                return *id;
-            }
-            let id = candidate.add_assume(term, None);
-            assumptions.push((term, id));
-            id
-        }
-
-        fn derive_affine_literal(
-            terms: &mut TermStore,
-            candidate: &mut Proof,
-            assumptions: &mut Vec<(TermId, ProofId)>,
-            arithmetic_roots: &[TermId],
-            conclusion: TermId,
-        ) -> Option<ProofId> {
-            if arithmetic_roots.is_empty() || arithmetic_roots.len() > MAX_ARITH_ROOTS {
-                return None;
-            }
-            // Prefer smaller premise sets. Besides producing compact proofs,
-            // this avoids zero-coefficient baggage that external la_generic
-            // checkers disagree about.
-            for cardinality in 1..=arithmetic_roots.len() {
-                let limit = 1_u64.checked_shl(arithmetic_roots.len() as u32)?;
-                for mask in 1_u64..limit {
-                    if mask.count_ones() as usize != cardinality {
-                        continue;
-                    }
-                    let selected: Vec<TermId> = arithmetic_roots
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, &root)| {
-                            ((mask & (1_u64 << index)) != 0).then_some(root)
-                        })
-                        .collect();
-                    let mut clause: Vec<TermId> = selected
-                        .iter()
-                        .map(|&root| terms.mk_not_raw(root))
-                        .collect();
-                    clause.push(conclusion);
-                    let mut farkas = None;
-                    let mut inferred = TheoryLemmaKind::Generic;
-                    if !super::proof_farkas::try_lra_farkas_reconstruction(
-                        terms,
-                        &clause,
-                        &mut farkas,
-                        &mut inferred,
-                    ) {
-                        continue;
-                    }
-                    let farkas = farkas?;
-                    let mut current = candidate.add_step(ProofStep::TheoryLemma {
-                        theory: "LRA".to_string(),
-                        clause: clause.clone(),
-                        farkas: Some(farkas),
-                        kind: TheoryLemmaKind::LraFarkas,
-                        lia: None,
-                    });
-                    let mut residual = clause;
-                    for root in selected {
-                        let negated = terms.mk_not_raw(root);
-                        let position = residual.iter().position(|&term| term == negated)?;
-                        let _ = residual.remove(position);
-                        let premise = assume_exact(candidate, assumptions, root);
-                        current =
-                            candidate.add_resolution(residual.clone(), root, current, premise);
-                    }
-                    if residual == [conclusion] {
-                        return Some(current);
-                    }
-                    return None;
-                }
-            }
-            None
-        }
-
-        let arithmetic_roots: Vec<TermId> = authored
-            .iter()
-            .copied()
-            .filter(|&root| is_pure_linear_literal(&self.ctx.terms, root))
-            .collect();
-        if arithmetic_roots.is_empty() || arithmetic_roots.len() > MAX_ARITH_ROOTS {
-            return;
-        }
-
-        for &negative_root in &authored {
-            let TermData::Not(goal_equality) = self.ctx.terms.get(negative_root) else {
-                continue;
-            };
-            let goal_equality = *goal_equality;
-            let Some((goal_lhs, goal_rhs)) = decode_eq_local(&self.ctx.terms, goal_equality) else {
-                continue;
-            };
-            for (goal_app, value) in [(goal_lhs, goal_rhs), (goal_rhs, goal_lhs)] {
-                let TermData::App(goal_symbol, goal_args) = self.ctx.terms.get(goal_app).clone()
-                else {
-                    continue;
-                };
-                // This reconstruction is specifically for EUF transport.
-                // Interpreted applications such as `count + 1` are not function
-                // symbols to pair by congruence here; admitting them sends pure
-                // incremental LIA proofs through an exponential subset search.
-                if goal_args.is_empty()
-                    || is_pure_linear_term(&self.ctx.terms, goal_app)
-                    || ay_frontend::is_reserved_symbol(goal_symbol.name())
-                {
-                    continue;
-                }
-                for &value_root in &authored {
-                    if value_root == negative_root || arithmetic_roots.contains(&value_root) {
-                        continue;
-                    }
-                    let Some((value_lhs, value_rhs)) = decode_eq_local(&self.ctx.terms, value_root)
-                    else {
-                        continue;
-                    };
-                    for (source_app, source_value) in
-                        [(value_lhs, value_rhs), (value_rhs, value_lhs)]
-                    {
-                        if source_value != value {
-                            continue;
-                        }
-                        let TermData::App(source_symbol, source_args) =
-                            self.ctx.terms.get(source_app).clone()
-                        else {
-                            continue;
-                        };
-                        if source_symbol != goal_symbol
-                            || source_args.len() != goal_args.len()
-                            || source_args.is_empty()
-                        {
-                            continue;
-                        }
-
-                        let mut candidate = Proof::new();
-                        let mut assumptions = Vec::new();
-                        let mut argument_equalities = Vec::with_capacity(source_args.len());
-                        let mut argument_units = Vec::with_capacity(source_args.len());
-                        let mut failed = false;
-                        for (&source_arg, &goal_arg) in source_args.iter().zip(goal_args.iter()) {
-                            let argument_equality = self.ctx.terms.mk_app(
-                                Symbol::named("="),
-                                [source_arg, goal_arg],
-                                Sort::Bool,
-                            );
-                            let unit = if source_arg == goal_arg {
-                                candidate.add_rule_step(
-                                    AletheRule::EqReflexive,
-                                    vec![argument_equality],
-                                    Vec::new(),
-                                    Vec::new(),
-                                )
-                            } else {
-                                let forward = self.ctx.terms.mk_app(
-                                    Symbol::named("<="),
-                                    [source_arg, goal_arg],
-                                    Sort::Bool,
-                                );
-                                let reverse = self.ctx.terms.mk_app(
-                                    Symbol::named("<="),
-                                    [goal_arg, source_arg],
-                                    Sort::Bool,
-                                );
-                                let Some(forward_unit) = derive_affine_literal(
-                                    &mut self.ctx.terms,
-                                    &mut candidate,
-                                    &mut assumptions,
-                                    &arithmetic_roots,
-                                    forward,
-                                ) else {
-                                    failed = true;
-                                    break;
-                                };
-                                let Some(reverse_unit) = derive_affine_literal(
-                                    &mut self.ctx.terms,
-                                    &mut candidate,
-                                    &mut assumptions,
-                                    &arithmetic_roots,
-                                    reverse,
-                                ) else {
-                                    failed = true;
-                                    break;
-                                };
-                                let not_forward = self.ctx.terms.mk_not_raw(forward);
-                                let not_reverse = self.ctx.terms.mk_not_raw(reverse);
-                                let split = self.ctx.terms.mk_app(
-                                    Symbol::named("or"),
-                                    [argument_equality, not_forward, not_reverse],
-                                    Sort::Bool,
-                                );
-                                let split_unit = candidate.add_rule_step(
-                                    AletheRule::LaDisequality,
-                                    vec![split],
-                                    Vec::new(),
-                                    Vec::new(),
-                                );
-                                let split_clause = candidate.add_rule_step(
-                                    AletheRule::Or,
-                                    vec![argument_equality, not_forward, not_reverse],
-                                    vec![split_unit],
-                                    Vec::new(),
-                                );
-                                let forward_resolved = candidate.add_resolution(
-                                    vec![argument_equality, not_reverse],
-                                    forward,
-                                    split_clause,
-                                    forward_unit,
-                                );
-                                candidate.add_resolution(
-                                    vec![argument_equality],
-                                    reverse,
-                                    forward_resolved,
-                                    reverse_unit,
-                                )
-                            };
-                            argument_equalities.push(argument_equality);
-                            argument_units.push(unit);
-                        }
-                        if failed {
-                            continue;
-                        }
-
-                        let congruence_equality = self.ctx.terms.mk_app(
-                            Symbol::named("="),
-                            [source_app, goal_app],
-                            Sort::Bool,
-                        );
-                        let mut congruence_clause: Vec<TermId> = argument_equalities
-                            .iter()
-                            .map(|&equality| self.ctx.terms.mk_not_raw(equality))
-                            .collect();
-                        congruence_clause.push(congruence_equality);
-                        let mut congruence_unit = candidate.add_rule_step(
-                            AletheRule::EqCongruent,
-                            congruence_clause.clone(),
-                            Vec::new(),
-                            Vec::new(),
-                        );
-                        let mut residual = congruence_clause;
-                        for (&argument_equality, &argument_unit) in
-                            argument_equalities.iter().zip(argument_units.iter())
-                        {
-                            let negated = self.ctx.terms.mk_not_raw(argument_equality);
-                            let Some(position) = residual.iter().position(|&term| term == negated)
-                            else {
-                                failed = true;
-                                break;
-                            };
-                            let _ = residual.remove(position);
-                            congruence_unit = candidate.add_resolution(
-                                residual.clone(),
-                                argument_equality,
-                                congruence_unit,
-                                argument_unit,
-                            );
-                        }
-                        if failed || residual != [congruence_equality] {
-                            continue;
-                        }
-
-                        let not_congruence = self.ctx.terms.mk_not_raw(congruence_equality);
-                        let not_value_root = self.ctx.terms.mk_not_raw(value_root);
-                        let transitivity = candidate.add_rule_step(
-                            AletheRule::EqTransitive,
-                            vec![not_congruence, not_value_root, goal_equality],
-                            Vec::new(),
-                            Vec::new(),
-                        );
-                        let from_congruence = candidate.add_resolution(
-                            vec![not_value_root, goal_equality],
-                            congruence_equality,
-                            transitivity,
-                            congruence_unit,
-                        );
-                        let value_assume =
-                            assume_exact(&mut candidate, &mut assumptions, value_root);
-                        let goal_unit = candidate.add_resolution(
-                            vec![goal_equality],
-                            value_root,
-                            from_congruence,
-                            value_assume,
-                        );
-                        let negative_assume =
-                            assume_exact(&mut candidate, &mut assumptions, negative_root);
-                        candidate.add_resolution(
-                            Vec::new(),
-                            goal_equality,
-                            goal_unit,
-                            negative_assume,
-                        );
-
-                        if ay_proof::validate_reachable_assumes_in_problem_scope(
-                            &candidate, &authored,
-                        )
-                        .is_ok()
-                            && Self::proof_derives_empty_clause(&candidate)
-                            && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-                        {
-                            *proof = candidate;
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // The same mixed-theory conflict can be authored without an explicit
-        // UF disequality: `f(x) = v1`, `f(y) = v2`, arithmetic entails `x = y`,
-        // and `v1 != v2` is itself an unconditional linear theorem (the smoke
-        // corpus uses the distinct constants 10 and 20).  Compose that case
-        // explicitly as argument equality -> congruence -> value transitivity
-        // -> an independently reconstructed Farkas disequality.
-        let mut app_value_roots = Vec::new();
-        for &root in &authored {
-            let Some((lhs, rhs)) = decode_eq_local(&self.ctx.terms, root) else {
-                continue;
-            };
-            for (app, value) in [(lhs, rhs), (rhs, lhs)] {
-                let TermData::App(symbol, args) = self.ctx.terms.get(app).clone() else {
-                    continue;
-                };
-                if args.is_empty()
-                    || is_pure_linear_term(&self.ctx.terms, app)
-                    || ay_frontend::is_reserved_symbol(symbol.name())
-                    || !matches!(self.ctx.terms.sort(value), Sort::Int | Sort::Real)
-                    || self.ctx.terms.sort(app) != self.ctx.terms.sort(value)
-                {
-                    continue;
-                }
-                app_value_roots.push((root, app, value, symbol, args));
-            }
-        }
-
-        for source_index in 0..app_value_roots.len() {
-            for goal_index in (source_index + 1)..app_value_roots.len() {
-                let (source_root, source_app, source_value, source_symbol, source_args) =
-                    app_value_roots[source_index].clone();
-                let (goal_root, goal_app, goal_value, goal_symbol, goal_args) =
-                    app_value_roots[goal_index].clone();
-                if source_root == goal_root
-                    || source_symbol != goal_symbol
-                    || source_args.len() != goal_args.len()
-                    || source_args.is_empty()
-                    || self.ctx.terms.sort(source_value) != self.ctx.terms.sort(goal_value)
-                {
-                    continue;
-                }
-
-                let value_equality = self.ctx.terms.mk_app(
-                    Symbol::named("="),
-                    [source_value, goal_value],
-                    Sort::Bool,
-                );
-                let value_disequality = self.ctx.terms.mk_not_raw(value_equality);
-                let mut value_farkas = None;
-                let mut value_kind = TheoryLemmaKind::Generic;
-                let reconstructed_value_disequality =
-                    super::proof_farkas::try_lra_farkas_reconstruction(
-                        &self.ctx.terms,
-                        &[value_disequality],
-                        &mut value_farkas,
-                        &mut value_kind,
-                    );
-                if !reconstructed_value_disequality {
-                    // The LRA solver constant-folds a ground false equality
-                    // before it can return a conflict annotation.  The exact
-                    // one-row equality certificate is canonical; the strict
-                    // checker below still independently validates it before
-                    // this candidate can replace the original proof.
-                    value_farkas = Some(FarkasAnnotation::from_ints(&[1]));
-                }
-                let Some(value_farkas) = value_farkas else {
-                    continue;
-                };
-
-                let mut candidate = Proof::new();
-                let mut assumptions = Vec::new();
-                let mut argument_equalities = Vec::with_capacity(source_args.len());
-                let mut argument_units = Vec::with_capacity(source_args.len());
-                let mut failed = false;
-                for (&source_arg, &goal_arg) in source_args.iter().zip(goal_args.iter()) {
-                    let argument_equality = self.ctx.terms.mk_app(
-                        Symbol::named("="),
-                        [source_arg, goal_arg],
-                        Sort::Bool,
-                    );
-                    let unit = if source_arg == goal_arg {
-                        candidate.add_rule_step(
-                            AletheRule::EqReflexive,
-                            vec![argument_equality],
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                    } else {
-                        let forward = self.ctx.terms.mk_app(
-                            Symbol::named("<="),
-                            [source_arg, goal_arg],
-                            Sort::Bool,
-                        );
-                        let reverse = self.ctx.terms.mk_app(
-                            Symbol::named("<="),
-                            [goal_arg, source_arg],
-                            Sort::Bool,
-                        );
-                        let Some(forward_unit) = derive_affine_literal(
-                            &mut self.ctx.terms,
-                            &mut candidate,
-                            &mut assumptions,
-                            &arithmetic_roots,
-                            forward,
-                        ) else {
-                            failed = true;
-                            break;
-                        };
-                        let Some(reverse_unit) = derive_affine_literal(
-                            &mut self.ctx.terms,
-                            &mut candidate,
-                            &mut assumptions,
-                            &arithmetic_roots,
-                            reverse,
-                        ) else {
-                            failed = true;
-                            break;
-                        };
-                        let not_forward = self.ctx.terms.mk_not_raw(forward);
-                        let not_reverse = self.ctx.terms.mk_not_raw(reverse);
-                        let split = self.ctx.terms.mk_app(
-                            Symbol::named("or"),
-                            [argument_equality, not_forward, not_reverse],
-                            Sort::Bool,
-                        );
-                        let split_unit = candidate.add_rule_step(
-                            AletheRule::LaDisequality,
-                            vec![split],
-                            Vec::new(),
-                            Vec::new(),
-                        );
-                        let split_clause = candidate.add_rule_step(
-                            AletheRule::Or,
-                            vec![argument_equality, not_forward, not_reverse],
-                            vec![split_unit],
-                            Vec::new(),
-                        );
-                        let forward_resolved = candidate.add_resolution(
-                            vec![argument_equality, not_reverse],
-                            forward,
-                            split_clause,
-                            forward_unit,
-                        );
-                        candidate.add_resolution(
-                            vec![argument_equality],
-                            reverse,
-                            forward_resolved,
-                            reverse_unit,
-                        )
-                    };
-                    argument_equalities.push(argument_equality);
-                    argument_units.push(unit);
-                }
-                if failed {
-                    continue;
-                }
-
-                let mut congruence = None;
-                if source_app != goal_app {
-                    let congruence_equality = self.ctx.terms.mk_app(
-                        Symbol::named("="),
-                        [source_app, goal_app],
-                        Sort::Bool,
-                    );
-                    let mut congruence_clause: Vec<TermId> = argument_equalities
-                        .iter()
-                        .map(|&equality| self.ctx.terms.mk_not_raw(equality))
-                        .collect();
-                    congruence_clause.push(congruence_equality);
-                    let mut congruence_unit = candidate.add_rule_step(
-                        AletheRule::EqCongruent,
-                        congruence_clause.clone(),
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                    let mut residual = congruence_clause;
-                    for (&argument_equality, &argument_unit) in
-                        argument_equalities.iter().zip(argument_units.iter())
-                    {
-                        let negated = self.ctx.terms.mk_not_raw(argument_equality);
-                        let Some(position) = residual.iter().position(|&term| term == negated)
-                        else {
-                            failed = true;
-                            break;
-                        };
-                        let _ = residual.remove(position);
-                        congruence_unit = candidate.add_resolution(
-                            residual.clone(),
-                            argument_equality,
-                            congruence_unit,
-                            argument_unit,
-                        );
-                    }
-                    if failed || residual != [congruence_equality] {
-                        continue;
-                    }
-                    congruence = Some((congruence_equality, congruence_unit));
-                }
-
-                let source_assume = assume_exact(&mut candidate, &mut assumptions, source_root);
-                let goal_assume = assume_exact(&mut candidate, &mut assumptions, goal_root);
-                let mut chain_clause = vec![self.ctx.terms.mk_not_raw(source_root)];
-                if let Some((congruence_equality, _)) = congruence {
-                    chain_clause.push(self.ctx.terms.mk_not_raw(congruence_equality));
-                }
-                chain_clause.push(self.ctx.terms.mk_not_raw(goal_root));
-                chain_clause.push(value_equality);
-                let mut value_unit = candidate.add_rule_step(
-                    AletheRule::EqTransitive,
-                    chain_clause.clone(),
-                    Vec::new(),
-                    Vec::new(),
-                );
-                let mut residual = chain_clause;
-                for (pivot, unit) in std::iter::once((source_root, source_assume))
-                    .chain(congruence)
-                    .chain(std::iter::once((goal_root, goal_assume)))
-                {
-                    let negated = self.ctx.terms.mk_not_raw(pivot);
-                    let Some(position) = residual.iter().position(|&term| term == negated) else {
-                        failed = true;
-                        break;
-                    };
-                    let _ = residual.remove(position);
-                    value_unit =
-                        candidate.add_resolution(residual.clone(), pivot, value_unit, unit);
-                }
-                if failed || residual != [value_equality] {
-                    continue;
-                }
-
-                let disequality_unit = candidate.add_step(ProofStep::TheoryLemma {
-                    theory: "LRA".to_string(),
-                    clause: vec![value_disequality],
-                    farkas: Some(value_farkas),
-                    kind: TheoryLemmaKind::LraFarkas,
-                    lia: None,
-                });
-                candidate.add_resolution(Vec::new(), value_equality, value_unit, disequality_unit);
-
-                if ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored)
-                    .is_ok()
-                    && Self::proof_derives_empty_clause(&candidate)
-                    && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-                {
-                    *proof = candidate;
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Replace a non-strict provisional BV refutation with a complete,
-    /// independently replayed Bool/BV refutation of the exact authored roots.
-    ///
-    /// The checker first proves the clause `¬A1 ∨ ... ∨ ¬An` with its bounded
-    /// bit-blast/LRAT producer. Exact `Assume(Ai)` leaves then resolve that
-    /// theorem to the empty clause. Unsupported roots, too many roots, SAT
-    /// authored conjunctions, resource exhaustion, or any whole-proof replay
-    /// failure leave the original trust-bearing proof untouched.
-    fn replace_with_exact_authored_bv_refutation(&mut self, proof: &mut Proof) {
-        const MAX_AUTHORED_ROOTS: usize = 64;
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
-            return;
-        }
-
-        let authored = self.exact_concrete_authored_scope();
-        if authored.is_empty()
-            || authored.len() > MAX_AUTHORED_ROOTS
-            || authored
-                .iter()
-                .any(|&term| !matches!(self.ctx.terms.sort(term), Sort::Bool))
-        {
-            return;
-        }
-
-        let mut exact_roots = Vec::with_capacity(authored.len());
-        let mut opposites = Vec::with_capacity(authored.len());
-        for &assertion in &authored {
-            let opposite = match self.ctx.terms.get(assertion).clone() {
-                TermData::Not(inner) => inner,
-                _ => self.ctx.terms.mk_not_raw(assertion),
-            };
-            // Resolution removes one complementary literal per assumption.
-            // Distinct authored syntax can normalize to the same opposite;
-            // retain the first exact root only so one resolution removes one
-            // occurrence and the final residual is structurally honest.
-            if opposites.contains(&opposite) {
-                continue;
-            }
-            exact_roots.push(assertion);
-            opposites.push(opposite);
-        }
-        if !ay_proof::recognize_bv_bitblast(&self.ctx.terms, &opposites) {
-            return;
-        }
-
-        let mut candidate = Proof::new();
-        let assumptions: Vec<ProofId> = exact_roots
-            .iter()
-            .enumerate()
-            .map(|(index, &assertion)| {
-                candidate.add_assume(assertion, Some(format!("authored_bv_{index}")))
-            })
-            .collect();
-        let mut current = candidate.add_theory_lemma_with_kind(
-            "bv",
-            opposites.clone(),
-            TheoryLemmaKind::BvBitBlast,
-        );
-        let mut residual = opposites.clone();
-        for (&assumption, &opposite) in assumptions.iter().zip(opposites.iter()) {
-            residual.retain(|&literal| literal != opposite);
-            current = candidate.add_rule_step(
-                AletheRule::ThResolution,
-                residual.clone(),
-                vec![current, assumption],
-                Vec::new(),
-            );
-        }
-        if residual.is_empty()
-            && ay_proof::validate_reachable_assumes_in_problem_scope(&candidate, &authored).is_ok()
-            && Self::proof_derives_empty_clause(&candidate)
-            && self.check_proof_strict_with_datatypes(&candidate).is_ok()
-        {
-            *proof = candidate;
-        }
-    }
-
     fn promote_semantically_checked_bv_lemmas(terms: &TermStore, proof: &mut Proof) {
         let mut proof_producer_attempts = 0_usize;
         for step in &mut proof.steps {
@@ -2058,23 +227,12 @@ impl Executor {
     /// `(= x x)` to `true`); the raw term is resolved away inside the split, so no
     /// non-canonical term escapes into the surrounding proof.
     ///
-    /// SOUND + FAIL-SAFE on three levels:
-    /// 1. Recognition (`plan_euf_congruence_split`) fires ONLY when the conclusion
-    ///    is a positive equality of two applications of the SAME symbol with equal
-    ///    arity, every premise is a negated equality, every varying position is
-    ///    chain-connected, and the chains together use EVERY premise (no redundant
-    ///    premise the resolution chain cannot consume). Positions may share a chain
-    ///    (`g(a,a)=g(b,b)`) or be reflexive (consume no premises); the binary
-    ///    resolution chain deduplicates shared edges and the gate (level 3) is the
-    ///    backstop for any combination the construction gets wrong.
-    /// 2. Each replacement step is constructed to exactly match its checker's
-    ///    acceptance shape; the final resolvent is computed by explicit set
-    ///    resolution and replaces the fused clause's `ProofId`, so downstream
-    ///    resolution is unaffected and nothing is logically weakened.
-    /// 3. After the rebuild, the whole proof is re-validated with
-    ///    [`check_proof`]; if it does not check (e.g. a resolution mismatch from a
-    ///    shape this construction got wrong), the ENTIRE rebuild is reverted to the
-    ///    original trust proof. Any unrecognized shape is copied through unchanged.
+    /// SOUND + FAIL-SAFE: recognition requires same-symbol applications, exact
+    /// arity, negated-equality premises, chain connectivity, and consumption of
+    /// every premise. Each replacement matches its strict-checker schema and
+    /// explicit set resolution preserves the original `ProofId` conclusion.
+    /// Finally, [`check_proof`] re-validates the whole rebuild; any mismatch
+    /// restores the original proof, while unrecognized shapes pass through.
     ///
     /// The proof is rebuilt sequentially with an old→new `ProofId` remap (ids are
     /// positional — `ProofId(i) == steps[i]`); proofs containing subproof
@@ -2083,6 +241,11 @@ impl Executor {
         terms: &mut TermStore,
         proof: &mut Proof,
         decomp_meters: &crate::executor::GroundConflictDecompMeters,
+        // #diagnostic-envelope: the whole-proof revert gate below runs under
+        // the caller's solve controls. Lifted out of the executor by the caller
+        // because `terms` is already borrowed mutably here.
+        should_stop: &dyn Fn() -> bool,
+        memory_limit: Option<usize>,
     ) {
         // Anchors carry forward references the in-order remap cannot resolve.
         if proof
@@ -2376,33 +539,17 @@ impl Executor {
             remap.push(id);
         }
 
-        if !changed {
-            proof.steps = original;
-            return;
-        }
-
-        let mut remapped_named = original_named.clone();
-        remapped_named.retain(|_, id| {
-            let old_index = id.0 as usize;
-            if !matches!(original.get(old_index), Some(ProofStep::Assume(_))) {
-                return false;
-            }
-            let Some(new_id) = remap.get(old_index) else {
-                return false;
-            };
-            *id = *new_id;
-            true
-        });
-        proof.steps = new_steps;
-        proof.named_steps = remapped_named;
-
-        // (3) Whole-proof revert gate: if the rebuilt proof fails to check (a
-        // resolution the construction got wrong for some shape), discard ALL
-        // splits and keep the original trust proof — never ship an invalid proof.
-        if ay_proof::check_proof(proof, terms).is_err() {
-            proof.steps = original;
-            proof.named_steps = original_named;
-        }
+        finalize_euf_congruence_split(
+            proof,
+            terms,
+            original,
+            original_named,
+            &remap,
+            new_steps,
+            changed,
+            should_stop,
+            memory_limit,
+        );
     }
 
     /// Expand exact shadowed two-store equality lemmas into standard Alethe
@@ -2541,6 +688,102 @@ impl Executor {
         }
     }
 
+    /// `term` read as exactly `(not (= a b))` over the unordered pair `{a, b}`,
+    /// returning the inner equality. Any other shape — an `and`, an n-ary
+    /// `distinct`, a different pair — is `None`.
+    fn exact_pair_disequality(
+        terms: &TermStore,
+        term: TermId,
+        a: TermId,
+        b: TermId,
+    ) -> Option<TermId> {
+        let TermData::Not(inner) = terms.get(term) else {
+            return None;
+        };
+        let inner = *inner;
+        let TermData::App(Symbol::Named(name), args) = terms.get(inner) else {
+            return None;
+        };
+        let [lhs, rhs] = args.as_slice() else {
+            return None;
+        };
+        if name != "=" || !((*lhs == a && *rhs == b) || (*lhs == b && *rhs == a)) {
+            return None;
+        }
+        Some(inner)
+    }
+
+    /// Index the problem's OWN asserted disequality edges over one pigeonhole
+    /// clique: unordered member pair -> `((not (= a b)), (= a b))`, drawn only
+    /// from `legitimate` (`proof_legit_assume_set`, which admits the nested
+    /// `and`-conjuncts of an asserted formula precisely because top-level
+    /// and-flattening asserts each conjunct as its own `assume`).
+    ///
+    /// #dt-enum-pigeonhole-nary-distinct. `collect_finite_enum_diseq_edges`
+    /// records the TOP-LEVEL assertion as every edge's provenance, so the
+    /// dominant authoring of a cardinality conflict — one n-ary
+    /// `(assert (distinct m_0 .. m_k))`, which preprocessing flattens into the
+    /// conjunction of its `k(k+1)/2` pairwise `(not (= m_i m_j))` — hands this
+    /// rebuild an `and` for every pair. Requiring the pair's own `(not (= a b))`
+    /// there made the rebuild decline, and with the tautology-only conclusion of
+    /// `45c6b107b` (which correctly stopped asserting `(cl false)`) the
+    /// refutation then had no closing step at all: measured on
+    /// `group_datatypes::parametric_datatypes`, the three
+    /// `test_parametric_finite_cardinality_{5_distinct,deeper_6_distinct,
+    /// bitvec_nested}_unsat` rows reached `finalize_unsat_proof` with a
+    /// single-step proof (the trust-family equality-graph stub, no empty clause)
+    /// and tripped the `proof_derives_empty_clause` postcondition.
+    ///
+    /// The conjunct IS the problem's own disequality edge, so citing it is what
+    /// gives the derived `false` premises instead of asserting it — the same
+    /// distinction `45c6b107b` drew for `row2_unit_distinct_indices`. Nothing is
+    /// interned or invented here: an edge is admitted only when the exact
+    /// `(not (= a b))` term is already in the legitimate assume set, and a pair
+    /// with no such edge fails closed at the call site. Both member endpoints are
+    /// required to be clique members, which bounds the index at `k(k+1)/2`
+    /// entries however large the legitimate set is. Orientation ties (`(= a b)`
+    /// and `(= b a)` both authored and separately interned) resolve to the lower
+    /// `TermId` so the cited premise does not depend on set iteration order.
+    fn authored_clique_edge_disequalities(
+        &self,
+        legitimate: &ay_core::kani_compat::DetHashSet<TermId>,
+        member_set: &ay_core::kani_compat::DetHashSet<TermId>,
+    ) -> ay_core::kani_compat::DetHashMap<(TermId, TermId), (TermId, TermId)> {
+        let mut edges: ay_core::kani_compat::DetHashMap<(TermId, TermId), (TermId, TermId)> =
+            ay_core::kani_compat::DetHashMap::default();
+        for &candidate in legitimate {
+            let TermData::Not(inner) = self.ctx.terms.get(candidate) else {
+                continue;
+            };
+            let inner = *inner;
+            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(inner) else {
+                continue;
+            };
+            let [lhs, rhs] = args.as_slice() else {
+                continue;
+            };
+            let (lhs, rhs) = (*lhs, *rhs);
+            if name != "=" || lhs == rhs || !member_set.contains(&lhs) || !member_set.contains(&rhs)
+            {
+                continue;
+            }
+            let key = if lhs.0 < rhs.0 {
+                (lhs, rhs)
+            } else {
+                (rhs, lhs)
+            };
+            edges
+                .entry(key)
+                .and_modify(|held| {
+                    if candidate.0 < held.0 .0 {
+                        *held = (candidate, inner);
+                    }
+                })
+                .or_insert((candidate, inner));
+        }
+        edges
+    }
+
     /// Preserve the pre-existing reconstruction for ordinary bounded source
     /// surfaces. The sealed early path is only an exception to oversized-source
     /// poisoning; a decline here leaves the original proof unchanged.
@@ -2565,11 +808,14 @@ impl Executor {
             return;
         };
         let legitimate = self.proof_legit_assume_set();
+        let authored_edges = self.authored_clique_edge_disequalities(&legitimate, &member_set);
 
         // Collect the authored disequality for every member pair, and the
         // matching equality literal for the lemma clause.
         let mut assumptions: Vec<TermId> = Vec::new();
         let mut equalities: Vec<TermId> = Vec::new();
+        let mut cited: ay_core::kani_compat::DetHashSet<TermId> =
+            ay_core::kani_compat::DetHashSet::default();
         for (i, &a) in witness.members.iter().enumerate() {
             for &b in &witness.members[i + 1..] {
                 let key = if a.0 < b.0 { (a, b) } else { (b, a) };
@@ -2579,21 +825,28 @@ impl Executor {
                 if !legitimate.contains(&source) {
                     return;
                 }
-                // The source must be exactly `(not (= a b))`; anything else is
-                // evidence we cannot cite verbatim.
-                let TermData::Not(inner) = self.ctx.terms.get(source) else {
-                    return;
+                // The provenance `source` is the TOP-LEVEL assertion the detector
+                // walked, so it is the pair's own edge only when the problem spelt
+                // that edge out as its own `(assert (not (= a b)))`. Prefer it
+                // verbatim in that case — byte-identical to what this rebuild has
+                // always cited. Otherwise cite the EDGE rather than the assertion
+                // that contains it (#dt-enum-pigeonhole-nary-distinct).
+                let edge = match Self::exact_pair_disequality(&self.ctx.terms, source, a, b) {
+                    Some(equality) => (source, equality),
+                    None => match authored_edges.get(&key) {
+                        Some(&edge) => edge,
+                        // Fail closed: the clique member pair has no authored
+                        // disequality to resolve against, so `false` would once
+                        // again rest on nothing. Leave the proof untouched.
+                        None => return,
+                    },
                 };
-                let inner = *inner;
-                let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(inner) else {
-                    return;
-                };
-                if name != "=" || args.len() != 2 {
-                    return;
-                }
-                let (lhs, rhs) = (args[0], args[1]);
-                let matches_pair = (lhs == a && rhs == b) || (lhs == b && rhs == a);
-                if !matches_pair {
+                let (source, inner) = edge;
+                // Two pairs citing ONE premise would let a `pair_count`-long
+                // premise list cover fewer than `pair_count` edges, and the
+                // resolution would not close. Distinct pairs intern distinct
+                // equalities, so this cannot fire; guard it anyway.
+                if !cited.insert(source) {
                     return;
                 }
                 assumptions.push(source);
@@ -3017,11 +1270,16 @@ impl Executor {
                 // which rational Farkas provably cannot show), so attaching
                 // `Divisibility` makes them genuinely strict-checkable without
                 // disturbing any rationally-certified lemma.
+                // `IntGuardedSplitGap` is listed because the funnel now types
+                // some of these clauses first, and this route is STRICTLY
+                // better: without it `(= (* 2 y) 7)` silently trades
+                // `lia_generic` for an honest `hole`.
                 if matches!(
                     *kind,
                     TheoryLemmaKind::Generic
                         | TheoryLemmaKind::LiaGeneric
                         | TheoryLemmaKind::LraFarkas
+                        | TheoryLemmaKind::IntGuardedSplitGap
                 ) && lia.is_none()
                     && ay_core::proof_validation::recognize_lia_divisibility(terms, clause)
                 {
@@ -4681,69 +2939,6 @@ impl Executor {
             let refl_id = proof.add_rule_step(AletheRule::Refl, vec![eq_t], vec![], vec![]);
             proof.add_resolution(vec![], eq_t, cl_neq, refl_id);
             self.record_rebuilt_authored_proof_premise(and_t);
-            return;
-        }
-    }
-
-    fn promote_bv_identity_collapse(&mut self, proof: &mut Proof) {
-        if !Self::proof_needs_schema_collapse_reconstruction(proof) {
-            return;
-        }
-        let parsed: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
-        for asrt in &parsed {
-            let Some((lhs, rhs)) = match_eq_negation(asrt) else {
-                continue;
-            };
-            // Faithfully rebuild both sides erased by the identity fold. `build_qfbv_pterm`
-            // translates the frontend AST 1:1 (symbol→TermId, literal→`mk_bitvec`, op→raw
-            // constructor) with a per-node faithfulness guard. Its Boolean layer covers BV-valued
-            // `ite` nodes nested below concat/extract in code-generator obligations.
-            let (Some(l_id), Some(r_id)) = (
-                build_bv_pterm(&mut self.ctx.terms, lhs)
-                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, lhs)),
-                build_bv_pterm(&mut self.ctx.terms, rhs)
-                    .or_else(|| build_qfbv_pterm(&mut self.ctx.terms, rhs)),
-            ) else {
-                continue;
-            };
-            // Both sides must share one BV sort for `=` to be well-formed.
-            if self.ctx.terms.sort(l_id) != self.ctx.terms.sort(r_id)
-                || !matches!(self.ctx.terms.sort(l_id), Sort::BitVec(_))
-            {
-                continue;
-            }
-            let eq_t = self
-                .ctx
-                .terms
-                .mk_app(Symbol::named("="), [l_id, r_id], Sort::Bool);
-            let reflexive = l_id == r_id;
-            let neg_t = self.ctx.terms.mk_not_raw(eq_t);
-            // Every printed term must survive the printer's surface-override
-            // table; see `rebuilt_terms_print_faithfully`.
-            if !self.rebuilt_terms_print_faithfully(&[neg_t, eq_t]) {
-                continue;
-            }
-
-            let mut candidate = Proof::new();
-            let assume_id = candidate.add_assume(neg_t, None);
-            let lemma_id = if reflexive {
-                candidate.add_rule_step(AletheRule::EqReflexive, vec![eq_t], Vec::new(), Vec::new())
-            } else if let Some(step) = add_bvand_commutative_congruence_proof(
-                &mut self.ctx.terms,
-                &mut candidate,
-                l_id,
-                r_id,
-            ) {
-                step
-            } else if ay_proof::recognize_bv_bitblast(&self.ctx.terms, &[eq_t]) {
-                candidate.add_theory_lemma_with_kind("bv", vec![eq_t], TheoryLemmaKind::BvBitBlast)
-            } else {
-                continue;
-            };
-            candidate.add_resolution(vec![], eq_t, assume_id, lemma_id);
-
-            self.record_rebuilt_authored_proof_premise(neg_t);
-            *proof = candidate;
             return;
         }
     }

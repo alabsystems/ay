@@ -21,8 +21,12 @@ mod configuration;
 mod derivation;
 mod exact_fragment;
 mod folded_unit_authority;
+mod hint_error;
+mod inspection;
 #[cfg(test)]
 mod tests;
+
+use hint_error::HintDerivationError;
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -57,17 +61,27 @@ pub(crate) struct SatProofManager<'a> {
     /// clause in the trace matches a recorded theory lemma, this map provides
     /// the annotation for emitting a `TheoryLemma` proof step.
     theory_lemma_proofs: Option<&'a HashMap<Vec<TermId>, TheoryLemmaProof>>,
-    /// Solver-minted fixed-false selector variables for the exact trace
-    /// snapshot. Positive selector guards are projected away only after the
-    /// structural replay has consumed the corresponding negative premises.
+    /// Exact-trace false selectors; project guards after negative-premise replay.
     scope_assumptions: &'a [Literal],
     /// Executor-sealed instantiation derivations keyed by exact instance term.
     instance_derivations: Option<&'a HashMap<TermId, FragmentInstanceDerivation>>,
     /// Executor-sealed Skolemization derivations keyed by asserted term.
     skolem_derivations: Option<&'a HashMap<TermId, FragmentSkolemDerivation>>,
-    /// Executor-sealed context derivations (#dt-context-derivation), keyed by
-    /// the NORMALIZED clause (sorted, deduplicated literal TermIds).
+    /// Context derivations keyed by normalized clause (#dt-context-derivation).
     context_derivations: Option<&'a HashMap<Vec<TermId>, FragmentContextDerivation>>,
+    /// Deterministic ground-refuter verdicts by normalized widened clause.
+    ground_refuter_memo: HashMap<Vec<TermId>, bool>,
+    /// Failed premise -> (largest tried depth, unit-memo size then). Retry after
+    /// more depth/new successes: avoid poisoning deep retries or re-exploration.
+    context_discharge_failures: HashMap<TermId, (usize, usize)>,
+    /// Final-pass retry bypasses failure caching for order-dependent subtrees.
+    pub(in crate::sat_proof_manager) context_deep_retry: bool,
+    /// Premise visits left for the current entry; zero declines fail-closed.
+    pub(in crate::sat_proof_manager) context_premise_budget: u64,
+    /// Per-build typed single-unit DT recognition, keyed by the unit term.
+    dt_unit_kind_memo: HashMap<TermId, Option<ay_core::TheoryLemmaKind>>,
+    /// Subject -> (key rank, equality, neighbour) for the transport lane.
+    equality_neighbour_index: Option<HashMap<TermId, Vec<(usize, TermId, TermId)>>>,
     /// Executor-sealed `PropagateValues` licensing environment (#ppp-c7).
     propagation_environment: Option<&'a FragmentPropagationEnvironment>,
     /// Executor-sealed qpf premise-forced instance roots (#ppp-c7).
@@ -93,28 +107,7 @@ pub(crate) struct SatProofManager<'a> {
     dt_registry_data: Option<&'a crate::theory_inference::DatatypeRegistryData>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HintDerivationError {
-    NoUsableHints,
-    NoResolutionPivot {
-        usable_hint_count: usize,
-    },
-    FinalClauseMismatch {
-        expected_clause: Vec<TermId>,
-        derived_clause: Vec<TermId>,
-    },
-    /// RUP replay: the target clause contains complementary literals, so it
-    /// is a tautology and not derivable by unit-propagation replay (#rank-4).
-    RupTautologicalTarget,
-    /// RUP replay: unit propagation over the hint clauses reached fixpoint
-    /// without producing a conflict (#rank-4).
-    RupNoConflict {
-        usable_hint_count: usize,
-        propagations: usize,
-    },
-}
-
-impl<'a> SatProofManager<'a> {
+impl SatProofManager<'_> {
     /// Convert a SAT literal to an SMT term
     ///
     /// - `pos(v)` -> normalized proof literal for `var_to_term[v]`
@@ -673,46 +666,5 @@ impl<'a> SatProofManager<'a> {
             // process_trace can still return a contradiction when no better
             // derivation exists (e.g., original empty clause inputs).
             .or(weak_empty)
-    }
-
-    /// Number of learned clauses that fell back to `AletheRule::Trust` due
-    /// to failed resolution hint reconstruction.
-    ///
-    /// A non-zero count means the proof contains unverified steps. The proof
-    /// is structurally valid but the trust nodes bypass independent checking.
-    /// (min, max) index of SAT variables missing from `var_to_term`, and the
-    /// number of mapped variables, for coverage diagnosis.
-    pub(crate) fn unmapped_var_range(&self) -> (Option<u32>, Option<u32>, usize) {
-        (
-            self.unmapped_var_min,
-            self.unmapped_var_max,
-            self.var_to_term.len(),
-        )
-    }
-
-    pub(crate) fn untranslatable_entries(&self) -> u32 {
-        self.untranslatable_entries
-    }
-
-    pub(crate) fn trust_fallback_count(&self) -> u32 {
-        self.trust_fallback_count
-    }
-
-    /// Check if the trace can be processed (has necessary variable mappings).
-    ///
-    /// Note: This method checks if clauses can be translated without actually
-    /// modifying the TermStore, so it uses the var_to_term map directly.
-    pub(crate) fn can_process(&self, trace: &ClauseTrace) -> bool {
-        if trace.is_empty() {
-            return trace.has_empty_clause();
-        }
-
-        trace.entries().iter().any(|entry| {
-            entry.clause.iter().all(|lit| {
-                let var_idx = lit.variable().index() as u32;
-                self.var_to_term.contains_key(&var_idx)
-                    || self.is_scope_assumption_variable(var_idx)
-            })
-        })
     }
 }

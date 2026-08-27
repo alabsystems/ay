@@ -134,9 +134,13 @@ const SAT_COMPETITION_WRAPPER_ROUTES: &[&str] = &[
     "satcomp-variant-probe",
 ];
 
-/// Proof formats the submission script accepts; `drat` is its DEFAULT.
-/// Mirrors the `case "$PROOF_FORMAT" in drat|lrat)` guard in that script.
-const SAT_COMPETITION_WRAPPER_PROOF_FORMATS: &[&str] = &["drat", "lrat"];
+/// Proof formats the submission script accepts; `veripb` is its DEFAULT since
+/// the declared checker moved to VeriPB (2026-08-25). Mirrors that script's
+/// `case "$PROOF_FORMAT" in veripb|drat|lrat)` guard, and must move with it: a
+/// token this predicate rejects costs the submission its competition timeout
+/// code (exit 0 for `s UNKNOWN`) on every instance that times out, exactly as
+/// the stale `lrat`-only spelling once did for the `drat` default.
+const SAT_COMPETITION_WRAPPER_PROOF_FORMATS: &[&str] = &["veripb", "drat", "lrat"];
 
 /// Global timeout in milliseconds (0 = no timeout)
 pub(crate) static GLOBAL_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
@@ -144,6 +148,16 @@ pub(crate) static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock
 /// Global timeout flag — set by watchdog thread instead of process::exit (#2971).
 /// All solve paths check this cooperatively and return Unknown/timeout.
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
+/// Abort-cause latch set by the memory watchdog alongside [`INTERRUPT_HANDLE`].
+///
+/// The watchdog's cooperative stop makes the solver return `Unknown`, and
+/// without this latch the publication paths could not tell that `Unknown`
+/// apart from a genuine decision gap: they printed
+/// `c reason: incomplete (...)` and exited 0, so a sweep row recorded
+/// `verdict=unknown, rc=0, memout=false` for a run that was killed by its
+/// `--memory` budget (the 6.7-18.9M-var .xz family at `--memory 6000`).
+/// Read via [`memout_abort_requested`] at verdict publication.
+static MEMOUT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Whether a verdict line (`sat`/`unsat`/`unknown`, or a DIMACS `s ...`
 /// status line) has already been printed to stdout (#8674, #verdict-latch).
 /// Once ANY verdict has been printed, no synthesized timeout/SIGTERM verdict
@@ -329,6 +343,10 @@ pub(crate) enum ProofFormat {
     Lrat,
     Lean4,
     Alethe,
+    /// VeriPB pseudo-Boolean derivation (`.pbp`). Text only — VeriPB has no
+    /// binary encoding — and checked against the DIMACS CNF directly, which
+    /// VeriPB parses as OPB, so no separate formula file is emitted.
+    Veripb,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,19 +456,21 @@ fn infer_proof_format(path: &str) -> (ProofFormat, bool) {
         "lratb" => (ProofFormat::Lrat, true),
         "lean4" | "lean" => (ProofFormat::Lean4, false),
         // SR (substitution-redundancy) proofs ride the DRAT writer surface: the
-        // DSR `a`-lines (`clause… witness… 0`, with the σ substitution witness) are
-        // emitted by `DratWriter::add_sr` (#8011 SR route). Text-form DSR for `.sr`,
-        // binary for `.srb`. Elaborated externally by dsr-trim.
+        // DSR `a`-lines (`clause… witness… 0`, with a family-specific partial
+        // assignment/substitution witness) are emitted by `DratWriter::add_sr`.
+        // Text-form DSR uses `.sr`, binary uses `.srb`; both can be elaborated by
+        // dsr-trim.
         "sr" | "dsr" => (ProofFormat::Drat, false),
         "srb" | "dsrb" => (ProofFormat::Drat, true),
-        // DPR (PR with witness) also rides the DRAT writer surface: the PR
-        // `a`-lines are emitted by `DratWriter::add_pr` (#8011 PR route) and
-        // elaborated externally by dpr-trim → cake_lpr (a SAT-COMP 2026
-        // sanctioned checker pipeline). Previously `.dpr` fell through to the
-        // unknown-extension Alethe default, which silently produced an
-        // unusable proof for a DIMACS solve.
+        // DPR is a DRAT-family container understood by the proof tooling. The
+        // solver no longer emits the retired generic per-generator PR route, but
+        // keeping these extensions mapped to DRAT makes plain DRAT output a valid
+        // DPR subset and avoids silently selecting Alethe for a DIMACS solve.
         "dpr" => (ProofFormat::Drat, false),
         "dprb" => (ProofFormat::Drat, true),
+        // VeriPB pseudo-Boolean derivations. `.pbp` is the extension the
+        // checker's own documentation and test corpus use.
+        "pbp" | "veripb" => (ProofFormat::Veripb, false),
         "alethe" | "chccert" => (ProofFormat::Alethe, false),
         other => {
             safe_eprintln!(
@@ -771,7 +791,14 @@ this only controls proof/self-check work, not confidence in the answer.
   certified  fail-closed: emit only answers AY can self-verify, else unknown (was --self-check)
 
 Proof artifact:
-  --proof FILE [--proof-format alethe|drat|lrat|lean4] [--proof-binary]
+  --proof FILE [--proof-format alethe|drat|lrat|lean4|veripb] [--proof-binary]
+  (Alethe is SMT-only; DIMACS uses DRAT, LRAT, VeriPB, or verified Lean4.)
+  --proof-checker dsr-trim|dpr-trim|drat-trim|gratgen|veripb declares the
+  external checker; routes whose steps that checker rejects are disabled
+  (default dsr-trim keeps the SR-witnessed symmetry routes enabled).
+  --proof-format veripb --proof-checker veripb keeps them enabled under a
+  checker on the official SAT-COMP 2026 menu: veripb --cnf FILE.cnf proof.pbp.
+  That pair is what the SAT-COMP 2026 submission declares and run.sh passes.
 
 SAT primary path:
   ay solve --sat-variant default FILE.cnf
@@ -1018,9 +1045,21 @@ struct SolveArgs {
     #[arg(long, value_name = "FILE", group = "proof_output")]
     proof: Option<PathBuf>,
 
-    /// Proof format (with --proof; overrides extension inference)
+    /// Proof format (overrides extension; Alethe is unavailable for DIMACS)
     #[arg(long, value_enum, requires = "proof")]
     proof_format: Option<CliProofFormat>,
+
+    /// Declared external checker for the emitted DIMACS proof (capability
+    /// axis, not a format). Default dsr-trim: the verified SR chain, so the
+    /// SR-witnessed symmetry routes stay enabled — the historical behaviour.
+    /// `veripb` keeps them enabled on the pseudo-Boolean surface and is what
+    /// the SAT-COMP submission declares (with `--proof-format veripb`). Any
+    /// declaration that cannot verify a substitution witness on the LIVE
+    /// surface — dpr-trim, drat-trim, gratgen, or a mismatch like `drat` +
+    /// `veripb` — disables those routes with a clean plain-CDCL fallback, so
+    /// the run can never emit a proof its own declared checker rejects.
+    #[arg(long, value_enum)]
+    proof_checker: Option<CliProofChecker>,
 
     /// Write binary DRAT/LRAT proof (with --proof).
     /// SMT Alethe and CHC certificate routes reject binary output.
@@ -1085,11 +1124,11 @@ struct SolveArgs {
     )]
     no_verify_proof: bool,
 
-    /// After emitting a Lean4 proof via `--proof FILE.lean4`, invoke the
-    /// `lean` binary to kernel-check the proof.
-    ///
+    /// After emitting a Lean4 proof via `--proof FILE.lean4`, invoke the pinned
+    /// Lean project to check its `AySoundness.lratCheck_sound` theorem.
     /// This is a stricter variant of `--verify-proof`: rather than using ay's
-    /// built-in DRAT/LRAT checker, it routes the emitted theorem through Lean.
+    /// built-in DRAT/LRAT checker, it routes the input-bound UNSAT theorem
+    /// through the embedded soundness project and its pinned toolchain; the authenticated descriptor route is currently Linux-only.
     /// Requires `--proof FILE.lean4` (or `--proof-format lean4`). Exit codes:
     /// 20 only when Lean accepts the proof; 2 when Lean rejects it, cannot run,
     /// or the requested proof is not Lean4. An unfulfilled explicit kernel
@@ -1097,7 +1136,7 @@ struct SolveArgs {
     #[arg(long, help_heading = "Proof verification", requires = "proof")]
     lean_verify: bool,
 
-    /// Path to the `lean` binary for `--lean-verify` (default: PATH lookup).
+    /// Compatible `lean` override (default: pinned `lake env lean`; Lake is required).
     #[arg(
         long,
         value_name = "PATH",
@@ -1703,7 +1742,14 @@ const MEMORY_WATCHDOG_POLL: Duration = Duration::from_millis(100);
 const MEMORY_WATCHDOG_GRACE: Duration = Duration::from_secs(2);
 
 const MEMOUT_STDOUT_SMTLIB: &[u8] = b"unknown\n";
-const MEMOUT_STDOUT_SAT_COMPETITION: &[u8] = b"s UNKNOWN\n";
+/// The competition-grammar memout verdict carries the `c memout` marker on
+/// STDOUT — `c ` comment lines are legal DIMACS solver output — in addition to
+/// the stderr note. The stdout copy is load-bearing for harnesses: wrapper
+/// scripts (e.g. `~/ay-bench/bin/ay-proofmode`) forward only stdout and the
+/// exit code, and the competition exit code for unknown is 0, so a
+/// stderr-only marker made a memout indistinguishable from a generic
+/// incomplete run through any such wrapper.
+const MEMOUT_STDOUT_SAT_COMPETITION: &[u8] = b"c memout\ns UNKNOWN\n";
 const MEMOUT_STDERR_SMTLIB: &[u8] = b"(:reason-unknown \"memout\")\n";
 const MEMOUT_STDERR_SAT_COMPETITION: &[u8] = b"c memout\n";
 
@@ -1721,6 +1767,19 @@ static HARD_CEILING_SAT_COMPETITION: ay_sys::HardMemoryCeiling = ay_sys::HardMem
     stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
     exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
 };
+
+/// Output grammar for the memory-budget verdicts (the watchdog fallback and
+/// the allocator hard ceiling): SAT-competition grammar when the submission
+/// wrapper env is present OR competition mode was requested on the command
+/// line. `--competition` is latched into [`COMPETITION_MODE_ENABLED`] before
+/// `arm_hard_memory_ceiling`/`arm_memory_watchdog` run (see `run_solve`), so
+/// the latch is authoritative at both arm time and breach time. Keying on the
+/// wrapper env alone made a local `--competition` sweep emit the SMT-LIB
+/// `(:reason-unknown "memout")` grammar with exit 124, which sweep.py's rc
+/// fallback scored as an impossible 8 s "timeout" on a 300 s budget.
+fn memory_grammar_is_sat_competition() -> bool {
+    sat_competition_wrapper_timeout_policy() || COMPETITION_MODE_ENABLED.load(Ordering::SeqCst)
+}
 
 fn memory_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> &'static [u8] {
     if sat_competition_wrapper {
@@ -1747,7 +1806,7 @@ fn memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper: bool)
 /// checkpoints, measured at 3-4x the budget on bit-blasting workloads, which no
 /// observer-based signal can bound because they can only request a stop.
 fn arm_hard_memory_ceiling(limit_bytes: usize) {
-    let action = if sat_competition_wrapper_timeout_policy() {
+    let action = if memory_grammar_is_sat_competition() {
         &HARD_CEILING_SAT_COMPETITION
     } else {
         &HARD_CEILING_SMTLIB
@@ -1762,7 +1821,7 @@ fn arm_hard_memory_ceiling(limit_bytes: usize) {
 /// run) and the exit code is the same resource-exhaustion code, so only the
 /// `:reason-unknown` payload distinguishes a memout from a timeout.
 fn hard_memory_fallback_exit() -> ! {
-    let sat_competition_wrapper = sat_competition_wrapper_timeout_policy();
+    let sat_competition_wrapper = memory_grammar_is_sat_competition();
     let export_abandoned = abandon_unfinished_bv_cnf_export("memory limit exceeded");
     if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
         let _ = Write::write_all(
@@ -1781,6 +1840,16 @@ fn hard_memory_fallback_exit() -> ! {
     std::process::exit(timeout_exit_code_for_sat_competition_wrapper(
         sat_competition_wrapper,
     ));
+}
+
+/// Whether the `Unknown` about to be published is actually a memory abort:
+/// either the memory watchdog latched a breach ([`MEMOUT_REQUESTED`]), or the
+/// process is still over the advisory threshold at publication time (a
+/// checkpoint-initiated stop that never went through the watchdog). Callers
+/// route such an `Unknown` through [`hard_memory_fallback_exit`] so the run
+/// reports a memout instead of a generic `c reason: incomplete` with exit 0.
+pub(crate) fn memout_abort_requested() -> bool {
+    MEMOUT_REQUESTED.load(Ordering::SeqCst) || ay_sys::process_memory_exceeded()
 }
 
 /// Escalation policy of the memory watchdog, split out of the thread so it is
@@ -1823,7 +1892,13 @@ fn arm_memory_watchdog() {
             ay_sys::process_memory_exceeded,
             MEMORY_WATCHDOG_POLL,
             MEMORY_WATCHDOG_GRACE,
-            move || handle.store(true, Ordering::SeqCst),
+            move || {
+                // Latch the cause BEFORE requesting the stop: a solver that
+                // observes the interrupt and publishes `Unknown` must already
+                // be able to see that the stop was a memory abort.
+                MEMOUT_REQUESTED.store(true, Ordering::SeqCst);
+                handle.store(true, Ordering::SeqCst);
+            },
             std::thread::sleep,
         );
         hard_memory_fallback_exit();
@@ -2084,9 +2159,9 @@ fn chc_run_stats_json(
         chc_competition_jit_json(chc_stats),
     );
     let proof_result = proof_transcript
-        .map(|transcript| transcript.result.as_str())
+        .map(ay::chc::ChcProofTranscriptMetadata::result)
         .unwrap_or("unknown");
-    let proof_accepted = proof_transcript.is_some_and(|transcript| transcript.accepted_as_proof);
+    let proof_accepted = proof_transcript.is_some_and(|metadata| metadata.accepted_as_proof());
     let safe_attempt = u64::from(proof_result == "safe");
     let unsafe_attempt = u64::from(proof_result == "unsafe");
     map.insert(
@@ -2334,16 +2409,16 @@ pub(crate) fn print_chc_stats(
         if let Some(proof_transcript) = proof_transcript {
             safe_eprintln!(
                 "c chc.normalized_input_sha256: {}",
-                proof_transcript.normalized_input_sha256
+                proof_transcript.normalized_input_sha256()
             );
             safe_eprintln!(
                 "c chc.pdr_input_sha256: {}",
                 proof_transcript.pdr_input_sha256()
             );
-            safe_eprintln!("c chc.proof_status: {}", proof_transcript.proof_status);
+            safe_eprintln!("c chc.proof_status: {}", proof_transcript.proof_status());
             safe_eprintln!(
                 "c chc.accepted_as_proof: {}",
-                proof_transcript.accepted_as_proof
+                proof_transcript.accepted_as_proof()
             );
             safe_eprintln!("c");
         }
@@ -4976,9 +5051,8 @@ fn run_solve(args: &SolveArgs) {
         VERIFY_PROOF_ENABLED.store(false, Ordering::SeqCst);
     }
 
-    // Lean kernel verification (#8773 Phase 1). Gated on --proof via clap
-    // `requires = "proof"`; only meaningful when the proof format is Lean4,
-    // which is enforced at invocation time in dimacs.rs.
+    // Lean verification is gated on --proof via clap `requires = "proof"`;
+    // only meaningful when the format is Lean4, enforced in dimacs.rs.
     if args.lean_verify {
         LEAN_VERIFY_ENABLED.store(true, Ordering::SeqCst);
         if let Some(ref p) = args.lean_path {
@@ -5407,6 +5481,7 @@ fn default_proof_kind(format: ProofFormat) -> &'static str {
         ProofFormat::Lrat => "LRAT",
         ProofFormat::Lean4 => "Lean4",
         ProofFormat::Alethe => "Alethe",
+        ProofFormat::Veripb => "VeriPB",
     }
 }
 

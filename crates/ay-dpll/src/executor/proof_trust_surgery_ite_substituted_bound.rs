@@ -54,6 +54,7 @@ impl Executor {
                         continue;
                     };
                     return Some(IteLiftPlan {
+                        guarded_then_or: false,
                         orig,
                         defining_source: None,
                         bound: Some(bound),

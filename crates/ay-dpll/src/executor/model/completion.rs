@@ -49,6 +49,8 @@ use super::{string_witness, EvalValue, Model};
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
 
+mod const_interp;
+
 /// Bound on graph, declaration, and commit work for checked-projection output completion.
 ///
 /// Resource exhaustion is reported as [`CheckedProjectionOutputCompletion::Stopped`]
@@ -485,12 +487,12 @@ impl Executor {
         // equality_no_false_unsat` from `sat` into `unknown`. Non-array
         // problems must observe exactly the pre-existing completion behaviour.
         let mut array_dependent = 0usize;
-        for var in model
-            .array_model
-            .is_some()
-            .then(|| self.collect_assertion_free_vars())
-            .unwrap_or_default()
-        {
+        let assertion_free_vars = if model.array_model.is_some() {
+            self.collect_assertion_free_vars()
+        } else {
+            Vec::new()
+        };
+        for var in assertion_free_vars {
             if !matches!(self.evaluate_term(&model, var), EvalValue::Unknown) {
                 continue;
             }
@@ -1206,12 +1208,22 @@ impl Executor {
         array_sort: &ay_core::ArraySort,
         mode: super::output_format::ArrayInterpMode,
     ) -> Option<ArrayInterpretation> {
-        // Datatype elements containing array fields are eligible here too. The
-        // recursive witness renderer preserves every observed nested cell; any
-        // missing field is only a completion candidate, and the strict plus
-        // independent gates re-check the completed model before publication.
-        // Refusing the entire sort left even unconstrained arrays in a simple
-        // asserted disequality without a printable witness.
+        // FAITHFULNESS GUARD (#dt-array-model-census): an array whose datatype
+        // cells are opened through an ARRAY-sorted field read cannot be
+        // rendered into committed cells — the per-term renderer cannot see
+        // cells observed through a CONGRUENT field term, so the spelled-out
+        // field collapses to a fabricated const-default the strict arrays
+        // oracle then (correctly) rejects, fail-closing a genuinely-sat
+        // instance to `unknown`. Leave such arrays UNcompleted: the
+        // observation-based census certifies them cell-by-cell from the
+        // asserted reads instead. The guard is keyed on the OBSERVED reads,
+        // not on the element sort alone: an array of such a sort with no
+        // nested field read anywhere (a bare asserted disequality, say) has
+        // nothing to mis-spell and keeps its printable completed witness —
+        // the case cead05ab0 dropped the sort-wide guard for.
+        if self.array_field_datatype_cells_observed(array_sort) {
+            return None;
+        }
         let (default, mut stores) =
             self.array_completion_candidate_interp(model, term, &array_sort.element_sort, mode)?;
         stores.reverse();
@@ -1393,6 +1405,165 @@ impl Executor {
             && lhs.element_sort == rhs.element_sort
     }
 
+    /// Admit the definitional equality of an opaque array-valued application
+    /// whose congruent siblings, if any, provably constrain it not at all.
+    ///
+    /// (#opaque-array-app-def) CONGRUENCE FILTER for opaque array-valued
+    /// application targets.
+    ///
+    /// An array VARIABLE denotes one array per model, so its definitional
+    /// equality constrains nothing else. An APPLICATION does not have that
+    /// luxury: `v = w` forces `g(v) = g(w)`, and publishing an
+    /// interpretation for `(g v)` alone can contradict what the same model
+    /// says about a sibling `(g w)`. Nothing downstream re-derives UF
+    /// congruence over WHOLE-ARRAY values, so a congruence-inconsistent
+    /// interpretation published here would be re-checked only
+    /// per-application — and every assertion could then evaluate true under
+    /// a model no real interpretation of `g` realizes. That is a wrong-SAT
+    /// shape. THAT REASON IS UNCHANGED; what changed is the test used to
+    /// discharge it. Admission is refused unless:
+    ///
+    ///   (i)  the application has exactly ONE definitional right-hand side
+    ///        (competing definitions are ambiguous, never a chosen winner),
+    ///        and no other application of the same symbol carries one; and
+    ///   (ii) no sibling application of the same symbol (name, arity, array
+    ///        sort) CONSTRAINS it — every sibling is one the model DECIDES
+    ///        is applied at different arguments, so congruence relates the
+    ///        two not at all.
+    ///
+    /// (ii) used to read "it is the ONLY application of its symbol anywhere
+    /// in the query's term DAG". Sufficient, but far stronger than the guard
+    /// needs, and the gap cost real verdicts: in the verification-consumer `slices/range`
+    /// shape the query holds `(seq_array current)` AND `(seq_array final)`,
+    /// so `(seq_array final) = (store (seq_array current) ..)` was refused
+    /// for merely HAVING a sibling. `(seq_array final)` then fell back to a
+    /// reads-derived candidate whose default came from its single observed
+    /// cell — the CONSTANT-1 array, which falsifies the very store equality
+    /// the refused definition would have supplied. The published witness was
+    /// invalid, the independent model gate correctly refused it, and a
+    /// genuine `sat` published as `unknown` (#7956).
+    ///
+    /// "No sibling exists" becomes "no sibling CONSTRAINS this one", which
+    /// is the property the guard actually needs: congruence relates `(g v)`
+    /// and `(g w)` only when `v` and `w` denote the SAME element, so a
+    /// sibling the model applies ELSEWHERE imposes nothing on `(g v)` and
+    /// was never a reason to refuse.
+    ///
+    /// Be precise about the direction: this ADMITS STRICTLY MORE than the
+    /// old test — that is the point of the change — so it is a WEAKER
+    /// REFUSAL, not a stronger one. What is "at least as strong" is the
+    /// obligation it discharges: the old test implied the new one (a symbol
+    /// with no sibling at all has no constraining sibling), so every
+    /// admission made before is still made, and the extra admissions are
+    /// exactly the cases where congruence provably relates nothing.
+    ///
+    /// What it must never do is rest on ABSENCE of information, so the
+    /// dismissal runs on POSITIVE evidence only. `eval_values_equal_exact`
+    /// is deliberately TRI-state, and a sibling is dismissed ONLY where some
+    /// argument position is DECIDED unequal (`Some(false)`). An unknown or
+    /// undecidable argument yields `None`, which counts as CONSTRAINING, so
+    /// "cannot tell" behaves exactly as "a sibling exists" did before.
+    ///
+    /// Deliberately NOT admitted: a sibling the model applies at the SAME
+    /// arguments, even though congruence there is satisfiable by giving both
+    /// applications one shared array. Deciding that needs the two
+    /// INTERPRETATIONS, and this function only builds the completion GRAPH —
+    /// no candidate exists until `complete_array_models_for_validation` runs
+    /// its first pass and definition fixpoint over what is collected here.
+    /// Such a sibling keeps today's refusal.
+    ///
+    /// Both tests are purely restrictive: failing either falls back to
+    /// today's reads-derived candidate, exactly the pre-change behaviour.
+    ///
+    /// This mirrors, in the completion layer, the guard
+    /// `opaque_app_congruent_definitions_agree` already applies in
+    /// `normalize_array_with_definitions` (#seq-array-uf-def).
+    fn admit_unconstrained_opaque_app_definitions(
+        &self,
+        model: &Model,
+        opaque_app_definitions: &[(TermId, TermId)],
+        opaque_array_apps: &[TermId],
+        definitions: &mut Vec<(TermId, TermId)>,
+    ) {
+        if opaque_app_definitions.is_empty() {
+            return;
+        }
+        let group_key = |term: TermId| -> Option<(String, usize, Sort)> {
+            let TermData::App(symbol, args) = self.ctx.terms.get(term) else {
+                return None;
+            };
+            Some((
+                symbol.name().to_string(),
+                args.len(),
+                self.ctx.terms.sort(term).clone(),
+            ))
+        };
+        // Argument MODEL VALUES of every opaque array-valued application,
+        // computed once. The sibling scan below is quadratic in a symbol's
+        // application count and `evaluate_term` is not free.
+        let mut app_arg_values: HashMap<TermId, Vec<EvalValue>> = HashMap::default();
+        for &candidate in opaque_array_apps
+            .iter()
+            .chain(opaque_app_definitions.iter().map(|(app, _)| app))
+        {
+            if app_arg_values.contains_key(&candidate) {
+                continue;
+            }
+            let TermData::App(_, args) = self.ctx.terms.get(candidate) else {
+                continue;
+            };
+            let values: Vec<EvalValue> = args
+                .iter()
+                .map(|&arg| self.evaluate_term(model, arg))
+                .collect();
+            app_arg_values.insert(candidate, values);
+        }
+
+        // Does `other` constrain `app` by congruence? Yes UNLESS the model
+        // decides some argument position unequal. Absence of evidence (a
+        // missing entry, an `EvalValue::Unknown`, an undecidable algebraic
+        // comparison — all `None` from the tri-state helper) is NOT
+        // distinctness, so it answers `true` and the definition is refused.
+        let congruence_constrains = |app: TermId, other: TermId| -> bool {
+            let (Some(app_values), Some(other_values)) =
+                (app_arg_values.get(&app), app_arg_values.get(&other))
+            else {
+                return true;
+            };
+            if app_values.len() != other_values.len() {
+                return true;
+            }
+            !app_values
+                .iter()
+                .zip(other_values)
+                .any(|(a, b)| Self::eval_values_equal_exact(a, b) == Some(false))
+        };
+
+        for &(app, rhs) in opaque_app_definitions {
+            let Some(key) = group_key(app) else {
+                continue;
+            };
+            let ambiguous = opaque_app_definitions
+                .iter()
+                .any(|&(other_app, other_rhs)| {
+                    (other_app != app || other_rhs != rhs)
+                        && group_key(other_app).as_ref() == Some(&key)
+                });
+            if ambiguous {
+                continue;
+            }
+            let constrained_by_sibling = opaque_array_apps.iter().any(|&other| {
+                other != app
+                    && group_key(other).as_ref() == Some(&key)
+                    && congruence_constrains(app, other)
+            });
+            if constrained_by_sibling {
+                continue;
+            }
+            definitions.push((app, rhs));
+        }
+    }
+
     /// Collect only hard query structure: top-level conjunction equalities are
     /// alias/definition edges; equalities under disjunction, negation, or ITE
     /// are never treated as model authority.  Structural `store(result, base)`
@@ -1556,68 +1727,12 @@ impl Executor {
             }
         }
 
-        // (#opaque-array-app-def) CONGRUENCE FILTER for opaque array-valued
-        // application targets.
-        //
-        // An array VARIABLE denotes one array per model, so its definitional
-        // equality constrains nothing else. An APPLICATION does not have that
-        // luxury: `v = w` forces `g(v) = g(w)`, and publishing an
-        // interpretation for `(g v)` alone can contradict what the same model
-        // says about a sibling `(g w)`. Nothing downstream re-derives UF
-        // congruence over WHOLE-ARRAY values, so a congruence-inconsistent
-        // interpretation published here would be re-checked only
-        // per-application — and every assertion could then evaluate true under
-        // a model no real interpretation of `g` realizes. That is a wrong-SAT
-        // shape, so admission is refused unless congruence is vacuous:
-        //
-        //   (i)  the application has exactly ONE definitional right-hand side
-        //        (competing definitions are ambiguous, never a chosen winner),
-        //        and no other application of the same symbol carries one; and
-        //   (ii) it is the ONLY application of its symbol (name, arity, array
-        //        sort) anywhere in the query's term DAG, so there is no
-        //        sibling application for congruence to relate it to.
-        //
-        // Under (ii) the value we publish for `(g v)` cannot conflict with any
-        // other application of `g`, because there is none. Both tests are
-        // purely restrictive: failing either falls back to today's
-        // reads-derived candidate, which is exactly the pre-change behaviour.
-        //
-        // This mirrors, in the completion layer, the guard
-        // `opaque_app_congruent_definitions_agree` already applies in
-        // `normalize_array_with_definitions` (#seq-array-uf-def).
-        if !opaque_app_definitions.is_empty() {
-            let group_key = |term: TermId| -> Option<(String, usize, Sort)> {
-                let TermData::App(symbol, args) = self.ctx.terms.get(term) else {
-                    return None;
-                };
-                Some((
-                    symbol.name().to_string(),
-                    args.len(),
-                    self.ctx.terms.sort(term).clone(),
-                ))
-            };
-            for &(app, rhs) in &opaque_app_definitions {
-                let Some(key) = group_key(app) else {
-                    continue;
-                };
-                let ambiguous = opaque_app_definitions
-                    .iter()
-                    .any(|&(other_app, other_rhs)| {
-                        (other_app != app || other_rhs != rhs)
-                            && group_key(other_app).as_ref() == Some(&key)
-                    });
-                if ambiguous {
-                    continue;
-                }
-                let has_congruent_sibling = opaque_array_apps
-                    .iter()
-                    .any(|&other| other != app && group_key(other).as_ref() == Some(&key));
-                if has_congruent_sibling {
-                    continue;
-                }
-                definitions.push((app, rhs));
-            }
-        }
+        self.admit_unconstrained_opaque_app_definitions(
+            model,
+            &opaque_app_definitions,
+            &opaque_array_apps,
+            &mut definitions,
+        );
 
         edges.sort_by_key(|(lhs, rhs)| (lhs.index(), rhs.index()));
         edges.dedup();
@@ -2993,9 +3108,8 @@ impl Executor {
         model: &mut Model,
         exact_roots: &[TermId],
     ) -> bool {
-        // Work on an unsealed semantic clone and publish it only after every
-        // source/root/binding/default check succeeds. A false return therefore
-        // leaves the caller's producer model byte-for-byte untouched.
+        // Work on an unsealed semantic clone, publishing only after every check succeeds.
+        // A false return leaves the caller's producer model byte-for-byte untouched.
         let mut completed = model.clone();
         let source_stamp = self.ctx.source_context_stamp();
         let Some(root_entries) = exact_roots
@@ -3020,9 +3134,8 @@ impl Executor {
             return false;
         }
 
-        // Record semantic occurrences with exact core identities. Triggers are
-        // intentionally not children of quantifiers in `TermStore::children`:
-        // they guide search but do not constrain the interpretation.
+        // Record exact semantic occurrences. Quantifier triggers guide search but are
+        // not generic `TermStore::children`, so they do not constrain interpretation.
         let mut seen = HashSet::default();
         let mut occurring_constants = HashSet::default();
         let mut occurring_functions = HashSet::default();
@@ -3045,11 +3158,9 @@ impl Executor {
             }
             stack.extend(self.ctx.terms.children(term));
         }
-
-        // Plan the complete extension while `model` is immutable. Only direct
-        // ordinary source declarations are eligible; aliases, overload
-        // implementation names, definitions, theory heads, and internals are
-        // conservatively omitted.
+        // Plan immutably. Which declarations may be completed at all is the
+        // shared decision of `is_ordinary_free_primary_declaration`; what
+        // follows is only this pass's extra, formula-neutral restriction.
         let substituted: HashSet<TermId> =
             self.recorded_var_substitutions.keys().copied().collect();
         let mut constant_defaults = Vec::new();
@@ -3057,13 +3168,7 @@ impl Executor {
         for (surface_name, info) in self.ctx.symbol_iter() {
             let identity = self.ctx.symbol_identity_name(surface_name, info);
             let symbol = Symbol::named(identity);
-            let is_ordinary_free_primary = info.declaration_kind()
-                == DeclarationKind::Uninterpreted
-                && info.internal_name.is_none()
-                && !self.ctx.is_internal_symbol(surface_name)
-                && !self.ctx.is_defined_fun(surface_name)
-                && self.ctx.adopted_macro_interp(surface_name).is_none();
-            if !is_ordinary_free_primary {
+            if !self.is_ordinary_free_primary_declaration(surface_name, info) {
                 continue;
             }
             if info.arg_sorts.is_empty() {
@@ -3228,7 +3333,6 @@ impl Executor {
         if !poller.boundary() {
             return CheckedProjectionOutputCompletion::Stopped;
         }
-
         // Plan every mutation while the installed model is immutable. A stop or
         // declaration conflict during this phase therefore leaves it untouched.
         let mut constant_defaults = Vec::new();
@@ -3242,7 +3346,8 @@ impl Executor {
             let symbol = Symbol::named(identity);
             let is_ordinary_free_primary = info.declaration_kind()
                 == DeclarationKind::Uninterpreted
-                && info.internal_name.is_none()
+                && info.is_direct_source_declaration()
+                && self.ctx.overloaded_surface_name(identity).is_none()
                 && !self.ctx.is_internal_symbol(surface_name)
                 && !self.ctx.is_defined_fun(surface_name)
                 && self.ctx.adopted_macro_interp(surface_name).is_none();
@@ -5597,10 +5702,8 @@ mod checked_projection_output_completion_tests {
 
     #[test]
     fn checked_completion_rejects_live_projection_signature_conflict() {
-        // The semantic checker sees a BV projection, while the deliberately
-        // fault-injected frontend declaration with the same core spelling has a
-        // Bool signature. Production source evidence rejects this earlier; the
-        // output boundary must still fail closed independently.
+        // A fault-injected Bool declaration conflicts with the checked BV
+        // projection; the output boundary must fail closed independently.
         let (mut executor, checked, _) =
             installed_projection_fixture("(declare-fun f (Bool) Bool)");
 
@@ -5618,218 +5721,4 @@ mod checked_projection_output_completion_tests {
     }
 }
 
-#[cfg(test)]
-mod quantified_output_completion_tests {
-    use super::{EvalValue, Executor, Model};
-    use ay_core::term::Symbol;
-    use ay_core::Sort;
-    use ay_frontend::parse;
-    use num_bigint::BigInt;
-    use num_rational::BigRational;
-
-    fn executor_with_absent_g() -> Executor {
-        let mut executor = Executor::new();
-        executor
-            .execute_all(
-                &parse(
-                    "(set-logic UFLIA)\n\
-                     (set-option :produce-models true)\n\
-                     (declare-fun g (Int) Int)\n\
-                     (assert true)",
-                )
-                .expect("valid quantified-output completion fixture"),
-            )
-            .expect("fixture executes");
-        executor
-    }
-
-    fn g_at_zero(executor: &mut Executor) -> ay_core::TermId {
-        let zero = executor.ctx.terms.mk_int(BigInt::from(0));
-        executor
-            .ctx
-            .terms
-            .mk_app(Symbol::named("g"), vec![zero], Sort::Int)
-    }
-
-    #[test]
-    fn quantified_preseal_completion_isolates_the_candidate_from_ambient_eval_memo() {
-        let mut executor = Executor::new();
-        executor
-            .execute_all(
-                &parse(
-                    "(set-logic LIA)\n\
-                     (assert true)",
-                )
-                .expect("valid memo-isolation fixture"),
-            )
-            .expect("fixture executes");
-        let roots = executor.ctx.assertions.clone();
-        // Use the low-level primary registrar so this fixture remains an
-        // eligible formula-neutral constant even if surface declarations are
-        // collision-mangled by the frontend's stable-identity layer.
-        let c = executor.ctx.terms.mk_var("c", Sort::Bool);
-        executor.ctx.register_symbol("c".to_string(), c, Sort::Bool);
-        let info = executor.ctx.symbol_info("c").expect("registered constant");
-        assert_eq!(
-            info.declaration_kind(),
-            ay_frontend::DeclarationKind::Uninterpreted
-        );
-        assert!(info.internal_name.is_none());
-        assert!(!executor.ctx.is_internal_symbol("c"));
-        assert_eq!(
-            executor.evaluate_term(&Model::empty(), c),
-            EvalValue::Unknown
-        );
-        let stale = EvalValue::Bool(true);
-        let canonical_default = EvalValue::Bool(false);
-
-        // Simulate an outer validation pass over a different predecessor model.
-        // Completion must neither read this value nor overwrite it with the
-        // candidate's value when its nested evaluation finishes.
-        let memo_session = crate::executor::model::EvalMemoSession::new();
-        crate::executor::model::seed_eval_memo_for_test(c, stale.clone());
-        assert_eq!(
-            crate::executor::model::with_isolated_eval_memo(|| {
-                executor.evaluate_term(&Model::empty(), c)
-            }),
-            EvalValue::Unknown,
-            "an isolated candidate evaluation must not read the outer memo"
-        );
-        let mut candidate = Model::empty();
-        assert!(executor.complete_quantified_output_model_before_seal(&mut candidate, &roots,));
-        assert_eq!(candidate.bool_overrides.get(&c), Some(&false));
-        assert_eq!(
-            executor.evaluate_term(&Model::empty(), c),
-            stale,
-            "the ambient predecessor memo must be restored byte-for-byte"
-        );
-
-        drop(memo_session);
-        assert_eq!(executor.evaluate_term(&candidate, c), canonical_default);
-    }
-
-    #[test]
-    fn quantified_authority_publication_clears_the_predecessor_eval_memo() {
-        #[derive(Clone, Copy)]
-        enum AuthorityLane {
-            Datatype,
-            Mbqi,
-        }
-
-        for lane in [AuthorityLane::Datatype, AuthorityLane::Mbqi] {
-            let mut executor = Executor::new();
-            executor
-                .execute_all(
-                    &parse("(set-logic ALL)\n(assert true)").expect("valid authority memo fixture"),
-                )
-                .expect("fixture executes");
-            let roots = executor.ctx.assertions.clone();
-            let c = executor.ctx.terms.mk_var("memo-c", Sort::Bool);
-            executor
-                .ctx
-                .register_symbol("memo-c".to_string(), c, Sort::Bool);
-            executor.last_model = Some(Model::empty());
-
-            let memo_session = crate::executor::model::EvalMemoSession::new();
-            crate::executor::model::seed_eval_memo_for_test(c, EvalValue::Bool(true));
-            assert_eq!(
-                executor
-                    .evaluate_term(executor.last_model.as_ref().expect("predecessor model"), c,),
-                EvalValue::Bool(true)
-            );
-
-            let admitted = match lane {
-                AuthorityLane::Datatype => {
-                    crate::executor::mbqi::CheckedDtSatAuthority::for_test(&mut executor, &roots)
-                        .is_some()
-                }
-                AuthorityLane::Mbqi => {
-                    crate::executor::mbqi::CheckedMbqiSatAuthority::for_test(&mut executor, &roots)
-                        .is_some()
-                }
-            };
-            assert!(admitted, "authority constructor must accept its fixture");
-            assert_eq!(
-                executor.evaluate_term(executor.last_model.as_ref().expect("completed model"), c,),
-                EvalValue::Bool(false),
-                "installing the completed model must invalidate predecessor memo entries"
-            );
-            drop(memo_session);
-        }
-    }
-
-    #[test]
-    fn quantified_preseal_function_default_is_not_euf_evidence_and_round_trips() {
-        let mut executor = executor_with_absent_g();
-        let roots = executor.ctx.assertions.clone();
-        let application = g_at_zero(&mut executor);
-        let mut model = Model::empty();
-
-        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &roots));
-        assert!(
-            model.euf_model.is_none(),
-            "output completion must not create EUF gate evidence"
-        );
-        assert_eq!(
-            executor.evaluate_term(&model, application),
-            EvalValue::Rational(BigRational::from_integer(BigInt::from(0)))
-        );
-        assert_eq!(model.formula_neutral_function_default_entries().len(), 1);
-
-        executor.last_model = Some(model);
-        let evidence =
-            crate::executor::mbqi::CheckedMbqiSatAuthority::for_test(&mut executor, &roots)
-                .expect("preseal completion retains a model-bound theorem");
-        assert!(executor.install_mbqi_sat_authority(evidence));
-        assert!(executor
-            .mbqi_sat_cert_query_grant
-            .as_ref()
-            .is_some_and(|grant| grant.is_current_for(&executor, &roots)));
-        executor.last_result = Some(crate::executor_types::SolveResult::Sat);
-        let printed = executor.model();
-        assert!(
-            printed.contains("(define-fun g ((x!0 Int)) Int\n    0)"),
-            "get-model must print the same canonical value returned by evaluation: {printed}"
-        );
-    }
-
-    #[test]
-    fn quantified_function_default_fails_closed_after_source_epoch_change() {
-        let mut executor = executor_with_absent_g();
-        let roots = executor.ctx.assertions.clone();
-        let application = g_at_zero(&mut executor);
-        let mut model = Model::empty();
-        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &roots));
-
-        executor
-            .execute(&ay_frontend::Command::Push(1))
-            .expect("scope mutation succeeds");
-        assert!(!model.formula_neutral_function_defaults_are_current(&executor.ctx));
-        assert_eq!(
-            executor.evaluate_term(&model, application),
-            EvalValue::Unknown
-        );
-    }
-
-    #[test]
-    fn replanning_with_function_in_exact_roots_clears_prior_default_package() {
-        let mut executor = executor_with_absent_g();
-        let initial_roots = executor.ctx.assertions.clone();
-        let application = g_at_zero(&mut executor);
-        let mut model = Model::empty();
-        assert!(executor.complete_quantified_output_model_before_seal(&mut model, &initial_roots));
-        assert_eq!(model.formula_neutral_function_default_entries().len(), 1);
-
-        let zero = executor.ctx.terms.mk_int(BigInt::from(0));
-        let constrained_root = executor.ctx.terms.mk_eq(application, zero);
-        assert!(
-            executor.complete_quantified_output_model_before_seal(&mut model, &[constrained_root],)
-        );
-        assert!(model.formula_neutral_function_default_entries().is_empty());
-        assert!(model.euf_model.is_none());
-        assert_eq!(
-            executor.evaluate_term(&model, application),
-            EvalValue::Unknown
-        );
-    }
-}
+include!("completion/quantified_output_completion_tests.rs");

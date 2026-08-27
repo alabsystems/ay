@@ -85,7 +85,7 @@ fn random_rlt_case(
     // 1-2 VUB rows: `a·x_j − a·u·y ≤ 0` with y binary. u is chosen so u ≥ up_j, which is what
     // makes it a genuine bound rather than an extra restriction — but the derivation does not
     // require that, so sometimes emit a TIGHTER one too.
-    for _ in 0..(1 + rng.upto(2)) {
+    for _ in 0..=rng.upto(2) {
         let j = rng.upto(n as i64) as usize;
         let y = rng.upto(nbin as i64) as usize;
         if j == y {
@@ -103,7 +103,7 @@ fn random_rlt_case(
         push(&mut m, row, f64::NEG_INFINITY, 0.0, &mut rows);
     }
     // 1-2 packing rows over binaries: the conflict source.
-    for _ in 0..(1 + rng.upto(2)) {
+    for _ in 0..=rng.upto(2) {
         let mut row = vec![0.0; n];
         let mut k = 0;
         for j in 0..nbin {
@@ -117,7 +117,7 @@ fn random_rlt_case(
         }
     }
     // 1-3 generic rows, mixed signs, both orientations and equalities.
-    for _ in 0..(1 + rng.upto(3)) {
+    for _ in 0..=rng.upto(3) {
         let a: Vec<f64> = (0..n).map(|_| (rng.upto(7) - 3) as f64).collect();
         let hi = rng.upto(8) as f64;
         match rng.upto(3) {

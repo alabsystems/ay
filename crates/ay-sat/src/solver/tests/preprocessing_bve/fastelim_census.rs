@@ -5,8 +5,8 @@
 use super::*;
 use crate::bve::fast_eliminate::{QUICK_ELIM_BOUND, QUICK_ELIM_CLS_LIMIT, QUICK_ELIM_OCC_LIMIT};
 use crate::{
-    ProofOutput, SatFeatures, SolverVariant, VariantInput, VariantProfilePlan, VariantRouteProfile,
-    VariantStartupPolicy,
+    ProofOutput, SatFeatures, SolverVariant, VariantInput, VariantProfilePlan, VariantProofMode,
+    VariantRouteProfile, VariantStartupPolicy,
 };
 
 #[derive(Debug, Default)]
@@ -36,9 +36,13 @@ fn official_main_lrat_solver(formula: &crate::DimacsFormula) -> Solver {
     let proof = ProofOutput::lrat_text(Vec::<u8>::new(), formula.num_clauses as u64);
     let mut solver = Solver::with_proof_output(formula.num_vars, proof);
     let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
-    let input = VariantInput::new(formula.num_vars, formula.num_clauses, true, true)
-        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+    let input = VariantInput::new(
+        formula.num_vars,
+        formula.num_clauses,
+        VariantProofMode::Lrat,
+    )
+    .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+    .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
     let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
     plan.apply_to_solver(&mut solver);
     for clause in &formula.clauses {

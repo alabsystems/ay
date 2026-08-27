@@ -13,9 +13,12 @@
 
 use ay_core::{AletheRule, ProofStep};
 
-use super::is_fresh_def_bound_step;
+use super::{is_fresh_def_bound_step, is_fresh_def_eq_step};
 use crate::Executor;
 use ay_frontend::parse;
+
+#[path = "proof_fresh_def_eq_tests.rs"]
+mod eq;
 
 /// The `EqDiffVar` pass's own target shape: a guarded var-var equality chain.
 /// Copied from `solve_harness::tests::eq_diffvar_runs_and_mandatory_unsat_certification_survives`
@@ -140,9 +143,14 @@ fn the_published_unsat_is_still_backed_by_a_certificate() {
 #[test]
 fn a_bound_over_a_symbol_the_problem_constrains_is_left_alone() {
     // The producer-side admission test must agree with the checker's. Here the
-    // `<=` bounds are over AUTHORED variables, so nothing may be promoted —
-    // otherwise `(<= x 2)` would be certified as a free definition of `x`,
-    // which is false at `x = 3`.
+    // `<=` bounds in the PROBLEM are over AUTHORED variables, so neither may be
+    // promoted — otherwise `(<= x y)` would be certified as a free definition
+    // of `x`, which is false at `x = 3, y = 0`.
+    //
+    // The assertion is on WHICH symbol, not on how many bounds appear (#4751):
+    // `EqDiffVar` folds the nested `(= x y)` atom here, and the lane that
+    // derives that rewrite legitimately introduces `fresh_def_bound` steps over
+    // its own difference variable. Counting them all would pin the wrong thing.
     let script = r#"
         (set-logic QF_LIA)
         (declare-const x Int)
@@ -155,9 +163,21 @@ fn a_bound_over_a_symbol_the_problem_constrains_is_left_alone() {
     let commands = parse(script).expect("parse");
     let mut exec = Executor::new();
     assert_eq!(exec.execute_all(&commands).expect("exec"), vec!["unsat"]);
-    assert_eq!(
-        fresh_def_bound_steps(&exec),
-        0,
-        "bounds over authored variables are not definitions and must not be promoted"
-    );
+    let proof = exec.last_proof.as_ref().expect("a proof was reconstructed");
+    for step in &proof.steps {
+        if !is_fresh_def_bound_step(&exec.ctx.terms, step) {
+            continue;
+        }
+        let ProofStep::Step { clause, .. } = step else {
+            continue;
+        };
+        let (definiendum, _) = exec
+            .fresh_def_bound_operands(clause[0])
+            .expect("a fresh_def_bound step is a definitional bound");
+        let name = ay_proof::format_term_alethe(&exec.ctx.terms, definiendum);
+        assert!(
+            name.starts_with("__ay_"),
+            "`{name}` is an authored symbol; a bound over it is not a definition"
+        );
+    }
 }

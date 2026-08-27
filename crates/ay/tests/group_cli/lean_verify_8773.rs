@@ -2,17 +2,15 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Integration tests for `--lean-verify` (#8773, Phase 1 thin wrapper).
+//! Integration tests for the soundness-grounded `--lean-verify` route.
 //!
-//! Validates the Phase 1 deliverables from
-//! the development design notes:
+//! Validates that:
 //! 1. The CLI flag is registered on `ay solve --help` alongside
 //!    `--verify-proof` (#8771).
 //! 2. The flag is gated on `--proof FILE` (clap `requires = "proof"`) and
 //!    `--lean-path` is gated on `--lean-verify`.
-//! 3. End-to-end on a trivial UNSAT DIMACS with a `.lean4` proof path, ay
-//!    invokes the Lean verifier and exits with a contract-defined code: 20
-//!    only when Lean accepts, otherwise 2 without publishing UNSAT.
+//! 3. The emitted theorem binds the original CNF and concludes `Unsat` via the
+//!    verified `AySoundness.lratCheck_sound` theorem.
 //! 4. Rejection path: when `--lean-path` points at a bogus binary, the
 //!    verifier reports `Unavailable` and the explicit verification promise
 //!    fails closed with exit 2 and no UNSAT verdict.
@@ -49,6 +47,13 @@ fn temp_paths(stem: &str) -> (PathBuf, PathBuf, CleanupGuard) {
 
 fn ay_binary() -> &'static str {
     env!("CARGO_BIN_EXE_ay")
+}
+
+fn lake_available() -> bool {
+    Command::new("lake")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 /// `--lean-verify` and `--lean-path` MUST appear in `ay solve --help` so
@@ -131,6 +136,9 @@ fn test_lean_path_without_lean_verify_errors() {
 /// UNSAT.
 #[test]
 fn test_lean_verify_unavailable_bogus_binary_fails_closed() {
+    if !lake_available() {
+        return;
+    }
     let (cnf, proof, _guard) = temp_paths("unavailable");
     let output = Command::new(ay_binary())
         .arg("--lean-verify")
@@ -164,10 +172,14 @@ fn test_lean_verify_unavailable_bogus_binary_fails_closed() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn lean_verifier_reads_authenticated_snapshot_while_public_proof_is_swapped() {
     use std::os::unix::fs::PermissionsExt as _;
+
+    if !lake_available() {
+        return;
+    }
 
     let temp = tempfile::tempdir().expect("temporary directory");
     let cnf = temp.path().join("input.cnf");
@@ -197,7 +209,9 @@ mv "$AY_TEST_PUBLIC_PROOF" "$saved"
 cp "$AY_TEST_REPLACEMENT" "$AY_TEST_PUBLIC_PROOF"
 printf '%s\n' "$snapshot" > "$AY_TEST_OBSERVED_PATH"
 cp "$snapshot" "$AY_TEST_OBSERVED_BYTES"
-grep -q 'theorem proof_valid' "$snapshot"
+grep -q 'import AySoundness.Lrat' "$snapshot"
+grep -q 'theorem unsat : Unsat (clauses original)' "$snapshot"
+! grep -q 'native_decide' "$snapshot"
 ! grep -q 'MUTABLE_PUBLIC_REPLACEMENT' "$snapshot"
 "#,
     )
@@ -232,19 +246,19 @@ grep -q 'theorem proof_valid' "$snapshot"
     let verifier_path = std::fs::read_to_string(&observed_path).expect("read verifier argv");
     assert_ne!(verifier_path.trim(), proof.to_string_lossy());
     let checked = std::fs::read_to_string(&observed_bytes).expect("read checked snapshot bytes");
-    assert!(checked.contains("theorem proof_valid"));
+    assert!(checked.contains("theorem unsat : Unsat (clauses original)"));
+    assert!(!checked.contains("native_decide"));
     assert!(!checked.contains("MUTABLE_PUBLIC_REPLACEMENT"));
     let retained = std::fs::read_to_string(&proof).expect("read restored public proof");
     assert!(retained.contains("theorem proof_valid"));
     assert!(!retained.contains("MUTABLE_PUBLIC_REPLACEMENT"));
 }
 
-/// `--proof file.lean4` must emit a kernel-checkable proof artifact, not the
-/// legacy data-only proof-step dump. This is the CLI boundary needed by #8697:
-/// the file carries original clauses plus a `proof_valid` theorem that Lean's
-/// kernel can accept or reject.
+/// `--proof file.lean4` must emit the original clauses and a genuine UNSAT
+/// theorem grounded in the verified checker, not a self-defined Boolean
+/// checker whose acceptance has no proved connection to unsatisfiability.
 #[test]
-fn test_lean4_proof_output_contains_kernel_checker_boundary() {
+fn test_lean4_proof_output_contains_verified_soundness_boundary() {
     let (cnf, proof, _guard) = temp_paths("kernel_artifact");
     let output = Command::new(ay_binary())
         .arg("--proof")
@@ -262,11 +276,14 @@ fn test_lean4_proof_output_contains_kernel_checker_boundary() {
 
     let emitted = std::fs::read_to_string(&proof).expect("read emitted Lean4 proof");
     for marker in [
-        "def originalClauses",
-        "def lratCheck",
-        "def proofSteps",
+        "import AySoundness.Lrat",
+        "def original : List (Cid × Clause)",
+        "def proof : List (Cid × Clause × List Int)",
         "theorem proof_valid",
-        "native_decide",
+        "theorem unsat : Unsat (clauses original)",
+        "lratCheck_sound",
+        "set_option maxRecDepth 100000",
+        "set_option maxHeartbeats 10000000",
         "(1, [1])",
         "(2, [-1])",
     ] {
@@ -277,9 +294,45 @@ fn test_lean4_proof_output_contains_kernel_checker_boundary() {
         );
     }
     assert!(
-        !emitted.contains("Original clauses referenced"),
-        "Lean4 proof should not use the legacy data-only emitter"
+        !emitted.contains("native_decide") && !emitted.contains("def lratCheck "),
+        "Lean4 proof must use the imported verified checker"
     );
+}
+
+/// Exercise a generated proof whose original-clause table exceeds Lean's
+/// default recursion depth. The pinned project must elaborate the bound theorem
+/// under the emitter's explicit resource policy before UNSAT is published.
+#[test]
+fn test_lean_verify_with_pinned_project_accepts_deep_bound_unsat() {
+    if !lake_available() {
+        return;
+    }
+    let (cnf, proof, _guard) = temp_paths("pinned_project");
+    let repeated_units = 1_600;
+    let mut deep_unsat = format!("p cnf 1 {}\n", repeated_units + 1);
+    for _ in 0..repeated_units {
+        deep_unsat.push_str("1 0\n");
+    }
+    deep_unsat.push_str("-1 0\n");
+    std::fs::write(&cnf, deep_unsat).expect("write deep UNSAT CNF");
+    let output = Command::new(ay_binary())
+        .arg("--lean-verify")
+        .arg("--proof")
+        .arg(&proof)
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay with pinned Lean project");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "pinned project did not verify bound UNSAT: stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("s UNSATISFIABLE"));
+    assert!(stderr.contains("Lean verification: OK"));
+    let emitted = std::fs::read_to_string(&proof).expect("read deep Lean proof");
+    assert!(emitted.contains("-- Original clauses: 1601"));
 }
 
 /// `--lean-verify` only runs when the emitted proof is Lean4. If the user

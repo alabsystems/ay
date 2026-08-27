@@ -655,7 +655,7 @@ pub(crate) fn explain_univariate(lits: &[ConflictLit]) -> Option<Explanation> {
     // THE GATE. Not "the producer said so" — the clause is re-derived as a
     // theory consequence by an independent decision procedure, and anything
     // short of a proof is refused.
-    if clause_is_valid(&sub)? != true {
+    if !clause_is_valid(&sub)? {
         return None;
     }
 
@@ -853,29 +853,7 @@ pub(crate) fn project(polys: &[RPoly<MPolyZ>], pairs: &[(usize, usize)]) -> Opti
     })
 }
 
-/// Degree of `p` in variable `v`, for the degree report.
-pub(crate) fn degree_in(p: &MPolyZ, v: MVar) -> u32 {
-    p.terms()
-        .iter()
-        .map(|(m, _)| {
-            m.pairs()
-                .iter()
-                .find(|&&(w, _)| w == v)
-                .map_or(0, |&(_, e)| e)
-        })
-        .max()
-        .unwrap_or(0)
-}
-
-/// Signed-ness helper kept so `Signed` is used; the sign of a polynomial's
-/// leading coefficient is what orients a projection factor.
-pub(crate) fn lc_sign(p: &[BigInt]) -> i32 {
-    match p.iter().rev().find(|c| !c.is_zero()) {
-        Some(c) if c.is_negative() => -1,
-        Some(_) => 1,
-        None => 0,
-    }
-}
+include!("explain/projection_metrics.rs");
 
 #[cfg(test)]
 #[path = "explain_tests.rs"]

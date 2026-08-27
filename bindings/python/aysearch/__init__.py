@@ -246,6 +246,8 @@ class Model:
                     for var, value in zip(variables_tuple, values)
                 ]
             )
+        if not encoded_rows:
+            raise SearchError("table requires at least one allowed tuple")
         self._constraints.append(
             {"table": {"variables": names, "tuples": encoded_rows}}
         )

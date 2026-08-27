@@ -9,6 +9,16 @@
 //! the tests track that explicit incomplete behavior instead of silently
 //! accepting any non-UNSAT result.
 //!
+//! That incomplete behavior is `Unknown`, not `Timeout`. Both canaries asserted
+//! `Timeout` until `run_executor_smt_with_timeout` was fixed to stop returning
+//! `Timeout` without reading a single output line: the solver was ALREADY
+//! producing an `unknown` verdict here and the helper was discarding it. The
+//! solver's behavior did not change -- only what the harness lets us see. The
+//! distinction is worth keeping, because `Unknown` says the executor reached a
+//! decision point and declared incompleteness, while `Timeout` says it was cut
+//! off with nothing to report. Measured stable at `Unknown` over three reps per
+//! benchmark under load ~80 on 16 cores.
+//!
 //! Root cause: NOT the unit theory lemma enqueue reason (mod.rs:2184) nor
 //! the LRA strictness propagation. Both of those are correct fixes but
 //! do not resolve the false-UNSAT. The actual root cause is deeper in
@@ -41,8 +51,8 @@ fn test_false_unsat_simple_startup_10nodes_6242() -> Result<()> {
     );
     assert_eq!(
         run_executor_file_with_timeout(&path, STARTUP_CANARY_TIMEOUT_SECS)?,
-        SolverOutcome::Timeout,
-        "#6242 canary changed for simple_startup_10nodes; tighten the assertion to SAT once the benchmark stops timing out"
+        SolverOutcome::Unknown,
+        "#6242 canary changed for simple_startup_10nodes; UNSAT here is the false-UNSAT this test exists to catch, and SAT means it is time to tighten the assertion to SAT"
     );
     Ok(())
 }
@@ -60,8 +70,8 @@ fn test_false_unsat_simple_startup_14nodes_6242() -> Result<()> {
     );
     assert_eq!(
         run_executor_file_with_timeout(&path, STARTUP_CANARY_TIMEOUT_SECS)?,
-        SolverOutcome::Timeout,
-        "#6242 canary changed for simple_startup_14nodes; tighten the assertion to SAT once the benchmark stops timing out"
+        SolverOutcome::Unknown,
+        "#6242 canary changed for simple_startup_14nodes; UNSAT here is the false-UNSAT this test exists to catch, and SAT means it is time to tighten the assertion to SAT"
     );
     Ok(())
 }

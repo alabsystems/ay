@@ -66,7 +66,7 @@ fn a_datatype_tester_fold_records_its_argument() {
     let exec = solve(&format!(
         "{DT_PRELUDE}(assert (and (not ((_ is leaf) (leaf x1))) (not (= x3 x4))))\n(check-sat)\n"
     ));
-    assert_eq!(exec.last_result_is_unsat(), true, "the instance is unsat");
+    assert!(exec.last_result_is_unsat(), "the instance is unsat");
     let proof = exec.last_proof.as_ref().expect("a proof is retained");
     assert!(
         !is_argument_free(proof),
@@ -105,7 +105,7 @@ fn a_reflexive_disequality_fold_records_a_fully_checkable_argument() {
     let exec = solve(&format!(
         "{DT_PRELUDE}(assert (and (not (= (succ zero) (succ zero))) (= x3 x4)))\n(check-sat)\n"
     ));
-    assert_eq!(exec.last_result_is_unsat(), true, "the instance is unsat");
+    assert!(exec.last_result_is_unsat(), "the instance is unsat");
     let proof = exec.last_proof.as_ref().expect("a proof is retained");
     assert!(!is_argument_free(proof), "the argument must be recorded");
     let _ = sole_assume(&exec.ctx.terms, proof);
@@ -142,7 +142,7 @@ fn a_nested_conjunct_is_projected_through_the_and_tree() {
     let exec = solve(&format!(
         "{DT_PRELUDE}(assert (and (and (and (not ((_ is leaf) (leaf x1))) (= x3 x3)) (= x4 x4)) (= x3 x3)))\n(check-sat)\n"
     ));
-    assert_eq!(exec.last_result_is_unsat(), true, "the instance is unsat");
+    assert!(exec.last_result_is_unsat(), "the instance is unsat");
     let proof = exec.last_proof.as_ref().expect("a proof is retained");
     assert!(!is_argument_free(proof), "the argument must be recorded");
     let and_pos_steps = proof

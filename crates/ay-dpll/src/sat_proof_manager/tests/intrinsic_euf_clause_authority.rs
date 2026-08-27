@@ -10,13 +10,17 @@ fn build_fragment_for_clause(
     atoms: &[TermId],
     clause: Vec<Literal>,
 ) -> Result<ExactOriginalProofFragment, ExactOriginalProofError> {
-    let var_to_term = atoms.iter().copied().enumerate().map(|(index, term)| {
-        (
-            u32::try_from(index).expect("small test variable index"),
-            term,
-        )
-    });
-    let var_to_term = HashMap::from_iter(var_to_term);
+    let var_to_term: HashMap<_, _> = atoms
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, term)| {
+            (
+                u32::try_from(index).expect("small test variable index"),
+                term,
+            )
+        })
+        .collect();
     let mut trace = ClauseTrace::new();
     trace.add_clause(1, clause, true);
     SatProofManager::new(&var_to_term, terms).build_exact_original_proof_fragment(&trace, &[])

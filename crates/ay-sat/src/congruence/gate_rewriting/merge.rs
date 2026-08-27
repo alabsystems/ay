@@ -12,13 +12,12 @@
 
 use crate::gates::GateType;
 use crate::literal::Literal;
-use hashbrown::HashMap;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 
 use super::super::union_find::{merge_or_contradict, UnionFind};
 use super::super::CongruenceStats;
-use super::GateSignature;
+use super::GateTable;
 
 use super::super::CongruenceClosure;
 
@@ -40,7 +39,7 @@ impl CongruenceClosure {
         units_to_propagate: &mut VecDeque<usize>,
         unit_vals: &mut [i8],
         discovered_units: &mut Vec<Literal>,
-        gate_table: &mut HashMap<GateSignature, usize>,
+        gate_table: &mut GateTable,
         occs: &mut [Vec<usize>],
         num_lits: usize,
         stats: &mut CongruenceStats,

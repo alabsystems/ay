@@ -75,8 +75,9 @@ impl FpSolver<'_> {
     /// variables. Each of the three fields is handled independently:
     ///
     /// * A BV-constant field is pinned to its literal bit pattern.
-    /// * A symbolic (non-constant) field is bit-blasted via `bitblast_bv_term`
-    ///   and the resulting CNF bits become the corresponding FP field bits.
+    /// * A symbolic (non-constant) field is bit-blasted via
+    ///   [`Self::bitblast_conv_bv_arg`] and the resulting CNF bits become the
+    ///   corresponding FP field bits.
     ///
     /// This is critical for soundness (#bug8): when only some fields are
     /// symbolic, the concrete fields must still constrain the value. Previously
@@ -84,15 +85,53 @@ impl FpSolver<'_> {
     /// unconstrained variables, which let predicates such as `fp.isZero` over a
     /// `(fp s #b0...0 #b...1)` (concrete subnormal mantissa) be wrong-SAT by
     /// freely choosing exponent/significand bits.
+    ///
+    /// The three fields used to go through the LEAF-ONLY
+    /// [`Self::bitblast_bv_term`], which hands back fresh *unconstrained* bits
+    /// (and flags an encoding gap) for anything that is not a `Var` / 0-ary /
+    /// constant. That is the identical defect already documented and fixed on
+    /// the `to_fp` path — see [`Self::bitblast_conv_bv_arg`]. In practice the
+    /// constructor's operands are almost always composite: the SV-COMP /
+    /// Ultimate-Automizer encoding of a `double` reinterpretation is
+    /// `(fp ((_ extract 63 63) q) ((_ extract 62 52) q) ((_ extract 51 0) q))`,
+    /// three `extract`s over ONE shared 64-bit variable. Under the leaf-only
+    /// call each field became three mutually independent fresh vectors with no
+    /// tie back to `q`, so the encoding gap flag fired and the whole query
+    /// collapsed to Unknown. Routing through the composite-aware encoder both
+    /// *constrains* the bits (they become the actual extracted bits of the same
+    /// `q`) and removes the spurious gap.
+    ///
+    /// Fails closed: a genuinely unsupported composite yields `None` from
+    /// `bitblast_conv_bv_arg`, which has already set `has_encoding_gap`, and the
+    /// decomposition degrades to [`Self::fresh_decomposed`] — a sound Unknown,
+    /// never a free `sat`.
     pub(crate) fn decompose_fp_constructor(
         &mut self,
         args: &[TermId],
         precision: FpPrecision,
     ) -> FpDecomposed {
-        let sign = self.fp_constructor_sign_bit(args[0]);
-        let exponent = self.fp_constructor_field_bits(args[1], precision.exponent_bits() as usize);
-        let significand =
-            self.fp_constructor_field_bits(args[2], precision.significand_bits() as usize - 1);
+        // Every early return below re-asserts `has_encoding_gap` rather than
+        // trusting the callee to have set it. `fresh_decomposed` hands back
+        // UNCONSTRAINED bits; if it is ever reached without the gap flag armed,
+        // a `sat` built on those bits is published as a real answer. The flag is
+        // idempotent, so re-arming it costs nothing and closes that hole by
+        // construction instead of by audit.
+        let Some(sign) = self.fp_constructor_sign_bit(args[0]) else {
+            self.has_encoding_gap = true;
+            return self.fresh_decomposed(precision);
+        };
+        let Some(exponent) =
+            self.fp_constructor_field_bits(args[1], precision.exponent_bits() as usize)
+        else {
+            self.has_encoding_gap = true;
+            return self.fresh_decomposed(precision);
+        };
+        let Some(significand) =
+            self.fp_constructor_field_bits(args[2], precision.significand_bits() as usize - 1)
+        else {
+            self.has_encoding_gap = true;
+            return self.fresh_decomposed(precision);
+        };
 
         FpDecomposed {
             sign,
@@ -104,33 +143,45 @@ impl FpSolver<'_> {
 
     /// Resolve the sign bit of an `(fp s e m)` constructor: a literal for a
     /// 1-bit BV constant, else the bit-blasted symbolic BV bit.
-    fn fp_constructor_sign_bit(&mut self, arg: TermId) -> CnfLit {
+    ///
+    /// `None` means "cannot encode this operand" and the caller must fail
+    /// closed; it must NEVER be turned into a fresh unconstrained literal here.
+    fn fp_constructor_sign_bit(&mut self, arg: TermId) -> Option<CnfLit> {
         if let Some(v) = self.extract_bv_const(arg) {
-            return if v.bit(0) {
+            return Some(if v.bit(0) {
                 self.const_true()
             } else {
                 self.const_false()
-            };
+            });
         }
-        let bits = self.bitblast_bv_term(arg, 1);
-        bits[0]
+        let bits = self.bitblast_conv_bv_arg(arg, 1)?;
+        bits.first().copied()
     }
 
     /// Resolve an exponent/significand field of an `(fp s e m)` constructor:
     /// constant bits when the BV arg is a constant, else the symbolic BV bits.
-    fn fp_constructor_field_bits(&mut self, arg: TermId, width: usize) -> Vec<CnfLit> {
+    ///
+    /// `None` means "cannot encode this operand" — see
+    /// [`Self::fp_constructor_sign_bit`].
+    fn fp_constructor_field_bits(&mut self, arg: TermId, width: usize) -> Option<Vec<CnfLit>> {
         if let Some(v) = self.extract_bv_const(arg) {
-            return (0..width)
-                .map(|i| {
-                    if v.bit(i as u64) {
-                        self.const_true()
-                    } else {
-                        self.const_false()
-                    }
-                })
-                .collect();
+            return Some(
+                (0..width)
+                    .map(|i| {
+                        if v.bit(i as u64) {
+                            self.const_true()
+                        } else {
+                            self.const_false()
+                        }
+                    })
+                    .collect(),
+            );
         }
-        self.bitblast_bv_term(arg, width)
+        let bits = self.bitblast_conv_bv_arg(arg, width)?;
+        // Width discipline: the FP field is exactly `width` bits. A shorter
+        // vector would leave the top field bits unconstrained — the very
+        // wrong-`sat` generator this fix exists to remove.
+        (bits.len() == width).then_some(bits)
     }
 
     /// Decompose `(_ to_fp eb sb)` based on argument count and sorts.

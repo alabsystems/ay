@@ -69,6 +69,19 @@ impl EufLemmaPlan {
                         protect_justification(audit, terms, edge);
                     }
                 }
+                EufDeriv::RowLeaf {
+                    row_eq,
+                    guard_eq,
+                    guard,
+                } => {
+                    audit.protect_rigid_operand(terms, *row_eq);
+                    if let Some(guard_eq) = guard_eq {
+                        audit.protect_rigid_operand(terms, *guard_eq);
+                    }
+                    if let Some(guard) = guard {
+                        protect_justification(audit, terms, guard);
+                    }
+                }
             }
         }
         match &self.concl {

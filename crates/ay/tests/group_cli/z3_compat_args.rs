@@ -3400,6 +3400,85 @@ fn smt_rlimit_option_query_uses_z3_bare_values() {
     }
 }
 
+/// Pigeonhole SMT text (n pigeons, m holes): UNSAT for n > m, exponentially
+/// hard for resolution and immune to cheap preprocessing, so the CDCL core
+/// must accrue real search conflicts — the same instance family the executor
+/// `:rlimit` tests use.
+fn pigeonhole_smt(pigeons: u32, holes: u32, rlimit: Option<u64>) -> String {
+    let mut smt = String::from("(set-logic QF_UF)\n");
+    if let Some(budget) = rlimit {
+        smt.push_str(&format!("(set-option :rlimit {budget})\n"));
+    }
+    for i in 1..=pigeons {
+        for j in 1..=holes {
+            smt.push_str(&format!("(declare-const p_{i}_{j} Bool)\n"));
+        }
+    }
+    for i in 1..=pigeons {
+        let lits: Vec<String> = (1..=holes).map(|j| format!("p_{i}_{j}")).collect();
+        smt.push_str(&format!("(assert (or {}))\n", lits.join(" ")));
+    }
+    for j in 1..=holes {
+        for i in 1..=pigeons {
+            for k in (i + 1)..=pigeons {
+                smt.push_str(&format!("(assert (or (not p_{i}_{j}) (not p_{k}_{j})))\n"));
+            }
+        }
+    }
+    smt.push_str("(check-sat)\n(get-info :reason-unknown)\n(exit)\n");
+    smt
+}
+
+#[test]
+#[timeout(60_000)]
+fn smt_rlimit_option_forwards_conflict_budget_through_cli() {
+    // Regression (#8749 class, CLI layer): the transcript interceptor kept the
+    // z3-compat `get-option :rlimit` echo but never forwarded the value to the
+    // Executor, so through the `ay` BINARY the deterministic conflict budget
+    // was silently dropped — `(set-option :rlimit 1)` bounded nothing while
+    // `(get-option :rlimit)` claimed it was set. The budget must now bite:
+    // a 1-conflict budget on a real-search UNSAT instance stops with
+    // `unknown` + `resourceout` instead of solving to `unsat` (which is
+    // exactly what the pre-fix CLI printed — the drop is what this asserts
+    // against). Deterministic, so identical on every round.
+    let script = pigeonhole_smt(6, 5, Some(1));
+    for round in 0..3 {
+        let output = run_stdin(&script);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "round {round}: rlimit-budgeted run should exit cleanly; stdout={stdout}"
+        );
+        assert_eq!(
+            stdout, "unknown\n(:reason-unknown resourceout)\n",
+            "round {round}: the CLI must forward `:rlimit 1` to the executor \
+             (pre-fix it printed `unsat` because the budget was dropped)"
+        );
+    }
+
+    // `:rlimit 0` = unlimited per Z3 convention (and the default-ground-budget
+    // opt-out): the same instance must solve through to its real verdict.
+    let output = run_stdin(&pigeonhole_smt(6, 5, Some(0)));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "rlimit-0 run should exit cleanly; stdout={stdout}"
+    );
+    assert!(
+        stdout.starts_with("unsat\n"),
+        "`:rlimit 0` must mean unlimited, never a cap: {stdout}"
+    );
+
+    // And a generous budget must never perturb a verdict (exhaustion is
+    // Unknown/resourceout, NEVER a verdict — the budget is not evidence).
+    let output = run_stdin(&pigeonhole_smt(6, 5, Some(10_000_000)));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("unsat\n"),
+        "a generous `:rlimit` must not flip the UNSAT verdict: {stdout}"
+    );
+}
+
 #[test]
 #[timeout(30_000)]
 fn smt_legacy_boolean_option_queries_use_z3_bare_values() {

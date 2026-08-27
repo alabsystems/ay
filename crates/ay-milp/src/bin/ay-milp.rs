@@ -50,7 +50,10 @@ USAGE
   ay-milp solve <file.mps[.gz]> [options]
   ay-milp verify --model <file.mps> --cert <file.ayc> [--accept-replay] [--exit-zero]
   ay-milp check-point --model <file.mps> --point <file.sol> [--repair-continuous]
-  ay-milp diag <root-closure|lp-only|dualfix|block-angular|margin-row|cross-check|profile> <file.mps> [--time-limit <sec>] [--memory-budget <bytes>]
+  ay-milp diag <root-closure|lp-only|shipped-lp|dualfix|block-angular|margin-row|cross-check|profile> <file.mps> [--time-limit <sec>] [--memory-budget <bytes>]
+      lp-only    ITERATION ECONOMICS ONLY: one cold float walk, no ladder, nothing certified.
+                 Its status and objective are NOT solver behaviour; every line it prints says so.
+      shipped-lp the SAME LP through the lane a solve actually runs, with its certified verdict.
   ay-milp knobs [--list] [--bucket <b>] [--audit] [--deprecated]
   ay-milp features --list
   ay-milp replay-claims
@@ -67,6 +70,18 @@ solve options
   --emit-cert <path.ayc>       certificate path (DEFAULT: <input>.ayc)
   --no-emit-cert               opt out of certificate emission
   --emit-cert-max-bytes <n>    cap; an overflowing block is DROPPED and its claim downgraded
+  --opt-tree-work <n>          DETERMINISTIC work budget for the whole-tree OPTIMALITY proof,
+                               in exact-arithmetic passes (0 = off). Default 24000000/nnz,
+                               because one pass costs O(nnz). The evidence a run emits is a
+                               function of this, never of machine load.
+  --opt-tree-grid <bits>       snap optimality-tree duals to 2^-bits before exactifying (0 = off).
+                               Halves certificate bytes at no leaf cost; weak duality holds for
+                               ANY feasible y, so a snapped y is a valid bound, never a wrong one.
+  --opt-tree-leaves <n>        leaf budget for the same (default 20000; 0 = off)
+  --opt-tree-secs <secs>       wall-clock SAFETY NET for the same (default 600; 0 = no net).
+                               Not the budget: if this ever binds the run says `deadline` and
+                               its evidence was load-dependent.
+  --no-opt-tree                opt out of whole-tree optimality derivation
   --emit-witness <path>        write the witness on ANY verdict that has one
   --witness-format <ay|sol|rational>   default: rational
   --format <line|json>         stdout shape (default line)
@@ -80,23 +95,138 @@ standing (verified / refuted / unbacked), so a consumer never has to infer which
 half of an `optimal` was proved from the aggregate word alone.
 ";
 
+/// THE OPTIMALITY-TREE BUDGET, and it is deterministic. In `work` units TIMES
+/// the model's matrix nonzeros — see [`default_opt_tree_work`], which divides.
+///
+/// # Why the budget is nnz-weighted, measured
+///
+/// One `work` unit is one exact-arithmetic pass over the model
+/// (`ay_milp::OptTreeReport::work`), and a pass costs O(nnz). A FLAT unit cap
+/// therefore means wildly different wall times: at a flat 8,000 units, `air03`
+/// (91,028 nnz) took **508.6 s** while `dcmulti` (1,315 nnz) took **0.385 s**.
+///
+/// Measured on the 30-instance `~/ay-bench/milp-gate` corpus plus `f2gap40400`
+/// and `supportcase16`, 27 usable derivations, comparing candidate currencies
+/// by the wall each would cost at a cap set to preserve every certificate:
+///
+/// ```text
+///   currency            median predicted   worst predicted
+///   leaves (the shipped knob)     58.7 s          950.7 s
+///   work (flat)                   23.8 s       89,825.3 s
+///   work x sqrt(nnz)              21.1 s        2,188.7 s
+///   work x (rows+cols)            13.9 s          368.0 s
+///   nodes x nnz                   15.7 s          231.5 s
+///   work x nnz            -->     10.1 s          102.5 s
+/// ```
+///
+/// `work x nnz` wins on both, and by two to three orders of magnitude on the
+/// worst case. It is also the currency with the tightest measured rate spread
+/// (max/min 257x across the corpus, against 50,449x for flat `work`).
+///
+/// # Why THIS number
+///
+/// EVIDENCE PRESERVATION sets it. `work` for an instance that CERTIFIES is the
+/// total the derivation needed, not a truncation, and it is deterministic — so
+/// the floor is exact rather than statistical. The eight instances that certify
+/// at the old 5 s default spend, in `work x nnz`:
+///
+/// ```text
+///   misc03 20,811,261   stein27 19,353,600   supportcase16 1,468,740
+///   f2gap40400 1,135,200   flugpl 252,678   p0033 198,254
+///   gt2 84,224   enigma 289
+/// ```
+///
+/// 24,000,000 clears the binding one (`misc03`) by 15%, which on a
+/// deterministic quantity is margin rather than hope, and every other
+/// certificate by 16x or more.
+const OPT_TREE_WORK_NNZ: u64 = 24_000_000;
+
+/// The default work budget for `model`, in `OptTreeReport::work` units.
+///
+/// Size-derived, exactly as the exact rim's own `Budget::default_iters(vars)`
+/// is. `max(1)` rather than a floor: on a model whose nonzeros already exceed
+/// the whole budget the honest answer is one node and an immediate decline, not
+/// a token allowance that costs minutes to spend.
+fn default_opt_tree_work(model: &ay_milp::Model) -> u64 {
+    let nnz: u64 = (0..model.num_rows())
+        .filter_map(|r| model.row_at(r))
+        .map(|r| model.row(r).0.len() as u64)
+        .sum();
+    (OPT_TREE_WORK_NNZ / nnz.max(1)).max(1)
+}
+
+/// The leaf budget. It is REACHED now, and it was not before.
+///
+/// Under the shipped 5 s clock it could not fire at all: across 164 derivations
+/// over 41 OPTIMAL instances, 136 declined on the DEADLINE and ZERO on this.
+/// With the primary bound denominated in work it does — measured on this build,
+/// `lseu` commits **20,270** leaves and `markshare1` **20,165** against a cap of
+/// 20,000. `leaves <= nodes <= work` is structural (one leaf per node, one unit
+/// per node), so the cap is reachable exactly when a model is sparse enough for
+/// its work budget to exceed it: `lseu` (309 nnz) draws 77,669 units.
+///
+/// It is NOT the terminal decline on either of those runs, and that is a
+/// property of the terminal reason rather than of this cap: the leaf cap trips
+/// deep in a subtree, the descent unwinds, and the parent then spends the rest
+/// of the budget in the exact rim, so LAST-WRITER-WINS reports `work-cap`.
+/// `OptTreeReport::leaf_capped` counts the event separately for exactly that
+/// reason — the same repair `depth_capped` already had — and the CLI prints it.
+///
+/// It stays a separate number rather than being folded into the work cap
+/// because it bounds the ARTIFACT, not the search: a `boundleaf` carries one
+/// multiplier per column with a nonzero reduced cost, so leaves x columns is
+/// what turns `misc07` into 191 MB.
+const OPT_TREE_LEAVES: usize = 20_000;
+
+/// The wall-clock SAFETY NET, in seconds. NOT the budget.
+///
+/// It exists only so that a model whose per-unit cost is far outside anything
+/// measured cannot make a `solve` appear to hang. It is sized NOT TO BIND: the
+/// worst derivation predicted at [`OPT_TREE_WORK_NNZ`] across the calibration
+/// corpus is `mas76` at 102.5 s and the median is 10.1 s, so this is ~6x the
+/// worst case there. If it ever fires the run reports `deadline` rather than
+/// `work-cap` — the two are deliberately different tags — which is the signal
+/// that this run's evidence was load-dependent after all.
+const OPT_TREE_BACKSTOP_SECS: f64 = 600.0;
+
+/// Wall clock at the first instruction of `main` in the FINAL (post-`arm`)
+/// process image, for `--phase-ledger`.
+///
+/// Everything before this — the caller's `fork`/`exec`, dyld, the Rust runtime
+/// prologue, and `arm`'s re-exec chain through `taskpolicy` — is invisible from
+/// in-process and has to be differenced against the caller's own wall clock.
+/// That difference is exactly the term a harness timing `subprocess.run`
+/// charges to the solver and an in-process API timing (`gp.Env` + `gp.read` +
+/// `optimize`) does not pay at all.
+static MAIN_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
 fn main() -> ExitCode {
     // FIRST statement of main: arm() re-execs this process under a kernel-held
     // memory bound, so anything above it is discarded work, and it sets an env
     // var (sound only while single-threaded). See crates/ay-sys/src/govern.rs.
     ay_sys::govern::arm();
+    // Immediately AFTER arm(), not before. A `MAIN_T0.set` above it violated the
+    // invariant the comment right there states, and bought nothing: arm() re-execs,
+    // so the pre-exec process that ran that line is replaced and its `Instant` is
+    // discarded — the value actually read at the ledger below is the one set by the
+    // post-exec process on its own pass through main. In that process arm() returns
+    // on an env-var check, so anchoring here rather than one line earlier moves
+    // `in_main` by an env lookup. The exec chain is recovered against the wall
+    // clock further down, exactly as the ledger comment describes.
+    let _ = MAIN_T0.set(Instant::now());
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        print!("{USAGE}");
-        return ExitCode::from(2);
-    }
     // Help is accepted ANYWHERE, not just first: the subcommand parsers refuse
     // an unknown flag now, and `ay-milp solve --help` asking for help must not
     // be answered with "unknown flag `--help`".
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    let no_args = args.is_empty();
+    if no_args || args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}");
-        return ExitCode::SUCCESS;
+        return if no_args {
+            ExitCode::from(2)
+        } else {
+            ExitCode::SUCCESS
+        };
     }
     // THE CORRECTNESS FIX, on every invocation: an `AY_*` name nothing reads is
     // a campaign silently measuring the wrong arm. It now REFUSES rather than
@@ -196,7 +326,18 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     // The engine switches PLUS this command's own three. An unknown `--flag`
     // is refused here rather than parsed into silence (see `Flags::parse`).
     let mut switches = engine_flags::switch_flags();
-    switches.extend(["no-emit-cert", "deterministic", "no-deterministic"]);
+    switches.extend([
+        "no-emit-cert",
+        "no-opt-tree",
+        "deterministic",
+        "no-deterministic",
+        // DIAGNOSTIC ONLY (`--phase-ledger`): one stderr line attributing this
+        // process's wall to the phases OUTSIDE the search, so "ay's fixed
+        // per-solve cost" stops being a regression intercept and becomes a
+        // measured sum. Reporting only; no phase is skipped, reordered, or
+        // budgeted by it, and every verdict is byte-identical with it on.
+        "phase-ledger",
+    ]);
     let flags = match Flags::parse(args, engine_flags::VALUE_FLAGS, &switches) {
         Ok(f) => f,
         Err(e) => return die(&e),
@@ -235,10 +376,16 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         Some(other) => return die(&format!("--require {other}: expected none|witness|full")),
     };
 
+    let ledger = flags.has("phase-ledger");
+    let t_dispatch = Instant::now();
+
+    let t_ph = Instant::now();
     let text = match read_maybe_gz(&path) {
         Ok(t) => t,
         Err(e) => return die(&format!("cannot read {path}: {e}")),
     };
+    let ph_read = t_ph.elapsed();
+    let t_ph = Instant::now();
     let p = match ay_milp::read_mps(&text) {
         Ok(p) => p,
         Err(e) => {
@@ -246,7 +393,10 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    let ph_parse = t_ph.elapsed();
+    let t_ph = Instant::now();
     report_shape(&p);
+    let ph_shape = t_ph.elapsed();
 
     // Full posture is adjudicated after solving, claim by claim.  In
     // particular, an integral model with a nonzero objective may still be
@@ -259,6 +409,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         Err(message) => return die(&message),
     };
 
+    let t_ph = Instant::now();
     let col_names = p.col_names.clone();
     let obj_scale = p.obj_scale.clone();
     let mut s = match BabSession::new(p.model, &opts) {
@@ -268,6 +419,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             return ExitCode::from(4);
         }
     };
+    let ph_session = t_ph.elapsed();
     if let Some(seedf) = flags.get("seed-solution").cloned() {
         match std::fs::read_to_string(&seedf) {
             Ok(text) => {
@@ -325,6 +477,166 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         },
         None => None,
     };
+    // THE DUAL HALF OF AN `Optimal`. Derived here, AFTER the verdict, by an
+    // independent certifying descent over the caller's model — it consumes only
+    // `value` and `model_values` and re-checks both, so it cannot influence what
+    // the solver answered. A budget overrun yields `None` and the claim degrades
+    // to `NONE` exactly as it did before this existed; nothing is ever asserted
+    // that could not be re-derived.
+    // Reported on the EXISTING `certificate:` line rather than its own, so the
+    // diagnostic costs no new stderr site.
+    let mut opt_tree_note = String::new();
+    let mut ph_opt_tree = Duration::ZERO;
+    let opt_tree = if flags.has("no-opt-tree") || cert_path.is_none() {
+        None
+    } else {
+        // THE BUDGET IS WORK; THE CLOCK IS A NET. `--opt-tree-secs` defaulted
+        // to 5 and was the bound that actually fired — 136 of 164 derivations
+        // over 41 OPTIMAL instances declined on it and ZERO on the leaf cap —
+        // which made the emitted certificate a function of machine load.
+        // Measured on `08af5e9a7`: `f2gap40400` certified 509 leaves /
+        // 10,068,501 bytes / `verify` exit 0 on 4 of 4 reps at load ~70, and
+        // declined at 350 / 311 / 304 / 320 leaves on 4 of 4 with the same
+        // binary and input under deliberate contention. Same verdict, four
+        // different certificates.
+        let secs = match flags.get("opt-tree-secs") {
+            Some(v) => match v.parse::<f64>() {
+                Ok(x) if x >= 0.0 => x,
+                _ => return die("--opt-tree-secs needs a non-negative number"),
+            },
+            None => OPT_TREE_BACKSTOP_SECS,
+        };
+        let work = match flags.get("opt-tree-work") {
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => return die("--opt-tree-work needs a non-negative integer"),
+            },
+            None => default_opt_tree_work(s.model()),
+        };
+        let leaves = match flags.get("opt-tree-leaves") {
+            Some(v) => match v.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return die("--opt-tree-leaves needs an integer"),
+            },
+            None => OPT_TREE_LEAVES,
+        };
+        // THE SIZE DIAL, and the reason it is a dial and not a constant is that
+        // it is the one setting on this feature that trades an artifact's SIZE
+        // against the work spent producing it. `0` restores the lossless
+        // `f64 -> BigRational` conversion the feature shipped with. It cannot
+        // trade away validity: weak duality holds for ANY dual vector, so a
+        // coarser one still yields a valid bound, and every leaf is re-verified
+        // against the caller's model before it enters the tree.
+        let grid = match flags.get("opt-tree-grid") {
+            Some(v) => match v.parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) if n <= 60 => Some(n),
+                _ => return die("--opt-tree-grid needs an integer in 0..=60"),
+            },
+            None => ay_milp::OptimalityTreeBudget::new(1).dual_grid_bits,
+        };
+        match &outcome {
+            ay_milp::Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            } if leaves > 0 => {
+                let t = Instant::now();
+                let budget = ay_milp::OptimalityTreeBudget::new(leaves)
+                    .with_work(work)
+                    .with_dual_grid_bits(grid)
+                    .with_deadline(
+                        (secs > 0.0).then(|| Instant::now() + Duration::from_secs_f64(secs)),
+                    );
+                let (derived, report) = ay_milp::derive_optimality_tree_reported(
+                    s.model(),
+                    value,
+                    model_values,
+                    &budget,
+                );
+                // "declined (budget or model out of reach)" was ONE message for
+                // at least three unrelated events. Name the one that fired, and
+                // say what it cost: the difference between `deadline` and
+                // `unbounded-leaf` is the difference between "raise the budget"
+                // and "never spend a second here again".
+                opt_tree_note = format!(
+                    ", optimality-tree {} in {:.3} s",
+                    derived.as_ref().map_or_else(
+                        || {
+                            format!(
+                                "declined ({}{}; {} leaves, depth {}, {} float + {} rim LPs, \
+                                 work {}/{}, root-gap {})",
+                                report
+                                    .decline
+                                    .map_or("unknown", ay_milp::OptTreeDecline::tag),
+                                // The terminal reason is the LAST one raised, so a
+                                // descent that abandoned a 512-deep subtree, or
+                                // tripped the leaf cap, and then spent the rest of
+                                // its budget in the exact rim says only `work-cap`.
+                                // Say all three: one is a budget the caller can
+                                // move, one is an artifact bound it can move
+                                // separately, and one is a shape it cannot.
+                                {
+                                    let mut extra = String::new();
+                                    if report.depth_capped > 0 {
+                                        extra.push_str(&format!(
+                                            " + {} at depth-cap",
+                                            report.depth_capped
+                                        ));
+                                    }
+                                    if report.leaf_capped > 0 {
+                                        extra.push_str(&format!(
+                                            " + {} at leaf-cap",
+                                            report.leaf_capped
+                                        ));
+                                    }
+                                    extra
+                                },
+                                report.leaves,
+                                report.max_depth,
+                                report.float_solves,
+                                report.rim_solves,
+                                report.work,
+                                work,
+                                report
+                                    .root_gap_rel
+                                    .map_or_else(|| "n/a".to_string(), |g| format!("{g:.6}"))
+                            )
+                        },
+                        // WORK IS ON THE SUCCESS LINE TOO. It is the only number
+                        // here that says how close this derivation came to the
+                        // budget, and a harness that wants to know whether a
+                        // certificate is at risk of being lost to a future
+                        // budget change has nowhere else to read it.
+                        // `grid` and `grid-fallbacks` ride here for the mirror
+                        // reason: a fallback count near `by bound` means the
+                        // coarse rung is closing nothing and only costing
+                        // retries, and neither number can be read off the file.
+                        |c| format!(
+                            "{} leaves = {} by bound + {} empty (work {}/{}, root-gap {}, \
+                             grid {}, {} grid-fallbacks)",
+                            c.num_leaves(),
+                            c.num_dominated_leaves(),
+                            c.num_leaves() - c.num_dominated_leaves(),
+                            report.work,
+                            work,
+                            report
+                                .root_gap_rel
+                                .map_or_else(|| "n/a".to_string(), |g| format!("{g:.6}")),
+                            grid.map_or_else(|| "off".to_string(), |b| format!("2^-{b}")),
+                            report.grid_fallbacks,
+                        )
+                    ),
+                    t.elapsed().as_secs_f64()
+                );
+                ph_opt_tree = t.elapsed();
+                derived
+            }
+            _ => None,
+        }
+    };
+
+    let mut ph_cert = Duration::ZERO;
     if let Some(cp) = &cert_path {
         let t = Instant::now();
         let ctx = cert_io::EmitCtx {
@@ -340,6 +652,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
             network_design_optimality_certificate: s.network_design_optimality_certificate(),
             block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
+            milp_optimality_tree_certificate: opt_tree.as_ref(),
             single_machine_scheduling_optimality_certificate: s
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
@@ -361,11 +674,12 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         let bytes = ayc.len();
         match std::fs::write(cp, ayc.as_bytes()) {
             Ok(()) => eprintln!(
-                "certificate: {cp} ({bytes} bytes, {} us)",
+                "certificate: {cp} ({bytes} bytes, {} us){opt_tree_note}",
                 t.elapsed().as_micros()
             ),
             Err(e) => eprintln!("ay-milp: WARNING: cannot write {cp}: {e}"),
         }
+        ph_cert = t.elapsed();
     }
 
     // --emit-witness works on EVERY verdict that has a point, which is the whole
@@ -395,9 +709,11 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     }
 
     // BATTERY 4 — `--require witness` as the default posture. The engine's own
-    // `finish` gate already re-validates every verdict's witness; this makes
-    // the guarantee CONTRACTUAL by re-checking here, independently, and failing
-    // the run rather than printing an unbacked verdict.
+    // The session boundary validates any published witness; this makes the
+    // guarantee CONTRACTUAL by re-checking here independently and failing the
+    // run rather than printing an unbacked verdict.
+    let t_ph = Instant::now();
+    let mut ph_require = Duration::ZERO;
     if require != Require::None {
         if let Some(x) = witness_of(&outcome) {
             if let Err(v) = s.model().check_point(x) {
@@ -410,6 +726,56 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             eprintln!("ay-milp: --require witness FAILED: a sat verdict carries no point");
             return ExitCode::from(5);
         }
+        ph_require = t_ph.elapsed();
+    }
+
+    // THE FIXED PER-SOLVE COST, AS A SUM RATHER THAN A REGRESSION INTERCEPT.
+    //
+    // Least squares over 37 both-proved instances put ay at `1.492 s +
+    // 26.51 us/node` against Gurobi's `0.076 s + 49.48 us/node` and the
+    // campaign read the intercept ratio as a real 19.6x fixed-cost gap. It is
+    // not one: ay finishes stein9inf in 12 ms wall, which a 1.49 s fixed cost
+    // makes impossible. The intercept is what an unweighted two-parameter fit
+    // does with a per-node cost that spans four orders of magnitude across the
+    // corpus — it absorbs residual, and it is smaller than the residual SD.
+    //
+    // So the fixed cost has to be MEASURED. Every phase outside `check()` is
+    // timed above and printed here alongside `solve`, and the caller differences
+    // `total` against its own wall clock to recover the exec chain (`arm`'s
+    // re-exec through `taskpolicy` costs a second process image) plus dyld and
+    // the Rust prologue. `resid` is whatever this function did that no phase
+    // claimed; it is printed rather than absorbed, because a decomposition with
+    // an unattributed remainder is not a decomposition.
+    if ledger {
+        let in_main = MAIN_T0.get().map_or(Duration::ZERO, Instant::elapsed);
+        let dispatch = MAIN_T0.get().map_or(Duration::ZERO, |t0| {
+            t_dispatch.saturating_duration_since(*t0)
+        });
+        let named = ph_read
+            + ph_parse
+            + ph_shape
+            + ph_session
+            + Duration::from_secs_f64(dt)
+            + ph_opt_tree
+            + ph_cert
+            + ph_require
+            + dispatch;
+        let us = |d: Duration| d.as_micros();
+        eprintln!(
+            "phase-ledger: dispatch={} read={} parse={} shape={} session={} solve={} \
+             opt_tree={} cert={} require={} resid={} in_main={} (us)",
+            us(dispatch),
+            us(ph_read),
+            us(ph_parse),
+            us(ph_shape),
+            us(ph_session),
+            (dt * 1e6) as u128,
+            us(ph_opt_tree),
+            us(ph_cert),
+            us(ph_require),
+            us(in_main.saturating_sub(named)),
+            us(in_main),
+        );
     }
 
     let json = flags.get("format").map(String::as_str) == Some("json");
@@ -673,16 +1039,16 @@ fn cmd_verify(args: &[String]) -> ExitCode {
     // The checker re-parses the model itself and re-derives every number. It
     // takes NOTHING from the certificate as fact.
     let report = cert_io::check(&cert_text, &model_text);
-    for n in &report.notes {
+    for n in report.notes() {
         println!("  {n}");
     }
-    for c in &report.claims {
+    for c in report.claims() {
         println!(
             "  claim {:<11} {:<9} {}  {}",
-            c.name,
-            c.kind.token(),
-            if c.verified { "ok    " } else { "NOT-OK" },
-            c.detail
+            c.name(),
+            c.kind().token(),
+            if c.is_verified() { "ok    " } else { "NOT-OK" },
+            c.detail()
         );
     }
     // THE CENSUS LINE, always printed, on every status. The aggregate word
@@ -695,9 +1061,9 @@ fn cmd_verify(args: &[String]) -> ExitCode {
     // refuted=- unbacked=dual` and can act on it.
     println!("{}", report.census());
     let replay = report
-        .claims
+        .claims()
         .iter()
-        .any(|c| c.kind == cert_io::EvidenceKind::Replay);
+        .any(|c| c.kind() == cert_io::EvidenceKind::Replay);
 
     // The word VERIFIED is reserved. `--accept-replay` prints
     // ACCEPTED-ON-TRUST and still exits non-zero unless `--exit-zero` is ALSO
@@ -708,7 +1074,7 @@ fn cmd_verify(args: &[String]) -> ExitCode {
     // same aggregate ("nothing refuted; something has no object"), only more
     // precisely reported. It still cannot reach exit 0 without BOTH flags.
     if matches!(
-        report.status,
+        report.status(),
         cert_io::CheckStatus::Unverified | cert_io::CheckStatus::Partial
     ) && replay
         && flags.has("accept-replay")
@@ -720,16 +1086,83 @@ fn cmd_verify(args: &[String]) -> ExitCode {
         // The status's OWN code, so trusting the replay half does not erase
         // the fact that some other claim did or did not re-derive.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        return ExitCode::from(report.status.exit_code() as u8);
+        return ExitCode::from(report.status().exit_code() as u8);
     }
-    println!("{}", report.status.word());
+    println!("{}", report.status().word());
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    ExitCode::from(report.status.exit_code() as u8)
+    ExitCode::from(report.status().exit_code() as u8)
 }
 
 // ---------------------------------------------------------------------------
 // check-point — the standalone primal checker, promoted to a command
 // ---------------------------------------------------------------------------
+
+struct NamedPoint {
+    values: Vec<BigRational>,
+    supplied: Vec<Option<BigRational>>,
+    matched_lines: usize,
+}
+
+struct RepairLimits {
+    time_limit_secs: f64,
+    memory_budget: Option<usize>,
+}
+
+fn parse_named_point(problem: &MpsProblem, text: &str) -> NamedPoint {
+    let index = name_index(&problem.col_names);
+    let mut values = vec![BigRational::zero(); problem.model.num_cols()];
+    let mut supplied = vec![None; problem.model.num_cols()];
+    let mut matched_lines = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Accept `name value` and `x <j> <name> <value>`. A bare value list is
+        // deliberately not accepted because it is too easy to misalign.
+        let (name, value) = match fields[..] {
+            [name, value] | ["x", _, name, value] => (name, value),
+            _ => continue,
+        };
+        // Parse decimal text exactly: `0.9` is nine tenths, not the nearest
+        // binary floating-point value.
+        let Some(value) = parse_decimal_exact(value) else {
+            continue;
+        };
+        if let Some(&column) = index.get(name) {
+            values[column] = value.clone();
+            supplied[column] = Some(value);
+            matched_lines += 1;
+        }
+    }
+    NamedPoint {
+        values,
+        supplied,
+        matched_lines,
+    }
+}
+
+fn repair_limits(flags: &Flags) -> Result<RepairLimits, String> {
+    let time_limit = flags
+        .get("repair-time-limit")
+        .map_or(Ok(10.0), |value| value.parse::<f64>())
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "--repair-time-limit needs a positive finite number".to_owned())?;
+    let memory_budget = flags
+        .get("memory-budget")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "--memory-budget needs an integer".to_owned())
+        })
+        .transpose()?;
+    Ok(RepairLimits {
+        time_limit_secs: time_limit,
+        memory_budget,
+    })
+}
 
 fn cmd_check_point(args: &[String]) -> ExitCode {
     let flags = match Flags::parse(
@@ -758,40 +1191,15 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => return die(&format!("PARSE_ERROR {e}")),
     };
-    let idx = name_index(&p.col_names);
-    let mut x = vec![BigRational::zero(); p.model.num_cols()];
-    let mut supplied = vec![None; p.model.num_cols()];
-    let mut hits = 0usize;
-    for line in point_text.lines() {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with('#') {
-            continue;
-        }
-        let f: Vec<&str> = l.split_whitespace().collect();
-        // Accept the three shapes: `name value`, `x <j> <name> <value>`, and a
-        // bare `<value>` column list is deliberately NOT accepted (too easy to
-        // misalign silently).
-        let (key, val) = match f[..] {
-            [n, v] => (n, v),
-            ["x", _, n, v] => (n, v),
-            _ => continue,
-        };
-        // Parsed from the DECIMAL TEXT as an exact rational, not through f64:
-        // `0.9` is nine tenths, and an exact checker that read the nearest
-        // double would adjudicate a model nobody wrote.
-        let Some(v) = parse_decimal_exact(val) else {
-            continue;
-        };
-        if let Some(&j) = idx.get(key) {
-            x[j] = v.clone();
-            supplied[j] = Some(v);
-            hits += 1;
-        }
-    }
-    println!("point: {hits} of {} columns named", p.model.num_cols());
-    match p.model.check_point(&x) {
+    let point = parse_named_point(&p, &point_text);
+    println!(
+        "point: {} of {} columns named",
+        point.matched_lines,
+        p.model.num_cols()
+    );
+    match p.model.check_point(&point.values) {
         Ok(()) => {
-            let v = p.model.objective_value_at(&x);
+            let v = p.model.objective_value_at(&point.values);
             println!(
                 "FEASIBLE  objective {} (file frame)",
                 rat(&(&v / &p.obj_scale))
@@ -803,28 +1211,18 @@ fn cmd_check_point(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(v) if flags.has("repair-continuous") => {
-            let repair_time_limit = match flags
-                .get("repair-time-limit")
-                .map_or(Ok(10.0), |value| value.parse::<f64>())
-            {
-                Ok(value) if value.is_finite() && value > 0.0 => value,
-                _ => return die("--repair-time-limit needs a positive finite number"),
-            };
-            let memory_budget = match flags.get("memory-budget") {
-                Some(value) => match value.parse::<usize>() {
-                    Ok(value) => Some(value),
-                    Err(_) => return die("--memory-budget needs an integer"),
-                },
-                None => None,
+            let limits = match repair_limits(&flags) {
+                Ok(limits) => limits,
+                Err(error) => return die(&error),
             };
             println!(
                 "point: decimal text failed exact checking ({v:?}); attempting continuous repair"
             );
             match repair_continuous_completion(
                 &p.model,
-                &supplied,
-                Duration::from_secs_f64(repair_time_limit),
-                memory_budget,
+                &point.supplied,
+                Duration::from_secs_f64(limits.time_limit_secs),
+                limits.memory_budget,
             ) {
                 Ok(repaired) => {
                     let value = p.model.objective_value_at(&repaired);
@@ -937,106 +1335,8 @@ fn repair_continuous_completion(
 }
 
 #[cfg(test)]
-mod point_repair_tests {
-    use super::*;
-    use ay_milp::{Model, Sense};
-
-    fn thirds_model() -> Model {
-        let mut model = Model::new();
-        let integer = model.add_int_col(0.0, 1.0);
-        let continuous = model.add_col(0.0, 1.0);
-        model.add_row(0.0, 0.0, &[(integer, -1.0), (continuous, 3.0)]);
-        model.set_objective(&[(continuous, 1.0)], Sense::Minimize);
-        model
-    }
-
-    #[test]
-    fn rounded_continuous_value_is_repaired_with_integer_assignment_fixed() {
-        let model = thirds_model();
-        let supplied = vec![
-            Some(BigRational::one()),
-            Some(BigRational::new(
-                BigInt::from(333_333_333_333_333_i64),
-                BigInt::from(1_000_000_000_000_000_i64),
-            )),
-        ];
-        assert!(model
-            .check_point(
-                &supplied
-                    .iter()
-                    .map(|value| value.clone().expect("complete point"))
-                    .collect::<Vec<_>>()
-            )
-            .is_err());
-
-        let repaired =
-            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
-                .expect("the exact LP completion exists");
-        assert_eq!(repaired[0], BigRational::one());
-        assert_eq!(
-            repaired[1],
-            BigRational::new(BigInt::from(1), BigInt::from(3))
-        );
-        assert!(model.check_point(&repaired).is_ok());
-    }
-
-    #[test]
-    fn repair_refuses_missing_or_fractional_integral_assignments() {
-        let model = thirds_model();
-        let missing = vec![None, Some(BigRational::zero())];
-        assert!(repair_continuous_completion(
-            &model,
-            &missing,
-            Duration::from_secs(2),
-            Some(64 << 20),
-        )
-        .is_err());
-
-        let fractional = vec![
-            Some(BigRational::new(BigInt::from(1), BigInt::from(2))),
-            Some(BigRational::zero()),
-        ];
-        assert!(repair_continuous_completion(
-            &model,
-            &fractional,
-            Duration::from_secs(2),
-            Some(64 << 20),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn pure_lp_decimal_point_can_be_reconstructed_exactly() {
-        let mut model = Model::new();
-        let continuous = model.add_col(0.0, 1.0);
-        model.add_row(1.0, 1.0, &[(continuous, 3.0)]);
-        model.set_objective(&[(continuous, 1.0)], Sense::Minimize);
-        let supplied = vec![Some(BigRational::new(
-            BigInt::from(333_333_333_333_333_i64),
-            BigInt::from(1_000_000_000_000_000_i64),
-        ))];
-        let repaired =
-            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
-                .expect("the exact LP vertex exists");
-        assert_eq!(
-            repaired,
-            vec![BigRational::new(BigInt::from(1), BigInt::from(3))]
-        );
-    }
-
-    #[test]
-    fn repair_rejects_an_integer_the_numeric_model_cannot_represent() {
-        let mut model = Model::new();
-        model.add_int_col(f64::NEG_INFINITY, f64::INFINITY);
-        let supplied = vec![Some(BigRational::from_integer(BigInt::from(
-            9_007_199_254_740_993_u64,
-        )))];
-        let error =
-            repair_continuous_completion(&model, &supplied, Duration::from_secs(2), Some(64 << 20))
-                .expect_err("2^53 + 1 is not exactly representable as f64");
-        assert!(error.contains("cannot be represented exactly"), "{error}");
-    }
-}
+#[path = "ay_milp/point_repair_tests.rs"]
+mod point_repair_tests;
 
 // ---------------------------------------------------------------------------
 // diag — the old env-var modes, as subcommands
@@ -1045,54 +1345,15 @@ mod point_repair_tests {
 /// `diag` modes whose lane threads a caller [`SolveOpts`], so an engine flag
 /// given there actually reaches the engine.
 ///
-/// `root-closure`, `lp-only`, `dualfix` and `margin-row` reach it through the
-/// `_with` diagnostics; `cross-check` and `profile` reach it through
-/// `BabSession::check`, which installs the caller frame from whatever opts it is
-/// handed — they were only missing it because each built a throwaway
-/// `SolveOpts::new()` beside the flagged one.
+/// `root-closure`, `lp-only`, `shipped-lp`, `dualfix`, and `margin-row` use
+/// `_with` entries; `cross-check` and `profile` install the caller frame
+/// through `check`.
 ///
-/// EACH ENTRY HAS A MEASURED POSITIVE CONTROL — a flag that demonstrably moves
-/// that mode's own output on a real model. Listing a mode here without one would
-/// recreate the dead-flag defect in a new place, since the entry is precisely the
-/// promise that a flag given to the mode is honoured:
-///
-/// | mode | control | measured effect | when |
-/// |---|---|---|---|
-/// | `dualfix` | `--no-dualfix` | `p0548`: `int_after=477 fixings=55 … rounds=3` → `fixings=0 DECLINED` | this change |
-/// | `margin-row` | `--no-margin-reframe` | `…_1181_feas`: `reframed_solve=FEASIBLE_UNDECIDED … => original=UNKNOWN` → `reframed_solve=DECLINED reframed_bound=- … => original=plain-feasibility`, 3/3 repeats | this change |
-/// | `margin-row` | `--devex` | same model, 5 repeats each: `reframed_bound` ∈ [-0.110, -0.017] unflagged vs [+0.1464, +0.1498] flagged — disjoint ranges, not one pair, because that field is an ANYTIME bound (see `diag_margin_reframe_with`) | this change |
-/// | `lp-only` | `--devex` | `qiu` primal 3455 → 2176 | 814b23485 |
-/// | `root-closure` | `--root-cuts-per-round` | cut count / `bound_cut` move | 814b23485 |
-/// | `cross-check` | `--devex` | reaches the nested `BabSession` | 814b23485 |
-/// | `profile` | `--devex` | reaches the nested `BabSession` | 814b23485 |
-///
-/// The `when` column is not decoration: the last four are INHERITED claims, taken
-/// on the commit that added those entries, and re-verifying them was not part of
-/// this change. The first three were measured on the binary this comment ships
-/// with.
-///
-/// `block-angular` is NOT here, and that is a finding, not an omission. Its
-/// diagnostic reports the stage/decline/term/round census of the EXACT
-/// block-angular decomposition, and `block_angular_route.rs` contains ZERO knob
-/// reads — `grep -c 'tune::' crates/ay-milp/src/block_angular_route.rs` is 0 over
-/// 7,007 lines. Recognition, pricing and certificate replay are deterministic by
-/// construction, and the one nested LP it runs is a restricted master whose
-/// `SolveOpts` the route builds itself with `require_certificates = true` and
-/// `structure_routing = false` because its exactness argument depends on those
-/// two settings, not on the caller's taste. A `_with` variant would parse a flag,
-/// thread it, and move no number — the exact defect this list exists to prevent
-/// — so `block-angular` keeps refusing, loudly, at exit 2.
-///
-/// Its two real knobs are `diag`'s own and both work today. Measured on the
-/// two-block covering fixture from `tests/cert_io.rs`:
-///
-/// ```text
-/// (default)            … status=optimal … terms=1334 rounds=104 master_rows=1 blocks=2 route_budget_bytes=67108864 phase_cap_bytes=33554432
-/// --memory-budget 8388608  … status=optimal … terms=1334 rounds=104 master_rows=1 blocks=2 route_budget_bytes=8388608  phase_cap_bytes=4194304
-/// ```
+/// `block-angular` reads no tuning knobs, so it remains excluded.
 const DIAG_MODES_WITH_OPTS: &[&str] = &[
     "root-closure",
     "lp-only",
+    "shipped-lp",
     "dualfix",
     "margin-row",
     "cross-check",
@@ -1102,106 +1363,175 @@ const DIAG_MODES_WITH_OPTS: &[&str] = &[
 /// `diag`'s OWN carriers — parsed here, not by `engine_flags::apply`.
 const DIAG_OWN_FLAGS: &[&str] = &["time-limit", "memory-budget", "row", "solution"];
 
-fn cmd_diag(args: &[String]) -> ExitCode {
-    // ENGINE FLAGS REACH THE TWO MODES THAT CAN HONOUR THEM.
-    //
-    // `diag` used to refuse every engine flag, which was the safe half of the
-    // dead-flag repair: `--devex` on `lp-only` changed nothing, so refusing it
-    // beat measuring under it. The other half is this — `root-closure` and
-    // `lp-only` now build `SolveOpts`, run `engine_flags::apply` on it and hand
-    // it to the `_with` variant, so the flag moves the number it names.
-    //
+fn parse_diag_flags(args: &[String]) -> Result<Flags, String> {
     // The accept list is `applied_flags()`, NOT `VALUE_FLAGS`: the latter also
     // carries `solve`'s own names (`--emit-cert`, `--require`, `--threads`),
     // which no diagnostic reads, and accepting one of those here would be the
     // same defect in a new place.
-    let applied = engine_flags::applied_flags();
-    let all_switches = engine_flags::switch_flags();
-    let switches: Vec<&str> = all_switches
-        .iter()
-        .copied()
-        .filter(|n| applied.contains(n))
-        .collect();
-    let mut value_flags: Vec<&str> = DIAG_OWN_FLAGS.to_vec();
-    for name in &applied {
-        if !switches.contains(name) && !value_flags.contains(name) {
-            value_flags.push(name);
-        }
+    //
+    // The set algebra that used to be spelled out here is now
+    // `engine_flags::parse_applied`, which the five measurement harnesses call
+    // too — `diag` was the only surface that had it right, and a second copy
+    // is a second thing to forget.
+    engine_flags::parse_applied(args, DIAG_OWN_FLAGS, &[])
+}
+
+fn validate_diag_mode_flags(mode: &str, flags: &Flags) -> Result<(), String> {
+    if DIAG_MODES_WITH_OPTS.contains(&mode) {
+        return Ok(());
     }
-    let flags = match Flags::parse(args, &value_flags, &switches) {
-        Ok(f) => f,
-        Err(e) => return die(&e),
-    };
-    let Some(mode) = flags.positional.first().cloned() else {
-        return die("diag needs a mode \
-             (root-closure|lp-only|dualfix|block-angular|margin-row|cross-check|profile)");
-    };
-    // A mode that threads no opts must not accept a flag it cannot honour. The
-    // parser cannot enforce this (the mode is a positional, read after parsing),
-    // so the refusal is here, and it names the flag and the modes that do take it.
-    if !DIAG_MODES_WITH_OPTS.contains(&mode.as_str()) {
-        if let Some(stray) = flags
-            .names_given()
-            .into_iter()
-            .find(|n| !DIAG_OWN_FLAGS.contains(n))
-        {
-            return die(&format!(
-                "`diag {mode}` threads no SolveOpts, so `--{stray}` would have been parsed \
-                 and IGNORED — REFUSED rather than measured under a flag that does nothing. \
-                 Engine flags apply to: {}.",
-                DIAG_MODES_WITH_OPTS.join(", ")
-            ));
-        }
+    if let Some(stray) = flags
+        .names_given()
+        .into_iter()
+        .find(|name| !DIAG_OWN_FLAGS.contains(name))
+    {
+        return Err(format!(
+            "`diag {mode}` threads no SolveOpts, so `--{stray}` would have been parsed \
+             and IGNORED — REFUSED rather than measured under a flag that does nothing. \
+             Engine flags apply to: {}.",
+            DIAG_MODES_WITH_OPTS.join(", ")
+        ));
     }
-    let Some(path) = flags.positional.get(1).cloned() else {
-        return die("diag needs a model file");
-    };
-    let secs: f64 = flags
-        .get("time-limit")
-        .and_then(|s| s.parse().ok())
-        .or_else(|| flags.positional.get(2).and_then(|s| s.parse().ok()))
-        .unwrap_or(60.0);
-    // The flagged opts the two `_with` lanes consume. Built even when no engine
-    // flag was given: `SolveOpts::new()` plus the time limit is what those lanes
-    // used to construct internally, so the default path is unchanged.
-    let opts = match engine_flags::apply(
-        &flags,
+    Ok(())
+}
+
+fn diag_options(flags: &Flags, secs: f64) -> Result<SolveOpts, String> {
+    engine_flags::apply(
+        flags,
         SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs)),
-    ) {
-        Ok(o) => o,
-        Err(e) => return die(&format!("bad engine flag: {e}")),
+    )
+    .map_err(|error| format!("bad engine flag: {error}"))
+}
+
+fn run_diag_root_closure(p: &MpsProblem, secs: f64, opts: &SolveOpts) -> ExitCode {
+    let line = ay_milp::diag_root_closure_with(&p.model, secs, opts);
+    // The diagnostic reports in the model's sense/offset frame; what it cannot
+    // undo is the reader's integralising objective scale.
+    let scale = p.obj_scale.to_f64().unwrap_or(1.0);
+    let rescaled = line
+        .split_whitespace()
+        .map(|token| match token.split_once('=') {
+            Some((key @ ("bound_lp" | "bound_cut" | "gain"), value)) => {
+                let value: f64 = value.parse().unwrap_or(f64::NAN);
+                format!("{key}={}", value / scale)
+            }
+            _ => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("{rescaled}");
+    ExitCode::SUCCESS
+}
+
+fn run_diag_profile(model: ay_milp::Model, opts: &SolveOpts) -> ExitCode {
+    let mut session = match BabSession::new(model, opts) {
+        Ok(session) => session,
+        Err(error) => return die(&format!("{error:?}")),
     };
-    let text = match read_maybe_gz(&path) {
-        Ok(t) => t,
-        Err(e) => return die(&format!("cannot read {path}: {e}")),
+    let started = Instant::now();
+    let outcome = session.check();
+    eprintln!(
+        "profile: {:?} in {:.3}s",
+        outcome.map(|value| value.is_sat()),
+        started.elapsed().as_secs_f64()
+    );
+    print_profiles();
+    ExitCode::SUCCESS
+}
+
+fn run_diag_block_angular(flags: &Flags, p: &MpsProblem, secs: f64) -> ExitCode {
+    let memory_budget = match flags.get("memory-budget") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) => Some(value),
+            Err(_) => return die("--memory-budget needs an integer"),
+        },
+        None => None,
     };
-    let p = match ay_milp::read_mps(&text) {
-        Ok(p) => p,
-        Err(e) => return die(&format!("PARSE_ERROR {e}")),
+    println!(
+        "{}",
+        ay_milp::diag_block_angular(&p.model, secs, memory_budget)
+    );
+    ExitCode::SUCCESS
+}
+
+struct DiagRequest {
+    flags: Flags,
+    mode: String,
+    secs: f64,
+    opts: SolveOpts,
+    problem: MpsProblem,
+}
+
+fn prepare_diag(args: &[String]) -> Result<DiagRequest, String> {
+    let flags = parse_diag_flags(args)?;
+    let mode = flags.positional.first().cloned().ok_or_else(|| {
+        "diag needs a mode (root-closure|lp-only|shipped-lp|dualfix|block-angular|margin-row|cross-check|profile)"
+            .to_owned()
+    })?;
+    validate_diag_mode_flags(&mode, &flags)?;
+    let path = flags
+        .positional
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "diag needs a model file".to_owned())?;
+    let secs = flags
+        .get("time-limit")
+        .and_then(|value| value.parse().ok())
+        .or_else(|| flags.positional.get(2).and_then(|value| value.parse().ok()))
+        .unwrap_or(60.0);
+    let opts = diag_options(&flags, secs)?;
+    let text = read_maybe_gz(&path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let problem = ay_milp::read_mps(&text).map_err(|error| format!("PARSE_ERROR {error}"))?;
+    Ok(DiagRequest {
+        flags,
+        mode,
+        secs,
+        opts,
+        problem,
+    })
+}
+
+fn cmd_diag(args: &[String]) -> ExitCode {
+    let request = match prepare_diag(args) {
+        Ok(request) => request,
+        Err(error) => return die(&error),
     };
+    let DiagRequest {
+        flags,
+        mode,
+        secs,
+        opts,
+        problem: p,
+    } = request;
     report_shape(&p);
     match mode.as_str() {
-        "root-closure" => {
-            let line = ay_milp::diag_root_closure_with(&p.model, secs, &opts);
-            // The diagnostic reports in the model's sense/offset frame; what it
-            // cannot undo is the reader's integralising objective scale.
-            let scale = p.obj_scale.to_f64().unwrap_or(1.0);
-            let rescaled = line
-                .split_whitespace()
-                .map(|tok| match tok.split_once('=') {
-                    Some((k @ ("bound_lp" | "bound_cut" | "gain"), v)) => {
-                        let x: f64 = v.parse().unwrap_or(f64::NAN);
-                        format!("{k}={}", x / scale)
-                    }
-                    _ => tok.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("{rescaled}");
+        "root-closure" => run_diag_root_closure(&p, secs, &opts),
+        "lp-only" => {
+            // `units_clause` is APPENDED, not printed under: the value on this line
+            // is the scaled model's, and the factor has to travel with it.
+            eprintln!(
+                "{}{}",
+                ay_milp::diag_float_lp_with(&p.model, secs, &opts),
+                p.units_clause()
+            );
+            print_profiles();
             ExitCode::SUCCESS
         }
-        "lp-only" => {
-            eprintln!("{}", ay_milp::diag_float_lp_with(&p.model, secs, &opts));
+        // THE SHIPPED LANE, on the same subject as `lp-only`. `lp-only` is an
+        // iteration-economics scaffold: one cold walk, no ladder, nothing
+        // certified. Its status and objective have twice been quoted as solver
+        // behaviour and been wrong both times, so the diagnostic that answers
+        // "what does the solver actually do with this LP" now exists as its own
+        // mode rather than as a footnote nobody reads.
+        "shipped-lp" => {
+            // Same append, and it matters MORE here: this line says
+            // `certified=true`, so its value reads as adjudicated truth. It is —
+            // in the scaled model's units.
+            eprintln!(
+                "{}{}",
+                ay_milp::diag_shipped_float_lp(&p.model, secs, &opts),
+                p.units_clause()
+            );
             print_profiles();
             ExitCode::SUCCESS
         }
@@ -1209,37 +1539,10 @@ fn cmd_diag(args: &[String]) -> ExitCode {
         // is the `DualReductions=0` arm and `int_after` the default one, both
         // measured on the same pass so the attribution needs no second run.
         "dualfix" => {
-            // `--no-dualfix` is the rule's only kill switch and it lives on the
-            // caller layer, so the flagged `opts` — not a throwaway — is what
-            // makes it reachable here at all.
             println!("{}", ay_milp::diag_dualfix_with(&p.model, secs, &opts));
             ExitCode::SUCCESS
         }
-        // THE ONE MODE THAT STAYS FRAMELESS, ON PURPOSE. `diag_block_angular`
-        // takes no `SolveOpts` and is not given one, because there is nothing on
-        // its path for a caller profile to reach: `block_angular_route.rs` reads
-        // ZERO `tune` knobs, and the restricted-master LP it runs is configured
-        // by the route itself (`require_certificates = true`,
-        // `structure_routing = false`) because the exactness argument depends on
-        // those two settings, not on the caller's taste. Threading opts here
-        // would satisfy the letter of DIAG_MODES_WITH_OPTS and reintroduce its
-        // defect: a flag that parses, threads, and moves no number. Its real
-        // knobs (`--time-limit`, `--memory-budget`) are `diag`'s own, and both
-        // already work.
-        "block-angular" => {
-            let memory_budget = match flags.get("memory-budget") {
-                Some(value) => match value.parse::<usize>() {
-                    Ok(value) => Some(value),
-                    Err(_) => return die("--memory-budget needs an integer"),
-                },
-                None => None,
-            };
-            println!(
-                "{}",
-                ay_milp::diag_block_angular(&p.model, secs, memory_budget)
-            );
-            ExitCode::SUCCESS
-        }
+        "block-angular" => run_diag_block_angular(&flags, &p, secs),
         "margin-row" => {
             // B22: --row is the carrier; the env fallback is retired.
             let spec = flags.get("row").cloned().unwrap_or_else(|| "last".into());
@@ -1283,9 +1586,6 @@ fn cmd_diag(args: &[String]) -> ExitCode {
                 }
             }
             eprintln!("cross-check: pinned {pinned} integer columns to the reference solution");
-            // The flagged `opts` from above, not a throwaway `SolveOpts::new()`.
-            // `check` installs the caller frame from what it is handed, so the
-            // one-line shadow was the whole reason `--devex` did nothing here.
             let mut s = match BabSession::new(m, &opts) {
                 Ok(s) => s,
                 Err(e) => return die(&format!("{e:?}")),
@@ -1300,22 +1600,7 @@ fn cmd_diag(args: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        "profile" => {
-            // Same one-line shadow as `cross-check`, same repair.
-            let mut s = match BabSession::new(p.model, &opts) {
-                Ok(s) => s,
-                Err(e) => return die(&format!("{e:?}")),
-            };
-            let t0 = Instant::now();
-            let o = s.check();
-            eprintln!(
-                "profile: {:?} in {:.3}s",
-                o.map(|x| x.is_sat()),
-                t0.elapsed().as_secs_f64()
-            );
-            print_profiles();
-            ExitCode::SUCCESS
-        }
+        "profile" => run_diag_profile(p.model, &opts),
         other => die(&format!("unknown diag mode `{other}`")),
     }
 }
@@ -1673,224 +1958,5 @@ fn read_maybe_gz(path: &str) -> std::io::Result<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod json_output_tests {
-    use super::*;
-    use ay_milp::{Model, UnknownReason};
-
-    /// The `--format json` line for an outcome, built exactly as `cmd_solve`
-    /// builds it: `verdict_line` then `solve_json_line`. Only the numbers are
-    /// stand-ins.
-    fn emit(o: &Outcome) -> String {
-        let mut m = Model::new();
-        m.add_col(0.0, 1.0);
-        let scale = BigRational::one();
-        let (status, value, detail) = verdict_line(o, &m, &scale, 1.5, 7);
-        solve_json_line(
-            &status,
-            value.as_deref(),
-            None,
-            detail.as_deref(),
-            1.5,
-            7,
-            0,
-        )
-    }
-
-    fn parse(line: &str) -> serde_json::Value {
-        serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("`--format json` emitted invalid JSON: {e}\n  {line}"))
-    }
-
-    fn point() -> Vec<BigRational> {
-        vec![BigRational::zero()]
-    }
-
-    /// EVERY `UnknownReason` in `outcome.rs`, in declaration order. `Outcome`
-    /// and `UnknownReason` are `#[non_exhaustive]`, so this crate cannot get a
-    /// compile-time exhaustiveness check on them — `outcome.rs`'s
-    /// `cli_json_coverage` test carries that check (it lives in the defining
-    /// crate, where the match IS exhaustive) and names this list.
-    fn every_unknown_reason() -> Vec<UnknownReason> {
-        vec![
-            UnknownReason::Timeout,
-            UnknownReason::Interrupted,
-            UnknownReason::IterationLimit,
-            UnknownReason::MemoryLimit,
-            UnknownReason::CertificateUnavailable,
-            UnknownReason::SolverIncomplete {
-                detail: "branch-and-bound could not settle every node".to_owned(),
-            },
-            UnknownReason::WitnessRejected {
-                detail: "the verdict's point is infeasible".to_owned(),
-            },
-        ]
-    }
-
-    /// EVERY `Outcome` in `outcome.rs`, in declaration order, paired with the
-    /// status token the CLI must print for it.
-    fn every_outcome() -> Vec<(&'static str, Outcome)> {
-        let mut v = vec![
-            (
-                "OPTIMAL",
-                Outcome::Optimal {
-                    value: BigRational::zero(),
-                    model_values: point(),
-                    cert: None,
-                },
-            ),
-            (
-                "FEASIBLE",
-                Outcome::Feasible {
-                    model_values: point(),
-                    incumbent_only: true,
-                    dual_bound: None,
-                },
-            ),
-            (
-                "INFEASIBLE",
-                Outcome::Infeasible {
-                    cert: None,
-                    tree_cert: None,
-                },
-            ),
-            ("UNBOUNDED", Outcome::Unbounded),
-            (
-                "BOUND",
-                Outcome::Bound {
-                    dual_bound: BigRational::zero(),
-                    rigorous: true,
-                },
-            ),
-        ];
-        v.extend(
-            every_unknown_reason()
-                .into_iter()
-                .map(|reason| ("UNKNOWN", Outcome::Unknown { reason })),
-        );
-        v
-    }
-
-    /// THE REGRESSION. Before the fix, `verdict_line` returned
-    /// `UNKNOWN SolverIncomplete { detail: "branch-and-bound could not settle
-    /// every node" }` as the whole status and it was interpolated raw into the
-    /// `"status"` literal, so the inner quotes terminated the string and a real
-    /// parser stopped at the `S` of `SolverIncomplete`.
-    #[test]
-    fn a_debug_payload_status_is_still_json() {
-        let line = emit(&Outcome::Unknown {
-            reason: UnknownReason::SolverIncomplete {
-                detail: "branch-and-bound could not settle every node".to_owned(),
-            },
-        });
-        let v = parse(&line);
-        assert_eq!(v["status"], "UNKNOWN");
-        assert_eq!(
-            v["detail"],
-            "SolverIncomplete { detail: \"branch-and-bound could not settle every node\" }",
-            "the payload must survive the round trip, not just parse"
-        );
-    }
-
-    /// Not just the observed one: every status the CLI can print. (`OTHER` is
-    /// covered separately — a future `#[non_exhaustive]` variant cannot be
-    /// constructed here to reach the arm that produces it.)
-    #[test]
-    fn every_status_emits_valid_json() {
-        for (want, o) in every_outcome() {
-            let line = emit(&o);
-            let v = parse(&line);
-            assert_eq!(v["status"], want, "wrong status token for {o:?}\n  {line}");
-            // The status is the discriminator, so it must stay a bare token —
-            // a `Debug` blob smuggled back in would parse but be unmatchable.
-            assert!(
-                v["status"]
-                    .as_str()
-                    .is_some_and(|s| s.chars().all(|c| c.is_ascii_uppercase() || c == '-')),
-                "status must be an enumerable token, got {:?}",
-                v["status"]
-            );
-            assert!(v["time"].is_number() && v["nodes"].is_number());
-        }
-    }
-
-    /// The `OTHER` arm carries a whole `Outcome`'s `Debug`, not a reason's, and
-    /// `#[non_exhaustive]` means no variant reaching it can be constructed from
-    /// this crate. Drive the emission path with exactly the string that arm
-    /// builds so the catch-all is not the one shape nobody ever parsed.
-    #[test]
-    fn the_non_exhaustive_catch_all_emits_valid_json() {
-        let blob = format!(
-            "{:?}",
-            Outcome::Unknown {
-                reason: UnknownReason::SolverIncomplete {
-                    detail: "a \"quoted\" payload".to_owned(),
-                },
-            }
-        );
-        let line = solve_json_line("OTHER", None, None, Some(&blob), 1.5, 7, 0);
-        let v = parse(&line);
-        assert_eq!(v["status"], "OTHER");
-        assert_eq!(v["detail"], blob);
-    }
-
-    /// ⚠ A partial escape is the same bug with a smaller trigger. The quote is
-    /// what broke today; a backslash, a newline, a tab or a bare control
-    /// character each break a quote-only escaper. `Debug` renders some of these
-    /// itself, so drive the escaper directly as well as through an outcome.
-    #[test]
-    fn escaping_covers_more_than_the_double_quote() {
-        let nasty = "quote \" backslash \\ newline \n cr \r tab \t bs \u{8} ff \u{c} nul \u{0} \
-                     unit-sep \u{1f} unicode ü▲";
-        let line = emit(&Outcome::Unknown {
-            reason: UnknownReason::WitnessRejected {
-                detail: nasty.to_owned(),
-            },
-        });
-        let v = parse(&line);
-        assert_eq!(v["status"], "UNKNOWN");
-        assert_eq!(
-            v["detail"],
-            format!(
-                "{:?}",
-                UnknownReason::WitnessRejected {
-                    detail: nasty.to_owned()
-                }
-            ),
-            "the escaped detail must decode back to the exact Debug string"
-        );
-
-        // And the escaper on its own, against a real parser's idea of a string.
-        let escaped = json_escape(nasty);
-        let round: serde_json::Value = serde_json::from_str(&format!("\"{escaped}\""))
-            .unwrap_or_else(|e| panic!("json_escape produced an unparseable literal: {e}"));
-        assert_eq!(round, nasty);
-        assert!(
-            !escaped.contains('\n') && !escaped.contains('\t'),
-            "raw control characters are not legal inside a JSON string: {escaped:?}"
-        );
-    }
-
-    /// The line (non-JSON) shape is frozen — the journal's measurement scripts
-    /// read it — so splitting status/detail must re-join byte for byte.
-    #[test]
-    fn the_line_format_is_unchanged_by_the_split() {
-        let mut m = Model::new();
-        m.add_col(0.0, 1.0);
-        let scale = BigRational::one();
-        let o = Outcome::Unknown {
-            reason: UnknownReason::SolverIncomplete {
-                detail: "branch-and-bound could not settle every node".to_owned(),
-            },
-        };
-        let (status, value, detail) = verdict_line(&o, &m, &scale, 1.5, 7);
-        let rejoined = format!(
-            "{status}{} {}",
-            detail.map_or(String::new(), |d| format!(" {d}")),
-            value.as_deref().unwrap_or("-")
-        );
-        assert_eq!(
-            rejoined,
-            "UNKNOWN SolverIncomplete { detail: \"branch-and-bound could not settle every node\" } -"
-        );
-    }
-}
+#[path = "ay_milp/json_output_tests.rs"]
+mod json_output_tests;

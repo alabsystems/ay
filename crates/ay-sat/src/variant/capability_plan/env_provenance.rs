@@ -9,7 +9,8 @@ use crate::auto::DecisionSource;
 use crate::features::{InstanceClass, SatFeatures};
 use crate::proof_capability::ProofMode;
 use crate::variant::{
-    SolverVariant, VariantConfig, VariantRouteProfile, BVE_SPARSE_MAX_DENSITY, BVE_SPARSE_MAX_VARS,
+    SolverVariant, VariantConfig, VariantProofMode, VariantRouteProfile, BVE_SPARSE_MAX_DENSITY,
+    BVE_SPARSE_MAX_VARS,
 };
 
 pub(super) fn startup_policy_veto_source(
@@ -19,9 +20,11 @@ pub(super) fn startup_policy_veto_source(
 ) -> Option<(DecisionSource, String)> {
     let decided = route_source == Some(DecisionSource::EnvShim("AY_SAT_AI_CLASS"))
         && matches!(config.variant, SolverVariant::Default)
-        && matches!(config.input.route_profile, VariantRouteProfile::Standard)
-        && config.input.proof_mode
-        && config.input.lrat_mode
+        && matches!(
+            config.input().route_profile(),
+            VariantRouteProfile::Standard
+        )
+        && matches!(config.input().proof_mode(), VariantProofMode::Lrat)
         && matches!(gate.capability, "walk" | "warmup")
         && gate.final_state;
     decided.then(|| {
@@ -102,11 +105,11 @@ fn substitution_env_source(capability: &str) -> Option<(DecisionSource, String)>
 }
 
 fn bve_env_source(config: &VariantConfig) -> Option<(DecisionSource, String)> {
-    let num_vars = config.input.num_vars;
-    if config.input.lrat_mode || num_vars == 0 {
+    let num_vars = config.input().num_vars();
+    if matches!(config.input().proof_mode(), VariantProofMode::Lrat) || num_vars == 0 {
         return None;
     }
-    let density = config.input.num_clauses as f64 / num_vars as f64;
+    let density = config.input().num_clauses() as f64 / num_vars as f64;
     let max_vars_env = ay_core::sat_ab_switches()
         .bve_sparse_max_vars
         .filter(|value| *value > 0);
@@ -188,5 +191,5 @@ pub(super) fn circuit_equiv_symmetry_cli_decided(
 }
 
 pub(super) fn declared_clause_var_ratio(config: &VariantConfig) -> f64 {
-    config.input.num_clauses as f64 / config.input.num_vars.max(1) as f64
+    config.input().num_clauses() as f64 / config.input().num_vars().max(1) as f64
 }

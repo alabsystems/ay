@@ -102,6 +102,10 @@ pub struct Certificate {
     pub optcert_trivial: bool,
     /// The whole-tree infeasibility certificate, when present.
     pub tree: Option<MilpInfeasibilityCertificate>,
+    /// The whole-tree OPTIMALITY split tree, when present. A SEPARATE field
+    /// from `tree` on purpose: the two carry opposite claims, and a bound tree
+    /// read as a proof of emptiness would be fatal rather than merely vacuous.
+    pub opt_tree: Option<OptTreeNode>,
     /// Exact source-to-reduced affine replay, including reduced-frame proof.
     pub affine_aggregation: Option<AffineAggregationCertificate>,
     /// Exact GF(2) source-row contradiction, when present.
@@ -151,6 +155,7 @@ pub(super) const SUCCINCT_SOURCES: &[&str] = &[
     "farkas",
     "optcert",
     "tree",
+    "optimality-tree",
     "sat-relu-rup",
     "affine-aggregation",
     "parity-gf2",

@@ -55,7 +55,7 @@ mod tests {
     use ay_bv::BvBits;
 
     fn bits(values: &[i32]) -> BvBits {
-        values.iter().copied().collect()
+        values.to_vec()
     }
 
     #[test]

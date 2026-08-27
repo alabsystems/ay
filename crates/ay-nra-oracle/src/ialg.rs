@@ -67,12 +67,12 @@ use ay_nra::oracle_api::{
 };
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, Signed, Zero};
+use num_traits::{One, Zero};
 
 use crate::anum::{dyadic_iv, rationals};
 use crate::checks::{Divergence, Outcome, Sabotage};
 use crate::polygen::Rng;
-use crate::z3::{Ptr, Z3};
+use crate::z3::{Ast, Z3};
 
 /// Integers scanned either side of an interval when `check_pick` looks for a
 /// simpler value than AY returned. Bounded so the minimality leg can never run
@@ -263,19 +263,19 @@ pub(crate) fn gen_ia(rng: &mut Rng) -> GenIA {
 /// the same two endpoints.
 struct Pair {
     ay: OIAlgInterval,
-    lo: Option<Ptr>,
-    hi: Option<Ptr>,
+    lo: Option<Ast>,
+    hi: Option<Ast>,
 }
 
 /// A point to probe, as both sides see it.
 struct Probe {
     label: String,
     ay: ODyadicAnum,
-    z3: Ptr,
+    z3: Ast,
 }
 
 /// Build AY numbers and z3 ASTs for every real root of `p`, ascending.
-fn roots_of(z3: &Z3, p: &[BigInt]) -> Option<Vec<(ODyadicAnum, Ptr)>> {
+fn roots_of(z3: &Z3, p: &[BigInt]) -> Option<Vec<(ODyadicAnum, Ast)>> {
     let rs = z3.roots(&rationals(p))?;
     let mut out = Vec::with_capacity(rs.len());
     for v in rs {
@@ -289,14 +289,21 @@ fn roots_of(z3: &Z3, p: &[BigInt]) -> Option<Vec<(ODyadicAnum, Ptr)>> {
     Some(out)
 }
 
+/// Whether generated intervals include unbounded rays.
+#[derive(Clone, Copy)]
+enum EndpointExtent {
+    Bounded,
+    OpenEnded,
+}
+
 /// Pair the roots up into intervals `(r0, r1)`, `(r2, r3)`, ... with strictness
-/// drawn from `strict`, plus, when `open_ends` is set, an unbounded ray on each
-/// side. `base_lit` seeds the justification so each interval is distinguishable.
+/// drawn from `strict`. `base_lit` seeds the justification so each interval is
+/// distinguishable.
 fn pairs_from(
-    roots: &[(ODyadicAnum, Ptr)],
+    roots: &[(ODyadicAnum, Ast)],
     strict: u64,
     base_lit: i32,
-    open_ends: bool,
+    extent: EndpointExtent,
 ) -> Vec<Pair> {
     let mut out = Vec::new();
     let mut bit = 0u32;
@@ -305,7 +312,7 @@ fn pairs_from(
         *b += 1;
         v
     };
-    if open_ends && !roots.is_empty() {
+    if matches!(extent, EndpointExtent::OpenEnded) && !roots.is_empty() {
         out.push(Pair {
             ay: OIAlgInterval {
                 lo: None,
@@ -334,7 +341,7 @@ fn pairs_from(
             hi: Some(w[1].1),
         });
     }
-    if open_ends && !roots.is_empty() {
+    if matches!(extent, EndpointExtent::OpenEnded) && !roots.is_empty() {
         let last = &roots[roots.len() - 1];
         out.push(Pair {
             ay: OIAlgInterval {
@@ -355,32 +362,36 @@ fn pairs_from(
 ///
 /// This is the reference answer. It never looks at AY's normalised set, so
 /// sorting, merging and empty-dropping are all under test rather than assumed.
-fn z3_member(z3: &Z3, pairs: &[Pair], x: Ptr) -> bool {
-    pairs.iter().any(|p| {
+fn z3_member(z3: &Z3, pairs: &[Pair], x: Ast) -> Option<bool> {
+    for p in pairs {
         let lo_ok = match p.lo {
             None => true,
             Some(l) => {
                 if p.ay.lo_open {
-                    z3.gt(x, l)
+                    z3.gt(x, l)?
                 } else {
-                    z3.gt(x, l) || z3.eq(x, l)
+                    z3.gt(x, l)? || z3.eq(x, l)?
                 }
             }
         };
         if !lo_ok {
-            return false;
+            continue;
         }
-        match p.hi {
+        let hi_ok = match p.hi {
             None => true,
             Some(h) => {
                 if p.ay.hi_open {
-                    z3.lt(x, h)
+                    z3.lt(x, h)?
                 } else {
-                    z3.lt(x, h) || z3.eq(x, h)
+                    z3.lt(x, h)? || z3.eq(x, h)?
                 }
             }
+        };
+        if hi_ok {
+            return Some(true);
         }
-    })
+    }
+    Some(false)
 }
 
 /// The probe list: every rational point drawn, PLUS every endpoint as a genuine
@@ -389,13 +400,13 @@ fn z3_member(z3: &Z3, pairs: &[Pair], x: Ptr) -> bool {
 /// The endpoints are the whole point. A corpus of rational probes cannot tell
 /// `(a, b)` from `[a, b]` when `a` is irrational, so every strictness defect
 /// would be a question the code cannot get wrong.
-fn probes(z3: &Z3, g: &GenIA, roots: &[(ODyadicAnum, Ptr)]) -> Vec<Probe> {
+fn probes(z3: &Z3, g: &GenIA, roots: &[(ODyadicAnum, Ast)]) -> Option<Vec<Probe>> {
     let mut out = Vec::with_capacity(g.points.len() + roots.len());
     for r in &g.points {
         out.push(Probe {
             label: r.to_string(),
             ay: ODyadicAnum::rational(r.clone()),
-            z3: z3.rational(r),
+            z3: z3.rational(r)?,
         });
     }
     for (i, (a, v)) in roots.iter().enumerate() {
@@ -405,7 +416,7 @@ fn probes(z3: &Z3, g: &GenIA, roots: &[(ODyadicAnum, Ptr)]) -> Vec<Probe> {
             z3: *v,
         });
     }
-    out
+    Some(out)
 }
 
 /// The ceilings are asserted BEFORE any consumer runs, so that a later `None`
@@ -420,1199 +431,24 @@ fn build(pairs: &[Pair]) -> Option<OIAlgSet> {
     OIAlgSet::from_parts(&parts)
 }
 
-// ===========================================================================
-// Check 1 — `ialg-membership`
-// ===========================================================================
-
-/// The representation, normalisation, and the roster of entry points.
-///
-/// z3 legs: for every probe — rational AND algebraic — membership in AY's
-/// normalised set must equal membership in the raw interval list as z3
-/// computes it. Emptiness must agree in the unsound direction: if AY reports
-/// empty, z3 must find no member.
-/// Identity legs: `len` respects the merge (a normalised set of `n` raw
-/// intervals has at most `n`), justifications survive normalisation, and
-/// `full` contains every probe.
-/// Guards, fired on purpose with a positive control on the SAME endpoints: a
-/// closed infinite endpoint and an over-ceiling interval count are both refused.
-pub(crate) fn check_membership(z3: &Z3, g: &GenIA, sab: Sabotage) -> Outcome {
-    let Some(roots) = roots_of(z3, &g.p) else {
-        return Outcome::Skipped("z3 declined / no isolable root");
-    };
-    if roots.len() < 2 {
-        return Outcome::Skipped("fewer than two roots");
+fn add_matches(total: &mut u64, outcome: Outcome) -> Result<(), Outcome> {
+    match outcome {
+        Outcome::Match(n) => {
+            *total += n;
+            Ok(())
+        }
+        other => Err(other),
     }
-    let pairs = pairs_from(&roots, g.strict, 100, true);
-    if !under_ceilings(&pairs) {
-        return Outcome::Skipped("over declared ceiling");
-    }
-    let mut n = 0u64;
-
-    // THE PROPERTY ASSERTED BEFORE THE CONSUMER'S ANSWER IS READ.
-    //
-    // `from_parts` declines only when an endpoint comparison declines, when an
-    // infinite endpoint is closed (not the case: built as open above), or when
-    // a ceiling is hit (excluded above). Endpoint comparison is `cmp_anum`,
-    // documented total below the separation ceiling. So a `None` here is a
-    // DIVERGENCE. Without this line the fail-open defect class this module
-    // exists to prevent would surface only as a falling match count.
-    n += 1;
-    let Some(set) = build(&pairs) else {
-        if sab.on() {
-            return Outcome::Declined("sabotage");
-        }
-        return Divergence::new(
-            "ialg-membership",
-            "z3",
-            "from_parts DECLINED under the declared ceilings, but every endpoint \
-             comparison is documented total"
-                .to_string(),
-            inputs(g),
-        );
-    };
-
-    let ps = probes(z3, g, &roots);
-    for pr in &ps {
-        n += 1;
-        let want = z3_member(z3, &pairs, pr.z3);
-        let Some(mut got) = set.contains(&pr.ay) else {
-            if sab.on() {
-                return Outcome::Declined("sabotage");
-            }
-            return Divergence::new(
-                "ialg-membership",
-                "z3",
-                format!(
-                    "contains({}) DECLINED; comparison is documented total",
-                    pr.label
-                ),
-                inputs(g),
-            );
-        };
-        if sab.on() && pr.label.starts_with("root") {
-            got = !got;
-        }
-        if got != want {
-            return Divergence::new(
-                "ialg-membership",
-                "z3",
-                format!(
-                    "contains({}) = {got}, z3 says {want} (raw {} intervals -> {} normalised)",
-                    pr.label,
-                    pairs.len(),
-                    set.len()
-                ),
-                inputs(g),
-            );
-        }
-    }
-
-    // Emptiness, in the direction that would be UNSOUND to get wrong: a set
-    // reported empty is a conflict, so z3 must find nothing in it.
-    if set.is_empty() {
-        for pr in &ps {
-            n += 1;
-            if z3_member(z3, &pairs, pr.z3) {
-                return Divergence::new(
-                    "ialg-membership",
-                    "z3",
-                    format!("set reported EMPTY but z3 places {} in it", pr.label),
-                    inputs(g),
-                );
-            }
-        }
-    }
-
-    if !sab.on() {
-        // Normalisation can only merge, never split.
-        n += 1;
-        if set.len() > pairs.len() {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                format!("normalise grew {} intervals to {}", pairs.len(), set.len()),
-                inputs(g),
-            );
-        }
-        // Every literal handed in survives.
-        n += 1;
-        let Some(js) = set.justification() else {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                "justification DECLINED under the declared ceiling".to_string(),
-                inputs(g),
-            );
-        };
-        // NO INVENTED LITERALS. A justification is a conflict clause: a literal
-        // in it that is not responsible for the conflict makes the clause WRONG,
-        // not merely imprecise. This leg only ever asserted that handed-in
-        // literals SURVIVE, so a verifier merged a literal that was never
-        // supplied (-99999) and got 0 divergences over 9,000 cases across three
-        // seeds with selftest 41/41 and golden 44/44.
-        {
-            let mut supplied: Vec<i32> = Vec::new();
-            for p in &pairs {
-                for l in &p.ay.lits {
-                    if !supplied.contains(l) {
-                        supplied.push(*l);
-                    }
-                }
-            }
-            for l in &js {
-                n += 1;
-                if !supplied.contains(l) {
-                    return Divergence::new(
-                        "ialg-membership",
-                        "identity",
-                        format!(
-                            "justification cites literal {l}, which was never supplied — an \
-                             invented literal makes the conflict clause wrong"
-                        ),
-                        inputs(g),
-                    );
-                }
-            }
-        }
-        for p in &pairs {
-            for l in &p.ay.lits {
-                n += 1;
-                if !set.is_empty() && !js.contains(l) {
-                    return Divergence::new(
-                        "ialg-membership",
-                        "identity",
-                        format!("literal {l} lost by normalisation"),
-                        inputs(g),
-                    );
-                }
-            }
-        }
-        // `full` holds everything; `empty` holds nothing.
-        let Some(full) = OIAlgSet::full(&[7]) else {
-            return Outcome::Skipped("full declined");
-        };
-        for pr in &ps {
-            n += 1;
-            if full.contains(&pr.ay) != Some(true) {
-                return Divergence::new(
-                    "ialg-membership",
-                    "identity",
-                    format!("full does not contain {}", pr.label),
-                    inputs(g),
-                );
-            }
-            n += 1;
-            if OIAlgSet::empty().contains(&pr.ay) != Some(false) {
-                return Divergence::new(
-                    "ialg-membership",
-                    "identity",
-                    format!("empty contains {}", pr.label),
-                    inputs(g),
-                );
-            }
-        }
-        // Union with itself is idempotent on the point set.
-        let Some(u) = set.union(&set) else {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                "union DECLINED under the declared ceilings".to_string(),
-                inputs(g),
-            );
-        };
-        for pr in &ps {
-            n += 1;
-            if u.contains(&pr.ay) != set.contains(&pr.ay) {
-                return Divergence::new(
-                    "ialg-membership",
-                    "identity",
-                    format!("union with self moved {}", pr.label),
-                    inputs(g),
-                );
-            }
-        }
-
-        // GUARDS, fired on purpose, each with a positive control that must
-        // still succeed on the SAME endpoints.
-        n += 1;
-        let closed_inf = OIAlgSet::from_parts(&[OIAlgInterval {
-            lo: None,
-            lo_open: false,
-            hi: Some(roots[0].0.clone()),
-            hi_open: true,
-            lits: vec![1],
-        }]);
-        if closed_inf.is_some() {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                "a CLOSED -inf endpoint was accepted".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if OIAlgSet::from_parts(&[OIAlgInterval {
-            lo: None,
-            lo_open: true,
-            hi: Some(roots[0].0.clone()),
-            hi_open: true,
-            lits: vec![1],
-        }])
-        .is_none()
-        {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                "the OPEN control on the same endpoint was refused too".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        let too_many: Vec<OIAlgInterval> = (0..=oialg_max_intervals())
-            .map(|i| OIAlgInterval {
-                lo: Some(ODyadicAnum::rational(BigRational::from_integer(
-                    BigInt::from(3 * i as i64),
-                ))),
-                lo_open: false,
-                hi: Some(ODyadicAnum::rational(BigRational::from_integer(
-                    BigInt::from(3 * i as i64 + 1),
-                ))),
-                hi_open: false,
-                lits: vec![1],
-            })
-            .collect();
-        if OIAlgSet::from_parts(&too_many).is_some() {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                format!("{} intervals accepted past the ceiling", too_many.len()),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if OIAlgSet::from_parts(&too_many[..oialg_max_intervals()]).is_none() {
-            return Divergence::new(
-                "ialg-membership",
-                "identity",
-                "the at-ceiling control was refused too".to_string(),
-                inputs(g),
-            );
-        }
-    }
-    Outcome::Match(n)
 }
 
-// ===========================================================================
-// Check 2 — `ialg-intersect`
-// ===========================================================================
+mod complement;
+mod intersect;
+mod membership;
+mod pick;
+mod sign_cells;
 
-/// Intersection, and the justifications it must keep.
-///
-/// z3 legs: membership in `a n b` equals `member(a) && member(b)` at every
-/// probe, computed by z3 on the raw lists; and the conflict direction — an
-/// intersection reported EMPTY must contain no probe.
-/// Identity legs: commutativity; idempotence; intersecting with `full` and with
-/// `empty`; and the justification of every surviving interval must include the
-/// literals of BOTH sides, which is what makes the conflict clause entail the
-/// conflict.
-pub(crate) fn check_intersect(z3: &Z3, g: &GenIA, sab: Sabotage) -> Outcome {
-    let (Some(ra), Some(rb)) = (roots_of(z3, &g.p), roots_of(z3, &g.q)) else {
-        return Outcome::Skipped("z3 declined / no isolable root");
-    };
-    if ra.len() < 2 || rb.len() < 2 {
-        return Outcome::Skipped("fewer than two roots");
-    }
-    let pa = pairs_from(&ra, g.strict, 100, false);
-    let pb = pairs_from(&rb, g.strict >> 7, 200, false);
-    if pa.is_empty() || pb.is_empty() || !under_ceilings(&pa) || !under_ceilings(&pb) {
-        return Outcome::Skipped("empty or over declared ceiling");
-    }
-    let (Some(sa), Some(sb)) = (build(&pa), build(&pb)) else {
-        return Divergence::new(
-            "ialg-intersect",
-            "z3",
-            "from_parts DECLINED under the declared ceilings".to_string(),
-            inputs(g),
-        );
-    };
-    let mut n = 1u64;
-
-    let Some(inter) = sa.intersect(&sb) else {
-        if sab.on() {
-            return Outcome::Declined("sabotage");
-        }
-        return Divergence::new(
-            "ialg-intersect",
-            "z3",
-            "intersect DECLINED under the declared ceilings, but every endpoint \
-             comparison is documented total"
-                .to_string(),
-            inputs(g),
-        );
-    };
-
-    let mut all = ra.clone();
-    all.extend(rb.iter().cloned());
-    let ps = probes(z3, g, &all);
-    for pr in &ps {
-        n += 1;
-        let want = z3_member(z3, &pa, pr.z3) && z3_member(z3, &pb, pr.z3);
-        let Some(mut got) = inter.contains(&pr.ay) else {
-            if sab.on() {
-                return Outcome::Declined("sabotage");
-            }
-            return Divergence::new(
-                "ialg-intersect",
-                "z3",
-                format!(
-                    "contains({}) DECLINED; comparison is documented total",
-                    pr.label
-                ),
-                inputs(g),
-            );
-        };
-        if sab.on() && pr.label.starts_with("root") {
-            got = !got;
-        }
-        if got != want {
-            return Divergence::new(
-                "ialg-intersect",
-                "z3",
-                format!(
-                    "(a n b).contains({}) = {got}, z3 says {want} ({} n {} -> {})",
-                    pr.label,
-                    sa.len(),
-                    sb.len(),
-                    inter.len()
-                ),
-                inputs(g),
-            );
-        }
-    }
-    if inter.is_empty() {
-        for pr in &ps {
-            n += 1;
-            if z3_member(z3, &pa, pr.z3) && z3_member(z3, &pb, pr.z3) {
-                return Divergence::new(
-                    "ialg-intersect",
-                    "z3",
-                    format!(
-                        "intersection reported EMPTY but z3 places {} in both",
-                        pr.label
-                    ),
-                    inputs(g),
-                );
-            }
-        }
-    }
-
-    // SAME_SET_AS IS ITSELF WITNESSED, before anything is built on it.
-    //
-    // Six identity legs in this file are of the form
-    // `.and_then(|x| x.same_set_as(..)).unwrap_or(false)` expecting `true`, so a
-    // `same_set_as` hardwired to `Some(true)` certifies commutativity,
-    // idempotence, double-complement, `(a\b) U (a n b) = a`, `a \ empty = a`
-    // and "complement of Lt is Ge" ALL AT ONCE. A verifier did exactly that and
-    // got 0 divergences over 9,000 cases across three seeds, with selftest
-    // 41/41, golden 44/44 and all 40 unit tests passing. It is the function this
-    // module ADDED because the oracle caught three real defects on its first
-    // run — and the fix was then made self-certifying.
-    //
-    // The necessary condition asserted here is independent of `same_set_as`: if
-    // two sets are equal they must agree on membership at EVERY probe point,
-    // decided by `contains`, which is a different function. A hardwired `true`
-    // fails this the moment two probed sets differ anywhere.
-    if !sab.on() {
-        n += 1;
-        match sa.same_set_as(&sb) {
-            Some(equal) => {
-                for pr in &probes(z3, g, &ra) {
-                    let (ca, cb) = (sa.contains(&pr.ay), sb.contains(&pr.ay));
-                    if let (Some(ca), Some(cb)) = (ca, cb) {
-                        n += 1;
-                        if equal && ca != cb {
-                            return Divergence::new(
-                                "ialg-intersect",
-                                "identity",
-                                "same_set_as says EQUAL but the two sets disagree on \
-                                 membership at a probe point"
-                                    .to_string(),
-                                inputs(g),
-                            );
-                        }
-                    }
-                }
-            }
-            None => {
-                return Divergence::new(
-                    "ialg-intersect",
-                    "identity",
-                    "same_set_as DECLINED — set equality is documented total here".to_string(),
-                    inputs(g),
-                );
-            }
-        }
-        n += 1;
-        if !sb
-            .intersect(&sa)
-            .and_then(|x| x.same_set_as(&inter))
-            .unwrap_or(false)
-        {
-            return Divergence::new(
-                "ialg-intersect",
-                "identity",
-                "intersection is not commutative".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if !sa
-            .intersect(&sa)
-            .and_then(|x| x.same_set_as(&sa))
-            .unwrap_or(false)
-        {
-            return Divergence::new(
-                "ialg-intersect",
-                "identity",
-                "intersection is not idempotent".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if !sa
-            .intersect(&OIAlgSet::empty())
-            .is_some_and(|s| s.is_empty())
-        {
-            return Divergence::new(
-                "ialg-intersect",
-                "identity",
-                "a n empty is not empty".to_string(),
-                inputs(g),
-            );
-        }
-        // JUSTIFICATIONS. A surviving cell must cite both sides; a clause built
-        // from one side alone does not entail the conflict.
-        for iv in inter.intervals() {
-            n += 1;
-            let from_a = iv.lits.iter().any(|l| (100..200).contains(l));
-            let from_b = iv.lits.iter().any(|l| *l >= 200);
-            if !from_a || !from_b {
-                return Divergence::new(
-                    "ialg-intersect",
-                    "identity",
-                    format!(
-                        "surviving cell cites {:?}: from_a={from_a} from_b={from_b}",
-                        iv.lits
-                    ),
-                    inputs(g),
-                );
-            }
-        }
-    }
-    Outcome::Match(n)
-}
-
-// ===========================================================================
-// Check 3 — `ialg-complement`
-// ===========================================================================
-
-/// Complement and subtract — how a refuted cell is removed.
-///
-/// z3 legs: membership in the complement is exactly NON-membership in the raw
-/// list, at every probe including the endpoints (which is the only way a
-/// strictness flip is visible); and `a \ b` is `member(a) && !member(b)`.
-/// Identity legs: double complement is the identity; `a \ a` is empty;
-/// `a \ empty` is `a`; complement of `full` is empty and back.
-pub(crate) fn check_complement(z3: &Z3, g: &GenIA, sab: Sabotage) -> Outcome {
-    let (Some(ra), Some(rb)) = (roots_of(z3, &g.p), roots_of(z3, &g.q)) else {
-        return Outcome::Skipped("z3 declined / no isolable root");
-    };
-    if ra.len() < 2 || rb.len() < 2 {
-        return Outcome::Skipped("fewer than two roots");
-    }
-    let pa = pairs_from(&ra, g.strict, 100, false);
-    let pb = pairs_from(&rb, g.strict >> 11, 200, false);
-    if pa.is_empty() || pb.is_empty() || !under_ceilings(&pa) || !under_ceilings(&pb) {
-        return Outcome::Skipped("empty or over declared ceiling");
-    }
-    let (Some(sa), Some(sb)) = (build(&pa), build(&pb)) else {
-        return Divergence::new(
-            "ialg-complement",
-            "z3",
-            "from_parts DECLINED under the declared ceilings".to_string(),
-            inputs(g),
-        );
-    };
-    let mut n = 1u64;
-
-    let (Some(ca), Some(diff)) = (sa.complement(), sa.subtract(&sb)) else {
-        if sab.on() {
-            return Outcome::Declined("sabotage");
-        }
-        return Divergence::new(
-            "ialg-complement",
-            "z3",
-            "complement or subtract DECLINED under the declared ceilings, but every \
-             endpoint comparison is documented total"
-                .to_string(),
-            inputs(g),
-        );
-    };
-
-    let mut all = ra.clone();
-    all.extend(rb.iter().cloned());
-    let ps = probes(z3, g, &all);
-    for pr in &ps {
-        let in_a = z3_member(z3, &pa, pr.z3);
-        let in_b = z3_member(z3, &pb, pr.z3);
-
-        n += 1;
-        let Some(mut got) = ca.contains(&pr.ay) else {
-            if sab.on() {
-                return Outcome::Declined("sabotage");
-            }
-            return Divergence::new(
-                "ialg-complement",
-                "z3",
-                format!("complement.contains({}) DECLINED", pr.label),
-                inputs(g),
-            );
-        };
-        if sab.on() && pr.label.starts_with("root") {
-            got = !got;
-        }
-        if got != !in_a {
-            return Divergence::new(
-                "ialg-complement",
-                "z3",
-                format!(
-                    "complement.contains({}) = {got}, z3 says member(a) = {in_a}",
-                    pr.label
-                ),
-                inputs(g),
-            );
-        }
-
-        n += 1;
-        let Some(mut gotd) = diff.contains(&pr.ay) else {
-            return Divergence::new(
-                "ialg-complement",
-                "z3",
-                format!("subtract.contains({}) DECLINED", pr.label),
-                inputs(g),
-            );
-        };
-        if sab.on() && pr.label.starts_with("root") {
-            gotd = !gotd;
-        }
-        if gotd != (in_a && !in_b) {
-            return Divergence::new(
-                "ialg-complement",
-                "z3",
-                format!(
-                    "(a \\ b).contains({}) = {gotd}, z3 says a={in_a} b={in_b}",
-                    pr.label
-                ),
-                inputs(g),
-            );
-        }
-    }
-
-    if !sab.on() {
-        n += 1;
-        if !ca
-            .complement()
-            .and_then(|x| x.same_set_as(&sa))
-            .unwrap_or(false)
-        {
-            return Divergence::new(
-                "ialg-complement",
-                "identity",
-                "double complement is not the identity".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if !sa.subtract(&sa).is_some_and(|s| s.is_empty()) {
-            return Divergence::new(
-                "ialg-complement",
-                "identity",
-                "a \\ a is not empty".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        if !sa
-            .subtract(&OIAlgSet::empty())
-            .and_then(|x| x.same_set_as(&sa))
-            .unwrap_or(false)
-        {
-            return Divergence::new(
-                "ialg-complement",
-                "identity",
-                "a \\ empty is not a".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        // `a \ b` and `a n b` partition `a`.
-        let Some(mid) = sa.intersect(&sb) else {
-            return Outcome::Skipped("intersect declined");
-        };
-        if !diff
-            .union(&mid)
-            .and_then(|x| x.same_set_as(&sa))
-            .unwrap_or(false)
-        {
-            return Divergence::new(
-                "ialg-complement",
-                "identity",
-                "(a \\ b) U (a n b) is not a".to_string(),
-                inputs(g),
-            );
-        }
-        n += 1;
-        let Some(full) = OIAlgSet::full(&[3]) else {
-            return Outcome::Skipped("full declined");
-        };
-        if !full.complement().is_some_and(|s| s.is_empty()) {
-            return Divergence::new(
-                "ialg-complement",
-                "identity",
-                "complement of full is not empty".to_string(),
-                inputs(g),
-            );
-        }
-    }
-    Outcome::Match(n)
-}
-
-// ===========================================================================
-// Check 4 — `ialg-pick`
-// ===========================================================================
-
-/// The sample-point ladder.
-///
-/// z3 legs: every picked value must lie in the raw interval list as z3
-/// computes it — a wrong sample point is a wrong decision, and the whole
-/// verification-before-return discipline in `pick` exists to make this
-/// impossible; and the MINIMALITY of the rung is checked by an independent
-/// search that z3 adjudicates, never by reading AY's own tag.
-/// Identity legs: `pick` on a non-empty set must succeed (a refusal here is a
-/// divergence, see below); `pick` on the empty set must refuse;
-/// `oialg_classify_value` is exercised directly on arbitrary values.
-///
-/// # A refusal is a divergence
-///
-/// `pick`'s ladder is a heuristic, but its TOTALITY on this corpus is not: the
-/// dyadic rung succeeds for any interval with a non-empty interior, and the
-/// algebraic rung covers the closed singleton, so the only non-empty set it can
-/// refuse is one whose intervals are narrower than `2^-256`. No set built from
-/// distinct roots of these small integer polynomials is. Reporting a refusal as
-/// a decline would let a broken ladder — one whose bracket search silently
-/// stopped finding anything — pass as silence, which is exactly how
-/// `root_index` went from 111 matched to 21 matched with 0 divergences.
-pub(crate) fn check_pick(z3: &Z3, g: &GenIA, sab: Sabotage) -> Outcome {
-    let Some(roots) = roots_of(z3, &g.p) else {
-        return Outcome::Skipped("z3 declined / no isolable root");
-    };
-    if roots.len() < 2 {
-        return Outcome::Skipped("fewer than two roots");
-    }
-    let pairs = pairs_from(&roots, g.strict, 100, false);
-    if pairs.is_empty() || !under_ceilings(&pairs) {
-        return Outcome::Skipped("empty or over declared ceiling");
-    }
-    let Some(set) = build(&pairs) else {
-        return Divergence::new(
-            "ialg-pick",
-            "z3",
-            "from_parts DECLINED under the declared ceilings".to_string(),
-            inputs(g),
-        );
-    };
-    let mut n = 1u64;
-
-    n += 1;
-    if OIAlgSet::empty().pick().is_some() {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "pick returned a value from the EMPTY set".to_string(),
-            inputs(g),
-        );
-    }
-    if set.is_empty() {
-        return Outcome::Skipped("set normalised to empty");
-    }
-
-    n += 1;
-    let Some(v) = set.pick() else {
-        if sab.on() {
-            return Outcome::Declined("sabotage");
-        }
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            format!(
-                "pick REFUSED a non-empty set of {} intervals; the dyadic rung is \
-                 total for any non-degenerate interior",
-                set.len()
-            ),
-            inputs(g),
-        );
-    };
-
-    // Sabotage moves the picked value off its set. MEASURED: an off-by-ONE was
-    // caught in only 19 of 29 sabotaged cases (65.5%, below the 80% gate),
-    // because these intervals are routinely wider than 1 and `v + 1` lands back
-    // inside — the corruption was real but not observable. `SABOTAGE_SHIFT` is
-    // past the Cauchy bound of every polynomial this generator draws (degree at
-    // most 5, coefficients at most 9, so every root is within 10), so the
-    // shifted value is outside the set whatever the shape.
-    const SABOTAGE_SHIFT: i64 = 1_000;
-    let v = if sab.on() {
-        let base = v
-            .to_rational()
-            .unwrap_or_else(|| BigRational::from_integer(BigInt::zero()));
-        ODyadicAnum::rational(base + BigRational::from_integer(BigInt::from(SABOTAGE_SHIFT)))
-    } else {
-        v
-    };
-
-    // THE ANSWER, ADJUDICATED BY z3 — not by AY's own `contains`.
-    n += 1;
-    let Ok(vz) = z3_ast_of(z3, &v) else {
-        return Outcome::Skipped("z3 could not name AY's pick");
-    };
-    if !z3_member(z3, &pairs, vz) {
-        return Divergence::new(
-            "ialg-pick",
-            "z3",
-            format!(
-                "pick returned {} which z3 places OUTSIDE the set",
-                z3.ast_string(vz)
-            ),
-            inputs(g),
-        );
-    }
-
-    if sab.on() {
-        return Outcome::Match(n);
-    }
-
-    // MINIMALITY, derived and independently searched.
-    //
-    // The rung is re-derived from the value; there is no tag to read. Then a
-    // simpler value is hunted for directly, with z3 adjudicating membership.
-    // If one is found, AY's ladder skipped a rung.
-    let rung = oialg_classify_value(&v);
-    n += 1;
-    if rung > OIRung::Integer {
-        if let Some(k) = integer_span(z3, &pairs) {
-            for m in k.0..=k.1 {
-                n += 1;
-                let cand = z3.rational(&BigRational::from_integer(BigInt::from(m)));
-                if z3_member(z3, &pairs, cand) {
-                    return Divergence::new(
-                        "ialg-pick",
-                        "z3",
-                        format!("pick returned a {rung:?} value but the INTEGER {m} is in the set"),
-                        inputs(g),
-                    );
-                }
-            }
-        }
-    }
-    if rung > OIRung::Simple {
-        if let Some(k) = integer_span(z3, &pairs) {
-            'outer: for d in 2..=oialg_max_simple_den() {
-                for m in (k.0 * d)..=(k.1 * d) {
-                    if m.checked_mul(1).is_none() {
-                        break 'outer;
-                    }
-                    n += 1;
-                    let cand = z3.rational(&BigRational::new(BigInt::from(m), BigInt::from(d)));
-                    if z3_member(z3, &pairs, cand) {
-                        return Divergence::new(
-                            "ialg-pick",
-                            "z3",
-                            format!(
-                                "pick returned a {rung:?} value but the simple rational \
-                                 {m}/{d} is in the set"
-                            ),
-                            inputs(g),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // THE SINGLETON CELL — the only shape that reaches the bottom of the ladder.
-    //
-    // MEASURED: over 12,000 fuzz cases at seed 20260806 this check observed the
-    // `Integer` rung 247 times and `Simple` 25 times, and `Dyadic`, `Rational`
-    // and `Algebraic` ZERO times. Intervals between consecutive roots of small
-    // integer polynomials are simply wide enough that an integer is always
-    // available, so the lower rungs of the ladder were an unwitnessed witness:
-    // the only question the corpus could ask had the top rung as its answer.
-    // The `narrow` shape fixes the middle rungs; a closed singleton `[r, r]` is
-    // the only set whose ONLY member is `r` itself, so it is the only way to
-    // force the algebraic rung, and it also pins the strongest property `pick`
-    // has — on a singleton the answer is not a choice.
-    let single = OIAlgSet::from_parts(&[OIAlgInterval {
-        lo: Some(roots[0].0.clone()),
-        lo_open: false,
-        hi: Some(roots[0].0.clone()),
-        hi_open: false,
-        lits: vec![11],
-    }]);
-    n += 1;
-    let Some(single) = single else {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "a closed singleton at a root of p was refused".to_string(),
-            inputs(g),
-        );
-    };
-    n += 1;
-    if single.is_empty() || single.len() != 1 {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            format!(
-                "the singleton [r, r] normalised to {} intervals",
-                single.len()
-            ),
-            inputs(g),
-        );
-    }
-    n += 1;
-    let Some(sv) = single.pick() else {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "pick REFUSED a closed singleton, whose sole member is its endpoint".to_string(),
-            inputs(g),
-        );
-    };
-    // z3 adjudicates that the picked value IS the root — not merely inside.
-    n += 1;
-    if let Ok(svz) = z3_ast_of(z3, &sv) {
-        if !z3.eq(svz, roots[0].1) {
-            return Divergence::new(
-                "ialg-pick",
-                "z3",
-                format!(
-                    "pick on the singleton [r, r] returned {}, which z3 says is not r",
-                    z3.ast_string(svz)
-                ),
-                inputs(g),
-            );
-        }
-    }
-    // The rung is whatever the ROOT is; for an irrational root that is
-    // `Algebraic`, which nothing else in this corpus reaches.
-    n += 1;
-    if oialg_classify_value(&sv) != oialg_classify_value(&roots[0].0) {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            format!(
-                "singleton pick classified {:?} but the root classifies {:?}",
-                oialg_classify_value(&sv),
-                oialg_classify_value(&roots[0].0)
-            ),
-            inputs(g),
-        );
-    }
-
-    // `classify_value` exercised DIRECTLY, not only through `pick`.
-    n += 1;
-    if oialg_classify_value(&ODyadicAnum::rational(BigRational::from_integer(
-        BigInt::from(-4),
-    ))) != OIRung::Integer
-    {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "classify_value(-4) is not Integer".to_string(),
-            inputs(g),
-        );
-    }
-    n += 1;
-    if oialg_classify_value(&ODyadicAnum::rational(BigRational::new(
-        BigInt::one(),
-        BigInt::from(oialg_max_simple_den() * 4),
-    ))) != OIRung::Dyadic
-    {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "a small dyadic past the simple ceiling is not classified Dyadic".to_string(),
-            inputs(g),
-        );
-    }
-    n += 1;
-    if !roots.is_empty()
-        && !roots[0].0.is_rational()
-        && oialg_classify_value(&roots[0].0) != OIRung::Algebraic
-    {
-        return Divergence::new(
-            "ialg-pick",
-            "identity",
-            "an irrational root is not classified Algebraic".to_string(),
-            inputs(g),
-        );
-    }
-    Outcome::Match(n)
-}
-
-/// The integer range worth scanning for the minimality legs, or `None` when the
-/// set is too wide to scan — a bound, so this leg can never run away.
-fn integer_span(z3: &Z3, pairs: &[Pair]) -> Option<(i64, i64)> {
-    let mut lo = i64::MAX;
-    let mut hi = i64::MIN;
-    for p in pairs {
-        let (l, h) = (p.lo?, p.hi?);
-        let (a, _) = z3.bracket(l, 40)?;
-        let (_, b) = z3.bracket(h, 40)?;
-        lo = lo.min(rat_floor_i64(&a)? - 1);
-        hi = hi.max(rat_ceil_i64(&b)? + 1);
-    }
-    if lo > hi || hi - lo > MINIMALITY_SPAN {
-        return None;
-    }
-    Some((lo, hi))
-}
-
-fn rat_floor_i64(r: &BigRational) -> Option<i64> {
-    i64::try_from(r.floor().to_integer()).ok()
-}
-
-fn rat_ceil_i64(r: &BigRational) -> Option<i64> {
-    i64::try_from(r.ceil().to_integer()).ok()
-}
-
-/// z3's AST for an AY value: exact for a rational, and for an algebraic value
-/// the unique root of AY's OWN defining polynomial inside AY's OWN interval.
-fn z3_ast_of(z3: &Z3, a: &ODyadicAnum) -> Result<Ptr, ()> {
-    if let Some(r) = a.to_rational() {
-        return Ok(z3.rational(&r));
-    }
-    let coeffs = rationals(&a.poly_coeffs().ok_or(())?);
-    let roots = z3.roots(&coeffs).ok_or(())?;
-    let iv = a.interval().ok_or(())?;
-    let lo = z3.rational(&iv.lo().to_rational());
-    let hi = z3.rational(&iv.hi().to_rational());
-    let mut found = None;
-    for r in roots {
-        if z3.gt(r, lo) && z3.lt(r, hi) {
-            if found.is_some() {
-                return Err(());
-            }
-            found = Some(r);
-        }
-    }
-    if z3.errored() {
-        return Err(());
-    }
-    found.ok_or(())
-}
-
-// ===========================================================================
-// Check 5 — `ialg-sign-cells`
-// ===========================================================================
-
-/// Construction from a sign condition — the operation that turns a root
-/// isolation into a feasible set, and the one where a fail-open predicate would
-/// be catastrophic.
-///
-/// z3 legs: for every probe, membership in AY's constructed set must equal
-/// `cond.accepts(sign of p at that probe)` with the SIGN COMPUTED BY z3
-/// (`Z3_algebraic_eval`). That single assertion pins the whole cell
-/// decomposition: sample-point selection, sign propagation, which cells are
-/// kept, and how the closed root cells are glued onto the open ones.
-/// Identity legs: complementary conditions partition the line (`Lt` and `Ge`
-/// are complements, as are `Le`/`Gt` and `Eq`/`Ne`); the roots themselves are
-/// in the `Eq` set and out of the `Ne` set.
-/// Guard, fired on purpose: a descending root list is refused.
-///
-/// # Why this is where the fail-open defect lives
-///
-/// If the sign at a sample point cannot be evaluated, the permissive answers
-/// are "keep the cell" (silently too large) and "drop the cell" (silently too
-/// small — and a feasible set wrongly emptied is a CONFLICT THAT DOES NOT
-/// EXIST). `from_sign_condition` takes neither and returns `None`. The injected
-/// defect used to demonstrate this check replaces that `?` with an assumption,
-/// which is the `check_monomial_consistency` shape exactly.
-pub(crate) fn check_sign_cells(z3: &Z3, g: &GenIA, sab: Sabotage) -> Outcome {
-    let Some(roots) = roots_of(z3, &g.p) else {
-        return Outcome::Skipped("z3 declined / no isolable root");
-    };
-    if 2 * roots.len() + 1 > oialg_max_intervals() {
-        return Outcome::Skipped("over declared ceiling");
-    }
-    let ay_roots: Vec<ODyadicAnum> = roots.iter().map(|(a, _)| a.clone()).collect();
-    let coeffs = rationals(&g.p);
-    let mut n = 1u64;
-
-    // Feed z3's OWN ascending root list — the pure function is driven
-    // directly, not through a consumer.
-    let Some(set) = oialg_from_sign_condition(&g.p, &ay_roots, g.cond, &[5]) else {
-        if sab.on() {
-            return Outcome::Declined("sabotage");
-        }
-        return Divergence::new(
-            "ialg-sign-cells",
-            "z3",
-            format!(
-                "from_sign_condition DECLINED on z3's own ascending {}-root list; \
-                 every sign is evaluable and every comparison is documented total",
-                roots.len()
-            ),
-            inputs(g),
-        );
-    };
-
-    let ps = probes(z3, g, &roots);
-    for pr in &ps {
-        let Some(s) = z3.eval_sign(&coeffs, pr.z3) else {
-            continue;
-        };
-        let want = g.cond.accepts(s);
-        n += 1;
-        let Some(mut got) = set.contains(&pr.ay) else {
-            if sab.on() {
-                return Outcome::Declined("sabotage");
-            }
-            return Divergence::new(
-                "ialg-sign-cells",
-                "z3",
-                format!(
-                    "contains({}) DECLINED; comparison is documented total",
-                    pr.label
-                ),
-                inputs(g),
-            );
-        };
-        if sab.on() {
-            got = !got;
-        }
-        if got != want {
-            return Divergence::new(
-                "ialg-sign-cells",
-                "z3",
-                format!(
-                    "cond {:?}: contains({}) = {got}, but z3 says sign(p) = {s} there \
-                     so it should be {want} ({} cells, {} roots)",
-                    g.cond,
-                    pr.label,
-                    set.len(),
-                    roots.len()
-                ),
-                inputs(g),
-            );
-        }
-    }
-
-    if !sab.on() {
-        // Complementary conditions partition the line.
-        for (a, b) in [
-            (OISignCond::Lt, OISignCond::Ge),
-            (OISignCond::Le, OISignCond::Gt),
-            (OISignCond::Eq, OISignCond::Ne),
-        ] {
-            let (Some(sa), Some(sb)) = (
-                oialg_from_sign_condition(&g.p, &ay_roots, a, &[5]),
-                oialg_from_sign_condition(&g.p, &ay_roots, b, &[6]),
-            ) else {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    format!("from_sign_condition DECLINED for {a:?}/{b:?}"),
-                    inputs(g),
-                );
-            };
-            n += 1;
-            if !sa.intersect(&sb).is_some_and(|s| s.is_empty()) {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    format!("{a:?} and {b:?} overlap"),
-                    inputs(g),
-                );
-            }
-            n += 1;
-            if !sa
-                .complement()
-                .and_then(|x| x.same_set_as(&sb))
-                .unwrap_or(false)
-            {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    format!("complement of {a:?} is not {b:?}"),
-                    inputs(g),
-                );
-            }
-        }
-        // Every root is in the `Eq` set and out of the `Ne` set.
-        let Some(eq) = oialg_from_sign_condition(&g.p, &ay_roots, OISignCond::Eq, &[5]) else {
-            return Outcome::Skipped("Eq declined");
-        };
-        for (a, _) in &roots {
-            n += 1;
-            if eq.contains(a) != Some(true) {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    "a root of p is not in the Eq set".to_string(),
-                    inputs(g),
-                );
-            }
-        }
-        n += 1;
-        if eq.len() != roots.len() {
-            return Divergence::new(
-                "ialg-sign-cells",
-                "identity",
-                format!("Eq set has {} cells for {} roots", eq.len(), roots.len()),
-                inputs(g),
-            );
-        }
-        // GUARD, fired on purpose: a descending root list must be refused,
-        // and the ascending control on the SAME roots must still succeed.
-        if roots.len() >= 2 {
-            n += 1;
-            let mut rev = ay_roots.clone();
-            rev.reverse();
-            if oialg_from_sign_condition(&g.p, &rev, g.cond, &[5]).is_some() {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    "a DESCENDING root list was accepted".to_string(),
-                    inputs(g),
-                );
-            }
-            n += 1;
-            if oialg_from_sign_condition(&g.p, &ay_roots, g.cond, &[5]).is_none() {
-                return Divergence::new(
-                    "ialg-sign-cells",
-                    "identity",
-                    "the ascending control on the same roots was refused too".to_string(),
-                    inputs(g),
-                );
-            }
-        }
-    }
-    Outcome::Match(n)
-}
-
-/// Unused-import silencer for the numeric traits the helpers need.
-#[allow(dead_code)]
-fn _traits_used() -> bool {
-    BigInt::one().is_positive() && BigRational::zero().is_zero()
-}
+pub(crate) use complement::check_complement;
+pub(crate) use intersect::check_intersect;
+pub(crate) use membership::check_membership;
+pub(crate) use pick::check_pick;
+pub(crate) use sign_cells::check_sign_cells;

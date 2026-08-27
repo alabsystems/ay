@@ -634,7 +634,7 @@ pub fn build_equality_affine_floor_cert(
 /// allocated (the build loop itself is also polled every `EQ_AFFINE_INNER_POLL`
 /// rows). Within the admitted band, `should_stop` is polled per pivot column and
 /// per eliminated row, AND
-/// (counter-based, every [`EQ_AFFINE_INNER_POLL`] iterations) inside the
+/// (counter-based, every `EQ_AFFINE_INNER_POLL` iterations) inside the
 /// row-elimination / comb-multiplier inner loops themselves: with
 /// multiplicatively growing bignum entries a SINGLE row combination can take
 /// seconds, so per-row polling alone still overshoots the deadline and the

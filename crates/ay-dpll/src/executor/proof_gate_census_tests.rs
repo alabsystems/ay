@@ -50,21 +50,25 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
     (
         "executor/check_sat.rs",
         2,
-        3,
+        2,
         0,
         "2x vacuous-under-shedding debug_assert postconditions (audited); \
-         3x explicit-demand gates (closed-universal precheck, seq \
-         corroboration re-solve [B2: KEPT in v1], dense BV array-initializer \
-         rewrite); deep QE is separately restricted to the post-Unknown retry \
-         and must clear the authored-query publication gates",
+         2x explicit-demand gates (seq corroboration re-solve [B2: KEPT in \
+         v1], dense BV array-initializer rewrite); deep QE is separately \
+         restricted to the post-Unknown retry and must clear the \
+         authored-query publication gates. Re-vet 2026-08-21: the \
+         closed-universal precheck gate that was the third entry here moved \
+         to executor/qe_route.rs in 6228729e9, which named it \
+         closed_universal_precheck_armed; see that entry",
     ),
     (
         "executor/lifecycle.rs",
         0,
-        2,
+        1,
         0,
-        "explicit-demand gates: tracker disable on external-stop finalize + \
-         the competition_shedding_active predicate itself",
+        "explicit-demand gate: the competition_shedding_active predicate \
+         itself (the external-stop finalize gate moved with the \
+         unknown-publication split, below)",
     ),
     (
         "executor/lifecycle/proof_access.rs",
@@ -75,6 +79,15 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
          from the lifecycle split; the sole !is_producing_proofs site is a \
          test assertion (proof_checking_solve_does_not_expose_proof_without_\
          output_request), not a live UNSAT-routing lane — bookkeeping only",
+    ),
+    (
+        "executor/lifecycle/unknown_publication.rs",
+        0,
+        1,
+        0,
+        "explicit-demand bookkeeping gate: tracker disable on external-stop \
+         finalization, relocated from lifecycle.rs with the Unknown \
+         publication boundary",
     ),
     (
         "executor/proof.rs",
@@ -91,6 +104,23 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
         0,
         "the unvetted_no_proof_lane_allowed definition (the vetted \
          chokepoint), relocated here by the upstream lane-policy refactor",
+    ),
+    (
+        "executor/qe_route.rs",
+        0,
+        1,
+        0,
+        "re-vet after 6228729e9 (\"park the closed-universal proof precheck\") \
+         moved the closed-universal validity precheck's gate here from an \
+         inline `!is_producing_proofs()` in executor/check_sat.rs and named it \
+         closed_universal_precheck_armed; same audited explicit-demand gate, \
+         new file, semantics unchanged. It stays on !is_producing_proofs() \
+         rather than unvetted_no_proof_lane_allowed() DELIBERATELY: proof mode \
+         is the default posture, and CLOSED_UNIVERSAL_STALE_GATE_2026-08-21.md \
+         records that arming it under proofs regresses authored-scope artifact \
+         fidelity, so it is parked there rather than shed-gated. On a public \
+          query the precheck fails closed to `unknown`; only a disposable solve \
+          takes its verdict-only UNSAT",
     ),
     (
         "executor/quantifier_loop/preprocess.rs",
@@ -166,10 +196,16 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
     (
         "executor/unsat_cert.rs",
         0,
-        5,
+        6,
         0,
-        "5x post-publication/stop-path tracker disables in the certification \
-         funnel (cost hygiene; an explicit proof demand keeps it armed)",
+        "6x post-publication/stop-path tracker disables in the certification \
+         funnel (cost hygiene; an explicit proof demand keeps it armed). The \
+         6th is `decline_unexportable_assume_scope_under_proof_demand`'s, \
+         AUDITED: it is byte-identical to the sibling site in \
+         `decline_trust_bearing_unsat_under_strict_proofs` -- same three \
+         lines, same `UnknownOrigin::TerminalTrust`, same unconditional \
+         `SolveResult::Unknown` return -- and sits on a path that has ALREADY \
+         decided to withhold, so it can neither originate nor route an UNSAT",
     ),
 ];
 

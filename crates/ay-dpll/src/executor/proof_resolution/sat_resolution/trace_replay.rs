@@ -44,7 +44,7 @@ fn write_proof_introspection(
     if let Ok(mut fh) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(path)
     {
         // Format first, then ONE `write_all`: several solver threads may
         // append concurrently, and a multi-call `writeln!` interleaves

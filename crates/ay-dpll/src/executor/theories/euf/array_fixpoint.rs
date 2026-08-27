@@ -804,6 +804,42 @@ impl Executor {
         );
     }
 
+    /// Recompute [`Executor::array_axiom_dead_skolems`] for the assertion epoch
+    /// in flight: the `Var` terms that predate it
+    /// (`< assertion_epoch_terms_len`) and that none of its assertions or
+    /// assumption roots can reach.
+    ///
+    /// Incremental solves already run under the stricter reachability scope, so
+    /// the set stays empty there. It also stays empty for a session that has
+    /// never reset its assertions (`assertion_epoch_terms_len == 0`) — which is
+    /// every single-query problem — and for any problem with no `Var` terms at
+    /// all: the cheap tag scan gates the reachability DFS, so a
+    /// quantifier-free query pays nothing.
+    fn compute_array_axiom_dead_skolems(&mut self, assumption_roots: &[TermId]) {
+        self.array_axiom_dead_skolems.clear();
+        if self.incremental_mode
+            || self.assertion_epoch_terms_len == 0
+            || !self.store_has_free_var()
+        {
+            return;
+        }
+        let reachable = if assumption_roots.is_empty() {
+            reachable_term_set(&self.ctx.terms, &self.ctx.assertions)
+        } else {
+            let mut roots = Vec::with_capacity(self.ctx.assertions.len() + assumption_roots.len());
+            roots.extend_from_slice(&self.ctx.assertions);
+            roots.extend_from_slice(assumption_roots);
+            reachable_term_set(&self.ctx.terms, &roots)
+        };
+        let horizon = self.assertion_epoch_terms_len.min(self.ctx.terms.len());
+        for idx in 0..horizon {
+            let term = TermId::new(idx as u32);
+            if matches!(self.ctx.terms.get(term), TermData::Var(..)) && !reachable.contains(&term) {
+                self.array_axiom_dead_skolems.insert(term);
+            }
+        }
+    }
+
     /// Run the array axiom fixpoint with extra root terms included in the
     /// reachable set for scope filtering (#6736). Used by check-sat-assuming
     /// paths where assumption terms contain array operations that need axioms
@@ -816,12 +852,37 @@ impl Executor {
     ) {
         self.row_seeded_terms.clear();
 
+        // A NON-incremental solve carries dead witnesses ACROSS QUERIES, which
+        // the `incremental_mode`-only scope below never covered. The TermStore
+        // is append-only and lives for the whole `Solver`, so every Skolem an
+        // earlier check minted — a quantifier instantiation, an
+        // `__ay_ext_diff` extensionality witness, a `qmg!` model-gate witness —
+        // survives `(reset-assertions)` as a `Var` no current assertion can
+        // reach. Unfiltered, `refresh_array_congruence_caches` and
+        // `collect_array_row_patterns` walk the WHOLE store and index fresh
+        // ROW/congruence axioms at those dead witnesses; the Nelson-Oppen
+        // fixpoint then stops converging and the route answers `unknown` on a
+        // goal it decides in two rounds when solved alone. The shape is not
+        // exotic: every `Z3_solver_check` through `ay-ffi` is a
+        // `reset-assertions` + re-assert on ONE shared engine, so the second
+        // check of any context inherits the first check's Skolems.
+        //
+        // This is deliberately NOT the incremental scope. That one declines
+        // every unreachable term, which on this route also declines live array
+        // terms the finite-set/background axioms still need (measured: the
+        // QF finite-set cardinality laws go `unsat` -> `unknown`). What is
+        // excluded here is only the witnesses themselves: a `Var` that predates
+        // this assertion epoch AND that nothing in it can reach is, by
+        // construction, a name the current query cannot mention, so no axiom
+        // indexed at it can be relevant to the current query.
+        self.compute_array_axiom_dead_skolems(assumption_roots);
+
         // In incremental mode, scope axiom generation to terms reachable from
         // current assertions (and assumption roots, if any). This prevents
         // phantom axioms from dead terms in popped scopes (#6726). Terms
         // created during the fixpoint (idx >= start_len) always pass the
         // scope check.
-        if self.incremental_mode {
+        if self.incremental_mode || self.shared_store_derived_query {
             let start_len = self.ctx.terms.len();
             let reachable = if assumption_roots.is_empty() {
                 reachable_term_set(&self.ctx.terms, &self.ctx.assertions)
@@ -1356,7 +1417,7 @@ impl Executor {
         assumption_roots: &[TermId],
     ) {
         // Scope filtering for incremental mode (#6726).
-        if self.incremental_mode {
+        if self.incremental_mode || self.shared_store_derived_query {
             let start_len = self.ctx.terms.len();
             let reachable = if assumption_roots.is_empty() {
                 reachable_term_set(&self.ctx.terms, &self.ctx.assertions)

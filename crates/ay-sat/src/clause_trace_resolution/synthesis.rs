@@ -378,7 +378,7 @@ fn sweep_synthesis_database(
             .map(|(id, clause)| (*id, clause.as_slice()))
             .chain(derived.iter().map(|step| (step.id, step.clause.as_slice())));
         for (id, clause) in clauses {
-            match scan_terminal_hint_clause(clause, &assign, meter)? {
+            match scan_terminal_hint_clause(clause, assign, meter)? {
                 TerminalHintScan::Satisfied | TerminalHintScan::Open => {}
                 TerminalHintScan::Unit(literal) => {
                     // Unit scans only return an unassigned literal. Recording

@@ -10,6 +10,15 @@ repository.workspace = true
 [features]
 default = []
 benchmark_matrix_tests = []
+# Long-running measurement harnesses that print timings instead of asserting.
+# They are minutes of work, so they are off by default — but with the feature
+# on they RUN, rather than carrying `#[ignore]` (which the repository forbids
+# and which meant they ran nowhere). Every gate they sit next to is
+# unconditional, so this feature only ever adds a measurement.
+#
+#   cargo test -p ay-chc --release --features measurement-harness-tests \
+#       --lib measure_expired_deadline_cost_fraction -- --nocapture
+measurement-harness-tests = []
 
 [dependencies]
 ay-core.workspace = true

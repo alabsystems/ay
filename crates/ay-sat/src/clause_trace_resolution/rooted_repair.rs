@@ -233,9 +233,9 @@ fn sweep_rooted_candidates(
                     let code = literal_code(variable, !assigned);
                     let start = heads[code] as usize;
                     let end = heads[code + 1] as usize;
-                    for item_index in start..end {
+                    for &item in &index_items[start..end] {
                         meter.charge(1)?;
-                        let id = u64::from(index_items[item_index]) + 1;
+                        let id = u64::from(item) + 1;
                         let Some(clause) = prior_clause_by_id(original_clauses, derived, id) else {
                             continue;
                         };

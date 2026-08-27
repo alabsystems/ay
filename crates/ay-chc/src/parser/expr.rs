@@ -244,6 +244,28 @@ impl ChcParser {
         self.expect_char('(')?;
 
         // Parse variable declarations and register them
+        //
+        // CAPTURE: stripping hoists each binder into the FLAT clause scope, so
+        // two binders in one clause sharing a name become ONE clause variable
+        // and two independent quantifications collapse into one. That is a
+        // wrong-answer bug, not a cosmetic one -- it weakens or strengthens the
+        // clause depending on polarity, and AY's verdict then depends on the
+        // NAME of a bound variable:
+        //
+        //   (=> (and (exists ((y Int)) (P y)) (exists ((y Int)) (R y))) false)  -> sat   WRONG
+        //   (=> (and (exists ((y Int)) (P y)) (exists ((z Int)) (R z))) false)  -> unsat correct
+        //
+        // (the development design notes, z3-cross-checked
+        // in both directions.)
+        //
+        // Rename ONLY on a binder-vs-binder collision inside the SAME clause.
+        // A binder shadowing a file-scoped `declare-var` is the ordinary
+        // `(declare-var x Int)` + `(forall ((x Int)) ...)` idiom: there is only
+        // one binding of `x` in the clause, so nothing is captured and the name
+        // must be left alone. An earlier attempt renamed on ANY shadow and cost
+        // five regressions in name-dependent machinery (BMC witness replay,
+        // formula-form round trips) plus a 1.8x suite slowdown.
+        let renames_before = self.active_renames.len();
         loop {
             self.skip_whitespace_and_comments();
             if self.peek_char() == Some(')') {
@@ -258,12 +280,26 @@ impl ChcParser {
             self.expect_char(')')?;
 
             // Register variable in scope (CHC treats quantifiers as implicit)
-            self.variables.insert(var_name, sort);
+            if self.clause_binder_names.contains(&var_name)
+                || self.declared_var_names.contains(&var_name)
+            {
+                let fresh = self.fresh_binder_name(&var_name);
+                self.variables.insert(fresh.clone(), sort);
+                self.clause_binder_names.insert(fresh.clone());
+                self.active_renames.push((var_name, fresh));
+            } else {
+                self.clause_binder_names.insert(var_name.clone());
+                self.variables.insert(var_name, sort);
+            }
         }
         self.expect_char(')')?;
 
         self.skip_whitespace_and_comments();
         let body = self.parse_expr()?;
+        // This binder group's renames end with its body. Renaming during the
+        // parse rather than substituting afterwards means no extra walk over
+        // the body and no fail-closed post-check.
+        self.active_renames.truncate(renames_before);
         self.skip_whitespace_and_comments();
         self.expect_char(')')?;
 
@@ -415,6 +451,23 @@ impl ChcParser {
                         return Ok(ChcExpr::FuncApp(name, ret_sort, Vec::new()));
                     }
                 }
+                // An active binder rename shadows everything else: inside a
+                // renamed binder's body this name denotes THAT binder, not the
+                // outer binding of the same name. Innermost wins, so scan back.
+                // `active_renames` is empty unless a capture actually occurred.
+                let name = if self.active_renames.is_empty() {
+                    name
+                } else {
+                    match self
+                        .active_renames
+                        .iter()
+                        .rev()
+                        .find(|(from, _)| *from == name)
+                    {
+                        Some((_, to)) => to.clone(),
+                        None => name,
+                    }
+                };
                 // Look up variable
                 if let Some(sort) = self.variables.get(&name).cloned() {
                     Ok(ChcExpr::var(ChcVar::new(name, sort)))

@@ -803,6 +803,16 @@ pub struct SymbolInfo {
 enum SymbolBindingOrigin {
     Other,
     DirectSourceDeclaration,
+    /// Installed by a native-API declaration that ALLOCATES its own term and
+    /// registers it atomically (`register_native_global_constant`), so the
+    /// spelling/identity coherence a parsed `declare-const` guarantees holds
+    /// by construction. Distinct from [`Self::DirectSourceDeclaration`] so
+    /// the two lanes stay separately auditable, and NEVER given to
+    /// `register_symbol`/`register_native_global_symbol`: those accept a
+    /// caller-supplied term, which is exactly the freedom the forged-owner
+    /// rejection tests exercise, and are also used for solver-internal
+    /// bookkeeping symbols that must not leak into user models.
+    NativeApiDeclaration,
 }
 
 impl SymbolInfo {
@@ -899,34 +909,9 @@ impl SymbolInfo {
             binding_origin: SymbolBindingOrigin::Other,
         }
     }
-
-    /// Stable identity of the declaration behind this binding.
-    #[must_use]
-    pub fn declaration_id(&self) -> &DeclarationId {
-        &self.declaration_id
-    }
-
-    /// Positive origin kind of this declaration.
-    ///
-    /// Use [`Context::effective_declaration_kind`] when an adopted
-    /// definitional macro must be distinguished from its free origin.
-    #[must_use]
-    pub fn declaration_kind(&self) -> DeclarationKind {
-        self.declaration_kind
-    }
-
-    /// Whether this binding was installed directly by a source
-    /// `declare-const`/`declare-fun`, rather than by an alias, definition,
-    /// datatype/theory registration, or solver-internal API.
-    ///
-    /// This predicate is only producer-side provenance. It is not sufficient
-    /// projection authority without the frontend's exact identity, kind,
-    /// signature, overload, and scope-epoch checks.
-    #[must_use]
-    pub fn is_direct_source_declaration(&self) -> bool {
-        self.binding_origin == SymbolBindingOrigin::DirectSourceDeclaration
-    }
 }
+
+include!("symbol_info.rs");
 
 /// Optimization direction for an objective term
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2647,6 +2632,7 @@ mod app;
 mod commands;
 mod datatypes;
 mod declarations;
+mod derived_query;
 pub use declarations::IntroKind;
 mod indexed;
 mod public_sorts;

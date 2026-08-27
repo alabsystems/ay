@@ -201,9 +201,7 @@ impl Solver {
                 .unwrap_or(0);
             // Register proof ID so later deletions emit correct LRAT ID (#5005).
             if self.cold.lrat_enabled && proof_id != 0 {
-                if clause_idx >= self.cold.clause_ids.len() {
-                    self.cold.clause_ids.resize(clause_idx + 1, 0);
-                }
+                self.cold.clause_ids_grow_for(clause_idx);
                 self.cold.clause_ids[clause_idx] = proof_id;
             }
             let cref = ClauseRef(clause_idx as u32);
@@ -659,9 +657,7 @@ impl Solver {
             // bve_marked and marks JIT dirty vars (#8202).
             self.note_irredundant_clause_added_for_bve(idx, &lits);
             {
-                if idx >= self.cold.clause_ids.len() {
-                    self.cold.clause_ids.resize(idx + 1, 0);
-                }
+                self.cold.clause_ids_grow_for(idx);
                 let cid = if proof_ids[i] != 0 {
                     proof_ids[i]
                 } else {

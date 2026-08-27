@@ -8,13 +8,13 @@
 //! `verification/lean/AySoundness/CombinedBvBlastAbstract.lean`).
 //!
 //! The emitted file defines:
-//!   * `Val` — a propositional assignment `α : Nat → Bool` plus, per [`BitLemma`],
+//!   * `Val` — a propositional assignment `α : Nat → Bool` plus, per `BitLemma`,
 //!     a proof that the gate output bit equals `gateEval` of its inputs;
 //!   * `atomVal m = m.α` — atoms are bits, gate outputs are constrained (not
 //!     computed), so there is no recursion over the gate DAG;
 //!   * `original` — the `Disequality`-provenance clauses (the refuted obligation);
 //!   * `lemmas` — the `BitLemmaCnf` clauses (each valid under any gate-respecting α);
-//!   * `proof` — the [`Refutation`] resolution chain as RUP/`lratCheck` steps;
+//!   * `proof` — the `Refutation` resolution chain as RUP/`lratCheck` steps;
 //!   * `lemmas_valid` — proved per clause LOCALLY (case-split only that clause's
 //!     gate's ≤ 3 inputs + its own respect), so it scales independent of width;
 //!   * `wα` + `val_inhabited : Nonempty Val` — a witness assignment (topological

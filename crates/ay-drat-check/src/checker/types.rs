@@ -26,7 +26,7 @@ pub(crate) enum Visit {
 }
 
 /// Statistics collected during proof checking.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
     pub original: u64,
     pub additions: u64,
@@ -48,7 +48,8 @@ pub struct Stats {
 /// Result of proof conclusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcludeResult {
-    /// Proof verified: empty clause derived, no failures.
+    /// Proof verified: an empty clause was derived without failures or
+    /// unchecked adapter mutations.
     Verified,
     /// Proof failed: reason provided.
     Failed(ConcludeFailure),
@@ -63,7 +64,8 @@ pub enum ConcludeFailure {
     /// One or more derivation steps failed.
     #[error("one or more derivation steps failed")]
     StepFailures,
-    /// No proof steps were processed.
-    #[error("no proof steps were processed")]
-    NoStepsProcessed,
+    /// Cross-crate diagnostic code mutated checker state without a RUP/RAT
+    /// proof obligation, so that state cannot authorize an UNSAT conclusion.
+    #[error("checker state was changed through the unchecked diagnostic adapter")]
+    UncheckedAdapterMutation,
 }

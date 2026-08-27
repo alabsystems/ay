@@ -2087,6 +2087,9 @@ impl Solver {
         );
         debug_assert!(!self.chrono_enabled);
         let dl = self.decision_level;
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829): this clause just
+        // forced a literal. No-op unless the two-stage arm is armed.
+        self.two_stage_note_bcp_use(reason);
         // SAFETY: index bound asserted above (#8359 guards upstream); the
         // unsafe BCP loop entry calls reserve_trail_for_bcp.
         unsafe {
@@ -2105,6 +2108,9 @@ impl Solver {
         );
         debug_assert!(!self.chrono_enabled);
         let dl = self.decision_level;
+        // `OnClauseUse(c)`, BCP half (arXiv:2602.20829): this clause just
+        // forced a literal. No-op unless the two-stage arm is armed.
+        self.two_stage_note_bcp_use(reason);
         // SAFETY: the only call site passes an unassigned blocker from a live
         // binary watcher. The watch/rebuild invariant keeps that literal below
         // `2 * num_vars`, so its variable indexes phase/VarData. Because each

@@ -33,7 +33,9 @@ use crate::proof_capability::{self, ProofMode};
 use crate::{BranchHeuristic, InprocessingFeatureProfile, Solver};
 
 mod capability_plan;
+mod input;
 pub use capability_plan::VariantProfilePlan;
+pub use input::{VariantInput, VariantProofMode};
 
 /// Named SAT-COMP preset selector.
 ///
@@ -302,97 +304,6 @@ impl SolverVariant {
     }
 }
 
-/// Input facts used to resolve a preset into concrete solver settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VariantInput {
-    /// Number of variables in the input formula.
-    pub num_vars: usize,
-    /// Number of clauses in the input formula.
-    pub num_clauses: usize,
-    /// Whether any proof output is enabled.
-    pub proof_mode: bool,
-    /// Whether the active proof format is LRAT.
-    pub lrat_mode: bool,
-    /// Startup phase-initialization policy for this route.
-    pub startup_policy: VariantStartupPolicy,
-    /// Frontend-selected route profile, before formula-class adaptation.
-    pub route_profile: VariantRouteProfile,
-    /// Default-off dense-mutex focused restart gate experiment (#9164).
-    pub dense_mutex_focused_restart_gate_experiment: bool,
-    /// Default-off dense-clique MAB branch-policy experiment (#9229).
-    pub dense_clique_mab_branch_experiment: bool,
-    /// Default-off official Main/LRAT bounded BVE scout route (#8922).
-    pub bve_lrat_scout_route: bool,
-    /// Default-off official Main/LRAT Fmla decompose preflight route (#9590).
-    pub fmla_decompose_lrat_preflight_route: bool,
-}
-
-impl VariantInput {
-    /// Construct variant input metadata.
-    #[must_use]
-    pub const fn new(
-        num_vars: usize,
-        num_clauses: usize,
-        proof_mode: bool,
-        lrat_mode: bool,
-    ) -> Self {
-        Self {
-            num_vars,
-            num_clauses,
-            proof_mode: proof_mode || lrat_mode,
-            lrat_mode,
-            startup_policy: VariantStartupPolicy::Preserve,
-            route_profile: VariantRouteProfile::Standard,
-            dense_mutex_focused_restart_gate_experiment: false,
-            dense_clique_mab_branch_experiment: false,
-            bve_lrat_scout_route: false,
-            fmla_decompose_lrat_preflight_route: false,
-        }
-    }
-
-    /// Return this input with an explicit startup phase-initialization policy.
-    #[must_use]
-    pub const fn with_startup_policy(mut self, startup_policy: VariantStartupPolicy) -> Self {
-        self.startup_policy = startup_policy;
-        self
-    }
-
-    /// Return this input with an explicit frontend route profile.
-    #[must_use]
-    pub const fn with_route_profile(mut self, route_profile: VariantRouteProfile) -> Self {
-        self.route_profile = route_profile;
-        self
-    }
-
-    /// Return this input with the dense-mutex focused restart gate experiment set.
-    #[must_use]
-    pub const fn with_dense_mutex_focused_restart_gate_experiment(mut self, enabled: bool) -> Self {
-        self.dense_mutex_focused_restart_gate_experiment = enabled;
-        self
-    }
-
-    /// Return this input with the dense-clique MAB branch experiment set.
-    #[must_use]
-    pub const fn with_dense_clique_mab_branch_experiment(mut self, enabled: bool) -> Self {
-        self.dense_clique_mab_branch_experiment = enabled;
-        self
-    }
-
-    /// Return this input with the bounded Main/LRAT BVE scout route set.
-    #[must_use]
-    pub const fn with_bve_lrat_scout_route(mut self, enabled: bool) -> Self {
-        self.bve_lrat_scout_route = enabled;
-        self
-    }
-
-    /// Return this input with the Fmla Main/LRAT decompose preflight route set.
-    #[must_use]
-    pub const fn with_fmla_decompose_lrat_preflight_route(mut self, enabled: bool) -> Self {
-        self.fmla_decompose_lrat_preflight_route = enabled;
-        self
-    }
-}
-
 /// Route-level profile selected by a frontend before formula-class adaptation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VariantRouteProfile {
@@ -499,7 +410,7 @@ pub struct VariantConfig {
     /// Preset that produced this config.
     pub variant: SolverVariant,
     /// Formula/proof metadata used to resolve the preset.
-    pub input: VariantInput,
+    input: VariantInput,
     /// Whether to request full preprocessing instead of quick mode.
     pub full_preprocessing: bool,
     /// Restart behavior for the preset.
@@ -543,9 +454,9 @@ impl VariantHotPathConfig {
 
 fn is_official_main_lrat_default_route(variant: SolverVariant, input: VariantInput) -> bool {
     matches!(variant, SolverVariant::Default)
-        && input.lrat_mode
+        && matches!(input.proof_mode(), VariantProofMode::Lrat)
         && matches!(
-            input.route_profile,
+            input.route_profile(),
             VariantRouteProfile::OfficialSatCompMainLrat
         )
 }
@@ -604,6 +515,36 @@ const BVE_SPARSE_MAX_DENSITY: f64 = 12.0;
 /// margin below both the 200K preprocess gate and the first measured
 /// loss (184K). Tunable via --sat-bve-sparse-max-vars.
 const BVE_SPARSE_MAX_VARS: usize = 150_000;
+/// Small-circuit BVE arm: variable-count cap (second arm of
+/// `sparse_band_bve_unlock_active`, 2026-08-21 barrel6 gap fix).
+///
+/// The 2026-06-04 reconstruction clamp turned BVE off on the whole Default
+/// DIMACS route; the 2026-07-08 sparse-band unlock restored it only for
+/// density <= 12. That left a gap for SMALL structured circuit instances
+/// just above the sparse edge: cmu-bmc-barrel6 (248 vars, 3729 clauses,
+/// density 15.04) — the BVE-effectiveness floor benchmark (#3464, CaDiCaL
+/// eliminates 25 vars there; AY eliminates 62 once BVE runs, sound UNSAT in
+/// <0.3s) — got ZERO eliminations because no route ever armed
+/// `features.bve`. This arm re-opens BVE for tiny formulas only:
+/// `num_vars <= 10_000 && density <= BVE_SMALL_CIRCUIT_MAX_DENSITY`.
+///
+/// Cost is bounded: at <= 10K vars x density <= 16 the formula is <= 160K
+/// clauses, and the preprocess fastelim walls (#8448 deadline,
+/// FASTELIM_WALL_CLOCK_LIMIT_SECS) plus the productivity backoff
+/// (#8135/#8482) bound the pass. Verdict safety is unchanged: the braun.11
+/// FINALIZE_SAT_FAIL root cause was fixed (ef818369) before the 2026-07-08
+/// default flip, and the LRAT route stays fail-closed (the arm sits after
+/// the `VariantProofMode::Lrat` refusal). `--sat-no-bve-sparse` kills both arms.
+const BVE_SMALL_CIRCUIT_MAX_VARS: usize = 10_000;
+/// Small-circuit BVE arm: density cap.
+///
+/// 16.0 includes the barrel/BMC circuit class (cmu-bmc-barrel6 at 15.04)
+/// while staying below the first documented small-dense BVE loss,
+/// clique_n2_k10 (180 vars, 3160 clauses, density 17.6 — the 1409->148K
+/// resolvent-blowup instance). The other documented losses are excluded by
+/// the var cap or far denser: Schur_161_5 (density 37), shuffling-2 (138K
+/// vars, density 33.8), d421913d (60K vars, density 40).
+const BVE_SMALL_CIRCUIT_MAX_DENSITY: f64 = 16.0;
 /// Giant raw-BVE band (lever 3, 2026-07-11 sparse-prize completion round;
 /// `AY_AB_BVE_GIANT_RAW`, see `bve_giant_raw_route_active`).
 ///
@@ -618,12 +559,38 @@ const BVE_SPARSE_MAX_VARS: usize = 150_000;
 /// (1.69M vars / 5.96M clauses, density 3.5, kissat unsat@66s via 93%
 /// elimination, AY unknown@120s on main) sits inside with headroom.
 const BVE_GIANT_RAW_MAX_VARS: usize = 2_000_000;
-/// Clause-count ceiling for the giant raw-BVE band: 8M — equal to
-/// AUTO_CONGRUENCE_MAX_CLAUSES for the same "probe-reachable band" reason as
-/// BVE_GIANT_RAW_MAX_VARS. Also bounds the O(active_clauses) occ-list
-/// rebuild + GC scans each deep BVE round pays: at 40-63M clauses (the SAT
-/// giant controls) those scans alone would eat multiples of the deep wall.
-const BVE_GIANT_RAW_MAX_CLAUSES: usize = 8_000_000;
+/// Clause-count ceiling for the giant raw-BVE band: 10M, re-pinned from 8M to
+/// `AUTO_CONGRUENCE_GIANT_MAX_CLAUSES` (2026-08-26).
+///
+/// The ceiling's whole justification is "equal to the AUTO collapse probe
+/// clause cap, for the same probe-reachable-band reason as
+/// `BVE_GIANT_RAW_MAX_VARS`" — the band is meant to be exactly the region
+/// where the probe RAN and found no substitution structure. It was written
+/// against `AUTO_CONGRUENCE_MAX_CLAUSES` (8M); the probe band was subsequently
+/// raised to the giant band `AUTO_CONGRUENCE_GIANT_MAX_VARS` /
+/// `AUTO_CONGRUENCE_GIANT_MAX_CLAUSES` (4M/10M, default ON off the proof path)
+/// and this constant was never re-pinned, so it silently stopped meaning what
+/// its own doc comment says.
+///
+/// The 2M-clause gap is not academic: the `cabp-V-nos6` family (1,529,550 vars
+/// / 8,599,702 clauses, density 5.6 — SAT, kissat solves it, AY returns
+/// `bve_eliminated: 0` and `factor_count: 0`) sits inside the raised probe
+/// band and just outside the stale 8M ceiling, so it was refused here even
+/// with the route armed. 10M admits it; the `cabp-X-can__715` family (13.7M -
+/// 14.0M clauses) stays out of band, as does everything above the probe caps.
+///
+/// The O(active_clauses) occ-list rebuild + GC bound the original comment
+/// cites is still enforced by the 2M `BVE_GIANT_RAW_MAX_VARS` ceiling, which
+/// is deliberately NOT moved: that is what keeps the giant SAT floor controls
+/// 4d6e18e5 (7.3M vars / 40.7M clauses) and 00fd8ac9 (23.4M vars / 63M
+/// clauses) excluded by construction. Inert unless `--sat-bve-giant-raw true`
+/// arms the route (`bve_giant_raw_route_active` refuses before reading it).
+const BVE_GIANT_RAW_MAX_CLAUSES: usize = 10_000_000;
+/// Default for the giant raw-BVE route arm (`--sat-bve-giant-raw`): OFF.
+///
+/// See `SatAbSwitches::bve_giant_raw` for why the route is compiled live again
+/// and why it nonetheless still ships off.
+const BVE_GIANT_RAW_ROUTE_DEFAULT: bool = false;
 const DIMACS_PROOF_REDUCED_EFFORT_MIN_VARS: usize = 5_000;
 /// Official Main LRAT full preprocessing remains enabled for small/moderate
 /// formulas where adaptive symmetry/preprocessing wins matter, but is skipped
@@ -710,6 +677,12 @@ const MIDBAND_DEEP_RESTART_MIN_CLAUSE_VAR_RATIO: f64 = 3.5;
 const MIDBAND_DEEP_RESTART_LUBY_BASE: u64 = 250;
 
 impl VariantConfig {
+    /// Formula and route metadata used to resolve this configuration.
+    #[must_use]
+    pub const fn input(&self) -> VariantInput {
+        self.input
+    }
+
     /// Resolve a preset into concrete solver settings.
     #[must_use]
     pub fn for_variant(variant: SolverVariant, input: VariantInput) -> Self {
@@ -763,8 +736,8 @@ impl VariantConfig {
             },
         };
 
-        if input.proof_mode {
-            config.clamp_for_proof_mode(ProofMode::from_lrat_enabled(input.lrat_mode));
+        if let Some(proof_mode) = input.capability_mode() {
+            config.clamp_for_proof_mode(proof_mode);
         }
         config.apply_startup_policy();
         config.apply_route_profile_clamps();
@@ -875,7 +848,7 @@ impl VariantConfig {
             // { drat: true, lrat: false }). The stricter any-proof refusal
             // was lifted by wf_0c7d84e9 after the f0bafebd emission fix was
             // externally re-verified end-to-end; see the doc above.
-            None => !(self.input.proof_mode && self.input.lrat_mode),
+            None => !matches!(self.input.proof_mode(), VariantProofMode::Lrat),
         }
     }
 
@@ -922,7 +895,7 @@ impl VariantConfig {
     ///     explicit `--sat-no-subst-auto=1` keeps the historical 2M/8M
     ///     measurement semantics, and `--sat-no-subst-auto` kills the whole
     ///     AUTO stack including this band.
-    ///   - NON-PROOF only (`!input.proof_mode`): under DRAT the congruence
+    ///   - NON-PROOF only (`VariantProofMode::Disabled`): under DRAT the congruence
     ///     proof ladder RUP-probes per edge (~10.4K edges/s measured); the
     ///     1.31M-edge giant closures would burn >115s emitting the proof, so
     ///     proof solves keep the 2M/8M band bit-for-bit. AUTO already
@@ -932,7 +905,7 @@ impl VariantConfig {
     ///     unset = ON per the measured +2 flips / 0 floor losses).
     pub(crate) fn subst_auto_giant_band_active(&self) -> bool {
         self.subst_auto_collapse_capped()
-            && !self.input.proof_mode
+            && matches!(self.input.proof_mode(), VariantProofMode::Disabled)
             && Self::subst_auto_giant_env_enabled()
     }
 
@@ -978,8 +951,11 @@ impl VariantConfig {
     /// Default variant ONLY inside the sparse band
     /// (clauses/vars <= BVE_SPARSE_MAX_DENSITY and num_vars <=
     /// BVE_SPARSE_MAX_VARS — see that constant for the measured win/loss
-    /// size split), leaving dense formulas — the entire historical BVE
-    /// loss set — and huge formulas at today's behavior.
+    /// size split) or the small-circuit arm (num_vars <=
+    /// BVE_SMALL_CIRCUIT_MAX_VARS and density <=
+    /// BVE_SMALL_CIRCUIT_MAX_DENSITY — the #3464 barrel6 gap fix), leaving
+    /// dense formulas — the entire historical BVE loss set — and huge
+    /// formulas at today's behavior.
     ///
     /// Proof safety: BVE is DRAT-legal in PROOF_CAPABILITY_REGISTRY
     /// (`Bve { drat: true, lrat: false }`), so the default DRAT route needs
@@ -1017,7 +993,7 @@ impl VariantConfig {
         }
         // Fail-closed on LRAT: the official submission route keeps BVE
         // opt-in via the LRAT-only scout knobs (config_preprocess_bve.rs).
-        if self.input.lrat_mode {
+        if matches!(self.input.proof_mode(), VariantProofMode::Lrat) {
             return false;
         }
         use std::sync::OnceLock;
@@ -1029,22 +1005,31 @@ impl VariantConfig {
         if !enabled {
             return false;
         }
-        if self.input.num_vars == 0 {
+        if self.input.num_vars() == 0 {
             return false;
         }
         let max_vars = ay_core::sat_ab_switches()
             .bve_sparse_max_vars
             .filter(|value| *value > 0)
             .unwrap_or(BVE_SPARSE_MAX_VARS);
-        if self.input.num_vars > max_vars {
+        if self.input.num_vars() > max_vars {
             return false;
         }
         let max_density = ay_core::sat_ab_switches()
             .bve_sparse_max_density
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(BVE_SPARSE_MAX_DENSITY);
-        let density = self.input.num_clauses as f64 / self.input.num_vars as f64;
-        density <= max_density
+        let density = self.input.num_clauses() as f64 / self.input.num_vars() as f64;
+        if density <= max_density {
+            return true;
+        }
+        // Small-circuit arm (#3464 barrel6 gap fix): tiny formulas just
+        // above the sparse density edge. Fixed-edge by design (the
+        // --sat-bve-sparse-* tunables scope the sparse arm only);
+        // `--sat-no-bve-sparse` kills both arms via the shared gate above.
+        // See BVE_SMALL_CIRCUIT_MAX_VARS / BVE_SMALL_CIRCUIT_MAX_DENSITY.
+        self.input.num_vars() <= BVE_SMALL_CIRCUIT_MAX_VARS
+            && density <= BVE_SMALL_CIRCUIT_MAX_DENSITY
     }
 
     /// Giant raw-BVE unlock route/band predicate (lever 3, 2026-07-11
@@ -1090,42 +1075,49 @@ impl VariantConfig {
     /// targets/controls is unswept, so per the round's gate ("default-ON
     /// only with clean evidence") it ships opt-in:
     ///
-    ///   AY_AB_BVE_GIANT_RAW=1        -> route armed (opt-in)
-    ///   unset / AY_AB_BVE_GIANT_RAW=0 -> inert (default)
-    ///   AY_BVE_GIANT_RAW_MAX_VARS=<n>    -> tune the var ceiling (default 2M)
-    ///   AY_BVE_GIANT_RAW_MAX_CLAUSES=<n> -> tune the clause ceiling (default 8M)
+    ///   --sat-bve-giant-raw true  -> route armed (opt-in)
+    ///   unset / =false            -> inert (default)
     ///
-    /// The two size tunables (default 2M/8M) let the ac388757-class cap lift
-    /// (raise to e.g. 4M/10M) be measured without changing the default band or
-    /// the floor-control exclusions; they only take effect when the route is
-    /// also armed. Cached per-process like the other AY_AB_* knobs.
+    /// B21 (`d2bd18e6e2`) had hard-wired this predicate to `return false` as
+    /// part of the env-flag retirement sweep, filed under "measured-negative
+    /// opt-ins made compiled-inert". Re-read against its own evidence that
+    /// label is too strong: neither measurement ever attributed a loss to the
+    /// route — `877271de86` recorded "does not flip, controls HELD, no
+    /// regression" and `d47bf815de` recorded "neither flips (search-bound)" —
+    /// and both were taken on `9d7caee5`/`ac388757` while PAIRED with the
+    /// additive Pass-1 fastelim budget that has since shipped default-ON above
+    /// 200K vars. The arm is therefore back as a sweepable
+    /// `--sat-bve-giant-raw` opt-in (still DEFAULT OFF: nothing here is new
+    /// positive evidence, only an argument that the negative was never
+    /// established).
     fn bve_giant_raw_route_active(&self) -> bool {
         if !matches!(self.variant, SolverVariant::Default) {
             return false;
         }
         // Fail-closed on LRAT (same scoping as sparse_band_bve_unlock_active).
-        if self.input.lrat_mode {
+        if matches!(self.input.proof_mode(), VariantProofMode::Lrat) {
             return false;
         }
-        // B21: the AY_AB_BVE_GIANT_RAW opt-in is retired — measured
-        // default-OFF, never armed anywhere. The route stays compiled for a
-        // future measured revival; this gate keeps it inert.
-        if true {
-            return false;
-        }
-        // Band ceilings: named constants (B21 — the ceiling env raises were
-        // inert without the route gate above; ac388757's measured NO-flip in
-        // 120s means the defaults stand, and re-probing means editing the
-        // constants).
-        let max_vars = BVE_GIANT_RAW_MAX_VARS;
-        let max_clauses = BVE_GIANT_RAW_MAX_CLAUSES;
-        if self.input.num_vars <= BVE_SPARSE_MAX_VARS
-            || self.input.num_vars > max_vars
-            || self.input.num_clauses > max_clauses
+        if !ay_core::sat_ab_switches()
+            .bve_giant_raw
+            .unwrap_or(BVE_GIANT_RAW_ROUTE_DEFAULT)
         {
             return false;
         }
-        let density = self.input.num_clauses as f64 / self.input.num_vars as f64;
+        // Band ceilings. The VAR ceiling is untouched at 2M — it is what keeps
+        // the giant SAT floor controls 4d6e18e5 (7.3M vars) and 00fd8ac9
+        // (23.4M vars) out of band by construction. The CLAUSE ceiling is
+        // re-pinned to the AUTO probe band that shipped after this predicate
+        // was written; see BVE_GIANT_RAW_MAX_CLAUSES.
+        let max_vars = BVE_GIANT_RAW_MAX_VARS;
+        let max_clauses = BVE_GIANT_RAW_MAX_CLAUSES;
+        if self.input.num_vars() <= BVE_SPARSE_MAX_VARS
+            || self.input.num_vars() > max_vars
+            || self.input.num_clauses() > max_clauses
+        {
+            return false;
+        }
+        let density = self.input.num_clauses() as f64 / self.input.num_vars() as f64;
         density <= BVE_SPARSE_MAX_DENSITY
     }
 
@@ -1146,32 +1138,32 @@ impl VariantConfig {
     /// Intended for fresh solvers before clauses are added. Frontend debug
     /// overrides should run after this so bisection flags still win.
     pub fn apply_to_solver(&self, solver: &mut Solver) {
-        let official_main_lrat_default =
-            is_official_main_lrat_default_route(self.variant, self.input);
+        let input = self.input;
+        let num_vars = input.num_vars();
+        let num_clauses = input.num_clauses();
+        let official_main_lrat_default = is_official_main_lrat_default_route(self.variant, input);
         let official_main_lrat_exceeds_full_preprocess_cutoff = official_main_lrat_default
-            && (self.input.num_vars > OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_VARS
-                || self.input.num_clauses > OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_CLAUSES);
+            && (num_vars > OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_VARS
+                || num_clauses > OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_CLAUSES);
 
-        // Keep the historical DIMACS clause threshold: default SAT runs full
-        // preprocessing on moderate inputs, but avoids the heavy prepass on
-        // multi-million-clause CNF where the SAT packet relies on search.
+        // Keep moderate DIMACS full preprocessing, but avoid it on multi-million-clause CNF.
         let full_preprocessing = match self.variant {
             SolverVariant::Default if official_main_lrat_default => {
-                self.input.num_vars > 0
-                    && self.input.num_clauses > 0
-                    && self.input.num_vars <= OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_VARS
-                    && self.input.num_clauses <= OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_CLAUSES
+                num_vars > 0
+                    && num_clauses > 0
+                    && num_vars <= OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_VARS
+                    && num_clauses <= OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_CLAUSES
             }
-            SolverVariant::Default => self.input.num_clauses <= DIMACS_FULL_PREPROCESS_MAX_CLAUSES,
+            SolverVariant::Default => num_clauses <= DIMACS_FULL_PREPROCESS_MAX_CLAUSES,
             _ => self.full_preprocessing,
         };
         // Apply the full feature profile via the unified setter (#8149).
         solver.apply_feature_profile(&self.features);
         if matches!(
-            self.input.startup_policy,
+            input.startup_policy(),
             VariantStartupPolicy::DisableWarmupWalk
         ) && matches!(self.variant, SolverVariant::Default)
-            && self.input.lrat_mode
+            && matches!(input.proof_mode(), VariantProofMode::Lrat)
         {
             // Official Main/default/LRAT enters CDCL without allocating
             // startup-only warmup shadow watches or startup walk occurrence
@@ -1226,10 +1218,10 @@ impl VariantConfig {
         // --sat-no-subst-auto. See subst_auto_giant_band_active.
         solver.set_subst_auto_giant_band(self.subst_auto_giant_band_active());
 
-        if official_main_lrat_default && self.input.bve_lrat_scout_route {
+        if official_main_lrat_default && input.bve_lrat_scout_route() {
             solver.set_bve_lrat_scout_route_enabled(true);
         }
-        if official_main_lrat_default && self.input.fmla_decompose_lrat_preflight_route {
+        if official_main_lrat_default && input.fmla_decompose_lrat_preflight_route() {
             solver.set_fmla_decompose_lrat_preflight_route_enabled(true);
         }
 
@@ -1257,14 +1249,14 @@ impl VariantConfig {
             //
             // Reduced BVE/subsumption effort budgets are kept to avoid
             // pathological preprocessing overhead on large formulas.
-            if self.input.proof_mode {
-                if self.input.num_vars > DIMACS_PROOF_REDUCED_EFFORT_MIN_VARS {
+            if !matches!(input.proof_mode(), VariantProofMode::Disabled) {
+                if num_vars > DIMACS_PROOF_REDUCED_EFFORT_MIN_VARS {
                     solver.set_bve_effort_permille(DIMACS_REDUCED_EFFORT_BVE);
                 }
                 if official_main_lrat_exceeds_full_preprocess_cutoff {
                     solver.set_subsume_effort_permille(DIMACS_REDUCED_EFFORT_SUBSUME);
                 }
-            } else if self.input.num_vars > DIMACS_PROOF_REDUCED_EFFORT_MIN_VARS {
+            } else if num_vars > DIMACS_PROOF_REDUCED_EFFORT_MIN_VARS {
                 // Only reduce BVE/subsumption effort on large formulas (>5K vars).
                 // Small formulas (like clique 437 vars) need full BVE effort to
                 // achieve high elimination rates. CaDiCaL's --sat config reduces
@@ -1284,7 +1276,7 @@ impl VariantConfig {
     fn apply_route_profile_clamps(&mut self) -> bool {
         if !self
             .input
-            .route_profile
+            .route_profile()
             .requires_proof_safe_specialist_routing()
         {
             return false;
@@ -1302,7 +1294,9 @@ impl VariantConfig {
             self.features.symmetry = false;
             changed = true;
         }
-        if matches!(self.variant, SolverVariant::Default) && self.input.lrat_mode {
+        if matches!(self.variant, SolverVariant::Default)
+            && matches!(self.input.proof_mode(), VariantProofMode::Lrat)
+        {
             let official_policy = VariantBranchPolicy::MabUcb1 {
                 epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
             };
@@ -1333,9 +1327,9 @@ impl VariantConfig {
             }
         }
         if !matches!(self.variant, SolverVariant::Default)
-            || !self.input.lrat_mode
+            || !matches!(self.input.proof_mode(), VariantProofMode::Lrat)
             || !matches!(
-                self.input.route_profile,
+                self.input.route_profile(),
                 VariantRouteProfile::OfficialSatCompMainLrat
             )
         {
@@ -1401,7 +1395,7 @@ impl VariantConfig {
         &mut self,
         features: &SatFeatures,
     ) -> bool {
-        let enabled = self.input.dense_mutex_focused_restart_gate_experiment
+        let enabled = self.input.dense_mutex_focused_restart_gate_experiment()
             && dense_mutex_focused_restart_feature_candidate(features);
         if self.hot_path.dense_mutex_focused_restart_gate_experiment == enabled {
             false
@@ -1412,7 +1406,7 @@ impl VariantConfig {
     }
 
     fn apply_dense_clique_mab_branch_experiment(&mut self, features: &SatFeatures) -> bool {
-        let enabled = self.input.dense_clique_mab_branch_experiment
+        let enabled = self.input.dense_clique_mab_branch_experiment()
             && is_official_main_lrat_default_route(self.variant, self.input)
             && official_main_lrat_dense_clique_mutex_candidate(features);
         let mut changed = false;
@@ -1698,7 +1692,7 @@ mod tests {
                 ],
             ],
         );
-        let input = VariantInput::new(4, 2, false, false);
+        let input = VariantInput::new(4, 2, VariantProofMode::Disabled);
         let config = SolverVariant::Default.config(input);
         let plan = VariantProfilePlan::from_config_features(config, &features);
         assert_eq!(plan.ledger.entries().len(), 23);
@@ -1722,7 +1716,7 @@ mod tests {
         };
         let plan = VariantProfilePlan::for_features_with_source(
             SolverVariant::Custom(profile),
-            VariantInput::new(1_000, 101_000, false, false),
+            VariantInput::new(1_000, 101_000, VariantProofMode::Disabled),
             &features,
             DecisionSource::Cli,
         );
@@ -1739,7 +1733,7 @@ mod tests {
         let features = SatFeatures::from_streaming_counters(10_000, 20_000, 0, 20_000);
         let plan = VariantProfilePlan::for_features_with_source(
             SolverVariant::Probe,
-            VariantInput::new(10_000, 20_000, true, true),
+            VariantInput::new(10_000, 20_000, VariantProofMode::Lrat),
             &features,
             DecisionSource::Cli,
         );
@@ -1756,7 +1750,7 @@ mod tests {
             sweep: true,
             ..Default::default()
         };
-        let input = VariantInput::new(10_000, 20_000, false, false)
+        let input = VariantInput::new(10_000, 20_000, VariantProofMode::Disabled)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
         let plan = VariantProfilePlan::for_features_with_source(
             SolverVariant::Custom(profile),
@@ -1796,7 +1790,7 @@ mod tests {
     fn test_default_variant_matches_dimacs_baseline() {
         let config = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
 
         assert!(!config.full_preprocessing);
@@ -1853,7 +1847,7 @@ mod tests {
 
         let lrat = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(1_000, 3_000, true, true),
+            VariantInput::new(1_000, 3_000, VariantProofMode::Lrat),
         );
         assert!(
             !lrat.features.congruence,
@@ -1872,7 +1866,7 @@ mod tests {
         // default AUTO path therefore opens the collapse under DRAT.
         let drat = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(1_000, 3_000, true, false),
+            VariantInput::new(1_000, 3_000, VariantProofMode::Drat),
         );
         assert!(
             drat.features.congruence,
@@ -1888,7 +1882,7 @@ mod tests {
         // Non-Default variants are untouched by the AUTO knob.
         let probe = VariantConfig::for_variant(
             SolverVariant::Probe,
-            VariantInput::new(1_000, 3_000, false, false),
+            VariantInput::new(1_000, 3_000, VariantProofMode::Disabled),
         );
         assert!(
             !probe.features.congruence,
@@ -1899,21 +1893,26 @@ mod tests {
     #[test]
     fn test_sparse_band_bve_unlock_default_off() {
         // Default flipped ON 2026-07-08 (post ef818369): with the knob
-        // unset (or =1) the unlock is ACTIVE — BVE enabled exactly for the
-        // in-band shape (density<=12, vars<=150K) and untouched elsewhere.
-        // --sat-no-bve-sparse is the kill-switch (asserted hermetically only
-        // when set). The LRAT clamp below is unconditional.
+        // unset (or =1) the unlock is ACTIVE — BVE enabled for the in-band
+        // sparse shape (density<=12, vars<=150K) plus the small-circuit arm
+        // (vars<=10K, density<=16 — the #3464 barrel6 gap fix) and untouched
+        // elsewhere. --sat-no-bve-sparse is the kill-switch (asserted
+        // hermetically only when set). The LRAT clamp below is unconditional.
         if ab_bve_sparse_knob_set() {
             for (vars, clauses, expect_bve) in [
                 (1_000usize, 12_000usize, true), // in-band sparse
-                (1_000, 12_001, false),          // out-of-band dense
+                (1_000, 12_001, true),           // small-circuit arm (<=10K vars)
+                (248, 3_729, true),              // cmu-bmc-barrel6 shape (#3464)
+                (1_000, 16_000, true),           // small-circuit arm density edge
+                (1_000, 16_001, false),          // above both density edges
+                (10_001, 130_013, false),        // small-arm var cap (density 13)
                 (150_000, 450_000, true),        // at the size cap
                 (150_001, 450_003, false),       // above the size cap
                 (0, 0, false),                   // degenerate header
             ] {
                 let plain = VariantConfig::for_variant(
                     SolverVariant::Default,
-                    VariantInput::new(vars, clauses, false, false),
+                    VariantInput::new(vars, clauses, VariantProofMode::Disabled),
                 );
                 assert_eq!(
                     plain.features.bve, expect_bve,
@@ -1924,7 +1923,7 @@ mod tests {
             for (vars, clauses) in [(1_000usize, 12_000usize), (150_000, 450_000)] {
                 let plain = VariantConfig::for_variant(
                     SolverVariant::Default,
-                    VariantInput::new(vars, clauses, false, false),
+                    VariantInput::new(vars, clauses, VariantProofMode::Disabled),
                 );
                 assert!(
                     !plain.features.bve,
@@ -1936,7 +1935,7 @@ mod tests {
         // LRAT route is additionally fail-closed by the proof clamp.
         let lrat = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(1_000, 3_000, true, true),
+            VariantInput::new(1_000, 3_000, VariantProofMode::Lrat),
         );
         assert!(!lrat.features.bve, "LRAT keeps BVE clamped (fail-closed)");
     }
@@ -1945,7 +1944,7 @@ mod tests {
     fn test_aggressive_variant_enables_full_preprocessing() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
 
         assert!(config.full_preprocessing);
@@ -1956,7 +1955,7 @@ mod tests {
     fn test_minimal_variant_disables_preprocessing_pipeline() {
         let config = VariantConfig::for_variant(
             SolverVariant::Minimal,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
 
         assert!(!config.features.preprocess);
@@ -1972,7 +1971,7 @@ mod tests {
     fn test_probe_variant_enables_probing_backbone() {
         let config = VariantConfig::for_variant(
             SolverVariant::Probe,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
 
         // Core probe-focused features enabled
@@ -2018,7 +2017,7 @@ mod tests {
     fn test_lrat_input_clamps_destructive_features() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
-            VariantInput::new(32, 96, true, true),
+            VariantInput::new(32, 96, VariantProofMode::Lrat),
         );
 
         assert!(config.features.probe, "probe remains LRAT-enabled");
@@ -2040,7 +2039,7 @@ mod tests {
     fn test_drat_input_clamps_sweep_in_variant_config() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
-            VariantInput::new(32, 96, true, false),
+            VariantInput::new(32, 96, VariantProofMode::Drat),
         );
 
         assert!(config.features.factor, "factor remains DRAT-enabled");
@@ -2054,7 +2053,7 @@ mod tests {
 
     #[test]
     fn test_proof_profile_plan_keeps_adaptive_symmetry_clamped() {
-        let input = VariantInput::new(32, 96, true, true);
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat);
         let clauses: Vec<Vec<crate::Literal>> = Vec::new();
         let features = SatFeatures::extract(32, &clauses);
 
@@ -2068,7 +2067,7 @@ mod tests {
 
     #[test]
     fn test_official_main_lrat_default_disables_startup_phase_init() {
-        let input = VariantInput::new(32, 96, true, true)
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let config = VariantConfig::for_variant(SolverVariant::Default, input);
@@ -2136,7 +2135,7 @@ mod tests {
     #[test]
     fn test_official_main_lrat_full_preprocessing_prunes_large_and_unknown_only() {
         fn full_preprocessing_enabled(num_vars: usize, num_clauses: usize) -> bool {
-            let input = VariantInput::new(num_vars, num_clauses, true, true)
+            let input = VariantInput::new(num_vars, num_clauses, VariantProofMode::Lrat)
                 .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
                 .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
             let config = VariantConfig::for_variant(SolverVariant::Default, input);
@@ -2187,7 +2186,7 @@ mod tests {
     #[test]
     fn test_official_main_lrat_large_formula_reduces_subsume_effort() {
         fn official_main_lrat_subsume_effort(num_vars: usize, num_clauses: usize) -> u64 {
-            let input = VariantInput::new(num_vars, num_clauses, true, true)
+            let input = VariantInput::new(num_vars, num_clauses, VariantProofMode::Lrat)
                 .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
                 .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
             let config = VariantConfig::for_variant(SolverVariant::Default, input);
@@ -2232,7 +2231,7 @@ mod tests {
         let num_vars = OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_VARS + 1;
         let num_clauses = OFFICIAL_MAIN_LRAT_FULL_PREPROCESS_MAX_CLAUSES;
 
-        let standard_input = VariantInput::new(num_vars, num_clauses, true, true);
+        let standard_input = VariantInput::new(num_vars, num_clauses, VariantProofMode::Lrat);
         let standard_config = VariantConfig::for_variant(SolverVariant::Default, standard_input);
         let mut standard_solver = Solver::new(num_vars);
         standard_config.apply_to_solver(&mut standard_solver);
@@ -2242,7 +2241,7 @@ mod tests {
             "plain default/LRAT proof runs keep full subsume effort"
         );
 
-        let official_input = VariantInput::new(num_vars, num_clauses, true, true)
+        let official_input = VariantInput::new(num_vars, num_clauses, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let aggressive_config =
@@ -2281,7 +2280,7 @@ mod tests {
                 .stable_only_rephase
         }
 
-        let official_lrat = VariantInput::new(32, 96, true, true)
+        let official_lrat = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
 
         assert!(
@@ -2291,7 +2290,7 @@ mod tests {
         assert!(
             !stable_only_rephase(
                 SolverVariant::Default,
-                VariantInput::new(32, 96, true, true)
+                VariantInput::new(32, 96, VariantProofMode::Lrat)
             ),
             "plain default/LRAT proof runs keep normal rephase scheduling"
         );
@@ -2302,7 +2301,7 @@ mod tests {
         assert!(
             !stable_only_rephase(
                 SolverVariant::Default,
-                VariantInput::new(32, 96, true, false)
+                VariantInput::new(32, 96, VariantProofMode::Drat)
                     .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat),
             ),
             "official default non-LRAT proof runs keep normal rephase scheduling"
@@ -2316,7 +2315,7 @@ mod tests {
             symmetry: true,
             ..InprocessingFeatureProfile::default()
         };
-        let input = VariantInput::new(32, 96, true, true)
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
 
         let config = VariantConfig::for_variant(SolverVariant::Custom(profile), input);
@@ -2346,7 +2345,7 @@ mod tests {
     fn test_non_official_lrat_default_preserves_startup_phase_init() {
         let config = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(32, 96, true, true),
+            VariantInput::new(32, 96, VariantProofMode::Lrat),
         );
 
         assert!(
@@ -2385,7 +2384,7 @@ mod tests {
 
     #[test]
     fn test_startup_phase_policy_is_default_lrat_only() {
-        let input = VariantInput::new(32, 96, true, true)
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let config = VariantConfig::for_variant(SolverVariant::Aggressive, input);
 
@@ -2424,7 +2423,7 @@ mod tests {
         let b = crate::Literal::negative(crate::Variable(1));
         let clauses = vec![vec![a, b]; 8];
         let features = SatFeatures::extract(128, &clauses);
-        let input = VariantInput::new(128, clauses.len(), true, true)
+        let input = VariantInput::new(128, clauses.len(), VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
 
@@ -2432,7 +2431,7 @@ mod tests {
 
         assert_eq!(plan.instance_class, InstanceClass::Small);
         assert_eq!(
-            plan.config.input.route_profile,
+            plan.config.input().route_profile(),
             VariantRouteProfile::OfficialSatCompMainLrat
         );
         assert!(
@@ -2463,7 +2462,7 @@ mod tests {
     #[test]
     fn test_official_main_lrat_small_dense_uses_legacy_branch_policy() {
         let features = SatFeatures::from_streaming_counters(999, 10_990, 0, 0);
-        let input = VariantInput::new(999, 10_990, true, true)
+        let input = VariantInput::new(999, 10_990, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
 
@@ -2530,7 +2529,7 @@ mod tests {
     #[test]
     fn test_midband_deep_restart_gate_flips_default_to_luby() {
         let features = midband_557d_feature_signature();
-        let input = VariantInput::new(57_935, 229_320, false, false);
+        let input = VariantInput::new(57_935, 229_320, VariantProofMode::Disabled);
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
         if midband_kill_switch_thrown() {
             assert_eq!(
@@ -2584,7 +2583,11 @@ mod tests {
             (&wide, "bin+tern < 85%"),
             (&dense, "clause/var ratio > 6 (6f354fbe floor exclusion)"),
         ] {
-            let input = VariantInput::new(features.num_vars, features.num_clauses, false, false);
+            let input = VariantInput::new(
+                features.num_vars,
+                features.num_clauses,
+                VariantProofMode::Disabled,
+            );
             let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, features);
             assert_eq!(
                 plan.config.restart_policy,
@@ -2597,7 +2600,7 @@ mod tests {
     #[test]
     fn test_midband_deep_restart_gate_default_variant_only() {
         let features = midband_557d_feature_signature();
-        let input = VariantInput::new(57_935, 229_320, false, false);
+        let input = VariantInput::new(57_935, 229_320, VariantProofMode::Disabled);
         for variant in [SolverVariant::Minimal, SolverVariant::Aggressive] {
             let plan = VariantProfilePlan::for_features(variant, input, &features);
             assert_eq!(
@@ -2663,9 +2666,13 @@ mod tests {
             "clique_n2_k10 feature signature must enter the deterministic dense-clique/mutex route"
         );
 
-        let input = VariantInput::new(features.num_vars, features.num_clauses, true, true)
-            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+        let input = VariantInput::new(
+            features.num_vars,
+            features.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
 
         assert_eq!(
@@ -2702,9 +2709,13 @@ mod tests {
     #[test]
     fn test_dense_clique_mab_branch_experiment_is_default_off() {
         let features = clique_n2_k10_feature_signature();
-        let input = VariantInput::new(features.num_vars, features.num_clauses, true, true)
-            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+        let input = VariantInput::new(
+            features.num_vars,
+            features.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
 
         assert_eq!(
@@ -2736,10 +2747,10 @@ mod tests {
         let mab = VariantBranchPolicy::MabUcb1 {
             epoch_min_conflicts: OFFICIAL_MAIN_LRAT_MAB_EPOCH_MIN_CONFLICTS,
         };
-        let input = VariantInput::new(clique.num_vars, clique.num_clauses, true, true)
+        let input = VariantInput::new(clique.num_vars, clique.num_clauses, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
-            .with_dense_clique_mab_branch_experiment(true);
+            .with_dense_clique_mab_branch_experiment();
 
         let clique_plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &clique);
         assert_eq!(
@@ -2797,11 +2808,14 @@ mod tests {
             "applied clique plan should leave the restart experiment disabled"
         );
 
-        let battleship_input =
-            VariantInput::new(battleship.num_vars, battleship.num_clauses, true, true)
-                .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-                .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
-                .with_dense_clique_mab_branch_experiment(true);
+        let battleship_input = VariantInput::new(
+            battleship.num_vars,
+            battleship.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
+        .with_dense_clique_mab_branch_experiment();
         let battleship_plan =
             VariantProfilePlan::for_features(SolverVariant::Default, battleship_input, &battleship);
         assert!(
@@ -2823,9 +2837,13 @@ mod tests {
     #[test]
     fn test_dense_mutex_focused_restart_gate_is_default_off() {
         let features = clique_n2_k10_feature_signature();
-        let input = VariantInput::new(features.num_vars, features.num_clauses, true, true)
-            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+        let input = VariantInput::new(
+            features.num_vars,
+            features.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
 
         assert!(
@@ -2848,10 +2866,10 @@ mod tests {
     fn test_dense_mutex_focused_restart_gate_opt_in_routes_clique_only() {
         let clique = clique_n2_k10_feature_signature();
         let battleship = battleship_14_26_feature_signature();
-        let input = VariantInput::new(clique.num_vars, clique.num_clauses, true, true)
+        let input = VariantInput::new(clique.num_vars, clique.num_clauses, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
             .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
-            .with_dense_mutex_focused_restart_gate_experiment(true);
+            .with_dense_mutex_focused_restart_gate_experiment();
 
         let clique_plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &clique);
         assert!(
@@ -2877,11 +2895,14 @@ mod tests {
             "applied clique plan should enable the solver restart experiment"
         );
 
-        let battleship_input =
-            VariantInput::new(battleship.num_vars, battleship.num_clauses, true, true)
-                .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-                .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
-                .with_dense_mutex_focused_restart_gate_experiment(true);
+        let battleship_input = VariantInput::new(
+            battleship.num_vars,
+            battleship.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
+        .with_dense_mutex_focused_restart_gate_experiment();
         let battleship_plan =
             VariantProfilePlan::for_features(SolverVariant::Default, battleship_input, &battleship);
         assert!(
@@ -2914,11 +2935,15 @@ mod tests {
             "the detector must not silently widen official Main/LRAT branch routing"
         );
 
-        let input = VariantInput::new(features.num_vars, features.num_clauses, true, true)
-            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
-            .with_dense_clique_mab_branch_experiment(true)
-            .with_dense_mutex_focused_restart_gate_experiment(true);
+        let input = VariantInput::new(
+            features.num_vars,
+            features.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk)
+        .with_dense_clique_mab_branch_experiment()
+        .with_dense_mutex_focused_restart_gate_experiment();
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
 
         assert!(
@@ -2947,9 +2972,13 @@ mod tests {
     }
 
     fn branch_policy_for_official_features(features: &SatFeatures) -> VariantBranchPolicy {
-        let input = VariantInput::new(features.num_vars, features.num_clauses, true, true)
-            .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
+        let input = VariantInput::new(
+            features.num_vars,
+            features.num_clauses,
+            VariantProofMode::Lrat,
+        )
+        .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
+        .with_startup_policy(VariantStartupPolicy::DisableWarmupWalk);
         VariantProfilePlan::for_features(SolverVariant::Default, input, features)
             .config
             .branch_policy
@@ -2988,7 +3017,7 @@ mod tests {
         let b = crate::Literal::negative(crate::Variable(1));
         let clauses = vec![vec![a, b]; 8];
         let features = SatFeatures::extract(128, &clauses);
-        let input = VariantInput::new(128, clauses.len(), false, false);
+        let input = VariantInput::new(128, clauses.len(), VariantProofMode::Disabled);
 
         let plan = VariantProfilePlan::for_features(SolverVariant::Default, input, &features);
 
@@ -3008,7 +3037,7 @@ mod tests {
     fn test_lrat_apply_to_solver_clamps_sbva() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
-            VariantInput::new(32, 96, true, true),
+            VariantInput::new(32, 96, VariantProofMode::Lrat),
         );
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3027,7 +3056,7 @@ mod tests {
 
     #[test]
     fn test_bve_lrat_scout_route_is_default_off_and_official_only() {
-        let official_input = VariantInput::new(32, 96, true, true)
+        let official_input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
         let official_config = VariantConfig::for_variant(SolverVariant::Default, official_input);
         let mut official_solver = Solver::new(32);
@@ -3042,7 +3071,8 @@ mod tests {
             "default official Main/LRAT must keep broad BVE clamped"
         );
 
-        let standard_input = VariantInput::new(32, 96, true, true).with_bve_lrat_scout_route(true);
+        let standard_input =
+            VariantInput::new(32, 96, VariantProofMode::Lrat).with_bve_lrat_scout_route();
         let standard_config = VariantConfig::for_variant(SolverVariant::Default, standard_input);
         let mut standard_solver = Solver::new(32);
         standard_config.apply_to_solver(&mut standard_solver);
@@ -3059,9 +3089,9 @@ mod tests {
 
     #[test]
     fn test_bve_lrat_scout_route_does_not_reopen_broad_lrat_bve() {
-        let input = VariantInput::new(32, 96, true, true)
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_bve_lrat_scout_route(true);
+            .with_bve_lrat_scout_route();
         let config = VariantConfig::for_variant(SolverVariant::Default, input);
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3084,7 +3114,7 @@ mod tests {
 
     #[test]
     fn test_fmla_decompose_lrat_preflight_route_is_default_off_and_official_only() {
-        let official_input = VariantInput::new(32, 96, true, true)
+        let official_input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
         let official_config = VariantConfig::for_variant(SolverVariant::Default, official_input);
         let mut official_solver = Solver::new(32);
@@ -3099,8 +3129,8 @@ mod tests {
             "default official Main/LRAT must keep broad decompose clamped"
         );
 
-        let standard_input =
-            VariantInput::new(32, 96, true, true).with_fmla_decompose_lrat_preflight_route(true);
+        let standard_input = VariantInput::new(32, 96, VariantProofMode::Lrat)
+            .with_fmla_decompose_lrat_preflight_route();
         let standard_config = VariantConfig::for_variant(SolverVariant::Default, standard_input);
         let mut standard_solver = Solver::new(32);
         standard_config.apply_to_solver(&mut standard_solver);
@@ -3117,9 +3147,9 @@ mod tests {
 
     #[test]
     fn test_fmla_decompose_lrat_preflight_route_does_not_reopen_broad_lrat_decompose() {
-        let input = VariantInput::new(32, 96, true, true)
+        let input = VariantInput::new(32, 96, VariantProofMode::Lrat)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat)
-            .with_fmla_decompose_lrat_preflight_route(true);
+            .with_fmla_decompose_lrat_preflight_route();
         let config = VariantConfig::for_variant(SolverVariant::Default, input);
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3145,7 +3175,7 @@ mod tests {
     fn test_apply_to_solver_sets_feature_profile() {
         let config = VariantConfig::for_variant(
             SolverVariant::Aggressive,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3168,7 +3198,7 @@ mod tests {
     fn test_probe_variant_apply_to_solver_enables_mab_branch_policy() {
         let config = VariantConfig::for_variant(
             SolverVariant::Probe,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3184,8 +3214,10 @@ mod tests {
 
     #[test]
     fn test_probe_variant_mab_solves_small_unsat_formula() {
-        let config =
-            VariantConfig::for_variant(SolverVariant::Probe, VariantInput::new(2, 4, false, false));
+        let config = VariantConfig::for_variant(
+            SolverVariant::Probe,
+            VariantInput::new(2, 4, VariantProofMode::Disabled),
+        );
         let mut solver = Solver::new(2);
         config.apply_to_solver(&mut solver);
 
@@ -3225,7 +3257,7 @@ mod tests {
         };
         let config = VariantConfig::for_variant(
             SolverVariant::Custom(profile),
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
         assert!(!config.features.bve);
         assert!(!config.features.vivify);
@@ -3241,7 +3273,7 @@ mod tests {
     fn test_custom_variant_default_matches_dimacs_baseline() {
         let custom_default = SolverVariant::Custom(InprocessingFeatureProfile::default());
         let dimacs = SolverVariant::Default;
-        let input = VariantInput::new(32, 96, false, false);
+        let input = VariantInput::new(32, 96, VariantProofMode::Disabled);
         let mut dimacs_features = dimacs.config(input).features;
         // The sparse-band BVE unlock (--sat-no-bve-sparse, default ON) and the
         // substitution-collapse AUTO (--sat-no-subst-auto, default ON since
@@ -3265,7 +3297,7 @@ mod tests {
     fn test_default_variant_restores_dimacs_sat_packet() {
         let config = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(32, 96, false, false),
+            VariantInput::new(32, 96, VariantProofMode::Disabled),
         );
         let mut solver = Solver::new(32);
         config.apply_to_solver(&mut solver);
@@ -3281,7 +3313,11 @@ mod tests {
     fn test_default_variant_large_formula_stays_in_quick_preprocess() {
         let config = VariantConfig::for_variant(
             SolverVariant::Default,
-            VariantInput::new(10_000, DIMACS_FULL_PREPROCESS_MAX_CLAUSES + 1, false, false),
+            VariantInput::new(
+                10_000,
+                DIMACS_FULL_PREPROCESS_MAX_CLAUSES + 1,
+                VariantProofMode::Disabled,
+            ),
         );
         let mut solver = Solver::new(10_000);
         config.apply_to_solver(&mut solver);
@@ -3324,9 +3360,83 @@ mod tests {
         assert_eq!(SolverVariant::parse(""), None);
     }
 
+    /// Parsed header counts of the shapes the giant raw-BVE band arithmetic
+    /// turns on. `cabp-V-nos6.mtx.rnd-k275` is the witness this arm exists
+    /// for: at HEAD, with the route inert, AY reports `bve_eliminated: 0` and
+    /// `factor_count: 0` on it while kissat solves it.
+    const CABP_V_NOS6_K275: (usize, usize) = (1_529_550, 8_599_702);
+    const CABP_X_CAN715_K108: (usize, usize) = (1_622_335, 13_805_307);
+    const GIANT_FLOOR_4D6E18E5: (usize, usize) = (7_300_000, 40_700_000);
+    const GIANT_FLOOR_00FD8AC9: (usize, usize) = (23_400_000, 63_000_000);
+
+    fn giant_raw_route_armed(counts: (usize, usize), proof: VariantProofMode) -> bool {
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+            bve_giant_raw: Some(true),
+            ..Default::default()
+        });
+        SolverVariant::Default
+            .config(VariantInput::new(counts.0, counts.1, proof))
+            .bve_giant_raw_route_active()
+    }
+
+    /// The arm ships OFF: with default switches the route refuses the witness
+    /// exactly as the retired `if true { return false; }` gate did.
+    #[test]
+    fn bve_giant_raw_route_is_default_off_on_the_cabp_witness() {
+        let _guard = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches::default());
+        let config = SolverVariant::Default.config(VariantInput::new(
+            CABP_V_NOS6_K275.0,
+            CABP_V_NOS6_K275.1,
+            VariantProofMode::Disabled,
+        ));
+        assert!(
+            !config.bve_giant_raw_route_active(),
+            "default config must leave the giant raw-BVE route inert"
+        );
+    }
+
+    /// Band arithmetic of the clause-ceiling re-pin (8M ->
+    /// `AUTO_CONGRUENCE_GIANT_MAX_CLAUSES` 10M): it admits the `cabp-V`
+    /// family, and the untouched 2M VAR ceiling is what still excludes the
+    /// giant SAT floor controls. `cabp-X` (13.8M clauses) stays out of band —
+    /// the re-pin follows the probe cap, it does not chase instances.
+    #[test]
+    fn bve_giant_raw_band_admits_cabp_v_and_still_excludes_the_giant_floor() {
+        assert!(
+            giant_raw_route_armed(CABP_V_NOS6_K275, VariantProofMode::Disabled),
+            "the 8.60M-clause witness must be in band at the re-pinned ceiling"
+        );
+        assert!(
+            !giant_raw_route_armed(CABP_X_CAN715_K108, VariantProofMode::Disabled),
+            "13.8M clauses is above the probe cap and must stay out of band"
+        );
+        assert!(
+            !giant_raw_route_armed(GIANT_FLOOR_4D6E18E5, VariantProofMode::Disabled),
+            "floor control 4d6e18e5 must stay excluded by the 2M var ceiling"
+        );
+        assert!(
+            !giant_raw_route_armed(GIANT_FLOOR_00FD8AC9, VariantProofMode::Disabled),
+            "floor control 00fd8ac9 must stay excluded by the 2M var ceiling"
+        );
+    }
+
+    /// The route fails closed under LRAT even when armed, so a proof-mode A/B
+    /// of this arm is only meaningful on a DRAT surface.
+    #[test]
+    fn bve_giant_raw_route_fails_closed_under_lrat() {
+        assert!(
+            giant_raw_route_armed(CABP_V_NOS6_K275, VariantProofMode::Drat),
+            "DRAT keeps the armed route live"
+        );
+        assert!(
+            !giant_raw_route_armed(CABP_V_NOS6_K275, VariantProofMode::Lrat),
+            "LRAT must refuse the route before the band is consulted"
+        );
+    }
+
     #[test]
     fn test_four_variants_produce_distinct_configs() {
-        let input = VariantInput::new(1000, 5000, false, false);
+        let input = VariantInput::new(1000, 5000, VariantProofMode::Disabled);
         let configs: Vec<VariantConfig> =
             SolverVariant::ALL.iter().map(|v| v.config(input)).collect();
 

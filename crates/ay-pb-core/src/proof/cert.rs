@@ -17,6 +17,8 @@
 //! claim). A `None` or a proof that fails to verify must never change the
 //! reported SAT/UNSAT status — certification is strictly additive.
 
+mod lp_dual_floor;
+
 use ay_sat::{Literal, ProofOutput, SatResult, Solver};
 
 use super::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
@@ -29,6 +31,21 @@ use super::veripb::{
 };
 use crate::encoding::CnfEncoder;
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
+
+/// Emits a direct OPT-LIN lower bound by reconstructing a tight complemented-space dual with checked non-negative arithmetic and bounded denominator.
+/// `None` withholds only the certificate; returned text is untrusted until the external VeriPB verify-before-claim gate accepts it.
+pub fn certify_opt_lin_lp_dual_floor(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+) -> Option<String> {
+    lp_dual_floor::certify_opt_lin_lp_dual_floor(instance, incumbent, optimum)
+}
+
+/// Reports why [`certify_opt_lin_lp_dual_floor`] did or did not fire; measurement-only.
+pub fn lp_dual_floor_diagnosis(instance: &PbInstance, optimum: i128) -> String {
+    lp_dual_floor::lp_dual_floor_diagnosis(instance, optimum)
+}
 
 /// Solve `instance` via its CNF encoding with DRAT proof logging and, on UNSAT,
 /// return a VeriPB v3 proof text refuting the original PB instance. Returns
@@ -441,10 +458,10 @@ pub fn certify_opt_lin_bounds_interruptible(
 ///      exactly the id the solver's imported-input map assigns the improving
 ///      row (it is pushed LAST onto the augmented instance), so solver and
 ///      checker stay in id lockstep
-///      ([`PbCdclSolver::with_appended_proof_tap_interruptible`] verifies
+///      (`PbCdclSolver::with_appended_proof_tap_interruptible` verifies
 ///      the alignment before any step is emitted).
 ///   2. The solver's refutation of the augmented instance
-///      ([`PbCdclSolver::solve_refutation_only_interruptible`]): every learned
+///      (`PbCdclSolver::solve_refutation_only_interruptible`): every learned
 ///      constraint is a checked `pol`/`rup` step, ending in a derived
 ///      contradiction row (no conclusion block).
 ///   3. `conclusion BOUNDS optimum optimum`, hinted with the contradiction row
@@ -1092,294 +1109,9 @@ pub fn certify_opt_lin_knapsack_cardinality(
     String::from_utf8(writer.into_inner()).ok()
 }
 
-/// DIRECT OPT-LIN-CERT lower bound from the exact LP DUAL — certifies TIGHT-LP
-/// optima of ANY objective sign (incl. maximization) that the aggregation floor and
-/// the augmented refutation cannot reach.
-///
-/// When `ceil(LP*) == optimum`, the exact-rational LP dual gives non-negative
-/// multipliers that entail `Σ obj_j x_j >= optimum` as a Chvátal–Gomory combination.
-/// AY's LP solver ([`crate::optimize::lp_bound::lp_dual_raw`]) works in a
-/// COMPLEMENTED space (each negative-objective var `x_j -> 1 - x'_j`, plus one box
-/// row `-x'_j >= -1` per var). This un-complements that dual back to the ORIGINAL
-/// rows and literal axioms and emits it as `pol`:
-///   * scale each original `>=` row `v` by its dual `Y_v` and sum (the CG aggregate);
-///   * add each box dual `YB_j` as an `x_j >= 0` axiom (complemented var) or a
-///     `~x_j >= 0` axiom (non-complemented);
-///   * lift each var `j` by `L_j` on the OPPOSITE axiom up to its objective
-///     coefficient;
-///   * ceil-divide by the multiplier denominator; add the `soli` row → `0 >= 1`.
-///
-/// SOUNDNESS: fail-closed by a runtime SELF-CHECK — the emitter computes the exact
-/// coefficient the derivation lands on for every variable and the final RHS, and
-/// emits ONLY when they equal `(obj_j, optimum)` with every `Y_v/YB_j/L_j >= 0`. So
-/// every emitted `pol` step is a non-negative scaling of an instance-entailed row or
-/// literal axiom, and the derived constraint is exactly the objective floor — a
-/// construction bug can only make the self-check decline (or, at worst, VeriPB
-/// reject), never accept a false bound. `None` = withheld, status unaffected.
-pub fn certify_opt_lin_lp_dual_floor(
-    instance: &PbInstance,
-    incumbent: &[bool],
-    optimum: i128,
-) -> Option<String> {
-    use num_traits::ToPrimitive;
-    let objective = instance.objective.as_ref()?;
-    // Objective as a var -> coefficient map (single-literal terms only). A negated
-    // objective literal is not modeled here (decline; the aggregation floor covers
-    // the plain-positive covering case).
-    let mut obj: std::collections::BTreeMap<u32, i128> = std::collections::BTreeMap::new();
-    for term in &objective.terms {
-        let [lit] = term.lits.as_slice() else {
-            return None;
-        };
-        if lit.negated || lit.var == 0 {
-            return None;
-        }
-        *obj.entry(lit.var).or_insert(0) = obj
-            .get(&lit.var)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(term.coeff)?;
-    }
-    if obj.is_empty() {
-        return None;
-    }
-    // NOTE: no objective-sign gate. This emitter certifies ANY tight-LP optimum —
-    // maximization (KE/knapsack), mixed-sign (ss97), and plain-positive NON-covering
-    // instances (fir/5_10/mps) that the aggregation floor cannot express (it runs
-    // FIRST in the cert chain, so reaching here means it already declined). The
-    // 8s deadline below bounds the exact-simplex cost on instances that then fall
-    // through to the refutation routes.
-    let n = instance.num_vars as usize;
-    if incumbent.len() != n {
-        return None;
-    }
-    if evaluate_linear_objective(objective, incumbent)? != optimum {
-        return None;
-    }
-    if !crate::eval::verify_all_constraints(&instance.constraints, incumbent) {
-        return None;
-    }
-
-    // Single-literal-per-term rows only (so each row maps to `f` ids 1:1). Equality
-    // rows are ALLOWED: the LP model splits `a·x = b` into two `>=` rows (`+a≥+b`,
-    // `-a≥-b`) in order, and VeriPB likewise assigns an equality TWO consecutive `f`
-    // ids (`veripb_input_constraint_count` counts Eq as 2), so the split-row order
-    // matches the id order — each half is a separate id with its own non-negative
-    // dual (no signed multiplier needed).
-    let constraints = &instance.constraints;
-    for con in constraints {
-        if con.terms.iter().any(|t| t.lits.len() != 1) {
-            return None;
-        }
-    }
-    // The LP model's constraint ROWS in `f`-id order: `Ge -> 1`, `Eq -> (+a≥+b, -a≥-b)`.
-    // Each row's coefficients fold negated literals (`~x = 1 - x`) into the rhs.
-    let mut rows: Vec<(std::collections::BTreeMap<u32, i128>, i128)> = Vec::new();
-    for con in constraints {
-        let mut cf: std::collections::BTreeMap<u32, i128> = std::collections::BTreeMap::new();
-        let mut rhs = con.rhs;
-        for t in &con.terms {
-            let lit = t.lits[0];
-            if lit.negated {
-                rhs = rhs.checked_sub(t.coeff)?;
-                *cf.entry(lit.var).or_insert(0) = cf
-                    .get(&lit.var)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_sub(t.coeff)?;
-            } else {
-                *cf.entry(lit.var).or_insert(0) = cf
-                    .get(&lit.var)
-                    .copied()
-                    .unwrap_or(0)
-                    .checked_add(t.coeff)?;
-            }
-        }
-        match con.rel {
-            PbRel::Ge => rows.push((cf, rhs)),
-            PbRel::Eq => {
-                let neg: std::collections::BTreeMap<u32, i128> =
-                    cf.iter().map(|(&v, &co)| (v, -co)).collect();
-                rows.push((cf, rhs));
-                rows.push((neg, rhs.checked_neg()?));
-            }
-        }
-    }
-    let num_rows = rows.len();
-
-    // Bound the exact-rational dual simplex so it can never hang / steal the whole
-    // cert budget (it declines to `None` on timeout — fail-closed). 60s: measured on
-    // `6_12` (78v/84r), the exact dual needs more than 8s to converge to the tight
-    // ceil floor (it reported 5785 @8s vs true LP* in (5866, 5867]); at competition
-    // budget (1800s) a 60s slice is cheap and converts ceil-tight-but-slow instances.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
-    let raw =
-        crate::optimize::lp_bound::lp_dual_raw(objective, constraints, instance.num_vars, &|| {
-            std::time::Instant::now() >= deadline
-        })?;
-    // Must be TIGHT: the LP floor meets the incumbent.
-    if raw.bound != optimum {
-        return None;
-    }
-    if raw.num_constraint_rows != num_rows || raw.duals.len() != num_rows + n {
-        return None;
-    }
-    // Integer duals only (this first cut); a non-integer dual declines (fail-closed).
-    for d in &raw.duals {
-        if !d.is_integer() {
-            return None;
-        }
-    }
-    let to_i128 = |r: &num_rational::BigRational| -> Option<i128> { r.to_integer().to_i128() };
-    let yv: Vec<i128> = raw.duals[..num_rows]
-        .iter()
-        .map(&to_i128)
-        .collect::<Option<_>>()?;
-    let ybox: Vec<i128> = raw.duals[num_rows..num_rows + n]
-        .iter()
-        .map(to_i128)
-        .collect::<Option<_>>()?;
-    if yv.iter().chain(ybox.iter()).any(|&x| x < 0) {
-        return None;
-    }
-    let comp = &raw.complement; // comp[v0] = var (v0+1) complemented
-
-    // Aggregate the ROWS scaled by their duals: agg_coeff[j] = Σ_r yv[r]·row_r[j];
-    // agg_rhs = Σ_r yv[r]·rhs_r. Row `r` is VeriPB `f` id `r+1`.
-    let mut agg_coeff: std::collections::BTreeMap<u32, i128> = std::collections::BTreeMap::new();
-    let mut agg_rhs: i128 = 0;
-    for (r, (cf, rhs)) in rows.iter().enumerate() {
-        if yv[r] == 0 {
-            continue;
-        }
-        agg_rhs = agg_rhs.checked_add(yv[r].checked_mul(*rhs)?)?;
-        for (&var, &co) in cf {
-            *agg_coeff.entry(var).or_insert(0) = agg_coeff
-                .get(&var)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(yv[r].checked_mul(co)?)?;
-        }
-    }
-
-    // Per-variable lift onto the opposite axiom, plus the running final coeff / rhs.
-    // complemented j:   final = agg + ybox_j - lift_j   (box on x>=0, lift on ~x>=0)
-    // non-complemented: final = agg - ybox_j + lift_j   (box on ~x>=0, lift on x>=0)
-    let mut lift: Vec<i128> = vec![0; n];
-    let mut final_rhs = agg_rhs;
-    for j in 1..=n as u32 {
-        let a = agg_coeff.get(&j).copied().unwrap_or(0);
-        let yb = ybox[(j - 1) as usize];
-        let want = obj.get(&j).copied().unwrap_or(0);
-        let complemented = comp[(j - 1) as usize];
-        let l = if complemented {
-            // want = a + yb - l
-            a.checked_add(yb)?.checked_sub(want)?
-        } else {
-            // want = a - yb + l
-            want.checked_sub(a)?.checked_add(yb)?
-        };
-        if l < 0 {
-            return None;
-        }
-        lift[(j - 1) as usize] = l;
-        // RHS contributions: complemented box(x>=0) adds 0, lift(~x>=0) adds -l;
-        // non-complemented box(~x>=0) adds -yb, lift(x>=0) adds 0.
-        if complemented {
-            final_rhs = final_rhs.checked_sub(l)?;
-        } else {
-            final_rhs = final_rhs.checked_sub(yb)?;
-        }
-        // SELF-CHECK: the coefficient the derivation lands on must equal obj_j.
-        let landed = if complemented { a + yb - l } else { a - yb + l };
-        if landed != want {
-            return None;
-        }
-    }
-    // Final RHS must be exactly the optimum (integer duals => no divide needed).
-    if final_rhs != optimum {
-        return None;
-    }
-
-    // ---- Emit ----
-    let f_count = veripb_input_constraint_count(instance).ok()?;
-    let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f_count).ok()?;
-    let soli_id = writer
-        .log_step(ProofStep::SolutionImproving(format_assignment(incumbent)))
-        .ok()?;
-
-    // Aggregate the rows scaled by their duals (row `r` = VeriPB `f` id `r+1`).
-    let agg_terms: Vec<(u64, i128)> = (0..num_rows)
-        .filter(|&r| yv[r] != 0)
-        .map(|r| (u64::try_from(r + 1).unwrap(), yv[r]))
-        .collect();
-    if agg_terms.is_empty() {
-        return None;
-    }
-    let mut expr = if agg_terms[0].1 == 1 {
-        format!("{}", agg_terms[0].0)
-    } else {
-        format!("{} {} *", agg_terms[0].0, agg_terms[0].1)
-    };
-    for &(id, m) in &agg_terms[1..] {
-        if m == 1 {
-            expr.push_str(&format!(" {id} +"));
-        } else {
-            expr.push_str(&format!(" {id} {m} * +"));
-        }
-    }
-    expr.push_str(" ;");
-    let mut cur = writer.log_step(ProofStep::Polynomial(expr)).ok()?;
-
-    // Box duals: complemented -> x_j>=0 ; non-complemented -> ~x_j>=0.
-    for j in 1..=n as u32 {
-        let yb = ybox[(j - 1) as usize];
-        if yb == 0 {
-            continue;
-        }
-        let axiom = if comp[(j - 1) as usize] {
-            format!("x{j}")
-        } else {
-            format!("~x{j}")
-        };
-        let e = if yb == 1 {
-            format!("{cur} {axiom} + ;")
-        } else {
-            format!("{cur} {axiom} {yb} * + ;")
-        };
-        cur = writer.log_step(ProofStep::Polynomial(e)).ok()?;
-    }
-    // Lifts: complemented -> ~x_j>=0 ; non-complemented -> x_j>=0.
-    for j in 1..=n as u32 {
-        let l = lift[(j - 1) as usize];
-        if l == 0 {
-            continue;
-        }
-        let axiom = if comp[(j - 1) as usize] {
-            format!("~x{j}")
-        } else {
-            format!("x{j}")
-        };
-        let e = if l == 1 {
-            format!("{cur} {axiom} + ;")
-        } else {
-            format!("{cur} {axiom} {l} * + ;")
-        };
-        cur = writer.log_step(ProofStep::Polynomial(e)).ok()?;
-    }
-    // Contradiction with the soli row, then hinted BOUNDS (required in
-    // unchecked-deletion mode; see `conclude_opt_hinted`).
-    let contradiction_id = writer.log_step(ProofStep::Addition(cur, soli_id)).ok()?;
-    writer.set_opt_bounds(optimum, optimum).ok()?;
-    writer
-        .conclude_opt_hinted(Some(contradiction_id), Some(&format_assignment(incumbent)))
-        .ok()?;
-    String::from_utf8(writer.into_inner()).ok()
-}
-
 /// OPT-LIN-CERT, COMPACT lower bound: same two-halves certificate as
 /// [`certify_opt_lin_bounds`], but the lower bound is closed by the COMPACT
-/// (proof-producing Sinz) route ([`certify_decision_unsat_compact`]) instead of
+/// (proof-producing Sinz) route (`certify_decision_unsat_compact`) instead of
 /// the aux-free lift. This certifies optimization instances whose augmented
 /// `{instance ∧ obj <= optimum-1}` refutation needs auxiliary register variables
 /// the aux-free lifter cannot express (any `>=` direction with threshold `>= 2`,
@@ -1396,7 +1128,7 @@ pub fn certify_opt_lin_lp_dual_floor(
 ///   2. **Per-constraint Sinz introductions + top-register telescope.** For every
 ///      `>=` direction encoded by the compact encoder we `red`-introduce its Sinz
 ///      definition clauses and `pol`-derive its top register, via
-///      [`emit_sinz_introductions_pol_derived_weighted`]. The improving row is the
+///      `emit_sinz_introductions_pol_derived_weighted`. The improving row is the
 ///      LAST constraint of the augmented instance, so the compact encoder records
 ///      its `input_row_id` as `f_count + 1` — precisely the soli-installed id. The
 ///      same `obj <= optimum-1` constraint is therefore BOTH installed by `soli`

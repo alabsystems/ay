@@ -10,6 +10,19 @@
 //! <id> d <id1> <id2> ... 0                          # deletion
 //! ```
 //!
+//! The two leading `<id>` fields do **not** mean the same thing. On an
+//! addition the field is the new clause's ID and must strictly exceed every
+//! ID introduced so far. On a deletion it is a positional stamp naming the
+//! most recently added clause, not a new ID: drat-trim's LRAT writer prints
+//! `"%i d "` with `lastAdded` (`reference/drat-trim/drat-trim.c:383`) and
+//! CaDiCaL does the same, so `25 ... 0` immediately followed by `25 d ... 0`
+//! is standard. The reference checker parses the field and discards it —
+//! `reference/drat-trim/lrat-check.c:462` dispatches deletions on
+//! `litList + 2` and never looks at `litList[0]` — so it imposes no ordering
+//! constraint at all. AY's own emitter instead burns a fresh ID for the line
+//! (`ay-sat/src/proof/lrat.rs:317`), which is equally acceptable. This parser
+//! therefore accepts any deletion stamp that does not run *backwards*.
+//!
 //! ## Binary format
 //!
 //! Addition: `a` byte, LEB128 id, LEB128 lits..., 0, LEB128 hints..., 0
@@ -68,10 +81,102 @@ pub fn is_binary_lrat(data: &[u8]) -> bool {
     false
 }
 
+/// Parse the body of a text deletion step: the `<id1> <id2> ... 0` after `d`.
+///
+/// The line's leading stamp is handled by the caller and never reaches here:
+/// it is positional, not a clause reference, so `LratStep::Delete` has no
+/// field for it.
+fn parse_text_deletion_body(rest: &[&str]) -> Result<LratStep, LratParseError> {
+    let mut ids = Vec::new();
+    let mut terminated = false;
+    for (index, &token) in rest.iter().enumerate() {
+        let id: u64 = token.parse().map_err(|_| LratParseError::InvalidStep {
+            detail: format!("invalid deletion ID: {token}"),
+        })?;
+        if id == 0 {
+            terminated = true;
+            if index + 1 != rest.len() {
+                return Err(LratParseError::InvalidStep {
+                    detail: "tokens after deletion terminator".into(),
+                });
+            }
+            break;
+        }
+        ids.push(id);
+    }
+    if !terminated {
+        return Err(LratParseError::InvalidStep {
+            detail: "deletion step is missing its terminating 0".into(),
+        });
+    }
+    Ok(LratStep::Delete { ids })
+}
+
+/// Parse the body of a text addition step: `<lit1> ... 0 <hint1> ... 0`.
+fn parse_text_addition_body(id: u64, rest: &[&str]) -> Result<LratStep, LratParseError> {
+    let mut clause = Vec::new();
+    let mut hints = Vec::new();
+    let mut in_hints = false;
+    let mut hints_terminated = false;
+
+    for (index, &token) in rest.iter().enumerate() {
+        if in_hints {
+            let hint: i64 = token.parse().map_err(|_| LratParseError::InvalidStep {
+                detail: format!("invalid hint ID: {token}"),
+            })?;
+            if hint == 0 {
+                hints_terminated = true;
+                if index + 1 != rest.len() {
+                    return Err(LratParseError::InvalidStep {
+                        detail: "tokens after hint terminator".into(),
+                    });
+                }
+                break;
+            }
+            hints.push(hint);
+        } else {
+            let lit: i64 = token.parse().map_err(|_| LratParseError::InvalidStep {
+                detail: format!("invalid literal: {token}"),
+            })?;
+            if lit == 0 {
+                in_hints = true;
+            } else {
+                if lit.unsigned_abs() > MAX_LRAT_VAR {
+                    return Err(LratParseError::InvalidStep {
+                        detail: format!(
+                            "literal {lit} exceeds the supported maximum variable \
+                             index {MAX_LRAT_VAR}; refusing to allocate"
+                        ),
+                    });
+                }
+                let lit32 = i32::try_from(lit).map_err(|_| LratParseError::InvalidStep {
+                    detail: format!("literal {lit} exceeds i32 range"),
+                })?;
+                clause.push(Literal::try_from_dimacs(lit32)?);
+            }
+        }
+    }
+    if !in_hints {
+        return Err(LratParseError::InvalidStep {
+            detail: "addition step is missing its clause terminator".into(),
+        });
+    }
+    if !hints_terminated {
+        return Err(LratParseError::InvalidStep {
+            detail: "addition step is missing its hint terminator".into(),
+        });
+    }
+    Ok(LratStep::Add { id, clause, hints })
+}
+
 /// Parse a text-format LRAT proof.
 pub fn parse_text_lrat(input: &str) -> Result<Vec<LratStep>, LratParseError> {
     let mut steps = Vec::new();
-    let mut previous_step_id = 0;
+    // High-water mark over the step IDs seen so far. An addition must strictly
+    // exceed it (it introduces a new clause ID); a deletion only has to not go
+    // below it, because its leading field is a positional stamp rather than a
+    // new ID. See the module docs for the format citation.
+    let mut max_step_id = 0;
 
     for line in input.lines() {
         let line = line.trim();
@@ -93,101 +198,35 @@ pub fn parse_text_lrat(input: &str) -> Result<Vec<LratStep>, LratParseError> {
                 detail: "step ID 0 is reserved".into(),
             });
         }
-        if step_id <= previous_step_id {
-            return Err(LratParseError::InvalidStep {
-                detail: format!("non-monotonic step ID {step_id} after {previous_step_id}"),
-            });
-        }
-        previous_step_id = step_id;
 
-        if tokens.len() > 1 && tokens[1] == "d" {
-            // Deletion step: <id> d <id1> <id2> ... 0
-            let mut ids = Vec::new();
-            let mut terminated = false;
-            for (index, &token) in tokens[2..].iter().enumerate() {
-                let id: u64 = token.parse().map_err(|_| LratParseError::InvalidStep {
-                    detail: format!("invalid deletion ID: {token}"),
-                })?;
-                if id == 0 {
-                    terminated = true;
-                    if index + 1 != tokens[2..].len() {
-                        return Err(LratParseError::InvalidStep {
-                            detail: "tokens after deletion terminator".into(),
-                        });
-                    }
-                    break;
-                }
-                ids.push(id);
-            }
-            if !terminated {
+        // The ordering predicate depends on which kind of step this is, so the
+        // addition/deletion split has to happen *before* the check, not after.
+        let is_deletion = tokens.len() > 1 && tokens[1] == "d";
+        if is_deletion {
+            // A deletion stamp may repeat the current high-water mark (the
+            // drat-trim/CaDiCaL convention) or sit above it (AY's convention).
+            // Only a backwards jump — a truncated, reordered or corrupted
+            // proof — is rejected. The value itself is never used: the checker
+            // consumes `LratStep::Delete { ids }`, which carries no step ID.
+            if step_id < max_step_id {
                 return Err(LratParseError::InvalidStep {
-                    detail: "deletion step is missing its terminating 0".into(),
+                    detail: format!("decreasing deletion step ID {step_id} after {max_step_id}"),
                 });
             }
-            let _ = step_id; // deletion step ID is informational
-            steps.push(LratStep::Delete { ids });
+        } else if step_id <= max_step_id {
+            return Err(LratParseError::InvalidStep {
+                detail: format!("non-monotonic step ID {step_id} after {max_step_id}"),
+            });
+        }
+        max_step_id = step_id;
+
+        steps.push(if is_deletion {
+            // Deletion step: <id> d <id1> <id2> ... 0
+            parse_text_deletion_body(&tokens[2..])?
         } else {
             // Addition step: <id> <lit1> ... 0 <hint1> ... 0
-            let mut clause = Vec::new();
-            let mut hints = Vec::new();
-            let mut in_hints = false;
-            let mut hints_terminated = false;
-
-            for (index, &token) in tokens[1..].iter().enumerate() {
-                if in_hints {
-                    let hint: i64 = token.parse().map_err(|_| LratParseError::InvalidStep {
-                        detail: format!("invalid hint ID: {token}"),
-                    })?;
-                    if hint == 0 {
-                        hints_terminated = true;
-                        if index + 1 != tokens[1..].len() {
-                            return Err(LratParseError::InvalidStep {
-                                detail: "tokens after hint terminator".into(),
-                            });
-                        }
-                        break;
-                    }
-                    hints.push(hint);
-                } else {
-                    let lit: i64 = token.parse().map_err(|_| LratParseError::InvalidStep {
-                        detail: format!("invalid literal: {token}"),
-                    })?;
-                    if lit == 0 {
-                        in_hints = true;
-                    } else {
-                        if lit.unsigned_abs() > MAX_LRAT_VAR {
-                            return Err(LratParseError::InvalidStep {
-                                detail: format!(
-                                    "literal {lit} exceeds the supported maximum variable \
-                                     index {MAX_LRAT_VAR}; refusing to allocate"
-                                ),
-                            });
-                        }
-                        let lit32 =
-                            i32::try_from(lit).map_err(|_| LratParseError::InvalidStep {
-                                detail: format!("literal {lit} exceeds i32 range"),
-                            })?;
-                        clause.push(Literal::from_dimacs(lit32));
-                    }
-                }
-            }
-            if !in_hints {
-                return Err(LratParseError::InvalidStep {
-                    detail: "addition step is missing its clause terminator".into(),
-                });
-            }
-            if !hints_terminated {
-                return Err(LratParseError::InvalidStep {
-                    detail: "addition step is missing its hint terminator".into(),
-                });
-            }
-
-            steps.push(LratStep::Add {
-                id: step_id,
-                clause,
-                hints,
-            });
-        }
+            parse_text_addition_body(step_id, &tokens[1..])?
+        });
     }
 
     Ok(steps)
@@ -254,7 +293,7 @@ fn decode_binary_lit(encoded: u64) -> Result<Literal, LratParseError> {
         detail: format!("binary LRAT literal var {var_u64} exceeds i32 range"),
     })?;
     let dimacs = if encoded & 1 == 0 { var } else { -var };
-    Ok(Literal::from_dimacs(dimacs))
+    Literal::try_from_dimacs(dimacs).map_err(LratParseError::from)
 }
 
 /// Parse a binary-format LRAT proof.
@@ -369,3 +408,6 @@ fn lit(dimacs: i32) -> Literal {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_deletion_step_id;

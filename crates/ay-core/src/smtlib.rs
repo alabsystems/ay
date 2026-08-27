@@ -275,7 +275,7 @@ impl std::error::Error for StringDecodeError {}
 ///
 /// A `\u` form that is not a well-formed, in-alphabet escape is NOT an escape:
 /// every one of its characters is literal and NOTHING is consumed. This matters
-/// for soundness — see [`parse_unicode_escape`] for the exact grammar and for
+/// for soundness — see `parse_unicode_escape` for the exact grammar and for
 /// the verdict-flipping failure mode that consuming-on-failure produced.
 ///
 /// # Examples

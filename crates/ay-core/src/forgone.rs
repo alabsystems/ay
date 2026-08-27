@@ -59,7 +59,7 @@ pub struct Site {
     pub unit: &'static str,
 }
 
-/// The audited gates, in declaration order. Index into [`COSTS`] / [`HITS`].
+/// The audited gates, in declaration order. Index into `COSTS` / `HITS`.
 ///
 /// These are exactly the five `SIZE_GATE_ANTIPATTERN.md` lists as unaudited, plus
 /// their duplicate. Adding a gate here is how it gets audited; the constant's own

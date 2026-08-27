@@ -71,7 +71,7 @@ impl QbfSolver {
     /// Check if formula is satisfied under current assignment
     pub(super) fn is_satisfied(&self) -> bool {
         // Check all original clauses
-        for clause in &self.formula.clauses {
+        for clause in self.formula.clauses() {
             if !self.clause_satisfied(clause) {
                 return false;
             }

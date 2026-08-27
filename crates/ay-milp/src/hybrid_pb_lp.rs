@@ -2691,6 +2691,13 @@ fn trace_result(decomposition: &Decomposition, cuts: usize, verdict: &str, elaps
     }
 }
 
+/// Force this module's cached env accessor at solve entry, so a consumer that
+/// rewrites its environment between window solves cannot race it. Called from
+/// `bab::prime_env_all`.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3460,11 +3467,4 @@ mod tests {
         assert!(result.is_none());
         assert!(polls >= 2);
     }
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

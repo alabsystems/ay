@@ -112,9 +112,8 @@ impl Executor {
         }
         let mut authored_true = false;
         for term in parsed.iter() {
-            match term {
-                FrontendTerm::Const(ay_frontend::command::Constant::True) => authored_true = true,
-                _ => {}
+            if let FrontendTerm::Const(ay_frontend::command::Constant::True) = term {
+                authored_true = true;
             }
         }
         (authored_true, authored_false)

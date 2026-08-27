@@ -114,7 +114,7 @@ fn structure_elimination_preserves_the_optimum() {
         let mut m = Model::new();
         for _ in 0..n {
             let lo = rng.in_range(-2, 2);
-            let hi = if rng.next() % 3 == 0 {
+            let hi = if rng.next().is_multiple_of(3) {
                 lo
             } else {
                 lo + rng.in_range(0, 3)

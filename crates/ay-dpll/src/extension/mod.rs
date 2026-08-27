@@ -31,6 +31,7 @@ use ay_core::TheorySolver;
 use ay_sat::{ExtCheckResult, ExtPropagateResult, Extension, SolverContext};
 use ay_sat::{Literal, Variable};
 
+mod context_derivation;
 mod types;
 pub(crate) use types::CachedExtensionData;
 pub(crate) use types::TheoryAxiomKey;
@@ -687,101 +688,18 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
     }
 }
 
-impl<T: TheorySolver> TheoryExtension<'_, T> {
-    /// #skip-assigned: rebuild the unassigned free-list from `ctx.value()` (the
-    /// source of truth). Threads only currently-unassigned seed positions
-    /// head->tail in ascending seed order, resets the incremental scan cursor to
-    /// the current trail length, and clears the dirty flag.
-    fn rebuild_unassigned_list(&self, ctx: &dyn SolverContext) {
-        let mut prev = self.unassigned_prev.borrow_mut();
-        let mut next = self.unassigned_next.borrow_mut();
-        let mut linked = self.unassigned_linked.borrow_mut();
-        let n = self.seed_index.len();
-        let mut head = UNASSIGNED_NIL;
-        let mut last = UNASSIGNED_NIL;
-        for pos in 0..n {
-            let (sat_var, _atom) = self.seed_index[pos];
-            if ctx.value(Variable::new(sat_var)).is_none() {
-                prev[pos] = last;
-                next[pos] = UNASSIGNED_NIL;
-                linked[pos] = true;
-                if last == UNASSIGNED_NIL {
-                    head = pos as u32;
-                } else {
-                    next[last as usize] = pos as u32;
-                }
-                last = pos as u32;
-            } else {
-                linked[pos] = false;
-            }
-        }
-        self.unassigned_head.set(head);
-        self.unassigned_scan_pos.set(ctx.trail().len());
-        self.unassigned_dirty.set(false);
-    }
-
-    /// #skip-assigned: incrementally unlink seed positions whose SAT variable
-    /// became assigned since the last maintenance. The trail only grows between
-    /// rebuilds, so every seed variable appearing in `trail[scan_pos..]` was
-    /// unassigned (hence linked) at rebuild time; the `linked` guard keeps the
-    /// unlink idempotent regardless.
-    fn advance_unassigned_scan(&self, ctx: &dyn SolverContext) {
-        let trail = ctx.trail();
-        let scan_pos = self.unassigned_scan_pos.get();
-        let trail_len = trail.len();
-        // Backtrack normally marks the list dirty before the next query. Keep
-        // this defensive recovery as well: a context that exposes a shorter
-        // trail without that callback must lose performance, never candidates.
-        if scan_pos > trail_len {
-            self.rebuild_unassigned_list(ctx);
-            return;
-        }
-        if scan_pos == trail_len {
-            return;
-        }
-        let mut prev = self.unassigned_prev.borrow_mut();
-        let mut next = self.unassigned_next.borrow_mut();
-        let mut linked = self.unassigned_linked.borrow_mut();
-        for &lit in &trail[scan_pos..] {
-            let var_id = lit.variable().id() as usize;
-            if var_id >= self.sat_var_to_seed_pos.len() {
-                continue;
-            }
-            let pos = self.sat_var_to_seed_pos[var_id];
-            if pos == UNASSIGNED_NIL {
-                continue;
-            }
-            let pos_u = pos as usize;
-            if !linked[pos_u] {
-                continue;
-            }
-            linked[pos_u] = false;
-            let p = prev[pos_u];
-            let nx = next[pos_u];
-            if p == UNASSIGNED_NIL {
-                self.unassigned_head.set(nx);
-            } else {
-                next[p as usize] = nx;
-            }
-            if nx != UNASSIGNED_NIL {
-                prev[nx as usize] = p;
-            }
-        }
-        self.unassigned_scan_pos.set(trail_len);
-    }
-}
-
 mod check;
 mod construction;
 mod helpers;
 mod native_dispatch;
 mod propagate;
+mod unassigned;
 pub(crate) use construction::infer_bound_axiom_arith_kind;
-use native_dispatch::{NativeTheoryPropagationControl, NativeTheoryPropagationDispatch};
-
+#[cfg(test)]
+use native_dispatch::NativeTheoryPropagationControl;
+use native_dispatch::NativeTheoryPropagationDispatch;
 mod phase_hint;
 pub(crate) use phase_hint::PhaseHintExtension;
-
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;

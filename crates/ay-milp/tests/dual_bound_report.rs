@@ -64,7 +64,7 @@ fn solve_capped(model: &Model, cap: u64, cover_off: bool, opts: &SolveOpts) -> (
 }
 
 fn opts() -> SolveOpts {
-    SolveOpts::new().with_time_limit(Duration::from_secs(120))
+    SolveOpts::new().with_time_limit(Duration::from_mins(2))
 }
 
 /// The rigorous dual bound an outcome reports, in the CALLER's frame, or `None`

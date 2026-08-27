@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use super::{check_claims::ClaimReportSeal, checking_main::CheckReportSeal};
 
 /// The checker's verdict. The word VERIFIED is RESERVED.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,20 +63,81 @@ impl CheckStatus {
 }
 
 /// One claim's independent re-check.
+///
+/// Claim reports are checker-created evidence. Their fields and constructor
+/// are private to the checker, while consumers receive read-only accessors.
+///
+/// ```compile_fail
+/// use ay_milp::cert_io::{ClaimReport, EvidenceKind};
+///
+/// let _forged = ClaimReport {
+///     name: "primal".to_owned(),
+///     kind: EvidenceKind::Succinct,
+///     verified: true,
+///     detail: "unchecked".to_owned(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use ay_milp::cert_io::ClaimReport;
+///
+/// fn forge(mut report: ClaimReport) {
+///     report.verified = true;
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ClaimReport {
     /// The claim's name.
-    pub name: String,
+    name: String,
     /// The kind the certificate asserted.
-    pub kind: EvidenceKind,
+    kind: EvidenceKind,
     /// Whether this checker re-derived it. NEVER true for a REPLAY or NONE
     /// claim, whatever the certificate says.
-    pub verified: bool,
+    verified: bool,
     /// Human-readable detail.
-    pub detail: String,
+    detail: String,
 }
 
 impl ClaimReport {
+    pub(super) fn new(
+        _seal: ClaimReportSeal,
+        name: String,
+        kind: EvidenceKind,
+        verified: bool,
+        detail: String,
+    ) -> Self {
+        Self {
+            name,
+            kind,
+            verified: verified && kind == EvidenceKind::Succinct,
+            detail,
+        }
+    }
+
+    /// The claim's name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The evidence kind asserted by the certificate.
+    #[must_use]
+    pub const fn kind(&self) -> EvidenceKind {
+        self.kind
+    }
+
+    /// Whether the checker independently re-derived this claim.
+    #[must_use]
+    pub const fn is_verified(&self) -> bool {
+        self.verified
+    }
+
+    /// Human-readable detail from the check.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
     /// This claim's standing, as one of the THREE outcomes a consumer must be
     /// able to tell apart.
     ///
@@ -106,17 +168,78 @@ pub enum ClaimStanding {
 }
 
 /// The checker's full report.
+///
+/// Reports are constructed only by the checker. A consumer can inspect the
+/// checker-derived status and details, but cannot fabricate or mutate them.
+///
+/// ```compile_fail
+/// use ay_milp::cert_io::{CheckReport, CheckStatus};
+///
+/// let _forged = CheckReport {
+///     status: CheckStatus::Verified,
+///     claims: Vec::new(),
+///     notes: Vec::new(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use ay_milp::cert_io::{check, CheckStatus};
+///
+/// let mut report = check("", "");
+/// report.status = CheckStatus::Verified;
+/// ```
 #[derive(Debug, Clone)]
 pub struct CheckReport {
     /// The overall status.
-    pub status: CheckStatus,
+    status: CheckStatus,
     /// Per-claim breakdown.
-    pub claims: Vec<ClaimReport>,
+    claims: Vec<ClaimReport>,
     /// Notes about the model binding and anything the checker refused.
-    pub notes: Vec<String>,
+    notes: Vec<String>,
 }
 
 impl CheckReport {
+    pub(super) fn new(
+        _seal: CheckReportSeal,
+        status: CheckStatus,
+        claims: Vec<ClaimReport>,
+        notes: Vec<String>,
+    ) -> Self {
+        let status = if status == CheckStatus::Verified
+            && (claims.is_empty() || claims.iter().any(|claim| !claim.is_verified()))
+        {
+            CheckStatus::Unverified
+        } else {
+            status
+        };
+        Self {
+            status,
+            claims,
+            notes,
+        }
+    }
+
+    /// The checker-derived aggregate status.
+    #[must_use]
+    pub const fn status(&self) -> CheckStatus {
+        self.status
+    }
+
+    /// Per-claim reports, in certificate order, including duplicate names.
+    ///
+    /// No first-match name lookup is exposed because duplicate names remain
+    /// distinct checker results.
+    #[must_use]
+    pub fn claims(&self) -> &[ClaimReport] {
+        &self.claims
+    }
+
+    /// Notes about model binding and refused evidence.
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
     /// Claim names in a given standing, in certificate order.
     #[must_use]
     pub fn claims_in(&self, standing: ClaimStanding) -> Vec<&str> {

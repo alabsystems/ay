@@ -24,6 +24,6 @@ const _: () = assert!(
 pub(super) fn to_proof_lits(clause: &[Literal]) -> Vec<ProofLit> {
     clause
         .iter()
-        .map(|lit| ProofLit::from_index(lit.0 as usize))
+        .map(|lit| ProofLit::from_raw(lit.raw()))
         .collect()
 }

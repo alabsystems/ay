@@ -65,6 +65,7 @@
 
 use std::collections::BTreeMap;
 
+use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
@@ -83,6 +84,30 @@ const MAX_NONZEROS: usize = 200_000;
 /// Hard cap on simplex pivots. Hitting it still yields a sound (weaker) bound
 /// from the last dual-feasible vertex.
 const MAX_PIVOTS: usize = 20_000;
+/// Largest dense simplex tableau either exact tier will allocate, in entries.
+///
+/// Sized to be EXACTLY what [`MAX_VARS`] x [`MAX_ROWS`] already admitted
+/// (`5_000 * (12_000 + 5_000)`), so it changes nothing for a model that passes
+/// those caps. It exists because the caps are enforced at model BUILD time,
+/// which gated the sparse f64-certified tier — whose own limits are ten times
+/// larger — behind the dense tiers' memory ceiling. The certificate path may now
+/// build a bigger model ([`CERT_MAX_VARS`]); this is what stops the dense tiers
+/// from trying to allocate `n * (m + n)` rationals for it.
+const MAX_DENSE_TABLEAU_ENTRIES: usize = 85_000_000;
+/// Model size the CERTIFICATE path may build, above the dense tiers' own caps.
+///
+/// Chosen to sit inside `safe_lp_bound`'s limits (50k vars / 50k rows / 2M
+/// nonzeros), because on a model this large only the sparse f64-certified tier
+/// can run at all — the dense tiers decline on
+/// [`MAX_DENSE_TABLEAU_ENTRIES`]. Three PB25 `pbfvmc-formulae/hw32` instances
+/// (10_272 / 10_432 / 11_744 variables) were refused UNREAD at [`MAX_VARS`]
+/// while the tier that could have certified them was never consulted.
+const CERT_MAX_VARS: usize = 20_000;
+/// Row cap for the certificate path. Rows are constraints PLUS one box row per
+/// variable, so it must clear `CERT_MAX_VARS` with room for the constraints.
+const CERT_MAX_ROWS: usize = 40_000;
+/// Nonzero cap for the certificate path (structural entries plus box rows).
+const CERT_MAX_NONZEROS: usize = 400_000;
 /// Poll cadence, in tableau entries, INSIDE a single Gauss-Jordan pivot. A
 /// pivot rewrites up to `n * (m + n)` entries (order 1e8 on the largest
 /// admitted shapes) with growing bignum numerators, so polling only BETWEEN
@@ -522,26 +547,279 @@ pub(crate) struct LpDualRaw {
     pub complement: Vec<bool>,
     /// Number of constraint rows (Ge -> 1, Eq -> 2); box rows follow.
     pub num_constraint_rows: usize,
+    /// Whether the solve REACHED OPTIMALITY, so `bound` is `ceil(LP*)` and not
+    /// merely some valid floor.
+    ///
+    /// Read this before drawing any conclusion FROM A SHORTFALL. `bound` is sound
+    /// at every dual-feasible point (weak duality), which is why the emitter can
+    /// use it without asking — but the tiers deliberately return a non-optimal
+    /// vertex when they hit a deadline, a pivot cap, or a stall, and
+    /// [`Self::solve_dual`]'s own comment records the small tier handing back
+    /// floors of 35/44/45 against a true `LP*` of 138.09. So `bound < optimum`
+    /// means "this dual point fell short", NOT "the LP relaxation falls short":
+    /// only `converged` licenses the second reading, which is the one that names
+    /// an integrality gap.
+    ///
+    /// Sourced from `DualSolution::optimal`, which ONLY the two exact-rational
+    /// simplex tiers set, and only when no positive reduced cost remained. It is
+    /// one-way: `true` proves optimality, `false` proves nothing either way.
+    pub converged: bool,
+    /// Which tier produced `duals`, for the census. Advisory: nothing downstream
+    /// branches on it, and every tier's point is dual-feasible.
+    pub tier: &'static str,
+}
+
+/// Why [`lp_dual_raw_diagnosed`] produced no dual point.
+///
+/// EXISTS BECAUSE "declined" IS NOT A DIAGNOSIS. On the PB25 OPT-LIN census,
+/// `lp:dual-solve-declined` was the single largest cause of a withheld
+/// certificate, and it silently merged two populations needing opposite fixes:
+/// models rejected UNREAD by a static size cap, and models whose exact simplex
+/// ran out of the caller's clock. Only the second is a budget problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LpDualDecline {
+    /// A static LP size cap rejected the model before any arithmetic happened.
+    ModelTooLarge {
+        cap: &'static str,
+        limit: usize,
+        measured: usize,
+    },
+    /// Not an LP we model: empty/non-linear objective, or a row we cannot linearise.
+    ModelShape,
+    /// The model built, but no tier returned a dual point inside the budget.
+    NoDualPoint,
+    /// Row bookkeeping mismatch — unreachable for a model this function built.
+    RowCount,
+}
+
+impl LpDualDecline {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::ModelTooLarge {
+                cap,
+                limit,
+                measured,
+            } => format!("model-too-large({cap}={limit},measured={measured})"),
+            Self::ModelShape => "model-shape".to_string(),
+            Self::NoDualPoint => "no-dual-point-in-budget".to_string(),
+            Self::RowCount => "row-count".to_string(),
+        }
+    }
+}
+
+/// Size caps a model must satisfy to be built.
+///
+/// Two sets exist because the caps mean different things. [`Self::DENSE`] is a
+/// MEMORY ceiling for the exact simplex tiers, which materialise an `n x (m+n)`
+/// rational tableau. [`Self::CERTIFICATE`] is what the certificate path may
+/// model at all: on a model between the two, the dense tiers decline on
+/// [`MAX_DENSE_TABLEAU_ENTRIES`] and the sparse f64-certified tier — whose own
+/// limits are far larger — does the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LpSizeCaps {
+    vars: usize,
+    rows: usize,
+    nonzeros: usize,
+}
+
+impl LpSizeCaps {
+    const DENSE: Self = Self {
+        vars: MAX_VARS,
+        rows: MAX_ROWS,
+        nonzeros: MAX_NONZEROS,
+    };
+    const CERTIFICATE: Self = Self {
+        vars: CERT_MAX_VARS,
+        rows: CERT_MAX_ROWS,
+        nonzeros: CERT_MAX_NONZEROS,
+    };
+
+    /// Names the cap a partially built model has already broken.
+    fn decline(&self, rows: usize, nonzeros: usize) -> Option<LpDualDecline> {
+        if rows > self.rows {
+            return Some(LpDualDecline::ModelTooLarge {
+                cap: "MAX_ROWS",
+                limit: self.rows,
+                measured: rows,
+            });
+        }
+        if nonzeros > self.nonzeros {
+            return Some(LpDualDecline::ModelTooLarge {
+                cap: "MAX_NONZEROS",
+                limit: self.nonzeros,
+                measured: nonzeros,
+            });
+        }
+        None
+    }
+}
+
+/// Whether the dense exact tiers may allocate this model's tableau.
+///
+/// `n` rows of `m + n` rational entries. Declining here is sound and free: the
+/// caller keeps whatever another tier proved, and a `None` bound is no claim.
+fn dense_tableau_admissible(m: usize, n: usize) -> bool {
+    m.checked_add(n)
+        .and_then(|cols| n.checked_mul(cols))
+        .is_some_and(|entries| entries <= MAX_DENSE_TABLEAU_ENTRIES)
 }
 
 /// Solves the exact-rational LP dual and returns the raw multipliers for the
-/// VeriPB floor-certificate emitter. `None` if the model could not be built/solved.
-pub(crate) fn lp_dual_raw(
+/// VeriPB floor-certificate emitter, NAMING the decline when there is one and
+/// scheduling the tiers for a CERTIFICATE.
+///
+/// # The scheduling defect this fixes
+///
+/// [`LpModel::solve_dual`] treats the f64-certified tier as a RESCUE: it runs
+/// only after the exact `i128` tier has come back unconverged or empty. On a
+/// model where the exact tier consumes the caller's whole deadline — the common
+/// case for a certificate, which asks for full optimality with no early-exit
+/// target — `should_stop` is already latched TRUE when the rescue is finally
+/// called, so its advisory simplex expires on its first poll, fails its own
+/// convergence check, and returns `None`. THE RESCUE IS SCHEDULED AFTER THE
+/// BUDGET IT NEEDS IS GONE, and the whole solve declines having proved nothing.
+///
+/// Here the cheap tier goes FIRST, bounded by its own
+/// [`F64_TIER_SIMPLEX_BUDGET`], and the exact tiers get what is left. Both
+/// produce exactly dual-feasible points, so `max` over their bounds is valid by
+/// weak duality (this is the same argument [`LpModel::solve_dual`] already makes
+/// for keeping the better of two tiers); the two are never spliced — the
+/// returned `duals` are always the ones attaining the returned `bound`.
+///
+/// `target` is the claimed optimum when there is one. It is threaded to the
+/// exact tier's in-simplex early exit and short-circuits the exact solve
+/// entirely once a floor already reaches it, which is what makes a certificate
+/// for an LP-tight instance stop depending on the wall clock.
+///
+/// `max_scale` is the emitter's denominator cap. With both it and `target` set,
+/// a tight dual whose denominators exceed the cap is re-expressed over a small
+/// common denominator (see [`LpModel::reduce_dual_denominator`]) rather than
+/// thrown away — the f64-certified tier returns BINARY-EXPANSION rationals
+/// (`BigRational::from_float`), so its duals routinely carry denominators of
+/// `2^50`-and-up and are refused by any sane cap even when the floor is exact.
+pub(crate) fn lp_dual_raw_diagnosed(
     objective: &PbObjective,
     constraints: &[PbConstraint],
     num_vars: u32,
+    target: Option<i128>,
+    max_scale: Option<i128>,
     should_stop: &dyn Fn() -> bool,
-) -> Option<LpDualRaw> {
-    let model = LpModel::build(objective, constraints, num_vars)?;
-    let dual = model.solve_dual(should_stop, None)?;
-    let n = usize::try_from(num_vars).ok()?;
-    Some(LpDualRaw {
-        bound: dual.bound,
-        duals: dual.duals,
+) -> Result<LpDualRaw, LpDualDecline> {
+    let model =
+        LpModel::build_diagnosed(objective, constraints, num_vars, LpSizeCaps::CERTIFICATE)?;
+    let n = usize::try_from(num_vars).map_err(|_| LpDualDecline::ModelShape)?;
+    let num_constraint_rows = model
+        .rows
+        .len()
+        .checked_sub(n)
+        .ok_or(LpDualDecline::RowCount)?;
+
+    // Cheap tier first (<= F64_TIER_SIMPLEX_BUDGET), so the exact tier can no
+    // longer starve it of the clock it needs.
+    let mut best = model
+        .solve_dual_f64_certified(should_stop)
+        .map(|solution| (solution, "f64-certified"));
+    let reached_target =
+        |candidate: &Option<(DualSolution, &'static str)>| match (candidate, target) {
+            (Some((solution, _)), Some(want)) => solution.bound >= want,
+            _ => false,
+        };
+    if !reached_target(&best) {
+        if let Some(exact) = model.solve_dual(should_stop, target) {
+            // Strictly better bound wins; on a tie the CONVERGED point wins,
+            // because only a converged solve licenses reading its shortfall as
+            // an integrality gap (see `LpDualRaw::converged`).
+            let better = match &best {
+                Some((cheap, _)) => {
+                    exact.bound > cheap.bound
+                        || (exact.bound == cheap.bound && exact.optimal && !cheap.optimal)
+                }
+                None => true,
+            };
+            if better {
+                best = Some((exact, "exact-dispatch"));
+            }
+        }
+    }
+    let (dual, mut tier) = best.ok_or(LpDualDecline::NoDualPoint)?;
+    let mut bound = dual.bound;
+    let mut duals = dual.duals;
+    let mut converged = dual.optimal;
+
+    // --- Denominator reduction, when the emitter's scale cap would refuse. ---
+    if let (Some(want), Some(cap)) = (target, max_scale) {
+        if bound == want && exceeds_common_denominator(&duals, cap) {
+            if let Some((snapped, snapped_bound)) = model.reduce_dual_denominator(&duals, cap, want)
+            {
+                bound = snapped_bound;
+                duals = snapped;
+                // A snapped point is a different, still dual-feasible vertex; it
+                // is not the optimal one, so it licenses no `ceil(LP*)` reading.
+                converged = false;
+                tier = "denominator-reduced";
+            }
+        }
+    }
+
+    Ok(LpDualRaw {
+        bound,
+        converged,
+        duals,
         complement: model.complement.clone(),
-        num_constraint_rows: model.rows.len().checked_sub(n)?,
+        num_constraint_rows,
+        tier,
     })
 }
+
+/// Whether the least common denominator of `duals` exceeds `cap`.
+///
+/// Mirrors the emitter's own LCM (`common_dual_scale`) closely enough to decide
+/// whether reduction is worth attempting; it is only a TRIGGER, and the emitter
+/// recomputes the real scale and self-checks the whole derivation regardless.
+fn exceeds_common_denominator(duals: &[BigRational], cap: i128) -> bool {
+    let cap = BigInt::from(cap);
+    let mut lcm = BigInt::from(1);
+    for dual in duals {
+        let denominator = dual.denom();
+        if denominator.sign() != Sign::Plus {
+            return true;
+        }
+        let mut a = lcm.clone();
+        let mut b = denominator.clone();
+        while b.sign() != Sign::NoSign {
+            let remainder = &a % &b;
+            a = b;
+            b = remainder;
+        }
+        if a.sign() == Sign::NoSign {
+            return true;
+        }
+        lcm = &lcm / a * denominator;
+        if lcm > cap {
+            return true;
+        }
+    }
+    false
+}
+
+/// Common denominators tried by [`LpModel::reduce_dual_denominator`], ascending.
+///
+/// Ascending because a smaller denominator is both cheaper to test and yields a
+/// smaller `pol` multiplier and shorter proof text.
+///
+/// TWO FAMILIES, AND BOTH ARE NEEDED. The highly composite rungs (6, 12, 60,
+/// 840, ...) land exactly on the halves, thirds, quarters and fifths that real
+/// LP vertices have. The POWERS OF TWO are for the f64-certified tier, whose
+/// duals are `BigRational::from_float` binary expansions: measured on
+/// `pbfvmc-formulae/hw32`, 4726 of 4726 fractional duals were exact powers of
+/// two, out to 2^116. On such a point a composite rung is the WORST choice —
+/// snapping 1/1024 onto a 1/720720 grid perturbs a dual that was already exact —
+/// whereas the 2^20 rung reproduces every dual coarser than 2^-20 EXACTLY and
+/// touches only the float noise below it. The composite-only ladder recovered
+/// nothing on that family; adding the powers of two is what recovers it.
+pub(crate) const DUAL_DENOMINATOR_LADDER: [i128; 16] = [
+    1, 2, 4, 6, 12, 24, 60, 120, 256, 840, 5_040, 55_440, 65_536, 262_144, 720_720, 1_048_576,
+];
 
 /// [`lp_lower_bound`] with an optional **early-exit target**: once the running
 /// (already sound) bound reaches `target`, further tightening (the cutting-plane
@@ -1046,6 +1324,21 @@ struct DualSolution {
     duals: Vec<BigRational>,
     /// Fractional primal point, or `None` if it could not be recovered.
     primal: Option<Vec<BigRational>>,
+    /// Whether an EXACT simplex proved this vertex optimal, so `bound` is
+    /// `ceil(LP*)` rather than merely some valid floor.
+    ///
+    /// SEPARATE FROM `primal.is_some()`, which used to stand in for it and
+    /// cannot. Both the f64-certified tier and the subgradient tier populate a
+    /// primal point — an advisory one, for cut separation — while returning a
+    /// bound that is only a valid FLOOR: the f64 tier's own convergence check is
+    /// about its float simplex, and its quality gate is RELATIVE, so at large
+    /// objective magnitudes a "converged" certified floor can sit whole integer
+    /// units below `LP*`. Reading `primal.is_some()` as optimality therefore
+    /// reports a rescued shortfall as an LP integrality gap, which is exactly
+    /// the wrong-without-being-visibly-wrong verdict this field exists to stop.
+    /// Set only by the two exact-rational simplex tiers, and only when their own
+    /// `optimal` flag says no positive reduced cost remained.
+    optimal: bool,
 }
 
 /// Output of one subgradient solve: the certified [`DualSolution`] plus the raw
@@ -1072,12 +1365,39 @@ fn int(v: i128) -> BigRational {
 
 impl LpModel {
     fn build(objective: &PbObjective, constraints: &[PbConstraint], num_vars: u32) -> Option<Self> {
-        let n = usize::try_from(num_vars).ok()?;
-        if n == 0 || n > MAX_VARS {
-            return None;
+        Self::build_diagnosed(objective, constraints, num_vars, LpSizeCaps::DENSE).ok()
+    }
+
+    /// [`Self::build`], but NAMING the limb that declined.
+    ///
+    /// "The LP declined" is not a diagnosis: a model rejected by a static size
+    /// cap and a model whose simplex ran out of clock need completely different
+    /// fixes, and the certificate census that motivated this could not tell them
+    /// apart. Only [`lp_dual_raw_diagnosed`] reads the error; [`Self::build`]
+    /// keeps its `Option` contract for every other caller.
+    fn build_diagnosed(
+        objective: &PbObjective,
+        constraints: &[PbConstraint],
+        num_vars: u32,
+        caps: LpSizeCaps,
+    ) -> Result<Self, LpDualDecline> {
+        let n = usize::try_from(num_vars).map_err(|_| LpDualDecline::ModelShape)?;
+        if n == 0 {
+            return Err(LpDualDecline::ModelShape);
         }
-        if constraints.len() > MAX_ROWS {
-            return None;
+        if n > caps.vars {
+            return Err(LpDualDecline::ModelTooLarge {
+                cap: "MAX_VARS",
+                limit: caps.vars,
+                measured: n,
+            });
+        }
+        if constraints.len() > caps.rows {
+            return Err(LpDualDecline::ModelTooLarge {
+                cap: "MAX_ROWS",
+                limit: caps.rows,
+                measured: constraints.len(),
+            });
         }
 
         // --- Net objective coefficient per 1-indexed PB variable. ---
@@ -1091,9 +1411,9 @@ impl LpModel {
                 continue;
             }
             let [lit] = term.lits.as_slice() else {
-                return None;
+                return Err(LpDualDecline::ModelShape);
             };
-            let v = var_index(*lit, n)?;
+            let v = var_index(*lit, n).ok_or(LpDualDecline::ModelShape)?;
             let coeff = int(term.coeff);
             if lit.negated {
                 // coeff * (1 - x_v) = coeff - coeff * x_v
@@ -1105,7 +1425,7 @@ impl LpModel {
             any_obj = true;
         }
         if !any_obj {
-            return None;
+            return Err(LpDualDecline::ModelShape);
         }
 
         // --- Complement variables with negative net objective coefficient so
@@ -1132,21 +1452,24 @@ impl LpModel {
         for constraint in constraints {
             match constraint.rel {
                 PbRel::Ge => {
-                    let row = build_row(constraint, &complement, n, 1)?;
+                    let row = build_row(constraint, &complement, n, 1)
+                        .ok_or(LpDualDecline::ModelShape)?;
                     nonzeros += row.coeffs.len();
                     rows.push(row);
                 }
                 PbRel::Eq => {
                     // a·x = b  <=>  a·x >= b  AND  -a·x >= -b
-                    let pos = build_row(constraint, &complement, n, 1)?;
-                    let neg = build_row(constraint, &complement, n, -1)?;
+                    let pos = build_row(constraint, &complement, n, 1)
+                        .ok_or(LpDualDecline::ModelShape)?;
+                    let neg = build_row(constraint, &complement, n, -1)
+                        .ok_or(LpDualDecline::ModelShape)?;
                     nonzeros += pos.coeffs.len() + neg.coeffs.len();
                     rows.push(pos);
                     rows.push(neg);
                 }
             }
-            if rows.len() > MAX_ROWS || nonzeros > MAX_NONZEROS {
-                return None;
+            if let Some(decline) = caps.decline(rows.len(), nonzeros) {
+                return Err(decline);
             }
         }
 
@@ -1159,11 +1482,11 @@ impl LpModel {
             });
         }
         nonzeros += n;
-        if rows.len() > MAX_ROWS || nonzeros > MAX_NONZEROS {
-            return None;
+        if let Some(decline) = caps.decline(rows.len(), nonzeros) {
+            return Err(decline);
         }
 
-        Some(Self {
+        Ok(Self {
             c,
             rows,
             offset,
@@ -1313,6 +1636,14 @@ impl LpModel {
         //   - dual constraint v: sum_r (A^T)_{v,r} y_r <= c_v.
         // Tableau columns: m structural (y) then n slack (s). Rows: n.
         // Build A^T column-major implicitly from the sparse primal rows.
+        // MEMORY ADMISSION. The certificate path may hand this tier a model far
+        // past `MAX_VARS`, because the sparse f64-certified tier can carry it.
+        // This tier cannot: it materialises `n * (m + n)` `BigRational`s.
+        // Declining is free and sound — the caller keeps whatever another tier
+        // proved, and no bound is no claim.
+        if !dense_tableau_admissible(m, n) {
+            return None;
+        }
         let total_cols = m.checked_add(n)?;
 
         // tableau[i] is dual constraint i (i in 0..n): coefficients over columns.
@@ -1459,6 +1790,7 @@ impl LpModel {
             exact_bound,
             duals: y,
             primal,
+            optimal,
         })
     }
 
@@ -1523,7 +1855,11 @@ impl LpModel {
             rows_small.push((coeffs, b));
         }
 
-        // Mirrors the big tier's `m.checked_add(n)?` decline.
+        // Mirrors the big tier's memory admission and `m.checked_add(n)?`
+        // decline (see [`Self::solve_dual_big`]).
+        if !dense_tableau_admissible(m, n) {
+            return Solved(None);
+        }
         let Some(total_cols) = m.checked_add(n) else {
             return Solved(None);
         };
@@ -1685,6 +2021,7 @@ impl LpModel {
             exact_bound: exact_bound.to_big(),
             duals: y.iter().map(SmallRat::to_big).collect(),
             primal,
+            optimal,
         }))
     }
 
@@ -1902,7 +2239,122 @@ impl LpModel {
             exact_bound,
             duals: y,
             primal: primal_ok.then_some(primal),
+            // An f64 simplex that converged has proved nothing exactly: this
+            // bound is a certified FLOOR, never `ceil(LP*)`.
+            optimal: false,
         })
+    }
+
+    /// Re-expresses a dual-feasible point over a SMALL common denominator, so a
+    /// certificate emitter with a denominator cap can still use it.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::solve_dual_f64_certified`] builds its duals with
+    /// `BigRational::from_float`, which is EXACT — and therefore hands back the
+    /// full binary expansion of each f64. A dual that "is" 1/2 arrives as
+    /// `4503599627370496/9007199254740992`, and a dual that is 1/3 arrives as a
+    /// 53-bit dyadic near-miss. The LCM of a few hundred such entries is
+    /// astronomically past any cap a proof format can carry, so the tier that
+    /// exists to rescue hard models produced duals no certificate could ever
+    /// use. That is a REPRESENTATION defect, not a mathematical obstruction:
+    /// the floor those duals certify is real.
+    ///
+    /// # Why the result is sound whatever the rounding did
+    ///
+    /// Exactly the argument the f64 tier already relies on. Round the structural
+    /// duals to the nearest multiple of `1/d` and clamp at zero: any `y >= 0`
+    /// whatsoever is admissible, because dual feasibility is then RESTORED
+    /// EXACTLY by the box-row repair — for each variable whose structural slack
+    /// `c_v - (A^T_struct y)_v` went negative, the box row `-x_v >= -1` takes
+    /// multiplier `excess = (A^T_struct y)_v - c_v > 0`, which lands
+    /// `(A^T y)_v = min((A^T_struct y)_v, c_v) <= c_v` and (its `b = -1`) pays
+    /// `excess` off the bound. The returned `offset + b·y` is accumulated in
+    /// exact rational arithmetic and is a valid lower bound by weak duality; a
+    /// bad rounding can only make it SMALLER, never larger, which is why the
+    /// caller can simply test the result and keep it or not.
+    ///
+    /// Every returned entry is an exact multiple of `1/d` provided the model's
+    /// own coefficients are integral (they are, for PB): the repair excesses are
+    /// integer combinations of the rounded duals. Nothing depends on that — the
+    /// emitter recomputes the true common denominator itself and declines if it
+    /// is still too large.
+    ///
+    /// Returns `None` unless some `d` on the ladder keeps `ceil(offset + b·y)`
+    /// at `target`, i.e. unless the reduction costs no certified value at all.
+    fn reduce_dual_denominator(
+        &self,
+        y: &[BigRational],
+        cap: i128,
+        target: i128,
+    ) -> Option<(Vec<BigRational>, i128)> {
+        if y.len() != self.rows.len() {
+            return None;
+        }
+        for denominator in DUAL_DENOMINATOR_LADDER {
+            if denominator > cap {
+                break;
+            }
+            let (snapped, exact_bound) = self.snap_dual_to_denominator(y, denominator)?;
+            if rational_ceil_to_i64(&exact_bound) == Some(target) {
+                return Some((snapped, target));
+            }
+        }
+        None
+    }
+
+    /// One rung of [`Self::reduce_dual_denominator`]: round the structural duals
+    /// to the nearest multiple of `1/denominator`, then restore exact dual
+    /// feasibility with the box-row repair.
+    ///
+    /// Returns the repaired point (structural duals then box duals, the layout
+    /// [`LpDualRaw`] documents) and its EXACT bound `offset + b·y`. Sound for any
+    /// `y >= 0` whatsoever, including one that is not dual-feasible to begin
+    /// with: the repair is what establishes `A^T y <= c`, and it is priced into
+    /// the returned bound.
+    fn snap_dual_to_denominator(
+        &self,
+        y: &[BigRational],
+        denominator: i128,
+    ) -> Option<(Vec<BigRational>, BigRational)> {
+        let m = self.rows.len();
+        let n = self.c.len();
+        let m_struct = m.checked_sub(n)?;
+        if y.len() != m || denominator < 1 {
+            return None;
+        }
+        let scale = BigRational::from_integer(BigInt::from(denominator));
+        let mut snapped: Vec<BigRational> = Vec::with_capacity(m);
+        for value in &y[..m_struct] {
+            let rounded = (value * &scale).round();
+            snapped.push(if rounded.is_positive() {
+                rounded / &scale
+            } else {
+                BigRational::zero()
+            });
+        }
+        let mut aty = vec![BigRational::zero(); n];
+        let mut exact_bound = self.offset.clone();
+        for (r, row) in self.rows[..m_struct].iter().enumerate() {
+            let yr = &snapped[r];
+            if yr.is_zero() {
+                continue;
+            }
+            for &(v, ref coeff) in &row.coeffs {
+                aty[v] += yr * coeff;
+            }
+            exact_bound += &row.b * yr;
+        }
+        for v in 0..n {
+            let excess = &aty[v] - &self.c[v];
+            if excess.is_positive() {
+                exact_bound -= &excess;
+                snapped.push(excess);
+            } else {
+                snapped.push(BigRational::zero());
+            }
+        }
+        Some((snapped, exact_bound))
     }
 
     /// Lagrangian subgradient ascent on `L(y)` (see [`lagrangian_dual_floor`]).
@@ -2152,6 +2604,9 @@ impl LpModel {
                 exact_bound,
                 duals: y_exact,
                 primal: primal_ok.then_some(primal),
+                // Lagrangian ascent stops on a step schedule, not on a proof of
+                // optimality.
+                optimal: false,
             },
             y_float: best_y,
         })
@@ -2317,8 +2772,8 @@ impl LpModel {
         // (2) One x_v >= 0 lower-bound premise per variable, multiplier d_v.
         // d_v = c_v - aty_v (>= 0 by dual feasibility). A tiny negative from a
         // degenerate vertex would only make `check_slack` reject; never unsound.
-        let one_q = QPair::from_int(&num_bigint::BigInt::one());
-        let zero_q = QPair::from_int(&num_bigint::BigInt::zero());
+        let one_q = QPair::from_int(&BigInt::one());
+        let zero_q = QPair::from_int(&BigInt::zero());
         for v in 0..n {
             let d_v = &self.c[v] - &aty[v];
             premises.push(LinConZ {
@@ -2509,6 +2964,8 @@ fn small_vertex_solution(
         exact_bound: exact_bound.to_big(),
         duals: y.iter().map(SmallRat::to_big).collect(),
         primal: None,
+        // A pre-overflow snapshot: dual-feasible, never proved optimal.
+        optimal: false,
     })
 }
 
@@ -2959,6 +3416,248 @@ mod tests {
 
     fn never_stop() -> bool {
         false
+    }
+
+    /// SOUNDNESS NET for the denominator reduction. `snap_dual_to_denominator`
+    /// accepts an ARBITRARY point and is trusted to hand back one that is
+    /// exactly dual-feasible with an honestly priced bound, so it is checked
+    /// here against both halves of that contract on random models and random
+    /// (deliberately hostile, not solve-derived) starting points:
+    ///
+    ///   1. `A^T y <= c` EXACTLY, over structural rows and box rows together —
+    ///      this is what weak duality needs and what the box repair claims;
+    ///   2. the returned bound is exactly `offset + b·y` of the returned point;
+    ///   3. therefore `ceil(bound) <= brute-force integer optimum`, the property
+    ///      a false certificate would have to break.
+    #[test]
+    fn snapped_duals_are_exactly_dual_feasible_and_never_overstate() {
+        let mut rng = Rng(0x5a09_0000_0000_0001);
+        let mut checked = 0usize;
+        for _ in 0..400 {
+            let n: u32 = 2 + (rng.next() % 3) as u32;
+            let mut obj_terms = Vec::new();
+            for v in 1..=n {
+                let coeff = rng.range(-3, 4);
+                if coeff != 0 {
+                    obj_terms.push(term(coeff, lit(v)));
+                }
+            }
+            if obj_terms.is_empty() {
+                obj_terms.push(term(1, lit(1)));
+            }
+            let obj = PbObjective { terms: obj_terms };
+            let mut constraints = Vec::new();
+            for _ in 0..(1 + rng.next() % 4) {
+                let mut terms = Vec::new();
+                for v in 1..=n {
+                    let coeff = rng.range(-2, 3);
+                    if coeff != 0 {
+                        terms.push(term(coeff, lit(v)));
+                    }
+                }
+                if terms.is_empty() {
+                    terms.push(term(1, lit(1)));
+                }
+                constraints.push(ge(terms, rng.range(-2, 3)));
+            }
+            let Some(model) = LpModel::build(&obj, &constraints, n) else {
+                continue;
+            };
+            let Some(opt) = brute_force_optimum(&obj, &constraints, n) else {
+                continue; // infeasible: no claim to violate
+            };
+            let m = model.rows.len();
+            // A hostile starting point: dyadic junk with 40-bit denominators,
+            // exactly the shape `BigRational::from_float` produces, and NOT
+            // dual-feasible in general.
+            let start: Vec<BigRational> = (0..m)
+                .map(|_| {
+                    BigRational::new(
+                        BigInt::from(rng.next() % (1u64 << 20)),
+                        BigInt::from(1u64 << 20),
+                    )
+                })
+                .collect();
+            for denominator in [1i128, 2, 6, 60] {
+                let Some((y, bound)) = model.snap_dual_to_denominator(&start, denominator) else {
+                    continue;
+                };
+                assert_eq!(y.len(), m, "snapped point must cover every row");
+                assert!(
+                    y.iter().all(|value| !value.is_negative()),
+                    "a dual multiplier went negative: {y:?}"
+                );
+                // (1) A^T y <= c, exactly, over ALL rows.
+                let mut aty = vec![BigRational::zero(); n as usize];
+                for (r, row) in model.rows.iter().enumerate() {
+                    if y[r].is_zero() {
+                        continue;
+                    }
+                    for &(v, ref coeff) in &row.coeffs {
+                        aty[v] += &y[r] * coeff;
+                    }
+                }
+                for v in 0..n as usize {
+                    assert!(
+                        aty[v] <= model.c[v],
+                        "DUAL INFEASIBLE after repair at var {v}: {} > {}",
+                        aty[v],
+                        model.c[v]
+                    );
+                }
+                // (2) the bound is exactly this point's own b·y.
+                let mut recomputed = model.offset.clone();
+                for (r, row) in model.rows.iter().enumerate() {
+                    if !y[r].is_zero() {
+                        recomputed += &row.b * &y[r];
+                    }
+                }
+                assert_eq!(recomputed, bound, "the returned bound is not b·y");
+                // (3) hence it cannot overstate the integer optimum.
+                let ceiled = rational_ceil_to_i64(&bound).expect("bound fits i128");
+                assert!(
+                    ceiled <= opt,
+                    "SOUNDNESS VIOLATION: snapped floor {ceiled} > brute optimum {opt}\n\
+                     objective={obj:?}\nconstraints={constraints:?}\nd={denominator}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 400,
+            "only {checked} snapped points were checked — the test is not \
+             exercising the path it is meant to gate"
+        );
+    }
+
+    /// Every rung of the ladder must land on its own grid, or the emitter's
+    /// `lcm(denominators)` is not bounded by the rung and the whole reduction
+    /// buys nothing. (True because the model's coefficients are integral, so
+    /// the box-repair excesses are integer combinations of the rounded duals.)
+    #[test]
+    fn snapped_duals_land_on_the_requested_grid() {
+        let obj = PbObjective {
+            terms: vec![term(3, lit(1)), term(5, lit(2))],
+        };
+        let constraints = vec![
+            ge(vec![term(2, lit(1)), term(3, lit(2))], 3),
+            ge(vec![term(1, lit(1)), term(1, lit(2))], 1),
+        ];
+        let model = LpModel::build(&obj, &constraints, 2).expect("model");
+        let start = vec![
+            BigRational::new(BigInt::from(333_333_333i64), BigInt::from(1_000_000_000i64)),
+            BigRational::new(BigInt::from(499_999_997i64), BigInt::from(1_000_000_000i64)),
+            BigRational::zero(),
+            BigRational::zero(),
+        ];
+        for denominator in [2i128, 6, 12, 60] {
+            let (y, _) = model
+                .snap_dual_to_denominator(&start, denominator)
+                .expect("snap");
+            for value in &y {
+                assert!(
+                    (value * BigRational::from_integer(BigInt::from(denominator))).is_integer(),
+                    "dual {value} is not a multiple of 1/{denominator}"
+                );
+            }
+        }
+    }
+
+    /// The ladder must stay ASCENDING and must stay inside the emitter's cap:
+    /// out of order it would emit a needlessly large `pol` multiplier when a
+    /// smaller rung would have done, and past the cap it would build a plan the
+    /// emitter is guaranteed to refuse.
+    #[test]
+    fn the_denominator_ladder_is_ascending_and_within_the_emitters_cap() {
+        assert!(
+            DUAL_DENOMINATOR_LADDER.windows(2).all(|w| w[0] < w[1]),
+            "ladder is not strictly ascending: {DUAL_DENOMINATOR_LADDER:?}"
+        );
+        assert_eq!(DUAL_DENOMINATOR_LADDER[0], 1);
+        // Both families must be present: composite rungs for real LP vertices,
+        // powers of two for the f64-certified tier's binary expansions.
+        assert!(DUAL_DENOMINATOR_LADDER.contains(&720_720));
+        assert!(DUAL_DENOMINATOR_LADDER.contains(&(1 << 20)));
+    }
+
+    /// The f64-certified tier must NOT claim optimality. It used to be read as
+    /// optimal through `primal.is_some()`, which it populates for cut
+    /// separation, so a rescued shortfall was reported as an LP integrality gap
+    /// — a definitive verdict from a tier that proves only a floor.
+    #[test]
+    fn the_f64_certified_tier_never_claims_optimality() {
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1)), term(1, lit(2))],
+        };
+        let constraints = vec![ge(vec![term(1, lit(1)), term(1, lit(2))], 1)];
+        let model = LpModel::build(&obj, &constraints, 2).expect("model");
+        let certified = model
+            .solve_dual_f64_certified(&never_stop)
+            .expect("the f64 tier solves this trivially");
+        assert!(
+            !certified.optimal,
+            "the f64 tier claimed an exact optimality it cannot prove"
+        );
+        assert!(
+            certified.bound <= 1,
+            "certified floor {} overstates the optimum 1",
+            certified.bound
+        );
+    }
+
+    /// The dense exact tiers must REFUSE a model the certificate path is now
+    /// allowed to build, rather than try to allocate `n * (m + n)` rationals for
+    /// it. Without this the raised certificate cap is an out-of-memory hazard,
+    /// not a coverage fix.
+    #[test]
+    fn the_dense_tiers_refuse_a_tableau_they_cannot_hold() {
+        // `m` is the TOTAL row count and already includes the `n` box rows, so
+        // the largest shape the old caps admitted is `MAX_VARS x MAX_ROWS`.
+        assert!(
+            dense_tableau_admissible(MAX_ROWS, MAX_VARS),
+            "the largest shape the old caps admitted must still be admissible"
+        );
+        assert!(
+            !dense_tableau_admissible(MAX_ROWS + 1, MAX_VARS),
+            "one row past it must not be"
+        );
+        assert!(
+            !dense_tableau_admissible(706 + 10_272, 10_272),
+            "a 10k-variable hw32 model must be refused by the dense tiers"
+        );
+        assert!(
+            !dense_tableau_admissible(usize::MAX, usize::MAX),
+            "the entry count must not wrap"
+        );
+    }
+
+    /// A decline must name its limb. A model rejected UNREAD by a size cap and
+    /// one whose simplex ran out of clock were both `None`, and the certificate
+    /// census could not tell them apart — they need opposite fixes.
+    #[test]
+    fn a_size_cap_decline_names_the_cap_it_broke() {
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1))],
+        };
+        let too_many_vars = u32::try_from(MAX_VARS + 1).expect("fits u32");
+        assert_eq!(
+            LpModel::build_diagnosed(&obj, &[], too_many_vars, LpSizeCaps::DENSE).err(),
+            Some(LpDualDecline::ModelTooLarge {
+                cap: "MAX_VARS",
+                limit: MAX_VARS,
+                measured: MAX_VARS + 1,
+            })
+        );
+        assert_eq!(
+            LpModel::build_diagnosed(&PbObjective { terms: vec![] }, &[], 4, LpSizeCaps::DENSE)
+                .err(),
+            Some(LpDualDecline::ModelShape)
+        );
+        assert!(LpModel::build_diagnosed(&obj, &[], 4, LpSizeCaps::DENSE).is_ok());
+        // The certificate path admits it; only the DENSE tiers are capped there.
+        assert!(
+            LpModel::build_diagnosed(&obj, &[], too_many_vars, LpSizeCaps::CERTIFICATE).is_ok()
+        );
     }
 
     #[test]

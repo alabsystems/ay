@@ -55,7 +55,7 @@ pub enum ProofError {
     InvalidOptimizationBounds { lower: i128, upper: i128 },
 
     /// A solver was asked to CONTINUE an existing proof stream
-    /// ([`crate::cdcl::PbCdclSolver::with_appended_proof_tap_interruptible`])
+    /// (`crate::cdcl::PbCdclSolver::with_appended_proof_tap_interruptible`)
     /// whose id counter does not line up with the instance's input-row count,
     /// so every derived id would be shifted. Fails closed before any step is
     /// emitted against the misaligned stream.

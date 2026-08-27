@@ -132,7 +132,6 @@ fn exact_fragment_rejects_foreign_array_select_branch() {
         symbolic_select,
         true_select,
         false_select,
-        ..
     } = bool_select_fixture();
     let false_term = terms.mk_bool(false);
     let foreign_false_select = terms.mk_select(foreign_array, false_term);

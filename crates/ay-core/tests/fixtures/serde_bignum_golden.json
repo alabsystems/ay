@@ -1,0 +1,403 @@
+{
+  "schema": "ay.serde_bignum_golden.v1",
+  "generated_by": "crates/ay-core/tests/serde_bignum_golden.rs",
+  "num_bigint": "0.4.6 (feature \"serde\" ENABLED)",
+  "num_rational": "0.4.2 (feature \"serde\" ENABLED)",
+  "serde_format": "serde_json (the ONLY serde format in the ay workspace: no bincode, messagepack, cbor or postcard dependency or call site exists)",
+  "host": "aarch64-apple-darwin (64-bit BigDigit; see the cfg_digit note in the module docs)",
+  "encode": [
+    {
+      "name": "bigint/zero",
+      "ty": "Constant::Int(BigInt)",
+      "note": "sign NoSign (0) and an EMPTY limb vector",
+      "json": "{\"Int\":[0,[]]}",
+      "raw": "Int(0)"
+    },
+    {
+      "name": "bigint/one",
+      "ty": "Constant::Int(BigInt)",
+      "note": "smallest positive; limb vector [1]",
+      "json": "{\"Int\":[1,[1]]}",
+      "raw": "Int(1)"
+    },
+    {
+      "name": "bigint/neg_one",
+      "ty": "Constant::Int(BigInt)",
+      "note": "SIGN CARRIER: differs from bigint/one only in the sign field",
+      "json": "{\"Int\":[-1,[1]]}",
+      "raw": "Int(-1)"
+    },
+    {
+      "name": "bigint/u32_max",
+      "ty": "Constant::Int(BigInt)",
+      "note": "exactly fills one base-2^32 limb; the 64-bit hi word is zero and is OMITTED",
+      "json": "{\"Int\":[1,[4294967295]]}",
+      "raw": "Int(4294967295)"
+    },
+    {
+      "name": "bigint/two_pow_32",
+      "ty": "Constant::Int(BigInt)",
+      "note": "first value needing a second base-2^32 limb: [0, 1]",
+      "json": "{\"Int\":[1,[0,1]]}",
+      "raw": "Int(4294967296)"
+    },
+    {
+      "name": "bigint/two_pow_64_minus_1",
+      "ty": "Constant::Int(BigInt)",
+      "note": "LIMB STRADDLE (2^64 - 1): both u32 words of the sole 64-bit limb are nonzero",
+      "json": "{\"Int\":[1,[4294967295,4294967295]]}",
+      "raw": "Int(18446744073709551615)"
+    },
+    {
+      "name": "bigint/two_pow_64",
+      "ty": "Constant::Int(BigInt)",
+      "note": "LIMB STRADDLE (2^64): a second 64-bit limb opens; hi word of it is zero and OMITTED",
+      "json": "{\"Int\":[1,[0,0,1]]}",
+      "raw": "Int(18446744073709551616)"
+    },
+    {
+      "name": "bigint/two_pow_64_plus_1",
+      "ty": "Constant::Int(BigInt)",
+      "note": "LIMB STRADDLE (2^64 + 1)",
+      "json": "{\"Int\":[1,[1,0,1]]}",
+      "raw": "Int(18446744073709551617)"
+    },
+    {
+      "name": "bigint/neg_two_pow_64",
+      "ty": "Constant::Int(BigInt)",
+      "note": "SIGN CARRIER at the limb boundary: -(2^64)",
+      "json": "{\"Int\":[-1,[0,0,1]]}",
+      "raw": "Int(-18446744073709551616)"
+    },
+    {
+      "name": "bigint/i64_min",
+      "ty": "Constant::Int(BigInt)",
+      "note": "SIGN CARRIER: -2^63, the value a two's-complement codec most often mishandles",
+      "json": "{\"Int\":[-1,[0,2147483648]]}",
+      "raw": "Int(-9223372036854775808)"
+    },
+    {
+      "name": "bigint/two_pow_128_plus_1",
+      "ty": "Constant::Int(BigInt)",
+      "note": "INTERIOR ZERO limbs: a codec that trims zeros anywhere but the tail breaks here",
+      "json": "{\"Int\":[1,[1,0,0,0,1]]}",
+      "raw": "Int(340282366920938463463374607431768211457)"
+    },
+    {
+      "name": "bigint/large_positive",
+      "ty": "Constant::Int(BigInt)",
+      "note": "multi-limb ordinary magnitude",
+      "json": "{\"Int\":[1,[1312754386,3279151342,2397638646,1]]}",
+      "raw": "Int(123456789012345678901234567890)"
+    },
+    {
+      "name": "bigint/large_negative",
+      "ty": "Constant::Int(BigInt)",
+      "note": "SIGN CARRIER: negation of bigint/large_positive; only the sign field differs",
+      "json": "{\"Int\":[-1,[1312754386,3279151342,2397638646,1]]}",
+      "raw": "Int(-123456789012345678901234567890)"
+    },
+    {
+      "name": "bigrational/zero",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "0/1 — denominator is 1, NOT 0, and the numerator's sign is NoSign",
+      "json": "[[0,[]],[1,[1]]]",
+      "raw": "RationalWrapper(numer=0 denom=1)"
+    },
+    {
+      "name": "bigrational/one",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "1/1",
+      "json": "[[1,[1]],[1,[1]]]",
+      "raw": "RationalWrapper(numer=1 denom=1)"
+    },
+    {
+      "name": "bigrational/neg_numer",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "SIGN CARRIER: -3/4, sign rides the NUMERATOR",
+      "json": "[[-1,[3]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=-3 denom=4)"
+    },
+    {
+      "name": "bigrational/neg_denom_normalized",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "constructed 3/-4 via Ratio::new, which REDUCES and moves the sign to the numerator",
+      "json": "[[-1,[3]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=-3 denom=4)"
+    },
+    {
+      "name": "bigrational/neg_denom_raw",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "DENORMALIZED via Ratio::new_raw: the denominator really is negative on the wire",
+      "json": "[[1,[3]],[-1,[4]]]",
+      "raw": "RationalWrapper(numer=3 denom=-4)"
+    },
+    {
+      "name": "bigrational/unreduced_raw",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "UNREDUCED via Ratio::new_raw: 2/4 is stored as 2/4, not 1/2",
+      "json": "[[1,[2]],[1,[4]]]",
+      "raw": "RationalWrapper(numer=2 denom=4)"
+    },
+    {
+      "name": "bigrational/multilimb",
+      "ty": "RationalWrapper(BigRational)",
+      "note": "both members straddle the limb boundary",
+      "json": "[[1,[1,0,1]],[-1,[0,0,2]]]",
+      "raw": "RationalWrapper(numer=18446744073709551617 denom=-36893488147419103232)"
+    },
+    {
+      "name": "farkas/empty",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "empty coefficient vector — the degenerate annotation",
+      "json": "{\"coefficients\":[]}",
+      "raw": "coefficients=[]"
+    },
+    {
+      "name": "farkas/zero",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "0/1",
+      "json": "{\"coefficients\":[[0,1]]}",
+      "raw": "coefficients=[numer=0 denom=1]"
+    },
+    {
+      "name": "farkas/one",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "1/1",
+      "json": "{\"coefficients\":[[1,1]]}",
+      "raw": "coefficients=[numer=1 denom=1]"
+    },
+    {
+      "name": "farkas/neg_numer",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "SIGN CARRIER: -3/4",
+      "json": "{\"coefficients\":[[-3,4]]}",
+      "raw": "coefficients=[numer=-3 denom=4]"
+    },
+    {
+      "name": "farkas/neg_denom_normalized",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "3/-4 via Ratio::new — REDUCES, sign moves to the numerator",
+      "json": "{\"coefficients\":[[-3,4]]}",
+      "raw": "coefficients=[numer=-3 denom=4]"
+    },
+    {
+      "name": "farkas/neg_denom_raw",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "DENORMALIZED via Ratio::new_raw: negative denominator survives to the wire",
+      "json": "{\"coefficients\":[[3,-4]]}",
+      "raw": "coefficients=[numer=3 denom=-4]"
+    },
+    {
+      "name": "farkas/unreduced_raw",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "UNREDUCED via Ratio::new_raw: 2/4 stays 2/4",
+      "json": "{\"coefficients\":[[2,4]]}",
+      "raw": "coefficients=[numer=2 denom=4]"
+    },
+    {
+      "name": "farkas/i64_extremes",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "SIGN CARRIER: i64::MIN numerator and i64::MAX denominator, unreduced",
+      "json": "{\"coefficients\":[[-9223372036854775808,9223372036854775807]]}",
+      "raw": "coefficients=[numer=-9223372036854775808 denom=9223372036854775807]"
+    },
+    {
+      "name": "farkas/realistic_vector",
+      "ty": "FarkasAnnotation{Vec<Rational64>}",
+      "note": "a plausible Farkas certificate: several coefficients, mixed signs",
+      "json": "{\"coefficients\":[[1,1],[-3,4],[0,1],[7,2]]}",
+      "raw": "coefficients=[numer=1 denom=1, numer=-3 denom=4, numer=0 denom=1, numer=7 denom=2]"
+    },
+    {
+      "name": "constant/bool_true",
+      "ty": "Constant",
+      "note": "externally tagged newtype variant",
+      "json": "{\"Bool\":true}",
+      "raw": "Bool(true)"
+    },
+    {
+      "name": "constant/string",
+      "ty": "Constant",
+      "note": "externally tagged newtype variant carrying a String",
+      "json": "{\"String\":\"hello \\\"world\\\"\"}",
+      "raw": "String(\"hello \\\"world\\\"\")"
+    },
+    {
+      "name": "constant/int_neg",
+      "ty": "Constant",
+      "note": "SIGN CARRIER inside the enum tag",
+      "json": "{\"Int\":[-1,[1,0,1]]}",
+      "raw": "Int(-18446744073709551617)"
+    },
+    {
+      "name": "constant/rational_neg_denom_raw",
+      "ty": "Constant",
+      "note": "RationalWrapper is a newtype struct and is TRANSPARENT: no extra nesting",
+      "json": "{\"Rational\":[[1,[3]],[-1,[4]]]}",
+      "raw": "Rational(numer=3 denom=-4)"
+    },
+    {
+      "name": "constant/bitvec_zero_width8",
+      "ty": "Constant",
+      "note": "STRUCT VARIANT: named fields `value` and `width`, in declaration order",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8}}",
+      "raw": "BitVec(value=0 width=8)"
+    },
+    {
+      "name": "constant/bitvec_straddle_width65",
+      "ty": "Constant",
+      "note": "STRUCT VARIANT at the limb boundary",
+      "json": "{\"BitVec\":{\"value\":[1,[1,0,1]],\"width\":65}}",
+      "raw": "BitVec(value=18446744073709551617 width=65)"
+    }
+  ],
+  "decode": [
+    {
+      "name": "decode/bigint/nosign_with_limbs",
+      "ty": "Constant",
+      "note": "NON-CANONICAL: sign 0 with a nonempty limb vector. from_biguint CLEARS the limbs.",
+      "json": "{\"Int\":[0,[1,2]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(0)",
+        "reencoded": "{\"Int\":[0,[]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/plus_with_empty_limbs",
+      "ty": "Constant",
+      "note": "NON-CANONICAL: sign 1 with no limbs. from_biguint DEMOTES the sign to 0.",
+      "json": "{\"Int\":[1,[]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(0)",
+        "reencoded": "{\"Int\":[0,[]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/trailing_zero_limb",
+      "ty": "Constant",
+      "note": "NON-CANONICAL: a trailing zero limb is trimmed, so re-encoding differs from input.",
+      "json": "{\"Int\":[-1,[3,0]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Int(-3)",
+        "reencoded": "{\"Int\":[-1,[3]]}"
+      }
+    },
+    {
+      "name": "decode/bigint/bad_sign",
+      "ty": "Constant",
+      "note": "INVALID: sign outside {-1,0,1} must be REJECTED, not clamped.",
+      "json": "{\"Int\":[2,[1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `2`, expected a sign of -1, 0, or 1"
+      }
+    },
+    {
+      "name": "decode/bigint/limb_overflows_u32",
+      "ty": "Constant",
+      "note": "INVALID: limbs are u32; a value above u32::MAX must be REJECTED.",
+      "json": "{\"Int\":[1,[4294967296]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `4294967296`, expected u32"
+      }
+    },
+    {
+      "name": "decode/bigint/negative_limb",
+      "ty": "Constant",
+      "note": "INVALID: limbs are unsigned.",
+      "json": "{\"Int\":[1,[-1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `-1`, expected u32"
+      }
+    },
+    {
+      "name": "decode/rational/unreduced_preserved",
+      "ty": "Constant",
+      "note": "The decoder uses Ratio::new_raw and does NOT reduce: 2/4 stays 2/4.",
+      "json": "{\"Rational\":[[1,[2]],[1,[4]]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "Rational(numer=2 denom=4)",
+        "reencoded": "{\"Rational\":[[1,[2]],[1,[4]]]}"
+      }
+    },
+    {
+      "name": "decode/rational/zero_denominator",
+      "ty": "Constant",
+      "note": "INVALID: a zero denominator must be REJECTED.",
+      "json": "{\"Rational\":[[1,[1]],[0,[]]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/bitvec/unknown_field",
+      "ty": "Constant",
+      "note": "deny_unknown_fields is on the struct variant: an extra key must be REJECTED.",
+      "json": "{\"BitVec\":{\"value\":[0,[]],\"width\":8,\"extra\":1}}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "unknown field `extra`, expected `value` or `width`"
+      }
+    },
+    {
+      "name": "decode/farkas/unreduced_preserved",
+      "ty": "FarkasAnnotation",
+      "note": "Ratio<i64> decode does NOT reduce either: 2/4 stays 2/4.",
+      "json": "{\"coefficients\":[[2,4]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[numer=2 denom=4]",
+        "reencoded": "{\"coefficients\":[[2,4]]}"
+      }
+    },
+    {
+      "name": "decode/farkas/neg_denom_preserved",
+      "ty": "FarkasAnnotation",
+      "note": "A negative denominator survives decode unchanged; no sign migration.",
+      "json": "{\"coefficients\":[[3,-4]]}",
+      "outcome": {
+        "kind": "accept",
+        "raw": "coefficients=[numer=3 denom=-4]",
+        "reencoded": "{\"coefficients\":[[3,-4]]}"
+      }
+    },
+    {
+      "name": "decode/farkas/zero_denominator",
+      "ty": "FarkasAnnotation",
+      "note": "INVALID: zero denominator must be REJECTED.",
+      "json": "{\"coefficients\":[[1,0]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `0`, expected a ratio with non-zero denominator"
+      }
+    },
+    {
+      "name": "decode/farkas/unknown_field",
+      "ty": "FarkasAnnotation",
+      "note": "deny_unknown_fields on FarkasAnnotation: an extra key must be REJECTED.",
+      "json": "{\"coefficients\":[[1,1]],\"extra\":2}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "unknown field `extra`, expected `coefficients`"
+      }
+    },
+    {
+      "name": "decode/farkas/numer_overflows_i64",
+      "ty": "FarkasAnnotation",
+      "note": "INVALID: coefficients are i64.",
+      "json": "{\"coefficients\":[[9223372036854775808,1]]}",
+      "outcome": {
+        "kind": "reject",
+        "message_contains": "invalid value: integer `9223372036854775808`, expected i64"
+      }
+    }
+  ]
+}

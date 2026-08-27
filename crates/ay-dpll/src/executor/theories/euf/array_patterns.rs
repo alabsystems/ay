@@ -1489,18 +1489,80 @@ impl Executor {
                     }
                 }
             }
+            let Some((pigeonhole, equalities)) = self.finite_enum_pigeonhole_disjunction(&members)
+            else {
+                continue;
+            };
             self.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
                 k,
                 members,
                 edge_sources,
             });
-            let false_term = self.ctx.terms.false_term();
-            self.push_array_axiom_assertion_site(false_term, "finite_enum_pigeonhole");
-            // One asserted `false` already makes the whole problem UNSAT; no
-            // need to scan the remaining sorts.
+            self.push_finite_enum_pigeonhole_axiom(pigeonhole, equalities);
+            // The clique is refuted; no need to scan the remaining sorts.
             return true;
         }
         false
+    }
+
+    /// The finite-enum PIGEONHOLE TAUTOLOGY over one re-verified clique:
+    /// `(or (= m_i m_j) : i < j)` for `k + 1` members of a sort with exactly
+    /// `k` inhabitants. Two of them must be equal, so the disjunction holds in
+    /// EVERY model.
+    ///
+    /// #dt-enum-pigeonhole-false-lemma. The caller used to conclude by pushing
+    /// the Bool constant `false`, which `record_array_axiom_proof` recorded as
+    /// `TheoryLemma { kind: Generic, clause: [false] }` — a maximal trust
+    /// admission wearing a theory lemma's label, since `(cl false)` is valid in
+    /// no model at all. The disjunction is what the argument actually
+    /// establishes; combined with the problem's own disequality edges it
+    /// refutes the query, and the caller's `true` return (never the `false`
+    /// assertion) is what carries that to the solve. Asserting a VALID clause
+    /// removes no models, so the solver is no weaker.
+    ///
+    /// FAILS CLOSED: `mk_eq`/`mk_or` fold, so a degenerate clique could in
+    /// principle collapse an edge — or the whole disjunction — to a Bool
+    /// constant. `false` is the very step this exists to abolish and `true`
+    /// would leave the UNSAT claim with no recorded justification, so `None`
+    /// refuses the conflict outright and the caller routes to the ordinary
+    /// solver. Returns the asserted disjunction AND its disjuncts.
+    fn finite_enum_pigeonhole_disjunction(
+        &mut self,
+        members: &[TermId],
+    ) -> Option<(TermId, Vec<TermId>)> {
+        let (true_term, false_term) = (self.ctx.terms.true_term(), self.ctx.terms.false_term());
+        let mut equalities: Vec<TermId> = Vec::new();
+        for (index, &left) in members.iter().enumerate() {
+            for &right in &members[index + 1..] {
+                let equality = self.ctx.terms.mk_eq(left, right);
+                if equality == true_term || equality == false_term {
+                    return None;
+                }
+                equalities.push(equality);
+            }
+        }
+        let pigeonhole = self.ctx.terms.mk_or(equalities.clone());
+        (pigeonhole != false_term && pigeonhole != true_term).then_some((pigeonhole, equalities))
+    }
+
+    /// Assert the pigeonhole tautology and record it as a theory lemma whose
+    /// clause is the COMPLETE EQUALITY GRAPH, not the packed `(or ..)` term.
+    ///
+    /// `push_array_axiom_assertion_site` records `[axiom]` — one literal, the
+    /// whole disjunction. `proof::rebuild_finite_enum_pigeonhole_refutation`
+    /// matches this conflict's recorded stub literal BY LITERAL against the
+    /// member pairs it independently re-authenticated, so the packed form would
+    /// silently disable the strict-checkable `DatatypeEnumPigeonhole` rebuild
+    /// that authored-disequality cliques already receive (measured: the
+    /// four-member QF_DT clique of `api::tests::test_proof_artifact` loses its
+    /// `unsat` outright). Recording the disjuncts states exactly the same
+    /// clause and keeps that rebuild reachable.
+    fn push_finite_enum_pigeonhole_axiom(&mut self, axiom: TermId, equalities: Vec<TermId>) {
+        self.trace_array_axiom_assertion_site(axiom, "finite_enum_pigeonhole");
+        self.ctx.assertions.push(axiom);
+        if self.produce_proofs_enabled() {
+            let _ = self.proof_tracker.add_explicit_trust_lemma(equalities);
+        }
     }
 
     /// Maximum number of enum-sorted terms for which finite-domain coverage

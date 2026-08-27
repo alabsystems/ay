@@ -7,8 +7,8 @@
 //! [`FarkasCertificate`] / [`OptimalityCertificate`] /
 //! [`MilpInfeasibilityCertificate`] already hold evidence AS DATA with
 //! an independent `verify(&Model)`. What was missing was a way for that data to
-//! LEAVE THE PROCESS. Everything the engine proved was verified in-process and
-//! then dropped, so no consumer could re-check a verdict without re-running the
+//! LEAVE THE PROCESS. Typed evidence was verified in-process and then dropped,
+//! so no consumer could re-check an evidenced claim without re-running the
 //! solver — the exact thing a certificate exists to avoid.
 //!
 //! # The honesty requirement
@@ -91,6 +91,7 @@ use crate::hybrid_pb_lp::{
     verify_hybrid_pb_lp_infeasibility_certificate,
 };
 use crate::model::{exact, Col, ColKind, Model, Row, Sense};
+use crate::opt_cert::{verify_optimality_tree_bound, MilpOptimalityCertificate, OptTreeNode};
 use crate::outcome::{Outcome, UnknownReason};
 use crate::presolve::implied_free::{
     validate_certificate_payload_caps, AffineAggregationAnalysis, AffineAggregationCaps,
@@ -232,6 +233,7 @@ mod parse_affine;
 mod parse_affine_inner;
 mod parse_basic;
 mod parse_blocks;
+mod parse_opt_tree;
 mod parse_proofs;
 mod parse_replay;
 mod parse_routes;
@@ -260,6 +262,7 @@ use parse_affine::*;
 use parse_affine_inner::*;
 use parse_basic::*;
 use parse_blocks::*;
+use parse_opt_tree::*;
 use parse_proofs::*;
 use parse_replay::*;
 use parse_routes::*;

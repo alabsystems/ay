@@ -5,7 +5,9 @@
 use super::*;
 use ay_core::Symbol;
 
-fn list_registries() -> (Vec<(String, Vec<String>)>, Vec<(String, Vec<String>)>) {
+type Registry = Vec<(String, Vec<String>)>;
+
+fn list_registries() -> (Registry, Registry) {
     (
         vec![(
             "List".to_string(),

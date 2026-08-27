@@ -148,6 +148,43 @@ pub(super) fn optcert_block(oc: &OptimalityCertificate, trivial: bool) -> String
     s
 }
 
+/// The `opttree` block: a whole-tree OPTIMALITY certificate's DUAL half.
+///
+/// The witness rides in the certificate's own `witness` block (the `primal`
+/// claim), and the target value rides on the `verdict` line — so this block
+/// carries the split skeleton and the leaf multipliers and NOTHING ELSE. In
+/// particular a `boundleaf` writes no bound: recording one would create a
+/// second number that could disagree with the verdict, which is precisely the
+/// forgery the design review named.
+pub(super) fn opt_tree_block(root: &OptTreeNode) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "opttree");
+    // Explicit pre-order, iterative: a certificate is input data and its depth
+    // must not be the writer's stack limit.
+    let mut stack: Vec<&OptTreeNode> = vec![root];
+    while let Some(node) = stack.pop() {
+        match node {
+            OptTreeNode::Split { col, cut, lo, hi } => {
+                let _ = writeln!(s, "split {} {}", col.index(), fmt_rat(cut));
+                stack.push(hi);
+                stack.push(lo);
+            }
+            OptTreeNode::Empty { farkas } => {
+                let _ = writeln!(s, "leaf");
+                write_multipliers(&mut s, &farkas.multipliers);
+                let _ = writeln!(s, "endleaf");
+            }
+            OptTreeNode::Dominated { multipliers } => {
+                let _ = writeln!(s, "boundleaf");
+                write_multipliers(&mut s, multipliers);
+                let _ = writeln!(s, "endleaf");
+            }
+        }
+    }
+    let _ = writeln!(s, "end");
+    s
+}
+
 pub(super) fn tree_block(tc: &MilpInfeasibilityCertificate) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "tree");

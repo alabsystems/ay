@@ -173,6 +173,7 @@ impl TheorySolver for NraSolver<'_> {
         self.registered_atoms.clear();
         self.asserted_atom_set.clear();
         self.algebraic_model.clear();
+        self.last_unsat_certificate = None;
         self.lra.reset();
     }
 

@@ -27,6 +27,9 @@ pub(super) mod proof_farkas_validation;
 
 #[path = "proof_trust_surgery.rs"]
 pub(super) mod proof_trust_surgery;
+#[cfg(test)]
+#[path = "proof_trust_surgery_guarded_then_tests.rs"]
+mod proof_trust_surgery_guarded_then_tests;
 #[path = "proof_trust_surgery_ite.rs"]
 pub(super) mod proof_trust_surgery_ite;
 #[path = "proof_trust_surgery_ite_branch.rs"]
@@ -46,6 +49,9 @@ pub(super) mod proof_trust_surgery_provenance;
 pub(super) mod proof_trust_surgery_provenance_or;
 #[path = "proof_trust_surgery_provenance_or_emit.rs"]
 mod proof_trust_surgery_provenance_or_emit;
+#[cfg(test)]
+#[path = "proof_trust_surgery_provenance_or_false_tests.rs"]
+mod proof_trust_surgery_provenance_or_false_tests;
 #[cfg(test)]
 #[path = "proof_trust_surgery_provenance_or_tests.rs"]
 mod proof_trust_surgery_provenance_or_tests;

@@ -721,7 +721,7 @@ impl PortfolioSolver {
                             // sharing-disabled default both yield trustworthy
                             // refutations. A SAT result is always trustworthy: its
                             // model is verified against the original formula by
-                            // `VerifiedSatResult` before this point. An untrusted
+                            // the solver's always-on model gate before this point. An untrusted
                             // UNSAT is dropped (not emitted, does not stop siblings)
                             // so the portfolio fails closed to another worker's sound
                             // result or to `Unknown` — never to a wrong `UNSAT`.
@@ -1147,7 +1147,7 @@ fn create_solver_from_config(
 /// answer (task #14 soundness gate).
 ///
 /// `Sat` and `Unknown` are always safe to surface: a `Sat` model is verified
-/// against the original formula by `VerifiedSatResult` before it reaches the
+/// against the original formula by the solver's model gate before it reaches the
 /// join, and `Unknown` asserts nothing. An `Unsat` is only a **complete, sound
 /// refutation of the ORIGINAL formula** when the worker's clause database was
 /// not contaminated by (potentially unsound) cross-worker clause sharing — i.e.

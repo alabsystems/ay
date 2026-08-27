@@ -207,13 +207,9 @@ fn assert_relax_lift_case(case: usize, fixture: &RelaxLiftCase, cuts: &[Cut]) {
         .iter()
         .map(|&i| {
             let (lo, up) = (fixture.spec[i].2, fixture.spec[i].3);
-            let mut values = Vec::new();
-            let mut value = lo.ceil();
-            while value <= up + 1e-12 {
-                values.push(value);
-                value += 1.0;
-            }
-            values
+            std::iter::successors(Some(lo.ceil()), |value| Some(*value + 1.0))
+                .take_while(|value| *value <= up + 1e-12)
+                .collect()
         })
         .collect();
     let total: usize = ranges.iter().map(|range| range.len().max(1)).product();
@@ -281,7 +277,7 @@ fn assert_relax_lift_case(case: usize, fixture: &RelaxLiftCase, cuts: &[Cut]) {
 
 #[test]
 fn relax_lift_cuts_never_remove_an_integer_point() {
-    let mut seed = 0x51DE_2026_A5_u64;
+    let mut seed = 0x0051_DE20_26A5_u64;
     let mut rnd = || {
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         (seed >> 33) as i64

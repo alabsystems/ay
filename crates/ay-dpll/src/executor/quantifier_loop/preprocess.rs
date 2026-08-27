@@ -9,6 +9,8 @@
 //! These are private `impl Executor` methods called from the orchestrator
 //! in `mod.rs`.
 
+mod cegqi_debug;
+mod ematching_rounds;
 mod finite_expansion_provenance;
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -538,6 +540,7 @@ impl Executor {
                     after: record.instance,
                     stamp: 1,
                 }],
+                ..crate::preprocess::PropagationRecords::default()
             });
         }
     }
@@ -1661,191 +1664,6 @@ impl Executor {
         self.ctx.terms.mk_and(parts)
     }
 
-    /// Run multi-round E-matching, collecting instantiations across rounds.
-    ///
-    /// Uses the persistent `QuantifierManager` for generation tracking (#573).
-    /// Extracts the EUF model from the last solve for congruence-aware matching
-    /// (Phase B1b, #3325).
-    pub(super) fn run_ematching_rounds(&mut self) -> EmatchingSummary {
-        let max_rounds = self.ematching_round_limit();
-
-        // M5 FLIP — demand lane (PRODUCTION-authoritative for classified families):
-        // compute the frontier-gated family set BEFORE any long-lived borrow of
-        // `self`. Only the M1 self-chaining / bridge-cycle foralls are gated —
-        // those are the two geometric minters; every OTHER forall is untouched.
-        // `demand_lane_eligible` is `true` on every production path (release AND
-        // debug); it is `false` only under the debug-only force-eager differential
-        // override, where `gated` stays empty and the lane never arms (byte-
-        // identical eager path). Crucially, the lane ARMS below only if `gated` is
-        // NON-EMPTY, so a solve with no classified family is byte-identical too —
-        // this is what bounds the flip's blast radius to classified-family problems.
-        let demand_eligible = self.demand_lane_eligible();
-        let gated: HashSet<u32> = if demand_eligible {
-            let foralls = self.collect_classifiable_foralls();
-            let classes = self.classify_quantifier_families(&foralls);
-            classes
-                .iter()
-                .filter(|(_, c)| {
-                    matches!(
-                        c,
-                        crate::executor::quantifier_loop::family_classifier::FamilyClass::SelfChainingDefinitional
-                            | crate::executor::quantifier_loop::family_classifier::FamilyClass::BridgeCycle
-                    )
-                })
-                .map(|(tid, _)| tid.0)
-                .collect()
-        } else {
-            HashSet::default()
-        };
-
-        // Capture the deadline/interrupt closure before borrowing the quantifier
-        // manager mutably (the closure owns its snapshots, no borrow of `self`).
-        let should_stop = self.make_should_stop();
-        let euf_model_ref = self.last_model.as_ref().and_then(|m| m.euf_model.as_ref());
-
-        let qm = self
-            .quantifier_manager
-            .get_or_insert_with(QuantifierManager::new);
-        // LI-4: begin a new E-matching epoch. Drains the persistent (quant,binding)
-        // instantiation memo back to the scope baseline so any instance produced in
-        // a PRIOR check-sat (and since retracted by restore_assertions) is
-        // re-instantiable in this check-sat. This is a no-op on the incremental-mode
-        // path (where the QM is take()-swapped fresh per check-sat) and essential on
-        // the non-incremental reused-QM path. Called ONCE per process_quantifiers;
-        // run_post_cegqi_ematching and try_ematching_refinement_round share this
-        // epoch's memo (no begin_epoch there).
-        qm.begin_epoch();
-        // M5 FLIP: arm the demand lane for this solve (LAW #7 parking + LAW #1
-        // flush). `begin_epoch` reset it to inert above; arm it ONLY when a
-        // classified family is present (`gated` non-empty). This is the family-
-        // scoping seam: with an empty `gated` set (no self-chaining/bridge-cycle
-        // forall, or the force-eager override) the lane stays inert and every
-        // downstream armed-state gate falls through to the eager path byte-
-        // identically. The warm-start depth seeds the DT resume depth (LAW #5).
-        let gated_debug_len = gated.len();
-        if !gated.is_empty() {
-            qm.demand_arm(gated, crate::executor::dt_axioms::DT_WARM_START_DEPTH);
-        }
-        let mut assertions_for_round = self.ctx.assertions.clone();
-        let mut seen_instantiations: HashSet<TermId> =
-            assertions_for_round.iter().copied().collect();
-        let mut all_instantiations = Vec::new();
-        let mut all_instantiated_quantifiers = HashSet::default();
-        let mut all_unconditional_forall_instantiations = Vec::new();
-        let mut seen_forall_instantiations = HashSet::default();
-        let mut has_uninstantiated = false;
-        let mut uninstantiated_quantifiers = HashSet::default();
-        let mut reached_limit = false;
-        let mut exhausted_round_budget = false;
-        let mut rounds_completed: u64 = 0;
-        let mut instances_created: u64 = 0;
-        let mut all_unconditional_forall_roots: HashSet<TermId> = HashSet::default();
-
-        for round_idx in 0..max_rounds {
-            // Deadline/interrupt guard (#quantifier-deadline): stop entering new
-            // E-matching rounds once the budget is spent. Setting `reached_limit`
-            // routes any in-progress Sat to Unknown(QuantifierRoundLimit) in
-            // classify_quantifier_result; it can never finalize a bogus Sat.
-            if should_stop() {
-                reached_limit = true;
-                break;
-            }
-            let ematching_result = qm.run_ematching_round(
-                &mut self.ctx.terms,
-                &assertions_for_round,
-                euf_model_ref,
-                &should_stop,
-            );
-            rounds_completed += 1;
-            let round_reached_limit = ematching_result.reached_limit;
-            let round_has_uninstantiated = ematching_result.has_uninstantiated;
-            let round_uninstantiated_quantifiers = ematching_result.uninstantiated_quantifiers;
-            all_instantiated_quantifiers.extend(ematching_result.instantiated_quantifiers);
-            let round_forall_instantiations = ematching_result.unconditional_forall_instantiations;
-            instances_created += ematching_result.instantiations.len() as u64;
-            all_unconditional_forall_roots.extend(ematching_result.unconditional_forall_roots);
-            let mut round_added = 0usize;
-
-            for inst in ematching_result.instantiations {
-                if seen_instantiations.insert(inst) {
-                    assertions_for_round.push(inst);
-                    all_instantiations.push(inst);
-                    round_added += 1;
-                }
-            }
-            // Keep proof provenance independently of instance novelty. The same
-            // ground term can be seen first from a nested/non-direct quantifier
-            // and only later from an authenticated direct forall. Dropping the
-            // latter record would lose a valid certificate (not soundness), so
-            // deduplicate by the exact source/binding/instance triple instead.
-            for record in round_forall_instantiations {
-                if seen_forall_instantiations.insert((
-                    record.quantifier,
-                    record.binding.clone(),
-                    record.instance,
-                )) {
-                    all_unconditional_forall_instantiations.push(record);
-                }
-            }
-
-            has_uninstantiated = round_has_uninstantiated;
-            uninstantiated_quantifiers = round_uninstantiated_quantifiers;
-            reached_limit |= round_reached_limit;
-
-            if round_reached_limit || round_added == 0 {
-                break;
-            }
-
-            // We still made progress on the last allowed round, so there may be
-            // additional instantiations if we continued. Treat this as incomplete.
-            if round_idx + 1 == max_rounds {
-                exhausted_round_budget = true;
-            }
-        }
-
-        if exhausted_round_budget {
-            reached_limit = true;
-        }
-
-        // M5 demand-lane diagnostic (env-gated): report the gated set size + this
-        // solve's frontier / parked tally BEFORE the (possibly slow) ground
-        // final-solve, so a timed-out run still shows whether the lane armed +
-        // parked. Fires only when the lane actually armed (a classified family was
-        // present). Pure observation.
-        if gated_debug_len > 0 && ay_core::misc_cli_flags().demand_debug {
-            if let Some(qm) = self.quantifier_manager.as_ref() {
-                eprintln!(
-                    "c demand-lane batch_instances={} gated_families={} frontier={} has_parked={}",
-                    all_instantiations.len(),
-                    gated_debug_len,
-                    qm.demand_frontier(),
-                    qm.demand_has_parked(),
-                );
-            }
-        }
-
-        // Post-loop invariant: all_instantiations is a deduplicated set
-        // and its items are a subset of assertions_for_round.
-        debug_assert!(
-            all_instantiations.len() <= assertions_for_round.len() - self.ctx.assertions.len(),
-            "E-matching: more unique instantiations ({}) than new assertions ({})",
-            all_instantiations.len(),
-            assertions_for_round.len() - self.ctx.assertions.len()
-        );
-
-        EmatchingSummary {
-            instantiations: all_instantiations,
-            instantiated_quantifiers: all_instantiated_quantifiers,
-            unconditional_forall_instantiations: all_unconditional_forall_instantiations,
-            has_uninstantiated,
-            uninstantiated_quantifiers,
-            reached_limit,
-            rounds_completed,
-            instances_created,
-            unconditional_forall_roots: all_unconditional_forall_roots,
-        }
-    }
-
     /// (#recdt) Fold datatype selector-over-constructor applications in an
     /// [`EmatchingSummary`]'s instances and support-axiom roots.
     ///
@@ -2051,9 +1869,8 @@ impl Executor {
         let mut cegqi_has_forall = false;
         let mut cegqi_has_exists = false;
         let mut raw_ce_lemma_ids: Vec<TermId> = Vec::new();
-        // Provenance for the per-universal SAT flip (#cegqi-per-universal):
-        // which quantifier each raw CE lemma was created for. Parallel to the
-        // `raw_ce_lemma_ids` pushes below.
+        // Track which quantifier produced each raw CE lemma; this stays parallel
+        // to `raw_ce_lemma_ids` for the per-universal SAT flip.
         let mut raw_ce_lemma_quants: Vec<TermId> = Vec::new();
         let mut cegqi_ce_lemma_ids: Vec<TermId> = Vec::new();
         let mut has_completely_unhandled_quantifiers = false;
@@ -2099,6 +1916,9 @@ impl Executor {
         };
 
         for &quant in quantifiers {
+            if let Some(diagnostic) = cegqi_debug::setup_diagnostic(&self.ctx.terms, quant) {
+                ay_core::safe_eprintln!("{diagnostic}");
+            }
             let has_triggers = match self.ctx.terms.get(quant) {
                 TermData::Forall(_, _, triggers) | TermData::Exists(_, _, triggers) => {
                     !triggers.is_empty()
@@ -2136,11 +1956,8 @@ impl Executor {
             // records it as unhandled so no SAT certificate can grant on it
             // either.
             let quant_is_entailed_forall = !is_forall || entailed_foralls.contains(&quant);
-            // A `forall` marked "E-matching only" (`mark_no_mbqi`, e.g. the
-            // Hilbert-`choose` witness axiom) is EXCLUDED from CEGQI synthesis
-            // instantiation, exactly as it is from MBQI. It falls through to the
-            // fail-closed routing below, so it is discharged only by E-matching
-            // on a ground trigger (an established witness), matching Verus.
+            // An E-matching-only `forall` is excluded from CEGQI and MBQI; only
+            // an established ground trigger may discharge it, matching Verus.
             let should_process = !self.ctx.terms.is_no_mbqi(quant)
                 && quant_is_entailed_forall
                 && (is_triggerless_cegqi_forall

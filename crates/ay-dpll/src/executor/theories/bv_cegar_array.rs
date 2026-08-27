@@ -99,9 +99,8 @@ impl Executor {
                 let Some(next_clauses) = build.clauses.len().checked_add(pair_clauses) else {
                     return false;
                 };
-                let last_var = (build.next_var as usize)
-                    .checked_add(pair_vars.saturating_sub(1))
-                    .unwrap_or(usize::MAX);
+                let last_var =
+                    (build.next_var as usize).saturating_add(pair_vars.saturating_sub(1));
                 if pair_clauses == 0
                     || next_vars > budget::MAX_NEW_VARS
                     || next_clauses > budget::MAX_NEW_CLAUSES

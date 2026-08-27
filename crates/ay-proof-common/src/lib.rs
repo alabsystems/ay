@@ -19,3 +19,4 @@ pub mod leb128;
 pub mod literal;
 
 pub use error::ParseError;
+pub use literal::LiteralError;

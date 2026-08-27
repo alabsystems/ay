@@ -15,15 +15,15 @@ a 2 0
 "#;
 
     let formula = parse_qdimacs(input).unwrap();
-    assert_eq!(formula.num_vars, 3);
-    assert_eq!(formula.prefix.len(), 2);
-    assert_eq!(formula.clauses.len(), 2);
+    assert_eq!(formula.num_vars(), 3);
+    assert_eq!(formula.prefix().len(), 2);
+    assert_eq!(formula.clauses().len(), 2);
 
     // Check prefix
-    assert_eq!(formula.prefix[0].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix[0].variables, vec![1, 3]);
-    assert_eq!(formula.prefix[1].quantifier, Quantifier::Forall);
-    assert_eq!(formula.prefix[1].variables, vec![2]);
+    assert_eq!(formula.prefix()[0].quantifier, Quantifier::Exists);
+    assert_eq!(formula.prefix()[0].variables, vec![1, 3]);
+    assert_eq!(formula.prefix()[1].quantifier, Quantifier::Forall);
+    assert_eq!(formula.prefix()[1].variables, vec![2]);
 
     // Check quantifier info
     assert!(formula.is_existential(1));
@@ -35,9 +35,9 @@ a 2 0
 fn test_parse_minimal_qdimacs() {
     let input = "p cnf 2 1\ne 1 2 0\n1 2 0\n";
     let formula = parse_qdimacs(input).unwrap();
-    assert_eq!(formula.num_vars, 2);
-    assert_eq!(formula.prefix.len(), 1);
-    assert_eq!(formula.clauses.len(), 1);
+    assert_eq!(formula.num_vars(), 2);
+    assert_eq!(formula.prefix().len(), 1);
+    assert_eq!(formula.clauses().len(), 1);
 }
 
 #[test]
@@ -52,13 +52,13 @@ a 4 0
 "#;
 
     let formula = parse_qdimacs(input).unwrap();
-    assert_eq!(formula.prefix.len(), 4);
+    assert_eq!(formula.prefix().len(), 4);
 
     // Check alternation
-    assert_eq!(formula.prefix[0].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix[1].quantifier, Quantifier::Forall);
-    assert_eq!(formula.prefix[2].quantifier, Quantifier::Exists);
-    assert_eq!(formula.prefix[3].quantifier, Quantifier::Forall);
+    assert_eq!(formula.prefix()[0].quantifier, Quantifier::Exists);
+    assert_eq!(formula.prefix()[1].quantifier, Quantifier::Forall);
+    assert_eq!(formula.prefix()[2].quantifier, Quantifier::Exists);
+    assert_eq!(formula.prefix()[3].quantifier, Quantifier::Forall);
 
     // Check levels
     assert_eq!(formula.var_level(1), 0);
@@ -90,7 +90,7 @@ fn test_parse_error_var_out_of_range() {
 fn test_parse_preserves_empty_clause() {
     let formula = parse_qdimacs("p cnf 0 1\n0\n").unwrap();
 
-    assert_eq!(formula.clauses, vec![Vec::new()]);
+    assert_eq!(formula.clauses(), &[Vec::new()]);
 }
 
 #[test]

@@ -67,7 +67,6 @@ fn validate_clause_trace_resolution_interruptible_impl(
     )?;
 
     let conversion_work = meter.consumed_work();
-    drop(meter);
     let validation_work = replay_converted_dag(
         &dag,
         limits,
@@ -161,8 +160,7 @@ fn prepare_fixed_unit_premises(
                 premise_index,
                 variable,
                 num_vars,
-            }
-            .into());
+            });
         }
     }
     let unit_premises = copy_slice_bounded(
@@ -218,7 +216,7 @@ fn collect_entry_states(
         }
         meter.charge(1)?;
         if entry.id == 0 {
-            return Err(ClauseTraceResolutionError::ZeroClauseId { entry_index }.into());
+            return Err(ClauseTraceResolutionError::ZeroClauseId { entry_index });
         }
         if let Some(first) = states.insert(
             entry.id,
@@ -231,8 +229,7 @@ fn collect_entry_states(
                 id: entry.id,
                 first_index: first.trace_index,
                 duplicate_index: entry_index,
-            }
-            .into());
+            });
         }
     }
     Ok(states)

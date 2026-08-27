@@ -9,66 +9,7 @@
 
 include!("pipeline_proof_macros.rs");
 
-/// Thin control-flow shim over [`crate::pipeline_fns::add_incremental_conflict_clause`].
-///
-/// The clause-building / level-0-minimization / verdict logic was de-macro'd into
-/// that function (#8424); this macro survives only to translate the function's
-/// [`crate::pipeline_fns::AddConflictClauseOutcome::Break`] verdict into the
-/// caller loop's `break Ok(..)` (a function cannot break the caller's loop) and to
-/// capture the private `$self.last_result`/`last_unknown_reason` fields. All call
-/// sites are unchanged.
-macro_rules! pipeline_add_incremental_conflict_clause {
-    (
-        $self:ident,
-        state: $state:ident,
-        solver: $solver:ident,
-        term_to_var: $term_to_var:ident,
-        conflict_terms: $conflict_terms:expr,
-        tag: $tag:expr,
-        set_unknown_on_error: $set_unknown:expr,
-        unmapped_message: $unmapped_message:literal,
-        proof_enabled: $proof_enabled:expr,
-        theory_proof: $theory_proof:expr
-    ) => {{
-        match $crate::pipeline_fns::add_incremental_conflict_clause(
-            &mut $self.last_result,
-            &mut $self.last_unknown_reason,
-            $solver,
-            &$term_to_var,
-            &$conflict_terms,
-            $tag,
-            $set_unknown,
-            $unmapped_message,
-            $proof_enabled,
-        ) {
-            $crate::pipeline_fns::AddConflictClauseOutcome::Added { original_id } => {
-                let __acc_theory_proof = $theory_proof;
-                if let (Some(__acc_id), Some(__acc_proof)) = (original_id, __acc_theory_proof) {
-                    if !matches!(__acc_proof.kind, ay_core::TheoryLemmaKind::Generic) {
-                        $crate::pipeline_fns::place_original_clause_authority_at_id(
-                            &$solver,
-                            __acc_id,
-                            None,
-                            Some(__acc_proof),
-                            &mut $state.clausification_proofs,
-                            &mut $state.original_clause_theory_proofs,
-                        );
-                    }
-                }
-                if $proof_enabled {
-                    $crate::pipeline_fns::align_original_clause_authority_ledgers(
-                        &$solver,
-                        &mut $state.clausification_proofs,
-                        &mut $state.original_clause_theory_proofs,
-                    );
-                }
-            }
-            $crate::pipeline_fns::AddConflictClauseOutcome::Break(__acc_result) => {
-                break Ok(__acc_result)
-            }
-        }
-    }};
-}
+include!("pipeline_split_handler_macros/add_conflict_clause.rs");
 
 /// Persist a verified incremental split-loop conflict as a blocking clause.
 ///

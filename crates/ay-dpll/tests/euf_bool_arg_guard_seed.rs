@@ -44,10 +44,9 @@
 
 mod common;
 
-/// The guard's repair CEGAR must be enabled for this file to reach definite
-/// answers at all — without it both the fixed and the broken build report
-/// `sat unknown unknown`, so the flag is what makes the test discriminating.
-///
+// The guard's repair CEGAR must be enabled for this file to reach definite
+// answers at all — without it both the fixed and the broken build report
+// `sat unknown unknown`, so the flag is what makes the test discriminating.
 // B69: the repair arm rides the set-once typed carrier — installed below
 // before anything can read it into a `OnceLock` (single-test binary).
 

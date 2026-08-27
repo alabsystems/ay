@@ -401,3 +401,5 @@ fn test_fp_sqrt_neg_zero() {
 include!("fp_arithmetic_correctness/fma.rs");
 
 include!("fp_arithmetic_correctness/rounding_edges.rs");
+
+include!("fp_arithmetic_correctness/div_pow2.rs");

@@ -8,13 +8,18 @@
 //!
 //! ```text
 //! cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20
-//! --smt-lane cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20
+//! cargo run --release -p ay-milp --features smt --example milp_speed -- 30 20 --smt-lane
 //! ```
+//!
+//! The second line used to read `--smt-lane cargo run ...`, which is not a
+//! command: `8875fea71` rewrote the recipe's `AY_MILP_SMT=1` env prefix into
+//! the new flag spelling textually, leaving the flag where the env assignment
+//! had been. The same rewrite is what produced `milp_sparse_speed`'s
+//! `--lu TIME_LIMIT=30 ...` line and the six `simplex.rs` `--lu` citations.
 
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
 use ay_milp::{BabSession, Col, Model, Outcome, Row, Sense, SolveOpts};
 
 struct Rng(u64);
@@ -145,10 +150,15 @@ fn to_mps_format(model: &Model, cols: &[Col], rows: &[Row]) -> String {
 fn main() {
     // B40b: `--smt-lane` replaces the --smt-lane env force.
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let flags = Flags::parse(&raw, VALUE_FLAGS, &switch_flags()).unwrap_or_else(|e| {
-        eprintln!("usage: milp_speed [n m seed] [--smt-lane]: {e}");
-        std::process::exit(2);
-    });
+    // `applied_flags()` PLUS the two names this file reads by hand
+    // (`--time-limit`, `--threads`; see below). Handing `VALUE_FLAGS` here also
+    // accepted `--emit-cert`, `--require`, `--seed`, `--format` and ten more
+    // that this harness cannot honour.
+    let flags = ay_milp::engine_cli::parse_applied(&raw, &["time-limit", "threads"], &[])
+        .unwrap_or_else(|e| {
+            eprintln!("usage: milp_speed [n m seed] [--smt-lane]: {e}");
+            std::process::exit(2);
+        });
     let args = &flags.positional;
     let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(30);
     let m: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
@@ -186,10 +196,37 @@ fn main() {
     // — which is what makes a like-for-like comparison against another solver's
     // time-limited run possible at all.
     let mut opts = SolveOpts::new();
-    if smt_lane {
-        opts = opts.with_engine(ay_milp::EngineEconomics::new().with_smt_lane(true));
-    }
-    if let Ok(secs) = std::env::var("TIME_LIMIT") {
+    // THE WHOLE ENGINE SURFACE WAS PARSED AND DROPPED HERE. The parse call
+    // above was handed `VALUE_FLAGS` and `switch_flags()` — 247 names — so every
+    // engine knob was ACCEPTED on this harness, and `engine_cli::apply` was
+    // never called, so every one of them changed nothing. Measured on
+    // `5ebf652ba` before this line existed: `milp_speed 14 8 --trace` and
+    // `milp_speed 14 8` produced byte-identical 98-byte stderr and zero
+    // `--trace` lines (2 reps each), while `mps_solve flugpl.mps 10 --trace`
+    // produced 250 trace lines / 21,913 bytes against 576 bytes unflagged
+    // (2 reps each) on the same build. Same flag, same engine, same binary
+    // set: the difference was this call.
+    //
+    // `apply` is a no-op when no engine flag is given (`touched` stays false),
+    // so an unflagged run is byte-identical to before. It also carries
+    // `--smt-lane` itself (`BOOL_BUILDERS`, `EngineEconomics::with_smt_lane`),
+    // which is why the hand-rolled `with_engine` that used to sit here is gone:
+    // it would have been overwritten by `apply`'s own `EngineEconomics` the
+    // moment any second flag was passed.
+    opts = ay_milp::engine_cli::apply(&flags, opts).unwrap_or_else(|e| {
+        eprintln!("bad engine flag: {e}");
+        std::process::exit(2);
+    });
+    // `--time-limit` and `--threads` are this harness's OWN names now — it
+    // declares them in its `parse_applied` call above — because `apply` does not
+    // consume them (they are the `solve` subcommand's). Read them here, or the
+    // harness advertises two levers it ignores. The env spellings stay as the
+    // fallback because the journal's scripts set them.
+    let time_limit = flags
+        .get("time-limit")
+        .cloned()
+        .or_else(|| std::env::var("TIME_LIMIT").ok());
+    if let Some(secs) = time_limit {
         if let Ok(secs) = secs.parse::<f64>() {
             opts = opts.with_time_limit(std::time::Duration::from_secs_f64(secs));
         }
@@ -199,11 +236,19 @@ fn main() {
     // ignoring the requested worker count here would make its 8T comparison a
     // mislabeled 1T run.  Determinism remains the default at one thread; an
     // explicit multi-worker request opts out exactly as the real CLI does.
-    if let Ok(raw) = std::env::var("AY_MILP_THREADS") {
+    // MEASURED INERT before this read existed: `milp_speed 14 8 --threads 8`
+    // printed `worker budget: 1   deterministic: true` — identical to the
+    // unflagged run — on all 3 interleaved reps, while `AY_MILP_THREADS=8`
+    // printed `worker budget: 8   deterministic: false` on all 3.
+    let threads = flags
+        .get("threads")
+        .cloned()
+        .or_else(|| std::env::var("AY_MILP_THREADS").ok());
+    if let Some(raw) = threads {
         let threads = raw
             .parse::<u32>()
-            .expect("AY_MILP_THREADS must be a positive integer");
-        assert!(threads > 0, "AY_MILP_THREADS must be positive");
+            .expect("--threads / AY_MILP_THREADS must be a positive integer");
+        assert!(threads > 0, "--threads / AY_MILP_THREADS must be positive");
         if threads > 1 {
             opts = opts.with_threads(threads).with_determinism(false);
         }

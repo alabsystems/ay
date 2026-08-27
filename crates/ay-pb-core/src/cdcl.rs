@@ -616,7 +616,7 @@ pub struct PbCdclStats {
     /// silently degrades to the RUP proof fallback — this should stay 0.
     pub proof_id_lockstep_desyncs: u64,
     /// Number of solves decided by the single-equality knapsack subset-sum
-    /// DP special case (see [`crate::eq_knapsack`]) instead of CDCL search.
+    /// DP special case (see `crate::eq_knapsack`) instead of CDCL search.
     pub eq_knapsack_dp: u64,
 }
 

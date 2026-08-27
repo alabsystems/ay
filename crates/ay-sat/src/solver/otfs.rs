@@ -210,8 +210,15 @@ impl super::Solver {
         }
 
         self.arena.set_saved_pos(clause_idx, 2);
-        self.arena
-            .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        // OTFS only fires on a clause that was just a reason in conflict
+        // analysis, so under the two-stage arm this is an `OnClauseUse(c)`
+        // (`score += 1`), not a reset to MAX_USED.
+        if self.two_stage_clause_management {
+            self.two_stage_note_analysis_use(clause_idx);
+        } else {
+            self.arena
+                .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        }
         // CaDiCaL analyze.cpp:850: post-replace size must match new_lits
         debug_assert_eq!(
             self.arena.len_of(clause_idx),

@@ -38,10 +38,10 @@ fn fin(a: Anum) -> AEnd {
 }
 
 fn iv(lo: AEnd, lo_open: bool, hi: AEnd, hi_open: bool) -> AInterval {
-    match AInterval::new(lo, lo_open, hi, hi_open, Just::none()).expect("decided") {
-        Made::Iv(v) => v,
-        Made::Empty => panic!("expected non-empty"),
-    }
+    DecidedInterval::from_bounds(lo, lo_open, hi, hi_open, Just::none())
+        .expect("decided")
+        .into_interval()
+        .expect("expected non-empty")
 }
 
 fn set(ivs: Vec<AInterval>) -> IntervalSet {
@@ -76,11 +76,11 @@ fn ialg_algebraic_endpoint_is_not_rational() {
 #[test]
 fn ialg_closed_infinity_refused() {
     assert_eq!(
-        AInterval::new(AEnd::NegInf, false, fin(ri(1)), true, Just::none()),
+        DecidedInterval::from_bounds(AEnd::NegInf, false, fin(ri(1)), true, Just::none()),
         None
     );
     assert_eq!(
-        AInterval::new(fin(ri(1)), true, AEnd::PosInf, false, Just::none()),
+        DecidedInterval::from_bounds(fin(ri(1)), true, AEnd::PosInf, false, Just::none()),
         None
     );
 }
@@ -90,22 +90,30 @@ fn ialg_closed_infinity_refused() {
 #[test]
 fn ialg_empty_cases_are_proved_not_guessed() {
     // (3, 3) is empty; [3, 3] is not.
-    assert_eq!(
-        AInterval::new(fin(ri(3)), true, fin(ri(3)), true, Just::none()),
-        Some(Made::Empty)
+    assert!(
+        DecidedInterval::from_bounds(fin(ri(3)), true, fin(ri(3)), true, Just::none())
+            .expect("decided")
+            .into_interval()
+            .is_none()
     );
-    assert_eq!(
-        AInterval::new(fin(ri(3)), false, fin(ri(3)), true, Just::none()),
-        Some(Made::Empty)
+    assert!(
+        DecidedInterval::from_bounds(fin(ri(3)), false, fin(ri(3)), true, Just::none())
+            .expect("decided")
+            .into_interval()
+            .is_none()
     );
-    assert!(matches!(
-        AInterval::new(fin(ri(3)), false, fin(ri(3)), false, Just::none()),
-        Some(Made::Iv(_))
-    ));
+    assert!(
+        DecidedInterval::from_bounds(fin(ri(3)), false, fin(ri(3)), false, Just::none())
+            .expect("decided")
+            .into_interval()
+            .is_some()
+    );
     // Inverted.
-    assert_eq!(
-        AInterval::new(fin(ri(5)), false, fin(ri(1)), false, Just::none()),
-        Some(Made::Empty)
+    assert!(
+        DecidedInterval::from_bounds(fin(ri(5)), false, fin(ri(1)), false, Just::none())
+            .expect("decided")
+            .into_interval()
+            .is_none()
     );
 }
 
@@ -133,14 +141,14 @@ fn ialg_disjoint_algebraic_intersection_is_empty() {
 fn ialg_intersection_keeps_both_justifications() {
     let ja = Just::of(7).expect("nonzero");
     let jb = Just::of(-9).expect("nonzero");
-    let a = match AInterval::new(fin(ri(0)), false, fin(ri(10)), false, ja).expect("decided") {
-        Made::Iv(v) => v,
-        Made::Empty => panic!(),
-    };
-    let b = match AInterval::new(fin(ri(5)), false, fin(ri(20)), false, jb).expect("decided") {
-        Made::Iv(v) => v,
-        Made::Empty => panic!(),
-    };
+    let a = DecidedInterval::from_bounds(fin(ri(0)), false, fin(ri(10)), false, ja)
+        .expect("decided")
+        .into_interval()
+        .expect("non-empty");
+    let b = DecidedInterval::from_bounds(fin(ri(5)), false, fin(ri(20)), false, jb)
+        .expect("decided")
+        .into_interval()
+        .expect("non-empty");
     let sa = IntervalSet::normalize(vec![a]).expect("ok");
     let sb = IntervalSet::normalize(vec![b]).expect("ok");
     let inter = sa.intersect(&sb).expect("decided");
@@ -163,7 +171,7 @@ fn ialg_just_rejects_zero_and_dedups() {
 fn ialg_justification_survives_a_chain_of_intersections() {
     let mut s = IntervalSet::full(Just::none());
     for lit in 1..=5i32 {
-        let piece = IntervalSet::normalize(vec![match AInterval::new(
+        let interval = DecidedInterval::from_bounds(
             fin(ri(-100)),
             true,
             fin(ri(100)),
@@ -171,11 +179,9 @@ fn ialg_justification_survives_a_chain_of_intersections() {
             Just::of(lit).expect("nonzero"),
         )
         .expect("decided")
-        {
-            Made::Iv(v) => v,
-            Made::Empty => panic!(),
-        }])
-        .expect("ok");
+        .into_interval()
+        .expect("non-empty");
+        let piece = IntervalSet::normalize(vec![interval]).expect("ok");
         s = s.intersect(&piece).expect("decided");
     }
     assert_eq!(s.justification().expect("ok").lits(), &[1, 2, 3, 4, 5]);
@@ -492,12 +498,8 @@ fn ialg_sign_condition_rootless_polynomial() {
 #[test]
 fn ialg_sign_condition_zero_polynomial() {
     let z: Vec<BigInt> = vec![BigInt::zero()];
-    assert!(
-        from_sign_condition(&z, &[], SignCond::Eq, Just::none())
-            .expect("decided")
-            .len()
-            == 1
-    );
+    let equal = from_sign_condition(&z, &[], SignCond::Eq, Just::none()).expect("decided");
+    assert_eq!(equal.len(), 1);
     assert!(from_sign_condition(&z, &[], SignCond::Ne, Just::none())
         .expect("decided")
         .is_empty());
@@ -570,31 +572,7 @@ fn ialg_intersect_guard_fires() {
     assert_eq!(IntervalSet::from_ordered(adjacent), None);
 }
 
-#[test]
-fn ialg_bounds() {
-    // Normalisation refuses more than MAX_INTERVALS inputs before any work.
-    let many: Vec<AInterval> = (0..=(MAX_INTERVALS as i64))
-        .map(|i| iv(fin(ri(3 * i)), false, fin(ri(3 * i + 1)), false))
-        .collect();
-    assert_eq!(many.len(), MAX_INTERVALS + 1);
-    assert_eq!(IntervalSet::normalize(many), None);
-
-    // A justification cannot grow past MAX_JUST.
-    let a = Just {
-        lits: (1..=(MAX_JUST as i32)).collect(),
-    };
-    let b = Just::of(-1).expect("nonzero");
-    assert_eq!(a.merge(&b), None);
-    assert!(a.merge(&Just::of(1).expect("nonzero")).is_some());
-
-    // from_sign_condition refuses a root list that would exceed the ceiling.
-    let p = vec![BigInt::from(-2), BigInt::zero(), BigInt::one()];
-    let roots: Vec<Anum> = (0..MAX_INTERVALS as i64).map(ri).collect();
-    assert_eq!(
-        from_sign_condition(&p, &roots, SignCond::Lt, Just::none()),
-        None
-    );
-}
+include!("ialg_tests/bounds.rs");
 
 /// `inner_dyadic` terminates on a singleton, which has no interior at all.
 #[test]
@@ -623,19 +601,12 @@ fn ialg_algebraic_laws() {
     assert_eq!(a.subtract(&IntervalSet::empty()).expect("d"), a);
 }
 
-/// `from_sign_condition` must REFUSE a root list that is not exactly the real
-/// roots of `p` — in both directions.
+/// `from_sign_condition` must refuse incomplete or padded root lists.
 ///
-/// Verifying only that the list ascends leaves the failure in the UNSOUND
-/// direction. A verifier measured it: with `p = x^2 - 1` and the root `-1`
-/// dropped, `SignCond::Lt` returned the EMPTY set for a feasible set that is
-/// genuinely `(-1, 1)` — `is_empty()` true and `contains(0)` false. In an MCSAT
-/// search a wrongly emptied feasible set is a conflict that does not exist,
-/// i.e. a wrong `unsat`, and no model gate can catch that: every gate validates
-/// a model, and a model exists only on the `sat` side.
-///
-/// The oracle cannot see this by construction — `check_sign_cells` always feeds
-/// z3's complete root list — so it is pinned here.
+/// Ordering alone is unsound: dropping -1 from x^2 - 1 made `Lt` empty instead
+/// of `(-1, 1)`, a nonexistent conflict and potentially wrong UNSAT that no
+/// SAT-side model gate could catch. The oracle always supplies z3's complete
+/// list, so this regression needs a focused unit test.
 #[test]
 fn from_sign_condition_refuses_an_incomplete_or_padded_root_list() {
     // p = x^2 - 1, real roots -1 and 1.
@@ -661,12 +632,12 @@ fn from_sign_condition_refuses_an_incomplete_or_padded_root_list() {
 
     // A DROPPED root must be refused, not silently answered.
     assert!(
-        from_sign_condition(&p, &[p1.clone()], SignCond::Lt, Just::none()).is_none(),
+        from_sign_condition(&p, std::slice::from_ref(&p1), SignCond::Lt, Just::none()).is_none(),
         "an incomplete root list must be REFUSED: answering here returns the empty \
          set for a genuinely non-empty feasible set, which is a wrong conflict"
     );
     assert!(
-        from_sign_condition(&p, &[m1.clone()], SignCond::Lt, Just::none()).is_none(),
+        from_sign_condition(&p, std::slice::from_ref(&m1), SignCond::Lt, Just::none()).is_none(),
         "dropping the other root must be refused too"
     );
 

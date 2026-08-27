@@ -161,7 +161,7 @@ fn initial_rows(model: &Model, guard: &ResourceGuard) -> Option<Vec<WorkRow>> {
 fn aggregate_candidates(work: &mut Work, guard: &ResourceGuard) -> Option<()> {
     let mut blocked = HashSet::new();
     while work.recover.len() < MAX_ELIMINATIONS && !guard.stopped() {
-        let Some(candidate) = choose_candidate(&work, &blocked, &guard)? else {
+        let Some(candidate) = choose_candidate(work, &blocked, guard)? else {
             break;
         };
         let rejected = (candidate.row, candidate.pivot);

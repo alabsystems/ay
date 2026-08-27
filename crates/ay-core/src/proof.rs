@@ -2,25 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Proof representation for AY
-//!
-//! Proofs can be produced for unsatisfiable formulas.
-//! Supports export to Alethe format for independent verification.
-//!
-//! ## Alethe Proof Format
-//!
-//! The Alethe format (used by carcara proof checker) has three main commands:
-//! - `assume`: Input assertions from the problem
-//! - `step`: Proof steps with a rule name, premises, and conclusion clause
-//! - `anchor`: Subproofs (for nested reasoning)
-//!
-//! Example Alethe proof:
-//! ```text
-//! (assume h1 (= a b))
-//! (assume h2 (= b c))
-//! (step t1 (cl (= a c)) :rule trans :premises (h1 h2))
-//! (step t2 (cl (not (= a c)) (= a c)) :rule equiv_pos1 :premises (t1))
-//! ```
+#![doc = include_str!("proof/module_docs.md")]
 
 use crate::term::TermId;
 use serde::{Deserialize, Serialize};
@@ -44,41 +26,52 @@ pub use fp::FpOp;
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum TheoryLemmaKind {
-    /// EUF transitivity chain: `(cl (not (= a b)) (not (= b c)) ... (= a z))`
-    /// Uses Alethe rule `eq_transitive`
+    /// EUF transitivity chain `(cl (not (= a b)) ... (= a z))`; Alethe: `eq_transitive`.
     EufTransitive,
 
     /// EUF reflexivity: `(cl (= a a))`. Uses Alethe rule `eq_reflexive`.
     ///
-    /// The degenerate case of a transitivity conflict: when a refuted
-    /// disequality's two sides are the SAME term, the connecting chain is
-    /// empty and there is no transitivity to state. Emitting that as
-    /// [`Self::EufTransitive`] produced a ONE-literal `eq_transitive` clause,
-    /// which the strict checker rejects outright ("EufTransitive clause must
-    /// have at least 2 literals") — so the refutation was correct but
-    /// uncertifiable, and mandatory certification degraded it to `unknown`.
-    /// Reflexivity is a rule in its own right and its clause is legitimately a
-    /// unit, so the conflict is stated as what it actually is.
+    /// This is the degenerate, empty-chain case of transitivity: the refuted
+    /// disequality has identical sides. Encoding it as [`Self::EufTransitive`]
+    /// creates an invalid one-literal `eq_transitive` clause; the dedicated
+    /// unit rule keeps mandatory certification checkable.
     EufReflexive,
 
-    /// EUF congruence: `(cl (not (= a x)) ... (= (f a) (f x)))`
-    /// Uses Alethe rule `eq_congruent`
+    /// EUF congruence `(cl (not (= a x)) ... (= (f a) (f x)))`; Alethe: `eq_congruent`.
     EufCongruent,
 
     /// EUF congruence on predicates: `(cl (not (= a x)) ... (not (p a)) (p x))`
     /// Uses Alethe rule `eq_congruent_pred`
     EufCongruentPred,
 
-    /// LRA Farkas lemma: linear combination yields contradiction
-    /// Uses Alethe rule `la_generic`
+    /// A packed EUF **congruence-closure explanation**:
+    /// `(cl (not (= a_1 b_1)) .. (not (= a_n b_n)) (= s t))`, with the single
+    /// positive equality at ANY position and equally in the packed
+    /// `(cl (or L_1 .. L_m))` form.
+    ///
+    /// Accepted exactly when `{a_i = b_i}` entails `s = t` by congruence
+    /// closure over the clause's own sub-term DAG — the shape the lazy-EUF and
+    /// array lanes emit when the link between two terms is produced BY
+    /// congruence rather than stated, which [`Self::EufTransitive`] (a
+    /// syntactic path, conclusion last, no redundant premise) and
+    /// [`Self::EufCongruent`] (one function application per side) both reject.
+    ///
+    /// Order-free by construction, so a producer may relabel a leaf in place
+    /// without touching the clause its consumers already reference. Validated
+    /// by `ay-proof`'s `validate_euf_congruence_explanation`, which merges only
+    /// on a stated hypothesis or on a head-and-sort-matching congruence and
+    /// fails closed on everything else (binders are opaque leaves).
+    ///
+    /// Alethe has no single rule for a congruence-closure explanation, so this
+    /// internal certificate renders as an honest `hole` on that wire rather
+    /// than being mislabeled as `eq_transitive`/`eq_congruent`.
+    EufCongruenceExplanation,
+
+    /// LRA Farkas contradiction by linear combination; Alethe: `la_generic`.
     LraFarkas,
 
-    /// LIA: may include cutting planes or GCD reasoning.
-    ///
-    /// `lia_generic` is the internal identity, but the pinned external checker
-    /// treats that spelling as an unchecked placeholder. Export therefore
-    /// emits an honest `hole` unless the complete step lowers to checked
-    /// `evaluate` or its actual linear certificate promotes to `la_generic`.
+    /// LIA cutting-plane/GCD reasoning. The pinned checker treats `lia_generic` as
+    /// unchecked; export uses `hole` unless lowered to `evaluate` or certified `la_generic`.
     LiaGeneric,
 
     /// Euclidean integer-remainder range theorem.
@@ -107,13 +100,11 @@ pub enum TheoryLemmaKind {
 
     /// Exact five-root guarded sequence contradiction, replayed strictly; unsupported mixed quantified-array Alethe renders as `hole`.
     SeqExtensionalCompanionContradiction,
-    /// Bitvector bit-blasting (legacy, no gate info).
-    /// Uses Alethe rule `bv_bitblast`.
+    /// Bitvector bit-blasting (legacy, no gate info); Alethe: `bv_bitblast`.
     BvBitBlast,
 
-    /// Bitvector bit-blasting with gate type annotation.
+    /// Bitvector bit-blasting with gate metadata for proof checking.
     /// Uses Alethe rule `bv_bitblast`.
-    /// Carries the specific gate type and operand width for proof checking.
     BvBitBlastGate {
         /// The BV operation that was bit-blasted.
         gate_type: BvGateType,
@@ -123,10 +114,8 @@ pub enum TheoryLemmaKind {
 
     /// Array read-over-write (select-store) axiom.
     ///
-    /// When `index_eq` is true (positive case):
-    ///   `(= (select (store a i v) i) v)`
-    /// When `index_eq` is false (negative case):
-    ///   `(=> (not (= i j)) (= (select (store a i v) j) (select a j)))`
+    /// - Equal index: `(= (select (store a i v) i) v)`.
+    /// - Distinct index: `(=> (not (= i j)) (= (select (store a i v) j) (select a j)))`.
     ///
     /// Uses Alethe rules `read_over_write_pos` / `read_over_write_neg`.
     ArraySelectStore {
@@ -256,49 +245,7 @@ pub enum TheoryLemmaKind {
     /// means no evidence, and the lemma fails closed.
     SetCardEmptyByAssertion,
 
-    /// The definitional set-cardinality recurrence over a store chain rooted
-    /// at the SYNTACTIC empty set -- the elaborated form of
-    /// `set.singleton` / `set.insert` / `set.remove`.
-    ///
-    /// ```text
-    /// (= (set.card R) 0)                                   R syntactically empty
-    /// (= (set.card (store B e true))  (+ (set.card B) 1))  e not in B
-    /// (= (set.card (store B e true))  (set.card B))        e in B
-    /// (= (set.card (store B e false)) (set.card B))        e not in B
-    /// (= (set.card (store B e false)) (- (set.card B) 1))  e in B
-    /// ```
-    ///
-    /// THE EMPTY ROOT IS LOAD-BEARING, not incidental. A finite chain of writes
-    /// over the empty carrier denotes a FINITE set, and the recurrence is a
-    /// theorem of finite set theory. Over an unrestricted base it is not safe
-    /// to hand out: under the interpretation `card(X) = |X|` for finite `X` and
-    /// `card(X) = N` for infinite `X` (`N` above every literal-membership count
-    /// in the problem) -- which satisfies [`Self::SetCardNonNegative`],
-    /// [`Self::SetCardMemberLowerBound`], [`Self::SetCardEmpty`] and the
-    /// finite-chain recurrence alike -- an increment over the universal set
-    /// reads `N = N + 1`. Requiring the empty root keeps every instance inside
-    /// the fragment where the equations are simply true. AY's own producer
-    /// imposes the identical restriction (`is_covered_store_chain`).
-    ///
-    /// AY's strict checker establishes the empty root with a walk of its OWN,
-    /// separate from the one that decides the membership side condition: the
-    /// membership walk stops at the first write on the probed index and can
-    /// answer without ever reaching the root, so it cannot be what confines the
-    /// schema to the finite fragment.
-    ///
-    /// The membership side condition is likewise re-derived rather than taken
-    /// on the producer's word. That walk steps past a write only when the two
-    /// indices are syntactically identical or DISTINCT LITERAL constants. Two
-    /// symbolic indices may denote the same element, so an undecidable chain is
-    /// rejected fail-closed rather than guessed -- the difference between
-    /// refusing to certify `|{x, y}| = 2` and asserting it (false when
-    /// `x = y`).
-    ///
-    /// Either orientation of the equality is accepted; `=` is symmetric, so
-    /// the two spellings are the same claim.
-    ///
-    /// Checkable only by AY's native strict checker; the pinned external
-    /// Alethe checker has no rule for the non-standard `set.card` operator.
+    #[doc = include_str!("proof/set_card_chain_recurrence.md")]
     SetCardChainRecurrence,
 
     /// Reflexivity of a collection subset predicate: `(cl (X.subset a a))` for
@@ -838,6 +785,18 @@ pub enum TheoryLemmaKind {
     /// `proof_validation::lia_cut_lattice`. Honest `hole` on the wire.
     IntCutLatticeGap,
 
+    /// WIDE integer clause carrying one negated-disjunction literal, valid
+    /// because for that disjunction EVERY disjunct's branch is refuted against
+    /// the clause's other negated linear literals by equality substitution,
+    /// canonical two-row elimination, and the attainable-value gap test —
+    /// the empty-clause closer's head shape on guarded mod-witness queries
+    /// (#4751), whose closing branch is strictly integer (no rational Farkas
+    /// certificate exists). `ay-proof` re-derives the entire case analysis
+    /// from the clause — there is no annotation payload to forge; soundness
+    /// argument and declined classes: `proof_validation::lia_guarded_split`.
+    /// Honest `hole` on the Alethe wire.
+    IntGuardedSplitGap,
+
     /// If-then-else with identical branches: `(= (ite c x x) x)` — a conditional
     /// whose two branches are the same term equals that branch, for ANY condition
     /// `c` and ANY sort of `x`. Uses Alethe rule `ite_same`; validated
@@ -1063,6 +1022,7 @@ pub enum TheoryLemmaKind {
     GroundEqualitySubstitution,
 }
 
+// Textual inclusion preserves the public proof-step item paths.
 include!("proof/proof_steps.rs");
 
 #[allow(clippy::panic)]

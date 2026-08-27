@@ -141,17 +141,19 @@ fn validate_theory_datatype_primary(
             }
         },
         // Finite-enum pigeonhole. Same fail-closed contract as the sibling
-        // above: without the datatype registry the checker cannot establish
-        // the constructor count or the nullarity the argument rests on, so
-        // the kind is rejected rather than assumed.
+        // above: without the datatype registry and the member signatures the
+        // checker cannot establish the constructor set or the FIELD SORTS it
+        // folds into the carrier size the argument rests on, so the kind is
+        // rejected rather than assumed.
         TheoryLemmaKind::DatatypeEnumPigeonhole => match (dt_decls, datatype_member_signatures) {
-            (Some(decls), Some(_)) => {
+            (Some(decls), Some(signatures)) => {
                 datatype_axiom::validate_datatype_enum_pigeonhole(
                     terms,
                     step_id,
                     clause,
                     decls,
                     ctor_selectors,
+                    signatures,
                 )?;
             }
             _ => {

@@ -14,6 +14,9 @@ pub enum DratParseError {
     #[error("invalid DRAT literal: {detail}")]
     InvalidLiteral { detail: String },
 
+    #[error(transparent)]
+    Literal(#[from] ay_proof_common::literal::LiteralError),
+
     #[error("invalid binary DRAT encoding at offset {offset}: {detail}")]
     InvalidBinary { offset: usize, detail: String },
 
@@ -28,6 +31,11 @@ pub enum DratParseError {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum DratCheckError {
+    /// The one-shot bulk verifier was called on reused or manually mutated
+    /// checker state.
+    #[error("bulk proof verification requires a fresh checker")]
+    CheckerNotFresh,
+
     /// A derived clause is neither RUP nor RAT implied.
     #[error("clause not {kind}implied: {clause} (step {step})")]
     NotImplied {
@@ -44,7 +52,8 @@ pub enum DratCheckError {
         source: Box<Self>,
     },
 
-    /// Proof conclusion failed (no empty clause, or step failures).
+    /// Proof conclusion failed; [`ConcludeFailure`](super::checker::ConcludeFailure)
+    /// carries the exact reason.
     #[error("{0}")]
     ConclusionFailed(#[from] super::checker::ConcludeFailure),
 

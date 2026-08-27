@@ -28,16 +28,17 @@
 //! historical wrong-`sat` bugs lived.
 
 mod current_assertion_confirmation;
+mod forall_exists_witness;
 mod point_table;
+mod printed_uf_interpretation;
+pub(in crate::executor) mod probe_budget;
 mod restoration_bridge;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::Duration;
 
 use ay_core::kani_compat::DetHashMap;
 use ay_core::term::{Symbol, TermData, TermEntryStamp, TermStoreSnapshotStamp};
-use ay_core::time::Instant;
 use ay_core::{Sort, TermId, TermStore};
 use ay_fp::FpModelValue;
 use ay_frontend::{DeclarationKind, SourceContextStamp};
@@ -55,6 +56,11 @@ use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
 mod quantified_table;
+use forall_exists_witness::{
+    quantified_gate_extract_existential_block, quantified_gate_mentions_var,
+    quantified_gate_rebuild_guarded_witness, quantified_gate_witness_sort,
+    quantified_gate_witness_tuples,
+};
 use point_table::QuantifiedGateUfInterp;
 /// Exact roots of the public query being certified: the provenance-captured
 /// pre-solve assertion snapshot when available, otherwise the current base
@@ -2155,130 +2161,6 @@ impl IndependentModelView<'_> {
         built
     }
 
-    /// Uncached body of [`Self::printed_uf_interpretation`]: the printer's own
-    /// pipeline, in the printer's order, over the model's extracted table.
-    fn build_printed_uf_interpretation(&self, identity: &str) -> Option<PrintedUfInterpretation> {
-        let euf = self.model.euf_model.as_ref()?;
-        let raw = euf.function_tables.get(identity)?;
-
-        // Locate the DECLARED signature `(get-model)` would print this table
-        // under, and reproduce the printer's suppression / other-channel
-        // rules (`Executor::format_model`, same order).
-        let ctx = &self.exec.ctx;
-        let (surface, info) = ctx
-            .symbol_iter()
-            .find(|(name, info)| ctx.symbol_identity_name(name, info) == identity)?;
-        if self.exec.is_exact_dt_internal_symbol(identity) || ctx.is_internal_symbol(surface) {
-            return None;
-        }
-        let symbol = Symbol::named(identity);
-        if !matches!(
-            self.model.projection_ufs.projected_argument_for_signature(
-                &symbol,
-                &info.arg_sorts,
-                &info.sort,
-            ),
-            Ok(None)
-        ) {
-            return None;
-        }
-        if self
-            .model
-            .certified_total_ufs
-            .by_symbol
-            .contains_key(identity)
-            || self
-                .exec
-                .const_interp_cert_witness_entries(self.model)
-                .iter()
-                .any(|entry| entry.name() == Some(surface.as_str()))
-            || self
-                .model
-                .has_formula_neutral_function_default_symbol(&symbol)
-            || ctx.adopted_macro_interp(surface).is_some()
-            || ctx.is_defined_fun(surface)
-        {
-            return None;
-        }
-        let arg_sorts: &[Sort] = &info.arg_sorts;
-        let result_sort = &info.sort;
-        if arg_sorts.is_empty() {
-            return None;
-        }
-
-        let table = self
-            .exec
-            .sequence_table_provenance_placeholders(
-                identity,
-                arg_sorts,
-                result_sort,
-                raw,
-                euf.function_table_terms.get(identity).map(Vec::as_slice),
-            )
-            .ok()?;
-        let table = self.exec.resolve_function_table(self.model, &table);
-        let table =
-            match self
-                .exec
-                .dt_egraph_rewrite_uf_table(self.model, arg_sorts, result_sort, &table)
-            {
-                super::dt_egraph_values::DtUfTableRewrite::NotApplicable => table,
-                super::dt_egraph_values::DtUfTableRewrite::Rewritten(t) => t,
-                // The printer OMITS this definition, leaving the model partial here.
-                super::dt_egraph_values::DtUfTableRewrite::Drop => return None,
-            };
-        let rows = self
-            .exec
-            .printed_uf_table_rows(identity, arg_sorts, result_sort, &table, self.model)
-            .ok()?;
-
-        // Read the printed body back into gate values ONCE. An atom this view
-        // cannot parse — or parses into anything but the gate's canonical
-        // encoding for its sort — leaves the whole interpretation unreadable
-        // (`None`): a partially readable body could match the wrong `ite` arm.
-        // MEASURED instance of the encoding case: for a QF_UFDT enum
-        // `(declare-datatype Unit ((u0) (u1)))` the EUF table of `f : Unit ->
-        // Unit` is keyed by the class tokens `@Unit!N`, and `(get-model)`
-        // prints `(ite (= x0 (as @Unit!1 Unit)) (as @Unit!0 Unit) ..)` while
-        // the gate (and the printed constant `x`) hold the value as the
-        // CONSTRUCTOR `u1` (#dt-element-canon). Those tokens would never match
-        // a constructor-valued argument, so every read would fall to the
-        // `else` arm; the table is therefore declared unreadable and the
-        // application keeps today's pin-only read
-        // (`test_enum_sat_lane_gate_excludes_uf_at_variable_args` pins that).
-        let read_atom = |atom: &str, sort: &Sort| -> Option<ModelValue> {
-            let v = self.parse_leaf(atom, sort)?;
-            self.printed_atom_in_gate_encoding(&v, sort).then_some(v)
-        };
-        let Some((_, else_atom)) = rows.last() else {
-            // Empty table => the printer emits the canonical constant body.
-            let else_value =
-                read_atom(&format_default_value_surface(ctx, result_sort), result_sort)?;
-            return Some(PrintedUfInterpretation {
-                arity: arg_sorts.len(),
-                rows: Vec::new(),
-                else_value,
-            });
-        };
-        let else_value = read_atom(else_atom, result_sort)?;
-        let mut parsed_rows = Vec::with_capacity(rows.len() - 1);
-        for (row_args, row_value) in rows.iter().take(rows.len() - 1) {
-            if row_args.len() != arg_sorts.len() {
-                return None;
-            }
-            let mut point = Vec::with_capacity(row_args.len());
-            for (atom, sort) in row_args.iter().zip(arg_sorts) {
-                point.push(read_atom(atom, sort)?);
-            }
-            parsed_rows.push((point, read_atom(row_value, result_sort)?));
-        }
-        Some(PrintedUfInterpretation {
-            arity: arg_sorts.len(),
-            rows: parsed_rows,
-            else_value,
-        })
-    }
-
     /// Whether `v` is the encoding in which THIS view hands values of `sort`
     /// to the evaluator — the only encoding a printed atom may be compared
     /// against (#g3-gate-reads-printed-uf, see
@@ -2543,13 +2425,48 @@ fn values_equal(a: &ModelValue, b: &ModelValue) -> bool {
         }
         (V::Str(x), V::Str(y)) => x == y,
         (V::Uninterpreted(x), V::Uninterpreted(y)) => x == y,
+        // BY DENOTATION, not by spelling. The old arm compared stores
+        // positionally and by length, so `((as const A) 0)` and
+        // `(store ((as const A) 0) 1 0)` — the SAME function, read at every
+        // index — compared unequal. That is not an abstract nicety: the
+        // witness printer drops a store cell whose value equals the default
+        // (`format_array_witness_value_inner`, "redundant — skip to keep the
+        // witness minimal") while `array_from_model` keeps it, so the two
+        // sources the gate reconciles in `uf_app_value_at` spell the same array
+        // differently BY CONSTRUCTION. The gate read that as a pin/printed
+        // disagreement and failed closed, withdrawing a correct `sat` on a
+        // model it could print.
+        //
+        // The discipline here is `ay_model_check::array_eq`'s, the checker this
+        // helper feeds: agree at every explicit key of EITHER side (absent keys
+        // read the default) and agree on the defaults. Differing defaults stay
+        // UNEQUAL — over an unbounded index sort the remaining points carry no
+        // evidence — so this is a canonicalisation, never a relaxation: nothing
+        // that differs at any index starts comparing equal.
         (V::Array(x), V::Array(y)) => {
+            // `.rev()` is load-bearing, not style: `ArrayValue::store` is
+            // "oldest first (newest wins on `select`)" and repeated indices are
+            // DESIGNED for here (`array_from_model` reverses `interp.stores` so
+            // a repeated store index keeps the same winner). Reading the oldest
+            // override would not merely miss the case this arm exists to fix —
+            // two arrays that genuinely differ, both carrying shadowed
+            // duplicates that agree only on their oldest entry, would compare
+            // EQUAL, and `uf_app_value_at` would then accept a pin the
+            // published interpretation contradicts. That is the pin/printed
+            // hybrid `#g3-gate-reads-printed-uf` exists to refuse. Same scan
+            // direction as `ay_model_check::array_select`, deliberately.
+            let select = |a: &ArrayValue, key: &V| -> V {
+                a.store
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| values_equal(k, key))
+                    .map_or_else(|| a.default.clone(), |(_, v)| v.clone())
+            };
             values_equal(&x.default, &y.default)
-                && x.store.len() == y.store.len()
                 && x.store
                     .iter()
-                    .zip(y.store.iter())
-                    .all(|((ka, va), (kb, vb))| values_equal(ka, kb) && values_equal(va, vb))
+                    .chain(y.store.iter())
+                    .all(|(key, _)| values_equal(&select(x, key), &select(y, key)))
         }
         (V::Datatype { ctor: c1, args: a1 }, V::Datatype { ctor: c2, args: a2 }) => {
             c1 == c2
@@ -4784,16 +4701,12 @@ impl Executor {
 
         // One shared wall budget PER CHECK-SAT for every nested confirm (an
         // axiom-heavy problem must not multiply the budget per assertion),
-        // never extending an already-tighter outer deadline. Nested solves
-        // pollute `last_statistics`; snapshot and restore so the emitted
-        // statistics describe the OUTER solve, then record this gate's own
-        // verdict keys.
-        let saved_deadline = self.solve_deadline.get();
-        let budget = Instant::now() + Duration::from_secs(2);
-        self.set_deadline(match saved_deadline {
-            Some(d) if d < budget => Some(d),
-            _ => Some(budget),
-        });
+        // never extending an already-tighter outer deadline. The window is a
+        // SLICE of the query-owned envelope, not a fresh per-arm constant --
+        // see `probe_budget`. Nested solves pollute `last_statistics`; snapshot
+        // and restore so the emitted statistics describe the OUTER solve, then
+        // record this gate's own verdict keys.
+        let (arm, saved_deadline) = self.open_quantified_gate_arm();
         let saved_statistics = self.last_statistics.clone();
         self.in_quantified_model_gate = true;
         let mut failure: Option<(TermId, QuantifiedModelCheck)> = None;
@@ -4816,7 +4729,7 @@ impl Executor {
             }
         }
         self.in_quantified_model_gate = false;
-        self.set_deadline(saved_deadline);
+        self.close_quantified_gate_arm(arm, saved_deadline);
         self.last_statistics = saved_statistics;
 
         match failure {
@@ -5794,54 +5707,13 @@ impl Executor {
             return None;
         }
 
-        // Second polarity-normalized block: `matrix ≡ ∃ ex_binders. body`.
-        let mut ex_binders: Vec<(String, Sort)> = Vec::new();
-        let mut universal: Option<bool> = None;
-        let mut cur = matrix;
-        let mut positive = true;
-        loop {
-            match self.ctx.terms.get(cur).clone() {
-                TermData::Not(inner) => {
-                    positive = !positive;
-                    cur = inner;
-                }
-                TermData::Forall(vars, body, _) => {
-                    if *universal.get_or_insert(positive) != positive {
-                        break;
-                    }
-                    ex_binders.extend(vars);
-                    cur = body;
-                }
-                TermData::Exists(vars, body, _) => {
-                    if *universal.get_or_insert(!positive) == positive {
-                        break;
-                    }
-                    ex_binders.extend(vars);
-                    cur = body;
-                }
-                _ => break,
-            }
-        }
-        if universal != Some(false) {
-            return None;
-        }
-        let body = if positive {
-            cur
-        } else {
-            self.ctx.terms.mk_not(cur)
-        };
-        if contains_quantifier(&self.ctx.terms, body) {
-            return None;
-        }
-        if ex_binders.is_empty() || ex_binders.len() > QUANTIFIED_GATE_MAX_WITNESS_BINDERS {
-            return None;
-        }
-        if !ex_binders
-            .iter()
-            .all(|(_, sort)| quantified_gate_witness_sort(sort))
-        {
-            return None;
-        }
+        // Second polarity-normalized block: either
+        // `matrix ≡ ∃ ex_binders. body`, or the canonical guarded form
+        // `matrix ≡ guard_disjuncts ∨ ∃ ex_binders. body` produced by
+        // `mk_implies`. The latter is still confirm-only: after choosing a
+        // witness we prove the stronger `guard_disjuncts ∨ body[y := t]`.
+        let (guard_disjuncts, ex_binders, body) =
+            quantified_gate_extract_existential_block(&mut self.ctx.terms, matrix)?;
         // A name shared between the two blocks (or repeated inside one) makes
         // "substitute the universal variable for the existential binder" an
         // ill-defined capture question. Refuse rather than reason about it.
@@ -5875,7 +5747,12 @@ impl Executor {
             for ((name, _), &witness) in ex_binders.iter().zip(tuple.iter()) {
                 subst.insert(name.clone(), witness);
             }
-            let instantiated = crate::ematching::subst_vars(&mut self.ctx.terms, body, &subst);
+            let witnessed = crate::ematching::subst_vars(&mut self.ctx.terms, body, &subst);
+            let instantiated = quantified_gate_rebuild_guarded_witness(
+                &mut self.ctx.terms,
+                &guard_disjuncts,
+                witnessed,
+            );
 
             // Skolemize the universal prefix with fresh constants.
             let mut universals: DetHashMap<String, TermId> = DetHashMap::default();
@@ -7035,7 +6912,11 @@ impl Executor {
         let enabled = self.ctx.datatype_iter().next().is_none();
         quantified_table::simplify(&mut self.ctx.terms, &mut assertions, enabled);
         let roots = assertions;
-        let decision = self.checked_ground_solve(roots.clone(), LogicCategory::Other, 500)?;
+        // A CEILING, not a grant: `qpf_probe_executor` clamps every probe to
+        // `solve_deadline`, which inside an arm IS that arm's envelope slice.
+        let cap_ms = probe_budget::GATE_PROBE_CAP_MS;
+        self.quantified_gate_probe_budget.record_probe_cap(cap_ms);
+        let decision = self.checked_ground_solve(roots.clone(), LogicCategory::Other, cap_ms)?;
         Some(QuantifiedGateCheckedGroundDecision {
             decision,
             roots: roots.into(),
@@ -7493,59 +7374,6 @@ const QUANTIFIED_GATE_MAX_WITNESS_CANDIDATES: usize = 4;
 /// Cap on candidate TUPLES actually discharged. Each costs one nested ground
 /// solve out of the gate's shared per-check-sat budget.
 const QUANTIFIED_GATE_MAX_WITNESS_TUPLES: usize = 6;
-
-/// Binder sorts the ∀∃ witness route accepts: fixed-interpretation domains
-/// only, so a witness TERM means the same thing in every structure satisfying
-/// the pins. `Sort::Uninterpreted` is excluded on purpose — its carrier is
-/// model-dependent and the prefix route's universe expansion owns it.
-fn quantified_gate_witness_sort(sort: &Sort) -> bool {
-    matches!(sort, Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_))
-}
-
-/// Does `term` contain a `Var` named `name`? Used to reject a witness
-/// candidate that mentions the existential binder it must eliminate.
-/// Conservative: an over-budget walk answers `true` (candidate rejected).
-fn quantified_gate_mentions_var(terms: &TermStore, term: TermId, name: &str) -> bool {
-    let mut seen: HashSet<TermId> = HashSet::default();
-    let mut stack = vec![term];
-    let mut budget = 20_000usize;
-    while let Some(t) = stack.pop() {
-        if budget == 0 {
-            return true;
-        }
-        budget -= 1;
-        if !seen.insert(t) {
-            continue;
-        }
-        if let TermData::Var(var, _) = terms.get(t) {
-            if var == name {
-                return true;
-            }
-        }
-        stack.extend(terms.children(t));
-    }
-    false
-}
-
-/// Candidate witness TUPLES in "strongest first" order: the cartesian product
-/// of the per-binder candidate lists, ordered so the first candidate of every
-/// binder is tried first, capped at [`QUANTIFIED_GATE_MAX_WITNESS_TUPLES`].
-fn quantified_gate_witness_tuples(per_binder: &[Vec<TermId>]) -> Vec<Vec<TermId>> {
-    let mut tuples: Vec<Vec<TermId>> = vec![Vec::new()];
-    for candidates in per_binder {
-        let mut next = Vec::new();
-        for prefix in &tuples {
-            for &candidate in candidates {
-                let mut extended = prefix.clone();
-                extended.push(candidate);
-                next.push(extended);
-            }
-        }
-        tuples = next;
-    }
-    tuples.truncate(QUANTIFIED_GATE_MAX_WITNESS_TUPLES);
-    tuples
-}
 
 /// One resolved raw EUF-table entry (#quantified-model-gate), phase-A form —
 /// exactly what `resolve_table_value` would print, before term conversion.
@@ -9811,7 +9639,7 @@ mod tests {
         let (category, _) = exec.detect_logic_category(&assertions);
         assert_eq!(category, LogicCategory::QfNira);
 
-        let outer_deadline = Instant::now() + Duration::from_secs(10);
+        let outer_deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(10);
         exec.set_deadline(Some(outer_deadline));
         assert!(
             exec.quantified_gate_checked_ground_solve(assertions)
@@ -10712,525 +10540,9 @@ mod tests {
         );
     }
 
-    /// COMPLETION-ORDERING REGRESSION (#array-completion-order, seed 21453).
-    ///
-    /// A witness that VALIDATES under the gate's evaluator but is EMITTED with a
-    /// different value is an invalid witness. The concrete class: a combined
-    /// AUFLIA solve commits an Int variable's value to the arithmetic (LIA)
-    /// model, while a STALE value survives in the merged EUF `term_values` map.
-    /// `evaluate_var` — the value the gate checks — resolves LIA-FIRST (so the
-    /// gate validated `i = 0`), but `(get-model)` used to read the merged EUF
-    /// map FIRST for EVERY sort, so it printed the stale EUF value `-2`. The
-    /// emitted model then FALSIFIED the formula (`(= 0 i)` became `(= 0 -2)`)
-    /// even though the gate had confirmed the LIA witness. `(get-model)` now
-    /// skips the EUF map for Int/Real, so an arithmetic variable prints the same
-    /// LIA/LRA value the gate validated — emit stays faithful to validation.
-    #[test]
-    fn get_model_int_prefers_lia_over_stale_euf_term_value() {
-        let (mut exec, outputs) =
-            solved("(set-logic QF_UFLIA)(declare-fun i () Int)(assert (<= i i))(check-sat)");
-        assert_eq!(outputs[0], "sat");
-        let i = exec.ctx.terms.mk_var("i", Sort::Int);
-
-        // The validated model commits `i = 0` in LIA; a STALE EUF entry says -2.
-        let mut lia = DetHashMap::default();
-        lia.insert(i, BigInt::from(0));
-        let mut euf = ay_euf::EufModel::default();
-        euf.term_values.insert(i, "-2".to_string());
-        exec.last_model = Some(Model {
-            quantified_confirmation_seal: Default::default(),
-            quantified_grant_model_seal: Default::default(),
-            sat_model: vec![],
-            term_to_var: DetHashMap::default(),
-            bool_overrides: DetHashMap::default(),
-            euf_model: Some(euf),
-            array_model: None,
-            lra_model: None,
-            lia_model: Some(LiaModel { values: lia }),
-            bv_model: None,
-            fp_model: None,
-            string_model: None,
-            seq_model: None,
-            projection_ufs: Default::default(),
-            certified_total_ufs: Default::default(),
-            certified_const_interps: Default::default(),
-            formula_neutral_function_defaults: Default::default(),
-            completed_values: DetHashMap::default(),
-            dt_ground: DetHashMap::default(),
-            dt_pins: DetHashMap::default(),
-        });
-        exec.last_result = Some(SolveResult::Sat);
-
-        let model_str = exec.model();
-        assert!(
-            model_str.contains("i () Int 0"),
-            "get-model must emit the gate-validated LIA value 0 (LIA-first, like \
-             evaluate_var), not the stale merged-EUF value; got: {model_str}"
-        );
-        assert!(
-            !model_str.contains("(- 2)"),
-            "get-model must NOT emit the stale merged-EUF value -2; got: {model_str}"
-        );
-    }
-
-    /// A ∀∃ alternation whose truth depends on the EMITTED VALUE of a model
-    /// constant. `∀x:Int. ∃y:Int. (y = 1 ∧ x·y ≥ x + c)` forces `y := 1`, so
-    /// the alternation says exactly `c ≤ 0` (z3 5.0.0 differential, measured:
-    /// `sat` with `(= c 0)`, `unsat` with `(= c 5)`).
-    ///
-    /// It is deliberately NONLINEAR (`x·y`) so `deep_qe` cannot eliminate the
-    /// alternation and the general route stays non-decisive — the ∀∃ witness
-    /// route is the only lane that can decide it.
-    const FORALL_EXISTS_MODEL_SENSITIVE: &str = "(set-logic NIA)\
-         (declare-fun c () Int)\
-         (assert (forall ((x Int)) (exists ((y Int)) (and (= y 1) (>= (* x y) (+ x c))))))";
-
-    /// Load [`FORALL_EXISTS_MODEL_SENSITIVE`] and publish `c := value` as the
-    /// emitted witness, with NO `check-sat` — the gate is exercised on a model
-    /// this test chose, so the two legs below differ in the MODEL alone.
-    fn forall_exists_gate_with_c(value: i64) -> Executor {
-        let commands = parse(FORALL_EXISTS_MODEL_SENSITIVE).expect("valid SMT-LIB input");
-        let mut exec = Executor::new();
-        exec.execute_all(&commands).expect("execute succeeds");
-        let c = exec.ctx.terms.mk_var("c", Sort::Int);
-        exec.last_model = Some(synthetic_lia_model(&[(c, value)]));
-        exec
-    }
-
-    /// THE NON-VACUITY BAR for the ∀∃ witness route.
-    ///
-    /// A confirm that did not actually evaluate the quantified body under the
-    /// emitted model would pass the first leg and the second one too. This
-    /// test holds the FORMULA and the CODE PATH fixed and varies only the
-    /// model:
-    ///
-    /// * `c = 0` — the synthesised witness `y := 1` reduces the conjunct to
-    ///   the ground obligation `¬(sk·1 ≥ sk + 0)`, which is UNSAT, so the gate
-    ///   CONFIRMS and the `Sat` survives with the quantified-gate marker;
-    /// * `c = 5` — the same witness yields `¬(sk·1 ≥ sk + 5)`, which is
-    ///   SATISFIABLE, no other candidate discharges, and the gate fails closed
-    ///   to `Unknown`.
-    ///
-    /// The second leg is a MUTANT MODEL the gate must reject, and does.
-    #[test]
-    fn forall_exists_witness_route_confirm_is_model_sensitive() {
-        let mut honest = forall_exists_gate_with_c(0);
-        assert_eq!(
-            honest.apply_quantified_model_failclosed_gate(SolveResult::Sat),
-            SolveResult::Sat,
-            "the ∀∃ witness route must confirm the alternation under c = 0"
-        );
-        assert_eq!(
-            honest
-                .last_statistics
-                .get_string("model_check_gate.quantified"),
-            Some("confirmed"),
-            "the Sat must survive because the QUANTIFIED gate confirmed the \
-             alternation — not because some lane bypassed it"
-        );
-
-        let mut mutant = forall_exists_gate_with_c(5);
-        assert_eq!(
-            mutant.apply_quantified_model_failclosed_gate(SolveResult::Sat),
-            SolveResult::Unknown,
-            "a model that FALSIFIES the alternation must never be confirmed"
-        );
-        assert_ne!(
-            mutant
-                .last_statistics
-                .get_string("model_check_gate.quantified"),
-            Some("confirmed"),
-            "the mutant model must not be recorded as a quantified-gate confirm"
-        );
-    }
-
-    /// The witness route is CONFIRM-ONLY over a genuinely quantifier-free
-    /// obligation: it must decline when no candidate term witnesses the
-    /// existential. `∀x:Int. ∃y:Int. (y ≤ x ∧ y ≥ x+1)` is FALSE for every
-    /// `x`, so every candidate leaves the negated obligation satisfiable and
-    /// the gate must fail closed even though the sentence is closed and
-    /// alternating — the same shape the route confirms above.
-    #[test]
-    fn forall_exists_witness_route_declines_when_no_witness_exists() {
-        let commands = parse(
-            "(set-logic NIA)\
-             (assert (forall ((x Int)) (exists ((y Int)) \
-                (and (<= y x) (>= y (+ x 1)) (>= (* x x) 0)))))",
-        )
-        .expect("valid SMT-LIB input");
-        let mut exec = Executor::new();
-        exec.execute_all(&commands).expect("execute succeeds");
-        exec.last_model = Some(synthetic_lia_model(&[]));
-        assert_eq!(
-            exec.apply_quantified_model_failclosed_gate(SolveResult::Sat),
-            SolveResult::Unknown,
-            "an unwitnessable ∀∃ must never be confirmed by the witness route"
-        );
-    }
-
-    fn fp_value(sign: bool, exponent: u64, significand: u64, eb: u32, sb: u32) -> ModelValue {
-        ModelValue::FloatingPoint {
-            sign,
-            exponent,
-            significand,
-            exponent_bits: eb,
-            significand_bits: sb,
-        }
-    }
-
-    /// The minted literal must READ BACK as exactly the value it pins — that
-    /// round trip is the whole reason a wrong pin cannot manufacture a
-    /// confirmation. Checked on the classes whose bits differ only in ways an
-    /// approximate conversion would erase.
-    #[test]
-    fn fp_pin_literal_round_trips_bit_for_bit() {
-        let mut terms = TermStore::new();
-        let sort = Sort::FloatingPoint(8, 24);
-        for mv in [
-            fp_value(false, 0, 0, 8, 24),         // +zero
-            fp_value(true, 0, 0, 8, 24),          // -zero
-            fp_value(false, 127, 0, 8, 24),       // 1.0
-            fp_value(true, 0, 1, 8, 24),          // -smallest subnormal
-            fp_value(false, 255, 0, 8, 24),       // +oo
-            fp_value(true, 255, 0, 8, 24),        // -oo
-            fp_value(false, 255, 1 << 22, 8, 24), // quiet NaN
-            fp_value(true, 255, 0x2b, 8, 24),     // NaN, sign + payload set
-        ] {
-            let term =
-                fp_model_value_to_literal(&mut terms, &mv, &sort).expect("Float32 value is exact");
-            let TermData::App(sym, args) = terms.get(term).clone() else {
-                panic!("expected an `fp` application");
-            };
-            assert_eq!(sym.name(), "fp");
-            let fields: Vec<ModelValue> = args
-                .iter()
-                .map(|&a| match terms.get(a) {
-                    TermData::Const(ay_core::term::Constant::BitVec { value, width }) => {
-                        ModelValue::BitVec {
-                            width: *width,
-                            value: value.clone(),
-                        }
-                    }
-                    other => panic!("expected a bitvector field, got {other:?}"),
-                })
-                .collect();
-            let back = ay_model_check::fp::from_field_bitvectors(&fields)
-                .expect("the minted fields must re-read");
-            let (ModelValue::FloatingPoint { .. }, ModelValue::FloatingPoint { .. }) = (&mv, &back)
-            else {
-                panic!("round trip changed the value kind");
-            };
-            let key = |v: &ModelValue| match v {
-                ModelValue::FloatingPoint {
-                    sign,
-                    exponent,
-                    significand,
-                    exponent_bits,
-                    significand_bits,
-                } => (
-                    *sign,
-                    *exponent,
-                    *significand,
-                    *exponent_bits,
-                    *significand_bits,
-                ),
-                _ => unreachable!(),
-            };
-            assert_eq!(key(&mv), key(&back), "minted literal is not the same value");
-        }
-        // +0 and -0 must not collapse onto one term.
-        let pos = fp_model_value_to_literal(&mut terms, &fp_value(false, 0, 0, 8, 24), &sort);
-        let neg = fp_model_value_to_literal(&mut terms, &fp_value(true, 0, 0, 8, 24), &sort);
-        assert_ne!(pos, neg, "+zero and -zero must pin to DISTINCT literals");
-    }
-
-    /// Everything the arm cannot mint bit-exactly must return `None`, which
-    /// leaves the leaf free and clears `total` — today's fail-closed
-    /// behaviour, never a plausible neighbouring value.
-    #[test]
-    fn fp_pin_literal_fails_closed_off_format() {
-        let mut terms = TermStore::new();
-        // Value's format disagrees with the leaf's sort.
-        assert!(fp_model_value_to_literal(
-            &mut terms,
-            &fp_value(false, 0, 0, 11, 53),
-            &Sort::FloatingPoint(8, 24)
-        )
-        .is_none());
-        // Exponent field wider than its declared width.
-        assert!(fp_model_value_to_literal(
-            &mut terms,
-            &fp_value(false, 256, 0, 8, 24),
-            &Sort::FloatingPoint(8, 24)
-        )
-        .is_none());
-        // Significand field wider than its declared width.
-        assert!(fp_model_value_to_literal(
-            &mut terms,
-            &fp_value(false, 0, 1 << 23, 8, 24),
-            &Sort::FloatingPoint(8, 24)
-        )
-        .is_none());
-        // Float128: 112 stored bits do not fit the value's u64, so the
-        // evaluator's exact envelope refuses the format outright.
-        assert!(fp_model_value_to_literal(
-            &mut terms,
-            &fp_value(false, 0, 0, 15, 113),
-            &Sort::FloatingPoint(15, 113)
-        )
-        .is_none());
-        // Not a floating-point value at all.
-        assert!(fp_model_value_to_literal(
-            &mut terms,
-            &ModelValue::Bool(true),
-            &Sort::FloatingPoint(8, 24)
-        )
-        .is_none());
-    }
-
-    /// THE BARRIER FOR THE LOAD-BEARING ARM. Review found that reverting the
-    /// `ModelValue::FloatingPoint` arm of `model_value_to_pin_term` to `None`
-    /// — undoing every one of the ~490 verdicts this change publishes — left
-    /// the whole suite green, because the two FP tests call
-    /// `fp_model_value_to_literal` DIRECTLY and never reach the dispatcher.
-    /// This test enters through `model_value_to_pin_term`, so a no-op arm
-    /// fails it.
-    ///
-    /// The property that matters is not merely "returns Some": it is that the
-    /// pin is a CLOSED FP LITERAL the nested solve cannot reinterpret. An
-    /// opaque element would let the solve pick a different float and confirm a
-    /// model that says something else — which is how a wrong `sat` would be
-    /// manufactured here.
-    #[test]
-    fn fp_leaf_pins_through_the_dispatcher_to_a_closed_literal() {
-        let mut terms = TermStore::new();
-        let mut elems = QuantifiedGateElements::default();
-        let sort = Sort::FloatingPoint(8, 24);
-        // +0.0f32: sign 0, exponent 0x00, significand 0.
-        let value = ModelValue::FloatingPoint {
-            sign: false,
-            exponent: 0,
-            significand: 0,
-            exponent_bits: 8,
-            significand_bits: 24,
-        };
-        let term = model_value_to_pin_term(&mut terms, &value, &sort, &mut elems)
-            .expect("an FP model value must pin through the dispatcher");
-        // It must NOT be an opaque uninterpreted element.
-        assert!(
-            elems.by_token.is_empty(),
-            "an FP leaf must pin to a literal, never mint an opaque gate element"
-        );
-        // And the pinned term must be closed: no free variables to reinterpret.
-        let mut stack = vec![term];
-        while let Some(t) = stack.pop() {
-            match terms.get(t).clone() {
-                TermData::Var(..) => panic!("FP pin must be closed, found a variable"),
-                TermData::App(_, args) => stack.extend(args),
-                _ => {}
-            }
-        }
-    }
-
-    /// A `RoundingMode` leaf must pin to the MODE, not to an opaque gate
-    /// element the nested solve is free to reinterpret.
-    #[test]
-    fn rounding_mode_pins_to_the_literal_not_an_opaque_element() {
-        let mut terms = TermStore::new();
-        let mut elems = QuantifiedGateElements::default();
-        let sort = Sort::Uninterpreted("RoundingMode".to_string());
-        for (token, short) in [
-            ("roundNearestTiesToEven", "RNE"),
-            ("RNE", "RNE"),
-            ("roundTowardZero", "RTZ"),
-            ("RTP", "RTP"),
-        ] {
-            let term = model_value_to_pin_term(
-                &mut terms,
-                &ModelValue::Uninterpreted(token.to_string()),
-                &sort,
-                &mut elems,
-            )
-            .expect("a named rounding mode is exactly expressible");
-            let TermData::App(sym, args) = terms.get(term).clone() else {
-                panic!("expected a nullary rounding-mode application");
-            };
-            assert_eq!(sym.name(), short);
-            assert!(args.is_empty());
-        }
-        assert!(
-            elems.by_token.is_empty(),
-            "no opaque element constant may be minted for a rounding mode"
-        );
-        // A token that names no mode fails closed rather than inventing one.
-        assert!(model_value_to_pin_term(
-            &mut terms,
-            &ModelValue::Uninterpreted("@RoundingMode!0".to_string()),
-            &sort,
-            &mut elems,
-        )
-        .is_none());
-    }
-    // -----------------------------------------------------------------------
-    // #g3-gate-reads-printed-uf — RECONCILED read of the published UF
-    // interpretation (`IndependentModelView::uf_app_value_at`).
-    //
-    // These forge the model directly (no `check-sat`), so each pair below
-    // holds the FORMULA and the CODE PATH fixed and varies only the model —
-    // the same non-vacuity bar as `forall_exists_witness_route_confirm_is_model_sensitive`.
-    // The end-to-end positive cases live in `executor_tests/smt/qf_uflia.rs`
-    // (`test_clearsy_00302_prefix_first_query_is_sat`,
-    // `test_clearsy_00307_printed_uf_interpretation_queries_are_sat`).
-    // -----------------------------------------------------------------------
-
-    /// [`synthetic_euf_model`] plus the `function_tables` rows `(get-model)`
-    /// prints (last row = `else` branch).
-    fn synthetic_euf_model_with_tables(
-        term_values: &[(TermId, &str)],
-        function_tables: &[(&str, &[(&[&str], &str)])],
-    ) -> Model {
-        let mut model = synthetic_euf_model(term_values);
-        let euf = model.euf_model.as_mut().expect("euf model just installed");
-        for &(f, rows) in function_tables {
-            euf.function_tables.insert(
-                f.to_string(),
-                rows.iter()
-                    .map(|(args, v)| (args.iter().map(|a| a.to_string()).collect(), v.to_string()))
-                    .collect(),
-            );
-        }
-        model
-    }
-
-    const G3_UNLISTED_POINT_PREFIX: &str = "(set-logic QF_UF)\
-         (declare-sort U 0)\
-         (declare-fun mem (U U) Bool)\
-         (declare-fun bool (Bool) U)\
-         (declare-fun a () U)\
-         (declare-fun s () U)\
-         (assert (mem a s))";
-
-    /// Load [`G3_UNLISTED_POINT_PREFIX`] plus `extra_assertion` and publish a
-    /// model in which `(mem (bool true) s)` is an UNPINNED application at an
-    /// argument point the `mem` table does not list:
-    ///
-    ///     (define-fun bool ((x0 Bool)) U (as @U!2 U))
-    ///     (define-fun mem ((x0 U) (x1 U)) Bool
-    ///       (ite (and (= x0 (as @U!0 U)) (= x1 (as @U!1 U))) true false))
-    ///
-    /// so the printed interpretation answers `false` at `(mem @U!2 @U!1)`.
-    fn g3_unlisted_point_gate(extra_assertion: &str) -> Executor {
-        let mut exec = loaded(&format!("{G3_UNLISTED_POINT_PREFIX}{extra_assertion}"));
-        let u = Sort::Uninterpreted("U".to_string());
-        let a = exec.ctx.terms.mk_var("a", u.clone());
-        let s = exec.ctx.terms.mk_var("s", u);
-        exec.last_model = Some(synthetic_euf_model_with_tables(
-            &[(a, "@U!0"), (s, "@U!1")],
-            &[
-                (
-                    "mem",
-                    &[(&["@U!0", "@U!1"], "true"), (&["@U!1", "@U!1"], "false")],
-                ),
-                ("bool", &[(&["true"], "@U!2")]),
-            ],
-        ));
-        exec
-    }
-
-    /// POSITIVE: the unlisted point reads the printed `else` branch (`false`),
-    /// so `(not (mem (bool true) s))` holds and the gate CONFIRMS — the
-    /// completeness gap class C of
-    /// the development design notes, which returned
-    /// `CannotConfirm` ("model commits no value for this application") before
-    /// this patch.
-    #[test]
-    fn g3_unlisted_uf_point_reads_printed_else_branch() {
-        let exec = g3_unlisted_point_gate("(assert (not (mem (bool true) s)))");
-        assert!(
-            matches!(
-                exec.confirm_sat_with_independent_gate(),
-                GateVerdict::ConfirmedSat
-            ),
-            "#g3-gate-reads-printed-uf: an application at an argument point the \
-             table omits must be read from the PUBLISHED total interpretation"
-        );
-    }
-
-    /// NEGATIVE CONTROL (the real one): the SAME model, and the assertion now
-    /// needs the unlisted point to be `true`. The printed interpretation says
-    /// `false` there, so the published witness falsifies the assertion and the
-    /// gate must REFUTE it — never confirm, never merely "cannot confirm". This
-    /// is the property that separates reading the published witness from
-    /// relaxing the gate.
-    #[test]
-    fn g3_unlisted_uf_point_printed_value_falsifying_assertion_is_refuted() {
-        let exec = g3_unlisted_point_gate("(assert (mem (bool true) s))");
-        assert!(
-            matches!(
-                exec.confirm_sat_with_independent_gate(),
-                GateVerdict::ModelViolates { .. }
-            ),
-            "#g3-gate-reads-printed-uf: the printed else branch answers `false` \
-             at the unlisted point, so the published witness must be REFUTED"
-        );
-    }
-
-    const G3_PIN_VS_PRINTED: &str = "(set-logic QF_UF)\
-         (declare-sort U 0)\
-         (declare-fun g (U) U)\
-         (declare-fun a () U)\
-         (declare-fun b () U)\
-         (assert (= (g a) b))";
-
-    /// Load [`G3_PIN_VS_PRINTED`] with `(g a)` PINNED to `@U!1` (= `b`) and the
-    /// printed table for `g` answering `printed_g_a` at `a`'s value.
-    fn g3_pin_vs_printed_gate(printed_g_a: &str) -> Executor {
-        let mut exec = loaded(G3_PIN_VS_PRINTED);
-        let u = Sort::Uninterpreted("U".to_string());
-        let a = exec.ctx.terms.mk_var("a", u.clone());
-        let b = exec.ctx.terms.mk_var("b", u.clone());
-        let g_a = exec.ctx.terms.mk_app(Symbol::named("g"), [a], u);
-        exec.last_model = Some(synthetic_euf_model_with_tables(
-            &[(a, "@U!0"), (b, "@U!1"), (g_a, "@U!1")],
-            &[("g", &[(&["@U!0"], printed_g_a)])],
-        ));
-        exec
-    }
-
-    /// POSITIVE: pin and printed body AGREE at the point, so the gate confirms
-    /// exactly as it did before this patch.
-    #[test]
-    fn g3_pin_agreeing_with_printed_table_confirms() {
-        let exec = g3_pin_vs_printed_gate("@U!1");
-        assert!(matches!(
-            exec.confirm_sat_with_independent_gate(),
-            GateVerdict::ConfirmedSat
-        ));
-    }
-
-    /// NEGATIVE CONTROL: the per-application pin says `g(a) = @U!1` (which
-    /// satisfies the assertion) while `(get-model)` publishes
-    /// `(define-fun g ((x0 U)) U (as @U!2 U))`, under which `(= (g a) b)` is
-    /// FALSE. "Pin wins" — the semantics of the first, unlanded version of
-    /// this patch — confirms this hybrid and ships a `sat` whose own printed
-    /// witness a validator refutes (the counterexample in
-    /// the development design notes). The reconciled
-    /// gate must REFUSE (`CannotConfirm`: the two sources disagree, so there is
-    /// no single interpretation to certify).
-    #[test]
-    fn g3_pin_disagreeing_with_printed_table_is_refused() {
-        let exec = g3_pin_vs_printed_gate("@U!2");
-        match exec.confirm_sat_with_independent_gate() {
-            GateVerdict::CannotConfirm { reason } => assert!(
-                reason.contains("model commits no value for this application of `g`"),
-                "the refusal must come from the reconciled UF read, got: {reason}"
-            ),
-            other => panic!(
-                "#g3-gate-reads-printed-uf: a pin that disagrees with the published \
-                 interpretation at the same point must fail closed, got {other:?}"
-            ),
-        }
-    }
+    include!("independent_gate/model_value_regression_tests.rs");
+    include!("independent_gate/printed_uf_tests.rs");
+    include!("independent_gate/probe_budget_barrier_tests.rs");
 }
 
 #[cfg(test)]

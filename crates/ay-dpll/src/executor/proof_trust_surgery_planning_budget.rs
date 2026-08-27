@@ -31,6 +31,25 @@ pub(in crate::executor) fn surgery_sources_are_bounded(
     )
 }
 
+/// What pricing one canonical operand cost, for a scan that may skip a source.
+///
+/// Distinguishing the middle arm from the last one is the whole point: only
+/// [`Self::Exhausted`] means the aggregate planning budget is spent and every
+/// scan must stop.
+pub(in crate::executor) enum OperandCharge {
+    /// Priced and charged. The caller may traverse the operand.
+    Charged,
+    /// `canonical_term_work` declines to price this operand — it is a binder,
+    /// too deep, or carries an unsupported symbol — so nothing about it may be
+    /// traversed, substituted into, or printed. The probe's own walk was still
+    /// charged. A caller whose recognizer cannot use such a term anyway (the
+    /// ground ITE-lift scan: `term_ite_candidates_with_cond` never descends
+    /// into a binder) may skip this source and keep scanning.
+    Unpriceable,
+    /// The aggregate planning budget is gone.
+    Exhausted,
+}
+
 /// One authority shared by every trust leaf in a surgery attempt.
 pub(in crate::executor) struct SurgeryPlanningBudget {
     remaining_work: usize,
@@ -140,6 +159,56 @@ impl SurgeryPlanningBudget {
         self.spend_work(total)
     }
 
+    /// Price ONE canonical operand for a scan that is allowed to SKIP a source
+    /// it cannot use, instead of abandoning the whole search.
+    ///
+    /// [`Self::spend_terms`] collapses two very different answers into one
+    /// `false`: "the aggregate budget is gone" and "`canonical_term_work`
+    /// declines to price this term at all" (it refuses every `forall`/`exists`/
+    /// `let` outright). A scan over the AUTHORED ASSERTION LIST hits the second
+    /// answer on the first quantified assertion in the file and, reading it as
+    /// exhaustion, stops — so on a problem with a `forall` anywhere near the
+    /// front, every ground source after it becomes invisible to the repair.
+    /// Measured on the `inc_some_list` dual-vocabulary obligation
+    /// (#dt-uf-bridge-congruence): `originals[4]` of 111 is a `forall`, and the
+    /// Shannon-lift leaf's own source (`dn13`, `originals[14]`) was never
+    /// examined, so the ITE-lift lane declined a leaf it can actually prove.
+    ///
+    /// Both outcomes are charged: [`OperandCharge::Unpriceable`] costs the
+    /// probe's own traversal, so a refusal buys no free work.
+    pub(in crate::executor) fn charge_operand(
+        &mut self,
+        terms: &TermStore,
+        operand: TermId,
+    ) -> OperandCharge {
+        if let Some(&work) = self.canonical_work.get(&operand) {
+            return if self.spend_work(work) {
+                OperandCharge::Charged
+            } else {
+                OperandCharge::Exhausted
+            };
+        }
+        if self.canonical_work.len() >= MAX_CACHED_TERMS {
+            return OperandCharge::Exhausted;
+        }
+        let (work, probe) = canonical_term_work_probe(terms, operand);
+        let Some(work) = work else {
+            // Charge the refused walk on the SAME scale the success path uses.
+            let probe_work = probe.saturating_mul(size_of::<TermData>());
+            return if self.spend_work(probe_work) {
+                OperandCharge::Unpriceable
+            } else {
+                OperandCharge::Exhausted
+            };
+        };
+        self.canonical_work.insert(operand, work);
+        if self.spend_work(work) {
+            OperandCharge::Charged
+        } else {
+            OperandCharge::Exhausted
+        }
+    }
+
     /// Charge a solver-backed provenance reconstruction and all of its rows.
     pub(in crate::executor) fn spend_farkas_attempt(
         &mut self,
@@ -165,6 +234,18 @@ impl SurgeryPlanningBudget {
 /// Bound canonical traversal before substitution, formatting, or solver work.
 /// Shared DAGs are charged per occurrence to match recursive consumers.
 pub(in crate::executor) fn canonical_term_work(terms: &TermStore, root: TermId) -> Option<usize> {
+    canonical_term_work_probe(terms, root).0
+}
+
+/// [`canonical_term_work`] plus the traversal the PROBE ITSELF performed.
+///
+/// A refusal — a binder, an over-deep DAG, an unsupported symbol — still costs
+/// real walking, and a caller that reads the refusal as "skip this source"
+/// instead of "stop everything" has to pay for it: otherwise a file of
+/// `forall`s buys unbounded planning work one free probe at a time. The visit
+/// count is the same quantity the success path already folds into its cost
+/// (`visits * size_of::<TermData>()`), so both outcomes bill on one scale.
+fn canonical_term_work_probe(terms: &TermStore, root: TermId) -> (Option<usize>, usize) {
     const MAX_VISITS: usize = 100_000;
     const MAX_DEPTH: usize = 256;
     const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -198,59 +279,64 @@ pub(in crate::executor) fn canonical_term_work(terms: &TermStore, root: TermId) 
 
     let mut pending = vec![(root, 0usize)];
     let mut visits = 0usize;
-    let mut bytes = 0usize;
-    while let Some((term, depth)) = pending.pop() {
-        visits = visits.checked_add(1)?;
-        if visits > MAX_VISITS || depth > MAX_DEPTH {
-            return None;
-        }
-        let local = match terms.get(term) {
-            TermData::Const(Constant::Bool(_)) => 1,
-            TermData::Const(Constant::Int(value)) => bigint_bytes(value)?,
-            TermData::Const(Constant::Rational(value)) => {
-                bigint_bytes(value.0.numer())?.checked_add(bigint_bytes(value.0.denom())?)?
+    // The walk is wrapped so its `?` exits land HERE and `visits` survives them:
+    // a refusal has to report the work it already did, not zero.
+    let work = (|| {
+        let mut bytes = 0usize;
+        while let Some((term, depth)) = pending.pop() {
+            visits = visits.checked_add(1)?;
+            if visits > MAX_VISITS || depth > MAX_DEPTH {
+                return None;
             }
-            TermData::Const(Constant::BitVec { value, width }) => bigint_bytes(value)?
-                .max(usize::try_from(*width).ok()?)
-                .saturating_add(2),
-            TermData::Const(Constant::String(value)) => value.len(),
-            TermData::Var(name, _) => name.len(),
-            TermData::App(symbol, args) => {
-                if pending
-                    .len()
-                    .saturating_add(visits)
-                    .saturating_add(args.len())
-                    > MAX_VISITS
-                {
-                    return None;
+            let local = match terms.get(term) {
+                TermData::Const(Constant::Bool(_)) => 1,
+                TermData::Const(Constant::Int(value)) => bigint_bytes(value)?,
+                TermData::Const(Constant::Rational(value)) => {
+                    bigint_bytes(value.0.numer())?.checked_add(bigint_bytes(value.0.denom())?)?
                 }
-                pending.extend(args.iter().map(|&arg| (arg, depth + 1)));
-                symbol_work(symbol, MAX_VISITS.saturating_sub(visits))?
-                    .saturating_add(args.len().saturating_mul(4))
+                TermData::Const(Constant::BitVec { value, width }) => bigint_bytes(value)?
+                    .max(usize::try_from(*width).ok()?)
+                    .saturating_add(2),
+                TermData::Const(Constant::String(value)) => value.len(),
+                TermData::Var(name, _) => name.len(),
+                TermData::App(symbol, args) => {
+                    if pending
+                        .len()
+                        .saturating_add(visits)
+                        .saturating_add(args.len())
+                        > MAX_VISITS
+                    {
+                        return None;
+                    }
+                    pending.extend(args.iter().map(|&arg| (arg, depth + 1)));
+                    symbol_work(symbol, MAX_VISITS.saturating_sub(visits))?
+                        .saturating_add(args.len().saturating_mul(4))
+                }
+                TermData::Not(inner) => {
+                    pending.push((*inner, depth + 1));
+                    1
+                }
+                TermData::Ite(cond, then_term, else_term) => {
+                    pending.extend([
+                        (*cond, depth + 1),
+                        (*then_term, depth + 1),
+                        (*else_term, depth + 1),
+                    ]);
+                    3
+                }
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return None,
+                _ => return None,
+            };
+            bytes = bytes.checked_add(local)?;
+            if bytes > MAX_BYTES {
+                return None;
             }
-            TermData::Not(inner) => {
-                pending.push((*inner, depth + 1));
-                1
-            }
-            TermData::Ite(cond, then_term, else_term) => {
-                pending.extend([
-                    (*cond, depth + 1),
-                    (*then_term, depth + 1),
-                    (*else_term, depth + 1),
-                ]);
-                3
-            }
-            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => return None,
-            _ => return None,
-        };
-        bytes = bytes.checked_add(local)?;
-        if bytes > MAX_BYTES {
-            return None;
         }
-    }
-    bytes
-        .checked_add(visits.saturating_mul(size_of::<TermData>()))
-        .filter(|&work| work <= MAX_BYTES)
+        bytes
+            .checked_add(visits.saturating_mul(size_of::<TermData>()))
+            .filter(|&work| work <= MAX_BYTES)
+    })();
+    (work, visits)
 }
 
 #[cfg(test)]
@@ -269,6 +355,45 @@ mod tests {
             assert!(budget.spend_farkas_attempt(&terms, &[atom]));
         }
         assert!(!budget.spend_farkas_attempt(&terms, &[atom]));
+    }
+
+    /// The tri-state charge must separate "cannot price this" from "budget
+    /// gone" — the conflation that made one authored `forall` abort the whole
+    /// ground ITE-lift scan (#shannon-lift-checkable).
+    #[test]
+    fn charging_a_binder_operand_is_unpriceable_not_exhaustion() {
+        let mut terms = TermStore::new();
+        let body = terms.mk_var("charge_binder_body", Sort::Bool);
+        let binder = terms.mk_forall(vec![("charge_z".to_string(), Sort::Int)], body);
+        assert!(
+            super::canonical_term_work(&terms, binder).is_none(),
+            "the cost model refuses to price a binder",
+        );
+        let mut budget = SurgeryPlanningBudget::new();
+        assert!(matches!(
+            budget.charge_operand(&terms, binder),
+            super::OperandCharge::Unpriceable
+        ));
+        // The scan may go on to price and use an ordinary ground operand.
+        assert!(matches!(
+            budget.charge_operand(&terms, body),
+            super::OperandCharge::Charged
+        ));
+    }
+
+    /// A refusal is still billed, so a file of binders cannot buy unbounded
+    /// planning work one free probe at a time.
+    #[test]
+    fn an_unpriceable_operand_still_spends_the_aggregate_budget() {
+        let mut terms = TermStore::new();
+        let body = terms.mk_var("charge_drain_body", Sort::Bool);
+        let binder = terms.mk_forall(vec![("charge_drain_z".to_string(), Sort::Int)], body);
+        let mut budget = SurgeryPlanningBudget::new();
+        budget.set_remaining_work_for_test(1);
+        assert!(matches!(
+            budget.charge_operand(&terms, binder),
+            super::OperandCharge::Exhausted
+        ));
     }
 
     #[test]

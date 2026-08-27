@@ -10,6 +10,11 @@ use ay_core::{FarkasAnnotation, TermId};
 /// `P(ite c u v)`, together with every checked term needed to replace the
 /// trusted leaf by an `ite_intro`/linear-arithmetic derivation.
 pub(super) struct IteLiftPlan {
+    /// `false`: the goal is the packed `(ite c A B)` (the historical shape).
+    /// `true`: the goal is the GUARDED THEN-PROJECTION `(or (not c) A)` that
+    /// arithmetic-ITE clausification leaves when the else branch is trivially
+    /// true; only the then-side transfer is emitted, packed by `or_neg`.
+    pub(super) guarded_then_or: bool,
     pub(super) orig: TermId,
     /// Canonical source whose parsed surface spells `orig`.
     pub(super) defining_source: Option<TermId>,

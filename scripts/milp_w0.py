@@ -475,8 +475,37 @@ def cmd_gate(args) -> int:
     return 1 if alarms else 0
 
 
+def ay_truncated(ay: dict) -> bool:
+    """Did ay's LP row fail to reach a terminating Optimal?
+
+    DERIVED, never stored — and that distinction is the whole point. The
+    `truncated` KEY is only written on the branch that successfully parses a
+    `diag_float_lp` line, so `HARDTIMEOUT`, `CRASH`, `TIMEOUT` and `NOPARSE`
+    rows carried no key at all and `.get("truncated")` read them as CLEAN.
+    Those are precisely the rows whose `t` is a deadline rather than a
+    measurement, so they were the ones contaminating the "restricted to rows
+    where both arms terminated" geomean this predicate exists to protect.
+    Anything that is not a terminating `Optimal` is a FLOOR.
+    """
+    return ay.get("status") != "Optimal"
+
+
 def run_ay_lp(inst: dict, secs: float) -> dict:
-    """ay's root LP relaxation, alone (`AY_LP_ONLY=1` -> `diag_float_lp`)."""
+    """ay's root LP relaxation on the MEASUREMENT SCAFFOLD lane, not the shipped one.
+
+    `AY_LP_ONLY=1` reaches `diag_float_lp`: ONE COLD WALK, no float-lane ladder,
+    no eager-perturb retry, nothing certified — and `plain_cold` OFF, where the
+    shipped continuous entry (`session::continuous_float_first_optimum`) has it
+    unconditionally ON and retries a declined walk on a fresh `FloatLp`. So:
+
+    * `primal_iters` / `dual_iters` / `primal_degen` are what this instrument is
+      FOR and are sound — deterministic counters on a named lane;
+    * `status` is the SCAFFOLD's status. `Stopped` here does not mean the solver
+      cannot answer the LP; `ay-milp diag shipped-lp` is the lane that says that;
+    * `t` on a non-`Optimal` row is the DEADLINE, i.e. a lower bound on the
+      walk's cost, and `cmd_lp` divides it by Gurobi's completed time anyway.
+      Ratios built from truncated rows are floors, not measurements.
+    """
     env = dict(os.environ, AY_LP_ONLY="1")
     env.pop("AY_ROOT_CLOSURE", None)
     try:
@@ -494,6 +523,10 @@ def run_ay_lp(inst: dict, secs: float) -> dict:
     # degenerate wants an anti-degeneracy device, one that is not wants better pricing.
     dg = re.search(r"degen=(\d+)", txt)
     return {"status": m.group(1), "t": float(m.group(2)),
+            # Which lane produced the row above, recorded in the artifact so a
+            # later reader cannot mistake it for the shipped one.
+            "lane": "scaffold-cold-walk(diag_float_lp): no ladder, no retry, plain_cold off",
+            "truncated": m.group(1) != "Optimal",
             "primal_iters": int(it.group(1)) if it else None,
             "dual_iters": int(it.group(2)) if it else None,
             "primal_degen": int(dg.group(1)) if dg else None}
@@ -532,6 +565,17 @@ def cmd_lp(args) -> int:
     every adopted row is carried by every LP of every node. That makes LP cost the
     binding constraint on cut quality, and this is the number behind that claim: the
     same LP relaxation, solved by ay's float lane and by Gurobi, single-threaded.
+
+    WHAT THE RATIO IS AND IS NOT. The ay arm is `run_ay_lp` — the measurement
+    SCAFFOLD's cold walk, not the lane a solve runs (see that function). Two
+    consequences the summary below now prints rather than leaving to the reader:
+
+    * a row whose ay arm is not `Optimal` contributes `deadline / gurobi_time`,
+      which is a FLOOR on the true ratio, not the ratio;
+    * the ay arm runs with `plain_cold` OFF and with no declined-walk retry, so
+      the ratio is against a configuration production does not use.
+
+    The counter columns (`primal_iters`, `primal_degen`) carry neither caveat.
     """
     corpus = load_corpus(args.tier, args.only, args.limit, opt_only=False)
     print(f"[lp] {len(corpus)} instances, {args.secs}s each", flush=True)
@@ -550,7 +594,20 @@ def cmd_lp(args) -> int:
               f"grb={tg if tg is None else f'{tg:7.3f}s'} {rt}", flush=True)
         emit(args.out, {"mode": "lp", "secs": args.secs, "rows": rows}, quiet=True)
     emit(args.out, {"mode": "lp", "secs": args.secs, "rows": rows})
-    have = [r for r in rows if r.get("ratio")]
+    # `is not None`, NOT truthiness. A ratio of exactly 0.0 is FALSY, and `wall=`
+    # was printed at THREE decimals, so every LP ay answered in under a millisecond
+    # reported `wall=0.000s`, produced ratio `0.0`, and was DELETED here — silently,
+    # and only ever from the rows where ay is FASTEST. A geomean whose sample is
+    # filtered by the metric's own smallness is not a geomean of the corpus.
+    # (The emission now prints six decimals; this guard is what makes that reach
+    # the summary, and it keeps the drop VISIBLE if a zero ever recurs.)
+    have = [r for r in rows if r.get("ratio") is not None and r["ratio"] > 0.0]
+    dropped_zero = [r for r in rows if r.get("ratio") == 0.0]
+    if dropped_zero:
+        print(f"[lp] {len(dropped_zero)} rows had ay wall below the emission's resolution "
+              f"(ratio 0.0) and are EXCLUDED — these are ay's FASTEST rows, so the "
+              f"geomean below is biased AGAINST ay by exactly this set: "
+              + ", ".join(sorted(r["name"] for r in dropped_zero)))
     if have:
         # GEOMETRIC mean: these are ratios spanning orders of magnitude, and an
         # arithmetic mean of ratios is dominated by whichever instance is worst.
@@ -560,9 +617,21 @@ def cmd_lp(args) -> int:
         slower = sum(1 for r in have if r["ratio"] > 1.0)
         print(f"\n[lp] ay/gurobi LP time over {len(have)}: geomean {geo:.1f}x, "
               f"median {med:.1f}x, ay slower on {slower}")
+        trunc = [r for r in have if ay_truncated(r["ay"])]
+        print(f"[lp] ay arm = SCAFFOLD cold walk (no ladder, no retry, plain_cold off), "
+              f"NOT the shipped lane; {len(trunc)}/{len(have)} ay rows did not reach Optimal, "
+              f"so their ratios are FLOORS (deadline/gurobi), not measurements")
+        if trunc:
+            clean = [r["ratio"] for r in have if not ay_truncated(r["ay"])]
+            if clean:
+                clogs = sorted(math.log(x) for x in clean)
+                print(f"[lp] restricted to the {len(clean)} rows where BOTH arms terminated: "
+                      f"geomean {math.exp(sum(clogs)/len(clogs)):.1f}x, "
+                      f"median {math.exp(clogs[len(clogs)//2]):.1f}x")
         worst = sorted(have, key=lambda r: -r["ratio"])[:8]
         for r in worst:
-            print(f"   {r['name']:26s} {r['ratio']:8.1f}x  ({r['rows']}x{r['cols']})")
+            flag = "  [FLOOR: ay truncated]" if ay_truncated(r["ay"]) else ""
+            print(f"   {r['name']:26s} {r['ratio']:8.1f}x  ({r['rows']}x{r['cols']}){flag}")
     return 0
 
 

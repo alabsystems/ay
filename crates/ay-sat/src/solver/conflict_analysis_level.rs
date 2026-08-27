@@ -105,7 +105,13 @@ impl Solver {
                         }
                     }
                 }
-                self.arena.literals_mut(clause_idx).swap(i, best_pos);
+                // `swap_literals`, not `literals_mut(..).swap(..)`: this is a
+                // PERMUTATION of one clause's literals (watch repair), and
+                // `literals_mut` conservatively bumps the arena's
+                // `formula_epoch` — which would invalidate the incremental
+                // relevancy frontier on every conflict for a mutation no
+                // set-valued consumer can observe (#relevancy-frontier-incremental).
+                self.arena.swap_literals(clause_idx, i, best_pos);
                 // Only add the new watch if we actually removed the old one.
                 if best_pos > 1 && removed_watch {
                     let new_watched = self.arena.literals(clause_idx)[i];

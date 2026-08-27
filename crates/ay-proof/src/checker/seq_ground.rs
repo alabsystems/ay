@@ -173,7 +173,7 @@ pub(crate) fn validate_seq_ground_eval(
 }
 
 /// Declaration-free recognizer used by proof producers: `true` exactly when
-/// [`validate_seq_ground_eval`] accepts the clause.
+/// `validate_seq_ground_eval` accepts the clause.
 #[must_use]
 pub fn recognize_seq_ground_eval(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_seq_ground_eval(terms, ProofId(0), clause).is_ok()

@@ -12,10 +12,10 @@
 //! roots, and the Thom derivative-tower sign encoding. No new mathematics — only
 //! visibility.
 //!
-//! Every function keeps the engine's fail-closed contract: it returns `None` on
-//! a refinement cap or an unrepresentable request, and NEVER a wrong value, so
-//! the FFI can map `None` to `Z3_EXCEPTION` without ever fabricating an
-//! algebraic number, sign, or ordering.
+//! Every function keeps the engine's fail-closed contract: it returns `None`
+//! when a bounded certificate declines or a request is unrepresentable, and
+//! NEVER a wrong value, so the FFI can map `None` to `Z3_EXCEPTION` without
+//! ever fabricating an algebraic number, sign, or ordering.
 
 use std::cmp::Ordering;
 
@@ -44,8 +44,9 @@ pub fn sign(s: &RealScalar) -> Option<i32> {
 /// Canonicalize a scalar: an algebraic value is reduced to identity-residue
 /// form over its canonical defining polynomial (or collapses to a rational when
 /// the value is actually rational); a rational is returned unchanged. `None`
-/// only on a refinement cap. Producing every stored scalar through this makes
-/// the classification / introspection surface exact and total.
+/// means a bounded refinement or rational-recognition certificate declined.
+/// Producing every stored scalar through this keeps the classification /
+/// introspection surface exact and fail-closed.
 pub fn canonicalize(s: &RealScalar) -> Option<RealScalar> {
     match s {
         RealScalar::Rational(r) => Some(RealScalar::Rational(r.clone())),
@@ -56,14 +57,15 @@ pub fn canonicalize(s: &RealScalar) -> Option<RealScalar> {
     }
 }
 
-/// `true` iff the (canonicalized) scalar is rational. `None` on a refinement cap.
+/// `true` iff the (canonicalized) scalar is rational. `None` when a bounded
+/// refinement or rational-recognition certificate declines.
 pub fn is_rational(s: &RealScalar) -> Option<bool> {
     Some(matches!(canonicalize(s)?, RealScalar::Rational(_)))
 }
 
 /// The rational value of `s` as `(numerator, denominator)` with a positive
 /// denominator, when `s` is rational; `None` when it is a genuine irrational
-/// algebraic (or on a refinement cap).
+/// algebraic (or when a bounded certificate declines).
 pub fn as_rational(s: &RealScalar) -> Option<(BigInt, BigInt)> {
     match canonicalize(s)? {
         RealScalar::Rational(r) => Some((r.numer().clone(), r.denom().clone())),
@@ -73,8 +75,8 @@ pub fn as_rational(s: &RealScalar) -> Option<(BigInt, BigInt)> {
 
 /// Integer coefficients (low-to-high) of a defining polynomial of `s`: the
 /// square-free integer defining polynomial for a genuine algebraic value, or
-/// `den*x - num` (coefficients `[-num, den]`) for a rational. `None` on a
-/// refinement cap.
+/// `den*x - num` (coefficients `[-num, den]`) for a rational. `None` when a
+/// bounded certificate declines.
 pub fn defining_coeffs(s: &RealScalar) -> Option<Vec<BigInt>> {
     match canonicalize(s)? {
         RealScalar::Rational(r) => Some(vec![-r.numer().clone(), r.denom().clone()]),
@@ -84,7 +86,7 @@ pub fn defining_coeffs(s: &RealScalar) -> Option<Vec<BigInt>> {
 
 /// 1-based root index of `s` among the ascending real roots of its defining
 /// polynomial. A rational is the unique root of `den*x - num`, so its index is
-/// `1`. `None` on a refinement cap.
+/// `1`. `None` when a bounded certificate declines.
 pub fn root_index(s: &RealScalar) -> Option<usize> {
     match canonicalize(s)? {
         RealScalar::Rational(_) => Some(1),
@@ -93,7 +95,7 @@ pub fn root_index(s: &RealScalar) -> Option<usize> {
 }
 
 /// Open isolating interval `(lo, hi)` of a genuine algebraic value; `None` for a
-/// rational (a point, not an interval) or on a refinement cap.
+/// rational (a point, not an interval) or when a bounded certificate declines.
 pub fn interval(s: &RealScalar) -> Option<(BigRational, BigRational)> {
     match canonicalize(s)? {
         RealScalar::Rational(_) => None,
@@ -106,7 +108,7 @@ pub fn interval(s: &RealScalar) -> Option<(BigRational, BigRational)> {
 
 /// z3 `root-obj` rendering of a genuine algebraic value (e.g.
 /// `(root-obj (+ (^ x 2) (- 2)) 2)` for √2); `None` for a rational (render it
-/// as a fraction instead) or on a refinement cap.
+/// as a fraction instead) or when a bounded certificate declines.
 pub fn root_obj_string(s: &RealScalar) -> Option<String> {
     match canonicalize(s)? {
         RealScalar::Rational(_) => None,
@@ -148,9 +150,9 @@ pub fn real_roots(coeffs: &[BigRational]) -> Option<Vec<RealScalar>> {
 /// * otherwise the unique real root with the sign of `a` (the non-negative root
 ///   for even `k`, `a > 0`; the unique real root for odd `k`).
 ///
-/// `None` on a refinement cap. `a^(1/k)` is a root of `q(x^k)` where `q` is a
-/// defining polynomial of `a`; the correct branch is selected by verifying
-/// `root^k == a` exactly.
+/// `None` also when a bounded certificate declines. `a^(1/k)` is a root of
+/// `q(x^k)` where `q` is a defining polynomial of `a`; the correct branch is
+/// selected by verifying `root^k == a` exactly.
 pub fn nth_root(a: &RealScalar, k: u32) -> Option<RealScalar> {
     if k == 0 {
         return None;
@@ -204,7 +206,7 @@ pub fn nth_root(a: &RealScalar, k: u32) -> Option<RealScalar> {
 /// `j = 1 ..= d-1`. These derivative signs uniquely pin the root among all real
 /// roots of `p` (Thom's lemma), realizing z3's `Z3_rcf_*_sign_condition_*`
 /// representation. Empty for a rational (degree-1 defining polynomial). `None`
-/// on a refinement cap.
+/// when a bounded certificate declines.
 pub fn thom_sign_conditions(s: &RealScalar) -> Option<Vec<(Vec<BigInt>, i32)>> {
     match canonicalize(s)? {
         RealScalar::Rational(_) => Some(Vec::new()),
@@ -267,6 +269,29 @@ mod tests {
         let seven_fifths = RealScalar::Rational(BigRational::new(BigInt::from(7), BigInt::from(5)));
         assert_eq!(s.cmp_exact(&three_halves), Some(Ordering::Less));
         assert_eq!(s.cmp_exact(&seven_fifths), Some(Ordering::Greater));
+    }
+
+    #[test]
+    fn large_denominator_rational_root_classification_fails_closed() {
+        // (D*x - 1)(x^2 - 2), with D beyond the rational-root certificate's
+        // leading-coefficient guard. Its unique root in (0, 1) is exactly 1/D,
+        // so classifying the declined certificate as irrational would be wrong.
+        let denominator = (BigInt::one() << 65usize) + BigInt::one();
+        let twice_denominator = &denominator << 1usize;
+        let polynomial = UniPoly::from_coeffs(vec![
+            r(2),
+            BigRational::from_integer(-twice_denominator),
+            r(-1),
+            BigRational::from_integer(denominator),
+        ]);
+        let root = RealAlgebraic::from_isolating_interval(&polynomial, &r(0), &r(1))
+            .expect("(0, 1) isolates the root 1/D");
+        let scalar = RealScalar::Algebraic(root.as_value());
+
+        assert!(root.rational_value().is_none());
+        assert!(root.as_value().to_number_for_output().is_none());
+        assert_eq!(root.as_value().to_smtlib(), Some(root.to_smtlib()));
+        assert_eq!(is_rational(&scalar), None);
     }
 
     #[test]

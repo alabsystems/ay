@@ -189,3 +189,16 @@ fn hybrid_bonus_normalises_over_available_signals_only() {
         view.bonus(0, false)
     );
 }
+
+/// Unordered history cannot become branching advice. In particular, replacing
+/// the explicit partial-order check with `avg <= 0.0` would let this NaN escape.
+#[test]
+fn hybrid_bonus_rejects_an_unordered_population_mean() {
+    let mut h = HybridHist::new(1);
+    h.infer(0, false, 1);
+    let mut view = hyb_view(&h, 8.0);
+    view.inf_avg = f64::NAN;
+    view.w_cut = 0.0;
+
+    assert_eq!(view.bonus(0, false).to_bits(), 0.0f64.to_bits());
+}

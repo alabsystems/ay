@@ -644,7 +644,7 @@ fn whole_polynomial_square_free_recurses_into_the_content() {
     // Gauss's lemma, stated as the oracle states it: the integer content is
     // carried through EXACTLY.
     assert_eq!(c.m.int_content(&sf), c.m.int_content(&p));
-    assert_eq!(c.m.int_content(&sf), num_bigint::BigInt::from(6));
+    assert_eq!(c.m.int_content(&sf), BigInt::from(6));
 }
 
 /// The integer content of `square_free(p)` equals that of `p` — the identity
@@ -666,7 +666,7 @@ fn whole_polynomial_square_free_preserves_the_integer_content() {
             c.add(&a, &b)
         };
         let base = c.mul(&f2, &g);
-        let p = c.m.mul_int(&base, &num_bigint::BigInt::from(scale));
+        let p = c.m.mul_int(&base, &BigInt::from(scale));
         let sf = c.m.square_free(&p).unwrap();
         assert_eq!(
             c.m.int_content(&sf),
@@ -781,7 +781,7 @@ fn every_declared_modulus_is_a_prime_below_2_pow_31() {
         }
         let mut d = 2u64;
         while d * d <= n {
-            if n % d == 0 {
+            if n.is_multiple_of(d) {
                 return false;
             }
             d += 1;
@@ -829,44 +829,4 @@ fn mod_gcd_fails_closed_rather_than_guessing() {
     }
 }
 
-#[test]
-fn coefficient_growth_of_the_two_gcds_is_measured_not_assumed() {
-    // A deliberately ill-conditioned pair: a dense degree-6 cofactor pair over
-    // a shared quadratic, where the PRS intermediates are known to swell.
-    let mut c = Ctx::new();
-    let g = {
-        let a = c.t(1, 2, 0, 0);
-        let b = c.t(-3, 1, 1, 0);
-        let d = c.t(7, 0, 0, 1);
-        let s = c.add(&a, &b);
-        c.add(&s, &d)
-    };
-    let mut u = g.clone();
-    let mut v = g.clone();
-    for k in 1..=4i64 {
-        let fa = c.t(k, 1, 0, 0);
-        let fb = c.t(k + 1, 0, 1, 0);
-        let fc = c.c(k * 3 - 1);
-        let f = c.add(&fa, &fb);
-        let f = c.add(&f, &fc);
-        u = c.mul(&u, &f);
-        let ha = c.t(k + 2, 1, 0, 0);
-        let hb = c.t(-k, 0, 0, 1);
-        let hc = c.c(k * 5 + 2);
-        let h = c.add(&ha, &hb);
-        let h = c.add(&h, &hc);
-        v = c.mul(&v, &h);
-    }
-    let prs = c.m.gcd(&u, &v).unwrap();
-    assert!(c.m.divides(&prs, &u) && c.m.divides(&prs, &v));
-    let modular = c.m.mod_gcd(&u, &v);
-    if let Some(mg) = modular {
-        assert_eq!(mg, prs);
-    }
-    // The answer is small even though the inputs are not; that is the whole
-    // point of the measurement in the oracle's `growth` subcommand.
-    assert!(
-        c.m.max_coeff_bits(&prs) <= c.m.max_coeff_bits(&u),
-        "the gcd cannot be wider than the input it divides"
-    );
-}
+include!("polymanager_tests/gcd_growth.rs");

@@ -159,7 +159,7 @@ pub(crate) fn validate_string_containment_identity(
 /// Recognize a clause the strict `StringContainmentIdentity` validator will
 /// accept.
 ///
-/// This is the EXACT precondition of [`validate_string_containment_identity`],
+/// This is the EXACT precondition of `validate_string_containment_identity`,
 /// so a proof producer can only tag clauses strict mode will then accept — no
 /// producer/checker drift. Decision logic lives ONLY in this module.
 #[must_use]
@@ -238,7 +238,7 @@ pub(crate) fn validate_string_concat_cancellation(
 /// Recognize a clause the strict `StringConcatCancellation` validator will
 /// accept.
 ///
-/// This is the EXACT precondition of [`validate_string_concat_cancellation`].
+/// This is the EXACT precondition of `validate_string_concat_cancellation`.
 #[must_use]
 pub fn recognize_string_concat_cancellation(terms: &TermStore, clause: &[TermId]) -> bool {
     if clause.is_empty() {
@@ -435,7 +435,7 @@ pub(crate) fn validate_string_ground_factor_conflict(
 /// accept.
 ///
 /// This is the EXACT precondition of
-/// [`validate_string_ground_factor_conflict`].
+/// `validate_string_ground_factor_conflict`.
 #[must_use]
 pub fn recognize_string_ground_factor_conflict(terms: &TermStore, clause: &[TermId]) -> bool {
     if clause.is_empty() {

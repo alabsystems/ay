@@ -51,6 +51,37 @@ pub struct ChcParser {
     problem: ChcProblem,
     /// Declared variables (name -> sort)
     variables: FxHashMap<String, ChcSort>,
+    /// Names hoisted into `variables` by a stripped QUANTIFIER BINDER in the
+    /// clause currently being parsed.
+    ///
+    /// Only binder-vs-binder collisions are variable capture. A binder that
+    /// shadows a file-scoped `declare-var` is the ordinary
+    /// `(declare-var x Int)` + `(forall ((x Int)) ...)` idiom and must be left
+    /// exactly alone — renaming it churns variable names through the emitted
+    /// formula and breaks name-dependent machinery downstream (BMC witness
+    /// replay, formula-form round trips).
+    ///
+    /// Reset per clause. NOTE this set is only a collision TRACKER: it never
+    /// removes anything from `variables`, so resolution behaviour outside a
+    /// genuine capture is bit-for-bit what it was.
+    clause_binder_names: FxHashSet<String>,
+    /// Names bound by a file-scoped `declare-var` / `declare-const`.
+    ///
+    /// A binder that shadows one of these DOES capture whenever the clause also
+    /// uses the outer name outside the binder -- e.g.
+    /// `(rule (=> (and (exists ((y Int)) (P y)) (= y 7)) (Q y)))`, where the
+    /// `y` in `(= y 7)` and `(Q y)` is the declare-var. Renaming the BINDER is
+    /// sound either way: the declare-var binding is left completely intact for
+    /// the rest of the clause, and the binder gets a private name. This is the
+    /// opposite of the earlier attempt, which REMOVED names from scope.
+    declared_var_names: FxHashSet<String>,
+    /// Active binder renames, innermost last: (source name -> minted name).
+    ///
+    /// Empty in every clause that has no capture, which is nearly all of them,
+    /// so the lookup in `parse_symbol_expr` costs one `is_empty` check.
+    active_renames: Vec<(String, String)>,
+    /// Counter making each minted binder name unique within a parse.
+    capture_counter: usize,
     /// Declared predicates (name -> (id, sorts))
     predicates: FxHashMap<String, (PredicateId, Vec<ChcSort>)>,
     /// Fixture-only TLA+ action declarations (name -> id)
@@ -85,6 +116,10 @@ impl ChcParser {
         Self {
             problem: ChcProblem::new(),
             variables: FxHashMap::default(),
+            clause_binder_names: FxHashSet::default(),
+            declared_var_names: FxHashSet::default(),
+            active_renames: Vec::new(),
+            capture_counter: 0,
             predicates: FxHashMap::default(),
             actions: FxHashMap::default(),
             declared_sorts: FxHashSet::default(),
@@ -163,6 +198,32 @@ impl ChcParser {
                 expected == actual
             }
             _ => expected == actual,
+        }
+    }
+
+    /// Clear the per-clause binder-collision tracker.
+    ///
+    /// Binder scopes are per-clause, so `forall ((u Int)) ...` appearing in
+    /// clause after clause is ordinary and must NOT read as capture. This
+    /// clears only the TRACKER; `variables` is deliberately untouched, so
+    /// nothing about name resolution changes outside a genuine capture.
+    pub(super) fn end_clause_binder_scope(&mut self) {
+        self.clause_binder_names.clear();
+        self.active_renames.clear();
+    }
+
+    /// Mint a binder name that cannot collide with any symbol in the input.
+    ///
+    /// A fixed prefix is not proof of freshness -- `!` is a legal SMT-LIB
+    /// symbol character, so the input may already contain `ay!cap!1!y`.
+    /// Extend the counter until the candidate occurs nowhere in the source.
+    pub(super) fn fresh_binder_name(&mut self, original: &str) -> String {
+        loop {
+            self.capture_counter += 1;
+            let candidate = format!("ay!cap!{}!{}", self.capture_counter, original);
+            if !self.input.contains(candidate.as_str()) {
+                return candidate;
+            }
         }
     }
 

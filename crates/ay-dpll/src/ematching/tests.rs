@@ -2229,25 +2229,4 @@ fn nested_binder_outer_only_let_alias_remains_a_trigger() {
     );
 }
 
-/// Producer/checker metering parity: the strict checker walks every occurrence
-/// of a shared DAG subtree. The exact producer must fail closed at the same
-/// 100k structural-work boundary instead of charging only distinct term IDs and
-/// emitting an artifact the checker cannot finish validating.
-#[test]
-fn exact_substitution_meters_repeated_dag_edges_like_the_checker() {
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("metered_exact_x", Sort::Int);
-    let r_x = terms.mk_app(Symbol::named("metered_exact_r"), [x], Sort::Int);
-    let q_r_x = terms.mk_app(Symbol::named("metered_exact_q"), [r_x], Sort::Int);
-    let p_q_r_x = terms.mk_app(Symbol::named("metered_exact_p"), [q_r_x], Sort::Bool);
-    let repeated = vec![p_q_r_x; 25_000];
-    let body = terms.mk_app(Symbol::named("and"), repeated, Sort::Bool);
-    let zero = terms.mk_int(BigInt::from(0));
-    let mut substitution = HashMap::default();
-    substitution.insert("metered_exact_x".to_string(), zero);
-
-    assert!(
-        subst_vars_exact_qf(&mut terms, body, &substitution).is_none(),
-        "repeated DAG edges above the strict checker's work budget must fail closed"
-    );
-}
+include!("tests/exact_substitution.rs");

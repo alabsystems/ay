@@ -137,7 +137,7 @@ const GREEN_TREE_MANUAL_D1: &str = r#"
 /// trigger plus a nonneg lemma, and a take_some-style prophecy goal over the two
 /// `Cons` constructor literals. The engine's landed selector-fold discharges this
 /// in a couple of E-matching rounds.
-const GREEN_SUM_DATATYPE_FORALL: &str = r#"
+pub(super) const GREEN_SUM_DATATYPE_FORALL: &str = r#"
 (set-logic ALL)
 (declare-datatypes ((Lst 0)) (((Nil) (Cons (hd Int) (tl Lst)))))
 (declare-fun sum (Lst) Int)

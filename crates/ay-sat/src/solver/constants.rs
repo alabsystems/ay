@@ -654,6 +654,44 @@ pub(super) const VIVIFY_MIN_EFFORT: u64 = 1_000_000;
 /// `VIVIFY_MIN_EFFORT` budget still prevents runaway on dense formulas.
 pub(super) const PREPROCESS_VIVIFY_MAX_ROUNDS: usize = 4;
 
+// ─── Irredundant vivification convergence (`--sat-vivify-converge`) ──────
+//
+// The shipped `vivify_preprocess` loop is described as a convergence loop but
+// its total effort is a formula-INDEPENDENT constant: PREPROCESS_VIVIFY_MAX_
+// ROUNDS (4) * VIVIFY_MIN_EFFORT (1M) = 4M ticks. On clause sets dominated by
+// asymmetric tautologies that constant is far below the fixed point, so the
+// loop always stops on the round cap rather than on "no progress", leaving the
+// bulk of the removable literals in place.
+//
+// Measured on the SAT-COMP 2026 `stable-400` family (400 vars; 15,939
+// all-negative binaries + 14,684 mostly-positive 20-64 literal clauses,
+// 630,483 literals): 4M ticks buys ~1.7 passes over the long clauses, AY stops
+// at 19,657 irredundant clauses, while kissat's repeated rounds reach 400.
+//
+// The convergence arm replaces the constant with a budget LINEAR in the size
+// of the formula actually being vivified, so the work bound is O(literals) and
+// can never become quadratic.
+/// Preprocessing convergence budget in vivification ticks per irredundant
+/// literal. Linear in formula size — this is the whole work bound.
+pub(super) const VIVIFY_CONVERGE_TICKS_PER_LITERAL: u64 = 64;
+
+/// Absolute ceiling on the preprocessing convergence budget, so a pathological
+/// formula cannot turn the linear bound into an unbounded one. `vivify_
+/// preprocess` only runs on `FormulaClass::Small` (< 10K vars, < 100K
+/// clauses), which caps the linear term well below this in practice.
+pub(super) const VIVIFY_CONVERGE_MAX_TICKS: u64 = 200_000_000;
+
+/// Round cap for the convergence loop. Reaching a fixed point on a cascading
+/// clause set needs many more than PREPROCESS_VIVIFY_MAX_ROUNDS passes; the
+/// tick budget is the real limiter, this only stops a degenerate ping-pong.
+pub(super) const VIVIFY_CONVERGE_MAX_ROUNDS: usize = 64;
+
+/// Wall-clock safety net for the convergence loop, in seconds. The tick budget
+/// is the primary (deterministic) bound; this only stops the loop running away
+/// on a machine where vivification BCP is far slower than the tick model
+/// assumes. Deliberately generous so ticks bind in practice.
+pub(super) const VIVIFY_CONVERGE_WALL_SECS: u64 = 30;
+
 /// Maximum number of consecutive retries for a successfully vivified clause.
 /// CaDiCaL vivify.cpp:1598-1608 (`opts.vivifyretry`, default 0): when a clause
 /// is strengthened and still has >2 literals, push it back onto the schedule for
@@ -1915,3 +1953,29 @@ pub(super) const BUCKET_QUEUE_RESTART_THRESHOLD: u32 = 8;
 /// `set_ic3_mode()` uses this default unless callers override it with
 /// `Solver::set_domain_bcp_min_vars`.
 pub(super) const IC3_DOMAIN_BCP_MIN_VARS_DEFAULT: usize = 50;
+
+// ─── Large-structured rephase walk (`--sat-large-rephase-walk`) ─────────
+//
+// Two independent gates keep `walk` from ever running on a multi-million-
+// clause structured formula:
+//
+//   1. `solve/mod.rs` disables rephasing wholesale once
+//      `num_original_clauses > VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD`
+//      (1M), and the rephase walk is the only in-search caller of `walk`.
+//   2. `rephase.rs` refuses the walk above
+//      `REPHASE_WALK_MAX_ACTIVE_CLAUSES` (2M active clauses) because walk
+//      setup rebuilds occurrence lists in O(clauses) on every call.
+//
+// kissat has no comparable cliff: `kissat_walking` (walk.c:911-934) only
+// refuses when the last irredundant clause reference or the irredundant
+// clause count exceeds `MAX_WALK_REF` = 2^31-1 (walk.c:19-20), and it walks
+// from the fixed stable-mode rephase cycle {B,W,I,B,W,O} (rephase.c:86-89).
+// On cabp-V-nos6.mtx.rnd-k275 (1,529,550 vars / 8,599,702 clauses) kissat
+// runs 3 walks and solves; AY logs `walk_ms: 0`.
+//
+// The arm lifts gate 2 to kissat's own bound and skips gate 1, leaving the
+// tick-proportional budget (`compute_walk_effort`, 50 per mille — the same
+// `walkeffort` default kissat uses) as the only limiter.
+/// Rephase-walk active-clause ceiling under `--sat-large-rephase-walk`.
+/// Mirrors kissat `MAX_WALK_REF` (`walk.c:19-20`).
+pub(super) const LARGE_REPHASE_WALK_MAX_ACTIVE_CLAUSES: usize = (1usize << 31) - 1;

@@ -8,6 +8,38 @@ use super::*;
 use crate::executor_types::{SolveResult, UnknownReason};
 
 impl Executor {
+    fn commit_authenticated_plain_bv_lia_refutation(
+        &mut self,
+        candidate: Proof,
+        quality: ay_proof::ProofQuality,
+    ) {
+        self.populate_proof_quality_stats(&quality);
+        self.last_proof_quality = Some(quality);
+        self.last_unsat_proof_reconstruction_suppressed = false;
+        self.last_sat_certificate = None;
+        self.last_unsat_certificate = None;
+        self.last_lrat_certificate = None;
+        self.last_proof_term_overrides = None;
+        self.last_clause_trace = None;
+        self.last_checked_sat_refutation = None;
+        self.last_var_to_term = None;
+        self.last_trail_provenance = None;
+        self.last_negations = None;
+        self.last_clausification_proofs = None;
+        self.last_original_clause_theory_proofs = None;
+        self.last_proof_decline = None;
+        self.last_bv_drat_self_cert = false;
+        self.clear_finite_enum_proof_state();
+        self.pending_nested_array_bool_bv_unsat = None;
+        self.clear_quantified_sat_authority();
+        self.last_model = None;
+        self.last_model_validated = false;
+        self.last_validation_stats = None;
+        self.last_proof = Some(candidate);
+        self.last_unknown_reason = None;
+        self.last_unknown_origin = None;
+    }
+
     fn authenticated_plain_authored_roots_for_seq_unknown_discharge(&self) -> Vec<TermId> {
         let Some(roots) = self.authenticated_plain_query_assertions_after_named_core_redirect()
         else {
@@ -21,9 +53,48 @@ impl Executor {
         // terms while adding no protection against generated roots.  Keep the
         // exact provenance equality explicit: this lane accepts neither a
         // prefix nor a solver-extended working set.
-        (self.proof_original_problem_assertions() == roots)
-            .then_some(roots)
-            .unwrap_or_default()
+        if self.proof_original_problem_assertions() == roots {
+            roots
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Record only the routing fact that the exact restored authored window was
+    /// rejected by the definitional-UF oracle. No proof is built here: the
+    /// restored outer seam independently authenticates and checks the complete
+    /// root set before it may change the verdict.
+    pub(in crate::executor) fn note_exact_ite_uf_definition_model_rejection(
+        &mut self,
+        oracle: &str,
+    ) {
+        if oracle != "ite_uf_definition"
+            || !self.ite_uf_definition_recovery.armed
+            || self.ite_uf_definition_recovery.attempted
+        {
+            return;
+        }
+        let Some(scope) = self.authenticated_unsat_query_roots_for_internal_certificate() else {
+            return;
+        };
+        if self.proof_original_problem_assertions() != scope {
+            return;
+        }
+        let Some(roots) = collect_bounded_bv_lia_roots(&self.ctx.terms, &scope) else {
+            return;
+        };
+        if roots.is_empty() {
+            return;
+        }
+        self.ite_uf_definition_recovery.attempted = true;
+        let auth = ay_proof::authenticate_bv_lia_unsat_query(
+            &self.ctx.terms,
+            &roots,
+            self.current_solve_deadline(),
+        );
+        if auth.is_ok() && !self.should_abort_theory_loop() {
+            self.ite_uf_definition_recovery.rejected = true;
+        }
     }
 
     /// Recompute the immutable, provenance-aligned authored roots that authorize
@@ -51,13 +122,31 @@ impl Executor {
         if originals.len() != parsed.len() {
             return Vec::new();
         }
-        let Some(roots) = self.authenticated_unsat_query_roots_for_internal_certificate() else {
+        // The strict variant requires the solver-visible assumption slot to
+        // equal the epoch's PUBLIC assumptions exactly. A named-core redirect
+        // (`:produce-unsat-cores` + `:named` assertions) leaves its TRACKING
+        // assumptions in that slot after restoring the assertion stack, so the
+        // strict variant declines ("solver assumptions mismatch") and the whole
+        // internal-certificate fallback is unreachable for every cored query —
+        // which is why a byte-identical problem answered `unsat` without the
+        // diagnostic option and `unknown (incomplete self-check-rejected)` with
+        // it. Fall back to the redirect-tolerant authority, which is exactly
+        // the helper written for this window: it still demands a current epoch,
+        // an assumption-FREE public query, `epoch.assertions == ctx.assertions`,
+        // matching source provenance, and that every surviving tracking term be
+        // a named assertion the query itself authorizes. It returns only the
+        // immutable epoch assertions, so the certificate scope is unchanged.
+        let Some(roots) = self
+            .authenticated_unsat_query_roots_for_internal_certificate()
+            .or_else(|| self.authenticated_plain_query_assertions_after_named_core_redirect())
+        else {
             return Vec::new();
         };
-        roots
-            .starts_with(&originals)
-            .then_some(roots)
-            .unwrap_or_default()
+        if roots.starts_with(&originals) {
+            roots
+        } else {
+            Vec::new()
+        }
     }
 
     /// Re-run the bounded fallback after an outer wrapper restores the exact
@@ -71,6 +160,140 @@ impl Executor {
         };
         self.rebuild_authenticated_bv_lia_internal_certificate_last_resort(&mut proof);
         self.last_proof = Some(proof);
+    }
+
+    /// Build, independently replay, exporter-scope check, and atomically
+    /// install one exact native BV/LIA-family refutation. Every fallible gate
+    /// runs before SAT/model/proof publication state is replaced.
+    fn try_install_authenticated_plain_bv_lia_refutation(
+        &mut self,
+        selected: &[TermId],
+        kind: TheoryLemmaKind,
+        authenticated_scope: &[TermId],
+    ) -> bool {
+        let Some(candidate) =
+            self.build_authenticated_bv_lia_refutation(selected, kind, authenticated_scope)
+        else {
+            return false;
+        };
+        let scope_is_current = |executor: &Self| {
+            executor.authenticated_plain_authored_roots_for_seq_unknown_discharge()
+                == authenticated_scope
+        };
+        let exporter_accepts = |executor: &Self| {
+            ay_proof::validate_reachable_assumes_in_problem_scope(
+                &candidate,
+                &executor.proof_export_scope_assertions(),
+            )
+            .is_ok()
+        };
+        if self.should_abort_theory_loop() || !scope_is_current(self) || !exporter_accepts(self) {
+            return false;
+        }
+        let Ok(quality) = self.check_proof_strict_with_datatypes(&candidate) else {
+            return false;
+        };
+        if !quality.is_complete()
+            || !Self::proof_derives_empty_clause(&candidate)
+            || self.should_abort_theory_loop()
+            || !scope_is_current(self)
+            || !exporter_accepts(self)
+        {
+            return false;
+        }
+
+        let saved_proof_check_result = self.proof_check_result.clone();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_proof_quality = self.last_proof_quality.clone();
+        let saved_statistics = self.last_statistics.clone();
+        self.proof_check_result = None;
+        self.proof_check_ok = false;
+        self.last_proof_quality = None;
+        #[cfg(feature = "proof-checker")]
+        {
+            self.run_internal_proof_check(&candidate);
+            if !self.proof_check_ok {
+                self.proof_check_result = saved_proof_check_result;
+                self.proof_check_ok = saved_proof_check_ok;
+                self.last_proof_quality = saved_proof_quality;
+                self.last_statistics = saved_statistics;
+                return false;
+            }
+        }
+        #[cfg(not(feature = "proof-checker"))]
+        if self.self_check() {
+            self.proof_check_result = saved_proof_check_result;
+            self.proof_check_ok = saved_proof_check_ok;
+            self.last_proof_quality = saved_proof_quality;
+            self.last_statistics = saved_statistics;
+            return false;
+        }
+        if self.should_abort_theory_loop() {
+            // Preserve the stop diagnostic/statistics just recorded by the
+            // deadline/interrupt check, but roll back proof-check artifacts.
+            self.proof_check_result = saved_proof_check_result;
+            self.proof_check_ok = saved_proof_check_ok;
+            self.last_proof_quality = saved_proof_quality;
+            return false;
+        }
+        if !scope_is_current(self) || !exporter_accepts(self) {
+            self.proof_check_result = saved_proof_check_result;
+            self.proof_check_ok = saved_proof_check_ok;
+            self.last_proof_quality = saved_proof_quality;
+            self.last_statistics = saved_statistics;
+            return false;
+        }
+        self.commit_authenticated_plain_bv_lia_refutation(candidate, quality);
+        true
+    }
+
+    /// Refute a strict `ite_uf_definition` model rejection only at the exact,
+    /// assumption-free public query window. The native API has already expanded
+    /// its definitional macro by construction, leaving a QF Bool/Int/BV query.
+    /// The existing authenticated BV/LIA builder and lifecycle are reused; no
+    /// source quantifier or generated component window can lend authority.
+    pub(in crate::executor) fn try_complete_exact_ite_uf_definition_rejection(
+        &mut self,
+        proposed: SolveResult,
+    ) -> SolveResult {
+        if !proposed.is_unknown()
+            || !crate::quant_unit_authority::consequence_replay_enabled()
+            || self.should_abort_theory_loop()
+            || !self.active_unsat_query_requires_strict_proof()
+        {
+            return proposed;
+        }
+        let authenticated_scope =
+            self.authenticated_plain_authored_roots_for_seq_unknown_discharge();
+        let Some(roots) = collect_bounded_bv_lia_roots(&self.ctx.terms, &authenticated_scope)
+        else {
+            return proposed;
+        };
+        if roots.is_empty() {
+            return proposed;
+        }
+        if ay_proof::authenticate_bv_lia_unsat_query(
+            &self.ctx.terms,
+            &roots,
+            self.current_solve_deadline(),
+        )
+        .is_err()
+            || self.should_abort_theory_loop()
+        {
+            return proposed;
+        }
+        let completed = self.try_install_authenticated_plain_bv_lia_refutation(
+            &roots,
+            TheoryLemmaKind::BvLiaTautology,
+            &authenticated_scope,
+        );
+        if completed {
+            let result = SolveResult::unsat();
+            self.last_result = Some(result.clone());
+            result
+        } else {
+            proposed
+        }
     }
 
     /// Discharge an exact sequence-extensionality companion theorem when
@@ -170,65 +393,13 @@ impl Executor {
         let Some((selected, kind)) = recognized else {
             return proposed;
         };
-        let Some(candidate) =
-            self.build_authenticated_bv_lia_refutation(&selected, kind, &authenticated_scope)
-        else {
-            return proposed;
-        };
-
-        // Candidate construction interns raw negations. Re-authenticate the
-        // epoch and exact term-entry stamps after that mutation, then replay
-        // through the executor's mandatory datatype-aware strict checker.
-        if self.should_abort_theory_loop()
-            || self.authenticated_plain_authored_roots_for_seq_unknown_discharge()
-                != authenticated_scope
-        {
-            return proposed;
-        }
-        let Ok(quality) = self.check_proof_strict_with_datatypes(&candidate) else {
-            return proposed;
-        };
-        if !quality.is_complete()
-            || !Self::proof_derives_empty_clause(&candidate)
-            || self.should_abort_theory_loop()
-            || self.authenticated_plain_authored_roots_for_seq_unknown_discharge()
-                != authenticated_scope
-        {
-            return proposed;
-        }
-
-        // Replace every proof/SAT-side cache as one lifecycle unit. In
-        // particular, never let `--self-check` consult a success bit left by a
-        // different proof or let an obsolete model coexist with this UNSAT.
-        self.proof_check_result = None;
-        self.proof_check_ok = false;
-        self.last_proof_quality = None;
-        #[cfg(feature = "proof-checker")]
-        {
-            self.run_internal_proof_check(&candidate);
-            if !self.proof_check_ok {
-                self.proof_check_result = None;
-                return proposed;
-            }
-        }
-        #[cfg(not(feature = "proof-checker"))]
-        if self.self_check() {
-            return proposed;
-        }
-        self.populate_proof_quality_stats(&quality);
-        self.last_proof_quality = Some(quality);
-        self.last_unsat_proof_reconstruction_suppressed = false;
-        self.last_sat_certificate = None;
-        self.last_unsat_certificate = None;
-        self.pending_nested_array_bool_bv_unsat = None;
-        self.clear_quantified_sat_authority();
-        self.last_model = None;
-        self.last_model_validated = false;
-        self.last_validation_stats = None;
-        self.last_proof = Some(candidate);
-        self.last_unknown_reason = None;
-        self.last_unknown_origin = None;
-        SolveResult::unsat()
+        self.try_install_authenticated_plain_bv_lia_refutation(
+            &selected,
+            kind,
+            &authenticated_scope,
+        )
+        .then(SolveResult::unsat)
+        .unwrap_or(proposed)
     }
 
     /// Exact native proof identity used by the self-check Seq exception.

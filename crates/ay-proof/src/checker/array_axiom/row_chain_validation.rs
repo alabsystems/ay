@@ -132,6 +132,17 @@ fn charge_row_chain_validation(
     // Sub-schema (B): cheap premise-loop overhead per positive equality, plus the
     // expensive cross-product re-walks of premise chains. This multiplicity is
     // ON TOP of the single per-node spine walks already charged above.
+    // Sub-schema (K) runs, for a TWO-literal clause only, 2 premise orientations
+    // x 2 root/chain orientations x 2 conclusion orientations = 8 chain walks of
+    // at most `n_max` entries with an `O(1)` fold decode each, on top of the 4
+    // `parse_store_chain` re-parses those orientations perform. Twelve `n_max`
+    // walks are therefore charged in full and ON TOP of the per-node spine walks
+    // above, so (K) can never be free and an adversarial spine fails closed here
+    // rather than being walked.
+    if l == 2 && !progress(mul(mul(12, n_max)?, 64)?, 0) {
+        return Err(ProofCheckError::ResourceLimit);
+    }
+
     let cheap_b = mul(pos_eq_all, premises)?;
     let expensive_b = mul(mul(pos_eq_with_select, premises)?, n_max)?;
     let cross = mul(add(cheap_b, expensive_b)?, 64)?;
@@ -210,6 +221,23 @@ fn charge_row_chain_validation(
 ///     both sides must write at the same exact index term `i`, and the two
 ///     bases `X`, `Y` are arbitrary and never inspected.
 ///
+/// (J) EXACT SAME-INDEX STORE OVERWRITE. Exactly ONE literal spells
+///     `(= (store (store B i u) i v) (store B i v))`, modulo equality
+///     orientation. `B`, `i` and `v` are exact shared terms; the shadowed
+///     value `u` is arbitrary and never inspected. This is the only
+///     one-literal sub-schema other than (A).
+///
+/// (K) ITE-FOLDED CHAIN EVALUATION UNDER AN ARRAY EQUALITY. Exactly two
+///     literals spell `not (= E C) OR (= (select E j) V)`, modulo equality and
+///     literal orientation, where `C` is a non-empty well-sorted `store` chain
+///     and `V` is the SYMBOLIC EVALUATION of `C` at `j`: nested
+///     `ite ((= i_k j)) v_k` outermost-first, terminating at the const-array
+///     default or at the exact term `(select base j)`, under the term store's
+///     own `ite` folds. The read is of the premise's OTHER root `E`, exactly.
+///     Unlike (A)/(B) this consumes NO guard literal, because the case split is
+///     inside the `ite` rather than discharged by the clause. See the
+///     `ite_eval` module for the fold table and what it deliberately declines.
+///
 /// SOUNDNESS. Assume the clause false. Then every `(= x i)` literal consumed by
 /// `eval` is false, i.e. `x != i`, so each skipped `store` is transparent at
 /// `x` by the read-over-write-negative axiom and each taken entry gives its
@@ -233,7 +261,22 @@ fn charge_row_chain_validation(
 /// `v = select(store(X,i,v), i) = select(store(Y,i,w), i) = w`, contradicting
 /// the assumed-false conclusion. That derivation never mentions `X` or `Y`,
 /// which is why they are unconstrained.
-/// (C)/(D)/(E)/(F)/(G)/(H)/(I) are intentionally exact.
+/// For (J), read both sides at an arbitrary index `k`. When `k` IS `i`,
+/// read-over-write-positive gives `v` on both sides; otherwise
+/// read-over-write-negative makes both sides read `select(B, k)`. The two
+/// arrays therefore agree at every index and extensionality equates them,
+/// contradicting the assumed-false literal. The case split needs no clause
+/// literal to discharge it because ONE syntactically identical index term is
+/// written by all three stores — the same extensional authority
+/// [`validate_array_store_permutation`] already exercises, stated for the
+/// degenerate index pair that schema cannot express.
+/// For (K), `E = C` follows from the false negative literal, so by congruence
+/// `select(E, j) = select(C, j)`; the walk establishes `V = select(C, j)` from
+/// the McCarthy read-over-write identity
+/// `select(store(a, i, v), j) = ite((= i j), v, select(a, j))` — which holds
+/// with NO side condition — plus `select(const-array(f), j) = f`. That is why
+/// (K) needs no `(= x i)` literal: it never assumes a disequality at all.
+/// (C)/(D)/(E)/(F)/(G)/(H)/(I)/(J)/(K) are intentionally exact.
 pub(crate) fn validate_array_row_chain(
     terms: &TermStore,
     step_id: ProofId,

@@ -21,6 +21,7 @@ use crate::executor::Executor;
 
 mod bv_dependents;
 mod candidates;
+mod scalar_passes;
 use bv_dependents::BvDependentIndex;
 use candidates::*;
 
@@ -115,66 +116,11 @@ impl Executor {
         self.last_statistics
             .set_int("model_minimization.runs", runs.saturating_add(1));
 
-        let mut pre_minimization: Option<Model> = None;
-        let mut scalar_changed = false;
-        let mut stopped = false;
-        'passes: for _pass in 0..MAX_MINIMIZATION_PASSES {
-            if should_stop(self) {
-                stopped = true;
-                break;
-            }
-            // Phase 1: candidate lists, plus the BV dependency index they share
-            // (one walk per pass, not one per candidate leaf).
-            let Some((mut attempts, dependents)) = self.collect_min_attempts_and_dependents()
-            else {
-                return;
-            };
-            if attempts.is_empty() {
-                break;
-            }
-            if pre_minimization.is_none() {
-                pre_minimization = self.last_model.clone();
-            }
-
-            // Sort by descending magnitude — try the largest values first
-            // since they have the most room to shrink.
-            attempts.sort_by_key(|a| std::cmp::Reverse(a.magnitude()));
-
-            // Phase 2: For each variable, try candidates via mutate-check-revert.
-            let mut any_changed = false;
-            for attempt in attempts {
-                // Live poll between variables — a single variable's candidate
-                // sweep is bounded by the same check inside try_*_candidates.
-                if should_stop(self) {
-                    stopped = true;
-                    break 'passes;
-                }
-                let changed = match attempt {
-                    MinAttempt::Lia(term_id, candidates) => {
-                        self.try_lia_candidates(term_id, candidates)
-                    }
-                    MinAttempt::Lra(term_id, candidates) => {
-                        self.try_lra_candidates(term_id, candidates)
-                    }
-                    MinAttempt::Bv(term_id, candidates) => {
-                        self.try_bv_candidates(term_id, candidates, &dependents)
-                    }
-                };
-                any_changed |= changed;
-                scalar_changed |= changed;
-            }
-
-            // If nothing changed this pass, no point in another pass.
-            if !any_changed {
-                break;
-            }
-        }
-        // A candidate check can itself consume the remaining budget. Poll once
-        // more after the last mutation so even the final attempt of the final
-        // pass cannot retain an un-gated cosmetic replacement past the stop.
-        if scalar_changed && !stopped && should_stop(self) {
-            stopped = true;
-        }
+        let Some((pre_minimization, scalar_changed, stopped)) =
+            self.minimize_scalar_model_values(&mut should_stop)
+        else {
+            return;
+        };
         if scalar_changed {
             let confirmed = !stopped
                 && matches!(

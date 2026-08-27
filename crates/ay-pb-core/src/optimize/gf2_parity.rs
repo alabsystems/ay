@@ -629,7 +629,7 @@ fn floor_div(a: i128, b: i128) -> i128 {
 
 /// Detects integer UNSAT via the GF(2) parity refutation, FIRST recovering
 /// entailed cardinality equalities from `±1` inequality/clause families (see
-/// [`recover_cardinality_equalities`]) and merging them with any native
+/// `recover_cardinality_equalities`) and merging them with any native
 /// equality rows before running [`gf2_parity_detects_unsat`].
 ///
 /// This cracks the re-encoded `EC_ODD_GRIDS` variants (`cnf-plain`,
@@ -1104,7 +1104,7 @@ fn gf2_parity_cp_refutation(
 
 /// Detects integer UNSAT via the native GF(2) parity refutation AND self-checks
 /// the reconstructed cutting-planes derivation against the kernel-verified
-/// algebra ([`crate::proof::refutation_check`]).
+/// algebra (`crate::proof::refutation_check`).
 ///
 /// Returns `true` ONLY when a checked `0 >= 1` cutting-planes refutation over the
 /// original equality rows exists. This is the production gate for emitting

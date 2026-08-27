@@ -8,7 +8,7 @@
 //! - No OTFS (on-the-fly subsumption) accounting
 //! - No tick accounting (search_ticks)
 //! - No clause bumping (bump_clause)
-//! - No streaming UNSAT core marking
+//! - No streaming original-clause support marking
 //! - No LRAT chain collection (already disabled by set_ic3_mode)
 //! - No JIT conflict processing (IC3 conflicts are 2-10 literals; JIT
 //!   overhead dominates for such tiny clauses)
@@ -34,7 +34,7 @@ impl Solver {
     ///
     /// Stripped version of `analyze_conflict` for IC3 workloads. Produces
     /// the same ConflictResult but skips OTFS, tick accounting, clause
-    /// bumping, streaming core marking, JIT processing, ghost guards,
+    /// bumping, streaming-support marking, JIT processing, ghost guards,
     /// and logging.
     ///
     /// SAFETY: Caller must ensure `ic3_mode` is set (which guarantees

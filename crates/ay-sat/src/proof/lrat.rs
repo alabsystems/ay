@@ -310,10 +310,10 @@ impl<W: Write> LratWriter<W> {
             self.recycle_pending_deletions(&mut deletions);
             self.pending_deletions = deletions;
         } else {
-            // Text format: "step_id d id1 id2 ... 0"
-            // Step IDs must be strictly increasing (both additions AND deletions
-            // share the same monotonic ID space). Using latest_id reuses the
-            // previous addition's ID, which is a format error (#4398).
+            // Text format: "step_id d id1 id2 ... 0". Burning a fresh ID is
+            // AY's convention (#4398), not a format rule — drat-trim/CaDiCaL
+            // stamp the line with the previous addition's ID and the reference
+            // checker ignores the field — so do not derive a parser rule here.
             let del_id = self.next_id;
             self.next_id = del_id + 1;
             let needed = lrat_text_delete_capacity_estimate(self.pending_deletions.len());

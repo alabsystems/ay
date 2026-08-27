@@ -140,6 +140,13 @@ enum CliProofFormat {
     Lrat,
     Lean4,
     Alethe,
+    /// VeriPB pseudo-Boolean derivation (`.pbp`), checked against the DIMACS
+    /// CNF directly: `veripb --cnf instance.cnf proof.pbp` (no OPB companion
+    /// file; `--cnf` is named rather than left to extension sniffing). The only
+    /// DIMACS format that can carry the SR-witnessed symmetry routes under a
+    /// checker on the official SAT-COMP 2026 menu, and what the SAT-COMP 2026
+    /// submission declares.
+    Veripb,
 }
 
 impl From<CliProofFormat> for ProofFormat {
@@ -149,6 +156,36 @@ impl From<CliProofFormat> for ProofFormat {
             CliProofFormat::Lrat => Self::Lrat,
             CliProofFormat::Lean4 => Self::Lean4,
             CliProofFormat::Alethe => Self::Alethe,
+            CliProofFormat::Veripb => Self::Veripb,
+        }
+    }
+}
+
+/// CLI wrapper for [`ay_core::DeclaredProofChecker`] (`--proof-checker`).
+///
+/// A capability declaration paired with the format: `dsr-trim` verifies the DSR
+/// substitution-witnessed symmetry steps inside `--proof-format drat`, and
+/// `veripb` verifies the same steps inside `--proof-format veripb`. Any other
+/// declaration — or a checker/format mismatch — makes the solver clamp those
+/// routes to plain-CDCL-checkable emission.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum CliProofChecker {
+    DsrTrim,
+    DprTrim,
+    DratTrim,
+    Gratgen,
+    Veripb,
+}
+
+impl From<CliProofChecker> for ay_core::DeclaredProofChecker {
+    fn from(cli: CliProofChecker) -> Self {
+        match cli {
+            CliProofChecker::DsrTrim => Self::DsrTrim,
+            CliProofChecker::DprTrim => Self::DprTrim,
+            CliProofChecker::DratTrim => Self::DratTrim,
+            CliProofChecker::Gratgen => Self::Gratgen,
+            CliProofChecker::Veripb => Self::Veripb,
         }
     }
 }

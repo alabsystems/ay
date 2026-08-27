@@ -88,7 +88,7 @@ impl Solver {
         if self.cold.next_clause_id <= clause_id {
             self.cold.next_clause_id = clause_id + 1;
         }
-        if let Some(ref mut trace) = self.cold.clause_trace {
+        if let Some(trace) = self.live_clause_trace_mut() {
             trace.add_clause_with_hints(clause_id, Vec::new(), false, Vec::new());
         }
         Ok(())
@@ -175,10 +175,10 @@ impl Solver {
                 };
                 self.cold.empty_clause_lrat_id = Some(clause_id);
                 // Record to clause trace if enabled — hints attached atomically
-                if let Some(ref mut trace) = self.cold.clause_trace {
+                if let Some(trace) = self.live_clause_trace_mut() {
                     trace.add_clause_with_hints(clause_id, vec![], false, trace_hints);
                 }
-            } else if self.cold.clause_trace.is_some() {
+            } else if self.has_live_clause_trace() {
                 // SMT proof path: clause trace enabled without LRAT. Allocate a
                 // local clause ID and record the empty clause with resolution
                 // hints so process_trace can build a proper derivation (#6368).
@@ -188,7 +188,7 @@ impl Solver {
                     id
                 });
                 self.cold.empty_clause_lrat_id = Some(clause_id);
-                if let Some(ref mut trace) = self.cold.clause_trace {
+                if let Some(trace) = self.live_clause_trace_mut() {
                     trace.add_clause_with_hints(clause_id, vec![], false, trace_hints);
                 }
             }
@@ -293,10 +293,10 @@ impl Solver {
             if let Some(ref mut manager) = self.proof_manager {
                 manager.register_clause_id(clause_id);
             }
-            if self.cold.clause_trace.is_some() {
+            if self.has_live_clause_trace() {
                 let _ = self.charge_proof_bookkeeping(16);
             }
-            if let Some(ref mut trace) = self.cold.clause_trace {
+            if let Some(trace) = self.live_clause_trace_mut() {
                 trace.add_clause_with_hints(clause_id, Vec::new(), true, Vec::new());
             }
         }

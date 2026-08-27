@@ -246,6 +246,9 @@ export class Model {
         this._encodeValue(vars[index], value),
       );
     });
+    if (!encodedRows.length) {
+      throw new SearchError("table requires at least one allowed tuple");
+    }
     this._constraints.push({
       table: { variables: names, tuples: encodedRows },
     });

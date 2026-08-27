@@ -162,9 +162,18 @@ fn test_state_invalidates_solver_local_handles_when_rebound() {
 
     let mut second = Solver::try_new(Logic::QfUflia).expect("second solver");
     let unrelated = second.declare_const("unrelated", Sort::Bool);
+    // Handle identity is arena-authenticated, so two solvers can never mint
+    // equal `Term`s. The hazard this test guards lives one level down, in the
+    // raw numeric ID the second arena hands out again: a cache that kept the
+    // stale handle across the rebind would resolve "x" to `unrelated`.
     assert_eq!(
-        stale_term, unrelated,
+        stale_term.to_raw(),
+        unrelated.to_raw(),
         "the regression needs the stale raw handle to alias a different term"
+    );
+    assert_ne!(
+        stale_term, unrelated,
+        "arena authority must not survive a different solver"
     );
 
     let mut session = TranslationSession::new(&mut second, &mut state);
@@ -214,9 +223,18 @@ fn test_state_invalidates_solver_local_handles_after_full_reset() {
     };
     solver.try_reset().expect("full reset succeeds");
     let unrelated = solver.declare_const("unrelated", Sort::Bool);
+    // A full reset rotates the arena stamp, so the pre-reset handle stays
+    // distinguishable from anything the reset arena mints. What repeats is the
+    // raw ID underneath it -- and that repeat is exactly what makes an
+    // un-invalidated translation cache dangerous.
     assert_eq!(
-        stale_term, unrelated,
+        stale_term.to_raw(),
+        unrelated.to_raw(),
         "the reset regression needs the stale raw handle to be reused"
+    );
+    assert_ne!(
+        stale_term, unrelated,
+        "a full reset must rotate handle authority"
     );
 
     let mut session = TranslationSession::new(&mut solver, &mut state);
@@ -238,9 +256,17 @@ fn test_open_session_invalidates_caches_after_reset_through_solver_accessor() {
 
     session.solver().try_reset().expect("full reset succeeds");
     let unrelated = session.solver().declare_const("unrelated", Sort::Bool);
+    // Raw IDs repeat across the reset; authenticated handles do not. The cache
+    // is the only thing that can still confuse the two, which is what the
+    // invalidation checks below pin down.
     assert_eq!(
-        stale, unrelated,
+        stale.to_raw(),
+        unrelated.to_raw(),
         "the regression needs the reset arena to reuse a raw term ID"
+    );
+    assert_ne!(
+        stale, unrelated,
+        "a full reset must rotate handle authority"
     );
 
     assert!(!session.has_var(&"x".to_string()));
@@ -265,9 +291,17 @@ fn test_owning_context_invalidates_caches_after_reset_through_solver_accessor() 
 
     context.solver().try_reset().expect("full reset succeeds");
     let unrelated = context.solver().declare_const("unrelated", Sort::Bool);
+    // Raw IDs repeat across the reset; authenticated handles do not. The cache
+    // is the only thing that can still confuse the two, which is what the
+    // invalidation checks below pin down.
     assert_eq!(
-        stale, unrelated,
+        stale.to_raw(),
+        unrelated.to_raw(),
         "the regression needs the reset arena to reuse a raw term ID"
+    );
+    assert_ne!(
+        stale, unrelated,
+        "a full reset must rotate handle authority"
     );
 
     assert!(!context.has_var(&"x".to_string()));
@@ -292,7 +326,18 @@ fn test_open_session_rejects_cache_after_live_solver_is_swapped() {
     let unrelated = replacement.declare_const("unrelated", Sort::Bool);
     let mut session = TranslationSession::new(&mut original, &mut state);
     let stale = session.get_or_declare("x".to_string(), "x", Sort::Int);
-    assert_eq!(stale, unrelated, "the two live arenas must reuse a raw ID");
+    // Two live solvers authenticate against different arenas, so their handles
+    // never compare equal. The raw IDs do collide, and that collision is what a
+    // cache carried across the swap would get wrong.
+    assert_eq!(
+        stale.to_raw(),
+        unrelated.to_raw(),
+        "the two live arenas must reuse a raw ID"
+    );
+    assert_ne!(
+        stale, unrelated,
+        "handles from two live arenas must stay distinguishable"
+    );
 
     std::mem::swap(session.solver(), &mut replacement);
     assert!(session.get_var(&"x".to_string()).is_none());
@@ -315,7 +360,18 @@ fn test_owning_context_rejects_cache_after_live_solver_is_swapped() {
 
     let mut replacement = Solver::try_new(Logic::QfUflia).expect("replacement solver");
     let unrelated = replacement.declare_const("unrelated", Sort::Bool);
-    assert_eq!(stale, unrelated, "the two live arenas must reuse a raw ID");
+    // Two live solvers authenticate against different arenas, so their handles
+    // never compare equal. The raw IDs do collide, and that collision is what a
+    // cache carried across the swap would get wrong.
+    assert_eq!(
+        stale.to_raw(),
+        unrelated.to_raw(),
+        "the two live arenas must reuse a raw ID"
+    );
+    assert_ne!(
+        stale, unrelated,
+        "handles from two live arenas must stay distinguishable"
+    );
     std::mem::swap(context.solver(), &mut replacement);
 
     assert!(!context.has_var(&"x".to_string()));

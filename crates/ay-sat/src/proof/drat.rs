@@ -155,17 +155,12 @@ impl<W: Write> DratWriter<W> {
         }
     }
 
-    /// Log addition of a PR (propagation-redundant) clause in DPR format.
+    /// Log a caller-supplied propagation-redundancy step in DPR format.
     ///
-    /// The DPR `a`-line is the clause literals followed by the witness literals
-    /// and a terminating `0`. By the DPR convention the witness section begins by
-    /// repeating the clause's first literal (the pivot); callers MUST pass a
-    /// `witness` whose first literal equals `clause[0]` (the σ-image lex-leader
-    /// witness from `encode_perm_lex_leader_with_witness` satisfies this).
-    ///
-    /// This emits a proof step the plain RUP/RAT DRAT checker cannot verify — it
-    /// is intended for an external verified LPR checker (cake_lpr). After an I/O
-    /// failure, subsequent calls are no-ops (CaDiCaL-style).
+    /// This public serializer establishes wire shape only: `witness` must begin
+    /// with `clause[0]`, and the caller is responsible for supplying a valid PR
+    /// witness. The resulting step requires an independent PR/LPR checker; the
+    /// ordinary RUP/RAT checker cannot validate it.
     pub fn add_pr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         debug_assert!(
             !clause.is_empty() && witness.first() == clause.first(),
@@ -184,14 +179,14 @@ impl<W: Write> DratWriter<W> {
                 self.added_count += 1;
                 Ok(())
             }
-            Err(e) => {
+            Err(error) => {
                 self.io_failed = true;
-                Err(e)
+                Err(error)
             }
         }
     }
 
-    /// Write a DPR `a`-line in text format: `clause… witness… 0`.
+    /// Write a witnessed DRAT-family `a`-line in text format.
     fn write_text_pr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         let needed = drat_text_clause_capacity_estimate(clause.len() + witness.len(), false);
         write_drat_text_line(&mut self.writer, &mut self.text_line, needed, |line| {
@@ -205,7 +200,7 @@ impl<W: Write> DratWriter<W> {
         })
     }
 
-    /// Write a DPR `a`-line in binary format: `a clause… witness… 0`.
+    /// Write a witnessed DRAT-family `a`-line in binary format.
     fn write_binary_pr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         self.writer.write_all(b"a")?;
         for lit in clause {
@@ -221,17 +216,15 @@ impl<W: Write> DratWriter<W> {
     /// (#8011 SR route).
     ///
     /// The DSR `a`-line is `clause… witness… 0`, where the `witness` is the
-    /// substitution-witness token stream emitted by the symmetry encoder. By the
+    /// substitution-witness token stream emitted by a family-specific symmetry
+    /// construction. By the
     /// SR/DSR convention (see `dsr-trim`'s `parse_sr_clause_and_witness`), the
     /// witness begins by repeating the clause pivot `clause[0]`: the SECOND
     /// occurrence of the pivot opens the witness (PR part, pivot↦true), the THIRD
     /// occurrence acts as the separator that opens the literal↦literal substitution
-    /// part. Callers (`encode_perm_lex_leader_sr`) build the full token stream; the
-    /// writer is layout-agnostic and just appends `witness` after `clause`.
-    ///
-    /// Unlike [`Self::add_pr`] (DPR partial-assignment witness), the witness here
-    /// is a full substitution σ. Verified externally by `dsr-trim → drat/lsr →
-    /// cake_lpr`; the internal RUP/RAT checker cannot verify it. After an I/O
+    /// part. The writer is layout-agnostic and just appends `witness` after
+    /// `clause`. Verified externally by `dsr-trim → drat/lsr → cake_lpr`; the
+    /// internal RUP/RAT checker cannot verify it. After an I/O
     /// failure subsequent calls are no-ops (CaDiCaL-style).
     pub fn add_sr(&mut self, clause: &[Literal], witness: &[Literal]) -> io::Result<()> {
         debug_assert!(

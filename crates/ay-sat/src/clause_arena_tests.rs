@@ -763,7 +763,7 @@ fn large_arena_growth_is_bounded_not_doubled() {
 
     let cap_after = arena.words.capacity();
     assert!(
-        cap_after >= arena.words.len() + spare + 1,
+        cap_after > arena.words.len() + spare,
         "the reservation must actually cover the request"
     );
     assert!(
@@ -788,4 +788,115 @@ fn test_reserve_clauses_does_not_move_the_memory_heuristic() {
     );
     assert_eq!(arena.accounted_words, accounted_before);
     assert_eq!(arena.memory_bytes(), billed_before);
+}
+
+/// Load-time reclamation returns real capacity without moving the heuristic.
+///
+/// THE BARRIER. `shrink_words_to_fit` exists to hand ~660MB back to `--memory`
+/// on vlsat3_b99, and the ONLY thing separating it from a silent search change
+/// is that `memory_bytes()` bills `accounted_words` rather than the real
+/// capacity. Wire the shrink to `accounted_words` as well and the
+/// `should_reduce_db` byte trigger moves with it, so reduction fires at
+/// different conflict counts and the search trajectory diverges — with every
+/// verdict still correct, so nothing else in the suite would notice.
+#[test]
+fn shrink_words_to_fit_reclaims_capacity_without_moving_the_memory_heuristic() {
+    let mut arena = ClauseArena::new();
+    arena.add(&[lit(1), lit(-2)], false);
+
+    // Slack well past the 16MB floor (4M u32 words).
+    arena.words.reserve_exact(6_000_000);
+    let cap_before = arena.words.capacity();
+    let len_before = arena.words.len();
+    let billed_before = arena.memory_bytes();
+    let accounted_before = arena.accounted_words;
+    assert!(
+        (cap_before - len_before) * size_of::<u32>() >= 16 << 20,
+        "precondition: slack must exceed the reclamation floor"
+    );
+
+    arena.shrink_words_to_fit();
+
+    assert!(
+        arena.words.capacity() < cap_before,
+        "real capacity must actually be handed back: {cap_before} -> {}",
+        arena.words.capacity()
+    );
+    assert_eq!(arena.words.len(), len_before, "contents must be untouched");
+    assert_eq!(
+        arena.accounted_words, accounted_before,
+        "the clause-DB heuristic's ladder must not move"
+    );
+    assert_eq!(
+        arena.memory_bytes(),
+        billed_before,
+        "reduction cadence must be bit-identical across reclamation"
+    );
+}
+
+/// A small formula never pays a realloc to reclaim a few kilobytes.
+#[test]
+fn shrink_words_to_fit_is_a_noop_below_the_floor() {
+    let mut arena = ClauseArena::new();
+    for i in 0..64u32 {
+        arena.add(&[lit(i as i32 + 1), lit(-((i as i32 % 7) + 1))], false);
+    }
+    let cap_before = arena.words.capacity();
+    assert!(
+        (cap_before - arena.words.len()) * size_of::<u32>() < 16 << 20,
+        "precondition: this arena's slack is below the floor"
+    );
+
+    arena.shrink_words_to_fit();
+
+    assert_eq!(
+        arena.words.capacity(),
+        cap_before,
+        "sub-floor slack must not trigger a realloc"
+    );
+}
+
+/// BARRIER: the phantom signature-table capacity ladder must reproduce
+/// `DetHashMap`'s real `capacity()` under one-at-a-time inserts of distinct
+/// keys — the growth pattern the retired clause-signature side table
+/// followed. `memory_bytes()` feeds the `should_reduce_db` byte trigger, so
+/// if hashbrown's growth policy ever drifts from the ladder, the trigger
+/// basis (and with it the search trajectory) silently moves; this test fails
+/// first.
+#[test]
+fn phantom_signature_capacity_matches_dethashmap() {
+    use super::accessors::phantom_signature_table_capacity;
+    let mut map: DetHashMap<u32, u64> = DetHashMap::default();
+    assert_eq!(phantom_signature_table_capacity(0), map.capacity());
+    for n in 1..=200_000usize {
+        map.insert(n as u32, n as u64);
+        assert_eq!(
+            phantom_signature_table_capacity(n),
+            map.capacity(),
+            "ladder diverges from DetHashMap at len {n}"
+        );
+    }
+}
+
+/// The phantom signature charge in `memory_bytes()` must track adds and
+/// compaction exactly like the retired side table's `len()` did: one entry
+/// per `add` (deletes left entries in place), reset to the live-clause count
+/// on compaction.
+#[test]
+fn phantom_signature_entries_track_adds_and_compaction() {
+    let mut arena = ClauseArena::new();
+    let a = arena.add(&[lit(1), lit(2), lit(3)], false);
+    let _b = arena.add(&[lit(-1), lit(4)], false);
+    let _c = arena.add(&[lit(2), lit(-4), lit(5)], true);
+    assert_eq!(arena.phantom_signature_entries, 3);
+
+    // Delete: the side table kept deleted entries, so the count must not
+    // move.
+    arena.delete(a);
+    assert_eq!(arena.phantom_signature_entries, 3);
+
+    // Compaction rebuilt the table from empty with one insert per live
+    // clause.
+    arena.compact();
+    assert_eq!(arena.phantom_signature_entries, 2);
 }

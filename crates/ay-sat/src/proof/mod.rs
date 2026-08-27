@@ -37,6 +37,14 @@
 //!
 //! **LRAT Binary format:**
 //! - 'a' byte followed by binary_id, binary_lits..., 0, binary_hints..., 0
+//!
+//! ## VeriPB
+//!
+//! VeriPB is a pseudo-Boolean proof checker on the official SAT-COMP 2026
+//! checker menu whose `red` rule carries a substitution witness natively, so
+//! AY's SR-witnessed symmetry steps are representable there without the
+//! DSR-only `a`-line encoding that all DRAT-family checkers except `dsr-trim`
+//! reject. See [`veripb`] for the rule mapping.
 //! - 'd' byte followed by binary_ids..., 0
 
 mod drat;
@@ -44,11 +52,13 @@ mod lrat;
 mod output;
 #[cfg(test)]
 mod tests;
+mod veripb;
 
 pub use drat::DratWriter;
 pub(crate) use lrat::LratBoundedResourceFailure;
 pub use lrat::{LratWriter, MAX_LRAT_ORIGINAL_CLAUSES};
 pub use output::ProofOutput;
+pub use veripb::VeripbWriter;
 
 use crate::literal::Literal;
 use std::any::Any;

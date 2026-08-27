@@ -14,15 +14,18 @@ enum ForwardReplay {
 }
 
 impl BackwardChecker {
-    /// Verify a complete proof using backward checking.
+    /// Verify a complete proof using backward checking on a fresh checker.
     ///
     /// Pass 1 replays all proof steps without verification. Pass 2 walks the
-    /// proof backward and verifies only ACTIVE clauses.
+    /// proof backward and verifies only ACTIVE clauses. This bulk API is
+    /// one-shot: a repeated call fails with [`DratCheckError::CheckerNotFresh`]
+    /// rather than reusing clauses or a contradiction from an earlier formula.
     pub fn verify(
         &mut self,
         clauses: &[Vec<Literal>],
         steps: &[ProofStep],
     ) -> Result<(), DratCheckError> {
+        self.inner.begin_bulk_verify()?;
         match self.replay_forward(clauses, steps)? {
             ForwardReplay::AlreadyVerified => Ok(()),
             ForwardReplay::NeedsBackwardPass => {
@@ -43,7 +46,10 @@ impl BackwardChecker {
         self.num_original = self.inner.clauses.len();
 
         if self.inner.inconsistent {
-            return Ok(ForwardReplay::AlreadyVerified);
+            return match self.inner.conclude_unsat() {
+                ConcludeResult::Verified => Ok(ForwardReplay::AlreadyVerified),
+                ConcludeResult::Failed(reason) => Err(DratCheckError::from(reason)),
+            };
         }
 
         for (step_idx, step) in steps.iter().enumerate() {

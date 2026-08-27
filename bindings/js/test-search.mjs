@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { Model, NativeSearchError } from "./search.mjs";
+import { Model, NativeSearchError, SearchError } from "./search.mjs";
 
 const model = new Model("4x4 Sudoku");
 const cell = model.intGrid("cell", 4, 4, 1, 4);
@@ -55,6 +55,10 @@ elementModel.element(index, [first, second], selected).add("index == 1");
 assert.equal(elementModel.solve().requireSolution().get(selected), 9);
 elementModel.minimize(selected);
 assert.throws(() => elementModel.enumerate(), /objective/);
+
+const emptyTable = new Model("empty table");
+const emptyTableVariable = emptyTable.int("x", 0, 1);
+assert.throws(() => emptyTable.table([emptyTableVariable], []), SearchError);
 
 const prototypeNames = new Model("prototype-safe names");
 const proto = prototypeNames.int("__proto__", 7, 7);

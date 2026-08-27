@@ -686,7 +686,22 @@ impl Context {
         info: &SymbolInfo,
         identity: &str,
     ) -> bool {
-        info.is_direct_source_declaration()
+        // `is_completion_eligible_declaration`, NOT `is_direct_source_declaration`:
+        // a native-API `declare_const`/`declare_fun` allocates its term in the
+        // same operation that records its metadata, so it carries the same
+        // "this is the source program's own free declaration" guarantee a
+        // parsed `(declare-fun ...)` does — that is the documented point of
+        // `SymbolBindingOrigin::NativeApiDeclaration`. Excluding it here made
+        // every projection-binding consumer (the const-interp /
+        // finite-table SAT certificates among them) decline outright for
+        // API-route embedders: deductive-checks's guarded-broadcast refutation queries
+        // pin a plain `declare-const` head, hit `NonOrdinaryBinding`, and a
+        // genuinely SAT counterexample surfaced as
+        // `Unknown (quantifier-unhandled)`. `Other` origins (aliases,
+        // definitions, caller-supplied-term registrations, solver internals)
+        // stay excluded, and the liveness, kind, overload, internal-symbol and
+        // signature gates above and below are untouched.
+        info.is_completion_eligible_declaration()
             && self.symbol_identity_name(surface, info) == identity
             && !self.overloaded_symbols.contains_key(surface)
             && !self.internal_symbols.contains(surface)

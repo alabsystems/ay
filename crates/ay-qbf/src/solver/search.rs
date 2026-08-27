@@ -117,15 +117,15 @@ impl QbfSolver {
     /// leading to better pruning and faster solving.
     pub(super) fn analyze_conflict(&mut self, conflict_clause_idx: usize) -> (Vec<Literal>, u32) {
         // Get the conflict clause and mark it as used
-        let conflict_clause = if conflict_clause_idx < self.formula.clauses.len() {
-            self.formula.clauses[conflict_clause_idx].clone()
+        let conflict_clause = if conflict_clause_idx < self.formula.clauses().len() {
+            self.formula.clauses()[conflict_clause_idx].clone()
         } else {
-            let learned_idx = conflict_clause_idx - self.formula.clauses.len();
+            let learned_idx = conflict_clause_idx - self.formula.clauses().len();
             self.mark_clause_used(learned_idx);
             self.learned[learned_idx].clone()
         };
 
-        let mut seen = vec![false; self.formula.num_vars];
+        let mut seen = vec![false; self.formula.num_vars()];
         let mut learned: Vec<Literal> = Vec::new();
         let mut counter = 0;
 
@@ -172,10 +172,10 @@ impl QbfSolver {
             // Get the reason clause and resolve
             let reason = self.reasons[var as usize - 1];
             if let Reason::Propagated(reason_idx) = reason {
-                let reason_clause = if reason_idx < self.formula.clauses.len() {
-                    self.formula.clauses[reason_idx].clone()
+                let reason_clause = if reason_idx < self.formula.clauses().len() {
+                    self.formula.clauses()[reason_idx].clone()
                 } else {
-                    let learned_idx = reason_idx - self.formula.clauses.len();
+                    let learned_idx = reason_idx - self.formula.clauses().len();
                     self.mark_clause_used(learned_idx);
                     self.learned[learned_idx].clone()
                 };

@@ -71,7 +71,7 @@ impl Solver {
             self.materialize_level0_unit_proofs();
             if !self.lrat_replacement_level0_reason_units_ready(
                 clause_idx,
-                &old_lits,
+                old_lits,
                 new_lits,
                 old_clause_id,
             ) {
@@ -79,7 +79,7 @@ impl Solver {
             }
         }
         self.mark_empty_clause_with_hints(&proof_hints);
-        return ReplaceResult::Empty;
+        ReplaceResult::Empty
     }
 
     pub(super) fn build_replacement_lrat_hints(

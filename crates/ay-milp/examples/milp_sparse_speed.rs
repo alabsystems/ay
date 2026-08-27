@@ -8,9 +8,18 @@
 //! separate them: a 60-row dense basis fills either way.
 //!
 //! ```text
-//! cargo run --release -p ay-milp --example milp_sparse_speed -- 2000 1500 6
-//! --lu TIME_LIMIT=30 ... -- 2000 1500 6
+//! TIME_LIMIT=30 cargo run --release -p ay-milp --example milp_sparse_speed -- 2000 1500 6
 //! ```
+//!
+//! THERE IS NO LANE SWITCH ON THIS HARNESS, and the recipe above used to imply
+//! one. It read `AY_MILP_LU=1 TIME_LIMIT=30 ...` until `8875fea71` rewrote the
+//! env prefix into `--lu` textually; `--lu` has had no carrier since (see
+//! `milp_profile::main`), and this example parses NO flags at all — it reads
+//! `args[1..4]` positionally, so a leading `--lu` would be swallowed as the
+//! column count, silently shifting `n, m, k` by one and measuring a DIFFERENT
+//! instance than the one the command line names. The basis engine here is
+//! chosen by shape (`FloatLp::tall_lu` / `wide_tall`); to force the eta lane on
+//! a tall model use `ay-milp solve --no-tall-lu`, which does carry.
 
 use std::time::Instant;
 

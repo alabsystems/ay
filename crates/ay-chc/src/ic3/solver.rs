@@ -631,7 +631,7 @@ impl Ic3Solver {
         assumptions: &[Literal],
         constraints: &[Vec<Literal>],
         domain: &[Variable],
-    ) -> ay_sat::VerifiedAssumeResult {
+    ) -> ay_sat::SolverAssumeResult {
         // Push a scope to isolate temporary clauses.
         self.solver.push();
 

@@ -124,8 +124,13 @@ fn incremental_bv_state_push_pop_tracks_pending_when_solver_missing() {
     assert!(!st.pop());
 }
 
+/// RETENTION BARRIER: `pop()` retracts one scope and destroys NOTHING. The
+/// bit-blast cache, the Tseitin mapping, the encoded-assertion map and the SAT
+/// solver (with its learned clauses) all survive; only the SAT-level scope is
+/// unwound. Restoring the old `reset_sat_encoding_for_rebuild()` teardown fails
+/// every assertion below.
 #[test]
-fn incremental_bv_state_pop_invalidates_sat_when_present() {
+fn incremental_bv_state_pop_keeps_the_bitblast_and_the_solver() {
     let mut st = IncrementalBvState::new();
     st.persistent_sat = Some(SatSolver::new(0));
     st.term_to_bits
@@ -140,9 +145,24 @@ fn incremental_bv_state_pop_invalidates_sat_when_present() {
     assert!(st.pop());
     assert_eq!(st.scope_depth, 0);
     assert_eq!(st.pending_pushes, 0);
-    assert!(st.persistent_sat.is_none());
-    assert!(st.term_to_bits.is_empty());
-    assert!(st.encoded_assertions.is_empty());
+    assert!(
+        st.persistent_sat.is_some(),
+        "pop must keep the SAT solver: dropping it discards every learned \
+         clause and forces a full re-encode on the next check-sat"
+    );
+    assert_eq!(
+        st.persistent_sat.as_ref().unwrap().scope_depth(),
+        0,
+        "pop must unwind exactly one SAT scope"
+    );
+    assert!(
+        !st.term_to_bits.is_empty(),
+        "pop must keep the bit-blast cache"
+    );
+    assert!(
+        !st.encoded_assertions.is_empty(),
+        "pop must keep the Tseitin root-literal map"
+    );
 }
 
 #[test]
@@ -415,8 +435,12 @@ fn incremental_bv_state_rebuild_reset_preserves_scope_depth() {
     assert!(st.delayed_ops.is_empty());
 }
 
+/// RETENTION BARRIER, nested case: popping depth 2 -> 1 unwinds one SAT scope
+/// and keeps every cache. The one thing retracted is the activation bookkeeping
+/// for assertions whose units lived in the popped scope — `Solver::pop`
+/// satisfied those permanently, so the next check-sat re-adds them (#2822).
 #[test]
-fn incremental_bv_state_pop_drops_stale_solver_but_keeps_remaining_depth() {
+fn incremental_bv_state_pop_unwinds_one_sat_scope_and_keeps_every_cache() {
     let mut st = IncrementalBvState::new();
     st.scope_depth = 2;
     st.pending_pushes = 0;
@@ -433,28 +457,44 @@ fn incremental_bv_state_pop_drops_stale_solver_but_keeps_remaining_depth() {
     st.bool_to_var.insert(TermId::new(4), 12);
     st.linked_equivalence_terms.insert(TermId::new(5));
     st.bv_ite_conditions.insert(TermId::new(6));
+    // Activated at the depth being popped: must be re-activated next solve.
     st.assertion_activation_scope.insert(TermId::new(7), 2);
+    // Activated at an ancestor depth: still live after the pop.
+    st.assertion_activation_scope.insert(TermId::new(11), 1);
     st.emitted_bv_eq_congruence_pairs
         .insert((TermId::new(8), TermId::new(9)));
 
     assert!(st.pop());
 
     assert_eq!(st.scope_depth, 1);
-    assert_eq!(st.pending_pushes, 1);
-    assert!(st.term_to_bits.is_empty());
-    assert_eq!(st.next_bv_var, 1);
-    assert!(st.persistent_sat.is_none());
-    assert_eq!(st.tseitin_state.next_var, 1);
-    assert!(st.encoded_assertions.is_empty());
-    assert!(st.assertion_activation_scope.is_empty());
-    assert_eq!(st.sat_num_vars, 0);
-    assert!(st.bv_var_offset.is_none());
-    assert!(st.emitted_bv_eq_congruence_pairs.is_empty());
-    assert!(st.predicate_to_var.is_empty());
-    assert!(st.bool_to_var.is_empty());
-    assert!(st.linked_equivalence_terms.is_empty());
-    assert!(st.bv_ite_conditions.is_empty());
-    assert!(st.delayed_ops.is_empty());
+    assert_eq!(st.pending_pushes, 0);
+    assert_eq!(
+        st.persistent_sat
+            .as_ref()
+            .expect("solver kept")
+            .scope_depth(),
+        1,
+        "exactly one SAT scope unwound"
+    );
+    assert!(!st.term_to_bits.is_empty(), "bit-blast cache kept");
+    assert_eq!(st.tseitin_state.next_var, 12, "Tseitin frontier kept");
+    assert!(!st.encoded_assertions.is_empty(), "root-literal map kept");
+    assert_eq!(st.bv_var_offset, Some(9), "stable BV offset kept");
+    assert!(!st.predicate_to_var.is_empty(), "predicate cache kept");
+    assert!(!st.bool_to_var.is_empty(), "bool-in-BV cache kept");
+    assert!(!st.linked_equivalence_terms.is_empty(), "link set kept");
+    assert!(!st.bv_ite_conditions.is_empty(), "ite-condition set kept");
+    // Kept: those clauses are global tautologies, valid in every scope.
+    assert!(!st.emitted_bv_eq_congruence_pairs.is_empty(), "pairs kept");
+    assert!(
+        !st.assertion_activation_scope.contains_key(&TermId::new(7)),
+        "activation recorded IN the popped scope must be retracted"
+    );
+    assert_eq!(
+        st.assertion_activation_scope.get(&TermId::new(11)),
+        Some(&1),
+        "activation recorded in a surviving ancestor scope must be kept"
+    );
 }
 
 mod theory_scope_cleanup;

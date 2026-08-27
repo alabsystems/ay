@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-use crate::api::{Logic, SolveResult, Solver, Sort, Term};
+use crate::api::{Logic, SolveResult, Solver, Sort, Term, UnknownReason};
 use std::time::Duration;
 
 fn count8_log_body(solver: &mut Solver, n: Term) -> Term {
@@ -135,31 +135,7 @@ fn test_verification_consumer_count8_transparent_logic_fn_axiom_entails_popcount
     );
 }
 
-#[test]
-fn test_verification_consumer_count8_transparent_logic_fn_vc_must_not_be_wrong_sat_8969() {
-    // verification-consumer `bitvectors/popcount.rs::count8` reduces to a transparent
-    // logic-function axiom for `logic_count8__log` plus a SWAR/BV-derived
-    // implementation result, then asserts the NEGATED postcondition
-    // `not (result == count8(n) and result <= 8)` to look for a counterexample.
-    //
-    // SOUNDNESS: this verification condition is UNSAT. The SWAR byte-popcount is
-    // correct, so for every n in [0, 255] the implementation `result == swar(n)`
-    // equals the spec `count8(n)` (the axiom pins it to popcount, see the
-    // entailment test above) and that value is <= 8. Hence the negated
-    // postcondition is unsatisfiable and NO counterexample exists.
-    //
-    // The solver cannot bit-blast the SWAR/BV pipeline against the LIA spec, so
-    // it CANNOT prove the Unsat; the sound, honest verdict is therefore Unknown
-    // (returning Unsat would require real BV+quantifier integration; that is the
-    // ideal future result). What the solver must NEVER do is return Sat: a Sat
-    // here is a fabricated counterexample to correct code — a wrong answer.
-    //
-    // Regression: a UF-completion relaxation that classifies this `forall` as
-    // "satisfiable by freely completing count8" produces exactly that wrong Sat,
-    // because the BV implementation term is opaque to model validation (it is
-    // recorded as an incomplete fallback) and so the MBQI re-validation backstop
-    // cannot refute it. This test pins the invariant: result is Unknown (today)
-    // or Unsat (ideal), never Sat.
+fn verification_consumer_count8_vc_solver() -> Solver {
     let mut solver = Solver::new(Logic::Uflia);
     solver.set_timeout(Some(Duration::from_secs(30)));
 
@@ -230,13 +206,69 @@ fn test_verification_consumer_count8_transparent_logic_fn_vc_must_not_be_wrong_s
     solver
         .try_assert_term(negated_post)
         .expect("assert negated popcount postcondition");
+    solver
+}
 
-    let verdict = solver.check_sat();
+#[test]
+fn test_verification_consumer_count8_transparent_logic_fn_vc_must_not_be_wrong_sat_8969() {
+    // verification-consumer `bitvectors/popcount.rs::count8` reduces to a transparent
+    // logic-function axiom plus a SWAR/BV implementation, then asserts the
+    // NEGATED postcondition. The VC is UNSAT: for every n in [0, 255], SWAR
+    // equals the pinned popcount spec and is <= 8. A UF-completion relaxation
+    // previously proposed wrong Sat. Require the exact native refutation on two
+    // consecutive public queries so lifecycle reset is load-bearing.
+    let mut solver = verification_consumer_count8_vc_solver();
+
+    for query in 1..=2 {
+        assert_eq!(
+            solver.check_sat(),
+            SolveResult::unsat(),
+            "query {query}: the exact restored instance must carry a native \
+             strict refutation of the popcount VC"
+        );
+        let proof = solver
+            .executor
+            .retained_internal_proof_for_test()
+            .unwrap_or_else(|| panic!("query {query}: UNSAT must retain its native certificate"))
+            .clone();
+        let quality = solver
+            .executor
+            .check_proof_strict_with_datatypes(&proof)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "query {query}: the plain native strict checker must accept the exact-authored \
+                     popcount refutation, got {error}"
+                )
+            });
+        assert!(
+            quality.is_complete(),
+            "query {query}: the plain native strict proof must be complete"
+        );
+    }
+}
+
+#[test]
+fn test_verification_consumer_count8_strict_wire_mode_fails_closed_on_native_only_proof() {
+    let mut solver = verification_consumer_count8_vc_solver();
+    solver
+        .try_set_option(":check-proofs-strict", "true")
+        .expect("enable strict Alethe proof mode");
+
+    assert_eq!(solver.check_sat(), SolveResult::Unknown);
+    assert_eq!(solver.unknown_reason(), Some(UnknownReason::ProofTrusted));
     assert!(
-        !verdict.result().is_sat(),
-        "popcount VC is UNSAT (SWAR impl is correct); solver must return \
-         Unknown (sound conservative) or Unsat (ideal), never a wrong Sat. \
-         Got {verdict:?}"
+        solver.last_proof().is_none(),
+        "BvLiaTautology is a known Alethe wire hole and must not be exported in strict mode"
+    );
+}
+
+#[test]
+fn test_verification_consumer_count8_internal_origin_cannot_borrow_authored_recovery() {
+    let mut solver = verification_consumer_count8_vc_solver();
+    assert_eq!(solver.check_sat_internal_query(), SolveResult::Unknown);
+    assert!(
+        solver.executor.retained_internal_proof_for_test().is_none(),
+        "a generic/internal query cannot borrow the authored-plain recovery seam"
     );
 }
 

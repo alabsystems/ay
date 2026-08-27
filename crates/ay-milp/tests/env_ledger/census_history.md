@@ -553,3 +553,13 @@ DEFAULT-OFF caller-flag arm. Ships OFF until the corpus A/B is run; the
 structure-elimination journal's own conclusion ("the reductions that pay
 are the ones that change what the relaxation can see") names this family
 as the candidate that substitutes rather than deletes.
+(no count change, 2026-08-21): Knob::NoTallColdDual (KillSwitch, typed-only —
+`--no-tall-cold-dual`, no env spelling, per the B49 contract). Routes TALL
+covering LPs (`m >= TALL_LU_ROWS && n < m` — metro / correlation-clustering
+set-cover, the mirror of air05's `wide_tall`) into the existing
+`try_cold_dual` dual-simplex start. Ships ON: metro inst2 (39,259 x 15,891)
+root LP Optimal in 4.2s / 15,191 dual pivots vs Stopped at 120s (52,610
+primal pivots) without it; B&B at 120s then carries a rigorous bound of 13
+instead of -10,649,855. Neutral (Stopped both arms at 120s) on the 130k-650k
+row correlation-clustering / metro inst22 members; the 19-instance node gate
+is exact either way.

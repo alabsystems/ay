@@ -22,7 +22,7 @@ use crate::circuit_scout::{
 use crate::dimacs_core::{self, DimacsCoreError, DimacsEvent, DimacsRecordRef};
 use crate::literal::{Literal, Variable};
 use crate::solver::Solver;
-use crate::{SolverVariant, VariantInput, VariantProfilePlan};
+use crate::{SolverVariant, VariantInput, VariantProfilePlan, VariantProofMode};
 use std::fs;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -397,8 +397,7 @@ impl DimacsFormula {
         let config = variant.config(VariantInput::new(
             solver_vars,
             self.num_clauses,
-            false,
-            false,
+            VariantProofMode::Disabled,
         ));
 
         // Apply adaptive adjustments before applying the config to the solver.

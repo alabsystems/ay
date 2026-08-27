@@ -9,6 +9,16 @@ impl SolveArgs {
     pub(super) fn install_solver_switches(&self) {
         self.install_theory_disable_flags();
         self.install_sat_ab_switches();
+        self.install_declared_proof_checker();
+    }
+
+    /// Install the declared external proof checker (`--proof-checker`) so the
+    /// SAT engine can gate SR-witnessed emission on the checker's measured
+    /// capabilities. Unset keeps the dsr-trim default (SR allowed).
+    fn install_declared_proof_checker(&self) {
+        if let Some(checker) = self.proof_checker {
+            let _ = ay_core::set_global_declared_proof_checker(checker.into());
+        }
     }
 
     /// Install miscellaneous CLI-owned settings, including the B17 MaxSAT pair.
@@ -25,9 +35,9 @@ impl SolveArgs {
             sat_variant,
             sat_variant_from_cli,
             disabled_sat_startup_capabilities: super::disabled_sat_startup_capabilities(self),
-            dpll_diagnostic_file: owned_cli_path(self.dpll_diagnostic_file.as_deref()),
+            dpll_diagnostic_file: self.dpll_diagnostic_file.as_deref().map(owned_cli_path),
             dpll_diagnostic_enabled: self.dpll_diagnostic,
-            dpll_trace_file: owned_cli_path(self.dpll_trace_file.as_deref()),
+            dpll_trace_file: self.dpll_trace_file.as_deref().map(owned_cli_path),
             maxsat_no_tot_eqs: self.ab_switches.maxsat_no_tot_eqs,
             maxsat_no_bce_revert: self.ab_switches.maxsat_no_bce_revert,
             maxsat_no_am1_maxcover: self.ab_switches.maxsat_no_am1_maxcover,
@@ -62,6 +72,9 @@ impl SolveArgs {
             proof_introspect: self.ab_switches.proof_introspect.clone(),
             proof_introspect_probe: self.ab_switches.proof_introspect_probe.clone(),
             str_w4_work: self.ab_switches.str_w4_work,
+            fmq_lane_budget_ms: self.ab_switches.fmq_lane_budget_ms,
+            fmq_probe_ms: self.ab_switches.fmq_probe_ms,
+            fmq_seed_ms: self.ab_switches.fmq_seed_ms,
             ab_subst_stats: self.ab_switches.sat_ab_subst_stats,
             ab_subst_dump_merges: self.ab_switches.sat_ab_subst_dump_merges,
             ab_subst_dump_gates: self.ab_switches.sat_ab_subst_dump_gates,
@@ -223,6 +236,11 @@ impl SolveArgs {
             nra_diag: self.ab_switches.nra_diag,
             nra_grid_probe: self.ab_switches.nra_grid_probe,
             nra_witness: self.ab_switches.nra_witness.clone(),
+            quant_relevance: self.ab_switches.quant_relevance,
+            quant_relevance_k: self.ab_switches.quant_relevance_k,
+            quant_relevance_min: self.ab_switches.quant_relevance_min,
+            quant_relevance_model: self.ab_switches.quant_relevance_model,
+            quant_relevance_debug: self.ab_switches.quant_relevance_debug,
         };
         let _ = ay_core::set_global_misc_cli_flags(flags);
     }
@@ -256,9 +274,7 @@ impl SolveArgs {
             congruence_memory_bound: f.sat_congruence_memory_bound,
             circuit_equiv_throughput_profile: f.sat_circuit_equiv_throughput_profile,
             signed_symmetry: f.sat_signed_symmetry,
-            signed_symmetry_sr: f.sat_signed_symmetry_sr,
             composite_symmetry: f.sat_composite_symmetry,
-            symmetry_sr: f.sat_symmetry_sr,
             symmetry_hhw: f.sat_symmetry_hhw,
             bve_sparse_max_vars: f.sat_bve_sparse_max_vars,
             bve_sparse_max_density: f.sat_bve_sparse_max_density,
@@ -310,6 +326,18 @@ impl SolveArgs {
             bcp_learned_1963_blocker_cert_false_reject_demote: f
                 .sat_bcp_learned_1963_blocker_cert_false_reject_demote,
             dense_clique_php_proof_route: f.sat_dense_clique_php_proof_route,
+            xor_proof_route: f.sat_xor_proof_route,
+            gf_probe: f.sat_gf_probe,
+            indep_support: f.sat_indep_support,
+            indep_enum: f.sat_indep_enum,
+            vivify_converge: f.sat_vivify_converge,
+            large_rephase_walk: f.sat_large_rephase_walk,
+            mode_equiticks_large: f.sat_mode_equiticks_large,
+            bve_giant_raw: f.sat_bve_giant_raw,
+            two_stage_clause_management: f.sat_two_stage_clause_management,
+            memory_aware_clause_db: f.sat_memory_aware_clause_db,
+            congruence_exact_gate_table: f.sat_congruence_exact_gate_table,
+            congruence_bounded_occs: f.sat_congruence_bounded_occs,
         };
         if switches != ay_core::SatAbSwitches::default() {
             let _ = ay_core::set_global_sat_ab_switches(switches);
@@ -425,6 +453,6 @@ impl SolveArgs {
     }
 }
 
-fn owned_cli_path(path: Option<&std::path::Path>) -> Option<String> {
-    path.map(|path| path.to_string_lossy().into_owned())
+fn owned_cli_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
 }

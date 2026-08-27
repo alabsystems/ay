@@ -20,6 +20,17 @@ mod ordered_tail;
 mod surface_pairs;
 use surface_pairs::{MAX_OVERRIDE_PAIRS, MAX_OVERRIDE_SOURCE_SCAN};
 
+/// Largest proof the RETENTION-OFF authority subset offers to the `EqDiffVar`
+/// derivation lane (#4751).
+///
+/// The bound belongs to the CALL SITE, not to the lane: the retention-ON path
+/// has been running the lane unbounded since #4751 and keeps doing so, so this
+/// constant can only ever narrow the NEW wiring. The measurement that fixes the
+/// value, and why no other observable separates the two regimes, is written out
+/// at the call site in
+/// [`Executor::run_assumption_authority_passes_without_parsed_syntax`].
+const EQ_DIFFVAR_RETENTION_OFF_MAX_PROOF_STEPS: usize = 4_096;
+
 impl Executor {
     /// Whether a valid arithmetic `evaluate` is outside Carcara's portable evaluator.
     ///
@@ -216,24 +227,39 @@ impl Executor {
     /// # The retention-off path is a NARROWED subset, not this whole function
     ///
     /// #cause-b-narrow-split. Running the *entire* tail with no parsed prefix
-    /// was measured over 2,166 non-QF_Datatypes instances (frozen arms, banked
-    /// argv, killpg walls): **+301 gained, 12 LOST, 0 wrong**. Every one of the
-    /// 12 losses traces to ONE pass in the tail,
-    /// [`Self::derive_conjunct_assumptions_from_problem_roots`], by two
-    /// independent mechanisms:
+    /// was originally measured over 2,166 non-QF_Datatypes instances at
+    /// **+301 gained, 12 LOST, 0 wrong**, and both recorded causes were
+    /// attributed to ONE pass in the tail,
+    /// [`Self::derive_conjunct_assumptions_from_problem_roots`]: 8 losses to a
+    /// re-validation blowup it triggers by restructuring the proof (all
+    /// `QF_IDL/parity`), and 4 to a CORRECTNESS DEFECT — a malformed `and_pos`
+    /// ("clause must contain the and gate literal and the indexed conjunct")
+    /// that it then rejects itself.
     ///
-    ///  * 8 losses (all `QF_IDL/parity`) — the pass RESTRUCTURES the proof
-    ///    (10,503 → 13,073 steps on `19.200.graph`) and downstream
-    ///    re-validation then hits an unmemoized recursive predicate:
-    ///    `matches_negated_components` is 76% of samples and its
-    ///    `vec![false; n]` alloc a further 17%. The pass body itself costs
-    ///    8.5 ms; BASE validates the same proof in 0.3 ms. `04.100.graph` goes
-    ///    0.05 s → 139-167 s.
-    ///  * 4 losses — a CORRECTNESS DEFECT in the same pass: it emits a
-    ///    malformed `and_pos` ("clause must contain the and gate literal and
-    ///    the indexed conjunct") and then rejects its own derivation. Spans
-    ///    `QF_IDL/parity`, `QF_IDL/sep/hardware` and `QF_LIA/convert`, so no
-    ///    family-scoped gate can contain it.
+    /// **All three of those figures have since been REFUTED by measurement**
+    /// (the development design notes, and the same
+    /// refutation independently in
+    /// the development design notes §4). Re-derived on
+    /// 2,215 files, paired and interleaved: the split is **+11 gained / 7 LOST**,
+    /// not +301/−12; the malformed `and_pos` produces **0 diagnostics in 2,215
+    /// files**; and **not one `QF_IDL/parity` file flips** — that family is now
+    /// a beneficiary (`01.100.graph` `trust` 54 → 1, `02.200.graph` 34 → 2,
+    /// both still `unsat` under 3 s). Do not re-derive from the old numbers.
+    ///
+    /// The exclusion stands on the MEASURED reason instead. Re-run three reps,
+    /// serially, with committed binaries, five of the seven SMT-LIB losses are
+    /// noise (four are `sat` verdicts, which never enter this path at all) and
+    /// **two are real and reproduce 3/3**: `QF_LRA/miplib/danoint-50` (`unsat`
+    /// 3.9 s → `unknown`, because the pass derives all 66 leaves and the
+    /// presentation goes REJECTED → CERTIFIED at +35 s of mandatory
+    /// corroboration) and `QF_LIA/convert/convert-jpg2gif-query-1141` (`unsat`
+    /// 7.0 s → `unknown`, +7 s for 946 of 1,020 leaves). Both files publish
+    /// `unsat` under the demotion path anyway, via
+    /// `discharge_trust_steps_for_certification`, so the reduction buys no
+    /// verdict there and costs one. A ROOT-WEIGHT budget reusing
+    /// `authored_conjunct_leaf::MAX_CONJUNCT_ROOT_WORK` fixes `danoint-50`
+    /// exactly and costs the whole reduction (−21.3% → −1.6%); the two are not
+    /// separable by root weight.
     ///
     /// And it is not needed for the loss the split exists to fix: measured on
     /// the cause-B exemplar and on the tracked reduced repro,
@@ -299,6 +325,17 @@ impl Executor {
         self.finish_input_syntax_rewrite(proof, &rewrites, term_overrides, &aux_assume_steps);
     }
 
+    /// Whether the retention-off authority subset may offer `proof` to the
+    /// `EqDiffVar` derivation lane (#4751).
+    ///
+    /// A named predicate rather than an inline comparison so the bound can be
+    /// pinned two-sided by a test: a mutation that drops it comes back RED on
+    /// the "too large" row instead of passing unnoticed on the "small enough"
+    /// one. See the call site for the measurement that fixes the value.
+    pub(in crate::executor) fn eq_diffvar_lane_fits_retention_off_bound(proof: &Proof) -> bool {
+        proof.steps.len() < EQ_DIFFVAR_RETENTION_OFF_MAX_PROOF_STEPS
+    }
+
     /// The ASSUMPTION-AUTHORITY subset of
     /// [`Self::apply_input_syntax_rewrites_to_proof`] that is safe to run with
     /// no parsed-assertion prefix.
@@ -324,12 +361,15 @@ impl Executor {
     ///
     /// # Why the derivation pass is deliberately absent
     ///
-    /// See the 12-loss measurement on
-    /// [`Self::apply_input_syntax_rewrites_to_proof`].
-    /// `derive_conjunct_assumptions_from_problem_roots` is BOTH the source of
-    /// the `QF_IDL/parity` re-validation blowup and of the malformed `and_pos`
-    /// correctness defect, and cause B does not need it: the demotion below is
-    /// sufficient on the cause-B exemplar and on the tracked reduced repro.
+    /// See the re-derived measurement on
+    /// [`Self::apply_input_syntax_rewrites_to_proof`] — NOT the `QF_IDL/parity`
+    /// blowup and NOT the malformed `and_pos`, both of which are refuted there.
+    /// `derive_conjunct_assumptions_from_problem_roots` reduces the premiseless
+    /// `Trust` class by a real 21.3% off the in-tree corpus and by exactly 0%
+    /// on it, and it loses two SMT-LIB verdicts that survive three interleaved
+    /// serial reps with the committed binaries. Cause B does not need it: the
+    /// demotion below is sufficient on the cause-B exemplar and on the tracked
+    /// reduced repro.
     /// Leaving it out keeps the retention-off path strictly narrower than the
     /// retention-on path it was measured against. `proof_rewrite_tests.rs`
     /// pins that absence so a later refactor cannot silently re-enable it.
@@ -365,6 +405,149 @@ impl Executor {
         );
         // DELIBERATELY NOT `derive_conjunct_assumptions_from_problem_roots`.
         Self::demote_non_problem_assumptions(proof, &extended_assertions);
+        // #fresh-def-eq — the fresh-definition promotion DOES belong here, by
+        // this function's own criterion: it reasons purely over canonical
+        // `TermId`s and needs no parse tree. It is not the derivation pass and
+        // carries none of its cost: two DAG traversals over the assertion
+        // scope and the candidate definientia, plus one `FreshDefRegistry`
+        // collect, all skipped outright when no candidate `trust` leaf exists.
+        //
+        // Leaving it out was measured, not assumed, to make the whole
+        // capability unreachable in the census regime: the CLI turns retention
+        // OFF for `--no-proof` / `--z3-mode` / competition mode, which is
+        // exactly the mandatory-certificate regime, and all 4 corpus files that
+        // carry a genuine fresh definitional EQUALITY are plain SMT files in it.
+        // Before this call they reached `check_strict_unsat_presentation` with
+        // the definition still a premiseless `trust` step.
+        //
+        // It grants no authority for the same reason the demotion above does
+        // not: the promoted step is re-validated from scratch by the UNTOUCHED
+        // strict checker through `ay_proof`'s `FreshDefRegistry`, and this
+        // lane's own Gate-2 reverts the whole rewrite if that registry
+        // declines. `problem_assertions_for_strict_proof()` is not touched.
+        self.promote_fresh_definitional_bounds(proof, &extended_assertions);
+        // (#4751) `EqDiffVar`-REWRITTEN assertions — the residual the promotion
+        // above correctly declines, because a rewritten assertion is not a
+        // definition. It belongs here by this function's own criterion: it
+        // reasons purely over canonical `TermId`s against provenance the
+        // preprocessing pass minted, and needs no parse tree. It is NOT
+        // `derive_conjunct_assumptions_from_problem_roots` and carries none of
+        // that pass's cost: its first guard is an emptiness test on the
+        // `EqDiffVar` record store, so a solve the pass never ran on pays one
+        // `is_empty()`.
+        //
+        // Leaving it out was MEASURED, not assumed, to make the whole
+        // capability unreachable in the regime that produces the population —
+        // the same finding `#fresh-def-eq` records two calls above, and for the
+        // same structural reason. The `EqDiffVar` pass runs only when the
+        // CALLER did not ask for a proof (`!is_producing_proofs()`, see
+        // `Executor::eq_diffvar_pass_enabled`), and the CLI turns parsed
+        // retention OFF for exactly that case (`--no-proof`, `--z3-mode`,
+        // competition mode). So every difference variable AY mints in the
+        // mandatory-certificate regime reaches this function, and before this
+        // call not one of them could be discharged here. Measured on the
+        // SMT-LIB QF_IDL `mathsat/fischer` family: 25 of the 146 premiseless
+        // `trust` leaves of `FISCHER7-3-ninc` mention `__ay_eqdv`, and the lane
+        // was never entered — `derive_eq_diffvar_rewritten_assertions` logged
+        // no call at all while the store held 45 atom folds and 454 rewrites.
+        //
+        // It grants no authority. Every step it emits is re-validated from
+        // scratch by the UNTOUCHED strict checker — `fresh_def_bound` through
+        // `ay_proof`'s `FreshDefRegistry`, the arithmetic lemmas through the
+        // same Farkas and `la_disequality` validators the strict `lra_farkas`
+        // path uses — and the lane's own Gate-2 re-runs `FreshDefRegistry`
+        // over the spliced result and declines the WHOLE lane if the registry
+        // does, so a promotion it cannot justify never becomes a hard
+        // `InvalidTheoryLemma` in place of the rescuable `trust` it replaced.
+        // `problem_assertions_for_strict_proof()` is not touched.
+        //
+        // THE SIZE BOUND IS NOT A LATENCY NICETY — it is what keeps this
+        // wiring from LOSING correct `unsat` verdicts, and it is the reason the
+        // bound lives at THIS call site instead of inside the lane: the
+        // retention-ON path keeps its exact behaviour.
+        //
+        // Mechanism, measured end to end on `ay solve --no-proof -T:10`. The
+        // derivations do their job — they remove premiseless `trust` leaves —
+        // and on a LARGE proof that is precisely the harm: with the early trust
+        // leaf gone, the strict checker no longer fails fast on it and instead
+        // runs until its aggregate WORK envelope refuses a charge. That turns a
+        // trust-family rejection into `ProofCheckError::ResourceLimit`, and
+        // `unsat_cert`'s deferred lane reaches
+        // `discharge_trust_steps_for_certification` with NOTHING collected, so
+        // the mint falls through to a fresh-`Executor` whole-problem
+        // corroboration re-solve. The proof is no less correct and the
+        // derivations are no less valid; the certificate simply costs seconds
+        // it did not cost before. Splicing itself is 13-50 ms and the strict
+        // check 3-78 ms even at 54,767 steps, so neither is the expense.
+        //
+        // Unbounded, on the SMT-LIB QF_IDL 900-file sample: 44 files degraded
+        // from a trust-family rejection to `ResourceLimit` (0 went the other
+        // way), and 5 of them crossed `-T:10` and published `unknown` in place
+        // of a correct `unsat` — `sal/bakery/inf-bakery-mutex-8` went 2.2 s to
+        // 10.0 s, reproduced unloaded at 1.5-1.8 s against 9.1-9.9 s over three
+        // reps each.
+        //
+        // The bound separates the two regimes on the one observable that
+        // actually tracks the checker's envelope, the size of the proof being
+        // enlarged: measured, `mathsat/fischer/FISCHER4-3-ninc` at **3,911
+        // steps** keeps its trust-family class, and `FISCHER5-3-ninc` at
+        // **5,117** is the smallest that degrades. Neither the number of steps
+        // spliced nor the growth RATIO separates them — `FISCHER4-3` grows by
+        // 13,250 steps (339%) and stays safe while `inf-bakery-mutex-8` grows
+        // by 4,152 (34%) and degrades — so the bound is on the pre-splice size
+        // and nothing else. Past it the strict checker refuses the document
+        // however many `trust` leaves come out of it, so the derivation buys no
+        // certificate at all and only spends the mint's budget.
+        if Self::eq_diffvar_lane_fits_retention_off_bound(proof) {
+            self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
+        }
+        // #rewritten-assertion-bridge — the residual the promotion above
+        // correctly declines: a REWRITTEN authored assertion, whose definiendum
+        // is an AUTHORED symbol, so no freshness argument applies to it at all.
+        // It is DERIVED instead, by congruence, from the authored assertions it
+        // was rewritten from plus any CHECKED definition it now mentions. It
+        // runs after the promotion so a `fresh_def_eq` step exists to cite.
+        // Like the promotion it reasons purely over canonical `TermId`s and
+        // needs no parse tree, and it grants no authority: every emitted step
+        // is re-validated by the UNTOUCHED strict checker, and the lane reverts
+        // the whole rewrite if the rebuilt proof does not check or loses a
+        // certification the original had.
+        self.derive_rewritten_assertions_by_congruence(proof, &extended_assertions);
+        // #rewritten-nonequality-bridge — the same repair for the rewritten
+        // assertions whose goal is NOT a binary `=`, which the lane above
+        // cannot take as a congruence-explanation conclusion. It runs after it
+        // and never competes for a leaf it serves.
+        self.derive_rewritten_nonequality_assertions(proof, &extended_assertions);
+        // #authored-conjunct-leaf — the residual BOTH bridges decline: a leaf
+        // whose clause IS a nested `and`-conjunct of an authored assertion,
+        // which is not a REWRITE of anything and so has no congruence to
+        // explain. It is derived by `and_pos` from an `assume` of the authored
+        // root. It runs last of the three so it never competes for a leaf a
+        // bridge serves. See `proof/authored_conjunct_leaf`.
+        self.derive_authored_conjunct_leaves(proof, &extended_assertions);
+        // #minted-definition-leaf — the LAST residual: a leaf that is an
+        // authored assertion with a FRESH symbol substituted in, whose
+        // definition the proof does not contain at all. The definition is
+        // MINTED as a checked `fresh_def_eq` step, vetted by the checker's own
+        // `FreshDefRegistry` over the FINISHED proof (Gate 2), which is why it
+        // runs last of every derivation lane. See `proof/minted_definition_leaf`.
+        self.derive_leaves_over_minted_definitions(proof, &extended_assertions);
+        // #conjunct-decomposition-leaf — the residual the lane above
+        // cannot reach: an `and`-headed leaf that differs from its
+        // authored root at a position UNDER a `not`, which
+        // `ay_proof::congruence_forest` deliberately never descends. It is
+        // derived CONJUNCT BY CONJUNCT instead, where `mk_eq`'s lifting
+        // `(= (not x) (not y)) -> (= x y)` puts the differing position back
+        // under an `App` head, and reassembled with one `and_neg`. It runs
+        // after the whole-term lane and never competes for a leaf that one
+        // serves. See `proof/conjunct_decomposition_leaf`.
+        self.derive_conjunctwise_decomposed_leaves(proof, &extended_assertions);
+        // #ite-definition-leaf — the ITE-DEFINITION guard clauses
+        // `name_non_bool_ites_all` appends over a fresh `__ay_ite_def_*`. Same
+        // placement rule as the two lanes above and for the same reason: the
+        // checker decides freshness against the FINISHED `assume` set. See
+        // `proof/ite_definition_leaf`.
+        self.derive_ite_definition_guard_leaves(proof, &extended_assertions);
         self.rebuild_trust_leaf_proof_from_original_assertions(proof);
     }
 }

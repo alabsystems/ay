@@ -75,12 +75,12 @@ pub(super) fn canonical_digest_is_stable_and_shape_sensitive() {
         None,
         "the streaming writer declines before exceeding its cap"
     );
+    let now = Instant::now();
+    let expired = now
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap_or(now);
     assert_eq!(
-        canonical_digest_bytes_bounded(
-            &m,
-            Some(Instant::now() - std::time::Duration::from_millis(1)),
-            usize::MAX,
-        ),
+        canonical_digest_bytes_bounded(&m, Some(expired), usize::MAX,),
         None,
         "an expired absolute deadline produces no partial digest"
     );

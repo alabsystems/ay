@@ -2,24 +2,12 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `--sat-composite-symmetry` must not produce an UNSAT that nobody checks.
+//! Symmetry proof routing must fail closed without a route-blind CLI refusal.
 //!
-//! The composite lex-leader route breaks symmetry with an equal-prefix aux
-//! tower that is not single-witness PR, so the steps it appends to the proof
-//! are not SR-checkable. Measured on the SAT-COMP 2026 instance `count_p2_M21`:
-//! AY reports `s UNSATISFIABLE` in 276 ms with an 11 378-line proof, and
-//! `dsr-trim` rejects it with `No UP contradiction for RAT clause 11670`.
-//!
-//! Two of the three legs are individually safe. With proof re-checking ON the
-//! internal checker fails closed and the bad certificate never escapes; with no
-//! proof requested the answer is uncertified but claims nothing. It is the
-//! conjunction -- route active, proof written, re-check off -- that yields a
-//! confident unverifiable artifact, and that conjunction is exactly what
-//! `--competition` produces. A stderr warning is not enough there because a
-//! competition harness reads the verdict and keeps the proof.
-//!
-//! These tests pin all three legs against the same binary, so the refusal
-//! cannot pass by refusing unconditionally.
+//! Plain composite and signed lex leaders are no-proof-only. Proof-mode routing
+//! permits the family-specific aux-free SR constructions and HHW, and otherwise
+//! skips symmetry before any clause is installed. The old generic DPR/full-SR
+//! switches are removed rather than left as certificate-producing experiments.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,8 +21,8 @@ impl Drop for DirGuard {
     }
 }
 
-/// Small UNSAT formula. The refusal is a configuration gate gated before the
-/// solve, so it does not need an instance that actually triggers the route.
+/// Small UNSAT formula for CLI routing and retired-flag checks. Tests that need
+/// to exercise symmetry preprocessing itself live in `ay-sat`.
 const UNSAT_CNF: &str = "p cnf 1 2\n1 0\n-1 0\n";
 
 fn scratch() -> (PathBuf, DirGuard) {
@@ -62,9 +50,10 @@ fn run(dir: &PathBuf, composite: bool, args: &[&str]) -> (i32, String) {
     (code, String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
-/// The unsafe conjunction: route on, proof written, re-check off. Must refuse.
+/// Composite symmetry plus an unchecked proof no longer needs a process-wide
+/// refusal: preprocessing itself skips the plain lex-leader route.
 #[test]
-fn composite_symmetry_with_unchecked_proof_is_refused() {
+fn composite_symmetry_with_unchecked_proof_falls_back_safely() {
     let (dir, _guard) = scratch();
     let proof = dir.join("p.drat");
     let (code, stderr) = run(
@@ -79,18 +68,55 @@ fn composite_symmetry_with_unchecked_proof_is_refused() {
         ],
     );
     assert_eq!(
-        code, 1,
-        "composite symmetry + written proof + no re-check must exit 1, got {code}; stderr: {stderr}"
+        code, 20,
+        "safe fallback must solve, got {code}; stderr: {stderr}"
     );
     assert!(
-        stderr.contains("--sat-composite-symmetry"),
-        "the refusal must name the flag responsible; stderr: {stderr}"
+        !stderr.contains("certificates that external checkers reject"),
+        "the retired route-blind refusal must be gone; stderr: {stderr}"
     );
-    // Never publish an UNSAT verdict alongside the refusal.
-    assert!(
-        !stderr.contains("s UNSATISFIABLE"),
-        "refusal must not also report a verdict; stderr: {stderr}"
+}
+
+/// HHW is a checker-consumable composite proof route, so a blanket composite
+/// gate must not reject it when post-solve rechecking is disabled.
+#[test]
+fn hhw_with_unchecked_proof_is_not_route_blind_refused() {
+    let (dir, _guard) = scratch();
+    let proof = dir.join("p.drat");
+    let (code, stderr) = run(
+        &dir,
+        true,
+        &[
+            "--sat-symmetry-hhw",
+            "--no-verify-proof",
+            "--proof",
+            proof.to_str().unwrap(),
+            "--proof-format",
+            "drat",
+        ],
     );
+    assert_eq!(
+        code, 20,
+        "HHW configuration must be allowed, got {code}; stderr: {stderr}"
+    );
+}
+
+/// The two uncomposed witness experiments are removed from the CLI, not merely
+/// hidden behind another unsafe combination of flags.
+#[test]
+fn retired_generic_sr_flags_are_unavailable() {
+    for flag in ["--sat-symmetry-sr", "--sat-signed-symmetry-sr"] {
+        let (dir, _guard) = scratch();
+        let (code, stderr) = run(&dir, false, &[flag]);
+        assert_eq!(
+            code, 2,
+            "retired flag {flag} must be rejected; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(flag),
+            "diagnostic must name {flag}: {stderr}"
+        );
+    }
 }
 
 /// Control 1: the same flag with NO proof requested is untouched. Nothing

@@ -56,7 +56,7 @@ pub struct Knob {
     ///
     /// The drift was not random, which is the interesting part. Twelve of the
     /// twenty-three are exactly the knobs `EngineEconomics` migrated to
-    /// [`crate::tune`]: their literal reads were deleted and the ledger still
+    /// `crate::tune`: their literal reads were deleted and the ledger still
     /// claimed one apiece. Three more were read by **nothing at all** and are now
     /// [`Bucket::Dead`] — see [`super::ROUTED`] for the ones that legitimately read zero.
     ///
@@ -68,7 +68,7 @@ pub struct Knob {
 /// Why a live knob has **zero** literal `env::var` sites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// Resolved through [`crate::tune`]'s accessors, which hold the only copy of
+    /// Resolved through `crate::tune`'s accessors, which hold the only copy of
     /// the name (`tune::Knob::env`). The call site names the typed knob, not the
     /// variable.
     Tune,

@@ -33,9 +33,7 @@ fn progress_path(
     clause: &[TermId],
     farkas: Option<&FarkasAnnotation>,
 ) -> Option<ProgressPath> {
-    let Some(farkas) = farkas else {
-        return None;
-    };
+    let farkas = farkas?;
     if farkas.coefficients.len() != clause.len() {
         return None;
     }

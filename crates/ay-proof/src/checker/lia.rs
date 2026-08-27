@@ -141,7 +141,7 @@ pub(crate) fn validate_arith_eq_triangle(
 }
 
 /// Recognize the exact flat arithmetic equality-triangle clause shape
-/// [`validate_arith_eq_triangle`] accepts: `(not (<= a b)) (not (<= b a))
+/// `validate_arith_eq_triangle` accepts: `(not (<= a b)) (not (<= b a))
 /// (= a b)` — the two negated bounds FIRST, in forward-then-reverse order,
 /// with the equality LAST.
 ///
@@ -262,6 +262,34 @@ pub(crate) fn validate_int_cut_lattice_gap(
             reason: "integer cut-lattice gap: no canonical two-row elimination ".to_string()
                 + "in this clause squeezes a derived linear form into a range "
                 + "without an attainable value",
+        })
+    }
+}
+
+/// Validate a [`ay_core::TheoryLemmaKind::IntGuardedSplitGap`] lemma.
+///
+/// Delegates to `ay_core::proof_validation::recognize_int_guarded_split_gap`,
+/// which re-derives EVERYTHING from the clause alone: the `≥`-oriented and
+/// equality rows read off the clause's negated linear literals, the case
+/// split over one of its negated-disjunction literals, and — per branch —
+/// the exact ±1-pivot equality substitutions, the canonical two-row
+/// elimination pairs, and the coefficient-`gcd` attainable-value test.
+/// Nothing is taken on the producer's word — the kind carries no annotation
+/// payload — so a forged label on any other clause is rejected here.
+pub(crate) fn validate_int_guarded_split_gap(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if ay_core::proof_validation::recognize_int_guarded_split_gap(terms, clause) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "integer guarded-split gap: no negated-disjunction literal ".to_string()
+                + "of this clause has every branch refuted by the clause's "
+                + "negated linear literals under equality substitution, "
+                + "two-row elimination, and the attainable-value test",
         })
     }
 }

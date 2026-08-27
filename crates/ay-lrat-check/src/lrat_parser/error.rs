@@ -13,6 +13,9 @@ pub enum LratParseError {
     #[error("invalid binary LRAT data at byte {position}: {detail}")]
     InvalidBinary { position: usize, detail: String },
 
+    #[error(transparent)]
+    Literal(#[from] ay_proof_common::literal::LiteralError),
+
     #[error("{0}")]
     Common(#[from] ay_proof_common::ParseError),
 }

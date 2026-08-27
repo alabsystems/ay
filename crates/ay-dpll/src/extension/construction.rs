@@ -22,8 +22,8 @@ use ay_sat::{Literal, Variable};
 
 use super::types::{build_unassigned_freelist_state, unassigned_skip_enabled, UNASSIGNED_NIL};
 use super::{
-    BoundRefinementHandoff, NativeTheoryPropagationControl, NativeTheoryPropagationDispatch,
-    ProofContext, TheoryAxiomKey, TheoryExtension,
+    BoundRefinementHandoff, NativeTheoryPropagationDispatch, ProofContext, TheoryAxiomKey,
+    TheoryExtension,
 };
 use crate::executor::BoundRefinementReplayKey;
 use crate::proof_tracker::ProofTracker;
@@ -249,11 +249,8 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             }
         };
 
-        let native_theory_propagation_dispatch = NativeTheoryPropagationDispatch::evaluate(
-            theory.native_theory_propagation_profile(),
-            theory_atoms.len(),
-            NativeTheoryPropagationControl::Disabled,
-        );
+        let native_theory_propagation_dispatch =
+            NativeTheoryPropagationDispatch::disabled(theory, theory_atoms.len());
         let mut eager_stats = DpllEagerStats::default();
         native_theory_propagation_dispatch.record(&mut eager_stats);
 
@@ -867,11 +864,8 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             }
         };
 
-        let native_theory_propagation_dispatch = NativeTheoryPropagationDispatch::evaluate(
-            theory.native_theory_propagation_profile(),
-            theory_atoms.len(),
-            NativeTheoryPropagationControl::Disabled,
-        );
+        let native_theory_propagation_dispatch =
+            NativeTheoryPropagationDispatch::disabled(theory, theory_atoms.len());
         let mut eager_stats = DpllEagerStats::default();
         native_theory_propagation_dispatch.record(&mut eager_stats);
 
@@ -1137,17 +1131,6 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
         memo: &'a mut crate::verification::ConflictSemanticVerifyMemo,
     ) -> Self {
         self.verify_memo = Some(memo);
-        self
-    }
-
-    /// Wire the Executor-owned #dt-context-derivation record sink into this
-    /// eager extension. See the `context_records` field doc; `None` (the
-    /// default) keeps the eager path record-free.
-    pub(crate) fn with_context_records(
-        mut self,
-        records: &'a mut crate::executor::DtContextConflictSink,
-    ) -> Self {
-        self.context_records = Some(records);
         self
     }
 

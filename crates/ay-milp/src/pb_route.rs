@@ -1741,6 +1741,13 @@ fn trace_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
+/// Force this module's cached env accessor at solve entry, so a consumer that
+/// rewrites its environment between window solves cannot race it. Called from
+/// `bab::prime_env_all`.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1866,7 +1873,7 @@ mod tests {
     #[test]
     fn dense_boolean_deadline_leaves_native_third_and_honours_cap() {
         let now = Instant::now();
-        let sixty = now + Duration::from_secs(60);
+        let sixty = now + Duration::from_mins(1);
         let deadline = portfolio_trial_deadline(
             PortfolioTrialOwnership::DenseBooleanOptimization,
             Some(sixty),
@@ -1944,7 +1951,7 @@ mod tests {
     #[test]
     fn generic_slice_is_denominated_in_translation_not_in_the_caller_deadline() {
         let now = Instant::now();
-        let hour = now + Duration::from_secs(3600);
+        let hour = now + Duration::from_hours(1);
 
         // Same enormous caller deadline, two models a factor apart in
         // representation cost => two different slices, both well under the old
@@ -2016,7 +2023,7 @@ mod tests {
         assert_eq!(
             portfolio_trial_deadline(
                 PortfolioTrialOwnership::DenseBooleanOptimization,
-                Some(now + Duration::from_secs(60)),
+                Some(now + Duration::from_mins(1)),
                 now,
                 Some(Duration::from_micros(500))
             ),
@@ -2030,7 +2037,7 @@ mod tests {
         assert_eq!(
             portfolio_trial_deadline(
                 PortfolioTrialOwnership::Generic,
-                Some(now + Duration::from_secs(60)),
+                Some(now + Duration::from_mins(1)),
                 now,
                 None
             ),
@@ -2562,11 +2569,4 @@ mod tests {
             "a model mutation must invalidate the previous check's evidence"
         );
     }
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

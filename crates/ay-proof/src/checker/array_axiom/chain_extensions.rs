@@ -228,3 +228,87 @@ pub(super) fn same_index_store_value_equality_terms(
     }
     None
 }
+
+/// Sub-schema (J): EXACT SAME-INDEX STORE OVERWRITE — the ONE-literal
+/// tautology `(= (store (store B i u) i v) (store B i v))`, modulo equality
+/// orientation.
+///
+/// Every occurrence of `B`, `i` and `v` is an EXACT shared `TermId`; `u` is
+/// arbitrary and never inspected, because the identity does not depend on the
+/// value the outer write shadows. All three `store` applications are
+/// re-derived through [`well_sorted_store_parts`], which re-establishes the
+/// complete signature against the base array sort — `TermStore` permits raw
+/// applications, so the strict proof boundary cannot take the producer's word
+/// for any of it.
+///
+/// SOUNDNESS. Assume the single literal false, i.e.
+/// `store(store(B,i,u),i,v) != store(B,i,v)`. Read both sides at an arbitrary
+/// index `k`. If `k` IS `i`, read-over-write-positive gives `v` on both sides.
+/// If `k` is not `i`, read-over-write-negative gives `select(store(B,i,u),k) =
+/// select(B,k)` on the left (twice) and `select(B,k)` on the right. So the two
+/// arrays agree at EVERY index, and extensionality makes them equal —
+/// contradicting the assumption. No side condition of any kind is involved:
+/// the index is one syntactically identical term in all three writes, so the
+/// case split above is exhaustive without any clause literal to discharge it.
+///
+/// This is the same extensional authority
+/// [`validate_array_store_permutation`] already exercises (store
+/// commutativity at pairwise-distinct indices is equally an extensional
+/// identity), stated for the DEGENERATE index pair the permutation schema
+/// cannot express: its condition (3) requires pairwise-DISTINCT index terms
+/// and its condition (2) a chain length of at least two on both sides, and the
+/// overwrite's two sides have lengths two and one and repeat one index.
+///
+/// Anything else fails closed: a literal count other than one, a non-`store`
+/// side, an inner write at a different index, a different written value, a
+/// different inner base, or any sort disagreement.
+pub(super) fn matches_exact_same_index_store_overwrite(
+    terms: &TermStore,
+    literals: &[TermId],
+) -> bool {
+    if literals.len() != 1 {
+        return false;
+    }
+    let Some((lhs, rhs)) = equality_sides(terms, literals[0]) else {
+        return false;
+    };
+    // Equality is symmetric, so both orientations are tried; the SHAPE decides
+    // which side is the depth-two overwrite.
+    for (overwrite, folded) in [(lhs, rhs), (rhs, lhs)] {
+        let (
+            Some((shadowed, outer_index, outer_value)),
+            Some((folded_base, folded_index, folded_value)),
+        ) = (
+            well_sorted_store_parts(terms, overwrite),
+            well_sorted_store_parts(terms, folded),
+        )
+        else {
+            continue;
+        };
+        let Some((inner_base, inner_index, _shadowed_value)) =
+            well_sorted_store_parts(terms, shadowed)
+        else {
+            continue;
+        };
+        if outer_index == inner_index
+            && outer_index == folded_index
+            && outer_value == folded_value
+            && inner_base == folded_base
+            && terms.sort(overwrite) == terms.sort(folded)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The `ArrayRowChain` sub-schemas whose matchers live outside `array_axiom.rs`
+/// itself: (I) same-index store-value equality, (J) same-index store overwrite,
+/// and (K) ITE-folded chain evaluation. Grouped behind one entry so
+/// [`super::matches_row_chain`]'s schema list names each module once; the
+/// disjunction is exactly the one it spelled inline before.
+pub(super) fn matches_extension_subschema(terms: &TermStore, literals: &[TermId]) -> bool {
+    same_index_store_value_equality_terms(terms, literals).is_some()
+        || matches_exact_same_index_store_overwrite(terms, literals)
+        || ite_eval::matches_ite_folded_chain_eval_under_array_eq(terms, literals)
+}

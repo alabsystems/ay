@@ -13,10 +13,22 @@
 # 34 upstream commits. Per-commit gating would not have caught either, because
 # nobody runs a 6-minute corpus sweep on every push -- but a nightly does.
 #
-# It runs TWO gates, because they answer different questions (see the header of
-# scripts/corpus_guard.py): the broad banded guard, and the exact node ratchet at
-# --tier all. The ratchet also runs pre-push; running it again here is not
-# redundant, it is the only lane that sees a merge nobody pushed through the hook.
+# It runs THREE gates, because they answer different questions (see the header of
+# scripts/corpus_guard.py): the broad banded guard, the exact node ratchet at
+# --tier all, and the exact-rim ratchet. The node ratchet also runs pre-push;
+# running it again here is not redundant, it is the only lane that sees a merge
+# nobody pushed through the hook.
+#
+# WHY THE RIM RATCHET IS HERE AND NOT IN THE PRE-PUSH HOOK. The first two gates
+# BOTH pass, clean, on a change measured at 4.9x on dcmulti and 3.45x on qnet1,
+# because both drive the float-first MILP lane and that lane enters `exact::`
+# about once per 1.36M nodes -- so until the Rust `milp_rim_gate` existed,
+# nothing under crates/ay-milp/src/exact/ was watched at all. It is nightly-only
+# for a cost reason and states it plainly: it measures through the #[cfg(test)]
+# probe, so it needs a `cargo test --no-run` build of the ay-milp lib (minutes
+# cold) on top of the example build the other two share. `--tier fast` (17s, 10
+# instances) is affordable pre-push if that build is already warm; --tier all
+# (105s, adds qiu) belongs here.
 set -u
 REPO="${AY_REPO:-$HOME/ay}"
 # The canonical corpus (scripts/milp_gate_corpus.py owns it, .milp_gate_corpus.tsv
@@ -41,7 +53,8 @@ LOG="$OUT/$STAMP.log"
   fi
 
   print "\n--- build ---"
-  if ! cargo build --release -p ay-milp --example mps_solve 2>&1 | tail -3; then
+  if ! cargo build --release -p ay-milp \
+      --example mps_solve --example milp_rim_gate 2>&1 | tail -3; then
     print "BUILD FAILED -- guard did not run."
     exit 2
   fi
@@ -63,13 +76,38 @@ LOG="$OUT/$STAMP.log"
       --json "$OUT/$STAMP.json"
   rc=$?
 
+  print "\n--- exact-rim ratchet (switch point / pivots / exact optimum, --tier all) ---"
+  # The probe is #[cfg(test)], so this needs the lib TEST binary rather than the
+  # example the two gates above share. Built here, not inside the gate, for the
+  # same reason the example is: a gate that cannot build is UNKNOWN (2), never
+  # clean, and the compile's own load average must not be the thing that makes
+  # the quiet-box precondition refuse.
+  # NOT `if ! cargo ... | tail -3`: a pipeline's status is its LAST command's, so
+  # that form is always tail's 0 and the failure branch below could never run --
+  # a build-failure branch that cannot fire is the dead gate this file argues
+  # against. zsh's $pipestatus keeps the compiler's own status.
+  cargo test -p ay-milp --release --lib --no-run 2>&1 | tail -3
+  if [[ ${pipestatus[1]} -ne 0 ]]; then
+    print "RIM PROBE BUILD FAILED -- the rim ratchet did not run."
+    rrc=2
+  else
+    # Cargo may place artifacts outside the repository, but this is still an
+    # exact path rather than a target/ glob: CARGO_TARGET_DIR is Cargo's own
+    # selected root and the example target name is fixed in the manifest.
+    RIM_TARGET="${CARGO_TARGET_DIR:-$REPO/target}"
+    if [[ "$RIM_TARGET" != /* ]]; then RIM_TARGET="$REPO/$RIM_TARGET"; fi
+    "$RIM_TARGET/release/examples/milp_rim_gate" \
+        --check --tier all --corpus "$CORPUS"
+    rrc=$?
+  fi
+
   print "\n--- verdict ---"
-  print "corpus manifest: $mrc   node ratchet: $nrc   corpus guard: $rc"
+  print "corpus manifest: $mrc   node ratchet: $nrc   corpus guard: $rc   rim ratchet: $rrc"
   # WORST WINS, and 2 is worse than 1. A run that could not measure is UNKNOWN,
   # and reporting unknown as either clean or as a regression is how a gate stops
   # being believed.
   worst=0
-  for x in $mrc $nrc $rc; do
+  for x in $mrc $nrc $rc $rrc; do
     if [[ $x -eq 2 ]]; then worst=2; elif [[ $x -eq 1 && $worst -ne 2 ]]; then worst=1; fi
   done
   case $worst in

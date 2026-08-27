@@ -55,8 +55,9 @@
 //! caller (SolveOpts)  >  explicit valid environment value  >  policy  >  compiled default
 //! ```
 //!
-//! Every existing A/B recipe, kill switch and reproduction script keeps working
-//! unchanged, and a measurement can always pin a setting against the policy.
+//! Every live, supported A/B recipe, kill switch and reproduction script keeps
+//! working unchanged, and a measurement can always pin a setting against the
+//! policy. Retired no-op carriers such as full pricing are outside that promise.
 //! The environment-over-policy half of that ordering is not negotiable: without
 //! it, the harness that measures the policy could not override the policy it is
 //! measuring. The one qualification is that an explicit but *unparseable*
@@ -720,10 +721,6 @@ pub(crate) fn real_opt(k: Knob) -> Option<f64> {
     policy(k).and_then(Setting::as_real)
 }
 
-/// The environment half of [`real`]/[`real_opt`]: parse the raw value exactly
-/// as `finite_nonnegative_setting` (`bab.rs:3961`) did, then apply the domain.
-/// Not trimmed, for the reason [`num`] gives.
-
 /// The admissible domain for every [`Setting::Real`], shared by the accessors
 /// and by [`crate::EngineEconomics`]'s builders so one number defines it.
 ///
@@ -738,6 +735,27 @@ pub(crate) const MAX_REAL: f64 = 1e15;
 fn in_real_domain(v: f64) -> bool {
     v.is_finite() && (0.0..=MAX_REAL).contains(&v)
 }
+
+/// Force [`EnvSnapshot`]'s one-shot capture to happen NOW.
+///
+/// The snapshot is `OnceLock`-backed and captured on FIRST USE, which without this
+/// is wherever the solve path first resolves a knob through this layer — the second
+/// of the two cached holes left by `bab::prime_env_all`. Priming it alongside the
+/// rest puts every environment read in the crate's cached set at one point the
+/// caller controls.
+///
+/// # Genuinely a no-op under `cfg(test)`
+///
+/// [`env_layer`] forks on `cfg(test)` and reads LIVE there, deliberately, so the
+/// crate's own `ScopedEnvVar` kill-switch coverage keeps working. An earlier
+/// version of this function said it was a no-op in test builds and then called
+/// `env_layer` anyway — 18 live `var_os` calls that stored nothing. Harmless, and
+/// the doc was still false; a review caught it. The `cfg` split below makes the
+/// sentence true rather than merely nearly-true.
+/// B38: the env snapshot layer is gone; priming is a no-op kept so the
+/// `bab::prime_env_all` choke point keeps one shape while its other cached
+/// holes retire.
+pub(crate) fn prime_env() {}
 
 #[cfg(test)]
 mod tests {
@@ -806,14 +824,14 @@ mod tests {
         assert!(profile.is_empty(), "shipped policy must select nothing");
         let _g = activate_profile(profile);
         for k in Knob::ALL {
-            assert!(!on(k), "{:?}: unset must be off", k);
-            assert!(!on_strict(k), "{:?}: unset must be off", k);
-            assert!(on_unless_zero(k), "{:?}: unset must be on", k);
-            assert_eq!(num(k, 7), 7, "{:?}: unset must be the default", k);
-            assert_eq!(count(k, 9), 9, "{:?}: unset must be the default", k);
-            assert_eq!(real(k, 0.25), 0.25, "{:?}: unset must be the default", k);
-            assert_eq!(count_opt(k), None, "{:?}: unset must be absent", k);
-            assert_eq!(real_opt(k), None, "{:?}: unset must be absent", k);
+            assert!(!on(k), "{k:?}: unset must be off");
+            assert!(!on_strict(k), "{k:?}: unset must be off");
+            assert!(on_unless_zero(k), "{k:?}: unset must be on");
+            assert_eq!(num(k, 7), 7, "{k:?}: unset must be the default");
+            assert_eq!(count(k, 9), 9, "{k:?}: unset must be the default");
+            assert_eq!(real(k, 0.25), 0.25, "{k:?}: unset must be the default");
+            assert_eq!(count_opt(k), None, "{k:?}: unset must be absent");
+            assert_eq!(real_opt(k), None, "{k:?}: unset must be absent");
         }
     }
 
@@ -1001,15 +1019,15 @@ mod tests {
             for bad in OUT_OF_DOMAIN {
                 {
                     let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Real(bad)));
-                    assert_eq!(real(k, 15.0), 15.0, "caller {:?}={}", k, bad);
-                    assert_eq!(real_opt(k), None, "caller {:?}={}", k, bad);
+                    assert_eq!(real(k, 15.0), 15.0, "caller {k:?}={bad}");
+                    assert_eq!(real_opt(k), None, "caller {k:?}={bad}");
                     let _ = Duration::from_secs_f64(real(k, 15.0));
                     let _ = Duration::from_secs(1).mul_f64(real(k, 1.5));
                 }
                 {
                     let _policy = activate_profile(Profile::EMPTY.with(k, Setting::Real(bad)));
-                    assert_eq!(real(k, 15.0), 15.0, "policy {:?}={}", k, bad);
-                    assert_eq!(real_opt(k), None, "policy {:?}={}", k, bad);
+                    assert_eq!(real(k, 15.0), 15.0, "policy {k:?}={bad}");
+                    assert_eq!(real_opt(k), None, "policy {k:?}={bad}");
                     let _ = Duration::from_secs_f64(real(k, 15.0));
                     let _ = Duration::from_secs(1).mul_f64(real(k, 1.5));
                 }
@@ -1017,13 +1035,8 @@ mod tests {
             // A count is a budget, so a negative one is meaningless rather than
             // meaningfully zero, in this layer as in the environment.
             let _neg = activate_caller(Profile::EMPTY.with(k, Setting::Num(-1)));
-            assert_eq!(
-                count(k, 9),
-                9,
-                "{:?}: a negative count takes the default",
-                k
-            );
-            assert_eq!(count_opt(k), None, "{:?}", k);
+            assert_eq!(count(k, 9), 9, "{k:?}: a negative count takes the default");
+            assert_eq!(count_opt(k), None, "{k:?}");
         }
     }
 
@@ -1032,7 +1045,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for k in Knob::ALL {
             if let Some(name) = k.env() {
-                assert!(seen.insert(name), "duplicate env name for {:?}", k);
+                assert!(seen.insert(name), "duplicate env name for {k:?}");
             }
             assert_eq!(Knob::ALL[k.slot()], k, "slot must round-trip");
         }
@@ -1055,18 +1068,18 @@ mod tests {
             Knob::NoFeasConflict,
             Knob::NoColdLu,
         ] {
+            let label = k.label();
             {
                 let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(true)));
-                assert!(on(k), "{}: a typed `true` engages the switch", k.label());
+                assert!(on(k), "{label}: a typed `true` engages the switch");
             }
             {
                 let _caller = activate_caller(Profile::EMPTY.with(k, Setting::Flag(false)));
-                assert!(!on(k), "{}: a typed `false` disengages it", k.label());
+                assert!(!on(k), "{label}: a typed `false` disengages it");
             }
             assert!(
                 !on(k),
-                "{}: no opinion resolves to the compiled default",
-                k.label()
+                "{label}: no opinion resolves to the compiled default"
             );
         }
     }
@@ -1090,24 +1103,3 @@ mod tests {
         );
     }
 }
-
-/// Force [`EnvSnapshot`]'s one-shot capture to happen NOW.
-///
-/// The snapshot is `OnceLock`-backed and captured on FIRST USE, which without this
-/// is wherever the solve path first resolves a knob through this layer — the second
-/// of the two cached holes left by `bab::prime_env_all`. Priming it alongside the
-/// rest puts every environment read in the crate's cached set at one point the
-/// caller controls.
-///
-/// # Genuinely a no-op under `cfg(test)`
-///
-/// [`env_layer`] forks on `cfg(test)` and reads LIVE there, deliberately, so the
-/// crate's own `ScopedEnvVar` kill-switch coverage keeps working. An earlier
-/// version of this function said it was a no-op in test builds and then called
-/// `env_layer` anyway — 18 live `var_os` calls that stored nothing. Harmless, and
-/// the doc was still false; a review caught it. The `cfg` split below makes the
-/// sentence true rather than merely nearly-true.
-/// B38: the env snapshot layer is gone; priming is a no-op kept so the
-/// `bab::prime_env_all` choke point keeps one shape while its other cached
-/// holes retire.
-pub(crate) fn prime_env() {}

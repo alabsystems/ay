@@ -4,6 +4,16 @@
 
 use super::*;
 
+pub(super) struct CheckReportSeal {
+    _private: (),
+}
+
+impl CheckReportSeal {
+    fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 pub(super) struct CheckState {
     pub(super) status: CheckStatus,
     pub(super) notes: Vec<String>,
@@ -40,11 +50,12 @@ pub fn check(cert_text: &str, model_text: &str) -> CheckReport {
         Ok(problem) => problem,
         Err(error) => {
             state.notes.push(format!("model does not parse: {error}"));
-            return CheckReport {
-                status: CheckStatus::Mismatch,
-                claims: Vec::new(),
-                notes: state.notes,
-            };
+            return CheckReport::new(
+                CheckReportSeal::new(),
+                CheckStatus::Mismatch,
+                Vec::new(),
+                state.notes,
+            );
         }
     };
     check_model_binding(&certificate, &problem, &mut state);
@@ -59,22 +70,19 @@ pub fn check(cert_text: &str, model_text: &str) -> CheckReport {
     );
     enforce_claim_policy(&certificate, &mut state);
     append_metadata_notes(&certificate, &reports, &mut state);
-    if state.status == CheckStatus::Unverified && reports.iter().any(|claim| claim.verified) {
+    if state.status == CheckStatus::Unverified && reports.iter().any(ClaimReport::is_verified) {
         state.status = CheckStatus::Partial;
     }
-    CheckReport {
-        status: state.status,
-        claims: reports,
-        notes: state.notes,
-    }
+    CheckReport::new(CheckReportSeal::new(), state.status, reports, state.notes)
 }
 
 fn malformed_report(error: CertIoError) -> CheckReport {
-    CheckReport {
-        status: CheckStatus::Refuted,
-        claims: Vec::new(),
-        notes: vec![format!("certificate malformed: {error}")],
-    }
+    CheckReport::new(
+        CheckReportSeal::new(),
+        CheckStatus::Refuted,
+        Vec::new(),
+        vec![format!("certificate malformed: {error}")],
+    )
 }
 
 fn status_rank(status: CheckStatus) -> u8 {

@@ -877,7 +877,7 @@ pub(crate) fn validate_fp_ground_eval(
 
 /// Recognize a clause the strict `FpGroundEval` validator will accept.
 ///
-/// The EXACT precondition of [`validate_fp_ground_eval`], plus the FP-content
+/// The EXACT precondition of `validate_fp_ground_eval`, plus the FP-content
 /// hygiene gate, so the `ay-dpll` classifier can only assign this kind to
 /// lemmas strict mode then accepts — no classifier/checker drift. All decision
 /// logic lives in this module.

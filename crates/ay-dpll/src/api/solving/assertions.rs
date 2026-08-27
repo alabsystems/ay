@@ -4,6 +4,8 @@
 
 //! Assertion stack management: assert, push, pop, scopes, reset.
 
+mod adoption_support;
+
 use ay_core::term::Symbol;
 use ay_core::{Sort, TermData, TermId};
 use ay_frontend::command::Term as ParsedTerm;
@@ -324,6 +326,11 @@ impl Solver {
         if self.scope_level != 0 {
             return None;
         }
+        if !self.adoption_suppressed_funs.is_empty()
+            && self.definitional_head_is_adoption_suppressed(assertion)
+        {
+            return None;
+        }
         let TermData::Forall(vars, body, _) = self.terms().get(assertion).clone() else {
             return None;
         };
@@ -344,44 +351,14 @@ impl Solver {
             return None;
         }
 
-        // Head candidacy is restricted to USER-DECLARED functions.  A theory
-        // builtin (`bvadd`, `+`, `select`, …) is already totally interpreted,
-        // so it can never be the symbol a definition defines; without this
-        // restriction `forall a b. (= (add a b) (bvadd a b))` — the RHS being
-        // the binders applied exactly, in order — made BOTH sides look like
-        // heads and the disambiguation below refused a definition that is in
-        // fact unambiguous.  This can only NARROW candidacy, so it removes no
-        // adoption: an undeclared head was already rejected a few lines down
-        // by `native_fun_signatures.get(&name)?`.  Two user-declared heads
-        // (`f(a,b) = g(a,b)`) stay genuinely ambiguous and keep refusing.
-        let exact_head = |solver: &Self, candidate: TermId| {
-            let TermData::App(Symbol::Named(name), args) = solver.terms().get(candidate) else {
-                return None;
-            };
-            if !solver.native_fun_signatures.contains_key(name) {
-                return None;
-            }
-            if args.len() != vars.len()
-                || args
-                    .iter()
-                    .zip(vars.iter())
-                    .any(|(&arg, (var_name, sort))| {
-                        !matches!(
-                            solver.terms().get(arg),
-                            TermData::Var(name, _) if name == var_name
-                        ) || solver.terms().sort(arg) != sort
-                    })
-            {
-                return None;
-            }
-            Some((name.clone(), args.clone(), candidate))
+        let (core_name, param_terms, head, definition_body) = match (
+            self.exact_native_definitional_head(sides[0], &vars),
+            self.exact_native_definitional_head(sides[1], &vars),
+        ) {
+            (Some((name, params, head)), None) => (name, params, head, sides[1]),
+            (None, Some((name, params, head))) => (name, params, head, sides[0]),
+            _ => return None,
         };
-        let (core_name, param_terms, head, definition_body) =
-            match (exact_head(self, sides[0]), exact_head(self, sides[1])) {
-                (Some((name, params, head)), None) => (name, params, head, sides[1]),
-                (None, Some((name, params, head))) => (name, params, head, sides[0]),
-                _ => return None,
-            };
         let (name, registration) = self
             .native_fun_signatures
             .iter()

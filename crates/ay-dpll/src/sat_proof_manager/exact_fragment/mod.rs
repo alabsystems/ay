@@ -6,12 +6,15 @@
 
 mod build_steps;
 mod builder;
+mod context_derivation;
+mod ground_substitution;
 mod intrinsic_authority;
 mod metering;
 mod propagation_chains;
 mod types;
 mod unit_chains;
 
+use context_derivation::ContextDerivationState;
 pub(super) use types::OrFoldUnitPlan;
 pub(crate) use types::{
     ExactOriginalProofError, ExactOriginalProofFragment, FragmentContextDerivation,

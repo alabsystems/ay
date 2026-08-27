@@ -724,10 +724,10 @@ impl Model {
     /// feasibility verdict with a valid exact certificate.
     ///
     /// The caller names the margin, so the reframe never guesses which row is
-    /// the violation. The hint is advisory to correctness: the session
-    /// re-validates every verdict against this model regardless, and declines
-    /// the reframe (falling back to the plain feasibility solve) whenever the
-    /// row or objective does not fit the shape at solve time.
+    /// the violation. The hint is advisory to correctness: the session validates
+    /// every published witness against this model and declines the reframe
+    /// (falling back to the plain feasibility solve) whenever the row or objective
+    /// does not fit the shape at solve time.
     ///
     /// # Errors
     /// [`ModelError::Unsupported`] if `row` is out of range, has no

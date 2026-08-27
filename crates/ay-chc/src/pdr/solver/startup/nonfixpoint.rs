@@ -10,6 +10,8 @@
 
 use super::super::{PdrResult, PdrSolver};
 
+include!("nonfixpoint/budget.rs");
+
 impl PdrSolver {
     /// Run non-fixpoint discovery passes once after core fixpoint converges.
     ///
@@ -45,26 +47,6 @@ impl PdrSolver {
             None => nonfixpoint_budget,
         };
 
-        // Helper closure: check if non-fixpoint budget is exhausted.
-        let nonfixpoint_budget_exceeded = |start: ay_core::time::Instant,
-                                           budget: Option<std::time::Duration>,
-                                           verbose: bool|
-         -> bool {
-            if let Some(b) = budget {
-                if start.elapsed() >= b {
-                    if verbose {
-                        safe_eprintln!(
-                            "PDR: Non-fixpoint startup budget exhausted ({:?} >= {:?}), skipping remaining passes",
-                            start.elapsed(),
-                            b
-                        );
-                    }
-                    return true;
-                }
-            }
-            false
-        };
-
         let _t2 = ay_core::time::Instant::now();
         self.discover_sum_invariants();
         if self.config.verbose {
@@ -89,8 +71,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2a = ay_core::time::Instant::now();
             self.discover_sum_equals_var_invariants();
             if self.config.verbose {
@@ -235,8 +216,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2b = ay_core::time::Instant::now();
             self.discover_affine_invariants();
             if self.config.verbose {
@@ -264,8 +244,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2d = ay_core::time::Instant::now();
             self.propagate_affine_invariants_to_derived_predicates();
             if self.config.verbose {
@@ -278,8 +257,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2e = ay_core::time::Instant::now();
             let affine_hint_added = self.apply_affine_equality_propagation_hints();
             if self.config.verbose {
@@ -303,8 +281,7 @@ impl PdrSolver {
         //  (b) a re-run of the step-difference bound pass whose candidates
         //      were rejected pre-kernel as not entry-inductive
         //      (SAD's A <= B + 2).
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2f = ay_core::time::Instant::now();
             self.discover_derived_entry_value_bounds();
             if self.config.verbose {
@@ -317,8 +294,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t2g = ay_core::time::Instant::now();
             self.discover_step_difference_bound_invariants();
             if self.config.verbose {
@@ -331,8 +307,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t3 = ay_core::time::Instant::now();
             self.discover_triple_sum_invariants();
             if self.config.verbose {
@@ -349,8 +324,7 @@ impl PdrSolver {
         // where one variable is subtracted. Run after unsigned triple sum.
         // Example: bouncy_three_counters_merged needs D = A + C - B.
         // Accidentally removed in 8e9057446 (zone adoption revert).
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t3s = ay_core::time::Instant::now();
             self.discover_signed_triple_sum_invariants();
             if self.config.verbose {
@@ -365,8 +339,7 @@ impl PdrSolver {
         }
         // #1362: Quad sum invariants (vi + vj + vk + vm = vl) for 4-way
         // nondeterministic branching (s_multipl_14). Run after triple sum.
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t3q = ay_core::time::Instant::now();
             self.discover_sum_invariants();
             if self.config.verbose {
@@ -379,8 +352,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t4 = ay_core::time::Instant::now();
             self.discover_difference_invariants();
             if self.config.verbose {
@@ -393,8 +365,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t5 = ay_core::time::Instant::now();
             self.discover_scaled_difference_invariants();
             if self.config.verbose {
@@ -407,8 +378,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t6 = ay_core::time::Instant::now();
             self.discover_scaled_sum_invariants();
             if self.config.verbose {
@@ -421,8 +391,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t7 = ay_core::time::Instant::now();
             // Cap parity at 500ms: probes involve individual SMT queries per
             // (var, modulus) pair. On problems without modular structure (e.g.,
@@ -452,11 +421,7 @@ impl PdrSolver {
             }
             let frame1_after_parity_retry = self.frames.get(1).map_or(0, |f| f.lemmas.len());
             if frame1_after_parity_retry > frame1_before_parity_retry
-                && !nonfixpoint_budget_exceeded(
-                    nonfixpoint_start,
-                    nonfixpoint_budget,
-                    self.config.verbose,
-                )
+                && !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget)
             {
                 let rerun_cap = std::time::Duration::from_millis(150);
                 let rerun_deadline = nonfixpoint_budget.map(|b| {
@@ -553,8 +518,7 @@ impl PdrSolver {
         // The startup fixpoint loop discovers equalities before parity, so the SCC check
         // correctly rejects them. Now that parity invariants are in the frame, re-running
         // equality discovery allows the SCC check to use them.
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t_eq_retry = ay_core::time::Instant::now();
             self.discover_equality_invariants();
             if self.config.verbose {
@@ -591,13 +555,7 @@ impl PdrSolver {
                 }
         });
         // Modular equality discovery is expensive and only useful with mod/div
-        if has_mod
-            && !nonfixpoint_budget_exceeded(
-                nonfixpoint_start,
-                nonfixpoint_budget,
-                self.config.verbose,
-            )
-        {
+        if has_mod && !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t9 = ay_core::time::Instant::now();
             self.discover_modular_equality_invariants();
             if self.config.verbose {
@@ -610,8 +568,7 @@ impl PdrSolver {
                 return Some(self.finish_with_result_trace(PdrResult::Unknown));
             }
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // Conditional invariants: discover phase-transition patterns
             // (pivot <= threshold => other = init) AND (pivot > threshold => other = pivot)
             let _t10 = ay_core::time::Instant::now();
@@ -622,12 +579,24 @@ impl PdrSolver {
                     _t10.elapsed()
                 );
             }
+            // Guarded scaled equalities: `mode = g => B - k*A = c`, for
+            // accumulators whose closed form depends on a mode fixed at entry.
+            // Runs beside the threshold-based pass above because the guard is a
+            // latch equality rather than a phase threshold, and the consequent
+            // is a SCALED relation the unguarded difference pass cannot state.
+            let _t10b = ay_core::time::Instant::now();
+            self.discover_guarded_scaled_equalities();
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: discover_guarded_scaled_equalities took {:?}",
+                    _t10b.elapsed()
+                );
+            }
         }
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // Relational invariants: discover var1 <= var2 or var1 >= var2 relationships
             let _t11 = ay_core::time::Instant::now();
             self.discover_relational_invariants();
@@ -641,8 +610,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // Step-bounded difference: discover var_i < var_j + step from loop guard + increment patterns
             let _t12 = ay_core::time::Instant::now();
             self.discover_step_bounded_difference_invariants();
@@ -656,8 +624,7 @@ impl PdrSolver {
         if self.is_cancelled() {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // Counting invariants: discover B = k*C relationships for chained predicates
             let _t13 = ay_core::time::Instant::now();
             self.discover_counting_invariants();
@@ -674,8 +641,7 @@ impl PdrSolver {
         // NOTE: discover_error_implied_invariants is now part of the startup fixpoint loop
         // (see #1398) so it runs earlier and can benefit from prerequisite equalities.
 
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // Three-variable difference bound invariants: discover d >= b - a patterns from init
             // e.g., for init D >= B - A, derive D + A >= B as an invariant
             let _t14b = ay_core::time::Instant::now();
@@ -701,8 +667,7 @@ impl PdrSolver {
             return Some(self.finish_with_result_trace(PdrResult::Unknown));
         }
 
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             // ITE constant propagation: when a constant argument forces an ITE condition,
             // derive the resulting constant value as an invariant for the target predicate.
             // Essential for dillig12_m where mode=0 forces SAD's first arg to be 1.
@@ -763,8 +728,7 @@ impl PdrSolver {
         // candidate emission). Both layers are independently env-gated and DEFAULT
         // OFF: with no flag set these calls return immediately after one cheap
         // boolean check, proposing nothing, so the default verdict is unchanged.
-        if !nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget, self.config.verbose)
-        {
+        if !self.nonfixpoint_budget_exceeded(nonfixpoint_start, nonfixpoint_budget) {
             let _t_arr = ay_core::time::Instant::now();
             self.run_array_frontier_telemetry();
             self.discover_array_content_invariants();

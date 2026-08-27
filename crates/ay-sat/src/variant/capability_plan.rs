@@ -6,7 +6,7 @@
 
 use super::{
     dimacs_baseline_features, minimal_features, probe_features, SolverVariant, VariantConfig,
-    VariantInput, VariantStartupPolicy,
+    VariantInput, VariantProofMode, VariantStartupPolicy,
 };
 use crate::auto::{CapabilityDecision, CapabilityLedger, CapabilityState, DecisionSource};
 use crate::features::{InstanceClass, SatFeatures};
@@ -116,11 +116,8 @@ impl VariantProfilePlan {
             config.apply_dense_mutex_focused_restart_gate_experiment(features);
         let midband_restart_adjusted = config.apply_midband_deep_restart_gate(features);
         let before_proof_features = config.features;
-        if config.input.proof_mode {
-            proof_capability::apply_profile_permissions(
-                &mut config.features,
-                ProofMode::from_lrat_enabled(config.input.lrat_mode),
-            );
+        if let Some(proof_mode) = config.input().capability_mode() {
+            proof_capability::apply_profile_permissions(&mut config.features, proof_mode);
         }
         let proof_adjusted = before_proof_features != config.features;
         let mut startup_features = config.features;
@@ -254,7 +251,10 @@ fn capability_provenance(
         if startup_phase_initialization_disabled(config) {
             return (
                 route_source.unwrap_or(DecisionSource::Auto),
-                format!("startup_policy={}", config.input.startup_policy.as_str()),
+                format!(
+                    "startup_policy={}",
+                    config.input().startup_policy().as_str()
+                ),
             );
         }
         return (
@@ -263,8 +263,7 @@ fn capability_provenance(
                 .to_string(),
         );
     }
-    if proof_policy_decided(config, features, instance_class, gate) {
-        let mode = ProofMode::from_lrat_enabled(config.input.lrat_mode);
+    if let Some(mode) = proof_policy_mode(config, features, instance_class, gate) {
         if let Some(source) = drat_substitution_env_source(mode, config.variant, gate) {
             return source;
         }
@@ -276,7 +275,7 @@ fn capability_provenance(
     if route_policy_decided(config, features, instance_class, gate) {
         return (
             route_source.unwrap_or(DecisionSource::Auto),
-            format!("route={}", config.input.route_profile.as_str()),
+            format!("route={}", config.input().route_profile().as_str()),
         );
     }
     if gate.resolved != gate.adaptive {
@@ -300,10 +299,10 @@ fn capability_provenance(
             format!("resolved {:?} profile policy", config.variant),
         );
     }
-    if !config.input.proof_mode
+    if matches!(config.input().proof_mode(), VariantProofMode::Disabled)
         && !config
-            .input
-            .route_profile
+            .input()
+            .route_profile()
             .requires_proof_safe_specialist_routing()
         && circuit_equiv_symmetry_cli_decided(features, instance_class, gate)
     {
@@ -339,8 +338,8 @@ fn default_provenance(
 
 fn startup_policy_decided(config: &VariantConfig, gate: GateStages) -> bool {
     if !config
-        .input
-        .route_profile
+        .input()
+        .route_profile()
         .requires_proof_safe_specialist_routing()
         || !matches!(gate.capability, "walk" | "warmup")
     {
@@ -357,30 +356,29 @@ fn startup_policy_decided(config: &VariantConfig, gate: GateStages) -> bool {
 
 fn startup_phase_initialization_disabled(config: &VariantConfig) -> bool {
     matches!(
-        config.input.startup_policy,
+        config.input().startup_policy(),
         VariantStartupPolicy::DisableWarmupWalk
     ) && matches!(config.variant, SolverVariant::Default)
-        && config.input.lrat_mode
+        && matches!(config.input().proof_mode(), VariantProofMode::Lrat)
 }
 
-fn proof_policy_decided(
+fn proof_policy_mode(
     config: &VariantConfig,
     features: &SatFeatures,
     instance_class: InstanceClass,
     gate: GateStages,
-) -> bool {
-    if !config.input.proof_mode || gate.final_state {
-        return false;
+) -> Option<ProofMode> {
+    let mode = config.input().capability_mode()?;
+    if gate.final_state {
+        return None;
     }
-    let Some(transform) = proof_transform(gate.capability) else {
-        return false;
-    };
-    let mode = ProofMode::from_lrat_enabled(config.input.lrat_mode);
-    !proof_capability::transform_allowed(mode, transform)
+    let transform = proof_transform(gate.capability)?;
+    (!proof_capability::transform_allowed(mode, transform)
         && (gate.nominal
             || gate.before_proof
             || resolved_env_source(config, gate).is_some()
-            || circuit_equiv_symmetry_cli_decided(features, instance_class, gate))
+            || circuit_equiv_symmetry_cli_decided(features, instance_class, gate)))
+    .then_some(mode)
 }
 
 fn route_policy_decided(
@@ -390,8 +388,8 @@ fn route_policy_decided(
     gate: GateStages,
 ) -> bool {
     config
-        .input
-        .route_profile
+        .input()
+        .route_profile()
         .requires_proof_safe_specialist_routing()
         && matches!(gate.capability, "sweep" | "symmetry")
         && !gate.final_state

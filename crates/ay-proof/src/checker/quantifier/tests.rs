@@ -6,6 +6,8 @@ use ay_core::{Sort, Symbol};
 
 use super::*;
 
+include!("tests/forall_inst_sequential.rs");
+
 struct ForallInstFixture {
     terms: TermStore,
     quantified: TermId,
@@ -258,6 +260,61 @@ fn forall_inst_rejects_nested_binder_and_partial_capture() {
     assert!(
         validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[binder_as_argument],)
             .is_err()
+    );
+}
+
+#[test]
+fn forall_inst_accepts_a_binder_free_body_instantiated_at_a_shadowed_symbol() {
+    // `(or (not (forall ((fi_amb_x Int)) (fi_amb_p fi_amb_x))) (fi_amb_p fi_amb_x))`
+    // — the conclusion's `fi_amb_x` is FREE (the forall is discharged), so this
+    // is `∀x. p x ⊢ p c` at the ambient `c` the binder shadows. The body binds
+    // nothing, so the conclusion binds nothing and no name in it can be
+    // captured; refusing on the spelling alone rejected a valid instantiation.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("fi_amb_x", Sort::Int);
+    let body = terms.mk_app(Symbol::named("fi_amb_p"), [x], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("fi_amb_x".to_string(), Sort::Int)], body);
+    let not_quantified = terms.mk_not_raw(quantified);
+    let implication = terms.mk_app(Symbol::named("or"), [not_quantified, body], Sort::Bool);
+
+    validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[x])
+        .expect("a binder-free body instantiated at the symbol its binder shadows is valid");
+}
+
+#[test]
+fn forall_inst_accepts_a_distinct_same_spelled_argument_in_a_binder_free_body() {
+    let mut terms = TermStore::new();
+    let bound = terms.mk_var("fi_amb2_x", Sort::Int);
+    let ambient = terms.mk_fresh_named_var("fi_amb2_x", Sort::Int);
+    assert_ne!(bound, ambient);
+    let body = terms.mk_app(Symbol::named("fi_amb2_p"), [bound], Sort::Bool);
+    let instance = terms.mk_app(Symbol::named("fi_amb2_p"), [ambient], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("fi_amb2_x".to_string(), Sort::Int)], body);
+    let not_quantified = terms.mk_not_raw(quantified);
+    let implication = terms.mk_app(Symbol::named("or"), [not_quantified, instance], Sort::Bool);
+
+    validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[ambient])
+        .expect("a binder-free conclusion cannot capture, whatever the argument is spelled");
+}
+
+#[test]
+fn forall_inst_rejects_an_argument_named_by_a_binder_the_body_rebinds() {
+    // `forall ((x Int)) (and (p x) (forall ((x Int)) (q x)))` with argument `x`:
+    // the body puts the spelling back in scope over a substitution site, so the
+    // source-binder test stays in force here.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("fi_rebind_x", Sort::Int);
+    let p_x = terms.mk_app(Symbol::named("fi_rebind_p"), [x], Sort::Bool);
+    let q_x = terms.mk_app(Symbol::named("fi_rebind_q"), [x], Sort::Bool);
+    let inner = terms.mk_forall(vec![("fi_rebind_x".to_string(), Sort::Int)], q_x);
+    let body = terms.mk_app(Symbol::named("and"), [p_x, inner], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("fi_rebind_x".to_string(), Sort::Int)], body);
+    let not_quantified = terms.mk_not_raw(quantified);
+    let implication = terms.mk_app(Symbol::named("or"), [not_quantified, body], Sort::Bool);
+
+    assert!(
+        validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[x]).is_err(),
+        "a source binder the body re-binds is still in scope and must fail closed"
     );
 }
 

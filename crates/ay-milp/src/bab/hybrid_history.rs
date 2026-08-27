@@ -2,6 +2,8 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use std::cmp::Ordering;
+
 use super::PropDeps;
 
 /// HYBRID BRANCHING HISTORY (`the hybrid knob`) — the non-pseudocost half of a
@@ -158,7 +160,11 @@ impl HybridView<'_> {
     /// `[0, 1)` as `(x/avg) / (1 + x/avg)`, so an average column scores 0.5 and
     /// no single outlier can dominate the sum.
     fn norm(x: f64, avg: f64) -> f64 {
-        if !(avg > 0.0) || !(x > 0.0) {
+        // An unordered input has no usable positive signal. Spell the partial
+        // order explicitly: `<= 0.0` alone would let NaN reach the score.
+        if avg.partial_cmp(&0.0) != Some(Ordering::Greater)
+            || x.partial_cmp(&0.0) != Some(Ordering::Greater)
+        {
             return 0.0;
         }
         let r = x / avg;

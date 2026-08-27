@@ -494,6 +494,19 @@ pub(crate) fn substitute_binary_complements(
     ))
 }
 
+/// Cached trace predicate; see the live-read ratchet in `tests/env_ledger.rs`.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
+}
+
+/// Force this module's cached env accessor at solve entry, so a consumer that
+/// rewrites its environment between window solves cannot race it. Called from
+/// `bab::prime_env_all`.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,17 +731,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Cached trace predicate; see the live-read ratchet in `tests/env_ledger.rs`.
-fn trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

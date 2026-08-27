@@ -423,6 +423,120 @@ pub enum ProofFormat {
     Alethe,
 }
 
+/// The EXTERNAL proof checker the caller declares will verify the emitted
+/// certificate.
+///
+/// This is a CAPABILITY axis that is *paired with* the emitted format rather
+/// than implied by it. Of the DRAT-family checkers only `dsr-trim` accepts the
+/// DSR substitution-witnessed `a`-lines that AY's SR symmetry routes emit
+/// (measured 2026-08-24: php_11_8's orbitope staircase proof is
+/// `s VERIFIED UNSAT` under dsr-trim and `s NOT VERIFIED` under both
+/// drat-trim and dpr-trim). VeriPB accepts the same witnesses, but only on its
+/// own pseudo-Boolean surface. SAT-COMP registrants declare their checker, and
+/// a rejected UNSAT proof under the declared checker is disqualifying, so proof
+/// routes gate on BOTH [`DeclaredProofChecker::accepts_sr_witnesses`] and
+/// [`DeclaredProofChecker::reads_veripb`] (matched against the live proof
+/// surface) and fall back to plain-CDCL-checkable emission when the declared
+/// checker cannot consume their steps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "cli", clap(rename_all = "kebab-case"))]
+pub enum DeclaredProofChecker {
+    /// `dsr-trim` (the verified SR chain dsr-trim → drat/lsr → cake_lpr).
+    /// The DEFAULT for plain local use — SR-witnessed routes stay enabled,
+    /// which is exactly the behaviour before this axis existed.
+    #[default]
+    DsrTrim,
+    /// `dpr-trim` — on the SAT-COMP 2026 checker menu; PR witnesses only,
+    /// measured to REJECT DSR substitution witnesses.
+    DprTrim,
+    /// `drat-trim` — RUP/RAT only; measured to reject every witnessed
+    /// `a`-line. NOT on the SAT-COMP 2026 checker menu.
+    DratTrim,
+    /// `gratgen`/`gratchk` — RUP/RAT only; on the 2026 menu.
+    Gratgen,
+    /// VeriPB — on the 2026 menu, and its `red` (redundance-based
+    /// strengthening) rule takes a substitution witness natively, so the SR
+    /// symmetry routes ARE representable under this declaration. They must be
+    /// written on the pseudo-Boolean surface (`--proof-format veripb`), not as
+    /// DSR `a`-lines: VeriPB does not consume DRAT files at all. See
+    /// [`Self::reads_veripb`] for the surface half of that gate.
+    Veripb,
+}
+
+impl DeclaredProofChecker {
+    /// Whether the declared checker accepts a substitution witness on a
+    /// redundancy step at all — on whichever proof surface that checker reads.
+    ///
+    /// Fail-closed: `drat-trim`, `dpr-trim` and `gratgen` are RUP/RAT (or
+    /// PR-at-most) checkers and are measured to reject them. `dsr-trim` accepts
+    /// them as DSR `a`-lines in a DRAT stream; VeriPB accepts them as the
+    /// witness argument of `red` in a pseudo-Boolean derivation (measured
+    /// 2026-08-24: php_sudoku_p15_h14's 91-step orbitope staircase is
+    /// `s VERIFIED UNSATISFIABLE` under the checker `ci/veripb.pin` names —
+    /// upstream 4bb10c2c plus the AY soundness patch, NOT stock 3.0.2, which
+    /// still accepts five of the nine `ci/veripb-soundness/` fixtures).
+    ///
+    /// This is only half the question — see [`Self::reads_veripb`] for the
+    /// other half, which is whether the emitted FORMAT is the one this checker
+    /// can read.
+    #[must_use]
+    pub const fn accepts_sr_witnesses(self) -> bool {
+        matches!(self, Self::DsrTrim | Self::Veripb)
+    }
+
+    /// Whether this checker reads the pseudo-Boolean (`.pbp`) surface rather
+    /// than a DRAT-family clause stream.
+    ///
+    /// The two surfaces are not interchangeable in either direction, so an
+    /// SR-witnessed step is only checkable when this matches the format being
+    /// emitted. `--proof-format drat --proof-checker veripb` and
+    /// `--proof-format veripb --proof-checker dsr-trim` are both declarations
+    /// under which the witnessed routes must clamp.
+    #[must_use]
+    pub const fn reads_veripb(self) -> bool {
+        matches!(self, Self::Veripb)
+    }
+
+    /// Canonical kebab-case checker name for diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DsrTrim => "dsr-trim",
+            Self::DprTrim => "dpr-trim",
+            Self::DratTrim => "drat-trim",
+            Self::Gratgen => "gratgen",
+            Self::Veripb => "veripb",
+        }
+    }
+}
+
+/// Global declared proof checker, installed once by the CLI
+/// (`--proof-checker`; the submission run.sh always passes it).
+static GLOBAL_DECLARED_PROOF_CHECKER: OnceLock<DeclaredProofChecker> = OnceLock::new();
+
+/// Install the declared proof checker (first caller wins).
+///
+/// # Errors
+///
+/// The rejected value when a checker was already installed.
+pub fn set_global_declared_proof_checker(
+    checker: DeclaredProofChecker,
+) -> Result<(), DeclaredProofChecker> {
+    GLOBAL_DECLARED_PROOF_CHECKER.set(checker)
+}
+
+/// The installed declared proof checker, or the dsr-trim default (SR-witnessed
+/// routes allowed — identical to the pre-axis behaviour for library consumers
+/// and plain local runs).
+#[must_use]
+pub fn declared_proof_checker() -> DeclaredProofChecker {
+    GLOBAL_DECLARED_PROOF_CHECKER
+        .get()
+        .copied()
+        .unwrap_or_default()
+}
+
 /// Configuration for which debug channels are active.
 ///
 /// Wraps a `HashSet<DebugChannel>` with convenience methods. The `Theory`
@@ -964,6 +1078,15 @@ pub struct MiscCliFlags {
     pub proof_introspect_probe: Option<String>,
     /// `--str-w4-work <n>` — W4 work cap (`0` = unbounded; B42).
     pub str_w4_work: Option<u64>,
+    /// `--fmq-lane-budget-ms <n>` — override the finite-model MBQI lane's
+    /// per-invocation wall cap (B43 A/B; `None` = the shipped sizing).
+    pub fmq_lane_budget_ms: Option<u64>,
+    /// `--fmq-probe-ms <n>` — override the finite-model MBQI lane's
+    /// per-sub-solve ceiling (B43 A/B; `None` = the shipped constant).
+    pub fmq_probe_ms: Option<u64>,
+    /// `--fmq-seed-ms <n>` — override the finite-model MBQI lane's session
+    /// decline seed (B43 A/B; `None` = the shipped constant).
+    pub fmq_seed_ms: Option<u64>,
     /// `--sat-ab-subst-stats` — congruence/substitution stats dumps (B43).
     pub ab_subst_stats: bool,
     /// `--sat-ab-subst-dump-merges` — merge/unit provenance dump (B43).
@@ -1296,21 +1419,31 @@ pub struct MiscCliFlags {
     pub ic3_lane_noslice: bool,
     /// `--reve-debug` (B74): REVE invariant-sampling stderr tracing.
     pub reve_debug: bool,
-    /// `--max-propagate-rounds` (B74): research override for the extension
-    /// propagate spin guard (default 50M; a genuine solve never reaches it).
+    /// `--max-propagate-rounds` (B74): extension spin guard override (default 50M).
     pub max_propagate_rounds: Option<u64>,
     /// `--lra-cond-trail` (B75): experimental LRA conditional bound trail.
     pub lra_cond_trail: bool,
-    /// `--euf-inc-neg-pop` (B77): experimental EUF incremental negative-pop arm.
-    /// Default-flip A/B 2026-08-20: NOT A WIN (+2/314 runs, both limit-edge;
-    /// median unchanged) — stays opt-in. the development design notes.
+    /// `--euf-inc-neg-pop` (B77): opt-in; 2026-08-20 A/B was not a win.
+    /// (+2/314 limit-edge runs; median unchanged; see the dated EUF A/B report.)
     pub euf_inc_neg_pop: bool,
     /// `--nra-diag` (B77): NRA ICP diagnostics.
     pub nra_diag: bool,
     /// `--nra-grid-probe` (B77): NRA ICP grid probe diagnostics.
     pub nra_grid_probe: bool,
-    /// `--nra-witness <PATH>` (B77): NRA witness dump path.
+    /// `--nra-witness <ASSIGNMENTS>` (B77): inline rationals such as `x=1/2,y=-3`.
     pub nra_witness: Option<String>,
+    /// `--quant-relevance <bool>` (B79): e-matching relevance admission layer
+    /// (measured 2026-08-19: real flood control, no verdict conversions yet —
+    /// default OFF; see ematching/relevance.rs).
+    pub quant_relevance: Option<bool>,
+    /// `--quant-relevance-k <n>` (B79): per-round admission budget.
+    pub quant_relevance_k: Option<usize>,
+    /// `--quant-relevance-min <n>` (B79): flood threshold.
+    pub quant_relevance_min: Option<usize>,
+    /// `--quant-relevance-model <bool>` (B79): model-signal ranking.
+    pub quant_relevance_model: Option<bool>,
+    /// `--quant-relevance-debug` (B79): per-round admission trace.
+    pub quant_relevance_debug: bool,
 }
 
 /// Global miscellaneous CLI flags, initialized once per process.
@@ -1373,6 +1506,9 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         proof_introspect: None,
         proof_introspect_probe: None,
         str_w4_work: None,
+        fmq_lane_budget_ms: None,
+        fmq_probe_ms: None,
+        fmq_seed_ms: None,
         ab_subst_stats: false,
         ab_subst_dump_merges: false,
         ab_subst_dump_gates: false,
@@ -1539,6 +1675,11 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         nra_diag: false,
         nra_grid_probe: false,
         nra_witness: None,
+        quant_relevance: None,
+        quant_relevance_k: None,
+        quant_relevance_min: None,
+        quant_relevance_model: None,
+        quant_relevance_debug: false,
     }
 }
 
@@ -1585,10 +1726,9 @@ pub mod misc_test_override {
     }
 }
 
-/// Set the global miscellaneous CLI flags explicitly (e.g., from CLI flags).
-///
-/// Called by the `ay` CLI binary after argument parsing to replace the
-/// env-var IPC round-trip (#8835).
+/// Set the global miscellaneous CLI flags after parsing, without env-var IPC (#8835).
+/// Returns the rejected flags when another value is already installed.
+#[expect(clippy::result_large_err, reason = "duplicate-set ownership")]
 pub fn set_global_misc_cli_flags(flags: MiscCliFlags) -> Result<(), MiscCliFlags> {
     GLOBAL_MISC_CLI_FLAGS.set(flags)
 }

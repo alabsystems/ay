@@ -320,3 +320,27 @@ fn wire_rendering_preserves_internal_identity_and_exposes_holes() {
     assert_eq!(TheoryLemmaKind::LraFarkas.alethe_wire_rule(), "la_generic");
     assert_eq!(TheoryLemmaKind::LiaGeneric.alethe_wire_rule(), "hole");
 }
+
+/// No name in the checkable vocabulary may be one the pinned checker rejects.
+///
+/// This is the invariant `is_checkable_alethe_rule` promises, stated as a test
+/// rather than left to the next person to rediscover. `dt_clash` violated it:
+/// probed directly against `carcara 1.1.0 [git master 9a352ee]` it answers
+/// `unknown rule` and the whole document comes back `invalid`, which is the
+/// one outcome the predicate exists to rule out.
+///
+/// The list cannot be probed from a unit test — that needs the installed
+/// binary, and `ay-proof/tests/wire_rule_coverage.rs` owns that lane. What is
+/// pinned here is the measured conclusion, so re-adding the name is a test
+/// failure rather than a silent regression.
+#[test]
+fn the_pinned_checker_implements_no_datatype_rules() {
+    for name in ["dt_clash", "dt_distinct", "dt_split", "dt_cons_eq"] {
+        assert!(
+            !is_checkable_alethe_rule(name),
+            "`{name}` is a datatype rule; the pinned carcara implements none of \
+             them, and claiming it is checkable turns a `holey` proof into an \
+             `invalid` document"
+        );
+    }
+}

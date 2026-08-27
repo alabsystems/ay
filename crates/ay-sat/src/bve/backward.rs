@@ -286,9 +286,18 @@ impl BVE {
 
             // 64-bit signature pre-filter (#7922): R's variables must be a
             // subset of D's variables (ignoring polarity) for subsumption or
-            // self-subsumption. This O(1) check avoids the O(|D|) literal
-            // scan for most non-matching candidates.
-            let d_sig = clauses.signature(d_idx);
+            // self-subsumption. Recomputed from D's literals now that the
+            // always-on arena signature side table is retired: the recompute
+            // is a branch-free OR sweep over the contiguous literal words of
+            // `d_lits` (already resident from the length check above), where
+            // the old path was a guaranteed-cold probe into a table spanning
+            // hundreds of MB. It still pays for itself against the
+            // mark-array scan below (random access into a num_vars-sized
+            // array per literal), and the filter decision — hence
+            // `checks`/`backward_sig_filtered` — is identical: the side
+            // table was maintained on every add/replace, so it too always
+            // reflected D's current literals.
+            let d_sig = compute_clause_signature(d_lits);
             if !clause_signature_vars_subset(r_sig, d_sig) {
                 self.stats.backward_sig_filtered += 1;
                 continue;

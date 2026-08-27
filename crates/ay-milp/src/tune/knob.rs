@@ -46,6 +46,7 @@ impl Knob {
             Self::NoCutoff => "no-cutoff",
             Self::NoNodeLu => "no-node-lu",
             Self::NoTallLu => "no-tall-lu",
+            Self::NoTallColdDual => "no-tall-cold-dual",
             Self::NoDualChurnBand => "no-dual-churn-band",
             Self::DualBloomCap => "dual-bloom-cap",
             Self::NoFlowcoverAgg => "no-flowcover-agg",
@@ -75,7 +76,6 @@ impl Knob {
             Self::DiagCostPerturb => "diag-cost-perturb",
             Self::FcMode => "fc-mode",
             Self::FlipSolve => "flip-solve",
-
             Self::NoCertDecouple => "no-cert-decouple",
             Self::NoGubBranch => "no-gub-branch",
             Self::NoDedupCols => "no-dedup-cols",
@@ -93,9 +93,9 @@ impl Knob {
             Self::NoChainShape => "no-chain-shape",
             Self::NoChainPreorder => "no-chain-preorder",
             Self::NoBumpLu => "no-bump-lu",
-            Self::FullPricing => "full-pricing",
             Self::DualBypassMode => "dual-bypass-mode",
             Self::EagerPerturbMode => "eager-perturb-mode",
+            Self::HarrisRt => "harris-rt",
             Self::SymBranchBand => "sym-branch-band",
             Self::Rins => "rins",
             Self::DualfixAll => "dualfix-all",
@@ -250,7 +250,7 @@ impl Knob {
         }
     }
 
-    pub(super) const ALL: [Knob; 225] = [
+    pub(super) const ALL: [Knob; 226] = [
         Self::GmiRounds,
         Self::RootCutsPerRound,
         Self::RootProbe,
@@ -299,6 +299,7 @@ impl Knob {
         Self::NoCutoff,
         Self::NoNodeLu,
         Self::NoTallLu,
+        Self::NoTallColdDual,
         Self::NoDualChurnBand,
         Self::DualBloomCap,
         Self::NoFlowcoverAgg,
@@ -344,9 +345,9 @@ impl Knob {
         Self::NoChainShape,
         Self::NoChainPreorder,
         Self::NoBumpLu,
-        Self::FullPricing,
         Self::DualBypassMode,
         Self::EagerPerturbMode,
+        Self::HarrisRt,
         Self::NoMirKnap,
         Self::BbGate,
         Self::ChildOrderMode,

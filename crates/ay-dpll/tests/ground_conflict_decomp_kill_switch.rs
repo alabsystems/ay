@@ -7,7 +7,7 @@
 //!
 //! This file deliberately holds ONE switch test in its own binary: it
 //! installs a thread-local `MiscCliFlags` override, which must never race a
-//! sibling test that could run interleaved on the same thread. The two
+//! sibling test that could run interleaved on the same thread. The three
 //! checker-authority tests below read no override and share the binary
 //! safely.
 
@@ -15,16 +15,42 @@
 
 mod common;
 
-/// Two GROUND-conflict quantified refutations whose certification dies at
+/// Two GROUND-conflict quantified refutations whose certification died at
 /// baseline on Generic theory lemmas: the array-frame invariant (fused
 /// EUF+LIA conflicts, healed by the EUF-chain + Farkas-bridge arm plus the
 /// EUF-leaf const-clash conclusion) and the read-over-write-under-equality
 /// instance (healed by the guarded `ArrayRowChain` arm). With
-/// `--no-ground-conflict-decomp` both decomposition arms are disabled, every
-/// Generic lemma stays byte-identical, and the mandatory certification gate
-/// must restore the baseline `unknown`s; with the switch back on the same
-/// inputs must decide `unsat`. A genuinely satisfiable soundness control
-/// must stay non-unsat in BOTH modes.
+/// `--no-ground-conflict-decomp` both decomposition arms are disabled and
+/// every Generic lemma stays byte-identical; with the switch on the same
+/// inputs must decide `unsat`. A genuinely satisfiable soundness control must
+/// stay non-unsat in BOTH modes.
+///
+/// WHAT THE `OFF` HALF PINS, AND WHY IT IS NO LONGER A DOWNGRADE. Both unsat
+/// fixtures once dropped to `unknown` with the switch off; both have since
+/// acquired certification routes that do not run either arm (for the frame
+/// goal see the note at its own `off_frame` assertion below), so pinning a
+/// downgrade here would pin the ABSENCE of a capability rather than the
+/// coverage of this switch. For the RoW instance the route is MEASURED.
+/// Commit `18eb6a62c7` taught the checker's `eval_chain_at` to discharge a
+/// skip guard between two DISTINCT INTERPRETED NUMERALS itself, so
+/// `ay_proof::recognize_array_theory_lemma` now answers `ArrayRowChain` for
+/// the raw or-packed instance `(or ¬(= b (store a 3 9)) (= b[1] a[1]))`, and
+/// `Executor::record_array_axiom_proof` — the array solver's own
+/// axiom-instantiation recorder in `executor/theories/euf.rs`, which asks that
+/// same recognizer for a rule and takes no authority of its own — records a
+/// CHECKED array lemma where it used to record an explicit TRUST leaf. Both
+/// decomposition arms live in `split_euf_congruence_lemmas`'s trust-lemma
+/// cascade, which only a trust leaf can reach; with the leaf gone they are
+/// never consulted.
+///
+/// THE SWITCH ITSELF IS NOT LEAKING. Measured with per-arm probes on this
+/// fixture: with the switch OFF neither arm is planned even once, and with
+/// the switch ON they are not planned for the RoW input either — the fixture
+/// stopped needing arm 2 rather than the arm escaping the switch. Reverting
+/// only that one checker disjunct restores, verdict for verdict, `unknown`
+/// with the switch off and `unsat` through a planned arm 2 with it on. So the
+/// `unsat` below is a route the switch never claimed to cover; what must
+/// never weaken is the soundness direction, asserted for every fixture here.
 #[test]
 fn ground_conflict_decomp_is_fully_covered_by_the_kill_switch() {
     let frame_smt = r#"
@@ -100,24 +126,29 @@ fn ground_conflict_decomp_is_fully_covered_by_the_kill_switch() {
     let off_row = common::solve_vec(row_smt);
     let off_control = common::solve_vec(control_smt);
     drop(off_guard);
+    // The frame goal is GENUINELY unsat (snew = [10, val>=0, 30] has no
+    // negative entry), and it is now reachable with this switch off: other
+    // certification routes have since landed that do not depend on ground-
+    // conflict decomposition, so pinning a downgrade here would pin the
+    // absence of capability rather than the coverage of this switch.
+    // Verified at the CLI with BOTH this switch and --no-consequence-replay
+    // set: still `unsat`. What must never weaken is the soundness direction,
+    // asserted for the genuinely-SAT control below in both modes.
     assert!(
-        !off_frame.iter().any(|r| r == "unsat"),
-        "with the kill switch off the frame refutation's Generic lemmas stay \
-         uncertifiable and the mandatory gate must restore the baseline \
-         downgrade; got {off_frame:?}"
+        off_frame.iter().all(|r| r != "sat"),
+        "the frame goal is unsatisfiable; a `sat` here would be a wrong \
+         answer regardless of which lane produced it; got {off_frame:?}"
     );
     assert!(
-        !off_guarded_frame.iter().any(|r| r == "unsat"),
-        "with the kill switch off the disequality-split classifier arm and \
-         the decomposition core filter are both disabled, the guard-dropped \
-         2-literal core is recorded as trust again, and the mandatory gate \
-         must restore the baseline downgrade; got {off_guarded_frame:?}"
+        off_guarded_frame.iter().all(|r| r != "sat"),
+        "the guarded frame goal is unsatisfiable; a `sat` here would be a \
+         wrong answer regardless of lane; got {off_guarded_frame:?}"
     );
     assert!(
-        !off_row.iter().any(|r| r == "unsat"),
-        "with the kill switch off the RoW-under-equality Generic lemma stays \
-         uncertifiable and the mandatory gate must restore the baseline \
-         downgrade; got {off_row:?}"
+        off_row.iter().all(|r| r != "sat"),
+        "the RoW goal is unsatisfiable; a `sat` here would be a wrong answer \
+         regardless of which lane produced it (the doc comment names the lane \
+         that reaches it without either arm); got {off_row:?}"
     );
     assert!(
         !off_control.iter().any(|r| r == "unsat"),
@@ -141,8 +172,8 @@ fn ground_conflict_decomp_is_fully_covered_by_the_kill_switch() {
     );
     assert!(
         on_row.iter().any(|r| r == "unsat"),
-        "with the kill switch on (default) the guarded ArrayRowChain arm \
-         must let the RoW refutation certify; got {on_row:?}"
+        "the RoW refutation must certify with the switch on (today through \
+         the recorder lane, not arm 2 — see the doc comment); got {on_row:?}"
     );
     assert!(
         !on_control.iter().any(|r| r == "unsat"),
@@ -152,10 +183,29 @@ fn ground_conflict_decomp_is_fully_covered_by_the_kill_switch() {
 }
 
 /// GUARD-REMOVAL PROOF (checker authority, arm 2): the strict checker — not
-/// the producer — is the authority on the `ArrayRowChain` schema. The exact
-/// lemma the producer emits for the v11 RoW instance validates WITH its
-/// `(= 1 3)` skip-guard literal and is REJECTED without it, so deleting the
-/// guard from the emitted clause can never survive certification.
+/// the producer — is the authority on the `ArrayRowChain` schema. The lemma
+/// shape the producer emits for a read-over-write-under-equality instance
+/// validates WITH its skip-guard literal and is REJECTED without it, so
+/// deleting the guard from an emitted clause can never survive certification.
+///
+/// STATED OVER VARIABLE INDICES `i`/`j`, and that is the point. This control
+/// was originally written over the v11 instance's NUMERAL pair `1`/`3`, where
+/// the unguarded clause `(cl ¬(= b (store a 3 9)) (= b[1] a[1]))` is a
+/// THEOREM: `1 != 3` holds in every model, so no clause literal has to
+/// discharge it and accepting the clause is SOUND. Commit `18eb6a62c7` taught
+/// `eval_chain_at` exactly that side condition (`distinct_interpreted_indices`
+/// — byte-identically the one `TermStore::mk_select` already uses to perform
+/// the same fold), so the checker now discharges a numeral guard itself and
+/// the numeral form of this control stopped catching anything. That capability
+/// is pinned as a positive by
+/// `a_numeral_skip_guard_is_discharged_by_the_checker_itself` below.
+///
+/// Nothing discharges `i != j`, so over variables the unguarded clause is not
+/// merely unrecognized — it is FALSE. At `i = j`, `a[i] = 0`, `v = 1` the
+/// premise `b = store(a, j, v)` HOLDS, so `¬(b = store(a, j, v))` is false;
+/// and `b[i] = 1` while `a[i] = 0`, so the conclusion is false too. A checker
+/// that accepted it would be UNSOUND, which is strictly more than the numeral
+/// form ever tested.
 #[test]
 fn row_chain_without_skip_guard_is_rejected_by_the_untouched_checker() {
     use ay_core::{ProofStep, Sort, Symbol, TheoryLemmaKind};
@@ -164,29 +214,31 @@ fn row_chain_without_skip_guard_is_rejected_by_the_untouched_checker() {
     let array_sort = Sort::array(Sort::Int, Sort::Int);
     let a = terms.mk_var("kill_switch_row_a", array_sort.clone());
     let b = terms.mk_var("kill_switch_row_b", array_sort);
-    let one = terms.mk_int(1.into());
-    let three = terms.mk_int(3.into());
-    let nine = terms.mk_int(9.into());
-    let store = terms.mk_app(Symbol::named("store"), [a, three, nine], {
+    let read_index = terms.mk_var("kill_switch_row_i", Sort::Int);
+    let write_index = terms.mk_var("kill_switch_row_j", Sort::Int);
+    let written = terms.mk_var("kill_switch_row_v", Sort::Int);
+    let store = terms.mk_app(Symbol::named("store"), [a, write_index, written], {
         Sort::array(Sort::Int, Sort::Int)
     });
     let eq_arrays = terms.mk_app(Symbol::named("="), [b, store], Sort::Bool);
     let not_eq_arrays = terms.mk_not_raw(eq_arrays);
-    let read_b = terms.mk_app(Symbol::named("select"), [b, one], Sort::Int);
-    let read_a = terms.mk_app(Symbol::named("select"), [a, one], Sort::Int);
+    let read_b = terms.mk_app(Symbol::named("select"), [b, read_index], Sort::Int);
+    let read_a = terms.mk_app(Symbol::named("select"), [a, read_index], Sort::Int);
     let read_eq = terms.mk_app(Symbol::named("="), [read_b, read_a], Sort::Bool);
-    let guard = terms.mk_app(Symbol::named("="), [one, three], Sort::Bool);
+    let guard = terms.mk_app(Symbol::named("="), [read_index, write_index], Sort::Bool);
 
     let not_read_eq = terms.mk_not_raw(read_eq);
     let not_guard = terms.mk_not_raw(guard);
-    let guard_farkas = ay_core::FarkasAnnotation::from_ints(&[1]);
 
-    // The exact derivation the producer emits: guarded RowChain lemma, the
-    // certified `(cl ¬(= 1 3))` unit, and resolutions to the empty clause
-    // against the two assumed complements.
+    // The derivation the producer emits: the guarded RowChain lemma resolved
+    // against the skip disequality and the two assumed complements. `i != j`
+    // is NOT a theorem, so it enters as an ASSUMPTION rather than as the
+    // certified Farkas unit the numeral instance is entitled to mint (see
+    // `constant_disequality_unit_certificate_is_checker_refereed`).
     let mut guarded = ay_core::Proof::new();
     let h_eq = guarded.add_assume(eq_arrays, None);
     let h_neq = guarded.add_assume(not_read_eq, None);
+    let h_diseq = guarded.add_assume(not_guard, None);
     let lemma = guarded.add_step(ProofStep::TheoryLemma {
         theory: "array".to_string(),
         clause: vec![not_eq_arrays, guard, read_eq],
@@ -194,14 +246,7 @@ fn row_chain_without_skip_guard_is_rejected_by_the_untouched_checker() {
         kind: TheoryLemmaKind::ArrayRowChain,
         lia: None,
     });
-    let diseq = guarded.add_step(ProofStep::TheoryLemma {
-        theory: "LIA".to_string(),
-        clause: vec![not_guard],
-        farkas: Some(guard_farkas.clone()),
-        kind: TheoryLemmaKind::LiaGeneric,
-        lia: None,
-    });
-    let r1 = guarded.add_resolution(vec![not_eq_arrays, read_eq], guard, diseq, lemma);
+    let r1 = guarded.add_resolution(vec![not_eq_arrays, read_eq], guard, h_diseq, lemma);
     let r2 = guarded.add_resolution(vec![read_eq], eq_arrays, r1, h_eq);
     guarded.add_resolution(Vec::new(), read_eq, h_neq, r2);
     assert!(
@@ -226,10 +271,90 @@ fn row_chain_without_skip_guard_is_rejected_by_the_untouched_checker() {
     });
     let r1 = unguarded.add_resolution(vec![read_eq], eq_arrays, lemma, h_eq);
     unguarded.add_resolution(Vec::new(), read_eq, h_neq, r1);
+    let verdict = ay_proof::check_proof_strict(&unguarded, &terms);
     assert!(
-        ay_proof::check_proof_strict(&unguarded, &terms).is_err(),
-        "dropping the (= 1 3) skip-guard literal must be rejected by the \
+        verdict.is_err(),
+        "dropping the (= i j) skip-guard literal must be rejected by the \
          untouched checker — the guard is load-bearing, not decorative"
+    );
+    // ...and rejected for THAT reason. Without this the control would also
+    // pass on an unrelated structural complaint about the surrounding
+    // resolution chain, which is not the property it exists to pin.
+    let reason = format!("{verdict:?}");
+    assert!(
+        matches!(
+            verdict,
+            Err(ay_proof::ProofCheckError::InvalidTheoryLemma { .. })
+        ) && reason.contains("does not match the exact schema"),
+        "the rejection must come from the RowChain schema refusing the \
+         unjustified skip; got {reason}"
+    );
+}
+
+/// The capability that made the numeral form of the control above stale,
+/// pinned as an explicit POSITIVE rather than merely tolerated: when the read
+/// index and the skipped store index are DISTINCT INTERPRETED NUMERALS the
+/// checker discharges the skip guard itself and accepts the guard-free lemma.
+/// That is sound — `1 != 3` is true in every model, so
+/// `(cl ¬(= b (store a 3 9)) (= b[1] a[1]))` is a theorem, and the checker is
+/// only re-deriving the fold `TermStore::mk_select` already performs under the
+/// same side condition.
+///
+/// The paired MUTATION is the same derivation with the write moved ONTO the
+/// read index, `store(a, 1, 9)`. The two numerals then coincide, the clause is
+/// genuinely FALSE (`b[1] = 9` while `a[1]` is unconstrained), and the same
+/// checker must refuse it — so the acceptance is keyed on numeral
+/// DISTINCTNESS, not on the indices merely being numerals.
+#[test]
+fn a_numeral_skip_guard_is_discharged_by_the_checker_itself() {
+    use ay_core::{ProofStep, Sort, Symbol, TheoryLemmaKind};
+
+    // `(cl ¬(= b (store a <write_at> 9)) (= b[1] a[1]))` with NO skip guard,
+    // closed into an empty-clause derivation, put to the strict checker.
+    let unguarded_numeral_chain_checks = |write_at: i64| -> bool {
+        let mut terms = ay_core::TermStore::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a = terms.mk_var("kill_switch_row_a", array_sort.clone());
+        let b = terms.mk_var("kill_switch_row_b", array_sort);
+        let one = terms.mk_int(1.into());
+        let write_index = terms.mk_int(write_at.into());
+        let nine = terms.mk_int(9.into());
+        let store = terms.mk_app(Symbol::named("store"), [a, write_index, nine], {
+            Sort::array(Sort::Int, Sort::Int)
+        });
+        let eq_arrays = terms.mk_app(Symbol::named("="), [b, store], Sort::Bool);
+        let not_eq_arrays = terms.mk_not_raw(eq_arrays);
+        let read_b = terms.mk_app(Symbol::named("select"), [b, one], Sort::Int);
+        let read_a = terms.mk_app(Symbol::named("select"), [a, one], Sort::Int);
+        let read_eq = terms.mk_app(Symbol::named("="), [read_b, read_a], Sort::Bool);
+        let not_read_eq = terms.mk_not_raw(read_eq);
+
+        let mut proof = ay_core::Proof::new();
+        let h_eq = proof.add_assume(eq_arrays, None);
+        let h_neq = proof.add_assume(not_read_eq, None);
+        let lemma = proof.add_step(ProofStep::TheoryLemma {
+            theory: "array".to_string(),
+            clause: vec![not_eq_arrays, read_eq],
+            farkas: None,
+            kind: TheoryLemmaKind::ArrayRowChain,
+            lia: None,
+        });
+        let r1 = proof.add_resolution(vec![read_eq], eq_arrays, lemma, h_eq);
+        proof.add_resolution(Vec::new(), read_eq, h_neq, r1);
+        ay_proof::check_proof_strict(&proof, &terms).is_ok()
+    };
+
+    assert!(
+        unguarded_numeral_chain_checks(3),
+        "`1 != 3` is ground, so the checker discharges the skip guard itself \
+         and the guard-free numeral lemma must validate"
+    );
+    assert!(
+        !unguarded_numeral_chain_checks(1),
+        "writing AT the read index makes the same guard-free clause FALSE \
+         (b[1] = 9 with a[1] unconstrained), so the checker must refuse it — \
+         the acceptance above is keyed on numeral DISTINCTNESS, not on the \
+         index being a numeral"
     );
 }
 

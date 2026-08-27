@@ -296,25 +296,36 @@ impl Solver {
 
     /// Pick the next decision restricted to the relevancy frontier (Scheme A).
     ///
-    /// Recomputes the CNF frontier and defers to the existing
-    /// `pick_domain_restricted_decision`. Returns `None` when the frontier is
-    /// empty — the partial assignment satisfies every live clause, i.e. it is a
-    /// model (re-verified by the always-on model gate before SAT is reported).
+    /// Syncs the INCREMENTAL frontier (`relevancy_frontier.rs`) and defers to
+    /// the existing `pick_domain_restricted_decision`. Returns `None` when the
+    /// frontier is empty — the partial assignment satisfies every live clause,
+    /// i.e. it is a model (re-verified by the always-on model gate before SAT is
+    /// reported).
     ///
     /// Returning `None` here is the SAT signal, exactly as the IC3 domain path
     /// (`pick_domain_restricted_decision` returning `None`) is.
+    ///
+    /// The frontier handed to the picker is EXACTLY the set the from-scratch
+    /// walk produced (`fill_relevancy_frontier`, kept below as the reference and
+    /// cross-checked by `debug_assert_relevancy_frontier_exact`), so which
+    /// variable is decided is unchanged.
     pub(super) fn pick_relevancy_frontier_decision(&mut self) -> Option<Variable> {
-        // Take the scratch buffer out so the frontier fill and the domain-picker
-        // can both borrow `self` without aliasing a `self` field.
-        let mut buf = std::mem::take(&mut self.relevancy_buf);
-        let any_relevant = self.fill_relevancy_frontier(&mut buf);
+        // Take the frontier out so the sync (which needs `&self` for the arena,
+        // trail and vals) and the domain picker (which needs `&mut self`) can
+        // both run without aliasing a `self` field.
+        let mut frontier = std::mem::take(&mut self.relevancy_frontier);
+        let any_relevant = frontier.sync(self);
+        #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+        if frontier.take_debug_check() {
+            self.debug_assert_relevancy_frontier_exact(frontier.buf(), any_relevant);
+        }
         let result = if any_relevant {
-            self.pick_domain_restricted_decision(&buf)
+            self.pick_domain_restricted_decision(frontier.buf())
         } else {
-            // Empty frontier ⇒ every live clause has a true literal ⇒ SAT.
+            // Empty frontier => every live clause has a true literal => SAT.
             None
         };
-        self.relevancy_buf = buf;
+        self.relevancy_frontier = frontier;
 
         if result.is_some() {
             let first = self.relevancy_decisions == 0;
@@ -332,18 +343,96 @@ impl Solver {
         result
     }
 
-    /// Fill `buf` (sized `num_vars`) with the current CNF relevancy frontier.
+    /// EXACTNESS PIN at the UNASSIGNMENT FOLD (#relevancy-frontier-incremental).
+    ///
+    /// Called at the tail of `backtrack_core` / `backtrack_ic3` whenever the
+    /// fold ran. The query-time pin below cannot cover this class on its own:
+    /// `RelevancyFrontier::sync` rebuilds from scratch whenever the arena's
+    /// `formula_epoch` moved, so any corruption a fold inflicted after a
+    /// clause-DB mutation is ERASED before `pick_relevancy_frontier_decision`
+    /// gets to compare anything. This runs BETWEEN the fold and the next
+    /// rebuild, against the state the fold actually produced.
+    ///
+    /// `debug_fold_to_current_strict` completes the fold the way the next
+    /// `sync` would — same work, same order, so nothing about the search
+    /// changes — except that every staleness fallback is an assertion instead
+    /// of a rebuild.
+    #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+    pub(super) fn debug_assert_relevancy_frontier_exact_after_fold(&mut self) {
+        let mut frontier = std::mem::take(&mut self.relevancy_frontier);
+        if frontier.take_debug_fold_check() {
+            let any_relevant = frontier.debug_fold_to_current_strict(self);
+            self.debug_assert_relevancy_frontier_exact(frontier.buf(), any_relevant);
+        }
+        self.relevancy_frontier = frontier;
+    }
+
+    /// EXACTNESS PIN for the incremental frontier
+    /// (#relevancy-frontier-incremental): recompute the frontier the old way
+    /// and assert the incrementally maintained set is identical.
+    ///
+    /// The frontier gates DECISIONS, so a frontier that is too LARGE silently
+    /// changes the search trajectory (a different variable is decided) and a
+    /// frontier that is too SMALL can additionally fire the empty-frontier SAT
+    /// signal early — degrading to `unknown` at the model gate. Neither is
+    /// caught by a verdict-level test, so the equality is asserted directly,
+    /// on every engaged decision under `--features
+    /// relevancy-frontier-invariants` and on a bounded prefix otherwise (see
+    /// `RelevancyFrontier::take_debug_check`).
+    #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
+    fn debug_assert_relevancy_frontier_exact(&self, buf: &[bool], any_relevant: bool) {
+        let mut reference = Vec::new();
+        let reference_any = self.fill_relevancy_frontier(&mut reference);
+        assert_eq!(
+            any_relevant, reference_any,
+            "BUG: incremental relevancy frontier disagrees on emptiness \
+             (incremental any={any_relevant}, from-scratch any={reference_any}) \
+             at conflicts={} decisions={}",
+            self.num_conflicts, self.num_decisions,
+        );
+        assert_eq!(
+            buf.len(),
+            reference.len(),
+            "BUG: incremental relevancy frontier has the wrong length",
+        );
+        if buf != reference.as_slice() {
+            let first = (0..buf.len())
+                .find(|&v| buf[v] != reference[v])
+                .unwrap_or(usize::MAX);
+            panic!(
+                "BUG: incremental relevancy frontier != from-scratch walk; first \
+                 mismatch at var {first} (incremental={}, from-scratch={}) at \
+                 conflicts={} decisions={} trail_len={} num_vars={}",
+                buf.get(first).copied().unwrap_or(false),
+                reference.get(first).copied().unwrap_or(false),
+                self.num_conflicts,
+                self.num_decisions,
+                self.trail.len(),
+                self.num_vars,
+            );
+        }
+    }
+
+    /// REFERENCE implementation: fill `buf` (sized `num_vars`) with the current
+    /// CNF relevancy frontier by walking the whole live clause DB.
+    ///
+    /// This was the per-decision hot path until #relevancy-frontier-incremental
+    /// made the frontier incremental; it is retained verbatim as the
+    /// specification the incremental state is checked against, and is compiled
+    /// only where that check is (`debug_assertions` or the
+    /// `relevancy-frontier-invariants` feature).
     ///
     /// Returns `true` iff at least one variable is relevant. Mirrors the
-    /// authoritative model-gate clause walk (`live_indices`) so the empty-frontier
-    /// SAT signal aligns with `first_model_violation`, minimising spurious
-    /// `unknown`. A clause with a true literal is satisfied and contributes
-    /// nothing; otherwise every UNASSIGNED, non-removed literal's variable is
-    /// relevant. (At a decision point BCP has reached fixpoint, so every
-    /// unsatisfied clause has ≥1 unassigned literal — design §2.1.)
+    /// authoritative model-gate clause walk (`live_indices`) so the
+    /// empty-frontier SAT signal aligns with `first_model_violation`, minimising
+    /// spurious `unknown`. A clause with a true literal is satisfied and
+    /// contributes nothing; otherwise every UNASSIGNED, non-removed literal's
+    /// variable is relevant. (At a decision point BCP has reached fixpoint, so
+    /// every unsatisfied clause has >=1 unassigned literal — design 2.1.)
     ///
     /// `buf` is passed by `&mut` (a caller-owned local, never a `self` field) so
     /// the clause walk can hold `&self` without a borrow conflict.
+    #[cfg(any(debug_assertions, feature = "relevancy-frontier-invariants"))]
     fn fill_relevancy_frontier(&self, buf: &mut Vec<bool>) -> bool {
         buf.clear();
         buf.resize(self.num_vars, false);

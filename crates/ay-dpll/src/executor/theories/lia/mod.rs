@@ -6,6 +6,7 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
+mod recovered_model;
 #[cfg(test)]
 mod tests;
 
@@ -130,42 +131,7 @@ impl Executor {
         }
 
         if matches!(result, Ok(SolveResult::Sat)) {
-            if let Some(model) = self
-                .last_model
-                .as_mut()
-                .and_then(|model| model.lia_model.as_mut())
-            {
-                recover_substituted_lia_values(&self.ctx.terms, &artifacts.var_subst, model);
-                recover_lia_equalities_from_assertions(
-                    &self.ctx.terms,
-                    &self.ctx.assertions,
-                    model,
-                );
-            }
-
-            // Recover Bool variables eliminated by VariableSubstitution.
-            // E.g., (= p (> x 0)) substitutes p -> (> x 0); the SAT model
-            // has no assignment for p, so model validation of the original
-            // assertion fails. Evaluate the substitution RHS against the
-            // recovered LIA model to compute p's Bool value.
-            if let Some(ref full_model) = self.last_model {
-                let lia_values = full_model
-                    .lia_model
-                    .as_ref()
-                    .map(|m| &m.values)
-                    .cloned()
-                    .unwrap_or_default();
-                let bool_overrides = recover_substituted_bool_values(
-                    &self.ctx.terms,
-                    &artifacts.var_subst,
-                    &lia_values,
-                );
-                if !bool_overrides.is_empty() {
-                    if let Some(ref mut full_model) = self.last_model {
-                        full_model.bool_overrides.extend(bool_overrides);
-                    }
-                }
-            }
+            self.recover_preprocessed_lia_model(&artifacts.var_subst);
 
             // #model-demand: witness cosmetics, skipped when no consumer exists.
             if self.counterexample_minimization_demanded() && self.last_assumptions.is_none() {
@@ -904,37 +870,7 @@ impl Executor {
         }
 
         if matches!(result, Ok(SolveResult::Sat)) {
-            if let Some(model) = self
-                .last_model
-                .as_mut()
-                .and_then(|model| model.lia_model.as_mut())
-            {
-                recover_substituted_lia_values(&self.ctx.terms, &artifacts.var_subst, model);
-                recover_lia_equalities_from_assertions(
-                    &self.ctx.terms,
-                    &self.ctx.assertions,
-                    model,
-                );
-            }
-
-            if let Some(ref full_model) = self.last_model {
-                let lia_values = full_model
-                    .lia_model
-                    .as_ref()
-                    .map(|m| &m.values)
-                    .cloned()
-                    .unwrap_or_default();
-                let bool_overrides = recover_substituted_bool_values(
-                    &self.ctx.terms,
-                    &artifacts.var_subst,
-                    &lia_values,
-                );
-                if !bool_overrides.is_empty() {
-                    if let Some(ref mut full_model) = self.last_model {
-                        full_model.bool_overrides.extend(bool_overrides);
-                    }
-                }
-            }
+            self.recover_preprocessed_lia_model(&artifacts.var_subst);
 
             // #model-demand: witness cosmetics, skipped when no consumer exists.
             if self.counterexample_minimization_demanded() && self.last_assumptions.is_none() {

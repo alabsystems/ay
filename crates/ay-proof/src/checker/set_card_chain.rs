@@ -431,7 +431,7 @@ fn matches_card_offset(terms: &TermStore, rhs: TermId, base: TermId, offset: i64
 /// The CHECKER'S OWN matcher for the chain recurrence.
 ///
 /// Producers call this rather than re-implementing the schema. The answer is a
-/// hint only: [`validate_set_card_chain_recurrence`] re-runs the identical test
+/// hint only: `validate_set_card_chain_recurrence` re-runs the identical test
 /// when the proof is checked, so a matcher bug can cost completeness but can
 /// never admit an unchecked clause.
 #[must_use]

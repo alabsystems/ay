@@ -6,10 +6,9 @@ use super::*;
 
 #[test]
 fn test_cegqi_internal_counterexample_name_cannot_alias_user_constant() {
-    // The formula is inconsistent over Int: no single `a` can equal every
-    // integer.  Historically CEGQI interned its witness as `__ce_x`, allowing
-    // the user declaration below to alias the internal counterexample and
-    // incorrectly constrain the validity check.
+    // The formula is inconsistent over Int: no single `a` can equal every integer.
+    // CEGQI once interned its witness as `__ce_x`, allowing the user declaration
+    // to alias the internal counterexample and incorrectly constrain validity.
     let input = r#"
         (set-logic AUFLIA)
         (declare-const __ce_x Int)
@@ -815,10 +814,9 @@ fn test_quantified_gate_still_failcloses_live_inner_binder() {
     );
 }
 
-/// A source declaration that reuses a map-target builtin spelling is still a
-/// free function. Its private core identity must prevent both quantified-model
-/// completion and the strict ground `evaluate` proof rule from assigning the
-/// builtin meaning of integer remainder to it.
+/// A source declaration that reuses a map-target builtin spelling is still free.
+/// Its private core identity must prevent quantified-model completion and the
+/// strict ground `evaluate` proof rule from assigning integer-remainder meaning.
 #[test]
 fn test_cegqi_declared_rem_is_not_builtin_ground_evaluate() {
     let input = r#"
@@ -861,3 +859,5 @@ fn test_cegqi_declared_rem_is_not_builtin_ground_evaluate() {
         "printed model must expose the certified free-UF interpretation: {rendered}"
     );
 }
+
+include!("cegqi/closed_universal_proof_hole.rs");

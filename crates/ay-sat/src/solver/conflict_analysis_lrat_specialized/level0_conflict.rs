@@ -29,7 +29,7 @@ impl Solver {
             self.mark_empty_clause_deferred_for_bounded_proof();
             return;
         }
-        if self.cold.clause_trace.is_none() && !self.cold.lrat_enabled {
+        if !self.has_live_clause_trace() && !self.cold.lrat_enabled {
             self.has_empty_clause = true;
             if self.cold.empty_clause_scope_depth == 0 {
                 self.cold.empty_clause_scope_depth = self.cold.scope_selectors.len();
@@ -67,9 +67,10 @@ impl Solver {
         if !proof_complete || !trace_complete {
             // Never attach a partial terminal chain. The semantic UNSAT result
             // remains valid, while every certificate consumer fails closed.
-            if let Some(trace) = self.cold.clause_trace.as_mut() {
+            if let Some(trace) = self.live_clause_trace_mut() {
                 trace.mark_proof_work_exhausted();
             }
+            self.refresh_proof_consumer_state();
             self.mark_empty_clause_deferred_for_bounded_proof();
             return;
         }
@@ -147,7 +148,7 @@ impl Solver {
         trace_chain: Option<&[u64]>,
         conflict_id: u64,
     ) -> bool {
-        let Some(trace) = self.cold.clause_trace.as_ref() else {
+        let Some(trace) = self.live_clause_trace() else {
             return true;
         };
         let Some(chain) = trace_chain else {

@@ -242,6 +242,27 @@ mod metering_semantic;
 #[path = "quality_tests/metering_tightening.rs"]
 mod metering_tightening;
 
+#[path = "quality_tests/metering_clause_identity.rs"]
+mod metering_clause_identity;
+
+#[path = "quality_tests/metering_and_neg.rs"]
+mod metering_and_neg;
+
+#[path = "quality_tests/metering_and_neg_bounds.rs"]
+mod metering_and_neg_bounds;
+
+#[path = "quality_tests/metering_and_pos.rs"]
+mod metering_and_pos;
+
+#[path = "quality_tests/metering_and_pos_mirror.rs"]
+mod metering_and_pos_mirror;
+
+#[path = "quality_tests/metering_and_pos_bounds.rs"]
+mod metering_and_pos_bounds;
+
+#[path = "quality_tests/metering_and_pos_ledger.rs"]
+mod metering_and_pos_ledger;
+
 #[test]
 fn test_premise_authentication_rejects_unauthorized_assume() {
     let mut terms = TermStore::new();

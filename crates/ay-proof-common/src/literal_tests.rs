@@ -43,6 +43,41 @@ fn test_from_index_roundtrip() {
 }
 
 #[test]
+fn test_raw_roundtrip_covers_full_encoding() {
+    for raw in [0, 1, u32::MAX - 1, u32::MAX] {
+        assert_eq!(Literal::from_raw(raw).raw(), raw);
+    }
+}
+
+#[test]
+fn test_try_from_index_checks_narrowing() {
+    let max = u32::MAX as usize;
+    assert_eq!(
+        Literal::try_from_index(max),
+        Ok(Literal::from_raw(u32::MAX))
+    );
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let too_large = max + 1;
+        assert_eq!(
+            Literal::try_from_index(too_large),
+            Err(LiteralError::IndexOutOfRange {
+                index: too_large,
+                maximum: u32::MAX,
+            })
+        );
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+#[should_panic(expected = "exceeds u32::MAX")]
+fn test_from_index_never_silently_truncates() {
+    let _ = Literal::from_index(u32::MAX as usize + 1);
+}
+
+#[test]
 fn test_max_var_boundary() {
     // MAX_VAR should be representable without overflow.
     let var = Variable::new(Literal::MAX_VAR);
@@ -55,31 +90,54 @@ fn test_max_var_boundary() {
 }
 
 #[test]
-#[should_panic(expected = "exceeds Literal::MAX_VAR")]
-fn test_overflow_variable_panics() {
-    // Variable > MAX_VAR triggers assert! in both debug and release.
-    let var = Variable::new(Literal::MAX_VAR + 1);
-    let _ = Literal::positive(var);
+fn test_try_new_variable_boundaries() {
+    assert_eq!(
+        Variable::try_new(Literal::MAX_VAR),
+        Ok(Variable::new(Literal::MAX_VAR))
+    );
+    assert_eq!(
+        Variable::try_new(Literal::MAX_VAR + 1),
+        Err(LiteralError::VariableOutOfRange {
+            id: Literal::MAX_VAR + 1,
+            maximum: Literal::MAX_VAR,
+        })
+    );
 }
 
-/// Verifies that the overflow guard in Literal::positive/negative is a
-/// runtime assert (not debug_assert), catching overflow in release builds.
-/// Previously this was debug_assert only — fixed by promoting to assert!.
+#[test]
+#[should_panic(expected = "exceeds Variable::MAX_ID")]
+fn test_overflow_variable_panics() {
+    // Invalid state is rejected at the Variable boundary in every build mode.
+    let _ = Variable::new(Literal::MAX_VAR + 1);
+}
+
 #[test]
 fn test_max_var_guard_is_always_on() {
     assert_eq!(Literal::MAX_VAR, (1u32 << 31) - 1);
+    assert_eq!(Variable::MAX_ID, Literal::MAX_VAR);
     let var = Variable::new(Literal::MAX_VAR);
     let lit = Literal::positive(var);
     assert_eq!(lit.variable(), var);
-    // The overflow case (MAX_VAR + 1) is tested in
-    // test_overflow_variable_panics — now catches in BOTH debug and release.
+}
+
+#[test]
+fn test_try_from_dimacs_boundaries() {
+    assert_eq!(
+        Literal::try_from_dimacs(0),
+        Err(LiteralError::ZeroDimacsLiteral)
+    );
+    for d in [i32::MIN, -i32::MAX, -1, 1, i32::MAX] {
+        let lit = Literal::from_dimacs(d);
+        assert_eq!(Literal::try_from_dimacs(d), Ok(lit));
+        assert_eq!(lit.try_to_dimacs(), Ok(d));
+        assert_eq!(lit.to_dimacs(), d);
+    }
 }
 
 #[test]
 #[should_panic(expected = "variable ID too large for DIMACS")]
 fn test_to_dimacs_overflow_panics() {
-    // MAX_VAR = 2^31 - 1 = 2_147_483_647. DIMACS is 1-indexed, so
-    // to_dimacs needs var_id + 1 = 2_147_483_648, which overflows i32.
+    // Positive MAX_VAR needs DIMACS +2_147_483_648, outside i32.
     let var = Variable::new(Literal::MAX_VAR);
     let lit = Literal::positive(var);
     let _ = lit.to_dimacs();
@@ -87,10 +145,17 @@ fn test_to_dimacs_overflow_panics() {
 
 #[test]
 fn test_to_dimacs_i64_handles_max_var() {
-    // to_dimacs_i64 must not panic even for MAX_VAR (where to_dimacs panics).
     let var = Variable::new(Literal::MAX_VAR);
     let pos = Literal::positive(var);
     let neg = Literal::negative(var);
+    assert_eq!(
+        pos.try_to_dimacs(),
+        Err(LiteralError::DimacsOutOfRange {
+            value: 2_147_483_648,
+        })
+    );
+    assert_eq!(neg.try_to_dimacs(), Ok(i32::MIN));
+    assert_eq!(neg.to_dimacs(), i32::MIN);
     assert_eq!(pos.to_dimacs_i64(), 2_147_483_648i64);
     assert_eq!(neg.to_dimacs_i64(), -2_147_483_648i64);
 }
@@ -149,11 +214,15 @@ fn test_encoding_invariants_dense() {
         assert_eq!(neg.index(), 2 * v as usize + 1);
         assert_eq!(Literal::from_index(pos.index()), pos);
         assert_eq!(Literal::from_index(neg.index()), neg);
+        assert_eq!(Literal::try_from_index(pos.index()), Ok(pos));
+        assert_eq!(Literal::try_from_index(neg.index()), Ok(neg));
     }
     // DIMACS round-trip — soundness-critical for DRAT/LRAT proof parsing.
     for d in (-20_000i32..=20_000).filter(|&d| d != 0) {
         let lit = Literal::from_dimacs(d);
         assert_eq!(lit.to_dimacs(), d, "to_dimacs must invert from_dimacs");
+        assert_eq!(Literal::try_from_dimacs(d), Ok(lit));
+        assert_eq!(lit.try_to_dimacs(), Ok(d));
         assert_eq!(lit.to_dimacs_i64(), i64::from(d));
         assert_eq!(lit.is_positive(), d > 0);
     }

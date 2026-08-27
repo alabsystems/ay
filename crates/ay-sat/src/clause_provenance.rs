@@ -129,9 +129,9 @@ impl ProvenanceTracker {
     /// Compute a provenance breakdown for a subset of clauses identified by
     /// arena index.
     ///
-    /// Used to generate [`CoreProvenanceSummary`] from the UNSAT core: the
-    /// caller provides the arena indices of clauses in the core, and this
-    /// method tallies the provenance of each.
+    /// Used to generate [`TrackedClauseProvenanceSummary`]: the caller provides
+    /// arena indices from a diagnostic support set, and this method tallies the
+    /// provenance of each.
     pub(crate) fn breakdown_for_indices(
         &self,
         indices: &[usize],
@@ -149,26 +149,27 @@ impl ProvenanceTracker {
     }
 }
 
-/// Summary of clause provenance within an UNSAT core (#8322).
+/// Provenance summary for tracked original-clause support (#8322).
 ///
-/// Produced by [`crate::solver::Solver::core_provenance_summary()`] when both
-/// provenance tracking is enabled AND the result is UNSAT. Reports which
-/// categories of clauses participated in the proof of unsatisfiability.
+/// Produced by
+/// [`crate::solver::Solver::tracked_clause_provenance_summary()`]. The tracked
+/// set is diagnostic reconstruction metadata and may over-approximate a
+/// terminal refutation; this summary does not certify an UNSAT core.
 #[derive(Debug, Clone)]
-pub struct CoreProvenanceSummary {
+pub struct TrackedClauseProvenanceSummary {
     /// Total clauses in the problem (with provenance tracking).
     pub total_clauses: usize,
-    /// Number of clauses in the UNSAT core.
-    pub core_clauses: usize,
-    /// Breakdown of core clauses by provenance category.
+    /// Number of tracked support clauses found in the arena.
+    pub tracked_clauses: usize,
+    /// Breakdown of tracked support clauses by provenance category.
     pub breakdown: BTreeMap<ClauseProvenance, usize>,
 }
 
-impl std::fmt::Display for CoreProvenanceSummary {
+impl std::fmt::Display for TrackedClauseProvenanceSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "UNSAT Core Provenance Summary:")?;
+        writeln!(f, "Tracked Clause Provenance Summary:")?;
         writeln!(f, "  total clauses:  {}", self.total_clauses)?;
-        writeln!(f, "  core clauses:   {}", self.core_clauses)?;
+        writeln!(f, "  tracked clauses: {}", self.tracked_clauses)?;
         if !self.breakdown.is_empty() {
             writeln!(f, "  breakdown:")?;
             let mut entries: Vec<_> = self.breakdown.iter().collect();
@@ -177,8 +178,8 @@ impl std::fmt::Display for CoreProvenanceSummary {
                     .then_with(|| format!("{}", a.0).cmp(&format!("{}", b.0)))
             });
             for (prov, count) in entries {
-                let pct = if self.core_clauses > 0 {
-                    (*count as f64 / self.core_clauses as f64) * 100.0
+                let pct = if self.tracked_clauses > 0 {
+                    (*count as f64 / self.tracked_clauses as f64) * 100.0
                 } else {
                     0.0
                 };
@@ -286,7 +287,7 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 1);
     }
 
-    // -- CoreProvenanceSummary tests (#8322) --
+    // -- TrackedClauseProvenanceSummary tests (#8322) --
 
     #[test]
     fn test_breakdown_for_indices_enabled() {
@@ -300,7 +301,7 @@ mod tests {
         tracker.tag(3, ClauseProvenance::Learned);
         tracker.tag(4, ClauseProvenance::ProblemEncoding);
 
-        // Only indices 0, 2, 4 are in the "core".
+        // Only indices 0, 2, 4 are in the tracked support set.
         let breakdown = tracker.breakdown_for_indices(&[0, 2, 4]);
         assert_eq!(breakdown[&ClauseProvenance::ProblemEncoding], 2);
         assert_eq!(breakdown[&ClauseProvenance::TheoryConflict], 1);
@@ -335,37 +336,37 @@ mod tests {
     }
 
     #[test]
-    fn test_core_provenance_summary_display() {
+    fn test_tracked_clause_provenance_summary_display() {
         let mut breakdown = BTreeMap::new();
         breakdown.insert(ClauseProvenance::ProblemEncoding, 5);
         breakdown.insert(ClauseProvenance::TheoryConflict, 3);
         breakdown.insert(ClauseProvenance::Learned, 2);
 
-        let summary = CoreProvenanceSummary {
+        let summary = TrackedClauseProvenanceSummary {
             total_clauses: 100,
-            core_clauses: 10,
+            tracked_clauses: 10,
             breakdown,
         };
 
         let output = format!("{summary}");
         assert!(output.contains("total clauses:  100"));
-        assert!(output.contains("core clauses:   10"));
+        assert!(output.contains("tracked clauses: 10"));
         assert!(output.contains("Problem encoding: 5 (50.0%)"));
         assert!(output.contains("Theory conflict: 3 (30.0%)"));
         assert!(output.contains("Learned: 2 (20.0%)"));
     }
 
     #[test]
-    fn test_core_provenance_summary_empty_breakdown() {
-        let summary = CoreProvenanceSummary {
+    fn test_tracked_clause_provenance_summary_empty_breakdown() {
+        let summary = TrackedClauseProvenanceSummary {
             total_clauses: 0,
-            core_clauses: 0,
+            tracked_clauses: 0,
             breakdown: BTreeMap::new(),
         };
 
         let output = format!("{summary}");
         assert!(output.contains("total clauses:  0"));
-        assert!(output.contains("core clauses:   0"));
+        assert!(output.contains("tracked clauses: 0"));
         // No breakdown section when empty.
         assert!(!output.contains("breakdown:"));
     }

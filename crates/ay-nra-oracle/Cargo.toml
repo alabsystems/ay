@@ -25,8 +25,13 @@ num-integer = { workspace = true }
 num-rational = { workspace = true }
 num-traits = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # The AY side under test. `oracle-api` is a dev-only facade feature over the
 # crate-private exact primitives; no shipping build enables it.
+# The in-image kernel memory bound. Every bin target must arm it as the first
+# statement of main (scripts/ci/../check_govern_armed.sh); `ay-sys` depends only
+# on libc, so this adds no graph of its own.
+ay-sys = { workspace = true }
 ay-nra = { workspace = true, features = ["oracle-api"] }
 
 [lints]

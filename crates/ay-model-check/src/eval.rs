@@ -1017,9 +1017,8 @@ impl<'a> Evaluator<'a> {
         if self.term_depends_on_local_binding(term) {
             return Err("model-backed context-dependent application is unsupported".to_string());
         }
-        // First time this key is seen: adopt the model's committed
-        // per-application value as the representative. A model that does not pin
-        // the application leaves the gate unable to confirm (fail closed).
+        // First use adopts the model's value at these evaluated arguments;
+        // `uf_app_value_at` lets a total published table reconcile any pin.
         //
         // Report the MISS, not `dt_err`. `dt_err` is the datatype-dispatch
         // failure that routed us here, and for a plain uninterpreted symbol it
@@ -1031,14 +1030,6 @@ impl<'a> Evaluator<'a> {
         // the evaluator vs. complete the model — and the misattribution sends a
         // reader to the wrong one. Keep `dt_err` in the text so the datatype
         // path is still diagnosable when that is genuinely the cause.
-        //
-        // The argument values are passed through (`uf_app_value_at`) so an
-        // implementor whose PUBLISHED model interprets the function totally —
-        // a table plus an else branch — can answer AT this argument point, and
-        // can RECONCILE a per-application pin against that published body. The
-        // value is still keyed into `uf_graph` by these same argument values
-        // below, so single-valuedness is enforced identically
-        // (#g3-gate-reads-printed-uf).
         let val = if let Some(committed) = self.model.uf_app_value_at(term, &arg_vals) {
             // A normal model commitment always wins. The typed fallback exists
             // solely for otherwise-uncommitted theory applications.

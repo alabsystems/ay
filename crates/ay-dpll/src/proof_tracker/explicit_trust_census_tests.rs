@@ -75,6 +75,22 @@ const VETTED: &[(&str, usize, usize, &str)] = &[
          probes decline (C1.ii); unrecognized packed axiom stays trust",
     ),
     (
+        "executor/theories/euf/array_patterns.rs",
+        1,
+        0,
+        "#dt-enum-pigeonhole-false-lemma: the finite-enum pigeonhole tautology \
+         `(or (= m_i m_j) : i<j)` over a re-verified `k+1` clique of a \
+         `k`-inhabitant enum sort. It REPLACED a `[false]` recording — a \
+         maximal trust admission wearing a theory lemma's label — and is TRUE \
+         in every model, but no payload-free validator expresses it from the \
+         clause alone: `DatatypeEnumPigeonhole` needs the datatype/selector \
+         registries, which `proof::rebuild_finite_enum_pigeonhole_refutation` \
+         supplies downstream, re-authenticating every member pair against an \
+         authored root disequality before it emits the TYPED kind. Recording \
+         the complete equality GRAPH here (not the packed `(or ..)` literal) \
+         is exactly what keeps that typed rebuild reachable",
+    ),
+    (
         "executor/theories/euf/dt.rs",
         1,
         0,

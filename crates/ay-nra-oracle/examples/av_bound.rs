@@ -1,7 +1,5 @@
 //! Focused repro: `refine_step_bound` at `bits(L) == bits(R)`.
 
-#![allow(unsafe_code)] // Dedicated C-ABI boundary to libz3; sites carry local invariants.
-
 use ay_nra::oracle_api::{obq_refine_step_bound, obq_refine_to_width, OBq, OBqInterval, ORefined};
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -72,7 +70,7 @@ fn main() {
                 format!("Exact {}/2^{} steps={}", v.numerator(), v.k(), tr.steps)
             }
         };
-        println!("  target {}/2^{}  ->  {}", ta, tk, desc);
+        println!("  target {ta}/2^{tk}  ->  {desc}");
     }
 
     println!();

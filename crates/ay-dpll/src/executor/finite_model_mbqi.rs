@@ -167,10 +167,8 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
-use ay_core::time::Instant;
 use ay_core::{Sort, Symbol, TermData, TermId, TermStore};
 use num_bigint::BigInt;
-use std::time::Duration;
 
 use super::model::EvalValue;
 use super::quantifier_loop::result_mapping::CheckedGroundDecision;
@@ -179,193 +177,13 @@ use crate::ematching::{contains_quantifier, subst_vars};
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
 
+mod budget;
 mod witness;
+pub(in crate::executor) use budget::LaneAccount;
+use budget::{
+    LaneBudget, FINITE_MODEL_LANE_BUDGET_MS, FINITE_MODEL_LANE_SEED_MS, MAX_FINITE_MODEL_ROUNDS,
+};
 use witness::PassOutcome;
-
-/// Maximum synth/verify refinement rounds before failing closed.
-///
-/// Each round costs one counterexample probe per universal plus one ground
-/// re-solve. The declined queries converge in a handful of rounds (the pinned
-/// counterexample search excludes one model value per round and the satisfying
-/// region of these invariants is large), so a small cap buys the decisions
-/// without letting a pathological instance burn the query budget.
-const MAX_FINITE_MODEL_ROUNDS: usize = 12;
-
-/// Per-sub-solve budget in milliseconds.
-///
-/// Both obligations are quantifier-free and mostly ground: `verify_i` has one
-/// free constant per binder and `confirm` is `G` under a near-total pin set.
-/// A short budget keeps a hard instance from consuming the enclosing query.
-const FINITE_MODEL_PROBE_MS: u64 = 2_000;
-
-/// Wall budget for the SUB-SOLVES of one invocation of this lane
-/// (#witness-check-cost).
-///
-/// NOT a bound on the invocation's total spend — review measured invocations at
-/// 2,981 ms (float-to-double1) and 3,582 ms (rlim_invariant) against this
-/// 2,500 ms figure, and the original wording claimed the stronger property. The
-/// ground re-solve sits INSIDE the account window but OUTSIDE `sub_solve_ms()`:
-/// it is charged to the account, so the session rule still sees it, but it is
-/// not capped by this constant. Read this as "the budget every sub-solve draws
-/// from", not "the most an invocation can cost".
-///
-/// WHY A LANE-WIDE CAP AND NOT A PER-SUB-SOLVE ONE.
-/// [`FINITE_MODEL_PROBE_MS`] already caps each sub-solve, but a pass runs many:
-/// one or two refutations per universal, a counterexample probe, the residual
-/// `confirm` solve, and the witness probe — and
-/// [`Executor::try_finite_model_forall_refinement`] runs up to
-/// [`MAX_FINITE_MODEL_ROUNDS`] passes. The per-sub-solve cap therefore bounds a
-/// check-sat's exposure at tens of seconds.
-///
-/// WHERE 2.5 s COMES FROM. Measured, not guessed: with the budget removed and
-/// `--debug-cert` reporting every invocation's wall cost, the invocations that
-/// CERTIFY cost
-///
-/// ```text
-///   file                     n     mean    p90    max
-///   rlim_invariant         582    314ms  809ms  2456ms
-///   float-to-double1       155    659ms 1398ms  1789ms
-///   exp_loop                31   1080ms 1491ms  2349ms
-/// ```
-///
-/// so 2.5 s admits every certificate any of the three produced, while the
-/// DECLINED invocations on `exp_loop` (mean 881 ms, p90 4.5 s, max 6.0 s) are
-/// exactly what it truncates. A cap of 1 s was tried first and cost 25% of
-/// `float-to-double1`'s certificates and 8% of `rlim_invariant`'s — measured,
-/// on the division that must hold.
-///
-/// FAIL CLOSED. Exhausting the budget declines the pass, i.e. publishes the
-/// `unknown` the lane existed to avoid — never a weaker check and never a
-/// verdict this lane would not otherwise have been entitled to.
-const FINITE_MODEL_LANE_BUDGET_MS: u64 = 2_500;
-
-/// Speculative capital: what the lane may spend on DECLINES in one session
-/// before it has to have paid for itself (#witness-check-cost).
-///
-/// The per-invocation cap alone does not fix an incremental trace, because the
-/// trace multiplies it: 1,645 check-sats times a per-query cap is still a
-/// budget-sized number. The session rule is
-///
-/// ```text
-///   declined_spend <= FINITE_MODEL_LANE_SEED_MS + certified_spend
-/// ```
-///
-/// — after the seed, the lane may spend on failures at most what it has already
-/// spent on successes.
-///
-/// WHY THIS STATISTIC. It is scale-free: no millisecond threshold has to track
-/// how fast the host is. And it separates the two divisions by two orders of
-/// magnitude. Measured with the budget removed:
-///
-/// ```text
-///   file                declined     certified   ratio needed
-///   float-to-double1      16.6s        102.1s          0.16
-///   rlim_invariant        61.8s        183.0s          0.34
-///   exp_loop             359.4s         33.5s         10.73
-/// ```
-///
-/// A ratio of 1 cuts `exp_loop`'s lane spend to 7% of what it was. It does NOT
-/// leave both FP files alone — review measured that claim false for
-/// `rlim_invariant`: its peak deficit reaches 20,057 ms against the 20,000 ms
-/// seed, the latch trips at invocation ~1062, 1,297 invocations are refused,
-/// and it keeps 159 certificates rather than the 582 claimed here.
-/// float-to-double1 does match (153 kept, 0 latch events).
-///
-/// FPArith survives that at -1 answer and still clears the bar, but the margin
-/// is 6, so the safety argument for this constant is empirical, not structural.
-/// Note also that the latch is ABSORBING: `finite_model_lane_open` returns
-/// `None` before any settle, so once a session's lane closes it can never earn
-/// its way back open.
-///
-/// The seed is deliberately several invocations' worth: with a seed near the
-/// per-invocation cap, one expensive first decline would close the lane for the
-/// whole session before it ever had a chance to certify.
-const FINITE_MODEL_LANE_SEED_MS: u64 = 20_000;
-
-/// Session-scoped spend and yield for this lane (#witness-check-cost).
-///
-/// Lives here rather than as loose `Executor` fields so the rule and the state
-/// it reads are one unit. Deliberately NOT reset per check-sat: the whole point
-/// is that an incremental trace which the lane never pays back stops paying for
-/// it, and a per-call reset would restore the compounding cost exactly.
-/// `reset-assertions` starts a new problem, so it does clear the account.
-#[derive(Clone, Debug, Default)]
-pub(in crate::executor) struct LaneAccount {
-    /// Wall spent on invocations that returned nothing, in milliseconds.
-    declined_ms: u64,
-    /// Wall spent on invocations that returned a certificate.
-    certified_ms: u64,
-    /// How many certificates that was — trace only, the rule reads the times.
-    certificates: u64,
-    /// Test-only override of the per-invocation cap
-    /// ([`FINITE_MODEL_LANE_BUDGET_MS`] when `None`).
-    ///
-    /// Exists so the lane's barrier test can drive an ALREADY-SPENT account
-    /// through the real lane on a fixture that certifies today. Never set on
-    /// any production path.
-    pub(in crate::executor) budget_ms_override: Option<u64>,
-}
-
-impl LaneAccount {
-    /// Fresh speculative capital for a new problem.
-    pub(in crate::executor) fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-/// The spend limit for one lane invocation.
-///
-/// Constructed at the lane's entry points ONLY, so every sub-solve of a
-/// check-sat's pass — across refinement rounds — draws on the same account.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct LaneBudget {
-    opened: Instant,
-    deadline: Instant,
-}
-
-impl LaneBudget {
-    /// Open an account worth `budget_ms` from now.
-    ///
-    /// `budget_ms == 0` yields an account that is already spent, which is what
-    /// the barrier test drives.
-    fn start(budget_ms: u64) -> Self {
-        let opened = Instant::now();
-        Self {
-            opened,
-            deadline: opened + Duration::from_millis(budget_ms),
-        }
-    }
-
-    /// Milliseconds left, saturating at zero.
-    fn remaining_ms(&self) -> u64 {
-        let now = Instant::now();
-        if now >= self.deadline {
-            0
-        } else {
-            u64::try_from((self.deadline - now).as_millis()).unwrap_or(u64::MAX)
-        }
-    }
-
-    /// Milliseconds actually spent since the account was opened.
-    fn elapsed_ms(&self) -> u64 {
-        u64::try_from((Instant::now() - self.opened).as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Nothing left to spend.
-    pub(super) fn spent(&self) -> bool {
-        self.remaining_ms() == 0
-    }
-
-    /// Budget for ONE sub-solve: never more than the lane still has.
-    ///
-    /// Handing a sub-solve the full [`FINITE_MODEL_PROBE_MS`] out of an account
-    /// with less than that left is how a "bounded" pass overruns its cap by an
-    /// order of magnitude, so the two limits are combined here rather than at
-    /// each call site.
-    pub(super) fn sub_solve_ms(&self) -> u64 {
-        self.remaining_ms().min(FINITE_MODEL_PROBE_MS)
-    }
-}
 
 /// `--debug-cert` trace for this lane. Every decline reports WHICH step
 /// declined, so a measured null is attributable instead of anonymous.
@@ -717,8 +535,11 @@ impl Executor {
     /// reach a budget decline from outside otherwise, and a barrier that never
     /// runs is the vacuous kind this lane has already shipped once.
     fn finite_model_lane_budget_ms(&self) -> u64 {
-        self.finite_model_lane
-            .budget_ms_override
+        if let Some(override_ms) = self.finite_model_lane.budget_ms_override {
+            return override_ms;
+        }
+        ay_core::misc_cli_flags()
+            .fmq_lane_budget_ms
             .unwrap_or(FINITE_MODEL_LANE_BUDGET_MS)
     }
 
@@ -729,8 +550,10 @@ impl Executor {
     /// decline, which is this lane's ordinary fail-closed outcome.
     fn finite_model_lane_open(&self) -> Option<LaneBudget> {
         let per_invocation = self.finite_model_lane_budget_ms();
-        let allowance =
-            FINITE_MODEL_LANE_SEED_MS.saturating_add(self.finite_model_lane.certified_ms);
+        let seed = ay_core::misc_cli_flags()
+            .fmq_seed_ms
+            .unwrap_or(FINITE_MODEL_LANE_SEED_MS);
+        let allowance = seed.saturating_add(self.finite_model_lane.certified_ms);
         let left = allowance.saturating_sub(self.finite_model_lane.declined_ms);
         if left == 0 {
             trace(|| {
@@ -1027,7 +850,7 @@ impl Executor {
                 .consume(self, &confirm)
                 .then(|| self.finite_model_prepare_witness(&confirm, &completions, budget))
                 .flatten()
-                .map_or(PassOutcome::Declined, PassOutcome::Certified),
+                .map_or(PassOutcome::Declined, PassOutcome::certified),
             // A refuted residual says only that no model of the PINS satisfies
             // the roots. The pins are an extra hypothesis nobody asserted, so
             // on its own that refutes nothing about the query. See the
@@ -1096,7 +919,7 @@ impl Executor {
                     return false;
                 };
                 let installed =
-                    self.install_finite_model_full_domain_sat_authority(evidence, model);
+                    self.install_finite_model_full_domain_sat_authority(evidence, *model);
                 trace(|| format!("gate-hook: installed={installed}"));
                 installed
             }
@@ -1300,7 +1123,7 @@ impl Executor {
                         trace(|| format!("round {round}: authority roots do not cover"));
                         return None;
                     };
-                    if !self.install_finite_model_full_domain_sat_authority(evidence, model) {
+                    if !self.install_finite_model_full_domain_sat_authority(evidence, *model) {
                         trace(|| format!("round {round}: staged witness install declined"));
                         return None;
                     }

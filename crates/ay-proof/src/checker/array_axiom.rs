@@ -56,6 +56,7 @@ use ay_core::{
 use super::ProofCheckError;
 
 mod chain_extensions;
+pub(crate) mod ite_eval;
 
 /// Maximum number of `store` nodes the folded-default checker will traverse.
 /// This bounds work on untrusted proof bundles independently of proof size.
@@ -103,7 +104,7 @@ pub(crate) fn validate_array_select_store(
 /// (index-equal) schema, `Some(false)` for the ROW2 (index-disequality) schema,
 /// or `None` if it is not a strict-checkable read-over-write lemma.
 ///
-/// This is the EXACT inverse of [`validate_array_select_store`]: the proof
+/// This is the EXACT inverse of `validate_array_select_store`: the proof
 /// classifier (`ay-dpll` `theory_inference`) calls it so the kind it assigns is
 /// precisely the one strict mode will accept — no classifier/checker drift.
 /// Extensionality is intentionally NOT recognized here: it is not a tautology,
@@ -1624,122 +1625,9 @@ pub(super) fn validate_folded_registry_match_with_budget(
     Ok(false)
 }
 
-/// Memoized, work-bounded structural matcher for folded witness reads.
-///
-/// Array terms are DAGs. In particular, proof-shape-preserving raw ITEs may
-/// retain identical branches, so naive recursion would revisit one shared
-/// child exponentially many times. The `(array, index, candidate, depth)` memo
-/// makes matching linear in the reachable product DAG. The hard state ceiling
-/// also makes an adversarial non-shared depth-64 tree fail closed instead of
-/// consuming unbounded checker work.
-struct FoldedReadMatcher<'terms, 'budget, 'counter> {
-    terms: &'terms TermStore,
-    memo: DetHashMap<(TermId, TermId, TermId, usize), bool>,
-    budget: &'budget mut FoldedReadWorkBudget<'counter>,
-}
-
-impl<'terms, 'budget, 'counter> FoldedReadMatcher<'terms, 'budget, 'counter> {
-    const FOLD_BOUND: usize = 64;
-
-    fn new(terms: &'terms TermStore, budget: &'budget mut FoldedReadWorkBudget<'counter>) -> Self {
-        Self {
-            terms,
-            memo: DetHashMap::default(),
-            budget,
-        }
-    }
-
-    /// Independently match the proof-shape-preserving fold of `select(array,
-    /// index)` against an already-interned `candidate` term.
-    fn matches(&mut self, array: TermId, index: TermId, candidate: TermId, depth: usize) -> bool {
-        let key = (array, index, candidate, depth);
-        if let Some(&cached) = self.memo.get(&key) {
-            return cached;
-        }
-        if !self.budget.consume() {
-            return false;
-        }
-
-        let result = self.matches_uncached(array, index, candidate, depth);
-        self.memo.insert(key, result);
-        result
-    }
-
-    fn matches_uncached(
-        &mut self,
-        array: TermId,
-        index: TermId,
-        candidate: TermId,
-        depth: usize,
-    ) -> bool {
-        let Sort::Array(array_sort) = self.terms.sort(array) else {
-            return false;
-        };
-        let index_sort = array_sort.index_sort.clone();
-        let element_sort = array_sort.element_sort.clone();
-        if self.terms.sort(index) != &index_sort || self.terms.sort(candidate) != &element_sort {
-            return false;
-        }
-        if depth >= Self::FOLD_BOUND {
-            return is_exact_well_sorted_select(self.terms, candidate, array, index);
-        }
-
-        if let Some(fill) = self.terms.get_const_array(array) {
-            return self.terms.sort(fill) == &element_sort && candidate == fill;
-        }
-
-        match self.terms.get(array).clone() {
-            TermData::App(Symbol::Named(symbol), args) if symbol == "store" && args.len() == 3 => {
-                let (base, store_index, value) = (args[0], args[1], args[2]);
-                if self.terms.sort(base) != self.terms.sort(array)
-                    || self.terms.sort(store_index) != &index_sort
-                    || self.terms.sort(value) != &element_sort
-                {
-                    return false;
-                }
-                if store_index == index {
-                    return candidate == value;
-                }
-                if matches!(self.terms.get(index), TermData::Const(_))
-                    && matches!(self.terms.get(store_index), TermData::Const(_))
-                {
-                    return self.matches(base, index, candidate, depth + 1);
-                }
-
-                let TermData::Ite(condition, then_value, else_value) =
-                    self.terms.get(candidate).clone()
-                else {
-                    return false;
-                };
-                self.terms.sort(condition) == &Sort::Bool
-                    && self.terms.sort(then_value) == &element_sort
-                    && self.terms.sort(else_value) == &element_sort
-                    && matches_equality_pair(self.terms, condition, index, store_index)
-                    && then_value == value
-                    && self.matches(base, index, else_value, depth + 1)
-            }
-            TermData::Ite(guard, then_array, else_array) => {
-                if self.terms.sort(guard) != &Sort::Bool
-                    || self.terms.sort(then_array) != self.terms.sort(array)
-                    || self.terms.sort(else_array) != self.terms.sort(array)
-                {
-                    return false;
-                }
-                let TermData::Ite(candidate_guard, then_value, else_value) =
-                    self.terms.get(candidate).clone()
-                else {
-                    return false;
-                };
-                candidate_guard == guard
-                    && self.terms.sort(then_value) == &element_sort
-                    && self.terms.sort(else_value) == &element_sort
-                    && self.matches(then_array, index, then_value, depth + 1)
-                    && self.matches(else_array, index, else_value, depth + 1)
-            }
-            _ => is_exact_well_sorted_select(self.terms, candidate, array, index),
-        }
-    }
-}
+mod folded_read;
+pub(crate) use folded_read::distinct_interpreted_indices;
+use folded_read::FoldedReadMatcher;
 
 fn is_exact_well_sorted_select(
     terms: &TermStore,
@@ -1817,7 +1705,7 @@ impl ExtDiffRegistry {
     ///  1. SHAPE — no premises, no conclusion clause, exactly three `:args`
     ///     `(k a b)` with `a`, `b` two DISTINCT terms of the same array sort
     ///     and `k` an atomic symbol at that sort's index sort
-    ///     ([`validate_ext_diff_intro`]).
+    ///     (`validate_ext_diff_intro`).
     ///  2. BOUND ONCE — two introductions naming the same symbol are rejected
     ///     outright, so a symbol can never acquire two array-pair definitions
     ///     (which would be unsound: one index cannot in general witness two
@@ -2627,9 +2515,15 @@ fn eval_chain_at(
         if entry_index == index {
             return Some(ChainValue::Value(entry_value));
         }
-        // Skipping this store is only justified when the clause itself carries
-        // the `(= index entry_index)` literal we get to assume false.
-        if !eqs.contains(index, entry_index) {
+        // Skipping this store needs `index != entry_index`. Either the clause
+        // itself carries the `(= index entry_index)` literal we get to assume
+        // false, or the two indices are interpreted constants with different
+        // values and the disequality is GROUND — the same side condition
+        // `TermStore::mk_select` already uses to perform this exact fold, so
+        // the checker is only re-deriving a step the producer took.
+        if !eqs.contains(index, entry_index)
+            && !distinct_interpreted_indices(terms, index, entry_index)
+        {
             return None;
         }
     }
@@ -2677,7 +2571,7 @@ fn matches_row_chain(terms: &TermStore, literals: &[TermId]) -> bool {
         || matches_exact_store_congruence(terms, literals)
         || matches_exact_store_idempotence_under_eq(terms, literals)
         || matches_exact_guarded_matching_outer_store_read(terms, literals)
-        || chain_extensions::same_index_store_value_equality_terms(terms, literals).is_some()
+        || chain_extensions::matches_extension_subschema(terms, literals)
 }
 
 /// Sub-schema (D): exact, two-literal select congruence.

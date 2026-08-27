@@ -166,7 +166,7 @@ fn debug_theory_packet_steps() -> [ExternalStep; 6] {
     ]
 }
 
-fn release_library_steps() -> [ExternalStep; 2] {
+fn release_library_steps() -> [ExternalStep; 3] {
     [
         ExternalStep::new(
             "release_ay_sat_soundness_regressions",
@@ -196,6 +196,27 @@ fn release_library_steps() -> [ExternalStep; 2] {
                 "--test",
                 "group_lra",
                 "qf_lra_release_soundness_",
+                "--",
+                "--nocapture",
+            ],
+        ),
+        // #4751 capability guard: the full dillig12_m benchmark must remain
+        // provable-Safe. The test gives both profiles a generous 90s hang
+        // budget for an unloaded solve measured at roughly 40s; the wall clock
+        // is not a performance stopwatch. Keep it in a dedicated test binary
+        // so concurrent heavy tests do not turn scheduler contention into a
+        // false capability regression.
+        ExternalStep::new(
+            "release_ay_chc_dillig12_m_deadline_guard",
+            "cargo",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "ay-chc",
+                "--release",
+                "--test",
+                "dillig12_m_deadline_4751",
                 "--",
                 "--nocapture",
             ],

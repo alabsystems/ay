@@ -47,6 +47,64 @@ impl PropagationChainPlanner<'_> {
         )
     }
 
+    /// `(cl (= a b))` from the two implications `(cl b (not a))` and
+    /// `(cl a (not b))`.
+    ///
+    /// `equiv_neg2` is `(cl (= a b) a b)` and `equiv_neg1` is
+    /// `(cl (= a b) (not a) (not b))` in this checker; both are premise-free
+    /// tautologies, and the two implications resolve them down to `(cl (= a b))`
+    /// in three steps. Shared by the `EqDiffVar` atom bridge and the
+    /// connective-reorder bridge, which differ only in how they derive the two
+    /// implications.
+    pub(super) fn plan_equivalence_from_implications(
+        &mut self,
+        cx: &mut PlanCx<'_>,
+        a: TermId,
+        b: TermId,
+        forward: ProofId,
+        backward: ProofId,
+    ) -> Option<(TermId, ProofId)> {
+        cx.spend(5)?;
+        let equivalence = self.terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+        match self.terms.get(equivalence) {
+            TermData::App(symbol, args) if symbol.name() == "=" && args.as_slice() == [a, b] => {}
+            _ => return None,
+        }
+        let not_a = self.terms.mk_not_raw(a);
+        let not_b = self.terms.mk_not_raw(b);
+        let positive = cx.chain.add_rule_step(
+            AletheRule::EquivNeg2,
+            vec![equivalence, a, b],
+            Vec::new(),
+            Vec::new(),
+        );
+        let negative = cx.chain.add_rule_step(
+            AletheRule::EquivNeg1,
+            vec![equivalence, not_a, not_b],
+            Vec::new(),
+            Vec::new(),
+        );
+        let without_a = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equivalence, not_a],
+            vec![negative, forward],
+            Vec::new(),
+        );
+        let with_a = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equivalence, a],
+            vec![positive, backward],
+            Vec::new(),
+        );
+        let id = cx.chain.add_rule_step(
+            AletheRule::ThResolution,
+            vec![equivalence],
+            vec![without_a, with_a],
+            Vec::new(),
+        );
+        Some((equivalence, id))
+    }
+
     /// Shape A: `before = (or d1 .. dk)` with all-distinct disjuncts; every
     /// changed disjunct must replay to literal `false`. `after` is then one
     /// of three shapes, and anything else declines:

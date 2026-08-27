@@ -24,8 +24,8 @@ impl Solver {
     /// assigned at decision levels 1, 2, ..., n. When a conflict occurs that
     /// requires backtracking past all assumptions (to level 0), the assumptions
     /// involved in the conflict analysis form the unsat core.
-    pub fn solve_with_assumptions(&mut self, assumptions: &[Literal]) -> VerifiedAssumeResult {
-        VerifiedAssumeResult::from_validated(self.solve_with_assumptions_raw(assumptions))
+    pub fn solve_with_assumptions(&mut self, assumptions: &[Literal]) -> SolverAssumeResult {
+        SolverAssumeResult::from_solver_result(self.solve_with_assumptions_raw(assumptions))
     }
 
     /// Internal assumption solve returning raw `AssumeResult`.
@@ -92,11 +92,11 @@ impl Solver {
         &mut self,
         assumptions: &[Literal],
         should_stop: F,
-    ) -> VerifiedAssumeResult
+    ) -> SolverAssumeResult
     where
         F: Fn() -> bool,
     {
-        VerifiedAssumeResult::from_validated(
+        SolverAssumeResult::from_solver_result(
             self.solve_with_assumptions_interruptible_raw(assumptions, should_stop),
         )
     }
@@ -359,7 +359,7 @@ impl Solver {
         self.cold.original_clause_boundary = self.arena.len();
         self.install_and_apply_sat_whole_loop_guard_at_solver_start();
 
-        // Initialize streaming UNSAT core bitmap (#8250).
+        // Initialize streaming original-clause support (#8250).
         // Issued-original max, not next_original_clause_id - 1: the latter
         // jumps past derived IDs (b93692341 follow-up).
         let num_originals = self.cold.issued_original_clause_id_max;
@@ -858,28 +858,28 @@ impl Solver {
                         if !result.bump_vars.is_empty() {
                             self.bump_theory_vars(&result.bump_vars);
                         }
-
                         if let Some(conflict) = result.conflict {
+                            for clause in result.clauses {
+                                self.add_theory_lemma(clause);
+                            }
                             if conflict.is_empty() {
                                 return self.declare_unsat_assume(failed_assumptions);
                             }
                             self.add_theory_lemma(conflict);
                             continue;
                         }
-
                         let has_work = !result.clauses.is_empty()
                             || !result.propagations.is_empty()
                             || !result.lazy_propagations.is_empty();
 
-                        // Process theory propagations and lemmas.
+                        for clause in result.clauses {
+                            self.add_theory_lemma(clause);
+                        }
                         for (clause, propagated) in result.propagations {
                             self.add_theory_propagation(clause, propagated);
                         }
                         for (propagated, reason_data) in result.lazy_propagations {
                             self.add_lazy_theory_propagation(propagated, reason_data);
-                        }
-                        for clause in result.clauses {
-                            self.add_theory_lemma(clause);
                         }
 
                         if self.has_empty_clause {

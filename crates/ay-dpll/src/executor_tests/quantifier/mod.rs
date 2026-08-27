@@ -11,6 +11,7 @@ use ay_frontend::parse;
 
 mod assuming;
 mod cegqi;
+mod consequence_replay_envelope;
 mod deferred;
 mod demand_lane_shadow;
 mod demand_probes;
@@ -22,5 +23,6 @@ mod guard_bounded_expansion;
 mod patterned_trigger_soundness;
 mod prepass_reachability;
 mod qe_prepass_e2e;
+mod qe_route;
 mod refinement;
 mod unknown_and_misc;

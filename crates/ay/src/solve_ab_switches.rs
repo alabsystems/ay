@@ -12,23 +12,18 @@ pub(super) struct SolveAbSwitches {
     /// Quarantine the NIA clausal local-search lane (B16).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_nia_clausal_sls: bool,
-
     /// Disable cross-solve warm simplex state (B16).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_lra_warm_simplex: bool,
-
     /// Disable the EUF incremental disequality-undo lane (B30).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_euf_inc_diseq_undo: bool,
-
     /// Restore eager EUF propagation reasons (B30).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_euf_lazy_explain: bool,
-
     /// Disable lazy EUF no-propagation reasons (B30).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_euf_lazy_noprop: bool,
-
     /// Skip the LIA probe minimization scan (B30).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_lia_probe_scan: bool,
@@ -74,7 +69,6 @@ pub(super) struct SolveAbSwitches {
     /// Lift the XOR-extension clause cap (B41).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     xor_allow_large: bool,
-
     /// Allow residual-dominated XOR routing (B41).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     xor_allow_residual: bool,
@@ -108,6 +102,15 @@ pub(super) struct SolveAbSwitches {
     proof_introspect_probe: Option<String>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     str_w4_work: Option<u64>,
+    /// Finite-model MBQI lane per-invocation wall cap, ms (B43 A/B).
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    fmq_lane_budget_ms: Option<u64>,
+    /// Finite-model MBQI lane per-sub-solve ceiling, ms (B43 A/B).
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    fmq_probe_ms: Option<u64>,
+    /// Finite-model MBQI lane session decline seed, ms (B43 A/B).
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    fmq_seed_ms: Option<u64>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_ab_subst_stats: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -443,9 +446,29 @@ pub(super) struct SolveAbSwitches {
         long,
         hide_short_help = true,
         hide_long_help = true,
-        value_name = "PATH"
+        value_name = "ASSIGNMENTS"
     )]
     nra_witness: Option<String>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    quant_relevance: Option<bool>,
+    #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
+    quant_relevance_k: Option<usize>,
+    #[arg(long, hide_short_help = true, hide_long_help = true, value_name = "N")]
+    quant_relevance_min: Option<usize>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    quant_relevance_model: Option<bool>,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    quant_relevance_debug: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_deterministic_inproc: Option<bool>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
@@ -553,16 +576,61 @@ pub(super) struct SolveAbSwitches {
     sat_bcp_learned_1963_blocker_cert_false_reject_demote: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_dense_clique_php_proof_route: bool,
-
-    /// Force the banded additive BVE fast-elim on (overrides the band auto
-    /// decision; B36).
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_xor_proof_route: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_gf_probe: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_indep_support: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_indep_enum: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_vivify_converge: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_large_rephase_walk: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_mode_equiticks_large: Option<bool>,
+    /// Force the banded additive BVE fast-elim on (overrides the band auto decision; B36).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_bve_additive_fastelim: bool,
-
     /// Force the banded additive BVE fast-elim off (B36).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_no_bve_additive_fastelim: bool,
-
     /// Disable CHC derivation expansion (B15).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     chc_no_deriv_expansion: bool,
@@ -787,17 +855,48 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_signed_symmetry: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
-    sat_signed_symmetry_sr: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_composite_symmetry: bool,
-    #[arg(long, hide_short_help = true, hide_long_help = true)]
-    sat_symmetry_sr: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_symmetry_hhw: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_bve_sparse_max_vars: Option<usize>,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     sat_bve_sparse_max_density: Option<f64>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_bve_giant_raw: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_two_stage_clause_management: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_memory_aware_clause_db: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_congruence_exact_gate_table: Option<bool>,
+    #[arg(
+        long,
+        hide_short_help = true,
+        hide_long_help = true,
+        value_name = "BOOL"
+    )]
+    sat_congruence_bounded_occs: Option<bool>,
 }
 
 include!("solve_ab_switches/test_support.rs");

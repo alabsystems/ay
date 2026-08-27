@@ -2,29 +2,22 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Lean kernel verification glue for `--lean-verify` (#8773, Phase 1).
+//! Lean kernel verification glue for `--lean-verify`.
 //!
-//! This module is the **Phase 1 thin wrapper** described in
-//! the development design notes. It exposes a minimal
-//! [`LeanVerifier`] that shells out to the `lean` binary on a previously
-//! emitted `.lean4` kernel-checked proof and classifies the outcome.
-//!
-//! # Why it lives in `ay` (not `ay-lean-bridge`) in Phase 1
-//!
-//! `ay-lean-bridge` currently depends on `ay` (for the `ay::api::Solver`
-//! facade), so `ay -> ay-lean-bridge` would be a dependency cycle. The
-//! canonical home for this verifier is `ay-lean-bridge::verify` per the
-//! design doc. Phase 2 of that migration lifts the LRAT emitter into
-//! `ay-lean-bridge` without a `ay` dep (design §2, Option B), at which
-//! point this shim becomes a one-line delegation to
-//! `ay_lean_bridge::verify::LeanVerifier`.
-//!
-//! Until that migration lands, this module IS the canonical verification
-//! entry point invoked by `--lean-verify`.
+//! The emitted theorem imports `AySoundness.Lrat`; running an arbitrary `lean`
+//! process from the caller's working directory would not resolve that module
+//! and would leave the checker version ambiguous. This module materializes the
+//! exact soundness source and toolchain metadata embedded in the `ay` binary,
+//! builds that private project, and checks the authenticated proof snapshot in
+//! its environment.
+
+mod project;
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
+
+use project::SoundnessProject;
 
 /// Outcome of invoking the Lean kernel on an emitted `.lean4` proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,13 +25,13 @@ use std::time::Duration;
 pub(crate) enum LeanVerificationOutcome {
     /// Lean accepted the proof (exit 0, no kernel errors).
     Accepted,
-    /// Lean rejected the proof. Carries captured stderr and exit code.
-    Rejected { stderr: String, exit_code: i32 },
-    /// Lean binary unavailable (missing / not on PATH / timed out / IO error).
+    /// Lean rejected the proof. Carries combined diagnostics and exit code.
+    Rejected { diagnostic: String, exit_code: i32 },
+    /// The pinned project or Lean executable was unavailable.
     Unavailable { reason: String },
 }
 
-/// Thin wrapper that invokes `lean <proof-file>`.
+/// Verify a proof against the binary-embedded `AySoundness.Lrat` project.
 ///
 /// The `--lean-verify` CLI flag constructs one of these per UNSAT result,
 /// invokes [`LeanVerifier::verify_descriptor`] on an authenticated proof
@@ -46,31 +39,74 @@ pub(crate) enum LeanVerificationOutcome {
 /// `crates/ay/README.md`.
 #[derive(Debug, Clone)]
 pub(crate) struct LeanVerifier {
-    lean_path: PathBuf,
+    lean_path: Option<PathBuf>,
     timeout: Option<Duration>,
 }
 
 impl LeanVerifier {
-    /// Construct a verifier targeting `lean` on PATH with a 300s timeout.
+    /// Use the pinned project's `lake env lean` with a 300s timeout.
     pub(crate) fn new() -> Self {
         Self {
-            lean_path: PathBuf::from("lean"),
+            lean_path: None,
             timeout: Some(Duration::from_mins(5)),
         }
     }
 
-    /// Use a specific `lean` binary (for sandboxed or pinned builds).
+    /// Use a specific Lean binary after building the pinned checker module.
+    ///
+    /// The override must be compatible with the repository's pinned Lean
+    /// toolchain; otherwise the explicit verification request fails closed.
     pub(crate) fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.lean_path = path.into();
+        self.lean_path = Some(path.into());
         self
+    }
+
+    fn prepare_soundness_project(&self) -> Result<SoundnessProject, LeanVerificationOutcome> {
+        let project =
+            SoundnessProject::create().map_err(|error| LeanVerificationOutcome::Unavailable {
+                reason: format!("failed to materialize embedded AySoundness project: {error}"),
+            })?;
+        match self.run_command(project.build_command()) {
+            LeanVerificationOutcome::Accepted => Ok(project),
+            LeanVerificationOutcome::Rejected {
+                diagnostic,
+                exit_code,
+            } => {
+                Err(LeanVerificationOutcome::Unavailable {
+                    reason: format!(
+                        "failed to build embedded AySoundness.Lrat with the pinned toolchain (exit {exit_code}): {}",
+                        diagnostic_summary(&diagnostic)
+                    ),
+                })
+            }
+            LeanVerificationOutcome::Unavailable { reason } => {
+                Err(LeanVerificationOutcome::Unavailable {
+                    reason: format!("could not prepare embedded AySoundness.Lrat: {reason}"),
+                })
+            }
+        }
+    }
+
+    fn proof_command(&self, project: &SoundnessProject) -> Command {
+        let Some(path) = &self.lean_path else {
+            return project.pinned_lean_command();
+        };
+        let mut command = Command::new(path);
+        command
+            .current_dir(project.root())
+            .env("LEAN_PATH", project.module_path());
+        command
     }
 
     /// Invoke Lean on the exact inode named by `proof_file`, not on a mutable
     /// public pathname. The cloned descriptor is inherited across `exec`, and
     /// Lean receives the child-local descriptor path.
-    #[cfg(unix)]
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn verify_descriptor(&self, proof_file: &std::fs::File) -> LeanVerificationOutcome {
+        let project = match self.prepare_soundness_project() {
+            Ok(project) => project,
+            Err(outcome) => return outcome,
+        };
         let inherited = match proof_file.try_clone() {
             Ok(file) => file,
             Err(error) => {
@@ -79,50 +115,20 @@ impl LeanVerifier {
                 };
             }
         };
-        #[cfg(any(target_os = "linux", target_os = "android"))]
         let descriptor_path = PathBuf::from("/proc/self/fd/0");
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let descriptor_path = PathBuf::from("/dev/stdin");
-        let mut cmd = Command::new(&self.lean_path);
+        let mut cmd = self.proof_command(&project);
         cmd.arg(descriptor_path)
             .stdin(std::process::Stdio::from(inherited));
-        self.run_command(cmd)
-    }
-
-    /// Invoke Lean on a retained private snapshot stage plus the pinned
-    /// descriptor on stdin. Used on hosts without a re-openable descriptor
-    /// pathname: macOS has no `/proc/self/fd`, and its `/dev/fd` entries have
-    /// dup-offset semantics, so a verifier that opens its input path more
-    /// than once would read from EOF. The caller re-authenticates the pinned
-    /// descriptor bytes against the published digest before and after this
-    /// call, so the private stage pathname is never the trust root for the
-    /// verified-content claim.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn verify_snapshot_path(
-        &self,
-        snapshot_path: &std::path::Path,
-        proof_file: &std::fs::File,
-    ) -> LeanVerificationOutcome {
-        let inherited = match proof_file.try_clone() {
-            Ok(file) => file,
-            Err(error) => {
-                return LeanVerificationOutcome::Unavailable {
-                    reason: format!("failed to clone authenticated Lean snapshot: {error}"),
-                };
-            }
-        };
-        let mut cmd = Command::new(&self.lean_path);
-        cmd.arg(snapshot_path)
-            .stdin(std::process::Stdio::from(inherited));
-        self.run_command(cmd)
+        normalize_project_failure(self.run_command(cmd))
     }
 
     fn spawn_command(
         &self,
         mut cmd: Command,
     ) -> Result<std::process::Child, LeanVerificationOutcome> {
-        // Capture both streams so Accepted warnings don't leak to the user's
-        // stderr and Rejected stderr can be surfaced on failure.
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        // Lean may report elaboration errors on stdout or stderr. Capture both
+        // so an exit-zero diagnostic can never be mistaken for acceptance.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -130,14 +136,11 @@ impl LeanVerifier {
             Ok(child) => Ok(child),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Err(LeanVerificationOutcome::Unavailable {
-                    reason: format!(
-                        "lean binary not found at '{}' (use --lean-path to override)",
-                        self.lean_path.display()
-                    ),
+                    reason: format!("verification executable not found at '{program}'"),
                 })
             }
             Err(err) => Err(LeanVerificationOutcome::Unavailable {
-                reason: format!("failed to spawn '{}': {err}", self.lean_path.display()),
+                reason: format!("failed to spawn '{program}': {err}"),
             }),
         }
     }
@@ -168,8 +171,66 @@ fn run_until_exit(child: std::process::Child) -> LeanVerificationOutcome {
     };
     classify_output(
         output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        combine_diagnostics(&output.stdout, &output.stderr),
     )
+}
+
+fn read_pipe<R: std::io::Read>(stream: Option<R>) -> std::io::Result<Vec<u8>> {
+    let Some(mut stream) = stream else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+struct DiagnosticReaders {
+    stdout: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+impl DiagnosticReaders {
+    fn start(child: &mut std::process::Child) -> Self {
+        Self {
+            stdout: spawn_pipe_reader(child.stdout.take()),
+            stderr: spawn_pipe_reader(child.stderr.take()),
+        }
+    }
+
+    fn finish(self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let stdout = join_pipe_reader(self.stdout, "stdout")?;
+        let stderr = join_pipe_reader(self.stderr, "stderr")?;
+        Ok((stdout, stderr))
+    }
+}
+
+fn spawn_pipe_reader<R>(stream: Option<R>) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || read_pipe(stream))
+}
+
+fn join_pipe_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    name: &str,
+) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| format!("Lean {name} reader panicked"))?
+        .map_err(|error| format!("failed to read Lean {name}: {error}"))
+}
+
+fn combine_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, _) => String::from_utf8_lossy(stderr).into_owned(),
+        (_, true) => String::from_utf8_lossy(stdout).into_owned(),
+        (false, false) => format!(
+            "{}\n{}",
+            String::from_utf8_lossy(stdout),
+            String::from_utf8_lossy(stderr)
+        ),
+    }
 }
 
 fn run_with_timeout(mut child: std::process::Child, timeout: Duration) -> LeanVerificationOutcome {
@@ -179,29 +240,28 @@ fn run_with_timeout(mut child: std::process::Child, timeout: Duration) -> LeanVe
     // default 300s timeout.
     let start = std::time::Instant::now();
     let poll = Duration::from_millis(50);
+    // Drain both pipes from launch onward. Waiting until the child exits can
+    // deadlock once either OS pipe buffer fills, preventing the exit we poll.
+    let readers = DiagnosticReaders::start(&mut child);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Child exited; drain stderr.
-                let stderr_bytes = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        use std::io::Read;
-                        let mut buf = Vec::new();
-                        let _ = s.read_to_end(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
+                let (stdout, stderr) = match readers.finish() {
+                    Ok(output) => output,
+                    Err(reason) => {
+                        return LeanVerificationOutcome::Unavailable { reason };
+                    }
+                };
                 return classify_output(
                     status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                    combine_diagnostics(&stdout, &stderr),
                 );
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = readers.finish();
                     return LeanVerificationOutcome::Unavailable {
                         reason: format!(
                             "lean verification exceeded timeout of {}s",
@@ -212,6 +272,9 @@ fn run_with_timeout(mut child: std::process::Child, timeout: Duration) -> LeanVe
                 std::thread::sleep(poll);
             }
             Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = readers.finish();
                 return LeanVerificationOutcome::Unavailable {
                     reason: format!("failed polling lean child: {err}"),
                 };
@@ -220,26 +283,97 @@ fn run_with_timeout(mut child: std::process::Child, timeout: Duration) -> LeanVe
     }
 }
 
-fn classify_output(exit_code: i32, stderr: String) -> LeanVerificationOutcome {
+fn classify_output(exit_code: i32, diagnostic: String) -> LeanVerificationOutcome {
     if exit_code == 0 {
-        // Lean emits warnings on stderr even when the kernel accepts. Treat
-        // any non-zero-indicating stderr (unknown identifier, error:, failed
-        // to verify) as Rejected even on exit 0 — defensive for future Lean
-        // toolchains that may not propagate every kernel error to exit code.
-        if stderr_indicates_rejection(&stderr) {
-            return LeanVerificationOutcome::Rejected { stderr, exit_code };
+        if diagnostic_indicates_rejection(&diagnostic) {
+            return LeanVerificationOutcome::Rejected {
+                diagnostic,
+                exit_code,
+            };
         }
         LeanVerificationOutcome::Accepted
     } else {
-        LeanVerificationOutcome::Rejected { stderr, exit_code }
+        LeanVerificationOutcome::Rejected {
+            diagnostic,
+            exit_code,
+        }
     }
 }
 
-fn stderr_indicates_rejection(stderr: &str) -> bool {
-    stderr.contains("error:")
-        || stderr.contains("proof failed")
-        || stderr.contains("declaration uses 'sorry'")
-        || stderr.contains("declaration uses `sorry`")
+fn diagnostic_indicates_rejection(diagnostic: &str) -> bool {
+    diagnostic.contains("error:")
+        || diagnostic.contains("proof failed")
+        || diagnostic.contains("declaration uses 'sorry'")
+        || diagnostic.contains("declaration uses `sorry`")
+}
+
+fn normalize_project_failure(outcome: LeanVerificationOutcome) -> LeanVerificationOutcome {
+    let LeanVerificationOutcome::Rejected {
+        diagnostic,
+        exit_code,
+    } = outcome
+    else {
+        return outcome;
+    };
+    if !(0..128).contains(&exit_code) || resource_exhaustion_diagnostic(&diagnostic) {
+        return LeanVerificationOutcome::Unavailable {
+            reason: format!(
+                "Lean verification exhausted resources or terminated abnormally (exit {exit_code}): {}",
+                diagnostic_summary(&diagnostic)
+            ),
+        };
+    }
+    if soundness_project_diagnostic(&diagnostic) {
+        return LeanVerificationOutcome::Unavailable {
+            reason: format!(
+                "embedded AySoundness.Lrat could not be loaded by the selected Lean toolchain (exit {exit_code}): {}",
+                diagnostic_summary(&diagnostic)
+            ),
+        };
+    }
+    LeanVerificationOutcome::Rejected {
+        diagnostic,
+        exit_code,
+    }
+}
+
+fn resource_exhaustion_diagnostic(diagnostic: &str) -> bool {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    [
+        "maximum recursion depth",
+        "recursion depth limit",
+        "maximum heartbeats",
+        "heartbeat limit",
+        "deterministic timeout",
+        "timeout at",
+        "resource exhausted",
+        "out of memory",
+        "memory exhausted",
+        "memory allocation",
+        "cannot allocate memory",
+        "failed to allocate",
+    ]
+    .iter()
+    .any(|marker| diagnostic.contains(marker))
+}
+
+fn soundness_project_diagnostic(diagnostic: &str) -> bool {
+    let names_checker =
+        diagnostic.contains("AySoundness.Lrat") || diagnostic.contains("AySoundness/Lrat.olean");
+    let describes_load_failure = diagnostic.contains("unknown module")
+        || diagnostic.contains("object file")
+        || diagnostic.contains("cannot load")
+        || diagnostic.contains("does not exist")
+        || diagnostic.contains("different version");
+    names_checker && describes_load_failure
+}
+
+fn diagnostic_summary(diagnostic: &str) -> String {
+    let compact = diagnostic.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "no diagnostic output".to_string();
+    }
+    compact.chars().take(500).collect()
 }
 
 #[cfg(test)]
@@ -248,13 +382,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_verifier_reports_unavailable_for_missing_binary() {
-        let verifier = LeanVerifier::new().with_path("/nonexistent/bogus-lean-binary-xyz");
-        let tmp = std::env::temp_dir().join("ay-lean-verify-unit-test.lean4");
-        std::fs::write(&tmp, "theorem t : True := trivial\n").expect("write tmp");
-        let proof = std::fs::File::open(&tmp).expect("open tmp");
-        let outcome = verifier.verify_descriptor(&proof);
-        let _ = std::fs::remove_file(&tmp);
+    fn test_spawn_reports_unavailable_for_missing_binary() {
+        let verifier = LeanVerifier::new();
+        let outcome =
+            match verifier.spawn_command(Command::new("/nonexistent/bogus-lean-binary-xyz")) {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    panic!("missing verifier binary unexpectedly spawned")
+                }
+                Err(outcome) => outcome,
+            };
         assert!(
             matches!(outcome, LeanVerificationOutcome::Unavailable { .. }),
             "expected Unavailable for missing binary, got {outcome:?}"
@@ -262,13 +399,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_output_exit_zero_clean_stderr_accepts() {
+    fn test_classify_output_exit_zero_clean_diagnostic_accepts() {
         let outcome = classify_output(0, String::new());
         assert_eq!(outcome, LeanVerificationOutcome::Accepted);
     }
 
     #[test]
-    fn test_classify_output_exit_zero_error_stderr_rejects() {
+    fn test_classify_output_exit_zero_error_diagnostic_rejects() {
         let outcome = classify_output(0, "error: something broke\n".to_string());
         assert!(matches!(outcome, LeanVerificationOutcome::Rejected { .. }));
     }
@@ -286,5 +423,62 @@ mod tests {
     fn test_classify_output_nonzero_exit_rejects() {
         let outcome = classify_output(1, String::new());
         assert!(matches!(outcome, LeanVerificationOutcome::Rejected { .. }));
+    }
+
+    #[test]
+    fn project_import_failure_is_unavailable_not_a_proof_rejection() {
+        let outcome = normalize_project_failure(LeanVerificationOutcome::Rejected {
+            diagnostic: "error: unknown module 'AySoundness.Lrat'".to_string(),
+            exit_code: 1,
+        });
+        assert!(matches!(
+            outcome,
+            LeanVerificationOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn resource_failures_are_unavailable_not_proof_rejections() {
+        for diagnostic in [
+            "error: maximum recursion depth has been reached",
+            "error: maximum heartbeats exceeded",
+            "fatal: out of memory",
+        ] {
+            let outcome = normalize_project_failure(LeanVerificationOutcome::Rejected {
+                diagnostic: diagnostic.to_string(),
+                exit_code: 1,
+            });
+            assert!(
+                matches!(outcome, LeanVerificationOutcome::Unavailable { .. }),
+                "resource failure was mislabeled as proof rejection: {outcome:?}"
+            );
+        }
+        let outcome = normalize_project_failure(LeanVerificationOutcome::Rejected {
+            diagnostic: String::new(),
+            exit_code: -1,
+        });
+        assert!(matches!(
+            outcome,
+            LeanVerificationOutcome::Unavailable { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_runner_concurrently_drains_verbose_child() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "i=0; while [ \"$i\" -lt 12000 ]; do echo verbose-output-line; echo verbose-diagnostic-line >&2; i=$((i + 1)); done",
+            )
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = command.spawn().expect("spawn verbose test child");
+
+        assert_eq!(
+            run_with_timeout(child, Duration::from_secs(10)),
+            LeanVerificationOutcome::Accepted
+        );
     }
 }

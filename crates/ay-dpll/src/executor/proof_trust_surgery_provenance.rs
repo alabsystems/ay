@@ -22,7 +22,7 @@ mod planning_budget;
 #[cfg(test)]
 pub(in crate::executor) use planning_budget::MAX_FARKAS_ATTEMPTS;
 pub(in crate::executor) use planning_budget::{
-    canonical_term_work, surgery_sources_are_bounded, SurgeryPlanningBudget,
+    canonical_term_work, surgery_sources_are_bounded, OperandCharge, SurgeryPlanningBudget,
 };
 
 /// Hard width bound for provenance-driven repair inputs.

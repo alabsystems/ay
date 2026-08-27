@@ -549,7 +549,7 @@ struct VerifyArgs {
 fn parse_verify_args(args: Vec<String>) -> Result<VerifyArgs, String> {
     let mut instance = None;
     let mut solution = None;
-    // Default: use z3 if present, never fail merely because it is absent.
+    // Default: try z3. An unavailable checker leaves OPTIMUM unverified.
     let mut z3 = ay_pb::Z3Mode::Auto;
     let mut z3_timeout_secs = 120u64;
     let mut i = 0;
@@ -590,7 +590,7 @@ fn parse_verify_args(args: Vec<String>) -> Result<VerifyArgs, String> {
 }
 
 /// Independently verify a solver output against an OPB instance. Prints a report
-/// and exits 0 (verified) or 1 (a check failed); exits 2 on argument/IO errors.
+/// and exits 0 only when fully verified, 1 otherwise; exits 2 on argument/IO errors.
 fn run_verify(args: Vec<String>) -> Result<PbStatus, String> {
     let cmd = parse_verify_args(args)?;
 
@@ -618,12 +618,12 @@ fn run_verify(args: Vec<String>) -> Result<PbStatus, String> {
     let report = ay_pb::verify(&instance, &output, cmd.z3, cmd.z3_timeout_secs);
 
     println!("c verify: {}", cmd.instance.display());
-    println!("c status: {}", report.status.as_deref().unwrap_or("<none>"));
-    for msg in &report.messages {
+    println!("c status: {}", report.status().unwrap_or("<none>"));
+    for msg in report.messages() {
         println!("c   {msg}");
     }
-    println!("s VERIFIED {}", if report.ok { "PASS" } else { "FAIL" });
-    std::process::exit(if report.ok { 0 } else { 1 });
+    println!("s VERIFICATION {}", report.verdict().as_str());
+    std::process::exit(if report.is_verified() { 0 } else { 1 });
 }
 
 include!("ay/solve_args.rs");

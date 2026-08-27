@@ -370,6 +370,13 @@ impl Solver {
                     self.backtrack(0);
                 }
                 self.rephase();
+                // The rephase walk satisfied every included clause and the
+                // candidate passed reconstruction + full clause-DB
+                // verification (latch_rephase_walk_model). We are at level 0
+                // — the same safe point the startup walk declares from.
+                if let Some(model) = self.cold.rephase_walk_model.take() {
+                    return self.declare_sat_from_model(model);
+                }
             } else if self.should_run_lookahead() {
                 debug_assert_eq!(self.decision_level, 0);
                 self.run_lookahead_round();
@@ -873,6 +880,22 @@ impl Solver {
                     }
                 }
                 self.rephase();
+                // Pure SAT only: a CNF model verified by
+                // latch_rephase_walk_model is a complete answer. Theory mode
+                // (USE_CALLBACK) must keep searching — the walk knows nothing
+                // about theory constraints, so the latch is left to expire at
+                // the next rephase() entry.
+                if !USE_CALLBACK {
+                    if let Some(model) = self.cold.rephase_walk_model.take() {
+                        if self.cold.tla_trace.is_some() {
+                            self.tla_trace_step(
+                                CdclTraceState::Sat,
+                                Some(CdclTraceAction::DeclareSat),
+                            );
+                        }
+                        return self.declare_sat_from_model(model);
+                    }
+                }
             } else if self.should_run_lookahead() {
                 // #8087: Lookahead-guided decisions for hard combinatorial instances.
                 // When stable mode search is stuck (high LBD ratio), run a full

@@ -250,7 +250,7 @@ impl Rng {
         lo + (self.next() % ((hi - lo + 1) as u64)) as i64
     }
     fn chance(&mut self, one_in: u64) -> bool {
-        self.next() % one_in == 0
+        self.next().is_multiple_of(one_in)
     }
 }
 

@@ -106,14 +106,14 @@ fn assert_endpoint_admitted(spec: &Spec, cuts: &[Cut], what: &str, point: &[f64]
     for cut in cuts {
         let activity: f64 = cut.coeffs.iter().map(|&(j, a)| a * point[j.index()]).sum();
         let tolerance = 1e-6 * scale * cut.coeffs.iter().map(|&(_, a)| a.abs()).fold(1.0, f64::max);
-        if activity > cut.ub + tolerance || activity < cut.lb - tolerance {
-            panic!(
-                "{what}: CUT DELETES A FEASIBLE POINT\n  point   {point:?}\n  \
-                 feasible by margin {margin}\n  cut     {:?} in [{}, {}]\n  \
-                 activity {activity}\n  rows    {:?}\n  lo {:?} up {:?}",
-                cut.coeffs, cut.lb, cut.ub, spec.rows, spec.lo, spec.up
-            );
-        }
+        let violates = activity > cut.ub + tolerance || activity < cut.lb - tolerance;
+        assert!(
+            !violates,
+            "{what}: CUT DELETES A FEASIBLE POINT\n  point   {point:?}\n  \
+             feasible by margin {margin}\n  cut     {:?} in [{}, {}]\n  \
+             activity {activity}\n  rows    {:?}\n  lo {:?} up {:?}",
+            cut.coeffs, cut.lb, cut.ub, spec.rows, spec.lo, spec.up
+        );
     }
     true
 }
@@ -439,7 +439,7 @@ fn adv_default_is_bit_identical_to_near() {
 /// vacuous. Counts models where the two policies emit different cut sets.
 #[test]
 fn adv_knap_arm_is_not_vacuous() {
-    let mut r = Rng(0xC0FFEE_11);
+    let mut r = Rng(0xC0FF_EE11);
     let mut differ = 0;
     let mut total = 0;
     for _ in 0..600 {

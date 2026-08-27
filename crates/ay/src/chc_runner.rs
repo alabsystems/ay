@@ -341,10 +341,7 @@ fn chc_safe_invariant_discharges(problem: &ChcProblem, model: &InvariantModel) -
 /// safety clause and runs in every mode), this gate is `--strict-proofs`-only
 /// and requires the full obligation set to POSITIVELY re-discharge. Default-mode
 /// verdicts are therefore unchanged.
-fn chc_strict_safe_checked_replay_discharges(
-    problem: &ChcProblem,
-    proof_run: &ChcPdrProofRun,
-) -> bool {
+fn chc_strict_safe_checked_replay_discharges(proof_run: &ChcPdrProofRun) -> bool {
     let ms = GLOBAL_TIMEOUT_MS.load(Ordering::Relaxed);
     // A positive budget is mandatory (`run_checked_replay` rejects a zero
     // budget). With an active wall-clock timeout use the remaining time; with no
@@ -363,12 +360,12 @@ fn chc_strict_safe_checked_replay_discharges(
         return false;
     }
     match catch_chc_boundary("chc strict safe checked replay", || {
-        proof_run.run_checked_replay(problem, budget)
+        proof_run.run_checked_replay(budget)
     }) {
         Ok(Ok(run)) => {
             safe_eprintln!(
                 "c CHC strict checked replay: SAFE certificate independently re-discharged ({} obligations, all unsat on AY's own executor)",
-                run.summary.obligations.len()
+                run.summary().obligations.len()
             );
             true
         }
@@ -1376,7 +1373,6 @@ struct ChcCliManifestParts {
 }
 
 fn build_chc_manifest_parts(
-    problem: &ChcProblem,
     proof_run: &ChcPdrProofRun,
     time_budget: Duration,
     strict_proofs: bool,
@@ -1385,15 +1381,15 @@ fn build_chc_manifest_parts(
     let options = ChcProofEvidenceOptions::portfolio(time_budget, strict_proofs)
         .with_memory_limit_bytes(Some(ay_sys::get_process_memory_limit() as u64));
     let solver = current_solver_identity("portfolio");
-    let problem_hash = problem.normalized_input_sha256();
+    let problem_hash = proof_run.problem().normalized_input_sha256();
     let obligation_id = chc_cli_obligation_id(&problem_hash);
     let mut replay_evidence = ChcReplayEvidence::new(
         problem_hash,
         options.identity_sha256(),
         solver.identity_sha256(),
         obligation_id.clone(),
-        proof_run.metadata.result.clone(),
-        proof_run.metadata.proof_status.clone(),
+        proof_run.metadata().result().to_string(),
+        proof_run.metadata().proof_status().to_string(),
     );
 
     // The trace subsystem currently exposes only a pathname, not the retained
@@ -1436,7 +1432,6 @@ fn chc_checked_replay_budget() -> Option<Duration> {
 /// (manifest, transcript) pair on success; `None` keeps metadata-only
 /// evidence. Never changes the printed verdict.
 fn try_chc_checked_replay(
-    problem: &ChcProblem,
     proof_run: &ChcPdrProofRun,
     parts: &ChcCliManifestParts,
     result_str: &str,
@@ -1450,7 +1445,6 @@ fn try_chc_checked_replay(
     let budget = chc_checked_replay_budget()?;
     match catch_chc_boundary("chc checked replay", || {
         proof_run.run_checked_replay_with_binding(
-            problem,
             parts.options.clone(),
             parts.solver.clone(),
             parts.obligation_id.clone(),
@@ -1458,7 +1452,10 @@ fn try_chc_checked_replay(
             budget,
         )
     }) {
-        Ok(Ok(checked)) => Some((checked.manifest, checked.proof_run.metadata)),
+        Ok(Ok(checked)) => Some((
+            checked.manifest().clone(),
+            checked.proof_run().metadata().clone(),
+        )),
         Ok(Err(error)) => {
             safe_eprintln!("c CHC checked replay unavailable (metadata-only): {error}");
             None
@@ -1487,7 +1484,6 @@ enum ChcCheckedReplayMode {
 }
 
 fn build_chc_stats_evidence(
-    problem: &ChcProblem,
     proof_run: &ChcPdrProofRun,
     time_budget: Duration,
     strict_proofs: bool,
@@ -1495,23 +1491,20 @@ fn build_chc_stats_evidence(
     result_str: &str,
     checked_replay_mode: ChcCheckedReplayMode,
 ) -> ChcSettledStatsEvidence {
-    let parts = build_chc_manifest_parts(problem, proof_run, time_budget, strict_proofs, artifacts);
+    let parts = build_chc_manifest_parts(proof_run, time_budget, strict_proofs, artifacts);
     let upgraded = match checked_replay_mode {
-        ChcCheckedReplayMode::Allow => {
-            try_chc_checked_replay(problem, proof_run, &parts, result_str)
-        }
+        ChcCheckedReplayMode::Allow => try_chc_checked_replay(proof_run, &parts, result_str),
         ChcCheckedReplayMode::Skip => None,
     };
     let (proof_manifest, proof_transcript) = upgraded.unwrap_or_else(|| {
         (
             proof_run.evidence_manifest_with_replay_evidence(
-                problem,
                 parts.options,
                 parts.solver,
                 parts.obligation_id,
                 parts.evidence,
             ),
-            proof_run.metadata.clone(),
+            proof_run.metadata().clone(),
         )
     });
     ChcSettledStatsEvidence {
@@ -1525,7 +1518,6 @@ fn build_chc_stats_evidence(
 /// through status and stats emission; the final validation detects pathname or
 /// lock-authority replacement during manifest construction/checked replay.
 fn settle_chc_stats_before_verdict(
-    problem: &ChcProblem,
     proof_run: &ChcPdrProofRun,
     time_budget: Duration,
     strict_proofs: bool,
@@ -1537,7 +1529,6 @@ fn settle_chc_stats_before_verdict(
 ) -> ChcStatsSettlement {
     let mut stats_evidence = stats_cfg.any().then(|| {
         Box::new(build_chc_stats_evidence(
-            problem,
             proof_run,
             time_budget,
             strict_proofs,
@@ -1568,7 +1559,6 @@ fn settle_chc_stats_before_verdict(
         // Rebuild a metadata-only manifest from the now-empty artifact set;
         // never retain stale digests or rerun checked replay against them.
         stats_evidence = Some(Box::new(build_chc_stats_evidence(
-            problem,
             proof_run,
             time_budget,
             strict_proofs,
@@ -1745,8 +1735,8 @@ pub(crate) fn run_chc_from_content(
         None
     };
 
-    let result = match catch_chc_boundary("solve CHC portfolio", || solver.solve()) {
-        Ok(result) => result,
+    let proof_run = match catch_chc_boundary("solve CHC portfolio", || solver.solve_proof_run()) {
+        Ok(run) => run,
         Err(error) => {
             emit_chc_fail_closed_unknown(
                 stats_cfg,
@@ -1757,7 +1747,7 @@ pub(crate) fn run_chc_from_content(
             return None;
         }
     };
-    let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
+    let result = proof_run.result().clone();
     let chc_stats = solver.statistics();
 
     // Stop progress thread before printing result. Drop joins the thread.
@@ -1797,7 +1787,7 @@ pub(crate) fn run_chc_from_content(
         // completeness-for-soundness trade must apply ONLY under `--strict-proofs`.
         VerifiedChcResult::Safe(_)
             if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
-                && !chc_strict_safe_checked_replay_discharges(solver.problem(), &proof_run) =>
+                && !chc_strict_safe_checked_replay_discharges(&proof_run) =>
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
@@ -1827,7 +1817,6 @@ pub(crate) fn run_chc_from_content(
                 Some(artifacts) => {
                     replay_artifacts = artifacts;
                     match settle_chc_stats_before_verdict(
-                        solver.problem(),
                         &proof_run,
                         time_budget,
                         strict_proofs,
@@ -1897,7 +1886,6 @@ pub(crate) fn run_chc_from_content(
                 Some(artifacts) => {
                     replay_artifacts = artifacts;
                     match settle_chc_stats_before_verdict(
-                        solver.problem(),
                         &proof_run,
                         time_budget,
                         strict_proofs,
@@ -2097,8 +2085,8 @@ pub(crate) fn run_portfolio(
         None
     };
 
-    let result = match catch_chc_boundary("solve CHC portfolio", || solver.solve()) {
-        Ok(result) => result,
+    let proof_run = match catch_chc_boundary("solve CHC portfolio", || solver.solve_proof_run()) {
+        Ok(run) => run,
         Err(error) => {
             emit_chc_fail_closed_unknown(
                 stats_cfg,
@@ -2109,7 +2097,7 @@ pub(crate) fn run_portfolio(
             return;
         }
     };
-    let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
+    let result = proof_run.result().clone();
     let chc_stats = solver.statistics();
 
     // Stop progress thread before printing result. Drop joins the thread.
@@ -2148,7 +2136,7 @@ pub(crate) fn run_portfolio(
         // completeness-for-soundness trade must apply ONLY under `--strict-proofs`.
         VerifiedChcResult::Safe(_)
             if STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
-                && !chc_strict_safe_checked_replay_discharges(solver.problem(), &proof_run) =>
+                && !chc_strict_safe_checked_replay_discharges(&proof_run) =>
         {
             exit_if_timed_out();
             emit_chc_unknown_stdout(stats_cfg, emitted_build_provenance);
@@ -2178,7 +2166,6 @@ pub(crate) fn run_portfolio(
                 Some(artifacts) => {
                     replay_artifacts = artifacts;
                     match settle_chc_stats_before_verdict(
-                        solver.problem(),
                         &proof_run,
                         time_budget,
                         strict_proofs,
@@ -2247,7 +2234,6 @@ pub(crate) fn run_portfolio(
                 Some(artifacts) => {
                     replay_artifacts = artifacts;
                     match settle_chc_stats_before_verdict(
-                        solver.problem(),
                         &proof_run,
                         time_budget,
                         strict_proofs,
@@ -2650,14 +2636,14 @@ mod tests {
         let mut config = AdaptiveConfig::with_budget(Duration::from_secs(30), false);
         config.strict_proofs = true;
         let solver = AdaptivePortfolio::new(problem, config);
-        let result = solver.solve();
+        let proof_run = solver.solve_proof_run();
+        let result = proof_run.result();
         assert!(
             matches!(result, VerifiedChcResult::Safe(_)),
             "fixture must solve SAFE"
         );
-        let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
         assert!(
-            chc_strict_safe_checked_replay_discharges(solver.problem(), &proof_run),
+            chc_strict_safe_checked_replay_discharges(&proof_run),
             "a discharge-able SAFE invariant must independently re-discharge under --strict-proofs"
         );
     }

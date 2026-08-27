@@ -204,7 +204,7 @@ mod reorder;
 mod subsume;
 mod sweep;
 mod transred;
-mod vivify;
+pub(in crate::solver) mod vivify;
 
 impl Solver {
     /// Level-0 garbage collection: remove satisfied clauses and root-false literals.

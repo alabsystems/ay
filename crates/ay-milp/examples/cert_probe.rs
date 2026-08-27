@@ -11,7 +11,6 @@
 
 use std::time::{Duration, Instant};
 
-use ay_milp::engine_cli::{switch_flags, Flags, VALUE_FLAGS};
 use ay_milp::{BabSession, Outcome, SolveOpts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +18,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `mps_solve` does, so an evidence measurement can be taken under the same
     // configuration the throughput measurement was.
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let flags = Flags::parse(&raw, VALUE_FLAGS, &switch_flags()).map_err(std::io::Error::other)?;
+    // `applied_flags()` ONLY: this harness has no flags of its own, and it took
+    // `VALUE_FLAGS` — `ay-milp solve`'s table — until this commit. That
+    // accepted `--require` and `--emit-cert`, neither of which it can carry:
+    // `require` is POSITIONAL #3 here, so `cert_probe m 5 --require optimal`
+    // reported `require_certificates=0` on 3 of 3 interleaved reps while
+    // `cert_probe m 5 1` reported `1` on 3 of 3 — the flag named one arm and
+    // measured the other. `--emit-cert F` left F absent on 3 of 3 while
+    // `ay-milp solve` wrote 11,304 bytes. Both are now refused by name.
+    let flags =
+        ay_milp::engine_cli::parse_applied(&raw, &[], &[]).map_err(std::io::Error::other)?;
     let mut args = flags.positional.iter().cloned();
     let path = args.next().ok_or_else(|| {
         std::io::Error::new(

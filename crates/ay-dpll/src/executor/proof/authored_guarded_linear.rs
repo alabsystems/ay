@@ -12,6 +12,23 @@ impl Executor {
     /// two independently checked Farkas implications and
     /// `la_disequality`. Only a binary authored disjunction and an exact
     /// complementary guard literal are accepted.
+    ///
+    /// # Entry gate
+    ///
+    /// The lane declines on [`Self::authored_cascade_publishable`], NOT on a
+    /// bare strict check. MEASURED on the #6660 standalone expression-split
+    /// fixture, which is the exact shape this lane was written for: the
+    /// arithmetic branch's blocking clause is recorded as
+    /// `ArithClauseTautology`, a kind AY's strict checker RE-DERIVES (through
+    /// `nia_linear_ideal`) and the pinned Alethe wire cannot spell. The
+    /// document is therefore strict-OK and still prints `:rule hole`, so a
+    /// bare `check_proof_strict_with_datatypes(..).is_ok()` returned here and
+    /// the lane never ran on the one family it exists to serve. The
+    /// publishable predicate is the cascade's own — `!wire_gap &&
+    /// strict-complete` — and is the same convention `RepairEntry::Check`
+    /// already encodes for the conjunct and equality-chain members. The commit
+    /// gate is unchanged, so this widens only WHEN the lane may try, never
+    /// what it may commit.
     pub(super) fn replace_with_exact_authored_guarded_linear_refutation(
         &mut self,
         proof: &mut Proof,
@@ -19,7 +36,7 @@ impl Executor {
         const MAX_LINEAR_ROOTS: usize = 12;
         const MAX_FARKAS_ROOTS: usize = 6;
 
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
+        if self.authored_cascade_publishable(proof) {
             return;
         }
         let authored = self.exact_concrete_authored_scope();

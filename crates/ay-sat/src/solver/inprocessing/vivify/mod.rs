@@ -14,6 +14,19 @@ mod tier;
 use super::super::*;
 use super::VivifyTierRun;
 
+/// Why the `vivify_preprocess` round loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VivifyLoopStop {
+    /// Round cap reached — the loop never got to a fixed point.
+    Rounds,
+    /// A round strengthened nothing: a genuine fixed point.
+    Converged,
+    /// Total tick budget exhausted.
+    Budget,
+    /// Wall-clock deadline tripped.
+    Deadline,
+}
+
 impl Solver {
     /// Run vivification (wrapper: always reschedules learned vivification).
     ///
@@ -99,6 +112,12 @@ impl Solver {
             // prevent starvation on problems with very few search ticks.
             let irred_budget = irred_budget.max(VIVIFY_IRRED_CLAUSES_PER_CALL as u64);
 
+            self.inproc.vivifier.stats.irred_calls_inproc = self
+                .inproc
+                .vivifier
+                .stats
+                .irred_calls_inproc
+                .saturating_add(1);
             let run = self.vivify_tier(VivifyTier::Irredundant, &noccs, irred_budget);
             if run.conflict {
                 return true;
@@ -244,22 +263,28 @@ impl Solver {
         }
         self.ensure_reason_clause_marks_current();
 
-        // Total budget for all preprocessing vivification rounds.
-        // Kissat's effective preprocessing vivification budget is ~10M ticks
-        // (mineffort=10 * 1M). Use the same generous budget so that multiple
-        // convergence rounds can complete on dense formulas.
-        let total_budget = VIVIFY_MIN_EFFORT * PREPROCESS_VIVIFY_MAX_ROUNDS as u64;
+        let (total_budget, max_rounds, converge_deadline) = self.preprocess_vivify_budget();
         let mut total_ticks_used: u64 = 0;
         let mut total_strengthened: u64 = 0;
         let mut total_processed: u64 = 0;
+        let mut rounds_run: u64 = 0;
+        // Why the loop ended. `Rounds` (the round cap) is the fallthrough, so a
+        // run that never reaches a fixed point is never mislabelled converged.
+        let mut stop = VivifyLoopStop::Rounds;
 
-        for round in 0..PREPROCESS_VIVIFY_MAX_ROUNDS {
-            // Respect the preprocessing wall-clock deadline (#8448).
-            // Without this check, vivification runs up to MAX_ROUNDS * 1M ticks
-            // even when the preprocessing budget is exhausted. On Schur_161_5
-            // (757 vars, 28K clauses), this caused 9-11s vivification within a
-            // 2s preprocessing budget.
-            if self.preprocess_timed_out() {
+        for round in 0..max_rounds {
+            // Respect the preprocessing wall-clock deadline (#8448): without
+            // it vivification runs its full tick budget even when the
+            // preprocessing budget is spent (Schur_161_5: 9-11s inside a 2s
+            // budget). The converge arm deliberately runs past that shared 2s
+            // Small-class budget — reaching the fixed point is the point — and
+            // uses its own wall-clock net instead.
+            let timed_out = match converge_deadline {
+                Some(deadline) => ay_core::time::Instant::now() >= deadline,
+                None => self.preprocess_timed_out(),
+            };
+            if timed_out {
+                stop = VivifyLoopStop::Deadline;
                 break;
             }
 
@@ -268,6 +293,7 @@ impl Solver {
             // VIVIFY_MIN_EFFORT per round to allow multiple rounds.
             let round_budget = remaining_budget.min(VIVIFY_MIN_EFFORT);
             if round_budget == 0 {
+                stop = VivifyLoopStop::Budget;
                 break;
             }
 
@@ -279,23 +305,28 @@ impl Solver {
             let noccs = self.vivify_literal_scores();
 
             let ticks_before = self.cold.vivify_ticks;
+            self.inproc.vivifier.stats.irred_calls_preprocess = self
+                .inproc
+                .vivifier
+                .stats
+                .irred_calls_preprocess
+                .saturating_add(1);
             let run = self.vivify_tier(VivifyTier::Irredundant, &noccs, round_budget);
             let ticks_used = self.cold.vivify_ticks.saturating_sub(ticks_before);
             total_ticks_used += ticks_used;
             total_strengthened += run.strengthened;
             total_processed += run.processed;
+            rounds_run += 1;
 
-            if run.conflict {
-                return true;
-            }
-
-            if run.enqueued_units && self.vivify_propagate().is_some() {
+            if run.conflict || (run.enqueued_units && self.vivify_propagate().is_some()) {
+                self.record_preprocess_vivify_termination(rounds_run, total_ticks_used, stop);
                 return true;
             }
 
             // Convergence check: if this round strengthened nothing, further
             // rounds will not find new opportunities either.
             if run.strengthened == 0 {
+                stop = VivifyLoopStop::Converged;
                 tracing::info!(
                     round = round + 1,
                     total_processed,
@@ -330,10 +361,86 @@ impl Solver {
             );
         }
 
+        self.record_preprocess_vivify_termination(rounds_run, total_ticks_used, stop);
+
         debug_assert_eq!(
             self.decision_level, 0,
             "BUG: vivify_preprocess did not restore decision level to 0"
         );
         false
     }
+
+    /// Total tick budget, round cap and optional wall-clock deadline for the
+    /// preprocessing vivification loop.
+    ///
+    /// SHIPPED (converge arm off): kissat's effective preprocessing
+    /// vivification budget is ~10M ticks (mineffort=10 * 1M); AY uses
+    /// `PREPROCESS_VIVIFY_MAX_ROUNDS * VIVIFY_MIN_EFFORT` = 4M and the shared
+    /// preprocessing deadline. Returned unchanged so the arm is a no-op.
+    ///
+    /// CONVERGE ARM (`--sat-vivify-converge true`): that 4M is
+    /// formula-INDEPENDENT, so on a clause set whose fixed point costs more it
+    /// can only ever stop on the round cap, never at a fixed point. Scale the
+    /// budget with the size of the formula actually being vivified —
+    /// O(irredundant literals), never quadratic — raise the round cap so "no
+    /// progress" becomes reachable, and swap the shared 2s preprocessing
+    /// deadline for a dedicated wall-clock net (running past that shared
+    /// budget is the point).
+    fn preprocess_vivify_budget(&self) -> (u64, usize, Option<ay_core::time::Instant>) {
+        let shipped_budget = VIVIFY_MIN_EFFORT * PREPROCESS_VIVIFY_MAX_ROUNDS as u64;
+        if !vivify_converge_enabled() {
+            return (shipped_budget, PREPROCESS_VIVIFY_MAX_ROUNDS, None);
+        }
+        let scaled = self
+            .irredundant_literal_count()
+            .saturating_mul(VIVIFY_CONVERGE_TICKS_PER_LITERAL);
+        let deadline = ay_core::time::Instant::now()
+            + std::time::Duration::from_secs(VIVIFY_CONVERGE_WALL_SECS);
+        (
+            scaled.clamp(shipped_budget, VIVIFY_CONVERGE_MAX_TICKS),
+            VIVIFY_CONVERGE_MAX_ROUNDS,
+            Some(deadline),
+        )
+    }
+
+    /// Record how the preprocessing convergence loop terminated. Exactly one
+    /// stop-reason counter is bumped per invocation, so a run that never
+    /// reaches a fixed point is visible as `preprocess_stop_rounds` /
+    /// `_budget` / `_deadline` rather than `_converged`.
+    fn record_preprocess_vivify_termination(
+        &mut self,
+        rounds_run: u64,
+        total_ticks_used: u64,
+        stop: VivifyLoopStop,
+    ) {
+        let stats = &mut self.inproc.vivifier.stats;
+        stats.preprocess_rounds = stats.preprocess_rounds.saturating_add(rounds_run);
+        stats.preprocess_ticks = stats.preprocess_ticks.saturating_add(total_ticks_used);
+        let slot = match stop {
+            VivifyLoopStop::Converged => &mut stats.preprocess_stop_converged,
+            VivifyLoopStop::Deadline => &mut stats.preprocess_stop_deadline,
+            VivifyLoopStop::Budget => &mut stats.preprocess_stop_budget,
+            VivifyLoopStop::Rounds => &mut stats.preprocess_stop_rounds,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// Total literal count across live irredundant clauses — the size term the
+    /// convergence budget scales with.
+    fn irredundant_literal_count(&self) -> u64 {
+        let mut total: u64 = 0;
+        for idx in self.arena.active_indices() {
+            if self.arena.is_garbage_any(idx) || self.arena.is_learned(idx) {
+                continue;
+            }
+            total = total.saturating_add(self.arena.len_of(idx) as u64);
+        }
+        total
+    }
+}
+
+/// Opt-in for the irredundant-vivification convergence arm
+/// (`--sat-vivify-converge <bool>`). Default OFF — see `SatAbSwitches`.
+pub(in crate::solver) fn vivify_converge_enabled() -> bool {
+    ay_core::sat_ab_switches().vivify_converge.unwrap_or(false)
 }

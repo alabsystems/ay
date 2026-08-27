@@ -128,7 +128,7 @@ fn test_ic3_deadline_yields_unknown_not_a_truncated_verdict() {
     }
 
     // Far-future deadline is inert: the same system still proves Safe.
-    let far = ay_core::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let far = ay_core::time::Instant::now() + std::time::Duration::from_hours(1);
     let mut solver = Ic3Solver::new(build_ts(), false).with_deadline(Some(far));
     match solver.solve() {
         Ic3Result::Safe { .. } => {}

@@ -175,6 +175,80 @@ fn test_factor_basic_matrix() {
 }
 
 #[test]
+fn test_duplicate_clauses_do_not_poison_factor_chains() {
+    // Regression for #dup-factor-poison: exact-duplicate clauses used to
+    // fabricate phantom quotient support in `find_next_factor` (one count
+    // per source CLAUSE, so a duplicated pair passed MIN_FACTOR_MATCHES on
+    // what is really one clause) and record the same partner arena index in
+    // several matrix cells; the extraction then bailed to the occ-rescan
+    // fallback, found fewer disjoint cells than `factors * quotients`, and
+    // returned None. Duplicates placed on every productive candidate made
+    // the whole pass yield zero (mexam raw inputs: factor_count 0).
+    //
+    // Clean 2x3 matrix (factors {a, b}, quotients {c, d, e}) plus one
+    // duplicated support clause per candidate literal: (a ∨ c) poisons the
+    // chains seeded at a and c, (b ∨ d) poisons b and d, (a ∨ e) poisons e.
+    // Before the dedup fix this formula factored NOTHING; with it, the
+    // duplicate copies are dropped from the candidate's eligible view and
+    // the clean 2x3 matrix extracts exactly.
+    let mut clause_db = ClauseArena::new();
+    let a = lit(0, true);
+    let b = lit(1, true);
+    let c = lit(2, true);
+    let d = lit(3, true);
+    let e = lit(4, true);
+
+    let c0 = clause_db.add(&[a, c], false);
+    let c1 = clause_db.add(&[b, c], false);
+    let c2 = clause_db.add(&[a, d], false);
+    let c3 = clause_db.add(&[b, d], false);
+    let c4 = clause_db.add(&[a, e], false);
+    let c5 = clause_db.add(&[b, e], false);
+    let c6 = clause_db.add(&[a, c], false); // duplicate of c0
+    let c7 = clause_db.add(&[b, d], false); // duplicate of c3
+    let c8 = clause_db.add(&[a, e], false); // duplicate of c4
+
+    let mut occ = OccList::new(6);
+    for ci in [c0, c1, c2, c3, c4, c5, c6, c7, c8] {
+        occ.add_clause(ci, clause_db.literals(ci));
+    }
+
+    let vals = vec![0i8; 12];
+    let var_states = vec![crate::solver::lifecycle::VarState::Active; 6];
+    let mut factor = Factor::new(6);
+
+    let result = factor.run(
+        &clause_db,
+        &occ,
+        &vals,
+        &var_states,
+        &FactorConfig {
+            next_var_id: 6,
+            effort_limit: u64::MAX,
+            elim_bound: 0,
+        },
+    );
+
+    assert_eq!(
+        result.factored_count, 1,
+        "duplicated support clauses must not poison the clean 2x3 factoring"
+    );
+    assert_eq!(result.extension_vars_needed, 1);
+    assert_eq!(
+        result.to_delete.len(),
+        6,
+        "exactly the clean 2x3 matrix is deleted"
+    );
+    assert_eq!(result.new_clauses.len(), 5); // 2 dividers + 3 quotients
+    for dup in [c6, c7, c8] {
+        assert!(
+            !result.to_delete.contains(&dup),
+            "surviving duplicate copies stay in the clause DB"
+        );
+    }
+}
+
+#[test]
 fn test_factor_elim_bound_guards_marginal_factoring() {
     // Same 2×3 matrix as test_factor_basic_matrix: reduction = 1.
     // With elim_bound = 1, factoring should NOT fire because

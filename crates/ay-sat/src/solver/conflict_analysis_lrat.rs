@@ -246,8 +246,14 @@ impl Solver {
         // Deferred from add_clause_db_checked because LBD wasn't set yet.
         self.mark_subsume_dirty_if_kept(clause_idx);
         // CaDiCaL analyze.cpp:535: new learned clauses start with max_used protection
-        self.arena
-            .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        //
+        // Under the two-stage arm `add_clause_db_checked` has already run
+        // `OnLearnedClause(c): score(c) <- 1`; overwriting it with MAX_USED
+        // here would hand every newborn clause 31 decay periods of immunity.
+        if !self.two_stage_clause_management {
+            self.arena
+                .set_used(clause_idx, crate::clause_arena::MAX_USED);
+        }
         let clause_id = self.clause_id(clause_ref);
         let trace_clause_id = if clause_id == 0 {
             (clause_idx as u64) + 1
@@ -319,7 +325,7 @@ impl Solver {
             && !resolution_chain.is_empty()
             && !resolution_chain.contains(&0)
             && !fmla_learned_lrat_authority_fail_closed
-            && self.cold.clause_trace.is_none()
+            && !self.has_live_clause_trace()
             && self.cold.diagnostic_trace.is_none();
         let clause_ref = if can_reuse_chain_for_lrat_hints {
             resolution_chain.reverse();

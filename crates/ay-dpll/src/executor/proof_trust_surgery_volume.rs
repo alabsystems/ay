@@ -183,6 +183,25 @@ fn spend_or_bridge(volume: &mut Volume, bridge: &ProvenanceOrBridge) -> bool {
 
 fn spend_provenance_or(volume: &mut Volume, plan: &ProvenanceOrPlan) -> bool {
     match plan {
+        ProvenanceOrPlan::FalseDisjunct(plan) => {
+            let width = plan.source_disjuncts.len();
+            if plan.eliminations.len().saturating_add(plan.kept.len()) != width
+                || !volume.spend(plan.authored_sources.len())
+                || !volume.clause(width)
+            {
+                return false;
+            }
+            for _ in &plan.eliminations {
+                // lemma clause, support resolution unit, shrinking resolution
+                if !volume.clause(2) || !volume.clause(1) || !volume.clause(width) {
+                    return false;
+                }
+            }
+            // or_neg links plus packing resolutions plus the contraction
+            volume.spend(plan.kept.len().saturating_mul(2))
+                && volume.triangle(width)
+                && volume.clause(1)
+        }
         ProvenanceOrPlan::Conflict(plan) => {
             let width = plan.disjuncts.len();
             if plan.refutations.len() != width

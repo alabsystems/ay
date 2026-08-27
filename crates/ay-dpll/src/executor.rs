@@ -8,24 +8,21 @@
 //! theory integration.
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{ClausificationProof, Proof, TheoryLemmaProof};
-use ay_core::{Sort, TermId, TermStore};
-use ay_frontend::{Command, CommandResult, Context, OptionValue};
-use ay_sat::{ClauseTrace, SatUnknownReason};
-use std::cell::Cell;
-use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Duration;
-
-use crate::incremental_state::IncrementalSubsystem;
-
-use ay_proof::PartialProofCheck;
-
 use crate::executor_types::{
     ExecutorError, Result, SolveResult, Statistics, UnknownOrigin, UnknownReason,
 };
+use crate::incremental_state::IncrementalSubsystem;
 use crate::quantifier_manager::QuantifierManager;
 use crate::VerificationLevel;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
+use ay_core::{ClausificationProof, Proof, Sort, TermId, TermStore, TheoryLemmaProof};
+use ay_frontend::{Command, CommandResult, Context, OptionValue};
+use ay_proof::PartialProofCheck;
+use ay_sat::{ClauseTrace, SatUnknownReason};
+use proof_original_rebuild::bv_lia_recovery_state::ExactIteUfDefinitionRecovery;
+use std::cell::Cell;
+use std::sync::{atomic::AtomicBool, Arc};
+use std::time::Duration;
 
 // Combined theory solvers
 pub use crate::combined_solvers::TheoryCombiner;
@@ -87,6 +84,7 @@ mod proof_surface_syntax;
 mod purify_bool_args;
 mod purify_int_uf_arith;
 mod qe_prepass;
+mod qe_route;
 mod quantified_sat;
 mod quantifier_loop;
 mod query_authority;
@@ -108,15 +106,9 @@ pub(crate) use model::sat_emit::SatCertificate;
 pub(in crate::executor) use query_authority::AuthoredPlainHardQueryPermit;
 pub(in crate::executor) use query_authority::QuantifiedSatAuthorityGrant;
 pub(crate) use query_authority::{NativeSoftQueryBinding, QueryAuthorityEpoch};
-pub(crate) use query_state::{
-    BvMbqiFalseInstanceRecord, DtContextConflictRecord, DtContextConflictSink,
-    EmatchingProofRecord, FiniteArrayCachedAxiom, FiniteArrayExpansionLedger,
-    FiniteEnumPigeonholeWitness, GroundConflictDecompMeters, PrepassReachability,
-    QpfPremiseForcedInstanceRecord, QuantExpansionRecord, SkolemInstanceRecord,
-    SkolemWitnessRecord,
-};
+include!("executor/query_state_exports.rs");
 pub(crate) use solve_deadline::SolveDeadlineCell;
-pub(crate) use unsat_cert::UnsatCertificate;
+pub(crate) use unsat_cert::{probe_cert_reject_raw, UnsatCertificate};
 
 /// Red zone for `stacker::maybe_grow` at the executor entry points
 /// ([`Executor::new`], [`Executor::execute`], the check-sat pipeline, and
@@ -363,6 +355,8 @@ pub struct Executor {
     /// `check_sat_guarded` to re-solve with preprocessing disabled. Reset at
     /// `check_sat_guarded` entry.
     pub(crate) bv_subst_model_rejected: bool,
+    /// Permit-bound semantic routing state for exact definitional-UF rejection recovery.
+    pub(in crate::executor) ite_uf_definition_recovery: ExactIteUfDefinitionRecovery,
     /// #abv-subst-model-retry: retry-once latch (loop guard). The
     /// preprocessing-free re-solve fires AT MOST ONCE per public check-sat; a
     /// still-rejected re-solve stays the fail-closed Unknown.
@@ -475,23 +469,20 @@ pub struct Executor {
     /// may still be mathematically sound, but its trace is not publication
     /// authority; result mapping must use the semantic-only proof firewall.
     quantified_proof_translation_incomplete: bool,
-    /// The deep-QE `Unknown`-fallback lane is active for the solve currently in
-    /// flight (#qe-prepass). Set ONLY by [`Executor::deep_qe_unknown_retry`],
-    /// which owns the one-attempt-per-public-solve contract; it is the sole
-    /// condition under which the deep-QE pre-pass adopts a rewrite, so a
-    /// certificate-bearing authored shape is never erased on a solve that could
-    /// still decide it.
+    /// The deep-QE `Unknown` fallback belongs only to
+    /// [`Executor::deep_qe_unknown_retry`]; it is the sole condition under
+    /// which the pre-pass adopts a rewrite, preserving certificate-bearing
+    /// authored shapes that could still decide the solve.
     deep_qe_retry_armed: bool,
     /// The #quantified-trace-arming `Unknown`-fallback lane is active for the
     /// solve currently in flight. Set ONLY by
     /// [`Executor::quantified_trace_arming_unknown_retry`], which owns the
     /// one-attempt-per-public-solve contract.
     quantified_trace_retry_armed: bool,
-    /// Lifetime reachability counters for the check-sat pre-passes that carry a
-    /// mode guard (#prepass-reachability).  Monotone across solves and NEVER
-    /// cleared by `invalidate_last_check_result`: their only consumer is the
-    /// reachability regression test, which must be able to observe that a
-    /// guarded pre-pass really executed on an ordinary public solve.
+    measured_negative_quantifier_routes: qe_route::MeasuredNegativeRoutes,
+    /// Monotone check-sat pre-pass reachability counters (#prepass-reachability).
+    /// Never cleared by result invalidation, so tests observe guarded pre-passes
+    /// across ordinary public solves.
     prepass_reachability: PrepassReachability,
     /// Last LRAT certificate serialized from the SAT clause trace.
     ///
@@ -512,29 +503,38 @@ pub struct Executor {
         Option<theories::solve_harness::ProofProblemAssertionProvenance>,
     /// Provenance of finite-domain quantifier expansions that REPLACED a
     /// top-level `forall` assertion in place with its ground instance
-    /// conjunction (#quant-expansion-proof). The proof exporter's trust
-    /// surgery uses these to re-derive each consumed conjunct from the
-    /// ORIGINAL `forall` premise via `forall_inst` steps, so the exported
-    /// `assume` matches the problem file instead of the merged expansion no
-    /// external checker can match. Cleared per check-sat alongside
+    /// conjunction (#quant-expansion-proof). Proof export re-derives consumed
+    /// conjuncts from the ORIGINAL `forall` via `forall_inst`, so exported
+    /// assumptions match the problem rather than the internal expansion.
+    /// Cleared per check-sat alongside
     /// `proof_problem_assertion_provenance`.
     pub(crate) quant_expansion_records: Vec<QuantExpansionRecord>,
     /// Direct, independently authenticated E-matching instantiations for the
     /// current check-sat.  Cleared and nested-solve scoped alongside
     /// `quant_expansion_records`; no record outlives its authored authority.
     pub(crate) ematching_proof_records: Vec<EmatchingProofRecord>,
-    /// Consequence-replay probe attempts consumed by the CURRENT check-sat
-    /// (#consequence-replay). Each attempt is one bounded same-context probe
-    /// solve; the cap keeps repeated cascade/certification retries from
-    /// re-solving an already-declined consequence set. Cleared per check-sat
-    /// alongside `ematching_proof_records`.
+    /// Consequence-replay same-context probes consumed by the current query.
     pub(crate) consequence_replay_attempts: Cell<u8>,
+    /// Query-wide wall envelope for consequence-replay probes; executor
+    /// ownership prevents per-scope restoration from replenishing it.
+    consequence_replay_probe_budget: proof::ConsequenceReplayProbeBudget,
+    /// Query-wide gate-arm wall envelope (`independent_gate::probe_budget`).
+    pub(in crate::executor) quantified_gate_probe_budget: model::QuantifiedGateProbeBudget,
+    /// Last direct ground-pin input fingerprint and distinct-attempt count.
+    pub(crate) consequence_replay_direct_state: Cell<Option<(u64, u8)>>,
     /// Probe attempts consumed by the negated-existential ground-instantiation
     /// artifact-firewall translation for the CURRENT check-sat
     /// (#inc-fparith-negated-exists-inst). Counted separately from
     /// `consequence_replay_attempts` so the two lanes cannot starve each
     /// other. Cleared per check-sat alongside `ematching_proof_records`.
     pub(crate) negated_exists_ground_inst_attempts: Cell<u8>,
+    /// Probe attempts consumed by the implied-universal ground-instantiation
+    /// artifact-firewall translation for the CURRENT check-sat
+    /// (#implied-forall-ground-inst). Counted separately from
+    /// `consequence_replay_attempts` and the negated-exists lane so the three
+    /// lanes cannot starve each other. Cleared per check-sat alongside
+    /// `ematching_proof_records`.
+    pub(crate) implied_forall_ground_inst_attempts: Cell<u8>,
     /// Single-binder Skolemization provenance for assertions REPLACED in place
     /// by `skolemize_existentials` (#skolem-unit-authority). Each record binds
     /// the authored source (`exists x. B` or `not (forall x. B)`), the exact
@@ -581,12 +581,8 @@ pub struct Executor {
     /// both nested-solve rollbacks so no record outlives a rolled-back
     /// speculative window.
     pub(crate) qpf_premise_forced_instance_records: Vec<QpfPremiseForcedInstanceRecord>,
-    /// Context-derivation producer hints (#dt-context-derivation): solver-
-    /// injected clauses entailed only under recorded asserted premises.
-    /// Lifecycle mirrors `qpf_premise_forced_instance_records`: cleared per
-    /// check-sat, saved+restored across the DT lazy lane's speculative
-    /// window. Capped; overflow drops silently (a missing hint can only
-    /// decline an authentication, never mint one).
+    /// Sealed context-derivation hints, cleared per query and rolled back with
+    /// DT speculation; cap overflow can only make authentication decline.
     pub(crate) dt_context_conflict_records: DtContextConflictSink,
     /// `PropagateValues` producer provenance for the current check-sat
     /// (#ppp-provenance): in-place rewrite records plus the asserted defining
@@ -936,15 +932,14 @@ pub struct Executor {
     /// Session-scoped spend/yield account for the finite-model lane
     /// (#witness-check-cost). See `finite_model_mbqi::LaneAccount`.
     pub(in crate::executor) finite_model_lane: finite_model_mbqi::LaneAccount,
-    /// Deadline propagated from API-level timeout settings.
-    ///
-    /// LIVE shared cell (#quantifier-determinism): stop closures capture a
-    /// `.clone()` handle and poll through it, so the mid-call backstop
-    /// extension (`install_quantifier_deadline_backstop`) and the
-    /// alternation-validation sub-deadline tighten/restore windows are
-    /// visible to closures built at ANY point in the call. Value snapshots
-    /// (save/restore, plumbing into per-sub-solve components) use `.get()`.
+    /// Live API deadline cell (#quantifier-determinism). Stop closures poll a
+    /// cloned handle, so backstop extension and alternation sub-deadline
+    /// windows remain visible; value snapshots use `.get()`.
     solve_deadline: SolveDeadlineCell,
+    /// Command deadline untouched by inner-lane halving (#dt-context-derivation).
+    /// Certification may spend this outer envelope on a found refutation;
+    /// search lanes narrow only `solve_deadline`, never this cell.
+    certification_deadline: SolveDeadlineCell,
     /// One-shot marker: the quantified-solve wall-clock backstop extension has
     /// been applied for the current check-sat call (#quantifier-determinism,
     /// see `install_quantifier_deadline_backstop`). Re-armed per call in
@@ -956,6 +951,31 @@ pub struct Executor {
     /// quantified backstop; accepting certification probes select `Exact` so a
     /// caller's absolute deadline can only stop work, never be extended.
     quantifier_deadline_policy: QuantifierDeadlinePolicy,
+    /// Whether the caller has OPTED IN to the quantified wall-clock backstop
+    /// (#honest-timeout). `false` by default, which is what makes
+    /// `set_timeout(d)` an actual bound: without it,
+    /// `install_quantifier_deadline_backstop` is a no-op and every stop path
+    /// polls the caller's own deadline.
+    ///
+    /// WHY IT IS STILL HERE. The backstop buys DETERMINISM, and that is a real
+    /// capability, not a bug: the quantifier pipeline's termination is governed
+    /// by deterministic instantiation budgets (E-matching round/instance caps,
+    /// interleaved/CEGQI/MBQI round caps), so a proof whose instantiation chain
+    /// converges just inside the budget on an idle machine used to be cut short
+    /// on a loaded one and the verdict flipped Verified <-> Unknown with CPU
+    /// load. A caller that wants that guarantee — a verification driver
+    /// replaying a fixed obligation set, where a load-dependent verdict is
+    /// worse than a long one — turns it on with
+    /// `set_quantifier_deadline_backstop(true)` and accepts a wall of up to 4x
+    /// the remaining budget (capped at +3 min).
+    ///
+    /// WHY IT IS OFF BY DEFAULT. It was silently ON for every caller, so a
+    /// 60 s `set_timeout` bought a ~240 s wall with nothing in the API saying
+    /// so. A timeout whose only documented meaning is "moderately past" cannot
+    /// be used to bound a batch, a CI job or an interactive query, and the
+    /// caller had no way to decline. Opt-in keeps the capability and makes the
+    /// overrun the caller's explicit choice.
+    quantifier_deadline_backstop_opt_in: bool,
     /// #read-congruence-quantified-scope (#7956 tseitin regression): `true`
     /// from the moment the current check-sat's quantifier pipeline actually
     /// instantiates quantifiers (`process_quantifiers`, past its
@@ -965,6 +985,25 @@ pub struct Executor {
     /// read-congruence index-pair obligations — see
     /// `TheoryCombiner::set_read_congruence_pairs_enabled`.
     pub(in crate::executor) quantifier_pipeline_engaged: bool,
+    /// TermStore length at the last `(reset-assertions)`, i.e. the boundary
+    /// between the assertion epoch now in flight and everything before it.
+    ///
+    /// The store is append-only and lives for the whole `Solver`, so every
+    /// Skolem an EARLIER epoch minted — a quantifier instantiation, an
+    /// `__ay_ext_diff` extensionality witness, a `qmg!` model-gate witness —
+    /// is still there afterwards, as a `Var` no current assertion reaches.
+    /// This mark is what separates "left over from a previous epoch" from
+    /// "belongs to this one", and it is what
+    /// [`Executor::array_axiom_dead_skolems`] is computed against.
+    ///
+    /// The RESET is the right boundary, not the check-sat: nested probe and
+    /// retry solves re-enter the check-sat entry points with a much longer
+    /// store, and arming there would have re-classified the OUTER query's own
+    /// live terms as leftovers (measured: `free_dt_array_alias_consistent_
+    /// reads_is_sat` degraded `sat` -> `unknown`). `0` — the value for a
+    /// session that has never reset, which is every single-query problem —
+    /// means "no leftovers", i.e. exactly the unfiltered behaviour.
+    pub(in crate::executor) assertion_epoch_terms_len: usize,
     /// Broad solver phase currently executing, used to attribute timeouts and
     /// other Unknown results to a responsible phase.
     active_solve_phase: Option<String>,
@@ -1497,6 +1536,32 @@ pub struct Executor {
     /// assertions. The `usize` is the TermStore length at fixpoint entry — terms
     /// created during the fixpoint (idx >= this) always pass the scope check.
     array_axiom_scope: Option<(HashSet<TermId>, usize)>,
+    /// This executor solves a DERIVED query window on a SHARED outer term
+    /// store (`checked_same_context_unsat_proof`), so whole-store array-axiom
+    /// scans must be scoped to window-reachable terms exactly as in
+    /// incremental mode (#6726). MEASURED on the #7956 same-context probe:
+    /// unscoped, the fixpoint seeds extensionality/store congruence from the
+    /// OUTER solve's dead array-equality terms — 247 axioms (218
+    /// `store_base_cong`, 12 fresh `__ay_ext_diff` extensionality skolems) and
+    /// no ROW clauses versus the identical standalone set's 21 — turning a
+    /// sub-second refutation (391 ms standalone) into a >2000 ms timeout AND
+    /// replacing the small resolution steps the strict checker accepts with
+    /// one fused 8-literal `Generic` array+EUF+LIA conflict it must refuse.
+    /// With the scope armed the same probe answers in 30 ms.
+    pub(in crate::executor) shared_store_derived_query: bool,
+    /// Dead engine-minted witnesses the array-axiom generators must not index.
+    ///
+    /// Every `Var` in here predates the assertion epoch in flight
+    /// (`< assertion_epoch_terms_len`) and is unreachable from its assertions —
+    /// the signature of a Skolem an EARLIER query minted and this one cannot name:
+    /// a quantifier instantiation, an `__ay_ext_diff` extensionality witness, a
+    /// `qmg!` model-gate witness. The TermStore is append-only for the whole
+    /// `Solver`, so `(reset-assertions)` does not remove them, and the
+    /// whole-store scans in `array_congruence` / `array_row` would otherwise
+    /// treat them as live select indices. Recomputed per array fixpoint and
+    /// cleared per check alongside `array_axiom_scope`; empty means "no
+    /// exclusion", i.e. exactly the unfiltered behaviour.
+    array_axiom_dead_skolems: HashSet<TermId>,
     /// #8785: select terms that were first created by eager ROW seeding in the
     /// current preprocessing run. These descendants must not recursively seed
     /// further eager ROW terms, or AUFLIA storecomm reproducers can project a
@@ -1753,6 +1818,7 @@ include!("executor/incremental_subsystem_macro.rs");
 
 mod command_boundary;
 mod lifecycle;
+mod test_hooks;
 
 use command_boundary::CommandExecutionBoundary;
 
@@ -1886,8 +1952,8 @@ impl Executor {
         let publication_deadline =
             is_decision_command.then(|| self.install_command_publication_deadline());
         let result = self.execute_stack_guarded_with_publication_deadline(cmd, boundary);
-        if let Some(previous_deadline) = publication_deadline {
-            self.restore_timeout_deadline_after_call(previous_deadline);
+        if let Some(previous_deadlines) = publication_deadline {
+            self.restore_command_publication_deadline_after_call(previous_deadlines);
         }
         drop(decision_timer);
         if outermost_decision_command {
@@ -2021,6 +2087,11 @@ impl Executor {
             // and activation-clause mappings survive into subsequent queries.
             // (#5850)
             Command::ResetAssertions => {
+                // Everything the append-only store holds RIGHT NOW belongs to
+                // the epoch being discarded; nothing asserted after this point
+                // can name the witnesses it minted. See
+                // `assertion_epoch_terms_len`.
+                self.assertion_epoch_terms_len = self.ctx.terms.len();
                 // Discard all incremental state. A fresh state will be
                 // created on the next push. Stay in incremental_mode per
                 // SMT-LIB 2.6 §4.2.2.
@@ -2061,13 +2132,11 @@ impl Executor {
                     // callers keep a true opt-out to unbounded solving.
                     // Previously this option was parsed and silently dropped, so a
                     // caller that relied on it for termination got no bound at all.
+                    // Semantics live in `apply_rlimit_option` — shared with
+                    // the `ay` CLI transcript layer, which echoes the option
+                    // for z3-compat `get-option` but forwards the budget here.
                     if let ay_frontend::sexp::SExpr::Numeral(ref n) = *value {
-                        if let Ok(budget) = n.parse::<u64>() {
-                            self.set_resource_limit((budget != 0).then_some(budget));
-                            if budget == 0 {
-                                self.set_ground_budget_enabled(false);
-                            }
-                        }
+                        self.apply_rlimit_option(n);
                     }
                 } else if key == "max-memory" {
                     // `(set-option :max-memory <megabytes>)` installs a process-RSS
@@ -2385,64 +2454,5 @@ impl Executor {
                 dpll.set_observer(Some(Box::new(obs)));
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_applied_sat_random_seed_for_test(&self) -> Option<u64> {
-        self.last_applied_sat_random_seed.get()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_applied_dpll_random_seed_for_test(&self) -> Option<u64> {
-        self.last_applied_dpll_random_seed.get()
-    }
-
-    /// Number of core-guided rounds the OLL MaxSMT engine completed on its most
-    /// recent invocation (#phase2-pr1). 0 means OLL fell back to the baseline
-    /// without core-guided progress. Used by the MaxSMT soundness tests.
-    #[cfg(test)]
-    pub(crate) fn last_oll_core_rounds_for_test(&self) -> u64 {
-        self.last_oll_core_rounds.get()
-    }
-
-    /// Force one exact MaxSMT final-accounting value for a fail-closed canary.
-    #[cfg(test)]
-    pub(crate) fn force_maxsmt_exact_cost_for_test(&self, cost: u64) {
-        self.forced_maxsmt_exact_cost.set(Some(cost));
-    }
-
-    /// Inject one non-assumption OLL core literal for a fail-closed canary.
-    #[cfg(test)]
-    pub(crate) fn force_maxsmt_oll_core_anomaly_for_test(&self) {
-        self.forced_maxsmt_oll_core_anomaly.set(true);
-    }
-
-    /// Corrupt the final MaxSMT witness once, after SAT emission, to prove that
-    /// public soft accounting is bound to the final consumer-visible model.
-    #[cfg(test)]
-    pub(crate) fn force_maxsmt_post_emit_soft_flip_for_test(&self) {
-        self.forced_maxsmt_post_emit_soft_flip.set(true);
-    }
-
-    /// Corrupt one finite LIA objective after SAT emission to prove that public
-    /// optimization outcomes are bound to the final consumer-visible model.
-    #[cfg(test)]
-    pub(crate) fn force_optimization_post_emit_objective_flip_for_test(&self) {
-        self.forced_optimization_post_emit_objective_flip.set(true);
-    }
-
-    /// Test-only: record whether the Phase 5 diff-logic engine decided the most
-    /// recent solve. No-op outside tests.
-    pub(crate) fn record_diff_logic_decided_for_test(&self, decided: bool) {
-        #[cfg(test)]
-        self.last_diff_logic_decided.set(decided);
-        #[cfg(not(test))]
-        let _ = decided;
-    }
-
-    /// Test-only: whether the Phase 5 diff-logic engine decided the last solve.
-    #[cfg(test)]
-    pub(crate) fn last_diff_logic_decided_for_test(&self) -> bool {
-        self.last_diff_logic_decided.get()
     }
 }

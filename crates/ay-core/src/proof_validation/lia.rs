@@ -96,7 +96,7 @@ pub fn validate_lia_theory_lemma(
 /// a single POSITIVE equality `(= L R)` whose difference `L - R` reduces to the
 /// identically-zero integer linear form (every variable coefficient 0 AND the
 /// constant 0), so `L = R` holds for all integer assignments. This is the exact
-/// inverse of [`validate_linear_identity`], so a classifier upgrading a lemma to
+/// inverse of `validate_linear_identity`, so a classifier upgrading a lemma to
 /// `LiaGeneric`/`LinearIdentity` can never drift from the strict checker.
 #[must_use]
 pub fn recognize_lia_linear_identity(terms: &TermStore, clause: &[TermId]) -> bool {
@@ -256,9 +256,9 @@ fn validate_bounds_gap(
 /// endpoint exceeds its rounded upper endpoint.
 ///
 /// Both literals must be blocking-clause negations of comparisons over the
-/// SAME all-Int linear form. [`parse_int_bound`] performs the exact integer
+/// SAME all-Int linear form. `parse_int_bound` performs the exact integer
 /// rounding and rejects Real/nonlinear/non-integral forms. This function is
-/// the producer-facing inverse of the first arm of [`validate_bounds_gap`].
+/// the producer-facing inverse of the first arm of `validate_bounds_gap`.
 #[must_use]
 pub fn recognize_lia_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
     recognize_rounded_integer_bounds_gap(terms, clause)
@@ -267,7 +267,7 @@ pub fn recognize_lia_bounds_gap(terms: &TermStore, clause: &[TermId]) -> bool {
 /// Recognize an exact two-literal integer clause whose simultaneous falsity
 /// would impose contradictory rounded bounds on the same linear form.
 /// Unlike the historical bounds-gap recognizer, literals may be positive
-/// (cover clause) or negated (mutex clause); [`parse_int_bound`] converts each
+/// (cover clause) or negated (mutex clause); `parse_int_bound` converts each
 /// blocking literal to the constraint asserted by the clause's negation.
 #[must_use]
 pub fn recognize_int_bounds_tautology(terms: &TermStore, clause: &[TermId]) -> bool {
@@ -316,7 +316,7 @@ pub fn arith_disequality_split_has_primitive_guard(terms: &TermStore, clause: &[
 /// assignment. If either branch holds the clause holds. Otherwise
 /// `¬(C_b <= T_b - 1) ∧ ¬(C_b >= T_b + 1)` gives `C_b >= T_b` and `C_b <= T_b`,
 /// hence `C_b = T_b` — this is where integrality is load-bearing, and
-/// [`int_linear_diff`] fails closed on any non-`Int`-sorted atom or
+/// `int_linear_diff` fails closed on any non-`Int`-sorted atom or
 /// non-integral coefficient, so a `Real` form (satisfiable strictly between the
 /// branches) can never reach here. Then `C_g = k·C_b = k·T_b`, so the guard
 /// holds precisely when `T_g = k·T_b`. Both conditions are checked, so the
@@ -335,8 +335,8 @@ pub fn arith_disequality_split_has_primitive_guard(terms: &TermStore, clause: &[
 ///   missing variable, or a per-variable ratio — is rejected by the full
 ///   verification loop.
 ///
-/// The affine case needs no separate handling: [`canonical_int_equality`] and
-/// [`parse_int_comparison`] both push the constant term into the TARGET, so
+/// The affine case needs no separate handling: `canonical_int_equality` and
+/// `parse_int_comparison` both push the constant term into the TARGET, so
 /// `T_g = k·T_b` IS the requirement that the constant scale with the
 /// coefficients. The benchmark shape `q <= -1 ∨ q >= 1 ∨ 2q+1 = 4q+1`
 /// canonicalizes to branch `(C_b = q, T_b = 0)` and guard `(C_g = 2q, T_g = 0)`,
@@ -474,7 +474,7 @@ fn recognize_rounded_integer_bounds_gap(terms: &TermStore, clause: &[TermId]) ->
 ///
 /// Used by the proof builder to PROMOTE a `Generic`/trust lemma of this shape to
 /// a `LiaGeneric` step carrying [`LiaAnnotation::Divisibility`]. It delegates to
-/// the SAME [`validate_divisibility`] the strict checker runs, so the classifier
+/// the SAME `validate_divisibility` the strict checker runs, so the classifier
 /// and checker cannot drift: a clause this accepts is genuinely re-validated, and
 /// any other clause stays trust (fail-closed). The promotion changes no verdict —
 /// the lemma is already a valid integer tautology.
@@ -593,7 +593,7 @@ fn decode_negated_eq(terms: &TermStore, lit: TermId) -> Option<(TermId, TermId)>
 /// integers. Returns `None` (fail-closed) if any variable is non-`Int`-sorted (a
 /// `Real` variable would make the constraint rationally solvable — the key
 /// soundness guard) or any coefficient/constant is non-integer.
-fn int_linear_diff(
+pub(super) fn int_linear_diff(
     terms: &TermStore,
     a: TermId,
     b: TermId,
@@ -643,6 +643,21 @@ pub(super) fn parse_int_bound(
     parse_int_comparison(terms, bound, asserted_value)
 }
 
+/// [`parse_int_comparison`] under its blocking-row contract, for the sibling
+/// guarded-split module: the returned triple is the constraint that holds
+/// when `bound` evaluates to `asserted_value`.
+pub(super) fn parse_int_comparison_row(
+    terms: &TermStore,
+    bound: TermId,
+    asserted_value: bool,
+) -> Option<(
+    std::collections::BTreeMap<TermId, num_bigint::BigInt>,
+    bool,
+    num_bigint::BigInt,
+)> {
+    parse_int_comparison(terms, bound, asserted_value)
+}
+
 fn parse_int_comparison(
     terms: &TermStore,
     bound: TermId,
@@ -682,26 +697,7 @@ fn parse_int_comparison(
     Some((coeffs, is_upper, val))
 }
 
-fn canonical_int_equality(
-    terms: &TermStore,
-    lhs: TermId,
-    rhs: TermId,
-) -> Option<(
-    std::collections::BTreeMap<TermId, num_bigint::BigInt>,
-    num_bigint::BigInt,
-)> {
-    use num_traits::Signed;
-    let (coeffs, c0) = int_linear_diff(terms, lhs, rhs)?;
-    let flip = coeffs
-        .values()
-        .next()
-        .is_some_and(num_bigint::BigInt::is_negative);
-    if flip {
-        Some((coeffs.into_iter().map(|(v, c)| (v, -c)).collect(), c0))
-    } else {
-        Some((coeffs, -c0))
-    }
-}
+include!("lia/canonical_equality.rs");
 
 /// Validate a CuttingPlane LIA proof.
 ///

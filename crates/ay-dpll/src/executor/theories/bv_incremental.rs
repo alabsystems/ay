@@ -23,6 +23,9 @@ use super::super::Executor;
 use super::bv::{install_bv_sat_interrupt, BvSolveConfig};
 use super::bv_encoding;
 
+#[path = "bv_incremental/resource_budget.rs"]
+mod resource_budget;
+
 impl Executor {
     /// Incremental BV solve: persistent SAT solver with push/pop scope management.
     ///
@@ -51,6 +54,8 @@ impl Executor {
         // Instead, clone the Arc and copy the deadline directly.
         let sat_interrupt = self.solve_interrupt.clone();
         let sat_deadline = self.solve_deadline.get();
+        // Snapshot `:rlimit` before the persistent solver is mutably borrowed.
+        let bv_conflict_allowance = self.resource_limit;
         let interrupt_flag = sat_interrupt.clone();
         let deadline = self.solve_deadline.clone();
         let should_stop = move || {
@@ -99,10 +104,9 @@ impl Executor {
         let state = self
             .incr_bv_state
             .get_or_insert_with(IncrementalBvState::new);
-        // Same-scope repeated check-sat calls intentionally reuse this state.
-        // `IncrementalBvState::pop()` is the invalidation boundary: it drops the
-        // stale SAT/encoding caches so the next solve rebuilds from surviving
-        // assertions at the new frontend depth.
+        // This state is reused for the WHOLE session, across pops included:
+        // `IncrementalBvState::pop()` unwinds one SAT scope and destroys
+        // nothing. See its doc comment for why that is safe by construction.
 
         // Sync variable allocations to avoid overlap with SAT scope selectors.
         // sync_tseitin_next_var() ensures Tseitin vars start beyond all SAT vars
@@ -538,8 +542,11 @@ impl Executor {
 
         // Add assertion activation clauses in the current SCOPE for assertions that
         // are not already active from this scope or an ancestor (#1452).
-        // After a pop-triggered rebuild, `assertion_activation_scope` is cleared, so
-        // the next solve re-adds units for the surviving frontend assertions exactly once.
+        // `IncrementalBvState::pop` drops the activation records deeper than the
+        // new frontend depth, so the next solve re-activates the survivors once.
+        // This is AY's form of Bitwuzla's `top_level = level == 0` split: depth 0
+        // gets a permanent unit, depth d>0 a `+selector_d`-guarded one entered by
+        // assuming `¬selector_d`. Nothing scoped becomes a permanent clause.
         for &assertion in &self.ctx.assertions {
             if let Some(&root_lit) = state.encoded_assertions.get(&assertion) {
                 let needs_activation = state
@@ -576,14 +583,9 @@ impl Executor {
             .expect("incremental BV must store persistent SAT solver before solve");
         let _deadline_guard = install_bv_sat_interrupt(solver, sat_interrupt, sat_deadline);
 
-        // With delayed internalization (#7015), this becomes an iterative loop:
-        // 1. Solve SAT
-        // 2. If SAT, check delayed operations against model
-        // 3. If violations: add conflict clauses, re-solve (up to MAX_DELAY_ITERATIONS)
-        // 4. If all consistent or UNSAT: finalize
-        //
-        // Mirrors the non-incremental delayed loop (lines 653-735). Clauses are
-        // added via add_clause_global so they survive push/pop.
+        resource_budget::arm_persistent_sat_conflict_budget(solver, bv_conflict_allowance);
+
+        // Iterate solve, model check, and global clause repair for delayed ops.
         const MAX_DELAY_ITERATIONS: usize = 32;
         let mut delay_iteration = 0;
         let mut solve_result;
@@ -748,7 +750,7 @@ impl Executor {
                 // Extract clause trace before calling finalize (NLL: releases
                 // the solver borrow from self.incr_bv_state).
                 let trace = if proof_enabled {
-                    solver.take_clause_trace()
+                    solver.snapshot_clause_trace()
                 } else {
                     None
                 };

@@ -486,7 +486,7 @@ fn validate_member_application(
 
 /// Recognize whether `clause` is a valid datatype constructor-distinctness
 /// lemma under the given declarations — i.e. whether
-/// [`validate_datatype_distinct`] would accept it.
+/// `validate_datatype_distinct` would accept it.
 ///
 /// The proof classifier (`ay-dpll`) calls this to upgrade `Generic` lemmas the
 /// live conflict classifier could not label (it lacks the datatype registry)
@@ -574,7 +574,7 @@ pub(crate) fn validate_datatype_distinct(
 }
 
 /// Recognize a datatype tester evaluation theorem under the supplied
-/// datatype declarations. See [`validate_datatype_tester_eval`].
+/// datatype declarations. See `validate_datatype_tester_eval`.
 #[must_use]
 pub fn recognize_datatype_tester_eval(
     terms: &TermStore,
@@ -952,48 +952,168 @@ pub(super) fn constructor_datatype<'a>(
 /// `(constructor_name, [selector_name in field order])`.
 pub(crate) type SelectorDecls<'a> = &'a [(String, Vec<String>)];
 
-/// Validate a finite-enum pigeonhole lemma.
+/// Cap on any re-derived carrier size, and on the running products/sums that
+/// build one. Mirrors the executor's `FINITE_CARDINALITY_CAP`: it keeps the
+/// `usize` arithmetic below overflow and keeps this validation cheap. A carrier
+/// at or above the cap is reported as NOT established (the pigeonhole is refused),
+/// which costs completeness only — a clique that large is not reachable anyway.
+const CARRIER_SIZE_CAP: usize = 1 << 20;
+
+/// Recursion depth and total-step budgets for the carrier-size derivation. The
+/// `in_progress` cycle guard already bounds any single path by the number of
+/// declared datatypes; these bound the FAN-OUT (a wide constructor whose fields
+/// are themselves datatypes re-enters per field, so nesting alone is not a
+/// bound). Exhausting either budget is a fail-closed "not established".
+const CARRIER_MAX_DEPTH: usize = 64;
+const CARRIER_MAX_STEPS: u32 = 100_000;
+
+/// EXACT finite carrier size of `sort`, re-derived by the CHECKER from the
+/// declaration registry and the member-signature table alone.
 ///
-/// Clause shape: the COMPLETE graph of equalities over `m` distinct terms of one
-/// datatype sort whose `k` constructors are ALL NULLARY, with `m > k`:
+/// `Some(n)` ONLY when the sort has exactly `n` inhabitants and `n <
+/// CARRIER_SIZE_CAP`. Every other case — an `Int`/`Real`/`String`/`Seq`/array
+/// field, a genuinely uninterpreted sort, a sort naming no declared datatype, a
+/// recursive datatype, a budget or cap breach — is `None`, i.e. NOT ESTABLISHED.
 ///
-/// ```text
-/// (cl (= t1 t2) (= t1 t3) ... (= t_{m-1} t_m))
-/// ```
+/// That direction of conservatism is what makes the pigeonhole sound: the caller
+/// rejects unless `m > k`, so `k` must never OVER-estimate the true carrier (an
+/// over-estimate would reject a valid lemma — merely incomplete) and must never
+/// UNDER-estimate it (an under-estimate would ACCEPT an invalid one). Returning
+/// `None` rather than a guess is the only safe answer on anything unmodelled.
 ///
-/// Soundness: an all-nullary datatype's carrier is EXACTLY its `k` constructor
-/// constants, so any `m > k` terms of that sort must contain an equal pair and
-/// the disjunction holds in every model.
+/// Algebra: `Bool = 2`; `BitVec(w) = 2^w` (capped); `FiniteDomain(n) = n`; a
+/// declared datatype = `sum over constructors of (product over field sorts)`, an
+/// empty product (nullary constructor) contributing 1. Arrays and every other
+/// sort are deliberately NOT modelled here: they were never accepted before, so
+/// omitting them cannot regress anything, and each would need its own soundness
+/// argument.
+fn sort_carrier_size(
+    sort: &Sort,
+    dt_decls: DatatypeDecls<'_>,
+    signatures: &[DatatypeMemberSignature],
+    in_progress: &mut Vec<String>,
+    steps: &mut u32,
+) -> Option<usize> {
+    *steps = steps.checked_sub(1)?;
+    match sort {
+        Sort::Bool => Some(2),
+        Sort::FiniteDomain(_, size) => {
+            let size = usize::try_from(*size).ok()?;
+            (size < CARRIER_SIZE_CAP).then_some(size)
+        }
+        Sort::BitVec(bv) => {
+            let width = usize::try_from(bv.width).ok()?;
+            if width >= (CARRIER_SIZE_CAP.trailing_zeros() as usize) {
+                return None;
+            }
+            Some(1usize << width)
+        }
+        Sort::Datatype(definition) => datatype_carrier_size(
+            definition.name.as_str(),
+            dt_decls,
+            signatures,
+            in_progress,
+            steps,
+        ),
+        Sort::Uninterpreted(name) => {
+            datatype_carrier_size(name, dt_decls, signatures, in_progress, steps)
+        }
+        _ => None,
+    }
+}
+
+/// EXACT finite carrier size of the datatype named `dt_name`:
+/// `sum over constructors of (product over that constructor's field sorts)`.
 ///
-/// Everything the argument rests on is re-derived here from the declaration
-/// registry — the constructor COUNT and, critically, the NULLARITY that makes the
-/// carrier finite. The executor's claim is never taken on trust: a datatype with
-/// any non-nullary constructor has an infinite carrier and no pigeonhole, so a
-/// missing or non-empty selector entry fails closed.
-pub(crate) fn validate_datatype_enum_pigeonhole(
+/// The constructor list comes from `dt_decls`; each constructor's FIELD SORTS
+/// come from its own `DatatypeMemberSignature.argument_sorts`, and the signature
+/// is accepted only when its `result_sort` is this very datatype — so a
+/// same-named member of another datatype cannot supply the field list. A
+/// constructor with no signature, or a datatype absent from the registry, is
+/// NOT ESTABLISHED (`None`). `in_progress` makes a recursive datatype `None`
+/// (infinite carrier), which is the fail-closed answer, not an approximation.
+fn datatype_carrier_size(
+    dt_name: &str,
+    dt_decls: DatatypeDecls<'_>,
+    signatures: &[DatatypeMemberSignature],
+    in_progress: &mut Vec<String>,
+    steps: &mut u32,
+) -> Option<usize> {
+    *steps = steps.checked_sub(1)?;
+    if in_progress.len() >= CARRIER_MAX_DEPTH || in_progress.iter().any(|held| held == dt_name) {
+        return None;
+    }
+    let (_, constructors) = dt_decls.iter().find(|(name, _)| name == dt_name)?;
+    if constructors.is_empty() {
+        return None;
+    }
+    in_progress.push(dt_name.to_string());
+    let mut total: usize = 0;
+    let mut established = true;
+    for constructor in constructors {
+        let Some(signature) = signatures.iter().find(|candidate| {
+            candidate.identity == *constructor
+                && sort_matches_datatype(&candidate.result_sort, dt_name)
+        }) else {
+            established = false;
+            break;
+        };
+        // Empty product = 1: a nullary constructor contributes exactly its own
+        // constant, which is where the all-nullary `k = #constructors` case
+        // falls out of this algebra unchanged.
+        let mut product: usize = 1;
+        for field in &signature.argument_sorts {
+            let Some(size) = sort_carrier_size(field, dt_decls, signatures, in_progress, steps)
+            else {
+                established = false;
+                break;
+            };
+            match product.checked_mul(size) {
+                Some(next) if next < CARRIER_SIZE_CAP => product = next,
+                _ => {
+                    established = false;
+                    break;
+                }
+            }
+        }
+        if !established {
+            break;
+        }
+        match total.checked_add(product) {
+            Some(next) if next < CARRIER_SIZE_CAP => total = next,
+            _ => {
+                established = false;
+                break;
+            }
+        }
+    }
+    in_progress.pop();
+    established.then_some(total)
+}
+
+/// Read an enum-pigeonhole clause as an equality graph and return its distinct
+/// members together with the ONE datatype sort they all share.
+///
+/// Every literal must be an equality between two DISTINCT terms, no pair may
+/// repeat, and every member must carry the same declared datatype sort. The
+/// completeness of the graph is not checked here: it is an arithmetic identity
+/// between the member count and the literal count, which the caller tests once
+/// the carrier size is known.
+fn enum_pigeonhole_graph_members(
     terms: &TermStore,
     step_id: ProofId,
-    clause: &[TermId],
-    dt_decls: DatatypeDecls<'_>,
-    ctor_selectors: Option<SelectorDecls<'_>>,
-) -> Result<(), ProofCheckError> {
+    literals: &[TermId],
+) -> Result<(ay_core::kani_compat::DetHashSet<TermId>, String), ProofCheckError> {
     let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
         step: step_id,
         reason,
     };
 
-    let literals = flatten_clause_literals(terms, clause);
-    if literals.is_empty() {
-        return Err(invalid(
-            "enum pigeonhole clause must be non-empty".to_string(),
-        ));
-    }
-
     let mut values = det_hash_set_with_capacity(literals.len().saturating_add(1));
     let mut pairs = det_hash_set_with_capacity(literals.len());
     let mut sort_name: Option<String> = None;
 
-    for &literal in &literals {
+    for &literal in literals {
         let Some((lhs, rhs)) = syntactic_equality_sides(terms, literal) else {
             return Err(invalid(
                 "enum pigeonhole literals must all be equalities".to_string(),
@@ -1040,49 +1160,169 @@ pub(crate) fn validate_datatype_enum_pigeonhole(
     let Some(sort_name) = sort_name else {
         return Err(invalid("enum pigeonhole clause has no sort".to_string()));
     };
+    Ok((values, sort_name))
+}
+
+/// Require the selector registry and the member-signature table to AGREE about
+/// every constructor's field count before either is used to size the carrier.
+///
+/// The carrier size is what the pigeonhole rests on, so it is re-derived rather
+/// than assumed, and the two tables that feed that derivation must first be
+/// shown consistent. A constructor the executor declares nullary while its
+/// signature carries fields (or the reverse) is a registry disagreement, and
+/// disagreement is refused rather than resolved in favour of either table.
+fn agree_on_constructor_fields(
+    step_id: ProofId,
+    sort_name: &str,
+    constructors: &[String],
+    ctor_selectors: Option<SelectorDecls<'_>>,
+    signatures: &[DatatypeMemberSignature],
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+
+    let Some(selectors) = ctor_selectors else {
+        return Err(invalid(
+            "enum pigeonhole needs the constructor->selector registry to establish \
+             the carrier size"
+                .to_string(),
+        ));
+    };
+    for ctor in constructors {
+        let Some((_, fields)) = selectors.iter().find(|(name, _)| name == ctor) else {
+            return Err(invalid(format!(
+                "constructor {ctor} of {sort_name} is absent from the selector \
+                 registry, so the carrier size cannot be established"
+            )));
+        };
+        let Some(signature) = signatures.iter().find(|candidate| {
+            candidate.identity == *ctor && sort_matches_datatype(&candidate.result_sort, sort_name)
+        }) else {
+            return Err(invalid(format!(
+                "constructor {ctor} of {sort_name} has no member signature returning \
+                 {sort_name}, so its field sorts cannot be established"
+            )));
+        };
+        if signature.argument_sorts.len() != fields.len() {
+            return Err(invalid(format!(
+                "constructor {ctor} of {sort_name} has {} selector(s) but {} argument \
+                 sort(s); the registries disagree",
+                fields.len(),
+                signature.argument_sorts.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a finite-enum pigeonhole lemma.
+///
+/// Clause shape: the COMPLETE graph of equalities over `m` distinct terms of one
+/// datatype sort with exactly `k` inhabitants, with `m > k`:
+///
+/// ```text
+/// (cl (= t1 t2) (= t1 t3) ... (= t_{m-1} t_m))
+/// ```
+///
+/// Soundness: a datatype whose carrier is EXACTLY `k` values cannot seat `m > k`
+/// pairwise-distinct terms, so some pair must be equal and the disjunction holds
+/// in every model.
+///
+/// Everything the argument rests on is re-derived here from the declaration
+/// registry and the member-signature table — the constructor set, each
+/// constructor's FIELD SORTS, and from them the carrier size that makes the
+/// carrier finite at all. The executor's claim is never taken on trust, and
+/// nothing in the certificate supplies `k`: `sort_carrier_size` computes it, and
+/// anything it cannot establish outright is refused.
+///
+/// #dt-enum-pigeonhole-carrier-size. This used to demand that every constructor
+/// be NULLARY, taking `k = #constructors`. That is the special case of the
+/// algebra above where every product is empty, and it left the FIELD-BEARING
+/// finite carriers — which `pigeonhole_datatype_cardinality` has always fired on
+/// — with no checkable form: measured on
+/// `group_datatypes::parametric_datatypes`, the three
+/// `test_parametric_finite_cardinality_{5_distinct,deeper_6_distinct,
+/// bitvec_nested}_unsat` rows produced a complete, empty-clause-deriving
+/// refutation that `mint_unsat_certificate` then rejected with "enum pigeonhole
+/// requires an all-nullary datatype, but constructor `osome@Opt!{Opt!{Bool}}` of
+/// `Opt!{Opt!{Bool}}` takes fields", publishing `unknown` for a genuine `unsat`.
+/// `(Opt (Opt Bool))` is `1 + (1 + 2) = 4`; `(Opt (Opt (Opt Bool)))` is
+/// `1 + (1 + (1 + 2)) = 5`; `(Opt (Opt (_ BitVec 1)))` folds the width in as
+/// `1 + (1 + 2^1) = 4`. All-nullary carriers keep the identical `k` and the
+/// identical verdict — the algebra reproduces `#constructors` exactly — so this
+/// widens what is CHECKABLE without widening what is TRUSTED.
+pub(crate) fn validate_datatype_enum_pigeonhole(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    dt_decls: DatatypeDecls<'_>,
+    ctor_selectors: Option<SelectorDecls<'_>>,
+    signatures: &[DatatypeMemberSignature],
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason,
+    };
+
+    let literals = flatten_clause_literals(terms, clause);
+    if literals.is_empty() {
+        return Err(invalid(
+            "enum pigeonhole clause must be non-empty".to_string(),
+        ));
+    }
+
+    let (values, sort_name) = enum_pigeonhole_graph_members(terms, step_id, &literals)?;
     let Some((_, constructors)) = dt_decls.iter().find(|(dt, _)| dt == &sort_name) else {
         return Err(invalid(format!(
             "enum pigeonhole sort {sort_name} is not a declared datatype"
         )));
     };
-    let k = constructors.len();
-    if k == 0 {
+    if constructors.is_empty() {
         return Err(invalid(format!(
             "enum pigeonhole sort {sort_name} declares no constructors"
         )));
     }
 
-    // NULLARITY is what makes the carrier finite, so it is checked, not assumed.
-    let Some(selectors) = ctor_selectors else {
-        return Err(invalid(
-            "enum pigeonhole needs the constructor->selector registry to establish \
-             that every constructor is nullary"
-                .to_string(),
-        ));
+    // The CARRIER SIZE is what the pigeonhole rests on, so it is re-derived, not
+    // assumed. The selector registry is still required and still cross-checked
+    // against the member signatures: a constructor the executor declares nullary
+    // while its signature carries fields (or the reverse) is a registry
+    // disagreement, and the two tables must agree before either is used.
+    agree_on_constructor_fields(
+        step_id,
+        &sort_name,
+        constructors,
+        ctor_selectors,
+        signatures,
+    )?;
+    let mut in_progress = Vec::new();
+    let mut steps = CARRIER_MAX_STEPS;
+    let Some(k) = datatype_carrier_size(
+        &sort_name,
+        dt_decls,
+        signatures,
+        &mut in_progress,
+        &mut steps,
+    ) else {
+        return Err(invalid(format!(
+            "enum pigeonhole could not establish a finite carrier size for \
+             {sort_name} from the declaration registry (a recursive datatype, a \
+             field of unmodelled or infinite sort, or a cap/budget breach)"
+        )));
     };
-    for ctor in constructors {
-        match selectors.iter().find(|(name, _)| name == ctor) {
-            Some((_, fields)) if fields.is_empty() => {}
-            Some((_, _)) => {
-                return Err(invalid(format!(
-                    "enum pigeonhole requires an all-nullary datatype, but constructor \
-                     {ctor} of {sort_name} takes fields"
-                )));
-            }
-            None => {
-                return Err(invalid(format!(
-                    "constructor {ctor} of {sort_name} is absent from the selector \
-                     registry, so nullarity cannot be established"
-                )));
-            }
-        }
+    if k == 0 {
+        return Err(invalid(format!(
+            "enum pigeonhole carrier {sort_name} was derived as empty"
+        )));
     }
 
     let m = values.len();
     if m <= k {
         return Err(invalid(format!(
-            "enum pigeonhole needs more terms than constructors, got {m} terms for \
-             {k} constructors of {sort_name}"
+            "enum pigeonhole needs more terms than the carrier holds, got {m} terms \
+             for a carrier of {k} inhabitants of {sort_name}"
         )));
     }
     let expected = m
@@ -1102,7 +1342,7 @@ pub(crate) fn validate_datatype_enum_pigeonhole(
 
 /// Recognize whether `clause` is a valid datatype selector-projection lemma
 /// under the given constructor→selector registry — i.e. whether
-/// [`validate_datatype_selector_project`] would accept it.
+/// `validate_datatype_selector_project` would accept it.
 #[must_use]
 pub fn recognize_datatype_selector_project(
     terms: &TermStore,
@@ -1190,7 +1430,7 @@ pub(crate) fn validate_datatype_selector_project(
 
 /// Recognize whether `clause` is a valid datatype tester pairwise-exclusivity
 /// lemma under the given declarations — i.e. whether
-/// [`validate_datatype_tester_exclusive`] would accept it.
+/// `validate_datatype_tester_exclusive` would accept it.
 ///
 /// The DT axiom recorder (`ay-dpll`) calls this to tag the injected
 /// exclusivity disjunctions with the strict-checkable
@@ -1304,7 +1544,7 @@ pub(crate) fn validate_datatype_tester_exclusive(
 
 /// Recognize whether `clause` is a valid datatype value-equality congruence
 /// biconditional under the given registries — i.e. whether
-/// [`validate_datatype_value_eq_congruence`] would accept it.
+/// `validate_datatype_value_eq_congruence` would accept it.
 ///
 /// The DT axiom recorder (`ay-dpll`) calls this to tag the injected
 /// value-equality biconditionals with the strict-checkable
@@ -1328,7 +1568,7 @@ mod value_eq_congruence_tests;
 
 /// Recognize whether `clause` is a valid datatype constructor-coverage
 /// (exhaustiveness) lemma under the given declarations — i.e. whether
-/// [`validate_datatype_exhaustive`] would accept it.
+/// `validate_datatype_exhaustive` would accept it.
 ///
 /// The DT axiom recorder (`ay-dpll`) calls this to tag the eagerly injected
 /// exhaustiveness disjunctions with the strict-checkable `DatatypeExhaustive`
@@ -1346,7 +1586,7 @@ pub fn recognize_datatype_exhaustive(
 
 /// Recognize whether `clause` is a valid guarded constructor-reconstruction
 /// lemma under the given registries — i.e. whether
-/// [`validate_datatype_constructor_reconstruct`] would accept it.
+/// `validate_datatype_constructor_reconstruct` would accept it.
 ///
 /// The DT axiom recorder (`ay-dpll`) calls this to tag the eagerly injected
 /// constructor axioms (`is-C(t) => t = C(sel_1(t), ..)`, desugared to the

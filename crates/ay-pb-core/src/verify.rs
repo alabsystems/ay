@@ -25,22 +25,35 @@
 //! development / CI soundness gate, not a substitute for the certified-track
 //! VeriPB proof pipeline (which formally checks the *derivation*). It is also
 //! only useful on instances small enough for z3 to decide quickly.
+//!
+//! A SAT claim is fully verified by an independently checked feasible model. An
+//! OPTIMUM claim additionally requires a matching objective and a confirmed z3
+//! check. Missing, unknown, unsupported, unproved UNSAT, skipped, and
+//! inconclusive claims remain explicitly unverified.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use crate::solver::{eval_constraint, eval_objective};
 use crate::types::{PbConstraint, PbInstance, PbObjective, PbRel};
+
+mod report;
+
+pub use report::{UnverifiedReason, VerificationFailure, VerificationVerdict, VerifyReport};
 
 /// Whether to run the independent z3 optimality cross-check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Z3Mode {
     /// Never invoke z3 (model + objective checks only).
     Off,
-    /// Invoke z3 if it is available on `PATH`; skip (do not fail) otherwise.
+    /// Invoke z3 if it is available on `PATH`.
+    ///
+    /// An unavailable or inconclusive checker leaves an optimum claim
+    /// unverified; it never produces a fully verified report.
     Auto,
-    /// Require z3: if it is unavailable or inconclusive, that is reported (and
-    /// makes the overall result not fully verified).
+    /// Require z3 for an optimum claim.
+    ///
+    /// This compatibility mode has the same fail-closed verification verdict
+    /// as [`Self::Auto`]: unavailable or inconclusive checks are unverified.
     Require,
 }
 
@@ -52,9 +65,9 @@ pub struct SolverOutput {
     pub status: Option<String>,
     /// The last `o <value>` line (the best objective the solver reported).
     pub objective: Option<i128>,
-    /// Assignment indexed by `var - 1` (true = variable set to 1). Sized to the
-    /// largest variable mentioned on the `v` lines or the header, whichever is
-    /// larger.
+    /// Assignment indexed by `var - 1` (true = variable set to 1), sized
+    /// strictly to the declared header variable count. Out-of-range `v` tokens
+    /// are ignored.
     pub assignment: Vec<bool>,
     /// Whether any `v` line was present at all.
     pub has_model: bool,
@@ -76,30 +89,11 @@ pub enum OptimalityCheck {
     Inconclusive(String),
 }
 
-/// Full verification report. `ok` is the overall pass/fail used for exit codes.
-#[derive(Debug, Clone)]
-pub struct VerifyReport {
-    pub status: Option<String>,
-    /// True if the output carried a model that could be checked.
-    pub checked_model: bool,
-    pub total_constraints: usize,
-    pub violated_constraints: usize,
-    pub claimed_objective: Option<i128>,
-    pub computed_objective: Option<i128>,
-    /// `Some(true/false)` when both a claimed and computed objective exist.
-    pub objective_matches: Option<bool>,
-    pub optimality: OptimalityCheck,
-    /// Overall verdict: model feasible, objective consistent, and optimality not
-    /// refuted (and, under `Z3Mode::Require`, actually confirmed for OPTIMUM).
-    pub ok: bool,
-    /// Human-readable findings, in order.
-    pub messages: Vec<String>,
-}
-
 /// Parse the `s` / `o` / `v` lines of a solver output.
 ///
-/// `header_vars` seeds the assignment length so a fully-specified model has the
+/// `header_vars` fixes the assignment length so a fully-specified model has the
 /// expected size even if the largest variable is left false on the `v` line.
+/// Variable tokens outside `1..=header_vars` are ignored without allocating.
 pub fn parse_solver_output(text: &str, header_vars: u32) -> SolverOutput {
     let mut status = None;
     let mut objective = None;
@@ -127,9 +121,11 @@ pub fn parse_solver_output(text: &str, header_vars: u32) -> SolverOutput {
                     if var == 0 {
                         continue;
                     }
-                    let idx = (var - 1) as usize;
+                    let Ok(idx) = usize::try_from(var - 1) else {
+                        continue;
+                    };
                     if idx >= assignment.len() {
-                        assignment.resize(idx + 1, false);
+                        continue;
                     }
                     assignment[idx] = val;
                 }
@@ -145,20 +141,6 @@ pub fn parse_solver_output(text: &str, header_vars: u32) -> SolverOutput {
     }
 }
 
-fn status_is_optimum(status: &Option<String>) -> bool {
-    status
-        .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("OPTIMUM FOUND"))
-        .unwrap_or(false)
-}
-
-fn status_is_model_bearing(status: &Option<String>) -> bool {
-    status
-        .as_deref()
-        .map(|s| s.eq_ignore_ascii_case("OPTIMUM FOUND") || s.eq_ignore_ascii_case("SATISFIABLE"))
-        .unwrap_or(false)
-}
-
 /// Verify a solver output against an OPB instance.
 ///
 /// `z3_timeout_secs` bounds each z3 query (soft `-T:` timeout).
@@ -168,129 +150,13 @@ pub fn verify(
     z3: Z3Mode,
     z3_timeout_secs: u64,
 ) -> VerifyReport {
-    let mut messages = Vec::new();
-    let mut ok = true;
-
-    let total_constraints = instance.constraints.len();
-    let mut violated_constraints = 0;
-    let mut checked_model = false;
-    let mut computed_objective = None;
-    let mut objective_matches = None;
-
-    if status_is_model_bearing(&output.status) {
-        if !output.has_model {
-            messages.push("status claims a model but no `v` line was present".to_string());
-            ok = false;
-        } else {
-            checked_model = true;
-            violated_constraints = instance
-                .constraints
-                .iter()
-                .filter(|c| !eval_constraint(c, &output.assignment))
-                .count();
-            if violated_constraints == 0 {
-                messages.push(format!(
-                    "model feasible: {total_constraints}/{total_constraints} constraints satisfied"
-                ));
-            } else {
-                messages.push(format!(
-                    "MODEL INFEASIBLE: {violated_constraints}/{total_constraints} constraints violated"
-                ));
-                ok = false;
-            }
-
-            if let Some(obj) = instance.objective.as_ref() {
-                let computed = eval_objective(obj, &output.assignment);
-                computed_objective = Some(computed);
-                if let Some(claimed) = output.objective {
-                    let matches = computed == claimed;
-                    objective_matches = Some(matches);
-                    if matches {
-                        messages.push(format!(
-                            "objective consistent: claimed = computed = {claimed}"
-                        ));
-                    } else {
-                        messages.push(format!(
-                            "OBJECTIVE MISMATCH: claimed o {claimed}, model attains {computed}"
-                        ));
-                        ok = false;
-                    }
-                } else {
-                    messages.push(format!(
-                        "objective not reported on an `o` line; model attains {computed}"
-                    ));
-                }
-            }
-        }
-    } else if output.status.as_deref() == Some("UNSATISFIABLE")
-        || output
-            .status
-            .as_deref()
-            .map(|s| s.eq_ignore_ascii_case("UNSATISFIABLE"))
-            .unwrap_or(false)
-    {
-        messages.push("status UNSATISFIABLE (no model to check)".to_string());
-    } else {
-        messages.push(format!(
-            "status {:?}: nothing to model-check",
-            output.status.as_deref().unwrap_or("<none>")
-        ));
-    }
-
-    // Independent optimality cross-check (only meaningful for OPTIMUM with a
-    // claimed objective and a feasible model already confirmed above).
-    let optimality = if !status_is_optimum(&output.status) {
-        OptimalityCheck::NotApplicable
-    } else if z3 == Z3Mode::Off {
-        OptimalityCheck::Skipped("z3 check disabled (--no-z3)".to_string())
-    } else if violated_constraints > 0 {
-        OptimalityCheck::Skipped("model infeasible; optimality moot".to_string())
-    } else {
-        match output.objective {
-            None => OptimalityCheck::Skipped("no claimed objective".to_string()),
-            Some(claimed) => match instance.objective.as_ref() {
-                None => OptimalityCheck::Skipped("instance has no objective".to_string()),
-                Some(obj) => run_z3_optimality_check(instance, obj, claimed, z3_timeout_secs),
-            },
-        }
-    };
-
-    match &optimality {
-        OptimalityCheck::Confirmed => messages.push(format!(
-            "independent optimality (z3): no feasible solution beats {} \u{2192} OPTIMUM CONFIRMED",
-            output.objective.unwrap_or_default()
-        )),
-        OptimalityCheck::Refuted(detail) => {
-            messages.push(format!("UNSOUND OPTIMUM (z3): {detail}"));
-            ok = false;
-        }
-        OptimalityCheck::Inconclusive(detail) => {
-            messages.push(format!("optimality unconfirmed (z3): {detail}"));
-            if z3 == Z3Mode::Require {
-                ok = false;
-            }
-        }
-        OptimalityCheck::Skipped(detail) => {
-            messages.push(format!("optimality not checked: {detail}"));
-            if z3 == Z3Mode::Require && status_is_optimum(&output.status) {
-                ok = false;
-            }
-        }
-        OptimalityCheck::NotApplicable => {}
-    }
-
-    VerifyReport {
-        status: output.status.clone(),
-        checked_model,
-        total_constraints,
-        violated_constraints,
-        claimed_objective: output.objective,
-        computed_objective,
-        objective_matches,
-        optimality,
-        ok,
-        messages,
-    }
+    report::verify_with_checker(
+        instance,
+        output,
+        z3,
+        z3_timeout_secs,
+        run_z3_optimality_check,
+    )
 }
 
 /// Ask z3 whether any feasible assignment has objective <= `claimed - 1`.
@@ -301,12 +167,16 @@ fn run_z3_optimality_check(
     claimed: i128,
     timeout_secs: u64,
 ) -> OptimalityCheck {
-    let smt = emit_smt2_better_than(instance, objective, claimed);
+    let Some(smt) = emit_smt2_better_than(instance, objective, claimed) else {
+        return OptimalityCheck::Inconclusive(
+            "claimed objective is i128::MIN; its strict improvement bound is outside the i128 verification range"
+                .to_string(),
+        );
+    };
     match run_z3(&smt, timeout_secs) {
         Ok(Z3Result::Unsat) => OptimalityCheck::Confirmed,
         Ok(Z3Result::Sat) => OptimalityCheck::Refuted(format!(
-            "z3 found a feasible assignment with objective <= {} (better than the claimed optimum {claimed})",
-            claimed - 1
+            "z3 found a feasible assignment strictly better than the claimed optimum {claimed}"
         )),
         Ok(Z3Result::Unknown) => {
             OptimalityCheck::Inconclusive(format!("z3 returned unknown within {timeout_secs}s"))
@@ -315,7 +185,12 @@ fn run_z3_optimality_check(
             Z3Error::NotFound => OptimalityCheck::Skipped(
                 "z3 not found on PATH (install z3 to enable this check)".to_string(),
             ),
-            Z3Error::Io(msg) => OptimalityCheck::Inconclusive(format!("z3 invocation failed: {msg}")),
+            Z3Error::Io(msg) => {
+                OptimalityCheck::Inconclusive(format!("z3 invocation failed: {msg}"))
+            }
+            Z3Error::UnsuccessfulExit(detail) => {
+                OptimalityCheck::Inconclusive(format!("z3 did not exit successfully: {detail}"))
+            }
         },
     }
 }
@@ -329,6 +204,7 @@ enum Z3Result {
 enum Z3Error {
     NotFound,
     Io(String),
+    UnsuccessfulExit(String),
 }
 
 fn run_z3(smt2: &str, timeout_secs: u64) -> Result<Z3Result, Z3Error> {
@@ -355,6 +231,13 @@ fn run_z3(smt2: &str, timeout_secs: u64) -> Result<Z3Result, Z3Error> {
     let out = child
         .wait_with_output()
         .map_err(|e| Z3Error::Io(e.to_string()))?;
+    if !out.status.success() {
+        let detail = out.status.code().map_or_else(
+            || "terminated by signal".to_string(),
+            |code| format!("exit status {code}"),
+        );
+        return Err(Z3Error::UnsuccessfulExit(detail));
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     for line in stdout.lines() {
         match line.trim() {
@@ -377,7 +260,12 @@ fn run_z3(smt2: &str, timeout_secs: u64) -> Result<Z3Result, Z3Error> {
 /// that forces case-splitting (the latter timed out on 1800-var instances).
 /// Product terms (the NLC track) make it nonlinear, so the logic widens to
 /// `ALL`.
-fn emit_smt2_better_than(instance: &PbInstance, objective: &PbObjective, claimed: i128) -> String {
+fn emit_smt2_better_than(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    claimed: i128,
+) -> Option<String> {
+    let bound = claimed.checked_sub(1)?;
     // Collect referenced variables so we only declare what is used.
     let mut used: Vec<u32> = Vec::new();
     for c in &instance.constraints {
@@ -418,14 +306,13 @@ fn emit_smt2_better_than(instance: &PbInstance, objective: &PbObjective, claimed
         s.push_str(&format!("(assert {})\n", constraint_smt(c)));
     }
     // objective <= claimed - 1
-    let bound = claimed - 1;
     s.push_str(&format!(
         "(assert (<= {} {}))\n",
         terms_sum_smt(&objective.terms),
         int_smt(bound)
     ));
     s.push_str("(check-sat)\n");
-    s
+    Some(s)
 }
 
 fn constraint_smt(c: &PbConstraint) -> String {

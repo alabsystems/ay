@@ -11,7 +11,7 @@
 //! assert the exit status is not `VERIFIED`.
 
 use ay_milp::cert_io::{self, CheckStatus, ClaimStanding, EvidenceKind};
-use ay_milp::{BabSession, Outcome, SolveOpts};
+use ay_milp::{BabSession, EngineEconomics, Outcome, SolveOpts};
 use num_rational::BigRational;
 use num_traits::One;
 
@@ -35,8 +35,12 @@ BOUNDS
 ENDATA
 ";
 
-/// `min x + y` s.t. `x + y >= 3`, `x <= 2`, both INTEGER. Optimum 3. A MILP
-/// optimum has no dual-side object in this build; the certificate must say so.
+/// `min x + y` s.t. `x + y >= 3`, `x <= 2`, both INTEGER. Optimum 3.
+///
+/// A MILP optimum has no dual-side object UNLESS a whole-tree optimality proof
+/// is supplied alongside it, and `solve_and_emit` deliberately supplies none —
+/// so this fixture goes on pinning the `NONE` dual path exactly as before. The
+/// tree lane is exercised separately, in section (g).
 const MILP: &str = "NAME          MILP1
 ROWS
  N  COST
@@ -215,9 +219,8 @@ BOUNDS
 ENDATA
 ";
 
-/// The same contradictory recourse system with a bounded three-valued master
-/// integer.  The checker must rebuild the radix lift before replaying the
-/// nested hybrid certificate.
+/// The same contradictory recourse system with a bounded three-valued master integer.
+/// The checker must rebuild the radix lift before replaying the nested hybrid certificate.
 const HYBRID_INTEGER_INF: &str = "NAME          HYBRIDINTINF
 ROWS
  N  COST
@@ -410,43 +413,72 @@ BOUNDS
 ENDATA
 ";
 
+/// Renders from a temporary context so every borrow of `session` ends on
+/// return.
+fn emit_session_certificate(
+    session: &BabSession,
+    model_text: &str,
+    col_names: &[String],
+    obj_scale: &BigRational,
+    outcome: &Outcome,
+) -> String {
+    emit_session_certificate_with_tree(session, model_text, col_names, obj_scale, outcome, None)
+}
+
+/// As [`emit_session_certificate`], plus the whole-tree optimality artifact the
+/// CLI derives after the verdict. Passing `None` is what every pre-existing
+/// test does, which is why those tests still pin the `NONE` dual path.
+fn emit_session_certificate_with_tree(
+    session: &BabSession,
+    model_text: &str,
+    col_names: &[String],
+    obj_scale: &BigRational,
+    outcome: &Outcome,
+    opt_tree: Option<&ay_milp::MilpOptimalityCertificate>,
+) -> String {
+    let ctx = cert_io::EmitCtx {
+        model: session.model(),
+        model_text,
+        col_names,
+        obj_scale,
+        provenance: "host=test",
+        replay_claims: session.replay_claims(),
+        affine_aggregation_certificate: session.affine_aggregation_certificate(),
+        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
+        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
+        network_design_infeasibility_certificate: session
+            .network_design_infeasibility_certificate(),
+        network_design_optimality_certificate: session.network_design_optimality_certificate(),
+        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
+        milp_optimality_tree_certificate: opt_tree,
+        single_machine_scheduling_optimality_certificate: session
+            .single_machine_scheduling_optimality_certificate(),
+        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
+        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
+        open_domain_single_row_dp_infeasibility_certificate: session
+            .open_domain_single_row_dp_infeasibility_certificate(),
+        open_domain_multi_row_bdd_infeasibility_certificate: session
+            .open_domain_multi_row_bdd_infeasibility_certificate(),
+        open_domain_hybrid_pb_lp_infeasibility_certificate: session
+            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
+        open_domain_hybrid_integer_lift_infeasibility_certificate: session
+            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
+        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
+        hybrid_integer_lift_infeasibility_certificate: session
+            .hybrid_integer_lift_infeasibility_certificate(),
+        max_bytes: None,
+    };
+    cert_io::emit(&ctx, outcome)
+}
+
 fn solve_with_opts_and_emit(text: &str, opts: &SolveOpts) -> (String, Outcome) {
     let p = ay_milp::read_mps(text).expect("model parses");
     let names = p.col_names.clone();
     let scale = p.obj_scale.clone();
-    let mut s = BabSession::new(p.model, opts).expect("session");
-    let outcome = s.check().expect("solve");
-    let ctx = cert_io::EmitCtx {
-        model: s.model(),
-        model_text: text,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: s.replay_claims(),
-        affine_aggregation_certificate: s.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: s.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: s.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: s.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: s
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: s.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: s
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: s
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: s
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: s
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: s.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: s
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    (cert_io::emit(&ctx, &outcome), outcome)
+    let mut session = BabSession::new(p.model, opts).expect("session");
+    let outcome = session.check().expect("solve");
+    let ayc = emit_session_certificate(&session, text, &names, &scale, &outcome);
+    (ayc, outcome)
 }
 
 /// The DEFAULT shipped posture: structure routing on, `--require witness`.
@@ -503,6 +535,40 @@ fn reseal(text: &str) -> String {
     format!("{body}%END sha256:{digest}\n")
 }
 
+#[derive(Clone, Copy)]
+struct LineReplacement<'a> {
+    from: &'a str,
+    to: &'a str,
+}
+
+/// Filters certificate lines, replaces every occurrence requested, and keeps
+/// the original pipelines' trailing newline for every retained line.
+fn rewrite_certificate_lines(
+    text: &str,
+    mut keep: impl FnMut(&str) -> bool,
+    replacement: Option<LineReplacement<'_>>,
+) -> String {
+    let mut rewritten = String::with_capacity(text.len());
+    for line in text.lines() {
+        if !keep(line) {
+            continue;
+        }
+        match replacement {
+            Some(replacement) => {
+                for (index, part) in line.split(replacement.from).enumerate() {
+                    if index != 0 {
+                        rewritten.push_str(replacement.to);
+                    }
+                    rewritten.push_str(part);
+                }
+            }
+            None => rewritten.push_str(line),
+        }
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
 // ---------------------------------------------------------------------------
 // (a) Emission and the happy path.
 // ---------------------------------------------------------------------------
@@ -511,13 +577,13 @@ fn reseal(text: &str) -> String {
 fn continuous_optimum_is_fully_verified() {
     let (ayc, _) = solve_and_emit(LP);
     let r = cert_io::check(&ayc, LP);
-    assert_eq!(r.status, CheckStatus::Verified, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 0);
-    assert_eq!(r.claims.len(), 2);
+    assert_eq!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 0);
+    assert_eq!(r.claims().len(), 2);
     assert!(r
-        .claims
+        .claims()
         .iter()
-        .all(|c| c.verified && c.kind == EvidenceKind::Succinct));
+        .all(|c| c.is_verified() && c.kind() == EvidenceKind::Succinct));
 }
 
 #[test]
@@ -528,7 +594,7 @@ fn network_optimality_artifact_round_trips_and_value_tampering_fails() {
     let parsed = cert_io::parse(&ayc).expect("network optimality certificate parses");
     assert!(parsed.network_design_optimality.is_some());
     let report = cert_io::check(&ayc, NETWORK_OPT);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let tampered = reseal(&ayc.replacen(
         "network-design-optimality value=5 frame=model",
@@ -536,7 +602,7 @@ fn network_optimality_artifact_round_trips_and_value_tampering_fails() {
         1,
     ));
     let rejected = cert_io::check(&tampered, NETWORK_OPT);
-    assert_ne!(rejected.status, CheckStatus::Verified, "{rejected:#?}");
+    assert_ne!(rejected.status(), CheckStatus::Verified, "{rejected:#?}");
 }
 
 #[test]
@@ -552,7 +618,7 @@ fn block_angular_artifact_is_verified_end_to_end_and_tampering_is_refuted() {
     let parsed = cert_io::parse(&ayc).expect("block-angular certificate parses");
     assert!(parsed.block_angular_optimality.is_some());
     let report = cert_io::check(&ayc, BLOCK_ANGULAR_OPT);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let master_line = ayc
         .lines()
@@ -564,7 +630,7 @@ fn block_angular_artifact_is_verified_end_to_end_and_tampering_is_refuted() {
         .expect("master row index");
     let tampered = reseal(&ayc.replacen(master_line, &format!("master {row} -1"), 1));
     let rejected = cert_io::check(&tampered, BLOCK_ANGULAR_OPT);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 }
 
 #[test]
@@ -611,7 +677,7 @@ fn block_angular_exact_decimal_side_store_reaches_the_public_checker() {
     let parsed = cert_io::parse(&ayc).expect("exact-decimal artifact parses");
     assert!(parsed.block_angular_optimality.is_some());
     let checked = cert_io::check(&ayc, &exact_decimal);
-    assert_eq!(checked.status, CheckStatus::Verified, "{checked:#?}");
+    assert_eq!(checked.status(), CheckStatus::Verified, "{checked:#?}");
 }
 
 #[test]
@@ -631,10 +697,10 @@ fn block_angular_public_parser_rejects_oversized_rationals_fail_closed() {
             Ok(_) => panic!("oversized block-angular rational parsed"),
         }
         let checked = cert_io::check(artifact, BLOCK_ANGULAR_OPT);
-        assert_eq!(checked.status, CheckStatus::Refuted, "{checked:#?}");
+        assert_eq!(checked.status(), CheckStatus::Refuted, "{checked:#?}");
         assert!(
             checked
-                .notes
+                .notes()
                 .iter()
                 .any(|note| note.contains(expected_field) && note.contains("4096-bit")),
             "the public checker must report its bounded parser rejection: {checked:#?}"
@@ -679,7 +745,7 @@ fn scheduling_optimality_artifact_round_trips_and_tampering_fails() {
     let parsed = cert_io::parse(&ayc).expect("scheduling optimality certificate parses");
     assert!(parsed.single_machine_scheduling_optimality.is_some());
     let report = cert_io::check(&ayc, SCHEDULING_OPT);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let sequence_line = ayc
         .lines()
@@ -690,7 +756,7 @@ fn scheduling_optimality_artifact_round_trips_and_tampering_fails() {
     let repeated_sequence = format!("sequence {0} {0}", sequence_fields[1]);
     let sequence_tamper = reseal(&ayc.replacen(sequence_line, &repeated_sequence, 1));
     let rejected = cert_io::check(&sequence_tamper, SCHEDULING_OPT);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     let proof_line = ayc
         .lines()
@@ -709,58 +775,58 @@ fn scheduling_optimality_artifact_round_trips_and_tampering_fails() {
         .join(" ");
     let value_tamper = reseal(&ayc.replacen(proof_line, &value_tamper_line, 1));
     let rejected = cert_io::check(&value_tamper, SCHEDULING_OPT);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     let changed_model = SCHEDULING_OPT.replacen("TARD0      2", "TARD0      1", 1);
     assert_ne!(changed_model, SCHEDULING_OPT);
     let rejected = cert_io::check(&ayc, &changed_model);
-    assert_eq!(rejected.status, CheckStatus::Mismatch, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Mismatch, "{rejected:#?}");
 }
 
 #[test]
 fn network_infeasibility_artifact_round_trips_and_corruption_fails() {
     let (ayc, outcome) = solve_full_and_emit(NETWORK_INF);
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(ayc.contains("evidence infeasible SUCCINCT network-design-infeasibility"));
     let parsed = cert_io::parse(&ayc).expect("network infeasibility certificate parses");
     assert!(parsed.network_design_infeasibility.is_some());
     let report = cert_io::check(&ayc, NETWORK_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let tampered = reseal(&ayc.replacen("\"format\":\"", "\"format\":\"tampered-", 1));
     let rejected = cert_io::check(&tampered, NETWORK_INF);
-    assert_ne!(rejected.status, CheckStatus::Verified, "{rejected:#?}");
+    assert_ne!(rejected.status(), CheckStatus::Verified, "{rejected:#?}");
 }
 
 #[test]
 fn parity_infeasibility_artifact_round_trips_and_row_tampering_fails() {
     let (ayc, outcome) = solve_full_and_emit(PARITY_INF);
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(ayc.contains("evidence infeasible SUCCINCT parity-gf2"));
     assert!(ayc.contains("parity-gf2 rows=2\nrow 0\nrow 1\nend\n"));
 
     let parsed = cert_io::parse(&ayc).expect("parity certificate parses");
     assert!(parsed.parity_infeasibility.is_some());
     let report = cert_io::check(&ayc, PARITY_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     // Keep the wire format canonical and re-seal it, but point the proof at a
     // source row that does not exist.  The model-bound replay, not the body
     // checksum or parser, must reject the forged contradiction.
     let tampered = reseal(&ayc.replacen("row 1\nend\n", "row 2\nend\n", 1));
     let rejected = cert_io::check(&tampered, PARITY_INF);
-    assert_ne!(rejected.status, CheckStatus::Verified, "{rejected:#?}");
+    assert_ne!(rejected.status(), CheckStatus::Verified, "{rejected:#?}");
 }
 
 #[test]
 fn single_row_dp_infeasibility_artifact_verifies_and_tampering_fails() {
     let (ayc, outcome) = solve_and_emit(DP_INF);
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(ayc.contains("evidence infeasible SUCCINCT single-row-dp"));
     let parsed = cert_io::parse(&ayc).expect("single-row DP certificate parses");
     assert!(parsed.single_row_dp.is_some());
     let report = cert_io::check(&ayc, DP_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let needle = "\"reachable_words\":[1";
     assert!(
@@ -769,7 +835,7 @@ fn single_row_dp_infeasibility_artifact_verifies_and_tampering_fails() {
     );
     let corrupted = reseal(&ayc.replacen(needle, "\"reachable_words\":[0", 1));
     let rejected = cert_io::check(&corrupted, DP_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
     assert_eq!(
         rejected.claims_in(ClaimStanding::Refuted),
         vec!["infeasible"]
@@ -786,53 +852,21 @@ fn full_posture_multi_row_bdd_artifact_verifies_and_corruption_fails() {
         .with_require_certificates(true);
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.single_row_dp_infeasibility_certificate().is_none());
     assert!(session.multi_row_bdd_infeasibility_certificate().is_some());
     assert!(session.replay_claims().is_empty());
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: BDD_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, BDD_INF, &names, &scale, &outcome);
     assert!(ayc.contains("evidence infeasible SUCCINCT multi-row-bdd"));
     let parsed = cert_io::parse(&ayc).expect("multi-row BDD certificate parses");
     assert!(parsed.multi_row_bdd.is_some());
     let report = cert_io::check(&ayc, BDD_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     let format = "ay.multi-row-bdd-infeasible.v1";
     assert!(ayc.contains(format));
     let corrupted = reseal(&ayc.replacen(format, "ay.multi-row-bdd-infeasible.x1", 1));
     let rejected = cert_io::check(&corrupted, BDD_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
     assert_eq!(
         rejected.claims_in(ClaimStanding::Refuted),
         vec!["infeasible"]
@@ -885,7 +919,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
         .with_require_certificates(true);
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture open-domain solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.replay_claims().is_empty());
     assert!(
         session
@@ -895,39 +929,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
                 .open_domain_multi_row_bdd_infeasibility_certificate()
                 .is_some()
     );
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: OPEN_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, OPEN_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-dp")
             || ayc.contains("evidence infeasible SUCCINCT open-domain-bdd"),
@@ -936,7 +938,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
     let parsed = cert_io::parse(&ayc).expect("open-domain certificate parses");
     assert!(parsed.open_domain_dp.is_some() || parsed.open_domain_bdd.is_some());
     let report = cert_io::check(&ayc, OPEN_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let corrupted = if ayc.contains("ay.multi-row-bdd-infeasible.v1") {
         ayc.replacen(
@@ -952,7 +954,7 @@ fn open_domain_residual_artifact_rebuilds_and_verifies() {
         )
     };
     let rejected = cert_io::check(&reseal(&corrupted), OPEN_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     session.push().expect("scope");
     session
@@ -978,44 +980,12 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
     let outcome = session
         .check()
         .expect("full-posture open-domain hybrid solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.replay_claims().is_empty());
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
         .is_some());
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: OPEN_HYBRID_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, OPEN_HYBRID_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-hybrid-pb-lp"),
         "{ayc}"
@@ -1023,7 +993,7 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
     let parsed = cert_io::parse(&ayc).expect("open-domain hybrid certificate parses");
     assert!(parsed.open_domain_hybrid_pb_lp.is_some());
     let report = cert_io::check(&ayc, OPEN_HYBRID_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let corrupted = reseal(&ayc.replacen(
         "ay.hybrid-pb-lp-infeasible.v1",
@@ -1031,7 +1001,7 @@ fn open_domain_hybrid_artifact_rebuilds_projection_and_verifies() {
         1,
     ));
     let rejected = cert_io::check(&corrupted, OPEN_HYBRID_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     session.push().expect("scope");
     session
@@ -1054,7 +1024,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
     let outcome = session
         .check()
         .expect("full-posture open-domain integer-lift hybrid solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.replay_claims().is_empty());
     assert!(session
         .open_domain_hybrid_pb_lp_infeasibility_certificate()
@@ -1062,39 +1032,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
     assert!(session
         .open_domain_hybrid_integer_lift_infeasibility_certificate()
         .is_some());
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: OPEN_HYBRID_INTEGER_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, OPEN_HYBRID_INTEGER_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT open-domain-hybrid-integer-lift"),
         "{ayc}"
@@ -1102,7 +1040,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
     let parsed = cert_io::parse(&ayc).expect("open-domain integer-lift certificate parses");
     assert!(parsed.open_domain_hybrid_integer_lift.is_some());
     let report = cert_io::check(&ayc, OPEN_HYBRID_INTEGER_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let corrupted = reseal(&ayc.replacen(
         "ay.hybrid-integer-lift-infeasible.v1",
@@ -1110,7 +1048,7 @@ fn open_domain_integer_lift_hybrid_artifact_rebuilds_both_transforms() {
         1,
     ));
     let rejected = cert_io::check(&corrupted, OPEN_HYBRID_INTEGER_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     session.push().expect("scope");
     session
@@ -1127,49 +1065,17 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     let names = p.col_names.clone();
     let scale = p.obj_scale.clone();
     let opts = SolveOpts::new()
-        .with_time_limit(std::time::Duration::from_secs(300)) // Hang guard, not a performance limit.
+        .with_time_limit(std::time::Duration::from_mins(5)) // Hang guard, not a performance limit.
         .with_require_certificates(true);
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session.check().expect("full-posture hybrid solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.replay_claims().is_empty());
     assert!(session.hybrid_pb_lp_infeasibility_certificate().is_some());
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
         .is_none());
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: HYBRID_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, HYBRID_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT hybrid-pb-lp"),
         "{ayc}"
@@ -1177,12 +1083,12 @@ fn hybrid_cut_ledger_artifact_rebuilds_and_verifies() {
     let parsed = cert_io::parse(&ayc).expect("hybrid certificate parses");
     assert!(parsed.hybrid_pb_lp.is_some());
     let report = cert_io::check(&ayc, HYBRID_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
     let format = "ay.hybrid-pb-lp-infeasible.v1";
     assert!(ayc.contains(format));
     let corrupted = reseal(&ayc.replacen(format, "ay.hybrid-pb-lp-infeasible.x1", 1));
     let rejected = cert_io::check(&corrupted, HYBRID_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     session.push().expect("scope");
     session
@@ -1198,50 +1104,19 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
     let scale = p.obj_scale.clone();
     let opts = SolveOpts::new()
         .with_time_limit(std::time::Duration::from_secs(20))
-        .with_require_certificates(true);
+        .with_require_certificates(true)
+        .with_engine(EngineEconomics::new().with_hybrid_pb_lp(true));
     let mut session = BabSession::new(p.model, &opts).expect("session");
     let outcome = session
         .check()
         .expect("full-posture integer-lift hybrid solve");
-    assert!(matches!(outcome, Outcome::Infeasible { .. }));
+    assert!(matches!(outcome, Outcome::Infeasible { .. }), "{outcome:?}");
     assert!(session.replay_claims().is_empty());
     assert!(session.hybrid_pb_lp_infeasibility_certificate().is_none());
     assert!(session
         .hybrid_integer_lift_infeasibility_certificate()
         .is_some());
-    let ctx = cert_io::EmitCtx {
-        model: session.model(),
-        model_text: HYBRID_INTEGER_INF,
-        col_names: &names,
-        obj_scale: &scale,
-        provenance: "host=test",
-        replay_claims: session.replay_claims(),
-        affine_aggregation_certificate: session.affine_aggregation_certificate(),
-        parity_infeasibility_certificate: session.parity_infeasibility_certificate(),
-        sat_relu_infeasibility_certificate: session.sat_relu_infeasibility_certificate(),
-        network_design_infeasibility_certificate: session
-            .network_design_infeasibility_certificate(),
-        network_design_optimality_certificate: session.network_design_optimality_certificate(),
-        block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
-        single_machine_scheduling_optimality_certificate: session
-            .single_machine_scheduling_optimality_certificate(),
-        single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
-        multi_row_bdd_infeasibility_certificate: session.multi_row_bdd_infeasibility_certificate(),
-        open_domain_single_row_dp_infeasibility_certificate: session
-            .open_domain_single_row_dp_infeasibility_certificate(),
-        open_domain_multi_row_bdd_infeasibility_certificate: session
-            .open_domain_multi_row_bdd_infeasibility_certificate(),
-        open_domain_hybrid_pb_lp_infeasibility_certificate: session
-            .open_domain_hybrid_pb_lp_infeasibility_certificate(),
-        open_domain_hybrid_integer_lift_infeasibility_certificate: session
-            .open_domain_hybrid_integer_lift_infeasibility_certificate(),
-        hybrid_pb_lp_infeasibility_certificate: session.hybrid_pb_lp_infeasibility_certificate(),
-        hybrid_integer_lift_infeasibility_certificate: session
-            .hybrid_integer_lift_infeasibility_certificate(),
-        max_bytes: None,
-    };
-    let ayc = cert_io::emit(&ctx, &outcome);
-    drop(ctx);
+    let ayc = emit_session_certificate(&session, HYBRID_INTEGER_INF, &names, &scale, &outcome);
     assert!(
         ayc.contains("evidence infeasible SUCCINCT hybrid-integer-lift"),
         "{ayc}"
@@ -1249,13 +1124,13 @@ fn hybrid_integer_lift_artifact_rebuilds_and_verifies() {
     let parsed = cert_io::parse(&ayc).expect("integer-lift certificate parses");
     assert!(parsed.hybrid_integer_lift.is_some());
     let report = cert_io::check(&ayc, HYBRID_INTEGER_INF);
-    assert_eq!(report.status, CheckStatus::Verified, "{report:#?}");
+    assert_eq!(report.status(), CheckStatus::Verified, "{report:#?}");
 
     let format = "ay.hybrid-integer-lift-infeasible.v1";
     assert!(ayc.contains(format));
     let corrupted = reseal(&ayc.replacen(format, "ay.hybrid-integer-lift-infeasible.x1", 1));
     let rejected = cert_io::check(&corrupted, HYBRID_INTEGER_INF);
-    assert_eq!(rejected.status, CheckStatus::Refuted, "{rejected:#?}");
+    assert_eq!(rejected.status(), CheckStatus::Refuted, "{rejected:#?}");
 
     session.push().expect("scope");
     session
@@ -1280,17 +1155,17 @@ fn milp_optimum_emits_the_witness_and_admits_the_missing_dual() {
     // `three_outcomes_a_consumer_must_be_able_to_tell_apart` for why the
     // distinction is load-bearing and `CheckStatus::Partial` for the ny
     // measurement that forced it.
-    assert_eq!(r.status, CheckStatus::Partial, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 11);
-    assert_ne!(r.status.exit_code(), 0, "the word VERIFIED stays reserved");
+    assert_eq!(r.status(), CheckStatus::Partial, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 11);
+    assert_ne!(r.status().exit_code(), 0, "VERIFIED stays reserved");
     let primal = r
-        .claims
+        .claims()
         .iter()
-        .find(|c| c.name == "primal")
+        .find(|c| c.name() == "primal")
         .expect("primal");
-    assert!(primal.verified && primal.kind == EvidenceKind::Succinct);
-    let dual = r.claims.iter().find(|c| c.name == "dual").expect("dual");
-    assert!(!dual.verified, "the dual half is not proved: {dual:#?}");
+    assert!(primal.is_verified() && primal.kind() == EvidenceKind::Succinct);
+    let dual = &r.claims()[1];
+    assert!(!dual.is_verified() && dual.name() == "dual", "{dual:#?}");
     // The KIND may be `None` (no device ran) or `Replay` (a device exhausted
     // the space and said so, e.g. `pb-projection-optimal` when the PB route
     // owns the optimum). Replay is strictly MORE information than None and the
@@ -1298,12 +1173,12 @@ fn milp_optimum_emits_the_witness_and_admits_the_missing_dual() {
     // dressed as checkable evidence: `Succinct` is the only kind that can earn
     // exit 0, and there is no exported dual object in this build.
     assert_ne!(
-        dual.kind,
+        dual.kind(),
         EvidenceKind::Succinct,
         "an unproved dual bound must never be labelled succinct: {dual:#?}"
     );
     assert!(
-        matches!(dual.kind, EvidenceKind::None | EvidenceKind::Replay),
+        matches!(dual.kind(), EvidenceKind::None | EvidenceKind::Replay),
         "unexpected dual evidence kind: {dual:#?}"
     );
     // The witness IS in the file — the thing the old `AY_DUMP_SOL` could not do
@@ -1333,20 +1208,20 @@ fn deleting_the_required_dual_claim_cannot_bless_an_optimum() {
         ayc.contains("evidence dual"),
         "fixture must carry a dual record"
     );
-    let stripped: String = ayc
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("evidence dual"))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let stripped = rewrite_certificate_lines(
+        &ayc,
+        |line| !line.trim_start().starts_with("evidence dual"),
+        None,
+    );
     let forged = reseal(&stripped);
     assert_ne!(forged, ayc, "the deletion must actually apply");
     let r = cert_io::check(&forged, MILP);
     // REFUTED, not merely Unverified: a missing REQUIRED claim is a forged or
     // truncated certificate, which is a stronger failure than an unproven one.
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 20);
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 20);
     assert!(
-        r.notes.iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
+        r.notes().iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
         "the refusal must name the claim-set violation: {r:#?}"
     );
 }
@@ -1358,15 +1233,18 @@ fn promoting_a_feasible_verdict_to_optimal_cannot_bless_a_wrong_value() {
     // witness is genuinely feasible, so every check that EXISTS passes; only
     // the claim set catches it.
     let (ayc, _) = solve_and_emit(MILP);
-    let promoted: String = ayc
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("evidence dual"))
-        .map(|l| format!("{}\n", l.replace("verdict feasible", "verdict optimal")))
-        .collect();
+    let promoted = rewrite_certificate_lines(
+        &ayc,
+        |line| !line.trim_start().starts_with("evidence dual"),
+        Some(LineReplacement {
+            from: "verdict feasible",
+            to: "verdict optimal",
+        }),
+    );
     let forged = reseal(&promoted);
     let r = cert_io::check(&forged, MILP);
     assert_ne!(
-        r.status,
+        r.status(),
         CheckStatus::Verified,
         "a promoted verdict with its dual obligation deleted must never verify: {r:#?}"
     );
@@ -1379,9 +1257,9 @@ fn an_infeasible_verdict_carrying_a_primal_witness_is_self_contradictory() {
     let (ayc, _) = solve_and_emit(MILP);
     let flipped = reseal(&ayc.replace("verdict optimal", "verdict infeasible"));
     let r = cert_io::check(&flipped, MILP);
-    assert_ne!(r.status, CheckStatus::Verified, "{r:#?}");
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
     assert!(
-        r.notes.iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
+        r.notes().iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
         "a primal claim under an infeasible verdict must be rejected: {r:#?}"
     );
 }
@@ -1393,14 +1271,14 @@ fn deleting_a_replay_claim_cannot_launder_it_into_a_proof() {
     // Synthesised on the MILP fixture so the test does not depend on the
     // lattice device arming.
     let (ayc, _) = solve_and_emit(MILP);
-    let stripped: String = ayc
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("evidence dual"))
-        .map(|l| format!("{l}\n"))
-        .collect();
+    let stripped = rewrite_certificate_lines(
+        &ayc,
+        |line| !line.trim_start().starts_with("evidence dual"),
+        None,
+    );
     let r = cert_io::check(&reseal(&stripped), MILP);
     assert_ne!(
-        r.status,
+        r.status(),
         CheckStatus::Verified,
         "deleting an unmet obligation must never produce a pass: {r:#?}"
     );
@@ -1419,19 +1297,22 @@ fn a_bound_verdict_is_unverified_not_refuted_when_its_dual_is_unbacked() {
     // Unverified (its dual is typically exported unchecked) or Verified (if the
     // dual is genuinely backed) — but not the alarm reserved for forgeries.
     let (ayc, _) = solve_and_emit(MILP);
-    let bounded: String = ayc
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("evidence primal"))
-        .map(|l| format!("{}\n", l.replace("verdict optimal", "verdict bound")))
-        .collect();
+    let bounded = rewrite_certificate_lines(
+        &ayc,
+        |line| !line.trim_start().starts_with("evidence primal"),
+        Some(LineReplacement {
+            from: "verdict optimal",
+            to: "verdict bound",
+        }),
+    );
     let r = cert_io::check(&reseal(&bounded), MILP);
     assert_ne!(
-        r.status,
+        r.status(),
         CheckStatus::Refuted,
         "an honest bound verdict must not be REFUTED: {r:#?}"
     );
     assert!(
-        !r.notes.iter().any(|n| n.contains("UNRECOGNISED VERDICT")),
+        !r.notes().iter().any(|n| n.contains("UNRECOGNISED VERDICT")),
         "`bound` must be a RECOGNISED verdict word: {r:#?}"
     );
 }
@@ -1442,19 +1323,22 @@ fn a_bound_verdict_with_its_dual_record_deleted_is_still_refuted() {
     // so deleting it is a truncated certificate, not merely an unproven one.
     // This is what stops the new arm from becoming its own bypass.
     let (ayc, _) = solve_and_emit(MILP);
-    let stripped: String = ayc
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
+    let stripped = rewrite_certificate_lines(
+        &ayc,
+        |line| {
+            let t = line.trim_start();
             !t.starts_with("evidence dual") && !t.starts_with("evidence primal")
-        })
-        .map(|l| format!("{}\n", l.replace("verdict optimal", "verdict bound")))
-        .collect();
+        },
+        Some(LineReplacement {
+            from: "verdict optimal",
+            to: "verdict bound",
+        }),
+    );
     let r = cert_io::check(&reseal(&stripped), MILP);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 20);
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 20);
     assert!(
-        r.notes.iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
+        r.notes().iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
         "the refusal must name the claim-set violation: {r:#?}"
     );
 }
@@ -1468,9 +1352,9 @@ fn a_bound_verdict_carrying_a_primal_witness_is_self_contradictory() {
     let (ayc, _) = solve_and_emit(MILP);
     let forged = reseal(&ayc.replace("verdict optimal", "verdict bound"));
     let r = cert_io::check(&forged, MILP);
-    assert_ne!(r.status, CheckStatus::Verified, "{r:#?}");
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
     assert!(
-        r.notes.iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
+        r.notes().iter().any(|n| n.contains("CLAIM-SET VIOLATION")),
         "a primal claim under a bound verdict must be rejected: {r:#?}"
     );
 }
@@ -1488,7 +1372,7 @@ fn an_unrecognised_verdict_word_fails_closed() {
         let forged = reseal(&ayc.replace("verdict optimal", &format!("verdict {word}")));
         let r = cert_io::check(&forged, MILP);
         assert_ne!(
-            r.status,
+            r.status(),
             CheckStatus::Verified,
             "verdict `{word}` must not verify: {r:#?}"
         );
@@ -1506,7 +1390,7 @@ fn root_infeasibility_emits_a_verifying_farkas() {
         "the native lane must still export a root Farkas: {ayc}"
     );
     let r = cert_io::check(&ayc, INF);
-    assert_eq!(r.status, CheckStatus::Verified, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Verified, "{r:#?}");
 }
 
 /// The shipped CLI default is `--require witness` with structure routing ON.
@@ -1529,7 +1413,7 @@ fn root_infeasibility_under_the_shipped_default_still_verifies() {
         let (default_ayc, _) = solve_and_emit(model);
         let default_report = cert_io::check(&default_ayc, model);
         assert_eq!(
-            default_report.status,
+            default_report.status(),
             CheckStatus::Verified,
             "the shipped default posture must emit verifying evidence: {default_report:#?}"
         );
@@ -1541,7 +1425,7 @@ fn root_infeasibility_under_the_shipped_default_still_verifies() {
         let (full_ayc, _) = solve_full_and_emit(model);
         let full_report = cert_io::check(&full_ayc, model);
         assert_eq!(
-            full_report.status,
+            full_report.status(),
             CheckStatus::Verified,
             "certificate posture must verify too: {full_report:#?}"
         );
@@ -1570,8 +1454,8 @@ fn tamper_witness_value_is_refuted() {
     let tampered = reseal(&ayc.replace("x 0 X 2\n", "x 0 X 1\n"));
     assert_ne!(tampered, ayc, "the tamper must actually apply");
     let r = cert_io::check(&tampered, LP);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 20);
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 20);
 }
 
 #[test]
@@ -1583,12 +1467,12 @@ fn tamper_claimed_optimum_is_refuted() {
     let tampered = reseal(&ayc.replace("value=4 frame=file", "value=3 frame=file"));
     assert_ne!(tampered, ayc);
     let r = cert_io::check(&tampered, LP);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
     assert!(r
-        .claims
+        .claims()
         .iter()
-        .filter(|c| c.name == "primal" || c.name == "dual")
-        .all(|c| !c.verified));
+        .filter(|c| c.name() == "primal" || c.name() == "dual")
+        .all(|c| !c.is_verified()));
 }
 
 /// A `.replace` that MUST change something.
@@ -1622,7 +1506,7 @@ fn tamper_multiplier_is_refuted() {
     // `0·x >= positive`.
     let tampered = tamper(&ayc, "mult row 1 upper 1\n", "mult row 1 upper 2\n");
     let r = cert_io::check(&tampered, INF);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
 }
 
 #[test]
@@ -1630,7 +1514,7 @@ fn tamper_dropped_multiplier_is_refuted() {
     let (ayc, _) = solve_native_and_emit(INF);
     let tampered = tamper(&ayc, "mult row 0 lower 1\n", "");
     let r = cert_io::check(&tampered, INF);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
 }
 
 #[test]
@@ -1641,8 +1525,8 @@ fn tamper_model_file_digest_is_a_mismatch() {
     let tampered = reseal(&ayc.replace(&parsed.header.file_digest, &forged));
     assert_ne!(tampered, ayc);
     let r = cert_io::check(&tampered, LP);
-    assert_eq!(r.status, CheckStatus::Mismatch, "{r:#?}");
-    assert_eq!(r.status.exit_code(), 30);
+    assert_eq!(r.status(), CheckStatus::Mismatch, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 30);
 }
 
 #[test]
@@ -1652,7 +1536,7 @@ fn tamper_canonical_model_digest_is_a_mismatch() {
     let forged = "1".repeat(64);
     let tampered = reseal(&ayc.replace(&parsed.header.canon_digest, &forged));
     let r = cert_io::check(&tampered, LP);
-    assert_eq!(r.status, CheckStatus::Mismatch, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Mismatch, "{r:#?}");
 }
 
 #[test]
@@ -1663,14 +1547,14 @@ fn tamper_end_digest_is_a_mismatch() {
     let tampered = ayc.replace("solver ay-milp", "solver not-ay-milp");
     assert_ne!(tampered, ayc);
     let r = cert_io::check(&tampered, LP);
-    assert_eq!(r.status, CheckStatus::Mismatch, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Mismatch, "{r:#?}");
 }
 
 #[test]
 fn certificate_checked_against_a_different_model_is_a_mismatch() {
     let (ayc, _) = solve_and_emit(LP);
     let r = cert_io::check(&ayc, MILP);
-    assert_eq!(r.status, CheckStatus::Mismatch, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Mismatch, "{r:#?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,7 +1598,7 @@ end
     );
     // And the checker reports it as REFUTED, never as a pass.
     let r = cert_io::check(&sealed, LP);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
 }
 
 #[test]
@@ -1745,7 +1629,7 @@ fn a_succinct_claim_whose_block_is_missing_is_refuted() {
     }
     let forged = reseal(&body);
     let r = cert_io::check(&forged, INF);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
 }
 
 #[test]
@@ -1779,12 +1663,12 @@ end
     );
     let sealed = reseal(&forged);
     let r = cert_io::check(&sealed, LP);
-    assert_eq!(r.status, CheckStatus::Refuted, "{r:#?}");
-    let dual = r.claims.iter().find(|c| c.name == "dual").expect("dual");
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+    let dual = &r.claims()[0];
     assert!(
-        dual.detail.contains("DIFFERENT objective"),
+        dual.detail().contains("DIFFERENT objective"),
         "the rejection must name the reason: {}",
-        dual.detail
+        dual.detail()
     );
 }
 
@@ -1826,7 +1710,7 @@ fn a_future_format_version_is_refused() {
     let (ayc, _) = solve_and_emit(LP);
     let forged = reseal(&ayc.replace("%AYC 1", "%AYC 2"));
     assert!(cert_io::parse(&forged).is_err());
-    assert_eq!(cert_io::check(&forged, LP).status, CheckStatus::Refuted);
+    assert_eq!(cert_io::check(&forged, LP).status(), CheckStatus::Refuted);
 }
 
 // ---------------------------------------------------------------------------
@@ -1854,6 +1738,7 @@ fn a_size_cap_downgrades_the_claim_it_drops() {
         network_design_infeasibility_certificate: s.network_design_infeasibility_certificate(),
         network_design_optimality_certificate: s.network_design_optimality_certificate(),
         block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
+        milp_optimality_tree_certificate: None,
         single_machine_scheduling_optimality_certificate: s
             .single_machine_scheduling_optimality_certificate(),
         single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
@@ -1877,7 +1762,7 @@ fn a_size_cap_downgrades_the_claim_it_drops() {
     assert!(ayc.contains("evidence primal NONE truncated"), "{ayc}");
     let r = cert_io::check(&ayc, LP);
     // Downgraded, not passed and not silently shortened.
-    assert_eq!(r.status, CheckStatus::Unverified, "{r:#?}");
+    assert_eq!(r.status(), CheckStatus::Unverified, "{r:#?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,8 +1819,8 @@ fn three_outcomes_a_consumer_must_be_able_to_tell_apart() {
     // (a) A witness verified exactly, and something else has no object.
     let (ayc, _) = solve_and_emit(MILP);
     let a = cert_io::check(&ayc, MILP);
-    assert_eq!(a.status, CheckStatus::Partial, "{a:#?}");
-    assert_eq!(a.status.exit_code(), 11);
+    assert_eq!(a.status(), CheckStatus::Partial, "{a:#?}");
+    assert_eq!(a.status().exit_code(), 11);
     assert_eq!(a.claims_in(ClaimStanding::Verified), vec!["primal"]);
     assert!(a.claims_in(ClaimStanding::Refuted).is_empty());
     assert_eq!(a.census(), "CLAIMS verified=primal refuted=- unbacked=dual");
@@ -1958,8 +1843,8 @@ fn three_outcomes_a_consumer_must_be_able_to_tell_apart() {
             .join("\n"),
     );
     let b = cert_io::check(&stripped, INF);
-    assert_eq!(b.status, CheckStatus::Unverified, "{b:#?}");
-    assert_eq!(b.status.exit_code(), 10);
+    assert_eq!(b.status(), CheckStatus::Unverified, "{b:#?}");
+    assert_eq!(b.status().exit_code(), 10);
     assert!(b.claims_in(ClaimStanding::Verified).is_empty());
     assert_eq!(
         b.census(),
@@ -1985,8 +1870,8 @@ fn three_outcomes_a_consumer_must_be_able_to_tell_apart() {
             .join("\n"),
     );
     let c = cert_io::check(&broken, LP);
-    assert_eq!(c.status, CheckStatus::Refuted, "{c:#?}");
-    assert_eq!(c.status.exit_code(), 20);
+    assert_eq!(c.status(), CheckStatus::Refuted, "{c:#?}");
+    assert_eq!(c.status().exit_code(), 20);
     assert_eq!(c.claims_in(ClaimStanding::Refuted), vec!["primal"]);
     assert!(
         c.census().contains("refuted=primal"),
@@ -2381,7 +2266,7 @@ fn every_shipped_infeasibility_format_refutes_a_semantic_payload_tamper() {
         );
         let baseline = cert_io::check(&ayc, &case.model);
         assert_eq!(
-            baseline.status,
+            baseline.status(),
             CheckStatus::Verified,
             "{}: honest certificate must verify: {baseline:#?}",
             case.source
@@ -2402,7 +2287,7 @@ fn every_shipped_infeasibility_format_refutes_a_semantic_payload_tamper() {
         for (pos, label, mutated) in &mutations {
             let doc = retarget_payload(&ayc, case.source, mutated);
             let r = cert_io::check(&doc, &case.model);
-            match r.status {
+            match r.status() {
                 CheckStatus::Refuted => refuted += 1,
                 CheckStatus::Verified if provenance.iter().any(|&(a, b)| *pos >= a && *pos < b) => {
                     // The documented provenance field; see
@@ -2462,13 +2347,13 @@ fn every_shipped_infeasibility_format_refutes_a_feasible_variant() {
         assert_ne!(spliced, proof, "{}: the splice must apply", case.source);
         let r = cert_io::check(&spliced, &case.feasible);
         assert_eq!(
-            r.status,
+            r.status(),
             CheckStatus::Refuted,
             "{}: a refutation of an infeasible model must not prove a feasible \
              one infeasible: {r:#?}",
             case.source
         );
-        assert_eq!(r.status.exit_code(), 20);
+        assert_eq!(r.status().exit_code(), 20);
     }
 }
 
@@ -2488,4 +2373,232 @@ fn the_feasible_variants_are_actually_feasible() {
             case.source
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// (g) THE WHOLE-TREE OPTIMALITY BLOCK (`opttree`). A branched MILP's dual half.
+//
+// These use the MILP fixture above, whose optimum is 3 (x = 2, y = 1) and whose
+// root LP relaxation already reaches 3 — so the derived tree is small enough to
+// read, while the model is still a genuine integer program with two columns.
+// ---------------------------------------------------------------------------
+
+/// The derived tree, and the emission that carries it.
+fn milp_with_tree() -> (String, ay_milp::MilpOptimalityCertificate) {
+    let p = ay_milp::read_mps(MILP).expect("parses");
+    let names = p.col_names.clone();
+    let scale = p.obj_scale.clone();
+    let opts = SolveOpts::new().with_time_limit(std::time::Duration::from_secs(20));
+    let mut session = BabSession::new(p.model, &opts).expect("session");
+    let outcome = session.check().expect("solve");
+    let Outcome::Optimal {
+        value,
+        model_values,
+        ..
+    } = &outcome
+    else {
+        panic!("MILP fixture must solve to optimality: {outcome:?}");
+    };
+    let tree = ay_milp::derive_optimality_tree(
+        session.model(),
+        value,
+        model_values,
+        &ay_milp::OptimalityTreeBudget::new(4096),
+    )
+    .expect("the certifying descent closes this two-column integer program");
+    tree.verify(session.model())
+        .expect("the derived tree stands on its own");
+    let ayc =
+        emit_session_certificate_with_tree(&session, MILP, &names, &scale, &outcome, Some(&tree));
+    (ayc, tree)
+}
+
+#[test]
+fn a_milp_optimum_with_a_tree_verifies_on_both_halves() {
+    // THE HEADLINE. Without the tree this same verdict is PARTIAL / exit 11
+    // with `unbacked=dual` — pinned by
+    // `a_milp_optimum_reports_partial_with_an_unbacked_dual_claim` below, which
+    // emits the SAME model with no tree.
+    let (ayc, _) = milp_with_tree();
+    assert!(
+        ayc.contains("evidence dual SUCCINCT optimality-tree"),
+        "{ayc}"
+    );
+    assert!(ayc.contains("\nopttree\n"), "{ayc}");
+    assert!(ayc.contains("\nboundleaf\n"), "{ayc}");
+    let r = cert_io::check(&ayc, MILP);
+    assert_eq!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 0);
+    for claim in r.claims() {
+        assert_eq!(
+            claim.standing(),
+            ClaimStanding::Verified,
+            "claim {} is not verified: {claim:#?}",
+            claim.name()
+        );
+        assert_eq!(claim.kind(), EvidenceKind::Succinct);
+    }
+}
+
+#[test]
+fn the_same_milp_without_a_tree_does_not_verify() {
+    // THE CONTROL for the test above: identical model, identical verdict, no
+    // tree — so the Verified there is attributable to the tree and nothing
+    // else.
+    //
+    // What this model reaches WITHOUT a tree is a REPLAY claim
+    // (pb-portfolio-projection-optimal): the PB route exhausted the projection
+    // but exported no object, so the dual half is re-verifiable only by
+    // re-running the solver. A REPLAY claim can never earn exit 0, which is
+    // exactly the gap the tree closes — and note the tree does not merely
+    // relabel that claim, it replaces it with a SUCCINCT one whose evidence the
+    // checker re-derives.
+    let (ayc, _) = solve_and_emit(MILP);
+    let dual = ayc
+        .lines()
+        .find(|l| l.starts_with("evidence dual "))
+        .expect("an optimal verdict always emits a dual claim");
+    assert!(
+        !dual.contains("SUCCINCT"),
+        "without a tree this MILP has no succinct dual evidence, got: {dual}"
+    );
+    let r = cert_io::check(&ayc, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+    assert_ne!(r.status().exit_code(), 0);
+}
+
+#[test]
+fn a_tree_priced_against_a_tampered_verdict_value_is_refuted() {
+    // THE SINGLE-SOURCE PROPERTY, both directions. The tree carries no value of
+    // its own; it is priced at the number on the `verdict` line, which is the
+    // same number the witness is pinned to. So moving that number breaks one
+    // half or the other, and there is no third place to move it to.
+    let (ayc, _) = milp_with_tree();
+    assert!(ayc.contains("verdict optimal value=3 frame=file"), "{ayc}");
+
+    // Claiming a BETTER optimum (2): the witness no longer attains it.
+    let better = reseal(&ayc.replace(
+        "verdict optimal value=3 frame=file",
+        "verdict optimal value=2 frame=file",
+    ));
+    let r = cert_io::check(&better, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+
+    // Claiming a WORSE optimum (4): the witness attains 3, not 4, so the primal
+    // half fails here too — and the tree, which proves `obj >= 3`, cannot reach
+    // 4 either. Both halves refuse.
+    let worse = reseal(&ayc.replace(
+        "verdict optimal value=3 frame=file",
+        "verdict optimal value=4 frame=file",
+    ));
+    let r = cert_io::check(&worse, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+}
+
+#[test]
+fn a_bound_tree_offered_as_an_infeasibility_proof_is_refuted() {
+    // THE FATAL CONFLATION, and the reason the token and the parsed field are
+    // both distinct. A Farkas tree backing `dual` is merely vacuous; a BOUND
+    // tree backing `infeasible` would assert that a model with a known feasible
+    // point has none. The MILP fixture is feasible — x = 2, y = 1 — so this
+    // certificate is a lie about a model whose witness it also carries.
+    let (ayc, _) = milp_with_tree();
+    let forged = reseal(
+        &ayc.replace(
+            "evidence dual SUCCINCT optimality-tree",
+            "evidence infeasible SUCCINCT optimality-tree",
+        )
+        .replace("verdict optimal value=3 frame=file", "verdict infeasible"),
+    );
+    let r = cert_io::check(&forged, MILP);
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+    assert_eq!(r.status().exit_code(), 20);
+}
+
+#[test]
+fn a_boundleaf_inside_an_infeasibility_tree_does_not_parse() {
+    // The other half of the same conflation, at the token level: `boundleaf`
+    // has no arm in `parse_tree`, so a bound leaf cannot be smuggled into a
+    // `tree` block and read as a proof of emptiness.
+    let (ayc, _) = solve_and_emit(INF);
+    assert!(ayc.contains("farkas "), "{ayc}");
+    let forged = reseal(&ayc.replace("farkas mults=2", "tree\nboundleaf"));
+    let r = cert_io::check(&forged, INF);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+}
+
+#[test]
+fn an_opttree_claim_whose_block_is_missing_is_refuted() {
+    let (ayc, _) = milp_with_tree();
+    let mut body = String::new();
+    let mut in_tree = false;
+    for l in ayc.lines() {
+        if l == "opttree" {
+            in_tree = true;
+            continue;
+        }
+        if in_tree {
+            if l == "end" {
+                in_tree = false;
+            }
+            continue;
+        }
+        body.push_str(l);
+        body.push('\n');
+    }
+    let forged = reseal(&body);
+    assert!(!forged.contains("opttree"), "{forged}");
+    assert!(
+        forged.contains("evidence dual SUCCINCT optimality-tree"),
+        "{forged}"
+    );
+    let r = cert_io::check(&forged, MILP);
+    assert_eq!(r.status(), CheckStatus::Refuted, "{r:#?}");
+}
+
+#[test]
+fn deleting_a_split_from_the_tree_is_refuted() {
+    // A tree that no longer tiles the domain. Dropping one `split` line leaves
+    // the pre-order with an extra node, which the parser rejects outright; the
+    // point is that the certificate cannot be quietly shrunk into one that
+    // covers less.
+    let (ayc, _) = milp_with_tree();
+    let Some(split) = ayc.lines().find(|l| l.starts_with("split ")) else {
+        // A tree with no split still exercises every other test here; skip the
+        // splice rather than assert on the shape of a derived artifact.
+        return;
+    };
+    let forged = reseal(&ayc.replacen(&format!("{split}\n"), "", 1));
+    let r = cert_io::check(&forged, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+}
+
+#[test]
+fn rescaling_one_leaf_multiplier_is_refuted() {
+    // The identity is exact: every leaf's combination must BE the model's
+    // objective. Doubling any single multiplier breaks it.
+    let (ayc, _) = milp_with_tree();
+    let mut lines: Vec<String> = ayc.lines().map(str::to_string).collect();
+    let mut patched = false;
+    for l in &mut lines {
+        if l.starts_with("mult ") && l.ends_with(" 1") {
+            *l = l.replace(" 1", " 2");
+            patched = true;
+            break;
+        }
+    }
+    assert!(
+        patched,
+        "the derived tree has no unit multiplier to rescale"
+    );
+    let forged = reseal(&(lines.join("\n") + "\n"));
+    let r = cert_io::check(&forged, MILP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
+}
+
+#[test]
+fn a_tree_checked_against_a_different_model_is_not_verified() {
+    let (ayc, _) = milp_with_tree();
+    let r = cert_io::check(&ayc, LP);
+    assert_ne!(r.status(), CheckStatus::Verified, "{r:#?}");
 }

@@ -11,9 +11,9 @@ use crate::executor::{SatCertificate, UnsatCertificate};
 
 /// SMT-level proof certificate wrapping the SAT-level [`ProofCertificate`].
 ///
-/// Always present on `SolveResult::Unsat`. Like the SAT certificate, proof
-/// materialization is lazy: no reconstruction work occurs until the consumer
-/// explicitly requests it via [`sat_certificate()`](Self::sat_certificate).
+/// Always present on `SolveResult::Unsat`. Backward reconstruction has already
+/// run; converting its retained steps to the public proof representation stays
+/// lazy until the consumer inspects the SAT certificate.
 /// Some independently checked semantic UNSAT lanes have no LRAT derivation;
 /// those carry the existing explicitly-incomplete empty payload, while
 /// [`VerifiedSolveResult`] separately records the exact certification kind and
@@ -21,8 +21,8 @@ use crate::executor::{SatCertificate, UnsatCertificate};
 ///
 /// # Zero-cost path
 ///
-/// If the consumer never inspects the proof, no reconstruction work is
-/// performed beyond the reference-counted wrapper.
+/// If the consumer never inspects the proof, no public-step conversion or
+/// allocation is performed beyond the reference-counted wrapper.
 #[derive(Debug, Clone)]
 pub struct SmtProofCertificate {
     /// The underlying SAT-level proof certificate.
@@ -71,14 +71,14 @@ impl SmtProofCertificate {
         &self.sat_cert
     }
 
-    /// Compute a proof-minimal UNSAT core from the LRAT proof certificate.
+    /// Return clause IDs tracked or syntactically classified as original support.
     ///
-    /// Delegates to [`ProofCertificate::minimal_core()`] on the underlying
-    /// SAT-level certificate. Returns a sorted, deduplicated list of original
-    /// input clause IDs that were actually used in the UNSAT derivation.
+    /// Delegates to [`ProofCertificate::tracked_original_clause_ids()`]. The sorted
+    /// result may contain redundant support; incomplete streams may misclassify a
+    /// missing derived step as original. It is neither checked nor a minimal core.
     #[must_use]
-    pub fn minimal_core(&self) -> Vec<u64> {
-        self.sat_cert.minimal_core()
+    pub fn tracked_original_clause_ids(&self) -> Vec<u64> {
+        self.sat_cert.tracked_original_clause_ids()
     }
 
     /// Write the LRAT proof as a Lean4 proof script (Phase 1, #8253).
@@ -100,8 +100,8 @@ pub enum SolveResult {
     /// The constraints are unsatisfiable, with a lazily-materialized proof
     /// certificate.
     ///
-    /// The certificate is zero-cost when not consumed: proof reconstruction
-    /// is deferred until the consumer requests it.
+    /// Backward reconstruction ran during UNSAT finalization; conversion to
+    /// public proof steps is deferred until the consumer requests it.
     Unsat(SmtProofCertificate),
     /// The solver could not determine satisfiability
     Unknown,

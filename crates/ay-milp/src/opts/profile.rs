@@ -10,6 +10,30 @@ use super::EngineEconomics;
 
 mod affine;
 
+fn inverted_flag(enabled: bool) -> Setting {
+    Setting::Flag(!enabled)
+}
+
+fn count<T: Into<usize>>(value: T) -> Setting {
+    Setting::Count(value.into())
+}
+
+/// Apply one ordered batch in a narrow loop.
+///
+/// [`Profile::with`] consumes its large array carrier. Centralizing that move
+/// here prevents straight-line lowering from reserving a separate stack
+/// temporary for every setting in a batch.
+fn extend_with_settings<const N: usize>(
+    profile: &mut Profile,
+    settings: [(Knob, Option<Setting>); N],
+) {
+    for (knob, value) in settings {
+        if let Some(value) = value {
+            *profile = (*profile).with(knob, value);
+        }
+    }
+}
+
 impl EngineEconomics {
     /// Lower these settings into the engine's internal knob carrier.
     ///
@@ -113,254 +137,141 @@ impl EngineEconomics {
     }
 
     fn extend_retired_env_profile(&self, mut p: Profile) -> Profile {
-        if let Some(v) = self.gub_branch {
-            p = p.with(Knob::NoGubBranch, Setting::Flag(!v));
-        }
-        if let Some(v) = self.dedup_cols {
-            p = p.with(Knob::NoDedupCols, Setting::Flag(!v));
-        }
-        if let Some(v) = self.binary_complement_sub {
-            p = p.with(Knob::NoBinaryComplementSub, Setting::Flag(!v));
-        }
-        if let Some(v) = self.lb_activity {
-            p = p.with(Knob::NoLbAct, Setting::Flag(!v));
-        }
-        if let Some(v) = self.gi_dfs {
-            p = p.with(Knob::NoGiDfs, Setting::Flag(!v));
-        }
-        if let Some(v) = self.impl_cut {
-            p = p.with(Knob::NoImplCut, Setting::Flag(!v));
-        }
-        if let Some(v) = self.impl_tab {
-            p = p.with(Knob::NoImplTab, Setting::Flag(!v));
-        }
-        if let Some(v) = self.knap_redirect {
-            p = p.with(Knob::NoKnapRedirect, Setting::Flag(!v));
-        }
-        if let Some(v) = self.dive_skip {
-            p = p.with(Knob::NoDiveSkip, Setting::Flag(!v));
-        }
-        if let Some(v) = self.cut_fma {
-            p = p.with(Knob::NoCutFma, Setting::Flag(!v));
-        }
-        if let Some(v) = self.odd_lift {
-            p = p.with(Knob::NoOddLift, Setting::Flag(!v));
-        }
-        if let Some(v) = self.strongcg {
-            p = p.with(Knob::NoStrongcg, Setting::Flag(!v));
-        }
-        if let Some(v) = self.dense_gmi_lu {
-            p = p.with(Knob::DenseGmiLu, Setting::Flag(v));
-        }
-        if let Some(v) = self.mir_knap {
-            p = p.with(Knob::NoMirKnap, Setting::Flag(!v));
-        }
-        if let Some(v) = self.bound_branch {
-            p = p.with(Knob::BbGate, Setting::Flag(v));
-        }
-        if let Some(v) = self.child_order {
-            p = p.with(Knob::ChildOrderMode, Setting::Count(v));
-        }
-        if let Some(v) = self.cuts_per_round {
-            p = p.with(Knob::CutsPerRound, Setting::Count(v));
-        }
-        if let Some(v) = self.cut_eff_floor {
-            p = p.with(Knob::CutEffFloor, Setting::Real(v));
-        }
-        if let Some(v) = self.ft_spike {
-            p = p.with(Knob::FtSpikeArm, Setting::Count(v));
-        }
-        if let Some(v) = self.gub_sb {
-            p = p.with(Knob::GubSb, Setting::Flag(v));
-        }
-        if let Some(v) = self.ng_box {
-            p = p.with(Knob::NgBox, Setting::Flag(v));
-        }
-        if let Some(v) = self.ng_branch_pct {
-            p = p.with(Knob::NgBranchPct, Setting::Real(v));
-        }
-        if let Some(v) = self.node_prop {
-            p = p.with(Knob::NodeProp, Setting::Flag(v));
-        }
-        if let Some(v) = self.sb_sustain {
-            p = p.with(Knob::SbSustain, Setting::Flag(v));
-        }
-        if let Some(v) = self.plunge {
-            p = p.with(Knob::Plunge, Setting::Flag(v));
-        }
-        if let Some(v) = self.gmi_rounds {
-            p = p.with(Knob::GmiRounds, Setting::Count(v));
-        }
-        if let Some(v) = self.root_cuts_per_round {
-            p = p.with(Knob::RootCutsPerRound, Setting::Count(v));
-        }
-        if let Some(v) = self.root_probe {
-            p = p.with(Knob::RootProbe, Setting::Flag(v));
-        }
-        if let Some(v) = self.dfs {
-            p = p.with(Knob::Dfs, Setting::Flag(v));
-        }
-        if let Some(v) = self.node_cuts {
-            p = p.with(Knob::NodeCuts, Setting::Flag(v));
-        }
-        if let Some(v) = self.sym_branch_band {
-            p = p.with(Knob::SymBranchBand, Setting::Real(v));
-        }
-        if let Some(v) = self.rins {
-            p = p.with(Knob::Rins, Setting::Count(v));
-        }
-        if let Some(v) = self.dualfix_all {
-            p = p.with(Knob::DualfixAll, Setting::Flag(v));
-        }
-        if let Some(v) = self.implied_bound {
-            p = p.with(Knob::ImpliedBound, Setting::Flag(v));
-        }
-        if let Some(v) = self.lifted_cover {
-            p = p.with(Knob::LiftedCover, Setting::Flag(v));
-        }
-        if let Some(v) = self.lnp_budget {
-            p = p.with(Knob::LnpBudget, Setting::Count(v));
-        }
-        if let Some(v) = self.lattice_bkz_beta {
-            p = p.with(Knob::LatticeBkzBeta, Setting::Count(v));
-        }
-        if let Some(v) = self.dual_perturb {
-            p = p.with(Knob::DualPerturb, Setting::Real(v));
-        }
-        if let Some(v) = self.cert_grace_secs {
-            p = p.with(Knob::CertGraceSecs, Setting::Real(v));
-        }
-        if let Some(v) = self.anchor_first_refusal_ms {
-            p = p.with(Knob::AnchorFirstRefusalMs, Setting::Count(v));
-        }
-        if let Some(v) = self.rins_every {
-            p = p.with(Knob::RinsEvery, Setting::Count(v));
-        }
-        if let Some(v) = self.rins_drycap {
-            p = p.with(Knob::RinsDrycap, Setting::Count(v));
-        }
-        if let Some(v) = self.pump_share {
-            p = p.with(Knob::PumpShare, Setting::Real(v));
-        }
-        if let Some(v) = self.setpart_share {
-            p = p.with(Knob::SetpartShare, Setting::Real(v));
-        }
-        if let Some(v) = self.parity {
-            p = p.with(Knob::NoParity, Setting::Flag(!v));
-        }
-        if let Some(v) = self.margin_reframe {
-            p = p.with(Knob::NoMarginReframe, Setting::Flag(!v));
-        }
-        if let Some(v) = self.sym_mode {
-            p = p.with(Knob::SymMode, Setting::Count(v));
-        }
-        if let Some(v) = self.heur_share {
-            p = p.with(Knob::HeurShare, Setting::Real(v));
-        }
-        if let Some(v) = self.sb_rel {
-            p = p.with(Knob::SbRel, Setting::Count(v));
-        }
-        if let Some(v) = self.sb_cands {
-            p = p.with(Knob::SbCands, Setting::Count(v));
-        }
-        if let Some(v) = self.sb_total {
-            p = p.with(Knob::SbTotal, Setting::Count(v));
-        }
-        if let Some(v) = self.presolve {
-            p = p.with(Knob::NoPresolve, Setting::Flag(!v));
-        }
-        if let Some(v) = self.presolve_scout {
-            p = p.with(Knob::NoPresolveScout, Setting::Flag(!v));
-        }
-        if let Some(v) = self.vsids {
-            p = p.with(Knob::Vsids, Setting::Flag(v));
-        }
-        if let Some(v) = self.root_probe_all {
-            p = p.with(Knob::RootProbeAll, Setting::Flag(v));
-        }
-        if let Some(v) = self.sepstat {
-            p = p.with(Knob::Sepstat, Setting::Flag(v));
-        }
-        if let Some(v) = self.root_closure_presolve {
-            p = p.with(Knob::RootClosurePresolve, Setting::Flag(v));
-        }
-        if let Some(v) = self.tableau_mir {
-            p = p.with(Knob::TableauMir, Setting::Flag(v));
-        }
-        if let Some(v) = self.mir_agg_root {
-            p = p.with(Knob::MirAggRoot, Setting::Flag(v));
-        }
-        if let Some(v) = self.lp_stats {
-            p = p.with(Knob::LpStats, Setting::Flag(v));
-        }
-        if let Some(v) = self.step_trace {
-            p = p.with(Knob::StepTraceN, Setting::Count(v));
-        }
-        if let Some(v) = self.bump_diag {
-            p = p.with(Knob::BumpDiag, Setting::Flag(v));
-        }
-        if let Some(v) = self.bumpdiff_lanes {
-            p = p.with(Knob::BumpdiffLanes, Setting::Count(v));
-        }
-        if let Some(v) = self.diag_plain_cold {
-            p = p.with(Knob::DiagPlainCold, Setting::Flag(v));
-        }
-        if let Some(v) = self.dump_vertex {
-            p = p.with(Knob::DumpVertex, Setting::Flag(v));
-        }
-        if let Some(v) = self.smt_lane {
-            p = p.with(Knob::SmtLane, Setting::Flag(v));
-        }
-        if let Some(v) = self.max_nodes {
-            p = p.with(Knob::MaxNodes, Setting::Count(v));
-        }
+        self.extend_retired_feature_profile(&mut p);
+        self.extend_retired_search_profile(&mut p);
+        self.extend_retired_presolve_and_diagnostics_profile(&mut p);
         p = affine::extend_reduction_profile(self, p);
-        if let Some(v) = self.bound_cover {
-            p = p.with(Knob::NoBoundCover, Setting::Flag(!v));
-        }
-        if let Some(v) = self.pump_iter_mult {
-            p = p.with(Knob::PumpIterMult, Setting::Real(v));
-        }
-        if let Some(v) = self.pump_iter_cap {
-            p = p.with(Knob::NoPumpIterCap, Setting::Flag(!v));
-        }
-        if let Some(v) = self.ng_up {
-            p = p.with(Knob::NgUp, Setting::Flag(v));
-        }
-        if let Some(v) = self.cut_shadow {
-            p = p.with(Knob::CutShadow, Setting::Count(v as usize));
-        }
-        if let Some(v) = self.chain_agg {
-            p = p.with(Knob::ChainAgg, Setting::Flag(v));
-        }
-        if let Some(v) = self.auto_margin {
-            p = p.with(Knob::AutoMargin, Setting::Flag(v));
-        }
-        if let Some(v) = self.impl_lane {
-            p = p.with(Knob::ImplLane, Setting::Flag(v));
-        }
-        if let Some(v) = self.impl_arm {
-            p = p.with(Knob::ImplArm, Setting::Count(v));
-        }
-        if let Some(v) = self.drought_dive {
-            p = p.with(Knob::DroughtDive, Setting::Count(v));
-        }
-        if let Some(v) = self.prop_conflict {
-            p = p.with(Knob::PropConflict, Setting::Flag(v));
-        }
-        if let Some(v) = self.lb_conflict {
-            p = p.with(Knob::LbConflict, Setting::Count(v as usize));
-        }
-        if let Some(v) = self.lb_arm {
-            p = p.with(Knob::LbArm, Setting::Count(v));
-        }
-        if let Some(v) = self.lb_strict {
-            p = p.with(Knob::LbStrict, Setting::Flag(v));
-        }
-        if let Some(v) = self.dual_cutoff {
-            p = p.with(Knob::DualCutoff, Setting::Real(v));
-        }
+        self.extend_retired_post_reduction_profile(&mut p);
         p
+    }
+
+    fn extend_retired_feature_profile(&self, profile: &mut Profile) {
+        extend_with_settings(
+            profile,
+            [
+                (Knob::NoGubBranch, self.gub_branch.map(inverted_flag)),
+                (Knob::NoDedupCols, self.dedup_cols.map(inverted_flag)),
+                (
+                    Knob::NoBinaryComplementSub,
+                    self.binary_complement_sub.map(inverted_flag),
+                ),
+                (Knob::NoLbAct, self.lb_activity.map(inverted_flag)),
+                (Knob::NoGiDfs, self.gi_dfs.map(inverted_flag)),
+                (Knob::NoImplCut, self.impl_cut.map(inverted_flag)),
+                (Knob::NoImplTab, self.impl_tab.map(inverted_flag)),
+                (Knob::NoKnapRedirect, self.knap_redirect.map(inverted_flag)),
+                (Knob::NoDiveSkip, self.dive_skip.map(inverted_flag)),
+                (Knob::NoCutFma, self.cut_fma.map(inverted_flag)),
+                (Knob::NoOddLift, self.odd_lift.map(inverted_flag)),
+                (Knob::NoStrongcg, self.strongcg.map(inverted_flag)),
+                (Knob::DenseGmiLu, self.dense_gmi_lu.map(Setting::Flag)),
+                (Knob::NoMirKnap, self.mir_knap.map(inverted_flag)),
+            ],
+        )
+    }
+
+    fn extend_retired_search_profile(&self, profile: &mut Profile) {
+        extend_with_settings(
+            profile,
+            [
+                (Knob::BbGate, self.bound_branch.map(Setting::Flag)),
+                (Knob::ChildOrderMode, self.child_order.map(count)),
+                (Knob::CutsPerRound, self.cuts_per_round.map(count)),
+                (Knob::CutEffFloor, self.cut_eff_floor.map(Setting::Real)),
+                (Knob::FtSpikeArm, self.ft_spike.map(count)),
+                (Knob::GubSb, self.gub_sb.map(Setting::Flag)),
+                (Knob::NgBox, self.ng_box.map(Setting::Flag)),
+                (Knob::NgBranchPct, self.ng_branch_pct.map(Setting::Real)),
+                (Knob::NodeProp, self.node_prop.map(Setting::Flag)),
+                (Knob::SbSustain, self.sb_sustain.map(Setting::Flag)),
+                (Knob::Plunge, self.plunge.map(Setting::Flag)),
+                (Knob::GmiRounds, self.gmi_rounds.map(count)),
+                (Knob::RootCutsPerRound, self.root_cuts_per_round.map(count)),
+                (Knob::RootProbe, self.root_probe.map(Setting::Flag)),
+                (Knob::Dfs, self.dfs.map(Setting::Flag)),
+                (Knob::NodeCuts, self.node_cuts.map(Setting::Flag)),
+                (Knob::SymBranchBand, self.sym_branch_band.map(Setting::Real)),
+                (Knob::Rins, self.rins.map(count)),
+                (Knob::DualfixAll, self.dualfix_all.map(Setting::Flag)),
+                (Knob::ImpliedBound, self.implied_bound.map(Setting::Flag)),
+                (Knob::LiftedCover, self.lifted_cover.map(Setting::Flag)),
+                (Knob::LnpBudget, self.lnp_budget.map(count)),
+                (Knob::LatticeBkzBeta, self.lattice_bkz_beta.map(count)),
+                (Knob::DualPerturb, self.dual_perturb.map(Setting::Real)),
+                (Knob::CertGraceSecs, self.cert_grace_secs.map(Setting::Real)),
+                (
+                    Knob::AnchorFirstRefusalMs,
+                    self.anchor_first_refusal_ms.map(count),
+                ),
+                (Knob::RinsEvery, self.rins_every.map(count)),
+                (Knob::RinsDrycap, self.rins_drycap.map(count)),
+                (Knob::PumpShare, self.pump_share.map(Setting::Real)),
+                (Knob::SetpartShare, self.setpart_share.map(Setting::Real)),
+                (Knob::NoParity, self.parity.map(inverted_flag)),
+                (
+                    Knob::NoMarginReframe,
+                    self.margin_reframe.map(inverted_flag),
+                ),
+                (Knob::SymMode, self.sym_mode.map(count)),
+                (Knob::HeurShare, self.heur_share.map(Setting::Real)),
+                (Knob::SbRel, self.sb_rel.map(count)),
+                (Knob::SbCands, self.sb_cands.map(count)),
+                (Knob::SbTotal, self.sb_total.map(count)),
+            ],
+        )
+    }
+
+    fn extend_retired_presolve_and_diagnostics_profile(&self, profile: &mut Profile) {
+        extend_with_settings(
+            profile,
+            [
+                (Knob::NoPresolve, self.presolve.map(inverted_flag)),
+                (
+                    Knob::NoPresolveScout,
+                    self.presolve_scout.map(inverted_flag),
+                ),
+                (Knob::Vsids, self.vsids.map(Setting::Flag)),
+                (Knob::RootProbeAll, self.root_probe_all.map(Setting::Flag)),
+                (Knob::Sepstat, self.sepstat.map(Setting::Flag)),
+                (
+                    Knob::RootClosurePresolve,
+                    self.root_closure_presolve.map(Setting::Flag),
+                ),
+                (Knob::TableauMir, self.tableau_mir.map(Setting::Flag)),
+                (Knob::MirAggRoot, self.mir_agg_root.map(Setting::Flag)),
+                (Knob::LpStats, self.lp_stats.map(Setting::Flag)),
+                (Knob::StepTraceN, self.step_trace.map(count)),
+                (Knob::BumpDiag, self.bump_diag.map(Setting::Flag)),
+                (Knob::BumpdiffLanes, self.bumpdiff_lanes.map(count)),
+                (Knob::DiagPlainCold, self.diag_plain_cold.map(Setting::Flag)),
+                (Knob::DumpVertex, self.dump_vertex.map(Setting::Flag)),
+                (Knob::SmtLane, self.smt_lane.map(Setting::Flag)),
+                (Knob::MaxNodes, self.max_nodes.map(count)),
+            ],
+        )
+    }
+
+    fn extend_retired_post_reduction_profile(&self, profile: &mut Profile) {
+        extend_with_settings(
+            profile,
+            [
+                (Knob::NoBoundCover, self.bound_cover.map(inverted_flag)),
+                (Knob::PumpIterMult, self.pump_iter_mult.map(Setting::Real)),
+                (Knob::NoPumpIterCap, self.pump_iter_cap.map(inverted_flag)),
+                (Knob::NgUp, self.ng_up.map(Setting::Flag)),
+                (Knob::CutShadow, self.cut_shadow.map(count)),
+                (Knob::ChainAgg, self.chain_agg.map(Setting::Flag)),
+                (Knob::AutoMargin, self.auto_margin.map(Setting::Flag)),
+                (Knob::ImplLane, self.impl_lane.map(Setting::Flag)),
+                (Knob::ImplArm, self.impl_arm.map(count)),
+                (Knob::DroughtDive, self.drought_dive.map(count)),
+                (Knob::PropConflict, self.prop_conflict.map(Setting::Flag)),
+                (Knob::LbConflict, self.lb_conflict.map(count)),
+                (Knob::LbArm, self.lb_arm.map(count)),
+                (Knob::LbStrict, self.lb_strict.map(Setting::Flag)),
+                (Knob::DualCutoff, self.dual_cutoff.map(Setting::Real)),
+            ],
+        )
     }
 
     fn extend_branch_and_bound_profile(&self, mut p: Profile) -> Profile {

@@ -505,7 +505,7 @@ impl EngineEconomics {
     /// # Errors
     ///
     /// [`EngineConfigError`] unless `value` is finite and in `[0, 1e15]` — the
-    /// domain [`Setting::Real`] itself admits, so the builder cannot accept a
+    /// domain `Setting::Real` itself admits, so the builder cannot accept a
     /// value the accessor would then discard.
     pub fn with_node_gmi_margin(mut self, value: f64) -> Result<Self, EngineConfigError> {
         self.node_gmi_margin = Some(checked(Knob::NodeGmiMargin, value, 0.0, MAX_KNOB_SECS)?);
@@ -518,7 +518,7 @@ impl EngineEconomics {
     /// # Errors
     ///
     /// [`EngineConfigError`] unless `value` is finite and in `[0, 1e15]` — the
-    /// domain [`Setting::Real`] itself admits, so the builder cannot accept a
+    /// domain `Setting::Real` itself admits, so the builder cannot accept a
     /// value the accessor would then discard.
     pub fn with_dive_probe_secs(mut self, value: f64) -> Result<Self, EngineConfigError> {
         self.dive_probe_secs = Some(checked(Knob::DiveProbeSecs, value, 0.0, MAX_KNOB_SECS)?);
@@ -531,7 +531,7 @@ impl EngineEconomics {
     /// # Errors
     ///
     /// [`EngineConfigError`] unless `value` is finite and in `[0, 1e15]` — the
-    /// domain [`Setting::Real`] itself admits, so the builder cannot accept a
+    /// domain `Setting::Real` itself admits, so the builder cannot accept a
     /// value the accessor would then discard.
     pub fn with_rens_window(mut self, value: f64) -> Result<Self, EngineConfigError> {
         self.rens_window = Some(checked(Knob::RensWindow, value, 0.0, MAX_KNOB_SECS)?);
@@ -543,11 +543,9 @@ impl EngineEconomics {
     ///
     /// # Errors
     ///
-    /// [`EngineConfigError`] unless `value` is finite and in `[0, 1e15]` — the
-    /// domain [`Setting::Real`] itself admits, so the builder cannot accept a
-    /// value the accessor would then discard.
+    /// [`EngineConfigError`] unless `value` is finite and in `[0, 1]`.
     pub fn with_root_probe_share(mut self, value: f64) -> Result<Self, EngineConfigError> {
-        self.root_probe_share = Some(checked(Knob::RootProbeShare, value, 0.0, MAX_KNOB_SECS)?);
+        self.root_probe_share = Some(checked(Knob::RootProbeShare, value, 0.0, 1.0)?);
         Ok(self)
     }
     /// Radius of the CDCL ball propagation search run once before the ladder.
@@ -557,7 +555,7 @@ impl EngineEconomics {
     /// # Errors
     ///
     /// [`EngineConfigError`] unless `value` is finite and in `[0, 1e15]` — the
-    /// domain [`Setting::Real`] itself admits, so the builder cannot accept a
+    /// domain `Setting::Real` itself admits, so the builder cannot accept a
     /// value the accessor would then discard.
     pub fn with_prop_first(mut self, value: f64) -> Result<Self, EngineConfigError> {
         self.prop_first = Some(checked(Knob::PropFirst, value, 0.0, MAX_KNOB_SECS)?);

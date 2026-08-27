@@ -599,7 +599,9 @@ fn array_extensionality_sat_different_at_other_index() {
     assert_eq!(run_script(input), vec!["sat"]);
 }
 
+mod array_row_guard;
 mod negated_pointwise_array;
+mod pigeonhole_false_lemma;
 
 #[test]
 fn negated_pointwise_forall_array_eq_with_eq_premise_is_unsat() {
@@ -638,8 +640,23 @@ fn positive_pointwise_forall_array_eq_with_diseq_is_unsat() {
 // for this QF_AX problem (theory completeness gap, not a regression). The test
 // was added in euf.rs split (daec7b69d) but never verified to pass.
 
+/// #6282 + #row2-unit-guard.
+///
+/// This test used to be named `array_row_lemmas_use_unit_clause_for_asserted_
+/// disequality_6282` and required the ROW2 consequent to be asserted as a BARE
+/// UNIT once `i != j` was readable off the assertions. That expectation was the
+/// defect: the unit is ROW2, valid only under `i != j` — a PROBLEM fact, never a
+/// theory fact — so `record_array_axiom_proof` recorded a premiseless `Generic`
+/// theory lemma that is FALSE at `i = j` with the stored value off `a[j]`. The
+/// refutation, with a named countermodel checked literal by literal, is in
+/// `ay-proof`'s `array_row_axiom_guard_negative_tests` and again in
+/// `euf::tests::array_row_guard`.
+///
+/// The pin is otherwise UNCHANGED and is strictly stronger: the same single
+/// added assertion, the same withheld ROW1, plus the new requirement that what
+/// is added is the GUARDED clause and never the bare unit.
 #[test]
-fn array_row_lemmas_use_unit_clause_for_asserted_disequality_6282() {
+fn array_row_lemmas_use_guarded_clause_for_asserted_disequality_6282() {
     let mut exec = prepare_executor(
         r#"
         (set-logic QF_AUFLIA)
@@ -671,15 +688,15 @@ fn array_row_lemmas_use_unit_clause_for_asserted_disequality_6282() {
     assert_eq!(
         exec.ctx.assertions.len(),
         before + 1,
-        "asserted i != j should turn ROW2 into a single unit equality"
+        "asserted i != j should still add exactly ONE ROW clause"
     );
     assert!(
-        exec.ctx.assertions.contains(&row2_eq),
-        "ROW2 consequent should be asserted directly as a unit fact"
+        exec.ctx.assertions.contains(&row2_clause),
+        "the GUARDED ROW2 clause is the only shape a theory rule licenses"
     );
     assert!(
-        !exec.ctx.assertions.contains(&row2_clause),
-        "disjunctive ROW2 clause should be skipped once i != j is known"
+        !exec.ctx.assertions.contains(&row2_eq),
+        "the unguarded ROW2 unit is false at i = j and must never be asserted"
     );
     assert!(
         !exec.ctx.assertions.contains(&row1_clause),

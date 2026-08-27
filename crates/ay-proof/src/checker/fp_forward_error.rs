@@ -85,7 +85,7 @@ const MAX_EXPONENT_BITS: u32 = 24;
 const MAX_SIGNIFICAND_BITS: u32 = 1024;
 
 /// Recognize whether `clause` is a strict-checkable FP forward-error lemma —
-/// i.e. whether [`validate_fp_forward_error`] would accept it. By construction
+/// i.e. whether `validate_fp_forward_error` would accept it. By construction
 /// the exact inverse of the validator (it calls the validator), so the proof
 /// classifier (`ay-dpll`) and the strict checker cannot drift: a `Generic`
 /// trust lemma is upgraded to `FpForwardError` ONLY when strict mode will

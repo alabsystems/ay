@@ -33,6 +33,12 @@ impl Solver {
     pub(super) fn analyze_conflict(&mut self, conflict_ref: ClauseRef) -> Option<ConflictResult> {
         solver_log!(self, "analyze conflict clause {}", conflict_ref.0);
 
+        // Depth observability (see SolverStats::trail_at_conflict_sum): sampled
+        // once per conflict, before any backtracking, so it records the state
+        // the conflict was actually reached in.
+        self.stats.trail_at_conflict_sum += self.trail.len() as u64;
+        self.stats.level_at_conflict_sum += u64::from(self.decision_level);
+
         // #8707: If `materialize_current_level_lazy_reasons` failed to
         // reconstruct a lazy theory reason, the affected variable was
         // demoted to a fake decision (`reason = NO_REASON`). Running 1UIP
@@ -151,7 +157,7 @@ impl Solver {
             });
         }
 
-        // Streaming UNSAT core: mark conflict clause if it's an original (#8250).
+        // Streaming support: mark the conflict clause if it is original (#8250).
         self.mark_streaming_core(conflict_ref);
 
         // Forward LRAT chain: add the conflict clause ID to start the chain.
@@ -807,7 +813,7 @@ impl Solver {
 
                             self.bump_clause(prev_reason);
 
-                            // Streaming UNSAT core: mark OTFS prev_reason if original (#8250).
+                            // Streaming support: mark an original OTFS reason (#8250).
                             self.mark_streaming_core(prev_reason);
 
                             if self.cold.lrat_enabled {
@@ -1087,7 +1093,7 @@ impl Solver {
                         TRIAGE_ANTECEDENTS.with(|b| b.borrow_mut().push(reason_ref.0));
                     }
 
-                    // Streaming UNSAT core: mark reason clause if original (#8250).
+                    // Streaming support: mark the reason if it is original (#8250).
                     self.mark_streaming_core(reason_ref);
 
                     // Tick accounting: charge 1 search tick per reason clause
@@ -1141,7 +1147,7 @@ impl Solver {
 
     /// Mark an antecedent only when its bounded ID was issued to an original.
     /// Late-original allocation can leave derived IDs in `1..=num_originals`,
-    /// so range membership alone is insufficient for a streaming core.
+    /// so range membership alone is insufficient for streaming support.
     #[inline(always)]
     pub(super) fn mark_streaming_core(&mut self, clause_ref: ClauseRef) {
         let num_originals = self.cold.streaming_core_num_originals;

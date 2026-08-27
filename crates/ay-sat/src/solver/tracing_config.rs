@@ -99,28 +99,32 @@ impl Solver {
     /// materialization becomes a no-op and the clause trace is marked
     /// `proof_work_exhausted`, so downstream reconstruction fails closed
     /// (verdict kept, honest "no proof certificate emitted" warning).
+    ///
+    /// # Panics
+    ///
+    /// Panics for `Some` unless one live synthesized clause trace is the sole
+    /// proof consumer. `None` is always accepted and normalizes ownership.
     pub fn set_proof_bookkeeping_budget(&mut self, budget: Option<u64>) {
+        if budget.is_some() {
+            self.assert_can_set_proof_bookkeeping_budget();
+        }
         self.cold.proof_bookkeeping_budget = budget;
+        self.refresh_proof_consumer_state();
     }
 
     /// Enable LRAT proof support (track clause IDs and resolution chains)
     ///
     /// # Panics
     ///
-    /// Panics if called after clauses have been added. Late enabling creates
-    /// unstable clause IDs because existing clauses have no LRAT IDs while
-    /// new clauses start allocation from 1, causing ID collisions.
+    /// Panics after any clause authority has been registered, or while a proof
+    /// bookkeeping budget is configured. Late enabling would create unstable
+    /// clause IDs; budgeted traces must remain the sole LRAT owner.
     pub fn enable_lrat(&mut self) {
-        assert!(
-            self.arena.is_empty(),
-            "BUG: enable_lrat() called after {} clauses were added — \
-             must be called before adding any clauses",
-            self.arena.num_clauses(),
-        );
-        self.cold.lrat_enabled = true;
+        self.assert_can_enable_internal_lrat();
+        self.cold.internal_lrat_enabled = true;
         self.cold.lrat_level0_unit_materialize_cursor = 0;
         self.cold.lrat_level0_unit_materialize_pinned.clear();
-        self.enforce_inprocessing_proof_overrides();
+        self.refresh_proof_consumer_state();
         // unit_proof_id, level0_proof_id, and clause_ids are now allocated
         // unconditionally at construction (#8069: Phase 2a). No resizing needed.
     }
@@ -134,24 +138,16 @@ impl Solver {
     ///
     /// # Panics
     ///
-    /// Panics if called after clauses have been added. Late enabling creates
-    /// unstable clause IDs because existing clauses have no LRAT IDs while
-    /// new clauses start allocation from 1, causing ID collisions.
+    /// Panics after any clause authority has been registered. Late enabling
+    /// would assign unstable or colliding clause IDs.
     pub fn enable_clause_trace(&mut self) {
-        assert!(
-            self.arena.is_empty(),
-            "BUG: enable_clause_trace() called after {} clauses were added — \
-             must be called before adding any clauses",
-            self.arena.num_clauses(),
-        );
-        // Enable LRAT mode for clause ID tracking
-        self.cold.lrat_enabled = true;
-        self.enforce_inprocessing_proof_overrides();
+        self.assert_can_enable_clause_trace();
         // unit_proof_id, level0_proof_id, and clause_ids are now allocated
         // unconditionally at construction (#8069: Phase 2a). No resizing needed.
         // Allocate clause trace
         let capacity = self.num_vars.saturating_mul(4).min(100_000);
         self.cold.clause_trace = Some(ClauseTrace::with_capacity(capacity));
+        self.refresh_proof_consumer_state();
     }
 
     /// Enable or disable UNSAT proof-certificate construction.
@@ -192,9 +188,14 @@ impl Solver {
         self.set_startup_walk_enabled(false);
     }
 
-    /// Check if clause trace is enabled
+    /// Whether a live clause trace is actively recording proof work.
+    ///
+    /// An exhausted trace remains available through [`Self::clause_trace`],
+    /// [`Self::snapshot_clause_trace`], and [`Self::take_clause_trace`] as
+    /// fail-closed evidence, but is no longer enabled for writes or routing.
+    #[must_use]
     pub fn clause_trace_enabled(&self) -> bool {
-        self.cold.clause_trace.is_some()
+        self.has_live_clause_trace()
     }
 
     /// Highest clause ID ever issued to an original (non-derived) clause.
@@ -217,38 +218,13 @@ impl Solver {
         self.is_original_clause_id(id)
     }
 
-    /// Take the clause trace, consuming it from the solver
-    ///
-    /// Returns `None` if clause trace was not enabled.
-    pub fn take_clause_trace(&mut self) -> Option<ClauseTrace> {
-        let solver_num_vars = self.total_num_vars();
-        let scope_assumptions = self.active_scope_assumptions();
-        let mut trace = self.cold.clause_trace.take();
-        if let Some(t) = trace.as_mut() {
-            t.stamp_solver_provenance(solver_num_vars, &scope_assumptions);
-            // #A2b observability: the two search-time proof bookkeeping
-            // meters (trace bytes recorded, root-trail entries rescanned by
-            // level-0 LRAT materialization) that calibrate the construction
-            // work budget.
-            tracing::debug!(
-                trace_used_bytes = t.used_bytes(),
-                trace_entries = t.len(),
-                materialize_root_trail_entries =
-                    self.stats.lrat_materialize_root_trail_entries
-                        + self.stats.lrat_materialize_minimize_root_trail_entries,
-                budget_remaining = ?self.cold.proof_bookkeeping_budget,
-                "clause trace taken (#A2b bookkeeping meters)"
-            );
-        }
-        trace
-    }
-
     /// Clone the clause trace and bind the snapshot to this solver's exact
     /// variable namespace.
     ///
     /// Unlike [`Self::clause_trace`], the returned value is an immutable proof
     /// candidate with bundled namespace provenance. Mutating its proof content
     /// through a public [`ClauseTrace`] mutator clears that provenance.
+    #[must_use]
     pub fn snapshot_clause_trace(&self) -> Option<ClauseTrace> {
         let mut trace = self.cold.clause_trace.clone()?;
         trace.stamp_solver_provenance(self.total_num_vars(), &self.active_scope_assumptions());
@@ -256,6 +232,7 @@ impl Solver {
     }
 
     /// Get a reference to the clause trace
+    #[must_use]
     pub fn clause_trace(&self) -> Option<&ClauseTrace> {
         self.cold.clause_trace.as_ref()
     }

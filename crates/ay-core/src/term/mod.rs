@@ -656,10 +656,9 @@ impl TermStore {
             .map_or(&[], Vec::as_slice)
     }
 
-    /// Copy parser-level quantifier metadata when a logically equivalent
-    /// quantifier is rebuilt (for example by the NNF `not exists` collector).
-    /// This metadata changes instantiation policy and rendering, never formula
-    /// truth, so copying it is sound and avoids silently losing user intent.
+    /// Copy metadata when a logically equivalent quantifier is rebuilt.
+    /// IDs, weights, and no-patterns mirror the source. `no_mbqi` is monotone
+    /// across hash-consed rewrites: either origin's restriction survives.
     pub fn copy_quantifier_metadata(&mut self, source: TermId, target: TermId) {
         let target_is_forall = matches!(self.get(target), TermData::Forall(..));
         if !target_is_forall && !matches!(self.get(target), TermData::Exists(..)) {
@@ -667,16 +666,17 @@ impl TermStore {
         }
 
         // Snapshot first: source and target may be the same interned term.
-        let no_mbqi = self.no_mbqi.contains(&source);
+        let no_mbqi =
+            target_is_forall && (self.no_mbqi.contains(&source) || self.no_mbqi.contains(&target));
         let qid = self.quantifier_id.get(&source).cloned();
         let skid = self.skolem_id.get(&source).cloned();
         let weight = self.quantifier_weight.get(&source).copied();
         let no_patterns = self.quantifier_no_patterns(source).to_vec();
 
-        // Mirror the source exactly. A rebuilt term can already be interned and
-        // carry metadata from an earlier construction, so only inserting
-        // present fields would leave stale annotations behind.
-        if no_mbqi && target_is_forall {
+        // Mirror ordinary metadata exactly. `no_mbqi` is the exception: a
+        // rebuilt term can hash-cons onto a distinct marked quantifier, so its
+        // restrictive instantiation policy is merged rather than cleared.
+        if no_mbqi {
             self.no_mbqi.insert(target);
         } else {
             self.no_mbqi.remove(&target);
@@ -1120,7 +1120,7 @@ impl TermStore {
 
     /// Snapshot every interned term as an ordered `(TermData, Sort)` list where
     /// position `i` corresponds to `TermId(i)`. This is the checker-only payload
-    /// needed to re-validate a proof offline: [`check_proof_strict`] reads terms
+    /// needed to re-validate a proof offline: `check_proof_strict` reads terms
     /// purely by index (`get`/`sort`) and never re-interns, so the hash-cons map,
     /// the name table, and the byte counters need not round-trip.
     #[must_use]
@@ -1132,10 +1132,10 @@ impl TermStore {
     }
 
     /// Rebuild a CHECKER-ONLY term store from a positional `(TermData, Sort)`
-    /// snapshot (see [`entries_snapshot`]). `TermId(i)` resolves to `entries[i]`,
+    /// snapshot (see `entries_snapshot`). `TermId(i)` resolves to `entries[i]`,
     /// preserving every id embedded in a serialized proof. The hash-cons interner
     /// and the name table are left EMPTY: this store supports `get`/`sort`/
-    /// `true_term`/`false_term` — everything [`check_proof_strict`] needs — but
+    /// `true_term`/`false_term` — everything `check_proof_strict` needs — but
     /// MUST NOT mint or look up terms (`mk_*`/`find_interned` would
     /// mis-deduplicate against the empty interner). `instance_term_bytes` is left
     /// at 0 so the `Drop` global-accounting path is a no-op for this transient

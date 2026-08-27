@@ -82,7 +82,7 @@ fn integer_sweep_no_invented_or_deleted_points() {
 
 #[test]
 fn fractional_coefficient_sweep() {
-    let cov = sweep(0x0fee_1dead_beefu64, 3000, true, 5);
+    let cov = sweep(0x0000_fee1_dead_beef_u64, 3000, true, 5);
     assert!(cov.fired > 300, "vacuous: fired {}", cov.fired);
     eprintln!(
         "adversary fractional sweep: fired {} fixed {} dropped {}",

@@ -14,7 +14,7 @@ Usage:
       --solver ay=./target/release/ay [--solver kissat=/tmp/kissat/build/kissat] \
       --out results.json
 """
-import argparse, concurrent.futures as cf, functools, glob, json, os, subprocess, sys, time
+import argparse, concurrent.futures as cf, datetime, functools, glob, hashlib, json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build
 
@@ -32,6 +32,108 @@ def kissat_accepts_options(path):
         return probe.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+def solver_reported_memout(result):
+    """True when the captured output carries ay's graceful memout marker.
+
+    The binary's memout grammar (crates/ay/src/main.rs, MEMOUT_* constants):
+      - SMT-LIB grammar: stdout `unknown`, stderr `(:reason-unknown "memout")`,
+        rc 124 -- the bare rc fallback used to mislabel these rows "timeout"
+        (impossible 8 s "timeouts" on a 300 s budget).
+      - --competition grammar: `c memout` on BOTH stdout and stderr plus
+        `s UNKNOWN`, rc 0. The stdout copy is load-bearing here:
+        ~/ay-bench/bin/ay-proofmode discards the child's stderr, so a
+        proof-mode sweep only ever sees the stdout marker.
+    """
+    for stream in (result.stdout, result.stderr):
+        if '(:reason-unknown "memout")' in stream:
+            return True
+        if any(line.strip() == "c memout" for line in stream.splitlines()):
+            return True
+    return False
+
+
+SOLVER_WALL_RE = re.compile(r"\b(?:wall_time_ms|ay-wall-ms)=(\d+)")
+
+
+def solver_reported_wall_ms(result):
+    """AY's OWN wall clock, or None.
+
+    Two spellings, because the number lives on STDERR (`c ay.session.end ...
+    wall_time_ms=`) and ~/ay-bench/bin/ay-proofmode discards the child's stderr:
+    the wrapper re-publishes it on stdout as `c ay-wall-ms=`.
+
+    The harness clock is not the solve time: it also carries wrapper fork
+    overhead and, in proof mode, whatever the wrapper does after the solver
+    exits. Pricing a row at the solver's own clock is what makes a proof-mode
+    PAR-2 mean the same thing as a bare-binary one. See
+    scripts/verify_proof_manifest.py for the three configurations this
+    distinction protects.
+    """
+    for stream in (result.stdout, result.stderr):
+        hits = SOLVER_WALL_RE.findall(stream or "")
+        if hits:
+            return int(hits[-1])
+    return None
+
+# SAT Competition 2026 Main Track envelope, from
+# https://satcompetition.github.io/2026/tracks.html : "The solvers will be
+# executed with a time limit of 5000 seconds and memory limit of 32GB." (It was
+# 128 GB in 2024 and 30 GB in 2025, so this is re-checked per year, not assumed.)
+#
+# This constant exists because a sweep silently measured against a cap 5.3x
+# tighter than the competition's: six workers sharing one 137 GB box got
+# --mem-mb 6000 each, and 23 instances were recorded `memout` and counted as
+# losses. Re-run at 32 GB, they solve -- 6.xz in 9.4 s at 7.1 GB peak,
+# oddball_70_5 in 188 s at 13.6 GB, both models verified against the full CNF.
+# A memout under a sub-competition cap is an UNMEASURED row, exactly as a
+# missing proof verdict is unmeasured rather than unverified.
+SATCOMP_MEMORY_LIMIT_MB = 32_768
+
+
+def solver_provenance(path):
+    """Identify WHICH build produced a run's rows.
+
+    A sweep JSON used to record `solver_configuration: "competition"` and
+    nothing else, so a row could not be attributed to a binary. That is not
+    cosmetic: on 2026-08-26 simon-r20-0/simon-r22-1 sat in
+    proofmode-full400-aug25-corrected.json as 300 s timeouts while the binary
+    on disk solved both in ~85 ms through the identical wrapper, NBCORE and
+    memory cap. The rows were stale -- produced by an older build, kept after
+    the regression was fixed -- and there was no way to prove that from the
+    file. Everything derived from such a file inherits the error, so record
+    the identity of the binary alongside the numbers.
+
+    Hashing is capped: a solver binary is tens of MB, but some entries are
+    shell wrappers of a few hundred bytes, and both must be identified.
+    """
+    info = {"path": path}
+    real = shutil.which(path) or path
+    try:
+        st = os.stat(real)
+        info["resolved"] = os.path.realpath(real)
+        info["size"] = st.st_size
+        info["mtime_utc"] = datetime.datetime.utcfromtimestamp(
+            st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+        h = hashlib.sha256()
+        with open(real, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        info["sha256"] = h.hexdigest()
+    except OSError as e:
+        info["error"] = str(e)
+        return info
+    # Best-effort build stamp. A wrapper script has no --version and must not
+    # be allowed to hang or to pollute the record with a usage error.
+    try:
+        p = subprocess.run([real, "--version"], capture_output=True,
+                           text=True, timeout=20)
+        if p.returncode == 0 and p.stdout.strip():
+            info["version"] = p.stdout.strip().splitlines()[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return info
+
 
 def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1, extra=(),
             proof_mode=False):
@@ -94,14 +196,23 @@ def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1, extra=(
             if ls == "s UNSATISFIABLE" or ls.endswith(" UNSATISFIABLE"):
                 verdict = "unsat"; break
         if verdict == "unknown":
-            if rc == 10: verdict = "sat"
+            # A solver-reported memout outranks every rc fallback: the SMT-LIB
+            # grammar exits 124 (which the bare rc rule read as "timeout") and
+            # the --competition grammar exits 0 (which read as "unknown").
+            if solver_reported_memout(result):
+                verdict = "memout"
+            elif rc == 10: verdict = "sat"
             elif rc == 20: verdict = "unsat"
             elif rc == 124: verdict = "timeout"
-    return {"solver": solver_name, "cnf": os.path.basename(cnf),
-            "verdict": verdict, "time": round(elapsed, 2), "rc": rc,
-            "memout": result.memout, "timed_out": result.timed_out,
-            "output_truncated": result.output_truncated,
-            "cancelled": result.cancelled}
+    row = {"solver": solver_name, "cnf": os.path.basename(cnf),
+           "verdict": verdict, "time": round(elapsed, 2), "rc": rc,
+           "memout": result.memout, "timed_out": result.timed_out,
+           "output_truncated": result.output_truncated,
+           "cancelled": result.cancelled}
+    wall_ms = solver_reported_wall_ms(result)
+    if wall_ms is not None:
+        row["solver_wall_ms"] = wall_ms
+    return row
 
 def main():
     ap = argparse.ArgumentParser()
@@ -117,8 +228,10 @@ def main():
     ap.add_argument("--proof-mode", action="store_true",
                     help="do NOT pass --no-proof to ay* solvers, so the run matches the "
                          "competition configuration (the submission always writes a proof). "
-                         "Pair with a solver wrapper that requests --proof and checks the "
-                         "certificate, e.g. ~/ay-bench/bin/ay-proofmode.")
+                         "Pair with a solver wrapper that requests --proof, e.g. "
+                         "~/ay-bench/bin/ay-proofmode. The wrapper RETAINS each certificate "
+                         "and defers verification to scripts/verify_proof_manifest.py, so "
+                         "this sweep's unsat count is PROVISIONAL until that join runs.")
     ap.add_argument("--phantom-memout-frac", type=float, default=0.15,
                     help="a memout/SIGKILL row that dies in under this fraction of "
                          "the timeout is suspect (rss watchdog tripped by CONCURRENT "
@@ -169,6 +282,11 @@ def main():
           f"timeout: {args.timeout}s  workers: {args.workers}  "
           f"memory: {enforced_mem_mb}MiB/child NBCORE={plan.nbcore} "
           f"enforcement=rss_watchdog", flush=True)
+    if enforced_mem_mb < SATCOMP_MEMORY_LIMIT_MB:
+        print(f"  !! memout rows are UNMEASURED, not losses: {enforced_mem_mb} MiB/child "
+              f"is below SAT-COMP's {SATCOMP_MEMORY_LIMIT_MB} MiB. Re-run any memout at "
+              f"--mem-mb {SATCOMP_MEMORY_LIMIT_MB} before counting it against the solver.",
+              flush=True)
 
     jobs = [(name, path, cnf) for cnf in cnfs for name, path in solvers.items()]
     results = []
@@ -247,11 +365,37 @@ def main():
         if len(set(defs.values())) > 1:
             disagreements.append({"cnf": cnf, "verdicts": verdicts})
 
+    # Name the configuration in the artifact itself. Three exist and this
+    # campaign has repeatedly conflated them: (1) `--competition --no-proof`
+    # (upper bound only, never a score), (2) `--competition --proof ...
+    # --no-verify-proof` (what the submission runs; its wall time IS the solve
+    # time and its solved count is what compares with the official field), and
+    # (3) (2) plus an OFFLINE certificate pass (the honest score). A sweep only
+    # ever produces (1) or (2); reaching (3) requires
+    # scripts/verify_proof_manifest.py score. See that file's header.
+    configuration = "competition" if args.proof_mode else "no-proof"
+    # Identity of every binary that produced a row, so a future reader can tell
+    # a stale result from a current one instead of assuming (see
+    # solver_provenance).
+    provenance = {name: solver_provenance(path)
+                  for name, path in sorted(solvers.items())}
+    # An ay* entry is usually the ay-proofmode wrapper, whose own hash says
+    # nothing about the solver; record the ay build it dispatches to as well.
+    ay_bin = os.environ.get("AY_PROOFMODE_BIN") or "./target/release/ay"
+    if any(n.startswith("ay") for n in solvers) and os.path.exists(ay_bin):
+        provenance["_ay_binary"] = solver_provenance(ay_bin)
     out = {"timeout_s": args.timeout, "workers": args.workers,
+           "solver_configuration": configuration,
+           "solver_provenance": provenance,
            "resource_plan": {
                "requested_jobs": requested_workers,
                "jobs": args.workers,
                "memlimit_mb_per_child": enforced_mem_mb,
+               "satcomp_memory_limit_mb": SATCOMP_MEMORY_LIMIT_MB,
+               # True => this run's `memout` rows say nothing about the solver's
+               # competition behaviour and must not be scored as losses.
+               "memout_rows_are_unmeasured":
+                   enforced_mem_mb < SATCOMP_MEMORY_LIMIT_MB,
                "nbcore_per_child": plan.nbcore,
                "headroom_mb": plan.headroom_mb,
                "enforcement": "exec-stopped + rss-watchdog-zero-grace(all solvers); "
@@ -274,6 +418,16 @@ def main():
             print(f"  {d['cnf']}: {d['verdicts']}", flush=True)
     else:
         print("\nno soundness disagreements", flush=True)
+    if args.proof_mode:
+        print("\n--- configuration (2): --competition + an explicit proof, NOT "
+              "re-checked in-process ---", flush=True)
+        print("The count above is SOLVED (competition mode) and is PROVISIONAL "
+              "as a score: certificates", flush=True)
+        print("are verified OFFLINE, outside the solve budget. Drain and join "
+              "before quoting a standing:", flush=True)
+        print("  scripts/verify_proof_manifest.py drain", flush=True)
+        print(f"  scripts/verify_proof_manifest.py score --sweep {args.out}",
+              flush=True)
     print(f"\nwrote {args.out}", flush=True)
 
 if __name__ == "__main__":

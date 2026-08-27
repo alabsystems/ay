@@ -70,9 +70,18 @@ impl Executor {
         &self,
         clause: TermId,
     ) -> Option<Vec<(TermId, TermId, TermId)>> {
-        let recorded = self
+        let Some(recorded) = self
             .array_ext_witness_cache
-            .generated_clause_bindings(&self.ctx.terms, clause)?;
+            .generated_clause_bindings(&self.ctx.terms, clause)
+        else {
+            // STRICTLY LAST, and only where the clause-keyed lookup already
+            // returned nothing: recover the same generation-site fact through
+            // the PAIR key. Nothing an exact record would have licensed can
+            // change class here.
+            return self
+                .folded_array_extensionality_by_pair(clause)
+                .map(|binding| vec![binding]);
+        };
         if let Some(recognized) =
             ay_proof::recognize_array_extensionality_chain(&self.ctx.terms, &[clause])
         {
@@ -113,6 +122,81 @@ impl Executor {
             generated.array_a,
             generated.array_b,
         )])
+    }
+
+    /// Recover a generation-site-authenticated extensionality axiom whose
+    /// witness reads a LATER preprocessing pass already folded away.
+    ///
+    /// ## Why the clause-keyed record is not enough
+    ///
+    /// `generated_clause_bindings` is keyed by the exact clause TERM, recorded
+    /// the instant `add_array_extensionality_axioms` mints it. The eager
+    /// BV/array lane then re-runs `expand_select_store_all_adaptive` over the
+    /// WHOLE assertion stack — including axioms already injected into it — so
+    /// for a `(store (as const …) i v)` right-hand side the assertion that
+    /// actually reaches the proof is
+    ///
+    /// ```text
+    /// (or (= a C) (not (= (select a k) (ite (= i k) v default))))
+    /// ```
+    ///
+    /// a DIFFERENT term from the recorded one. The exact lookup misses, no
+    /// promotion happens, and the axiom ships as a premiseless `:rule trust`
+    /// step whose clause is not a theorem: two arrays that agree at one index
+    /// are not equal (`k = 0`, `C = [true, false]`, `E = [true, true]`
+    /// falsifies it). That step is exactly as unjustified as the 152 unguarded
+    /// ROW2 units this campaign fixed at source.
+    ///
+    /// ## What it is entitled to claim, and how that is re-established
+    ///
+    /// The producer is entitled to the FRESH-WITNESS conservative extension,
+    /// which is what `TheoryLemmaKind::ArrayExtensionality` means and what
+    /// `validate_array_extensionality` checks. Two independent facts license
+    /// it, and neither is taken on faith here:
+    ///
+    ///  * the witness comes from the generation-site cache, keyed by the
+    ///    canonical array PAIR and identity-checked (name + `Var` id + sort),
+    ///    never from the `__ay_ext_diff` spelling;
+    ///  * `ay_proof::recognize_folded_array_extensionality` re-derives, from
+    ///    the McCarthy axioms alone, that this exact clause IS the
+    ///    extensionality axiom for that pair at that witness.
+    ///
+    /// Both must hold; either failing leaves the step exactly as it was. The
+    /// strict checker re-establishes the whole-proof half independently
+    /// (freshness against the problem, bound-once, acyclic dependencies) from
+    /// the `array_ext_diff_intro` steps the promotion appends, so a promotion
+    /// this method gets wrong is REJECTED rather than believed.
+    fn folded_array_extensionality_by_pair(
+        &self,
+        clause: TermId,
+    ) -> Option<(TermId, TermId, TermId)> {
+        let terms = &self.ctx.terms;
+        let literals = flattened_clause_literals(terms, clause);
+        // The one-level schema, and only it: a longer clause is not this axiom.
+        if literals.len() != 2 {
+            return None;
+        }
+        for &root in &literals {
+            let Some((array_a, array_b)) = positive_array_equality_sides(terms, root) else {
+                continue;
+            };
+            let Some(witness) = self
+                .array_ext_witness_cache
+                .pair_witness(terms, array_a, array_b)
+            else {
+                continue;
+            };
+            if ay_proof::recognize_folded_array_extensionality(
+                terms,
+                &[clause],
+                array_a,
+                array_b,
+                witness,
+            ) {
+                return Some((witness, array_a, array_b));
+            }
+        }
+        None
     }
 
     /// Replace injected extensionality assumptions with certified
@@ -288,6 +372,37 @@ fn promotable_clause_term(step: &ProofStep) -> Option<TermId> {
         } if premises.is_empty() && args.is_empty() && clause.len() == 1 => Some(clause[0]),
         _ => None,
     }
+}
+
+/// One level of `or` flattening, the same normalization the checker's
+/// `flatten_clause_literals` performs before recognizing an axiom clause.
+fn flattened_clause_literals(terms: &ay_core::TermStore, clause: TermId) -> Vec<TermId> {
+    match terms.get(clause) {
+        ay_core::TermData::App(symbol, args) if symbol.name() == "or" => args.clone(),
+        _ => vec![clause],
+    }
+}
+
+/// The two sides of a POSITIVE equality between two DISTINCT array terms.
+///
+/// Polarity is load-bearing: the extensionality axiom's root literal is the
+/// positive `(= a b)`. Reading a NEGATED array equality as the pair would
+/// select the mirror clause, which is a different (and false) claim.
+fn positive_array_equality_sides(
+    terms: &ay_core::TermStore,
+    literal: TermId,
+) -> Option<(TermId, TermId)> {
+    let ay_core::TermData::App(symbol, args) = terms.get(literal) else {
+        return None;
+    };
+    if symbol.name() != "=" || args.len() != 2 {
+        return None;
+    }
+    let (lhs, rhs) = (args[0], args[1]);
+    if lhs == rhs || !matches!(terms.sort(lhs), ay_core::Sort::Array(_)) {
+        return None;
+    }
+    (terms.sort(lhs) == terms.sort(rhs)).then_some((lhs, rhs))
 }
 
 fn ordered(a: TermId, b: TermId) -> (TermId, TermId) {

@@ -276,6 +276,16 @@ impl FpSolver<'_> {
             }
             "fp.div" => {
                 let rm = self.get_rounding_mode(args[0]);
+                // Dividing by a constant power of two is exact scaling, so the
+                // reciprocal multiply is the same value through a circuit an
+                // order of magnitude smaller (#fp-div-pow2). The divider is
+                // this bit-blaster's most expensive gate by a wide margin, so
+                // this is checked before it is built, not after.
+                if let Some(result) =
+                    self.try_make_div_by_power_of_two(args[1], args[2], rm, precision)
+                {
+                    return result;
+                }
                 let x = self.get_fp(args[1]);
                 let y = self.get_fp(args[2]);
                 self.make_div(&x, &y, rm)

@@ -63,6 +63,33 @@ impl PdrSolver {
             return SmtResult::Unsat;
         }
 
+        // `timeout` bounds the WHOLE split, not one check of it.
+        //
+        // `scoped_check_timeout` is a PER-CHECK bound and
+        // `check_sat_with_ite_case_split` issues one check per LEAF (ITE
+        // pre-split to `MAX_ITE_SPLIT_DEPTH`, the OR/disequality fallbacks,
+        // and `decide_bool_mod_unsat`'s exhaustive split over up to
+        // `MAX_BOOL_SPLIT_VARS` Booleans), so the bound multiplied. Every
+        // caller derives `timeout` from the remainder of the enclosing
+        // per-clause verification budget (`current_verify_step_timeout`,
+        // `VERIFY_CASE_SPLIT_TIMEOUT.min(remaining)`), so the multiplier is
+        // exactly how that budget gets exceeded. Measured at a 20s adaptive
+        // budget over the extra-small-lia corpus: 7 of 250 calls ran past
+        // their `timeout`, worst 680ms against 200ms (3.40x) on
+        // `count_by_2_m_nest_000` and 618ms (3.09x) twice on `dillig12_m_000`.
+        //
+        // The recursion already consults the thread SMT deadline
+        // (`smt_deadline_expired()` at its entry; `check_sat` clamps every
+        // per-check timeout through `clamp_timeout_to_smt_deadline`) — it was
+        // simply never armed on this path. `ScopedSmtDeadline` only ever
+        // TIGHTENS, so an enclosing engine deadline still wins, and the guard
+        // is released when this call returns.
+        //
+        // Verdict-safe by construction: an expired deadline yields `Unknown`
+        // for that leaf, `any_unknown` then suppresses the all-branches-UNSAT
+        // conclusion, and every caller treats `Unknown` as "not decided" and
+        // falls through. It can lose an UNSAT, never fabricate one.
+        let _split_deadline = crate::smt::ScopedSmtDeadline::install(timeout);
         let _timeout = smt.scoped_check_timeout(Some(timeout));
         let (result, _) = Self::check_sat_with_ite_case_split(smt, verbose, &simplified);
         result

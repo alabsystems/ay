@@ -169,11 +169,43 @@ impl Executor {
     /// or when the term is reachable from current assertions.
     #[inline]
     fn term_in_array_scope(&self, term_id: TermId) -> bool {
+        // A term built over a witness only a PREVIOUS query could name is out
+        // of scope no matter what the reachability filter says — see
+        // `array_axiom_dead_skolems`. This is checked first because it is the
+        // one exclusion that also applies when no scope filter is active at
+        // all, which is the ordinary state of a non-incremental solve.
+        if self.term_indexes_dead_skolem(term_id) {
+            return false;
+        }
         match &self.array_axiom_scope {
             None => true,
             Some((reachable, start_len)) => {
                 (term_id.0 as usize) >= *start_len || reachable.contains(&term_id)
             }
+        }
+    }
+
+    /// Whether `term_id` IS, or is applied directly to, a dead engine-minted
+    /// witness from an earlier query (see `array_axiom_dead_skolems`).
+    ///
+    /// One level deep is exactly the leak surface: the whole-store scans admit
+    /// `select`/`store`/`=` applications and then use their INDEX argument as
+    /// an axiom index, so a dead witness reaches axiom generation only as a
+    /// direct operand. Deeper occurrences are reached through their own
+    /// enclosing application, which this same test declines.
+    #[inline]
+    fn term_indexes_dead_skolem(&self, term_id: TermId) -> bool {
+        if self.array_axiom_dead_skolems.is_empty() {
+            return false;
+        }
+        if self.array_axiom_dead_skolems.contains(&term_id) {
+            return true;
+        }
+        match self.ctx.terms.get(term_id) {
+            TermData::App(_, args) => args
+                .iter()
+                .any(|arg| self.array_axiom_dead_skolems.contains(arg)),
+            _ => false,
         }
     }
 

@@ -464,6 +464,11 @@ impl Solver {
             self.trail_lim[lim_idx] = write;
             lim_idx += 1;
         }
+        // #relevancy-frontier-incremental: the incremental relevancy frontier
+        // folds a PREFIX of the trail; rewriting the trail outside backtrack
+        // invalidates that correspondence, so drop the cache (the next query
+        // rebuilds with the original from-scratch walk).
+        self.relevancy_frontier.invalidate();
         self.trail.truncate(write);
         self.qhead = new_qhead.unwrap_or(write);
         self.no_conflict_until = new_ncu.unwrap_or(write);

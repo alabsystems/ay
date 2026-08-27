@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Bounded opt-in diagnostics for strict certification rejection.
+//! Bounded opt-in diagnostics for strict certification and datatype derivation.
 
 use ay_core::{ProofId, TermId};
 
@@ -17,11 +17,37 @@ const CERT_REJECT_PROBE_MAX_TERM_CHARS: usize = 8 * 1024;
 /// `(incomplete self-check-rejected)` reason code, so the gate that actually
 /// refused a refutation -- and, for a strict-checker refusal, the Alethe rule
 /// and step it names -- is otherwise unobservable outside this crate. The
-/// message is computed lazily so an unset variable costs one `var_os` probe.
+/// message is computed lazily so a disabled typed flag does no formatting.
 pub(in crate::executor) fn probe_cert_reject(message: impl FnOnce() -> String) {
-    if ay_core::misc_cli_flags().probe_cert_reject {
-        eprintln!("--probe-cert-reject: {}", message());
+    emit_probe_cert_reject(ProbeFormat::Prefixed, message);
+}
+
+/// Print one unprefixed certification/datatype diagnostic through the shared
+/// output boundary.
+///
+/// Raw diagnostics retain their historical `c ...` spelling and are visible
+/// only under `--probe-cert-reject`. Callers still decide which work to perform:
+/// in particular, the authority census remains guarded by the same typed flag
+/// before it invokes this sink.
+pub(crate) fn probe_cert_reject_raw(message: impl FnOnce() -> String) {
+    emit_probe_cert_reject(ProbeFormat::Raw, message);
+}
+
+enum ProbeFormat {
+    Prefixed,
+    Raw,
+}
+
+fn emit_probe_cert_reject(format: ProbeFormat, message: impl FnOnce() -> String) {
+    let enabled = ay_core::misc_cli_flags().probe_cert_reject;
+    if !enabled {
+        return;
     }
+    let prefix = match format {
+        ProbeFormat::Prefixed => "--probe-cert-reject: ",
+        ProbeFormat::Raw => "",
+    };
+    ay_core::safe_eprintln!("{prefix}{}", message());
 }
 
 impl Executor {

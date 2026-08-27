@@ -269,6 +269,112 @@ fn test_preprocess_symmetry_drat_proof_has_no_sbp_clause() {
 }
 
 #[test]
+fn composite_symmetry_does_not_unlock_the_retired_dpr_route() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        composite_symmetry: true,
+        ..Default::default()
+    });
+    let mut solver = Solver::with_proof(3, Vec::<u8>::new());
+    solver.set_symmetry_oneshot(true);
+    add_swap_pair_formula(&mut solver);
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(
+        !changed,
+        "plain composite symmetry must stay off proof surfaces"
+    );
+    assert_eq!(solver.arena.active_clause_count(), before);
+    assert_eq!(
+        solver.cold.symmetry_stats.last_skipped_reason,
+        Some(crate::symmetry::SymmetrySkipReason::ProofMode),
+    );
+}
+
+#[test]
+fn signed_symmetry_stays_no_proof_only() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        signed_symmetry: true,
+        ..Default::default()
+    });
+    let mut solver = Solver::with_proof(3, Vec::<u8>::new());
+    solver.set_symmetry_oneshot(true);
+    add_swap_pair_formula(&mut solver);
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(!changed, "signed symmetry must stay off proof surfaces");
+    assert_eq!(solver.arena.active_clause_count(), before);
+    assert!(!solver
+        .cold
+        .symmetry_stats
+        .routes
+        .iter()
+        .any(|(route, _)| *route == "signed"));
+}
+
+#[test]
+fn hhw_remains_the_general_composite_proof_route() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        no_symmetry_sr_auxfree: true,
+        composite_symmetry: true,
+        symmetry_hhw: true,
+        ..Default::default()
+    });
+    let mut solver = Solver::with_proof(3, Vec::<u8>::new());
+    solver.set_symmetry_oneshot(true);
+    add_swap_pair_formula(&mut solver);
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(changed, "HHW must remain enabled on a DRAT proof surface");
+    assert!(solver.arena.active_clause_count() > before);
+    assert_eq!(
+        solver.user_num_vars, 3,
+        "HHW auxiliaries must stay internal"
+    );
+}
+
+#[test]
+fn auxfree_miss_reapplies_the_ir_variable_cap_before_fallback() {
+    let _switches = ay_core::sat_ab_test_override::set(ay_core::SatAbSwitches {
+        no_orbitope: true,
+        composite_symmetry: true,
+        ..Default::default()
+    });
+    // One variable above the generic IR cap. The aux-free detector may inspect
+    // this larger instance, but an aux-free miss must not unlock generic IR.
+    let mut solver = Solver::new(4_097);
+    solver.set_symmetry_oneshot(true);
+    assert!(solver.add_clause(vec![
+        Literal::positive(Variable(0)),
+        Literal::positive(Variable(1)),
+    ]));
+    assert!(solver.add_clause(vec![
+        Literal::negative(Variable(0)),
+        Literal::negative(Variable(1)),
+    ]));
+
+    let before = solver.arena.active_clause_count();
+    let (unsat, changed) = solver.preprocess_symmetry();
+    assert!(!unsat);
+    assert!(!changed);
+    assert_eq!(solver.arena.active_clause_count(), before);
+    assert_eq!(
+        solver.cold.symmetry_stats.last_skipped_reason,
+        Some(crate::symmetry::SymmetrySkipReason::TooLarge),
+    );
+}
+
+#[test]
 fn test_preprocess_symmetry_skips_lrat_mode() {
     // LRAT mode requires explicit resolution hints; symmetry should be skipped.
     use crate::ProofOutput;
@@ -376,3 +482,5 @@ fn test_preprocess_symmetry_skips_clause_trace_reconstruction_mode() {
     );
     assert_eq!(solver.cold.symmetry_stats.sb_clauses_added, 0);
 }
+
+include!("symmetry_orbitope_proof_surface_tests.rs");

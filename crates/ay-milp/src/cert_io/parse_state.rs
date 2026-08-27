@@ -33,6 +33,7 @@ impl ParseState {
                 optcert: None,
                 optcert_trivial: false,
                 tree: None,
+                opt_tree: None,
                 affine_aggregation: None,
                 parity_infeasibility: None,
                 sat_relu_infeasibility: None,

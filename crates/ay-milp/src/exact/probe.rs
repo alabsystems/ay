@@ -132,7 +132,7 @@ pub(super) fn tick() {
         v
     });
     let stride = TRACE.with(std::cell::Cell::get);
-    if stride > 0 && n % stride == 0 {
+    if stride > 0 && n.is_multiple_of(stride) {
         let (w, s) = WIN.with(|p| p.replace((0, 0)));
         let share = if w == 0 {
             100.0

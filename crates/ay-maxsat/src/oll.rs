@@ -9470,7 +9470,7 @@ mod lp_boost_tests {
         // no descent, so the bar stays absolute — note the scaled bar would
         // have been 300_000 * 128, i.e. this is not a coincidence of clamping.
         let wide = mk(vec![500_000, 300_000, 300_000]);
-        assert!(500_000 + 300_000 + 300_000 > GTE_CHEAP_OUTS);
+        assert!(wide.soft_weights.iter().copied().sum::<Weight>() > GTE_CHEAP_OUTS);
         assert_eq!(wide.descent_kick_gap_cap(), DESCENT_KICK_GAP);
 
         // The A/B escape restores the pre-2026-08-02 absolute bar. It reads the
@@ -9506,7 +9506,20 @@ mod lp_boost_tests {
         );
         // The window must leave room for the minimum sample, or the gate can
         // never open.
-        assert!(COLD_CORE_WINDOW >= COLD_CORE_MIN_SAMPLE);
+        const {
+            assert!(COLD_CORE_WINDOW >= COLD_CORE_MIN_SAMPLE);
+        }
+    }
+
+    /// Builds synthetic history without relying on platform-specific `Instant`
+    /// subtraction panics.
+    fn checked_test_instant_sub(
+        instant: Instant,
+        duration: Duration,
+    ) -> Result<Instant, &'static str> {
+        instant
+            .checked_sub(duration)
+            .ok_or("test fixture exceeds the platform Instant range")
     }
 
     /// #cold-core-descent. The rate gate's whole job is to be RELATIVE: the
@@ -9527,7 +9540,8 @@ mod lp_boost_tests {
     /// improve, and the `lsu_min_cores == u64::MAX` "descents never engage"
     /// tuning sentinel.
     #[test]
-    fn cold_core_gate_measures_the_drought_against_the_instances_own_rate() {
+    fn cold_core_gate_measures_the_drought_against_the_instances_own_rate(
+    ) -> Result<(), &'static str> {
         // An engine with an incumbent and a synthetic search history: `n`
         // intervals of `gap_ms`, then a drought of exactly `drought` running
         // right now.
@@ -9540,34 +9554,34 @@ mod lp_boost_tests {
             // leaves this white-box fixture alone.
             let mut engine = OllEngine::new(4, ClauseStore::new(), soft_store, vec![7, 5, 5]);
             engine.best_model = Some(vec![false; 4]);
-            let last = Instant::now() - drought;
-            let base = last - Duration::from_millis(gap_ms * n as u64);
+            let last = checked_test_instant_sub(Instant::now(), drought)?;
+            let base = checked_test_instant_sub(last, Duration::from_millis(gap_ms * n as u64))?;
             for i in 0..=n {
                 engine.note_search_core(base + Duration::from_millis(gap_ms * i as u64));
             }
-            engine
+            Ok(engine)
         };
-        let started = |elapsed: Duration| Instant::now() - elapsed;
-        let run = Duration::from_secs(300);
+        let started = |elapsed: Duration| checked_test_instant_sub(Instant::now(), elapsed);
+        let run = Duration::from_mins(5);
 
         // Cheap cores (200ms trailing median): 12 * 200ms is a lull, not a
         // collapse, so the absolute floor is the binding bar. 30_000 written
         // out, not `COLD_CORE_MIN_DROUGHT.as_millis()`.
-        let fast = mk(200, 16, Duration::from_secs(5));
+        let fast = mk(200, 16, Duration::from_secs(5))?;
         assert_eq!(fast.core_gap_median_ms, 200);
         assert_eq!(fast.cold_core_bar_ms(), 30_000);
         assert!(
-            !fast.core_discovery_cold(started(run)),
+            !fast.core_discovery_cold(started(run)?),
             "a 5s lull on a 200ms-median instance is not a collapse",
         );
         assert!(
-            mk(200, 16, Duration::from_secs(45)).core_discovery_cold(started(run)),
+            mk(200, 16, Duration::from_secs(45))?.core_discovery_cold(started(run)?),
             "225x the instance's own interval must read as cold",
         );
 
         // Expensive cores (5s trailing median, the rna-alignment/protein_ins
         // shape): the RELATIVE term takes over and the floor goes inert.
-        let slow = mk(5_000, 16, Duration::from_secs(30));
+        let slow = mk(5_000, 16, Duration::from_secs(30))?;
         assert_eq!(slow.core_gap_median_ms, 5_000);
         assert_eq!(
             slow.cold_core_bar_ms(),
@@ -9581,45 +9595,46 @@ mod lp_boost_tests {
              adaptive comment",
         );
         assert!(
-            !slow.core_discovery_cold(started(run)),
+            !slow.core_discovery_cold(started(run)?),
             "30s without a core is ordinary on a 5s-per-core instance: firing \
              here is the premature entry that costs the slow-walk families",
         );
         assert!(
-            mk(5_000, 16, Duration::from_secs(90)).core_discovery_cold(started(run)),
+            mk(5_000, 16, Duration::from_secs(90))?.core_discovery_cold(started(run)?),
             "18x its own interval is a collapse even on a slow instance",
         );
 
         // Brakes, all with written-out numbers.
         assert!(
-            !mk(200, 7, Duration::from_secs(300)).core_discovery_cold(started(run)),
+            !mk(200, 7, Duration::from_mins(5))?.core_discovery_cold(started(run)?),
             "must not fire on 7 observed intervals (the minimum sample is 8)",
         );
         assert!(
-            mk(200, 8, Duration::from_secs(300)).core_discovery_cold(started(run)),
+            mk(200, 8, Duration::from_mins(5))?.core_discovery_cold(started(run)?),
             "8 intervals is the minimum sample, so the gate is live there",
         );
         assert!(
-            !mk(200, 16, Duration::from_secs(300))
-                .core_discovery_cold(started(Duration::from_secs(10))),
+            !mk(200, 16, Duration::from_mins(5))?
+                .core_discovery_cold(started(Duration::from_secs(10))?),
             "must not enter 10s into a run (the opening floor is 20s)",
         );
-        let mut no_incumbent = mk(200, 16, Duration::from_secs(300));
+        let mut no_incumbent = mk(200, 16, Duration::from_mins(5))?;
         no_incumbent.best_model = None;
         assert!(
-            !no_incumbent.core_discovery_cold(started(run)),
+            !no_incumbent.core_discovery_cold(started(run)?),
             "no incumbent => nothing for the descent to improve",
         );
-        let mut never = mk(200, 16, Duration::from_secs(300));
+        let mut never = mk(200, 16, Duration::from_mins(5))?;
         never.tuning.lsu_min_cores = u64::MAX;
         assert!(
-            !never.core_discovery_cold(started(run)),
+            !never.core_discovery_cold(started(run)?),
             "u64::MAX is the tuning sentinel for 'descents never engage'",
         );
 
         // Default-ON escape hatch, read through a OnceLock (assert the
         // default rather than flipping the process environment mid-test).
         assert!(cold_core_descent_enabled(), "lever must default ON");
+        Ok(())
     }
 
     /// #cold-core-descent: the rate baseline must TRACK THE RECENT WALK, not
@@ -9637,12 +9652,13 @@ mod lp_boost_tests {
     /// baseline freezes and the drought grows past it. Both halves are asserted
     /// here.
     #[test]
-    fn cold_core_rate_baseline_tracks_the_recent_walk_not_the_opening_burst() {
+    fn cold_core_rate_baseline_tracks_the_recent_walk_not_the_opening_burst(
+    ) -> Result<(), &'static str> {
         let mut soft_store = ClauseStore::new();
         soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
         let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
         engine.best_model = Some(vec![false; 2]);
-        let mut at = Instant::now() - Duration::from_secs(3_600);
+        let mut at = checked_test_instant_sub(Instant::now(), Duration::from_hours(1))?;
 
         // A fast opening fills the window: 16 intervals of 500ms.
         for _ in 0..=16 {
@@ -9674,25 +9690,32 @@ mod lp_boost_tests {
             "the baseline must track the RECENT walk, not the opening burst",
         );
         assert_eq!(engine.cold_core_bar_ms(), 480_000);
-        engine.pause_core_drought_at(at + Duration::from_secs(60));
+        engine.pause_core_drought_at(at + Duration::from_mins(1));
         assert!(
-            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(3_600)),
+            !engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_hours(1),
+            )?),
             "60s without a core on a 40s-per-core walk is one slow step, not a \
              collapse — this is the brake that protects rna-alignment",
         );
 
         // Anti-self-cancellation: once cores STOP, no further interval is
         // recorded, so the baseline freezes and the drought overtakes it.
-        engine.core_drought = Duration::from_secs(600);
+        engine.core_drought = Duration::from_mins(10);
         engine.core_drought_since = None;
         assert_eq!(
             engine.core_gap_median_ms, 40_000,
             "a drought contributes no interval, so it cannot raise its own bar",
         );
         assert!(
-            engine.core_discovery_cold(Instant::now() - Duration::from_secs(3_600)),
+            engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_hours(1),
+            )?),
             "10 minutes with no core against a 40s walk is a collapse",
         );
+        Ok(())
     }
 
     /// #cold-core-descent D1: the drought clock must not run while the engine
@@ -9706,12 +9729,12 @@ mod lp_boost_tests {
     /// is the 29s of OLL time that genuinely failed to produce a core, and the
     /// arm stays shut.
     #[test]
-    fn cold_core_drought_clock_stops_across_a_descent_slice() {
+    fn cold_core_drought_clock_stops_across_a_descent_slice() -> Result<(), &'static str> {
         let mut soft_store = ClauseStore::new();
         soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
         let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
         engine.best_model = Some(vec![false; 2]);
-        let mut at = Instant::now() - Duration::from_secs(1_000);
+        let mut at = checked_test_instant_sub(Instant::now(), Duration::from_secs(1_000))?;
         // 16 intervals of 200ms => bar is the 30s floor. `at` ends ON the last
         // arrival, so the offsets below are measured from it exactly.
         engine.note_search_core(at);
@@ -9732,7 +9755,10 @@ mod lp_boost_tests {
             "the 300s descent slice must contribute nothing to the drought",
         );
         assert!(
-            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(1_000)),
+            !engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_secs(1_000),
+            )?),
             "a descent slice must not manufacture the drought that justifies \
              the next entry",
         );
@@ -9742,63 +9768,16 @@ mod lp_boost_tests {
         engine.pause_core_drought_at(at + Duration::from_secs(331));
         assert_eq!(engine.core_drought(), Duration::from_secs(31));
         assert!(
-            engine.core_discovery_cold(Instant::now() - Duration::from_secs(1_000)),
+            engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_secs(1_000),
+            )?),
             "31s of genuine core-searching time is past the 30s bar",
         );
+        Ok(())
     }
 
-    /// #cold-core-descent D3: the minimum-sample brake must not be satisfiable
-    /// by BATCHED core payments.
-    ///
-    /// `pay_mined_cores` and the AM1 probe's failed-selector loop call
-    /// `process_core` back-to-back over an already-computed list, so 8
-    /// "intervals" can be recorded in microseconds without a single SAT call —
-    /// handing the gate a "this instance was streaming cores" baseline built
-    /// entirely out of bookkeeping, and satisfying `COLD_CORE_MIN_SAMPLE` on an
-    /// instance that has searched for nothing.
-    #[test]
-    fn cold_core_rate_sample_ignores_batched_core_payments() {
-        let mk = || {
-            let mut soft_store = ClauseStore::new();
-            for i in 1..=24i32 {
-                soft_store.push_from_iter([i].iter().map(|&l| Literal::from(l)));
-            }
-            let mut engine = OllEngine::new(32, ClauseStore::new(), soft_store, vec![1; 24]);
-            for i in 1..=24i32 {
-                engine.active.insert(Literal::from(i), 1);
-            }
-            engine.level = 1;
-            engine
-        };
-
-        // 12 batch payments, back-to-back, exactly as the batch sites do.
-        let mut batched = mk();
-        for i in 1..=12i32 {
-            batched.process_core(&[Literal::from(i)], CoreOrigin::Batch);
-        }
-        assert_eq!(batched.stats.cores_found, 12, "batch cores still count");
-        assert_eq!(batched.core_search_cores, 0);
-        assert!(
-            batched.core_gaps_ms.is_empty(),
-            "batched payments must contribute no rate intervals",
-        );
-        assert!(
-            !batched.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
-            "the minimum-sample brake must not be satisfiable by bookkeeping",
-        );
-
-        // The same 12 cores arriving from search DO set the baseline.
-        let mut searched = mk();
-        for i in 1..=12i32 {
-            searched.process_core(&[Literal::from(i)], CoreOrigin::Search);
-        }
-        assert_eq!(searched.core_search_cores, 12);
-        assert_eq!(
-            searched.core_gaps_ms.len(),
-            11,
-            "n search cores give n-1 intervals",
-        );
-    }
+    include!("oll/lp_boost_cold_core_tests.rs");
 
     /// #cold-core-descent D4: a stratification level change must reset the
     /// drought.
@@ -9809,20 +9788,23 @@ mod lp_boost_tests {
     /// collapsing. Without the reset the arm can take the entry before the
     /// fresh stratum has had a single chance to produce a core.
     #[test]
-    fn cold_core_level_activation_resets_the_drought() {
+    fn cold_core_level_activation_resets_the_drought() -> Result<(), &'static str> {
         let mut soft_store = ClauseStore::new();
         soft_store.push_from_iter([1i32].iter().map(|&l| Literal::from(l)));
         let mut engine = OllEngine::new(2, ClauseStore::new(), soft_store, vec![1]);
         engine.best_model = Some(vec![false; 2]);
-        let mut at = Instant::now() - Duration::from_secs(600);
+        let mut at = checked_test_instant_sub(Instant::now(), Duration::from_mins(10))?;
         for _ in 0..=16 {
             engine.note_search_core(at);
             at += Duration::from_millis(200);
         }
-        engine.core_drought = Duration::from_secs(300);
+        engine.core_drought = Duration::from_mins(5);
         engine.core_drought_since = None;
         assert!(
-            engine.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
+            engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_mins(10),
+            )?),
             "precondition: the gate is open before the level change",
         );
 
@@ -9836,9 +9818,13 @@ mod lp_boost_tests {
             "and leave the clock running for the new stratum",
         );
         assert!(
-            !engine.core_discovery_cold(Instant::now() - Duration::from_secs(600)),
+            !engine.core_discovery_cold(checked_test_instant_sub(
+                Instant::now(),
+                Duration::from_mins(10),
+            )?),
             "the arm must not commit before the fresh stratum has had a chance",
         );
+        Ok(())
     }
 
     /// #cold-core-descent D7: the descent entry gate's WIRING, not just the
@@ -9894,7 +9880,7 @@ mod lp_boost_tests {
     #[test]
     fn cold_descent_entry_takes_a_reversible_slice() {
         let kick = Duration::from_secs(10);
-        let organic = Duration::from_secs(120);
+        let organic = Duration::from_mins(2);
 
         // The cold arm is bounded REGARDLESS of #descent-organic-slice, and at
         // the organic length: its evidence earns a longer slice than a kick,

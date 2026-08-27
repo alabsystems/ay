@@ -35,14 +35,17 @@
 //!   construction and can only be caught by the second.
 //! * [`parse_verdict`] accepts only `exit 0` AND a first `s ` line reading
 //!   `s VERIFIED BOUNDS <lo> <= obj <= <hi>`. It is deliberately NOT a
-//!   substring search over stdout — that is the defect in
-//!   `ay-pb/src/veripb_runner.rs:472-481`, where a `c` comment line containing
-//!   the word VERIFIED is enough to pass.
+//!   substring search over stdout. That substring form WAS live in
+//!   `ay-pb-core/src/veripb_runner.rs`, where `stdout.contains("VERIFIED
+//!   UNSATISFIABLE")` accepted a checker that had REFUSED the proof and said
+//!   so in a `c` comment. It is now closed there too — the runner reads the
+//!   verdict LINE — and `ci/fake-checkers/comment-verified.sh` is the
+//!   committed fake that keeps it closed.
 //!
 //! The two probes here are the same discipline as the six in `ay-test-support`,
 //! narrowed to the conclusion shape this lane emits (`BOUNDS`, not `UNSAT` or
 //! `SAT`). The remaining four there are a checker-SOUNDNESS gate (does this
-//! build carry the six known upstream wrong-verdict bugs?) that
+//! build carry the eight known upstream wrong-verdict defects?) that
 //! `scripts/ci/pb_certified_gate.sh` already owns and re-proves against
 //! committed fixtures. What a bench sweep needs to establish at t=0 is
 //! narrower: that the binary it is about to trust can both verify and refuse.
@@ -142,6 +145,14 @@ pub(crate) mod pin {
     pub(crate) fn patch_sha256() -> &'static str {
         require("VERIPB_PATCH_SHA256")
     }
+
+    /// SHA-256 of the SECOND patch, applied on top of the first. It closes the
+    /// ninth wrong-verdict defect (`pol` addition wrapping the cancellation
+    /// subtraction), which the first patch does not, so it is as much a part of
+    /// the checker's identity as the first one.
+    pub(crate) fn patch2_sha256() -> &'static str {
+        require("VERIPB_PATCH2_SHA256")
+    }
 }
 
 /// Environment overrides consulted first, in order. Same names, same order as
@@ -154,12 +165,15 @@ const CHECKER_ENV_VARS: [&str; 3] = ["VERIPB_BIN", "AY_PB26_VERIPB_BIN", "VERIPB
 const SEARCH_PATH_ENV: &str = "AY_VERIPB_SEARCH_PATH";
 
 /// Cache-key contract shared with `scripts/ci/pb_certified_gate.sh` and
-/// `ay-test-support`: the patch is part of the checker identity, so a changed
-/// patch must not silently reuse a binary built from the same upstream commit.
+/// `ay-test-support`: EVERY patch is part of the checker identity, so a changed
+/// or added patch must not silently reuse a binary built from the same upstream
+/// commit. Both prefixes are in the key for that reason.
 fn pinned_build_id() -> String {
     let patch_sha = pin::patch_sha256();
     let patch_prefix = patch_sha.get(..12).unwrap_or(patch_sha);
-    format!("{}-{patch_prefix}", pin::commit())
+    let patch2_sha = pin::patch2_sha256();
+    let patch2_prefix = patch2_sha.get(..12).unwrap_or(patch2_sha);
+    format!("{}-{patch_prefix}-{patch2_prefix}", pin::commit())
 }
 
 /// Every path a checker could be resolved from, in resolution order.
@@ -482,8 +496,9 @@ fn strip_status<'a>(body: &'a str, token: &str) -> Option<&'a str> {
 ///   (a proof that concluded nothing) is printed with exit 0 too.
 ///
 /// The scan is over `s `-prefixed lines only, never `stdout.contains(...)`. A
-/// `c` comment line mentioning VERIFIED must not accept; the substring form is
-/// a live defect in `ay-pb/src/veripb_runner.rs`.
+/// `c` comment line mentioning VERIFIED must not accept; the substring form
+/// was a live defect in `ay-pb-core/src/veripb_runner.rs`, now closed there and
+/// pinned by `ci/fake-checkers/comment-verified.sh`.
 ///
 /// # `Rejected` vs `Unusable`: contradiction versus non-confirmation
 ///
@@ -1695,9 +1710,10 @@ mod tests {
         assert!(observed.to_string().contains("WEAKENED"), "{observed}");
     }
 
-    /// The `ay-pb/src/veripb_runner.rs:478` bug, stated as a property: the
-    /// verdict is the FIRST `s `-prefixed line, and nothing else on stdout is
-    /// a verdict.
+    /// The `ay-pb-core/src/veripb_runner.rs` substring bug, stated as a
+    /// property: the verdict is the FIRST `s `-prefixed line, and nothing else
+    /// on stdout is a verdict. (That module now reads its verdict line the same
+    /// way; this test keeps the property pinned on THIS lane's reader.)
     ///
     /// The previous version of this test asserted only `Rejected` on a stdout
     /// whose comment line ALSO parsed as a refusal, so it passed under the very
@@ -1991,10 +2007,15 @@ mod tests {
             path
         };
 
-        let mut targets: Vec<(String, PathBuf)> = ["silent-exit0.sh", "always-unsat.sh"]
-            .iter()
-            .map(|name| ((*name).to_string(), fake_checker(name)))
-            .collect();
+        // `comment-verified.sh` is here for the same reason the stub below is:
+        // it needs no delegate, so it runs on a checker-free host. It REFUSES
+        // the proof on its verdict line while a `c` comment says otherwise, so
+        // only a reader anchored to the `s ` line can tell the two apart.
+        let mut targets: Vec<(String, PathBuf)> =
+            ["silent-exit0.sh", "always-unsat.sh", "comment-verified.sh"]
+                .iter()
+                .map(|name| ((*name).to_string(), fake_checker(name)))
+                .collect();
 
         // The exit-code half of the verdict rule, covered on EVERY host. This
         // stub is a CORRECT checker in every respect but one: it accepts the
@@ -2413,6 +2434,10 @@ mod tests {
         assert_eq!(
             pin::patch_sha256(),
             ay_test_support::veripb::pin::patch_sha256()
+        );
+        assert_eq!(
+            pin::patch2_sha256(),
+            ay_test_support::veripb::pin::patch2_sha256()
         );
         assert_eq!(pin::commit().len(), 40);
     }

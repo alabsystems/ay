@@ -36,48 +36,7 @@ use ay::solution_visualization::{render_solution_visualization, VisualizationFor
 
 const SMT_FILE_THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Adapt a proof config for the SMT-LIB execution path.
-///
-/// When default proof auto-verification synthesizes a temporary DRAT path, the
-/// choice happens before the input format is known. SMT-LIB produces Alethe,
-/// which AY cannot post-check with its DRAT/LRAT verifier. Such verify-only temp
-/// configs are therefore dropped instead of enabling costly proof tracking,
-/// writing Alethe, and deleting it without verification. An explicit
-/// `--verify-proof` is rejected by the route gate before this adapter runs.
-///
-/// Returns `None` when `proof_config` is `None` or verify-only temporary.
-/// Persistent default and explicit proof configs are returned unchanged; the
-/// caller validates that their format is Alethe.
-fn adapt_proof_config_for_smt(proof_config: Option<&ProofConfig>) -> Option<ProofConfig> {
-    let src = proof_config?;
-    if src.is_temp {
-        return None;
-    }
-    Some(src.clone())
-}
-
-fn logic_from_commands(commands: &[Command]) -> Option<&str> {
-    commands.iter().find_map(|command| {
-        if let Command::SetLogic(logic) = command {
-            Some(logic.as_str())
-        } else {
-            None
-        }
-    })
-}
-
-/// Remove a synthesized temp proof file after the SMT run completes.
-/// No-op when the config is `None`, not marked `is_temp`, or the file is
-/// already absent. Used to avoid leaving stray `/tmp/ay-verify-*.alethe`
-/// files when `--verify-proof` auto-defaults on under debug builds with
-/// no user-supplied `--proof` path (Finding A).
-fn cleanup_temp_proof(proof_config: Option<&ProofConfig>) {
-    if let Some(proof) = proof_config {
-        if proof.is_temp {
-            let _ = std::fs::remove_file(&proof.path);
-        }
-    }
-}
+include!("run/smt_proof_config.rs");
 
 /// Create an executor with global timeout interrupt wired in (#2971).
 fn new_executor() -> Executor {
@@ -163,8 +122,12 @@ fn new_executor() -> Executor {
     if self_check_enabled() {
         executor.set_self_check(true);
         // A refutation proof is required to certify UNSAT, so force proof
-        // production on even without `--proof`.
-        executor.set_produce_proofs(true);
+        // production on even without `--proof`. Collection only: self-check
+        // demands verified truth, not the exported artifact, so this must not
+        // record an explicit-artifact demand (`proof_artifact_required`) —
+        // that flag makes the certification mint refuse the independent
+        // lanes self-check's own funnel publishes on (#letleak wall 3).
+        executor.set_mandatory_proof_collection();
     }
     // The firewall diagnostics are reconstructed from the refutation proof, so
     // proof production must be on even without `--proof`.
@@ -317,12 +280,29 @@ fn configure_proof_policy(executor: &mut Executor, proof: &ProofConfig) {
     // requested. In particular, `--verify-firewall` synthesizes its proof
     // config by default; treating that config as best-effort could stop proof
     // reconstruction before the requested diagnostics run.
+    let gates = ResultGateRequests::current();
     if should_budget_synthesized_proof(
         proof.synthesized_default,
         proof.artifact_path.is_some(),
-        ResultGateRequests::current(),
+        gates,
     ) {
         executor.set_best_effort_produce_proofs(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET);
+    } else if proof.synthesized_default
+        && proof.artifact_path.is_none()
+        && gates
+            == (ResultGateRequests {
+                self_check: true,
+                ..ResultGateRequests::default()
+            })
+    {
+        // Self-check is the ONLY active result gate and the proof config is
+        // the synthesized default with no artifact path: reconstruction must
+        // be mandatory and unbudgeted (the internal checker inspects it), but
+        // no one demanded the translated artifact itself, so the independent
+        // certification lanes stay available (#letleak wall 3). Any other
+        // gate, an explicit config, or an artifact path keeps the artifact
+        // mandatory below.
+        executor.set_mandatory_proof_collection();
     } else {
         executor.set_produce_proofs(true);
     }
@@ -1098,55 +1078,7 @@ fn collect_command_sources(input: &str) -> Vec<CommandSource> {
     collect_command_sources_from_line(input, 1)
 }
 
-/// Command names whose execution READS the model of the preceding `check-sat`.
-///
-/// `(include "f")` is here because AY does not implement it: the spliced file's
-/// commands are invisible to this scan, so any script mentioning it must be
-/// treated as possibly reading a model.
-const MODEL_READING_COMMANDS: &[&str] = &[
-    "check-synth",
-    "eval",
-    "get-assignment",
-    "get-model",
-    "get-objective-certificates",
-    "get-objectives",
-    "get-value",
-    "include",
-];
-
-/// Whether anything in `input` could read a model, answered by a deliberately
-/// CONSERVATIVE token scan of the raw text.
-///
-/// The scan over-approximates on purpose. It does not skip comments or string
-/// literals and does not care whether the name is in command position, so
-/// `; remember to add (get-model)` and `(declare-fun get-value () Bool)` both
-/// count as demand. Over-approximating costs a little wasted witness polish;
-/// under-approximating would silently degrade a model someone then prints, so
-/// every uncertainty resolves toward "demanded".
-///
-/// Soundness of the *negative* answer rests on one fact: an SMT-LIB command
-/// name is literal source text. There is no macro, no `include` AY honors (the
-/// spelling is in the list above), and no runtime construction of a command —
-/// so a reader that runs must have its name written here.
-fn smt_text_may_consume_a_model(input: &str) -> bool {
-    let bytes = input.as_bytes();
-    let is_symbol_byte =
-        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'?');
-    MODEL_READING_COMMANDS.iter().any(|name| {
-        let needle = name.as_bytes();
-        bytes.windows(needle.len()).enumerate().any(|(at, window)| {
-            window == needle
-                && !bytes
-                    .get(at.wrapping_sub(1))
-                    .copied()
-                    .is_some_and(is_symbol_byte)
-                && !bytes
-                    .get(at + needle.len())
-                    .copied()
-                    .is_some_and(is_symbol_byte)
-        })
-    })
-}
+include!("run/model_demand.rs");
 
 /// Like [`collect_command_sources`] but numbers the first line `line_base`
 /// instead of 1. The streaming `-in` path parses one command chunk at a time and
@@ -1540,7 +1472,11 @@ fn sexpr_status_value(cmd: &Command) -> Option<&'static str> {
     sexpr_status(value)
 }
 
-fn maybe_handle_cli_transcript_command(state: &mut SmtTranscriptState, cmd: &Command) -> bool {
+fn maybe_handle_cli_transcript_command(
+    executor: &mut Executor,
+    state: &mut SmtTranscriptState,
+    cmd: &Command,
+) -> bool {
     if matches!(cmd, Command::GetUnsatAssumptions) && !state.produce_unsat_assumptions {
         print_regular_line(
             state,
@@ -1726,7 +1662,15 @@ fn maybe_handle_cli_transcript_command(state: &mut SmtTranscriptState, cmd: &Com
             maybe_print_success(state);
             return true;
         }
-        if key == "rlimit" && sexpr_numeral(value).is_some() {
+        if let Some(numeral) = (key == "rlimit").then(|| sexpr_numeral(value)).flatten() {
+            // Forward the deterministic conflict budget to the executor
+            // (#8749 class: this arm used to update only the z3-compat
+            // `get-option` echo and silently DROP the budget, so through the
+            // `ay` binary `:rlimit` bounded nothing while `(get-option
+            // :rlimit)` claimed it was set). Semantics — including `0` =
+            // unlimited + default-ground-budget opt-out — are the executor's
+            // own `apply_rlimit_option`, shared, not re-derived here.
+            executor.apply_rlimit_option(numeral);
             update_transcript_state_after_command(state, cmd);
             maybe_print_success(state);
             return true;
@@ -2259,6 +2203,8 @@ fn z3_compat_sort_mismatch_error(state: &SmtTranscriptState, message: &str) -> O
     ))
 }
 
+include!("run/z3_options.rs");
+
 /// z3's `set-option` error for a parameter it does not recognize, or `None`
 /// when the key is legal.
 ///
@@ -2277,70 +2223,6 @@ fn z3_compat_sort_mismatch_error(state: &SmtTranscriptState, message: &str) -> O
 ///
 /// Note the error is multi-line and goes to STDOUT, and z3 CONTINUES after it.
 fn z3_unknown_option_error(state: &SmtTranscriptState, keyword: &str) -> Option<String> {
-    // SMT-LIB 2.6 standard options. All 14 verified accepted by the oracle.
-    const SMTLIB_OPTIONS: &[&str] = &[
-        "diagnostic-output-channel",
-        "global-declarations",
-        "interactive-mode",
-        "print-success",
-        "produce-assertions",
-        "produce-assignments",
-        "produce-models",
-        "produce-proofs",
-        "produce-unsat-assumptions",
-        "produce-unsat-cores",
-        "random-seed",
-        "regular-output-channel",
-        "reproducible-resource-limit",
-        "verbosity",
-    ];
-
-    // Options z3 accepts that are neither SMT-LIB standard names nor global
-    // parameters, so neither lookup below finds them. Each is dispatched by
-    // AY's own `set-option` handling (`keyword_key(keyword) == ...` arms, and
-    // `is_global_decls_option` for the `global-decls` alias), and each was
-    // measured accepted by the oracle. Reporting them unknown REJECTED VALID
-    // OPTIONS -- `:global-decls` is z3's own alias for
-    // `:global-declarations`, and rejecting it broke global-declaration scope
-    // semantics outright.
-    const AY_DISPATCHED_OPTIONS: &[&str] = &[
-        "error-behavior",
-        "global-decls",
-        "int-real-coercions",
-        "print-warning",
-    ];
-
-    // AY's OWN options -- keys z3 has never had, that AY reads back through
-    // `Context::get_option` inside the executor. The two lists above are the
-    // z3 surface; this one is the AY surface, and it is deliberately NOT a
-    // conformance claim: z3 rejects every key here.
-    //
-    // They were rejected as unknown until 2026-08-20, which meant the CLI
-    // PRINTED an error and RETURNED BEFORE `executor.execute_authored(cmd)`
-    // -- so the key never reached `ctx.options` and every reader fell back to
-    // its default. Every AY-specific option was therefore dead through the
-    // binary while working through the library API (which is why the
-    // in-crate `:minimize-counterexamples` regressions all pass). Measured on
-    // ABVFPLRA/inv_Newton: `(set-option :minimize-counterexamples false)` left
-    // `minimize_model_sat_preserving` running and the wall clock unchanged,
-    // and run.rs's own comment about a script enabling strict proofs with
-    // `(set-option :check-proofs-strict true)` described something the binary
-    // could not do.
-    //
-    // Divergence accepted knowingly: a script written for z3 cannot contain
-    // these keys, so accepting them changes no z3-authored transcript, whereas
-    // rejecting them makes AY ignore options AY itself documents. An unknown
-    // key that is neither z3's nor AY's still reports exactly as before.
-    const AY_NATIVE_OPTIONS: &[&str] = &[
-        "ay-diff-logic",
-        "ay-eq-diffvar",
-        "ay-maxsmt-engine",
-        "ay-proof-no-varsubst",
-        "ay-unit-prop",
-        "check-proofs-strict",
-        "minimize-counterexamples",
-    ];
-
     // z3 resolves the two families differently, and the difference is
     // observable. SMT-LIB options match VERBATIM: `:produce-models` is
     // accepted, `:produce_models` is not. Global parameters are normalized
@@ -2350,8 +2232,8 @@ fn z3_unknown_option_error(state: &SmtTranscriptState, keyword: &str) -> Option<
     // by their exact hyphenated spelling.
     let name = keyword.trim_start_matches(':');
     if SMTLIB_OPTIONS.contains(&name)
-        || AY_DISPATCHED_OPTIONS.contains(&name)
-        || AY_NATIVE_OPTIONS.contains(&name)
+        || DISPATCHED_OPTIONS.contains(&name)
+        || NATIVE_OPTIONS.contains(&name)
     {
         return None;
     }
@@ -2363,31 +2245,7 @@ fn z3_unknown_option_error(state: &SmtTranscriptState, keyword: &str) -> Option<
     // are matched case-insensitively (`:OPT.x` resolves to `opt`) and both
     // halves normalize `-` -> `_` before lookup and in the report.
     if let Some((module, parameter)) = name.split_once('.') {
-        let module = module.replace('-', "_").to_ascii_lowercase();
-        let parameter = parameter.replace('-', "_").to_ascii_lowercase();
-
-        if !crate::z3_parameter_help::is_known_module(&module) {
-            return Some(set_option_error(
-                state,
-                keyword,
-                &format!("invalid parameter, unknown module '{module}'"),
-            ));
-        }
-        if crate::z3_parameter_help::is_known_module_parameter(&module, &parameter) {
-            return None;
-        }
-
-        let mut body = String::new();
-        body.push_str(&format!(
-            "unknown parameter '{parameter}' at module '{module}'\nLegal parameters are:"
-        ));
-        for line in crate::z3_parameter_help::legal_module_parameter_report_lines(&module)
-            .expect("module was just verified known")
-        {
-            body.push('\n');
-            body.push_str(&line);
-        }
-        return Some(set_option_error(state, keyword, &body));
+        return z3_unknown_module_option_error(state, keyword, module, parameter);
     }
     let normalized = name.replace('-', "_").to_ascii_lowercase();
     if crate::z3_parameter_help::is_known_global_parameter(&normalized) {
@@ -3951,7 +3809,7 @@ fn execute_and_print(
     emit_z3_unknown_attribute_warnings(transcript, cmd);
 
     let recoverable_errors_before = transcript.recoverable_error_count;
-    if maybe_handle_cli_transcript_command(transcript, cmd) {
+    if maybe_handle_cli_transcript_command(executor, transcript, cmd) {
         return !(transcript.exit_on_error
             && transcript.recoverable_error_count > recoverable_errors_before);
     }
@@ -8705,6 +8563,8 @@ fn run_smt_file_content_on_dedicated_stack(
     });
 }
 
+include!("run/smt_file.rs");
+
 fn run_smt_file_content(
     content: &str,
     source: Option<&SmtFileSource>,
@@ -8713,36 +8573,7 @@ fn run_smt_file_content(
     visualization: Option<VisualizationFormat>,
 ) {
     reject_explicit_proof_verification_for_route("SMT-LIB", "Alethe");
-    // MILP FAST-PATH (#milp-fastpath): a QF_LRA script that is exactly a big-M
-    // MILP feasibility problem — conjunctive linear rows plus 0/1 disjunctions,
-    // the shape the downstream optimization consumer's mip-diff pipes in — is decided by ay-milp's branch-and-cut
-    // instead of the generic DPLL(T) case-split, which produces no verdict on
-    // real NN windows the MILP lane settles in minutes. Fail-closed: anything
-    // outside the recognised fragment falls through to the standard lane
-    // untouched, and the route is skipped when the caller asked for stats,
-    // visualization, an EXPLICIT `--proof`, or a mandatory result gate — the
-    // fast path cannot produce Alethe or route its verdict through those gates.
-    // Solver-synthesized DEFAULT certificate configs do not block it: a
-    // fast-path `sat` needs no certificate, and a fast-path `unsat` trades the
-    // best-effort default certificate for a verdict the generic lane cannot
-    // reach at all on this shape. The default-on DRAT/LRAT auto-check likewise
-    // does not disable this SMT-only lane; an EXPLICIT `--verify-proof` is
-    // rejected above because AY has no Alethe post-checker.
-    let explicit_proof = proof_config.is_some_and(|p| !p.synthesized_default && !p.is_temp);
-    if !explicit_proof
-        // These modes promise to inspect the executor's SAT/UNSAT result before
-        // it reaches stdout. The standalone MILP lane prints its own verdict
-        // and cannot provide those checks/certificates, so it must not bypass
-        // the common result-gate path.
-        && may_use_ungated_solver_route(ResultGateRequests::current())
-        // Decision traces are produced by the SAT-backed executor. The MILP
-        // fast path prints directly and cannot finalize the reserved trace.
-        && ay_core::trace_config().decision_trace_path.is_none()
-        && visualization.is_none()
-        && !stats_cfg.human
-        && !stats_cfg.json
-        && crate::milp_fastpath::try_milp_fastpath(content)
-    {
+    if try_smt_milp_fastpath(content, &stats_cfg, proof_config, &visualization) {
         return;
     }
 
@@ -8779,7 +8610,7 @@ fn run_smt_file_content(
     // a visualization renders solver state. The interactive `-in` lane never
     // reaches here, so it always keeps the demand-assumed default.
     executor.set_model_output_shedding(
-        !smt_text_may_consume_a_model(content)
+        !commands_may_consume_a_model(&command_sources)
             && !z3_model_enabled()
             && !MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
             && visualization.is_none(),

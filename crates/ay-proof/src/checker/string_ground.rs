@@ -153,7 +153,7 @@ pub(crate) fn validate_string_ground_eval(
 /// non-empty, propositional, mentioning string/regex content, and carrying at
 /// least one ground literal that evaluates to `true`.
 ///
-/// This is the EXACT precondition of [`validate_string_ground_eval`] (plus the
+/// This is the EXACT precondition of `validate_string_ground_eval` (plus the
 /// string-content hygiene gate), so the proof classifier in `ay-dpll` can only
 /// assign the kind to lemmas strict mode will then accept — no
 /// classifier/checker drift. Evaluation logic lives ONLY in this module.

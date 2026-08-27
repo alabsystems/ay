@@ -362,8 +362,24 @@ impl Executor {
             evaluated,
         );
         let not_false = self.ctx.terms.mk_not_raw(false_term);
+        // `AletheRule::False`, NOT `True`. This step's clause is exactly
+        // `(cl (not false))`, which IS Alethe's `false` axiom — the local name
+        // `false_taut` says so. Labelling it `True` made the printer demote it,
+        // correctly: `wire_rule_for_printed_step` turns a `true` whose printed
+        // conclusion is not `(cl true)` into an `hole`, because the two
+        // fixed-conclusion axioms are the one place a real rule name can still
+        // be misapplied (carcara answers `invalid` for the whole document, not
+        // merely `holey`). With the right name the same guard keeps it: a
+        // `false` printing exactly `(cl (not false))` passes through as the
+        // real, CHECKED rule.
+        //
+        // Measured before this change: the exported certificate carried
+        // `(step t7 (cl (not false)) :rule hole)` — an unverifiable step in an
+        // otherwise complete refutation. Internally it always passed, because
+        // AY's bool-constant validator admits both spellings; only the printed
+        // artifact an external checker reads was affected.
         let false_taut =
-            candidate.add_rule_step(AletheRule::True, vec![not_false], Vec::new(), Vec::new());
+            candidate.add_rule_step(AletheRule::False, vec![not_false], Vec::new(), Vec::new());
         Some(candidate.add_resolution(vec![not_instance], false_term, false_taut, elided))
     }
 

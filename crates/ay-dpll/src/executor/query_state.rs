@@ -43,6 +43,15 @@ pub(crate) struct PrepassReachability {
     /// is the attribution counter: a behaviour change on a query with this at
     /// zero did not come from the deep-QE lane.
     pub(crate) deep_qe_unknown_retries: u64,
+    /// Times the #qe-alternation-route recognizer ACCEPTED the problem (pure
+    /// arithmetic, quantified, no UF / arrays / BV / nonlinear) at the pre-pass
+    /// site, i.e. the route was applicable.
+    pub(crate) qe_route_applicable: u64,
+    /// Times the #qe-alternation-route actually adopted a fully quantifier-free
+    /// residue, so `has_quantified_assertions` was recomputed to false and the
+    /// ground lane owned the rest of the solve. The gap to
+    /// `qe_route_applicable` is the eliminators' fail-closed refusal rate.
+    pub(crate) qe_route_grounded: u64,
 }
 
 /// Provenance of one finite-domain quantifier expansion that replaced a
@@ -228,20 +237,26 @@ pub(crate) struct DtContextConflictRecord {
 
 /// Deduplicated, capped store for [`DtContextConflictRecord`] producer hints
 /// (#dt-context-derivation). Theory propagations re-mint across restarts by
-/// the thousands; first-wins keying by the normalized clause keeps one hint
-/// per distinct fact so the firehose cannot crowd out conflict records.
+/// the thousands; normalized-clause keying retains a bounded set of distinct
+/// premise alternatives, so duplicate traffic cannot crowd out conflict records.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DtContextConflictSink {
     pub(crate) records: Vec<DtContextConflictRecord>,
-    keys: ay_core::kani_compat::DetHashSet<Vec<TermId>>,
+    keys: ay_core::kani_compat::DetHashMap<Vec<TermId>, u8>,
 }
 
 impl DtContextConflictSink {
     const MAX_RECORDS: usize = 16384;
-    const MAX_PREMISES: usize = 16;
+    const MAX_PREMISES: usize = 32;
+    /// Alternatives kept per normalized clause. Different emitters justify
+    /// the same fact through different premise sets (a rewrite-time hint vs
+    /// a mid-solve reason walk); consumption tries each until one
+    /// discharges, so a single undischargeable early hint cannot shadow a
+    /// later usable one.
+    const MAX_PER_KEY: u8 = 6;
 
-    /// First-wins record with dedup and caps; degenerate hints are dropped
-    /// (a missing hint can only decline an authentication, never mint one).
+    /// Capped, per-key-bounded record; degenerate hints are dropped (a
+    /// missing hint can only decline an authentication, never mint one).
     pub(crate) fn record(&mut self, clause: Vec<TermId>, premises: Vec<TermId>) {
         if clause.is_empty()
             || premises.is_empty()
@@ -253,9 +268,11 @@ impl DtContextConflictSink {
         let mut key = clause.clone();
         key.sort_unstable();
         key.dedup();
-        if !self.keys.insert(key) {
+        let slot = self.keys.entry(key).or_insert(0);
+        if *slot >= Self::MAX_PER_KEY {
             return;
         }
+        *slot += 1;
         self.records
             .push(DtContextConflictRecord { clause, premises });
     }

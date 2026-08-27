@@ -64,3 +64,63 @@ pub(in crate::executor) fn sanitize_farkas_annotations(terms: &TermStore, proof:
         }
     }
 }
+
+/// The atom and asserted polarity of a conflict literal, with every surface
+/// `not` unwrapped — the same normalization
+/// [`ay_core::proof_validation::conflict_lits_satisfied_by`] performs, so the
+/// LRA solver is asked about the atom the verifier will parse.
+fn asserted_atom(terms: &TermStore, literal: &ay_core::TheoryLit) -> (TermId, bool) {
+    let mut term = literal.term;
+    let mut value = literal.value;
+    while let TermData::Not(inner) = terms.get(term) {
+        term = *inner;
+        value = !value;
+    }
+    (term, value)
+}
+
+/// Whether a MODEL of `clause`'s negation exists AND has been verified here.
+///
+/// `clause` is a blocking clause, so its negation is the conjunction of the
+/// asserted literals. When this returns `true`, no sub-multiset of those
+/// literals admits a Farkas certificate that
+/// [`certificate_valid_for_blocking_clause`] would accept: the model satisfies
+/// every row, and every accept path needs a weighted combination of rows to be
+/// contradictory. A producer searching bounded SUBSETS of a fixed literal pool
+/// can therefore decide the whole search with this ONE call instead of
+/// enumerating it.
+///
+/// The LRA solver is a HINT source and is granted no authority. It supplies
+/// candidate values — which is why any non-`Unsat` verdict is taken, including
+/// the combined-theory `NeedModelEquality`/`NeedSplit` interface requests that
+/// carry a simplex assignment without a final verdict — and
+/// [`ay_core::proof_validation::conflict_lits_satisfied_by`] then re-derives
+/// the verifier's own rows and checks every one of them by evaluation. A solver
+/// that answered wrongly, or a rational assignment that does not satisfy the
+/// integer strengthening the verifier applies, is rejected here and the caller
+/// falls back to its unpruned search. Fail-closed in both directions.
+pub(in crate::executor) fn blocking_clause_negation_has_verified_model(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> bool {
+    let conflict = blocking_clause_to_conflict(terms, clause);
+    let mut lra = ay_lra::LraSolver::new(terms);
+    lra.set_combined_theory_mode(true);
+    for literal in &conflict {
+        let (atom, _) = asserted_atom(terms, literal);
+        ay_core::TheorySolver::register_atom(&mut lra, atom);
+    }
+    for literal in &conflict {
+        let (atom, value) = asserted_atom(terms, literal);
+        ay_core::TheorySolver::assert_literal(&mut lra, atom, value);
+    }
+    if matches!(
+        ay_core::TheorySolver::check(&mut lra),
+        ay_core::TheoryResult::Unsat(_) | ay_core::TheoryResult::UnsatWithFarkas(_)
+    ) {
+        return false;
+    }
+    ay_core::proof_validation::conflict_lits_satisfied_by(terms, &conflict, &|term| {
+        lra.get_value(term)
+    })
+}

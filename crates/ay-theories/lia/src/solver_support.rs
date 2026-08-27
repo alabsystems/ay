@@ -13,7 +13,7 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::One;
 
-impl<'a> LiaSolver<'a> {
+impl LiaSolver<'_> {
     /// Number of learned HNF cuts stored across soft resets.
     /// Used by combined solver tests to verify cut preservation (#3510).
     pub fn learned_cut_count(&self) -> usize {

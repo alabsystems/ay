@@ -2075,6 +2075,11 @@ fn trace_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::debug_flags::milp_debug_flags().trace)
 }
 
+/// Prime this cached accessor from `bab::prime_env_all` before window solves rewrite the environment.
+pub(crate) fn prime_env() {
+    let _ = trace_enabled();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2298,6 +2303,7 @@ mod tests {
                 .network_design_infeasibility_certificate(),
             network_design_optimality_certificate: session.network_design_optimality_certificate(),
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
+            milp_optimality_tree_certificate: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session
@@ -2337,12 +2343,12 @@ mod tests {
     fn flip_hex_after(text: &str, marker: &str) -> String {
         let mut changed = text.to_owned();
         let index = changed.find(marker).expect("tamper marker exists") + marker.len();
-        let replacement = if &changed[index..index + 1] == "0" {
+        let replacement = if &changed[index..=index] == "0" {
             "1"
         } else {
             "0"
         };
-        changed.replace_range(index..index + 1, replacement);
+        changed.replace_range(index..=index, replacement);
         reseal_ayc(&changed)
     }
 
@@ -2732,7 +2738,9 @@ mod tests {
     #[test]
     fn expired_deadline_declines_without_a_late_verdict() {
         let model = gadget(1, &[vec![(0, true)]], EPS, &[]);
-        let deadline = Instant::now() - std::time::Duration::from_millis(1);
+        let deadline = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
         assert!(try_solve(&model, Some(deadline)).is_none());
     }
 
@@ -2994,7 +3002,7 @@ mod tests {
         assert!(wire.contains("evidence dual SUCCINCT optcert"), "{wire}");
         let report = crate::cert_io::check(&wire, &model_text);
         assert_eq!(
-            report.status,
+            report.status(),
             crate::cert_io::CheckStatus::Verified,
             "{report:#?}\n{wire}"
         );
@@ -3214,6 +3222,7 @@ mod tests {
                 .network_design_infeasibility_certificate(),
             network_design_optimality_certificate: session.network_design_optimality_certificate(),
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
+            milp_optimality_tree_certificate: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session
@@ -3241,7 +3250,7 @@ mod tests {
         assert!(decoded.sat_relu_infeasibility.is_some());
         let report = crate::cert_io::check(&wire, &model_text);
         assert_eq!(
-            report.status,
+            report.status(),
             crate::cert_io::CheckStatus::Verified,
             "{report:#?}"
         );
@@ -3297,7 +3306,7 @@ mod tests {
         ] {
             let rejected = crate::cert_io::check(&tampered, &model_text);
             assert_ne!(
-                rejected.status,
+                rejected.status(),
                 crate::cert_io::CheckStatus::Verified,
                 "{name} tamper was accepted: {rejected:#?}"
             );
@@ -3356,11 +3365,4 @@ mod tests {
         linear.set_objective(&[(linear.col_at(0).expect("input"), 1.0)], Sense::Minimize);
         assert!(try_solve(&linear, None).is_none());
     }
-}
-
-/// Force this module's cached env accessor at solve entry, so a consumer that
-/// rewrites its environment between window solves cannot race it. Called from
-/// `bab::prime_env_all`.
-pub(crate) fn prime_env() {
-    let _ = trace_enabled();
 }

@@ -441,6 +441,48 @@ pub struct InprocessingPassAccounting {
 ///
 /// Reference: CaDiCaL `Stats` struct groups all counters separately from
 /// solver state.
+
+/// Two-stage clause management telemetry (arXiv:2602.20829).
+///
+/// Only the two-stage code paths can make any field non-zero, so this doubles
+/// as the reachability proof for `--sat-two-stage-clause-management`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TwoStageClauseStats {
+    /// Whether the policy is armed for this solver.
+    pub enabled: bool,
+    /// `OnLearnedClause(c)` score initialisations.
+    pub learned_inits: u64,
+    /// `OnClauseUse(c)` bumps from a clause forcing a literal during BCP.
+    pub bcp_bumps: u64,
+    /// `OnClauseUse(c)` bumps from a clause being a reason in conflict analysis.
+    pub analysis_bumps: u64,
+    /// Bumps dropped because the score field was already at
+    /// `MAX_TWO_STAGE_SCORE`.
+    pub score_saturations: u64,
+    /// `OnPeriodicDecay()` sweeps executed.
+    pub decay_rounds: u64,
+    /// Clauses actually decremented by those sweeps.
+    pub decay_clauses: u64,
+    /// Reductions that ran `TwoStageReduction`.
+    pub reduce_rounds: u64,
+    /// Clauses kept by stage 1 (`score > 0`).
+    pub stage1_kept: u64,
+    /// `score == 0` clauses forwarded to stage 2.
+    pub stage2_candidates: u64,
+    /// Stage-2 clauses actually deleted.
+    pub stage2_deleted: u64,
+    /// Due flushes rerouted through the two-stage path.
+    pub flushes_absorbed: u64,
+    /// Sum of candidate scores seen at reduce time.
+    pub score_total: u64,
+    /// Maximum candidate score seen at reduce time.
+    pub score_max: u64,
+    /// Reduce-time score histogram, bucketed
+    /// `[0, 1, 2-3, 4-7, 8-15, 16-31, 32-255, 256+]`. The last two buckets are
+    /// only reachable since the score left the 5-bit `used` field.
+    pub score_histogram: [u64; 8],
+}
+
 #[derive(Clone)]
 pub(crate) struct SolverStats {
     /// Chronological backtrack count.
@@ -805,6 +847,33 @@ pub(crate) struct SolverStats {
     pub rephase_best_resets: u64,
     /// Cold restarts performed (Zhang et al. 2024, arXiv:2404.16387).
     pub cold_restarts: u64,
+    /// Restarts that reused at least one trail level instead of backtracking to
+    /// 0, and the total number of levels so reused.
+    ///
+    /// CaDiCaL reports this as `reused: N (X% per restart)` (stats.cpp:517-518)
+    /// and it is a first-order input to decisions/conflict: a restart that keeps
+    /// its prefix does not re-make those decisions. AY had NO equivalent counter,
+    /// so its trail-reuse rate was unobservable and an external estimate of
+    /// "6.3% / 36.7% vs CaDiCaL's 74.5% / 78.1%" could be neither confirmed nor
+    /// refuted. Measure it rather than infer it.
+    pub trail_reuse_restarts: u64,
+    /// Sum of reused decision levels across all restarts (see above).
+    pub trail_reused_levels: u64,
+    /// Sum of trail length observed at each conflict, and sum of decision level
+    /// at each conflict. Divided by the conflict count these give mean trail
+    /// occupancy and mean conflict depth.
+    ///
+    /// CaDiCaL reports a `trail%` figure; AY had no equivalent, which left the
+    /// decisions/conflict gap unexplainable: `decisions` is arithmetically
+    /// Sum(decision_level - target_level), so it is a MIXTURE of variable-order
+    /// quality, TRAIL DEPTH, restart/reuse policy and backjump depth. Without a
+    /// depth counter those terms cannot be separated. An earlier attempt to
+    /// measure depth compared AY's mean decision level against CaDiCaL's mean
+    /// BACKJUMP-TARGET level (report.cpp:132 <- analyze.cpp:1255) — a units
+    /// error that invalidated every ratio derived from it.
+    pub trail_at_conflict_sum: u64,
+    /// Sum of decision level at each conflict (see above).
+    pub level_at_conflict_sum: u64,
     /// Focused-mode decisions (for computing focused dec/confl).
     pub focused_decisions: u64,
     /// Stable-mode decisions.
@@ -875,8 +944,76 @@ pub(crate) struct SolverStats {
     pub search_time_ns: u64,
     /// Wall-clock time spent in lucky-phase probing (nanoseconds).
     pub lucky_time_ns: u64,
+    /// Wall-clock time spent in the GF(p) one-hot linear-system probe
+    /// (nanoseconds).
+    pub gf_probe_time_ns: u64,
+    /// Wall-clock time spent computing the independent support (nanoseconds).
+    pub indep_support_time_ns: u64,
+    /// Size of the live independent support (0 = not restricting).
+    pub indep_support_size: u64,
+    /// Size the support had when it was computed, before preprocessing
+    /// retired any of its members.
+    pub indep_support_installed_size: u64,
+    /// Decidable variables (unassigned at root, not eliminated) seen by the
+    /// independent-support computation.
+    pub indep_support_decidable_vars: u64,
+    /// Gate definitions recovered by the independent-support computation.
+    pub indep_support_gates: u64,
+    /// Supports refused because the closure replay left a decidable variable
+    /// underivable.
+    pub indep_support_closure_rejected: u64,
+    /// Support size that was refused by the restriction policy (too large or
+    /// not a meaningful reduction); 0 when no support was computed.
+    pub indep_support_rejected_size: u64,
+    /// Decisions taken from the independent-support whitelist.
+    pub indep_support_decisions: u64,
+    /// Decisions where the whitelist was exhausted and the search fell
+    /// through to unrestricted branching.
+    pub indep_support_fallback_decisions: u64,
+    /// Wall-clock time spent in the bit-parallel support enumerator
+    /// (`solver/indep_enum.rs`), nanoseconds.
+    pub indep_enum_time_ns: u64,
+    /// Support size the enumerator would enumerate (0 = never got that far).
+    pub indep_enum_support_size: u64,
+    /// Constraints after the XOR collapse.
+    pub indep_enum_constraints: u64,
+    /// Upper bound on constraint visits the admission gate computed.
+    pub indep_enum_projected_visits: u64,
+    /// Times the admission gate let the enumerator run.
+    pub indep_enum_admitted: u64,
+    /// Blocks completed (each covers `2^min(|S|, ENUM_BITS)` assignments).
+    pub indep_enum_blocks: u64,
+    /// Assignments actually evaluated.
+    pub indep_enum_assignments: u64,
+    /// Constraint visits performed.
+    pub indep_enum_visits: u64,
+    /// Runs that enumerated the whole support space with no model (NOT
+    /// reported as UNSAT — see `indep_enum.rs`).
+    pub indep_enum_exhausted: u64,
+    /// Runs abandoned because propagation saturated with constraints
+    /// unresolved (the support did not determine the formula).
+    pub indep_enum_stalled: u64,
+    /// Surviving columns that failed model self-verification (always a bug).
+    pub indep_enum_verify_failures: u64,
+    /// Slices that spent their wall budget (or hit the whole-solve deadline)
+    /// without a model and handed the rest of the budget back to search.
+    pub indep_enum_budget_exhausted: u64,
     /// Wall-clock time spent in walk-based phase initialization (nanoseconds).
+    ///
+    /// STARTUP walk only. The in-search rephase walk is timed separately in
+    /// `rephase_walk_ns` — reading `walk_time_ns` (the `walk_ms` stat line) as
+    /// "walk never ran" is wrong, and did mislead a census: on any formula
+    /// above the startup size gate it reads 0 no matter how often
+    /// `rephase_walk` fires.
     pub walk_time_ns: u64,
+    /// Wall-clock time spent inside `rephase_walk`'s call to `walk`
+    /// (nanoseconds), excluding the calls the size gate declines.
+    pub rephase_walk_ns: u64,
+    /// Times `rephase_walk` passed its size gate and actually ran `walk`.
+    pub rephase_walk_runs: u64,
+    /// Times `rephase_walk` was scheduled but declined by the active-clause
+    /// size gate (`rephase_walk_clause_cap`).
+    pub rephase_walk_gate_skips: u64,
     /// Number of MAB arm switches (branch heuristic changes via UCB1).
     pub mab_arm_switches: u64,
     /// Retired SAT propagation compiler: propagations discovered by native code.
@@ -1011,6 +1148,36 @@ pub(crate) struct SolverStats {
     pub learned_reduction_hyper_deleted: u64,
     /// Learned clause reduction telemetry: recently-used hyper clauses kept.
     pub learned_reduction_hyper_kept: u64,
+    /// Two-stage clause management: `OnLearnedClause` score initialisations.
+    pub two_stage_learned_inits: u64,
+    /// Two-stage clause management: `OnClauseUse` bumps from BCP forcing.
+    pub two_stage_bcp_bumps: u64,
+    /// Two-stage clause management: `OnClauseUse` bumps from conflict analysis.
+    pub two_stage_analysis_bumps: u64,
+    /// Two-stage clause management: bumps dropped because the score field
+    /// was already at `MAX_TWO_STAGE_SCORE`.
+    pub two_stage_score_saturations: u64,
+    /// Two-stage clause management: `OnPeriodicDecay` sweeps executed.
+    pub two_stage_decay_rounds: u64,
+    /// Two-stage clause management: clauses actually decremented by those sweeps.
+    pub two_stage_decay_clauses: u64,
+    /// Two-stage clause management: reductions that ran the two-stage policy.
+    pub two_stage_reduce_rounds: u64,
+    /// Two-stage clause management: clauses kept by stage 1 (`score > 0`).
+    pub two_stage_stage1_kept: u64,
+    /// Two-stage clause management: `score == 0` clauses forwarded to stage 2.
+    pub two_stage_stage2_candidates: u64,
+    /// Two-stage clause management: stage-2 clauses actually deleted.
+    pub two_stage_stage2_deleted: u64,
+    /// Two-stage clause management: due flushes rerouted through the policy.
+    pub two_stage_flushes_absorbed: u64,
+    /// Two-stage clause management: sum of candidate scores seen at reduce time.
+    pub two_stage_score_total: u64,
+    /// Two-stage clause management: maximum candidate score seen at reduce time.
+    pub two_stage_score_max: u64,
+    /// Two-stage clause management: reduce-time score histogram, bucketed
+    /// `[0, 1, 2-3, 4-7, 8-15, 16-31, 32-255, 256+]`.
+    pub two_stage_score_hist: [u64; 8],
     /// Learned 19-63 pressure reduction: eligible already-deletable candidates seen.
     pub learned_1963_pressure_reduction_candidates: u64,
     /// Learned 19-63 pressure reduction: candidates with exact pressure rows.
@@ -2020,6 +2187,10 @@ impl SolverStats {
             rephase_target_phase_updates: 0,
             rephase_best_resets: 0,
             cold_restarts: 0,
+            trail_reuse_restarts: 0,
+            trail_reused_levels: 0,
+            trail_at_conflict_sum: 0,
+            level_at_conflict_sum: 0,
             focused_decisions: 0,
             stable_decisions: 0,
             inprocessing_time_ns: [0; INPROCESS_TIMING_LABELS.len()],
@@ -2050,7 +2221,32 @@ impl SolverStats {
             preprocess_time_ns: 0,
             search_time_ns: 0,
             lucky_time_ns: 0,
+            gf_probe_time_ns: 0,
+            indep_support_time_ns: 0,
+            indep_support_size: 0,
+            indep_support_installed_size: 0,
+            indep_support_decidable_vars: 0,
+            indep_support_gates: 0,
+            indep_support_closure_rejected: 0,
+            indep_support_rejected_size: 0,
+            indep_support_decisions: 0,
+            indep_support_fallback_decisions: 0,
+            indep_enum_time_ns: 0,
+            indep_enum_support_size: 0,
+            indep_enum_constraints: 0,
+            indep_enum_projected_visits: 0,
+            indep_enum_admitted: 0,
+            indep_enum_blocks: 0,
+            indep_enum_assignments: 0,
+            indep_enum_visits: 0,
+            indep_enum_exhausted: 0,
+            indep_enum_stalled: 0,
+            indep_enum_verify_failures: 0,
+            indep_enum_budget_exhausted: 0,
             walk_time_ns: 0,
+            rephase_walk_ns: 0,
+            rephase_walk_runs: 0,
+            rephase_walk_gate_skips: 0,
             mab_arm_switches: 0,
             jit_propagations: 0,
             jit_conflicts: 0,
@@ -2106,6 +2302,20 @@ impl SolverStats {
             learned_reduction_ic3_protected: 0,
             learned_reduction_low_lbd_protected: 0,
             learned_reduction_usage_protected: 0,
+            two_stage_learned_inits: 0,
+            two_stage_bcp_bumps: 0,
+            two_stage_analysis_bumps: 0,
+            two_stage_score_saturations: 0,
+            two_stage_decay_rounds: 0,
+            two_stage_decay_clauses: 0,
+            two_stage_reduce_rounds: 0,
+            two_stage_stage1_kept: 0,
+            two_stage_stage2_candidates: 0,
+            two_stage_stage2_deleted: 0,
+            two_stage_flushes_absorbed: 0,
+            two_stage_score_total: 0,
+            two_stage_score_max: 0,
+            two_stage_score_hist: [0; 8],
             learned_reduction_target_kept: 0,
             learned_reduction_lrat_retained_delete_skips: 0,
             learned_reduction_hyper_deleted: 0,

@@ -387,7 +387,8 @@ fn c5b_kinds_remain_inert_with_both_registries() {
     // walk) and `DatatypeValueEqCongruence` on 2026-08-20 (registry-complete
     // biconditional validator); both are covered by their own shape tests
     // plus the engaged-but-fail-closed assertions below the loop.
-    for kind in [TheoryLemmaKind::DatatypeInjective] {
+    {
+        let kind = TheoryLemmaKind::DatatypeInjective;
         let step = ProofStep::TheoryLemma {
             theory: "DT".to_string(),
             clause: Vec::new(),
@@ -411,7 +412,6 @@ fn c5b_kinds_remain_inert_with_both_registries() {
             None,
         )
         .expect_err("inert C5b kinds must fail closed even with both registries");
-
         assert_eq!(
             error,
             ProofCheckError::UnsupportedTheoryLemmaKind {

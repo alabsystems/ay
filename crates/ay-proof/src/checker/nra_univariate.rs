@@ -67,7 +67,7 @@ use super::ProofCheckError;
 /// constraints in exactly ONE variable that the checker's OWN exact
 /// Sturm-based cell decomposition proves infeasible over the reals.
 ///
-/// This is the EXACT precondition of [`validate_nra_univariate_unsat`], so
+/// This is the EXACT precondition of `validate_nra_univariate_unsat`, so
 /// the proof classifier in `ay-dpll` can only assign the kind to lemmas
 /// strict mode will then accept — no classifier/checker drift. All decision
 /// logic lives ONLY in this module and the shared `nra_poly` kernel.

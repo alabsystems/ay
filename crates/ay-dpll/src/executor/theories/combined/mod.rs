@@ -5162,6 +5162,9 @@ impl Executor {
             let saved_assertions = std::mem::replace(&mut self.ctx.assertions, support_assertions);
             let support_result = self.solve_auf_lia();
             self.ctx.assertions = saved_assertions;
+            if self.ite_uf_definition_recovery.ready() {
+                return Ok(SolveResult::Unknown);
+            }
             if matches!(support_result, Ok(ref result) if result.is_unsat()) {
                 if !extra_roots.is_empty() {
                     self.last_assumption_core = Some(extra_roots.to_vec());
@@ -5179,6 +5182,10 @@ impl Executor {
             self.solve_auf_lia_with_assumptions(&scoped_assertions, extra_roots)
         };
         self.ctx.assertions = base_assertions_exact;
+
+        if self.ite_uf_definition_recovery.ready() {
+            return Ok(SolveResult::Unknown);
+        }
 
         match arithmetic_result? {
             SolveResult::Unsat(_) => Ok(SolveResult::unsat()),
@@ -5985,6 +5992,7 @@ impl Executor {
                     this.last_statistics.model_validation_failures > _uflia_mvf_before;
                 let _uflia_hybrid_trip = _uflia_arm == UfliaSplitArm::Hybrid
                     && matches!(result, Ok(SolveResult::Unknown))
+                    && !this.ite_uf_definition_recovery.ready()
                     && (_uflia_demand_first
                         || this.uflia_wander_abort_tripped()
                         || _uflia_model_rejected)
@@ -6656,7 +6664,7 @@ impl Executor {
         let saved_last_proof_rebuild_originals =
             std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
-        let saved_ematching_proof_records = std::mem::take(&mut self.ematching_proof_records);
+        let saved_consequence_replay_state = self.take_consequence_replay_state();
 
         // Give solve_nia the folded window without ever promoting folded terms
         // to authored premises. Unchanged originals retain their identity;
@@ -6708,7 +6716,7 @@ impl Executor {
                 self.proof_check_ok = false;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
-                self.ematching_proof_records = saved_ematching_proof_records;
+                self.restore_consequence_replay_state(saved_consequence_replay_state);
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
                 // Mark this UNSAT as the trust-free array-free-residue reduction
                 // so the nested-array quarantine boundary accepts it.
@@ -6741,7 +6749,7 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
-                self.ematching_proof_records = saved_ematching_proof_records;
+                self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Ok(None)
             }
             Err(err) => {
@@ -6769,7 +6777,7 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.quant_expansion_records = saved_quant_expansion_records;
-                self.ematching_proof_records = saved_ematching_proof_records;
+                self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Err(err)
             }
         }

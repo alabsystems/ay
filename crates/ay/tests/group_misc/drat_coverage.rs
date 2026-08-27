@@ -25,12 +25,12 @@ use ay_drat_check::checker::DratChecker;
 use ay_drat_check::cnf_parser::parse_cnf;
 use ay_drat_check::drat_parser::parse_drat;
 use ay_sat::{
-    parse_dimacs, ProofOutput, SatFeatures, Solver, SolverVariant, VariantInput, VariantProfilePlan,
+    parse_dimacs, ProofOutput, SatFeatures, Solver, SolverVariant, VariantInput,
+    VariantProfilePlan, VariantProofMode::Drat,
 };
 use ntest::timeout;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -131,7 +131,7 @@ fn solve_and_verify_drat(cnf_path: &Path, drat_trim: Option<&Path>) -> DratResul
     let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
     let profile = VariantProfilePlan::for_features(
         SolverVariant::Default,
-        VariantInput::new(formula.num_vars, formula.num_clauses, true, false),
+        VariantInput::new(formula.num_vars, formula.num_clauses, Drat),
         &features,
     );
     profile.config.apply_to_solver(&mut solver);

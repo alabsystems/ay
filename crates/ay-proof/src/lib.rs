@@ -1,7 +1,6 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
-
 #![forbid(unsafe_code)]
 //! AY Proof - Proof production and export
 //!
@@ -52,15 +51,21 @@ use std::fmt::Write;
 
 mod alethe_parser;
 mod alethe_printer;
+mod array_row_axiom;
+mod array_store_overwrite;
 mod bundle;
 pub mod bv_blast_export;
 pub mod bv_blast_lean;
 pub mod bv_blast_solver;
 pub mod bv_cnf_refutation;
 mod checker;
+mod congruence_derivation;
+mod congruence_forest;
+mod definition_bridge;
 mod la_generic_signs;
 mod partial;
 mod quality;
+mod scope;
 mod terminal_trust;
 mod variables;
 mod wire_rule;
@@ -72,6 +77,8 @@ pub use alethe_parser::{
 pub use alethe_printer::{
     split_alethe_application_bounded, AlethePrintError, AletheSurfaceParseError,
 };
+pub use array_row_axiom::{mint_row1_axiom, plan_row1_axiom_instances};
+pub use array_store_overwrite::{mint_store_overwrite_axiom, plan_store_overwrite_instances};
 pub use bundle::{
     re_check_bundle_strict, render_term_canonical, BundleReCheck, SerializableProofBundle,
     PROOF_BUNDLE_SCHEMA,
@@ -92,7 +99,6 @@ pub use bv_cnf_refutation::surface_bv_cnf_refutation;
 pub use checker::assumed_is_authored_bool_ite_consequence;
 pub use checker::clause_mentions_floating_point;
 pub use checker::clause_mentions_string_or_regex;
-pub use checker::ground_substitution_image_matches;
 pub use checker::recognize_arith_clause_tautology;
 pub use checker::recognize_arith_eq_triangle;
 pub use checker::recognize_array_guarded_row_expansion;
@@ -101,7 +107,6 @@ pub use checker::recognize_euf_congruent;
 pub use checker::recognize_euf_congruent_pred;
 pub use checker::recognize_euf_reflexive;
 pub use checker::recognize_euf_transitive;
-pub use checker::recognize_ground_equality_substitution;
 pub use checker::recognize_ground_evaluate;
 pub use checker::recognize_ite_branch_projection;
 pub use checker::recognize_ite_same;
@@ -135,16 +140,18 @@ pub use checker::{
 };
 pub use checker::{
     check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,
-    check_proof_collecting_trust_with_typed_context, DatatypeMemberSignature, ProofCheckError,
+    check_proof_collecting_trust_with_typed_context, check_proof_with_progress,
+    DatatypeMemberSignature, ProofCheckError,
 };
 pub use checker::{
-    recognize_array_extensionality, recognize_array_extensionality_chain,
-    recognize_array_finite_extensionality,
+    ground_substitution_image_matches, recognize_array_extensionality,
+    recognize_array_extensionality_chain, recognize_array_finite_extensionality,
     recognize_array_finite_extensionality_with_typed_context,
     recognize_array_finite_select_expansion,
-    recognize_array_finite_select_expansion_with_typed_context, recognize_array_select_store,
-    recognize_array_theory_lemma, recognize_array_theory_lemma_with_typed_context,
-    recognize_folded_array_extensionality, ExtDiffRegistry,
+    recognize_array_finite_select_expansion_with_typed_context, recognize_array_row_chain_ite_eval,
+    recognize_array_select_store, recognize_array_theory_lemma,
+    recognize_array_theory_lemma_with_typed_context, recognize_folded_array_extensionality,
+    recognize_ground_equality_substitution, ExtDiffRegistry,
 };
 pub use checker::{
     recognize_datatype_constructor_reconstruct, recognize_datatype_distinct,
@@ -153,14 +160,20 @@ pub use checker::{
     recognize_datatype_tester_eval_with_selectors, recognize_datatype_tester_exclusive,
     recognize_datatype_value_eq_congruence,
 };
+pub use checker::{recognize_euf_congruence_explanation, recognize_euf_polarity_congruence};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use checker::{
     recognize_fp_forward_error, recognize_fp_ground_eval, recognize_fp_rounding_mode_domain,
 };
 pub use checker::{recognize_set_card_chain_recurrence, recognize_subset_theory_lemma};
 pub use checker::{MAX_EXPENSIVE_BV_BYTES_PER_LEMMA, MAX_EXPENSIVE_BV_WORK_PER_LEMMA};
+pub use congruence_derivation::{
+    close_congruence_derivation, congruence_derivation_renders, plan_euf_congruence_derivation,
+    CongruenceDerivation,
+};
+pub use definition_bridge::{plan_definitional_bridge, DefinitionBridge, MAX_BRIDGE_CANDIDATES};
 pub use la_generic_signs::*;
-pub use partial::{check_proof_partial, PartialProofCheck};
+pub use partial::{check_proof_partial, check_proof_partial_with_progress, PartialProofCheck};
 pub use quality::{
     authenticate_premise_clauses_strict_with_context,
     authenticate_premise_clauses_strict_with_context_and_progress,
@@ -168,13 +181,15 @@ pub use quality::{
     authenticate_premise_clauses_strict_with_typed_context_and_progress,
     authenticate_premise_clauses_with_deferred_generic_theory_and_progress,
     authenticate_premise_clauses_with_deferred_generic_theory_and_typed_context_and_progress,
-    check_proof_partial_with_quality, check_proof_strict, check_proof_strict_with_context,
+    check_proof_partial_with_quality, check_proof_partial_with_quality_and_progress,
+    check_proof_strict, check_proof_strict_with_context,
     check_proof_strict_with_context_and_progress, check_proof_strict_with_datatypes,
     check_proof_strict_with_datatypes_and_selectors, check_proof_strict_with_typed_context,
     check_proof_strict_with_typed_context_and_progress, check_proof_with_quality,
     validate_array_extensionality_provenance, AuthenticatedPremiseClauses,
     PremiseClausesWithDeferredGeneric, ProofQuality,
 };
+pub use scope::problem_scope_symbol_names;
 pub use terminal_trust::{
     terminal_trust_report, terminal_trust_report_with_provenance, TerminalTrustReport,
 };
@@ -185,18 +200,6 @@ use variables::{
     collect_auxiliary_proof_declarations, collect_proof_variables, free_var_names,
     SymbolSortConflict,
 };
-
-/// The problem-declared symbol names the Alethe exporter treats as already in
-/// scope.
-///
-/// The round-trip self-check needs a [`ProblemScope`]; when the problem text
-/// is not available on disk (stdin mode) this is the in-process substitute.
-/// Sorts are not recoverable this way, so the resulting scope tolerates
-/// unknown sort names — see [`ProblemScope::from_symbols`].
-#[must_use]
-pub fn problem_scope_symbol_names(terms: &TermStore, problem_assertions: &[TermId]) -> Vec<String> {
-    variables::problem_scope_symbol_names(terms, problem_assertions)
-}
 
 impl From<SymbolSortConflict> for AlethePrintError {
     fn from(conflict: SymbolSortConflict) -> Self {
@@ -647,8 +650,7 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
 }
 
 include!("reachable_assume_validation.rs");
-/// Render an [`AlethePrintError`] as a loudly-marked Alethe document and
-/// log a warning to `stderr`.
+/// Render an [`AlethePrintError`] as a loudly-marked document and warn on `stderr`.
 ///
 /// The output is intentionally NOT a valid Alethe proof. Every downstream
 /// checker will refuse it: the `(error ...)` S-expression is not a legal

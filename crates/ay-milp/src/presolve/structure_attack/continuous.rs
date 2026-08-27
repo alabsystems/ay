@@ -80,14 +80,13 @@ fn audit_half_integer_grid(
     let steps: Vec<Vec<BigRational>> = (0..n)
         .map(|j| {
             let (lower, upper) = model.col_bounds(Col(j as u32));
-            let mut values = Vec::new();
-            let mut value = lower;
-            while value <= upper + 1e-12 {
+            // This fixture generates integral finite bounds, so the doubled
+            // span is the exact number of half-steps to enumerate.
+            let half_steps = ((upper - lower) * 2.0) as usize;
+            let mut values = Vec::with_capacity(half_steps.saturating_add(1));
+            for step in 0..=half_steps {
+                let value = lower + step as f64 * 0.5;
                 values.push(exact(value).unwrap());
-                value += 0.5;
-            }
-            if values.is_empty() {
-                values.push(exact(lower).unwrap());
             }
             values
         })

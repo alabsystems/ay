@@ -69,6 +69,9 @@ node bindings/js/examples/search-minesweeper.mjs
 
 Enumeration is satisfaction-only: `enumerate()` rejects a model after
 `minimize()` or `maximize()` instead of silently changing the requested mode.
+All numeric inputs and decoded outputs in this JavaScript API must satisfy
+`Number.isSafeInteger`; use the Rust or Python API for the full signed-64-bit
+SearchSpec range.
 
 ## Requirements
 

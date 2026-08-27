@@ -133,6 +133,31 @@ impl CheckedFiniteEnumPigeonholeProof {
     }
 }
 
+#[cfg(test)]
+impl Executor {
+    pub(in crate::executor) fn plant_stale_finite_enum_sidecars_for_test(&mut self) {
+        self.last_finite_enum_pigeonhole = Some(crate::executor::FiniteEnumPigeonholeWitness {
+            k: 0,
+            members: Vec::new(),
+            edge_sources: Default::default(),
+        });
+        self.last_checked_finite_enum_pigeonhole = Some(CheckedFiniteEnumPigeonholeProof {
+            query_epoch: self.query_authority_epoch.clone(),
+            source_context_stamp: self.ctx.source_context_stamp(),
+            root_len: self.ctx.assertions.len(),
+            members: Box::new([]),
+            member_entries: Box::new([]),
+            sources: Box::new([]),
+            equalities: Box::new([]),
+            equality_entries: Box::new([]),
+            surface: None,
+            datatype_decls: Box::new([]),
+            selector_decls: Box::new([]),
+            member_signatures: Box::new([]),
+        });
+    }
+}
+
 impl Executor {
     pub(super) fn bounded_pair_count(k: usize, members: usize) -> Option<usize> {
         if k == 0 || members > MAX_MEMBERS || members != k.checked_add(1)? {

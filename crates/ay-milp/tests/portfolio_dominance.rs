@@ -70,11 +70,11 @@ fn sat_clause_milp() -> Model {
 /// the routed answer and reports regressions that are not there — which is
 /// exactly what the first draft of this file did, on the model below.
 ///
-/// (`Outcome::trust` has the same blind spot, and it is worse there than here:
-/// it will describe a verdict backed by a verified single-row DP refutation as
-/// "infeasibility with neither a Farkas witness nor a tree certificate". Folding
-/// the thirteen fields into the returned verdict is the real fix; reading both
-/// halves is what a test can do today.)
+/// (`Outcome::evidence_shape` has the same intentionally narrow field of view:
+/// it reports a verdict backed by a verified single-row DP refutation as lacking
+/// an `Outcome`-resident certificate. Folding the thirteen fields into the
+/// returned verdict is the real fix; reading both halves is what a test can do
+/// today.)
 struct Answer {
     outcome: Outcome,
     typed_certificate: bool,
@@ -265,7 +265,7 @@ fn pigeonhole(pigeons: usize, holes: usize) -> Model {
 #[test]
 fn the_deferral_engages_on_a_model_a_replay_lane_would_otherwise_claim() {
     let model = pigeonhole(8, 7);
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(60));
+    let opts = SolveOpts::new().with_time_limit(Duration::from_mins(1));
     let mut session = BabSession::new(model, &opts).expect("session");
     let outcome = session.check().expect("check");
     assert!(
@@ -281,46 +281,46 @@ fn the_deferral_engages_on_a_model_a_replay_lane_would_otherwise_claim() {
     );
 }
 
-/// **THE WALL CLOCK MAY CHANGE HOW MUCH PROOF COMES BACK, NEVER WHICH ANSWER.**
+/// **DISABLING TREE CAPTURE DOES NOT DISARM ROOT-FARKAS FIRST REFUSAL.**
 ///
-/// This is the determinism argument, and it is structural rather than a
-/// property of any budget. A deferred claim has already decided the model; the
-/// anchor's first refusal only competes for the EVIDENCE. So whichever side
-/// wins the race, the verdict is the same — and that is what makes a wall-clock
-/// slice safe to use in a solver that must give the same answer twice.
-///
-/// Driven here through `--tree-cert-leaves`, which moves [`crate::claim::anchor_cap`]
-/// and therefore decides whether the floor defers at all, rather than through
-/// the process-global cap knob: same model, deferral on and deferral off, one
-/// verdict.
+/// `tree_cert_leaves` controls one source of succinct infeasibility evidence,
+/// but the post-tree root relaxation can independently produce a succinct
+/// Farkas row. The floor is an upper bound on structurally reachable evidence,
+/// not a prediction for this model, so both leaf-budget arms must defer the
+/// replay refutation and retain the same raw conclusion under default policy.
 #[test]
-fn the_verdict_does_not_depend_on_whether_the_floor_deferred() {
+fn disabling_tree_capture_keeps_root_farkas_deferral() {
     let model = pigeonhole(8, 7);
-    let base = SolveOpts::new().with_time_limit(Duration::from_secs(60));
+    let base = SolveOpts::new().with_time_limit(Duration::from_mins(1));
 
     // Leaf budget armed: the anchor could reach SUCCINCT, so the replay
     // refutation is held back and native gets first refusal.
     let deferring = solve(&model, &base);
-    // Leaf budget off: the anchor can no longer reach SUCCINCT, so the floor
-    // admits the refutation and it closes the solve immediately.
-    let greedy = solve(&model, &base.clone().with_tree_cert_leaves(0));
+    // Leaf budget off: root Farkas remains reachable, so the replay floor still
+    // grants native first refusal.
+    let leafless = solve(&model, &base.clone().with_tree_cert_leaves(0));
 
     assert_eq!(
         verdict_rank(&deferring),
-        verdict_rank(&greedy),
-        "deferral changed the VERDICT, not just the evidence: deferring={:?} \
-         greedy={:?}. First refusal is only allowed to compete for proof.",
+        verdict_rank(&leafless),
+        "the leaf budget changed the raw conclusion: deferring={:?} leafless={:?}",
         deferring.outcome,
-        greedy.outcome,
+        leafless.outcome,
     );
     assert!(
         matches!(deferring.outcome, Outcome::Infeasible { .. })
-            && matches!(greedy.outcome, Outcome::Infeasible { .. }),
+            && matches!(leafless.outcome, Outcome::Infeasible { .. }),
         "both arms must still refute PHP(8,7)"
     );
     assert_eq!(
-        greedy.deferred_lane, None,
-        "the zero-tree-capacity arm must recover immediate greedy closure"
+        deferring.deferred_lane,
+        Some(("direct-cnf", "infeasible")),
+        "the default tree budget must defer the replay refutation"
+    );
+    assert_eq!(
+        leafless.deferred_lane,
+        Some(("direct-cnf", "infeasible")),
+        "a zero tree-leaf budget must not hide the independently reachable root Farkas artifact"
     );
 }
 

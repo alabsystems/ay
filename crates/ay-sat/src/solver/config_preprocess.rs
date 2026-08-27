@@ -869,11 +869,25 @@ impl Solver {
                     self.num_vars.saturating_sub(self.count_fixed_vars()),
                     self.arena.active_clause_count(),
                 );
+                // Converge arm (`--sat-vivify-converge`): the shared
+                // `skip_expensive_preprocessing_passes` gate is a DENSITY gate
+                // (`skip_dense_formula_elim`, > 50 clauses/var) built for the
+                // ELIMINATION passes, which can inflate a formula. Vivification
+                // only strengthens or deletes clauses, so density is exactly
+                // the wrong reason to skip it — and the asymmetric-tautology
+                // families that need it most are dense by construction. The
+                // SAT-COMP 2026 `stable-400` family (400 vars, 30,623 clauses,
+                // density 76.6) trips this gate and therefore never runs
+                // preprocessing vivification at all (measured:
+                // `viv_irr_calls_pp: 0`). The arm exempts vivification from the
+                // density gate only; the class/route gates are untouched.
+                let vivify_density_exempt = skip_expensive_preprocessing_passes
+                    && inprocessing::vivify::vivify_converge_enabled();
                 if !dense_factor_bve_lrat_route
                     && !self.circuit_bve_lrat_preprocess_route_active()
                     && formula_class == FormulaClass::Small
                     && self.inproc_ctrl.vivify.enabled
-                    && !skip_expensive_preprocessing_passes
+                    && (!skip_expensive_preprocessing_passes || vivify_density_exempt)
                 {
                     self.set_diagnostic_pass(DiagnosticPass::Vivify);
                     if self.vivify_preprocess() {

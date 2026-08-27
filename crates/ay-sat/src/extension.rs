@@ -25,6 +25,9 @@
 
 use crate::{Literal, Variable};
 
+mod prepared;
+pub use prepared::PreparedExtension;
+
 /// Result of extension's final check
 #[derive(Debug)]
 #[non_exhaustive]
@@ -42,6 +45,26 @@ pub enum ExtCheckResult {
     /// scratch), add the lemma clauses and continue within the same SAT
     /// invocation. This eliminates O(N) full SAT-solve round-trips.
     AddClauses(Vec<Vec<Literal>>),
+}
+
+/// One proof-only step from a preprocessing extension (task #20 chunked XOR
+/// ladders).
+///
+/// These steps are written to the proof stream verbatim and are NEVER added
+/// to the solver's clause database: they may reference fresh extension
+/// variables above the solver's variable range (DRAT extension variables),
+/// which must never participate in search or reach a model. Literal order is
+/// preserved on the wire — a RAT addition (e.g. an XOR chain-definition
+/// clause over a fresh variable) must carry its pivot as the FIRST literal,
+/// because external DRAT checkers (dsr-trim) resolve RAT on the first
+/// literal of the emitted line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtProofStep {
+    /// Add a clause to the proof (RUP, or RAT on the first literal).
+    Add(Vec<Literal>),
+    /// Delete a previously added proof-only clause (a DRAT `d`-line). Keeps
+    /// checker memory bounded when derivation intermediates are exhausted.
+    Delete(Vec<Literal>),
 }
 
 /// Result of extension's unit propagation
@@ -104,6 +127,12 @@ pub struct ExtPropagateResult {
     /// bumps at registration and restart, causing the SAT solver to stop
     /// focusing on theory-relevant variables after ~20 conflicts.
     pub bump_vars: Vec<Variable>,
+
+    /// Proof-only steps that must reach the proof stream BEFORE this result's
+    /// `clauses`, `propagations`, and `conflict` are processed (chunked XOR
+    /// ladder scaffolding over fresh extension variables). Empty for every
+    /// extension except the chunked XOR proof route. See [`ExtProofStep`].
+    pub proof_script: Vec<ExtProofStep>,
 }
 
 impl ExtPropagateResult {
@@ -121,6 +150,7 @@ impl ExtPropagateResult {
             conflict: None,
             stop: false,
             bump_vars: Vec::new(),
+            proof_script: Vec::new(),
         }
     }
 
@@ -133,6 +163,7 @@ impl ExtPropagateResult {
             conflict: None,
             stop: false,
             bump_vars: Vec::new(),
+            proof_script: Vec::new(),
         }
     }
 
@@ -145,6 +176,7 @@ impl ExtPropagateResult {
             conflict: Some(clause),
             stop: false,
             bump_vars: Vec::new(),
+            proof_script: Vec::new(),
         }
     }
 
@@ -162,6 +194,7 @@ impl ExtPropagateResult {
             conflict,
             stop,
             bump_vars: Vec::new(),
+            proof_script: Vec::new(),
         }
     }
 
@@ -175,50 +208,6 @@ impl ExtPropagateResult {
     pub fn with_bump_vars(mut self, vars: Vec<Variable>) -> Self {
         self.bump_vars = vars;
         self
-    }
-}
-
-/// Extension instance prepared during the SAT solver's preprocessing phase.
-///
-/// This allows a downstream crate to:
-/// 1. inspect a snapshot of the current irredundant clause set,
-/// 2. decide which clauses are consumed by a theory-specific extractor, and
-/// 3. freeze theory-tracked variables before SAT preprocessing continues.
-///
-/// The consumed clause positions refer to the exact clause snapshot passed to
-/// the builder callback. The extension must enforce the exact conjunction of
-/// those clauses over their shared variables, not merely an equisatisfiable
-/// projection: SAT preprocessing may derive other constraints from the source
-/// clauses before ownership is committed. Every variable occurring in a
-/// consumed clause must therefore also appear in `frozen_variables`; the
-/// solver rejects preparation when that interface is incomplete.
-pub struct PreparedExtension<E> {
-    /// The extension to activate once SAT preprocessing finishes.
-    pub extension: E,
-    /// Positions in the builder's clause snapshot that should be removed from
-    /// the SAT clause database because the extension now owns them.
-    pub consumed_clause_positions: Vec<usize>,
-    /// Variables that must be frozen before destructive SAT preprocessing
-    /// continues (for example, to keep BVE from eliminating XOR-tracked vars).
-    pub frozen_variables: Vec<Variable>,
-}
-
-impl<E> PreparedExtension<E> {
-    /// Create a prepared extension and canonicalize its metadata.
-    pub fn new(
-        extension: E,
-        mut consumed_clause_positions: Vec<usize>,
-        mut frozen_variables: Vec<Variable>,
-    ) -> Self {
-        consumed_clause_positions.sort_unstable();
-        consumed_clause_positions.dedup();
-        frozen_variables.sort_unstable_by_key(|var| var.index());
-        frozen_variables.dedup_by_key(|var| var.index());
-        Self {
-            extension,
-            consumed_clause_positions,
-            frozen_variables,
-        }
     }
 }
 

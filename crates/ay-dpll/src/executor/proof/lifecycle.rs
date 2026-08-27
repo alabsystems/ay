@@ -134,11 +134,13 @@ impl Executor {
         proof: &mut Proof,
         hidden_equality_assertions: &[TermId],
     ) {
+        let should_stop = self.make_should_stop();
         crate::executor::proof_repair::proof_farkas::reconstruct_missing_farkas_coefficients(
             &mut self.ctx.terms,
             proof,
             &self.ctx.assertions,
             hidden_equality_assertions,
+            &should_stop,
         );
         Self::demote_uncertified_arithmetic_lemmas_to_trust(proof);
     }

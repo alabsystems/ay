@@ -846,12 +846,12 @@ fn build_direct_refutation(
 
 /// Detects pigeonhole/Hall UNSAT and SELF-CHECKS the reconstructed cutting-planes
 /// derivation against the kernel-verified algebra
-/// ([`crate::proof::refutation_check`]).
+/// (`crate::proof::refutation_check`).
 ///
 /// Returns `true` ONLY when a checked `0 >= c` (`c >= 1`) cutting-planes
 /// refutation over the ORIGINAL constraints exists. Tries the pure global
-/// counting path first ([`pigeonhole_cp_refutation`]), then the general Hall
-/// extension ([`hall_cp_refutation`]) for the `php-exit` v2 multi-exit shape. The
+/// counting path first (`pigeonhole_cp_refutation`), then the general Hall
+/// extension (`hall_cp_refutation`) for the `php-exit` v2 multi-exit shape. The
 /// caller may then emit `s UNSATISFIABLE` without trusting this detector: a `true`
 /// here means the verdict carries a kernel-algebra-checked refutation. Returns
 /// `false` otherwise (no structure, size limits, or a candidate that fails the

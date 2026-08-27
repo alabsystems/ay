@@ -76,7 +76,7 @@ fn veripb_verdict(veripb: &Path, opb: &str, pbp: &str, label: &str) -> String {
         .lines()
         .find(|l| l.starts_with("s "))
         .map(str::to_string)
-        .unwrap_or_else(|| format!("REJECTED: {}", stderr.replace('\n', " ").trim().to_string()))
+        .unwrap_or_else(|| format!("REJECTED: {}", stderr.replace('\n', " ").trim()))
 }
 
 fn lit(var: u32, negated: bool) -> PbLit {

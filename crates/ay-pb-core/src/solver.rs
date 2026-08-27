@@ -4,11 +4,12 @@
 
 use crate::{PbConstraint, PbLit, PbObjective, PbRel, PbTerm};
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 /// Failure while exactly evaluating a pseudo-Boolean objective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectiveEvalError {
-    /// The exact objective sum exceeded the `i128` accumulator range.
+    /// The final mathematical objective sum is outside the `i128` range.
     Overflow,
 }
 
@@ -71,13 +72,20 @@ pub fn eval_objective(objective: &PbObjective, assignment: &[bool]) -> i128 {
 
 /// Evaluates a pseudo-Boolean objective exactly in `i128`.
 ///
-/// Returns [`ObjectiveEvalError::Overflow`] rather than wrapping if any checked
-/// accumulation step exceeds the `i128` range.
+/// The common path uses checked `i128` accumulation. If an intermediate sum
+/// overflows, evaluation falls back to [`BigInt`] so later cancellation remains
+/// exact. Returns [`ObjectiveEvalError::Overflow`] only when the final
+/// mathematical sum is outside the `i128` range.
 pub fn eval_objective_exact(
     objective: &PbObjective,
     assignment: &[bool],
 ) -> Result<i128, ObjectiveEvalError> {
-    eval_terms_checked(&objective.terms, assignment)
+    match eval_terms_checked(&objective.terms, assignment) {
+        Ok(value) => Ok(value),
+        Err(ObjectiveEvalError::Overflow) => eval_terms_bigint(&objective.terms, assignment)
+            .to_i128()
+            .ok_or(ObjectiveEvalError::Overflow),
+    }
 }
 
 /// Evaluates an objective and returns `None` if the exact value does not fit `i128`.
@@ -317,6 +325,82 @@ mod tests {
         };
 
         assert_eq!(eval_objective(&objective, &[true, true]), i128::MAX);
+        assert_eq!(
+            eval_objective_exact(&objective, &[true, true]),
+            Err(ObjectiveEvalError::Overflow)
+        );
+    }
+
+    #[test]
+    fn test_eval_objective_exact_recovers_positive_overflow_with_cancellation() {
+        let objective = PbObjective {
+            terms: vec![
+                term(i128::MAX, vec![lit(1)]),
+                term(1, vec![lit(2)]),
+                term(-1, vec![lit(3)]),
+            ],
+        };
+
+        assert_eq!(
+            eval_objective_exact(&objective, &[true, true, true]),
+            Ok(i128::MAX)
+        );
+    }
+
+    #[test]
+    fn test_eval_objective_exact_diverges_from_checked_fold_on_recoverable_overflow() {
+        // WITNESS for the deductive-checks TARGET 2 contract. The BigInt fallback makes
+        // `eval_objective_exact` STRICTLY MORE DEFINED than the checked fold it
+        // starts from: here the fold's INTERMEDIATE `i128::MAX + 1` overflows
+        // (so `eval_terms_checked` fails closed) while the exact mathematical
+        // sum `i128::MAX` fits, so the function recovers `Ok(i128::MAX)`.
+        //
+        // The two therefore DISAGREE on this input, which is why the fixture may
+        // NOT pin `result == eval_terms_checked(&objective.terms, assignment)`:
+        // that contract is FALSE of the shipped body exactly here. The honest
+        // contract is the two-armed one the body implements (Ok-passthrough plus
+        // the exact-BigInt narrowing on the Err arm).
+        let objective = PbObjective {
+            terms: vec![
+                term(i128::MAX, vec![lit(1)]),
+                term(1, vec![lit(2)]),
+                term(-1, vec![lit(3)]),
+            ],
+        };
+        let assignment = [true, true, true];
+
+        assert_eq!(
+            eval_terms_checked(&objective.terms, &assignment),
+            Err(ObjectiveEvalError::Overflow),
+            "the checked fold must fail closed on the intermediate overflow"
+        );
+        assert_eq!(
+            eval_objective_exact(&objective, &assignment),
+            Ok(i128::MAX),
+            "the live body must recover the exact in-range sum"
+        );
+        assert_ne!(
+            eval_objective_exact(&objective, &assignment),
+            eval_terms_checked(&objective.terms, &assignment),
+            "the live body is NOT the checked fold — the divergence the overflow \
+             fallback exists for"
+        );
+    }
+
+    #[test]
+    fn test_eval_objective_exact_recovers_negative_overflow_with_cancellation() {
+        let objective = PbObjective {
+            terms: vec![
+                term(i128::MIN, vec![lit(1)]),
+                term(-1, vec![lit(2)]),
+                term(1, vec![lit(3)]),
+            ],
+        };
+
+        assert_eq!(
+            eval_objective_exact(&objective, &[true, true, true]),
+            Ok(i128::MIN)
+        );
     }
 
     #[test]

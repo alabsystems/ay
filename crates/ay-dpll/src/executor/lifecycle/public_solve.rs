@@ -124,6 +124,17 @@ impl Executor {
     /// that must remain cumulative across every nested solve/restart it owns.
     pub(crate) fn begin_external_decision_query(&mut self, preserve_pareto_enumeration: bool) {
         self.begin_external_proof_checkpoint_budget();
+        // The consequence-replay lane's WALL envelope re-arms HERE and nowhere
+        // else. `begin_public_solve` is the wrong boundary: nested
+        // corroboration re-solves and internal probe executors call it, and a
+        // per-`begin_public_solve` replenish would restore exactly the
+        // unbounded multiplication this envelope exists to stop.
+        self.consequence_replay_probe_budget.begin_external_query();
+        // Same boundary, same reason, for the quantified model gate's arms.
+        // `begin_public_solve` is the wrong one: the gate's own nested probe
+        // executors call it, and re-arming there would hand every probe a fresh
+        // envelope -- the per-call constant this replaced, wearing a new name.
+        self.quantified_gate_probe_budget.begin_external_query();
         self.finite_array_expansion
             .prune_to_active_assertions(&self.ctx.terms, &self.ctx.assertions);
         self.finite_array_expansion.begin_external_query();

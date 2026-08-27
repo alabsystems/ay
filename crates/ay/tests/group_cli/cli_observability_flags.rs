@@ -134,12 +134,11 @@ fn test_proof_flag_writes_lrat_for_unsat_dimacs() {
 
 #[test]
 #[timeout(60_000)]
-fn test_proof_format_alethe_writes_alethe_for_unsat_dimacs() {
+fn test_proof_format_alethe_is_refused_for_dimacs() {
     let ay_path = env!("CARGO_BIN_EXE_ay");
     let cnf = "p cnf 1 2\n1 0\n-1 0\n";
     let (input_path, _input_cleanup) = write_temp(cnf, "cnf");
     let (proof_path, _proof_cleanup) = temp_path("proof");
-
     let output = Command::new(ay_path)
         .arg("--proof")
         .arg(&proof_path)
@@ -151,26 +150,27 @@ fn test_proof_format_alethe_writes_alethe_for_unsat_dimacs() {
 
     assert_eq!(
         output.status.code(),
-        Some(20),
-        "expected UNSAT exit code 20: {}",
+        Some(1),
+        "DIMACS Alethe must fail closed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("UNSATISFIABLE"),
-        "expected UNSAT, got {}",
+        !String::from_utf8_lossy(&output.stdout).contains("UNSATISFIABLE"),
+        "refused DIMACS Alethe leaked UNSAT: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-
-    let proof = std::fs::read_to_string(&proof_path).expect("proof file");
-    assert!(!proof.is_empty(), "expected non-empty Alethe proof file");
     assert!(
-        proof.contains("(assume "),
-        "expected assume steps in Alethe proof"
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Alethe proof output is unavailable for DIMACS input"),
+        "missing retired-format diagnostic: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        proof.contains("(step "),
-        "expected step entries in Alethe proof"
+        String::from_utf8_lossy(&output.stderr).contains("original clause literals"),
+        "diagnostic must explain the missing binding: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!proof_path.exists(), "refusal created a proof artifact");
 }
 
 #[test]

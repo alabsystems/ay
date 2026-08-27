@@ -43,6 +43,8 @@ use ay_core::time::Instant;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+mod checked_run;
+
 /// Cap on clause instantiations while expanding an acyclic clause system into
 /// one quantifier-free error-reachability query. Prevents pathological DAG
 /// sharing from blowing up the synthesized obligation; exceeding the cap fails
@@ -57,7 +59,7 @@ const ACYCLIC_EXPANSION_MAX_DEPTH: usize = 128;
 ///
 /// Everything in here is bound together fail-closed: `manifest` admitted the
 /// validated `summary` via `try_with_checked_replay_summary`, and
-/// `proof_run.metadata` is the upgraded (`replayable`) transcript whose
+/// `proof_run.metadata()` is the upgraded (`replayable`) transcript whose
 /// digests point at the byte payloads carried alongside.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -65,27 +67,27 @@ pub struct ChcCheckedReplayRun {
     /// The sealed proof run with UPGRADED transcript metadata
     /// (`replay.status == transcript.status == "replayable"`,
     /// `trust_full_verifier_admissible() == true`).
-    pub proof_run: ChcPdrProofRun,
+    proof_run: ChcPdrProofRun,
     /// Evidence manifest with the checked replay summary attached
     /// (`trust_full_verifier_admissible() == true`).
-    pub manifest: ChcProofEvidenceManifest,
+    manifest: ChcProofEvidenceManifest,
     /// The validated checked replay summary.
-    pub summary: ChcCheckedReplaySummary,
+    summary: ChcCheckedReplaySummary,
     /// Normalized CHC input bytes (the `problem` artifact).
-    pub problem_bytes: Vec<u8>,
+    problem_bytes: Vec<u8>,
     /// Certificate bytes (the `proof-certificate` artifact).
-    pub certificate_bytes: Vec<u8>,
+    certificate_bytes: Vec<u8>,
     /// Deterministic solver run-log bytes (the `solver-transcript` artifact),
     /// when produced by this pass. `None` when the caller-supplied evidence
     /// already carried a solver transcript (e.g. the CLI trace file), whose
     /// bytes live at that artifact's recorded path.
-    pub run_log_bytes: Option<Vec<u8>>,
+    run_log_bytes: Option<Vec<u8>>,
     /// Replay log bytes: the per-obligation pass record (the `replay-report`
     /// artifact).
-    pub replay_log_bytes: Vec<u8>,
+    replay_log_bytes: Vec<u8>,
     /// Checked proof report bytes: the summary JSON whose SHA-256 is emitted
     /// as `checked_report.sha256` in the transcript metadata.
-    pub checked_report_bytes: Vec<u8>,
+    checked_report_bytes: Vec<u8>,
 }
 
 fn verification_error(message: impl Into<String>) -> ChcError {
@@ -118,11 +120,7 @@ impl ChcPdrProofRun {
     /// Fail-closed: `Unknown` results, budget exhaustion, any obligation
     /// failure, and any digest-binding mismatch return `Err`, and callers must
     /// keep using the original metadata-only run.
-    pub fn run_checked_replay(
-        &self,
-        problem: &ChcProblem,
-        budget: Duration,
-    ) -> ChcResult<ChcCheckedReplayRun> {
+    pub fn run_checked_replay(&self, budget: Duration) -> ChcResult<ChcCheckedReplayRun> {
         let engine = self.metadata.engine.clone();
         let mut options = ChcProofEvidenceOptions::pdr_strict(&crate::PdrConfig::default());
         options.proof_mode = format!("checked-replay:{engine}");
@@ -131,7 +129,7 @@ impl ChcPdrProofRun {
             "ay-chc:checked-replay:{}",
             self.metadata.normalized_input_sha256
         );
-        self.run_checked_replay_with_binding(problem, options, solver, obligation_id, None, budget)
+        self.run_checked_replay_with_binding(options, solver, obligation_id, None, budget)
     }
 
     /// Run the checked replay pass against caller-supplied manifest binding
@@ -144,13 +142,13 @@ impl ChcPdrProofRun {
     /// executes — otherwise the pass fails closed.
     pub fn run_checked_replay_with_binding(
         &self,
-        problem: &ChcProblem,
         options: ChcProofEvidenceOptions,
         solver: ChcProofSolverIdentity,
         obligation_id: impl Into<String>,
         base_evidence: Option<ChcReplayEvidence>,
         budget: Duration,
     ) -> ChcResult<ChcCheckedReplayRun> {
+        let problem = self.problem();
         let obligation_id = obligation_id.into();
         if budget.is_zero() {
             return Err(verification_error(
@@ -213,14 +211,12 @@ impl ChcPdrProofRun {
             // UNSAT obligations (initiation/consecution/safety and synthesized
             // acyclic-exhaustion/ghost-pair discharges) are discharged with a
             // NATIVE STRICT ALETHE self-check — self-contained, no z3, no
-            // external checker. We require BOTH (1) AY's in-process strict
-            // verdict to be Verified and (2) the offline re-check of the
-            // recorded proof bundle (AY's own `re_check_bundle_strict`) to
-            // pass. Anything else — no cert produced (e.g. array/quantifier
-            // obligations whose proof carries a trust/hole step and fails
-            // strict), a Rejected verdict, or a bundle that fails the offline
-            // re-check — fails closed to metadata-only. A trusted re-run
-            // verdict is no longer sufficient for an UNSAT obligation.
+            // external checker. AY's in-process strict verdict must be
+            // Verified. No certificate, or a Rejected verdict, fails closed
+            // to metadata-only; a trusted re-run verdict is insufficient.
+            // The serialized bundle is digest-bound for downstream checking,
+            // but the stricter plain `re_check_bundle_strict` is deliberately
+            // not this admission gate, as explained below.
             //
             // SAT (trace-validity) obligations have no UNSAT proof: a witness
             // is checked by verdict (ground-eval), exactly as before.
@@ -265,10 +261,11 @@ impl ChcPdrProofRun {
                 // step demoted from genuine BV/array theory reasoning is
                 // independently re-discharged as a theory tautology (¬clause
                 // UNSAT) on AY's OWN executor — self-contained, no z3, no
-                // external checker. The proof bundle is serialized and
-                // digest-bound below as the PORTABLE certificate for downstream
-                // offline verification. The separately hashed Alethe text is
-                // diagnostic and may honestly contain `hole`; note the plain
+                // external checker. The proof bundle and Alethe text are
+                // serialized only to bind diagnostic hashes below; their bytes
+                // are not retained in the checked-replay row, so that row is
+                // not standalone offline proof evidence. The Alethe text may
+                // honestly contain `hole`; note the plain
                 // offline `re_check_bundle_strict` is STRICTER than this gate (it
                 // rejects deferred-trust-rescued proofs), so it is not used as
                 // the admission gate here — doing so would fail-close legitimate
@@ -475,13 +472,8 @@ impl ChcPdrProofRun {
         evidence.replay_report = Some(replay_log_digest.clone());
 
         // 4. Build the manifest, validate the summary against it, and admit.
-        let manifest = self.evidence_manifest_with_replay_evidence(
-            problem,
-            options,
-            solver,
-            obligation_id,
-            evidence,
-        );
+        let manifest =
+            self.evidence_manifest_with_replay_evidence(options, solver, obligation_id, evidence);
         let artifacts = ChcCheckedReplayArtifacts::new(
             problem_digest,
             certificate_digest,
@@ -516,10 +508,7 @@ impl ChcPdrProofRun {
         })?;
 
         Ok(ChcCheckedReplayRun {
-            proof_run: ChcPdrProofRun {
-                result: self.result.clone(),
-                metadata,
-            },
+            proof_run: self.with_metadata(metadata),
             manifest,
             summary,
             problem_bytes,
@@ -528,45 +517,6 @@ impl ChcPdrProofRun {
             replay_log_bytes,
             checked_report_bytes,
         })
-    }
-}
-
-impl VerifiedChcResult {
-    /// Build replay/proof metadata for this result, attempting a budget-capped
-    /// CHECKED replay pass first.
-    ///
-    /// On success the returned metadata is `replayable` (transcript uri +
-    /// SHA-256, replay SHA-256, checked-report SHA-256, Trust-full-verifier
-    /// admissible). On ANY failure — non-proof result, budget exhaustion,
-    /// obligation failure, internal panic — this degrades to the plain
-    /// metadata-only [`VerifiedChcResult::proof_transcript_metadata`] result,
-    /// so callers see exactly the pre-existing fail-closed behavior.
-    pub fn checked_proof_transcript_metadata(
-        &self,
-        problem: &ChcProblem,
-        engine: impl Into<String>,
-        replay_budget: Duration,
-    ) -> ChcProofTranscriptMetadata {
-        let run = ChcPdrProofRun::new(problem, self.clone(), engine);
-        let checked = ay_core::catch_ay_panics(
-            std::panic::AssertUnwindSafe(|| run.run_checked_replay(problem, replay_budget)),
-            |reason| {
-                Err(verification_error(format!(
-                    "checked replay panic: {reason}"
-                )))
-            },
-        );
-        match checked {
-            Ok(checked) => checked.proof_run.metadata,
-            Err(err) => {
-                // Fail-closed is correct, but silently discarding the reason
-                // made this undiagnosable: consumers see only a metadata-only
-                // transcript and cannot tell whether replay was disabled,
-                // starved of budget, or genuinely failed. Surface it.
-                eprintln!("[ay-chc] checked replay fell back to metadata-only: {err}");
-                run.metadata
-            }
-        }
     }
 }
 

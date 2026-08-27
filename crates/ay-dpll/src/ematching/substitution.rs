@@ -7,6 +7,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 
+mod exact_helpers;
+
 /// Red zone size for `stacker::maybe_grow` in substitution recursion (#8414).
 ///
 /// Quantifier instantiation on datatype-heavy problems can produce deeply nested
@@ -320,9 +322,15 @@ pub(crate) fn subst_vars(
 /// strict checker now accepts capture-safe substitution beneath preserved
 /// `forall`/`exists` binders. Mirror that exact lane here: nested binding lists
 /// and trigger-group structure are preserved, shadowed names are blocked, and a
-/// replacement which contains any source/nested binder name (or another binder
-/// or let) fails closed. Lets in the authored body remain unsupported, exactly
-/// like the checker.
+/// replacement which contains a binder or a let, or which names a binder the
+/// body still has in scope, fails closed. Lets in the authored body remain
+/// unsupported, exactly like the checker.
+///
+/// The source binders themselves are DISCHARGED by the instantiation, so their
+/// spellings bind nothing in the result. They are refused as replacement names
+/// only while the body still carries a binder of its own — see the
+/// `capturing_binders` computation below for why that distinction is exactly
+/// the capture criterion and not a relaxation of it.
 pub(crate) fn subst_vars_exact_qf(
     terms: &mut TermStore,
     term: TermId,
@@ -330,45 +338,17 @@ pub(crate) fn subst_vars_exact_qf(
 ) -> Option<TermId> {
     const WORK_LIMIT: usize = 100_000;
 
-    fn nested_binder_names(
-        terms: &TermStore,
-        root: TermId,
-        work: &mut usize,
-    ) -> Option<HashSet<String>> {
-        let mut names = HashSet::default();
-        let mut seen = HashSet::default();
-        let mut stack = vec![root];
-        while let Some(term) = stack.pop() {
-            if !seen.insert(term) {
-                continue;
-            }
-            if *work >= WORK_LIMIT {
-                return None;
-            }
-            *work += 1;
-            match terms.get(term) {
-                TermData::Forall(bindings, body, triggers)
-                | TermData::Exists(bindings, body, triggers) => {
-                    names.extend(bindings.iter().map(|(name, _)| name.clone()));
-                    stack.push(*body);
-                    stack.extend(triggers.iter().flatten().copied());
-                }
-                TermData::App(_, args) => stack.extend(args.iter().copied()),
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(condition, then_branch, else_branch) => {
-                    stack.extend([*condition, *then_branch, *else_branch]);
-                }
-                TermData::Let(..) => return None,
-                _ => {}
-            }
-        }
-        Some(names)
-    }
-
+    /// A replacement is usable when it carries no binder of its own and names
+    /// no binder that is still in scope at the substitution sites.
+    ///
+    /// `capturing_binders` is that in-scope subset of the source binders — see
+    /// the call site. It is EMPTY for a binder-free body, where the instance
+    /// cannot contain a binder at all; it is the full source binder set for
+    /// every body that does bind something.
     fn replacement_is_ground_for(
         terms: &TermStore,
         root: TermId,
-        source_binders: &HashSet<String>,
+        capturing_binders: &HashSet<String>,
         work: &mut usize,
     ) -> Option<bool> {
         let mut seen = HashSet::default();
@@ -382,40 +362,9 @@ pub(crate) fn subst_vars_exact_qf(
             }
             *work += 1;
             match terms.get(term) {
-                TermData::Var(name, _) if source_binders.contains(name) => return Some(false),
-                TermData::Var(..) | TermData::Const(..) => {}
-                TermData::App(_, args) => stack.extend(args.iter().copied()),
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(condition, then_branch, else_branch) => {
-                    stack.extend([*condition, *then_branch, *else_branch]);
-                }
-                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                TermData::Var(name, _) if capturing_binders.contains(name) => {
                     return Some(false);
                 }
-                _ => return Some(false),
-            }
-        }
-        Some(true)
-    }
-
-    fn replacement_avoids_nested_names(
-        terms: &TermStore,
-        root: TermId,
-        nested_names: &HashSet<String>,
-        work: &mut usize,
-    ) -> Option<bool> {
-        let mut seen = HashSet::default();
-        let mut stack = vec![root];
-        while let Some(term) = stack.pop() {
-            if !seen.insert(term) {
-                continue;
-            }
-            if *work >= WORK_LIMIT {
-                return None;
-            }
-            *work += 1;
-            match terms.get(term) {
-                TermData::Var(name, _) if nested_names.contains(name) => return Some(false),
                 TermData::Var(..) | TermData::Const(..) => {}
                 TermData::App(_, args) => stack.extend(args.iter().copied()),
                 TermData::Not(inner) => stack.push(*inner),
@@ -580,15 +529,44 @@ pub(crate) fn subst_vars_exact_qf(
     }
 
     let mut work = 0usize;
-    let nested_names = nested_binder_names(terms, term, &mut work)?;
-    let source_binders = subst.keys().cloned().collect::<HashSet<_>>();
+    let nested_names = exact_helpers::nested_binder_names(terms, term, &mut work)?;
+    // Which binder spellings can a replacement's free names actually collide
+    // with? Only the ones that are still BINDING somewhere in the substituted
+    // region. The source binders are not: this call instantiates them away, so
+    // after the walk they bind nothing and a replacement mentioning one denotes
+    // the ambient free symbol the binder happened to shadow.
+    //
+    // When the body carries no binder at all, that is decidable outright.
+    // `nested_binder_names` fails closed on any `let` and collects every
+    // `forall`/`exists` binder reachable through bodies AND trigger groups, so
+    // an empty set means the body is binder-free; every replacement is checked
+    // binder-free just below (the `Let | Forall | Exists` arm of
+    // `replacement_is_ground_for`); and `visit` introduces no binder of its own.
+    // The instance is therefore binder-free too — there is nothing in it that
+    // could capture anything, whatever the replacements are spelled.
+    //
+    // The moment the body DOES contain a binder we are in the nested lane this
+    // walker was widened for, and the source-binder spelling test stays in
+    // force exactly as written: a body that re-binds a source spelling
+    // (`forall x. … forall x. …`) puts that spelling back in scope over a
+    // substitution site, and a spelling-blind acceptance there would capture.
+    let capturing_binders = if nested_names.is_empty() {
+        HashSet::default()
+    } else {
+        subst.keys().cloned().collect::<HashSet<_>>()
+    };
     for &replacement in subst.values() {
         // Keep the two scans separate and in checker order. Besides checking
         // the same predicates, this ensures the producer consumes at least the
         // same shared work budget as `forall_inst` validation.
-        if replacement_is_ground_for(terms, replacement, &source_binders, &mut work) != Some(true)
-            || replacement_avoids_nested_names(terms, replacement, &nested_names, &mut work)
-                != Some(true)
+        if replacement_is_ground_for(terms, replacement, &capturing_binders, &mut work)
+            != Some(true)
+            || exact_helpers::replacement_avoids_nested_names(
+                terms,
+                replacement,
+                &nested_names,
+                &mut work,
+            ) != Some(true)
         {
             return None;
         }

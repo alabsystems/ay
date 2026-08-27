@@ -292,25 +292,42 @@ impl Solver {
                 let equiticks = match self.cold.mode_equiticks_cached {
                     Some(v) => v,
                     None => {
-                        let v = match ay_core::sat_ab_switches().mode_equiticks {
-                            Some(forced) => forced,
-                            // DEFAULT OFF (2026-07-16 full-400 certification):
-                            // the <=300K & ratio<=20 banded default was NOT
-                            // net-positive — it flipped 59fc779f/3ef7fa06/
-                            // cbd09330 (+3) but REGRESSED prior in-band wins
-                            // 416e33a8 (SAT@57s with =0, unknown@120s banded;
-                            // kill-switch-confirmed), 602c8a20 (SAT@16.8s
-                            // with =0; confirmed) and 474e9594 (presumed) —
-                            // no clean band separator exists (loser ratios
-                            // 2.44-9.0 interleave winner ratios 2.92-11.4).
-                            // Net <= 0 with unquantified in-band tail risk =>
-                            // opt-in until a full in-band A/B designs a real
-                            // discriminator (the retired band was: PARSED
-                            // original_ledger.num_clauses() <= 300_000 AND
-                            // parsed clause/var ratio <= 20, with vars = the
-                            // pre-extension count first_extension_var_index).
-                            None => false,
-                        };
+                        // DEFAULT OFF (2026-07-16 full-400 certification):
+                        // the <=300K & ratio<=20 banded default was NOT
+                        // net-positive — it flipped 59fc779f/3ef7fa06/
+                        // cbd09330 (+3) but REGRESSED prior in-band wins
+                        // 416e33a8 (SAT@57s with =0, unknown@120s banded;
+                        // kill-switch-confirmed), 602c8a20 (SAT@16.8s
+                        // with =0; confirmed) and 474e9594 (presumed) —
+                        // no clean band separator exists (loser ratios
+                        // 2.44-9.0 interleave winner ratios 2.92-11.4).
+                        // Net <= 0 with unquantified in-band tail risk =>
+                        // opt-in until a full in-band A/B designs a real
+                        // discriminator (the retired band was: PARSED
+                        // original_ledger.num_clauses() <= 300_000 AND
+                        // parsed clause/var ratio <= 20 using the pre-extension var count).
+                        // `None` selects the certified default, not a heuristic band.
+                        //
+                        // ...with one addition: when the global switch is
+                        // unset, `--sat-mode-equiticks-large` (default OFF,
+                        // resolved into `mode_equiticks_large_band` at solve
+                        // entry) can arm equiticks for formulas ABOVE
+                        // `VERY_LARGE_FORMULA_STABLE_BIAS_THRESHOLD`. That
+                        // band is disjoint from the <=300K/ratio<=20 band the
+                        // negative above was measured on, and it is the band
+                        // where the bootstrap-frozen `stabilize_tick_inc`
+                        // starves stable mode worst: on
+                        // cabp-V-nos6.mtx.rnd-k275 (1,529,550 vars /
+                        // 8,599,702 clauses) the default schedule spends
+                        // 22.3% of search ticks in stable at 300s, the arm
+                        // 48.2% — kissat's `update_mode_limit` equal-effort
+                        // split. Both arms still return UNKNOWN there, and
+                        // the share is not free on the UNSAT side of the same
+                        // band (spg_200_301: 7.6% -> 48.0% stable ticks,
+                        // UNSAT 26.4s -> 58.2s), so this ships opt-in.
+                        let v = ay_core::sat_ab_switches()
+                            .mode_equiticks
+                            .unwrap_or(self.cold.mode_equiticks_large_band);
                         self.cold.mode_equiticks_cached = Some(v);
                         v
                     }
@@ -776,6 +793,10 @@ impl Solver {
         } else {
             self.compute_reuse_trail_level()
         };
+        if reuse_level > 0 {
+            self.stats.trail_reuse_restarts += 1;
+            self.stats.trail_reused_levels += u64::from(reuse_level);
+        }
         self.backtrack(reuse_level);
 
         // Stale watch entries from lazy clause deletion are handled by:

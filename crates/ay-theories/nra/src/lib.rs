@@ -97,15 +97,13 @@ mod upoly;
 mod verification;
 
 #[cfg(test)]
-mod anum_profile;
-#[cfg(test)]
 mod av_probe;
 #[cfg(test)]
-mod explain_cost;
-#[cfg(test)]
-mod ialg_cost;
+mod interval_fixture_tests;
 #[cfg(test)]
 mod mpbq_tests;
+#[cfg(test)]
+mod reset_tests;
 #[cfg(test)]
 mod scaled_product_tests;
 #[cfg(test)]

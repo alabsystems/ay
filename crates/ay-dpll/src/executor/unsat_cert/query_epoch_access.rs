@@ -62,49 +62,79 @@ impl Executor {
             UnsatCertificateKind::StrictProof(scope)
             | UnsatCertificateKind::DischargedTrust(scope) => scope.is_current(self),
             UnsatCertificateKind::CheckedSatRefutation { checked, scope } => {
+                // Three admissible shapes, strictest first:
+                // 1. the solver solved with exactly the bound assumptions;
+                // 2. no assumptions anywhere;
+                // 3. the FOLDED named-assumption rescue: the redirect solved
+                //    `roots = base ++ A` with an empty assumption vector and
+                //    bound the epoch the same way, while the outer
+                //    `check-sat-assuming A` leaves `last_assumptions = A`.
+                //    Sound because `checked.is_current_for` below
+                //    authenticates the FULL root vector — including that
+                //    exact `A` tail — so the sidecar's theorem IS
+                //    `base ∧ A ⊢ ⊥`, precisely the claim the outer command
+                //    publishes. The tail comparison is positional and exact;
+                //    a permuted, widened, or truncated `A` does not match.
                 let solver_assumptions_match = self.last_assumptions.as_deref()
                     == Some(bound_assumptions)
-                    || (bound_assumptions.is_empty() && self.last_assumptions.is_none());
-                scope.is_current(self)
-                    && epoch.is_current(self)
-                    && epoch.declared_extension.is_empty()
-                    && epoch.declared_extension_entries.is_empty()
-                    && epoch.declared_extension_objectives.is_none()
-                    && epoch.declared_extension_objective_entries.is_none()
-                    && solver_assumptions_match
-                    && self
-                        .proof_problem_assertion_provenance
-                        .as_ref()
-                        .is_some_and(|provenance| {
-                            provenance.original_problem_assertions == epoch.assertions
-                        })
-                    && checked.is_current_for(
-                        &epoch.authority_epoch,
-                        &epoch.source_context_stamp,
-                        &epoch.assertions,
-                        bound_assumptions,
-                    )
+                    || (bound_assumptions.is_empty()
+                        && match self.last_assumptions.as_deref() {
+                            None => true,
+                            Some(last) => !last.is_empty() && epoch.assertions.ends_with(last),
+                        });
+                let legs = [
+                    ("scope", scope.is_current(self)),
+                    ("epoch", epoch.is_current(self)),
+                    (
+                        "ext",
+                        epoch.declared_extension.is_empty()
+                            && epoch.declared_extension_entries.is_empty()
+                            && epoch.declared_extension_objectives.is_none()
+                            && epoch.declared_extension_objective_entries.is_none(),
+                    ),
+                    ("solver_assumptions", solver_assumptions_match),
+                    (
+                        "provenance",
+                        self.proof_problem_assertion_provenance
+                            .as_ref()
+                            .is_some_and(|provenance| {
+                                provenance.original_problem_assertions == epoch.assertions
+                            }),
+                    ),
+                    (
+                        "checked_current",
+                        checked.is_current_for(
+                            &epoch.authority_epoch,
+                            &epoch.source_context_stamp,
+                            &epoch.assertions,
+                            bound_assumptions,
+                        ),
+                    ),
+                ];
+                let all = legs.iter().all(|(_, ok)| *ok);
+                if !all {
+                    probe_cert_reject(|| {
+                        format!("take_unsat_certificate CheckedSatRefutation NOT current: {legs:?}")
+                    });
+                }
+                all
             }
             UnsatCertificateKind::CheckedBoolBv(checked) => checked.is_current(self),
             UnsatCertificateKind::CheckedUfLeafBoolBv(checked) => checked.is_current(self),
             UnsatCertificateKind::CheckedBvLia(checked) => checked.is_current(self),
-            UnsatCertificateKind::CheckedExactExists(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
-            }
-            UnsatCertificateKind::CheckedExactForallExists(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
-            }
-            UnsatCertificateKind::CheckedExactClosedForall(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
-            }
-            UnsatCertificateKind::CheckedExactClosedSentence(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
-            }
-            UnsatCertificateKind::CheckedExactForallUfGround(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
-            }
-            UnsatCertificateKind::CheckedExactFiniteExpansion(evidence) => {
-                self.exact_plain_hard_unsat_scope_is_current() && evidence.is_current(self)
+            // The exact semantic family, all seven arms. Each used to spell
+            // out `scope_is_current() && evidence.is_current(self)`, which is
+            // literally the body of `checked_exact_semantic_is_current` — one
+            // definition now, so a new theorem cannot be admitted here under a
+            // currentness rule the publication funnel does not also apply.
+            UnsatCertificateKind::CheckedExactExists(_)
+            | UnsatCertificateKind::CheckedExactForallExists(_)
+            | UnsatCertificateKind::CheckedExactClosedForall(_)
+            | UnsatCertificateKind::CheckedExactClosedSentence(_)
+            | UnsatCertificateKind::CheckedExactForallUfGround(_)
+            | UnsatCertificateKind::CheckedExactFiniteExpansion(_)
+            | UnsatCertificateKind::CheckedExactRmDomainExpansion(_) => {
+                certificate.checked_exact_semantic_is_current(self)
             }
             // #proof-capability B3 — the raw token dies the instant any proof
             // demand appears: consumption re-requires ACTIVE shedding, so the

@@ -19,6 +19,14 @@ use super::{extract_int_constant, ChcExpr, ChcOp, ChcSort, ChcVar, PredicateId};
 
 mod sort;
 
+/// Conjuncts processed between two `should_stop` polls in
+/// [`ChcExpr::and_all_checked`].
+///
+/// A power of two well above the cost of one `Instant::now()` (tens of ns) so
+/// the poll is noise, yet small enough that a tripped deadline is observed
+/// within a few hundred microseconds of hash-consing.
+const AND_ALL_POLL_STRIDE: u32 = 512;
+
 impl ChcExpr {
     // Convenience constructors
 
@@ -169,14 +177,44 @@ impl ChcExpr {
     ///
     /// This is the canonical version used throughout CHC solving.
     pub fn and_all(conjuncts: impl IntoIterator<Item = Self>) -> Self {
+        Self::and_all_checked(conjuncts, || false)
+            .expect("and_all_checked never stops when the predicate is always false")
+    }
+
+    /// [`Self::and_all`], interruptible on a caller-supplied stop predicate.
+    ///
+    /// The flattening loop below is the hot spot when a synthesis stage builds
+    /// one very large conjunction: every conjunct is deep-hashed into `seen`,
+    /// so the loop can run for seconds while the *outer* iteration count stays
+    /// at one. A caller under a deadline therefore cannot bound this work by
+    /// polling between calls — it has to poll inside.
+    ///
+    /// `should_stop` is consulted every [`AND_ALL_POLL_STRIDE`] conjuncts, which
+    /// keeps the clock read off the per-conjunct path while bounding overshoot
+    /// to one stride's worth of hash-consing. Returning `None` means the stop
+    /// predicate tripped: the partial conjunction is DISCARDED rather than
+    /// returned, so no caller can mistake a truncated (weaker) formula for the
+    /// conjunction it asked for.
+    pub(crate) fn and_all_checked<F: FnMut() -> bool>(
+        conjuncts: impl IntoIterator<Item = Self>,
+        mut should_stop: F,
+    ) -> Option<Self> {
         let mut out: Vec<Arc<Self>> = Vec::new();
         let mut seen: FxHashSet<Arc<Self>> = FxHashSet::default();
         let mut pending: VecDeque<Self> = conjuncts.into_iter().collect();
+        let mut since_poll: u32 = 0;
 
         while let Some(expr) = pending.pop_front() {
+            since_poll += 1;
+            if since_poll >= AND_ALL_POLL_STRIDE {
+                since_poll = 0;
+                if should_stop() {
+                    return None;
+                }
+            }
             match expr {
                 Self::Bool(true) => {}
-                Self::Bool(false) => return Self::Bool(false),
+                Self::Bool(false) => return Some(Self::Bool(false)),
                 Self::Op(ChcOp::And, ref args) => {
                     // Maintain left-to-right order while flattening deeply nested And trees.
                     for arg in args.iter().rev() {
@@ -196,11 +234,11 @@ impl ChcExpr {
             }
         }
 
-        match out.len() {
+        Some(match out.len() {
             0 => Self::Bool(true),
             1 => (*out.pop().expect("len==1")).clone(),
             _ => Self::Op(ChcOp::And, out),
-        }
+        })
     }
 
     /// Build an n-ary disjunction from an iterator with constant folding.

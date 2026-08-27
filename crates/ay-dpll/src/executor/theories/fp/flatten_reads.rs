@@ -2,15 +2,44 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Constant-index array-read elimination for the ABVFP lane.
+//! Array-read elimination for the ABVFP lane.
 //!
 //! # What this does
 //!
-//! Replaces every `(select A k)` with `k` a *bitvector literal* and `A` a
-//! declared 1-D `(Array (_ BitVec i) (_ BitVec e))` symbol by a fresh
-//! `(_ BitVec e)` constant, keyed by **(array symbol, numeric index value)**.
-//! The result is an array-free QF_BVFP formula, which the existing FP/BV
+//! Replaces every `(select A i)` — `A` a declared
+//! `(Array (_ BitVec w) <non-array>)` symbol, `i` any bitvector term — by a
+//! fresh constant of the element sort, keyed by **(array symbol, index)**. The
+//! result is an array-free QF_BVFP formula, which the existing FP/BV
 //! bit-blaster decides.
+//!
+//! # Symbolic indices: the congruence closure is what makes this exact
+//!
+//! For a *literal* index the cell key is the numeric value, so two reads at the
+//! same address are literally the same variable and the array's functionality
+//! is free. A *symbolic* index has no such luxury: `(select A i)` and
+//! `(select A j)` become two independent variables `r_i`, `r_j`, and nothing
+//! stops a model from setting `i = j` while `r_i ≠ r_j` — an array that is not
+//! a function, i.e. a false `sat`.
+//!
+//! The fix is the classical Ackermann reduction: for EVERY pair of distinct
+//! cells on the SAME array, assert
+//!
+//! ```text
+//! (=> (= i j) (= r_i r_j))
+//! ```
+//!
+//! * **Forward (`φ` sat ⟹ `φ'` sat).** Set `r_i := M(A)[M(i)]`. Every axiom
+//!   holds because `M(A)` is a function: `M(i) = M(j)` forces the same cell.
+//! * **Backward (`φ'` sat ⟹ `φ` sat).** Given values for the `r`s satisfying
+//!   every axiom, define `M(A)[v] := r_i` for any cell whose index evaluates to
+//!   `v`. That is WELL-DEFINED exactly because the axioms make all such `r`s
+//!   agree — this is the step that fails without them — and arbitrary at
+//!   addresses no read mentions.
+//!
+//! Both directions need *all* pairs, which is why a pair budget overrun
+//! ([`FlattenAbstain::TooManyReadPairs`]) abstains instead of emitting a prefix.
+//! Pairs of two literal cells are skipped: distinct literal keys have distinct
+//! values, so `(= i j)` is `false` and the axiom is a tautology.
 //!
 //! This is exactly the transformation the SMT-LIB `20170428-Liew-KLEE`
 //! benchmark authors performed themselves: every QF_ABVFP file in that family
@@ -34,11 +63,12 @@
 //!   every other symbol. Each rewritten atom is *syntactically* the original
 //!   atom under that substitution, so it evaluates identically.
 //! * **Backward (`φ'` sat ⟹ `φ` sat) — the direction that matters.** Arrays
-//!   are TOTAL functions, so for any assignment to the (finitely many,
-//!   pairwise-distinct-by-numeric-value) fresh constants there EXISTS an array
-//!   agreeing with it at those indices and arbitrary elsewhere. The array's
-//!   behaviour off those indices is unobservable *because the side conditions
-//!   enforce it*:
+//!   are TOTAL functions, so for any assignment to the finitely many fresh
+//!   constants that satisfies the congruence axioms above (which is what makes
+//!   "the cell at address `v`" well defined when two symbolic indices collide)
+//!   there EXISTS an array agreeing with it at those indices and arbitrary
+//!   elsewhere. The array's behaviour off those indices is unobservable
+//!   *because the side conditions enforce it*:
 //!   - no `store` anywhere ⇒ no positional dependence on other cells;
 //!   - no array-sorted `=` / `distinct` / `ite` ⇒ no extensional comparison;
 //!   - every array symbol occurs ONLY as `args[0]` of a `select` ⇒ there is no
@@ -68,14 +98,30 @@
 //! degrade — see the existing template at the `congruence_incomplete && Sat`
 //! site in `fp.rs`.
 
+mod congruence;
+mod rewrite;
+
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
+use congruence::congruence_axioms;
 use num_bigint::BigInt;
+use rewrite::{is_array_free, rewrite};
 
-/// Stack red zone / growth for the DAG rewrite (KLEE queries nest deeply).
-const FLATTEN_STACK_RED_ZONE: usize = 128 * 1024;
-const FLATTEN_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// What identifies a read cell within one array.
+///
+/// Two reads share a cell iff they are the same `(array, index)` pair. For a
+/// literal index the key is the NUMERIC VALUE, so `(_ bv4 64)` and `#x04`
+/// collapse to one cell; for a symbolic index the key is the interned index
+/// TERM, and any two distinct keys are related by an explicit congruence axiom
+/// instead (see [`congruence`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellKey {
+    /// A bitvector-literal index, keyed by value.
+    Literal(BigInt),
+    /// A symbolic index, keyed by its interned term.
+    Symbolic(TermId),
+}
 
 /// Why the pre-pass declined to fire. Each variant maps to a DISTINCT
 /// `unknown.detail` string so the abstaining population is attributable
@@ -90,16 +136,21 @@ pub(super) enum FlattenAbstain {
     Quantifier,
     /// A `let` binding survived elaboration; its body is not walked here.
     LetBinding,
-    /// An array sort other than 1-D `(Array (_ BitVec i) (_ BitVec e))`.
+    /// An array sort this pass cannot eliminate: the index must be a bitvector
+    /// (the cell key is a bitvector value) and the element sort must not itself
+    /// be an array (a nested array would need its own elimination round).
     ArraySortUnsupported,
+    /// More read pairs on one array than [`congruence::MAX_CONGRUENCE_PAIRS`].
+    /// The closure is exact only when EVERY pair is asserted, so an overrun
+    /// abstains outright — a prefix would under-constrain the cells and
+    /// manufacture a false `sat`.
+    TooManyReadPairs,
     /// An array-sorted term that is not a declared symbol (`ite`, `store`,
     /// const-array, array-valued UF application, ...).
     ArrayTermNotSymbol,
     /// An array symbol occurs somewhere other than `args[0]` of a `select`
     /// (array `=` / `distinct` / `ite`, or an array passed to a UF).
     ArrayNotOnlySelected,
-    /// A `select` index is not a bitvector literal.
-    SymbolicIndex,
     /// FAIL-CLOSED BACKSTOP: the rewrite left array structure behind.
     ResidualArray,
 }
@@ -124,8 +175,12 @@ impl FlattenAbstain {
                  elaboration"
             }
             Self::ArraySortUnsupported => {
-                "ABVFP constant-index read elimination abstained: array sort is not 1-D \
-                 (Array (_ BitVec i) (_ BitVec e))"
+                "ABVFP array read elimination abstained: array sort is not \
+                 (Array (_ BitVec i) <non-array>)"
+            }
+            Self::TooManyReadPairs => {
+                "ABVFP array read elimination abstained: too many distinct read indices on one \
+                 array for an exact congruence closure within budget"
             }
             Self::ArrayTermNotSymbol => {
                 "ABVFP constant-index read elimination abstained: an array-sorted term is not a \
@@ -134,10 +189,6 @@ impl FlattenAbstain {
             Self::ArrayNotOnlySelected => {
                 "ABVFP constant-index read elimination abstained: an array symbol occurs outside \
                  `select` position (extensional `=`/`distinct`/`ite` or a UF argument)"
-            }
-            Self::SymbolicIndex => {
-                "ABVFP constant-index read elimination abstained: a `select` index is not a \
-                 bitvector literal"
             }
             Self::ResidualArray => {
                 "ABVFP constant-index read elimination abstained: the rewrite left array \
@@ -154,11 +205,18 @@ impl FlattenAbstain {
 pub(super) struct FlatCell {
     /// The declared array symbol's term.
     pub(super) array: TermId,
-    /// The index's numeric value — the KEY. `(_ bv4 64)` and
+    /// The index's numeric value when it is a literal. `(_ bv4 64)` and
     /// `#x0000000000000004` must collapse to ONE cell; keying on index SYNTAX
     /// would split a single array cell into two independent variables and
     /// manufacture a false `sat`.
-    pub(super) index_value: BigInt,
+    ///
+    /// `None` for a symbolic index, whose address is only known once a model
+    /// exists — the model builder resolves it through [`Self::index_term`].
+    pub(super) index_value: Option<BigInt>,
+    /// The index TERM as written. For a literal cell this is a literal; for a
+    /// symbolic cell it is the representative index term, and it is both what
+    /// the congruence axioms compare and what the model builder evaluates.
+    pub(super) index_term: TermId,
     /// The fresh element-sorted constant substituted for the read.
     pub(super) fresh: TermId,
 }
@@ -175,8 +233,8 @@ pub(super) struct FlattenPlan {
 
 /// What `plan_cells` collected before any term is built.
 struct CellScan {
-    /// Unique cells in discovery order: (array symbol, index value).
-    cells: Vec<(TermId, BigInt)>,
+    /// Unique cells in discovery order: (array symbol, key, index term).
+    cells: Vec<(TermId, CellKey, TermId)>,
     /// Every qualifying `select` term paired with its cell index. Keyed by the
     /// ORIGINAL interned `select` TermId — never by a reconstructed one, since
     /// `mk_select` is allowed to simplify and could hand back a different term.
@@ -191,11 +249,16 @@ fn bv_literal_value(terms: &TermStore, term: TermId) -> Option<BigInt> {
     }
 }
 
-/// Is `sort` a 1-D `(Array (_ BitVec i) (_ BitVec e))`?
-fn is_bv_to_bv_array(sort: &Sort) -> bool {
+/// Is `sort` an array this pass can eliminate in one round?
+///
+/// The index must be a bitvector: cell keys are bitvector values and the
+/// congruence axioms compare bitvector terms. The element sort may be anything
+/// EXCEPT another array — a nested array would leave `select` terms of array
+/// sort behind, which `is_array_free` (correctly) rejects as residue.
+fn is_eliminable_array(sort: &Sort) -> bool {
     match sort {
         Sort::Array(arr) => {
-            matches!(arr.index_sort, Sort::BitVec(_)) && matches!(arr.element_sort, Sort::BitVec(_))
+            matches!(arr.index_sort, Sort::BitVec(_)) && !matches!(arr.element_sort, Sort::Array(_))
         }
         _ => false,
     }
@@ -211,19 +274,81 @@ fn as_select(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     }
 }
 
+/// Everything mutated while scanning one `(select A i)` occurrence.
+struct ScanState {
+    cells: Vec<(TermId, CellKey, TermId)>,
+    reads: Vec<(TermId, usize)>,
+    /// (array term, tagged cell key) -> cell slot.
+    cell_index: HashMap<(TermId, Vec<u8>), usize>,
+}
+
+/// Validate one `(select array index)` and record its cell.
+///
+/// Returns the index term the caller must still push onto the scan stack: it is
+/// an arbitrary BV term that can itself contain a `select`, a `store`, or an
+/// array-sorted subterm, and skipping it would let exactly the shapes this pass
+/// refuses slip through unchecked. (`array` is deliberately NOT returned — that
+/// is the one legal array occurrence.)
+fn scan_select(
+    terms: &TermStore,
+    select_term: TermId,
+    array: TermId,
+    index: TermId,
+    state: &mut ScanState,
+) -> Result<TermId, FlattenAbstain> {
+    let array_sort = terms.sort(array).clone();
+    if !matches!(array_sort, Sort::Array(_)) {
+        return Err(FlattenAbstain::ArrayTermNotSymbol);
+    }
+    if !is_eliminable_array(&array_sort) {
+        return Err(FlattenAbstain::ArraySortUnsupported);
+    }
+    if !matches!(terms.get(array), TermData::Var(_, _)) {
+        return Err(FlattenAbstain::ArrayTermNotSymbol);
+    }
+    // Key a literal index on its NUMERIC VALUE, never on index syntax; key a
+    // symbolic index on its interned term. The leading tag byte keeps the two
+    // namespaces disjoint so a term id can never collide with a numeric value's
+    // encoding.
+    let (cell_key, key_bytes) = match bv_literal_value(terms, index) {
+        Some(value) => {
+            let mut bytes = vec![0u8];
+            bytes.extend_from_slice(&value.to_signed_bytes_le());
+            (CellKey::Literal(value), bytes)
+        }
+        None => {
+            let mut bytes = vec![1u8];
+            bytes.extend_from_slice(&index.index().to_le_bytes());
+            (CellKey::Symbolic(index), bytes)
+        }
+    };
+    let key = (array, key_bytes);
+    let slot = match state.cell_index.get(&key) {
+        Some(&slot) => slot,
+        None => {
+            let slot = state.cells.len();
+            state.cells.push((array, cell_key, index));
+            state.cell_index.insert(key, slot);
+            slot
+        }
+    };
+    state.reads.push((select_term, slot));
+    Ok(index)
+}
+
 /// Validate the side conditions and collect the qualifying cells.
 ///
 /// Walks the whole DAG reachable from `assertions`. Every array-sorted term
 /// must be a declared symbol of a supported sort, and must occur ONLY as
-/// `args[0]` of a `select` whose index is a BV literal. Any other shape is an
-/// abstention, never a guess.
+/// `args[0]` of a `select`. Any other shape is an abstention, never a guess.
 fn plan_cells(terms: &TermStore, assertions: &[TermId]) -> Result<CellScan, FlattenAbstain> {
     let mut visited: HashSet<TermId> = HashSet::default();
     let mut stack: Vec<TermId> = assertions.to_vec();
-    let mut cells: Vec<(TermId, BigInt)> = Vec::new();
-    let mut reads: Vec<(TermId, usize)> = Vec::new();
-    // (array term, numeric index value as bytes) -> cell slot.
-    let mut cell_index: HashMap<(TermId, Vec<u8>), usize> = HashMap::default();
+    let mut state = ScanState {
+        cells: Vec::new(),
+        reads: Vec::new(),
+        cell_index: HashMap::default(),
+    };
     let mut saw_array = false;
 
     while let Some(term) = stack.pop() {
@@ -237,7 +362,7 @@ fn plan_cells(terms: &TermStore, assertions: &[TermId]) -> Result<CellScan, Flat
             // `store` base). The backward direction of the equivalence needs
             // the array to be unobservable off the eliminated cells, so refuse.
             let sort = terms.sort(term).clone();
-            if !is_bv_to_bv_array(&sort) {
+            if !is_eliminable_array(&sort) {
                 return Err(FlattenAbstain::ArraySortUnsupported);
             }
             if !matches!(terms.get(term), TermData::Var(_, _)) {
@@ -252,33 +377,7 @@ fn plan_cells(terms: &TermStore, assertions: &[TermId]) -> Result<CellScan, Flat
                 }
                 if let Some((array, index)) = as_select(terms, term) {
                     saw_array = true;
-                    let array_sort = terms.sort(array).clone();
-                    if !matches!(array_sort, Sort::Array(_)) {
-                        return Err(FlattenAbstain::ArrayTermNotSymbol);
-                    }
-                    if !is_bv_to_bv_array(&array_sort) {
-                        return Err(FlattenAbstain::ArraySortUnsupported);
-                    }
-                    if !matches!(terms.get(array), TermData::Var(_, _)) {
-                        return Err(FlattenAbstain::ArrayTermNotSymbol);
-                    }
-                    let Some(value) = bv_literal_value(terms, index) else {
-                        return Err(FlattenAbstain::SymbolicIndex);
-                    };
-                    // Key on the NUMERIC value, never on index syntax.
-                    let key = (array, value.to_signed_bytes_le());
-                    let slot = match cell_index.get(&key) {
-                        Some(&slot) => slot,
-                        None => {
-                            let slot = cells.len();
-                            cells.push((array, value));
-                            cell_index.insert(key, slot);
-                            slot
-                        }
-                    };
-                    reads.push((term, slot));
-                    // Deliberately do NOT push `array` — that is the one legal
-                    // occurrence. The index is a literal with no children.
+                    stack.push(scan_select(terms, term, array, index, &mut state)?);
                     continue;
                 }
                 stack.extend_from_slice(args);
@@ -305,111 +404,13 @@ fn plan_cells(terms: &TermStore, assertions: &[TermId]) -> Result<CellScan, Flat
         }
     }
 
-    if !saw_array || cells.is_empty() {
+    if !saw_array || state.cells.is_empty() {
         return Err(FlattenAbstain::NoArrays);
     }
-    Ok(CellScan { cells, reads })
-}
-
-/// Rewrite `term`, replacing each planned `select` with its fresh constant.
-/// Structure-preserving everywhere else.
-fn rewrite(
-    terms: &mut TermStore,
-    term: TermId,
-    subst: &HashMap<TermId, TermId>,
-    memo: &mut HashMap<TermId, TermId>,
-) -> TermId {
-    stacker::maybe_grow(FLATTEN_STACK_RED_ZONE, FLATTEN_STACK_SIZE, || {
-        if let Some(&hit) = memo.get(&term) {
-            return hit;
-        }
-        if let Some(&fresh) = subst.get(&term) {
-            memo.insert(term, fresh);
-            return fresh;
-        }
-        let result = match terms.get(term).clone() {
-            TermData::App(sym, args) => {
-                let new_args: Vec<TermId> = args
-                    .iter()
-                    .map(|&a| rewrite(terms, a, subst, memo))
-                    .collect();
-                if new_args == args {
-                    term
-                } else {
-                    let sort = terms.sort(term).clone();
-                    terms.mk_app(sym, new_args, sort)
-                }
-            }
-            TermData::Not(inner) => {
-                let new_inner = rewrite(terms, inner, subst, memo);
-                if new_inner == inner {
-                    term
-                } else {
-                    terms.mk_not_raw(new_inner)
-                }
-            }
-            TermData::Ite(c, t, e) => {
-                let nc = rewrite(terms, c, subst, memo);
-                let nt = rewrite(terms, t, subst, memo);
-                let ne = rewrite(terms, e, subst, memo);
-                if nc == c && nt == t && ne == e {
-                    term
-                } else {
-                    terms.mk_ite_raw(nc, nt, ne)
-                }
-            }
-            // Everything else is a leaf for this rewrite. `plan_cells` already
-            // refused `let`/quantifier shapes, so nothing reachable can hide a
-            // `select` here; `is_array_free` re-verifies it anyway.
-            _ => term,
-        };
-        memo.insert(term, result);
-        result
+    Ok(CellScan {
+        cells: state.cells,
+        reads: state.reads,
     })
-}
-
-/// FAIL-CLOSED BACKSTOP: no array-sorted term, `select` or `store` may survive.
-///
-/// This is not decoration. `plan_cells` and `rewrite` walk the DAG
-/// independently; if they ever disagree (a future `TermData` variant, a shape
-/// the rewriter treats as a leaf) the residue would be an array term handed to
-/// a solver that cannot see the array theory — the #8728 failure mode.
-/// Detecting it here converts that into an abstention.
-fn is_array_free(terms: &TermStore, assertions: &[TermId]) -> bool {
-    let mut visited: HashSet<TermId> = HashSet::default();
-    let mut stack: Vec<TermId> = assertions.to_vec();
-    while let Some(term) = stack.pop() {
-        if !visited.insert(term) {
-            continue;
-        }
-        if matches!(terms.sort(term), Sort::Array(_)) {
-            return false;
-        }
-        match terms.get(term) {
-            TermData::App(sym, args) => {
-                if matches!(
-                    sym.name(),
-                    "select" | "store" | "const-array" | "lambda-array"
-                ) {
-                    return false;
-                }
-                stack.extend_from_slice(args);
-            }
-            TermData::Not(inner) => stack.push(*inner),
-            TermData::Ite(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
-            }
-            TermData::Let(bindings, body) => {
-                stack.extend(bindings.iter().map(|(_, v)| *v));
-                stack.push(*body);
-            }
-            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
-            _ => {}
-        }
-    }
-    true
 }
 
 /// Build the flattening plan for `assertions`, or say why not.
@@ -423,7 +424,7 @@ pub(super) fn plan(
     let scan = plan_cells(terms, assertions)?;
 
     let mut cells: Vec<FlatCell> = Vec::with_capacity(scan.cells.len());
-    for (array, index_value) in scan.cells {
+    for (array, cell_key, index_term) in scan.cells {
         let Sort::Array(arr) = terms.sort(array).clone() else {
             return Err(FlattenAbstain::ArraySortUnsupported);
         };
@@ -432,13 +433,27 @@ pub(super) fn plan(
         // (`mk_fresh_named_var` after a `pop`), and keying by name would alias
         // two independent arrays into one variable — a false `sat`. The `__ay_`
         // prefix cannot collide with a user symbol (the frontend rejects it).
-        let name = format!("__ay_arrflat!{}_{}", array.index(), index_value);
+        //
+        // A symbolic cell is named by the index TERM ID for the same reason: two
+        // different index terms are different cells until a congruence axiom
+        // relates them, and sharing a name would silently merge them.
+        let (name, index_value) = match &cell_key {
+            CellKey::Literal(v) => (
+                format!("__ay_arrflat!{}_{}", array.index(), v),
+                Some(v.clone()),
+            ),
+            CellKey::Symbolic(i) => (
+                format!("__ay_arrflat!{}_t{}", array.index(), i.index()),
+                None,
+            ),
+        };
         // `mk_var` returns the EXISTING term when name+sort already exist, which
         // makes the pass idempotent across repeated `check-sat` calls.
         let fresh = terms.mk_var(name, arr.element_sort.clone());
         cells.push(FlatCell {
             array,
             index_value,
+            index_term,
             fresh,
         });
     }
@@ -449,10 +464,18 @@ pub(super) fn plan(
     }
 
     let mut memo: HashMap<TermId, TermId> = HashMap::default();
-    let rewritten: Vec<TermId> = assertions
+    let mut rewritten: Vec<TermId> = assertions
         .iter()
         .map(|&a| rewrite(terms, a, &subst, &mut memo))
         .collect();
+
+    // The congruence closure that makes symbolic indices exact. See the module
+    // docs: WITHOUT these the cells are independent variables and a model may
+    // set `i = j` while `r_i != r_j`, which is an array that is not a function
+    // — a false `sat`. They are appended AFTER the rewrite so they cannot be
+    // rewritten themselves (their `select`s were never there to begin with).
+    let axioms = congruence_axioms(terms, &cells)?;
+    rewritten.extend(axioms);
 
     if !is_array_free(terms, &rewritten) {
         return Err(FlattenAbstain::ResidualArray);
@@ -463,5 +486,15 @@ pub(super) fn plan(
     })
 }
 
+/// Ackermann congruence axioms: `(=> (= i j) (= r_i r_j))` for every pair of
+/// distinct cells on the SAME array.
+///
+/// Two LITERAL cells are skipped: distinct literal keys have distinct numeric
+/// values, so `(= i j)` is `false` and the implication is a tautology. Every
+/// other pair — symbolic/symbolic and symbolic/literal — gets an axiom.
+///
+/// Returns [`FlattenAbstain::TooManyReadPairs`] rather than a truncated list.
+/// A PREFIX of these axioms is not a weaker-but-sound encoding: the omitted
+/// pairs are exactly the ones left free to disagree, so truncation is a
 #[cfg(test)]
 mod tests;

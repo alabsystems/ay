@@ -394,6 +394,69 @@ fn exact_nested_forall_instance_rejects_capture_and_duplicate_binders() {
     assert_eq!(ambiguous.num_steps(), 0);
 }
 
+/// REGRESSION, producer AND checker together, for the deductive-checks
+/// `(incomplete self-check-rejected)` class.
+///
+/// `forall ((self S)) (or (not (lt0 self)) (m self))` instantiated at the
+/// ambient `self` its binder shadows — deductive-checks mints the binder FROM the
+/// declared constant, so the axiom and its ground instance are the same term.
+/// The body is binder-free, so the instance is binder-free too and nothing in
+/// it can capture. Both halves must agree: the producer has to emit the
+/// `forall_inst` step, and AY's strict checker has to accept it. When the
+/// producer refuses instead, no `forall_inst` step exists at all, the instance
+/// degrades to an unauthenticated original clause, and the UNSAT certificate is
+/// rejected downstream.
+#[test]
+fn exact_forall_instance_at_a_shadowed_ambient_symbol_strictly_authenticates() {
+    let mut terms = TermStore::new();
+    let sort = Sort::Uninterpreted("shadow_e2e_S".to_string());
+    let ambient = terms.mk_var("shadow_e2e_self", sort.clone());
+    let lt0 = terms.mk_app(Symbol::named("shadow_e2e_lt0"), [ambient], Sort::Bool);
+    let not_lt0 = terms.mk_not_raw(lt0);
+    let m = terms.mk_app(Symbol::named("shadow_e2e_m"), [ambient], Sort::Bool);
+    let body = terms.mk_app(Symbol::named("or"), [not_lt0, m], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("shadow_e2e_self".to_string(), sort)], body);
+
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker
+        .add_forall_instantiated_assertion(&mut terms, quantified, &[ambient], body)
+        .expect("a binder-free body instantiated at the symbol its binder shadows is derivable");
+    let proof = tracker.take_proof();
+    ay_proof::authenticate_premise_clauses_strict_with_context(
+        &proof,
+        &terms,
+        None,
+        None,
+        &[quantified],
+    )
+    .expect("the strict checker must accept the instantiation the producer emitted");
+}
+
+/// Tamper control for the test above: the same witness spelling, but a body
+/// that RE-BINDS it. The spelling is back in scope over a substitution site, so
+/// the producer must still fail closed.
+#[test]
+fn exact_forall_instance_refuses_a_witness_named_by_a_rebinding_body() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("rebind_e2e_x", Sort::Int);
+    let p_x = terms.mk_app(Symbol::named("rebind_e2e_p"), [x], Sort::Bool);
+    let q_x = terms.mk_app(Symbol::named("rebind_e2e_q"), [x], Sort::Bool);
+    let inner = terms.mk_forall(vec![("rebind_e2e_x".to_string(), Sort::Int)], q_x);
+    let body = terms.mk_app(Symbol::named("and"), [p_x, inner], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("rebind_e2e_x".to_string(), Sort::Int)], body);
+
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    assert!(
+        tracker
+            .add_forall_instantiated_assertion(&mut terms, quantified, &[x], body)
+            .is_none(),
+        "a source spelling the body re-binds must not be instantiated at itself"
+    );
+    assert_eq!(tracker.num_steps(), 0);
+}
+
 #[test]
 fn exact_forall_instance_closes_with_checked_ground_evaluate() {
     let mut terms = TermStore::new();
@@ -1138,212 +1201,4 @@ fn test_push_pop_proof_isolation() {
     }
 }
 
-#[test]
-#[cfg(debug_assertions)]
-fn test_farkas_coefficient_count_mismatch_panics() {
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("LRA");
-
-    // Farkas annotation has 1 coefficient but clause has 2 literals.
-    let clause = vec![TermId(10), TermId(20)];
-    let farkas = FarkasAnnotation::from_ints(&[1]); // 1 coeff, 2 lits
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tracker.add_theory_lemma_with_farkas_and_kind(clause, farkas, TheoryLemmaKind::LraFarkas);
-    }));
-    assert!(
-        result.is_err(),
-        "Farkas coefficient/clause length mismatch must be caught"
-    );
-}
-
-#[test]
-fn test_record_theory_conflict_unsat_basic() {
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("EUF");
-
-    let mut negations = HashMap::default();
-    negations.insert(TermId(10), TermId(11));
-    negations.insert(TermId(20), TermId(21));
-
-    let conflict = vec![
-        TheoryLit::new(TermId(10), true),
-        TheoryLit::new(TermId(20), true),
-    ];
-
-    let id = record_theory_conflict_unsat(&mut tracker, None, &negations, &conflict);
-    assert!(id.is_some(), "enabled tracker should produce a proof step");
-    assert_eq!(tracker.num_steps(), 1);
-}
-
-#[test]
-fn test_record_theory_conflict_unsat_disabled_returns_none() {
-    let mut tracker = ProofTracker::new();
-    // Tracker is disabled (default)
-
-    let negations = HashMap::default();
-    let conflict = vec![TheoryLit::new(TermId(10), true)];
-
-    let id = record_theory_conflict_unsat(&mut tracker, None, &negations, &conflict);
-    assert!(id.is_none(), "disabled tracker must return None");
-    assert_eq!(tracker.num_steps(), 0);
-}
-
-#[test]
-fn test_record_theory_conflict_unsat_integer_bounds_use_lra_farkas_when_unit_certificate_is_valid()
-{
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("LIA");
-
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let one = terms.mk_int(BigInt::from(1));
-    let zero = terms.mk_int(BigInt::from(0));
-    let ge = terms.mk_ge(x, one);
-    let le = terms.mk_le(x, zero);
-    let not_ge = terms.mk_not(ge);
-    let not_le = terms.mk_not(le);
-
-    let mut negations = HashMap::default();
-    negations.insert(ge, not_ge);
-    negations.insert(le, not_le);
-
-    let conflict = vec![TheoryLit::new(ge, true), TheoryLit::new(le, true)];
-    let id = record_theory_conflict_unsat(&mut tracker, Some(&terms), &negations, &conflict)
-        .expect("enabled tracker should record integer arithmetic conflicts");
-    assert_eq!(tracker.num_steps(), 1);
-
-    let proof = tracker.take_proof();
-    match proof.get_step(id) {
-        Some(ProofStep::TheoryLemma { kind, .. }) => {
-            assert_eq!(
-                *kind,
-                TheoryLemmaKind::LraFarkas,
-                "Farkas-valid integer conflicts must export la_generic/LraFarkas"
-            );
-        }
-        other => panic!("expected TheoryLemma step, got {other:?}"),
-    }
-}
-
-#[test]
-fn conflict_trace_annotation_matches_recorded_unit_farkas_authority() {
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("LIA");
-
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let one = terms.mk_int(BigInt::from(1));
-    let zero = terms.mk_int(BigInt::from(0));
-    let ge = terms.mk_ge(x, one);
-    let le = terms.mk_le(x, zero);
-    let mut negations = HashMap::default();
-    negations.insert(ge, terms.mk_not(ge));
-    negations.insert(le, terms.mk_not(le));
-    let conflict = vec![TheoryLit::new(ge, true), TheoryLit::new(le, true)];
-
-    let (id, annotation) = record_theory_conflict_unsat_with_annotation(
-        &mut tracker,
-        Some(&terms),
-        &negations,
-        &conflict,
-    );
-    let id = id.expect("recorded conflict");
-    let annotation = annotation.expect("materialized conflict annotation");
-    let proof = tracker.take_proof();
-    let Some(ProofStep::TheoryLemma {
-        clause,
-        kind,
-        farkas,
-        lia,
-        ..
-    }) = proof.get_step(id)
-    else {
-        panic!("expected theory lemma");
-    };
-    assert_eq!(annotation.clause, *clause);
-    assert_eq!(annotation.kind, *kind);
-    assert_eq!(annotation.farkas, *farkas);
-    assert_eq!(annotation.lia, *lia);
-    assert!(annotation.farkas.is_some());
-}
-
-#[test]
-fn test_record_theory_conflict_unsat_with_invalid_integer_farkas_stays_lia_generic() {
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("LIA");
-
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let one = terms.mk_int(BigInt::from(1));
-    let zero = terms.mk_int(BigInt::from(0));
-    let ge = terms.mk_ge(x, one);
-    let le = terms.mk_le(x, zero);
-    let not_ge = terms.mk_not(ge);
-    let not_le = terms.mk_not(le);
-
-    let mut negations = HashMap::default();
-    negations.insert(ge, not_ge);
-    negations.insert(le, not_le);
-
-    let conflict = TheoryConflict::with_farkas(
-        vec![TheoryLit::new(ge, true), TheoryLit::new(le, true)],
-        FarkasAnnotation::from_ints(&[1, 0]),
-    );
-    let id =
-        record_theory_conflict_unsat_with_farkas(&mut tracker, Some(&terms), &negations, &conflict)
-            .expect("enabled tracker should record arithmetic conflicts with explicit annotations");
-
-    let proof = tracker.take_proof();
-    match proof.get_step(id) {
-        Some(ProofStep::TheoryLemma { kind, .. }) => {
-            assert_eq!(
-                *kind,
-                TheoryLemmaKind::LiaGeneric,
-                "an annotation that does not derive contradiction must not gain Farkas authority",
-            );
-        }
-        other => panic!("expected TheoryLemma step, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_record_theory_conflict_unsat_with_strict_integer_bounds_uses_lra_farkas() {
-    let mut tracker = ProofTracker::new();
-    tracker.enable();
-    tracker.set_theory("LIA");
-
-    let mut terms = TermStore::new();
-    let x = terms.mk_var("x", Sort::Int);
-    let ten = terms.mk_int(BigInt::from(10));
-    let five = terms.mk_int(BigInt::from(5));
-    let gt = terms.mk_gt(x, ten);
-    let lt = terms.mk_lt(x, five);
-    let not_gt = terms.mk_not(gt);
-    let not_lt = terms.mk_not(lt);
-
-    let mut negations = HashMap::default();
-    negations.insert(gt, not_gt);
-    negations.insert(lt, not_lt);
-
-    let conflict = vec![TheoryLit::new(gt, true), TheoryLit::new(lt, true)];
-    let id = record_theory_conflict_unsat(&mut tracker, Some(&terms), &negations, &conflict)
-        .expect("enabled tracker should record strict integer bound conflicts");
-
-    let proof = tracker.take_proof();
-    match proof.get_step(id) {
-        Some(ProofStep::TheoryLemma { kind, .. }) => {
-            assert_eq!(
-                *kind,
-                TheoryLemmaKind::LraFarkas,
-                "strict Farkas-valid integer conflicts must export la_generic/LraFarkas"
-            );
-        }
-        other => panic!("expected TheoryLemma step, got {other:?}"),
-    }
-}
+include!("tests/theory_conflicts.rs");

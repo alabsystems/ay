@@ -199,6 +199,11 @@ impl Solver {
             if self.stable_mode {
                 self.vsids.decay();
             }
+            // `OnPeriodicDecay()` (arXiv:2602.20829 Algorithm 1 lines 17-18):
+            // every T=4096 conflicts. Placed beside the reduce check but
+            // deliberately independent of it — the paper's decay clock is
+            // conflicts, not reduction rounds. No-op unless the arm is armed.
+            self.two_stage_periodic_decay_if_due();
             if self.should_reduce_db() {
                 self.reduce_db();
             }

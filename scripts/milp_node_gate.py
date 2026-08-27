@@ -13,8 +13,8 @@ That is the whole failure. The four are not a corpus; they are the four somebody
 happened to type. Fifteen more instances are just as deterministic on this box
 and were watching nothing.
 
-  WHAT IT PINS.  Nineteen instances, EXACT node counts, EXACT objective, EXACT
-                 status. No tolerance band. These nineteen are bit-stable across
+  WHAT IT PINS.  Twenty instances, EXACT node counts, EXACT objective, EXACT
+                 status. No tolerance band. These twenty are bit-stable across
                  repeats on a quiet machine, so a band would only buy the right
                  to miss a regression smaller than the band -- and it would also
                  hide IMPROVEMENTS, which have to be ratcheted deliberately or
@@ -22,9 +22,9 @@ and were watching nothing.
 
   WHAT IT WILL NOT PIN, and why the exclusion is the load-bearing half:
 
-     mas74 misc07 p2756 qiu nw04
+     mas74 misc07 p2756 nw04
 
-                 all five move run-to-run at a fixed configuration. misc07's
+                 all four move run-to-run at a fixed configuration. misc07's
                  root cut loop is WALL-DEADLINE bounded (measured spread 30.4%
                  over five repeats), and nw04 is budget-coupled at short limits
                  -- it fooled a prior round by agreeing across two quiet runs and
@@ -33,9 +33,49 @@ and were watching nothing.
                  `.milp_node_baseline.toml`'s `[flaky]` section so that "why
                  isn't misc07 here" has an answer in the file itself.
 
+  qiu WAS A FIFTH, AND THE EXCLUSION HAD GONE STALE -- which cost this gate its
+                 only view of a shipped disjunct. Two facts, both measured here
+                 on 2026-08-26:
+
+                 1. IT IS DETERMINISTIC NOW. 29 solves at the shipped default, 28
+                    completed (the 29th killed by an external SIGTERM, rc 143,
+                    and recorded as killed rather than counted); 28 of 28 gave
+                    2,831 nodes / -132.873136947 / OPTIMAL and the same GMICUTS
+                    separation digest (n=16, fc7d711a3895b1ff). Spanning
+                    1-minute load 2.5..19.7 on 14 cpus and spanning --limit
+                    60/120/300 interleaved, so unlike blend2 and mod010 its tree
+                    is not deadline-coupled either. The old entry ("moves
+                    run-to-run") was recorded on an OLDER engine, when qiu drifted
+                    3,946..4,121 across six runs; 6715ed282 later took it 4,121 ->
+                    2,831 and nobody re-opened the exclusion.
+
+                 2. IT WAS THE ONLY WITNESS TO A SHIPPED CODE PATH. qiu (1,192 x
+                    840) is the only one of the 30 canonical instances whose shape
+                    satisfies `m >= 1,000 && n < m` and therefore the only one that
+                    arms `FloatLp::tall_cold_dual` -- the warm-failure cold-dual
+                    disjunct in simplex.rs. With qiu excluded this gate reported
+                    `0 fail` at --tier all against a build with that disjunct
+                    disarmed; with qiu pinned the same build FAILS on qiu --
+                    `NODES expected 2831 actual 6506 (2.30x, REGRESSION)`. A gate
+                    that cannot see a disjunct must not be cited as safety
+                    evidence for it.
+
+                    That the DISARMED arm spans a range while the default does not
+                    is the point, not a caveat: interleaved A,B,A,B on one binary
+                    gave 2831/2831/2831/2831 against 6511/6499/6504, and across
+                    every disarmed run taken here (seven) the answer was one of
+                    FIVE distinct values in 6,499..6,529. Whatever the old "qiu
+                    moves" note was watching, it was not the shipped default.
+
+                 The cost is real and is stated rather than buried: qiu is ~35 s,
+                 so `--tier all` roughly doubles -- 42.0/42.7 s at nineteen
+                 instances against 73.6/75.9/76.3/81.1 s at twenty, same binary,
+                 same quiet box. It is tier "slow" for that reason and stays out
+                 of the pre-merge lane, which is unchanged at 7.0 s / 14.
+
   IT REFUSES TO RUN ON A BUSY BOX, and this is not decoration. "Node counts are
                  load-invariant" is the premise the whole gate rests on and it is
-                 only APPROXIMATELY true: two of the nineteen have a root cut loop
+                 only APPROXIMATELY true: two of the twenty have a root cut loop
                  whose round count is bounded by a SHARE of the wall deadline, so
                  contention silently buys fewer rounds and a different tree.
                  Measured here, same binary, same corpus, `--tier fast`:
@@ -50,6 +90,12 @@ and were watching nothing.
                  So the gate reads the 1-minute load average first and exits 2
                  (SETUP, not clean, not fail) above 0.35 x cpu_count. Override
                  with `--allow-busy` only to reproduce a failure you already have.
+
+                 SHARED, since 2026-08-26: `busy_box()` and `LOAD_FRACTION` below
+                 are imported by `scripts/corpus_guard.py`, which had NO load
+                 guard at all while being the more load-coupled of the two (it
+                 gates WALL ratios; this file records `wall_s` and gates only
+                 nodes). One definition, one threshold, one idiom.
 
   THE PIN IS A RATCHET, NOT A SNAPSHOT.  `--check` NEVER writes. A legitimate
                  improvement updates `.milp_node_baseline.toml` with `--ratchet`,
@@ -78,12 +124,22 @@ and were watching nothing.
 COST (measured, quiet box, aarch64-apple-darwin, release + target-cpu=native;
 see the `wall_s` field in the ratchet file for the per-instance number):
 
-    --tier fast    7.2s     14 instances    <- fallback lane
-    --tier all    46.9s     19 instances    <- pre-push AND nightly (wired)
+    --tier fast    7.0s     14 instances    <- fallback lane
+    --tier all    73.6-81.1s  20 instances  <- pre-push AND nightly (wired)
 
-(44.8s is the sum of the recorded per-instance `wall_s`; 46.9s is the harness
-wall of a whole `--check --tier all` run, which also pays process startup and
-MPS parsing per instance. Both are quiet-box numbers on the same box.)
+(44.8s is the sum of the recorded per-instance `wall_s`; 46.9s was the harness
+wall of a whole `--check --tier all` run at nineteen instances, which also pays
+process startup and MPS parsing per instance. Both are quiet-box numbers on the
+same box.)
+
+RE-MEASURED 2026-08-26 on the same box when qiu was pinned, quiet (load 2.7-3.8):
+42.0s and 42.7s at nineteen instances; 73.6 / 75.9 / 76.3 / 81.1s at twenty over
+four runs. qiu alone is ~34.4s, i.e. this gate roughly DOUBLED to buy the only
+view anyone has of `FloatLp::tall_cold_dual`. That is the trade, priced: the
+pre-merge `fast` lane is untouched (7.0s, 14 instances, re-measured), and
+`--tier all` is a pre-push/nightly lane where ~35 extra seconds is cheaper than
+the fortnight the disjunct spent ungated. The spread across those four runs is
+10%% and is why this is quoted as a RANGE: it is a wall number on a shared box.
 
 measured 2026-08-20, aarch64-apple-darwin, quiet box, serial (AY_MILP_THREADS=1).
 The five slow ones are air03, mas76, pk1, qnet1, stein45 -- together 37.6s of
@@ -97,7 +153,7 @@ were named -- blend2 9,070 -> 5,218, dcmulti 761 -> 2,948, enigma 16,765 ->
 88, p0548 2,380 -> 9,575. The standing four would have reported two of those
 eight. Reverting the scratch change returns the gate to clean at both tiers.
 
-NEITHER TIER BELONGS IN `cargo test`. The nineteen models are MIPLIB files;
+NEITHER TIER BELONGS IN `cargo test`. The twenty models are MIPLIB files;
 this repository contains seven .mps files in total, all tiny fixtures, and
 shipping MIPLIB into the tree is not on the table. `cargo test -p ay-milp` can
 therefore never measure them, and a test that silently skips when a corpus
@@ -138,6 +194,28 @@ SOLVER = os.path.join(REPO, 'target', 'release', 'examples', 'mps_solve')
 # scripts with the same default path spelled twice is how the path drifts.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from milp_gate_corpus import DEFAULT_CORPUS  # noqa: E402
+
+# THE QUIET-BOX THRESHOLD, defined ONCE and imported by `scripts/corpus_guard.py`
+# rather than re-typed there. Same reason as DEFAULT_CORPUS above: a constant
+# spelled in two gates is a constant that drifts, and both gates are wrong in the
+# SAME way on a busy box.
+LOAD_FRACTION = 0.35
+
+
+def busy_box(fraction=LOAD_FRACTION):
+    """`(busy, load, cpus)` for the quiet-box precondition.
+
+    `busy` is None -- not False -- when the platform has no load average, so a
+    caller can tell "measured quiet" from "could not measure"; both proceed,
+    because blocking every gate on a platform that cannot report load would be
+    worse than the drift it prevents.
+    """
+    cpus = os.cpu_count() or 1
+    try:
+        load = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return None, None, cpus
+    return load > fraction * cpus, load, cpus
 
 
 # ---------------------------------------------------------------------------
@@ -402,19 +480,14 @@ def main():
     # 2,291 with NO code change, because both instances' root cut loops are
     # bounded by a share of the wall deadline. Reporting that as drift is how a
     # gate gets muted. SETUP (2), never a FAIL (1) and never a clean (0).
-    busy = load = None
-    try:
-        load = os.getloadavg()[0]
-        busy = load > 0.35 * (os.cpu_count() or 1)
-    except (OSError, AttributeError):
-        pass  # no loadavg on this platform: proceed rather than block
+    busy, load, cpus = busy_box()
     if busy and not a.allow_busy:
         print('SETUP: load average %.1f on %d cpus -- this gate is only valid on a '
               'quiet box.\n       Two pinned instances are wall-deadline coupled '
               '(blend2, mod010) and drift\n       ~1%% under contention, which would '
               'read as a regression with no commit behind it.\n'
               '       Wait, or pass --allow-busy to reproduce a known failure.'
-              % (load, os.cpu_count() or 1), file=sys.stderr)
+              % (load, cpus), file=sys.stderr)
         return 2
 
     t0 = time.time()

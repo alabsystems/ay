@@ -279,7 +279,7 @@ impl Executor {
                 .collect();
             solver.add_clause(lits);
         }
-
+        self.arm_sat_conflict_budget(&mut solver, 0);
         let should_stop = self.make_should_stop();
         let result = solver.solve_interruptible(should_stop).into_inner();
 
@@ -579,6 +579,13 @@ impl Executor {
     /// cell constants' bitvector values, and attach it to the stored model.
     ///
     /// Returns `false` (fail closed) when any cell has no value in the model.
+    ///
+    /// A SYMBOLIC-index cell has no address until a model exists: its address is
+    /// whatever the model assigns to the index term. That value is read out of
+    /// the same `bv_model` the cell values come from, so the published array
+    /// pins exactly the addresses the flattened solve committed to. If the index
+    /// term has no value there, fail closed rather than guess an address — a
+    /// witness that pins the wrong cell is worse than no witness.
     fn attach_flattened_array_model(&mut self, cells: &[flatten_reads::FlatCell]) -> bool {
         use ay_core::Sort;
 
@@ -599,6 +606,13 @@ impl Executor {
             else {
                 return false;
             };
+            let index_value = match cell.index_value.as_ref() {
+                Some(v) => v.clone(),
+                None => match bv.values.get(&cell.index_term) {
+                    Some(v) => v.clone(),
+                    None => return false,
+                },
+            };
             let Some(value) = bv.values.get(&cell.fresh) else {
                 return false;
             };
@@ -618,7 +632,7 @@ impl Executor {
                         ..Default::default()
                     });
             entry.stores.push((
-                crate::executor_format::format_bitvec(&cell.index_value, idx_bv.width),
+                crate::executor_format::format_bitvec(&index_value, idx_bv.width),
                 crate::executor_format::format_bitvec(value, elem_bv.width),
             ));
         }

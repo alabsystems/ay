@@ -1453,3 +1453,450 @@ fn test_bvtoint_algebraic_false_proof_regression_7986() {
          Got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deadline observance in the synthesis phase.
+// ---------------------------------------------------------------------------
+
+/// A CHC problem whose algebraic synthesis phase is expensive in a way that a
+/// per-outer-iteration deadline check cannot bound.
+///
+/// One predicate, `width` Int arguments, all initialised to 0 and all
+/// incremented by 1 on the self-loop. Every pair therefore has the same
+/// constant delta, so `derive_auxiliary_invariants`' same-delta pair loop emits
+/// `width * (width - 1) / 2` equalities for a SINGLE predicate — the whole cost
+/// sits inside one iteration of the `for pred in predicates` loop, which is the
+/// shape that makes a per-iteration check look correct while bounding nothing.
+fn wide_lockstep_counter_problem(width: usize) -> ChcProblem {
+    use std::fmt::Write as _;
+
+    let pre: Vec<String> = (0..width).map(|i| format!("v{i}")).collect();
+    let post: Vec<String> = (0..width).map(|i| format!("w{i}")).collect();
+    let decl = vec!["Int"; width].join(" ");
+    let binders = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| format!("({n} Int)"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let apply = |names: &[String]| format!("(Inv {})", names.join(" "));
+
+    let mut smt = String::new();
+    let _ = writeln!(smt, "(set-logic HORN)");
+    let _ = writeln!(smt, "(declare-fun Inv ({decl}) Bool)");
+
+    let init_eqs: Vec<String> = pre.iter().map(|n| format!("(= {n} 0)")).collect();
+    let _ = writeln!(
+        smt,
+        "(assert (forall ({}) (=> (and {}) {})))",
+        binders(&pre),
+        init_eqs.join(" "),
+        apply(&pre)
+    );
+
+    let step_eqs: Vec<String> = (0..width).map(|i| format!("(= w{i} (+ v{i} 1))")).collect();
+    let mut loop_binders = binders(&pre);
+    loop_binders.push(' ');
+    loop_binders.push_str(&binders(&post));
+    let _ = writeln!(
+        smt,
+        "(assert (forall ({}) (=> (and {} {}) {})))",
+        loop_binders,
+        apply(&pre),
+        step_eqs.join(" "),
+        apply(&post)
+    );
+
+    let _ = writeln!(
+        smt,
+        "(assert (forall ({}) (=> (and {} (< v0 0)) false)))",
+        binders(&pre),
+        apply(&pre)
+    );
+    let _ = writeln!(smt, "(check-sat)");
+
+    ChcParser::parse(&smt).expect("generated lockstep-counter problem should parse")
+}
+
+/// Measurement harness for the expired-deadline cost fraction, not a gate: it
+/// prints timings and asserts nothing. It is minutes of synthesis at width 120,
+/// so it is compiled only under the `measurement-harness-tests` feature —
+/// which means it RUNS when that feature is on, rather than being an
+/// `#[ignore]`d test that runs nowhere (the repository forbids `#[ignore]`).
+/// The gate that does assert on this behaviour,
+/// `algebraic_prestage_honors_a_budget_that_expires_mid_flight`, is
+/// unconditional and runs on every `cargo test`.
+///
+/// ```text
+/// cargo test -p ay-chc --release --features measurement-harness-tests \
+///     --lib measure_expired_deadline_cost_fraction -- --nocapture
+/// ```
+#[cfg(feature = "measurement-harness-tests")]
+#[test]
+fn measure_expired_deadline_cost_fraction() {
+    for width in [40usize, 80, 120] {
+        let problem = wide_lockstep_counter_problem(width);
+
+        let t_full = ay_core::time::Instant::now();
+        let (full, _) = try_algebraic_solve_with_deadline_and_stats(&problem, false, None);
+        let full_elapsed = t_full.elapsed();
+
+        let t_exp = ay_core::time::Instant::now();
+        let (expired, _) = try_algebraic_solve_with_deadline_and_stats(
+            &problem,
+            false,
+            Some(ay_core::time::Instant::now()),
+        );
+        let expired_elapsed = t_exp.elapsed();
+
+        let tag = |r: &AlgebraicResult| match r {
+            AlgebraicResult::Safe(_) => "Safe",
+            AlgebraicResult::Unsafe => "Unsafe",
+            AlgebraicResult::NotApplicable => "NotApplicable",
+        };
+        println!(
+            "width={width:>4}  full={:>10.4}s  expired={:>10.4}s  fraction={:>7.2}%  \
+             full={} expired={}",
+            full_elapsed.as_secs_f64(),
+            expired_elapsed.as_secs_f64(),
+            100.0 * expired_elapsed.as_secs_f64() / full_elapsed.as_secs_f64().max(1e-9),
+            tag(&full),
+            tag(&expired),
+        );
+
+        // Mid-flight: a budget that expires while synthesis is running. This is
+        // the shape the corpus cells hit (nominal 5s, actual 33.67s) and the
+        // one an entry gate alone cannot catch.
+        for budget_ms in [10u64, 50, 200] {
+            let budget = std::time::Duration::from_millis(budget_ms);
+            let t = ay_core::time::Instant::now();
+            let (r, _) = try_algebraic_solve_with_deadline_and_stats(
+                &problem,
+                false,
+                Some(ay_core::time::Instant::now() + budget),
+            );
+            let el = t.elapsed();
+            println!(
+                "    midflight width={width:>4} budget={budget_ms:>4}ms  actual={:>9.4}s  \
+                 overrun={:>8.2}x  result={}",
+                el.as_secs_f64(),
+                el.as_secs_f64() / budget.as_secs_f64(),
+                tag(&r),
+            );
+        }
+    }
+}
+
+/// #9110 gate: a budget that expires DURING synthesis/validation must stop it.
+///
+/// The bug this pins was not "the deadline is never checked" — it was checked,
+/// at the top of three loops whose single iteration is where the time goes. The
+/// observable signature is a runtime that does not move when the budget moves.
+/// Measured before the fix on width 120: 1.992s at a 10ms budget, 1.986s at
+/// 50ms, 1.982s at 200ms.
+///
+/// Both assertions are RELATIVE to the same problem's own unbudgeted cost, so
+/// the gate holds in debug and release and on any machine speed.
+#[test]
+fn algebraic_prestage_honors_a_budget_that_expires_mid_flight() {
+    use std::time::Duration;
+
+    let problem = wide_lockstep_counter_problem(40);
+
+    // Non-vacuity floor 1: unbudgeted, this problem is genuinely SOLVED. The
+    // budgeted run below therefore gives up on real, available work rather
+    // than reporting NotApplicable because there was nothing to do.
+    let t = ay_core::time::Instant::now();
+    let (unbudgeted, _) = try_algebraic_solve_with_deadline_and_stats(&problem, false, None);
+    let full = t.elapsed();
+    assert!(
+        matches!(unbudgeted, AlgebraicResult::Safe(_)),
+        "non-vacuity: the lockstep problem must be solvable when unbudgeted, got {unbudgeted:?}"
+    );
+
+    // Non-vacuity floor 2: that work must be substantial relative to the
+    // budget, otherwise the ratio below compares timer noise to timer noise.
+    const BUDGET: Duration = Duration::from_millis(50);
+    assert!(
+        full > BUDGET * 4,
+        "non-vacuity: unbudgeted solve took {full:?}, which is not enough more than the \
+         {BUDGET:?} budget for this test to be able to detect an ignored budget"
+    );
+
+    let t = ay_core::time::Instant::now();
+    let (budgeted, _) = try_algebraic_solve_with_deadline_and_stats(
+        &problem,
+        false,
+        Some(ay_core::time::Instant::now() + BUDGET),
+    );
+    let budgeted_elapsed = t.elapsed();
+
+    // Soundness: an exhausted budget yields no verdict at all.
+    assert!(
+        matches!(budgeted, AlgebraicResult::NotApplicable),
+        "an exhausted budget must yield NotApplicable, never a verdict, got {budgeted:?}"
+    );
+
+    // The fix: the budgeted run must be a small fraction of the full one.
+    // Before the fix this ratio was ~1.08x (0.882s vs 0.951s) — i.e. the
+    // budget bought nothing. After it is ~17x.
+    assert!(
+        budgeted_elapsed * 4 < full,
+        "budget ignored: a {BUDGET:?} budget took {budgeted_elapsed:?}, versus {full:?} \
+         for the same problem with no budget at all"
+    );
+}
+
+/// #9110 gate: re-entering the pre-strategy on a spent budget must cost nothing.
+///
+/// The pre-strategy is entered up to three times per solve (original problem,
+/// BvToInt retry, adaptive escalation) sharing ONE deadline, and had no entry
+/// gate — so entries two and three replayed the whole phase against a deadline
+/// that had already passed. Measured before the fix at width 120: 3.93s of work
+/// on an already-expired deadline.
+#[test]
+fn algebraic_prestage_does_no_work_on_an_already_expired_deadline() {
+    let problem = wide_lockstep_counter_problem(40);
+
+    // Non-vacuity: there is real work here to skip.
+    let t = ay_core::time::Instant::now();
+    let (unbudgeted, _) = try_algebraic_solve_with_deadline_and_stats(&problem, false, None);
+    let full = t.elapsed();
+    assert!(
+        matches!(unbudgeted, AlgebraicResult::Safe(_)),
+        "non-vacuity: the lockstep problem must be solvable when unbudgeted, got {unbudgeted:?}"
+    );
+
+    let t = ay_core::time::Instant::now();
+    let (expired, _) = try_algebraic_solve_with_deadline_and_stats(
+        &problem,
+        false,
+        Some(ay_core::time::Instant::now()),
+    );
+    let expired_elapsed = t.elapsed();
+
+    assert!(
+        matches!(expired, AlgebraicResult::NotApplicable),
+        "an expired deadline must yield NotApplicable, got {expired:?}"
+    );
+    assert!(
+        expired_elapsed * 20 < full,
+        "an already-expired deadline still cost {expired_elapsed:?} against a full cost of {full:?}"
+    );
+}
+
+/// #9110 gate: the runtime must TRACK the budget, not merely take one.
+///
+/// This is the diagnostic that identified the defect in the first place. A
+/// solver that polls its budget finishes sooner when given less; a solver that
+/// merely accepts a budget parameter and never polls it takes the same wall
+/// clock whatever it is handed. The corpus cells showed 33.67s at a nominal 5s
+/// and 33.63s at 20s, and this problem reproduces exactly that: with the
+/// syntactic fast-path poll removed it takes 0.466s at a 10ms budget and
+/// 0.470s at 250ms (a ratio of 1.01), versus 0.013s and 0.204s with the poll
+/// in place (a ratio of 15).
+///
+/// Deliberately NOT a ratio against the unbudgeted cost: solving this width
+/// outright takes ~14s, and the gate must stay cheap. Comparing two budgets
+/// against each other is both cheaper and a sharper test of the actual
+/// property, and it is independent of build profile and machine speed.
+///
+/// The width-40 gates above cover the entry gate and the conjoin
+/// linearization; this one covers the Θ(|head|·|body|) validation scan, which
+/// is the phase that dominated the measured overrun.
+#[test]
+fn algebraic_prestage_runtime_tracks_the_budget_it_is_given() {
+    use std::time::Duration;
+
+    const WIDTH: usize = 80;
+    let problem = wide_lockstep_counter_problem(WIDTH);
+
+    // Non-vacuity (structural): this really is the wide problem, so the
+    // synthesized interpretation is large enough for the validation scan to be
+    // the dominant cost. A trivial problem would finish inside every budget
+    // and make the comparison below meaningless.
+    assert_eq!(problem.clauses().len(), 3, "init, self-loop, query");
+    assert_eq!(
+        problem
+            .predicates()
+            .first()
+            .expect("one predicate")
+            .arg_sorts
+            .len(),
+        WIDTH,
+        "non-vacuity: the predicate must be wide enough to make synthesis expensive"
+    );
+
+    let run = |budget: Duration| {
+        let t = ay_core::time::Instant::now();
+        let (result, _) = try_algebraic_solve_with_deadline_and_stats(
+            &problem,
+            false,
+            Some(ay_core::time::Instant::now() + budget),
+        );
+        assert!(
+            matches!(result, AlgebraicResult::NotApplicable),
+            "an exhausted budget must yield NotApplicable, never a verdict, got {result:?}"
+        );
+        t.elapsed()
+    };
+
+    let small = run(Duration::from_millis(10));
+    let large = run(Duration::from_millis(250));
+
+    assert!(
+        large > small * 3,
+        "the budget is not being polled: a 250ms budget took {large:?} and a 10ms budget \
+         took {small:?}, i.e. the runtime barely moved when the budget moved 25x"
+    );
+}
+
+/// #9110 gate: an external cancellation token must reach the pre-strategy.
+///
+/// It previously did not reach this module in any form, so an embedding
+/// driver's `cancellation_handle().cancel_after(..)` was inert here — arming it
+/// on a 341s corpus cell measurably made it WORSE (343s), because the timer ran
+/// and nothing observed it.
+#[test]
+fn algebraic_prestage_observes_an_external_cancellation_token() {
+    let problem = wide_lockstep_counter_problem(40);
+
+    // Non-vacuity: uncancelled, with no deadline, this problem is solved.
+    let t = ay_core::time::Instant::now();
+    let (uncancelled, _) = try_algebraic_solve_with_budget_and_stats(
+        &problem,
+        false,
+        None,
+        Some(crate::cancellation::CancellationToken::new()),
+    );
+    let full = t.elapsed();
+    assert!(
+        matches!(uncancelled, AlgebraicResult::Safe(_)),
+        "non-vacuity: an un-cancelled token must not disturb the solve, got {uncancelled:?}"
+    );
+
+    let token = crate::cancellation::CancellationToken::new();
+    token.cancel();
+    let t = ay_core::time::Instant::now();
+    let (cancelled, _) =
+        try_algebraic_solve_with_budget_and_stats(&problem, false, None, Some(token));
+    let cancelled_elapsed = t.elapsed();
+
+    assert!(
+        matches!(cancelled, AlgebraicResult::NotApplicable),
+        "cancellation must yield NotApplicable, never a verdict, got {cancelled:?}"
+    );
+    assert!(
+        cancelled_elapsed * 20 < full,
+        "cancellation was not observed: {cancelled_elapsed:?} against an uncancelled {full:?}"
+    );
+}
+
+/// #9110: an interrupted `and_all` must not hand back the partial conjunction.
+///
+/// A truncated conjunction is strictly WEAKER than the one the synthesizer
+/// derived, and a too-weak interpretation is not merely useless: validation
+/// reads a query clause the interpretation fails to exclude as evidence that
+/// bad states are reachable. Returning a partial result would therefore turn a
+/// timeout into a wrong verdict.
+#[test]
+fn and_all_checked_discards_the_partial_conjunction_when_it_stops() {
+    let conjuncts: Vec<ChcExpr> = (0..4096)
+        .map(|i| {
+            ChcExpr::ge(
+                ChcExpr::var(ChcVar::new(format!("x{i}"), ChcSort::Int)),
+                ChcExpr::int(i),
+            )
+        })
+        .collect();
+
+    // Non-vacuity: the input is big enough to cross several poll strides, so a
+    // stop predicate genuinely has somewhere to fire.
+    assert!(conjuncts.len() > 4 * 512, "input must span several strides");
+
+    // Stops immediately: no formula at all, not a truncated one.
+    assert!(
+        ChcExpr::and_all_checked(conjuncts.clone(), || true).is_none(),
+        "a tripped stop predicate must discard the partial conjunction"
+    );
+
+    // Never stops: identical to the unchecked constructor.
+    let checked = ChcExpr::and_all_checked(conjuncts.clone(), || false)
+        .expect("a stop predicate that never fires must produce the full conjunction");
+    assert_eq!(
+        checked,
+        ChcExpr::and_all(conjuncts.clone()),
+        "the checked and unchecked constructors must agree"
+    );
+    assert_eq!(
+        checked.conjuncts().len(),
+        conjuncts.len(),
+        "non-vacuity: every conjunct must survive"
+    );
+}
+
+/// #9110: linearizing `conjoin` must not change the formula it builds.
+///
+/// `conjoin` used to fold with `reduce(ChcExpr::and)`. That is not linear:
+/// `ChcExpr::and(a, b)` is `and_all([a, b])`, which re-flattens and re-hashes
+/// the whole accumulator every step, so folding n conjuncts did Θ(n²)
+/// hash-consing. Replacing the fold with one `and_all` pass is only safe if it
+/// produces the identical expression — same order, same flattening, same
+/// first-occurrence dedup, same constant folding.
+#[test]
+fn conjoin_matches_the_binary_fold_it_replaced() {
+    let var = |n: &str| ChcExpr::var(ChcVar::new(n.to_string(), ChcSort::Int));
+
+    let cases: Vec<Vec<ChcExpr>> = vec![
+        vec![],
+        vec![ChcExpr::ge(var("a"), ChcExpr::int(0))],
+        vec![
+            ChcExpr::ge(var("a"), ChcExpr::int(0)),
+            ChcExpr::le(var("b"), ChcExpr::int(7)),
+            ChcExpr::eq(var("c"), var("d")),
+        ],
+        // duplicates: first-occurrence dedup must be preserved
+        vec![
+            ChcExpr::ge(var("a"), ChcExpr::int(0)),
+            ChcExpr::ge(var("a"), ChcExpr::int(0)),
+            ChcExpr::le(var("b"), ChcExpr::int(7)),
+        ],
+        // nested And: flattening must be preserved
+        vec![
+            ChcExpr::and(
+                ChcExpr::ge(var("a"), ChcExpr::int(0)),
+                ChcExpr::le(var("b"), ChcExpr::int(7)),
+            ),
+            ChcExpr::eq(var("c"), var("d")),
+        ],
+        // constant folding, both polarities
+        vec![
+            ChcExpr::Bool(true),
+            ChcExpr::ge(var("a"), ChcExpr::int(0)),
+            ChcExpr::Bool(true),
+        ],
+        vec![
+            ChcExpr::ge(var("a"), ChcExpr::int(0)),
+            ChcExpr::Bool(false),
+            ChcExpr::le(var("b"), ChcExpr::int(7)),
+        ],
+    ];
+
+    for case in cases {
+        let folded = match case.len() {
+            0 => ChcExpr::Bool(true),
+            1 => case[0].clone(),
+            _ => case
+                .clone()
+                .into_iter()
+                .reduce(ChcExpr::and)
+                .expect("non-empty"),
+        };
+        assert_eq!(
+            conjoin(case.clone()),
+            folded,
+            "linearized conjoin disagreed with the binary fold on {case:?}"
+        );
+    }
+}

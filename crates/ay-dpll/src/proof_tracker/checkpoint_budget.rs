@@ -391,6 +391,7 @@ fn alethe_rule_payload(
         | AletheRule::ThResolution
         | AletheRule::Contraction
         | AletheRule::Weakening
+        | AletheRule::Reordering
         | AletheRule::Refl
         | AletheRule::Symm
         | AletheRule::Trans

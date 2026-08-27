@@ -5989,9 +5989,10 @@ mod tests {
     /// positive remaining budget `R`.
     #[test]
     fn bkz_budget_reserves_validation_margin() {
-        assert!(BKZ_BUDGET_FRACTION > 0.0 && BKZ_BUDGET_FRACTION < 1.0);
-        assert!(BKZ_ABS_CAP_SECS > 0.0);
-        assert!(BKZ_LARGE_ABS_CAP_SECS > 0.0);
+        const {
+            assert!(BKZ_BUDGET_FRACTION > 0.0 && BKZ_BUDGET_FRACTION < 1.0);
+            assert!(BKZ_ABS_CAP_SECS > 0.0 && BKZ_LARGE_ABS_CAP_SECS > 0.0);
+        }
         for pruned in [false, true] {
             assert_eq!(bkz_budget(Duration::ZERO, pruned), Duration::ZERO);
             for &r_secs in &[0.001_f64, 0.1, 1.0, 30.0, 60.0, 120.0, 600.0] {
@@ -6004,12 +6005,12 @@ mod tests {
             }
         }
         assert_eq!(
-            bkz_budget(Duration::from_secs(600), false),
+            bkz_budget(Duration::from_mins(10), false),
             Duration::from_secs_f64(BKZ_ABS_CAP_SECS),
             "the absolute cap must apply to long solve slices"
         );
         assert_eq!(
-            bkz_budget(Duration::from_secs(600), true),
+            bkz_budget(Duration::from_mins(10), true),
             Duration::from_secs_f64(BKZ_LARGE_ABS_CAP_SECS),
             "the large-kernel cap must apply to long pruned slices"
         );
@@ -8516,8 +8517,7 @@ mod tests {
                 if let EnumResult::Empty = pruned {
                     assert!(
                         truth.is_empty(),
-                        "UNSOUND: EMPTY at |x_d| = {biggest} but the face holds {:?}",
-                        truth
+                        "UNSOUND: EMPTY at |x_d| = {biggest} but the face holds {truth:?}"
                     );
                 }
             }

@@ -30,6 +30,10 @@ pub struct EmitCtx<'a> {
     pub network_design_optimality_certificate: Option<&'a NetworkDesignOptimalityCertificate>,
     /// Model-bound exact Lagrangian proof for an integral block-angular model.
     pub block_angular_optimality_certificate: Option<&'a BlockAngularOptimalityCertificate>,
+    /// Whole-tree exact proof that nothing feasible beats the claimed optimum:
+    /// the general dual half of an `Optimal`, applicable to any branched MILP
+    /// rather than to a recognised structure.
+    pub milp_optimality_tree_certificate: Option<&'a MilpOptimalityCertificate>,
     /// Model-bound exact optimum of a recognized single-machine scheduling model.
     pub single_machine_scheduling_optimality_certificate:
         Option<&'a SingleMachineSchedulingOptimalityCertificate>,

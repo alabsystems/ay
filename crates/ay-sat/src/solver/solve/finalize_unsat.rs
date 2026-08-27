@@ -171,18 +171,16 @@ impl Solver {
 
         // Build proof certificate from backward reconstruction result.
         let mut certificate = match backward_result {
-            Some(backward) => {
-                ProofCertificate::from_backward_result(backward.steps, backward.complete)
-            }
+            Some(backward) => ProofCertificate::from_backward_reconstruction(backward),
             None => ProofCertificate::empty(),
         };
 
-        // Finalize streaming UNSAT core: mark level-0 antecedents that
-        // conflict analysis never sees (#8250). Then attach to certificate.
+        // Finalize streaming support: mark level-0 antecedents that conflict
+        // analysis never sees (#8250). Then attach it to the certificate.
         if self.cold.retain_unsat_certificate {
             self.finalize_streaming_core();
             if let Some(core) = self.extract_streaming_core() {
-                certificate.set_streaming_core(core);
+                certificate.set_streaming_support(core);
             }
         }
 
@@ -356,7 +354,7 @@ impl Solver {
         // Keep ClauseTrace's UNSAT marker consistent with UNSAT returns even when
         // the solver exits at decision level 0 without explicitly learning/adding
         // an empty clause. This is required for SMT-level proof reconstruction.
-        if let Some(ref mut trace) = self.cold.clause_trace {
+        if let Some(trace) = self.live_clause_trace_mut() {
             trace.mark_empty();
         }
 
@@ -603,8 +601,8 @@ impl Solver {
         // assumption of this query. Nothing checked that. A SAT answer IS verified
         // in release against the original ledger and downgraded to Unknown on
         // failure; an UNSAT verdict and its core were verified by nothing, and
-        // `VerifiedAssumeResult::from_validated` is a no-op wrapper despite a doc
-        // comment claiming "Verification happened at construction time". That
+        // `SolverAssumeResult::from_solver_result` seals solver provenance but
+        // deliberately performs no verification of this verdict. That
         // asymmetry is why a too-HIGH wrong answer can reach a competition run
         // while a too-LOW one is always caught.
         //
@@ -695,8 +693,8 @@ impl Solver {
 
         // Run backward LRAT reconstruction BEFORE finalize_unsat_proof (same
         // ordering as declare_unsat) so the proof certificate captures the full
-        // derivation chain. This enables proof-based UNSAT core extraction
-        // via ProofCertificate::minimal_core() (#8209).
+        // derivation chain. This enables diagnostic original-clause support
+        // inspection via ProofCertificate::tracked_original_clause_ids() (#8209).
         let backward_result = self.run_backward_proof_reconstruction();
         if self.cold.backward_proof_failure.is_some()
             || (self.cold.backward_proof_limits.is_some() && !self.cold.empty_clause_in_proof)
@@ -717,21 +715,20 @@ impl Solver {
             None
         };
         let certificate = backward_result.map(|backward| {
-            let mut cert =
-                ProofCertificate::from_backward_result(backward.steps, backward.complete);
+            let mut cert = ProofCertificate::from_backward_reconstruction(backward);
             if let Some(sc) = streaming_core {
-                cert.set_streaming_core(sc);
+                cert.set_streaming_support(sc);
             }
             cert
         });
         AssumeResult::Unsat(core, certificate)
     }
 
-    /// Finalize the streaming UNSAT core by marking level-0 antecedents (#8250).
+    /// Finalize streaming original-clause support with level-0 antecedents (#8250).
     ///
     /// Conflict analysis only runs for conflicts at decision level > 0.
     /// For level-0 UNSAT (contradictory unit clauses, BCP at root level),
-    /// the streaming core bitmap may be empty because no analyze_conflict
+    /// the streaming-support bitmap may be empty because no conflict analysis
     /// was invoked. This method supplements the bitmap by:
     ///
     /// 1. Finding falsified clauses under the current assignment.
@@ -755,7 +752,7 @@ impl Solver {
         // live_indices (husk adjudication): skip garbage-kept husks, and keep
         // scanning past falsified clauses without a usable original ID
         // (cid==0 husks previously hit the unconditional `break`, silently
-        // emptying the streaming-core seed).
+        // emptying the streaming-support seed).
         for offset in self.arena.live_indices() {
             let lits = self.arena.literals(offset);
             if lits.is_empty() {
@@ -1024,11 +1021,11 @@ impl Solver {
         hex
     }
 
-    /// Extract the streaming UNSAT core from the solver's bitmap (#8250).
+    /// Extract streaming original-clause support from the solver bitmap (#8250).
     ///
     /// Converts the internal `streaming_core` bitmap (indexed by clause_id - 1)
     /// into a sorted `Vec<u64>` of 1-based original clause IDs. Returns `None`
-    /// if streaming core tracking was not active (e.g., no original clauses).
+    /// if streaming support tracking was not active (e.g., no original clauses).
     ///
     /// Cost: O(num_originals) scan of the bitmap. For typical formulas this is
     /// negligible compared to the solve time.
@@ -1579,19 +1576,19 @@ mod tests {
     }
 
     #[test]
-    fn core_subset_audit_accepts_genuine_subset_core() {
+    fn core_subset_audit_checks_membership_not_unsatisfiability() {
         let mut solver = Solver::new(4);
         let a = Literal::positive(Variable::new(0));
         let b = Literal::negative(Variable::new(1));
         solver.cold.prev_assumptions.clear();
         solver.cold.prev_assumptions.extend_from_slice(&[a, b]);
 
+        // Empty formula is SAT: membership is checked, unsatisfiability is not.
         let result = solver.declare_unsat_assume(vec![a]);
 
         assert!(
             matches!(result, AssumeResult::Unsat(..)),
-            "a core that is a subset of this query's assumptions must stay UNSAT, \
-             got {result:?}"
+            "the membership gate should preserve the solver verdict: {result:?}"
         );
     }
 }

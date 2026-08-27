@@ -614,8 +614,8 @@ impl Executor {
     ///    solver-invented, so the reconstructed refutation's leaves for them
     ///    carried no `assume` authority, were demoted to unit `trust`, and
     ///    strict certification rejected a CORRECT refutation:
-    ///      pigeon_3_2  unknown 11ms -> unsat 2ms
-    ///      syn2_MIN    unknown 2335ms -> unsat 44ms
+    ///    pigeon_3_2  unknown 11ms -> unsat 2ms
+    ///    syn2_MIN    unknown 2335ms -> unsat 44ms
     ///
     /// 2. It blew the certification RESCUE budget: with the outer proof leaning
     ///    on a trust step, `discharge_trust_steps_for_certification` re-decides
@@ -625,10 +625,9 @@ impl Executor {
     /// Re-measured on today's certification lanes, with the pass ON, by
     /// `eq_diffvar_runs_and_mandatory_unsat_certification_survives`:
     ///
-    ///     pigeon  (unguarded `distinct`)  unsat, 3 diff vars, STRICTLY verified
-    ///     guarded (the pass's own shape)  unsat, 5 diff vars, INDEPENDENTLY
-    ///                                     verified, 30ms — nowhere near the
-    ///                                     2000ms rescue budget
+    /// - `pigeon` (unguarded `distinct`): unsat, 3 diff vars, STRICTLY verified.
+    /// - `guarded` (the pass's own shape): unsat, 5 diff vars, INDEPENDENTLY
+    ///   verified in 30ms — nowhere near the 2000ms rescue budget.
     ///
     /// So (1) is gone outright on the unguarded shape: the strict checker now
     /// accepts the refutation. On the guarded shape the certificate comes from
@@ -867,15 +866,7 @@ impl Executor {
         // can never cause a wrong verdict).
         let has_uf = crate::features::StaticFeatures::collect(&self.ctx.terms, &assertions).has_uf;
         if self.eq_diffvar_pass_enabled() && !self.is_producing_proofs() && !has_uf {
-            let mut dv_pass = EqDiffVar::new();
-            if dv_pass.apply_with_sources(&mut self.ctx.terms, &mut assertions, &mut source_sets) {
-                self.last_statistics
-                    .set_int("preprocess.eq_diffvar.diff_vars", dv_pass.diff_vars);
-                self.last_statistics.set_int(
-                    "preprocess.eq_diffvar.rewritten_atoms",
-                    dv_pass.rewritten_atoms,
-                );
-            }
+            self.run_eq_diffvar_round(&mut assertions, &mut source_sets);
         }
 
         let mut var_subst = VariableSubstitution::new();
@@ -915,20 +906,8 @@ impl Executor {
         );
 
         if var_subst_changed {
-            let mut reflattened = Vec::new();
-            for (&assertion, source_set) in assertions.iter().zip(source_sets.iter()) {
-                flatten_assertion_with_source(
-                    &self.ctx.terms,
-                    assertion,
-                    source_set,
-                    &mut reflattened,
-                );
-            }
-            assertions = reflattened.iter().map(|(term, _)| *term).collect();
-            source_sets = reflattened
-                .into_iter()
-                .map(|(_, sources)| sources)
-                .collect();
+            (assertions, source_sets) =
+                self.reflatten_substituted_lia_assertions(&assertions, &source_sets);
         }
 
         // SOM normalization: distribute multiplication over addition (#4919).
@@ -1844,6 +1823,7 @@ pub(super) use super::solve_harness_helpers::substitute_store_flat_equalities;
 pub(super) use super::solve_harness_helpers::substitute_array_var_aliases;
 
 mod mod_elim_var_subst;
+mod reflatten_provenance;
 
 mod split_atoms;
 pub(in crate::executor) use split_atoms::{
@@ -1854,3 +1834,37 @@ pub(in crate::executor) use split_atoms::{
 #[allow(clippy::panic)]
 #[cfg(test)]
 mod tests;
+
+impl Executor {
+    /// The inc-14 difference-variable round, with its proof provenance.
+    ///
+    /// Extracted from `preprocess_lia_artifacts` because the quality gate
+    /// ratchets that function's length and it is already at its ceiling; the
+    /// call site's comment carries the pass's rationale and gating.
+    ///
+    /// (#4751) The snapshot is what lets the IN-PLACE atom fold be REPLAYED
+    /// into proof steps. Without it the rewritten assertion is not in the
+    /// authored stack and demotes to a premiseless `trust` — the exact residual
+    /// this pass's own `eq_diffvar_pass_enabled` RESIDUAL GAP note names. Only
+    /// proof-producing solves pay the clone.
+    fn run_eq_diffvar_round(
+        &mut self,
+        assertions: &mut Vec<TermId>,
+        source_sets: &mut Vec<Vec<TermId>>,
+    ) {
+        let before = self.produce_proofs_enabled().then(|| assertions.clone());
+        let mut dv_pass = EqDiffVar::new();
+        if !dv_pass.apply_with_sources(&mut self.ctx.terms, assertions, source_sets) {
+            return;
+        }
+        self.last_statistics
+            .set_int("preprocess.eq_diffvar.diff_vars", dv_pass.diff_vars);
+        self.last_statistics.set_int(
+            "preprocess.eq_diffvar.rewritten_atoms",
+            dv_pass.rewritten_atoms,
+        );
+        if let Some(before) = before {
+            self.extend_eq_diffvar_provenance(&before, assertions, &dv_pass.atom_folds);
+        }
+    }
+}

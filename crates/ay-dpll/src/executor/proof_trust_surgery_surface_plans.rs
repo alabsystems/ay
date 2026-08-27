@@ -52,22 +52,35 @@ impl Executor {
                 return None;
             }
             audit.protect_operand(&mut self.ctx.terms, plan.cond);
-            for operand in [
-                plan.orig,
-                plan.lifted_then,
-                plan.lifted_else,
-                plan.eq_then,
-                plan.eq_else,
-            ]
-            .into_iter()
-            .chain(plan.bound)
-            {
+            // A guarded then-projection emits ONLY the then-side transfer:
+            // its else substitution typically folds to `true` and never
+            // appears in the rebuilt proof, so no else-side artifact may be
+            // registered (registration would impose surface requirements for
+            // terms the emission cannot justify).
+            let farkas_operands: &[TermId] = if plan.guarded_then_or {
+                &[plan.orig, plan.lifted_then, plan.eq_then]
+            } else {
+                &[
+                    plan.orig,
+                    plan.lifted_then,
+                    plan.lifted_else,
+                    plan.eq_then,
+                    plan.eq_else,
+                ]
+            };
+            for operand in farkas_operands.iter().copied().chain(plan.bound) {
                 audit.protect_farkas_operand(&mut self.ctx.terms, operand);
             }
-            for (branch_eq, lifted, farkas) in [
-                (plan.eq_then, plan.lifted_then, &plan.then_coeffs),
-                (plan.eq_else, plan.lifted_else, &plan.else_coeffs),
-            ] {
+            let branches: &[(TermId, TermId, &ay_core::FarkasAnnotation)] = if plan.guarded_then_or
+            {
+                &[(plan.eq_then, plan.lifted_then, &plan.then_coeffs)]
+            } else {
+                &[
+                    (plan.eq_then, plan.lifted_then, &plan.then_coeffs),
+                    (plan.eq_else, plan.lifted_else, &plan.else_coeffs),
+                ]
+            };
+            for &(branch_eq, lifted, farkas) in branches {
                 let not_eq = complement_of(&mut self.ctx.terms, branch_eq);
                 let not_orig = complement_of(&mut self.ctx.terms, plan.orig);
                 let mut clause = vec![not_eq, not_orig];
@@ -191,7 +204,12 @@ impl Executor {
         } else {
             audit.require_original(&mut self.ctx, originals, original)
         };
-        source_ok && audit.promote_registered_requirement(condition)
+        // A native-API source registers NO surface requirement, so there is
+        // nothing to promote: the guard prints canonically. Any override a
+        // different (authored-text) source installs for the same guard is
+        // still validated by the final rendering replay.
+        source_ok
+            && (audit.promote_registered_requirement(condition) || audit.source_is_native(original))
     }
 
     /// Add plans discovered during Assume classification, then validate the

@@ -16,8 +16,7 @@ use wait_timeout::ChildExt;
 
 mod publish;
 mod solver_steps;
-use publish::is_executable_file;
-use solver_steps::solver_gate_cargo_steps;
+use self::{publish::is_executable_file, solver_steps::solver_gate_cargo_steps};
 
 #[derive(Subcommand)]
 pub(crate) enum GateCommand {
@@ -1476,7 +1475,7 @@ mod tests {
             .map(|pair| pair[1].as_str())
     }
 
-    const EXPECTED_SOLVER_GATE_STEP_NAMES: [&str; 19] = [
+    const EXPECTED_SOLVER_GATE_STEP_NAMES: [&str; 20] = [
         "code_quality",
         "debug_ay_build_version_stamp",
         "debug_ay_cli_external_codegen_consumer_canaries",
@@ -1492,6 +1491,7 @@ mod tests {
         "debug_ay_dpll_qf_ax_packet",
         "release_ay_sat_soundness_regressions",
         "release_only_ay_dpll_lra_regressions",
+        "release_ay_chc_dillig12_m_deadline_guard",
         "debug_ay_lra_release_fixture_integrity",
         "release_ay_lra_cli_mechanism_regressions",
         "release_ay_lra_cli_hermetic_sweep",

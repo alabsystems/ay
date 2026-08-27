@@ -139,13 +139,17 @@ pub(crate) fn validate_step_with_datatypes_and_progress(
             progress,
         )?,
         ProofStep::Step {
-            rule: AletheRule::FreshDefBound,
+            rule: rule @ (AletheRule::FreshDefBound | AletheRule::FreshDefEq),
             clause,
             premises,
             args,
-        } => derived_clauses.push(Some(validate_fresh_def_bound_step(
-            terms, step_id, clause, premises, args, strict, fresh_defs,
-        )?)),
+        } => derived_clauses.push(Some(if strict {
+            validate_fresh_definition_step(terms, rule, step_id, clause, premises, args, fresh_defs)?
+        } else {
+            // Non-strict checking admits the clause exactly as it admits the
+            // premiseless `trust` step this rule replaces.
+            clause.clone()
+        })),
         // An `array_ext_diff_intro` is a DEFINITION, not an inference: it
         // records that a fresh symbol is the extensionality difference witness
         // for one array pair. It is validated for shape here and recorded as

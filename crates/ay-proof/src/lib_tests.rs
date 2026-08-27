@@ -7,6 +7,8 @@ use ay_core::{string_literal, AletheRule, Sort, Symbol};
 
 #[path = "alethe_printer_bare_step_rule_tests.rs"]
 mod alethe_printer_bare_step_rule_tests;
+#[path = "alethe_printer_fresh_def_eq_tests.rs"]
+mod alethe_printer_fresh_def_eq_tests;
 #[path = "alethe_printer_fresh_def_tests.rs"]
 mod alethe_printer_fresh_def_tests;
 #[path = "alethe_printer_int_bound_lattice_tests.rs"]
@@ -15,6 +17,8 @@ mod alethe_printer_int_bound_lattice_tests;
 mod alethe_printer_int_cut_lattice_tests;
 #[path = "alethe_printer_linear_identity_tests.rs"]
 mod alethe_printer_linear_identity_tests;
+#[path = "alethe_printer_reordering_tests.rs"]
+mod alethe_printer_reordering_tests;
 #[path = "alethe_printer_resolution_args_tests.rs"]
 mod alethe_printer_resolution_args_tests;
 #[path = "alethe_printer_surface_and_pos_tests.rs"]

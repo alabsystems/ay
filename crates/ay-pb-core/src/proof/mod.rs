@@ -22,7 +22,7 @@ pub use self::cert::{
     certify_opt_lin_bounds_interruptible, certify_opt_lin_bounds_pb,
     certify_opt_lin_bounds_pb_interruptible, certify_opt_lin_direct_aggregation_floor,
     certify_opt_lin_knapsack_cardinality, certify_opt_lin_lp_dual_floor,
-    certify_opt_lin_trivial_zero_floor, solution_only_sat_proof,
+    certify_opt_lin_trivial_zero_floor, lp_dual_floor_diagnosis, solution_only_sat_proof,
 };
 pub use self::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
 #[cfg(test)]

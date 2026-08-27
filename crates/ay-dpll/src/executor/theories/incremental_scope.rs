@@ -34,16 +34,15 @@ impl Executor {
     ///
     /// #c2-tracker-isolation: for every non-`Unsat` exit, the proof tracker is
     /// isolated like the incremental theory/BV state and every proof step the
-    /// closure recorded is rolled back. A failed
-    /// witness/pivot sub-solve used to leave its steps (including reject-stub
+    /// closure recorded is rolled back. A failed witness/pivot sub-solve used
+    /// to leave its steps (including reject-stub
     /// tagged units such as `StringContentAxiom`) in the shared tracker, and
     /// the generic-unit alias in `ProofTracker::add_assumption` could later
     /// bind an assumption of the SAME `TermId` to the stale tagged step,
     /// pulling it into a published proof cone where strict validation
     /// hard-fails (C2_STRING_AXIOM_PROBE.md residual vector). Rolling the
-    /// ledger back restores the pre-alias behavior — a later
-    /// `add_assumption` mints a fresh `Assume` — which is total and
-    /// decline-only with respect to publishing: the mint-time strict check
+    /// ledger back restores the pre-alias behavior: `add_assumption` mints a
+    /// fresh `Assume`, total and decline-only for publication. The strict check
     /// and assumption authentication in `unsat_cert` are untouched. On
     /// `Unsat` the steps are KEPT verbatim (no behavior change): callers that
     /// use the inner refutation as their outer publication candidate need that

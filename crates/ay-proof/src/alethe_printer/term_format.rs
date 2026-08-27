@@ -4,7 +4,7 @@
 
 use super::*;
 
-impl<'a> AlethePrinter<'a> {
+impl AlethePrinter<'_> {
     /// Format a term as an SMT-LIB expression
     pub(crate) fn format_term(&self, term_id: TermId) -> String {
         let mut out = String::new();

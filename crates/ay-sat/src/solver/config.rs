@@ -294,6 +294,23 @@ impl Solver {
         self.cold.bcp_learned_1963_pressure_reduction
     }
 
+    /// Enable the default-off LBD-free two-stage clause-management policy
+    /// (arXiv:2602.20829). See `solver/reduction_two_stage.rs`.
+    ///
+    /// Changes the reduce RANKING and KEEP/DELETE decision only; the reduction
+    /// trigger schedule is untouched. Also re-points the meaning of the
+    /// per-clause `used` field from kissat's saturating recency flag to the
+    /// paper's cumulative usage score, so it must be set before the first
+    /// solve rather than mid-search.
+    pub fn set_two_stage_clause_management_enabled(&mut self, enabled: bool) {
+        self.two_stage_clause_management = enabled;
+    }
+
+    /// Return whether the two-stage clause-management policy is armed.
+    pub fn two_stage_clause_management_enabled(&self) -> bool {
+        self.two_stage_clause_management
+    }
+
     /// Enable default-off learned 19-63 pressure-aware reduce_db retention.
     ///
     /// This scheduling experiment only biases already-deletable normal reduce

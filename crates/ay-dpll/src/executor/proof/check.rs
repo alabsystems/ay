@@ -10,14 +10,55 @@
 //! Extracted from `proof.rs` for code health (#5970).
 
 use super::super::Executor;
-use ay_core::TermStore;
 use ay_core::{AletheRule, Proof, ProofStep, TermId};
 #[cfg(feature = "proof-checker")]
-use ay_proof::{check_proof_partial, PartialProofCheck};
+use ay_proof::PartialProofCheck;
 use ay_proof::{ProofCheckError, ProofQuality};
+#[path = "check/internal.rs"]
+mod internal;
+#[path = "check/strict.rs"]
+mod strict;
 #[path = "strict_check_progress.rs"]
 mod strict_check_progress;
 use self::strict_check_progress::check_with_executor_progress;
+#[cfg(feature = "proof-checker")]
+use self::strict_check_progress::{
+    check_partial_with_executor_progress, MeteredPartialCheck, WantQuality,
+};
+
+pub(in crate::executor) use self::strict_check_progress::{
+    check_proof_gate_under_controls, check_proof_gate_with_executor_progress,
+};
+
+/// What a metered resolution-chain check concluded about a proof's empty
+/// clause.
+///
+/// #diagnostic-envelope AMENDMENT. The predicate this replaces returned a
+/// `bool`, and its two callers wanted opposite things from the `false` limb:
+/// `unsat_proof_self_certified` reads it as "do not claim this", which is
+/// correct for every cause; `build_unsat_assembly` reads it as "the rewrite
+/// broke the chain, rebuild it", which is correct only when the checker
+/// actually inspected the chain. Once the walk became cancellable, `false` also
+/// meant "I never looked", and the rebuild ladder — ten unmetered re-derivation
+/// strategies followed by a Farkas repair polled only every 16 lemmas — started
+/// running on the largest proofs at the exact moment the caller had asked the
+/// solve to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum EmptyClauseDerivation {
+    /// The checker walked the proof and accepted it: it derives the empty
+    /// clause and the resolution chain links up.
+    Valid,
+    /// The checker walked the proof and REJECTED it, or there is no empty
+    /// clause at all. A genuine defect, and the only state a repair may act on.
+    Invalid,
+    /// The caller-owned envelope stopped the walk before it reached a verdict.
+    /// NOTHING was learned about this proof. Treat it as unverified (never
+    /// certify it), but do not treat it as broken (never repair it).
+    ///
+    /// Only the metered checker can learn "I was stopped".
+    #[cfg(feature = "proof-checker")]
+    Undetermined,
+}
 
 #[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_FAILURES_KEY: &str = "proof_checker_failures";
@@ -1327,347 +1368,6 @@ impl Executor {
         out.finish()
     }
 
-    /// Strict proof check that also validates datatype constructor-distinctness lemmas (#8419).
-    /// `DatatypeDistinct` steps (promoted from `Generic` at proof finalization
-    /// by `promote_datatype_distinct_lemmas`) cannot be validated from the
-    /// `TermStore` alone — runtime datatype terms carry `Sort::Uninterpreted`.
-    /// This supplies the `declare-datatype` registry so the strict checker can
-    /// semantically validate them against the actual constructor declarations
-    /// instead of failing closed.
-    ///
-    /// It also supplies the complete authored premise scope. Strict mode uses
-    /// that scope both to reject foreign `Assume` steps and to validate
-    /// `ArrayExtensionality`: that clause is sound only for a witness the solver
-    /// minted fresh, and "fresh" is a statement ABOUT the problem, so the
-    /// checker verifies it against the problem's own symbols rather than
-    /// trusting a name or a solver flag.
-    pub(crate) fn check_proof_strict_with_datatypes(
-        &self,
-        proof: &Proof,
-    ) -> Result<ProofQuality, ProofCheckError> {
-        // M0(a) attribution counters (the development design notes):
-        // every strict-check entry through this wrapper is counted, including
-        // the finite-enum route below and the mint-time re-check in
-        // `unsat_cert.rs`. Counting only — zero behavior change.
-        self.strict_check_invocations
-            .set(self.strict_check_invocations.get() + 1);
-        self.strict_check_steps_validated
-            .set(self.strict_check_steps_validated.get() + proof.steps.len() as u64);
-        if let Some(capability) = self.checked_finite_enum_capability_for_proof(proof) {
-            let assumptions: Vec<TermId> = capability.assumptions().collect();
-            return self.check_bounded_finite_enum_proof(
-                proof,
-                &assumptions,
-                &capability.datatype_decls,
-                &capability.selector_decls,
-                &capability.member_signatures,
-            );
-        }
-        let decls = self.datatype_decls_for_strict_proof();
-        let selectors = self.ctor_selector_decls_for_strict_proof();
-        let member_signatures = self
-            .datatype_member_signatures_for_strict_proof()
-            .ok_or_else(|| ProofCheckError::InvalidDatatypeSignatureContext {
-                reason: "executor datatype registries lack an exact sticky member signature"
-                    .to_string(),
-            })?;
-        // A non-matching candidate must never inherit a narrow scope merely
-        // because the current stored proof has a finite-enum capability.
-        let problem = self.complete_problem_assertions_for_strict_proof();
-        check_with_executor_progress(
-            self,
-            proof,
-            (!decls.is_empty()).then_some(decls.as_slice()),
-            (!selectors.is_empty()).then_some(selectors.as_slice()),
-            member_signatures.as_slice(),
-            Some(problem.as_slice()),
-        )
-    }
-
-    /// Strictly validate a proof's derivation while deliberately postponing
-    /// authored-premise authorization.
-    ///
-    /// Proof-surgery passes use this as an atomic revert gate while they replace
-    /// one derived lemma inside a larger proof. At that point the proof can still
-    /// contain preprocessing assumptions which a later rewrite will derive from
-    /// authored roots or demote to an explicit trust step. Treating those
-    /// unrelated leaves as an authorization failure here would revert a valid
-    /// local replacement and preserve its trust lemma.
-    ///
-    /// Every current `Assume` is supplied as an allowed premise solely for this
-    /// structural check. This does not weaken the final boundary:
-    /// [`Self::check_proof_strict_with_datatypes`] and the exported bundle still
-    /// validate the finished proof against the independently captured authored
-    /// scope. Including all assumes is also conservative for array witness
-    /// freshness: it can only reject a witness that occurs in a premise.
-    pub(crate) fn check_proof_strict_derivation_with_datatypes(
-        &self,
-        proof: &Proof,
-    ) -> Result<ProofQuality, ProofCheckError> {
-        let decls = self.datatype_decls_for_strict_proof();
-        let selectors = self.ctor_selector_decls_for_strict_proof();
-        let member_signatures = self
-            .datatype_member_signatures_for_strict_proof()
-            .ok_or_else(|| ProofCheckError::InvalidDatatypeSignatureContext {
-                reason: "executor datatype registries lack an exact sticky member signature"
-                    .to_string(),
-            })?;
-        let assumptions: Vec<TermId> = proof
-            .steps
-            .iter()
-            .filter_map(|step| match step {
-                ProofStep::Assume(term) => Some(*term),
-                _ => None,
-            })
-            .collect();
-        check_with_executor_progress(
-            self,
-            proof,
-            (!decls.is_empty()).then_some(decls.as_slice()),
-            (!selectors.is_empty()).then_some(selectors.as_slice()),
-            member_signatures.as_slice(),
-            Some(assumptions.as_slice()),
-        )
-    }
-
-    /// The complete authored premise scope for strict proof checking.
-    ///
-    /// Deliberately NOT `ctx.assertions`: at proof time that stack also carries
-    /// the solver's own injected extensionality axioms, which mention every
-    /// witness and would make all of them look non-fresh. The authored window
-    /// (captured before in-place preprocessing) is preferred when present; the
-    /// parsed-prefix and provenance-tracked problem assertions are unioned in.
-    /// `check-sat-assuming` literals and structurally authenticated source terms
-    /// rebuilt during proof repair are included because they can legitimately
-    /// appear as `Assume` leaves. Solver-generated constraints are excluded.
-    /// A SUPERSET is always safe here — extra terms can only make the freshness
-    /// test stricter, never more permissive.
-    pub(in crate::executor) fn complete_problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
-        let mut problem = self.proof_export_scope_assertions();
-        // Membership through a set, not `Vec::contains` (#strict-proof-dedup).
-        // Both loops below dedup against `problem`, which on the DT families is
-        // thousands of assertions long, so the linear scan made this O(n^2) —
-        // and mandatory certification runs it on EVERY public UNSAT. Order is
-        // preserved exactly: the set only answers "already present".
-        let mut seen: ay_core::kani_compat::DetHashSet<TermId> = problem.iter().copied().collect();
-        if let Some(authored) = self.self_check_authored_assertions.as_ref() {
-            for &assertion in authored {
-                if seen.insert(assertion) {
-                    problem.push(assertion);
-                }
-            }
-        }
-        // #pareto-terminal-obligation — a Pareto terminal `(check-sat)` refutes
-        // `authored AND blocking`, so the blocking conjuncts are part of the
-        // question being decided rather than facts borrowed from nowhere. The
-        // slot is empty for every other query and is writable only by
-        // `declare_pareto_front_exhaustion_extension`, which rebuilds its terms
-        // from the executor's own objectives.
-        for extension in self.declared_obligation_extension() {
-            if seen.insert(extension) {
-                problem.push(extension);
-            }
-        }
-        problem
-    }
-
-    /// Premise scope for APIs that export the exact stored proof.
-    ///
-    /// Only the canonical, current finite-enum proof receives its selected
-    /// direct-root scope. Every other proof path retains the complete authored
-    /// scope assembled above.
-    pub(crate) fn problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
-        self.last_proof
-            .as_ref()
-            .and_then(|proof| self.finite_enum_scope_for_proof(proof))
-            .unwrap_or_else(|| self.complete_problem_assertions_for_strict_proof())
-    }
-
-    /// Constructor→selector registry for strict proof validation:
-    /// `(constructor_name, [selector_name in field order])` from the elaboration
-    /// context. Like the distinctness registry, the field positions cannot be
-    /// recovered from the `TermStore` (datatype terms carry `Sort::Uninterpreted`),
-    /// so they are supplied here for `DatatypeSelectorProject` validation.
-    pub(crate) fn ctor_selector_decls_for_strict_proof(&self) -> Vec<(String, Vec<String>)> {
-        self.ctx
-            .ctor_selectors_iter()
-            .map(|(ctor, selectors)| (ctor.clone(), selectors.clone()))
-            .collect()
-    }
-
-    /// Complete exact core signatures for every sticky datatype constructor,
-    /// selector, and tester in the declaration registries used by strict proof
-    /// checking. Returns `None` on any registry/signature mismatch so callers
-    /// fail closed rather than silently dropping typed authority.
-    pub(crate) fn datatype_member_signatures_for_strict_proof(
-        &self,
-    ) -> Option<Vec<ay_proof::DatatypeMemberSignature>> {
-        let mut signatures = Vec::new();
-        for (_, constructors) in self.ctx.datatype_iter() {
-            for constructor in constructors {
-                let fields = self.ctx.constructor_selectors(constructor)?;
-                let tester = format!("is-{constructor}");
-                for identity in std::iter::once(constructor.as_str())
-                    .chain(std::iter::once(tester.as_str()))
-                    .chain(fields.iter().map(String::as_str))
-                {
-                    let info = self.ctx.exact_datatype_member_info(identity)?;
-                    signatures.push(ay_proof::DatatypeMemberSignature {
-                        identity: identity.to_string(),
-                        argument_sorts: info.arg_sorts.clone(),
-                        result_sort: info.sort.clone(),
-                        nullary_term: info.term,
-                    });
-                }
-            }
-        }
-        Some(signatures)
-    }
-
-    /// Validate proof and collect quality metrics.
-    ///
-    /// In debug builds, runs the full proof checker (rejects invalid proofs via
-    /// warning). In all builds, collects [`ProofQuality`] step-type counts for
-    /// diagnostic reporting via `(get-info :all-statistics)`.
-    pub(super) fn validate_and_measure_proof(&self, proof: &Proof) -> Option<ProofQuality> {
-        let has_hole = proof.steps.iter().any(|s| {
-            matches!(
-                s,
-                ProofStep::Step {
-                    rule: AletheRule::Hole,
-                    ..
-                }
-            )
-        });
-        if has_hole {
-            return None;
-        }
-
-        // Use strict checker when enabled (#4420).
-        let result = if self.strict_proofs_enabled() {
-            self.check_proof_strict_with_datatypes(proof)
-        } else {
-            ay_proof::check_proof_with_quality(proof, &self.ctx.terms)
-        };
-
-        match result {
-            Ok(quality) => {
-                tracing::debug!(
-                    %quality,
-                    complete = quality.is_complete(),
-                    "UNSAT proof quality"
-                );
-                if !quality.is_complete() {
-                    tracing::warn!(
-                        trust = quality.trust_count,
-                        hole = quality.hole_count,
-                        total = quality.total_steps,
-                        "UNSAT proof has unverified fallback steps"
-                    );
-                }
-                Some(quality)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    steps = proof.len(),
-                    "internal proof checker rejected UNSAT proof"
-                );
-                None
-            }
-        }
-    }
-
-    pub(crate) fn proof_derives_empty_clause(proof: &Proof) -> bool {
-        proof.steps.iter().any(|step| match step {
-            // An `array_ext_diff_intro` is a clause-free DEFINITION; its empty
-            // `clause` field is not a derivation of `(cl)`.
-            ProofStep::Step {
-                rule: AletheRule::ArrayExtDiffIntro,
-                ..
-            } => false,
-            ProofStep::Step { clause, .. } | ProofStep::Resolution { clause, .. } => {
-                clause.is_empty()
-            }
-            _ => false,
-        })
-    }
-
-    /// Check that the proof derives empty clause AND the resolution chain is
-    /// valid (each ThResolution step's conclusion matches its premises).
-    pub(super) fn proof_derives_valid_empty_clause(terms: &TermStore, proof: &Proof) -> bool {
-        if !Self::proof_derives_empty_clause(proof) {
-            return false;
-        }
-        // Quick check: run the partial checker. If it finds no errors, the
-        // chain is valid.
-        #[cfg(feature = "proof-checker")]
-        {
-            let (_, error) = check_proof_partial(proof, terms);
-            error.is_none()
-        }
-        #[cfg(not(feature = "proof-checker"))]
-        {
-            let _ = terms;
-            true
-        }
-    }
-
-    #[cfg(feature = "proof-checker")]
-    pub(in crate::executor) fn run_internal_proof_check(&mut self, proof: &Proof) {
-        // Strict mode (#4420): when enabled, reject trust and hole steps.
-        // This gates on the SMT-LIB option `(set-option :check-proofs-strict true)`.
-        if self.strict_proofs_enabled() {
-            match self.check_proof_strict_with_datatypes(proof) {
-                Ok(_quality) => {
-                    let shape = Self::proof_shape_summary(proof);
-                    self.proof_check_result = Some(PartialProofCheck {
-                        checked_steps: shape.total_steps,
-                        skipped_hole_steps: 0,
-                        total_steps: shape.total_steps,
-                    });
-                    self.record_proof_check_stats(0, Self::proof_shape_summary(proof));
-                }
-                Err(error) => {
-                    let shape = Self::proof_shape_summary(proof);
-                    let checked = shape.checked_steps;
-                    let skipped = shape.skipped_hole_steps;
-                    let total = shape.total_steps;
-                    self.proof_check_result = Some(shape.clone());
-                    self.record_proof_check_stats(1, shape);
-                    tracing::error!(
-                        error = %error,
-                        checked_steps = checked,
-                        skipped_hole_steps = skipped,
-                        total_steps = total,
-                        "strict proof checker rejected UNSAT proof"
-                    );
-                }
-            }
-            return;
-        }
-
-        let (summary, error) = check_proof_partial(proof, &self.ctx.terms);
-        self.proof_check_result = Some(summary.clone());
-        if let Some(error) = error {
-            let shape = Self::proof_shape_summary(proof);
-            let checked = shape.checked_steps;
-            let skipped = shape.skipped_hole_steps;
-            let total = shape.total_steps;
-            self.record_proof_check_stats(1, shape);
-
-            tracing::error!(
-                error = %error,
-                checked_steps = checked,
-                skipped_hole_steps = skipped,
-                total_steps = total,
-                "internal proof checker rejected UNSAT proof"
-            );
-        } else {
-            self.record_proof_check_stats(0, summary);
-        }
-    }
-
     /// Whether the last UNSAT was backed by a refutation proof that AY's own
     /// internal checker fully verified: `proof_check_ok`, a nonempty proof, and
     /// no trust/`Hole` placeholder (`skipped_hole_steps == 0`). This is the
@@ -1821,57 +1521,39 @@ impl Executor {
                     .proof_check_result
                     .as_ref()
                     .is_some_and(|c| c.total_steps > 0)
-                && Self::proof_derives_valid_empty_clause(&self.ctx.terms, proof)
+                && self.proof_derives_valid_empty_clause(proof)
         }
         #[cfg(not(feature = "proof-checker"))]
         {
             false
         }
     }
+}
 
-    #[cfg(feature = "proof-checker")]
-    fn proof_shape_summary(proof: &Proof) -> PartialProofCheck {
-        let total_steps = proof.steps.len() as u32;
-        let skipped_hole_steps = proof
-            .steps
-            .iter()
-            .filter(|step| {
-                matches!(
-                    step,
-                    ProofStep::Step {
-                        rule: AletheRule::Hole,
-                        ..
-                    }
-                )
-            })
-            .count() as u32;
-
-        PartialProofCheck {
-            checked_steps: total_steps.saturating_sub(skipped_hole_steps),
-            skipped_hole_steps,
-            total_steps,
-        }
-    }
-
-    #[cfg(feature = "proof-checker")]
-    fn record_proof_check_stats(&mut self, failures: u64, summary: PartialProofCheck) {
-        // Record whether the internal checker accepted the refutation with no
-        // errors. `--self-check` consults this (plus hole-freeness) before it
-        // will emit `unsat` rather than a sound `unknown`.
-        self.proof_check_ok = failures == 0;
-        self.last_statistics
-            .set_int(PROOF_CHECKER_FAILURES_KEY, failures);
-        self.last_statistics.set_int(
-            PROOF_CHECKER_SKIPPED_HOLE_STEPS_KEY,
-            u64::from(summary.skipped_hole_steps),
-        );
-        self.last_statistics.set_int(
-            PROOF_CHECKER_CHECKED_STEPS_KEY,
-            u64::from(summary.checked_steps),
-        );
-        self.last_statistics.set_int(
-            PROOF_CHECKER_TOTAL_STEPS_KEY,
-            u64::from(summary.total_steps),
-        );
+/// The pure (error, refusing-party) -> verdict mapping behind
+/// [`Executor::empty_clause_derivation_status`], separated so every limb is
+/// unit-testable without an executor.
+///
+/// The error KIND alone cannot settle the middle row: `ResourceLimit` also
+/// comes from budgets INSIDE the checker (`checker::lra_farkas`,
+/// `checker::nia_*`) which predate the envelope entirely, and those ARE a
+/// property of the proof — they keep their historical `Invalid` reading. Only
+/// the walk's own meter knows whether the caller-owned envelope was the
+/// refusing party, and BOTH envelope limbs (`Cancelled`, `BudgetRefused`)
+/// classify `Undetermined`: in neither case did the checker learn anything
+/// about this chain, so in neither case may a repair act on it. The limbs
+/// differ downstream — publication is already declined on `Cancelled`, and
+/// proceeds (through its own separately-metered re-validation) on
+/// `BudgetRefused` — but that difference belongs to the publication gate, not
+/// to this classification.
+#[cfg(feature = "proof-checker")]
+pub(super) fn classify_empty_clause_walk(
+    error: Option<&ProofCheckError>,
+    envelope_refused: bool,
+) -> EmptyClauseDerivation {
+    match error {
+        None => EmptyClauseDerivation::Valid,
+        Some(_) if envelope_refused => EmptyClauseDerivation::Undetermined,
+        Some(_) => EmptyClauseDerivation::Invalid,
     }
 }

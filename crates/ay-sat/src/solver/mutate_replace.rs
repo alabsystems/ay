@@ -307,9 +307,7 @@ impl Solver {
         // writer-less clause-trace lane mints no ids) must not mutate the
         // arena, or every later chain citing this clause id replays against
         // the stale trace snapshot.
-        if self.cold.lrat_enabled
-            && replacement_clause_id.is_none()
-            && self.cold.clause_trace.is_some()
+        if self.cold.lrat_enabled && replacement_clause_id.is_none() && self.has_live_clause_trace()
         {
             return ReplaceResult::Skipped;
         }
@@ -328,7 +326,7 @@ impl Solver {
             debug_assert!(clause_idx < self.cold.clause_ids.len());
             self.cold.clause_ids[clause_idx] = new_clause_id;
             // Do NOT advance next_clause_id here (#5239).
-            if let Some(ref mut trace) = self.cold.clause_trace {
+            if let Some(trace) = self.live_clause_trace_mut() {
                 trace.add_clause_with_hints(
                     new_clause_id,
                     reordered.clone(),

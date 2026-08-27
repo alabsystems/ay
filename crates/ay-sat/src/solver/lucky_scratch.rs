@@ -87,8 +87,15 @@ struct LuckyScratch {
     /// the dense clause ids containing `lit` (indexed by `Literal::index()`).
     occ_start: Vec<u32>,
     occ: Vec<u32>,
-    n_false: Vec<u32>,
-    n_sat: Vec<u32>,
+    /// Per-clause falsified/satisfied literal counters. `u16` is sound: the
+    /// arena's clause length field is 16 bits and `ClauseArena::add` stores
+    /// clauses consistently truncated to `u16::MAX` literals (see the
+    /// oversized-clause handling in `clause_arena.rs`), so no clause has more
+    /// than `u16::MAX` literal occurrences and neither counter can exceed
+    /// that. Halving these from `u32` saves 72 MB of the transient scratch on
+    /// an 18M-clause load.
+    n_false: Vec<u16>,
+    n_sat: Vec<u16>,
     /// Per-variable assignment: 1 true, -1 false, 0 unassigned.
     vals: Vec<i8>,
     trail: Vec<Literal>,
@@ -106,7 +113,11 @@ impl LuckyScratch {
     /// 1.4 GB CNF stays well under 4.3 G literals/words).
     fn build(arena: &ClauseArena, num_vars: usize) -> Option<Self> {
         let num_lits = num_vars.checked_mul(2)?;
-        let mut counts = vec![0u32; num_lits];
+        // Count occurrences directly into `occ_start[idx + 1]`: the in-place
+        // prefix sum below turns this buffer into the CSR range starts, so no
+        // separate `counts` vector is ever allocated (−54 MB transient on a
+        // 6.7M-var load).
+        let mut occ_start = vec![0u32; num_lits + 1];
         let mut clause_off: Vec<u32> = Vec::new();
         let mut total: u64 = 0;
         for off in arena.indices() {
@@ -127,7 +138,7 @@ impl LuckyScratch {
                     // Malformed literal — refuse to probe rather than risk OOB.
                     return None;
                 }
-                counts[idx] += 1;
+                occ_start[idx + 1] += 1;
                 total += 1;
             }
         }
@@ -135,23 +146,29 @@ impl LuckyScratch {
             return None;
         }
 
-        // Prefix sums -> occ_start; reuse `counts` as per-literal cursors.
-        let mut occ_start = vec![0u32; num_lits + 1];
-        let mut acc: u32 = 0;
-        for (i, &c) in counts.iter().enumerate() {
-            occ_start[i] = acc;
-            acc += c;
+        // In-place prefix sum: `occ_start[i]` becomes the start of literal
+        // i's range (counts were accumulated one slot right, so the running
+        // sum through slot i covers literals 0..i-1 exactly).
+        for i in 1..=num_lits {
+            occ_start[i] += occ_start[i - 1];
         }
-        occ_start[num_lits] = acc;
-        let mut cursor = occ_start.clone();
+
+        // Fill `occ` using `occ_start` itself as the per-literal write
+        // cursors instead of a cloned cursor vector (−54 MB transient).
         let mut occ = vec![0u32; total as usize];
         for (dense, &off) in clause_off.iter().enumerate() {
             for &lit in arena.literals(off as usize) {
-                let cur = &mut cursor[lit.index()];
+                let cur = &mut occ_start[lit.index()];
                 occ[*cur as usize] = dense as u32;
                 *cur += 1;
             }
         }
+        // Each cursor has advanced to the END of its range, which is the
+        // start of the next literal's range: shift right to restore starts.
+        for i in (1..=num_lits).rev() {
+            occ_start[i] = occ_start[i - 1];
+        }
+        occ_start[0] = 0;
 
         let n_clauses = clause_off.len();
         Some(Self {
@@ -159,8 +176,8 @@ impl LuckyScratch {
             clause_off,
             occ_start,
             occ,
-            n_false: vec![0u32; n_clauses],
-            n_sat: vec![0u32; n_clauses],
+            n_false: vec![0u16; n_clauses],
+            n_sat: vec![0u16; n_clauses],
             vals: vec![0i8; num_vars],
             trail: Vec::new(),
             qhead: 0,
@@ -255,10 +272,14 @@ impl LuckyScratch {
                 let off = self.clause_off[c] as usize;
                 let lits = arena.literals(off);
                 let len = lits.len() as u32;
-                if self.n_false[c] >= len {
+                // Widen to u32 for the comparisons: `n_false` is u16 and can
+                // legitimately sit at `u16::MAX` on a maximum-length clause,
+                // where a u16 `+ 1` would overflow.
+                let n_false = u32::from(self.n_false[c]);
+                if n_false >= len {
                     // Complete this literal's counter effects, then stop.
                     conflict = true;
-                } else if self.n_false[c] + 1 == len {
+                } else if n_false + 1 == len {
                     // n_false counts PROCESSED false literals, so exactly one
                     // literal of the clause is still unprocessed. It is
                     // either unassigned (a genuine unit — assign it),
